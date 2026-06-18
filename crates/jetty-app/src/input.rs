@@ -56,9 +56,13 @@ pub fn decide_key(
         // Fall through: key_to_bytes(Escape) will produce Send(vec![0x1b]).
     }
 
-    // Rules 3-5: Ctrl+Shift hotkeys.
+    // Rules 3-5 + panel toggle: Ctrl+Shift hotkeys keyed by PHYSICAL key, which
+    // is layout-independent. Ctrl+Shift+O toggles the Settings panel and works on
+    // every layout — unlike Ctrl+, which on a Turkish layout reports as Backslash
+    // (not Comma), so it never matched.
     if ctrl && shift {
         match physical {
+            PhysicalKey::Code(KeyCode::KeyO) => return KeyAction::TogglePanel,
             PhysicalKey::Code(KeyCode::KeyT) => return KeyAction::CycleTheme,
             PhysicalKey::Code(KeyCode::Equal) => return KeyAction::OpacityUp,
             PhysicalKey::Code(KeyCode::Minus) => return KeyAction::OpacityDown,

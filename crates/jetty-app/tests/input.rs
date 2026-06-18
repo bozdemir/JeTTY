@@ -55,6 +55,20 @@ fn ctrl_comma_logical_fallback_toggles_panel() {
 }
 
 #[test]
+fn ctrl_shift_o_toggles_panel() {
+    // Layout-independent panel toggle. Works on the Turkish layout, where the
+    // comma key reports to winit as Backslash (not Comma) so Ctrl+, never matched.
+    let action = decide_key(
+        true,
+        true,
+        phys(KeyCode::KeyO),
+        &Key::Character("O".into()),
+        false,
+    );
+    assert_eq!(action, KeyAction::TogglePanel);
+}
+
+#[test]
 fn escape_closes_open_panel() {
     let action = decide_key(
         false,
