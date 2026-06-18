@@ -33,6 +33,8 @@ pub struct App {
     dragging_scrollbar: bool,
     /// Y offset from thumb top where the user grabbed, in px.
     drag_grab_dy: f32,
+    /// Whether the Settings panel popup is currently visible.
+    panel_open: bool,
 }
 
 impl App {
@@ -66,6 +68,7 @@ impl App {
             cursor: (0.0, 0.0),
             dragging_scrollbar: false,
             drag_grab_dy: 0.0,
+            panel_open: false,
         };
         // Apply the initial theme+opacity so Terminal::new env defaults are
         // overridden by our managed state (avoids double-reads from env).
@@ -235,6 +238,31 @@ impl ApplicationHandler<()> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+                // --- Ctrl+, → toggle Settings panel ---
+                if self.modifiers.control_key() && !self.modifiers.shift_key() {
+                    if let Key::Character(s) = &event.logical_key {
+                        if s == "," {
+                            self.panel_open = !self.panel_open;
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                // --- Escape → close panel if open; otherwise forward to PTY ---
+                if let Key::Named(NamedKey::Escape) = &event.logical_key {
+                    if self.panel_open {
+                        self.panel_open = false;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                    // Panel closed: fall through to PTY forwarding below.
+                }
+
                 // --- Ctrl+Shift hotkeys (theme switch + opacity adjust) ---
                 // Must be checked BEFORE PageUp/Down and before key_to_bytes so
                 // the intercept key is not also forwarded to the PTY.
@@ -299,6 +327,9 @@ impl ApplicationHandler<()> for App {
             WindowEvent::RedrawRequested => {
                 self.drain_pty();
                 let snap = self.terminal.snapshot();
+                let panel_open = self.panel_open;
+                let opacity = self.opacity;
+                let theme_idx = self.theme_idx;
                 let (Some(gpu), Some(text), Some(quad)) =
                     (&mut self.gpu, &mut self.text, &mut self.quad)
                 else {
@@ -321,7 +352,23 @@ impl ApplicationHandler<()> for App {
                     {
                         rects.push(r);
                     }
+                    let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
+                    if panel_open {
+                        let pv = jetty_render::build_panel(width, height, opacity, theme_idx);
+                        rects.extend(pv.quads);
+                        labels = pv.labels;
+                    }
                     quad.render(&gpu.device, &gpu.queue, &view, width, height, &rects);
+                    if !labels.is_empty() {
+                        let _ = text.render_overlays(
+                            &gpu.device,
+                            &gpu.queue,
+                            &view,
+                            width,
+                            height,
+                            &labels,
+                        );
+                    }
                     frame.present();
                 }
             }

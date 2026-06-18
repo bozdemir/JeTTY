@@ -23,6 +23,8 @@ pub struct TextLayer {
     metrics: Metrics,
     cell_w: f32,
     cell_h: f32,
+    /// Growable pool of glyphon Buffers reused across frames for overlay labels.
+    overlay_buffers: Vec<Buffer>,
 }
 
 impl TextLayer {
@@ -76,6 +78,7 @@ impl TextLayer {
             metrics,
             cell_w,
             cell_h,
+            overlay_buffers: Vec::new(),
         }
     }
 
@@ -249,6 +252,101 @@ impl TextLayer {
             });
             if let Err(e) = self.renderer.render(&self.atlas, &self.viewport, &mut pass) {
                 eprintln!("jetty: text render error: {e:?}");
+            }
+        }
+        queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
+    /// Renders arbitrary text labels at pixel positions as a SEPARATE pass with
+    /// `LoadOp::Load`, so they draw ON TOP of whatever is already in `view`
+    /// (e.g., panel quads drawn by QuadLayer).
+    ///
+    /// `labels` is a slice of `(text, x, y, rgb_color)` tuples.
+    /// Returns `Ok(())` immediately when `labels` is empty.
+    pub fn render_overlays(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        labels: &[(String, f32, f32, [u8; 3])],
+    ) -> Result<(), PrepareError> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+
+        // Ensure we have enough buffers in the pool.
+        while self.overlay_buffers.len() < labels.len() {
+            let mut buf = Buffer::new(&mut self.font_system, self.metrics);
+            buf.set_size(&mut self.font_system, None, Some(height as f32));
+            self.overlay_buffers.push(buf);
+        }
+
+        let win_bounds = TextBounds {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
+
+        // First pass: set text content (requires &mut font_system, so can't borrow bufs as &T simultaneously).
+        for (i, (text, _x, _y, _rgb)) in labels.iter().enumerate() {
+            let buf = &mut self.overlay_buffers[i];
+            buf.set_size(&mut self.font_system, None, Some(height as f32));
+            let attrs = Attrs::new().family(Family::Name(FONT_FAMILY));
+            buf.set_text(&mut self.font_system, text, &attrs, Shaping::Basic, None);
+        }
+
+        // Second pass: build TextAreas with shared refs (no mutation of font_system needed).
+        let mut areas: Vec<TextArea> = Vec::with_capacity(labels.len());
+        for (i, (_text, x, y, rgb)) in labels.iter().enumerate() {
+            areas.push(TextArea {
+                buffer: &self.overlay_buffers[i],
+                left: *x,
+                top: *y,
+                scale: 1.0,
+                bounds: win_bounds,
+                default_color: Color::rgb(rgb[0], rgb[1], rgb[2]),
+                custom_glyphs: &[],
+            });
+        }
+
+        self.viewport.update(queue, Resolution { width, height });
+
+        self.renderer.prepare(
+            device,
+            queue,
+            &mut self.font_system,
+            &mut self.atlas,
+            &self.viewport,
+            areas,
+            &mut self.swash,
+        )?;
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("overlay-text"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("overlay-text-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let Err(e) = self.renderer.render(&self.atlas, &self.viewport, &mut pass) {
+                eprintln!("jetty: overlay text render error: {e:?}");
             }
         }
         queue.submit(Some(encoder.finish()));

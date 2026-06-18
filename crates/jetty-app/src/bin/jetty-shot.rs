@@ -105,14 +105,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Render to offscreen texture ---
     text.render_to(&device, &queue, &view, width, height, &snap)?;
 
-    // --- Draw scrollbar quad over the text ---
+    // --- Draw scrollbar quad (and optionally the settings panel) over the text ---
     {
         let mut quad = QuadLayer::new(&device, format);
         let mut rects: Vec<jetty_render::Rect> = Vec::new();
         if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height) {
             rects.push(r);
         }
+
+        let shot_panel = std::env::var("JETTY_SHOT_PANEL").unwrap_or_else(|_| "0".to_string());
+        let panel_labels = if shot_panel == "1" {
+            // Read opacity + theme_idx from env (same vars as the live app).
+            let opacity = std::env::var("JETTY_OPACITY")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .map(|v| v.clamp(0.1, 1.0))
+                .unwrap_or(1.0);
+            let theme_name = std::env::var("JETTY_THEME").unwrap_or_default();
+            let theme_idx = jetty_core::theme::PRESETS
+                .iter()
+                .position(|&n| n == theme_name.as_str())
+                .unwrap_or(0);
+
+            let pv = jetty_render::build_panel(width, height, opacity, theme_idx);
+            rects.extend(pv.quads);
+            eprintln!(
+                "jetty-shot: panel enabled (opacity={opacity:.2}, theme_idx={theme_idx})"
+            );
+            pv.labels
+        } else {
+            Vec::new()
+        };
+
         quad.render(&device, &queue, &view, width, height, &rects);
+
+        // Render panel text labels on top of the panel quads.
+        if !panel_labels.is_empty() {
+            let _ = text.render_overlays(&device, &queue, &view, width, height, &panel_labels);
+        }
     }
 
     // --- Read back to CPU ---
