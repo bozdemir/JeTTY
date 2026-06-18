@@ -26,11 +26,7 @@ impl ApplicationHandler for App {
             {
                 event_loop.exit();
             }
-            WindowEvent::RedrawRequested => {
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
+            WindowEvent::RedrawRequested => {}
             _ => {}
         }
     }
