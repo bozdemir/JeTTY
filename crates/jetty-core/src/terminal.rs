@@ -1,8 +1,8 @@
 use crate::snapshot::{CellSnapshot, GridSnapshot};
 use crate::theme::Theme;
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::term::{Config, Term, point_to_viewport};
 use alacritty_terminal::vte::ansi::Processor;
 
 #[derive(Clone, Copy)]
@@ -39,7 +39,8 @@ pub struct Terminal {
 impl Terminal {
     pub fn new(cols: usize, rows: usize) -> Terminal {
         let size = Size { cols, lines: rows };
-        let term = Term::new(Config::default(), &size, NoopListener);
+        let config = Config { scrolling_history: 10_000, ..Default::default() };
+        let term = Term::new(config, &size, NoopListener);
 
         // Load theme from JETTY_THEME env var; default to "default_dark".
         let theme_name = std::env::var("JETTY_THEME").unwrap_or_else(|_| "default_dark".to_string());
@@ -72,29 +73,62 @@ impl Terminal {
     }
 
     pub fn snapshot(&self) -> GridSnapshot {
-        use alacritty_terminal::index::{Column, Line, Point};
         let mut cells = vec![CellSnapshot::default(); self.cols * self.rows];
-        let grid = self.term.grid();
-        for row in 0..self.rows {
-            for col in 0..self.cols {
-                // NOTE: valid only while there is no scrollback (total_lines == screen_lines).
-                // When scrollback is added, map visible row -> absolute line before indexing.
-                let point = Point::new(Line(row as i32), Column(col));
-                let cell = &grid[point];
-                let fg = resolve_rgb(&self.theme, cell.fg);
-                let bg = resolve_rgb(&self.theme, cell.bg);
-                cells[row * self.cols + col] = CellSnapshot { c: cell.c, fg, bg };
+        let content = self.term.renderable_content();
+        let display_offset = content.display_offset;
+
+        // Iterate over all visible cells. Each item has point in terminal coordinates
+        // (line 0 = top of current viewport when display_offset=0; negative = history).
+        // point_to_viewport converts to display row: viewport_line = point.line.0 + display_offset.
+        for item in content.display_iter {
+            if let Some(vp) = point_to_viewport(display_offset, item.point) {
+                let row = vp.line;
+                let col = vp.column.0;
+                if row < self.rows && col < self.cols {
+                    let cell = item.cell;
+                    let fg = resolve_rgb(&self.theme, cell.fg);
+                    let bg = resolve_rgb(&self.theme, cell.bg);
+                    cells[row * self.cols + col] = CellSnapshot { c: cell.c, fg, bg };
+                }
             }
         }
-        let cursor = self.term.grid().cursor.point;
+
+        // Cursor point is in terminal coordinates; convert to viewport (display) row.
+        let cursor_vp = point_to_viewport(display_offset, content.cursor.point);
+        let (cursor_row, cursor_col) = cursor_vp
+            .map(|p| (p.line.min(self.rows.saturating_sub(1)), p.column.0.min(self.cols.saturating_sub(1))))
+            .unwrap_or((0, 0));
+
         GridSnapshot {
             cols: self.cols,
             rows: self.rows,
             cells,
-            cursor_row: cursor.line.0.max(0) as usize,
-            cursor_col: cursor.column.0,
+            cursor_row,
+            cursor_col,
             bg_rgba: self.theme.bg,
             cursor_rgb: self.theme.cursor,
+        }
+    }
+
+    /// Scroll the terminal display by `delta` lines.
+    /// Positive delta scrolls UP into history (shows older output).
+    /// Negative delta scrolls DOWN toward the bottom.
+    pub fn scroll_lines(&mut self, delta: i32) {
+        self.term.scroll_display(Scroll::Delta(delta));
+    }
+
+    /// Scroll to the very bottom (live view, most recent output).
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Scroll one page up (true) or down (false).
+    pub fn scroll_page(&mut self, up: bool) {
+        let delta = (self.rows as i32).saturating_sub(1);
+        if up {
+            self.scroll_lines(delta);
+        } else {
+            self.scroll_lines(-delta);
         }
     }
 }

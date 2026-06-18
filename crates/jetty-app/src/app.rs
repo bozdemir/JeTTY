@@ -5,6 +5,7 @@ use jetty_render::{GpuContext, TextLayer};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+use winit::event::MouseScrollDelta;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
@@ -86,8 +87,45 @@ impl ApplicationHandler<()> for App {
                     text.resize(gpu);
                 }
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Positive y = wheel up = scroll into history (older output).
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => (y.round() as i32) * 3,
+                    MouseScrollDelta::PixelDelta(p) => {
+                        // Approximate cell height; use 20.0 as a reasonable default.
+                        const CELL_H: f64 = 20.0;
+                        (p.y / CELL_H).round() as i32
+                    }
+                };
+                if lines != 0 {
+                    self.terminal.scroll_lines(lines);
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+                // PageUp/Down scroll the terminal without sending to the PTY.
+                match &event.logical_key {
+                    Key::Named(NamedKey::PageUp) => {
+                        self.terminal.scroll_page(true);
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                    Key::Named(NamedKey::PageDown) => {
+                        self.terminal.scroll_page(false);
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
                 if let Some(bytes) = key_to_bytes(&event.logical_key) {
+                    // Any real keystroke jumps back to the bottom so the user sees their input.
+                    self.terminal.scroll_to_bottom();
                     if let Some(w) = &mut self.writer {
                         let _ = w.write_all(&bytes);
                         let _ = w.flush();

@@ -68,6 +68,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Terminal::new picks up JETTY_THEME and JETTY_OPACITY from the environment.
     let mut terminal = jetty_core::Terminal::new(cols, rows);
     terminal.feed(&input_bytes);
+
+    // Optional: scroll the view before snapshotting (JETTY_SHOT_SCROLL, i32, positive = up).
+    if let Ok(scroll_str) = std::env::var("JETTY_SHOT_SCROLL") {
+        if let Ok(n) = scroll_str.parse::<i32>() {
+            if n != 0 {
+                terminal.scroll_lines(n);
+                eprintln!("jetty-shot: scrolled {} lines (positive=up into history)", n);
+            }
+        }
+    }
+
     let snap = terminal.snapshot();
 
     let bg_alpha = snap.bg_rgba[3];
