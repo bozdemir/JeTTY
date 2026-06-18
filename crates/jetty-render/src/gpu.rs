@@ -16,12 +16,20 @@ impl GpuContext {
     ) -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window.clone()).expect("surface");
+        // Prefer the integrated (Intel) GPU. On hybrid Intel+NVIDIA systems under
+        // X11, driving the discrete NVIDIA GPU via Vulkan can crash the KWin/X
+        // compositor — and a terminal has no need for discrete-GPU power.
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
+            power_preference: wgpu::PowerPreference::LowPower,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
         }))
         .expect("no adapter");
+        eprintln!(
+            "jetty: GPU adapter = {} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("jetty-device"),
             required_features: wgpu::Features::empty(),
