@@ -180,9 +180,9 @@ impl TextLayer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.renderer
-                .render(&self.atlas, &self.viewport, &mut pass)
-                .unwrap();
+            if let Err(e) = self.renderer.render(&self.atlas, &self.viewport, &mut pass) {
+                eprintln!("jetty: text render error: {e:?}");
+            }
         }
         gpu.queue.submit(Some(encoder.finish()));
         frame.present();
