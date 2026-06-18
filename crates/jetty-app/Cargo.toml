@@ -1,0 +1,10 @@
+[package]
+name = "jetty-app"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+jetty-core = { path = "../jetty-core" }
+jetty-render = { path = "../jetty-render" }
+jetty-platform = { path = "../jetty-platform" }
+winit = "0.30"

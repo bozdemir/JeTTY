@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/jetty-core", "crates/jetty-render", "crates/jetty-platform", "crates/jetty-app"]
+
+[package]
+name = "jetty"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "jetty"
+path = "src/main.rs"
+
+[dependencies]
+jetty-app = { path = "crates/jetty-app" }

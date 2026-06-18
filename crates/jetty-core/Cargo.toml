@@ -1,0 +1,8 @@
+[package]
+name = "jetty-core"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+alacritty_terminal = "0.26"
+portable-pty = "0.9"

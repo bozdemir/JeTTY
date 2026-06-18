@@ -1,0 +1,8 @@
+[package]
+name = "jetty-platform"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.30"
+raw-window-handle = "0.6"
