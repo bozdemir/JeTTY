@@ -6,8 +6,8 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::event::MouseScrollDelta;
-use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
+use crate::input;
 
 const COLS: usize = 100;
 const ROWS: usize = 30;
@@ -213,65 +213,60 @@ impl ApplicationHandler<()> for App {
                     return;
                 };
 
-                // --- Settings panel hit-testing (takes priority over scrollbar) ---
-                if self.panel_open {
-                    let pv = jetty_render::build_panel(w, h, self.opacity, self.theme_idx);
-                    let g = &pv.geom;
-                    // Slider handle or track
-                    if point_in(&g.slider_handle, self.cursor.0, self.cursor.1)
-                        || point_in(&g.slider_track, self.cursor.0, self.cursor.1)
-                    {
-                        self.dragging_slider = true;
-                        self.opacity = self.opacity_from_cursor(&g.slider_track);
-                        self.apply_theme();
-                        if let Some(w_) = &self.window {
-                            w_.request_redraw();
-                        }
-                        return; // consumed
-                    }
-                    // Theme chips
-                    for (i, chip) in g.chips.iter().enumerate() {
-                        if point_in(chip, self.cursor.0, self.cursor.1) {
-                            self.theme_idx = i;
-                            self.apply_theme();
-                            if let Some(w_) = &self.window {
-                                w_.request_redraw();
-                            }
-                            return; // consumed
-                        }
-                    }
-                    // Click anywhere else inside the panel: consume without action
-                    if point_in(&g.panel, self.cursor.0, self.cursor.1) {
-                        return;
-                    }
-                    // Click outside the panel while open: fall through to scrollbar
-                }
+                let panel_geom = if self.panel_open {
+                    Some(jetty_render::build_panel(w, h, self.opacity, self.theme_idx).geom)
+                } else {
+                    None
+                };
 
                 let rows = self.terminal.rows();
                 let scroll_offset = self.terminal.scroll_offset();
                 let scroll_max = self.terminal.scroll_max();
+                let scrollbar = jetty_render::scrollbar_rect_geom(rows, scroll_offset, scroll_max, w, h);
+
                 let cx = self.cursor.0 as f32;
                 let cy = self.cursor.1 as f32;
 
-                if let Some(rect) = jetty_render::scrollbar_rect_geom(rows, scroll_offset, scroll_max, w, h) {
-                    let in_thumb = cx >= rect.x && cx <= rect.x + rect.w
-                        && cy >= rect.y && cy <= rect.y + rect.h;
-                    let in_track = cx >= rect.x && cx <= rect.x + rect.w;
-
-                    if in_thumb {
-                        // Grab the thumb at the exact click point.
+                match input::decide_mouse_press(
+                    panel_geom.as_ref(),
+                    scrollbar.as_ref(),
+                    cx,
+                    cy,
+                ) {
+                    input::MouseAction::StartSliderDrag => {
+                        let track = panel_geom.as_ref().map(|g| g.slider_track);
+                        self.dragging_slider = true;
+                        if let Some(track_rect) = track {
+                            self.opacity = self.opacity_from_cursor(&track_rect);
+                            self.apply_theme();
+                        }
+                        if let Some(w_) = &self.window {
+                            w_.request_redraw();
+                        }
+                    }
+                    input::MouseAction::SetTheme(i) => {
+                        self.theme_idx = i;
+                        self.apply_theme();
+                        if let Some(w_) = &self.window {
+                            w_.request_redraw();
+                        }
+                    }
+                    input::MouseAction::ConsumePanel => {
+                        // Swallow the click; no state change needed.
+                    }
+                    input::MouseAction::StartScrollbarDrag { grab_dy } => {
                         self.dragging_scrollbar = true;
-                        self.drag_grab_dy = cy - rect.y;
-                    } else if in_track {
-                        // Clicked the track outside the thumb: jump to that position,
-                        // treating the grab point as the thumb center.
+                        self.drag_grab_dy = grab_dy;
+                    }
+                    input::MouseAction::ScrollbarTrackJump => {
                         self.dragging_scrollbar = true;
-                        self.drag_grab_dy = rect.h / 2.0;
+                        self.drag_grab_dy = scrollbar.map(|r| r.h / 2.0).unwrap_or(0.0);
                         self.apply_scroll_from_cursor(w, h);
                         if let Some(win) = &self.window {
                             win.request_redraw();
                         }
                     }
+                    input::MouseAction::None => {}
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
@@ -296,91 +291,64 @@ impl ApplicationHandler<()> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
-                // --- Ctrl+, → toggle Settings panel ---
-                // Match the PHYSICAL key: logical_key for "," is unreliable while
-                // Ctrl is held on X11/Wayland. Keep a logical fallback too.
-                let is_comma = matches!(event.physical_key, PhysicalKey::Code(KeyCode::Comma))
-                    || matches!(&event.logical_key, Key::Character(s) if s.as_str() == ",");
-                if self.modifiers.control_key() && !self.modifiers.shift_key() && is_comma {
-                    self.panel_open = !self.panel_open;
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
+                let ctrl = self.modifiers.control_key();
+                let shift = self.modifiers.shift_key();
+                match input::decide_key(ctrl, shift, event.physical_key, &event.logical_key, self.panel_open) {
+                    input::KeyAction::TogglePanel => {
+                        self.panel_open = !self.panel_open;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
                     }
-                    return;
-                }
-
-                // --- Escape → close panel if open; otherwise forward to PTY ---
-                if let Key::Named(NamedKey::Escape) = &event.logical_key {
-                    if self.panel_open {
+                    input::KeyAction::ClosePanel => {
                         self.panel_open = false;
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
-                        return;
                     }
-                    // Panel closed: fall through to PTY forwarding below.
-                }
-
-                // --- Ctrl+Shift hotkeys (theme switch + opacity adjust) ---
-                // Must be checked BEFORE PageUp/Down and before key_to_bytes so
-                // the intercept key is not also forwarded to the PTY.
-                if self.modifiers.control_key() && self.modifiers.shift_key() {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyT) => {
-                            self.theme_idx = (self.theme_idx + 1)
-                                % jetty_core::theme::PRESETS.len();
-                            self.apply_theme();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
-                            return;
+                    input::KeyAction::CycleTheme => {
+                        self.theme_idx = (self.theme_idx + 1)
+                            % jetty_core::theme::PRESETS.len();
+                        self.apply_theme();
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
                         }
-                        // "+" lives on the "=" key (Shift+=); match it physically.
-                        PhysicalKey::Code(KeyCode::Equal) => {
-                            self.opacity = (self.opacity + 0.05).min(1.0);
-                            self.apply_theme();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::Minus) => {
-                            self.opacity = (self.opacity - 0.05).max(0.1);
-                            self.apply_theme();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
-                            return;
-                        }
-                        _ => {}
                     }
-                }
-
-                // PageUp/Down scroll the terminal without sending to the PTY.
-                match &event.logical_key {
-                    Key::Named(NamedKey::PageUp) => {
+                    input::KeyAction::OpacityUp => {
+                        self.opacity = (self.opacity + 0.05).min(1.0);
+                        self.apply_theme();
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    input::KeyAction::OpacityDown => {
+                        self.opacity = (self.opacity - 0.05).max(0.1);
+                        self.apply_theme();
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    input::KeyAction::ScrollPageUp => {
                         self.terminal.scroll_page(true);
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
-                        return;
                     }
-                    Key::Named(NamedKey::PageDown) => {
+                    input::KeyAction::ScrollPageDown => {
                         self.terminal.scroll_page(false);
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
-                        return;
                     }
-                    _ => {}
-                }
-                if let Some(bytes) = key_to_bytes(&event.logical_key) {
-                    // Any real keystroke jumps back to the bottom so the user sees their input.
-                    self.terminal.scroll_to_bottom();
-                    if let Some(w) = &mut self.writer {
-                        let _ = w.write_all(&bytes);
-                        let _ = w.flush();
+                    input::KeyAction::Send(bytes) => {
+                        // Any real keystroke jumps back to the bottom so the user sees their input.
+                        self.terminal.scroll_to_bottom();
+                        if let Some(w) = &mut self.writer {
+                            let _ = w.write_all(&bytes);
+                            let _ = w.flush();
+                        }
                     }
+                    input::KeyAction::None => {}
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -436,26 +404,6 @@ impl ApplicationHandler<()> for App {
     }
 }
 
-/// Returns true if the point (x, y) lies within the rect (inclusive on all edges).
-fn point_in(r: &jetty_render::Rect, x: f64, y: f64) -> bool {
-    x as f32 >= r.x && x as f32 <= r.x + r.w && y as f32 >= r.y && y as f32 <= r.y + r.h
-}
-
-fn key_to_bytes(key: &Key) -> Option<Vec<u8>> {
-    match key {
-        Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
-        Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
-        Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
-        Key::Named(NamedKey::Escape) => Some(vec![0x1b]),
-        Key::Named(NamedKey::Space) => Some(b" ".to_vec()),
-        Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
-        Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
-        Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
-        Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
-        Key::Character(s) => Some(s.as_bytes().to_vec()),
-        _ => None,
-    }
-}
 
 fn spawn_waker(proxy: EventLoopProxy<()>) {
     std::thread::spawn(move || loop {
