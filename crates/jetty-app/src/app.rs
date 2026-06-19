@@ -139,11 +139,14 @@ impl App {
         Some((col.max(1) as usize, row.max(1) as usize))
     }
 
-    /// Encode a mouse event in SGR format and write it to the PTY. Used only
-    /// when the running application has enabled mouse reporting.
+    /// Encode a mouse event and write it to the PTY. Used only when the running
+    /// application has enabled mouse reporting (`mouse_mode()`). The wire format
+    /// matches what the app requested: SGR (1006) encoding when `mouse_sgr()` is
+    /// true (`\e[?1006h`), otherwise the legacy X10 encoding.
     fn send_mouse_report(&mut self, event: input::MouseEvent) {
         let Some((col, row)) = self.cursor_cell() else { return };
-        let bytes = input::encode_sgr_mouse(event, col, row);
+        let sgr = self.terminal.mouse_sgr();
+        let bytes = input::encode_mouse(event, col, row, sgr);
         if let Some(w) = &mut self.writer {
             let _ = w.write_all(&bytes);
             let _ = w.flush();
@@ -159,6 +162,13 @@ impl App {
         // The terminal may have produced replies to host queries (DSR/DA, etc.)
         // while feeding output. Send those back to the PTY so the shell's
         // startup queries succeed (fixes the red "x" at the first prompt).
+        //
+        // Ordering: we drain *after* feeding all pending output above, so every
+        // query parsed this tick has already enqueued its reply before we write
+        // here, and we flush immediately — the shell sees the answers before the
+        // next batch of PTY output is produced. Keystroke writes go through a
+        // separate path (KeyAction::Send), so query replies never interleave
+        // with, or get delayed behind, user input.
         let replies = self.terminal.drain_pty_writes();
         if !replies.is_empty() {
             if let Some(w) = &mut self.writer {
@@ -201,8 +211,15 @@ impl ApplicationHandler<()> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _ev: ()) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _ev: ()) {
         self.drain_pty();
+        // If the shell child exited while we were draining its last output,
+        // close the window. The waker fires this ~60x/s, so we react within a
+        // frame of the shell exiting. `event_loop.exit()` is safe to call here.
+        if self.terminal.child_exited() {
+            event_loop.exit();
+            return;
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -485,6 +502,13 @@ impl ApplicationHandler<()> for App {
             }
             WindowEvent::RedrawRequested => {
                 self.drain_pty();
+                // The shell may have exited as part of the output we just
+                // drained (e.g. the user typed `exit`); close the window rather
+                // than render one more dead frame.
+                if self.terminal.child_exited() {
+                    event_loop.exit();
+                    return;
+                }
                 let snap = self.terminal.snapshot();
                 let panel_open = self.panel_open;
                 let opacity = self.opacity;

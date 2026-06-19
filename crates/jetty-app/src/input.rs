@@ -301,6 +301,36 @@ pub enum MouseEvent {
     WheelDown,
 }
 
+/// The button-code half of a mouse event, shared by both the SGR and X10
+/// encoders so the two formats can never disagree about which button a given
+/// `MouseEvent` maps to. Returns `(button, is_release)`.
+///
+/// Left press/release use button 0; the wheel uses 64 (up) / 65 (down). Only a
+/// left release is a "release" event (terminator `m` in SGR); wheel events are
+/// always reported as a press (`M`).
+fn mouse_button_code(event: MouseEvent) -> (u8, bool) {
+    match event {
+        MouseEvent::LeftPress => (0, false),
+        MouseEvent::LeftRelease => (0, true),
+        MouseEvent::WheelUp => (64, false),
+        MouseEvent::WheelDown => (65, false),
+    }
+}
+
+/// Encode a mouse event in the format the running application requested.
+///
+/// When `sgr` is true the application enabled SGR (1006) reporting
+/// (`\e[?1006h`); use [`encode_sgr_mouse`]. Otherwise fall back to the legacy
+/// X10 encoding via [`encode_x10_mouse`]. This is the single dispatch point so
+/// callers never have to branch on the mode themselves.
+pub fn encode_mouse(event: MouseEvent, col: usize, row: usize, sgr: bool) -> Vec<u8> {
+    if sgr {
+        encode_sgr_mouse(event, col, row)
+    } else {
+        encode_x10_mouse(event, col, row)
+    }
+}
+
 /// Encode a mouse event as an SGR (1006) mouse report.
 ///
 /// Format: `\e[<Cb;Cx;CyM` for a press/motion and `\e[<Cb;Cx;Cym` for a
@@ -312,13 +342,38 @@ pub enum MouseEvent {
 pub fn encode_sgr_mouse(event: MouseEvent, col: usize, row: usize) -> Vec<u8> {
     let col = col.max(1);
     let row = row.max(1);
-    let (button, terminator) = match event {
-        MouseEvent::LeftPress => (0, 'M'),
-        MouseEvent::LeftRelease => (0, 'm'),
-        MouseEvent::WheelUp => (64, 'M'),
-        MouseEvent::WheelDown => (65, 'M'),
-    };
+    let (button, is_release) = mouse_button_code(event);
+    let terminator = if is_release { 'm' } else { 'M' };
     format!("\x1b[<{button};{col};{row}{terminator}").into_bytes()
+}
+
+/// Encode a mouse event as a legacy X10 mouse report.
+///
+/// Format: `\e[M` followed by exactly three bytes: `32 + button`, `32 + col`,
+/// `32 + row`, where `col`/`row` are 1-based cell coordinates. Each coordinate
+/// is clamped to 223 so `32 + coord` never exceeds 255 (the maximum a single
+/// byte can hold); coordinates beyond that are simply not representable in X10.
+///
+/// X10 has no separate release encoding per button: a release is reported as
+/// button 3 (`32 + 3`). Wheel events carry the 0x40 (64) "extra button" bit, so
+/// `32 + 64` for wheel up and `32 + 65` for wheel down, matching the SGR button
+/// numbers.
+pub fn encode_x10_mouse(event: MouseEvent, col: usize, row: usize) -> Vec<u8> {
+    // Clamp to 1..=223 so the +32 offset stays within a single byte (<=255).
+    let col = col.clamp(1, 223) as u8;
+    let row = row.clamp(1, 223) as u8;
+    let (button, is_release) = mouse_button_code(event);
+    // Legacy X10 reports every button release as button 3; only the position
+    // and the release indicator survive (no per-button release encoding).
+    let button = if is_release { 3 } else { button };
+    vec![
+        0x1b,
+        b'[',
+        b'M',
+        32u8.wrapping_add(button),
+        32 + col,
+        32 + row,
+    ]
 }
 
 #[cfg(test)]
@@ -341,5 +396,58 @@ mod tests {
     fn sgr_coords_clamped_to_one() {
         // 0-based callers that forgot to add 1 still get a valid 1-based report.
         assert_eq!(encode_sgr_mouse(MouseEvent::LeftPress, 0, 0), b"\x1b[<0;1;1M");
+    }
+
+    #[test]
+    fn x10_left_press_release() {
+        // Press: \e[M then 32+button, 32+col, 32+row.
+        assert_eq!(
+            encode_x10_mouse(MouseEvent::LeftPress, 5, 3),
+            vec![0x1b, b'[', b'M', 32, 32 + 5, 32 + 3],
+        );
+        // Release: legacy X10 encodes any release as button 3.
+        assert_eq!(
+            encode_x10_mouse(MouseEvent::LeftRelease, 5, 3),
+            vec![0x1b, b'[', b'M', 32 + 3, 32 + 5, 32 + 3],
+        );
+    }
+
+    #[test]
+    fn x10_wheel_buttons() {
+        assert_eq!(
+            encode_x10_mouse(MouseEvent::WheelUp, 1, 1),
+            vec![0x1b, b'[', b'M', 32u8.wrapping_add(64), 33, 33],
+        );
+        assert_eq!(
+            encode_x10_mouse(MouseEvent::WheelDown, 1, 1),
+            vec![0x1b, b'[', b'M', 32u8.wrapping_add(65), 33, 33],
+        );
+    }
+
+    #[test]
+    fn x10_coords_clamped_to_one_and_223() {
+        // 0-based callers still get a valid 1-based report (min clamp to 1).
+        assert_eq!(
+            encode_x10_mouse(MouseEvent::LeftPress, 0, 0),
+            vec![0x1b, b'[', b'M', 32, 33, 33],
+        );
+        // Coordinates above 223 saturate so 32+coord never exceeds 255.
+        assert_eq!(
+            encode_x10_mouse(MouseEvent::LeftPress, 500, 999),
+            vec![0x1b, b'[', b'M', 32, 255, 255],
+        );
+    }
+
+    #[test]
+    fn encode_mouse_dispatches_on_sgr_flag() {
+        // sgr=true → SGR encoding; sgr=false → X10 encoding.
+        assert_eq!(
+            encode_mouse(MouseEvent::LeftPress, 5, 3, true),
+            encode_sgr_mouse(MouseEvent::LeftPress, 5, 3),
+        );
+        assert_eq!(
+            encode_mouse(MouseEvent::LeftPress, 5, 3, false),
+            encode_x10_mouse(MouseEvent::LeftPress, 5, 3),
+        );
     }
 }
