@@ -21,6 +21,7 @@ fn ctrl_comma_physical_toggles_panel_closed() {
     let action = decide_key(
         true,
         false,
+        false,
         phys(KeyCode::Comma),
         &Key::Character(",".into()),
         false,
@@ -34,6 +35,7 @@ fn ctrl_comma_physical_toggles_panel_open() {
     let action = decide_key(
         true,
         false,
+        false,
         phys(KeyCode::Comma),
         &Key::Character(",".into()),
         true,
@@ -46,6 +48,7 @@ fn ctrl_comma_logical_fallback_toggles_panel() {
     // Fallback: physical key unknown but logical produces ",".
     let action = decide_key(
         true,
+        false,
         false,
         PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified),
         &Key::Character(",".into()),
@@ -61,6 +64,7 @@ fn ctrl_shift_o_toggles_panel() {
     let action = decide_key(
         true,
         true,
+        false,
         phys(KeyCode::KeyO),
         &Key::Character("O".into()),
         false,
@@ -71,22 +75,22 @@ fn ctrl_shift_o_toggles_panel() {
 #[test]
 fn ctrl_c_sends_sigint() {
     // Ctrl+C must send 0x03 (SIGINT), not the literal letter "c".
-    let a = decide_key(true, false, phys(KeyCode::KeyC), &Key::Character("c".into()), false);
+    let a = decide_key(true, false, false, phys(KeyCode::KeyC), &Key::Character("c".into()), false);
     assert_eq!(a, KeyAction::Send(vec![3]));
 }
 
 #[test]
 fn ctrl_letters_send_control_bytes() {
     assert_eq!(
-        decide_key(true, false, phys(KeyCode::KeyD), &Key::Character("d".into()), false),
+        decide_key(true, false, false, phys(KeyCode::KeyD), &Key::Character("d".into()), false),
         KeyAction::Send(vec![4]) // Ctrl+D = EOF
     );
     assert_eq!(
-        decide_key(true, false, phys(KeyCode::KeyZ), &Key::Character("z".into()), false),
+        decide_key(true, false, false, phys(KeyCode::KeyZ), &Key::Character("z".into()), false),
         KeyAction::Send(vec![26]) // Ctrl+Z = suspend
     );
     assert_eq!(
-        decide_key(true, false, phys(KeyCode::KeyL), &Key::Character("l".into()), false),
+        decide_key(true, false, false, phys(KeyCode::KeyL), &Key::Character("l".into()), false),
         KeyAction::Send(vec![12]) // Ctrl+L = clear
     );
 }
@@ -94,6 +98,7 @@ fn ctrl_letters_send_control_bytes() {
 #[test]
 fn escape_closes_open_panel() {
     let action = decide_key(
+        false,
         false,
         false,
         phys(KeyCode::Escape),
@@ -108,6 +113,7 @@ fn escape_sends_esc_byte_when_panel_closed() {
     let action = decide_key(
         false,
         false,
+        false,
         phys(KeyCode::Escape),
         &Key::Named(NamedKey::Escape),
         false,
@@ -120,6 +126,7 @@ fn ctrl_shift_t_cycles_theme() {
     let action = decide_key(
         true,
         true,
+        false,
         phys(KeyCode::KeyT),
         &Key::Character("T".into()),
         false,
@@ -132,6 +139,7 @@ fn ctrl_shift_equal_increases_opacity() {
     let action = decide_key(
         true,
         true,
+        false,
         phys(KeyCode::Equal),
         &Key::Character("+".into()),
         false,
@@ -144,6 +152,7 @@ fn ctrl_shift_minus_decreases_opacity() {
     let action = decide_key(
         true,
         true,
+        false,
         phys(KeyCode::Minus),
         &Key::Character("_".into()),
         false,
@@ -154,6 +163,7 @@ fn ctrl_shift_minus_decreases_opacity() {
 #[test]
 fn page_up_scrolls_up() {
     let action = decide_key(
+        false,
         false,
         false,
         phys(KeyCode::PageUp),
@@ -168,6 +178,7 @@ fn page_down_scrolls_down() {
     let action = decide_key(
         false,
         false,
+        false,
         phys(KeyCode::PageDown),
         &Key::Named(NamedKey::PageDown),
         false,
@@ -178,6 +189,7 @@ fn page_down_scrolls_down() {
 #[test]
 fn plain_s_sends_byte() {
     let action = decide_key(
+        false,
         false,
         false,
         phys(KeyCode::KeyS),
@@ -192,6 +204,7 @@ fn enter_sends_cr() {
     let action = decide_key(
         false,
         false,
+        false,
         phys(KeyCode::Enter),
         &Key::Named(NamedKey::Enter),
         false,
@@ -204,11 +217,104 @@ fn unknown_key_returns_none() {
     let action = decide_key(
         false,
         false,
+        false,
         phys(KeyCode::F12),
         &Key::Named(NamedKey::F12),
         false,
     );
     assert_eq!(action, KeyAction::None);
+}
+
+// ---------------------------------------------------------------------------
+// Alt/Meta + key → ESC-prefixed bytes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn alt_b_sends_esc_prefixed_b() {
+    // Alt+b → ESC b (meta sends escape). alt = true.
+    let action = decide_key(
+        false,
+        false,
+        true,
+        phys(KeyCode::KeyB),
+        &Key::Character("b".into()),
+        false,
+    );
+    assert_eq!(action, KeyAction::Send(vec![0x1b, b'b']));
+}
+
+#[test]
+fn alt_enter_sends_esc_prefixed_cr() {
+    // Alt+Enter → ESC CR (esc + the Enter key bytes).
+    let action = decide_key(
+        false,
+        false,
+        true,
+        phys(KeyCode::Enter),
+        &Key::Named(NamedKey::Enter),
+        false,
+    );
+    assert_eq!(action, KeyAction::Send(vec![0x1b, b'\r']));
+}
+
+// ---------------------------------------------------------------------------
+// Remaining Ctrl + symbol combos (physical, no shift) → C0 control bytes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ctrl_space_sends_nul() {
+    // Ctrl+Space → 0x00 (NUL).
+    let action = decide_key(
+        true,
+        false,
+        false,
+        phys(KeyCode::Space),
+        &Key::Named(NamedKey::Space),
+        false,
+    );
+    assert_eq!(action, KeyAction::Send(vec![0x00]));
+}
+
+#[test]
+fn ctrl_bracket_left_sends_esc() {
+    // Ctrl+[ → 0x1b (ESC).
+    let action = decide_key(
+        true,
+        false,
+        false,
+        phys(KeyCode::BracketLeft),
+        &Key::Character("[".into()),
+        false,
+    );
+    assert_eq!(action, KeyAction::Send(vec![0x1b]));
+}
+
+#[test]
+fn ctrl_backslash_sends_fs() {
+    // Ctrl+\ → 0x1c (FS).
+    let action = decide_key(
+        true,
+        false,
+        false,
+        phys(KeyCode::Backslash),
+        &Key::Character("\\".into()),
+        false,
+    );
+    assert_eq!(action, KeyAction::Send(vec![0x1c]));
+}
+
+#[test]
+fn ctrl_bracket_right_sends_gs() {
+    // Ctrl+] → 0x1d (GS).
+    let action = decide_key(
+        true,
+        false,
+        false,
+        phys(KeyCode::BracketRight),
+        &Key::Character("]".into()),
+        false,
+    );
+    assert_eq!(action, KeyAction::Send(vec![0x1d]));
 }
 
 // ---------------------------------------------------------------------------

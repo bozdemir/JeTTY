@@ -19,6 +19,7 @@ pub enum KeyAction {
 ///
 /// * `ctrl`       – whether the Control modifier is held
 /// * `shift`      – whether the Shift modifier is held
+/// * `alt`        – whether the Alt/Meta modifier is held
 /// * `physical`   – layout-independent [`PhysicalKey`] from the event
 /// * `logical`    – the produced [`Key`] from the event
 /// * `panel_open` – whether the Settings panel is currently visible
@@ -31,10 +32,13 @@ pub enum KeyAction {
 /// 5. Ctrl+Shift+Minus          → OpacityDown
 /// 6. PageUp                    → ScrollPageUp
 /// 7. PageDown                  → ScrollPageDown
-/// 8. Otherwise: key_to_bytes   → Send(bytes) or None
+/// 8. Ctrl+<symbol> (Space/[/\\/]) → control byte (0x00, 0x1b, 0x1c, 0x1d)
+/// 9. Alt+<key> that yields bytes  → ESC-prefixed Send(esc + bytes)
+/// 10. Otherwise: key_to_bytes  → Send(bytes) or None
 pub fn decide_key(
     ctrl: bool,
     shift: bool,
+    alt: bool,
     physical: PhysicalKey,
     logical: &Key,
     panel_open: bool,
@@ -78,10 +82,12 @@ pub fn decide_key(
     }
 
     // Ctrl+<letter> → control byte (Ctrl+C = 0x03 SIGINT, Ctrl+D = EOF, Ctrl+Z,
-    // Ctrl+L clear, ...). Keyed by PHYSICAL position so it is layout-independent.
-    // Must come before the plain key_to_bytes fallback, which would otherwise send
-    // the literal letter instead of the control code. (Our own shortcuts use
-    // Ctrl+Shift, so they are already handled above and never reach here.)
+    // Ctrl+L clear, ...). Also the remaining "C0" symbol combos: Ctrl+Space = NUL
+    // (0x00), Ctrl+[ = ESC (0x1b), Ctrl+\ = FS (0x1c), Ctrl+] = GS (0x1d). Keyed by
+    // PHYSICAL position so it is layout-independent. Must come before the plain
+    // key_to_bytes fallback, which would otherwise send the literal character
+    // instead of the control code. (Our own shortcuts use Ctrl+Shift, so they are
+    // already handled above and never reach here.)
     if ctrl && !shift {
         if let PhysicalKey::Code(code) = physical {
             if let Some(b) = ctrl_byte(code) {
@@ -90,9 +96,20 @@ pub fn decide_key(
         }
     }
 
-    // Rule 8: everything else → convert to bytes and send to PTY.
+    // Rule 9 + fallback: convert the key to its byte sequence. When Alt/Meta is
+    // held and the key produces bytes, send them ESC-prefixed (the classic
+    // "Meta sends Escape" convention), e.g. Alt+b → ESC b, Alt+Enter → ESC CR.
     match key_to_bytes(logical) {
-        Some(bytes) => KeyAction::Send(bytes),
+        Some(bytes) => {
+            if alt {
+                let mut out = Vec::with_capacity(bytes.len() + 1);
+                out.push(0x1b);
+                out.extend_from_slice(&bytes);
+                KeyAction::Send(out)
+            } else {
+                KeyAction::Send(bytes)
+            }
+        }
         None => KeyAction::None,
     }
 }
@@ -173,9 +190,11 @@ pub fn point_in(r: &jetty_render::Rect, x: f32, y: f32) -> bool {
     x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h
 }
 
-/// Map a physical letter key to its Ctrl control byte: Ctrl+A=1 .. Ctrl+Z=26
-/// (so Ctrl+C=3=SIGINT, Ctrl+D=4=EOF, Ctrl+Z=26, Ctrl+L=12=clear). Uses the
-/// physical key position, so it is independent of the keyboard layout.
+/// Map a physical key to its Ctrl control byte: Ctrl+A=1 .. Ctrl+Z=26 (so
+/// Ctrl+C=3=SIGINT, Ctrl+D=4=EOF, Ctrl+Z=26, Ctrl+L=12=clear), plus the remaining
+/// C0 symbol combos: Ctrl+Space=0x00 (NUL), Ctrl+[=0x1b (ESC), Ctrl+\=0x1c (FS),
+/// Ctrl+]=0x1d (GS). Uses the physical key position, so it is independent of the
+/// keyboard layout.
 fn ctrl_byte(code: KeyCode) -> Option<u8> {
     use KeyCode::*;
     let n: u8 = match code {
@@ -184,6 +203,10 @@ fn ctrl_byte(code: KeyCode) -> Option<u8> {
         KeyM => 13, KeyN => 14, KeyO => 15, KeyP => 16, KeyQ => 17, KeyR => 18,
         KeyS => 19, KeyT => 20, KeyU => 21, KeyV => 22, KeyW => 23, KeyX => 24,
         KeyY => 25, KeyZ => 26,
+        Space => 0x00,        // Ctrl+Space → NUL
+        BracketLeft => 0x1b,  // Ctrl+[ → ESC
+        Backslash => 0x1c,    // Ctrl+\ → FS
+        BracketRight => 0x1d, // Ctrl+] → GS
         _ => return None,
     };
     Some(n)

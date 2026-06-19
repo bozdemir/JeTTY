@@ -324,7 +324,8 @@ impl ApplicationHandler<()> for App {
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
                 let ctrl = self.modifiers.control_key();
                 let shift = self.modifiers.shift_key();
-                let action = input::decide_key(ctrl, shift, event.physical_key.clone(), &event.logical_key, self.panel_open);
+                let alt = self.modifiers.alt_key();
+                let action = input::decide_key(ctrl, shift, alt, event.physical_key.clone(), &event.logical_key, self.panel_open);
                 if self.debug {
                     let action_name = match &action {
                         input::KeyAction::TogglePanel => "TogglePanel",
