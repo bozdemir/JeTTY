@@ -5,10 +5,21 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::{Config, Term, point_to_viewport};
 use alacritty_terminal::vte::ansi::Processor;
 
-#[derive(Clone, Copy)]
-struct NoopListener;
-impl EventListener for NoopListener {
-    fn send_event(&self, _event: Event) {}
+/// EventListener that captures the terminal's write-back bytes (replies to
+/// host queries such as DSR/DA) and forwards them over a channel so the app
+/// can write them back to the PTY. Without this, queries from the shell
+/// (e.g. p10k/zsh capability probes) get no response and time out, which is
+/// what produced the red "x" at the first prompt.
+#[derive(Clone)]
+struct EventProxy {
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+}
+impl EventListener for EventProxy {
+    fn send_event(&self, event: Event) {
+        if let Event::PtyWrite(s) = event {
+            let _ = self.tx.send(s.into_bytes());
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -29,18 +40,21 @@ impl Dimensions for Size {
 }
 
 pub struct Terminal {
-    term: Term<NoopListener>,
+    term: Term<EventProxy>,
     parser: Processor,
     cols: usize,
     rows: usize,
     theme: Theme,
+    /// Receives the terminal's write-back bytes (replies to host queries).
+    pty_write_rx: std::sync::mpsc::Receiver<Vec<u8>>,
 }
 
 impl Terminal {
     pub fn new(cols: usize, rows: usize) -> Terminal {
         let size = Size { cols, lines: rows };
         let config = Config { scrolling_history: 10_000, ..Default::default() };
-        let term = Term::new(config, &size, NoopListener);
+        let (tx, pty_write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let term = Term::new(config, &size, EventProxy { tx });
 
         // Load theme from JETTY_THEME env var; default to "default_dark".
         let theme_name = std::env::var("JETTY_THEME").unwrap_or_else(|_| "default_dark".to_string());
@@ -55,7 +69,19 @@ impl Terminal {
             }
         }
 
-        Terminal { term, parser: Processor::new(), cols, rows, theme }
+        Terminal { term, parser: Processor::new(), cols, rows, theme, pty_write_rx }
+    }
+
+    /// Drain all currently-pending write-back byte chunks emitted by the
+    /// terminal (replies to host queries such as DSR/DA) into one `Vec<u8>`.
+    /// Returns an empty vec if there is nothing pending. The caller is
+    /// expected to write these bytes back to the PTY.
+    pub fn drain_pty_writes(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Ok(chunk) = self.pty_write_rx.try_recv() {
+            out.extend_from_slice(&chunk);
+        }
+        out
     }
 
     /// Replace the active theme at runtime.

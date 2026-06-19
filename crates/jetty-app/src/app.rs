@@ -132,6 +132,16 @@ impl App {
                 self.terminal.feed(&chunk);
             }
         }
+        // The terminal may have produced replies to host queries (DSR/DA, etc.)
+        // while feeding output. Send those back to the PTY so the shell's
+        // startup queries succeed (fixes the red "x" at the first prompt).
+        let replies = self.terminal.drain_pty_writes();
+        if !replies.is_empty() {
+            if let Some(w) = &mut self.writer {
+                let _ = w.write_all(&replies);
+                let _ = w.flush();
+            }
+        }
     }
 }
 

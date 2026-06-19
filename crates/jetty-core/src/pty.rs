@@ -17,7 +17,12 @@ impl PtySession {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let cmd = CommandBuilder::new(shell);
+        let mut cmd = CommandBuilder::new(shell);
+        // Advertise a capable terminal so shells (and prompts like p10k) run
+        // their capability probes and emit truecolor; without TERM set, those
+        // capability checks fail and the prompt renders the red "x".
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         let child = pair
             .slave
             .spawn_command(cmd)
