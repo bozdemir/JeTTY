@@ -126,6 +126,30 @@ impl App {
         (0.1 + frac * 0.9).clamp(0.1, 1.0)
     }
 
+    /// Convert the current cursor pixel position into 1-based terminal cell
+    /// coordinates `(col, row)` using the renderer's cell size. Returns `None`
+    /// when the renderer (and thus cell metrics) is not yet available.
+    fn cursor_cell(&self) -> Option<(usize, usize)> {
+        let (cell_w, cell_h) = self.text.as_ref()?.cell_size();
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let col = (self.cursor.0 as f32 / cell_w).floor() as i64 + 1;
+        let row = (self.cursor.1 as f32 / cell_h).floor() as i64 + 1;
+        Some((col.max(1) as usize, row.max(1) as usize))
+    }
+
+    /// Encode a mouse event in SGR format and write it to the PTY. Used only
+    /// when the running application has enabled mouse reporting.
+    fn send_mouse_report(&mut self, event: input::MouseEvent) {
+        let Some((col, row)) = self.cursor_cell() else { return };
+        let bytes = input::encode_sgr_mouse(event, col, row);
+        if let Some(w) = &mut self.writer {
+            let _ = w.write_all(&bytes);
+            let _ = w.flush();
+        }
+    }
+
     fn drain_pty(&mut self) {
         if let Some(pty) = &self.pty {
             while let Ok(chunk) = pty.output().try_recv() {
@@ -286,7 +310,15 @@ impl ApplicationHandler<()> for App {
                             win.request_redraw();
                         }
                     }
-                    input::MouseAction::None => {}
+                    input::MouseAction::None => {
+                        // The click landed in the terminal area (not a panel or
+                        // scrollbar widget). Only when the running app enabled
+                        // mouse reporting do we forward it as an SGR mouse press;
+                        // otherwise leave behavior unchanged (a no-op here).
+                        if self.terminal.mouse_mode() {
+                            self.send_mouse_report(input::MouseEvent::LeftPress);
+                        }
+                    }
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
@@ -301,8 +333,20 @@ impl ApplicationHandler<()> for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                // If we were dragging a host widget (scrollbar/slider), the
+                // release just ends that drag and is never forwarded to the app.
+                let was_dragging = self.dragging_scrollbar || self.dragging_slider;
                 self.dragging_scrollbar = false;
                 self.dragging_slider = false;
+
+                // Forward a release report only when the app enabled mouse mode
+                // and this release did not terminate a host-widget drag. We do
+                // not re-check widget hit-testing here: the matching press was
+                // only forwarded when it landed in the terminal area (action ==
+                // None), so a non-drag release pairs with that forwarded press.
+                if !was_dragging && self.terminal.mouse_mode() {
+                    self.send_mouse_report(input::MouseEvent::LeftRelease);
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Positive y = wheel up = scroll into history (older output).
@@ -315,9 +359,46 @@ impl ApplicationHandler<()> for App {
                     }
                 };
                 if lines != 0 {
-                    self.terminal.scroll_lines(lines);
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
+                    // When the app enabled mouse reporting, forward wheel events
+                    // as SGR button 64 (up) / 65 (down) — but only over the
+                    // terminal area, so wheeling over the scrollbar still scrolls
+                    // the host scrollback. One report per LineDelta notch
+                    // (clamped) keeps apps like less/htop responsive without
+                    // flooding the PTY.
+                    let over_scrollbar = {
+                        let rows = self.terminal.rows();
+                        let off = self.terminal.scroll_offset();
+                        let max = self.terminal.scroll_max();
+                        if let Some(gpu) = &self.gpu {
+                            let (w, h) = (gpu.config.width, gpu.config.height);
+                            jetty_render::scrollbar_rect_geom(rows, off, max, w, h)
+                                .map(|r| {
+                                    let cx = self.cursor.0 as f32;
+                                    cx >= r.x && cx <= r.x + r.w
+                                })
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    };
+
+                    if self.terminal.mouse_mode() && !over_scrollbar {
+                        let event = if lines > 0 {
+                            input::MouseEvent::WheelUp
+                        } else {
+                            input::MouseEvent::WheelDown
+                        };
+                        // Emit a bounded number of reports proportional to the
+                        // scroll magnitude (one per ~3 lines, i.e. per notch).
+                        let notches = ((lines.abs() + 2) / 3).clamp(1, 8);
+                        for _ in 0..notches {
+                            self.send_mouse_report(event);
+                        }
+                    } else {
+                        self.terminal.scroll_lines(lines);
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
                     }
                 }
             }

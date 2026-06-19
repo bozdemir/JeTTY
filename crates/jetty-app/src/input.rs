@@ -229,3 +229,59 @@ pub fn key_to_bytes(key: &Key) -> Option<Vec<u8>> {
         _ => None,
     }
 }
+
+/// A mouse event to encode for an application that enabled mouse reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseEvent {
+    /// Left button pressed.
+    LeftPress,
+    /// Left button released.
+    LeftRelease,
+    /// Wheel scrolled up (button 64).
+    WheelUp,
+    /// Wheel scrolled down (button 65).
+    WheelDown,
+}
+
+/// Encode a mouse event as an SGR (1006) mouse report.
+///
+/// Format: `\e[<Cb;Cx;CyM` for a press/motion and `\e[<Cb;Cx;Cym` for a
+/// release. `Cb` is the button code, `Cx`/`Cy` are 1-based cell coordinates.
+/// Wheel events always use the press terminator (`M`) per the xterm protocol.
+///
+/// `col`/`row` are 1-based cell coordinates. They are clamped to a minimum of 1
+/// so a click at the very edge never produces a 0 coordinate.
+pub fn encode_sgr_mouse(event: MouseEvent, col: usize, row: usize) -> Vec<u8> {
+    let col = col.max(1);
+    let row = row.max(1);
+    let (button, terminator) = match event {
+        MouseEvent::LeftPress => (0, 'M'),
+        MouseEvent::LeftRelease => (0, 'm'),
+        MouseEvent::WheelUp => (64, 'M'),
+        MouseEvent::WheelDown => (65, 'M'),
+    };
+    format!("\x1b[<{button};{col};{row}{terminator}").into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sgr_left_press_release() {
+        assert_eq!(encode_sgr_mouse(MouseEvent::LeftPress, 5, 3), b"\x1b[<0;5;3M");
+        assert_eq!(encode_sgr_mouse(MouseEvent::LeftRelease, 5, 3), b"\x1b[<0;5;3m");
+    }
+
+    #[test]
+    fn sgr_wheel_buttons() {
+        assert_eq!(encode_sgr_mouse(MouseEvent::WheelUp, 1, 1), b"\x1b[<64;1;1M");
+        assert_eq!(encode_sgr_mouse(MouseEvent::WheelDown, 10, 20), b"\x1b[<65;10;20M");
+    }
+
+    #[test]
+    fn sgr_coords_clamped_to_one() {
+        // 0-based callers that forgot to add 1 still get a valid 1-based report.
+        assert_eq!(encode_sgr_mouse(MouseEvent::LeftPress, 0, 0), b"\x1b[<0;1;1M");
+    }
+}

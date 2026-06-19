@@ -280,6 +280,23 @@ impl Terminal {
     pub fn rows(&self) -> usize {
         self.rows
     }
+
+    /// Whether the running application has enabled mouse reporting (any of the
+    /// X10/normal/button-event/any-event mouse modes). When true, the app wants
+    /// to receive mouse events (clicks, wheel) over the PTY instead of the host
+    /// handling them locally (scroll/panel).
+    pub fn mouse_mode(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Whether the running application requested SGR-encoded mouse reports
+    /// (`\e[?1006h`). We only emit SGR-format reports, so this gates whether
+    /// mouse events should be forwarded at all.
+    pub fn sgr_mouse(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::SGR_MOUSE)
+    }
 }
 
 /// Convert a 256-color palette index to RGB (standard xterm scheme):
@@ -373,6 +390,27 @@ mod tests {
         t.feed(b"hello world");
         let snap = t.snapshot();
         assert_eq!(&snap.row_text(0)[..11], "hello world");
+    }
+
+    #[test]
+    fn mouse_mode_off_by_default() {
+        let t = Terminal::new(20, 5);
+        assert!(!t.mouse_mode(), "mouse mode should be off by default");
+        assert!(!t.sgr_mouse(), "SGR mouse should be off by default");
+    }
+
+    #[test]
+    fn mouse_mode_enabled_by_app() {
+        let mut t = Terminal::new(20, 5);
+        // \e[?1000h: enable normal (button) mouse tracking.
+        t.feed(b"\x1b[?1000h");
+        assert!(t.mouse_mode(), "mouse mode should be on after \\e[?1000h");
+        // \e[?1006h: request SGR-encoded reports.
+        t.feed(b"\x1b[?1006h");
+        assert!(t.sgr_mouse(), "SGR mouse should be on after \\e[?1006h");
+        // Disabling turns it back off.
+        t.feed(b"\x1b[?1000l");
+        assert!(!t.mouse_mode(), "mouse mode should be off after \\e[?1000l");
     }
 
     #[test]
