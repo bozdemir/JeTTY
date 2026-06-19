@@ -9,8 +9,17 @@ use winit::event::MouseScrollDelta;
 use winit::window::{Window, WindowId};
 use crate::input;
 
-const COLS: usize = 100;
-const ROWS: usize = 30;
+/// Logical (device-independent) font size in points. Scaled by the display's
+/// scale_factor before being passed to TextLayer so glyphs are rendered at
+/// physical-pixel resolution on HiDPI screens.
+const FONT_LOGICAL: f32 = 16.0;
+
+/// Fallback grid dimensions used only when computing cols/rows from the window
+/// is not yet possible (e.g. before `resumed` completes). In practice the
+/// derived grid replaces these immediately; they are never used for the actual
+/// Terminal or PTY once a window exists.
+const FALLBACK_COLS: usize = 80;
+const FALLBACK_ROWS: usize = 24;
 
 pub struct App {
     proxy: EventLoopProxy<()>,
@@ -65,7 +74,7 @@ impl App {
             gpu: None,
             text: None,
             quad: None,
-            terminal: Terminal::new(COLS, ROWS),
+            terminal: Terminal::new(FALLBACK_COLS, FALLBACK_ROWS),
             pty: None,
             writer: None,
             theme_idx,
@@ -153,10 +162,17 @@ impl App {
         }
     }
 
-    fn drain_pty(&mut self) {
+    /// Drain pending PTY output into the terminal and flush any query replies.
+    ///
+    /// Returns `true` if any bytes were consumed (PTY data or reply writes),
+    /// so the caller can skip `request_redraw()` when nothing changed — making
+    /// the 100ms heartbeat essentially free when the terminal is idle.
+    fn drain_pty(&mut self) -> bool {
+        let mut had_data = false;
         if let Some(pty) = &self.pty {
             while let Ok(chunk) = pty.output().try_recv() {
                 self.terminal.feed(&chunk);
+                had_data = true;
             }
         }
         // The terminal may have produced replies to host queries (DSR/DA, etc.)
@@ -175,7 +191,9 @@ impl App {
                 let _ = w.write_all(&replies);
                 let _ = w.flush();
             }
+            had_data = true;
         }
+        had_data
     }
 }
 
@@ -186,14 +204,27 @@ impl ApplicationHandler<()> for App {
         }
         let window = jetty_platform::build_window(event_loop, "Jetty", (1000, 640));
         let size = window.inner_size();
+        // HiDPI: the display's scale factor (>1.0 on HiDPI/Retina screens).
+        // inner_size() already returns physical pixels; we multiply the logical
+        // font size by scale to get the physical font size so glyphs are sharp.
+        let scale = window.scale_factor() as f32;
         let gpu = GpuContext::new(window.clone(), size.width, size.height);
-        let (text, quad) = if let Some(ref g) = gpu {
-            let text = TextLayer::new(&g.device, &g.queue, g.format, 16.0);
+        let (text, quad, cols, rows) = if let Some(ref g) = gpu {
+            let text = TextLayer::new(&g.device, &g.queue, g.format, FONT_LOGICAL * scale);
+            let (cw, ch) = text.cell_size();
+            // Derive the grid from the physical pixel size and the physical cell size.
+            let cols = (size.width as f32 / cw).floor().max(1.0) as usize;
+            let rows = (size.height as f32 / ch).floor().max(1.0) as usize;
             let quad = QuadLayer::new(&g.device, g.format);
-            (Some(text), Some(quad))
+            (Some(text), Some(quad), cols, rows)
         } else {
-            (None, None)
+            (None, None, FALLBACK_COLS, FALLBACK_ROWS)
         };
+
+        // Re-build the terminal with the derived grid size so the PTY and
+        // terminal agree with the actual window layout.
+        self.terminal = Terminal::new(cols, rows);
+        self.apply_theme();
 
         // Pass an `on_data` callback that wakes the winit event loop the
         // instant bytes arrive from the PTY. This means drain_pty (and thus
@@ -201,7 +232,7 @@ impl ApplicationHandler<()> for App {
         // than waiting up to 16ms for a polling tick — critical for p10k's
         // cursor-position / capability queries which have tight timeouts.
         let proxy_wake = self.proxy.clone();
-        let pty = PtySession::spawn(COLS as u16, ROWS as u16, move || {
+        let pty = PtySession::spawn(cols as u16, rows as u16, move || {
             let _ = proxy_wake.send_event(());
         }).expect("pty");
         let writer = pty.writer();
@@ -223,16 +254,23 @@ impl ApplicationHandler<()> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _ev: ()) {
-        self.drain_pty();
+        let had_data = self.drain_pty();
         // If the shell child exited while we were draining its last output,
-        // close the window. The waker fires this ~60x/s, so we react within a
+        // close the window. The waker fires this ~10x/s, so we react within a
         // frame of the shell exiting. `event_loop.exit()` is safe to call here.
         if self.terminal.child_exited() {
             event_loop.exit();
             return;
         }
-        if let Some(w) = &self.window {
-            w.request_redraw();
+        // Damage-driven: only request a redraw when PTY data actually arrived
+        // (or query replies were sent). When the terminal is idle, the 100ms
+        // heartbeat drains nothing and we skip the redraw — no Vec allocation,
+        // no GPU work. Any state change that affects rendering still calls
+        // request_redraw directly in the relevant window_event arm.
+        if had_data {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
     }
 
@@ -245,6 +283,34 @@ impl ApplicationHandler<()> for App {
                 }
                 if let (Some(gpu), Some(text)) = (&self.gpu, &mut self.text) {
                     text.resize(gpu);
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // Fired when the window is moved between monitors with different DPI.
+                // Rebuild TextLayer with the new physical font size, re-derive the
+                // grid, and resize the terminal + PTY so the shell sees the correct
+                // dimensions. The surface size is updated by a subsequent Resized
+                // event that winit sends automatically, so we only need to handle
+                // the font/grid here.
+                let scale = scale_factor as f32;
+                if let Some(ref g) = self.gpu {
+                    let new_text = TextLayer::new(&g.device, &g.queue, g.format, FONT_LOGICAL * scale);
+                    let (cw, ch) = new_text.cell_size();
+                    let phys_w = g.config.width;
+                    let phys_h = g.config.height;
+                    let cols = (phys_w as f32 / cw).floor().max(1.0) as usize;
+                    let rows = (phys_h as f32 / ch).floor().max(1.0) as usize;
+                    self.text = Some(new_text);
+                    // Rebuild terminal with new grid (resets content — acceptable
+                    // for a monitor-move event which is rare).
+                    self.terminal = Terminal::new(cols, rows);
+                    self.apply_theme();
+                    if let Some(pty) = &self.pty {
+                        pty.resize(cols as u16, rows as u16);
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(m) => {
