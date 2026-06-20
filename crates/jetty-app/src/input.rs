@@ -10,6 +10,12 @@ pub enum KeyAction {
     OpacityDown,
     ScrollPageUp,
     ScrollPageDown,
+    /// Increase font size by one logical point.
+    FontUp,
+    /// Decrease font size by one logical point.
+    FontDown,
+    /// Reset font size to the default (16.0).
+    FontReset,
     /// Raw bytes to write to the PTY.
     Send(Vec<u8>),
     None,
@@ -86,6 +92,19 @@ pub fn decide_key(
         Key::Named(NamedKey::PageUp) => return KeyAction::ScrollPageUp,
         Key::Named(NamedKey::PageDown) => return KeyAction::ScrollPageDown,
         _ => {}
+    }
+
+    // Font-size bindings: Ctrl (no shift) + Equal/Minus/Digit0.
+    // These must be checked BEFORE the ctrl_byte fallback so they are never
+    // swallowed as a raw control code. Ctrl+Shift+Equal/Minus are already
+    // handled above as OpacityUp/Down and never reach here.
+    if ctrl && !shift {
+        match physical {
+            PhysicalKey::Code(KeyCode::Equal) => return KeyAction::FontUp,
+            PhysicalKey::Code(KeyCode::Minus) => return KeyAction::FontDown,
+            PhysicalKey::Code(KeyCode::Digit0) => return KeyAction::FontReset,
+            _ => {}
+        }
     }
 
     // Ctrl+<letter> → control byte (Ctrl+C = 0x03 SIGINT, Ctrl+D = EOF, Ctrl+Z,
@@ -379,6 +398,58 @@ pub fn encode_x10_mouse(event: MouseEvent, col: usize, row: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_physical(code: KeyCode) -> PhysicalKey {
+        PhysicalKey::Code(code)
+    }
+    fn make_logical_char(s: &'static str) -> Key {
+        Key::Character(winit::keyboard::SmolStr::new(s))
+    }
+
+    #[test]
+    fn ctrl_equal_maps_to_font_up() {
+        let action = decide_key(
+            true, false, false,
+            make_physical(KeyCode::Equal),
+            &make_logical_char("="),
+            false, false,
+        );
+        assert_eq!(action, KeyAction::FontUp);
+    }
+
+    #[test]
+    fn ctrl_minus_maps_to_font_down() {
+        let action = decide_key(
+            true, false, false,
+            make_physical(KeyCode::Minus),
+            &make_logical_char("-"),
+            false, false,
+        );
+        assert_eq!(action, KeyAction::FontDown);
+    }
+
+    #[test]
+    fn ctrl_digit0_maps_to_font_reset() {
+        let action = decide_key(
+            true, false, false,
+            make_physical(KeyCode::Digit0),
+            &make_logical_char("0"),
+            false, false,
+        );
+        assert_eq!(action, KeyAction::FontReset);
+    }
+
+    #[test]
+    fn ctrl_shift_equal_still_opacity_up() {
+        // Ctrl+Shift+Equal must remain OpacityUp even after adding FontUp.
+        let action = decide_key(
+            true, true, false,
+            make_physical(KeyCode::Equal),
+            &make_logical_char("="),
+            false, false,
+        );
+        assert_eq!(action, KeyAction::OpacityUp);
+    }
 
     #[test]
     fn sgr_left_press_release() {

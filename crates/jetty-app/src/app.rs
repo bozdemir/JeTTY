@@ -9,10 +9,11 @@ use winit::event::MouseScrollDelta;
 use winit::window::{Window, WindowId};
 use crate::input;
 
-/// Logical (device-independent) font size in points. Scaled by the display's
-/// scale_factor before being passed to TextLayer so glyphs are rendered at
-/// physical-pixel resolution on HiDPI screens.
-const FONT_LOGICAL: f32 = 16.0;
+/// Default logical (device-independent) font size in points. This is the value
+/// used when the user resets the font size with Ctrl+0 and on first launch.
+/// Scaled by the display's scale_factor before being passed to TextLayer so
+/// glyphs are rendered at physical-pixel resolution on HiDPI screens.
+const FONT_LOGICAL_DEFAULT: f32 = 16.0;
 
 /// Fallback grid dimensions used only when computing cols/rows from the window
 /// is not yet possible (e.g. before `resumed` completes). In practice the
@@ -34,6 +35,9 @@ pub struct App {
     theme_idx: usize,
     /// Background opacity (0.0..=1.0); modifies theme bg alpha at runtime.
     opacity: f32,
+    /// Current logical (device-independent) font size in points. Changed at
+    /// runtime via Ctrl+Equal/Ctrl+Minus/Ctrl+0 (font up/down/reset).
+    font_logical: f32,
     /// Track held modifier keys so Ctrl+Shift combos can be detected.
     modifiers: winit::keyboard::ModifiersState,
     /// Last known cursor position in physical pixels.
@@ -79,6 +83,7 @@ impl App {
             writer: None,
             theme_idx,
             opacity,
+            font_logical: FONT_LOGICAL_DEFAULT,
             modifiers: winit::keyboard::ModifiersState::empty(),
             cursor: (0.0, 0.0),
             dragging_scrollbar: false,
@@ -195,6 +200,44 @@ impl App {
         }
         had_data
     }
+
+    /// Shared reflow path: compute cols/rows from the current GPU surface size
+    /// and the current TextLayer cell size, then resize the terminal and PTY.
+    ///
+    /// Called from both `WindowEvent::Resized` and `set_font_size` so both
+    /// features share one code path.
+    fn reflow(&mut self) {
+        let (Some(gpu), Some(text)) = (&self.gpu, &self.text) else { return };
+        let (cw, ch) = text.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = gpu.config.width;
+        let h = gpu.config.height;
+        let cols = (w as f32 / cw).floor().max(1.0) as usize;
+        let rows = (h as f32 / ch).floor().max(1.0) as usize;
+        self.terminal.resize(cols, rows);
+        if let Some(pty) = &self.pty {
+            pty.resize(cols as u16, rows as u16);
+        }
+    }
+
+    /// Change the font size at runtime. `new_logical` is clamped to [6.0, 48.0].
+    /// Rebuilds TextLayer with the new physical font size (logical * scale),
+    /// then calls `reflow()` to recompute the grid, and requests a redraw.
+    fn set_font_size(&mut self, new_logical: f32) {
+        let clamped = new_logical.clamp(6.0, 48.0);
+        self.font_logical = clamped;
+        let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
+        if let Some(ref g) = self.gpu {
+            let new_text = TextLayer::new(&g.device, &g.queue, g.format, clamped * scale);
+            self.text = Some(new_text);
+        }
+        self.reflow();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
 }
 
 impl ApplicationHandler<()> for App {
@@ -210,7 +253,7 @@ impl ApplicationHandler<()> for App {
         let scale = window.scale_factor() as f32;
         let gpu = GpuContext::new(window.clone(), size.width, size.height);
         let (text, quad, cols, rows) = if let Some(ref g) = gpu {
-            let text = TextLayer::new(&g.device, &g.queue, g.format, FONT_LOGICAL * scale);
+            let text = TextLayer::new(&g.device, &g.queue, g.format, self.font_logical * scale);
             let (cw, ch) = text.cell_size();
             // Derive the grid from the physical pixel size and the physical cell size.
             let cols = (size.width as f32 / cw).floor().max(1.0) as usize;
@@ -284,33 +327,26 @@ impl ApplicationHandler<()> for App {
                 if let (Some(gpu), Some(text)) = (&self.gpu, &mut self.text) {
                     text.resize(gpu);
                 }
+                // Recompute grid to match the new surface size and notify PTY.
+                self.reflow();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // Fired when the window is moved between monitors with different DPI.
-                // Rebuild TextLayer with the new physical font size, re-derive the
-                // grid, and resize the terminal + PTY so the shell sees the correct
-                // dimensions. The surface size is updated by a subsequent Resized
-                // event that winit sends automatically, so we only need to handle
-                // the font/grid here.
+                // Rebuild TextLayer with the new physical font size (logical * new
+                // scale), then reflow() recomputes the grid from the current GPU
+                // surface size and the new cell metrics. A subsequent Resized event
+                // handles the surface-size change, so we only touch the font here.
                 let scale = scale_factor as f32;
                 if let Some(ref g) = self.gpu {
-                    let new_text = TextLayer::new(&g.device, &g.queue, g.format, FONT_LOGICAL * scale);
-                    let (cw, ch) = new_text.cell_size();
-                    let phys_w = g.config.width;
-                    let phys_h = g.config.height;
-                    let cols = (phys_w as f32 / cw).floor().max(1.0) as usize;
-                    let rows = (phys_h as f32 / ch).floor().max(1.0) as usize;
+                    let new_text = TextLayer::new(&g.device, &g.queue, g.format, self.font_logical * scale);
                     self.text = Some(new_text);
-                    // Rebuild terminal with new grid (resets content — acceptable
-                    // for a monitor-move event which is rare).
-                    self.terminal = Terminal::new(cols, rows);
-                    self.apply_theme();
-                    if let Some(pty) = &self.pty {
-                        pty.resize(cols as u16, rows as u16);
-                    }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                }
+                self.reflow();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
                 }
             }
             WindowEvent::ModifiersChanged(m) => {
@@ -511,6 +547,9 @@ impl ApplicationHandler<()> for App {
                         input::KeyAction::OpacityDown => "OpacityDown",
                         input::KeyAction::ScrollPageUp => "ScrollPageUp",
                         input::KeyAction::ScrollPageDown => "ScrollPageDown",
+                        input::KeyAction::FontUp => "FontUp",
+                        input::KeyAction::FontDown => "FontDown",
+                        input::KeyAction::FontReset => "FontReset",
                         input::KeyAction::Send(_) => "Send",
                         input::KeyAction::None => "None",
                     };
@@ -565,6 +604,15 @@ impl ApplicationHandler<()> for App {
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
+                    }
+                    input::KeyAction::FontUp => {
+                        self.set_font_size(self.font_logical + 1.0);
+                    }
+                    input::KeyAction::FontDown => {
+                        self.set_font_size(self.font_logical - 1.0);
+                    }
+                    input::KeyAction::FontReset => {
+                        self.set_font_size(FONT_LOGICAL_DEFAULT);
                     }
                     input::KeyAction::Send(bytes) => {
                         // Any real keystroke jumps back to the bottom so the user sees their input.

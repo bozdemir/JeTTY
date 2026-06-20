@@ -8,7 +8,8 @@ pub fn build_window(event_loop: &ActiveEventLoop, title: &str, size: (u32, u32))
     let attrs = Window::default_attributes()
         .with_title(title)
         .with_inner_size(LogicalSize::new(size.0, size.1))
-        .with_resizable(false)
+        .with_resizable(true)
+        .with_min_inner_size(LogicalSize::new(200.0_f64, 120.0_f64))
         .with_transparent(true);
     Arc::new(event_loop.create_window(attrs).expect("create_window failed"))
 }

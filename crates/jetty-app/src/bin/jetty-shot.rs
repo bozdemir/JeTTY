@@ -21,7 +21,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let width: u32 = 1000;
     let height: u32 = 640;
-    let font_size: f32 = 16.0;
+    // Allow headless renders at different font sizes so the test harness can
+    // verify that font-size changes produce a different cell grid.
+    let font_size: f32 = std::env::var("JETTY_FONT_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .map(|v| v.clamp(6.0, 48.0))
+        .unwrap_or(16.0);
 
     let default_input = "\x1b[1;32muser@host\x1b[0m:\x1b[1;34m~/jetty\x1b[0m$ ls --color\r\n\x1b[1;34msrc\x1b[0m  \x1b[33mCargo.toml\x1b[0m  \x1b[31mREADME.md\x1b[0m\r\n\x1b[1;32muser@host\x1b[0m:\x1b[1;34m~/jetty\x1b[0m$ \r\n";
     let input_bytes: Vec<u8> = match std::env::var("JETTY_SHOT_INPUT") {
