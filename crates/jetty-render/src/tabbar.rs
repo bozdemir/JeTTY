@@ -106,6 +106,29 @@ pub fn build_tab_bar_ex(
     // Tabs are laid out from the left and must never overlap the window
     // controls parked at the right; cap the usable area accordingly.
     let tab_area_w = (sw - CONTROLS_W).max(0.0);
+    // The "+" button sits after the last tab and must also stay left of the
+    // controls, so the tabs themselves get `tab_area_w - PLUS_W`.
+    let tabs_avail_w = (tab_area_w - PLUS_W).max(0.0);
+
+    // --- Dynamic tab width: shrink tabs to fit the available area so they never
+    // overflow under the window controls. With many tabs we shrink down to a
+    // readable minimum (TAB_W_MIN); if even that can't fit all of them, we cap the
+    // number of tabs drawn (the rest are unreachable here but stay index-aligned
+    // via the switch_tab keyboard path). ---
+    const TAB_W_MIN: f32 = 64.0;
+    let n_tabs = tabs.len().max(1) as f32;
+    // Ideal width per tab, clamped to [MIN, default]. Use the full default when
+    // there's room; shrink toward MIN as tabs are added.
+    let tab_w = (tabs_avail_w / n_tabs).clamp(TAB_W_MIN, TAB_W).min(TAB_W);
+    // How many tabs actually fit at `tab_w` (at least 1 so the active tab shows).
+    let max_visible = if tab_w > 0.0 {
+        ((tabs_avail_w / tab_w).floor() as usize).max(1)
+    } else {
+        1
+    };
+    let drawn = tabs.len().min(max_visible);
+    let overflow = tabs.len().saturating_sub(drawn);
+
     // Background for a tab currently being renamed: a brighter accent so the
     // editing target stands out.
     let rename_bg = active_bg;
@@ -125,8 +148,13 @@ pub fn build_tab_bar_ex(
         255,
     ];
 
+    // Characters that fit in a tab body, derived from its width (~9.6px advance).
+    // Reserve room for the close "×" + left padding. Floors at 3 so a min-width
+    // tab still shows a couple of chars + the ellipsis.
+    let max_chars = (((tab_w - CLOSE_W - 16.0) / 9.6).floor() as usize).max(3);
+
     let mut x = 0.0_f32;
-    for (i, (title, active)) in tabs.iter().enumerate() {
+    for (i, (title, active)) in tabs.iter().take(drawn).enumerate() {
         let being_renamed = matches!(renaming, Some((ri, _)) if ri == i);
         let bg_color = if being_renamed {
             rename_bg
@@ -135,12 +163,12 @@ pub fn build_tab_bar_ex(
         } else {
             inactive_bg
         };
-        let tab_rect = Rect { x, y: 0.0, w: TAB_W, h, color: bg_color, ..Default::default() };
+        let tab_rect = Rect { x, y: 0.0, w: tab_w, h, color: bg_color, ..Default::default() };
 
         // Inner tab body geometry (inset on all sides for the gap + border).
         let body_x = x + TAB_INSET;
         let body_y = TAB_INSET;
-        let body_w = TAB_W - TAB_INSET * 2.0;
+        let body_w = tab_w - TAB_INSET * 2.0;
         let body_h = h - TAB_INSET * 2.0;
         let border_color = if *active || being_renamed { active_border } else { inactive_border };
         // Border: a rounded rect 1px larger than the body on every side.
@@ -155,7 +183,6 @@ pub fn build_tab_bar_ex(
         // Fill: the rounded tab body on top of the border.
         quads.push(Rect::rounded(body_x, body_y, body_w, body_h, bg_color, TAB_RADIUS));
 
-        let max_chars = 14usize;
         let label_color = if *active || being_renamed { fg } else { dim_fg };
         if being_renamed {
             // Show the live edit buffer plus a trailing caret. Truncate from the
@@ -181,16 +208,16 @@ pub fn build_tab_bar_ex(
             labels.push((shown, x + 10.0, 8.0, label_color));
 
             // Close "×" at the tab's right (hidden while renaming this tab).
-            let close_x = x + TAB_W - CLOSE_W - 4.0;
+            let close_x = x + tab_w - CLOSE_W - 4.0;
             labels.push(("×".to_string(), close_x + 4.0, 8.0, label_color));
         }
 
         // Close hit-box (kept even while renaming so indices stay aligned).
-        let close_x = x + TAB_W - CLOSE_W - 4.0;
+        let close_x = x + tab_w - CLOSE_W - 4.0;
         close_rects.push(Rect { x: close_x, y: 0.0, w: CLOSE_W, h, color: bg_color, ..Default::default() });
 
         tab_rects.push(tab_rect);
-        x += TAB_W;
+        x += tab_w;
     }
 
     // "+" new-tab button after the last tab (clamped within the tab area).
@@ -198,6 +225,13 @@ pub fn build_tab_bar_ex(
     if x + PLUS_W <= tab_area_w {
         quads.push(Rect::rounded(x + 3.0, 3.0, PLUS_W - 6.0, h - 6.0, inactive_bg, 5.0));
         labels.push(("+".to_string(), x + 11.0, 7.0, fg));
+    }
+
+    // A small "+N" hint when some tabs couldn't be drawn (too many to fit even at
+    // the minimum width). Placed just left of the controls so it never overlaps.
+    if overflow > 0 {
+        let hint_x = (tab_area_w - 34.0).max(x + PLUS_W + 4.0);
+        labels.push((format!("+{overflow}"), hint_x, 8.0, dim_fg));
     }
 
     // --- Right-side controls (left→right): Help "?", Settings "⚙",
@@ -285,6 +319,38 @@ mod tests {
         // beyond what fits; the plus rect (when shown) stays left of controls.
         if bar.plus_rect.x + bar.plus_rect.w <= controls_left {
             assert!(bar.plus_rect.x + bar.plus_rect.w <= controls_left);
+        }
+    }
+
+    #[test]
+    fn tabs_shrink_to_fit_narrow_window() {
+        // 3 tabs in a 560px window: all must be drawn, none overlapping the
+        // controls, and each tab's close box stays left of the controls region.
+        let tabs = [
+            ("Tab 1".to_string(), true),
+            ("Tab 2".to_string(), false),
+            ("Tab 3".to_string(), false),
+        ];
+        let bar = build_tab_bar(560, &tabs, &theme());
+        let controls_left = 560.0 - CONTROLS_W;
+        assert_eq!(bar.tab_rects.len(), 3, "all 3 tabs should be drawn");
+        for r in &bar.tab_rects {
+            assert!(
+                r.x + r.w <= controls_left + 0.5,
+                "tab overflows controls: {} > {controls_left}",
+                r.x + r.w
+            );
+        }
+        for r in &bar.close_rects {
+            assert!(
+                r.x + r.w <= controls_left + 0.5,
+                "close box overlaps controls at x={}",
+                r.x + r.w
+            );
+        }
+        // The "+" button (when present) also stays left of the controls.
+        if bar.plus_rect.x + bar.plus_rect.w <= controls_left + 0.5 {
+            assert!(bar.plus_rect.x >= bar.tab_rects.last().unwrap().x);
         }
     }
 

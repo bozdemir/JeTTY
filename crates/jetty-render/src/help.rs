@@ -64,9 +64,17 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme) -> 
     // advance is ~9.6px; we slightly over-estimate so the computed panel always
     // contains the text rather than clipping it.
     const CHAR_W: f32 = 9.8;
-    const PAD: f32 = 20.0;
-    const TITLE_H: f32 = 34.0;
-    const ROW_H: f32 = 26.0;
+    // Ideal vertical metrics. When the window is too SHORT to fit every row, the
+    // padding / title / row heights are scaled DOWN proportionally (to a readable
+    // floor) so the overlay always fits and no row clips off-screen.
+    const PAD_IDEAL: f32 = 20.0;
+    const TITLE_H_IDEAL: f32 = 34.0;
+    const ROW_H_IDEAL: f32 = 26.0;
+    // Readable floors: below these we stop shrinking (the panel is clamped to the
+    // window top instead, which still keeps all rows on a very short window).
+    const ROW_H_MIN: f32 = 16.0;
+    const TITLE_H_MIN: f32 = 22.0;
+    const PAD_MIN_V: f32 = 8.0;
     // Minimum padding kept even when the window is too narrow to fit the ideal
     // padding — we shrink padding before we ever let text overflow.
     const MIN_PAD: f32 = 6.0;
@@ -82,7 +90,24 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme) -> 
     let content_w = longest_chars * CHAR_W;
 
     let rows = HELP_ROWS.len() as f32;
-    let panel_h = (PAD + TITLE_H + rows * ROW_H + PAD).min(sh.max(0.0));
+    // Ideal content height; if it exceeds the window, scale the vertical metrics
+    // down by a single factor (clamped so each metric keeps its readable floor).
+    let ideal_h = PAD_IDEAL + TITLE_H_IDEAL + rows * ROW_H_IDEAL + PAD_IDEAL;
+    let avail_h = sh.max(0.0);
+    let scale = if ideal_h > avail_h && ideal_h > 0.0 {
+        (avail_h / ideal_h).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    // Apply the scale, then enforce per-metric floors so text stays legible.
+    let pad_v = (PAD_IDEAL * scale).max(PAD_MIN_V);
+    let title_h = (TITLE_H_IDEAL * scale).max(TITLE_H_MIN);
+    let row_h = (ROW_H_IDEAL * scale).max(ROW_H_MIN);
+    // Recompute the actual height from the (possibly floored) metrics, then clamp
+    // to the window so the panel can never exceed it.
+    let panel_h = (pad_v + title_h + rows * row_h + pad_v).min(avail_h.max(0.0));
+    // `PAD` is the vertical text padding (top inset for the title).
+    let pad_top = pad_v;
 
     // Ideal width fits the content with full padding; clamp to the window with a
     // margin. If the window is narrower, reduce padding (down to MIN_PAD) so the
@@ -93,12 +118,12 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme) -> 
     const MARGIN: f32 = 16.0;
     let max_panel_w = (sw - MARGIN * 2.0).max(0.0);
     let min_panel_w = content_w + MIN_PAD * 2.0;
-    let ideal_w = content_w + PAD * 2.0;
+    let ideal_w = content_w + PAD_IDEAL * 2.0;
     // Prefer ideal, clamp down toward the window, but never below the hard floor.
     let panel_w = ideal_w.min(max_panel_w).max(min_panel_w);
     // Effective horizontal padding after sizing: split the leftover space, but
     // never below MIN_PAD.
-    let pad_x = ((panel_w - content_w) / 2.0).clamp(MIN_PAD, PAD);
+    let pad_x = ((panel_w - content_w) / 2.0).clamp(MIN_PAD, PAD_IDEAL);
 
     let px = ((sw - panel_w) / 2.0).max(0.0).floor();
     let py = ((sh - panel_h) / 2.0).max(0.0).floor();
@@ -107,9 +132,11 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme) -> 
 
     // Full-screen dim.
     quads.push(Rect { x: 0.0, y: 0.0, w: sw, h: sh, color: [0, 0, 0, 150], ..Default::default() });
-    // Border (rounded to match the window/tab frame).
+    // Border (rounded to match the window/tab frame). Clamp the top to y>=0 so a
+    // very short window (py==0) never draws the border off-screen at y=-2.
+    let border_y = (py - 2.0).max(0.0);
     quads.push(Rect::rounded(
-        px - 2.0, py - 2.0, panel_w + 4.0, panel_h + 4.0, border_col, 10.0,
+        (px - 2.0).max(0.0), border_y, panel_w + 4.0, panel_h + 4.0, border_col, 10.0,
     ));
     // Background panel (rounded).
     let panel = Rect::rounded(px, py, panel_w, panel_h, panel_bg, 8.0);
@@ -121,14 +148,14 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme) -> 
     labels.push((
         "Keyboard Shortcuts".to_string(),
         px + pad_x,
-        py + PAD,
+        py + pad_top,
         title_col,
     ));
 
     // Shortcut rows (one binding per row → never overflows the panel width).
-    let rows_top = py + PAD + TITLE_H;
+    let rows_top = py + pad_top + title_h;
     for (i, row) in HELP_ROWS.iter().enumerate() {
-        let y = rows_top + i as f32 * ROW_H;
+        let y = rows_top + i as f32 * row_h;
         labels.push((row.to_string(), px + pad_x, y, row_col));
     }
 
@@ -166,6 +193,27 @@ mod tests {
                 assert!(
                     est_right <= panel_right + 0.5,
                     "row {text:?} overflows panel at width {w}: {est_right} > {panel_right}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_row_fits_vertically_at_short_heights() {
+        // At short window heights the overlay must still fit every row on-screen
+        // (the lower rows must not clip off the bottom of the window).
+        for h in [360u32, 420, 480, 640] {
+            let overlay = build_help_overlay(700, h, &theme());
+            // The panel itself fits the window.
+            assert!(
+                overlay.panel.y >= 0.0 && overlay.panel.y + overlay.panel.h <= h as f32 + 0.5,
+                "panel exceeds window at height {h}"
+            );
+            // Every label's baseline sits inside the window.
+            for (text, _x, y, _c) in &overlay.labels {
+                assert!(
+                    *y >= 0.0 && *y <= h as f32,
+                    "row {text:?} clips off-screen at height {h}: y={y}"
                 );
             }
         }
