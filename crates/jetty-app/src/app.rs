@@ -106,6 +106,51 @@ impl SummonEffect {
     }
 }
 
+/// How F9 summons the window. Mirrors `SummonEffect`'s ORDER/cycle/from_config
+/// pattern. `Center` re-summons centered (or at the last position); `Dropdown`
+/// is a Yakuake-style top-anchored full-width strip that slides down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowMode {
+    Center,
+    Dropdown,
+}
+
+impl WindowMode {
+    const ORDER: [WindowMode; 2] = [WindowMode::Center, WindowMode::Dropdown];
+
+    fn display_name(self) -> &'static str {
+        match self {
+            WindowMode::Center => "Center",
+            WindowMode::Dropdown => "Dropdown",
+        }
+    }
+
+    fn cycle(self, forward: bool) -> WindowMode {
+        let i = Self::ORDER.iter().position(|&m| m == self).unwrap_or(0);
+        let n = Self::ORDER.len();
+        let j = if forward { (i + 1) % n } else { (i + n - 1) % n };
+        Self::ORDER[j]
+    }
+
+    fn from_config(s: &str) -> WindowMode {
+        match s {
+            "dropdown" => WindowMode::Dropdown,
+            _ => WindowMode::Center,
+        }
+    }
+
+    fn to_config(self) -> &'static str {
+        match self {
+            WindowMode::Center => "center",
+            WindowMode::Dropdown => "dropdown",
+        }
+    }
+}
+
+/// Dropdown slide-in duration in seconds (render-side content translate, not a
+/// per-frame reposition). A const, not persisted.
+const DROPDOWN_SLIDE_SECS: f32 = 0.15;
+
 /// Default logical (device-independent) font size in points. This is the value
 /// used when the user resets the font size with Ctrl+0 and on first launch.
 /// Scaled by the display's scale_factor before being passed to TextLayer so
@@ -135,7 +180,7 @@ struct Tab {
 /// (`build_panel` uses PANEL_W=380 × PANEL_H=504 plus a 2px border on each side)
 /// so the panel fills the window with no margin and the OS frame handles moving.
 const SETTINGS_WIN_W: u32 = 384;
-const SETTINGS_WIN_H: u32 = 508;
+const SETTINGS_WIN_H: u32 = 652;
 
 pub struct App {
     proxy: EventLoopProxy<AppEvent>,
@@ -167,6 +212,26 @@ pub struct App {
     offscreen: Option<(wgpu::Texture, wgpu::TextureView)>,
     /// The currently selected window-summon reveal effect.
     summon_effect: SummonEffect,
+    /// How F9 summons the window (Center vs Yakuake-style Dropdown).
+    window_mode: WindowMode,
+    /// Dropdown height as a fraction of the monitor height (clamped 0.25..=1.0).
+    dropdown_height_pct: f32,
+    /// Dropdown width as a fraction of the monitor width (clamped 0.2..=1.0).
+    /// Reserved; MVP ships full-width (1.0) and has no UI slider yet.
+    dropdown_width_pct: f32,
+    /// Start instant of the active Dropdown SLIDE animation, or None when idle.
+    /// The slide is a render-side content translate; while Some the redraw loop
+    /// self-drives frames (idle 0 CPU once cleared).
+    slide_anim: Option<std::time::Instant>,
+    /// Hide the window on focus loss (Yakuake auto-hide). Default ON.
+    focus_autohide: bool,
+    /// The id of the most recently focused window (main or settings). Used to
+    /// suppress auto-hide when focus moved to our own Settings window.
+    last_focused_window: Option<WindowId>,
+    /// Whether the user is dragging the Dropdown-height slider in Settings.
+    dragging_dropdown: bool,
+    /// One-time guard for the Wayland "positioning is a no-op" diagnostic.
+    wayland_warned: bool,
     /// Start instant of the active summon (crystallize) animation, or None when
     /// idle. While Some, the redraw loop self-drives frames; None = idle 0 CPU.
     summon_anim: Option<std::time::Instant>,
@@ -385,6 +450,14 @@ impl App {
             focus: None,
             offscreen: None,
             summon_effect: SummonEffect::Bayer,
+            window_mode: WindowMode::Center,
+            dropdown_height_pct: 0.50,
+            dropdown_width_pct: 1.0,
+            slide_anim: None,
+            focus_autohide: true,
+            last_focused_window: None,
+            dragging_dropdown: false,
+            wayland_warned: false,
             summon_anim: None,
             corner_radius,
             tabs: Vec::new(),
@@ -436,6 +509,10 @@ impl App {
         app.font_family = cfg.font_family;
         app.corner_radius = cfg.corner_radius.clamp(0.0, 24.0);
         app.summon_effect = SummonEffect::from_config(&cfg.summon_effect);
+        app.window_mode = WindowMode::from_config(&cfg.window_mode);
+        app.dropdown_height_pct = cfg.dropdown_height_pct.clamp(0.25, 1.0);
+        app.dropdown_width_pct = cfg.dropdown_width_pct.clamp(0.2, 1.0);
+        app.focus_autohide = cfg.focus_autohide;
 
         // Apply the initial theme+opacity so Terminal::new env defaults are
         // overridden by our managed state (avoids double-reads from env).
@@ -454,6 +531,10 @@ impl App {
             font_family: self.font_family.clone(),
             corner_radius: self.corner_radius,
             summon_effect: self.summon_effect.to_config().to_string(),
+            window_mode: self.window_mode.to_config().to_string(),
+            dropdown_height_pct: self.dropdown_height_pct,
+            dropdown_width_pct: self.dropdown_width_pct,
+            focus_autohide: self.focus_autohide,
         }
         .save();
     }
@@ -699,6 +780,39 @@ impl App {
         (frac * 24.0).clamp(0.0, 24.0)
     }
 
+    /// Compute the dropdown-height fraction ([0.25, 1.0]) from a cursor x relative
+    /// to the dropdown-height slider track rect.
+    fn dropdown_pct_from_cursor(&self, cx: f32, track: &jetty_render::Rect) -> f32 {
+        let frac = ((cx - track.x) / track.w).clamp(0.0, 1.0);
+        (0.25 + frac * 0.75).clamp(0.25, 1.0)
+    }
+
+    /// Select a new window mode: persist it, and apply it live. Switching to
+    /// Center clears any in-progress slide; switching to Dropdown clears last_pos
+    /// so the next summon re-docks from a clean top-flush geometry.
+    fn set_window_mode(&mut self, mode: WindowMode) {
+        if self.window_mode == mode {
+            return;
+        }
+        self.window_mode = mode;
+        match mode {
+            WindowMode::Center => {
+                self.slide_anim = None;
+            }
+            WindowMode::Dropdown => {
+                // Recompute dock geometry on the next summon (ignore stale pos).
+                self.last_pos = None;
+            }
+        }
+        self.persist();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+        if let Some(w) = &self.settings_window {
+            w.request_redraw();
+        }
+    }
+
     /// Convert the current cursor pixel position into 1-based terminal cell
     /// coordinates `(col, row)` using the renderer's cell size. Returns `None`
     /// when the renderer (and thus cell metrics) is not yet available.
@@ -916,24 +1030,41 @@ impl App {
     /// window is hidden — nothing is killed or suspended.
     fn toggle_visibility(&mut self, _event_loop: &ActiveEventLoop) {
         self.visible = !self.visible;
+        let mode = self.window_mode;
         if let Some(win) = &self.window {
             if self.visible {
-                win.set_visible(true);
-                // Re-summon at the spot the user left it; first time → center.
-                match self.last_pos {
-                    Some(pos) => {
-                        let _ = win.set_outer_position(pos);
+                match mode {
+                    WindowMode::Center => {
+                        win.set_visible(true);
+                        // Re-summon at the spot the user left it; first → center.
+                        match self.last_pos {
+                            Some(pos) => {
+                                let _ = win.set_outer_position(pos);
+                            }
+                            None => center_window(win),
+                        }
                     }
-                    None => center_window(win),
+                    WindowMode::Dropdown => {
+                        // Dock geometry is recomputed fresh each summon (ignores
+                        // last_pos). Position+size FIRST, then show, so the
+                        // resize happens before the window is visible.
+                        dock_window_top(win, self.dropdown_width_pct, self.dropdown_height_pct);
+                        win.set_visible(true);
+                        // Arm the render-side slide-down.
+                        self.slide_anim = Some(std::time::Instant::now());
+                    }
                 }
                 win.focus_window();
-                // Crystallize on every summon (F9 show), mirroring first open.
+                // Crystallize/reveal on every summon (F9 show), mirroring first open.
                 self.summon_anim = Some(std::time::Instant::now());
                 win.request_redraw();
             } else {
-                // Remember the current spot before hiding so the next summon
-                // restores it (where the user closed it from).
-                self.last_pos = win.outer_position().ok();
+                // Remember the current spot before hiding so the next Center
+                // summon restores it. Dropdown re-docks, so last_pos is unused.
+                if mode == WindowMode::Center {
+                    self.last_pos = win.outer_position().ok();
+                }
+                self.slide_anim = None;
                 win.set_visible(false);
             }
         }
@@ -989,6 +1120,7 @@ impl App {
         // doesn't leave a stale flag set that misbehaves on reopen.
         self.dragging_slider = false;
         self.dragging_radius = false;
+        self.dragging_dropdown = false;
         if self.debug {
             eprintln!("SETTINGS window closed");
         }
@@ -1001,7 +1133,10 @@ impl App {
         jetty_render::build_panel(
             w, h, self.opacity, self.theme_idx, self.font_logical,
             &self.font_families, &self.font_family, self.font_scroll_offset,
-            self.corner_radius, self.summon_effect.display_name(), 0.0, 0.0, &theme,
+            self.corner_radius, self.summon_effect.display_name(),
+            self.window_mode.display_name(), self.dropdown_height_pct,
+            self.window_mode == WindowMode::Dropdown, self.focus_autohide,
+            0.0, 0.0, &theme,
         )
     }
 
@@ -1012,6 +1147,11 @@ impl App {
         let font_logical = self.font_logical;
         let font_scroll_offset = self.font_scroll_offset;
         let corner_radius = self.corner_radius;
+        let summon_name = self.summon_effect.display_name();
+        let window_mode_name = self.window_mode.display_name();
+        let dropdown_height_pct = self.dropdown_height_pct;
+        let is_dropdown = self.window_mode == WindowMode::Dropdown;
+        let focus_autohide = self.focus_autohide;
         // Clone the small inputs build_panel needs so we can borrow the render
         // stack mutably below without overlapping the immutable self borrows.
         let families = self.font_families.clone();
@@ -1024,10 +1164,11 @@ impl App {
         };
         let width = gpu.config.width;
         let height = gpu.config.height;
-        let summon_name = self.summon_effect.display_name();
         let pv = jetty_render::build_panel(
             width, height, opacity, theme_idx, font_logical,
-            &families, &family, font_scroll_offset, corner_radius, summon_name, 0.0, 0.0, &theme,
+            &families, &family, font_scroll_offset, corner_radius, summon_name,
+            window_mode_name, dropdown_height_pct, is_dropdown, focus_autohide,
+            0.0, 0.0, &theme,
         );
         if let Some((frame, view)) = gpu.acquire_frame() {
             // Clear the window background to the panel border color, then paint the
@@ -1063,6 +1204,7 @@ impl App {
         action: input::MouseAction,
         track: Option<jetty_render::Rect>,
         radius_track: Option<jetty_render::Rect>,
+        dropdown_track: Option<jetty_render::Rect>,
     ) {
         let cx = self.settings_cursor.0 as f32;
         match action {
@@ -1111,6 +1253,25 @@ impl App {
             }
             input::MouseAction::SummonNext => {
                 self.set_summon_effect(self.summon_effect.cycle(true));
+            }
+            input::MouseAction::WinModePrev => {
+                self.set_window_mode(self.window_mode.cycle(false));
+            }
+            input::MouseAction::WinModeNext => {
+                self.set_window_mode(self.window_mode.cycle(true));
+            }
+            input::MouseAction::StartDropdownDrag => {
+                // No-op in Center mode (the slider is grayed/disabled there).
+                if self.window_mode == WindowMode::Dropdown {
+                    self.dragging_dropdown = true;
+                    if let Some(track_rect) = dropdown_track {
+                        self.dropdown_height_pct =
+                            self.dropdown_pct_from_cursor(cx, &track_rect);
+                    }
+                }
+            }
+            input::MouseAction::ToggleFocusAutoHide => {
+                self.focus_autohide = !self.focus_autohide;
             }
             // The OS title bar moves the window now; in-panel drag/consume are no-ops.
             input::MouseAction::StartDialogDrag
@@ -1169,8 +1330,8 @@ impl App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.settings_cursor = (position.x, position.y);
-                // Continue an opacity- or radius-slider drag started in this window.
-                if self.dragging_slider || self.dragging_radius {
+                // Continue an opacity-, radius-, or dropdown-height drag started here.
+                if self.dragging_slider || self.dragging_radius || self.dragging_dropdown {
                     if let Some(gpu) = &self.settings_gpu {
                         let (w, h) = (gpu.config.width, gpu.config.height);
                         let pv = self.settings_panel_view(w, h);
@@ -1181,6 +1342,10 @@ impl App {
                         }
                         if self.dragging_radius {
                             self.corner_radius = self.radius_from_cursor(cx, &pv.geom.radius_track);
+                        }
+                        if self.dragging_dropdown {
+                            self.dropdown_height_pct =
+                                self.dropdown_pct_from_cursor(cx, &pv.geom.dropdown_track);
                         }
                     }
                     if let Some(w) = &self.window {
@@ -1194,11 +1359,12 @@ impl App {
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 // Persist the final opacity/corner-radius after a drag settles
                 // (the drag itself only updates live state to keep writes cheap).
-                if self.dragging_slider || self.dragging_radius {
+                if self.dragging_slider || self.dragging_radius || self.dragging_dropdown {
                     self.persist();
                 }
                 self.dragging_slider = false;
                 self.dragging_radius = false;
+                self.dragging_dropdown = false;
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 let Some(gpu) = &self.settings_gpu else { return };
@@ -1206,11 +1372,12 @@ impl App {
                 let pv = self.settings_panel_view(w, h);
                 let track = pv.geom.slider_track;
                 let radius_track = pv.geom.radius_track;
+                let dropdown_track = pv.geom.dropdown_track;
                 let cx = self.settings_cursor.0 as f32;
                 let cy = self.settings_cursor.1 as f32;
                 // Hit-test the panel only (no scrollbar in the settings window).
                 let action = input::decide_mouse_press(Some(&pv.geom), None, cx, cy);
-                self.handle_settings_action(action, Some(track), Some(radius_track));
+                self.handle_settings_action(action, Some(track), Some(radius_track), Some(dropdown_track));
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Wheel over the font-family list scrolls it (same as the old
@@ -1257,6 +1424,14 @@ impl App {
                     }
                 }
             }
+            WindowEvent::Focused(true) => {
+                // Record that OUR settings window now holds focus so the main
+                // window's Focused(false) auto-hide doesn't fire when the user
+                // merely clicked into Settings.
+                if let Some(w) = &self.settings_window {
+                    self.last_focused_window = Some(w.id());
+                }
+            }
             WindowEvent::RedrawRequested => {
                 self.render_settings_window();
             }
@@ -1286,9 +1461,26 @@ impl ApplicationHandler<AppEvent> for App {
         });
 
         let window = jetty_platform::build_window(event_loop, "JeTTY", (1000, 640));
-        // First open: center the window. Subsequent F9 summons restore the last
-        // position (see toggle_visibility).
-        center_window(&window);
+        // First open: place the window per the configured mode. Center mode
+        // centers; Dropdown mode docks as a top strip and slides in.
+        match self.window_mode {
+            WindowMode::Center => center_window(&window),
+            WindowMode::Dropdown => {
+                dock_window_top(&window, self.dropdown_width_pct, self.dropdown_height_pct);
+                self.slide_anim = Some(std::time::Instant::now());
+            }
+        }
+        // One-time Wayland diagnostic: winit cannot report the outer position on
+        // Wayland, so set_outer_position/request_inner_size silently no-op and
+        // the compositor places the window. Accepted degradation (no DE code).
+        if !self.wayland_warned && window.outer_position().is_err() {
+            self.wayland_warned = true;
+            eprintln!(
+                "jetty: window positioning is a no-op on this platform (Wayland?); \
+                 Dropdown/Center geometry falls back to compositor placement + the \
+                 reveal effect — same accepted degradation as the F9 hotkey."
+            );
+        }
         let size = window.inner_size();
         // HiDPI: the display's scale factor (>1.0 on HiDPI/Retina screens).
         // inner_size() already returns physical pixels; we multiply the logical
@@ -1515,6 +1707,33 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
+            }
+            WindowEvent::Focused(true) => {
+                // The main terminal window gained focus.
+                self.last_focused_window = Some(id);
+            }
+            WindowEvent::Focused(false) => {
+                // Yakuake-style auto-hide: hide when the window loses focus, but
+                // only when ENABLED, currently visible, NOT mid-summon (X11 fires
+                // a synthetic Focused(false) during set_visible/focus), and focus
+                // did NOT move to our own Settings window.
+                let settings_id = self.settings_window.as_ref().map(|w| w.id());
+                let to_settings = self.last_focused_window.is_some()
+                    && self.last_focused_window == settings_id;
+                if self.focus_autohide
+                    && self.visible
+                    && self.summon_anim.is_none()
+                    && !to_settings
+                {
+                    if let Some(win) = &self.window {
+                        if self.window_mode == WindowMode::Center {
+                            self.last_pos = win.outer_position().ok();
+                        }
+                        self.slide_anim = None;
+                        win.set_visible(false);
+                    }
+                    self.visible = false;
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let prev = self.cursor;
@@ -1874,6 +2093,10 @@ impl ApplicationHandler<AppEvent> for App {
                     | input::MouseAction::FontScrollDown
                     | input::MouseAction::SummonPrev
                     | input::MouseAction::SummonNext
+                    | input::MouseAction::WinModePrev
+                    | input::MouseAction::WinModeNext
+                    | input::MouseAction::StartDropdownDrag
+                    | input::MouseAction::ToggleFocusAutoHide
                     | input::MouseAction::StartDialogDrag
                     | input::MouseAction::ConsumePanel => {}
                     input::MouseAction::StartScrollbarDrag { grab_dy } => {
@@ -2302,6 +2525,21 @@ impl ApplicationHandler<AppEvent> for App {
                 // physical-pixel surface (HiDPI-correct rounding).
                 let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
                 let corner_radius_px = self.corner_radius * scale;
+                // In Dropdown mode the window is flush to the monitor top, so the
+                // TOP corners must stay square (only the bottom corners round).
+                // Derive "top-flush" from the window's outer position vs the
+                // monitor top. On Wayland outer_position() is Err → not flush, so
+                // we keep all-4 rounding (accepted degradation, no DE code).
+                let top_flush = self.window_mode == WindowMode::Dropdown
+                    && self
+                        .window
+                        .as_ref()
+                        .and_then(|w| {
+                            let p = w.outer_position().ok()?;
+                            let mon = w.current_monitor().or_else(|| w.available_monitors().next())?;
+                            Some(p.y <= mon.position().y + 1)
+                        })
+                        .unwrap_or(false);
                 let corner_mask = self.corner_mask.as_ref();
                 let bayer_reveal = self.bayer_reveal.as_ref();
                 let phosphor = self.phosphor.as_ref();
@@ -2317,6 +2555,9 @@ impl ApplicationHandler<AppEvent> for App {
                     let d = summon_effect.duration();
                     if d <= 0.0 { 1.0 } else { start.elapsed().as_secs_f32() / d }
                 });
+                // Dropdown slide progress (ease-out cubic). Captured here; the
+                // pixel offset is computed once `height` is bound below.
+                let slide_anim = self.slide_anim;
                 // Theme accent for the reveal glow (captured before the mutable
                 // gpu/text/quad borrow below).
                 let summon_accent: [f32; 3] = {
@@ -2330,12 +2571,33 @@ impl ApplicationHandler<AppEvent> for App {
                 };
                 let width = gpu.config.width;
                 let height = gpu.config.height;
+                // Render-side Dropdown slide: translate ALL scene content down
+                // from -height to 0 via ease-out cubic over DROPDOWN_SLIDE_SECS.
+                // This is NOT a per-frame reposition (no X11 ConfigureWindow race,
+                // no-op-safe on Wayland) — it just shifts the content y-offset.
+                let slide_y_offset = slide_anim
+                    .map(|s| {
+                        let t = (s.elapsed().as_secs_f32() / DROPDOWN_SLIDE_SECS).min(1.0);
+                        let eased = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+                        -(height as f32) * (1.0 - eased)
+                    })
+                    .unwrap_or(0.0);
                 // Compute window-control hover from the last cursor position.
                 let ctrl_hover = ctrl_hover_at(self.cursor.0 as f32, self.cursor.1 as f32, width);
                 let rename_ref = rename_state.as_ref().map(|(i, b)| (*i, b.as_str()));
-                let bar = jetty_render::build_tab_bar_ex(
+                let mut bar = jetty_render::build_tab_bar_ex(
                     width, &tabs_meta, &theme, rename_ref, ctrl_hover,
                 );
+                // Offset the tab-bar quads + labels by the slide so the bar moves
+                // with the content during the Dropdown slide-in.
+                if slide_y_offset != 0.0 {
+                    for q in &mut bar.quads {
+                        q.y += slide_y_offset;
+                    }
+                    for l in &mut bar.labels {
+                        l.2 += slide_y_offset;
+                    }
+                }
                 if let Some((frame, view)) = gpu.acquire_frame() {
                     // Tier-B routing: when a Liquid/Focus effect is ACTIVELY
                     // summoning (t in [0,1)) AND the offscreen texture exists,
@@ -2359,7 +2621,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let (cell_w, cell_h) = text.cell_size();
                     let selection_bg = selection_bg_for(&theme);
                     let scrollbar_thumb = scrollbar_thumb_for(&theme);
-                    let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, TABBAR_H, selection_bg);
+                    let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, TABBAR_H + slide_y_offset, selection_bg);
                     quad.render_clear(
                         &gpu.device,
                         &gpu.queue,
@@ -2379,7 +2641,7 @@ impl ApplicationHandler<AppEvent> for App {
                         height,
                         &snap,
                         false,
-                        TABBAR_H,
+                        TABBAR_H + slide_y_offset,
                     );
                     // Pass 3: the tab bar (y 0..TABBAR_H) over the grid.
                     quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &bar.quads);
@@ -2390,9 +2652,10 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     // Pass 4: scrollbar (spans the grid area below the bar).
                     let mut rects: Vec<jetty_render::Rect> = Vec::new();
-                    if let Some(r) =
+                    if let Some(mut r) =
                         jetty_render::scrollbar_rect(&snap, width, height, TABBAR_H, scrollbar_thumb)
                     {
+                        r.y += slide_y_offset;
                         rects.push(r);
                     }
                     quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &rects);
@@ -2459,12 +2722,18 @@ impl ApplicationHandler<AppEvent> for App {
                     // Tier-B summon it's the offscreen frame, so the rounded corners
                     // are baked in before the effect samples it.
                     if let Some(mask) = corner_mask {
+                        // Bottom corners always round to corner_radius_px; the top
+                        // corners are zeroed when the window is top-flush (Dropdown).
+                        let r_top = if top_flush { 0.0 } else { corner_radius_px };
                         mask.apply(
                             &gpu.device,
                             &gpu.queue,
                             scene_view,
                             width,
                             height,
+                            r_top,
+                            r_top,
+                            corner_radius_px,
                             corner_radius_px,
                         );
                     }
@@ -2514,12 +2783,23 @@ impl ApplicationHandler<AppEvent> for App {
                                     }
                                 }
                             }
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
                         } else {
-                            // Animation complete — back to idle (no pass next frame).
+                            // Reveal complete — back to idle (no pass next frame).
                             self.summon_anim = None;
+                        }
+                    }
+                    // Dropdown slide self-driver: while the slide is live keep
+                    // requesting redraws; clear it at t>=1 so we return to idle.
+                    if let Some(s) = self.slide_anim {
+                        if s.elapsed().as_secs_f32() >= DROPDOWN_SLIDE_SECS {
+                            self.slide_anim = None;
+                        }
+                    }
+                    // Self-drive the next frame while EITHER animation is live so
+                    // idle CPU returns to ~0 only once BOTH have cleared.
+                    if self.summon_anim.is_some() || self.slide_anim.is_some() {
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
                         }
                     }
                     frame.present();
@@ -2600,16 +2880,48 @@ fn ctrl_hover_at(cx: f32, cy: f32, width: u32) -> jetty_render::CtrlHover {
 /// current one cannot be determined). No-ops gracefully if no monitor info is
 /// available.
 fn center_window(win: &Arc<Window>) {
-    let mon_size = win
+    let mon = win
         .current_monitor()
-        .or_else(|| win.available_monitors().next())
-        .map(|m| m.size());
+        .or_else(|| win.available_monitors().next());
 
-    if let Some(mon) = mon_size {
+    if let Some(mon) = mon {
+        let mon_pos = mon.position(); // physical px; nonzero on secondary monitors
+        let mon_size = mon.size();
         let win_size = win.outer_size();
-        let x = (mon.width.saturating_sub(win_size.width) / 2) as i32;
-        let y = (mon.height.saturating_sub(win_size.height) / 2) as i32;
+        // Center WITHIN the current monitor: add the monitor's origin so a
+        // multi-monitor setup centers on the right screen (the old code dropped
+        // position() and always centered relative to (0,0) — a real bug).
+        let x = mon_pos.x + (mon_size.width.saturating_sub(win_size.width) / 2) as i32;
+        let y = mon_pos.y + (mon_size.height.saturating_sub(win_size.height) / 2) as i32;
         win.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+    }
+}
+
+/// Dock the window as a Yakuake-style top strip on the current monitor: full
+/// monitor width (× `width_pct`), `height_pct` of the monitor height, flush to
+/// the top edge (y = monitor top), centered horizontally. Sizes/positions are
+/// set ONCE per summon (the slide-in is render-side, not a per-frame reposition).
+/// On Wayland set_outer_position/request_inner_size are no-ops — accepted
+/// degradation, same as the F9 hotkey.
+fn dock_window_top(win: &Arc<Window>, width_pct: f32, height_pct: f32) {
+    let mon = win
+        .current_monitor()
+        .or_else(|| win.available_monitors().next());
+    if let Some(mon) = mon {
+        let mon_pos = mon.position();
+        let mon_size = mon.size();
+        let mon_w = mon_size.width as f32;
+        let mon_h = mon_size.height as f32;
+        // Clamp to the min_inner_size floor so the strip never collapses.
+        let win_w = (mon_w * width_pct).max(400.0).min(mon_w);
+        let win_h = (mon_h * height_pct).max(200.0).min(mon_h);
+        let x = mon_pos.x + ((mon_w - win_w) / 2.0).round() as i32;
+        let y = mon_pos.y; // top-flush
+        win.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+        let _ = win.request_inner_size(winit::dpi::PhysicalSize::new(
+            win_w.round() as u32,
+            win_h.round() as u32,
+        ));
     }
 }
 

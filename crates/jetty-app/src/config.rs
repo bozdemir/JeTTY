@@ -26,10 +26,40 @@ pub struct Config {
     /// "focus" (the last two are Tier-B effects that sample the rendered frame).
     #[serde(default = "default_summon_effect")]
     pub summon_effect: String,
+    /// Window summon mode: "center" (re-summon centered/last-pos) or "dropdown"
+    /// (Yakuake-style top-anchored full-width strip that slides down).
+    #[serde(default = "default_window_mode")]
+    pub window_mode: String,
+    /// Dropdown height as a fraction of the monitor height (0.25..=1.0).
+    #[serde(default = "default_dropdown_height_pct")]
+    pub dropdown_height_pct: f32,
+    /// Dropdown width as a fraction of the monitor width (0.2..=1.0). Reserved;
+    /// the MVP ships full-width (1.0). No UI slider yet.
+    #[serde(default = "default_dropdown_width_pct")]
+    pub dropdown_width_pct: f32,
+    /// Hide the window on focus loss (Yakuake-style auto-hide). Default ON.
+    #[serde(default = "default_focus_autohide")]
+    pub focus_autohide: bool,
 }
 
 fn default_summon_effect() -> String {
     "phosphor".to_string()
+}
+
+fn default_window_mode() -> String {
+    "center".to_string()
+}
+
+fn default_dropdown_height_pct() -> f32 {
+    0.50
+}
+
+fn default_dropdown_width_pct() -> f32 {
+    1.0
+}
+
+fn default_focus_autohide() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -41,6 +71,10 @@ impl Default for Config {
             font_family: "MesloLGS NF".to_string(),
             corner_radius: 10.0,
             summon_effect: default_summon_effect(),
+            window_mode: default_window_mode(),
+            dropdown_height_pct: default_dropdown_height_pct(),
+            dropdown_width_pct: default_dropdown_width_pct(),
+            focus_autohide: default_focus_autohide(),
         }
     }
 }
@@ -93,6 +127,10 @@ mod tests {
         assert_eq!(c.font_family, "MesloLGS NF");
         assert_eq!(c.corner_radius, 10.0);
         assert_eq!(c.summon_effect, "phosphor");
+        assert_eq!(c.window_mode, "center");
+        assert_eq!(c.dropdown_height_pct, 0.50);
+        assert_eq!(c.dropdown_width_pct, 1.0);
+        assert!(c.focus_autohide);
     }
 
     #[test]
@@ -104,6 +142,18 @@ mod tests {
     }
 
     #[test]
+    fn missing_dropdown_keys_default() {
+        // An older config without the dropdown keys still loads (serde defaults),
+        // so an existing config.toml is unchanged on upgrade.
+        let toml = "theme = \"dracula\"\nopacity = 1.0\nfont_size = 16.0\nfont_family = \"MesloLGS NF\"\ncorner_radius = 10.0\nsummon_effect = \"phosphor\"\n";
+        let c: Config = toml::from_str(toml).expect("deserialize");
+        assert_eq!(c.window_mode, "center");
+        assert_eq!(c.dropdown_height_pct, 0.50);
+        assert_eq!(c.dropdown_width_pct, 1.0);
+        assert!(c.focus_autohide);
+    }
+
+    #[test]
     fn round_trip_through_toml() {
         let c = Config {
             theme: "dracula".to_string(),
@@ -112,6 +162,10 @@ mod tests {
             font_family: "Fira Code".to_string(),
             corner_radius: 6.0,
             summon_effect: "phosphor".to_string(),
+            window_mode: "dropdown".to_string(),
+            dropdown_height_pct: 0.6,
+            dropdown_width_pct: 1.0,
+            focus_autohide: false,
         };
         let s = toml::to_string_pretty(&c).expect("serialize");
         let back: Config = toml::from_str(&s).expect("deserialize");
@@ -130,6 +184,10 @@ mod tests {
             font_family: "MesloLGS NF".to_string(),
             corner_radius: 12.0,
             summon_effect: "none".to_string(),
+            window_mode: "center".to_string(),
+            dropdown_height_pct: 0.5,
+            dropdown_width_pct: 1.0,
+            focus_autohide: true,
         };
         std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
         let s = std::fs::read_to_string(&path).unwrap();

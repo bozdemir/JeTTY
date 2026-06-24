@@ -231,6 +231,14 @@ pub enum MouseAction {
     SummonPrev,
     /// User clicked the summon-effect "›" button — cycle to the next effect.
     SummonNext,
+    /// User clicked the window-mode "‹" button — cycle to the previous mode.
+    WinModePrev,
+    /// User clicked the window-mode "›" button — cycle to the next mode.
+    WinModeNext,
+    /// User pressed on the Dropdown-height slider handle or track — start drag.
+    StartDropdownDrag,
+    /// User clicked the "Auto-hide on focus loss" toggle pill.
+    ToggleFocusAutoHide,
     /// User pressed on the title bar (not on any widget) — start dialog drag.
     StartDialogDrag,
     /// User clicked inside the panel but not on any widget — swallow the event.
@@ -305,6 +313,21 @@ pub fn decide_mouse_press(
         }
         if point_in(&g.summon_next, cx, cy) {
             return MouseAction::SummonNext;
+        }
+        // Window-mode cycle buttons.
+        if point_in(&g.win_mode_prev, cx, cy) {
+            return MouseAction::WinModePrev;
+        }
+        if point_in(&g.win_mode_next, cx, cy) {
+            return MouseAction::WinModeNext;
+        }
+        // Dropdown-height slider handle or track.
+        if point_in(&g.dropdown_handle, cx, cy) || point_in(&g.dropdown_track, cx, cy) {
+            return MouseAction::StartDropdownDrag;
+        }
+        // Auto-hide toggle pill.
+        if point_in(&g.autohide_toggle, cx, cy) {
+            return MouseAction::ToggleFocusAutoHide;
         }
         // Font-family list rows.
         for (i, row) in g.font_rows.iter().enumerate() {

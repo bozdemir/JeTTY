@@ -273,6 +273,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0,
                 panel_radius,
                 std::env::var("JETTY_SHOT_PANEL_EFFECT").unwrap_or_else(|_| "Bayer".to_string()).as_str(),
+                std::env::var("JETTY_SHOT_PANEL_WINMODE").unwrap_or_else(|_| "Center".to_string()).as_str(),
+                std::env::var("JETTY_SHOT_PANEL_DH").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.50),
+                std::env::var("JETTY_SHOT_PANEL_WINMODE").map(|m| m == "Dropdown").unwrap_or(false),
+                std::env::var("JETTY_SHOT_PANEL_AUTOHIDE").map(|s| s != "0").unwrap_or(true),
                 panel_dx,
                 panel_dy,
                 terminal.theme(),
@@ -470,12 +474,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse::<f32>().ok())
         .map(|v| v.clamp(0.0, 24.0))
         .unwrap_or(0.0);
+    // JETTY_SHOT_DROPDOWN — verify Dropdown mode's BOTTOM-only rounding: the two
+    // top corners are square (top-flush), only the bottom corners round.
+    let dropdown = std::env::var("JETTY_SHOT_DROPDOWN").is_ok();
     if corner_radius > 0.0 {
-        eprintln!("jetty-shot: applying rounded-corner mask (radius={corner_radius}px)");
+        let (r_tl, r_tr) = if dropdown { (0.0, 0.0) } else { (corner_radius, corner_radius) };
+        eprintln!(
+            "jetty-shot: applying rounded-corner mask (radius={corner_radius}px, dropdown={dropdown})"
+        );
         for y in 0..height {
             for x in 0..width {
-                let cov = jetty_render::rounded_rect_coverage(
-                    x as f32, y as f32, width as f32, height as f32, corner_radius,
+                let cov = jetty_render::rounded_rect_coverage_per(
+                    x as f32, y as f32, width as f32, height as f32,
+                    r_tl, r_tr, corner_radius, corner_radius,
                 );
                 if cov < 1.0 {
                     let idx = ((y * width + x) * 4) as usize;
