@@ -87,6 +87,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Build TextLayer ---
     let mut text = TextLayer::new_with_family(&device, &queue, format, font_size, &font_family);
+    // FIXED-size chrome layer (16px), mirroring the live app: ALL window chrome
+    // (tab bar, context menu, settings panel, help, confirm popups) renders
+    // through this, so chrome text is the SAME size regardless of JETTY_FONT_SIZE.
+    // The terminal grid renders through `text` (which scales with the font).
+    let mut chrome_text = TextLayer::new_with_family(&device, &queue, format, 16.0, &font_family);
     let (cell_w, cell_h) = text.cell_size();
     let mono_families = text.monospace_families();
     eprintln!("jetty-shot: {} monospace families found (e.g. {:?})", mono_families.len(), mono_families.first());
@@ -338,9 +343,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         quad.render(&device, &queue, &view, width, height, &rects);
 
-        // Render panel text labels on top of the panel quads.
+        // Render chrome (panel/tabbar/menu/help/confirm) labels on top of the
+        // quads through the FIXED-size chrome layer, so they don't scale with the
+        // terminal font (this is what proves BUG 1 is fixed across JETTY_FONT_SIZE).
         if !panel_labels.is_empty() {
-            let _ = text.render_overlays(&device, &queue, &view, width, height, &panel_labels);
+            let _ = chrome_text.render_overlays(&device, &queue, &view, width, height, &panel_labels);
         }
     }
 

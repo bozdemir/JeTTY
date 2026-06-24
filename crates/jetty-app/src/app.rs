@@ -194,6 +194,11 @@ pub struct App {
     hotkey_manager: Option<()>,
     gpu: Option<GpuContext>,
     text: Option<TextLayer>,
+    /// FIXED-size TextLayer used for ALL window chrome (tab bar labels, context
+    /// menu, help overlay, confirm popup). Built at `FONT_LOGICAL_DEFAULT * scale`
+    /// and rebuilt only on SCALE-factor changes — NOT on terminal font changes —
+    /// so the chrome never scales with (and overflows from) the terminal font.
+    chrome_text: Option<TextLayer>,
     quad: Option<QuadLayer>,
     /// Final-pass rounded-corner mask for the borderless main window.
     corner_mask: Option<jetty_render::CornerMask>,
@@ -270,6 +275,11 @@ pub struct App {
     /// Current logical (device-independent) font size in points. Changed at
     /// runtime via Ctrl+Equal/Ctrl+Minus/Ctrl+0 (font up/down/reset).
     font_logical: f32,
+    /// When `Some`, a grid+PTY `reflow()` is scheduled for this instant. Rapid
+    /// Ctrl+/- font changes set this ~120ms ahead and rebuild the visual font
+    /// immediately; `about_to_wait` fires ONE reflow once the user stops, so N
+    /// presses coalesce into a single PTY SIGWINCH (avoids stacked p10k prompts).
+    reflow_pending_at: Option<std::time::Instant>,
     /// Current font family name (runtime-settable via the font picker).
     font_family: String,
     /// Cached sorted monospace family list (populated once TextLayer is built).
@@ -463,6 +473,7 @@ impl App {
             hotkey_manager: None,
             gpu: None,
             text: None,
+            chrome_text: None,
             quad: None,
             corner_mask: None,
             bayer_reveal: None,
@@ -490,6 +501,7 @@ impl App {
             theme_idx,
             opacity,
             font_logical: FONT_LOGICAL_DEFAULT,
+            reflow_pending_at: None,
             font_family,
             font_families: Vec::new(),
             font_scroll_offset: 0,
@@ -1027,6 +1039,25 @@ impl App {
         }
     }
 
+    /// Like `reflow`, but resizes ONLY the in-process terminal grids — it does
+    /// NOT issue `pty.resize` (no SIGWINCH). Used by `set_font_size` so the grid
+    /// matches the new cell size instantly while the (shell-visible) PTY resize is
+    /// debounced to a single SIGWINCH once the user stops changing the font size.
+    fn reflow_terminal_only(&mut self) {
+        let (Some(gpu), Some(text)) = (&self.gpu, &self.text) else { return };
+        let (cw, ch) = text.cell_size();
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        let w = gpu.config.width;
+        let h = gpu.config.height;
+        let cols = (w as f32 / cw).floor().max(1.0) as usize;
+        let rows = ((h as f32 - TABBAR_H) / ch).floor().max(1.0) as usize;
+        for tab in &mut self.tabs {
+            tab.terminal.resize(cols, rows);
+        }
+    }
+
     /// Change the font size at runtime. `new_logical` is clamped to [6.0, 48.0].
     /// Rebuilds TextLayer with the new physical font size (logical * scale),
     /// then calls `reflow()` to recompute the grid, and requests a redraw.
@@ -1044,7 +1075,14 @@ impl App {
                 self.font_families = t.monospace_families();
             }
         }
-        self.reflow();
+        // Resize the in-process grid NOW so the rendered content matches the new
+        // cell size immediately (no mis-fit flash), but DEBOUNCE the PTY resize:
+        // schedule a single SIGWINCH ~120ms out. Rapid Ctrl+/- presses keep pushing
+        // this instant forward so N presses collapse to ONE pty.resize → one
+        // shell-side prompt repaint (no staircase of duplicate p10k prompts).
+        self.reflow_terminal_only();
+        self.reflow_pending_at =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(120));
         self.persist();
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -1142,8 +1180,11 @@ impl App {
         let scale = window.scale_factor() as f32;
         let gpu = GpuContext::new(window.clone(), size.width, size.height);
         if let Some(ref g) = gpu {
+            // FIXED chrome size (16 * scale), independent of the terminal font, so
+            // the settings panel text never overflows its fixed-size window when
+            // the user has grown/shrunk the terminal font.
             let text = TextLayer::new_with_family(
-                &g.device, &g.queue, g.format, self.font_logical * scale, &self.font_family,
+                &g.device, &g.queue, g.format, FONT_LOGICAL_DEFAULT * scale, &self.font_family,
             );
             let quad = QuadLayer::new(&g.device, g.format);
             self.settings_text = Some(text);
@@ -1389,8 +1430,10 @@ impl App {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 let scale = scale_factor as f32;
                 if let Some(ref g) = self.settings_gpu {
+                    // FIXED chrome size (16 * scale), so the panel text never
+                    // overflows the fixed window regardless of the terminal font.
                     let new_text = TextLayer::new_with_family(
-                        &g.device, &g.queue, g.format, self.font_logical * scale, &self.font_family,
+                        &g.device, &g.queue, g.format, FONT_LOGICAL_DEFAULT * scale, &self.font_family,
                     );
                     self.settings_text = Some(new_text);
                 }
@@ -1547,10 +1590,27 @@ impl ApplicationHandler<AppEvent> for App {
     /// `Wait` (idle 0 CPU) the instant nothing is pending. On X11/Wayland this is
     /// just a brief Poll burst during the animation (redraws already deliver).
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Debounced font-size reflow: when the deadline set by `set_font_size`
+        // has elapsed (the user stopped pressing Ctrl+/-), issue ONE pty.resize
+        // (via `reflow`) so the shell gets a single SIGWINCH instead of one per
+        // press (which left stacked p10k prompts).
+        let reflow_due = self
+            .reflow_pending_at
+            .is_some_and(|d| std::time::Instant::now() >= d);
+        if reflow_due {
+            self.reflow_pending_at = None;
+            self.reflow();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+        let reflow_waiting = self.reflow_pending_at.is_some();
+
         let main_pending = self.summon_anim.is_some()
             || self.slide_anim.is_some()
             || self.summon_pending
-            || self.pending_dock_frames > 0;
+            || self.pending_dock_frames > 0
+            || reflow_waiting;
         if main_pending {
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -1681,6 +1741,16 @@ impl ApplicationHandler<AppEvent> for App {
             self.liquid = Some(jetty_render::LiquidDrop::new(&g.device, g.format));
             self.focus = Some(jetty_render::FocusPull::new(&g.device, g.format));
             self.summon_pending = true;
+        }
+
+        // Build the FIXED-size chrome TextLayer (tab bar / menus / overlays). It
+        // lives at FONT_LOGICAL_DEFAULT (16) * scale so its ~9.6px advance matches
+        // what build_tab_bar_ex assumes, and it is NEVER rebuilt on terminal font
+        // changes — only on scale changes — so chrome can't overflow the bar.
+        if let Some(ref g) = gpu {
+            self.chrome_text = Some(TextLayer::new_with_family(
+                &g.device, &g.queue, g.format, FONT_LOGICAL_DEFAULT * scale, &self.font_family,
+            ));
         }
 
         self.window = Some(window);
@@ -1834,6 +1904,12 @@ impl ApplicationHandler<AppEvent> for App {
                         &g.device, &g.queue, g.format, self.font_logical * scale, &self.font_family,
                     );
                     self.text = Some(new_text);
+                    // Rebuild the chrome layer at the new scale (still FIXED logical
+                    // size), so chrome stays sharp on the new monitor's DPI without
+                    // scaling to the terminal font.
+                    self.chrome_text = Some(TextLayer::new_with_family(
+                        &g.device, &g.queue, g.format, FONT_LOGICAL_DEFAULT * scale, &self.font_family,
+                    ));
                 }
                 self.reflow();
                 if let Some(w) = &self.window {
@@ -2725,8 +2801,8 @@ impl ApplicationHandler<AppEvent> for App {
                     let a = self.current_theme().palette[4];
                     [a[0] as f32 / 255.0, a[1] as f32 / 255.0, a[2] as f32 / 255.0]
                 };
-                let (Some(gpu), Some(text), Some(quad)) =
-                    (&mut self.gpu, &mut self.text, &mut self.quad)
+                let (Some(gpu), Some(text), Some(chrome_text), Some(quad)) =
+                    (&mut self.gpu, &mut self.text, &mut self.chrome_text, &mut self.quad)
                 else {
                     return;
                 };
@@ -2807,7 +2883,9 @@ impl ApplicationHandler<AppEvent> for App {
                     // Pass 3: the tab bar (y 0..TABBAR_H) over the grid.
                     quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &bar.quads);
                     if !bar.labels.is_empty() {
-                        let _ = text.render_overlays(
+                        // Chrome: fixed-size layer so the bar text never scales with
+                        // the terminal font (and never overflows the 36px bar).
+                        let _ = chrome_text.render_overlays(
                             &gpu.device, &gpu.queue, scene_view, width, height, &bar.labels,
                         );
                     }
@@ -2825,7 +2903,7 @@ impl ApplicationHandler<AppEvent> for App {
                         let menu = jetty_render::build_context_menu(mx, my, width, height, menu_hover, &theme);
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &menu.quads);
                         if !menu.labels.is_empty() {
-                            let _ = text.render_overlays(
+                            let _ = chrome_text.render_overlays(
                                 &gpu.device,
                                 &gpu.queue,
                                 scene_view,
@@ -2841,7 +2919,7 @@ impl ApplicationHandler<AppEvent> for App {
                         let help = jetty_render::build_help_overlay(width, height, &theme);
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &help.quads);
                         if !help.labels.is_empty() {
-                            let _ = text.render_overlays(
+                            let _ = chrome_text.render_overlays(
                                 &gpu.device,
                                 &gpu.queue,
                                 scene_view,
@@ -2859,7 +2937,7 @@ impl ApplicationHandler<AppEvent> for App {
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &popup.quads);
                         if !popup.labels.is_empty() {
-                            let _ = text.render_overlays(
+                            let _ = chrome_text.render_overlays(
                                 &gpu.device, &gpu.queue, scene_view, width, height, &popup.labels,
                             );
                         }
@@ -2867,7 +2945,7 @@ impl ApplicationHandler<AppEvent> for App {
                         let popup = jetty_render::build_confirm_close(width, height, title, &theme);
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &popup.quads);
                         if !popup.labels.is_empty() {
-                            let _ = text.render_overlays(
+                            let _ = chrome_text.render_overlays(
                                 &gpu.device,
                                 &gpu.queue,
                                 scene_view,
