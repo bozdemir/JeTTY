@@ -1,0 +1,79 @@
+name: release
+
+# Build prebuilt artifacts and publish a GitHub Release whenever a version tag
+# is pushed, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: System build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libvulkan-dev libwayland-dev libxkbcommon-dev \
+            libx11-dev libxcb1-dev libfontconfig1-dev libgl1-mesa-dev \
+            desktop-file-utils
+
+      - name: Build release binary
+        run: cargo build --release --bin jetty
+
+      - name: Tarball
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          stage="jetty-${ver}-x86_64-linux"
+          mkdir -p "dist/${stage}"
+          cp target/release/jetty "dist/${stage}/"
+          cp -r assets README.md LICENSE "dist/${stage}/"
+          tar -C dist -czf "${stage}.tar.gz" "${stage}"
+
+      - name: Debian package (.deb)
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb -p jetty --no-build
+          cp target/debian/*.deb "jetty_${GITHUB_REF_NAME#v}_amd64.deb" 2>/dev/null || cp target/debian/*.deb .
+
+      - name: AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          curl -fsSL -o linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy
+          mkdir -p AppDir
+          ./linuxdeploy --appdir AppDir \
+            --executable target/release/jetty \
+            --desktop-file assets/jetty.desktop \
+            --icon-file assets/icons/jetty-256.png \
+            --output appimage
+          mv ./*.AppImage "JeTTY-${GITHUB_REF_NAME#v}-x86_64.AppImage"
+
+      - name: Checksums
+        run: sha256sum *.tar.gz *.deb *.AppImage > SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          files: |
+            *.tar.gz
+            *.deb
+            *.AppImage
+            SHA256SUMS.txt

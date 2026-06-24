@@ -4,12 +4,41 @@ members = ["crates/jetty-core", "crates/jetty-render", "crates/jetty-platform", 
 
 [package]
 name = "jetty"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
+description = "A blazing-fast, GPU-accelerated, desktop-environment-independent terminal with a center-summon / Yakuake-style dropdown hotkey."
+authors = ["Burak Ozdemir <bozdemir@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/bozdemir/jetty"
+homepage = "https://github.com/bozdemir/jetty"
+readme = "README.md"
+keywords = ["terminal", "gpu", "wgpu", "tty", "dropdown"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "jetty"
 path = "src/main.rs"
+
+# Debian/Ubuntu package (cargo-deb). Vulkan/Wayland/xkb/fontconfig are loaded at
+# runtime, so list them explicitly in addition to $auto-detected shlib deps.
+[package.metadata.deb]
+maintainer = "Burak Ozdemir <bozdemir@gmail.com>"
+copyright = "2026, Burak Ozdemir"
+license-file = ["LICENSE", "0"]
+extended-description = "JeTTY is a GPU-rendered terminal emulator that drops into the center of your screen (or slides down Yakuake-style) on a global hotkey. Desktop-environment-independent: X11 and Wayland, KDE / GNOME / any compositor."
+depends = "$auto, libvulkan1, libxkbcommon0, fontconfig"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/jetty", "usr/bin/", "755"],
+    ["assets/jetty.desktop", "usr/share/applications/", "644"],
+    ["assets/icons/jetty-256.png", "usr/share/icons/hicolor/256x256/apps/jetty.png", "644"],
+    ["assets/icons/jetty-128.png", "usr/share/icons/hicolor/128x128/apps/jetty.png", "644"],
+    ["assets/icons/jetty-64.png", "usr/share/icons/hicolor/64x64/apps/jetty.png", "644"],
+    ["assets/icons/jetty-48.png", "usr/share/icons/hicolor/48x48/apps/jetty.png", "644"],
+    ["assets/icons/jetty-32.png", "usr/share/icons/hicolor/32x32/apps/jetty.png", "644"],
+    ["README.md", "usr/share/doc/jetty/README.md", "644"],
+]
 
 [dependencies]
 jetty-app = { path = "crates/jetty-app" }
