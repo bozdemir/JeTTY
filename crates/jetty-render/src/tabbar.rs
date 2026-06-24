@@ -3,7 +3,7 @@ use jetty_core::Theme;
 
 /// Height of the tab bar in physical pixels. The terminal grid is offset down by
 /// this amount; pixel↔cell math for the main grid subtracts it.
-pub const TABBAR_H: f32 = 32.0;
+pub const TABBAR_H: f32 = 38.0;
 
 /// Width of a single tab in physical pixels.
 const TAB_W: f32 = 140.0;
@@ -143,7 +143,8 @@ pub fn build_tab_bar_ex(
     // a slightly larger rounded rect behind it (active = accent border, inactive =
     // dim border) so the tabs match the rounded window frame.
     const TAB_RADIUS: f32 = 6.0;
-    const TAB_INSET: f32 = 3.0; // gap around each tab so borders read as separate
+    const TAB_INSET: f32 = 3.0; // horizontal gap between adjacent tabs
+    const TAB_VPAD: f32 = 6.0; // top/bottom margin so tabs don't touch the window edge
     const TAB_BORDER: f32 = 1.0;
     // Active tab border = accent; inactive = a dim blend toward the accent.
     let active_border = [accent[0], accent[1], accent[2], 255];
@@ -173,9 +174,9 @@ pub fn build_tab_bar_ex(
 
         // Inner tab body geometry (inset on all sides for the gap + border).
         let body_x = x + TAB_INSET;
-        let body_y = TAB_INSET;
+        let body_y = TAB_VPAD;
         let body_w = tab_w - TAB_INSET * 2.0;
-        let body_h = h - TAB_INSET * 2.0;
+        let body_h = h - TAB_VPAD * 2.0;
         let border_color = if *active || being_renamed { active_border } else { inactive_border };
         // Border: a rounded rect 1px larger than the body on every side.
         quads.push(Rect::rounded(
@@ -201,7 +202,7 @@ pub fn build_tab_bar_ex(
                 buf.to_string()
             };
             shown.push('▏');
-            labels.push((shown, x + 10.0, 8.0, label_color));
+            labels.push((shown, x + 10.0, 11.0, label_color));
         } else {
             // Truncated title label.
             let shown: String = if title.chars().count() > max_chars {
@@ -211,11 +212,11 @@ pub fn build_tab_bar_ex(
             } else {
                 title.clone()
             };
-            labels.push((shown, x + 10.0, 8.0, label_color));
+            labels.push((shown, x + 10.0, 11.0, label_color));
 
             // Close "×" at the tab's right (hidden while renaming this tab).
             let close_x = x + tab_w - CLOSE_W - 4.0;
-            labels.push(("×".to_string(), close_x + 4.0, 8.0, label_color));
+            labels.push(("×".to_string(), close_x + 4.0, 11.0, label_color));
         }
 
         // Close hit-box (kept even while renaming so indices stay aligned).
@@ -229,15 +230,15 @@ pub fn build_tab_bar_ex(
     // "+" new-tab button after the last tab (clamped within the tab area).
     let plus_rect = Rect { x, y: 0.0, w: PLUS_W, h, color: inactive_bg, ..Default::default() };
     if x + PLUS_W <= tab_area_x {
-        quads.push(Rect::rounded(x + 3.0, 3.0, PLUS_W - 6.0, h - 6.0, inactive_bg, 5.0));
-        labels.push(("+".to_string(), x + 11.0, 7.0, fg));
+        quads.push(Rect::rounded(x + 3.0, TAB_VPAD, PLUS_W - 6.0, h - TAB_VPAD * 2.0, inactive_bg, 5.0));
+        labels.push(("+".to_string(), x + 11.0, 10.0, fg));
     }
 
     // A small "+N" hint when some tabs couldn't be drawn (too many to fit even at
     // the minimum width). Placed just left of the controls so it never overlaps.
     if overflow > 0 {
         let hint_x = (tab_area_x - 34.0).max(x + PLUS_W + 4.0);
-        labels.push((format!("+{overflow}"), hint_x, 8.0, dim_fg));
+        labels.push((format!("+{overflow}"), hint_x, 11.0, dim_fg));
     }
 
     // --- Right-side controls (left→right): Help "?", Settings "⚙",
@@ -279,12 +280,12 @@ pub fn build_tab_bar_ex(
 
     // Glyphs centred-ish in each control cell. "⚙" may be missing in some
     // monospace fonts; "≡" is a safe, widely-available fallback for settings.
-    labels.push(("?".to_string(), help_x + 9.0, 8.0, fg));
-    labels.push(("⚙".to_string(), settings_x + 8.0, 8.0, fg));
-    labels.push(("─".to_string(), min_x + 8.0, 8.0, fg));
-    labels.push(("▢".to_string(), max_x + 8.0, 8.0, fg));
+    labels.push(("?".to_string(), help_x + 9.0, 11.0, fg));
+    labels.push(("⚙".to_string(), settings_x + 8.0, 11.0, fg));
+    labels.push(("─".to_string(), min_x + 8.0, 11.0, fg));
+    labels.push(("▢".to_string(), max_x + 8.0, 11.0, fg));
     let close_fg = if ctrl_hover == CtrlHover::Close { [0xFF, 0xFF, 0xFF] } else { fg };
-    labels.push(("✕".to_string(), close_x + 8.0, 8.0, close_fg));
+    labels.push(("✕".to_string(), close_x + 8.0, 11.0, close_fg));
 
     TabBar {
         quads, labels, tab_rects, close_rects, plus_rect,
