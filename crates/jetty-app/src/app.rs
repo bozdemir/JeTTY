@@ -250,6 +250,10 @@ pub struct App {
     /// shown window can take a beat to present — starting the clock at
     /// set_visible() time would let the whole effect elapse unseen (effectless).
     summon_pending: bool,
+    /// True while a freshly-opened settings window still owes its first paint —
+    /// macOS won't draw it under ControlFlow::Wait until a click, so `about_to_wait`
+    /// forces Poll until this clears on the first settings RedrawRequested.
+    settings_needs_paint: bool,
     /// Window corner radius in logical px, clamped [0, 24]. 0 = square corners.
     corner_radius: f32,
     /// All open terminal sessions, one per tab. Always non-empty once `resumed`
@@ -477,6 +481,7 @@ impl App {
             wayland_warned: false,
             summon_anim: None,
             summon_pending: false,
+            settings_needs_paint: false,
             corner_radius,
             tabs: Vec::new(),
             active: 0,
@@ -1146,6 +1151,9 @@ impl App {
         window.focus_window();
         window.request_redraw();
         self.settings_window = Some(window);
+        // macOS: force Poll until the first paint lands (a request_redraw alone is
+        // dropped under Wait until a click), so the window opens already drawn.
+        self.settings_needs_paint = true;
         if self.debug {
             eprintln!("SETTINGS window opened");
         }
@@ -1514,6 +1522,8 @@ impl App {
             }
             WindowEvent::RedrawRequested => {
                 self.render_settings_window();
+                // First paint delivered → stop forcing Poll for this window.
+                self.settings_needs_paint = false;
             }
             _ => {}
         }
@@ -1521,6 +1531,35 @@ impl App {
 }
 
 impl ApplicationHandler<AppEvent> for App {
+    /// Drive ControlFlow. macOS does NOT deliver a `RedrawRequested` for a
+    /// `request_redraw()` issued under `ControlFlow::Wait` until an input event
+    /// arrives — so self-driving animations stall and freshly-shown windows stay
+    /// blank until clicked. While any visual work is pending, switch to `Poll`
+    /// AND actively re-request the frame, so the loop pumps frames; return to
+    /// `Wait` (idle 0 CPU) the instant nothing is pending. On X11/Wayland this is
+    /// just a brief Poll burst during the animation (redraws already deliver).
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let main_pending = self.summon_anim.is_some()
+            || self.slide_anim.is_some()
+            || self.summon_pending
+            || self.pending_dock_frames > 0;
+        if main_pending {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+        if self.settings_needs_paint {
+            if let Some(w) = &self.settings_window {
+                w.request_redraw();
+            }
+        }
+        event_loop.set_control_flow(if main_pending || self.settings_needs_paint {
+            winit::event_loop::ControlFlow::Poll
+        } else {
+            winit::event_loop::ControlFlow::Wait
+        });
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
