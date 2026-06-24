@@ -413,13 +413,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // --- Bayer Crystallize summon keyframe (JETTY_SHOT_SUMMON_T) ---
+    // Apply the SAME ordered-dither reveal coverage the live GPU pass uses, at a
+    // fixed t (0..1), so a summon keyframe is inspectable. Runs AFTER the corner
+    // mask, mirroring the live pass order. The texture is premultiplied alpha, so
+    // multiply r/g/b/a by the coverage to keep premultiplication consistent.
+    if let Ok(t_str) = std::env::var("JETTY_SHOT_SUMMON_T") {
+        if let Ok(t) = t_str.parse::<f32>() {
+            eprintln!("jetty-shot: applying Bayer crystallize reveal (t={t})");
+            for y in 0..height {
+                for x in 0..width {
+                    let cov = jetty_render::reveal_coverage(x, y, t);
+                    if cov < 1.0 {
+                        let idx = ((y * width + x) * 4) as usize;
+                        for c in 0..4 {
+                            tight[idx + c] = (tight[idx + c] as f32 * cov).round() as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // --- Composite over checkerboard if bg alpha < 255 (or a corner radius is set,
     // so the now-transparent corners reveal the checkerboard even on an opaque
     // theme) ---
     // The rendered texture uses premultiplied alpha (the clear color is already
     // premultiplied in text.rs).  We un-premultiply before blending onto the
     // checkerboard, then output an opaque RGBA PNG.
-    let composited = if bg_alpha < 255 || corner_radius > 0.0 {
+    let summon_active = std::env::var("JETTY_SHOT_SUMMON_T").is_ok();
+    let composited = if bg_alpha < 255 || corner_radius > 0.0 || summon_active {
         eprintln!("jetty-shot: compositing over checkerboard (bg alpha={})", bg_alpha);
         const TILE: u32 = 16;
         const DARK: [u8; 3] = [40, 40, 40];

@@ -63,6 +63,11 @@ pub struct App {
     quad: Option<QuadLayer>,
     /// Final-pass rounded-corner mask for the borderless main window.
     corner_mask: Option<jetty_render::CornerMask>,
+    /// Final-pass Bayer crystallize reveal for the summon animation.
+    bayer_reveal: Option<jetty_render::BayerReveal>,
+    /// Start instant of the active summon (crystallize) animation, or None when
+    /// idle. While Some, the redraw loop self-drives frames; None = idle 0 CPU.
+    summon_anim: Option<std::time::Instant>,
     /// Window corner radius in logical px, clamped [0, 24]. 0 = square corners.
     corner_radius: f32,
     /// All open terminal sessions, one per tab. Always non-empty once `resumed`
@@ -272,6 +277,8 @@ impl App {
             text: None,
             quad: None,
             corner_mask: None,
+            bayer_reveal: None,
+            summon_anim: None,
             corner_radius,
             tabs: Vec::new(),
             active: 0,
@@ -770,6 +777,8 @@ impl App {
                     None => center_window(win),
                 }
                 win.focus_window();
+                // Crystallize on every summon (F9 show), mirroring first open.
+                self.summon_anim = Some(std::time::Instant::now());
                 win.request_redraw();
             } else {
                 // Remember the current spot before hiding so the next summon
@@ -1177,6 +1186,11 @@ impl ApplicationHandler<AppEvent> for App {
         // main window, using the same surface format as the rest of the pipeline.
         if let Some(ref g) = gpu {
             self.corner_mask = Some(jetty_render::CornerMask::new(&g.device, g.format));
+            // Build the Bayer crystallize reveal (final fullscreen pass) and arm
+            // the first-open summon so the frame materializes out of the dither
+            // lattice the instant the window appears.
+            self.bayer_reveal = Some(jetty_render::BayerReveal::new(&g.device, g.format));
+            self.summon_anim = Some(std::time::Instant::now());
         }
 
         self.window = Some(window);
@@ -2115,6 +2129,13 @@ impl ApplicationHandler<AppEvent> for App {
                 let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
                 let corner_radius_px = self.corner_radius * scale;
                 let corner_mask = self.corner_mask.as_ref();
+                let bayer_reveal = self.bayer_reveal.as_ref();
+                // Summon (crystallize) progress: t in [0,1) drives a reveal pass
+                // this frame and self-schedules the next; t>=1 ends the animation
+                // so we return to damage-driven idle (0 CPU). None = not animating.
+                let summon_t = self
+                    .summon_anim
+                    .map(|start| start.elapsed().as_secs_f32() / 0.20);
                 let (Some(gpu), Some(text), Some(quad)) =
                     (&mut self.gpu, &mut self.text, &mut self.quad)
                 else {
@@ -2240,6 +2261,22 @@ impl ApplicationHandler<AppEvent> for App {
                             height,
                             corner_radius_px,
                         );
+                    }
+                    // Final-final pass: Bayer crystallize summon reveal. After the
+                    // corner mask, multiply the surface by the dither coverage at
+                    // the current t. Both passes are dst-multiply so they compose
+                    // cleanly. At t>=1 every pixel is revealed (zero residue) and
+                    // we stop the animation; otherwise self-drive the next frame.
+                    if let (Some(reveal), Some(t)) = (bayer_reveal, summon_t) {
+                        if t < 1.0 {
+                            reveal.apply(&gpu.device, &gpu.queue, &view, width, height, t);
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                        } else {
+                            // Animation complete — back to idle (no pass next frame).
+                            self.summon_anim = None;
+                        }
                     }
                     frame.present();
                 }
