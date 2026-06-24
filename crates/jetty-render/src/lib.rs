@@ -15,7 +15,7 @@ pub use gpu::GpuContext;
 pub use text::TextLayer;
 pub use quad::{QuadLayer, Rect, cell_bg_rects, default_bg_clear, scrollbar_rect, scrollbar_rect_geom};
 pub use panel::{build_panel, PanelView, PanelGeom};
-pub use mask::{CornerMask, rounded_rect_coverage};
+pub use mask::{CornerMask, rounded_rect_coverage, rounded_rect_coverage_per};
 pub use reveal::{BayerReveal, bayer4, reveal_coverage};
 pub use phosphor::PhosphorIgnition;
 pub use liquid::LiquidDrop;

@@ -14,7 +14,10 @@
 //! square window renders byte-identical to before.
 
 const MASK_SHADER: &str = r#"
-struct Params { size: vec2<f32>, radius: f32, _pad: f32 };
+// Per-corner radii (r_tl/r_tr/r_bl/r_br) so Dropdown mode can round only the
+// BOTTOM corners. Layout is two 16-byte rows: {size.xy, r_tl, r_tr} then
+// {r_bl, r_br, _pad0, _pad1} — keeps std140 alignment (32 bytes total).
+struct Params { size: vec2<f32>, r_tl: f32, r_tr: f32, r_bl: f32, r_br: f32, _pad0: f32, _pad1: f32 };
 @group(0) @binding(0) var<uniform> params: Params;
 
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
@@ -31,20 +34,24 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return o;
 }
 
-// Signed distance from point p to a rounded rectangle of half-size b and corner
-// radius r, centered at the origin. Negative inside, positive outside.
-fn sd_round_rect(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
+// Signed distance to a rounded rectangle with a DIFFERENT radius per corner.
+// p is center-relative (y down), b is the half-size. The radius is selected by
+// quadrant: top corners use the top radii, bottom corners the bottom radii.
+fn sd_round_rect_per(p: vec2<f32>, b: vec2<f32>, r_tl: f32, r_tr: f32, r_bl: f32, r_br: f32) -> f32 {
+    // Pick the radius for the quadrant the point lies in.
+    let r_top = select(r_tl, r_tr, p.x > 0.0);
+    let r_bot = select(r_bl, r_br, p.x > 0.0);
+    let r = select(r_top, r_bot, p.y > 0.0);
     let q = abs(p) - b + vec2(r, r);
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0, 0.0))) - r;
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let r = params.radius;
     // Center-relative pixel coordinate.
     let half = params.size * 0.5;
     let p = in.uv - half;
-    let d = sd_round_rect(p, half, r);
+    let d = sd_round_rect_per(p, half, params.r_tl, params.r_tr, params.r_bl, params.r_br);
     // ~1px antialiased edge: coverage 1 inside, 0 outside, smooth across the seam.
     let cov = 1.0 - smoothstep(-0.75, 0.75, d);
     // Output coverage in all channels; the blend pipeline multiplies the
@@ -68,7 +75,7 @@ impl CornerMask {
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("corner-mask-uniform"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -143,8 +150,11 @@ impl CornerMask {
         Self { pipeline, uniform_buf, bind_group }
     }
 
-    /// Run the rounded-corner mask over `view`. A `radius <= 0` is a no-op (the
-    /// pass is skipped entirely, so a square window is byte-identical to before).
+    /// Run the rounded-corner mask over `view` with a per-corner radius
+    /// (top-left, top-right, bottom-left, bottom-right). When all four radii are
+    /// `<= 0` the pass is skipped entirely (square window, byte-identical to
+    /// before). In Dropdown mode the two top radii are zeroed so only the bottom
+    /// corners round.
     pub fn apply(
         &self,
         device: &wgpu::Device,
@@ -152,15 +162,28 @@ impl CornerMask {
         view: &wgpu::TextureView,
         width: u32,
         height: u32,
-        radius: f32,
+        r_tl: f32,
+        r_tr: f32,
+        r_bl: f32,
+        r_br: f32,
     ) {
-        if radius <= 0.0 {
+        if r_tl <= 0.0 && r_tr <= 0.0 && r_bl <= 0.0 && r_br <= 0.0 {
             return;
         }
-        // Clamp the radius so it never exceeds half the smaller dimension.
+        // Clamp each radius so it never exceeds half the smaller dimension.
         let max_r = (width.min(height) as f32) / 2.0;
-        let radius = radius.min(max_r).max(0.0);
-        let params: [f32; 4] = [width as f32, height as f32, radius, 0.0];
+        let c = |r: f32| r.min(max_r).max(0.0);
+        // Layout: [size.x, size.y, r_tl, r_tr, r_bl, r_br, _pad, _pad] (32 bytes).
+        let params: [f32; 8] = [
+            width as f32,
+            height as f32,
+            c(r_tl),
+            c(r_tr),
+            c(r_bl),
+            c(r_br),
+            0.0,
+            0.0,
+        ];
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&params));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -192,20 +215,34 @@ impl CornerMask {
 }
 
 /// Antialiased rounded-rectangle coverage at pixel `(x, y)` for a `w`×`h` frame
-/// and corner `radius` (in pixels). 1.0 fully inside, 0.0 fully outside, with a
-/// ~1px feather across the boundary. Mirrors the shader's SDF so the headless
-/// `jetty-shot` (CPU compositing) can apply the SAME mask as the live GPU pass.
-pub fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32 {
-    if radius <= 0.0 {
+/// with a PER-CORNER radius (top-left, top-right, bottom-left, bottom-right) in
+/// pixels. 1.0 fully inside, 0.0 fully outside, with a ~1px feather across the
+/// boundary. Mirrors the shader's per-quadrant SDF so the headless `jetty-shot`
+/// (CPU compositing) applies the SAME mask as the live GPU pass.
+pub fn rounded_rect_coverage_per(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r_tl: f32,
+    r_tr: f32,
+    r_bl: f32,
+    r_br: f32,
+) -> f32 {
+    if r_tl <= 0.0 && r_tr <= 0.0 && r_bl <= 0.0 && r_br <= 0.0 {
         return 1.0;
     }
     let max_r = w.min(h) / 2.0;
-    let r = radius.min(max_r).max(0.0);
+    let clamp_r = |r: f32| r.min(max_r).max(0.0);
     let hw = w / 2.0;
     let hh = h / 2.0;
     // Center-relative pixel center (+0.5 to sample the pixel center).
     let px = (x + 0.5) - hw;
     let py = (y + 0.5) - hh;
+    // Select the radius for the quadrant this pixel lies in (matches the shader).
+    let r_top = if px > 0.0 { r_tr } else { r_tl };
+    let r_bot = if px > 0.0 { r_br } else { r_bl };
+    let r = clamp_r(if py > 0.0 { r_bot } else { r_top });
     let qx = px.abs() - hw + r;
     let qy = py.abs() - hh + r;
     let outside_x = qx.max(0.0);
@@ -217,9 +254,58 @@ pub fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32
     1.0 - s
 }
 
+/// Uniform-radius shim over [`rounded_rect_coverage_per`] (all four corners
+/// equal). Kept so existing callers (jetty-shot CPU compositing) are unchanged.
+pub fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32 {
+    rounded_rect_coverage_per(x, y, w, h, radius, radius, radius, radius)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::rounded_rect_coverage;
+    use super::{rounded_rect_coverage, rounded_rect_coverage_per};
+
+    #[test]
+    fn top_flush_keeps_top_corners_square() {
+        // Dropdown: top radii zeroed, bottom radii 16. The TOP corners must stay
+        // square — a few px inside each top corner is fully opaque (a square
+        // corner only feathers the single edge pixel, unlike a 16px-rounded
+        // corner which carves out a whole quarter-disc). The BOTTOM corners round.
+        let tl = rounded_rect_coverage_per(3.0, 3.0, 100.0, 100.0, 0.0, 0.0, 16.0, 16.0);
+        let tr = rounded_rect_coverage_per(96.0, 3.0, 100.0, 100.0, 0.0, 0.0, 16.0, 16.0);
+        assert!(tl > 0.99, "top-left should be square/opaque, got {tl}");
+        assert!(tr > 0.99, "top-right should be square/opaque, got {tr}");
+        // 6px in from each top corner along the would-be quarter-disc is still
+        // opaque for the square corner (a 16px-rounded corner would be ~0 here).
+        let tl_disc = rounded_rect_coverage_per(2.0, 2.0, 100.0, 100.0, 0.0, 0.0, 16.0, 16.0);
+        assert!(tl_disc > 0.5, "square top corner not carved away, got {tl_disc}");
+        let bl = rounded_rect_coverage_per(0.0, 99.0, 100.0, 100.0, 0.0, 0.0, 16.0, 16.0);
+        let br = rounded_rect_coverage_per(99.0, 99.0, 100.0, 100.0, 0.0, 0.0, 16.0, 16.0);
+        assert!(bl < 0.01, "bottom-left should round (transparent), got {bl}");
+        assert!(br < 0.01, "bottom-right should round (transparent), got {br}");
+        // And a few px into the bottom corner IS carved away (rounded).
+        let br_disc = rounded_rect_coverage_per(96.0, 96.0, 100.0, 100.0, 0.0, 0.0, 16.0, 16.0);
+        assert!(br_disc < 0.5, "bottom corner should be rounded, got {br_disc}");
+    }
+
+    #[test]
+    fn per_corner_rounds_only_the_requested_corner() {
+        // Only the bottom-right corner is rounded; the other three stay square
+        // (sample a few px inside each square corner — fully opaque).
+        let r = 16.0;
+        let tl = rounded_rect_coverage_per(3.0, 3.0, 100.0, 100.0, 0.0, 0.0, 0.0, r);
+        let tr = rounded_rect_coverage_per(96.0, 3.0, 100.0, 100.0, 0.0, 0.0, 0.0, r);
+        let bl = rounded_rect_coverage_per(3.0, 96.0, 100.0, 100.0, 0.0, 0.0, 0.0, r);
+        let br = rounded_rect_coverage_per(99.0, 99.0, 100.0, 100.0, 0.0, 0.0, 0.0, r);
+        assert!(tl > 0.99 && tr > 0.99 && bl > 0.99, "three corners square");
+        assert!(br < 0.01, "only bottom-right rounds, got {br}");
+    }
+
+    #[test]
+    fn uniform_shim_matches_all_equal_per() {
+        let a = rounded_rect_coverage(7.0, 3.0, 100.0, 80.0, 12.0);
+        let b = rounded_rect_coverage_per(7.0, 3.0, 100.0, 80.0, 12.0, 12.0, 12.0, 12.0);
+        assert_eq!(a, b);
+    }
 
     #[test]
     fn radius_zero_is_fully_opaque_everywhere() {
