@@ -19,12 +19,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- startup-dominant cost: GPU adapter + device ---
     let t0 = Instant::now();
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+    // Match the live app: Vulkan-only instance (skips GLES enumeration), with an
+    // all-backends fallback if no Vulkan adapter is present.
+    let mut instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::LowPower,
         compatible_surface: None,
         force_fallback_adapter: false,
-    }))?;
+    })) {
+        Ok(a) => a,
+        Err(_) => {
+            instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))?
+        }
+    };
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("jetty-bench"),
         required_features: wgpu::Features::empty(),

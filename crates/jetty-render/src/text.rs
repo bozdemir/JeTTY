@@ -34,14 +34,11 @@ impl TextLayer {
         Self::new_with_family(device, queue, format, font_size, FONT_FAMILY_DEFAULT)
     }
 
-    /// Like `new`, but allows specifying the initial font family.
-    pub fn new_with_family(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        format: wgpu::TextureFormat,
-        font_size: f32,
-        family: &str,
-    ) -> Self {
+    /// Builds the cosmic-text `FontSystem` (scans fontconfig defaults + the
+    /// user's ~/.local/share/fonts). This is GPU-independent and `Send`, so the
+    /// app runs it on a worker thread overlapping the GPU device block — see
+    /// `new_with_family_and_fonts`. Costs ~20ms (essentially all of text_init).
+    pub fn build_font_system() -> FontSystem {
         let mut font_system = FontSystem::new();
         // Insurance: make sure user-installed fonts (e.g. ~/.local/share/fonts,
         // where MesloLGS NF lives) are in the database, not only the fontconfig
@@ -51,6 +48,33 @@ impl TextLayer {
                 .db_mut()
                 .load_fonts_dir(format!("{home}/.local/share/fonts"));
         }
+        font_system
+    }
+
+    /// Like `new`, but allows specifying the initial font family. Builds the
+    /// FontSystem synchronously; use `new_with_family_and_fonts` to supply a
+    /// prebuilt (e.g. thread-overlapped) FontSystem.
+    pub fn new_with_family(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        font_size: f32,
+        family: &str,
+    ) -> Self {
+        Self::new_with_family_and_fonts(device, queue, format, font_size, family, Self::build_font_system())
+    }
+
+    /// Like `new_with_family`, but takes a prebuilt `FontSystem` so its ~20ms
+    /// load can be overlapped with GPU device creation on a worker thread.
+    pub fn new_with_family_and_fonts(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        font_size: f32,
+        family: &str,
+        font_system: FontSystem,
+    ) -> Self {
+        let mut font_system = font_system;
         let swash = SwashCache::new();
         let cache = Cache::new(device);
         let viewport = Viewport::new(device, &cache);

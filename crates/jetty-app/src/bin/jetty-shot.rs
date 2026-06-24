@@ -36,12 +36,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // --- wgpu offscreen setup (no surface) ---
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+    // Match the live app: Vulkan-only instance (skips GLES enumeration), with an
+    // all-backends fallback if no Vulkan adapter is present.
+    let mut instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::LowPower,
         compatible_surface: None,
         force_fallback_adapter: false,
-    }))?;
+    })) {
+        Ok(a) => a,
+        Err(_) => {
+            instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))?
+        }
+    };
 
     eprintln!(
         "jetty-shot: GPU adapter = {} ({:?})",

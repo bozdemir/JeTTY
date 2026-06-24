@@ -14,28 +14,39 @@ impl GpuContext {
         width: u32,
         height: u32,
     ) -> Option<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let surface = match instance.create_surface(window.clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("jetty: GPU init failed (surface: {e}); running without rendering");
-                return None;
-            }
+        // Try a Vulkan-only instance first: this skips the GLES libEGL dlopen /
+        // eglInitialize + GL adapter enumeration that Backends::all() pays on every
+        // cold start, even though the Vulkan adapter is what gets selected anyway.
+        // This is the dominant cold-start win (~78ms off gpu_init on the Intel Arc).
+        // If no Vulkan adapter is found (no working ICD), fall back to all backends.
+        let make_instance_surface_adapter = |backends: wgpu::Backends|
+            -> Option<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let surface = instance.create_surface(window.clone()).ok()?;
+            // Prefer the integrated (Intel) GPU. On hybrid Intel+NVIDIA systems
+            // under X11, driving the discrete NVIDIA GPU via Vulkan can crash the
+            // KWin/X compositor — and a terminal has no need for discrete power.
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })).ok()?;
+            Some((instance, surface, adapter))
         };
-        // Prefer the integrated (Intel) GPU. On hybrid Intel+NVIDIA systems under
-        // X11, driving the discrete NVIDIA GPU via Vulkan can crash the KWin/X
-        // compositor — and a terminal has no need for discrete-GPU power.
-        let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        })) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("jetty: GPU init failed (no adapter: {e}); running without rendering");
-                return None;
-            }
+        let (instance, surface, adapter) = match make_instance_surface_adapter(wgpu::Backends::VULKAN) {
+            Some(t) => t,
+            None => match make_instance_surface_adapter(wgpu::Backends::all()) {
+                Some(t) => t,
+                None => {
+                    eprintln!("jetty: GPU init failed (no adapter); running without rendering");
+                    return None;
+                }
+            },
         };
+        let _ = &instance;
         eprintln!(
             "jetty: GPU adapter = {} ({:?})",
             adapter.get_info().name,

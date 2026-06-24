@@ -54,8 +54,10 @@ pub struct App {
     window: Option<Arc<Window>>,
     /// Whether the window is currently visible (toggled by F9).
     visible: bool,
-    /// Global hotkey manager — kept alive so the hotkey stays registered.
-    hotkey_manager: Option<global_hotkey::GlobalHotKeyManager>,
+    /// Whether the F9 global-hotkey worker has been launched. The manager itself
+    /// is kept alive inside that worker thread (it never returns), so we only need
+    /// a launched-once sentinel here rather than holding the manager on the App.
+    hotkey_manager: Option<()>,
     gpu: Option<GpuContext>,
     text: Option<TextLayer>,
     quad: Option<QuadLayer>,
@@ -824,6 +826,21 @@ impl ApplicationHandler<AppEvent> for App {
         if self.window.is_some() {
             return;
         }
+        // Cold-start parallelism: the FontSystem (~20ms) and the initial PTY
+        // fork/exec are both GPU-independent and Send, so kick them off NOW on
+        // worker threads. They run fully overlapped with build_window +
+        // GpuContext::new (the GPU adapter/device block dominates cold start),
+        // then we join after the GPU is ready. Window/surface stay on the main
+        // thread (they are !Send). The PTY is spawned at a provisional grid and
+        // resized to the real cols/rows once the cell size is known.
+        let font_handle = std::thread::spawn(TextLayer::build_font_system);
+        let proxy_wake = self.proxy.clone();
+        let pty_handle = std::thread::spawn(move || {
+            PtySession::spawn(FALLBACK_COLS as u16, FALLBACK_ROWS as u16, move || {
+                let _ = proxy_wake.send_event(AppEvent::Wake);
+            })
+        });
+
         let window = jetty_platform::build_window(event_loop, "JeTTY", (1000, 640));
         let size = window.inner_size();
         // HiDPI: the display's scale factor (>1.0 on HiDPI/Retina screens).
@@ -831,9 +848,13 @@ impl ApplicationHandler<AppEvent> for App {
         // font size by scale to get the physical font size so glyphs are sharp.
         let scale = window.scale_factor() as f32;
         let gpu = GpuContext::new(window.clone(), size.width, size.height);
+        // GPU is ready — join the font worker (its ~20ms load happened in
+        // parallel with the GPU block above, so this join is typically free).
+        let font_system = font_handle.join().expect("font worker panicked");
         let (text, quad, cols, rows) = if let Some(ref g) = gpu {
-            let text = TextLayer::new_with_family(
+            let text = TextLayer::new_with_family_and_fonts(
                 &g.device, &g.queue, g.format, self.font_logical * scale, &self.font_family,
+                font_system,
             );
             let (cw, ch) = text.cell_size();
             // Derive the grid from the physical pixel size and the physical cell size.
@@ -861,10 +882,12 @@ impl ApplicationHandler<AppEvent> for App {
         // p10k's cursor-position / capability queries which have tight timeouts.
         let mut terminal = Terminal::new(cols, rows);
         terminal.set_theme(self.current_theme());
-        let proxy_wake = self.proxy.clone();
-        let pty = PtySession::spawn(cols as u16, rows as u16, move || {
-            let _ = proxy_wake.send_event(AppEvent::Wake);
-        }).expect("pty");
+        // Join the PTY worker (forked in parallel with the GPU block) and resize
+        // it from the provisional grid to the real cols/rows now that the cell
+        // size is known.
+        let pty = pty_handle.join().expect("pty worker panicked").expect("pty");
+        pty.resize(cols as u16, rows as u16);
+        terminal.resize(cols, rows);
         let writer = pty.writer();
         self.tabs.push(Tab { terminal, pty, writer, title: "Tab 1".to_string() });
         self.active = 0;
@@ -873,38 +896,47 @@ impl ApplicationHandler<AppEvent> for App {
         // on X11; on Wayland registration will fail and we log a warning without
         // crashing. The manager must be kept alive (stored in self.hotkey_manager)
         // or the hotkey is automatically unregistered when it drops.
+        // Off the main thread: GlobalHotKeyManager::register() blocks on a worker
+        // that opens a 2nd X11 connection + xkb round-trips at the tail of a loop
+        // ending in a 50ms sleep — that wait used to sit at the END of resumed(),
+        // directly delaying the first redraw. The F9 event was already delivered
+        // through the async proxy (never read synchronously), so moving register()
+        // off-thread changes only WHERE it blocks, not the event semantics. The
+        // manager is kept alive inside the forwarding loop (which never returns).
         if self.hotkey_manager.is_none() {
-            match global_hotkey::GlobalHotKeyManager::new() {
-                Ok(manager) => {
-                    let hotkey = global_hotkey::hotkey::HotKey::new(
-                        None,
-                        global_hotkey::hotkey::Code::F9,
-                    );
-                    if let Err(e) = manager.register(hotkey) {
+            self.hotkey_manager = Some(());
+            let proxy_hotkey = self.proxy.clone();
+            std::thread::spawn(move || {
+                let manager = match global_hotkey::GlobalHotKeyManager::new() {
+                    Ok(m) => m,
+                    Err(e) => {
                         eprintln!("global hotkey F9 unavailable (Wayland? already grabbed?) — {e}");
-                    } else {
-                        // Spawn a thread that forwards F9-pressed events to the winit loop.
-                        let proxy_hotkey = self.proxy.clone();
-                        std::thread::spawn(move || {
-                            let rx = global_hotkey::GlobalHotKeyEvent::receiver();
-                            loop {
-                                match rx.recv() {
-                                    Ok(ev) => {
-                                        if ev.state == global_hotkey::HotKeyState::Pressed {
-                                            let _ = proxy_hotkey.send_event(AppEvent::ToggleVisibility);
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
+                        return;
+                    }
+                };
+                let hotkey = global_hotkey::hotkey::HotKey::new(
+                    None,
+                    global_hotkey::hotkey::Code::F9,
+                );
+                if let Err(e) = manager.register(hotkey) {
+                    eprintln!("global hotkey F9 unavailable (Wayland? already grabbed?) — {e}");
+                    return;
+                }
+                // Forward F9-pressed events to the winit loop. Keeps `manager`
+                // alive for the program lifetime (this loop never returns).
+                let rx = global_hotkey::GlobalHotKeyEvent::receiver();
+                loop {
+                    match rx.recv() {
+                        Ok(ev) => {
+                            if ev.state == global_hotkey::HotKeyState::Pressed {
+                                let _ = proxy_hotkey.send_event(AppEvent::ToggleVisibility);
                             }
-                        });
-                        self.hotkey_manager = Some(manager);
+                        }
+                        Err(_) => break,
                     }
                 }
-                Err(e) => {
-                    eprintln!("global hotkey F9 unavailable (Wayland? already grabbed?) — {e}");
-                }
-            }
+                drop(manager);
+            });
         }
 
         // Slow safety heartbeat — 100ms is enough for any future time-based UI
