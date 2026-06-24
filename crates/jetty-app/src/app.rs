@@ -108,6 +108,13 @@ pub struct App {
     context_menu: Option<(f32, f32)>,
     /// Index of the menu item currently under the cursor (for hover highlight).
     menu_hover: Option<usize>,
+    /// Inline tab rename: `Some(tab_index)` while the user is editing a tab title.
+    renaming: Option<usize>,
+    /// The edit buffer for the in-progress rename (committed/discarded on Enter/Esc).
+    rename_buf: String,
+    /// Time + physical-pixel position of the last left press on the top strip,
+    /// used to detect double-clicks (window maximize / enter-rename).
+    last_strip_click: Option<(std::time::Instant, f32, f32)>,
 }
 
 impl App {
@@ -162,6 +169,9 @@ impl App {
             debug,
             context_menu: None,
             menu_hover: None,
+            renaming: None,
+            rename_buf: String::new(),
+            last_strip_click: None,
         };
         // Apply the initial theme+opacity so Terminal::new env defaults are
         // overridden by our managed state (avoids double-reads from env).
@@ -284,6 +294,22 @@ impl App {
         self.active = n.min(self.tabs.len() - 1);
         if let Some(w) = &self.window {
             w.request_redraw();
+        }
+    }
+
+    /// Commit an in-progress tab rename: write `rename_buf` back to the tab's
+    /// title and clear the rename state. No-op when not renaming. An empty buffer
+    /// is ignored (keep the previous title) so a tab never ends up nameless.
+    fn commit_rename(&mut self) {
+        if let Some(i) = self.renaming.take() {
+            let trimmed = self.rename_buf.trim();
+            if i < self.tabs.len() && !trimmed.is_empty() {
+                self.tabs[i].title = trimmed.to_string();
+            }
+            self.rename_buf.clear();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
     }
 
@@ -1018,7 +1044,20 @@ impl ApplicationHandler<AppEvent> for App {
                 self.modifiers = m.state();
             }
             WindowEvent::CursorMoved { position, .. } => {
+                let prev = self.cursor;
                 self.cursor = (position.x, position.y);
+                // Repaint when the window-control hover state changes so the
+                // min/max/close highlight tracks the cursor.
+                if let Some(gpu) = &self.gpu {
+                    let w = gpu.config.width;
+                    let before = ctrl_hover_at(prev.0 as f32, prev.1 as f32, w);
+                    let after = ctrl_hover_at(position.x as f32, position.y as f32, w);
+                    if before != after {
+                        if let Some(win) = &self.window {
+                            win.request_redraw();
+                        }
+                    }
+                }
                 if self.dragging_scrollbar {
                     // Copy width/height to avoid borrow conflicts.
                     let (w, h) = if let Some(gpu) = &self.gpu {
@@ -1109,10 +1148,21 @@ impl ApplicationHandler<AppEvent> for App {
                 let cx = self.cursor.0 as f32;
                 let cy = self.cursor.1 as f32;
 
-                // --- Tab bar hit-test (only when the click is on the bar) ---
-                // Switch tabs, close a tab, or open a new one BEFORE any
-                // terminal-area selection logic.
+                // --- Tab bar / titlebar hit-test (only when the click is on the strip) ---
+                // Window controls, tab switching/close/new, inline-rename, window
+                // drag, and double-click-maximize — all BEFORE terminal selection.
                 if cy < TABBAR_H {
+                    // Detect a double-click on the strip (within ~400ms and ~5px).
+                    let now = std::time::Instant::now();
+                    let is_double = matches!(
+                        self.last_strip_click,
+                        Some((t, px, py))
+                            if now.duration_since(t) <= std::time::Duration::from_millis(400)
+                                && (cx - px).abs() <= 5.0
+                                && (cy - py).abs() <= 5.0
+                    );
+                    self.last_strip_click = Some((now, cx, cy));
+
                     let theme = self.current_theme();
                     let tabs_meta: Vec<(String, bool)> = self
                         .tabs
@@ -1120,17 +1170,45 @@ impl ApplicationHandler<AppEvent> for App {
                         .enumerate()
                         .map(|(i, t)| (t.title.clone(), i == self.active))
                         .collect();
-                    let bar = jetty_render::build_tab_bar(w, &tabs_meta, &theme);
+                    let rename_ref = self.renaming.map(|i| (i, self.rename_buf.as_str()));
+                    let bar = jetty_render::build_tab_bar_ex(
+                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None,
+                    );
+
+                    // Window controls take priority (rightmost region).
+                    if input::point_in(&bar.close_rect, cx, cy) {
+                        event_loop.exit();
+                        return;
+                    }
+                    if input::point_in(&bar.max_rect, cx, cy) {
+                        if let Some(win) = &self.window {
+                            win.set_maximized(!win.is_maximized());
+                        }
+                        return;
+                    }
+                    if input::point_in(&bar.min_rect, cx, cy) {
+                        if let Some(win) = &self.window {
+                            win.set_minimized(true);
+                        }
+                        return;
+                    }
+
+                    // A click anywhere on the strip commits an in-progress rename
+                    // unless it lands on the tab being renamed (handled below).
+                    let renaming_idx = self.renaming;
+
                     // Close buttons take priority over the tab body they sit on.
                     if let Some(i) = bar
                         .close_rects
                         .iter()
                         .position(|r| input::point_in(r, cx, cy))
                     {
+                        self.commit_rename();
                         self.close_tab(i, event_loop);
                         return;
                     }
                     if input::point_in(&bar.plus_rect, cx, cy) {
+                        self.commit_rename();
                         self.new_tab();
                         return;
                     }
@@ -1139,12 +1217,39 @@ impl ApplicationHandler<AppEvent> for App {
                         .iter()
                         .position(|r| input::point_in(r, cx, cy))
                     {
+                        // Double-click on a tab → enter inline rename.
+                        if is_double {
+                            self.renaming = Some(i);
+                            self.rename_buf = self.tabs[i].title.clone();
+                            self.last_strip_click = None;
+                            if let Some(win) = &self.window {
+                                win.request_redraw();
+                            }
+                            return;
+                        }
+                        // Single click on a different tab commits any rename.
+                        if renaming_idx != Some(i) {
+                            self.commit_rename();
+                        }
                         self.select_tab(i);
                         return;
                     }
-                    // Click on the empty part of the bar: ignore.
+
+                    // Empty strip space: commit any rename, then either maximize
+                    // (double-click) or start an OS window move (single press).
+                    self.commit_rename();
+                    if is_double {
+                        if let Some(win) = &self.window {
+                            win.set_maximized(!win.is_maximized());
+                        }
+                        self.last_strip_click = None;
+                    } else if let Some(win) = &self.window {
+                        let _ = win.drag_window();
+                    }
                     return;
                 }
+                // A click in the terminal area commits any in-progress rename.
+                self.commit_rename();
 
                 let rows = self.active_tab().terminal.rows();
                 let scroll_offset = self.active_tab().terminal.scroll_offset();
@@ -1311,6 +1416,48 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+                // --- Inline tab rename captures all keys ---
+                // While renaming, keys edit the title buffer and never reach the
+                // PTY: printable chars append, Backspace pops, Enter commits,
+                // Escape cancels. Return early so nothing leaks to the shell.
+                if let Some(i) = self.renaming {
+                    use winit::keyboard::{Key, NamedKey};
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Enter) => {
+                            self.commit_rename();
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            // Cancel: keep the old title.
+                            self.renaming = None;
+                            self.rename_buf.clear();
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            self.rename_buf.pop();
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                        }
+                        _ => {
+                            // Append any printable text the key produced.
+                            if let Some(t) = &event.text {
+                                for ch in t.chars() {
+                                    if !ch.is_control() {
+                                        self.rename_buf.push(ch);
+                                    }
+                                }
+                                if let Some(w) = &self.window {
+                                    w.request_redraw();
+                                }
+                            }
+                        }
+                    }
+                    // Defensive: keep `i` referenced so the renaming index is valid.
+                    let _ = i;
+                    return;
+                }
                 let ctrl = self.modifiers.control_key();
                 let shift = self.modifiers.shift_key();
                 let alt = self.modifiers.alt_key();
@@ -1464,6 +1611,8 @@ impl ApplicationHandler<AppEvent> for App {
                     .collect();
                 let context_menu = self.context_menu;
                 let menu_hover = self.menu_hover;
+                let rename_state: Option<(usize, String)> =
+                    self.renaming.map(|i| (i, self.rename_buf.clone()));
                 let (Some(gpu), Some(text), Some(quad)) =
                     (&mut self.gpu, &mut self.text, &mut self.quad)
                 else {
@@ -1471,7 +1620,12 @@ impl ApplicationHandler<AppEvent> for App {
                 };
                 let width = gpu.config.width;
                 let height = gpu.config.height;
-                let bar = jetty_render::build_tab_bar(width, &tabs_meta, &theme);
+                // Compute window-control hover from the last cursor position.
+                let ctrl_hover = ctrl_hover_at(self.cursor.0 as f32, self.cursor.1 as f32, width);
+                let rename_ref = rename_state.as_ref().map(|(i, b)| (*i, b.as_str()));
+                let bar = jetty_render::build_tab_bar_ex(
+                    width, &tabs_meta, &theme, rename_ref, ctrl_hover,
+                );
                 if let Some((frame, view)) = gpu.acquire_frame() {
                     // Pass 1: clear to the theme bg and paint per-cell background
                     // quads (reverse-video / colored backgrounds) UNDER the text.
@@ -1549,6 +1703,30 @@ fn spawn_waker(proxy: EventLoopProxy<AppEvent>) {
             break;
         }
     });
+}
+
+/// Which window-control button (if any) the cursor at `(cx, cy)` is over, given
+/// the surface `width`. Mirrors the control layout in `build_tab_bar_ex`: three
+/// `28px` cells parked at the right of the `TABBAR_H` strip (min, max, close).
+fn ctrl_hover_at(cx: f32, cy: f32, width: u32) -> jetty_render::CtrlHover {
+    use jetty_render::CtrlHover;
+    if cy >= TABBAR_H {
+        return CtrlHover::None;
+    }
+    let sw = width as f32;
+    let ctrl_w = jetty_render::CONTROLS_W / 3.0;
+    let min_x = sw - jetty_render::CONTROLS_W;
+    let max_x = sw - ctrl_w * 2.0;
+    let close_x = sw - ctrl_w;
+    if cx >= close_x {
+        CtrlHover::Close
+    } else if cx >= max_x {
+        CtrlHover::Max
+    } else if cx >= min_x {
+        CtrlHover::Min
+    } else {
+        CtrlHover::None
+    }
 }
 
 /// Centre `win` on its current monitor (or the first available monitor if the

@@ -10,6 +10,10 @@ pub fn build_window(event_loop: &ActiveEventLoop, title: &str, size: (u32, u32))
         .with_inner_size(LogicalSize::new(size.0, size.1))
         .with_resizable(true)
         .with_min_inner_size(LogicalSize::new(200.0_f64, 120.0_f64))
+        // Client-side decorations: drop the OS title bar/frame and draw our own
+        // custom titlebar (min/max/close + drag) in the tab strip. Transparency
+        // keeps the runtime opacity working and sets up future rounded corners.
+        .with_decorations(false)
         .with_transparent(true);
     Arc::new(event_loop.create_window(attrs).expect("create_window failed"))
 }
