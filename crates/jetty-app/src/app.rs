@@ -416,8 +416,27 @@ impl App {
         } else if self.active > i {
             self.active -= 1;
         }
+        // Keep index-bearing UI state aligned with the removed tab so the wrong
+        // tab is never renamed/confirmed, and any in-progress selection is reset.
+        Self::adjust_index_after_remove(&mut self.renaming, i);
+        Self::adjust_index_after_remove(&mut self.confirm_close, i);
+        if self.renaming.is_none() {
+            self.rename_buf.clear();
+        }
+        self.selecting = false;
         if let Some(w) = &self.window {
             w.request_redraw();
+        }
+    }
+
+    /// Adjust an `Option<usize>` index after the tab at `removed` is removed:
+    /// clear it if it pointed AT the removed tab; decrement it if it pointed to a
+    /// later tab (so it keeps referring to the same logical tab).
+    fn adjust_index_after_remove(idx: &mut Option<usize>, removed: usize) {
+        match *idx {
+            Some(j) if j == removed => *idx = None,
+            Some(j) if j > removed => *idx = Some(j - 1),
+            _ => {}
         }
     }
 
@@ -432,6 +451,8 @@ impl App {
         } else {
             (self.active + n - 1) % n
         };
+        // A pending text selection belongs to the previous tab's grid; reset it.
+        self.selecting = false;
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -443,6 +464,8 @@ impl App {
             return;
         }
         self.active = n.min(self.tabs.len() - 1);
+        // A pending text selection belongs to the previous tab's grid; reset it.
+        self.selecting = false;
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -629,6 +652,15 @@ impl App {
             if i < self.tabs.len() {
                 self.tabs.remove(i);
             }
+            // Adjust the active index and the index-bearing UI state the same way
+            // for each removed tab (highest first) so they all stay aligned.
+            if self.active == i {
+                // The active tab itself exited; clamp below.
+            } else if self.active > i {
+                self.active -= 1;
+            }
+            Self::adjust_index_after_remove(&mut self.renaming, i);
+            Self::adjust_index_after_remove(&mut self.confirm_close, i);
         }
         if self.tabs.is_empty() {
             event_loop.exit();
@@ -637,6 +669,10 @@ impl App {
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
+        if self.renaming.is_none() {
+            self.rename_buf.clear();
+        }
+        self.selecting = false;
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -1441,8 +1477,13 @@ impl ApplicationHandler<AppEvent> for App {
 
                     // Window controls take priority (rightmost region).
                     if input::point_in(&bar.help_rect, cx, cy) {
-                        // Toggle the in-window Help overlay.
+                        // Toggle the in-window Help overlay. Opening it closes the
+                        // context menu so the two overlays are mutually exclusive.
                         self.help_open = !self.help_open;
+                        if self.help_open {
+                            self.context_menu = None;
+                            self.menu_hover = None;
+                        }
                         if let Some(win) = &self.window {
                             win.request_redraw();
                         }
@@ -1498,14 +1539,23 @@ impl ApplicationHandler<AppEvent> for App {
                         .iter()
                         .position(|r| input::point_in(r, cx, cy))
                     {
-                        // Double-click on a tab → enter inline rename.
-                        if is_double {
+                        // Double-click on a tab → enter inline rename. But a
+                        // double-click on the tab ALREADY being renamed must not
+                        // reset the in-progress edit buffer (it would discard the
+                        // user's typing); leave the rename untouched.
+                        if is_double && self.renaming != Some(i) {
                             self.renaming = Some(i);
                             self.rename_buf = self.tabs[i].title.clone();
                             self.last_strip_click = None;
                             if let Some(win) = &self.window {
                                 win.request_redraw();
                             }
+                            return;
+                        }
+                        if is_double {
+                            // Already renaming this tab: swallow the click without
+                            // disturbing the buffer.
+                            self.last_strip_click = None;
                             return;
                         }
                         // Single click on a different tab commits any rename.
@@ -1596,6 +1646,15 @@ impl ApplicationHandler<AppEvent> for App {
                 // always free to show its context menu.
                 let cx = self.cursor.0 as f32;
                 let cy = self.cursor.1 as f32;
+                // A right-click on the tab bar must NOT open the terminal Copy/
+                // Paste menu (the strip has its own affordances).
+                if cy < TABBAR_H {
+                    return;
+                }
+                // Commit any in-progress rename and close the help overlay so the
+                // menu can't be orphaned under it.
+                self.commit_rename();
+                self.help_open = false;
                 self.context_menu = Some((cx, cy));
                 self.menu_hover = None;
                 if let Some(w) = &self.window {
@@ -1713,6 +1772,8 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                         Key::Named(NamedKey::Escape) => {
                             self.confirm_close = None;
+                            self.context_menu = None;
+                            self.menu_hover = None;
                             if let Some(w) = &self.window {
                                 w.request_redraw();
                             }
@@ -1736,6 +1797,8 @@ impl ApplicationHandler<AppEvent> for App {
                             // Cancel: keep the old title.
                             self.renaming = None;
                             self.rename_buf.clear();
+                            self.context_menu = None;
+                            self.menu_hover = None;
                             if let Some(w) = &self.window {
                                 w.request_redraw();
                             }
@@ -1774,6 +1837,8 @@ impl ApplicationHandler<AppEvent> for App {
                     )
                 {
                     self.help_open = false;
+                    self.context_menu = None;
+                    self.menu_hover = None;
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -2215,5 +2280,38 @@ mod resize_zone_tests {
         assert_eq!(ResizeZone::North.cursor_icon(), CursorIcon::NsResize);
         assert_eq!(ResizeZone::NorthWest.cursor_icon(), CursorIcon::NwseResize);
         assert_eq!(ResizeZone::NorthEast.cursor_icon(), CursorIcon::NeswResize);
+    }
+}
+
+#[cfg(test)]
+mod index_adjust_tests {
+    use super::App;
+
+    #[test]
+    fn clears_when_pointing_at_removed() {
+        let mut idx = Some(2);
+        App::adjust_index_after_remove(&mut idx, 2);
+        assert_eq!(idx, None);
+    }
+
+    #[test]
+    fn decrements_when_pointing_after_removed() {
+        let mut idx = Some(3);
+        App::adjust_index_after_remove(&mut idx, 1);
+        assert_eq!(idx, Some(2));
+    }
+
+    #[test]
+    fn unchanged_when_pointing_before_removed() {
+        let mut idx = Some(1);
+        App::adjust_index_after_remove(&mut idx, 3);
+        assert_eq!(idx, Some(1));
+    }
+
+    #[test]
+    fn none_stays_none() {
+        let mut idx: Option<usize> = None;
+        App::adjust_index_after_remove(&mut idx, 0);
+        assert_eq!(idx, None);
     }
 }
