@@ -2135,7 +2135,13 @@ impl ApplicationHandler<AppEvent> for App {
                 // so we return to damage-driven idle (0 CPU). None = not animating.
                 let summon_t = self
                     .summon_anim
-                    .map(|start| start.elapsed().as_secs_f32() / 0.20);
+                    .map(|start| start.elapsed().as_secs_f32() / 0.28);
+                // Theme accent for the crystallizing-front glow (captured before the
+                // mutable gpu/text/quad borrow below).
+                let summon_accent: [f32; 3] = {
+                    let a = self.current_theme().palette[4];
+                    [a[0] as f32 / 255.0, a[1] as f32 / 255.0, a[2] as f32 / 255.0]
+                };
                 let (Some(gpu), Some(text), Some(quad)) =
                     (&mut self.gpu, &mut self.text, &mut self.quad)
                 else {
@@ -2269,7 +2275,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // we stop the animation; otherwise self-drive the next frame.
                     if let (Some(reveal), Some(t)) = (bayer_reveal, summon_t) {
                         if t < 1.0 {
-                            reveal.apply(&gpu.device, &gpu.queue, &view, width, height, t);
+                            reveal.apply(&gpu.device, &gpu.queue, &view, width, height, t, summon_accent);
                             if let Some(w) = &self.window {
                                 w.request_redraw();
                             }

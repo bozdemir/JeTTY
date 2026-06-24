@@ -340,7 +340,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(t) = std::env::var("JETTY_SHOT_SUMMON_T").ok().and_then(|s| s.parse::<f32>().ok()) {
         eprintln!("jetty-shot: applying Bayer crystallize reveal (GPU pass, t={t})");
         let bayer = jetty_render::BayerReveal::new(&device, format);
-        bayer.apply(&device, &queue, &view, width, height, t);
+        let a = terminal.theme().palette[4];
+        let accent = [a[0] as f32 / 255.0, a[1] as f32 / 255.0, a[2] as f32 / 255.0];
+        bayer.apply(&device, &queue, &view, width, height, t, accent);
     }
 
     // --- Read back to CPU ---
