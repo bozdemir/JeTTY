@@ -54,7 +54,7 @@ sleep 2.5   # allow window creation + first render
 
 # 3) Optional input (windowfocus works without a window manager)
 if [ "${1:-}" != "" ]; then
-  WID=$(DISPLAY="$DISP" xdotool search --sync --name Jetty 2>/dev/null | head -1)
+  WID=$(DISPLAY="$DISP" xdotool search --sync --name JeTTY 2>/dev/null | head -1)
   if [ -n "$WID" ]; then
     DISPLAY="$DISP" xdotool windowfocus "$WID" 2>/dev/null
     sleep 0.3

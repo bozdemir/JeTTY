@@ -365,7 +365,7 @@ impl ApplicationHandler<AppEvent> for App {
         if self.window.is_some() {
             return;
         }
-        let window = jetty_platform::build_window(event_loop, "Jetty", (1000, 640));
+        let window = jetty_platform::build_window(event_loop, "JeTTY", (1000, 640));
         let size = window.inner_size();
         // HiDPI: the display's scale factor (>1.0 on HiDPI/Retina screens).
         // inner_size() already returns physical pixels; we multiply the logical

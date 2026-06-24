@@ -20,7 +20,7 @@ impl ApplicationHandler for Probe {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_none() {
             let w = el
-                .create_window(Window::default_attributes().with_title("Jetty"))
+                .create_window(Window::default_attributes().with_title("JeTTY"))
                 .unwrap();
             self.window = Some(Arc::new(w));
             eprintln!("PROBE: window created, ready for input");

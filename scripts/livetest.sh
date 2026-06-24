@@ -20,7 +20,7 @@ trap cleanup EXIT
 
 sleep 3   # let zsh + p10k initialize and the window map
 
-WID=$(xdotool search --sync --name Jetty 2>/dev/null | tail -1)
+WID=$(xdotool search --sync --name JeTTY 2>/dev/null | tail -1)
 if [ -z "$WID" ]; then
   echo "ERROR: Jetty window not found"; tail -5 "$LOG"; exit 1
 fi

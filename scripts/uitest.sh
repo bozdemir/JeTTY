@@ -53,7 +53,7 @@ SHELL=/usr/bin/zsh DISPLAY="$DISP" "$APP" >"$LOG" 2>&1 &
 APP_PID=$!
 sleep 3.5   # zsh + p10k init + first render
 
-WID=$(DISPLAY="$DISP" xdotool search --sync --name Jetty 2>/dev/null | tail -1)
+WID=$(DISPLAY="$DISP" xdotool search --sync --name JeTTY 2>/dev/null | tail -1)
 if [ -z "$WID" ]; then
   echo "ERROR: Jetty window not found on $DISP"; tail -8 "$LOG"; exit 1
 fi
