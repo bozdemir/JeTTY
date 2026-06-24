@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 winit = "0.30"
 raw-window-handle = "0.6"
+png = "0.18.1"

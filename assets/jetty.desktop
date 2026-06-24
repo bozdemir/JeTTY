@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=JeTTY
+GenericName=Terminal Emulator
+Comment=Blazing-fast GPU terminal with a center-summon hotkey
+Exec=jetty
+Icon=jetty
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+Keywords=terminal;shell;console;tty;prompt;
+StartupWMClass=jetty
