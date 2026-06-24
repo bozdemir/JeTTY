@@ -65,6 +65,13 @@ const CHIP_NAMES: [&str; 4] = ["Mocha", "Tokyo", "Gruvbox", "Dracula"];
 /// If more families exist, the list scrolls via `font_scroll_offset`.
 const MAX_FONT_ROWS: usize = 5;
 
+/// Settings-panel dimensions in logical px. The separate Settings OS window is
+/// sized to these (+ border) — see `SETTINGS_WIN_*` in jetty-app. Growing the
+/// panel here (e.g. adding a row) automatically resizes that window, so the
+/// bottom rows can never be clipped off a too-short window again.
+pub const PANEL_W: f32 = 380.0;
+pub const PANEL_H: f32 = 696.0;
+
 /// Build the settings panel for the given screen size, opacity (0.1..=1.0),
 /// selected theme index (index into `jetty_core::theme::PRESETS`), current
 /// logical font size (`font_size`), the list of monospace font families, the
@@ -92,7 +99,6 @@ pub fn build_panel(
     dy: f32,
     theme: &jetty_core::Theme,
 ) -> PanelView {
-    const PANEL_W: f32 = 380.0;
 
     // --- Theme-derived panel chrome colors ---
     // All panel colors are derived from the ACTIVE theme so the settings window
@@ -155,9 +161,7 @@ pub fn build_panel(
     //  py+502 ..         Font-family list rows (5×(22+2)=120px → bottom py+622)
     //  py+634            "Theme" label (12px gap after list bottom)
     //  py+654            Theme chips (h=36 → bottom py+690)
-    //  PANEL_H = 690 + 6 = 696
-
-    const PANEL_H: f32 = 696.0;
+    //  PANEL_H = 690 + 6 = 696  (PANEL_W/PANEL_H are module-level pub consts above)
 
     // Center, then apply the user drag offset, then clamp to screen edges.
     let sw = screen_w as f32;

@@ -176,11 +176,12 @@ struct Tab {
     title: String,
 }
 
-/// Logical size of the separate Settings window. Sized to exactly fit the panel
-/// (`build_panel` uses PANEL_W=380 × PANEL_H=504 plus a 2px border on each side)
-/// so the panel fills the window with no margin and the OS frame handles moving.
-const SETTINGS_WIN_W: u32 = 384;
-const SETTINGS_WIN_H: u32 = 652;
+/// Logical size of the separate Settings window — DERIVED from the panel size
+/// (+ 4px border) so it always fits exactly. Growing the panel (adding a settings
+/// row in `build_panel`) resizes this window automatically; the bottom rows
+/// (theme chips) can never be clipped off a too-short window again.
+const SETTINGS_WIN_W: u32 = jetty_render::PANEL_W as u32 + 4;
+const SETTINGS_WIN_H: u32 = jetty_render::PANEL_H as u32 + 4;
 
 pub struct App {
     proxy: EventLoopProxy<AppEvent>,
@@ -244,6 +245,11 @@ pub struct App {
     /// Start instant of the active summon (crystallize) animation, or None when
     /// idle. While Some, the redraw loop self-drives frames; None = idle 0 CPU.
     summon_anim: Option<std::time::Instant>,
+    /// Set when a summon is requested; the summon clock (`summon_anim`) starts on
+    /// the first redraw AFTER the window is actually shown. On macOS a freshly
+    /// shown window can take a beat to present — starting the clock at
+    /// set_visible() time would let the whole effect elapse unseen (effectless).
+    summon_pending: bool,
     /// Window corner radius in logical px, clamped [0, 24]. 0 = square corners.
     corner_radius: f32,
     /// All open terminal sessions, one per tab. Always non-empty once `resumed`
@@ -470,6 +476,7 @@ impl App {
             dragging_dropdown_width: false,
             wayland_warned: false,
             summon_anim: None,
+            summon_pending: false,
             corner_radius,
             tabs: Vec::new(),
             active: 0,
@@ -560,7 +567,7 @@ impl App {
         self.summon_effect = effect;
         self.persist();
         // One-shot preview on the main window (self-driving loop handles idle-0).
-        self.summon_anim = Some(std::time::Instant::now());
+        self.summon_pending = true;
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -1087,7 +1094,10 @@ impl App {
                 }
                 win.focus_window();
                 // Crystallize/reveal on every summon (F9 show), mirroring first open.
-                self.summon_anim = Some(std::time::Instant::now());
+                // Start the clock on the FIRST real frame (summon_pending), not here:
+                // on macOS the window can take a beat to present, which would
+                // otherwise let the whole effect elapse unseen (effectless).
+                self.summon_pending = true;
                 win.request_redraw();
             } else {
                 // Remember the current spot before hiding so the next Center
@@ -1496,6 +1506,10 @@ impl App {
                 // merely clicked into Settings.
                 if let Some(w) = &self.settings_window {
                     self.last_focused_window = Some(w.id());
+                    // macOS first-paint nudge: a request_redraw issued while the
+                    // window was still being shown can be dropped, leaving it blank
+                    // until the user clicks. Re-request now that it is shown+focused.
+                    w.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1615,7 +1629,7 @@ impl ApplicationHandler<AppEvent> for App {
             // a Tier-B effect is summoning; Tier-A and normal frames never use it.
             self.liquid = Some(jetty_render::LiquidDrop::new(&g.device, g.format));
             self.focus = Some(jetty_render::FocusPull::new(&g.device, g.format));
-            self.summon_anim = Some(std::time::Instant::now());
+            self.summon_pending = true;
         }
 
         self.window = Some(window);
@@ -1781,6 +1795,11 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::Focused(true) => {
                 // The main terminal window gained focus.
                 self.last_focused_window = Some(id);
+                // macOS first-paint nudge (see the settings window above): ensure a
+                // frame is drawn once the window is actually shown + focused.
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
             WindowEvent::Focused(false) => {
                 // Yakuake-style auto-hide: hide when the window loses focus, but
@@ -2575,6 +2594,13 @@ impl ApplicationHandler<AppEvent> for App {
                             win.request_redraw();
                         }
                     }
+                }
+                // Start the summon clock on the first real frame after a show (see
+                // `summon_pending`) — guarantees t starts at 0 even if macOS delayed
+                // presenting the window, so the reveal effect is never skipped.
+                if self.summon_pending {
+                    self.summon_pending = false;
+                    self.summon_anim = Some(std::time::Instant::now());
                 }
                 // Drain every tab so background shells keep running; close any
                 // whose child exited as part of the output we just drained.
