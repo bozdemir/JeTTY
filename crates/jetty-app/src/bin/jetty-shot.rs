@@ -245,11 +245,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .unwrap_or((0.0, 0.0));
 
+            let panel_radius = std::env::var("JETTY_CORNER_RADIUS")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .map(|v| v.clamp(0.0, 24.0))
+                .unwrap_or(10.0);
             let pv = jetty_render::build_panel(
                 width, height, opacity, theme_idx, font_size,
                 &mono_families,
                 mono_families.first().map(String::as_str).unwrap_or(""),
                 0,
+                panel_radius,
                 panel_dx,
                 panel_dy,
             );
@@ -331,11 +337,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(padded_data);
     readback_buffer.unmap();
 
-    // --- Composite over checkerboard if bg alpha < 255 ---
+    // --- Rounded-corner alpha mask (JETTY_CORNER_RADIUS) ---
+    // Apply the SAME antialiased rounded-rect SDF mask the live GPU pass uses, so
+    // the shot shows transparent (rounded) corners over the checkerboard while the
+    // center stays intact. The texture is premultiplied alpha, so multiply r/g/b/a
+    // by the coverage to keep premultiplication consistent.
+    let corner_radius = std::env::var("JETTY_CORNER_RADIUS")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .map(|v| v.clamp(0.0, 24.0))
+        .unwrap_or(0.0);
+    if corner_radius > 0.0 {
+        eprintln!("jetty-shot: applying rounded-corner mask (radius={corner_radius}px)");
+        for y in 0..height {
+            for x in 0..width {
+                let cov = jetty_render::rounded_rect_coverage(
+                    x as f32, y as f32, width as f32, height as f32, corner_radius,
+                );
+                if cov < 1.0 {
+                    let idx = ((y * width + x) * 4) as usize;
+                    for c in 0..4 {
+                        tight[idx + c] = (tight[idx + c] as f32 * cov).round() as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Composite over checkerboard if bg alpha < 255 (or a corner radius is set,
+    // so the now-transparent corners reveal the checkerboard even on an opaque
+    // theme) ---
     // The rendered texture uses premultiplied alpha (the clear color is already
     // premultiplied in text.rs).  We un-premultiply before blending onto the
     // checkerboard, then output an opaque RGBA PNG.
-    let composited = if bg_alpha < 255 {
+    let composited = if bg_alpha < 255 || corner_radius > 0.0 {
         eprintln!("jetty-shot: compositing over checkerboard (bg alpha={})", bg_alpha);
         const TILE: u32 = 16;
         const DARK: [u8; 3] = [40, 40, 40];

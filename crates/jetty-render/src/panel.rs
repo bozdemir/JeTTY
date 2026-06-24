@@ -24,6 +24,10 @@ pub struct PanelGeom {
     pub font_scroll_up: Rect,
     /// ▼ scroll button — increments font_scroll_offset.
     pub font_scroll_down: Rect,
+    /// Corner-radius slider track.
+    pub radius_track: Rect,
+    /// Corner-radius slider handle.
+    pub radius_handle: Rect,
 }
 
 /// Full description of how to draw the settings panel for one frame.
@@ -58,6 +62,7 @@ pub fn build_panel(
     families: &[String],
     selected_family: &str,
     font_scroll_offset: usize,
+    corner_radius: f32,
     dx: f32,
     dy: f32,
 ) -> PanelView {
@@ -68,14 +73,16 @@ pub fn build_panel(
     //  py+ 0  .. py+36   Title bar  (title label at py+12)
     //  py+48  .. py+96   Opacity band  (label at py+48, track at py+84)
     //                    slider track h=6 → bottom py+90; handle h=18 → bottom py+96
-    //  py+108 .. py+156  Font-size band  (label at py+108, buttons at py+128, btn h=28 → bottom py+156)
-    //  py+168 .. py+176  "Font" section header label
-    //  py+190 ..         Font-family list rows (5×(22+2)=120px → bottom py+310)
-    //  py+322            "Theme" label (12px gap after list bottom)
-    //  py+342            Theme chips (h=36 → bottom py+378)
-    //  PANEL_H = 378 + 18 = 396
+    //  py+108 .. py+156  Corner-radius band  (label at py+108, track at py+144)
+    //                    track h=6 → bottom py+150; handle h=18 → bottom py+156
+    //  py+168 .. py+216  Font-size band  (label at py+168, buttons at py+188, btn h=28 → bottom py+216)
+    //  py+228 .. py+236  "Font" section header label
+    //  py+250 ..         Font-family list rows (5×(22+2)=120px → bottom py+370)
+    //  py+382            "Theme" label (12px gap after list bottom)
+    //  py+402            Theme chips (h=36 → bottom py+438)
+    //  PANEL_H = 438 + 18 = 456
 
-    const PANEL_H: f32 = 396.0;
+    const PANEL_H: f32 = 456.0;
 
     // Center, then apply the user drag offset, then clamp to screen edges.
     let sw = screen_w as f32;
@@ -136,9 +143,30 @@ pub fn build_panel(
         color: [185, 185, 205, 255],
     };
 
-    // --- Font-size band (py+108 .. py+156) ---
-    // Label at py+108; "Npt" readout at py+134; buttons at py+128 (h=28 → bottom py+156).
-    let font_btn_y = py + 128.0;
+    // --- Corner-radius band (py+108 .. py+156) ---
+    // Label at py+108; track centred at py+144 (h=6); handle at py+138 (h=18).
+    // Radius range is [0, 24] px.
+    const RADIUS_MAX: f32 = 24.0;
+    let radius_track = Rect {
+        x: px + 16.0,
+        y: py + 144.0,
+        w: 348.0,
+        h: 6.0,
+        color: [60, 60, 75, 255],
+    };
+    let r_frac = (corner_radius / RADIUS_MAX).clamp(0.0, 1.0);
+    let radius_handle_x = px + 16.0 + r_frac * (348.0 - 14.0);
+    let radius_handle = Rect {
+        x: radius_handle_x,
+        y: py + 138.0,
+        w: 14.0,
+        h: 18.0,
+        color: [185, 185, 205, 255],
+    };
+
+    // --- Font-size band (py+168 .. py+216) ---
+    // Label at py+168; "Npt" readout at py+194; buttons at py+188 (h=28 → bottom py+216).
+    let font_btn_y = py + 188.0;
     let font_minus_x = px + 200.0;
     let font_plus_x  = font_minus_x + 36.0;
     let font_reset_x = font_plus_x  + 36.0;
@@ -165,9 +193,9 @@ pub fn build_panel(
         color: [55, 55, 72, 255],
     };
 
-    // --- Font scroll buttons (▲ / ▼) in the "Font" header row at py+168 ---
+    // --- Font scroll buttons (▲ / ▼) in the "Font" header row at py+228 ---
     // Two 20×20 buttons placed at the right side of the header row.
-    let scroll_btn_y = py + 166.0;
+    let scroll_btn_y = py + 226.0;
     let scroll_down_x = px + PANEL_W - 16.0 - 20.0;        // ▼ rightmost
     let scroll_up_x   = scroll_down_x - 24.0;               // ▲ left of ▼
     let font_scroll_up = Rect {
@@ -185,13 +213,13 @@ pub fn build_panel(
         color: [55, 55, 72, 255],
     };
 
-    // --- Font-family list (py+190 .. py+310) ---
-    // "Font" header at py+168; list rows start at py+190.
-    // 5 rows × (22px row + 2px gap) = 120px → list bottom = py+310.
-    // Theme label at py+322 (12px gap); chips at py+342.
+    // --- Font-family list (py+250 .. py+370) ---
+    // "Font" header at py+228; list rows start at py+250.
+    // 5 rows × (22px row + 2px gap) = 120px → list bottom = py+370.
+    // Theme label at py+382 (12px gap); chips at py+402.
     const ROW_H: f32 = 22.0;
     const ROW_GAP: f32 = 2.0;
-    let list_top = py + 190.0;
+    let list_top = py + 250.0;
     let list_x = px + 16.0;
     let list_w = PANEL_W - 32.0;
 
@@ -217,12 +245,12 @@ pub fn build_panel(
         });
     }
 
-    // --- Theme chips (py+342 .. py+378) ---
-    // "Theme" label at py+322; chips at py+342 (h=36 → bottom py+378).
+    // --- Theme chips (py+402 .. py+438) ---
+    // "Theme" label at py+382; chips at py+402 (h=36 → bottom py+438).
     let presets = jetty_core::theme::PRESETS;
     let num_presets = presets.len(); // should be 4
 
-    let chip_top = py + 342.0;
+    let chip_top = py + 402.0;
     let mut chip_rects: Vec<Rect> = Vec::with_capacity(num_presets);
     for i in 0..num_presets {
         let chip_x = px + 16.0 + i as f32 * 88.0;
@@ -271,9 +299,13 @@ pub fn build_panel(
     // Chip fills.
     quads.extend_from_slice(&chip_rects);
 
-    // Slider track + handle.
+    // Opacity slider track + handle.
     quads.push(slider_track);
     quads.push(slider_handle);
+
+    // Corner-radius slider track + handle.
+    quads.push(radius_track);
+    quads.push(radius_handle);
 
     // --- Labels ---
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
@@ -290,15 +322,24 @@ pub fn build_panel(
         [200, 200, 210],
     ));
 
-    // Font-size section header (band top at py+108).
-    labels.push(("Font size".to_string(), px + 16.0, py + 108.0, [200, 200, 210]));
+    // Corner-radius label (band top at py+108) with a px readout.
+    let radius_px = corner_radius.round() as i32;
+    labels.push((
+        format!("Corner radius  {}px", radius_px),
+        px + 16.0,
+        py + 108.0,
+        [200, 200, 210],
+    ));
+
+    // Font-size section header (band top at py+168).
+    labels.push(("Font size".to_string(), px + 16.0, py + 168.0, [200, 200, 210]));
 
     // Current font-size readout aligned with buttons.
     let fs_display = font_size.round() as i32;
     labels.push((
         format!("{}pt", fs_display),
         px + 140.0,
-        py + 134.0,
+        py + 194.0,
         [210, 210, 225],
     ));
 
@@ -307,8 +348,8 @@ pub fn build_panel(
     labels.push(("+".to_string(),  font_plus_x  + 8.0,  font_btn_y + 6.0,  [200, 200, 215]));
     labels.push(("rst".to_string(), font_reset_x + 6.0, font_btn_y + 6.0,  [200, 200, 215]));
 
-    // Font-family section header (at py+168; list starts at py+190).
-    labels.push(("Font".to_string(), px + 16.0, py + 168.0, [200, 200, 210]));
+    // Font-family section header (at py+228; list starts at py+250).
+    labels.push(("Font".to_string(), px + 16.0, py + 228.0, [200, 200, 210]));
 
     // Scroll button labels (▲ / ▼).
     labels.push(("^".to_string(), scroll_up_x   + 6.0, scroll_btn_y + 4.0, [200, 200, 215]));
@@ -343,11 +384,11 @@ pub fn build_panel(
         // Place the "(shown/total)" hint to the LEFT of the ▲/▼ buttons
         // (which sit at px+PANEL_W-60..) so the count and the arrows never overlap.
         let hint = format!("({}/{})", offset + visible_count, families.len());
-        labels.push((hint, px + PANEL_W - 132.0, py + 168.0, [140, 140, 155]));
+        labels.push((hint, px + PANEL_W - 132.0, py + 228.0, [140, 140, 155]));
     }
 
-    // Theme section label (at py+322; 12px gap after list bottom py+310).
-    labels.push(("Theme".to_string(), px + 16.0, py + 322.0, [200, 200, 210]));
+    // Theme section label (at py+382; 12px gap after list bottom py+370).
+    labels.push(("Theme".to_string(), px + 16.0, py + 382.0, [200, 200, 210]));
 
     // Chip name labels.
     for i in 0..num_presets {
@@ -386,6 +427,8 @@ pub fn build_panel(
         title_bar,
         font_scroll_up,
         font_scroll_down,
+        radius_track,
+        radius_handle,
     };
 
     PanelView { quads, labels, geom }

@@ -210,6 +210,8 @@ pub fn decide_key(
 pub enum MouseAction {
     /// User pressed on the opacity slider handle or track.
     StartSliderDrag,
+    /// User pressed on the corner-radius slider handle or track.
+    StartRadiusDrag,
     /// User clicked a theme chip. The index is into `jetty_core::theme::PRESETS`.
     SetTheme(usize),
     /// User clicked the font-size decrement button ("−").
@@ -262,9 +264,13 @@ pub fn decide_mouse_press(
     cy: f32,
 ) -> MouseAction {
     if let Some(g) = panel {
-        // Slider handle or track → start drag.
+        // Opacity slider handle or track → start drag.
         if point_in(&g.slider_handle, cx, cy) || point_in(&g.slider_track, cx, cy) {
             return MouseAction::StartSliderDrag;
+        }
+        // Corner-radius slider handle or track → start drag.
+        if point_in(&g.radius_handle, cx, cy) || point_in(&g.radius_track, cx, cy) {
+            return MouseAction::StartRadiusDrag;
         }
         // Theme chips.
         for (i, chip) in g.chips.iter().enumerate() {

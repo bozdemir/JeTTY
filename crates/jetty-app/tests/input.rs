@@ -472,7 +472,7 @@ fn arrow_keys_app_cursor_mode_all_directions() {
 
 /// Build a real PanelGeom for a 1000×640 window at 70% opacity, theme index 1.
 fn make_panel_geom() -> jetty_render::PanelGeom {
-    jetty_render::build_panel(1000, 640, 0.7, 1, 16.0, &[], "", 0, 0.0, 0.0).geom
+    jetty_render::build_panel(1000, 640, 0.7, 1, 16.0, &[], "", 0, 10.0, 0.0, 0.0).geom
 }
 
 /// Build a scrollbar rect that is non-None (requires scroll_max > 0).

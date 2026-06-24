@@ -44,10 +44,10 @@ struct Tab {
 }
 
 /// Logical size of the separate Settings window. Sized to exactly fit the panel
-/// (`build_panel` uses PANEL_W=380 × PANEL_H=396 plus a 2px border on each side)
+/// (`build_panel` uses PANEL_W=380 × PANEL_H=456 plus a 2px border on each side)
 /// so the panel fills the window with no margin and the OS frame handles moving.
 const SETTINGS_WIN_W: u32 = 384;
-const SETTINGS_WIN_H: u32 = 400;
+const SETTINGS_WIN_H: u32 = 460;
 
 pub struct App {
     proxy: EventLoopProxy<AppEvent>,
@@ -61,6 +61,10 @@ pub struct App {
     gpu: Option<GpuContext>,
     text: Option<TextLayer>,
     quad: Option<QuadLayer>,
+    /// Final-pass rounded-corner mask for the borderless main window.
+    corner_mask: Option<jetty_render::CornerMask>,
+    /// Window corner radius in logical px, clamped [0, 24]. 0 = square corners.
+    corner_radius: f32,
     /// All open terminal sessions, one per tab. Always non-empty once `resumed`
     /// has run; when it becomes empty the event loop exits.
     tabs: Vec<Tab>,
@@ -100,6 +104,8 @@ pub struct App {
     settings_cursor: (f64, f64),
     /// Whether the user is currently dragging the opacity slider in the Settings panel.
     dragging_slider: bool,
+    /// Whether the user is currently dragging the corner-radius slider.
+    dragging_radius: bool,
     /// Whether the user is currently dragging a text selection with the mouse.
     selecting: bool,
     /// Whether JETTY_DEBUG is set — enables input/panel state logging to stderr.
@@ -228,6 +234,13 @@ impl App {
             .map(|v| v.clamp(0.0, 1.0))
             .unwrap_or(1.0);
 
+        // Resolve initial corner radius from JETTY_CORNER_RADIUS env var.
+        let corner_radius = std::env::var("JETTY_CORNER_RADIUS")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .map(|v| v.clamp(0.0, 24.0))
+            .unwrap_or(10.0);
+
         let debug = std::env::var("JETTY_DEBUG").is_ok();
 
         // Resolve initial font family from JETTY_FONT_FAMILY env var.
@@ -242,6 +255,8 @@ impl App {
             gpu: None,
             text: None,
             quad: None,
+            corner_mask: None,
+            corner_radius,
             tabs: Vec::new(),
             active: 0,
             theme_idx,
@@ -260,6 +275,7 @@ impl App {
             settings_quad: None,
             settings_cursor: (0.0, 0.0),
             dragging_slider: false,
+            dragging_radius: false,
             selecting: false,
             debug,
             context_menu: None,
@@ -443,6 +459,13 @@ impl App {
     fn opacity_from_cursor(&self, cx: f32, track: &jetty_render::Rect) -> f32 {
         let frac = ((cx - track.x) / track.w).clamp(0.0, 1.0);
         (0.1 + frac * 0.9).clamp(0.1, 1.0)
+    }
+
+    /// Compute corner radius (px, [0, 24]) from a cursor x relative to the radius
+    /// slider track rect.
+    fn radius_from_cursor(&self, cx: f32, track: &jetty_render::Rect) -> f32 {
+        let frac = ((cx - track.x) / track.w).clamp(0.0, 1.0);
+        (frac * 24.0).clamp(0.0, 24.0)
     }
 
     /// Convert the current cursor pixel position into 1-based terminal cell
@@ -715,7 +738,7 @@ impl App {
         jetty_render::build_panel(
             w, h, self.opacity, self.theme_idx, self.font_logical,
             &self.font_families, &self.font_family, self.font_scroll_offset,
-            0.0, 0.0,
+            self.corner_radius, 0.0, 0.0,
         )
     }
 
@@ -725,6 +748,7 @@ impl App {
         let theme_idx = self.theme_idx;
         let font_logical = self.font_logical;
         let font_scroll_offset = self.font_scroll_offset;
+        let corner_radius = self.corner_radius;
         // Clone the small inputs build_panel needs so we can borrow the render
         // stack mutably below without overlapping the immutable self borrows.
         let families = self.font_families.clone();
@@ -738,7 +762,7 @@ impl App {
         let height = gpu.config.height;
         let pv = jetty_render::build_panel(
             width, height, opacity, theme_idx, font_logical,
-            &families, &family, font_scroll_offset, 0.0, 0.0,
+            &families, &family, font_scroll_offset, corner_radius, 0.0, 0.0,
         );
         if let Some((frame, view)) = gpu.acquire_frame() {
             // Clear the window background to the panel border color, then paint the
@@ -769,7 +793,12 @@ impl App {
     /// Apply a panel `MouseAction` decoded in the settings window. Updates shared
     /// state AND the live main terminal (theme/font/opacity), then requests a
     /// redraw of BOTH windows so each reflects the change immediately.
-    fn handle_settings_action(&mut self, action: input::MouseAction, track: Option<jetty_render::Rect>) {
+    fn handle_settings_action(
+        &mut self,
+        action: input::MouseAction,
+        track: Option<jetty_render::Rect>,
+        radius_track: Option<jetty_render::Rect>,
+    ) {
         let cx = self.settings_cursor.0 as f32;
         match action {
             input::MouseAction::StartSliderDrag => {
@@ -777,6 +806,12 @@ impl App {
                 if let Some(track_rect) = track {
                     self.opacity = self.opacity_from_cursor(cx, &track_rect);
                     self.apply_theme();
+                }
+            }
+            input::MouseAction::StartRadiusDrag => {
+                self.dragging_radius = true;
+                if let Some(track_rect) = radius_track {
+                    self.corner_radius = self.radius_from_cursor(cx, &track_rect);
                 }
             }
             input::MouseAction::SetTheme(i) => {
@@ -859,14 +894,19 @@ impl App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.settings_cursor = (position.x, position.y);
-                // Continue an opacity-slider drag started in this window.
-                if self.dragging_slider {
+                // Continue an opacity- or radius-slider drag started in this window.
+                if self.dragging_slider || self.dragging_radius {
                     if let Some(gpu) = &self.settings_gpu {
                         let (w, h) = (gpu.config.width, gpu.config.height);
                         let pv = self.settings_panel_view(w, h);
                         let cx = self.settings_cursor.0 as f32;
-                        self.opacity = self.opacity_from_cursor(cx, &pv.geom.slider_track);
-                        self.apply_theme();
+                        if self.dragging_slider {
+                            self.opacity = self.opacity_from_cursor(cx, &pv.geom.slider_track);
+                            self.apply_theme();
+                        }
+                        if self.dragging_radius {
+                            self.corner_radius = self.radius_from_cursor(cx, &pv.geom.radius_track);
+                        }
                     }
                     if let Some(w) = &self.window {
                         w.request_redraw();
@@ -878,17 +918,19 @@ impl App {
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 self.dragging_slider = false;
+                self.dragging_radius = false;
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 let Some(gpu) = &self.settings_gpu else { return };
                 let (w, h) = (gpu.config.width, gpu.config.height);
                 let pv = self.settings_panel_view(w, h);
                 let track = pv.geom.slider_track;
+                let radius_track = pv.geom.radius_track;
                 let cx = self.settings_cursor.0 as f32;
                 let cy = self.settings_cursor.1 as f32;
                 // Hit-test the panel only (no scrollbar in the settings window).
                 let action = input::decide_mouse_press(Some(&pv.geom), None, cx, cy);
-                self.handle_settings_action(action, Some(track));
+                self.handle_settings_action(action, Some(track), Some(radius_track));
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Wheel over the font-family list scrolls it (same as the old
@@ -991,6 +1033,12 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some(ref t) = text {
             self.font_families = t.monospace_families();
             eprintln!("jetty: found {} monospace families", self.font_families.len());
+        }
+
+        // Build the rounded-corner mask (final fullscreen pass) for the borderless
+        // main window, using the same surface format as the rest of the pipeline.
+        if let Some(ref g) = gpu {
+            self.corner_mask = Some(jetty_render::CornerMask::new(&g.device, g.format));
         }
 
         self.window = Some(window);
@@ -1389,6 +1437,7 @@ impl ApplicationHandler<AppEvent> for App {
                 ) {
                     // Panel actions cannot occur here (panel == None above).
                     input::MouseAction::StartSliderDrag
+                    | input::MouseAction::StartRadiusDrag
                     | input::MouseAction::SetTheme(_)
                     | input::MouseAction::FontMinus
                     | input::MouseAction::FontPlus
@@ -1736,6 +1785,12 @@ impl ApplicationHandler<AppEvent> for App {
                 let menu_hover = self.menu_hover;
                 let rename_state: Option<(usize, String)> =
                     self.renaming.map(|i| (i, self.rename_buf.clone()));
+                // Corner-mask inputs captured before the mutable render borrows.
+                // The radius is logical px; scale to physical so it matches the
+                // physical-pixel surface (HiDPI-correct rounding).
+                let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
+                let corner_radius_px = self.corner_radius * scale;
+                let corner_mask = self.corner_mask.as_ref();
                 let (Some(gpu), Some(text), Some(quad)) =
                     (&mut self.gpu, &mut self.text, &mut self.quad)
                 else {
@@ -1805,6 +1860,18 @@ impl ApplicationHandler<AppEvent> for App {
                                 &menu.labels,
                             );
                         }
+                    }
+                    // Final pass: round the window corners by zeroing alpha
+                    // outside a rounded rect. No-op when radius == 0 (square).
+                    if let Some(mask) = corner_mask {
+                        mask.apply(
+                            &gpu.device,
+                            &gpu.queue,
+                            &view,
+                            width,
+                            height,
+                            corner_radius_px,
+                        );
                     }
                     frame.present();
                 }
