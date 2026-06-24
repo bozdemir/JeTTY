@@ -360,9 +360,6 @@ pub fn default_bg_clear(snapshot: &jetty_core::GridSnapshot) -> wgpu::Color {
     }
 }
 
-/// The selection highlight background color (sRGB).
-const SELECTION_BG: [u8; 3] = [60, 90, 160];
-
 /// Build per-cell background rectangles for every cell whose background differs
 /// from the theme's default background (`snapshot.bg_rgba[0..3]`), plus
 /// selection highlight rects for all selected cells (overriding their normal bg).
@@ -377,6 +374,7 @@ pub fn cell_bg_rects(
     cell_w: f32,
     cell_h: f32,
     y_offset: f32,
+    selection_bg: [u8; 3],
 ) -> Vec<Rect> {
     let default_bg = [snapshot.bg_rgba[0], snapshot.bg_rgba[1], snapshot.bg_rgba[2]];
     let mut rects: Vec<Rect> = Vec::new();
@@ -386,7 +384,7 @@ pub fn cell_bg_rects(
         while col < snapshot.cols {
             let cell = snapshot.cell(row, col);
             // Effective bg: selection overrides normal bg.
-            let effective_bg = if cell.selected { SELECTION_BG } else { cell.bg };
+            let effective_bg = if cell.selected { selection_bg } else { cell.bg };
             if effective_bg == default_bg && !cell.selected {
                 col += 1;
                 continue;
@@ -396,7 +394,7 @@ pub fn cell_bg_rects(
             col += 1;
             while col < snapshot.cols {
                 let next = snapshot.cell(row, col);
-                let next_bg = if next.selected { SELECTION_BG } else { next.bg };
+                let next_bg = if next.selected { selection_bg } else { next.bg };
                 if next_bg != effective_bg {
                     break;
                 }
@@ -427,6 +425,7 @@ pub fn scrollbar_rect_geom(
     screen_w: u32,
     screen_h: u32,
     top_offset: f32,
+    thumb: [u8; 4],
 ) -> Option<Rect> {
     if scroll_max == 0 {
         return None;
@@ -442,7 +441,7 @@ pub fn scrollbar_rect_geom(
         y: thumb_y,
         w: 8.0,
         h: thumb_h,
-        color: [150, 150, 165, 220],
+        color: thumb,
         ..Default::default()
     })
 }
@@ -452,6 +451,7 @@ pub fn scrollbar_rect(
     screen_w: u32,
     screen_h: u32,
     top_offset: f32,
+    thumb: [u8; 4],
 ) -> Option<Rect> {
     scrollbar_rect_geom(
         snapshot.rows,
@@ -460,5 +460,6 @@ pub fn scrollbar_rect(
         screen_w,
         screen_h,
         top_offset,
+        thumb,
     )
 }

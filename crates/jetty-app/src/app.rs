@@ -1294,7 +1294,8 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some((mx, my)) = self.context_menu {
                     if let Some(gpu) = &self.gpu {
                         let (win_w, win_h) = (gpu.config.width, gpu.config.height);
-                        let menu = jetty_render::build_context_menu(mx, my, win_w, win_h, None);
+                        let theme = self.current_theme();
+                        let menu = jetty_render::build_context_menu(mx, my, win_w, win_h, None, &theme);
                         let cx = self.cursor.0 as f32;
                         let cy = self.cursor.1 as f32;
                         let new_hover = menu.item_rects.iter().position(|r| {
@@ -1323,7 +1324,8 @@ impl ApplicationHandler<AppEvent> for App {
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
                     let title = self.tabs.get(i).map(|t| t.title.clone()).unwrap_or_default();
-                    let popup = jetty_render::build_confirm_close(w, h, &title);
+                    let theme = self.current_theme();
+                    let popup = jetty_render::build_confirm_close(w, h, &title, &theme);
                     if input::point_in(&popup.close_rect, cx, cy) {
                         self.confirm_close = None;
                         self.close_tab(i, event_loop);
@@ -1344,7 +1346,8 @@ impl ApplicationHandler<AppEvent> for App {
                     self.menu_hover = None;
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
-                    let menu = jetty_render::build_context_menu(mx, my, w, h, None);
+                    let theme = self.current_theme();
+                    let menu = jetty_render::build_context_menu(mx, my, w, h, None, &theme);
                     let hit = menu.item_rects.iter().position(|r| {
                         cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
                     });
@@ -1386,7 +1389,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // a click inside is swallowed. Either way the click is consumed so
                 // it never reaches the tab bar, a resize edge, or the terminal. ---
                 if self.help_open {
-                    let help = jetty_render::build_help_overlay(w, h);
+                    let theme = self.current_theme();
+                    let help = jetty_render::build_help_overlay(w, h, &theme);
                     if !input::point_in(&help.panel, cx, cy) {
                         self.help_open = false;
                     }
@@ -1531,7 +1535,8 @@ impl ApplicationHandler<AppEvent> for App {
                 let rows = self.active_tab().terminal.rows();
                 let scroll_offset = self.active_tab().terminal.scroll_offset();
                 let scroll_max = self.active_tab().terminal.scroll_max();
-                let scrollbar = jetty_render::scrollbar_rect_geom(rows, scroll_offset, scroll_max, w, h, TABBAR_H);
+                // Color is irrelevant for hit-test geometry; pass transparent.
+                let scrollbar = jetty_render::scrollbar_rect_geom(rows, scroll_offset, scroll_max, w, h, TABBAR_H, [0, 0, 0, 0]);
 
                 // The settings panel no longer lives in this window, so pass no
                 // panel geometry — only the scrollbar and terminal area are hit.
@@ -1662,7 +1667,7 @@ impl ApplicationHandler<AppEvent> for App {
                         let max = self.active_tab().terminal.scroll_max();
                         if let Some(gpu) = &self.gpu {
                             let (w, h) = (gpu.config.width, gpu.config.height);
-                            jetty_render::scrollbar_rect_geom(rows, off, max, w, h, TABBAR_H)
+                            jetty_render::scrollbar_rect_geom(rows, off, max, w, h, TABBAR_H, [0, 0, 0, 0])
                                 .map(|r| {
                                     let cx = self.cursor.0 as f32;
                                     cx >= r.x && cx <= r.x + r.w
@@ -1963,7 +1968,9 @@ impl ApplicationHandler<AppEvent> for App {
                     // quads (reverse-video / colored backgrounds) UNDER the text.
                     // The grid's bg quads are offset down by the tab bar.
                     let (cell_w, cell_h) = text.cell_size();
-                    let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, TABBAR_H);
+                    let selection_bg = selection_bg_for(&theme);
+                    let scrollbar_thumb = scrollbar_thumb_for(&theme);
+                    let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, TABBAR_H, selection_bg);
                     quad.render_clear(
                         &gpu.device,
                         &gpu.queue,
@@ -1995,14 +2002,14 @@ impl ApplicationHandler<AppEvent> for App {
                     // Pass 4: scrollbar (spans the grid area below the bar).
                     let mut rects: Vec<jetty_render::Rect> = Vec::new();
                     if let Some(r) =
-                        jetty_render::scrollbar_rect(&snap, width, height, TABBAR_H)
+                        jetty_render::scrollbar_rect(&snap, width, height, TABBAR_H, scrollbar_thumb)
                     {
                         rects.push(r);
                     }
                     quad.render(&gpu.device, &gpu.queue, &view, width, height, &rects);
                     // Draw the right-click context menu on top of everything.
                     if let Some((mx, my)) = context_menu {
-                        let menu = jetty_render::build_context_menu(mx, my, width, height, menu_hover);
+                        let menu = jetty_render::build_context_menu(mx, my, width, height, menu_hover, &theme);
                         quad.render(&gpu.device, &gpu.queue, &view, width, height, &menu.quads);
                         if !menu.labels.is_empty() {
                             let _ = text.render_overlays(
@@ -2018,7 +2025,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // Draw the Help overlay (Keyboard Shortcuts) on top of all
                     // else — a dim layer, a bordered panel, and the binding rows.
                     if help_open {
-                        let help = jetty_render::build_help_overlay(width, height);
+                        let help = jetty_render::build_help_overlay(width, height, &theme);
                         quad.render(&gpu.device, &gpu.queue, &view, width, height, &help.quads);
                         if !help.labels.is_empty() {
                             let _ = text.render_overlays(
@@ -2034,7 +2041,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // Draw the close-tab confirmation popup on top of everything
                     // (above the help overlay): dim + bordered panel + buttons.
                     if let Some(title) = &confirm_close {
-                        let popup = jetty_render::build_confirm_close(width, height, title);
+                        let popup = jetty_render::build_confirm_close(width, height, title, &theme);
                         quad.render(&gpu.device, &gpu.queue, &view, width, height, &popup.quads);
                         if !popup.labels.is_empty() {
                             let _ = text.render_overlays(
@@ -2084,6 +2091,24 @@ fn spawn_waker(proxy: EventLoopProxy<AppEvent>) {
 /// Which window-control button (if any) the cursor at `(cx, cy)` is over, given
 /// the surface `width`. Mirrors the control layout in `build_tab_bar_ex`: three
 /// `28px` cells parked at the right of the `TABBAR_H` strip (min, max, close).
+/// Selection-highlight background derived from the active theme: a dim accent
+/// blend (mirrors panel.rs's selected-row color) so selections read on any theme.
+fn selection_bg_for(theme: &jetty_core::Theme) -> [u8; 3] {
+    let bg = theme.bg;
+    let accent = theme.palette[4];
+    [
+        ((bg[0] as u16 + accent[0] as u16 * 2) / 3) as u8,
+        ((bg[1] as u16 + accent[1] as u16 * 2) / 3) as u8,
+        ((bg[2] as u16 + accent[2] as u16 * 2) / 3) as u8,
+    ]
+}
+
+/// Scrollbar thumb color derived from the active theme: theme fg at alpha 160.
+fn scrollbar_thumb_for(theme: &jetty_core::Theme) -> [u8; 4] {
+    let fg = theme.fg;
+    [fg[0], fg[1], fg[2], 160]
+}
+
 fn ctrl_hover_at(cx: f32, cy: f32, width: u32) -> jetty_render::CtrlHover {
     use jetty_render::CtrlHover;
     if cy >= TABBAR_H {

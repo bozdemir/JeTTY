@@ -28,9 +28,30 @@ pub fn build_context_menu(
     win_w: u32,
     win_h: u32,
     hovered: Option<usize>,
+    theme: &jetty_core::Theme,
 ) -> ContextMenu {
     let sw = win_w as f32;
     let sh = win_h as f32;
+
+    // --- Theme-derived menu colors (mirrors panel.rs::build_panel) ---
+    let tbg = theme.bg;
+    let tfg = theme.fg;
+    let accent = theme.palette[4]; // blue accent → hover highlight
+    let lerp = |t: f32| -> [u8; 3] {
+        [
+            (tbg[0] as f32 + (tfg[0] as f32 - tbg[0] as f32) * t).round() as u8,
+            (tbg[1] as f32 + (tfg[1] as f32 - tbg[1] as f32) * t).round() as u8,
+            (tbg[2] as f32 + (tfg[2] as f32 - tbg[2] as f32) * t).round() as u8,
+        ]
+    };
+    let bg3 = lerp(0.06);
+    let menu_bg: [u8; 4] = [bg3[0], bg3[1], bg3[2], 242];
+    let row3 = lerp(0.10);
+    let row_bg: [u8; 4] = [row3[0], row3[1], row3[2], 255];
+    let border3 = lerp(0.30);
+    let border_col: [u8; 4] = [border3[0], border3[1], border3[2], 255];
+    let hover_col: [u8; 4] = [accent[0], accent[1], accent[2], 255];
+    let text_col = lerp(0.85);
 
     // Clamp so the full menu (plus border) stays on-screen.
     let total_w = MENU_W + BORDER * 2.0;
@@ -50,7 +71,7 @@ pub fn build_context_menu(
             y: cy + i as f32 * ROW_H,
             w: MENU_W,
             h: ROW_H,
-            color: [38, 38, 50, 255], // default row bg
+            color: row_bg, // default row bg
             ..Default::default()
         });
     }
@@ -63,7 +84,7 @@ pub fn build_context_menu(
         y: my,
         w: total_w,
         h: total_h,
-        color: [90, 90, 110, 255], ..Default::default() });
+        color: border_col, ..Default::default() });
 
     // Background panel.
     quads.push(Rect {
@@ -71,7 +92,7 @@ pub fn build_context_menu(
         y: cy,
         w: MENU_W,
         h: MENU_H,
-        color: [30, 30, 40, 245], ..Default::default() });
+        color: menu_bg, ..Default::default() });
 
     // Hover highlight quad (drawn on top of background, under labels).
     if let Some(idx) = hovered {
@@ -81,7 +102,7 @@ pub fn build_context_menu(
                 y: cy + idx as f32 * ROW_H,
                 w: MENU_W,
                 h: ROW_H,
-                color: [60, 80, 120, 255], ..Default::default() });
+                color: hover_col, ..Default::default() });
         }
     }
 
@@ -89,7 +110,7 @@ pub fn build_context_menu(
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
     for (i, &name) in MENU_ITEMS.iter().enumerate() {
         let label_y = cy + i as f32 * ROW_H + 7.0; // 7px from row top
-        labels.push((name.to_string(), cx + 10.0, label_y, [210, 210, 225]));
+        labels.push((name.to_string(), cx + 10.0, label_y, text_col));
     }
 
     ContextMenu { quads, labels, item_rects }

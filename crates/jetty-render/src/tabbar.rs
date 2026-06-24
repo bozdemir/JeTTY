@@ -203,8 +203,9 @@ pub fn build_tab_bar_ex(
     // --- Right-side controls (left→right): Help "?", Settings "⚙",
     // minimize "─", maximize "▢", close "✕" (rightmost). ---
     let hover_bg = active_bg;
-    // A red-ish background for the close button when hovered.
-    let close_hover_bg = [0xE0, 0x40, 0x40, 255];
+    // A red-ish background for the close button when hovered (theme's red).
+    let red = theme.palette[1];
+    let close_hover_bg = [red[0], red[1], red[2], 255];
     let ctrl_y = 0.0;
 
     let help_x = sw - CONTROLS_W;        // sw - 5*CTRL_W
@@ -300,7 +301,9 @@ mod tests {
     fn close_hover_changes_glyph_color() {
         let tabs = [("Tab 1".to_string(), true)];
         let hot = build_tab_bar_ex(800, &tabs, &theme(), None, CtrlHover::Close);
-        // A red-ish hover quad is appended when the close control is hovered.
-        assert!(hot.quads.iter().any(|q| q.color == [0xE0, 0x40, 0x40, 255]));
+        // A theme-red hover quad is appended when the close control is hovered.
+        let red = theme().palette[1];
+        let red_bg = [red[0], red[1], red[2], 255];
+        assert!(hot.quads.iter().any(|q| q.color == red_bg));
     }
 }

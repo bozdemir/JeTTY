@@ -35,9 +35,29 @@ pub struct HelpOverlay {
 /// Build the centered "Keyboard Shortcuts" help overlay for a window of size
 /// `win_w`×`win_h` (physical pixels). The panel is sized to fit the rows and
 /// clamped on-screen. A click outside `panel` (or Esc / the "?" button) closes it.
-pub fn build_help_overlay(win_w: u32, win_h: u32) -> HelpOverlay {
+pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme) -> HelpOverlay {
     let sw = win_w as f32;
     let sh = win_h as f32;
+
+    // --- Theme-derived overlay chrome (mirrors panel.rs::build_panel) ---
+    // All colors blend the active theme's bg→fg so the overlay re-skins itself
+    // with the theme instead of being a fixed dark card (which was invisible on
+    // the light theme and clashed on Gruvbox/Dracula).
+    let tbg = theme.bg;
+    let tfg = theme.fg;
+    let lerp = |t: f32| -> [u8; 3] {
+        [
+            (tbg[0] as f32 + (tfg[0] as f32 - tbg[0] as f32) * t).round() as u8,
+            (tbg[1] as f32 + (tfg[1] as f32 - tbg[1] as f32) * t).round() as u8,
+            (tbg[2] as f32 + (tfg[2] as f32 - tbg[2] as f32) * t).round() as u8,
+        ]
+    };
+    let bg3 = lerp(0.06);
+    let panel_bg: [u8; 4] = [bg3[0], bg3[1], bg3[2], 242];
+    let border3 = lerp(0.30);
+    let border_col: [u8; 4] = [border3[0], border3[1], border3[2], 255];
+    let title_col = tfg;
+    let row_col = lerp(0.70);
 
     // Approximate width of one rendered overlay character. The overlay text uses
     // the configured monospace font (default MesloLGS NF) near 16px, whose
@@ -93,9 +113,9 @@ pub fn build_help_overlay(win_w: u32, win_h: u32) -> HelpOverlay {
         y: py - 2.0,
         w: panel_w + 4.0,
         h: panel_h + 4.0,
-        color: [80, 80, 110, 255], ..Default::default() });
+        color: border_col, ..Default::default() });
     // Background panel.
-    let panel = Rect { x: px, y: py, w: panel_w, h: panel_h, color: [26, 26, 34, 245], ..Default::default() };
+    let panel = Rect { x: px, y: py, w: panel_w, h: panel_h, color: panel_bg, ..Default::default() };
     quads.push(panel);
 
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
@@ -105,14 +125,14 @@ pub fn build_help_overlay(win_w: u32, win_h: u32) -> HelpOverlay {
         "Keyboard Shortcuts".to_string(),
         px + pad_x,
         py + PAD,
-        [235, 235, 245],
+        title_col,
     ));
 
     // Shortcut rows (one binding per row → never overflows the panel width).
     let rows_top = py + PAD + TITLE_H;
     for (i, row) in HELP_ROWS.iter().enumerate() {
         let y = rows_top + i as f32 * ROW_H;
-        labels.push((row.to_string(), px + pad_x, y, [200, 205, 220]));
+        labels.push((row.to_string(), px + pad_x, y, row_col));
     }
 
     HelpOverlay { quads, labels, panel }
@@ -122,9 +142,13 @@ pub fn build_help_overlay(win_w: u32, win_h: u32) -> HelpOverlay {
 mod tests {
     use super::*;
 
+    fn theme() -> jetty_core::Theme {
+        jetty_core::Theme::by_name("catppuccin_mocha")
+    }
+
     #[test]
     fn panel_is_centered_and_on_screen() {
-        let h = build_help_overlay(1000, 700);
+        let h = build_help_overlay(1000, 700, &theme());
         assert!(h.panel.x >= 0.0 && h.panel.y >= 0.0);
         assert!(h.panel.x + h.panel.w <= 1000.0 + 0.5);
         assert!(h.panel.y + h.panel.h <= 700.0 + 0.5);
@@ -138,7 +162,7 @@ mod tests {
         // Across a range of widths (including very narrow), no row's estimated
         // rendered text right edge may exceed the panel's right border.
         for w in [320u32, 500, 700, 1000, 1600] {
-            let h = build_help_overlay(w, 700);
+            let h = build_help_overlay(w, 700, &theme());
             let panel_right = h.panel.x + h.panel.w;
             for (text, x, _y, _c) in &h.labels {
                 let est_right = x + text.chars().count() as f32 * 9.8;
@@ -160,7 +184,7 @@ mod tests {
 
     #[test]
     fn lists_core_bindings() {
-        let h = build_help_overlay(1000, 700);
+        let h = build_help_overlay(1000, 700, &theme());
         let joined: String = h.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("F9"));
         assert!(joined.contains("Ctrl+Shift+P"));

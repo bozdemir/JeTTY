@@ -200,7 +200,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Pass 1: clear to theme bg + paint per-cell background quads UNDER text ---
     let (cell_w, cell_h) = text.cell_size();
-    let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, 0.0);
+    let sel_accent = terminal.theme().palette[4];
+    let sel_bg = [
+        ((terminal.theme().bg[0] as u16 + sel_accent[0] as u16 * 2) / 3) as u8,
+        ((terminal.theme().bg[1] as u16 + sel_accent[1] as u16 * 2) / 3) as u8,
+        ((terminal.theme().bg[2] as u16 + sel_accent[2] as u16 * 2) / 3) as u8,
+    ];
+    let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, 0.0, sel_bg);
     quad.render_clear(
         &device,
         &queue,
@@ -217,7 +223,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Draw scrollbar quad (and optionally the settings panel) over the text ---
     {
         let mut rects: Vec<jetty_render::Rect> = Vec::new();
-        if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, 0.0) {
+        let sb_fg = terminal.theme().fg;
+        let sb_thumb = [sb_fg[0], sb_fg[1], sb_fg[2], 160];
+        if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, 0.0, sb_thumb) {
             rects.push(r);
         }
 
@@ -273,14 +281,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // JETTY_SHOT_MENU — render the right-click context menu for visual checks.
         if std::env::var("JETTY_SHOT_MENU").is_ok() {
-            let menu = jetty_render::build_context_menu(620.0, 120.0, width, height, Some(1));
+            let menu = jetty_render::build_context_menu(620.0, 120.0, width, height, Some(1), terminal.theme());
             rects.extend(menu.quads);
             panel_labels.extend(menu.labels);
         }
 
         // JETTY_SHOT_HELP — render the Keyboard Shortcuts help overlay.
         if std::env::var("JETTY_SHOT_HELP").is_ok() {
-            let help = jetty_render::build_help_overlay(width, height);
+            let help = jetty_render::build_help_overlay(width, height, terminal.theme());
             rects.extend(help.quads);
             panel_labels.extend(help.labels);
         }
@@ -302,7 +310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // JETTY_SHOT_CONFIRM — render the "Close this tab?" confirmation popup.
         if std::env::var("JETTY_SHOT_CONFIRM").is_ok() {
-            let popup = jetty_render::build_confirm_close(width, height, "Tab 2");
+            let popup = jetty_render::build_confirm_close(width, height, "Tab 2", terminal.theme());
             rects.extend(popup.quads);
             panel_labels.extend(popup.labels);
         }
