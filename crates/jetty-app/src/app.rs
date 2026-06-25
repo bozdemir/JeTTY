@@ -254,6 +254,13 @@ pub struct App {
     pending_center_pos: Option<winit::dpi::PhysicalPosition<i32>>,
     /// Hide the window on focus loss (Yakuake auto-hide). Default ON.
     focus_autohide: bool,
+    /// Cached tab-bar metadata (title, is-active), rebuilt only when the tab
+    /// titles or the active index change. Avoids cloning every tab title on
+    /// every RedrawRequested (incl. animation frames) — speed-first hot path.
+    cached_tabs_meta: Vec<(String, bool)>,
+    /// Signature (hash of titles + active index) of `cached_tabs_meta`; when it
+    /// differs from the live signature, the cache is rebuilt.
+    cached_tabs_sig: u64,
     /// The id of the most recently focused window (main or settings). Used to
     /// suppress auto-hide when focus moved to our own Settings window.
     last_focused_window: Option<WindowId>,
@@ -336,6 +343,11 @@ pub struct App {
     debug: bool,
     /// When Some, the right-click context menu is open at this physical-pixel position.
     context_menu: Option<(f32, f32)>,
+    /// Cached item hit-test rects for the open context menu, built once when the
+    /// menu opens (they depend only on the anchor + window size). Reused for
+    /// hover/click hit-testing so high-frequency CursorMoved doesn't rebuild the
+    /// whole menu every move.
+    menu_item_rects: Vec<jetty_render::Rect>,
     /// Index of the menu item currently under the cursor (for hover highlight).
     menu_hover: Option<usize>,
     /// Inline tab rename: `Some(tab_index)` while the user is editing a tab title.
@@ -512,6 +524,8 @@ impl App {
             pending_center_frames: 0,
             pending_center_pos: None,
             focus_autohide: true,
+            cached_tabs_meta: Vec::new(),
+            cached_tabs_sig: u64::MAX,
             last_focused_window: None,
             switching_to_settings: false,
             dragging_dropdown: false,
@@ -544,6 +558,7 @@ impl App {
             selecting: false,
             debug,
             context_menu: None,
+            menu_item_rects: Vec::new(),
             menu_hover: None,
             renaming: None,
             rename_buf: String::new(),
@@ -784,6 +799,30 @@ impl App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    /// Return the cached tab-bar metadata, rebuilding it only when the titles
+    /// or the active index change (compared via a cheap signature hash). Avoids
+    /// cloning every tab title on every frame, including animation frames.
+    fn tabs_meta(&mut self) -> &[(String, bool)] {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.active.hash(&mut hasher);
+        self.tabs.len().hash(&mut hasher);
+        for t in &self.tabs {
+            t.title.hash(&mut hasher);
+        }
+        let sig = hasher.finish();
+        if sig != self.cached_tabs_sig {
+            self.cached_tabs_meta = self
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (t.title.clone(), i == self.active))
+                .collect();
+            self.cached_tabs_sig = sig;
+        }
+        &self.cached_tabs_meta
     }
 
     /// Jump to tab `n` (0-based), clamped to the valid range.
@@ -2112,21 +2151,18 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
                 // --- Context menu hover update ---
-                if let Some((mx, my)) = self.context_menu {
-                    if let Some(gpu) = &self.gpu {
-                        let (win_w, win_h) = (gpu.config.width, gpu.config.height);
-                        let theme = self.current_theme();
-                        let menu = jetty_render::build_context_menu(mx, my, win_w, win_h, None, &theme);
-                        let cx = self.cursor.0 as f32;
-                        let cy = self.cursor.1 as f32;
-                        let new_hover = menu.item_rects.iter().position(|r| {
-                            cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
-                        });
-                        if new_hover != self.menu_hover {
-                            self.menu_hover = new_hover;
-                            if let Some(win) = &self.window {
-                                win.request_redraw();
-                            }
+                // Reuse the cached item_rects (built when the menu opened) instead
+                // of rebuilding the whole menu on every (high-frequency) move.
+                if self.context_menu.is_some() {
+                    let cx = self.cursor.0 as f32;
+                    let cy = self.cursor.1 as f32;
+                    let new_hover = self.menu_item_rects.iter().position(|r| {
+                        cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
+                    });
+                    if new_hover != self.menu_hover {
+                        self.menu_hover = new_hover;
+                        if let Some(win) = &self.window {
+                            win.request_redraw();
                         }
                     }
                 }
@@ -2184,13 +2220,12 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 // --- Context menu hit-test (consume the click entirely) ---
-                if let Some((mx, my)) = self.context_menu.take() {
+                if self.context_menu.take().is_some() {
                     self.menu_hover = None;
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
-                    let theme = self.current_theme();
-                    let menu = jetty_render::build_context_menu(mx, my, w, h, None, &theme);
-                    let hit = menu.item_rects.iter().position(|r| {
+                    // Reuse the cached item_rects built when the menu opened.
+                    let hit = self.menu_item_rects.iter().position(|r| {
                         cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
                     });
                     if let Some(idx) = hit {
@@ -2487,6 +2522,15 @@ impl ApplicationHandler<AppEvent> for App {
                 self.help_open = false;
                 self.context_menu = Some((cx, cy));
                 self.menu_hover = None;
+                // Cache the item hit-test rects once (anchor + size fixed for the
+                // menu's lifetime) so CursorMoved hover doesn't rebuild the menu.
+                if let Some(gpu) = &self.gpu {
+                    let theme = self.current_theme();
+                    let menu = jetty_render::build_context_menu(
+                        cx, cy, gpu.config.width, gpu.config.height, None, &theme,
+                    );
+                    self.menu_item_rects = menu.item_rects;
+                }
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -2880,12 +2924,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // gathered before borrowing the render stack mutably).
                 let snap = self.active_tab().terminal.snapshot();
                 let theme = self.current_theme();
-                let tabs_meta: Vec<(String, bool)> = self
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| (t.title.clone(), i == self.active))
-                    .collect();
+                // Refresh the cached tab metadata (rebuilds only on change), then
+                // take it out so the later &mut self.gpu/text borrow doesn't
+                // conflict with this &self borrow; it is restored after rendering.
+                self.tabs_meta();
+                let tabs_meta = std::mem::take(&mut self.cached_tabs_meta);
                 let context_menu = self.context_menu;
                 let menu_hover = self.menu_hover;
                 let help_open = self.help_open;
@@ -2946,6 +2989,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let (Some(gpu), Some(text), Some(chrome_text), Some(quad)) =
                     (&mut self.gpu, &mut self.text, &mut self.chrome_text, &mut self.quad)
                 else {
+                    self.cached_tabs_meta = tabs_meta;
                     return;
                 };
                 let width = gpu.config.width;
@@ -3190,6 +3234,9 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     frame.present();
                 }
+                // Restore the tab-metadata cache taken above so it persists across
+                // frames (its signature still matches, so it won't rebuild).
+                self.cached_tabs_meta = tabs_meta;
             }
             _ => {}
         }

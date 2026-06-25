@@ -4,6 +4,7 @@ use glyphon::{
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use jetty_core::GridSnapshot;
+use std::sync::Arc;
 use wgpu::MultisampleState;
 
 /// The default terminal font. Matches the user's Konsole profile: MesloLGS NF
@@ -26,7 +27,14 @@ pub struct TextLayer {
     /// Growable pool of glyphon Buffers reused across frames for overlay labels.
     overlay_buffers: Vec<Buffer>,
     /// Current font family name (runtime-settable via `set_font_family`).
-    font_family: String,
+    /// `Arc<str>` so per-frame span building can share it without cloning the
+    /// string (the family name is captured by every cell's `Attrs`).
+    font_family: Arc<str>,
+    /// Per-frame scratch buffers, reused across `render_to` calls to avoid
+    /// reallocating ~rows*cols heap items every frame (speed-first hot path).
+    /// Taken out via `mem::take` during the frame and put back at the end.
+    text_scratch: String,
+    cell_ranges_scratch: Vec<(usize, usize, Color)>,
 }
 
 impl TextLayer {
@@ -116,7 +124,9 @@ impl TextLayer {
             cell_w,
             cell_h,
             overlay_buffers: Vec::new(),
-            font_family: family.to_string(),
+            font_family: Arc::from(family),
+            text_scratch: String::new(),
+            cell_ranges_scratch: Vec::new(),
         }
     }
 
@@ -159,7 +169,7 @@ impl TextLayer {
     /// the cell size, and resets the cursor buffer glyph with the new family.
     /// The caller must call `reflow()` and `request_redraw()` after this.
     pub fn set_font_family(&mut self, name: &str) {
-        self.font_family = name.to_string();
+        self.font_family = Arc::from(name);
         // Re-measure cell width with the new family.
         self.cell_w = measure_advance_family(&mut self.font_system, self.metrics, name);
         // Reset cursor buffer glyph so the block cursor uses the new family.
@@ -208,9 +218,14 @@ impl TextLayer {
     ) -> Result<(), PrepareError> {
         // Build per-cell color spans: one (&str slice, Attrs) pair per cell.
         // We build a single String containing all text, then collect borrowed slices from it.
-        let mut text = String::new();
+        // Reuse the scratch buffers (taken out so the later &mut self.font_system
+        // borrow doesn't conflict with the &self borrows in the spans) to avoid
+        // reallocating ~rows*cols heap items per frame.
+        let mut text = std::mem::take(&mut self.text_scratch);
+        text.clear();
         // Store (byte_start, byte_end, Color) for each cell so we can borrow slices after.
-        let mut cell_ranges: Vec<(usize, usize, Color)> = Vec::new();
+        let mut cell_ranges = std::mem::take(&mut self.cell_ranges_scratch);
+        cell_ranges.clear();
 
         for row in 0..snapshot.rows {
             for col in 0..snapshot.cols {
@@ -235,7 +250,9 @@ impl TextLayer {
 
         // Build the spans iterator: (&str, Attrs) tuples, borrowing slices from `text`.
         // We collect into a Vec to satisfy the borrow checker (spans borrow `text`).
-        let family_name = self.font_family.clone();
+        // Clone the Arc (a refcount bump, not a string copy) so the family name
+        // can be borrowed by every span without re-borrowing self.
+        let family_name = Arc::clone(&self.font_family);
         let spans: Vec<(&str, Attrs)> = cell_ranges
             .iter()
             .map(|(s, e, color)| {
@@ -262,6 +279,12 @@ impl TextLayer {
             Shaping::Basic,
             None,
         );
+
+        // `spans` is consumed and its borrows on `text`/`cell_ranges`/`family_name`
+        // are released; return the scratch buffers to self for reuse next frame.
+        drop(family_name);
+        self.text_scratch = text;
+        self.cell_ranges_scratch = cell_ranges;
 
         self.viewport.update(queue, Resolution { width, height });
 
