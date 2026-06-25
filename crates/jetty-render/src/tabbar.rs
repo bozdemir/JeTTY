@@ -66,16 +66,35 @@ pub struct TabBar {
 /// its stored title. `ctrl_hover` selects which window-control button is drawn
 /// highlighted (close hover reads red).
 pub fn build_tab_bar(width: u32, tabs: &[(String, bool)], theme: &Theme) -> TabBar {
-    build_tab_bar_ex(width, tabs, theme, None, CtrlHover::None)
+    build_tab_bar_ex(width, tabs, theme, None, CtrlHover::None, None)
 }
 
-/// Extended tab-bar builder with inline-rename and window-control hover state.
+/// Approximate chrome-font advance per character, in physical px. Used for the
+/// perf-HUD width reservation + right-alignment (matches help.rs/panel.rs math).
+const CHROME_CHAR_W: f32 = 9.6;
+/// Gap (px) between the perf HUD's left edge and the nearest tab/+button, so the
+/// reserved area never visually touches the tabs.
+const PERF_GAP: f32 = 16.0;
+/// Minimum tab-area width (px) that must remain for the tabs after reserving the
+/// perf HUD. If the HUD can't fit without squeezing tabs below this, it's HIDDEN
+/// (the tab layout then matches the no-HUD case exactly).
+const PERF_MIN_TABS_W: f32 = 220.0;
+
+/// Extended tab-bar builder with inline-rename, window-control hover state, and
+/// an optional right-aligned performance HUD label.
+///
+/// `perf` is `Some(string)` to show the live perf HUD (`⚡ … ms · … fps · …`)
+/// right-aligned just left of the window controls. Its width is RESERVED out of
+/// the tab area so tabs never overlap it; if the window is too narrow to fit the
+/// HUD without squeezing the tabs below a sane minimum, the HUD is HIDDEN and the
+/// tab layout is identical to the no-HUD case. `None` shows no HUD.
 pub fn build_tab_bar_ex(
     width: u32,
     tabs: &[(String, bool)],
     theme: &Theme,
     renaming: Option<(usize, &str)>,
     ctrl_hover: CtrlHover,
+    perf: Option<&str>,
 ) -> TabBar {
     let sw = width as f32;
     let h = TABBAR_H;
@@ -116,7 +135,25 @@ pub fn build_tab_bar_ex(
     // `tab_area_x` is the absolute x where the controls begin — the right
     // boundary for the tabs and the "+" button.
     let left = STRIP_PAD;
-    let tab_area_x = (sw - STRIP_PAD - CONTROLS_W).max(left);
+    // The controls region begins here; tabs+HUD must stay left of it.
+    let controls_left = (sw - STRIP_PAD - CONTROLS_W).max(left);
+
+    // --- Perf HUD reservation ---
+    // The HUD sits between the tabs and the window controls, right-aligned with a
+    // small gap before the controls. Reserve its measured width out of the tab
+    // area so tabs never overlap it. If reserving it would squeeze the tabs below
+    // PERF_MIN_TABS_W, HIDE the HUD entirely (perf_shown = false) so the tab
+    // layout is byte-identical to the no-HUD case.
+    let perf_w = perf
+        .map(|s| s.chars().count() as f32 * CHROME_CHAR_W)
+        .unwrap_or(0.0);
+    // Width carved out of the tab area when the HUD is shown: the label plus the
+    // gap to the tabs and a small gap to the controls.
+    let perf_reserve = if perf_w > 0.0 { perf_w + PERF_GAP * 1.5 } else { 0.0 };
+    let perf_shown = perf_w > 0.0 && (controls_left - perf_reserve - left) >= PERF_MIN_TABS_W;
+    // Right boundary for the tabs / "+" / overflow hint. Shrinks by the HUD
+    // reservation only when the HUD is actually shown.
+    let tab_area_x = if perf_shown { controls_left - perf_reserve } else { controls_left };
     // The "+" button sits after the last tab and must stay left of the controls,
     // so the tabs themselves get the area from `left` to `tab_area_x - PLUS_W`.
     let tabs_avail_w = (tab_area_x - left - PLUS_W).max(0.0);
@@ -254,6 +291,25 @@ pub fn build_tab_bar_ex(
         labels.push((format!("+{overflow}"), hint_x, 9.0, dim_fg));
     }
 
+    // --- Perf HUD label (right-aligned, just left of the window controls) ---
+    // Drawn dim (a bg→fg blend, theme-derived — never a hardcoded gray) so it
+    // reads as a muted status line, matching the chrome. Only emitted when the
+    // HUD fits without squeezing the tabs (perf_shown).
+    if perf_shown {
+        if let Some(s) = perf {
+            // Dim blend: ~45% of the way from bg toward fg.
+            let hud_color = [
+                (bg[0] as f32 + (fg[0] as f32 - bg[0] as f32) * 0.45) as u8,
+                (bg[1] as f32 + (fg[1] as f32 - bg[1] as f32) * 0.45) as u8,
+                (bg[2] as f32 + (fg[2] as f32 - bg[2] as f32) * 0.45) as u8,
+            ];
+            // Right-align: right edge sits PERF_GAP left of the controls region.
+            let hud_w = s.chars().count() as f32 * CHROME_CHAR_W;
+            let hud_x = (controls_left - PERF_GAP - hud_w).max(left);
+            labels.push((s.to_string(), hud_x, 9.0, hud_color));
+        }
+    }
+
     // --- Right-side controls (left→right): Help "?", Settings "⚙",
     // minimize "─", maximize "▢", close "✕" (rightmost). ---
     let hover_bg = active_bg;
@@ -377,7 +433,7 @@ mod tests {
     #[test]
     fn rename_shows_caret() {
         let tabs = [("Old".to_string(), true)];
-        let bar = build_tab_bar_ex(800, &tabs, &theme(), Some((0, "New")), CtrlHover::None);
+        let bar = build_tab_bar_ex(800, &tabs, &theme(), Some((0, "New")), CtrlHover::None, None);
         // Renaming shows the edit buffer + caret (a "❯" marker label precedes it,
         // so check across labels rather than a fixed index).
         let buf = bar.labels.iter().find(|l| l.0.contains('▏'));
@@ -385,10 +441,71 @@ mod tests {
         assert!(buf.unwrap().0.starts_with("New"));
     }
 
+    const PERF: &str = "⚡ 5.1 ms · 190 fps · 0.5% CPU · 155 MB/s";
+
+    #[test]
+    fn perf_hud_present_shrinks_tab_area_and_no_overlap() {
+        // Wide window: the HUD fits, is emitted as a label, reserves space (so the
+        // tab area is smaller than without it), and no tab/close rect overlaps it.
+        let tabs = [
+            ("Tab 1".to_string(), true),
+            ("Tab 2".to_string(), false),
+        ];
+        let with = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, Some(PERF));
+        let without = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, None);
+
+        // The HUD label is present.
+        let hud = with.labels.iter().find(|l| l.0 == PERF).expect("HUD label missing");
+        // It sits left of the window controls (help button is the leftmost control).
+        assert!(hud.1 < with.help_rect.x, "HUD must be left of the controls");
+
+        // The HUD's reserved left edge: tabs/close rects must not cross into it.
+        let hud_left = hud.1 - PERF_GAP;
+        for r in &with.tab_rects {
+            assert!(r.x + r.w <= hud_left + 0.5, "tab overlaps the HUD reservation");
+        }
+        for r in &with.close_rects {
+            assert!(r.x + r.w <= hud_left + 0.5, "close box overlaps the HUD");
+        }
+        // The "+" button stays left of the HUD too.
+        assert!(with.plus_rect.x + with.plus_rect.w <= hud_left + 0.5);
+
+        // Reservation actually shrinks the usable tab area: at default tab width
+        // both layouts draw full-width tabs, so compare the "+" position — with the
+        // HUD it must sit no further right than without (area is smaller-or-equal),
+        // and the HUD eats real space so it's strictly left in the multi-tab case.
+        assert!(with.plus_rect.x <= without.plus_rect.x);
+    }
+
+    #[test]
+    fn perf_hud_hidden_when_too_narrow_keeps_layout() {
+        // Narrow window: the HUD cannot fit without squeezing tabs, so it's hidden
+        // and the tab layout is byte-identical to the no-HUD case.
+        let tabs = [
+            ("Tab 1".to_string(), true),
+            ("Tab 2".to_string(), false),
+            ("Tab 3".to_string(), false),
+        ];
+        let with = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, Some(PERF));
+        let without = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, None);
+
+        // No HUD label emitted.
+        assert!(with.labels.iter().all(|l| l.0 != PERF), "HUD should be hidden");
+        // Tab + close + plus geometry identical to the no-HUD layout.
+        assert_eq!(with.tab_rects.len(), without.tab_rects.len());
+        for (a, b) in with.tab_rects.iter().zip(&without.tab_rects) {
+            assert!((a.x - b.x).abs() < 0.01 && (a.w - b.w).abs() < 0.01);
+        }
+        for (a, b) in with.close_rects.iter().zip(&without.close_rects) {
+            assert!((a.x - b.x).abs() < 0.01);
+        }
+        assert!((with.plus_rect.x - without.plus_rect.x).abs() < 0.01);
+    }
+
     #[test]
     fn close_hover_changes_glyph_color() {
         let tabs = [("Tab 1".to_string(), true)];
-        let hot = build_tab_bar_ex(800, &tabs, &theme(), None, CtrlHover::Close);
+        let hot = build_tab_bar_ex(800, &tabs, &theme(), None, CtrlHover::Close, None);
         // A theme-red hover quad is appended when the close control is hovered.
         let red = theme().palette[1];
         let red_bg = [red[0], red[1], red[2], 255];

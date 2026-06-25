@@ -320,7 +320,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ("Tab 2".to_string(), false),
                 ("Tab 3".to_string(), false),
             ];
-            let mut bar = jetty_render::build_tab_bar(width, &tabs, terminal.theme());
+            // JETTY_SHOT_PERF — inject a sample perf-HUD string to eyeball the
+            // right-aligned HUD placement (defaults to the design-04 hero value).
+            let perf_owned: Option<String> = std::env::var("JETTY_SHOT_PERF")
+                .ok()
+                .map(|v| if v.is_empty() {
+                    "⚡ 5.1 ms · 190 fps · 0.5% CPU · 155 MB/s".to_string()
+                } else {
+                    v
+                });
+            let mut bar = jetty_render::build_tab_bar_ex(
+                width,
+                &tabs,
+                terminal.theme(),
+                None,
+                jetty_render::CtrlHover::None,
+                perf_owned.as_deref(),
+            );
             // JETTY_TAB_BAR=bottom — place the bar flush at the window bottom.
             // build_tab_bar lays it out at y 0..TABBAR_H; translate it down.
             let tab_bar_bottom =

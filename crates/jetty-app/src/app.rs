@@ -372,6 +372,43 @@ pub struct App {
     /// keypress, any mouse click in the grid area, or Esc. A single bool — the
     /// check and the clear are both O(1) so the idle path is unaffected.
     welcome_open: bool,
+
+    // --- Live performance HUD (tab bar: ⚡ ms · fps · CPU% · VT MB/s) ---
+    // CRITICAL: none of these fields ever force or schedule a redraw. They are
+    // updated ONLY inside frames already happening for another reason; when the
+    // app is idle (ControlFlow::Wait) the HUD simply freezes at its last value.
+    /// Whether to build/measure the perf HUD at all (mirrors config.show_perf_hud).
+    /// When false the HUD is never built and sysinfo is never sampled — zero cost.
+    show_perf_hud: bool,
+    /// Wall-clock of the previous rendered frame, for the smoothed frame-ms.
+    /// `None` until the first frame. Updated each render.
+    last_frame_at: Option<std::time::Instant>,
+    /// Exponentially-smoothed frame time in ms (ms = ms*0.9 + dt*0.1). fps is
+    /// derived from this. Reads the render rate DURING activity; freezes when idle.
+    perf_ms: f32,
+    /// sysinfo handle scoped to THIS process's CPU usage only (cheap refresh).
+    perf_sys: sysinfo::System,
+    /// Our own PID, resolved once at startup so per-frame refreshes are O(1).
+    perf_pid: sysinfo::Pid,
+    /// Last time we refreshed CPU% (gated to ≤1 Hz — sysinfo needs ≥~200ms
+    /// between samples for a valid %, and per-frame refresh would be wasteful).
+    last_cpu_at: std::time::Instant,
+    /// Last sampled process CPU%, held between the ≤1 Hz refreshes.
+    perf_cpu: f32,
+    /// Running total of bytes read from the PTY(s), incremented at the drain site.
+    vt_bytes: u64,
+    /// vt_bytes value at the start of the current ~1s throughput window.
+    vt_bytes_at_window_start: u64,
+    /// Start instant of the current throughput window.
+    vt_window_start: std::time::Instant,
+    /// Last computed VT throughput in MB/s, held between ~1s window updates.
+    perf_mb: f32,
+    /// The perf-HUD string built on the most recent render, cached so the
+    /// click-time tab-bar hit-test rebuild reserves the IDENTICAL HUD width and
+    /// the tab/close hit-rects line up with what's drawn. `None` when the HUD is
+    /// disabled or hidden (too-narrow window). Not perf-critical (clone on render).
+    perf_label: Option<String>,
+
     /// Whether the in-window "Keyboard Shortcuts" help overlay is open. Drawn on
     /// top of everything in the main window; dismissed by Esc, the "?" button,
     /// or a click outside the panel.
@@ -577,6 +614,22 @@ impl App {
             last_strip_click: None,
             resize_cursor: ResizeZone::None,
             welcome_open: true, // overridden below by config.show_welcome
+            show_perf_hud: true, // overridden below by config.show_perf_hud
+            last_frame_at: None,
+            perf_ms: 0.0,
+            // Scope sysinfo to nothing-on-construct; the per-process refresh in
+            // the render path supplies CPU data. new() with an empty RefreshKind
+            // avoids the costly whole-system probe at startup.
+            perf_sys: sysinfo::System::new(),
+            perf_pid: sysinfo::get_current_pid().unwrap_or(sysinfo::Pid::from(0)),
+            // Force the first CPU refresh to run on the first HUD frame.
+            last_cpu_at: std::time::Instant::now() - std::time::Duration::from_secs(2),
+            perf_cpu: 0.0,
+            vt_bytes: 0,
+            vt_bytes_at_window_start: 0,
+            vt_window_start: std::time::Instant::now(),
+            perf_mb: 0.0,
+            perf_label: None,
             help_open: false,
             confirm_close: None,
             confirm_quit: false,
@@ -605,6 +658,7 @@ impl App {
         app.dropdown_width_pct = cfg.dropdown_width_pct.clamp(0.2, 1.0);
         app.focus_autohide = cfg.focus_autohide;
         app.welcome_open = cfg.show_welcome;
+        app.show_perf_hud = cfg.show_perf_hud;
 
         // Apply the initial theme+opacity so Terminal::new env defaults are
         // overridden by our managed state (avoids double-reads from env).
@@ -633,6 +687,9 @@ impl App {
             // manually set show_welcome = false in their TOML keeps that choice
             // even when persist() is called for an unrelated setting change.
             show_welcome: crate::config::Config::load().show_welcome,
+            // show_perf_hud is a startup preference too; preserve the on-disk
+            // value so an unrelated persist() never clobbers the user's choice.
+            show_perf_hud: crate::config::Config::load().show_perf_hud,
         }
         .save();
     }
@@ -1076,9 +1133,15 @@ impl App {
     fn drain_pty(&mut self) -> (bool, Vec<usize>) {
         let mut active_had_data = false;
         let mut exited: Vec<usize> = Vec::new();
+        // Perf-HUD VT throughput: count bytes read this drain into a local
+        // (avoids a self borrow inside the &mut self.tabs loop), folded into the
+        // running total after the loop. Cheap; the rate is derived over ~1s
+        // windows in the render path.
+        let mut vt_read: u64 = 0;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             let mut had = false;
             while let Ok(chunk) = tab.pty.output().try_recv() {
+                vt_read += chunk.len() as u64;
                 tab.terminal.feed(&chunk);
                 had = true;
             }
@@ -1097,7 +1160,76 @@ impl App {
                 exited.push(i);
             }
         }
+        self.vt_bytes += vt_read;
         (active_had_data, exited)
+    }
+
+    /// Update the live perf-HUD metrics and return the formatted HUD string, or
+    /// `None` when the HUD is disabled (`show_perf_hud == false`).
+    ///
+    /// CRITICAL — IDLE-PATH INVARIANT: this is called ONLY from the render path
+    /// (inside a frame that is already happening for some other reason). It NEVER
+    /// calls `request_redraw()` and NEVER schedules a timer, so it cannot wake the
+    /// app or regress the 0-CPU `ControlFlow::Wait` idle. When idle the HUD simply
+    /// freezes at its last value.
+    ///
+    /// Cost discipline:
+    /// - frame ms: one `Instant::now()` diff + exponential smooth (per frame).
+    /// - CPU%: sysinfo refresh of THIS process ONLY, gated to ≤1 Hz (sysinfo needs
+    ///   ≥~200ms between samples for a valid %), so it's nearly free per frame.
+    /// - VT MB/s: derived from the running `vt_bytes` counter over ~1s windows.
+    fn update_perf_hud(&mut self) -> Option<String> {
+        if !self.show_perf_hud {
+            return None;
+        }
+        let now = std::time::Instant::now();
+
+        // Frame time: exponentially-smoothed dt since the previous rendered frame.
+        if let Some(prev) = self.last_frame_at {
+            let dt_ms = now.duration_since(prev).as_secs_f32() * 1000.0;
+            // Ignore absurd gaps (e.g. after a long idle) so one stale dt doesn't
+            // spike the smoothed value; treat a >1s gap as a fresh start.
+            if dt_ms <= 1000.0 {
+                if self.perf_ms <= 0.0 {
+                    self.perf_ms = dt_ms;
+                } else {
+                    self.perf_ms = self.perf_ms * 0.9 + dt_ms * 0.1;
+                }
+            }
+        }
+        self.last_frame_at = Some(now);
+
+        // CPU%: refresh only this process, at most once per second.
+        if now.duration_since(self.last_cpu_at) >= std::time::Duration::from_secs(1) {
+            self.last_cpu_at = now;
+            self.perf_sys.refresh_processes(
+                sysinfo::ProcessesToUpdate::Some(&[self.perf_pid]),
+                true,
+            );
+            if let Some(proc_) = self.perf_sys.process(self.perf_pid) {
+                // sysinfo reports CPU as a % of ONE core (can exceed 100). Keep as-is.
+                self.perf_cpu = proc_.cpu_usage();
+            }
+        }
+
+        // VT throughput: bytes/s over the current ~1s window → MB/s.
+        let win = now.duration_since(self.vt_window_start).as_secs_f32();
+        if win >= 1.0 {
+            let delta = self.vt_bytes.saturating_sub(self.vt_bytes_at_window_start);
+            self.perf_mb = (delta as f32 / win) / (1024.0 * 1024.0);
+            self.vt_window_start = now;
+            self.vt_bytes_at_window_start = self.vt_bytes;
+        }
+
+        let ms = if self.perf_ms > 0.0 { self.perf_ms } else { 0.0 };
+        let fps = if ms > 0.0 { (1000.0 / ms).round().clamp(0.0, 9999.0) as i32 } else { 0 };
+        Some(format!(
+            "⚡ {ms:.1} ms · {fps} fps · {cpu:.0}% CPU · {mb:.0} MB/s",
+            ms = ms,
+            fps = fps,
+            cpu = self.perf_cpu,
+            mb = self.perf_mb,
+        ))
     }
 
     /// Close every tab index in `exited` (descending so earlier indices stay
@@ -2341,8 +2473,12 @@ impl ApplicationHandler<AppEvent> for App {
                         .map(|(i, t)| (t.title.clone(), i == self.active))
                         .collect();
                     let rename_ref = self.renaming.map(|i| (i, self.rename_buf.as_str()));
+                    // Reserve the SAME perf-HUD width the last render used, so the
+                    // tab/close hit-rects align with what's drawn (the HUD only
+                    // shrinks the tab area; window controls are unaffected).
+                    let perf_ref = self.perf_label.as_deref();
                     let mut bar = jetty_render::build_tab_bar_ex(
-                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None,
+                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, perf_ref,
                     );
                     // build_tab_bar_ex lays the bar out at y 0..TABBAR_H; shift its
                     // hit-test rects down to the bar's actual position (bottom mode).
@@ -2982,6 +3118,12 @@ impl ApplicationHandler<AppEvent> for App {
                 // conflict with this &self borrow; it is restored after rendering.
                 self.tabs_meta();
                 let tabs_meta = std::mem::take(&mut self.cached_tabs_meta);
+                // Live perf HUD: update metrics (frame ms / CPU% / VT MB/s) and
+                // build the label. This runs ONLY here, inside a frame already in
+                // progress — it never requests a redraw, so the idle path stays
+                // 0-CPU. Cached so the click-time hit-test reserves the same width.
+                let perf_string = self.update_perf_hud();
+                self.perf_label = perf_string.clone();
                 let context_menu = self.context_menu;
                 let menu_hover = self.menu_hover;
                 let help_open = self.help_open;
@@ -3081,7 +3223,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let ctrl_hover = ctrl_hover_at(cursor.0 as f32, cursor.1 as f32, width, bar_y);
                 let rename_ref = rename_state.as_ref().map(|(i, b)| (*i, b.as_str()));
                 let mut bar = jetty_render::build_tab_bar_ex(
-                    width, &tabs_meta, &theme, rename_ref, ctrl_hover,
+                    width, &tabs_meta, &theme, rename_ref, ctrl_hover, perf_string.as_deref(),
                 );
                 // Translate the bar quads + labels to its actual y (bottom mode)
                 // PLUS the dropdown slide so it moves with the content.

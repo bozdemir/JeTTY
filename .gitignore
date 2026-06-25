@@ -20,3 +20,9 @@ flamegraph.svg
 
 # Claude Code local state (workflow worktrees, session data)
 .claude/
+
+# Scratch / design references (browser-automation output, design refs, headless shots)
+/.playwright-mcp/
+/design-*.png
+/shot-*.png
+/*.zip

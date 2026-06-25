@@ -48,6 +48,13 @@ pub struct Config {
     /// Default `true`. Set to `false` to skip the splash entirely.
     #[serde(default = "default_show_welcome")]
     pub show_welcome: bool,
+    /// Show the live performance HUD in the tab bar (frame ms · fps · CPU% ·
+    /// VT MB/s). Default `true`. The HUD never forces a redraw — it updates only
+    /// inside frames already happening for some other reason, so the 0-CPU idle
+    /// path is preserved. Set to `false` to skip it (and the sysinfo sampling)
+    /// entirely.
+    #[serde(default = "default_show_perf_hud")]
+    pub show_perf_hud: bool,
 }
 
 fn default_summon_effect() -> String {
@@ -78,6 +85,10 @@ fn default_show_welcome() -> bool {
     true
 }
 
+fn default_show_perf_hud() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -93,6 +104,7 @@ impl Default for Config {
             focus_autohide: default_focus_autohide(),
             tab_bar_position: default_tab_bar_position(),
             show_welcome: default_show_welcome(),
+            show_perf_hud: default_show_perf_hud(),
         }
     }
 }
@@ -151,6 +163,7 @@ mod tests {
         assert!(c.focus_autohide);
         assert_eq!(c.tab_bar_position, "top");
         assert!(c.show_welcome);
+        assert!(c.show_perf_hud);
     }
 
     #[test]
@@ -175,6 +188,8 @@ mod tests {
         assert_eq!(c.tab_bar_position, "top");
         // An older config without show_welcome still loads as true.
         assert!(c.show_welcome);
+        // An older config without show_perf_hud still loads as true.
+        assert!(c.show_perf_hud);
     }
 
     #[test]
@@ -192,6 +207,7 @@ mod tests {
             focus_autohide: false,
             tab_bar_position: "bottom".to_string(),
             show_welcome: false,
+            show_perf_hud: false,
         };
         let s = toml::to_string_pretty(&c).expect("serialize");
         let back: Config = toml::from_str(&s).expect("deserialize");
@@ -216,6 +232,7 @@ mod tests {
             focus_autohide: true,
             tab_bar_position: "bottom".to_string(),
             show_welcome: true,
+            show_perf_hud: true,
         };
         std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
         let s = std::fs::read_to_string(&path).unwrap();
