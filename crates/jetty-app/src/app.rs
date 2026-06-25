@@ -803,8 +803,11 @@ impl App {
             return;
         }
         // The scrollbar track spans the grid area (always TABBAR_H shorter than
-        // the surface, whichever side the bar is on).
-        let track_h = (h as f32 - TABBAR_H).max(0.0);
+        // the surface, whichever side the bar is on), minus a small GAP at each
+        // end. Must match scrollbar_rect_geom so the drawn thumb and the drag map
+        // agree.
+        const GAP: f32 = 4.0;
+        let track_h = (h as f32 - TABBAR_H - GAP * 2.0).max(0.0);
         // Recompute thumb height the same way as the geometry function.
         let rows = self.active_tab().terminal.rows();
         let total = rows + max;
@@ -816,7 +819,7 @@ impl App {
         }
 
         // Cursor y is absolute; subtract the grid origin so 0 == track top.
-        let thumb_top = ((self.cursor.1 as f32 - self.grid_top_offset()) - self.drag_grab_dy).clamp(0.0, travel);
+        let thumb_top = ((self.cursor.1 as f32 - self.grid_top_offset() - GAP) - self.drag_grab_dy).clamp(0.0, travel);
         // frac=0 → thumb at top → scroll_offset=max (oldest history)
         // frac=1 → thumb at bottom → scroll_offset=0 (live bottom)
         let frac = thumb_top / travel;

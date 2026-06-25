@@ -430,12 +430,18 @@ pub fn scrollbar_rect_geom(
     if scroll_max == 0 {
         return None;
     }
-    // The scrollbar spans the grid area below the tab bar (screen_h - top_offset).
-    let track_h = (screen_h as f32 - top_offset).max(0.0);
+    // The track is the GRID area, which is ALWAYS TABBAR_H shorter than the
+    // surface (the bar takes that height whichever side it sits on). Using
+    // `screen_h - top_offset` overshot in BOTTOM-bar mode (top_offset = 0): the
+    // scrollbar ran the full height and collided with the bottom window controls
+    // (the ✕). A small GAP also keeps the thumb clear of the bar / controls.
+    const GAP: f32 = 4.0; // keep in sync with apply_scroll_from_cursor
+    let track_top = top_offset + GAP;
+    let track_h = (screen_h as f32 - crate::TABBAR_H - GAP * 2.0).max(0.0);
     let total = rows + scroll_max;
     let thumb_h = (track_h * rows as f32 / total as f32).max(24.0);
     let frac = (scroll_max - scroll_offset) as f32 / scroll_max as f32;
-    let thumb_y = top_offset + frac * (track_h - thumb_h);
+    let thumb_y = track_top + frac * (track_h - thumb_h);
     let thumb_w = 14.0; // wide enough to grab comfortably
     Some(Rect {
         x: screen_w as f32 - thumb_w,
