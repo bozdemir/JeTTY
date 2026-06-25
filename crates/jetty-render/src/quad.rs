@@ -344,18 +344,26 @@ fn srgb_to_linear(c: u8) -> f64 {
 }
 
 /// The wgpu clear color for the terminal's default background, derived from the
-/// snapshot's theme bg. Premultiplied by alpha so transparent themes composite
-/// correctly under `PreMultiplied` alpha mode (and harmless when alpha == 255).
+/// snapshot's theme bg. `premultiply` MUST match the surface's chosen
+/// `CompositeAlphaMode` (see `GpuContext::premultiply_clear`):
+///   • `true`  (PreMultiplied surface — Vulkan/Wayland): rgb is multiplied by
+///     alpha so transparent themes composite correctly.
+///   • `false` (PostMultiplied surface — Metal/macOS, or Opaque): rgb stays
+///     STRAIGHT; the compositor multiplies by alpha itself. Premultiplying here
+///     would double-darken transparent themes (and on Metal, without selecting
+///     PostMultiplied at all the window can't be see-through).
+/// Harmless either way when alpha == 255.
 ///
 /// This is the same value `TextLayer::render_to` used to clear with; it now lives
 /// here so the per-cell background quad pass (which owns the clear) can reuse it.
-pub fn default_bg_clear(snapshot: &jetty_core::GridSnapshot) -> wgpu::Color {
+pub fn default_bg_clear(snapshot: &jetty_core::GridSnapshot, premultiply: bool) -> wgpu::Color {
     let [br, bg_, bb, ba] = snapshot.bg_rgba;
     let a = ba as f64 / 255.0;
+    let m = if premultiply { a } else { 1.0 };
     wgpu::Color {
-        r: srgb_to_linear(br) * a,
-        g: srgb_to_linear(bg_) * a,
-        b: srgb_to_linear(bb) * a,
+        r: srgb_to_linear(br) * m,
+        g: srgb_to_linear(bg_) * m,
+        b: srgb_to_linear(bb) * m,
         a,
     }
 }

@@ -377,7 +377,10 @@ impl TextLayer {
             // per-cell background pass's `default_bg_clear`. When `clear` is false
             // the background was already painted by a prior quad pass, so we load.
             let load = if clear {
-                wgpu::LoadOp::Clear(crate::quad::default_bg_clear(snapshot))
+                // This text-owned clear is not the live macOS surface clear (the
+                // app loads over the quad pass's clear at default_bg_clear); keep
+                // the historical premultiplied value for the bench/convenience paths.
+                wgpu::LoadOp::Clear(crate::quad::default_bg_clear(snapshot, true))
             } else {
                 wgpu::LoadOp::Load
             };

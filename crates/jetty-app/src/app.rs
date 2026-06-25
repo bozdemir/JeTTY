@@ -3267,7 +3267,10 @@ impl ApplicationHandler<AppEvent> for App {
                         width,
                         height,
                         &bg_rects,
-                        jetty_render::default_bg_clear(&snap),
+                        // premultiply the clear to match the surface's alpha_mode
+                        // (PreMultiplied on Vulkan, straight on Metal/macOS) so the
+                        // window is correctly see-through on every backend.
+                        jetty_render::default_bg_clear(&snap, gpu.premultiply_clear),
                     );
                     // Pass 2: draw glyphs on top of the painted background (load),
                     // offset down by the tab bar height.

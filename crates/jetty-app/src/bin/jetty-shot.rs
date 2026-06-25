@@ -223,7 +223,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         width,
         height,
         &bg_rects,
-        jetty_render::default_bg_clear(&snap),
+        // Headless harness CPU-composites over its own checkerboard, which expects
+        // the historical premultiplied clear — keep it independent of any surface.
+        jetty_render::default_bg_clear(&snap, true),
     );
 
     // --- Pass 2: render the grid text on top of the painted background (load) ---

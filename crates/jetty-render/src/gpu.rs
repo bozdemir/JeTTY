@@ -9,6 +9,10 @@ pub struct GpuContext {
     /// Human-readable wgpu backend name captured at adapter selection, e.g.
     /// "Vulkan", "Metal", "Gl". Used by the Welcome overlay "Render" row.
     pub backend_name: String,
+    /// Whether the frame clear should premultiply the theme bg by its alpha, to
+    /// match the chosen surface `alpha_mode` (true for PreMultiplied, false for
+    /// PostMultiplied/Opaque). See `default_bg_clear`.
+    pub premultiply_clear: bool,
 }
 
 impl GpuContext {
@@ -88,20 +92,33 @@ impl GpuContext {
             .or_else(|| caps.formats.first().copied())
             .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
 
-        // Prefer an alpha-capable composite mode for window transparency.
-        // PreMultiplied is most widely supported on Wayland/macOS. We do NOT use
-        // PostMultiplied: our clear color (default_bg_clear) is premultiplied and
-        // the quad pipeline uses straight ALPHA_BLENDING, leaving the framebuffer
-        // premultiplied — feeding that to PostMultiplied (which expects straight
-        // alpha) would multiply by alpha twice and render transparent themes too
-        // dark. So fall back straight to Opaque (always safe), then Auto.
+        // Pick a transparency-capable composite mode from what the SURFACE offers
+        // (capability-driven — NOT OS-gated). PreMultiplied and PostMultiplied want
+        // DIFFERENT framebuffer conventions:
+        //   • PreMultiplied  → fb.rgb already multiplied by alpha; compositor does
+        //                       fb + (1-fb.a)*dst.            (Vulkan/Wayland path)
+        //   • PostMultiplied → fb.rgb is STRAIGHT; compositor does fb.rgb*fb.a +
+        //                       (1-fb.a)*dst.                 (Metal/macOS path —
+        //                       Metal surfaces expose Opaque + PostMultiplied but
+        //                       NOT PreMultiplied, so without this a Mac falls to
+        //                       Opaque and the window is never see-through.)
+        // We record which we picked and let the frame clear match it via
+        // `premultiply_clear`: premultiply the bg ONLY for PreMultiplied. Feeding a
+        // premultiplied clear to PostMultiplied is what made transparent themes
+        // "too dark" before — fixed by using a straight clear in that mode.
+        // Order: PreMultiplied → PostMultiplied → Opaque → Auto.
         let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
             wgpu::CompositeAlphaMode::PreMultiplied
+        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+            wgpu::CompositeAlphaMode::PostMultiplied
         } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
             wgpu::CompositeAlphaMode::Opaque
         } else {
             wgpu::CompositeAlphaMode::Auto
         };
+        // The frame clear premultiplies the theme bg by its alpha ONLY for a
+        // PreMultiplied surface; PostMultiplied/Opaque want straight rgb.
+        let premultiply_clear = alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -118,7 +135,7 @@ impl GpuContext {
         // Capture the backend name for display in the Welcome overlay.
         let backend_name = format!("{:?}", adapter.get_info().backend);
 
-        Some(Self { surface, device, queue, config, format, backend_name })
+        Some(Self { surface, device, queue, config, format, backend_name, premultiply_clear })
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
