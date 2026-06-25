@@ -58,8 +58,12 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // Radial chromatic aberration: split R/B along the radial direction. Kept
     // modest so a low t reads as a soft, coherent defocus rather than a rainbow
     // smear on high-contrast text.
-    let dir = normalize(uv - vec2(0.5, 0.5));
-    let ca = (1.0 - t) * 0.012 * length(uv - vec2(0.5, 0.5));
+    // Guard the center pixel: normalize(vec2(0,0)) is NaN; NaN * ca (even ca=0)
+    // stays NaN and would corrupt the center fragment's R/B samples.
+    let dv = uv - vec2(0.5, 0.5);
+    let dl = length(dv);
+    let dir = select(vec2(0.0, 0.0), dv / dl, dl > 0.0001);
+    let ca = (1.0 - t) * 0.012 * dl;
     let r = blur_chan(uv + dir * ca, off, 0);
     let g = blur_chan(uv, off, 1);
     let b = blur_chan(uv - dir * ca, off, 2);
@@ -75,6 +79,9 @@ pub struct FocusPull {
     uniform_buf: wgpu::Buffer,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    /// Cached (offscreen view, bind group); rebuilt only when the frame view
+    /// changes (resize) instead of every animation frame. See LiquidDrop.
+    cached_bind: std::cell::RefCell<Option<(wgpu::TextureView, wgpu::BindGroup)>>,
 }
 
 impl FocusPull {
@@ -166,7 +173,13 @@ impl FocusPull {
             cache: None,
         });
 
-        Self { pipeline, uniform_buf, bind_group_layout, sampler }
+        Self {
+            pipeline,
+            uniform_buf,
+            bind_group_layout,
+            sampler,
+            cached_bind: std::cell::RefCell::new(None),
+        }
     }
 
     /// Run the FocusPull pass: sample `frame_tex_view` (the offscreen rendered
@@ -188,21 +201,28 @@ impl FocusPull {
         let params: [f32; 4] = [t, 0.0, 0.0, 0.0];
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&params));
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("focus-bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(frame_tex_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        // Rebuild the bind group only when the offscreen view changes (resize).
+        let mut cache = self.cached_bind.borrow_mut();
+        let stale = cache.as_ref().map(|(v, _)| v != frame_tex_view).unwrap_or(true);
+        if stale {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("focus-bg"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(frame_tex_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            *cache = Some((frame_tex_view.clone(), bg));
+        }
+        let bind_group = &cache.as_ref().unwrap().1;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("focus-encoder"),
@@ -222,7 +242,7 @@ impl FocusPull {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         queue.submit(Some(encoder.finish()));

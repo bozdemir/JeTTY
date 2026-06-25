@@ -44,7 +44,11 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let dr = dist - ring_r;
     let envelope = exp(-pow(dr / 0.08, 2.0));        // only the wavefront ring is active
     let amp = 0.025 * pow(1.0 - t, 2.0);             // decays to 0 at t=1
-    let dir = normalize(uv - vec2(0.5, 0.5));
+    // Guard the center pixel: normalize(vec2(0,0)) is NaN, which would corrupt
+    // the exact-center fragment. Fall back to a zero direction there.
+    let dv = uv - vec2(0.5, 0.5);
+    let dl = length(dv);
+    let dir = select(vec2(0.0, 0.0), dv / dl, dl > 0.0001);
     let duv = uv + dir * sin(dr * 40.0) * envelope * amp;
     return textureSample(frame, samp, clamp(duv, vec2(0.0, 0.0), vec2(1.0, 1.0)));
 }
@@ -55,6 +59,11 @@ pub struct LiquidDrop {
     uniform_buf: wgpu::Buffer,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    /// Cached (offscreen view, bind group). The bind group only depends on the
+    /// uniform buffer + sampler (stable) and the frame view (changes on resize),
+    /// so we rebuild it only when the view changes instead of every frame.
+    /// `RefCell` because `apply` takes `&self` (the caller holds a `&mut gpu`).
+    cached_bind: std::cell::RefCell<Option<(wgpu::TextureView, wgpu::BindGroup)>>,
 }
 
 impl LiquidDrop {
@@ -148,7 +157,13 @@ impl LiquidDrop {
             cache: None,
         });
 
-        Self { pipeline, uniform_buf, bind_group_layout, sampler }
+        Self {
+            pipeline,
+            uniform_buf,
+            bind_group_layout,
+            sampler,
+            cached_bind: std::cell::RefCell::new(None),
+        }
     }
 
     /// Run the LiquidDrop pass: sample `frame_tex_view` (the offscreen rendered
@@ -170,21 +185,30 @@ impl LiquidDrop {
         let params: [f32; 4] = [t, 0.0, 0.0, 0.0];
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&params));
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("liquid-bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(frame_tex_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        // Rebuild the bind group only when the offscreen view changes (resize);
+        // otherwise reuse the cached one to avoid a GPU allocator round-trip on
+        // every animation frame.
+        let mut cache = self.cached_bind.borrow_mut();
+        let stale = cache.as_ref().map(|(v, _)| v != frame_tex_view).unwrap_or(true);
+        if stale {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("liquid-bg"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(frame_tex_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            *cache = Some((frame_tex_view.clone(), bg));
+        }
+        let bind_group = &cache.as_ref().unwrap().1;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("liquid-encoder"),
@@ -204,7 +228,7 @@ impl LiquidDrop {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         queue.submit(Some(encoder.finish()));
