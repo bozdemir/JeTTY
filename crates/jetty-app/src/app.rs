@@ -257,6 +257,12 @@ pub struct App {
     /// Cached tab-bar metadata (title, is-active), rebuilt only when the tab
     /// titles or the active index change. Avoids cloning every tab title on
     /// every RedrawRequested (incl. animation frames) — speed-first hot path.
+    /// Cached "window top-flush against the monitor" flag (drives top-corner
+    /// rounding in Dropdown mode). Recomputed only on non-animating frames so the
+    /// outer_position()/current_monitor() syscalls don't run ~60fps during a
+    /// dropdown slide (the window doesn't move during the slide — it's a content
+    /// y-offset), and reused from the cache while sliding.
+    cached_top_flush: bool,
     cached_tabs_meta: Vec<(String, bool)>,
     /// Signature (hash of titles + active index) of `cached_tabs_meta`; when it
     /// differs from the live signature, the cache is rebuilt.
@@ -524,6 +530,7 @@ impl App {
             pending_center_frames: 0,
             pending_center_pos: None,
             focus_autohide: true,
+            cached_top_flush: false,
             cached_tabs_meta: Vec::new(),
             cached_tabs_sig: u64::MAX,
             last_focused_window: None,
@@ -2940,16 +2947,23 @@ impl ApplicationHandler<AppEvent> for App {
                 // Derive "top-flush" from the window's outer position vs the
                 // monitor top. On Wayland outer_position() is Err → not flush, so
                 // we keep all-4 rounding (accepted degradation, no DE code).
-                let top_flush = self.window_mode == WindowMode::Dropdown
-                    && self
-                        .window
-                        .as_ref()
-                        .and_then(|w| {
-                            let p = w.outer_position().ok()?;
-                            let mon = w.current_monitor().or_else(|| w.available_monitors().next())?;
-                            Some(p.y <= mon.position().y + 1)
-                        })
-                        .unwrap_or(false);
+                // Recompute the (syscall-backed) top-flush flag only on
+                // non-animating frames; during a dropdown slide the window is
+                // stationary, so reuse the cache and skip the per-frame
+                // outer_position()/current_monitor() round-trips.
+                if self.slide_anim.is_none() {
+                    self.cached_top_flush = self.window_mode == WindowMode::Dropdown
+                        && self
+                            .window
+                            .as_ref()
+                            .and_then(|w| {
+                                let p = w.outer_position().ok()?;
+                                let mon = w.current_monitor().or_else(|| w.available_monitors().next())?;
+                                Some(p.y <= mon.position().y + 1)
+                            })
+                            .unwrap_or(false);
+                }
+                let top_flush = self.cached_top_flush;
                 let corner_mask = self.corner_mask.as_ref();
                 let bayer_reveal = self.bayer_reveal.as_ref();
                 let phosphor = self.phosphor.as_ref();

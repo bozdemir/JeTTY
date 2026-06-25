@@ -86,17 +86,18 @@ impl GpuContext {
             .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
 
         // Prefer an alpha-capable composite mode for window transparency.
-        // PreMultiplied is most widely supported on Wayland/macOS; fall back to
-        // PostMultiplied, then whatever the driver reports first, then Auto.
+        // PreMultiplied is most widely supported on Wayland/macOS. We do NOT use
+        // PostMultiplied: our clear color (default_bg_clear) is premultiplied and
+        // the quad pipeline uses straight ALPHA_BLENDING, leaving the framebuffer
+        // premultiplied — feeding that to PostMultiplied (which expects straight
+        // alpha) would multiply by alpha twice and render transparent themes too
+        // dark. So fall back straight to Opaque (always safe), then Auto.
         let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
             wgpu::CompositeAlphaMode::PreMultiplied
-        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
-            wgpu::CompositeAlphaMode::PostMultiplied
+        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
         } else {
-            caps.alpha_modes
-                .first()
-                .copied()
-                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
+            wgpu::CompositeAlphaMode::Auto
         };
 
         let config = wgpu::SurfaceConfiguration {
