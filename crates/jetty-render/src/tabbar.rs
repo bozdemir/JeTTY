@@ -18,7 +18,7 @@ const CTRL_W: f32 = 28.0;
 pub const CONTROLS_W: f32 = CTRL_W * 5.0;
 /// Inset of the whole tab strip from the window's left/right edges, so tabs and
 /// the window controls don't sit flush against the rounded window corners.
-const STRIP_PAD: f32 = 8.0;
+pub const STRIP_PAD: f32 = 8.0;
 
 /// Which window-control button (if any) is hovered, for the highlight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

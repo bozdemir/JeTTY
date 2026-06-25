@@ -245,11 +245,23 @@ pub struct App {
     /// post-map redraws makes the WM honor the top-strip position; counts down to
     /// 0 so idle CPU returns to 0.
     pending_dock_frames: u8,
+    /// Center-mode analogue of pending_dock_frames: X11/KWin likewise ignores a
+    /// set_outer_position issued before the window is mapped, discarding the
+    /// user's saved position on every summon. Re-assert it on the first few
+    /// post-map redraws; counts down to 0 so idle CPU returns to 0.
+    pending_center_frames: u8,
+    /// The position to re-assert while pending_center_frames > 0.
+    pending_center_pos: Option<winit::dpi::PhysicalPosition<i32>>,
     /// Hide the window on focus loss (Yakuake auto-hide). Default ON.
     focus_autohide: bool,
     /// The id of the most recently focused window (main or settings). Used to
     /// suppress auto-hide when focus moved to our own Settings window.
     last_focused_window: Option<WindowId>,
+    /// Set when the Settings window gains focus; consumed by the main window's
+    /// Focused(false) to suppress auto-hide even when X11 delivers the main
+    /// Focused(false) BEFORE the settings Focused(true) (the last_focused_window
+    /// check alone loses that race).
+    switching_to_settings: bool,
     /// Whether the user is dragging the Dropdown-height slider in Settings.
     dragging_dropdown: bool,
     /// Whether the user is dragging the Dropdown-width slider in Settings.
@@ -497,8 +509,11 @@ impl App {
             dropdown_width_pct: 1.0,
             slide_anim: None,
             pending_dock_frames: 0,
+            pending_center_frames: 0,
+            pending_center_pos: None,
             focus_autohide: true,
             last_focused_window: None,
+            switching_to_settings: false,
             dragging_dropdown: false,
             dragging_dropdown_width: false,
             wayland_warned: false,
@@ -872,6 +887,9 @@ impl App {
         match mode {
             WindowMode::Center => {
                 self.slide_anim = None;
+                // Stop any in-flight dropdown dock re-assertion so it can't snap a
+                // just-switched Center window back to the top strip.
+                self.pending_dock_frames = 0;
             }
             WindowMode::Dropdown => {
                 // Recompute dock geometry (ignore stale pos). If the window is
@@ -1156,9 +1174,14 @@ impl App {
                     WindowMode::Center => {
                         win.set_visible(true);
                         // Re-summon at the spot the user left it; first → center.
+                        // X11/KWin ignores a position issued before the window is
+                        // mapped, so re-assert it on the next few post-map redraws
+                        // (mirrors pending_dock_frames) or the saved spot is lost.
                         match self.last_pos {
                             Some(pos) => {
                                 let _ = win.set_outer_position(pos);
+                                self.pending_center_pos = Some(pos);
+                                self.pending_center_frames = 5;
                             }
                             None => center_window(win),
                         }
@@ -1248,6 +1271,12 @@ impl App {
 
     /// Drop the settings window and its render stack (closes/hides the OS window).
     fn close_settings_window(&mut self) {
+        // Drop any focus bookkeeping that pointed at the now-destroyed settings
+        // window so the main window's auto-hide guard doesn't malfunction.
+        if self.last_focused_window == self.settings_window.as_ref().map(|w| w.id()) {
+            self.last_focused_window = None;
+        }
+        self.switching_to_settings = false;
         self.settings_window = None;
         self.settings_gpu = None;
         self.settings_text = None;
@@ -1610,6 +1639,7 @@ impl App {
                 // merely clicked into Settings.
                 if let Some(w) = &self.settings_window {
                     self.last_focused_window = Some(w.id());
+                    self.switching_to_settings = true;
                     // macOS first-paint nudge: a request_redraw issued while the
                     // window was still being shown can be dropped, leaving it blank
                     // until the user clicks. Re-request now that it is shown+focused.
@@ -1621,6 +1651,15 @@ impl App {
                 // The Poll repaint window (settings_paint_until) self-expires; no
                 // need to clear it here — we keep repainting until the surface has
                 // presented at least once.
+            }
+            WindowEvent::Focused(false) => {
+                // Settings lost focus: clear last_focused_window so a later main
+                // Focused(false) (focus left both Jetty windows to a third app) is
+                // not mistaken for a switch-to-settings and the terminal hides.
+                self.switching_to_settings = false;
+                if self.last_focused_window == self.settings_window.as_ref().map(|w| w.id()) {
+                    self.last_focused_window = None;
+                }
             }
             _ => {}
         }
@@ -1656,6 +1695,7 @@ impl ApplicationHandler<AppEvent> for App {
             || self.slide_anim.is_some()
             || self.summon_pending
             || self.pending_dock_frames > 0
+            || self.pending_center_frames > 0
             || reflow_waiting;
         if main_pending {
             if let Some(w) = &self.window {
@@ -1955,9 +1995,11 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // Fired when the window is moved between monitors with different DPI.
                 // Rebuild TextLayer with the new physical font size (logical * new
-                // scale), then reflow() recomputes the grid from the current GPU
-                // surface size and the new cell metrics. A subsequent Resized event
-                // handles the surface-size change, so we only touch the font here.
+                // scale). The surface has NOT resized yet — gpu.resize() only runs
+                // in the following Resized event — so calling reflow() here would
+                // SIGWINCH the shell with the stale surface size. Instead, arm the
+                // debounced reflow and let the Resized event's reflow correct the
+                // grid against the real surface size.
                 let scale = scale_factor as f32;
                 if let Some(ref g) = self.gpu {
                     let new_text = TextLayer::new_with_family(
@@ -1971,7 +2013,8 @@ impl ApplicationHandler<AppEvent> for App {
                         &g.device, &g.queue, g.format, FONT_LOGICAL_DEFAULT * scale, &self.font_family,
                     ));
                 }
-                self.reflow();
+                self.reflow_pending_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(120));
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -1994,8 +2037,12 @@ impl ApplicationHandler<AppEvent> for App {
                 // a synthetic Focused(false) during set_visible/focus), and focus
                 // did NOT move to our own Settings window.
                 let settings_id = self.settings_window.as_ref().map(|w| w.id());
-                let to_settings = self.last_focused_window.is_some()
-                    && self.last_focused_window == settings_id;
+                // `switching_to_settings` covers the X11 case where the main
+                // Focused(false) arrives BEFORE the settings Focused(true), which
+                // the last_focused_window comparison alone would miss.
+                let to_settings = self.switching_to_settings
+                    || (self.last_focused_window.is_some()
+                        && self.last_focused_window == settings_id);
                 if self.focus_autohide
                     && self.visible
                     && self.summon_anim.is_none()
@@ -2789,7 +2836,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // ignores a set_outer_position issued before the window is realized
                 // (it would land centered), so re-apply the top-strip geometry on
                 // the first few post-map redraws. Counts down → idle CPU back to 0.
-                if self.pending_dock_frames > 0 {
+                if self.pending_dock_frames > 0 && self.window_mode == WindowMode::Dropdown {
                     self.pending_dock_frames -= 1;
                     if let Some(win) = &self.window {
                         dock_window_top(win, self.dropdown_width_pct, self.dropdown_height_pct);
@@ -2797,6 +2844,21 @@ impl ApplicationHandler<AppEvent> for App {
                             win.request_redraw();
                         }
                     }
+                } else if self.pending_dock_frames > 0 {
+                    // Mode switched away from Dropdown mid-countdown — stop docking.
+                    self.pending_dock_frames = 0;
+                }
+                // Center-mode position re-assertion (see pending_center_frames).
+                if self.pending_center_frames > 0 && self.window_mode == WindowMode::Center {
+                    self.pending_center_frames -= 1;
+                    if let (Some(win), Some(pos)) = (&self.window, self.pending_center_pos) {
+                        let _ = win.set_outer_position(pos);
+                        if self.pending_center_frames > 0 {
+                            win.request_redraw();
+                        }
+                    }
+                } else if self.pending_center_frames > 0 {
+                    self.pending_center_frames = 0;
                 }
                 // Start the summon clock on the first real frame after a show (see
                 // `summon_pending`) — guarantees t starts at 0 even if macOS delayed
@@ -3178,14 +3240,19 @@ fn ctrl_hover_at(cx: f32, cy: f32, width: u32, bar_y: f32) -> jetty_render::Ctrl
     if cy < bar_y || cy >= bar_y + TABBAR_H {
         return CtrlHover::None;
     }
-    let sw = width as f32;
+    // The controls are inset from the surface's right edge by STRIP_PAD; mirror
+    // that here or every hover zone is shifted STRIP_PAD px right of the buttons.
+    let sw = width as f32 - jetty_render::STRIP_PAD;
     let ctrl_w = jetty_render::CONTROLS_W / 5.0;
     let help_x = sw - jetty_render::CONTROLS_W; // sw - 5*ctrl_w
     let settings_x = sw - ctrl_w * 4.0;
     let min_x = sw - ctrl_w * 3.0;
     let max_x = sw - ctrl_w * 2.0;
     let close_x = sw - ctrl_w;
-    if cx >= close_x {
+    if cx >= sw {
+        // Beyond the close button's right edge (in the STRIP_PAD margin).
+        CtrlHover::None
+    } else if cx >= close_x {
         CtrlHover::Close
     } else if cx >= max_x {
         CtrlHover::Max
