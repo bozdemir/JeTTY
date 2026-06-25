@@ -69,12 +69,20 @@ const CHIP_NAMES: [&str; 5] = ["Mocha", "Tokyo", "Gruv", "Drac", "Onyx"];
 /// If more families exist, the list scrolls via `font_scroll_offset`.
 const MAX_FONT_ROWS: usize = 5;
 
+/// Chrome-font character advance (px). Used for right-aligned value readouts
+/// and scroll-hint sizing. Matches the advance used in help.rs/tabbar.rs.
+const CHAR_W: f32 = 9.8;
+
 /// Settings-panel dimensions in logical px. The separate Settings OS window is
 /// sized to these (+ border) — see `SETTINGS_WIN_*` in jetty-app. Growing the
 /// panel here (e.g. adding a row) automatically resizes that window, so the
 /// bottom rows can never be clipped off a too-short window again.
+///
+/// PANEL_H was grown from 744→860 to accommodate the 2-column×3-row theme card
+/// grid (card_h=40, gap=8 → 3 rows = 136px) replacing the original single-row
+/// chips (36px). The 96px delta keeps the title+scroll hint math self-consistent.
 pub const PANEL_W: f32 = 380.0;
-pub const PANEL_H: f32 = 744.0;
+pub const PANEL_H: f32 = 860.0;
 
 /// Build the settings panel for the given screen size, opacity (0.1..=1.0),
 /// selected theme index (index into `jetty_core::theme::PRESETS`), current
@@ -134,6 +142,9 @@ pub fn build_panel(
     let slider_track_col: [u8; 4] = [track3[0], track3[1], track3[2], 255];
     // Accent for handles / selection highlights.
     let accent_col: [u8; 4] = [accent[0], accent[1], accent[2], 255];
+    // Accent fill for the "filled" (left) portion of slider tracks.
+    // Uses a slightly translucent accent so the track gradient reads clearly.
+    let accent_fill: [u8; 4] = [accent[0], accent[1], accent[2], 200];
     // Selected font-row background: a dim accent blend.
     let row_sel: [u8; 4] = [
         ((tbg[0] as u16 + accent[0] as u16 * 2) / 3) as u8,
@@ -148,26 +159,33 @@ pub fn build_panel(
     let text_main = tfg;
     let text_dim = lerp(0.70);
     let text_btn = lerp(0.78);
+    // Section headers (CAPS) use a slightly dimmer shade than body text so they
+    // read as labels rather than values, matching the design's "muted CAPS" look.
+    let text_header = lerp(0.55);
 
     // ── Vertical layout (non-overlapping bands, each ≥12px gap from prior) ──
     //
     //  py+ 0  .. py+36   Title bar  (title label at py+12)
-    //  py+48  .. py+96   Opacity band  (label at py+48, track at py+84)
-    //                    slider track h=6 → bottom py+90; handle h=18 → bottom py+96
-    //  py+108 .. py+156  Corner-radius band  (label at py+108, track at py+144)
-    //                    track h=6 → bottom py+150; handle h=18 → bottom py+156
-    //  py+168 .. py+216  Summon-effect band  (label at py+168, ‹ name › row at py+188, h=28 → bottom py+216)
-    //  py+216 .. py+264  Window-mode band    (label at py+216, ‹ name › row at py+236, h=28)
-    //  py+264 .. py+312  Tab-bar band        (label at py+264, ‹ name › row at py+284, h=28)
-    //  py+324 .. py+360  Dropdown-height band (label at py+324, track at py+348, handle py+342)
-    //  py+372 .. py+408  Dropdown-width band  (label at py+372, track at py+396, handle py+390)
-    //  py+420 .. py+456  Auto-hide band      (label at py+420, toggle pill at py+420, h=28)
-    //  py+468 .. py+516  Font-size band  (label at py+468, buttons at py+488, btn h=28 → bottom py+516)
-    //  py+528 .. py+536  "Font" section header label
-    //  py+550 ..         Font-family list rows (5×(22+2)=120px → bottom py+670)
-    //  py+682            "Theme" label (12px gap after list bottom)
-    //  py+702            Theme chips (h=36 → bottom py+738)
-    //  PANEL_H = 738 + 6 = 744  (PANEL_W/PANEL_H are module-level pub consts above)
+    //  py+48  .. py+96   Opacity band  (CAPS label+value at py+48, track at py+72)
+    //                    slider track h=6 → bottom py+78; handle h=18 → bottom py+84 (± 3)
+    //  py+96  .. py+144  Corner-radius band  (CAPS label+value at py+96, track at py+120)
+    //                    track h=6 → bottom py+126; handle h=18 → bottom py+132
+    //  py+144 .. py+192  Summon-effect band  (CAPS label at py+144, ‹ name › row at py+164, h=28)
+    //  py+192 .. py+240  Window-mode band    (CAPS label at py+192, ‹ name › row at py+212, h=28)
+    //  py+240 .. py+288  Tab-bar band        (CAPS label at py+240, ‹ name › row at py+260, h=28)
+    //  py+300 .. py+336  Dropdown-height band (CAPS label+value at py+300, track at py+324, handle py+318)
+    //  py+348 .. py+384  Dropdown-width band  (CAPS label+value at py+348, track at py+372, handle py+366)
+    //  py+396 .. py+432  Auto-hide band      (CAPS label at py+396, toggle pill at py+396, h=28)
+    //  py+444 .. py+492  Font-size band  (CAPS label+value at py+444, buttons at py+464, btn h=28 → bottom py+492)
+    //  py+504 .. py+512  "FONT" section header label + scroll arrows
+    //  py+526 ..         Font-family list rows (5×(22+2)=120px → bottom py+646)
+    //  py+658            "THEME" label (12px gap after list bottom)
+    //  py+678            Theme cards — 2-col × 3-row grid:
+    //                    col_w=(348−8)/2=170; card_h=40; gap=8
+    //                    row0 at py+678..py+718; row1 at py+726..py+766; row2 at py+774..py+814
+    //  py+814..py+820   6px bottom margin
+    //  PANEL_H = 820 + 6 = 826  → use 860 to leave a small extra margin
+    //  (PANEL_W/PANEL_H are module-level pub consts above)
 
     // Center, then apply the user drag offset, then clamp to screen edges.
     let sw = screen_w as f32;
@@ -199,66 +217,83 @@ pub fn build_panel(
         ..Default::default()
     };
 
+    // Helper: right-align a text value on the section-header row.
+    // Returns the x-position such that the text's right edge sits at px+PANEL_W-16.
+    let right_x = |text: &str| -> f32 {
+        let w = text.chars().count() as f32 * CHAR_W;
+        px + PANEL_W - 16.0 - w
+    };
+
     // --- Opacity band (py+48 .. py+96) ---
-    // Label at py+48; track centred at py+84 (h=6); handle at py+78 (h=18).
-    let slider_track = Rect::rounded(px + 16.0, py + 84.0, 348.0, 6.0, slider_track_col, 3.0);
+    // CAPS label at py+48; value right-aligned on same row; track at py+72 (h=6);
+    // handle at py+66 (h=18). The filled left portion of the track shows progress.
+    let slider_track = Rect::rounded(px + 16.0, py + 72.0, 348.0, 6.0, slider_track_col, 3.0);
     let frac = ((opacity - 0.1) / 0.9).clamp(0.0, 1.0);
     let handle_x = px + 16.0 + frac * (348.0 - 14.0);
-    let slider_handle = Rect::rounded(handle_x, py + 78.0, 14.0, 18.0, accent_col, 4.0);
+    let slider_handle = Rect::rounded(handle_x, py + 66.0, 14.0, 18.0, accent_col, 4.0);
+    // Filled portion: from track left to handle centre, in accent color.
+    let opacity_fill_w = (frac * (348.0 - 14.0) + 7.0).max(6.0).min(348.0);
+    let opacity_fill = Rect::rounded(px + 16.0, py + 72.0, opacity_fill_w, 6.0, accent_fill, 3.0);
 
-    // --- Corner-radius band (py+108 .. py+156) ---
-    // Label at py+108; track centred at py+144 (h=6); handle at py+138 (h=18).
+    // --- Corner-radius band (py+96 .. py+144) ---
+    // CAPS label at py+96; value right-aligned; track at py+120 (h=6); handle at py+114 (h=18).
     // Radius range is [0, 24] px.
     const RADIUS_MAX: f32 = 24.0;
-    let radius_track = Rect::rounded(px + 16.0, py + 144.0, 348.0, 6.0, slider_track_col, 3.0);
+    let radius_track = Rect::rounded(px + 16.0, py + 120.0, 348.0, 6.0, slider_track_col, 3.0);
     let r_frac = (corner_radius / RADIUS_MAX).clamp(0.0, 1.0);
     let radius_handle_x = px + 16.0 + r_frac * (348.0 - 14.0);
-    let radius_handle = Rect::rounded(radius_handle_x, py + 138.0, 14.0, 18.0, accent_col, 4.0);
+    let radius_handle = Rect::rounded(radius_handle_x, py + 114.0, 14.0, 18.0, accent_col, 4.0);
+    let radius_fill_w = (r_frac * (348.0 - 14.0) + 7.0).max(6.0).min(348.0);
+    let radius_fill = Rect::rounded(px + 16.0, py + 120.0, radius_fill_w, 6.0, accent_fill, 3.0);
 
-    // --- Summon-effect band (py+168 .. py+216) ---
-    // Label at py+168; ‹ / › cycle buttons at py+188 (h=28); effect name between them.
-    let summon_btn_y = py + 188.0;
+    // --- Summon-effect band (py+144 .. py+192) ---
+    // CAPS label at py+144; ‹ / › cycle buttons at py+164 (h=28); effect name between them.
+    let summon_btn_y = py + 164.0;
     let summon_prev_x = px + 200.0;
     let summon_next_x = px + PANEL_W - 16.0 - 28.0; // rightmost
     let summon_prev = Rect::rounded(summon_prev_x, summon_btn_y, 28.0, 28.0, btn_fill, 4.0);
     let summon_next = Rect::rounded(summon_next_x, summon_btn_y, 28.0, 28.0, btn_fill, 4.0);
 
-    // --- Window-mode band (py+216 .. py+264) ---
-    // Label at py+216; ‹ / › cycle buttons at py+236 (h=28); mode name between them.
-    let winmode_btn_y = py + 236.0;
+    // --- Window-mode band (py+192 .. py+240) ---
+    // CAPS label at py+192; ‹ / › cycle buttons at py+212 (h=28); mode name between them.
+    let winmode_btn_y = py + 212.0;
     let win_mode_prev = Rect::rounded(summon_prev_x, winmode_btn_y, 28.0, 28.0, btn_fill, 4.0);
     let win_mode_next = Rect::rounded(summon_next_x, winmode_btn_y, 28.0, 28.0, btn_fill, 4.0);
 
-    // --- Tab-bar band (py+264 .. py+312) ---
-    // Label at py+264; ‹ / › cycle buttons at py+284 (h=28); position name between.
-    let tabbar_btn_y = py + 284.0;
+    // --- Tab-bar band (py+240 .. py+288) ---
+    // CAPS label at py+240; ‹ / › cycle buttons at py+260 (h=28); position name between.
+    let tabbar_btn_y = py + 260.0;
     let tab_bar_prev = Rect::rounded(summon_prev_x, tabbar_btn_y, 28.0, 28.0, btn_fill, 4.0);
     let tab_bar_next = Rect::rounded(summon_next_x, tabbar_btn_y, 28.0, 28.0, btn_fill, 4.0);
 
-    // --- Dropdown-height band (py+324 .. py+360) ---
-    // Label at py+324; track centred at py+348 (h=6); handle at py+342 (h=18).
+    // --- Dropdown-height band (py+300 .. py+336) ---
+    // CAPS label at py+300; value right-aligned; track at py+324 (h=6); handle at py+318 (h=18).
     // Range 25%..100%. Grayed (treated as no-op) when mode==Center.
-    let dropdown_track = Rect::rounded(px + 16.0, py + 348.0, 348.0, 6.0, slider_track_col, 3.0);
+    let dropdown_track = Rect::rounded(px + 16.0, py + 324.0, 348.0, 6.0, slider_track_col, 3.0);
     let dh_frac = ((dropdown_height_pct - 0.25) / 0.75).clamp(0.0, 1.0);
     let dropdown_handle_x = px + 16.0 + dh_frac * (348.0 - 14.0);
-    let dropdown_handle = Rect::rounded(dropdown_handle_x, py + 342.0, 14.0, 18.0, accent_col, 4.0);
+    let dropdown_handle = Rect::rounded(dropdown_handle_x, py + 318.0, 14.0, 18.0, accent_col, 4.0);
+    let dh_fill_w = (dh_frac * (348.0 - 14.0) + 7.0).max(6.0).min(348.0);
+    let dh_fill = Rect::rounded(px + 16.0, py + 324.0, dh_fill_w, 6.0, accent_fill, 3.0);
 
-    // --- Dropdown-width band (py+372 .. py+408) ---
-    // Label at py+372; track centred at py+396 (h=6); handle at py+390 (h=18).
+    // --- Dropdown-width band (py+348 .. py+384) ---
+    // CAPS label at py+348; value right-aligned; track at py+372 (h=6); handle at py+366 (h=18).
     // Range 20%..100%. Grayed (treated as no-op) when mode==Center.
-    let dropdown_width_track = Rect::rounded(px + 16.0, py + 396.0, 348.0, 6.0, slider_track_col, 3.0);
+    let dropdown_width_track = Rect::rounded(px + 16.0, py + 372.0, 348.0, 6.0, slider_track_col, 3.0);
     let dw_frac = ((dropdown_width_pct - 0.2) / 0.8).clamp(0.0, 1.0);
     let dropdown_width_handle_x = px + 16.0 + dw_frac * (348.0 - 14.0);
-    let dropdown_width_handle = Rect::rounded(dropdown_width_handle_x, py + 390.0, 14.0, 18.0, accent_col, 4.0);
+    let dropdown_width_handle = Rect::rounded(dropdown_width_handle_x, py + 366.0, 14.0, 18.0, accent_col, 4.0);
+    let dw_fill_w = (dw_frac * (348.0 - 14.0) + 7.0).max(6.0).min(348.0);
+    let dw_fill = Rect::rounded(px + 16.0, py + 372.0, dw_fill_w, 6.0, accent_fill, 3.0);
 
-    // --- Auto-hide band (py+420 .. py+456) ---
-    // Label at py+420; toggle pill at the right (h=28). Pill is accent when ON.
+    // --- Auto-hide band (py+396 .. py+432) ---
+    // CAPS label at py+396; toggle pill at the right (h=28). Pill is accent when ON.
     let autohide_pill_col: [u8; 4] = if focus_autohide { accent_col } else { btn_fill };
-    let autohide_toggle = Rect::rounded(px + PANEL_W - 16.0 - 56.0, py + 420.0, 56.0, 28.0, autohide_pill_col, 14.0);
+    let autohide_toggle = Rect::rounded(px + PANEL_W - 16.0 - 56.0, py + 396.0, 56.0, 28.0, autohide_pill_col, 14.0);
 
-    // --- Font-size band (py+468 .. py+516) ---
-    // Label at py+468; "Npt" readout at py+494; buttons at py+488 (h=28 → bottom py+516).
-    let font_btn_y = py + 488.0;
+    // --- Font-size band (py+444 .. py+492) ---
+    // CAPS label+value at py+444; "Npt" readout right-aligned; buttons at py+464 (h=28 → bottom py+492).
+    let font_btn_y = py + 464.0;
     let font_minus_x = px + 200.0;
     let font_plus_x  = font_minus_x + 36.0;
     let font_reset_x = font_plus_x  + 36.0;
@@ -267,21 +302,21 @@ pub fn build_panel(
     let font_plus = Rect::rounded(font_plus_x, font_btn_y, 28.0, 28.0, btn_fill, 4.0);
     let font_reset = Rect::rounded(font_reset_x, font_btn_y, 44.0, 28.0, btn_fill, 4.0);
 
-    // --- Font scroll buttons (▲ / ▼) in the "Font" header row at py+528 ---
+    // --- Font scroll buttons (▲ / ▼) in the "FONT" header row at py+504 ---
     // Two 20×20 buttons placed at the right side of the header row.
-    let scroll_btn_y = py + 526.0;
+    let scroll_btn_y = py + 502.0;
     let scroll_down_x = px + PANEL_W - 16.0 - 20.0;        // ▼ rightmost
     let scroll_up_x   = scroll_down_x - 24.0;               // ▲ left of ▼
     let font_scroll_up = Rect::rounded(scroll_up_x, scroll_btn_y, 20.0, 20.0, btn_fill, 4.0);
     let font_scroll_down = Rect::rounded(scroll_down_x, scroll_btn_y, 20.0, 20.0, btn_fill, 4.0);
 
-    // --- Font-family list (py+550 .. py+670) ---
-    // "Font" header at py+528; list rows start at py+550.
-    // 5 rows × (22px row + 2px gap) = 120px → list bottom = py+670.
-    // Theme label at py+682 (12px gap); chips at py+702.
+    // --- Font-family list (py+526 .. py+646) ---
+    // "FONT" header at py+504; list rows start at py+526.
+    // 5 rows × (22px row + 2px gap) = 120px → list bottom = py+646.
+    // Theme label at py+658 (12px gap); cards start at py+678.
     const ROW_H: f32 = 22.0;
     const ROW_GAP: f32 = 2.0;
-    let list_top = py + 550.0;
+    let list_top = py + 526.0;
     let list_x = px + 16.0;
     let list_w = PANEL_W - 32.0;
 
@@ -297,29 +332,42 @@ pub fn build_panel(
         font_row_rects.push(Rect::rounded(list_x, row_y, list_w, ROW_H, row_color, 3.0));
     }
 
-    // --- Theme chips (py+702 .. py+738) ---
-    // "Theme" label at py+682; chips at py+702 (h=36 → bottom py+738).
+    // --- Theme cards — 2-column × 3-row grid (py+678 .. py+854) ---
+    // "THEME" label at py+658; cards start at py+678.
+    // Each card: col_w = (348 − 8) / 2 = 170px; card_h = 40px; row_gap = 8px.
+    // Layout: row0=[Mocha,Tokyo], row1=[Gruv,Drac], row2=[Onyx,(empty)].
+    // Each card contains a 3-dot color preview (bg, palette[4]/accent, palette[2])
+    // and the theme name beneath the dots, giving an at-a-glance swatch.
     let presets = jetty_core::theme::PRESETS;
-    let num_presets = presets.len(); // should be 4
+    let num_presets = presets.len(); // 5
 
-    let chip_top = py + 702.0;
-    // Chips fill the row evenly for however many presets exist, so adding a theme
-    // never overflows the panel (348px usable = PANEL_W - 2*16 margin).
-    let chip_gap = 8.0;
-    let chip_w = (348.0 - (num_presets as f32 - 1.0) * chip_gap) / num_presets as f32;
+    const CARD_COLS: usize = 2;
+    const CARD_H: f32 = 40.0;
+    const CARD_ROW_GAP: f32 = 8.0;
+    const CARD_COL_GAP: f32 = 8.0;
+    let card_w = (348.0 - (CARD_COLS as f32 - 1.0) * CARD_COL_GAP) / CARD_COLS as f32; // 170px
+    let card_top = py + 678.0;
+
     let mut chip_rects: Vec<Rect> = Vec::with_capacity(num_presets);
     for i in 0..num_presets {
-        let chip_x = px + 16.0 + i as f32 * (chip_w + chip_gap);
+        let col = (i % CARD_COLS) as f32;
+        let row = (i / CARD_COLS) as f32;
+        let card_x = px + 16.0 + col * (card_w + CARD_COL_GAP);
+        let card_y = card_top + row * (CARD_H + CARD_ROW_GAP);
         let theme_bg = jetty_core::Theme::by_name(presets[i]).bg;
         chip_rects.push(Rect::rounded(
-            chip_x, chip_top, chip_w, 36.0,
-            [theme_bg[0], theme_bg[1], theme_bg[2], 255], 4.0,
+            card_x, card_y, card_w, CARD_H,
+            [theme_bg[0], theme_bg[1], theme_bg[2], 255], 6.0,
         ));
     }
 
+    // Compute bottom of last card for PANEL_H sanity — last card row for 5 items:
+    // row = (4/2) = 2, bottom = card_top + 2*(40+8) + 40 = card_top + 136
+    // card_top = py+678, so bottom = py+814. PANEL_H=860 gives 46px margin. ✓
+
     // --- Build quads in draw order ---
-    // Order: dim, border, bg, font buttons, font-family rows,
-    //        per-chip selected-border, chip fills, slider track, slider handle.
+    // Order: dim, border, bg, buttons, filled-track portions, tracks, handles,
+    //        chip border highlight, chip fills, font-family rows.
     let mut quads: Vec<Rect> = Vec::new();
     quads.push(dim_rect);
     quads.push(border_rect);
@@ -337,8 +385,8 @@ pub fn build_panel(
     quads.push(tab_bar_prev);
     quads.push(tab_bar_next);
 
-    // Dropdown-height slider (track + handle). Grayed to ~0.4 alpha when the
-    // window mode is Center (the control is a no-op there).
+    // Dropdown-height slider (track → filled portion → handle).
+    // Grayed to ~0.4 alpha when the window mode is Center (control is a no-op).
     let dim_alpha = |mut r: Rect| -> Rect {
         if !is_dropdown {
             r.color[3] = (r.color[3] as f32 * 0.4).round() as u8;
@@ -346,11 +394,12 @@ pub fn build_panel(
         r
     };
     quads.push(dim_alpha(dropdown_track));
+    quads.push(dim_alpha(dh_fill));       // accent-filled left portion
     quads.push(dim_alpha(dropdown_handle));
 
-    // Dropdown-width slider (track + handle). Grayed identically to the height
-    // slider when the window mode is Center (the control is a no-op there).
+    // Dropdown-width slider (track → filled portion → handle). Grayed identically.
     quads.push(dim_alpha(dropdown_width_track));
+    quads.push(dim_alpha(dw_fill));       // accent-filled left portion
     quads.push(dim_alpha(dropdown_width_handle));
 
     // Auto-hide toggle pill.
@@ -372,19 +421,52 @@ pub fn build_panel(
     if theme_idx < num_presets {
         let chip = &chip_rects[theme_idx];
         quads.push(Rect::rounded(
-            chip.x - 2.0, chip.y - 2.0, chip.w + 4.0, chip.h + 4.0, accent_col, 5.0,
+            chip.x - 2.0, chip.y - 2.0, chip.w + 4.0, chip.h + 4.0, accent_col, 7.0,
         ));
     }
 
     // Chip fills.
     quads.extend_from_slice(&chip_rects);
 
-    // Opacity slider track + handle.
+    // Color-dot quads for each theme card (3 dots: bg-neighbor, accent, bright).
+    // Dots are 8×8 circles laid out at 3px from the card left edge, vertically
+    // centred in the top half of the card so the name label fits below them.
+    const DOT_R: f32 = 8.0;
+    const DOT_GAP: f32 = 4.0;
+    for i in 0..num_presets {
+        let card = &chip_rects[i];
+        let t = jetty_core::Theme::by_name(presets[i]);
+        // Three representative colors: bg-lifted, accent (palette[4]), bright (palette[6]).
+        let dot_colors = [
+            // Slightly lifted bg — "surface" color.
+            {
+                let c = t.bg;
+                let lift = 40u8;
+                [
+                    c[0].saturating_add(lift),
+                    c[1].saturating_add(lift),
+                    c[2].saturating_add(lift),
+                    255,
+                ]
+            },
+            [t.palette[4][0], t.palette[4][1], t.palette[4][2], 255], // accent
+            [t.palette[2][0], t.palette[2][1], t.palette[2][2], 255], // green/bright
+        ];
+        let dot_y = card.y + 8.0; // top area of card
+        for d in 0..3_usize {
+            let dot_x = card.x + 8.0 + d as f32 * (DOT_R + DOT_GAP);
+            quads.push(Rect::rounded(dot_x, dot_y, DOT_R, DOT_R, dot_colors[d], DOT_R / 2.0));
+        }
+    }
+
+    // Opacity slider: dim track, then accent-filled left portion, then handle.
     quads.push(slider_track);
+    quads.push(opacity_fill);
     quads.push(slider_handle);
 
-    // Corner-radius slider track + handle.
+    // Corner-radius slider: same pattern.
     quads.push(radius_track);
+    quads.push(radius_fill);
     quads.push(radius_handle);
 
     // --- Labels ---
@@ -393,26 +475,20 @@ pub fn build_panel(
     // Title.
     labels.push(("Settings".to_string(), px + 16.0, py + 12.0, text_main));
 
-    // Opacity label (band top at py+48).
+    // OPACITY header (py+48) — CAPS with right-aligned "97%" value.
     let pct = (opacity * 100.0).round() as i32;
-    labels.push((
-        format!("Opacity  {}%", pct),
-        px + 16.0,
-        py + 48.0,
-        text_dim,
-    ));
+    let pct_str = format!("{}%", pct);
+    labels.push(("OPACITY".to_string(), px + 16.0, py + 48.0, text_header));
+    labels.push((pct_str.clone(), right_x(&pct_str), py + 48.0, text_main));
 
-    // Corner-radius label (band top at py+108) with a px readout.
+    // CORNER RADIUS header (py+96) — CAPS with right-aligned "Npx" value.
     let radius_px = corner_radius.round() as i32;
-    labels.push((
-        format!("Corner radius  {}px", radius_px),
-        px + 16.0,
-        py + 108.0,
-        text_dim,
-    ));
+    let radius_str = format!("{}px", radius_px);
+    labels.push(("CORNER RADIUS".to_string(), px + 16.0, py + 96.0, text_header));
+    labels.push((radius_str.clone(), right_x(&radius_str), py + 96.0, text_main));
 
-    // Summon-effect section (band top at py+168).
-    labels.push(("Summon effect".to_string(), px + 16.0, py + 168.0, text_dim));
+    // SUMMON EFFECT section (py+144) — CAPS header.
+    labels.push(("SUMMON EFFECT".to_string(), px + 16.0, py + 144.0, text_header));
     // Effect name centered between the ‹ / › buttons.
     labels.push((
         summon_effect_name.to_string(),
@@ -424,8 +500,8 @@ pub fn build_panel(
     labels.push(("<".to_string(), summon_prev_x + 9.0, summon_btn_y + 6.0, text_btn));
     labels.push((">".to_string(), summon_next_x + 9.0, summon_btn_y + 6.0, text_btn));
 
-    // Window-mode section (band top at py+216).
-    labels.push(("Window mode".to_string(), px + 16.0, py + 216.0, text_dim));
+    // WINDOW MODE section (py+192) — CAPS header.
+    labels.push(("WINDOW MODE".to_string(), px + 16.0, py + 192.0, text_header));
     labels.push((
         window_mode_name.to_string(),
         summon_prev_x + 40.0,
@@ -435,8 +511,8 @@ pub fn build_panel(
     labels.push(("<".to_string(), summon_prev_x + 9.0, winmode_btn_y + 6.0, text_btn));
     labels.push((">".to_string(), summon_next_x + 9.0, winmode_btn_y + 6.0, text_btn));
 
-    // Tab-bar section (band top at py+264).
-    labels.push(("Tab bar".to_string(), px + 16.0, py + 264.0, text_dim));
+    // TAB BAR section (py+240) — CAPS header.
+    labels.push(("TAB BAR".to_string(), px + 16.0, py + 240.0, text_header));
     labels.push((
         tab_bar_name.to_string(),
         summon_prev_x + 40.0,
@@ -446,28 +522,25 @@ pub fn build_panel(
     labels.push(("<".to_string(), summon_prev_x + 9.0, tabbar_btn_y + 6.0, text_btn));
     labels.push((">".to_string(), summon_next_x + 9.0, tabbar_btn_y + 6.0, text_btn));
 
-    // Dropdown-height section (band top at py+324). Grayed when mode==Center.
-    let dh_text = if is_dropdown { text_dim } else { text_btn };
+    // DROPDOWN HEIGHT section (py+300) — CAPS header + right-aligned value.
+    // Grayed when mode==Center.
+    let dh_text = if is_dropdown { text_header } else { text_btn };
+    let dh_val_text = if is_dropdown { text_main } else { text_btn };
     let dh_pct = (dropdown_height_pct * 100.0).round() as i32;
-    labels.push((
-        format!("Dropdown height  {}%", dh_pct),
-        px + 16.0,
-        py + 324.0,
-        dh_text,
-    ));
+    let dh_str = format!("{}%", dh_pct);
+    labels.push(("DROPDOWN HEIGHT".to_string(), px + 16.0, py + 300.0, dh_text));
+    labels.push((dh_str.clone(), right_x(&dh_str), py + 300.0, dh_val_text));
 
-    // Dropdown-width section (band top at py+372). Grayed when mode==Center.
-    let dw_text = if is_dropdown { text_dim } else { text_btn };
+    // DROPDOWN WIDTH section (py+348) — CAPS header + right-aligned value.
+    let dw_text = if is_dropdown { text_header } else { text_btn };
+    let dw_val_text = if is_dropdown { text_main } else { text_btn };
     let dw_pct = (dropdown_width_pct * 100.0).round() as i32;
-    labels.push((
-        format!("Dropdown width  {}%", dw_pct),
-        px + 16.0,
-        py + 372.0,
-        dw_text,
-    ));
+    let dw_str = format!("{}%", dw_pct);
+    labels.push(("DROPDOWN WIDTH".to_string(), px + 16.0, py + 348.0, dw_text));
+    labels.push((dw_str.clone(), right_x(&dw_str), py + 348.0, dw_val_text));
 
-    // Auto-hide section (band top at py+420) with an ON/OFF pill label.
-    labels.push(("Auto-hide on focus loss".to_string(), px + 16.0, py + 420.0, text_dim));
+    // AUTO-HIDE section (py+396) — CAPS header with ON/OFF pill label.
+    labels.push(("AUTO-HIDE ON FOCUS LOSS".to_string(), px + 16.0, py + 396.0, text_header));
     let (pill_text, pill_col) = if focus_autohide {
         ("ON", [20u8, 20, 20])
     } else {
@@ -480,25 +553,19 @@ pub fn build_panel(
         pill_col,
     ));
 
-    // Font-size section header (band top at py+468).
-    labels.push(("Font size".to_string(), px + 16.0, py + 468.0, text_dim));
-
-    // Current font-size readout aligned with buttons.
+    // FONT SIZE section (py+444) — CAPS header + right-aligned "Npt" value.
     let fs_display = font_size.round() as i32;
-    labels.push((
-        format!("{}pt", fs_display),
-        px + 140.0,
-        py + 494.0,
-        text_main,
-    ));
+    let fs_str = format!("{}pt", fs_display);
+    labels.push(("FONT SIZE".to_string(), px + 16.0, py + 444.0, text_header));
+    labels.push((fs_str.clone(), right_x(&fs_str), py + 444.0, text_main));
 
     // Font button labels.
     labels.push(("-".to_string(),  font_minus_x + 9.0,  font_btn_y + 6.0,  text_btn));
     labels.push(("+".to_string(),  font_plus_x  + 8.0,  font_btn_y + 6.0,  text_btn));
     labels.push(("rst".to_string(), font_reset_x + 6.0, font_btn_y + 6.0,  text_btn));
 
-    // Font-family section header (at py+528; list starts at py+550).
-    labels.push(("Font".to_string(), px + 16.0, py + 528.0, text_dim));
+    // FONT section header (py+504) — CAPS header; list starts at py+526.
+    labels.push(("FONT".to_string(), px + 16.0, py + 504.0, text_header));
 
     // Scroll button labels (▲ / ▼).
     labels.push(("^".to_string(), scroll_up_x   + 6.0, scroll_btn_y + 4.0, text_btn));
@@ -535,28 +602,28 @@ pub fn build_panel(
         // digits the counts have — on desktops with hundreds of fonts a fixed
         // px+PANEL_W-132 anchor overran the arrows.
         let hint = format!("({}/{})", offset + visible_count, families.len());
-        const CHAR_W: f32 = 9.8; // chrome font advance (matches font-list metrics)
         let scroll_up_left = px + PANEL_W - 60.0;
         let hint_w = hint.chars().count() as f32 * CHAR_W;
         let hint_x = scroll_up_left - 6.0 - hint_w;
-        labels.push((hint, hint_x, py + 528.0, text_dim));
+        labels.push((hint, hint_x, py + 504.0, text_dim));
     }
 
-    // Theme section label (at py+682; 12px gap after list bottom py+670).
-    labels.push(("Theme".to_string(), px + 16.0, py + 682.0, text_dim));
+    // THEME section header (py+658) — CAPS, 12px gap after font-list bottom (py+646).
+    labels.push(("THEME".to_string(), px + 16.0, py + 658.0, text_header));
 
-    // Chip name labels.
+    // Theme card name labels and color-dot labels.
     for i in 0..num_presets {
-        let chip = &chip_rects[i];
-        // Pick black or white text per chip based on its own bg luminance so the
+        let card = &chip_rects[i];
+        // Pick black or white text per card based on its own bg luminance so the
         // name stays legible on any theme swatch.
         let cb = jetty_core::Theme::by_name(presets[i]).bg;
         let lum = 0.299 * cb[0] as f32 + 0.587 * cb[1] as f32 + 0.114 * cb[2] as f32;
         let label_color: [u8; 3] = if lum > 140.0 { [20, 20, 20] } else { [235, 235, 240] };
+        // Theme name sits in the lower half of the card, below the dot row.
         labels.push((
             CHIP_NAMES[i].to_string(),
-            chip.x + 8.0,
-            chip.y + 10.0,
+            card.x + 8.0,
+            card.y + 22.0, // below the 3-dot row (dots at y+8, dot_h=8 → bottom y+16)
             label_color,
         ));
     }
@@ -599,4 +666,233 @@ pub fn build_panel(
     };
 
     PanelView { quads, labels, geom }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a default panel view with representative inputs for assertion helpers.
+    fn default_panel(screen_w: u32, screen_h: u32) -> PanelView {
+        let theme = jetty_core::Theme::by_name("catppuccin_mocha");
+        let families: Vec<String> = vec![
+            "JetBrains Mono".to_string(),
+            "Fira Code".to_string(),
+            "Hack".to_string(),
+            "Source Code Pro".to_string(),
+            "Inconsolata".to_string(),
+            "Cascadia Code".to_string(),
+        ];
+        build_panel(
+            screen_w,
+            screen_h,
+            0.97,            // opacity
+            0,               // theme_idx = Mocha
+            15.0,            // font_size
+            &families,
+            "JetBrains Mono",
+            0,               // font_scroll_offset
+            8.0,             // corner_radius
+            "Phosphor",      // summon_effect_name
+            "Dropdown",      // window_mode_name
+            "Top",           // tab_bar_name
+            0.5,             // dropdown_height_pct
+            0.7,             // dropdown_width_pct
+            true,            // is_dropdown
+            false,           // focus_autohide
+            0.0, 0.0,        // dx, dy
+            &theme,
+        )
+    }
+
+    #[test]
+    fn panel_fits_on_screen_at_various_sizes() {
+        // Screen sizes that can fully contain the panel (PANEL_H = 860, PANEL_W = 380).
+        // Very small screens (< PANEL_H in height) clamp to y=0, which is correct
+        // but means panel_bottom > screen_h — we only assert the panel stays ≥0
+        // for those cases to avoid a false-failure on tiny displays.
+        for (w, h) in [(1920u32, 1080u32), (1280, 900), (1440, 900), (2560, 1440)] {
+            let pv = default_panel(w, h);
+            let g = &pv.geom;
+            let sw = w as f32;
+            let sh = h as f32;
+            assert!(
+                g.panel.x >= 0.0,
+                "panel.x < 0 at {w}×{h}: {}",
+                g.panel.x
+            );
+            assert!(
+                g.panel.y >= 0.0,
+                "panel.y < 0 at {w}×{h}: {}",
+                g.panel.y
+            );
+            assert!(
+                g.panel.x + g.panel.w <= sw + 0.5,
+                "panel overflows right at {w}×{h}: {} > {}",
+                g.panel.x + g.panel.w,
+                sw
+            );
+            assert!(
+                g.panel.y + g.panel.h <= sh + 0.5,
+                "panel overflows bottom at {w}×{h}: {} > {}",
+                g.panel.y + g.panel.h,
+                sh
+            );
+        }
+        // Smaller screens: panel is clamped to y=0, x=0. Just assert non-negative.
+        for (w, h) in [(1024u32, 768u32), (800, 600)] {
+            let pv = default_panel(w, h);
+            let g = &pv.geom;
+            assert!(g.panel.x >= 0.0, "panel.x < 0 at {w}×{h}");
+            assert!(g.panel.y >= 0.0, "panel.y < 0 at {w}×{h}");
+        }
+    }
+
+    #[test]
+    fn exactly_five_chips_in_presets_order() {
+        // There are exactly 5 PRESETS; chips must match 1-to-1.
+        let pv = default_panel(1920, 1080);
+        assert_eq!(
+            pv.geom.chips.len(),
+            5,
+            "expected 5 theme chips, got {}",
+            pv.geom.chips.len()
+        );
+        // Every chip rect must lie inside the panel rect.
+        let panel = &pv.geom.panel;
+        for (i, chip) in pv.geom.chips.iter().enumerate() {
+            assert!(
+                chip.x >= panel.x && chip.x + chip.w <= panel.x + panel.w + 0.5,
+                "chip[{i}] x out of panel: chip_x={} chip_x+w={} panel_x={} panel_right={}",
+                chip.x, chip.x + chip.w, panel.x, panel.x + panel.w
+            );
+            assert!(
+                chip.y >= panel.y && chip.y + chip.h <= panel.y + panel.h + 0.5,
+                "chip[{i}] y out of panel: chip_y={} chip_y+h={} panel_y={} panel_bottom={}",
+                chip.y, chip.y + chip.h, panel.y, panel.y + panel.h
+            );
+        }
+    }
+
+    #[test]
+    fn slider_handles_within_tracks() {
+        let pv = default_panel(1920, 1080);
+        let g = &pv.geom;
+
+        // Opacity slider: handle must start no earlier than track left and end
+        // no later than track right.
+        let track = &g.slider_track;
+        let handle = &g.slider_handle;
+        assert!(
+            handle.x >= track.x - 0.5,
+            "opacity handle left of track: hx={} tx={}",
+            handle.x, track.x
+        );
+        assert!(
+            handle.x + handle.w <= track.x + track.w + 0.5,
+            "opacity handle right of track: hx+w={} tx+w={}",
+            handle.x + handle.w, track.x + track.w
+        );
+
+        // Corner-radius slider.
+        let rtrack = &g.radius_track;
+        let rhandle = &g.radius_handle;
+        assert!(rhandle.x >= rtrack.x - 0.5);
+        assert!(rhandle.x + rhandle.w <= rtrack.x + rtrack.w + 0.5);
+
+        // Dropdown-height slider.
+        let dtrack = &g.dropdown_track;
+        let dhandle = &g.dropdown_handle;
+        assert!(dhandle.x >= dtrack.x - 0.5);
+        assert!(dhandle.x + dhandle.w <= dtrack.x + dtrack.w + 0.5);
+
+        // Dropdown-width slider.
+        let dwtrack = &g.dropdown_width_track;
+        let dwhandle = &g.dropdown_width_handle;
+        assert!(dwhandle.x >= dwtrack.x - 0.5);
+        assert!(dwhandle.x + dwhandle.w <= dwtrack.x + dwtrack.w + 0.5);
+    }
+
+    #[test]
+    fn no_adjacent_control_bands_overlap_vertically() {
+        // Check that major control bands don't overlap. We test select pairs of
+        // rects that should be strictly above/below each other. Tolerates 1px
+        // for rounding.
+        let pv = default_panel(1920, 1080);
+        let g = &pv.geom;
+        let pairs: &[(&Rect, &Rect, &str)] = &[
+            (&g.title_bar, &g.slider_track, "title_bar vs opacity_track"),
+            (&g.slider_track, &g.radius_track, "opacity_track vs radius_track"),
+            (&g.radius_track, &g.summon_prev, "radius_track vs summon_prev"),
+            (&g.summon_prev, &g.win_mode_prev, "summon_prev vs win_mode_prev"),
+            (&g.win_mode_prev, &g.tab_bar_prev, "win_mode_prev vs tab_bar_prev"),
+            (&g.dropdown_track, &g.dropdown_width_track, "dropdown_h_track vs dropdown_w_track"),
+            (&g.autohide_toggle, &g.font_minus, "autohide vs font_minus"),
+            (&g.font_minus, &g.font_scroll_up, "font_minus vs font_scroll_up"),
+        ];
+        for (a, b, label) in pairs {
+            let a_bottom = a.y + a.h;
+            let b_top = b.y;
+            assert!(
+                a_bottom <= b_top + 1.0,
+                "{label}: a_bottom={a_bottom} > b_top={b_top} (overlap)"
+            );
+        }
+    }
+
+    #[test]
+    fn theme_cards_form_2col_grid() {
+        let pv = default_panel(1920, 1080);
+        let chips = &pv.geom.chips;
+        assert_eq!(chips.len(), 5);
+
+        // Column 0 chips (i=0,2,4) share the same x.
+        let col0_x = chips[0].x;
+        assert!((chips[2].x - col0_x).abs() < 0.5, "chip[2].x != chip[0].x");
+        assert!((chips[4].x - col0_x).abs() < 0.5, "chip[4].x != chip[0].x");
+
+        // Column 1 chips (i=1,3) share the same x, which is > col0_x.
+        let col1_x = chips[1].x;
+        assert!(col1_x > col0_x, "col1 not to the right of col0");
+        assert!((chips[3].x - col1_x).abs() < 0.5, "chip[3].x != chip[1].x");
+
+        // Row pairs are vertically separated.
+        let row0_bottom = chips[0].y + chips[0].h;
+        let row1_top = chips[2].y;
+        assert!(row1_top >= row0_bottom - 0.5, "row1 overlaps row0");
+        let row1_bottom = chips[2].y + chips[2].h;
+        let row2_top = chips[4].y;
+        assert!(row2_top >= row1_bottom - 0.5, "row2 overlaps row1");
+    }
+
+    #[test]
+    fn caps_headers_present_in_labels() {
+        let pv = default_panel(1920, 1080);
+        let all_text: Vec<String> = pv.labels.iter().map(|l| l.0.clone()).collect();
+        for expected in &[
+            "OPACITY", "CORNER RADIUS", "SUMMON EFFECT", "WINDOW MODE",
+            "TAB BAR", "DROPDOWN HEIGHT", "DROPDOWN WIDTH",
+            "AUTO-HIDE ON FOCUS LOSS", "FONT SIZE", "FONT", "THEME",
+        ] {
+            assert!(
+                all_text.iter().any(|s| s == expected),
+                "missing CAPS header: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn right_aligned_values_in_labels() {
+        // Opacity, corner-radius, font-size, dropdown values must appear as
+        // separate right-aligned labels (not appended to the header string).
+        let pv = default_panel(1920, 1080);
+        let all_text: Vec<String> = pv.labels.iter().map(|l| l.0.clone()).collect();
+        // With opacity=0.97 → "97%", corner_radius=8→"8px", font=15→"15pt", dh=50%→"50%"
+        assert!(all_text.iter().any(|s| s == "97%"),  "missing opacity value label");
+        assert!(all_text.iter().any(|s| s == "8px"),  "missing corner radius value label");
+        assert!(all_text.iter().any(|s| s == "15pt"), "missing font size value label");
+        assert!(all_text.iter().any(|s| s == "50%"),  "missing dropdown height value label");
+    }
 }
