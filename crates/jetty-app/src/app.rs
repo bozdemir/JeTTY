@@ -3251,6 +3251,14 @@ fn dock_window_top(win: &Arc<Window>, width_pct: f32, height_pct: f32) {
         let win_h = (mon_h * height_pct).max(200.0).min(mon_h);
         let x = mon_pos.x + ((mon_w - win_w) / 2.0).round() as i32;
         let y = mon_pos.y; // top-flush
+        if std::env::var("JETTY_DEBUG_DOCK").is_ok() {
+            eprintln!(
+                "jetty dock: chosen monitor pos=({},{}) size={}x{} → target=({},{}) size={}x{}; window currently at outer_position={:?}",
+                mon_pos.x, mon_pos.y, mon_size.width, mon_size.height,
+                x, y, win_w.round() as u32, win_h.round() as u32,
+                win.outer_position(),
+            );
+        }
         win.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
         let _ = win.request_inner_size(winit::dpi::PhysicalSize::new(
             win_w.round() as u32,
