@@ -6,7 +6,8 @@
 #
 # Usage: scripts/livetest.sh ["keys to type"]   (default: "sadf")
 set -u
-APP=/home/burak/custom_terminal_project/target/release/jetty
+cd "$(dirname "$0")/.."   # run from the repo root regardless of caller's cwd
+APP=./target/release/jetty
 OUT=/tmp/jetty-live.png
 LOG=/tmp/jetty-live.log
 KEYS="${1:-sadf}"

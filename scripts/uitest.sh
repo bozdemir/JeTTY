@@ -17,11 +17,12 @@
 #     xdotool mousemove 500 300; xdotool click 1     # move + left click
 #     xdotool mousemove 400 320; xdotool mousedown 1; xdotool mousemove 600 320; xdotool mouseup 1  # drag
 set -u
+cd "$(dirname "$0")/.."   # run from the repo root regardless of caller's cwd
 DISP=:99
 W=1000; H=640
 OUT="${1:-/tmp/jetty-ui.png}"
 ACTIONS="${2:-}"
-APP=/home/burak/custom_terminal_project/target/release/jetty
+APP=./target/release/jetty
 LOG=/tmp/jetty-ui.log
 
 XEPHYR_PID=""; APP_PID=""
