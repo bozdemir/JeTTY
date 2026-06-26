@@ -291,9 +291,14 @@ pub fn build_tab_bar_ex(
 
     // A small "+N" hint when some tabs couldn't be drawn (too many to fit even at
     // the minimum width). Placed just left of the controls so it never overlaps.
+    // Guard: only draw when the hint fits left of the controls region — at very
+    // narrow widths (<~400px) the hint would otherwise overrun the window controls.
     if overflow > 0 {
         let hint_x = (tab_area_x - 34.0).max(x + PLUS_W + 4.0);
-        labels.push((format!("+{overflow}"), hint_x, 9.0, dim_fg));
+        let hint_w = format!("+{overflow}").chars().count() as f32 * CHROME_CHAR_W;
+        if hint_x + hint_w <= controls_left {
+            labels.push((format!("+{overflow}"), hint_x, 9.0, dim_fg));
+        }
     }
 
     // --- Perf HUD label (right-aligned, just left of the window controls) ---
@@ -527,6 +532,28 @@ mod tests {
         // Each drawn tab is comfortably above the squashed minimum.
         for r in &with.tab_rects {
             assert!(r.w >= PERF_MIN_TAB_W - 0.5, "tab squashed to {} despite hiding HUD", r.w);
+        }
+    }
+
+    #[test]
+    fn overflow_hint_does_not_overrun_controls_at_narrow_width() {
+        // Many tabs in a very narrow window — the "+N" hint must NOT appear when
+        // it would overlap the window controls region.
+        let tabs: Vec<(String, bool)> =
+            (0..20).map(|i| (format!("Tab {i}"), i == 0)).collect();
+        // 400px is narrow enough to stress the guard (controls_left ≈ 252px).
+        let bar = build_tab_bar(400, &tabs, &theme());
+        let controls_left = 400.0 - STRIP_PAD - CONTROLS_W;
+        // Any "+N" label must end before the controls region.
+        for label in &bar.labels {
+            if label.0.starts_with('+') && label.0[1..].chars().all(|c| c.is_ascii_digit()) {
+                let hint_w = label.0.chars().count() as f32 * CHROME_CHAR_W;
+                assert!(
+                    label.1 + hint_w <= controls_left + 0.5,
+                    "overflow hint overruns controls: hint_right={} controls_left={controls_left}",
+                    label.1 + hint_w
+                );
+            }
         }
     }
 

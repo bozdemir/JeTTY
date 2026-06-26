@@ -277,6 +277,39 @@ mod tests {
     }
 
     #[test]
+    fn menu_items_order_is_copy_paste_selectall_clear_closetab() {
+        // Pin the exact MENU_ITEMS order so accidental reordering is caught.
+        assert_eq!(MENU_ITEMS[0], "Copy",       "item[0] must be Copy");
+        assert_eq!(MENU_ITEMS[1], "Paste",      "item[1] must be Paste");
+        assert_eq!(MENU_ITEMS[2], "Select All", "item[2] must be Select All");
+        assert_eq!(MENU_ITEMS[3], "Clear",      "item[3] must be Clear");
+        assert_eq!(MENU_ITEMS[4], "Close Tab",  "item[4] must be Close Tab");
+    }
+
+    #[test]
+    fn click_in_separator_gap_hits_no_item_rect() {
+        // The separator gap between item[2] (Select All) and item[3] (Clear) must
+        // be a dead zone — a click coordinate inside it should not fall within any
+        // item_rect.
+        let menu = build_context_menu(50.0, 50.0, 1280, 800, None, &theme());
+        assert_eq!(menu.item_rects.len(), 5);
+
+        // The dead zone is the pixel band between bottom of rect[2] and top of rect[3].
+        let gap_top    = menu.item_rects[2].y + menu.item_rects[2].h;
+        let gap_bottom = menu.item_rects[3].y;
+        assert!(gap_bottom > gap_top, "expected a separator gap but rects are adjacent");
+
+        // A click in the middle of the gap.
+        let click_y = (gap_top + gap_bottom) * 0.5;
+        let click_x = menu.item_rects[0].x + menu.item_rects[0].w * 0.5;
+
+        let hit = menu.item_rects.iter().any(|r| {
+            click_x >= r.x && click_x < r.x + r.w && click_y >= r.y && click_y < r.y + r.h
+        });
+        assert!(!hit, "click in separator gap (y={click_y}) should hit no item_rect");
+    }
+
+    #[test]
     fn hover_highlight_aligns_with_item_rects() {
         // For each of the 5 items, the hover quad y must match the item rect y.
         // Quad order: [0] border, [1] bg, [2] hover, [3] separator.
