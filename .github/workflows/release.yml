@@ -57,10 +57,15 @@ jobs:
             https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           chmod +x linuxdeploy
           mkdir -p AppDir
+          # --icon-filename jetty: deploy the icon under the name the .desktop's
+          # `Icon=jetty` entry expects (linuxdeploy otherwise names it after the
+          # source file "jetty-256" → "Could not find suitable icon for Icon
+          # entry: jetty" and the AppImage step fails).
           ./linuxdeploy --appdir AppDir \
             --executable target/release/jetty \
             --desktop-file assets/jetty.desktop \
             --icon-file assets/icons/jetty-256.png \
+            --icon-filename jetty \
             --output appimage
           mv ./*.AppImage "JeTTY-${GITHUB_REF_NAME#v}-x86_64.AppImage"
 
