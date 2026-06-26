@@ -228,12 +228,14 @@ fn enter_sends_cr() {
 
 #[test]
 fn unknown_key_returns_none() {
+    // F13 has no xterm mapping (we encode F1–F12); a genuinely unmapped key
+    // must still produce no bytes. (F12 is now mapped — see function_keys test.)
     let action = decide_key(
         false,
         false,
         false,
-        phys(KeyCode::F12),
-        &Key::Named(NamedKey::F12),
+        phys(KeyCode::F13),
+        &Key::Named(NamedKey::F13),
         false,
         false,
     );
@@ -609,4 +611,74 @@ fn click_outside_panel_and_scrollbar_with_panel_open_is_none() {
     // Click at (0,0) — well outside any widget.
     let action = decide_mouse_press(Some(&geom), None, 0.0, 0.0);
     assert_eq!(action, MouseAction::None);
+}
+
+// ---------------------------------------------------------------------------
+// Navigation / editing / function keys + modified arrows (campaign fixes)
+// ---------------------------------------------------------------------------
+
+fn named(k: NamedKey) -> Key {
+    Key::Named(k)
+}
+fn send(bytes: &[u8]) -> KeyAction {
+    KeyAction::Send(bytes.to_vec())
+}
+
+#[test]
+fn nav_editing_keys_send_xterm_sequences() {
+    let cases: &[(NamedKey, &[u8])] = &[
+        (NamedKey::Home, b"\x1b[H"),
+        (NamedKey::End, b"\x1b[F"),
+        (NamedKey::Delete, b"\x1b[3~"),
+        (NamedKey::Insert, b"\x1b[2~"),
+    ];
+    for (k, want) in cases {
+        let a = decide_key(false, false, false, phys(KeyCode::Home), &named(k.clone()), false, false);
+        assert_eq!(a, send(want), "key {:?}", k);
+    }
+}
+
+#[test]
+fn function_keys_send_xterm_sequences() {
+    let cases: &[(NamedKey, &[u8])] = &[
+        (NamedKey::F1, b"\x1bOP"),
+        (NamedKey::F4, b"\x1bOS"),
+        (NamedKey::F5, b"\x1b[15~"),
+        (NamedKey::F12, b"\x1b[24~"),
+    ];
+    for (k, want) in cases {
+        let a = decide_key(false, false, false, phys(KeyCode::F1), &named(k.clone()), false, false);
+        assert_eq!(a, send(want), "key {:?}", k);
+    }
+}
+
+#[test]
+fn modified_arrows_use_csi_1_mod_form() {
+    // Ctrl+Left = mod 5, Shift+Right = mod 2, Alt+Up = mod 3, Ctrl+Shift+Down = mod 6.
+    let ctrl_left = decide_key(true, false, false, phys(KeyCode::ArrowLeft), &named(NamedKey::ArrowLeft), false, false);
+    assert_eq!(ctrl_left, send(b"\x1b[1;5D"));
+    let shift_right = decide_key(false, true, false, phys(KeyCode::ArrowRight), &named(NamedKey::ArrowRight), false, false);
+    assert_eq!(shift_right, send(b"\x1b[1;2C"));
+    let alt_up = decide_key(false, false, true, phys(KeyCode::ArrowUp), &named(NamedKey::ArrowUp), false, false);
+    assert_eq!(alt_up, send(b"\x1b[1;3A"));
+    let ctrl_shift_down = decide_key(true, true, false, phys(KeyCode::ArrowDown), &named(NamedKey::ArrowDown), false, false);
+    assert_eq!(ctrl_shift_down, send(b"\x1b[1;6B"));
+}
+
+#[test]
+fn plain_arrows_unchanged_in_both_decckm_modes() {
+    // No modifier → DECCKM-aware bare arrows (regression guard for the modified branch).
+    let normal = decide_key(false, false, false, phys(KeyCode::ArrowLeft), &named(NamedKey::ArrowLeft), false, false);
+    assert_eq!(normal, send(b"\x1b[D"));
+    let app = decide_key(false, false, false, phys(KeyCode::ArrowLeft), &named(NamedKey::ArrowLeft), false, true);
+    assert_eq!(app, send(b"\x1bOD"));
+}
+
+#[test]
+fn shift_tab_sends_back_tab() {
+    let a = decide_key(false, true, false, phys(KeyCode::Tab), &named(NamedKey::Tab), false, false);
+    assert_eq!(a, send(b"\x1b[Z"));
+    // Plain Tab still sends a literal TAB.
+    let plain = decide_key(false, false, false, phys(KeyCode::Tab), &named(NamedKey::Tab), false, false);
+    assert_eq!(plain, send(b"\t"));
 }

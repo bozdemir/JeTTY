@@ -173,6 +173,30 @@ pub fn decide_key(
         }
     }
 
+    // Modified arrows + back-tab. When any of Ctrl/Shift/Alt is held with an arrow,
+    // emit the xterm CSI form `\e[1;<mod><final>` (mod = 1 + shift + alt<<1 +
+    // ctrl<<2) so apps see word-jump (Ctrl+Left/Right), selection (Shift+Arrow),
+    // etc. instead of a bare arrow. This is used regardless of DECCKM; plain
+    // arrows fall through to the DECCKM-aware cursor_key_bytes below. Plain
+    // Shift+Tab (Ctrl+Shift+Tab is already intercepted as PrevTab above) sends
+    // CSI Z (back-tab) for reverse menu-complete.
+    if ctrl || shift || alt {
+        let arrow_final = match logical {
+            Key::Named(NamedKey::ArrowUp) => Some(b'A'),
+            Key::Named(NamedKey::ArrowDown) => Some(b'B'),
+            Key::Named(NamedKey::ArrowRight) => Some(b'C'),
+            Key::Named(NamedKey::ArrowLeft) => Some(b'D'),
+            _ => None,
+        };
+        if let Some(fin) = arrow_final {
+            let m = 1 + (shift as u8) + ((alt as u8) << 1) + ((ctrl as u8) << 2);
+            return KeyAction::Send(format!("\x1b[1;{}{}", m, fin as char).into_bytes());
+        }
+        if shift && !ctrl && !alt && matches!(logical, Key::Named(NamedKey::Tab)) {
+            return KeyAction::Send(b"\x1b[Z".to_vec());
+        }
+    }
+
     // Arrow keys honor DECCKM (application cursor mode). When `app_cursor` is set
     // (`\e[?1h`), arrows are encoded with the SS3 prefix (`\eO A/B/C/D`) instead of
     // the default CSI prefix (`\e[ A/B/C/D`) so apps like vim/readline see the
@@ -447,6 +471,28 @@ pub fn key_to_bytes(key: &Key) -> Option<Vec<u8>> {
         Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
         Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
         Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
+        // Navigation + editing keys (xterm encodings). Without these the keys are
+        // silently dropped, breaking readline line-editing, vim, htop, less, fzf
+        // and every ncurses TUI. Home/End use the CSI (`\e[H`/`\e[F`) form.
+        Key::Named(NamedKey::Home) => Some(b"\x1b[H".to_vec()),
+        Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
+        Key::Named(NamedKey::Delete) => Some(b"\x1b[3~".to_vec()),
+        Key::Named(NamedKey::Insert) => Some(b"\x1b[2~".to_vec()),
+        // Function row. F1–F4 use the SS3 (`\eOP`..`\eOS`) form; F5–F12 the CSI
+        // tilde form. (F9 is normally consumed by the global summon hotkey before
+        // it reaches here; this is the fallback when no global grab is active.)
+        Key::Named(NamedKey::F1) => Some(b"\x1bOP".to_vec()),
+        Key::Named(NamedKey::F2) => Some(b"\x1bOQ".to_vec()),
+        Key::Named(NamedKey::F3) => Some(b"\x1bOR".to_vec()),
+        Key::Named(NamedKey::F4) => Some(b"\x1bOS".to_vec()),
+        Key::Named(NamedKey::F5) => Some(b"\x1b[15~".to_vec()),
+        Key::Named(NamedKey::F6) => Some(b"\x1b[17~".to_vec()),
+        Key::Named(NamedKey::F7) => Some(b"\x1b[18~".to_vec()),
+        Key::Named(NamedKey::F8) => Some(b"\x1b[19~".to_vec()),
+        Key::Named(NamedKey::F9) => Some(b"\x1b[20~".to_vec()),
+        Key::Named(NamedKey::F10) => Some(b"\x1b[21~".to_vec()),
+        Key::Named(NamedKey::F11) => Some(b"\x1b[23~".to_vec()),
+        Key::Named(NamedKey::F12) => Some(b"\x1b[24~".to_vec()),
         Key::Character(s) => Some(s.as_bytes().to_vec()),
         _ => None,
     }
