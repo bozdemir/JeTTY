@@ -9,24 +9,77 @@ use winit::event_loop::{ControlFlow, EventLoop};
 /// Unix-socket path used for single-instance IPC. Any running primary Jetty
 /// instance listens here; secondary invocations (including `jetty --toggle`)
 /// connect and send a toggle message, then exit immediately.
+///
+/// When `XDG_RUNTIME_DIR` is set (the normal case on systemd/logind systems),
+/// that directory is already per-user, so a plain `jetty.sock` name is fine.
+/// When it is unset, we fall back to `/tmp` but UID-namespace the filename via
+/// `$USER` so two users can't collide or hijack each other's socket.
 fn ipc_socket_path() -> String {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    format!("{}/jetty.sock", runtime_dir)
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return format!("{runtime_dir}/jetty.sock");
+    }
+    // XDG_RUNTIME_DIR unset: namespace by $USER (or fall back to the raw UID
+    // read from /proc/self/loginuid so the name is still unique per user even
+    // without a $USER env var, and without requiring any libc dependency).
+    let user_tag = std::env::var("USER").unwrap_or_else(|_| {
+        std::fs::read_to_string("/proc/self/loginuid")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string())
+    });
+    format!("/tmp/jetty-{user_tag}.sock")
+}
+
+/// Outcome of an IPC connect attempt.
+enum ConnectResult {
+    /// Connected to a live primary; message was sent. This process should exit.
+    Forwarded,
+    /// No socket file exists (first launch).
+    NoSocket,
+    /// A socket file exists but `connect` returned `ECONNREFUSED` — it is a
+    /// stale leftover from a previous crash. Safe to unlink and rebind.
+    Stale,
+    /// Some other error (e.g. permission denied). Treated as "no live instance"
+    /// so we attempt to become the primary without removing anything.
+    Other,
 }
 
 /// Try to connect to a live Jetty instance and send a toggle message.
-/// Returns `true` if a live instance was found and the message was sent
-/// (i.e. this process should exit).
-fn try_toggle_running_instance(sock_path: &str) -> bool {
+/// Returns the connection outcome so the caller can decide whether to unlink.
+fn try_toggle_running_instance(sock_path: &str) -> ConnectResult {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
 
-    if let Ok(mut stream) = UnixStream::connect(sock_path) {
-        let _ = stream.write_all(b"toggle");
-        let _ = stream.flush();
-        return true;
+    match UnixStream::connect(sock_path) {
+        Ok(mut stream) => {
+            let _ = stream.write_all(b"toggle");
+            let _ = stream.flush();
+            ConnectResult::Forwarded
+        }
+        Err(e) => {
+            // ECONNREFUSED: socket file exists but nobody is listening — stale.
+            if e.raw_os_error() == Some(libc_econnrefused()) {
+                ConnectResult::Stale
+            } else if e.kind() == std::io::ErrorKind::NotFound {
+                ConnectResult::NoSocket
+            } else {
+                ConnectResult::Other
+            }
+        }
     }
-    false
+}
+
+/// Returns the `ECONNREFUSED` errno value portably without a libc dependency.
+/// On Linux/macOS/BSDs this is always 111 (Linux) or 61 (macOS). We read it
+/// from a refused loopback connect at start-up … but that adds latency and a
+/// syscall. Instead, rely on the OS constant directly: POSIX guarantees the
+/// value is defined; we hard-code the Linux and macOS values and fall back to
+/// 0 (which means the stale-socket heuristic is conservatively disabled) for
+/// any other host OS.
+#[inline]
+fn libc_econnrefused() -> i32 {
+    #[cfg(target_os = "linux")]   { 111 }
+    #[cfg(target_os = "macos")]   { 61  }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))] { 0 }
 }
 
 pub fn run() {
@@ -47,13 +100,27 @@ pub fn run() {
     // instance is already running — toggle that instance and exit.
     // On the very first launch there is no live instance, so we fall through to
     // becoming the primary.
-    if try_toggle_running_instance(&sock_path) {
-        std::process::exit(0);
+    //
+    // TOCTOU safety: we only unlink the socket when `connect` returned
+    // ECONNREFUSED (provably stale), never when a live primary owns it.
+    // This prevents the race where two concurrent cold-start processes both
+    // unlink-then-bind and one deletes the other's freshly-bound socket.
+    match try_toggle_running_instance(&sock_path) {
+        ConnectResult::Forwarded => {
+            std::process::exit(0);
+        }
+        ConnectResult::Stale => {
+            // Socket file exists but nobody is listening — safe to remove.
+            std::fs::remove_file(&sock_path).ok();
+        }
+        ConnectResult::NoSocket | ConnectResult::Other => {
+            // Nothing to remove; proceed to bind.
+        }
     }
 
-    // No live instance found — become the primary.
-    // Remove any stale socket file left over from a previous crash, then bind.
-    std::fs::remove_file(&sock_path).ok();
+    // No live instance found — become the primary. Bind directly (stale file
+    // was already removed above when detected; NoSocket/Other means no file or
+    // we conservatively skip the removal and let bind fail gracefully).
     let listener: Option<std::os::unix::net::UnixListener> =
         match std::os::unix::net::UnixListener::bind(&sock_path) {
             Ok(l) => {

@@ -24,9 +24,6 @@ impl Theme {
             "gruvbox_dark" => gruvbox_dark(),
             "dracula" => dracula(),
             "onyx" => onyx(),
-            "solarized_dark" => solarized_dark(),
-            "default_dark" => default_dark(),
-            "light" => light(),
             _ => catppuccin_mocha(),
         }
     }
@@ -173,87 +170,3 @@ pub fn onyx() -> Theme {
     }
 }
 
-/// Solarized Dark — Ethan Schoonover's classic low-contrast design.
-/// Available via name (not in the default PRESETS chip row).
-pub fn solarized_dark() -> Theme {
-    Theme {
-        name: "solarized_dark",
-        bg: [0, 43, 54, 255],
-        fg: [131, 148, 150],
-        cursor: [147, 161, 161],
-        palette: [
-            [7, 54, 66],     // 0  base02
-            [220, 50, 47],   // 1  red
-            [133, 153, 0],   // 2  green
-            [181, 137, 0],   // 3  yellow
-            [38, 139, 210],  // 4  blue
-            [211, 54, 130],  // 5  magenta
-            [42, 161, 152],  // 6  cyan
-            [238, 232, 213], // 7  base2
-            [0, 43, 54],     // 8  base03
-            [203, 75, 22],   // 9  orange
-            [88, 110, 117],  // 10 base01
-            [101, 123, 131], // 11 base00
-            [131, 148, 150], // 12 base0
-            [108, 113, 196], // 13 violet
-            [147, 161, 161], // 14 base1
-            [253, 246, 227], // 15 base3
-        ],
-    }
-}
-
-/// Generic xterm-style dark palette. Kept as a fallback / baseline option.
-pub fn default_dark() -> Theme {
-    Theme {
-        name: "default_dark",
-        bg: [18, 18, 23, 255],
-        fg: [220, 220, 220],
-        cursor: [200, 200, 200],
-        palette: [
-            [0, 0, 0],
-            [205, 0, 0],
-            [0, 205, 0],
-            [205, 205, 0],
-            [0, 0, 238],
-            [205, 0, 205],
-            [0, 205, 205],
-            [229, 229, 229],
-            [127, 127, 127],
-            [255, 0, 0],
-            [0, 255, 0],
-            [255, 255, 0],
-            [92, 92, 255],
-            [255, 0, 255],
-            [0, 255, 255],
-            [255, 255, 255],
-        ],
-    }
-}
-
-/// Solarized Light — clean bright background. Available via name.
-pub fn light() -> Theme {
-    Theme {
-        name: "light",
-        bg: [253, 246, 227, 255],
-        fg: [101, 123, 131],
-        cursor: [88, 110, 117],
-        palette: [
-            [7, 54, 66],
-            [220, 50, 47],
-            [133, 153, 0],
-            [181, 137, 0],
-            [38, 139, 210],
-            [211, 54, 130],
-            [42, 161, 152],
-            [238, 232, 213],
-            [0, 43, 54],
-            [203, 75, 22],
-            [88, 110, 117],
-            [101, 123, 131],
-            [131, 148, 150],
-            [108, 113, 196],
-            [147, 161, 161],
-            [253, 246, 227],
-        ],
-    }
-}

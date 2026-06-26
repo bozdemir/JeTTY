@@ -80,9 +80,13 @@ const CHAR_W: f32 = 9.8;
 ///
 /// PANEL_H was grown from 744→860 to accommodate the 2-column×3-row theme card
 /// grid (card_h=40, gap=8 → 3 rows = 136px) replacing the original single-row
-/// chips (36px). The 96px delta keeps the title+scroll hint math self-consistent.
+/// chips (36px). 860−744=116px delta (136−36=100px new content + 16px margin).
 pub const PANEL_W: f32 = 380.0;
 pub const PANEL_H: f32 = 860.0;
+
+// Compile-time lockstep: CHIP_NAMES must always have one entry per PRESETS entry.
+// This panics at build time if PRESETS grows without updating CHIP_NAMES (or vice versa).
+const _: () = assert!(CHIP_NAMES.len() == jetty_core::theme::PRESETS.len());
 
 /// Build the settings panel for the given screen size, opacity (0.1..=1.0),
 /// selected theme index (index into `jetty_core::theme::PRESETS`), current
@@ -489,38 +493,56 @@ pub fn build_panel(
     labels.push(("CORNER RADIUS".to_string(), px + 16.0, py + 96.0, text_header));
     labels.push((radius_str.clone(), right_x(&radius_str), py + 96.0, text_main));
 
+    // Helper: center a (possibly truncated) cycle-name label between the ‹ and ›
+    // buttons. The gap runs from [summon_prev_x+28] to [summon_next_x]; we clamp
+    // the x so a long name never overruns either button.
+    // Max chars that fit in the gap (108px / 9.8px ≈ 11 chars).
+    const CYCLE_MAX_CHARS: usize = 11;
+    let cycle_gap_left  = summon_prev_x + 28.0; // right edge of ‹ button
+    let cycle_gap_right = summon_next_x;         // left edge of › button
+    let cycle_gap_w     = cycle_gap_right - cycle_gap_left;
+    let center_cycle = |name: &str| -> (String, f32) {
+        // Truncate long names to avoid overrunning the buttons.
+        let shown: String = if name.chars().count() > CYCLE_MAX_CHARS {
+            let mut s: String = name.chars().take(CYCLE_MAX_CHARS - 1).collect();
+            s.push('…');
+            s
+        } else {
+            name.to_string()
+        };
+        let text_w = shown.chars().count() as f32 * CHAR_W;
+        // Center in the gap, clamped so text stays between the buttons.
+        let x = (cycle_gap_left + (cycle_gap_w - text_w) * 0.5)
+            .clamp(cycle_gap_left, (cycle_gap_right - text_w).max(cycle_gap_left));
+        (shown, x)
+    };
+
     // SUMMON EFFECT section (py+144) — CAPS header.
     labels.push(("SUMMON EFFECT".to_string(), px + 16.0, py + 144.0, text_header));
     // Effect name centered between the ‹ / › buttons.
-    labels.push((
-        summon_effect_name.to_string(),
-        summon_prev_x + 40.0,
-        summon_btn_y + 6.0,
-        text_main,
-    ));
+    {
+        let (shown, name_x) = center_cycle(summon_effect_name);
+        labels.push((shown, name_x, summon_btn_y + 6.0, text_main));
+    }
     // Cycle button labels (‹ / ›).
     labels.push(("<".to_string(), summon_prev_x + 9.0, summon_btn_y + 6.0, text_btn));
     labels.push((">".to_string(), summon_next_x + 9.0, summon_btn_y + 6.0, text_btn));
 
     // WINDOW MODE section (py+192) — CAPS header.
     labels.push(("WINDOW MODE".to_string(), px + 16.0, py + 192.0, text_header));
-    labels.push((
-        window_mode_name.to_string(),
-        summon_prev_x + 40.0,
-        winmode_btn_y + 6.0,
-        text_main,
-    ));
+    {
+        let (shown, name_x) = center_cycle(window_mode_name);
+        labels.push((shown, name_x, winmode_btn_y + 6.0, text_main));
+    }
     labels.push(("<".to_string(), summon_prev_x + 9.0, winmode_btn_y + 6.0, text_btn));
     labels.push((">".to_string(), summon_next_x + 9.0, winmode_btn_y + 6.0, text_btn));
 
     // TAB BAR section (py+240) — CAPS header.
     labels.push(("TAB BAR".to_string(), px + 16.0, py + 240.0, text_header));
-    labels.push((
-        tab_bar_name.to_string(),
-        summon_prev_x + 40.0,
-        tabbar_btn_y + 6.0,
-        text_main,
-    ));
+    {
+        let (shown, name_x) = center_cycle(tab_bar_name);
+        labels.push((shown, name_x, tabbar_btn_y + 6.0, text_main));
+    }
     labels.push(("<".to_string(), summon_prev_x + 9.0, tabbar_btn_y + 6.0, text_btn));
     labels.push((">".to_string(), summon_next_x + 9.0, tabbar_btn_y + 6.0, text_btn));
 

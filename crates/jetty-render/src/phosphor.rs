@@ -64,10 +64,15 @@ fn fs_glow(in: VsOut) -> @location(0) vec4<f32> {
     let ct = smoothstep(0.0, 0.45, t);
     // Descending bright scan line (matches the reveal front).
     let scan_y = smoothstep(0.15, 1.0, t);
-    let scan = smoothstep(0.05, 0.0, abs(in.uv.y - scan_y));
+    // Fix: smoothstep(0.05, 0.0, …) had edge0 > edge1 (spec-undefined).
+    // Rewrite as 1.0 - smoothstep(0.0, 0.05, …) which is equivalent and well-defined.
+    let scan = 1.0 - smoothstep(0.0, 0.05, abs(in.uv.y - scan_y));
     // Ignite envelope: 0 at t=0 and t=1 → no residue.
     let ignite = sin(t * 3.14159265);
-    let g = (rim * ct + scan) * ignite;
+    // Gate glow contribution by the rounded-rect SDF coverage so the additive
+    // pass doesn't re-opaque masked (rounded) corners that should be transparent.
+    let cov = clamp(-d, 0.0, 1.0);
+    let g = (rim * ct + scan) * ignite * cov;
     let accent = vec3<f32>(p.ar, p.ag, p.ab);
     return vec4<f32>(accent * g, g * 0.6);
 }
