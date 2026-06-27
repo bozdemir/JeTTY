@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.0] — 2026-06-27
+
+A polish + correctness release: a redesigned, elegant tab bar, a proper bottom
+status bar for the perf HUD, and a large wave of fixes from a deep multi-agent
+audit (89 agents) — including several that make JeTTY a *correct* terminal for
+TUIs (vim/htop/fzf), not just a fast one.
+
+### Added
+- **Bottom status bar** — the live perf HUD (ms · fps · CPU% · VT MB/s) moved off
+  the tab row into a slim status bar at the window bottom (`show_perf_hud`).
+- `CONTRIBUTING.md`, `CHANGELOG.md`, release notes, and GitHub issue/PR templates.
+
+### Changed
+- **Redesigned tab bar** — frameless, modern (Safari/Zed/Arc style): the active
+  tab is a soft theme-derived pill (no per-tab borders or `❯` marker); inactive
+  tabs are dim text only.
+- **Tab titles render in the platform's proportional sans-serif** (San Francisco
+  on macOS, the system UI sans on Linux) for an elegant, non-"code" look.
+- Chrome width math now uses the **measured** font advance — fixes HiDPI/Retina
+  overflow in menus, the HUD, and the settings panel.
+
+### Fixed
+- **Keyboard**: Home/End/Delete/Insert/F1–F12 were dropped entirely; `Ctrl/Shift/
+  Alt`+Arrow collapsed to bare arrows; Shift+Tab sent TAB. Now emit the proper
+  xterm sequences — vim/htop/less/fzf/readline editing works.
+- **Idle CPU**: a debounced resize held the loop in `Poll` and re-rendered ~15
+  frames for nothing — restored ~0% idle.
+- **macOS**: window transparency (correct `alpha_mode` selection) and Option-key
+  composed glyphs (©/ü) now reach the shell.
+- **Processes**: closed/exited shells are reaped (no more zombie/orphan leak).
+- Dropdown re-summons on the last-used monitor; lazy Tier-B offscreen; IPC socket
+  TOCTOU + UID-namespaced fallback; phosphor WGSL fixes; many smaller robustness
+  and consistency fixes.
+
+---
+
 ## [0.1.0] — 2026-06-26
 
 First public release of JeTTY — a blazing-fast, GPU-accelerated terminal with a
