@@ -122,14 +122,31 @@ pub fn build_tab_bar_ex(
             255,
         ]
     };
-    let active_bg = tint(0.22);
-    let inactive_bg = tint(0.07);
+    let active_bg = tint(0.22); // still used for the window-control hover highlight
     let fg = theme.fg;
     let dim_fg = [
         (fg[0] as u16 * 2 / 3) as u8,
         (fg[1] as u16 * 2 / 3) as u8,
         (fg[2] as u16 * 2 / 3) as u8,
     ];
+    // --- Elegant frameless tab palette ---
+    // The active tab is a soft, theme-derived NEUTRAL pill (a bg→fg blend, the
+    // same surface language as the settings panel) — no per-tab border, no marker.
+    // Inactive tabs are text only (transparent). This keeps the strip consistent
+    // with the rest of the UI instead of reading as bordered widgets.
+    let nl = |t: f32| -> [u8; 3] {
+        [
+            (bg[0] as f32 + (fg[0] as f32 - bg[0] as f32) * t) as u8,
+            (bg[1] as f32 + (fg[1] as f32 - bg[1] as f32) * t) as u8,
+            (bg[2] as f32 + (fg[2] as f32 - bg[2] as f32) * t) as u8,
+        ]
+    };
+    let n = |t: f32| -> [u8; 4] { let c = nl(t); [c[0], c[1], c[2], 255] };
+    let tab_active_fill = n(0.12); // soft lifted pill for the active/renaming tab
+    let tab_text_inactive = nl(0.46); // muted title on inactive tabs
+    let close_dim = nl(0.36); // recessive close × on inactive tabs
+    let close_active = nl(0.62); // close × on the active tab (a touch brighter)
+    let plus_col = nl(0.50); // "+" new-tab glyph
 
     let mut quads: Vec<Rect> = Vec::new();
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
@@ -190,73 +207,35 @@ pub fn build_tab_bar_ex(
     let drawn = tabs.len().min(max_visible);
     let overflow = tabs.len().saturating_sub(drawn);
 
-    // Background for a tab currently being renamed: a brighter accent so the
-    // editing target stands out.
-    let rename_bg = active_bg;
+    // Frameless pill geometry. The active/renaming tab is a single soft rounded
+    // pill (no border, no leading marker); inactive tabs draw nothing — just their
+    // dim title — so the strip reads as light, modern text-tabs rather than a row
+    // of bordered boxes.
+    const TAB_RADIUS: f32 = 8.0;
+    const TAB_INSET: f32 = 4.0; // horizontal gap between adjacent tabs
+    const TAB_VPAD: f32 = 6.0; // top/bottom margin so the pill doesn't touch edges
+    const TITLE_PAD: f32 = 13.0; // left inset of the title inside a tab
 
-    // Rounded-tab geometry. Each tab is a rounded rect with a 1px border drawn as
-    // a slightly larger rounded rect behind it (active = accent border, inactive =
-    // dim border) so the tabs match the rounded window frame.
-    const TAB_RADIUS: f32 = 6.0;
-    const TAB_INSET: f32 = 3.0; // horizontal gap between adjacent tabs
-    const TAB_VPAD: f32 = 6.0; // top/bottom margin so tabs don't touch the window edge
-    const TAB_BORDER: f32 = 1.0;
-    // Active tab border = accent; inactive = a dim blend toward the accent.
-    let active_border = [accent[0], accent[1], accent[2], 255];
-    let inactive_border = [
-        ((bg[0] as u16 + accent[0] as u16 * 2) / 3) as u8,
-        ((bg[1] as u16 + accent[1] as u16 * 2) / 3) as u8,
-        ((bg[2] as u16 + accent[2] as u16 * 2) / 3) as u8,
-        255,
-    ];
-
-    // Characters that fit in a tab body, derived from the measured chrome advance.
-    // Reserve room for the close "×" + left padding. Floors at 3 so a min-width
-    // tab still shows a couple of chars + the ellipsis.
-    let max_chars = (((tab_w - CLOSE_W - 32.0) / char_w).floor() as usize).max(2);
+    // Characters that fit, from the measured chrome advance. Reserve the close "×"
+    // box + left title pad + a little right breathing room.
+    let max_chars = (((tab_w - CLOSE_W - TITLE_PAD - 8.0) / char_w).floor() as usize).max(2);
 
     let mut x = left;
     for (i, (title, active)) in tabs.iter().take(drawn).enumerate() {
         let being_renamed = matches!(renaming, Some((ri, _)) if ri == i);
-        let bg_color = if being_renamed {
-            rename_bg
-        } else if *active {
-            active_bg
-        } else {
-            inactive_bg
-        };
-        let tab_rect = Rect { x, y: 0.0, w: tab_w, h, color: bg_color, ..Default::default() };
+        let is_on = *active || being_renamed;
 
-        // Inner tab body geometry (inset on all sides for the gap + border).
-        let body_x = x + TAB_INSET;
-        let body_y = TAB_VPAD;
-        let body_w = tab_w - TAB_INSET * 2.0;
-        let body_h = h - TAB_VPAD * 2.0;
-        let border_color = if *active || being_renamed { active_border } else { inactive_border };
-        // Border: a rounded rect 1px larger than the body on every side.
-        quads.push(Rect::rounded(
-            body_x - TAB_BORDER,
-            body_y - TAB_BORDER,
-            body_w + TAB_BORDER * 2.0,
-            body_h + TAB_BORDER * 2.0,
-            border_color,
-            TAB_RADIUS + TAB_BORDER,
-        ));
-        // Fill: the rounded tab body on top of the border.
-        quads.push(Rect::rounded(body_x, body_y, body_w, body_h, bg_color, TAB_RADIUS));
+        // Active/renaming tab → a soft filled pill. Inactive → nothing drawn.
+        if is_on {
+            let body_x = x + TAB_INSET;
+            let body_w = tab_w - TAB_INSET * 2.0;
+            quads.push(Rect::rounded(body_x, TAB_VPAD, body_w, h - TAB_VPAD * 2.0, tab_active_fill, TAB_RADIUS));
+        }
 
-        let label_color = if *active || being_renamed { fg } else { dim_fg };
-        // Leading oh-my-zsh-style prompt marker (❯): bright accent on the active
-        // tab, dim otherwise — the active indicator (in place of an underline).
-        let marker_color = if *active || being_renamed {
-            [active_border[0], active_border[1], active_border[2]]
-        } else {
-            dim_fg
-        };
-        labels.push(("❯".to_string(), x + 10.0, 9.0, marker_color));
+        let label_color = if is_on { fg } else { tab_text_inactive };
+        let title_x = x + TITLE_PAD;
         if being_renamed {
-            // Show the live edit buffer plus a trailing caret. Truncate from the
-            // FRONT so the caret/most-recent text stays visible while typing.
+            // Live edit buffer + trailing caret, front-truncated so the caret stays.
             let buf = match renaming { Some((_, b)) => b, None => "" };
             let mut shown: String = if buf.chars().count() > max_chars - 1 {
                 let skip = buf.chars().count() - (max_chars - 1);
@@ -265,9 +244,8 @@ pub fn build_tab_bar_ex(
                 buf.to_string()
             };
             shown.push('▏');
-            labels.push((shown, x + 26.0, 9.0, label_color));
+            labels.push((shown, title_x, 9.0, label_color));
         } else {
-            // Truncated title label.
             let shown: String = if title.chars().count() > max_chars {
                 let mut s: String = title.chars().take(max_chars - 1).collect();
                 s.push('…');
@@ -275,26 +253,27 @@ pub fn build_tab_bar_ex(
             } else {
                 title.clone()
             };
-            labels.push((shown, x + 26.0, 9.0, label_color));
+            labels.push((shown, title_x, 9.0, label_color));
 
-            // Close "×" at the tab's right (hidden while renaming this tab).
+            // Close "×": recessive on inactive tabs, a touch brighter on the active.
             let close_x = x + tab_w - CLOSE_W - 4.0;
-            labels.push(("×".to_string(), close_x + 4.0, 9.0, label_color));
+            let x_col = if is_on { close_active } else { close_dim };
+            labels.push(("×".to_string(), close_x + 4.0, 9.0, x_col));
         }
 
-        // Close hit-box (kept even while renaming so indices stay aligned).
+        // Close hit-box (kept while renaming so indices stay aligned). Color is
+        // unused for hit-testing.
         let close_x = x + tab_w - CLOSE_W - 4.0;
-        close_rects.push(Rect { x: close_x, y: 0.0, w: CLOSE_W, h, color: bg_color, ..Default::default() });
+        close_rects.push(Rect { x: close_x, y: 0.0, w: CLOSE_W, h, color: [0, 0, 0, 0], ..Default::default() });
 
-        tab_rects.push(tab_rect);
+        tab_rects.push(Rect { x, y: 0.0, w: tab_w, h, color: [0, 0, 0, 0], ..Default::default() });
         x += tab_w;
     }
 
-    // "+" new-tab button after the last tab (clamped within the tab area).
-    let plus_rect = Rect { x, y: 0.0, w: PLUS_W, h, color: inactive_bg, ..Default::default() };
+    // "+" new-tab button — minimal: just a dim glyph, no box.
+    let plus_rect = Rect { x, y: 0.0, w: PLUS_W, h, color: [0, 0, 0, 0], ..Default::default() };
     if x + PLUS_W <= tab_area_x {
-        quads.push(Rect::rounded(x + 3.0, TAB_VPAD, PLUS_W - 6.0, h - TAB_VPAD * 2.0, inactive_bg, 5.0));
-        labels.push(("+".to_string(), x + 11.0, 8.0, fg));
+        labels.push(("+".to_string(), x + 11.0, 8.0, plus_col));
     }
 
     // A small "+N" hint when some tabs couldn't be drawn (too many to fit even at
