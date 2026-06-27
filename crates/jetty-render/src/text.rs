@@ -11,6 +11,44 @@ use wgpu::MultisampleState;
 /// — a Nerd Font, so the zsh prompt's powerline/icon glyphs render correctly.
 const FONT_FAMILY_DEFAULT: &str = "MesloLGS NF";
 
+/// Which family the chrome-overlay pass (`render_overlays*`) shapes its labels
+/// in. Distinct from the TERMINAL grid font (`font_family`): chrome — tab
+/// titles, the status bar, the menu, the panel, help/confirm/welcome — renders
+/// in the user's chosen UI font, which defaults to the platform proportional
+/// sans (`Sans`). `Named` selects an installed family by name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChromeFamily {
+    /// Platform proportional sans-serif (`Family::SansSerif`). The default,
+    /// matching today's elegant sans tab titles.
+    Sans,
+    /// A specific installed family, chosen by the user from the UI-font picker.
+    Named(String),
+}
+
+impl ChromeFamily {
+    /// Build the glyphon `Family` to shape a chrome run with.
+    ///
+    /// `Named(name)` → that family for EVERY surface (the user opted into a UI
+    /// font, so all chrome unifies onto it).
+    ///
+    /// `Sans` is the DEFAULT and must render byte-identical to the pre-feature
+    /// chrome, which used two families: tab TITLES in the platform proportional
+    /// sans, and everything else (menu, status/perf bar, help/confirm/welcome,
+    /// window-control + close glyphs) in the MONOSPACE chrome font. The latter is
+    /// load-bearing: the mono font is a Nerd Font that carries the symbol glyphs
+    /// (⇧ ⌃ ⚡ ⚙ ✕ …) that the platform sans (e.g. Noto Sans) lacks — rendering
+    /// those in plain sans would show tofu boxes. So at the default we route
+    /// titles to `SansSerif` (`is_title`) and everything else to the mono
+    /// `mono_fallback` family, exactly as before.
+    fn as_family<'a>(&'a self, is_title: bool, mono_fallback: &'a str) -> Family<'a> {
+        match self {
+            ChromeFamily::Named(name) => Family::Name(name),
+            ChromeFamily::Sans if is_title => Family::SansSerif,
+            ChromeFamily::Sans => Family::Name(mono_fallback),
+        }
+    }
+}
+
 pub struct TextLayer {
     font_system: FontSystem,
     swash: SwashCache,
@@ -30,6 +68,12 @@ pub struct TextLayer {
     /// `Arc<str>` so per-frame span building can share it without cloning the
     /// string (the family name is captured by every cell's `Attrs`).
     font_family: Arc<str>,
+    /// Family the CHROME overlay pass renders in (tab titles, status bar, menu,
+    /// panel, help/confirm/welcome). Independent of `font_family` (the terminal
+    /// grid font). Defaults to `Sans` so the default chrome look is unchanged
+    /// (tab titles already render in `Family::SansSerif`). Set via
+    /// `set_ui_family` — no FontSystem rebuild.
+    ui_family: ChromeFamily,
     /// Per-frame scratch buffers, reused across `render_to` calls to avoid
     /// reallocating ~rows*cols heap items every frame (speed-first hot path).
     /// Taken out via `mem::take` during the frame and put back at the end.
@@ -125,6 +169,10 @@ impl TextLayer {
             cell_h,
             overlay_buffers: Vec::new(),
             font_family: Arc::from(family),
+            // Chrome defaults to the platform proportional sans, matching the
+            // pre-feature look (sans tab titles); the app overrides this from
+            // the persisted `ui_font_family` after construction.
+            ui_family: ChromeFamily::Sans,
             text_scratch: String::new(),
             cell_ranges_scratch: Vec::new(),
         }
@@ -165,6 +213,31 @@ impl TextLayer {
         families
     }
 
+    /// Returns the sorted, deduplicated list of PROPORTIONAL (non-monospaced)
+    /// font family names known to the font system — the candidates for the UI
+    /// (chrome) font picker. Mirrors `monospace_families` but inverts the
+    /// `monospaced` flag, so the list offers the user real sans/serif UI faces
+    /// (the synthetic "System Sans (default)" row in the panel always provides
+    /// the escape hatch back to the platform sans).
+    pub fn proportional_families(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut families: Vec<String> = Vec::new();
+
+        for face in self.font_system.db().faces() {
+            if !face.monospaced {
+                // The first family entry is always English US.
+                if let Some((name, _)) = face.families.first() {
+                    if seen.insert(name.clone()) {
+                        families.push(name.clone());
+                    }
+                }
+            }
+        }
+
+        families.sort();
+        families
+    }
+
     /// Change the active font family at runtime. Updates `font_family`, remeasures
     /// the cell size, and resets the cursor buffer glyph with the new family.
     /// The caller must call `reflow()` and `request_redraw()` after this.
@@ -181,6 +254,42 @@ impl TextLayer {
             Shaping::Basic,
             None,
         );
+    }
+
+    /// Change the CHROME (UI-overlay) font family at runtime. `None` or an empty
+    /// name selects the platform proportional sans (`ChromeFamily::Sans`);
+    /// otherwise the named installed family. Re-measures `cell_w` for the new
+    /// family so chrome width math (panel right-align, perf-HUD placement) stays
+    /// correct — but REUSES the existing `FontSystem` (its db already holds every
+    /// installed family from `build_font_system`), so this never pays the ~20ms
+    /// fontconfig rescan. Only affects `render_overlays*`; the terminal grid
+    /// (which uses `font_family`) is untouched. Caller should `request_redraw`.
+    pub fn set_ui_family(&mut self, name: Option<&str>) {
+        self.ui_family = match name {
+            Some(n) if !n.is_empty() => ChromeFamily::Named(n.to_string()),
+            _ => ChromeFamily::Sans,
+        };
+        // Re-measure the chrome cell advance with the new family so chrome_char_w
+        // (and every width reservation derived from it) tracks the UI font.
+        self.cell_w = self.measure_chrome_advance();
+    }
+
+    /// Measure the advance (`cell_w`) for the CURRENT chrome family at the current
+    /// metrics. For the default `Sans` we deliberately measure the MONOSPACE
+    /// `font_family` advance (today's ~9.6px chrome cell), NOT the true sans
+    /// advance — so a default config's `chrome_char_w` (which drives panel
+    /// right-align, perf-HUD placement, tab-bar reservations) is byte-for-byte
+    /// what it was before this feature, keeping the default look unchanged. A
+    /// user-chosen `Named` UI family measures that family's own advance.
+    fn measure_chrome_advance(&mut self) -> f32 {
+        match &self.ui_family {
+            ChromeFamily::Sans => {
+                measure_advance_family(&mut self.font_system, self.metrics, &Arc::clone(&self.font_family))
+            }
+            ChromeFamily::Named(n) => {
+                measure_advance_family(&mut self.font_system, self.metrics, &n.clone())
+            }
+        }
     }
 
     /// Change the font size in-place, REUSING the existing `FontSystem` (and its
@@ -204,14 +313,11 @@ impl TextLayer {
             Shaping::Basic,
             None,
         );
-        // Re-measure the monospace cell at the new size.
-        self.cell_w = measure_advance_family(
-            &mut self.font_system,
-            self.metrics,
-            // measure with the current family; clone the Arc cheaply to satisfy
-            // the &mut self.font_system borrow.
-            &Arc::clone(&self.font_family),
-        );
+        // Re-measure the cell at the new size. For the terminal layer (`ui_family`
+        // == Sans, never set away from default) this measures the monospace
+        // `font_family` — the grid cell. For the chrome layer it measures the
+        // active chrome family, so a UI-font SIZE change re-derives chrome_char_w.
+        self.cell_w = self.measure_chrome_advance();
         self.cell_h = line_height;
     }
 
@@ -423,7 +529,11 @@ impl TextLayer {
         width: u32,
         height: u32,
         labels: &[(String, f32, f32, [u8; 3])],
-        sans: bool,
+        // True for tab TITLES (the only chrome that defaulted to SansSerif before
+        // this feature). Steers the `Sans` DEFAULT only: titles → SansSerif, all
+        // other chrome → the mono Nerd Font (preserving its symbol glyphs). When a
+        // `Named` UI family is set, every surface uses it regardless of this flag.
+        is_title: bool,
     ) -> Result<(), PrepareError> {
         if labels.is_empty() {
             return Ok(());
@@ -443,18 +553,27 @@ impl TextLayer {
             bottom: height as i32,
         };
 
-        // First pass: set text content (requires &mut font_system, so can't borrow bufs as &T simultaneously).
-        let family_name = self.font_family.clone();
+        // First pass: set text content (requires &mut font_system, so can't borrow
+        // bufs as &T simultaneously). Clone the chrome family + mono fallback +
+        // metrics out of self so the `Family::Name` borrow doesn't conflict with
+        // the &mut font_system.
+        let ui_family = self.ui_family.clone();
+        let mono_fallback = self.font_family.clone();
+        let metrics = self.metrics;
         for (i, (text, _x, _y, _rgb)) in labels.iter().enumerate() {
             let buf = &mut self.overlay_buffers[i];
+            // POOLED buffers are reused across frames and retain whatever metrics
+            // they were created with. After a UI-font SIZE change the pool still
+            // holds buffers at the OLD size, so the first frames would render
+            // stale-size glyphs. Push the current metrics into every buffer each
+            // frame so a size change takes effect immediately (one-liner, easy to
+            // miss). Cheap: set_metrics is a no-op when the metrics are unchanged.
+            buf.set_metrics(&mut self.font_system, metrics);
             buf.set_size(&mut self.font_system, None, Some(height as f32));
-            // Tab titles render in the platform's default proportional sans
-            // (Family::SansSerif); all other chrome stays in the monospace family.
-            let attrs = if sans {
-                Attrs::new().family(Family::SansSerif)
-            } else {
-                Attrs::new().family(Family::Name(&family_name))
-            };
+            // A `Named` UI family unifies ALL chrome onto it; the `Sans` default
+            // keeps today's split (titles → sans, rest → mono Nerd Font) so the
+            // default look — including symbol glyphs — is byte-identical.
+            let attrs = Attrs::new().family(ui_family.as_family(is_title, &mono_fallback));
             buf.set_text(&mut self.font_system, text, &attrs, Shaping::Basic, None);
         }
 
@@ -512,7 +631,10 @@ impl TextLayer {
         Ok(())
     }
 
-    /// Render chrome labels in the configured monospace chrome font.
+    /// Render NON-TITLE chrome labels (menu, status/perf bar, panel, help,
+    /// confirm, welcome, window controls). With a `Named` UI family they render in
+    /// it; at the `Sans` default they render in the mono Nerd Font (preserving its
+    /// symbol glyphs ⇧ ⌃ ⚡ ⚙ ✕ …), exactly as before this feature.
     pub fn render_overlays(
         &mut self,
         device: &wgpu::Device,
@@ -525,11 +647,10 @@ impl TextLayer {
         self.render_overlays_inner(device, queue, view, width, height, labels, false)
     }
 
-    /// Render chrome labels in the platform's default PROPORTIONAL sans-serif font
-    /// (`Family::SansSerif` → e.g. San Francisco on macOS, the system UI sans on
-    /// Linux). Used for tab titles so the strip reads as elegant UI text rather
-    /// than monospace "code". Width math is unaffected — callers left-align the
-    /// titles and the proportional text is narrower than the monospace reservation.
+    /// Render tab TITLE labels. With a `Named` UI family they render in it (so the
+    /// titles follow the user's chosen UI font like the rest of the chrome); at
+    /// the `Sans` default they render in the platform proportional sans
+    /// (`Family::SansSerif`) — the elegant sans titles, identical to before.
     pub fn render_overlays_sans(
         &mut self,
         device: &wgpu::Device,
