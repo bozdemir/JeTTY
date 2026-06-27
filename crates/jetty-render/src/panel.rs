@@ -69,9 +69,13 @@ const CHIP_NAMES: [&str; 5] = ["Mocha", "Tokyo", "Gruv", "Drac", "Onyx"];
 /// If more families exist, the list scrolls via `font_scroll_offset`.
 const MAX_FONT_ROWS: usize = 5;
 
-/// Chrome-font character advance (px). Used for right-aligned value readouts
-/// and scroll-hint sizing. Matches the advance used in help.rs/tabbar.rs.
-const CHAR_W: f32 = 9.8;
+/// Fallback chrome-font character advance (px), used when a measured advance is
+/// not available. Passed in via the `char_w` parameter of `build_panel` on
+/// HiDPI-aware paths; matches the constant used in help.rs/tabbar.rs.
+/// Referenced by tests in this module; the `#[cfg(test)]` gating causes the
+/// compiler to warn about dead code in non-test builds, hence the allow.
+#[allow(dead_code)]
+pub(crate) const CHAR_W_FALLBACK: f32 = 9.8;
 
 /// Settings-panel dimensions in logical px. The separate Settings OS window is
 /// sized to these (+ border) — see `SETTINGS_WIN_*` in jetty-app. Growing the
@@ -94,6 +98,10 @@ const _: () = assert!(CHIP_NAMES.len() == jetty_core::theme::PRESETS.len());
 /// currently selected family name, the scroll offset into the family list, and
 /// a user drag offset (`dx`, `dy`) added to the centered position so the dialog
 /// can be moved. The panel is clamped to remain fully on-screen.
+///
+/// `char_w` is the measured physical-pixel advance of one chrome-font character
+/// (from `TextLayer::cell_size().0`). Pass `CHAR_W_FALLBACK` (9.8) when a real
+/// measurement is not available (scale-1 fallback used by tests).
 #[allow(clippy::too_many_arguments)]
 pub fn build_panel(
     screen_w: u32,
@@ -115,6 +123,7 @@ pub fn build_panel(
     dx: f32,
     dy: f32,
     theme: &jetty_core::Theme,
+    char_w: f32,
 ) -> PanelView {
 
     // --- Theme-derived panel chrome colors ---
@@ -224,7 +233,7 @@ pub fn build_panel(
     // Helper: right-align a text value on the section-header row.
     // Returns the x-position such that the text's right edge sits at px+PANEL_W-16.
     let right_x = |text: &str| -> f32 {
-        let w = text.chars().count() as f32 * CHAR_W;
+        let w = text.chars().count() as f32 * char_w;
         px + PANEL_W - 16.0 - w
     };
 
@@ -496,21 +505,26 @@ pub fn build_panel(
     // Helper: center a (possibly truncated) cycle-name label between the ‹ and ›
     // buttons. The gap runs from [summon_prev_x+28] to [summon_next_x]; we clamp
     // the x so a long name never overruns either button.
-    // Max chars that fit in the gap (108px / 9.8px ≈ 11 chars).
-    const CYCLE_MAX_CHARS: usize = 11;
+    // Max chars that fit in the gap (cycle_gap_w / char_w, approximately 11 at scale 1).
     let cycle_gap_left  = summon_prev_x + 28.0; // right edge of ‹ button
     let cycle_gap_right = summon_next_x;         // left edge of › button
     let cycle_gap_w     = cycle_gap_right - cycle_gap_left;
+    // Guard against zero/tiny char_w to avoid infinite truncation.
+    let cycle_max_chars = if char_w > 0.0 {
+        ((cycle_gap_w / char_w).floor() as usize).max(3)
+    } else {
+        11
+    };
     let center_cycle = |name: &str| -> (String, f32) {
         // Truncate long names to avoid overrunning the buttons.
-        let shown: String = if name.chars().count() > CYCLE_MAX_CHARS {
-            let mut s: String = name.chars().take(CYCLE_MAX_CHARS - 1).collect();
+        let shown: String = if name.chars().count() > cycle_max_chars {
+            let mut s: String = name.chars().take(cycle_max_chars - 1).collect();
             s.push('…');
             s
         } else {
             name.to_string()
         };
-        let text_w = shown.chars().count() as f32 * CHAR_W;
+        let text_w = shown.chars().count() as f32 * char_w;
         // Center in the gap, clamped so text stays between the buttons.
         let x = (cycle_gap_left + (cycle_gap_w - text_w) * 0.5)
             .clamp(cycle_gap_left, (cycle_gap_right - text_w).max(cycle_gap_left));
@@ -627,7 +641,7 @@ pub fn build_panel(
         // px+PANEL_W-132 anchor overran the arrows.
         let hint = format!("({}/{})", offset + visible_count, families.len());
         let scroll_up_left = px + PANEL_W - 60.0;
-        let hint_w = hint.chars().count() as f32 * CHAR_W;
+        let hint_w = hint.chars().count() as f32 * char_w;
         let hint_x = scroll_up_left - 6.0 - hint_w;
         labels.push((hint, hint_x, py + 504.0, text_dim));
     }
@@ -728,6 +742,7 @@ mod tests {
             false,           // focus_autohide
             0.0, 0.0,        // dx, dy
             &theme,
+            CHAR_W_FALLBACK, // char_w (scale-1 default for tests)
         )
     }
 

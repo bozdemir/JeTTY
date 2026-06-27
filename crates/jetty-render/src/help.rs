@@ -37,7 +37,11 @@ pub struct HelpOverlay {
 /// Build the centered "Keyboard Shortcuts" help overlay for a window of size
 /// `win_w`×`win_h` (physical pixels). The panel is sized to fit the rows and
 /// clamped on-screen. A click outside `panel` (or Esc / the "?" button) closes it.
-pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme) -> HelpOverlay {
+///
+/// `char_w` is the measured physical-pixel advance of one chrome-font character
+/// (from `TextLayer::cell_size().0`). Pass `9.8` when a real measurement is not
+/// available (scale-1 fallback used by tests).
+pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme, char_w: f32) -> HelpOverlay {
     let sw = win_w as f32;
     let sh = win_h as f32;
 
@@ -61,11 +65,9 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme) -> 
     let title_col = tfg;
     let row_col = lerp(0.70);
 
-    // Approximate width of one rendered overlay character. The overlay text uses
-    // the configured monospace font (default MesloLGS NF) near 16px, whose
-    // advance is ~9.6px; we slightly over-estimate so the computed panel always
-    // contains the text rather than clipping it.
-    const CHAR_W: f32 = 9.8;
+    // The caller supplies the measured chrome-font advance via `char_w`.
+    // On scale-1 displays this is ~9.8px (the historical hardcoded estimate);
+    // on HiDPI it scales proportionally so the panel is always wide enough.
     // Ideal vertical metrics. When the window is too SHORT to fit every row, the
     // padding / title / row heights are scaled DOWN proportionally (to a readable
     // floor) so the overlay always fits and no row clips off-screen.
@@ -89,7 +91,7 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme) -> 
         .chain(std::iter::once("Keyboard Shortcuts".chars().count()))
         .max()
         .unwrap_or(0) as f32;
-    let content_w = longest_chars * CHAR_W;
+    let content_w = longest_chars * char_w;
 
     let rows = HELP_ROWS.len() as f32;
     // Ideal content height; if it exceeds the window, scale the vertical metrics
@@ -172,9 +174,12 @@ mod tests {
         jetty_core::Theme::by_name("catppuccin_mocha")
     }
 
+    /// Scale-1 char advance used in tests (matches the historical fallback constant).
+    const TEST_CHAR_W: f32 = 9.8;
+
     #[test]
     fn panel_is_centered_and_on_screen() {
-        let h = build_help_overlay(1000, 700, &theme());
+        let h = build_help_overlay(1000, 700, &theme(), TEST_CHAR_W);
         assert!(h.panel.x >= 0.0 && h.panel.y >= 0.0);
         assert!(h.panel.x + h.panel.w <= 1000.0 + 0.5);
         assert!(h.panel.y + h.panel.h <= 700.0 + 0.5);
@@ -187,11 +192,13 @@ mod tests {
     fn every_row_text_fits_inside_panel() {
         // Across a range of widths (including very narrow), no row's estimated
         // rendered text right edge may exceed the panel's right border.
+        // The estimate uses the same char_w passed to the builder so the panel
+        // is always sized to contain the text.
         for w in [320u32, 500, 700, 1000, 1600] {
-            let h = build_help_overlay(w, 700, &theme());
+            let h = build_help_overlay(w, 700, &theme(), TEST_CHAR_W);
             let panel_right = h.panel.x + h.panel.w;
             for (text, x, _y, _c) in &h.labels {
-                let est_right = x + text.chars().count() as f32 * 9.8;
+                let est_right = x + text.chars().count() as f32 * TEST_CHAR_W;
                 assert!(
                     est_right <= panel_right + 0.5,
                     "row {text:?} overflows panel at width {w}: {est_right} > {panel_right}"
@@ -205,7 +212,7 @@ mod tests {
         // At short window heights the overlay must still fit every row on-screen
         // (the lower rows must not clip off the bottom of the window).
         for h in [360u32, 420, 480, 640] {
-            let overlay = build_help_overlay(700, h, &theme());
+            let overlay = build_help_overlay(700, h, &theme(), TEST_CHAR_W);
             // The panel itself fits the window.
             assert!(
                 overlay.panel.y >= 0.0 && overlay.panel.y + overlay.panel.h <= h as f32 + 0.5,
@@ -231,7 +238,7 @@ mod tests {
 
     #[test]
     fn lists_core_bindings() {
-        let h = build_help_overlay(1000, 700, &theme());
+        let h = build_help_overlay(1000, 700, &theme(), TEST_CHAR_W);
         let joined: String = h.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("F9"));
         assert!(joined.contains("Ctrl+Shift+P"));

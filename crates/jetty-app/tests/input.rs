@@ -477,7 +477,7 @@ fn make_panel_geom() -> jetty_render::PanelGeom {
     let theme = jetty_core::Theme::by_name("catppuccin_mocha");
     jetty_render::build_panel(
         1000, 640, 0.7, 1, 16.0, &[], "", 0, 10.0, "Bayer",
-        "Center", "Top", 0.50, 1.0, false, true, 0.0, 0.0, &theme,
+        "Center", "Top", 0.50, 1.0, false, true, 0.0, 0.0, &theme, 9.8,
     )
     .geom
 }

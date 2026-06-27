@@ -18,11 +18,16 @@ pub struct ConfirmPopup {
 
 /// Build a centered confirmation popup with an arbitrary `prompt` line plus
 /// Enter—Close / Esc—Cancel buttons, for a `win_w`×`win_h` (physical px) window.
+///
+/// `char_w` is the measured physical-pixel advance of one chrome-font character
+/// (from `TextLayer::cell_size().0`). Pass `9.8` when a real measurement is not
+/// available (scale-1 fallback used by tests).
 pub fn build_confirm(
     win_w: u32,
     win_h: u32,
     prompt: &str,
     theme: &jetty_core::Theme,
+    char_w: f32,
 ) -> ConfirmPopup {
     let sw = win_w as f32;
     let sh = win_h as f32;
@@ -47,7 +52,7 @@ pub fn build_confirm(
     let cancel3 = lerp(0.18);
     let cancel_btn: [u8; 4] = [cancel3[0], cancel3[1], cancel3[2], 255];
 
-    const CHAR_W: f32 = 9.8;
+    // char_w is the caller-supplied measured chrome advance (scale-correct).
     const PAD: f32 = 20.0;
     const RADIUS: f32 = 8.0;
     const BTN_H: f32 = 30.0;
@@ -65,10 +70,10 @@ pub fn build_confirm(
     };
 
     // Width fits the widest line (prompt, or the two buttons side by side).
-    let btn_close_w = close_label.chars().count() as f32 * CHAR_W + 20.0;
-    let btn_cancel_w = cancel_label.chars().count() as f32 * CHAR_W + 20.0;
+    let btn_close_w = close_label.chars().count() as f32 * char_w + 20.0;
+    let btn_cancel_w = cancel_label.chars().count() as f32 * char_w + 20.0;
     let buttons_w = btn_close_w + BTN_GAP + btn_cancel_w;
-    let prompt_w = prompt.chars().count() as f32 * CHAR_W;
+    let prompt_w = prompt.chars().count() as f32 * char_w;
     let content_w = prompt_w.max(buttons_w);
     let panel_w = (content_w + PAD * 2.0).min((sw - 32.0).max(0.0)).max(content_w + 12.0);
 
@@ -112,11 +117,14 @@ pub fn build_confirm(
 }
 
 /// Confirmation popup asking whether to close the tab titled `title`.
+///
+/// `char_w` is forwarded directly to `build_confirm`; see its docs.
 pub fn build_confirm_close(
     win_w: u32,
     win_h: u32,
     title: &str,
     theme: &jetty_core::Theme,
+    char_w: f32,
 ) -> ConfirmPopup {
     let shown_title: String = if title.chars().count() > 28 {
         let t: String = title.chars().take(27).collect();
@@ -124,7 +132,7 @@ pub fn build_confirm_close(
     } else {
         title.to_string()
     };
-    build_confirm(win_w, win_h, &format!("Close tab \"{shown_title}\"?"), theme)
+    build_confirm(win_w, win_h, &format!("Close tab \"{shown_title}\"?"), theme, char_w)
 }
 
 #[cfg(test)]
@@ -135,9 +143,12 @@ mod tests {
         jetty_core::Theme::by_name("catppuccin_mocha")
     }
 
+    /// Scale-1 char advance used in tests.
+    const TEST_char_w: f32 = 9.8;
+
     #[test]
     fn popup_is_centered_and_has_buttons() {
-        let p = build_confirm_close(1000, 700, "Tab 1", &theme());
+        let p = build_confirm_close(1000, 700, "Tab 1", &theme(), TEST_char_w);
         assert!(p.panel.x >= 0.0 && p.panel.y >= 0.0);
         assert!(p.panel.x + p.panel.w <= 1000.0 + 0.5);
         // Close button sits left of Cancel.
@@ -149,7 +160,7 @@ mod tests {
     #[test]
     fn long_title_is_truncated() {
         let long = "a".repeat(80);
-        let p = build_confirm_close(1000, 700, &long, &theme());
+        let p = build_confirm_close(1000, 700, &long, &theme(), TEST_char_w);
         let prompt = &p.labels[0].0;
         assert!(prompt.contains('…'), "long title should be truncated: {prompt}");
         assert!(p.panel.x + p.panel.w <= 1000.0 + 0.5);
@@ -157,7 +168,7 @@ mod tests {
 
     #[test]
     fn generic_confirm_shows_prompt() {
-        let p = build_confirm(1000, 700, "Quit JeTTY?", &theme());
+        let p = build_confirm(1000, 700, "Quit JeTTY?", &theme(), TEST_char_w);
         assert!(p.labels.iter().any(|l| l.0.contains("Quit JeTTY?")));
     }
 }

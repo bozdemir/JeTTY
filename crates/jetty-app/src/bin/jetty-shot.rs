@@ -92,6 +92,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // through this, so chrome text is the SAME size regardless of JETTY_FONT_SIZE.
     // The terminal grid renders through `text` (which scales with the font).
     let mut chrome_text = TextLayer::new_with_family(&device, &queue, format, 16.0, &font_family);
+    // Measured chrome-font advance: used by all overlay builders for scale-correct
+    // width reservations (HiDPI-aware). On a CI/scale-1 run this is ~9.6–9.8 px.
+    let chrome_char_w = chrome_text.cell_size().0;
     let (cell_w, cell_h) = text.cell_size();
     let mono_families = text.monospace_families();
     eprintln!("jetty-shot: {} monospace families found (e.g. {:?})", mono_families.len(), mono_families.first());
@@ -289,6 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 panel_dx,
                 panel_dy,
                 terminal.theme(),
+                chrome_char_w,
             );
             rects.extend(pv.quads);
             eprintln!(
@@ -301,14 +305,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // JETTY_SHOT_MENU — render the right-click context menu for visual checks.
         if std::env::var("JETTY_SHOT_MENU").is_ok() {
-            let menu = jetty_render::build_context_menu(620.0, 120.0, width, height, Some(1), terminal.theme());
+            let menu = jetty_render::build_context_menu(620.0, 120.0, width, height, Some(1), terminal.theme(), chrome_char_w);
             rects.extend(menu.quads);
             panel_labels.extend(menu.labels);
         }
 
         // JETTY_SHOT_HELP — render the Keyboard Shortcuts help overlay.
         if std::env::var("JETTY_SHOT_HELP").is_ok() {
-            let help = jetty_render::build_help_overlay(width, height, terminal.theme());
+            let help = jetty_render::build_help_overlay(width, height, terminal.theme(), chrome_char_w);
             rects.extend(help.quads);
             panel_labels.extend(help.labels);
         }
@@ -338,6 +342,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 jetty_render::CtrlHover::None,
                 perf_owned.as_deref(),
+                chrome_char_w,
             );
             // JETTY_TAB_BAR=bottom — place the bar flush at the window bottom.
             // build_tab_bar lays it out at y 0..TABBAR_H; translate it down.
@@ -371,6 +376,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 env!("CARGO_PKG_VERSION"),
                 "Vulkan",
                 terminal.theme(),
+                chrome_char_w,
             );
             rects.extend(splash.quads);
             panel_labels.extend(splash.labels);
@@ -379,7 +385,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // JETTY_SHOT_CONFIRM — render the "Close this tab?" confirmation popup.
         if std::env::var("JETTY_SHOT_CONFIRM").is_ok() {
-            let popup = jetty_render::build_confirm_close(width, height, "Tab 2", terminal.theme());
+            let popup = jetty_render::build_confirm_close(width, height, "Tab 2", terminal.theme(), chrome_char_w);
             rects.extend(popup.quads);
             panel_labels.extend(popup.labels);
         }
@@ -387,7 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // JETTY_SHOT_QUIT — render the whole-app "Quit JeTTY?" confirmation popup.
         if std::env::var("JETTY_SHOT_QUIT").is_ok() {
             let popup = jetty_render::build_confirm(
-                width, height, "Quit JeTTY? — all tabs will close", terminal.theme(),
+                width, height, "Quit JeTTY? — all tabs will close", terminal.theme(), chrome_char_w,
             );
             rects.extend(popup.quads);
             panel_labels.extend(popup.labels);

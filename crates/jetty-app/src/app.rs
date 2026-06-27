@@ -1071,6 +1071,18 @@ impl App {
         }
     }
 
+    /// Returns the measured physical-pixel advance of one chrome-font character
+    /// from the fixed-size chrome `TextLayer`. Falls back to `9.6` when the chrome
+    /// layer has not yet been initialised (i.e. before the first GPU frame).
+    ///
+    /// This is the scale-aware value that must be threaded into every chrome overlay
+    /// builder (`build_tab_bar_ex`, `build_panel`, `build_help_overlay`, etc.) so
+    /// that right-alignment and width reservations are correct on HiDPI displays.
+    #[inline]
+    fn chrome_char_w(&self) -> f32 {
+        self.chrome_text.as_ref().map(|ct| ct.cell_size().0).unwrap_or(9.6)
+    }
+
     /// Convert the current cursor pixel position into 1-based terminal cell
     /// coordinates `(col, row)` using the renderer's cell size. Returns `None`
     /// when the renderer (and thus cell metrics) is not yet available.
@@ -1518,7 +1530,7 @@ impl App {
             self.dropdown_height_pct,
             self.dropdown_width_pct,
             self.window_mode == WindowMode::Dropdown, self.focus_autohide,
-            0.0, 0.0, &theme,
+            0.0, 0.0, &theme, self.chrome_char_w(),
         )
     }
 
@@ -1541,6 +1553,7 @@ impl App {
         let families = self.font_families.clone();
         let family = self.font_family.clone();
         let theme = self.current_theme();
+        let char_w = self.chrome_char_w();
         let (Some(gpu), Some(text), Some(quad)) =
             (&mut self.settings_gpu, &mut self.settings_text, &mut self.settings_quad)
         else {
@@ -1552,7 +1565,7 @@ impl App {
             width, height, opacity, theme_idx, font_logical,
             &families, &family, font_scroll_offset, corner_radius, summon_name,
             window_mode_name, tab_bar_name, dropdown_height_pct, dropdown_width_pct, is_dropdown, focus_autohide,
-            0.0, 0.0, &theme,
+            0.0, 0.0, &theme, char_w,
         );
         if let Some((frame, view)) = gpu.acquire_frame() {
             // Clear the window background to the panel border color, then paint the
@@ -2412,7 +2425,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let cy = self.cursor.1 as f32;
                     let theme = self.current_theme();
                     let popup =
-                        jetty_render::build_confirm(w, h, "Quit JeTTY? — all tabs will close", &theme);
+                        jetty_render::build_confirm(w, h, "Quit JeTTY? — all tabs will close", &theme, self.chrome_char_w());
                     if input::point_in(&popup.close_rect, cx, cy) {
                         event_loop.exit();
                         return;
@@ -2435,7 +2448,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let cy = self.cursor.1 as f32;
                     let title = self.tabs.get(i).map(|t| t.title.clone()).unwrap_or_default();
                     let theme = self.current_theme();
-                    let popup = jetty_render::build_confirm_close(w, h, &title, &theme);
+                    let popup = jetty_render::build_confirm_close(w, h, &title, &theme, self.chrome_char_w());
                     if input::point_in(&popup.close_rect, cx, cy) {
                         self.confirm_close = None;
                         self.close_tab(i, event_loop);
@@ -2514,7 +2527,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // it never reaches the tab bar, a resize edge, or the terminal. ---
                 if self.help_open {
                     let theme = self.current_theme();
-                    let help = jetty_render::build_help_overlay(w, h, &theme);
+                    let help = jetty_render::build_help_overlay(w, h, &theme, self.chrome_char_w());
                     if !input::point_in(&help.panel, cx, cy) {
                         self.help_open = false;
                     }
@@ -2565,7 +2578,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // shrinks the tab area; window controls are unaffected).
                     let perf_ref = self.perf_label.as_deref();
                     let mut bar = jetty_render::build_tab_bar_ex(
-                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, perf_ref,
+                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, perf_ref, self.chrome_char_w(),
                     );
                     // build_tab_bar_ex lays the bar out at y 0..TABBAR_H; shift its
                     // hit-test rects down to the bar's actual position (bottom mode).
@@ -2785,7 +2798,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(gpu) = &self.gpu {
                     let theme = self.current_theme();
                     let menu = jetty_render::build_context_menu(
-                        cx, cy, gpu.config.width, gpu.config.height, None, &theme,
+                        cx, cy, gpu.config.width, gpu.config.height, None, &theme, self.chrome_char_w(),
                     );
                     self.menu_item_rects = menu.item_rects;
                 }
@@ -3358,8 +3371,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // Compute window-control hover from the last cursor position.
                 let ctrl_hover = ctrl_hover_at(cursor.0 as f32, cursor.1 as f32, width, bar_y);
                 let rename_ref = rename_state.as_ref().map(|(i, b)| (*i, b.as_str()));
+                let chrome_char_w = chrome_text.cell_size().0;
                 let mut bar = jetty_render::build_tab_bar_ex(
-                    width, &tabs_meta, &theme, rename_ref, ctrl_hover, perf_string.as_deref(),
+                    width, &tabs_meta, &theme, rename_ref, ctrl_hover, perf_string.as_deref(), chrome_char_w,
                 );
                 // Translate the bar quads + labels to its actual y (bottom mode)
                 // PLUS the dropdown slide so it moves with the content.
@@ -3457,6 +3471,7 @@ impl ApplicationHandler<AppEvent> for App {
                             env!("CARGO_PKG_VERSION"),
                             &gpu_backend_name,
                             &theme,
+                            chrome_char_w,
                         );
                         if !splash.quads.is_empty() {
                             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &splash.quads);
@@ -3469,7 +3484,7 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     // Draw the right-click context menu on top of everything.
                     if let Some((mx, my)) = context_menu {
-                        let menu = jetty_render::build_context_menu(mx, my, width, height, menu_hover, &theme);
+                        let menu = jetty_render::build_context_menu(mx, my, width, height, menu_hover, &theme, chrome_char_w);
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &menu.quads);
                         if !menu.labels.is_empty() {
                             let _ = chrome_text.render_overlays(
@@ -3485,7 +3500,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // Draw the Help overlay (Keyboard Shortcuts) on top of all
                     // else — a dim layer, a bordered panel, and the binding rows.
                     if help_open {
-                        let help = jetty_render::build_help_overlay(width, height, &theme);
+                        let help = jetty_render::build_help_overlay(width, height, &theme, chrome_char_w);
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &help.quads);
                         if !help.labels.is_empty() {
                             let _ = chrome_text.render_overlays(
@@ -3502,7 +3517,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // (above the help overlay): dim + bordered panel + buttons.
                     if confirm_quit {
                         let popup = jetty_render::build_confirm(
-                            width, height, "Quit JeTTY? — all tabs will close", &theme,
+                            width, height, "Quit JeTTY? — all tabs will close", &theme, chrome_char_w,
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &popup.quads);
                         if !popup.labels.is_empty() {
@@ -3511,7 +3526,7 @@ impl ApplicationHandler<AppEvent> for App {
                             );
                         }
                     } else if let Some(title) = &confirm_close {
-                        let popup = jetty_render::build_confirm_close(width, height, title, &theme);
+                        let popup = jetty_render::build_confirm_close(width, height, title, &theme, chrome_char_w);
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &popup.quads);
                         if !popup.labels.is_empty() {
                             let _ = chrome_text.render_overlays(

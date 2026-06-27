@@ -66,6 +66,13 @@ fn row_y(i: usize) -> f32 {
 ///
 /// The menu is clamped so its right and bottom edges stay within the window.
 /// `hovered` is the index (0-based) of the item under the cursor, if any.
+///
+/// `char_w` is the measured physical-pixel advance of one chrome-font character
+/// (from `TextLayer::cell_size().0`). Pass `9.8` when a real measurement is not
+/// available (scale-1 fallback used by tests). The shortcut-hint glyphs (⇧ ⌃)
+/// are wider than ASCII; the hint width is computed as `char_w * 1.25` to
+/// account for this — at scale 1 this gives ≈ 12.25 px/glyph, matching the
+/// previous hardcoded 12.0 estimate.
 pub fn build_context_menu(
     x: f32,
     y: f32,
@@ -73,6 +80,7 @@ pub fn build_context_menu(
     win_h: u32,
     hovered: Option<usize>,
     theme: &jetty_core::Theme,
+    char_w: f32,
 ) -> ContextMenu {
     let sw = win_w as f32;
     let sh = win_h as f32;
@@ -176,9 +184,11 @@ pub fn build_context_menu(
 
         let hint = MENU_HINTS[i];
         if !hint.is_empty() {
-            // Right-align: measure hint width at chrome advance ≈ 9.8 px/char.
-            // Unicode chars (⇧ ⌃) may be wider; using 12 px/glyph for safety.
-            let hint_w = hint.chars().count() as f32 * 12.0;
+            // Right-align the shortcut hint. Unicode glyph hints (⇧ ⌃) render
+            // wider than plain ASCII; use char_w * 1.25 so the reservation
+            // scales correctly on HiDPI (at scale 1, 9.8 * 1.25 ≈ 12.25 px —
+            // the same as the former hardcoded 12.0 estimate).
+            let hint_w = hint.chars().count() as f32 * (char_w * 1.25);
             let hint_x = cx + MENU_W - 10.0 - hint_w;
             labels.push((hint.to_string(), hint_x, label_y, hint_col));
         }
@@ -200,9 +210,12 @@ mod tests {
         jetty_core::Theme::by_name("catppuccin_mocha")
     }
 
+    /// Scale-1 char advance used in tests (matches the historical 9.8 estimate).
+    const TEST_CHAR_W: f32 = 9.8;
+
     #[test]
     fn exactly_five_item_rects() {
-        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme());
+        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), TEST_CHAR_W);
         assert_eq!(
             menu.item_rects.len(),
             5,
@@ -215,7 +228,7 @@ mod tests {
         // The separator is drawn as a quad in `quads`, NOT as an item_rect.
         // Verify that five item_rects exist and the gap between rect[2] and
         // rect[3] is positive (SEP_GAP wide).
-        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme());
+        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), TEST_CHAR_W);
         assert_eq!(menu.item_rects.len(), 5);
         let bottom_of_2 = menu.item_rects[2].y + menu.item_rects[2].h;
         let top_of_3 = menu.item_rects[3].y;
@@ -228,7 +241,7 @@ mod tests {
 
     #[test]
     fn hints_present_in_labels() {
-        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme());
+        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), TEST_CHAR_W);
         let texts: Vec<&str> = menu.labels.iter().map(|(t, ..)| t.as_str()).collect();
         // Each non-empty hint must appear as a label.
         for hint in MENU_HINTS.iter() {
@@ -244,7 +257,7 @@ mod tests {
 
     #[test]
     fn all_items_present_in_labels() {
-        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme());
+        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), TEST_CHAR_W);
         let texts: Vec<&str> = menu.labels.iter().map(|(t, ..)| t.as_str()).collect();
         for item in MENU_ITEMS.iter() {
             assert!(texts.contains(item), "item {:?} missing from labels", item);
@@ -255,7 +268,7 @@ mod tests {
     fn menu_stays_on_screen_when_clamped() {
         // Anchor near bottom-right corner — menu must clamp entirely on-screen.
         let (win_w, win_h) = (800u32, 600u32);
-        let menu = build_context_menu(790.0, 590.0, win_w, win_h, None, &theme());
+        let menu = build_context_menu(790.0, 590.0, win_w, win_h, None, &theme(), TEST_CHAR_W);
         let total_w = MENU_W + BORDER * 2.0;
         let total_h = MENU_H + BORDER * 2.0;
         // The outer border rect is the first quad.
@@ -291,7 +304,7 @@ mod tests {
         // The separator gap between item[2] (Select All) and item[3] (Clear) must
         // be a dead zone — a click coordinate inside it should not fall within any
         // item_rect.
-        let menu = build_context_menu(50.0, 50.0, 1280, 800, None, &theme());
+        let menu = build_context_menu(50.0, 50.0, 1280, 800, None, &theme(), TEST_CHAR_W);
         assert_eq!(menu.item_rects.len(), 5);
 
         // The dead zone is the pixel band between bottom of rect[2] and top of rect[3].
@@ -314,7 +327,7 @@ mod tests {
         // For each of the 5 items, the hover quad y must match the item rect y.
         // Quad order: [0] border, [1] bg, [2] hover, [3] separator.
         for hovered in 0..5 {
-            let menu = build_context_menu(50.0, 50.0, 1280, 800, Some(hovered), &theme());
+            let menu = build_context_menu(50.0, 50.0, 1280, 800, Some(hovered), &theme(), TEST_CHAR_W);
             let hover_quad = &menu.quads[2];
             let item = &menu.item_rects[hovered];
             assert_eq!(

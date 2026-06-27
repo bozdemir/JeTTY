@@ -66,11 +66,13 @@ pub struct TabBar {
 /// its stored title. `ctrl_hover` selects which window-control button is drawn
 /// highlighted (close hover reads red).
 pub fn build_tab_bar(width: u32, tabs: &[(String, bool)], theme: &Theme) -> TabBar {
-    build_tab_bar_ex(width, tabs, theme, None, CtrlHover::None, None)
+    build_tab_bar_ex(width, tabs, theme, None, CtrlHover::None, None, CHROME_CHAR_W)
 }
 
-/// Approximate chrome-font advance per character, in physical px. Used for the
-/// perf-HUD width reservation + right-alignment (matches help.rs/panel.rs math).
+/// Fallback chrome-font advance per character (physical px), used when the
+/// caller does not have a measured advance available (e.g. `build_tab_bar` thin
+/// wrapper and legacy call sites). The real measured value is threaded in via the
+/// `char_w` parameter of `build_tab_bar_ex` on HiDPI-aware paths.
 const CHROME_CHAR_W: f32 = 9.6;
 /// Gap (px) between the perf HUD's left edge and the nearest tab/+button, so the
 /// reserved area never visually touches the tabs.
@@ -89,6 +91,11 @@ const PERF_MIN_TAB_W: f32 = 110.0;
 /// the tab area so tabs never overlap it; if the window is too narrow to fit the
 /// HUD without squeezing the tabs below a sane minimum, the HUD is HIDDEN and the
 /// tab layout is identical to the no-HUD case. `None` shows no HUD.
+///
+/// `char_w` is the measured physical-pixel advance of one chrome-font character
+/// (from `TextLayer::cell_size().0`). Pass `CHROME_CHAR_W` (9.6) when a real
+/// measurement is not available (scale-1 fallback used by tests and the thin
+/// `build_tab_bar` wrapper).
 pub fn build_tab_bar_ex(
     width: u32,
     tabs: &[(String, bool)],
@@ -96,6 +103,7 @@ pub fn build_tab_bar_ex(
     renaming: Option<(usize, &str)>,
     ctrl_hover: CtrlHover,
     perf: Option<&str>,
+    char_w: f32,
 ) -> TabBar {
     let sw = width as f32;
     let h = TABBAR_H;
@@ -148,7 +156,7 @@ pub fn build_tab_bar_ex(
     // the tab layout then matches the no-HUD case exactly.
     let n_tabs = tabs.len().max(1) as f32;
     let perf_w = perf
-        .map(|s| s.chars().count() as f32 * CHROME_CHAR_W)
+        .map(|s| s.chars().count() as f32 * char_w)
         .unwrap_or(0.0);
     // Width carved out of the tab area when the HUD is shown: the label plus the
     // gap to the tabs and a small gap to the controls.
@@ -202,10 +210,10 @@ pub fn build_tab_bar_ex(
         255,
     ];
 
-    // Characters that fit in a tab body, derived from its width (~9.6px advance).
+    // Characters that fit in a tab body, derived from the measured chrome advance.
     // Reserve room for the close "×" + left padding. Floors at 3 so a min-width
     // tab still shows a couple of chars + the ellipsis.
-    let max_chars = (((tab_w - CLOSE_W - 32.0) / 9.6).floor() as usize).max(2);
+    let max_chars = (((tab_w - CLOSE_W - 32.0) / char_w).floor() as usize).max(2);
 
     let mut x = left;
     for (i, (title, active)) in tabs.iter().take(drawn).enumerate() {
@@ -295,7 +303,7 @@ pub fn build_tab_bar_ex(
     // narrow widths (<~400px) the hint would otherwise overrun the window controls.
     if overflow > 0 {
         let hint_x = (tab_area_x - 34.0).max(x + PLUS_W + 4.0);
-        let hint_w = format!("+{overflow}").chars().count() as f32 * CHROME_CHAR_W;
+        let hint_w = format!("+{overflow}").chars().count() as f32 * char_w;
         if hint_x + hint_w <= controls_left {
             labels.push((format!("+{overflow}"), hint_x, 9.0, dim_fg));
         }
@@ -314,7 +322,7 @@ pub fn build_tab_bar_ex(
                 (bg[2] as f32 + (fg[2] as f32 - bg[2] as f32) * 0.45) as u8,
             ];
             // Right-align: right edge sits PERF_GAP left of the controls region.
-            let hud_w = s.chars().count() as f32 * CHROME_CHAR_W;
+            let hud_w = s.chars().count() as f32 * char_w;
             let hud_x = (controls_left - PERF_GAP - hud_w).max(left);
             labels.push((s.to_string(), hud_x, 9.0, hud_color));
         }
@@ -443,7 +451,7 @@ mod tests {
     #[test]
     fn rename_shows_caret() {
         let tabs = [("Old".to_string(), true)];
-        let bar = build_tab_bar_ex(800, &tabs, &theme(), Some((0, "New")), CtrlHover::None, None);
+        let bar = build_tab_bar_ex(800, &tabs, &theme(), Some((0, "New")), CtrlHover::None, None, CHROME_CHAR_W);
         // Renaming shows the edit buffer + caret (a "❯" marker label precedes it,
         // so check across labels rather than a fixed index).
         let buf = bar.labels.iter().find(|l| l.0.contains('▏'));
@@ -461,8 +469,8 @@ mod tests {
             ("Tab 1".to_string(), true),
             ("Tab 2".to_string(), false),
         ];
-        let with = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, Some(PERF));
-        let without = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, None);
+        let with = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, Some(PERF), CHROME_CHAR_W);
+        let without = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W);
 
         // The HUD label is present.
         let hud = with.labels.iter().find(|l| l.0 == PERF).expect("HUD label missing");
@@ -496,8 +504,8 @@ mod tests {
             ("Tab 2".to_string(), false),
             ("Tab 3".to_string(), false),
         ];
-        let with = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, Some(PERF));
-        let without = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, None);
+        let with = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, Some(PERF), CHROME_CHAR_W);
+        let without = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W);
 
         // No HUD label emitted.
         assert!(with.labels.iter().all(|l| l.0 != PERF), "HUD should be hidden");
@@ -520,8 +528,8 @@ mod tests {
         // squashed to its ~64px minimum just to fit the stats readout.
         let tabs: Vec<(String, bool)> =
             (0..4).map(|i| (format!("Tab {i}"), i == 0)).collect();
-        let with = build_tab_bar_ex(900, &tabs, &theme(), None, CtrlHover::None, Some(PERF));
-        let without = build_tab_bar_ex(900, &tabs, &theme(), None, CtrlHover::None, None);
+        let with = build_tab_bar_ex(900, &tabs, &theme(), None, CtrlHover::None, Some(PERF), CHROME_CHAR_W);
+        let without = build_tab_bar_ex(900, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W);
 
         // HUD hidden, layout identical to no-HUD.
         assert!(with.labels.iter().all(|l| l.0 != PERF), "HUD should yield to the tabs");
@@ -560,7 +568,7 @@ mod tests {
     #[test]
     fn close_hover_changes_glyph_color() {
         let tabs = [("Tab 1".to_string(), true)];
-        let hot = build_tab_bar_ex(800, &tabs, &theme(), None, CtrlHover::Close, None);
+        let hot = build_tab_bar_ex(800, &tabs, &theme(), None, CtrlHover::Close, None, CHROME_CHAR_W);
         // A theme-red hover quad is appended when the close control is hovered.
         let red = theme().palette[1];
         let red_bg = [red[0], red[1], red[2], 255];
