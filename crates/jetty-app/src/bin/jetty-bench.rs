@@ -18,6 +18,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let font_size: f32 = 16.0;
 
     // --- startup-dominant cost: GPU adapter + device ---
+    // GPU selection. By default the bench requests LowPower → the integrated GPU,
+    // matching the live app (which deliberately avoids the discrete GPU on hybrid
+    // systems, where driving it under a live X11/Wayland surface can destabilize
+    // the compositor). Set JETTY_BENCH_GPU=high (aliases: `discrete`, `dgpu`) to
+    // benchmark on the high-performance discrete GPU instead — safe here because
+    // the bench is HEADLESS (offscreen texture, no compositor surface at risk) and
+    // it measures peak render throughput.
+    let power = match std::env::var("JETTY_BENCH_GPU").as_deref() {
+        Ok("high") | Ok("discrete") | Ok("dgpu") => wgpu::PowerPreference::HighPerformance,
+        _ => wgpu::PowerPreference::LowPower,
+    };
     let t0 = Instant::now();
     // Match the live app: Vulkan-only instance (skips GLES enumeration), with an
     // all-backends fallback if no Vulkan adapter is present.
@@ -26,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::LowPower,
+        power_preference: power,
         compatible_surface: None,
         force_fallback_adapter: false,
     })) {
@@ -34,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => {
             instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
+                power_preference: power,
                 compatible_surface: None,
                 force_fallback_adapter: false,
             }))?
@@ -106,12 +117,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     device.poll(wgpu::PollType::wait_indefinitely())?;
 
     let n_frames = 200;
+    // Split the per-frame cost into CPU-prep (build spans + shape + glyphon
+    // prepare + submit, ending at queue.submit inside render_to) vs GPU-execute
+    // (the wait for the GPU to finish, isolated by device.poll). This shows where
+    // the frame budget actually goes — JeTTY's grid render is CPU-prep-dominated
+    // (text shaping + atlas prep), so the GPU portion is small and a faster GPU
+    // barely moves the total.
+    let mut cpu_accum = 0.0f64;
     let t4 = Instant::now();
     for _ in 0..n_frames {
+        let c = Instant::now();
         text.render_to(&device, &queue, &view, width, height, &snap, true, 0.0)?;
+        cpu_accum += c.elapsed().as_secs_f64();
         device.poll(wgpu::PollType::wait_indefinitely())?;
     }
     let frame_ms = t4.elapsed().as_secs_f64() * 1000.0 / n_frames as f64;
+    let cpu_ms = cpu_accum * 1000.0 / n_frames as f64;
+    let gpu_ms = (frame_ms - cpu_ms).max(0.0);
 
     println!("=== Jetty perf bench ({} {:?}) ===", adapter.get_info().name, adapter.get_info().backend);
     println!("grid          {cols}x{rows} cells (cell {cw:.1}x{ch:.1}px) @ {width}x{height}");
@@ -120,5 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("throughput    {mbps:6.0} MB/s   (fed {mb:.0} MB colored VT in {feed_s:.2}s)");
     println!("snapshot      {snap_ms:8.3} ms/frame  ({:.0}k cells)", (cols * rows) as f64 / 1000.0);
     println!("render        {frame_ms:8.3} ms/frame  ({:.0} fps cap)", 1000.0 / frame_ms);
+    println!("  ├─ cpu prep {cpu_ms:8.3} ms/frame  (build spans + shape + atlas prepare + submit)");
+    println!("  └─ gpu exec {gpu_ms:8.3} ms/frame  (device.poll wait for GPU completion)");
     Ok(())
 }

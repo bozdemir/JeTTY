@@ -10,7 +10,16 @@
 ```bash
 # Hot-path numbers (headless, no window): GPU init, throughput, snapshot, render.
 cargo run --release -p jetty-app --bin jetty-bench
+
+# Same, but on the discrete / high-performance GPU on a hybrid system.
+# Headless-only — see "GPU selection" below.
+JETTY_BENCH_GPU=high cargo run --release -p jetty-app --bin jetty-bench
 ```
+
+`jetty-bench` splits `render` into **cpu prep** (build spans + cosmic-text shaping
++ glyphon atlas prepare + submit) and **gpu exec** (the wait for the GPU to finish)
+so the CPU-vs-GPU breakdown of the frame budget is visible — see
+"Render is CPU-bound" below.
 
 Live metrics (startup-to-first-frame, input latency, idle CPU, RSS) are measured
 on the running app — see "Live metrics" below.
@@ -19,6 +28,48 @@ Baseline machine: Intel Core Ultra 9 275HX (24 threads), 62 GiB RAM,
 Intel Arc (Arrow Lake) iGPU via Vulkan (LowPower — the NVIDIA dGPU is avoided on
 purpose), 1920×1200 @ 59.95 Hz. Compared against the terminals installed here:
 Konsole 23.08.5, GNOME Terminal / VTE 0.76.
+
+### GPU selection
+
+By default `jetty-bench` requests `LowPower` → the **integrated** GPU, matching the
+live app (which avoids the discrete GPU on hybrid systems, where driving it under a
+live compositor surface can be unstable). `JETTY_BENCH_GPU=high` (aliases
+`discrete`, `dgpu`) requests `HighPerformance` → the **discrete** GPU. This is safe
+in the bench because it is headless (renders to an offscreen texture — no
+compositor surface at risk); the live app's GPU choice is unchanged.
+
+### Second measured machine — render is CPU-bound
+
+Added 2026-06-28 on an AMD Ryzen (Rembrandt) APU with a **Radeon 680M iGPU** *and*
+an **NVIDIA RTX 3070 Ti (Laptop) dGPU**, Vulkan, 1920×1200, release build. Both
+GPUs clear the 144 Hz render gate — and comparing them exposes a defining property
+of the renderer:
+
+| Metric | AMD 680M (iGPU) | RTX 3070 Ti (dGPU) |
+|---|---|---|
+| **Frame render** | 6.5 ms (✅ ≤ 6.9) | 6.3 ms (✅ ≤ 6.9) |
+| &nbsp;&nbsp;├─ cpu prep | 6.14 ms | 6.08 ms |
+| &nbsp;&nbsp;└─ gpu exec | 0.36 ms | 0.17 ms |
+| Throughput | 101 MB/s | 101 MB/s |
+| Snapshot | 0.060 ms | 0.061 ms |
+
+**A ~10× more powerful GPU moves the frame only ~6.5 → ~6.3 ms**, because the GPU
+does just ~0.2–0.36 ms of it. The other **~6.1 ms is CPU**: cosmic-text shaping +
+glyphon's per-glyph atlas prepare, rebuilt for the whole grid each frame. Therefore:
+
+- *A faster GPU barely helps.* The real lever is CPU-side — incremental /
+  damage-aware shaping, or a per-cell glyph-instance cache — a larger architectural
+  change tracked as future work, **not** a quick win.
+- *Throughput (parser) and snapshot are pure CPU* and identical across both GPUs,
+  as expected.
+- *The gap to the Intel-Arc baseline's 5.5 ms is CPU single-thread, not GPU.* The
+  Core Ultra 9 275HX has substantially higher per-core throughput than this
+  Rembrandt APU — same code, different CPU.
+
+A small hot-path win landed alongside this measurement: `render_to` no longer
+materializes a ~rows×cols `(&str, Attrs)` Vec each frame (~0.5 MB at full screen),
+passing the spans straight into `set_rich_text` as an iterator — byte-identical
+shaping, one fewer large per-frame allocation.
 
 ## The budget
 

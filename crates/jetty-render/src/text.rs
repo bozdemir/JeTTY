@@ -386,20 +386,9 @@ impl TextLayer {
             cell_ranges.push((nl_start, nl_end, Color::rgb(220, 220, 220)));
         }
 
-        // Build the spans iterator: (&str, Attrs) tuples, borrowing slices from `text`.
-        // We collect into a Vec to satisfy the borrow checker (spans borrow `text`).
         // Clone the Arc (a refcount bump, not a string copy) so the family name
         // can be borrowed by every span without re-borrowing self.
         let family_name = Arc::clone(&self.font_family);
-        let spans: Vec<(&str, Attrs)> = cell_ranges
-            .iter()
-            .map(|(s, e, color)| {
-                (
-                    &text[*s..*e],
-                    Attrs::new().family(Family::Name(&family_name)).color(*color),
-                )
-            })
-            .collect();
 
         // Bound the layout height to the surface so cosmic-text lays out ALL
         // rows. With height = None it shapes only the first visible line, which
@@ -408,18 +397,30 @@ impl TextLayer {
             .set_size(&mut self.font_system, None, Some(height as f32));
 
         let default_attrs = Attrs::new().family(Family::Name(&family_name));
+        // Build the per-cell spans — (&str slice of `text`, Attrs) — as a lazy
+        // iterator passed STRAIGHT into `set_rich_text`. glyphon takes
+        // `IntoIterator`, so there is no need to collect into a Vec first: at a
+        // full screen that Vec was ~rows*cols * sizeof((&str, Attrs)) (~0.5 MB)
+        // allocated and written every frame on the hot path. The iterator yields
+        // the exact same spans in the same order, so shaping is byte-identical.
         // Shaping::Basic avoids kerning/ligatures so every glyph lands exactly
         // one cell-width apart — essential for a terminal grid.
         self.buffer.set_rich_text(
             &mut self.font_system,
-            spans,
+            cell_ranges.iter().map(|(s, e, color)| {
+                (
+                    &text[*s..*e],
+                    Attrs::new().family(Family::Name(&family_name)).color(*color),
+                )
+            }),
             &default_attrs,
             Shaping::Basic,
             None,
         );
 
-        // `spans` is consumed and its borrows on `text`/`cell_ranges`/`family_name`
-        // are released; return the scratch buffers to self for reuse next frame.
+        // The spans iterator is consumed and its borrows on `text`/`cell_ranges`/
+        // `family_name` are released; return the scratch buffers to self for reuse
+        // next frame.
         drop(family_name);
         self.text_scratch = text;
         self.cell_ranges_scratch = cell_ranges;
