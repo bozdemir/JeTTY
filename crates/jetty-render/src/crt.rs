@@ -8,9 +8,11 @@
 //! skipped while CRT is on, so the CRT pass owns the corners.
 //!
 //! Every effect is a no-op at its `param == 0`, so all-zero params reduce to a
-//! near-passthrough blit (plus corner rounding). The look is fully STATIC here:
-//! `time` and `flags` are laid into the uniform but intentionally unused — the
-//! rolling/flicker/jitter animation that consumes them is a later task.
+//! near-passthrough blit (plus corner rounding). Animation (Task 10) reads the
+//! `time` + `flags` uniform fields: bit0 = roll (scanline crawl), bit1 = flicker
+//! (subtle global brightness wobble), bit2 = jitter (sub-pixel horizontal sample
+//! shift). Each animated term collapses to the EXACT static result when its flag
+//! bit is clear, so `flags == 0` is byte-identical to the static (Task 9) look.
 //!
 //! One fullscreen-triangle pass with bindings {uniform, src_texture, sampler}
 //! and a `replace` blend (this pass owns every output pixel). Color and alpha are
@@ -32,10 +34,20 @@
 //   vignette      f32        @ 28
 //   tint          vec4<f32>  @ 32   (align 16; rgb + pad)
 //   corner_radius f32        @ 48
-//   time          f32        @ 52   (reserved — Task 10 animation)
-//   flags         u32        @ 56   (reserved — Task 10 animation)
+//   time          f32        @ 52   (animation phase, seconds — Task 10)
+//   flags         u32        @ 56   (roll/flicker/jitter bitfield — Task 10)
 //   _pad0         f32        @ 60
 //   => size 64, align 16.
+
+/// CRT animation flag bits packed into [`CrtUniform::flags`]. This is the single
+/// source of truth for the bit layout: the Rust packing site (jetty-app) ORs
+/// these together, and the WGSL fragment tests the SAME bit positions with literal
+/// masks (`(flags & 1u) != 0u`, etc.). Keep the WGSL masks in `CRT_SHADER` in sync
+/// with these values.
+pub const CRT_FLAG_ROLL: u32 = 1 << 0; // bit0: rolling scanline crawl
+pub const CRT_FLAG_FLICKER: u32 = 1 << 1; // bit1: global brightness flicker
+pub const CRT_FLAG_JITTER: u32 = 1 << 2; // bit2: sub-pixel horizontal jitter
+
 pub(crate) const CRT_SHADER: &str = r#"
 struct P {
     resolution: vec2<f32>,
@@ -56,6 +68,14 @@ struct P {
 @group(0) @binding(2) var src_samp: sampler;
 
 const PI: f32 = 3.14159265359;
+
+// Task 10 animation tunables. Each animated term is gated by a flag bit and is a
+// no-op when that bit is clear (see the fragment), so these only matter while the
+// matching toggle is on. Kept tasteful and subtle (sub-strobe, sub-pixel).
+const ROLL_SPEED: f32 = 6.0;     // scanline phase advance (rad/s): gentle crawl
+const FLICKER_FREQ: f32 = 50.0;  // brightness wobble angular freq (rad/s, ~8 Hz)
+const FLICKER_AMP: f32 = 0.04;   // brightness dip amplitude (4%), sub-strobe
+const JITTER_AMP: f32 = 0.5;     // horizontal sync jitter peak (sub-pixel px)
 
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
@@ -90,12 +110,27 @@ fn bright_tap(uv: vec2<f32>) -> vec3<f32> {
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let res = p.resolution;
 
+    // --- 0) Animation flags (Task 10). Each animated term below is a no-op when
+    // its bit is clear, so flags == 0 reproduces the static (Task 9) result
+    // byte-for-byte. Bit layout mirrors CRT_FLAG_ROLL/FLICKER/JITTER in crt.rs
+    // (the Rust packing site). ---
+    let roll_on = (p.flags & 1u) != 0u;     // bit0: rolling scanline
+    let flicker_on = (p.flags & 2u) != 0u;  // bit1: brightness flicker
+    let jitter_on = (p.flags & 4u) != 0u;   // bit2: horizontal jitter
+
     // --- 1) Barrel / curvature warp of the SAMPLE uv (output uv stays put). ---
     // Push coords outward by the square of the orthogonal axis; identity at
     // curvature == 0. Near the edges the warped uv leaves [0,1] -> bezel below.
     let cc = in.uv * 2.0 - 1.0;             // centered, [-1,1]
     let warp = p.curvature * 0.25;          // 0 => identity
-    let suv = (cc + cc * (cc.yx * cc.yx) * warp) * 0.5 + 0.5;
+    let suv0 = (cc + cc * (cc.yx * cc.yx) * warp) * 0.5 + 0.5;
+    // Jitter (bit2): a sub-pixel horizontal sample shift (analog h-sync wobble).
+    // Product of two incommensurate sines -> irregular, bounded to +/-JITTER_AMP
+    // px. jitter_dx == 0.0 exactly when off, so suv == suv0 (static sampling
+    // unchanged; +0.0 / 0.0-offset is an exact float identity).
+    let jitter_px = sin(p.time * 80.0) * sin(p.time * 13.0) * JITTER_AMP;
+    let jitter_dx = select(0.0, jitter_px / res.x, jitter_on);
+    let suv = suv0 + vec2(jitter_dx, 0.0);
 
     // Bezel: feather to transparent JUST OUTSIDE the unit box. No-op at
     // curvature == 0 (suv == in.uv stays within [0,1], so `outside` <= 0 and the
@@ -116,7 +151,10 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 
     // --- 3) Scanlines (output space), tinted by p.tint.rgb. Neutral darkening
     // at the default white tint; identity at scanline == 0. ---
-    let beam = 0.5 + 0.5 * sin(in.uv.y * res.y * PI);   // [0,1], 1 on the dark line
+    // Roll (bit0): advance the scanline phase by time so the lines crawl. The
+    // added phase is exactly 0.0 when off, so the static beam pattern is unchanged.
+    let roll_phase = select(0.0, p.time * ROLL_SPEED, roll_on);
+    let beam = 0.5 + 0.5 * sin(in.uv.y * res.y * PI + roll_phase);   // [0,1], 1 on the dark line
     let darken = p.scanline * beam;
     let scan_mul = (1.0 - darken) * mix(vec3(1.0, 1.0, 1.0), p.tint.rgb, darken);
     col = col * scan_mul;
@@ -153,6 +191,14 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let vig = mix(1.0, v, p.vignette);
     col = col * vig;
 
+    // --- 6b) Flicker (bit1): a subtle global brightness wobble (analog mains
+    // flutter), low amplitude so it never strobes. flicker_mul == 1.0 exactly when
+    // off, so the static brightness is unchanged (an exact *1.0 identity). Scales
+    // color only, NOT the corner/bezel alpha below, so coverage is unaffected. ---
+    let flick = 0.5 + 0.5 * sin(p.time * FLICKER_FREQ);   // [0,1]
+    let flicker_mul = select(1.0, 1.0 - FLICKER_AMP * flick, flicker_on);
+    col = col * flicker_mul;
+
     // --- 7) Rounded-corner alpha on the UN-WARPED output coords (so the rounding
     // is NOT distorted by curvature) — replicates mask.rs's SDF, feather and
     // radius clamp exactly so the corners match the non-CRT look. ---
@@ -176,8 +222,9 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 /// Layout: 64 bytes. No `vec3<f32>` so the Rust `#[repr(C)]` layout matches the
 /// WGSL `struct P` byte-for-byte (see the offset table on `CRT_SHADER` above and
 /// the `crt_uniform_layout` test). Every effect strength is a normalized 0..1
-/// slider value; each is a no-op at 0. `time`/`flags` are reserved for the
-/// animation task (Task 10) and are not read by the static shader yet.
+/// slider value; each is a no-op at 0. `time` (animation phase, seconds) and
+/// `flags` (CRT_FLAG_* bitfield) drive the roll/flicker/jitter animation; with
+/// `flags == 0` the shader output is identical to the static look.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CrtUniform {
@@ -199,9 +246,10 @@ pub struct CrtUniform {
     pub tint: [f32; 4],
     /// Rounded-corner radius in physical px (matches the corner mask). (offset 48)
     pub corner_radius: f32,
-    /// Reserved — animation phase (Task 10). Unused by the static shader. (offset 52)
+    /// Animation phase in seconds (free-running clock). Drives roll/flicker/jitter
+    /// via `fract`/`sin`, so unbounded growth is fine. (offset 52)
     pub time: f32,
-    /// Reserved — roll/flicker/jitter bitfield (Task 10). Unused here. (offset 56)
+    /// Roll/flicker/jitter bitfield (`CRT_FLAG_*`). 0 => static look. (offset 56)
     pub flags: u32,
     /// Padding — keep the struct 16-byte aligned (size 64). (offset 60)
     pub _pad0: f32,

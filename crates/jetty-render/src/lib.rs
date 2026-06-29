@@ -23,7 +23,7 @@ pub use reveal::{BayerReveal, bayer4, reveal_coverage};
 pub use phosphor::PhosphorIgnition;
 pub use liquid::LiquidDrop;
 pub use focus::FocusPull;
-pub use crt::{Crt, CrtUniform};
+pub use crt::{Crt, CrtUniform, CRT_FLAG_ROLL, CRT_FLAG_FLICKER, CRT_FLAG_JITTER};
 pub use menu::{build_context_menu, ContextMenu};
 pub use help::{build_help_overlay, HelpOverlay, HELP_ROWS};
 pub use confirm::{build_confirm, build_confirm_close, ConfirmPopup};

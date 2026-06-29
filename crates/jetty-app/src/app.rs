@@ -338,6 +338,12 @@ pub struct App {
     dragging_dropdown_width: bool,
     /// One-time guard for the Wayland "positioning is a no-op" diagnostic.
     wayland_warned: bool,
+    /// Free-running clock for CRT animation (roll/flicker/jitter). Initialized
+    /// once at construction and never reset; `elapsed().as_secs_f32()` feeds the
+    /// CRT uniform's `time`. The shader uses `fract`/`sin`, so unbounded growth is
+    /// fine. This clock does NOT by itself drive redraws — the redraw guard only
+    /// self-schedules frames while an animate toggle is on (see `crt_anim_live`).
+    crt_clock: std::time::Instant,
     /// Start instant of the active summon (crystallize) animation, or None when
     /// idle. While Some, the redraw loop self-drives frames; None = idle 0 CPU.
     summon_anim: Option<std::time::Instant>,
@@ -701,6 +707,7 @@ impl App {
             dragging_dropdown: false,
             dragging_dropdown_width: false,
             wayland_warned: false,
+            crt_clock: std::time::Instant::now(),
             summon_anim: None,
             summon_pending: false,
             summon_settle_until: None,
@@ -4513,14 +4520,29 @@ impl ApplicationHandler<AppEvent> for App {
                             self.slide_anim = None;
                         }
                     }
-                    // Self-drive the next frame while EITHER animation is live, OR
-                    // the Shift+drag hint toast is still showing (so it repaints
-                    // away on expiry instead of freezing on screen). Idle CPU
-                    // returns to ~0 once all three have cleared.
+                    // Self-drive the next frame while EITHER animation is live, the
+                    // Shift+drag hint toast is still showing (so it repaints away on
+                    // expiry instead of freezing on screen), OR an animated CRT
+                    // sub-effect is on. Idle CPU returns to ~0 once all have cleared.
                     let hint_live = self
                         .shift_hint_until
                         .map_or(false, |t| std::time::Instant::now() < t);
-                    if self.summon_anim.is_some() || self.slide_anim.is_some() || hint_live {
+                    // CRT animation self-drive: keep painting ONLY while CRT is on
+                    // AND at least one of roll/flicker/jitter is toggled on. Static
+                    // CRT (enabled, all three off) does NOT match here, so it stays
+                    // damage-driven (0-CPU idle preserved). Mirrors the `hint_live`
+                    // pattern: a condition in this self-redraw block that has no
+                    // `about_to_wait` Poll entry, so it returns to Wait/idle the
+                    // moment the condition clears.
+                    let crt_anim_live = self.fx.crt_enabled
+                        && (self.fx.crt_animate_roll
+                            || self.fx.crt_flicker
+                            || self.fx.crt_jitter);
+                    if self.summon_anim.is_some()
+                        || self.slide_anim.is_some()
+                        || hint_live
+                        || crt_anim_live
+                    {
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -4567,10 +4589,26 @@ impl ApplicationHandler<AppEvent> for App {
                                     // mask keeps the top corners square — that nuance
                                     // is not modeled here (single corner_radius).
                                     corner_radius: corner_radius_px,
-                                    // Reserved for Task 10 (rolling/flicker/jitter);
-                                    // the static shader does not read these yet.
-                                    time: 0.0,
-                                    flags: 0,
+                                    // Animation (Task 10): free-running phase +
+                                    // roll/flicker/jitter bitfield. When all three
+                                    // toggles are off, flags == 0 and the shader
+                                    // output is identical to the static look (each
+                                    // animated term collapses to its static value),
+                                    // so static CRT is byte-identical here.
+                                    time: self.crt_clock.elapsed().as_secs_f32(),
+                                    flags: (if self.fx.crt_animate_roll {
+                                        jetty_render::CRT_FLAG_ROLL
+                                    } else {
+                                        0
+                                    }) | (if self.fx.crt_flicker {
+                                        jetty_render::CRT_FLAG_FLICKER
+                                    } else {
+                                        0
+                                    }) | (if self.fx.crt_jitter {
+                                        jetty_render::CRT_FLAG_JITTER
+                                    } else {
+                                        0
+                                    }),
                                     _pad0: 0.0,
                                 },
                             );
