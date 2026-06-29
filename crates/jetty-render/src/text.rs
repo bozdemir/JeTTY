@@ -79,6 +79,22 @@ pub struct TextLayer {
     /// Taken out via `mem::take` during the frame and put back at the end.
     text_scratch: String,
     cell_ranges_scratch: Vec<(usize, usize, Color)>,
+    /// Glyph-coverage cache: does the PRIMARY terminal font (`font_family`) have a
+    /// real glyph for this char? A char the primary font lacks (e.g. Claude Code's
+    /// `⏵⏵` U+23F5) renders as a tofu box under `Shaping::Basic`, which does NO
+    /// font fallback. Probed lazily on the hot path (only non-ASCII, on miss) and
+    /// read every frame. Cleared when `font_family` changes (coverage is per-font).
+    glyph_coverage: std::collections::HashMap<char, bool>,
+    /// Scratch buffer used only to probe glyph coverage (shape one char, inspect
+    /// the resulting glyph id). Reused across frames.
+    coverage_buffer: Buffer,
+    /// Growable pool of single-glyph buffers that draw the fallback glyphs (the
+    /// chars the primary font lacks) on top of the blanked grid cell, shaped with
+    /// `Shaping::Advanced` so cosmic-text's font fallback supplies the glyph.
+    fallback_buffers: Vec<Buffer>,
+    /// Per-frame scratch: `(pixel_x, pixel_y, char, rgb)` for each cell whose glyph
+    /// is missing from the primary font and must be overdrawn from a fallback font.
+    fallback_cells_scratch: Vec<(f32, f32, char, [u8; 3])>,
 }
 
 impl TextLayer {
@@ -152,6 +168,10 @@ impl TextLayer {
             None,
         );
 
+        // Scratch buffer for glyph-coverage probing (see `covers`).
+        let mut coverage_buffer = Buffer::new(&mut font_system, metrics);
+        coverage_buffer.set_size(&mut font_system, None, None);
+
         // Measure a monospace cell by shaping a single 'M'.
         let cell_w = measure_advance_family(&mut font_system, metrics, family);
         let cell_h = line_height;
@@ -175,6 +195,10 @@ impl TextLayer {
             ui_family: ChromeFamily::Sans,
             text_scratch: String::new(),
             cell_ranges_scratch: Vec::new(),
+            glyph_coverage: std::collections::HashMap::new(),
+            coverage_buffer,
+            fallback_buffers: Vec::new(),
+            fallback_cells_scratch: Vec::new(),
         }
     }
 
@@ -243,6 +267,9 @@ impl TextLayer {
     /// The caller must call `reflow()` and `request_redraw()` after this.
     pub fn set_font_family(&mut self, name: &str) {
         self.font_family = Arc::from(name);
+        // Coverage is per-font: a glyph present in the old family may be missing
+        // in the new one (and vice versa). Drop the cache so it re-probes.
+        self.glyph_coverage.clear();
         // Re-measure cell width with the new family.
         self.cell_w = measure_advance_family(&mut self.font_system, self.metrics, name);
         // Reset cursor buffer glyph so the block cursor uses the new family.
@@ -336,6 +363,38 @@ impl TextLayer {
         let _ = gpu; // size not used for wrapping; viewport is updated per-frame
     }
 
+    /// Does the primary terminal font have a real glyph for `c`? ASCII is always
+    /// covered; other chars are probed once — shaped with the primary family under
+    /// `Shaping::Basic`, which does NOT fall back, so a resulting glyph id of 0
+    /// (`.notdef`, the tofu box) means the font lacks the char — then cached. The
+    /// caller blanks missing-glyph cells on the main grid and overdraws them from a
+    /// fallback font, so the real glyph is shown (like Konsole/Qt), not a box.
+    fn covers(&mut self, c: char) -> bool {
+        if (c as u32) < 0x80 {
+            return true;
+        }
+        if let Some(&v) = self.glyph_coverage.get(&c) {
+            return v;
+        }
+        let fam = Arc::clone(&self.font_family);
+        let mut tmp = [0u8; 4];
+        let s = c.encode_utf8(&mut tmp);
+        let attrs = Attrs::new().family(Family::Name(&fam));
+        self.coverage_buffer
+            .set_text(&mut self.font_system, s, &attrs, Shaping::Basic, None);
+        let covered = self
+            .coverage_buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .next()
+            .map(|g| g.glyph_id != 0)
+            // No glyph laid out at all (e.g. zero-width/control) — leave it to the
+            // main grid; don't try to fall back.
+            .unwrap_or(true);
+        self.glyph_coverage.insert(c, covered);
+        covered
+    }
+
     /// Renders the terminal grid to an arbitrary TextureView (offscreen or on-screen).
     /// Does NOT acquire a surface frame and does NOT present — the caller controls that.
     ///
@@ -364,12 +423,32 @@ impl TextLayer {
         // Store (byte_start, byte_end, Color) for each cell so we can borrow slices after.
         let mut cell_ranges = std::mem::take(&mut self.cell_ranges_scratch);
         cell_ranges.clear();
+        // Cells whose glyph the primary font lacks: blanked here, overdrawn below.
+        let mut fallback_cells = std::mem::take(&mut self.fallback_cells_scratch);
+        fallback_cells.clear();
+        let cell_w = self.cell_w;
+        let cell_h = self.cell_h;
 
         for row in 0..snapshot.rows {
             for col in 0..snapshot.cols {
                 let cell = snapshot.cell(row, col);
                 let start = text.len();
-                text.push(cell.c);
+                // A glyph the primary font lacks would render as a tofu box under
+                // Shaping::Basic (no fallback). Blank the cell on the main grid so
+                // it stays exactly one column wide, and record it for a fallback
+                // overdraw — the real glyph is drawn on top, aligned. ASCII and
+                // already-blank cells skip the (cached) probe entirely.
+                if cell.c != ' ' && cell.c != '\0' && !self.covers(cell.c) {
+                    text.push(' ');
+                    fallback_cells.push((
+                        col as f32 * cell_w,
+                        row as f32 * cell_h,
+                        cell.c,
+                        cell.fg,
+                    ));
+                } else {
+                    text.push(cell.c);
+                }
                 let end = text.len();
                 cell_ranges.push((
                     start,
@@ -426,6 +505,33 @@ impl TextLayer {
         self.text_scratch = text;
         self.cell_ranges_scratch = cell_ranges;
 
+        // Fallback glyph prep: shape each missing-glyph char in its OWN single-glyph
+        // buffer with Shaping::Advanced, so cosmic-text falls back to a font that
+        // HAS the glyph. Each is drawn at its exact cell origin in the SAME
+        // prepare() below, so it shifts no neighbor — the grid stays aligned.
+        // Usually empty (the only hot-path cost is the cached coverage probes), so
+        // this whole block is skipped.
+        if !fallback_cells.is_empty() {
+            while self.fallback_buffers.len() < fallback_cells.len() {
+                let mut b = Buffer::new(&mut self.font_system, self.metrics);
+                b.set_size(&mut self.font_system, None, None);
+                self.fallback_buffers.push(b);
+            }
+            let fam = Arc::clone(&self.font_family);
+            let metrics = self.metrics;
+            for (i, (_x, _y, c, _rgb)) in fallback_cells.iter().enumerate() {
+                let buf = &mut self.fallback_buffers[i];
+                // Pooled buffers retain old metrics across frames; push current
+                // metrics so a font-size change takes effect immediately.
+                buf.set_metrics(&mut self.font_system, metrics);
+                buf.set_size(&mut self.font_system, None, None);
+                let mut tmp = [0u8; 4];
+                let s = c.encode_utf8(&mut tmp);
+                let attrs = Attrs::new().family(Family::Name(&fam));
+                buf.set_text(&mut self.font_system, s, &attrs, Shaping::Advanced, None);
+            }
+        }
+
         self.viewport.update(queue, Resolution { width, height });
 
         let win_bounds = TextBounds {
@@ -466,6 +572,20 @@ impl TextLayer {
             });
         }
 
+        // Fallback glyphs: drawn ON TOP of the blanked cells, at the exact cell
+        // origin, in this same prepare() — so they never shift a neighbor.
+        for (i, (x, y, _c, rgb)) in fallback_cells.iter().enumerate() {
+            areas.push(TextArea {
+                buffer: &self.fallback_buffers[i],
+                left: *x,
+                top: *y + top_offset,
+                scale: 1.0,
+                bounds: win_bounds,
+                default_color: Color::rgb(rgb[0], rgb[1], rgb[2]),
+                custom_glyphs: &[],
+            });
+        }
+
         self.renderer.prepare(
             device,
             queue,
@@ -475,6 +595,8 @@ impl TextLayer {
             areas,
             &mut self.swash,
         )?;
+        // areas is consumed; return the scratch Vec for reuse next frame.
+        self.fallback_cells_scratch = fallback_cells;
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("text") });
