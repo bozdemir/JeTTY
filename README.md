@@ -47,7 +47,7 @@
 - 🎨 **5 beloved themes** — Catppuccin Mocha (default), Tokyo Night, Gruvbox Dark, Dracula, and Onyx, with exact community palettes. Every UI surface (panel, menus, tab bar, welcome, confirm dialogs) re-skins with the active theme.
 - 🪟 **Custom-decorated window** — borderless client-side decorations, our own title bar, rounded corners (radius slider), runtime opacity.
 - 🔤 **Live font control** — change font **size** (`Ctrl + +/-/0`) and **family** (any installed monospace) at runtime, no restart.
-- 📋 **Selection & clipboard** — drag to select (auto-copies), right-click **Copy / Paste / Select All** menu, `Ctrl+Shift+C/V`, middle-click paste, bracketed-paste aware.
+- 📋 **Selection & clipboard** — drag to select (auto-copies), **Shift+drag** to select even inside mouse-aware TUIs (vim/htop/tmux/Claude Code), right-click **Copy / Paste / Select All** menu, `Ctrl+Shift+C/V`, middle-click paste, bracketed-paste aware.
 - ⚙️ **Settings dialog** — `Ctrl+Shift+P` opens a movable dialog (theme, opacity, corner radius, summon effect, window mode, dropdown size, tab-bar position, focus auto-hide, welcome splash, performance HUD, font) — all **persisted** to `~/.config/jetty/config.toml`.
 - 📊 **Live performance HUD** — an optional tab-bar overlay showing frame ms · fps · CPU% · VT MB/s in real time, and an honest "idle" state when the app settles (never forces a redraw — idle stays ~0% CPU). Toggle with `show_perf_hud`.
 - 👋 **Welcome overlay** — a neofetch-style splash on first launch (accent ASCII logo + version/backend), dismissed on the first key/click/Esc. Toggle with `show_welcome`.
@@ -134,6 +134,7 @@ cargo build --release && ./target/release/jetty
 | `Ctrl` + `+` / `-` / `0` | Font size up / down / reset |
 | `Ctrl+Shift` + `+` / `-` | Opacity up / down |
 | Left-drag | Select text (auto-copies) |
+| **Shift**+drag | Select text over mouse-aware apps (vim/htop/tmux/Claude Code) |
 | Right-click | Copy / Paste / Select All / Clear / Close Tab menu |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / Paste |
 | `Ctrl+D` | Close the shell (and window) |
