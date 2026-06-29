@@ -374,6 +374,14 @@ pub struct App {
     modifiers: winit::keyboard::ModifiersState,
     /// Last known cursor position in physical pixels.
     cursor: (f64, f64),
+    /// Where a no-Shift press began while a mouse-reporting app was active (the
+    /// press was forwarded to the app). On release, if the cursor moved, the user
+    /// was likely trying to select — surface the Shift+drag hint. `take`n on release.
+    mouse_grab_press: Option<(f64, f64)>,
+    /// While `Some(t)` and `now < t`, the "Hold Shift to select" toast is drawn.
+    shift_hint_until: Option<std::time::Instant>,
+    /// Throttle: the toast won't re-arm until `now` passes this instant.
+    shift_hint_cooldown: Option<std::time::Instant>,
     /// Whether the user is currently dragging the scrollbar thumb.
     dragging_scrollbar: bool,
     /// Y offset from thumb top where the user grabbed, in px.
@@ -675,6 +683,9 @@ impl App {
             ui_font_scroll_offset: 0,
             modifiers: winit::keyboard::ModifiersState::empty(),
             cursor: (0.0, 0.0),
+            mouse_grab_press: None,
+            shift_hint_until: None,
+            shift_hint_cooldown: None,
             dragging_scrollbar: false,
             drag_grab_dy: 0.0,
             settings_window: None,
@@ -3132,6 +3143,10 @@ impl ApplicationHandler<AppEvent> for App {
                         // xterm/kitty) so you can still select & copy inside TUIs that
                         // grab the mouse (Claude Code, vim, htop, tmux).
                         if self.active_tab().terminal.mouse_mode() && !self.modifiers.shift_key() {
+                            // Remember where this app-bound press started: if the
+                            // user drags (not just clicks), they were probably trying
+                            // to select — we surface the Shift+drag hint on release.
+                            self.mouse_grab_press = Some(self.cursor);
                             self.send_mouse_report(input::MouseEvent::LeftPress);
                         } else {
                             // Clear prior selection and begin a new one.
@@ -3221,6 +3236,23 @@ impl ApplicationHandler<AppEvent> for App {
                 // None), so a non-drag release pairs with that forwarded press.
                 if !was_dragging && !was_selecting && self.active_tab().terminal.mouse_mode() {
                     self.send_mouse_report(input::MouseEvent::LeftRelease);
+                }
+
+                // If this release ended a no-Shift DRAG over a mouse-reporting app
+                // (press recorded, cursor moved > a few px), the user was likely
+                // trying to select — they just don't know Shift is needed. Surface
+                // a brief, throttled toast telling them how.
+                if let Some((px, py)) = self.mouse_grab_press.take() {
+                    let moved = ((self.cursor.0 - px).powi(2) + (self.cursor.1 - py).powi(2)).sqrt();
+                    let now = std::time::Instant::now();
+                    let off_cooldown = self.shift_hint_cooldown.map_or(true, |t| now >= t);
+                    if moved > 8.0 && off_cooldown {
+                        self.shift_hint_until = Some(now + std::time::Duration::from_millis(3500));
+                        self.shift_hint_cooldown = Some(now + std::time::Duration::from_secs(25));
+                        if let Some(win) = &self.window {
+                            win.request_redraw();
+                        }
+                    }
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Middle, .. } => {
@@ -3659,6 +3691,9 @@ impl ApplicationHandler<AppEvent> for App {
                 let menu_hover = self.menu_hover;
                 let help_open = self.help_open;
                 let welcome_open = self.welcome_open;
+                let shift_hint_show = self
+                    .shift_hint_until
+                    .map_or(false, |t| std::time::Instant::now() < t);
                 // Backend name for the welcome overlay (captured before the mutable
                 // gpu borrow; falls back to "?" when gpu is not yet available).
                 let gpu_backend_name: String = self
@@ -3907,6 +3942,30 @@ impl ApplicationHandler<AppEvent> for App {
                             );
                         }
                     }
+                    // Pass 4c: Shift+drag hint toast — a brief, centered pill shown
+                    // when the user drags (no Shift) inside a mouse-reporting app, so
+                    // they discover the Shift+drag-to-select gesture. Throttled.
+                    if shift_hint_show {
+                        let hint = "Hold Shift while dragging to select text";
+                        let cw = chrome_text.cell_size().0;
+                        let tw = hint.chars().count() as f32 * cw;
+                        let pad = 14.0;
+                        let pill_w = tw + pad * 2.0;
+                        let pill_h = 26.0;
+                        let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
+                        let pill_y =
+                            (height as f32 - status_h - 14.0 - pill_h).max(0.0) + slide_y_offset;
+                        let c = theme.cursor;
+                        let pill = jetty_render::Rect::rounded(
+                            pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
+                        );
+                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill]);
+                        let ty = pill_y + (pill_h - 16.0) / 2.0;
+                        let _ = chrome_text.render_overlays(
+                            &gpu.device, &gpu.queue, scene_view, width, height,
+                            &[(hint.to_string(), pill_x + pad, ty, [20, 20, 20])],
+                        );
+                    }
                     // Pass 4b: welcome splash — drawn over the grid but UNDER all
                     // modals (context menu, help, confirm popups). Only shown when
                     // welcome_open is true (dismissed on first PTY input/click/Esc).
@@ -4089,9 +4148,14 @@ impl ApplicationHandler<AppEvent> for App {
                             self.slide_anim = None;
                         }
                     }
-                    // Self-drive the next frame while EITHER animation is live so
-                    // idle CPU returns to ~0 only once BOTH have cleared.
-                    if self.summon_anim.is_some() || self.slide_anim.is_some() {
+                    // Self-drive the next frame while EITHER animation is live, OR
+                    // the Shift+drag hint toast is still showing (so it repaints
+                    // away on expiry instead of freezing on screen). Idle CPU
+                    // returns to ~0 once all three have cleared.
+                    let hint_live = self
+                        .shift_hint_until
+                        .map_or(false, |t| std::time::Instant::now() < t);
+                    if self.summon_anim.is_some() || self.slide_anim.is_some() || hint_live {
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
