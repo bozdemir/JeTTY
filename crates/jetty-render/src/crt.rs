@@ -1,25 +1,61 @@
 //! Crt post-effect — a GPU pass that samples a fully-rendered offscreen scene
-//! and writes the result to the surface. This scaffold is a passthrough (exact
-//! blit): the WGSL fragment simply returns `textureSample(src_tex, src_samp, uv)`.
-//! Real CRT effects (scanlines, phosphor bloom, barrel distortion) are added in
-//! subsequent tasks without touching the public API established here.
+//! and writes a CRT-styled result to the surface. The WGSL fragment applies, in
+//! one sample pass: barrel/curvature warp (with a transparent bezel outside the
+//! tube), chromatic aberration, tinted scanlines, a shadow-mask / aperture
+//! grille, single-pass in-shader bloom, and a radial vignette. It ALSO computes
+//! its own rounded-corner alpha (on the UN-warped output coords) so the
+//! transparent rounded window corners are restored — the corner mask pass is
+//! skipped while CRT is on, so the CRT pass owns the corners.
+//!
+//! Every effect is a no-op at its `param == 0`, so all-zero params reduce to a
+//! near-passthrough blit (plus corner rounding). The look is fully STATIC here:
+//! `time` and `flags` are laid into the uniform but intentionally unused — the
+//! rolling/flicker/jitter animation that consumes them is a later task.
 //!
 //! One fullscreen-triangle pass with bindings {uniform, src_texture, sampler}
-//! and a `replace` blend (this pass owns every output pixel). At all times the
-//! output is identical to the input — the caller decides when to route through
-//! this pass.
+//! and a `replace` blend (this pass owns every output pixel). Color and alpha are
+//! both multiplied by the corner+bezel coverage so corners fade out cleanly
+//! (mirrors mask.rs's dst-multiply convention — keeps premultiplication
+//! consistent, never re-opaques the corners).
 //!
 //! Self-contained: our own wgpu/WGSL, no desktop-environment / compositor /
 //! OS-specific code.
 
-// 16-byte uniform (4 scalars). No vec3<f32> so the host buffer layout is exact.
-// `resolution` carries physical pixel dimensions for future shader math; the two
-// `_pad` fields keep the struct 16-byte aligned and ready for extension.
+// 64-byte uniform. No vec3<f32> so the host (#[repr(C)]) layout matches the WGSL
+// struct byte-for-byte. Field byte offsets (Rust == WGSL), all naturally aligned:
+//   resolution    vec2<f32>  @  0   (align 8)
+//   curvature     f32        @  8
+//   scanline      f32        @ 12
+//   mask          f32        @ 16
+//   bloom         f32        @ 20
+//   chromatic     f32        @ 24
+//   vignette      f32        @ 28
+//   tint          vec4<f32>  @ 32   (align 16; rgb + pad)
+//   corner_radius f32        @ 48
+//   time          f32        @ 52   (reserved — Task 10 animation)
+//   flags         u32        @ 56   (reserved — Task 10 animation)
+//   _pad0         f32        @ 60
+//   => size 64, align 16.
 pub(crate) const CRT_SHADER: &str = r#"
-struct P { res_x: f32, res_y: f32, _a: f32, _b: f32 };
+struct P {
+    resolution: vec2<f32>,
+    curvature: f32,
+    scanline: f32,
+    mask: f32,
+    bloom: f32,
+    chromatic: f32,
+    vignette: f32,
+    tint: vec4<f32>,
+    corner_radius: f32,
+    time: f32,
+    flags: u32,
+    _pad0: f32,
+};
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var src_tex: texture_2d<f32>;
 @group(0) @binding(2) var src_samp: sampler;
+
+const PI: f32 = 3.14159265359;
 
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
@@ -34,25 +70,141 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return o;
 }
 
+// Rounded-rect SDF (mirrors mask.rs / phosphor.rs). Negative inside, 0 on the
+// edge, positive outside. `b` is the half-size, `r` the corner radius.
+fn sd_round_rect(pt: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
+    let q = abs(pt) - b + vec2(r, r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0, 0.0))) - r;
+}
+
+// One thresholded bloom tap: the scene color at `uv`, keeping only its bright
+// part (smoothstep on max channel). textureSampleLevel avoids derivative /
+// uniformity constraints so it is safe to call many times here.
+fn bright_tap(uv: vec2<f32>) -> vec3<f32> {
+    let c = textureSampleLevel(src_tex, src_samp, uv, 0.0).rgb;
+    let l = max(c.r, max(c.g, c.b));
+    return c * smoothstep(0.55, 0.9, l);
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(src_tex, src_samp, in.uv);
+    let res = p.resolution;
+
+    // --- 1) Barrel / curvature warp of the SAMPLE uv (output uv stays put). ---
+    // Push coords outward by the square of the orthogonal axis; identity at
+    // curvature == 0. Near the edges the warped uv leaves [0,1] -> bezel below.
+    let cc = in.uv * 2.0 - 1.0;             // centered, [-1,1]
+    let warp = p.curvature * 0.25;          // 0 => identity
+    let suv = (cc + cc * (cc.yx * cc.yx) * warp) * 0.5 + 0.5;
+
+    // Bezel: feather to transparent JUST OUTSIDE the unit box. No-op at
+    // curvature == 0 (suv == in.uv stays within [0,1], so `outside` <= 0 and the
+    // outermost edge pixels keep full coverage — true passthrough at the edge).
+    let outside = max(max(-suv.x, suv.x - 1.0), max(-suv.y, suv.y - 1.0));
+    let fpx = 1.5 / max(res.x, res.y);
+    let bezel = 1.0 - smoothstep(0.0, fpx, outside);
+
+    // --- 2) Chromatic aberration: R/G/B diverge along the radius, growing with
+    // distance from center; identity at chromatic == 0. ---
+    let dir = suv - vec2(0.5, 0.5);
+    let ca = p.chromatic * 0.006;
+    let cr = textureSampleLevel(src_tex, src_samp, suv + dir * ca, 0.0).r;
+    let cg = textureSampleLevel(src_tex, src_samp, suv, 0.0);
+    let cb = textureSampleLevel(src_tex, src_samp, suv - dir * ca, 0.0).b;
+    var col = vec3(cr, cg.g, cb);
+    let scene_a = cg.a;                      // carry the window's alpha through
+
+    // --- 3) Scanlines (output space), tinted by p.tint.rgb. Neutral darkening
+    // at the default white tint; identity at scanline == 0. ---
+    let beam = 0.5 + 0.5 * sin(in.uv.y * res.y * PI);   // [0,1], 1 on the dark line
+    let darken = p.scanline * beam;
+    let scan_mul = (1.0 - darken) * mix(vec3(1.0, 1.0, 1.0), p.tint.rgb, darken);
+    col = col * scan_mul;
+
+    // --- 4) Shadow-mask / aperture grille: vertical RGB stripes per output
+    // column; identity at mask == 0. ---
+    let idx = u32(floor(in.uv.x * res.x)) % 3u;
+    let triad = vec3(
+        select(0.0, 1.0, idx == 0u),
+        select(0.0, 1.0, idx == 1u),
+        select(0.0, 1.0, idx == 2u),
+    );
+    let depth = p.mask * 0.6;               // off-channels dim to (1 - depth)
+    let grille = vec3(1.0, 1.0, 1.0) - depth * (vec3(1.0, 1.0, 1.0) - triad);
+    col = col * grille;
+
+    // --- 5) Single-pass bloom: 13 thresholded taps of the warped scene (center
+    // + 4 axis @1.5px + 4 diagonal @1.5px + 4 axis @3px); identity at bloom == 0. ---
+    let s1 = 1.5 / res;
+    let s2 = 3.0 / res;
+    var glow = bright_tap(suv) * 0.20;
+    glow = glow + (bright_tap(suv + vec2(s1.x, 0.0)) + bright_tap(suv - vec2(s1.x, 0.0))
+                 + bright_tap(suv + vec2(0.0, s1.y)) + bright_tap(suv - vec2(0.0, s1.y))) * 0.10;
+    glow = glow + (bright_tap(suv + vec2(s1.x, s1.y)) + bright_tap(suv + vec2(s1.x, -s1.y))
+                 + bright_tap(suv + vec2(-s1.x, s1.y)) + bright_tap(suv + vec2(-s1.x, -s1.y))) * 0.075;
+    glow = glow + (bright_tap(suv + vec2(s2.x, 0.0)) + bright_tap(suv - vec2(s2.x, 0.0))
+                 + bright_tap(suv + vec2(0.0, s2.y)) + bright_tap(suv - vec2(0.0, s2.y))) * 0.05;
+    col = col + glow * p.bloom;
+
+    // --- 6) Vignette: radial edge darkening (output space); identity at
+    // vignette == 0. ---
+    let vd = length(in.uv - vec2(0.5, 0.5)) * 1.41421356;   // 0 center -> ~1 corner
+    let v = 1.0 - 0.85 * smoothstep(0.5, 1.15, vd);
+    let vig = mix(1.0, v, p.vignette);
+    col = col * vig;
+
+    // --- 7) Rounded-corner alpha on the UN-WARPED output coords (so the rounding
+    // is NOT distorted by curvature) — replicates mask.rs's SDF, feather and
+    // radius clamp exactly so the corners match the non-CRT look. ---
+    let frag = in.uv * res;                 // un-warped output pixel position
+    let half = res * 0.5;
+    let rr = min(p.corner_radius, min(res.x, res.y) * 0.5);
+    let d = sd_round_rect(frag - half, half, rr);
+    let cov_raw = 1.0 - smoothstep(-0.75, 0.75, d);
+    // radius <= 0 => fully opaque everywhere (square window, matches mask.rs skip).
+    let cov = select(1.0, cov_raw, p.corner_radius > 0.0);
+
+    // Multiply BOTH (premultiplied) color and alpha by the combined coverage so
+    // corners + bezel fade out without re-opaquing (mirrors mask.rs dst-multiply).
+    let amask = cov * bezel;
+    return vec4(col * amask, scene_a * amask);
 }
 "#;
 
 /// Per-frame uniform for the CRT pass.
 ///
-/// Layout: 16 bytes, 4 flat `f32` scalars. No `vec3<f32>` so the Rust buffer
-/// layout matches the WGSL struct exactly (see phosphor.rs:18 note).
-/// `resolution` holds physical pixel dimensions for future shader math (scanline
-/// pitch, curvature, etc.); `_pad` are reserved for extension.
+/// Layout: 64 bytes. No `vec3<f32>` so the Rust `#[repr(C)]` layout matches the
+/// WGSL `struct P` byte-for-byte (see the offset table on `CRT_SHADER` above and
+/// the `crt_uniform_layout` test). Every effect strength is a normalized 0..1
+/// slider value; each is a no-op at 0. `time`/`flags` are reserved for the
+/// animation task (Task 10) and are not read by the static shader yet.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CrtUniform {
-    /// Physical width and height in pixels.
+    /// Physical width and height in pixels. (offset 0)
     pub resolution: [f32; 2],
-    /// Reserved / padding — keep the struct 16-byte aligned.
-    pub _pad: [f32; 2],
+    /// Barrel/curvature warp strength. (offset 8)
+    pub curvature: f32,
+    /// Scanline darkening strength. (offset 12)
+    pub scanline: f32,
+    /// Shadow-mask / aperture-grille strength. (offset 16)
+    pub mask: f32,
+    /// Bloom/glow strength. (offset 20)
+    pub bloom: f32,
+    /// Chromatic-aberration strength. (offset 24)
+    pub chromatic: f32,
+    /// Vignette strength. (offset 28)
+    pub vignette: f32,
+    /// Scanline tint: rgb in `[0..2]`, `[3]` is padding. (offset 32, align 16)
+    pub tint: [f32; 4],
+    /// Rounded-corner radius in physical px (matches the corner mask). (offset 48)
+    pub corner_radius: f32,
+    /// Reserved — animation phase (Task 10). Unused by the static shader. (offset 52)
+    pub time: f32,
+    /// Reserved — roll/flicker/jitter bitfield (Task 10). Unused here. (offset 56)
+    pub flags: u32,
+    /// Padding — keep the struct 16-byte aligned (size 64). (offset 60)
+    pub _pad0: f32,
 }
 
 pub struct Crt {
@@ -184,12 +336,10 @@ impl Crt {
         height: u32,
         u: &CrtUniform,
     ) {
-        // Build the uniform with the caller's data, overriding resolution from
-        // the explicit width/height so callers don't have to compute it twice.
-        let uniform = CrtUniform {
-            resolution: [width as f32, height as f32],
-            _pad: u._pad,
-        };
+        // Use the caller's full uniform, overriding resolution from the explicit
+        // width/height so callers don't have to compute it twice.
+        let mut uniform = *u;
+        uniform.resolution = [width as f32, height as f32];
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
 
         // Rebuild the bind group only when the src view changes (resize);
@@ -265,6 +415,29 @@ mod tests {
         validator
             .validate(&module)
             .expect("CRT_SHADER must pass naga validation");
+    }
+
+    /// The Rust `CrtUniform` layout must match the WGSL `struct P` byte-for-byte
+    /// (see the offset table on `CRT_SHADER`). If these diverge, `write_buffer`
+    /// would feed the shader misaligned fields. 64 bytes, 16-byte aligned.
+    #[test]
+    fn crt_uniform_layout() {
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<CrtUniform>(), 64, "CrtUniform must be 64 bytes");
+        assert_eq!(offset_of!(CrtUniform, resolution), 0);
+        assert_eq!(offset_of!(CrtUniform, curvature), 8);
+        assert_eq!(offset_of!(CrtUniform, scanline), 12);
+        assert_eq!(offset_of!(CrtUniform, mask), 16);
+        assert_eq!(offset_of!(CrtUniform, bloom), 20);
+        assert_eq!(offset_of!(CrtUniform, chromatic), 24);
+        assert_eq!(offset_of!(CrtUniform, vignette), 28);
+        assert_eq!(offset_of!(CrtUniform, tint), 32);
+        assert_eq!(offset_of!(CrtUniform, corner_radius), 48);
+        assert_eq!(offset_of!(CrtUniform, time), 52);
+        assert_eq!(offset_of!(CrtUniform, flags), 56);
+        assert_eq!(offset_of!(CrtUniform, _pad0), 60);
+        // bytemuck::Pod requires no padding gaps; size is a multiple of align.
+        assert_eq!(size_of::<CrtUniform>() % align_of::<CrtUniform>(), 0);
     }
 
     /// Smoke-test that `Crt::new` succeeds on a real wgpu device.

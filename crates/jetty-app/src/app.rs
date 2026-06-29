@@ -4546,7 +4546,32 @@ impl ApplicationHandler<AppEvent> for App {
                                 height,
                                 &jetty_render::CrtUniform {
                                     resolution: [width as f32, height as f32],
-                                    _pad: [0.0, 0.0],
+                                    curvature: self.fx.crt_curvature,
+                                    scanline: self.fx.crt_scanline,
+                                    mask: self.fx.crt_mask,
+                                    bloom: self.fx.crt_bloom,
+                                    chromatic: self.fx.crt_chromatic,
+                                    vignette: self.fx.crt_vignette,
+                                    // Scanline tint rgb (+ pad). White => neutral.
+                                    tint: [
+                                        self.fx.crt_scanline_tint[0],
+                                        self.fx.crt_scanline_tint[1],
+                                        self.fx.crt_scanline_tint[2],
+                                        0.0,
+                                    ],
+                                    // The CRT pass owns the rounded corners (the
+                                    // corner mask is skipped while CRT is active),
+                                    // so feed it the same physical radius the mask
+                                    // would use. NOTE: a single radius rounds all
+                                    // four corners; in Dropdown (top-flush) mode the
+                                    // mask keeps the top corners square — that nuance
+                                    // is not modeled here (single corner_radius).
+                                    corner_radius: corner_radius_px,
+                                    // Reserved for Task 10 (rolling/flicker/jitter);
+                                    // the static shader does not read these yet.
+                                    time: 0.0,
+                                    flags: 0,
+                                    _pad0: 0.0,
                                 },
                             );
                         }
