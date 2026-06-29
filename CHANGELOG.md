@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.1] — 2026-06-29
+
+### Added
+- **Configurable shell** — new `shell` config key. Empty (default) auto-detects
+  in priority order: `$SHELL`, then the passwd login shell, then `/bin/bash`.
+  Set an absolute path (e.g. `shell = "/usr/bin/zsh"`) to force a shell — for
+  users whose login shell is bash but who live in zsh/fish, so their
+  oh-my-zsh/autosuggestions/plugins actually load. Nothing is hardcoded to one
+  shell.
+- **`jetty --show` / `jetty --hide`** — explicit summon/dismiss commands over the
+  single-instance IPC, alongside `--toggle`. Bind a dedicated summon or dismiss
+  key in your compositor (Wayland-friendly, no portal/DE-specific code).
+  *(Thanks @YKesX, PR #4.)*
+- **`JETTY_GPU=high`** (aliases `discrete`, `dgpu`) — env override to select the
+  discrete GPU. The default stays LowPower/integrated (a terminal needs no
+  discrete power, and the dGPU can destabilize some hybrid compositors); the
+  override fixes presentation on dGPU-primary (e.g. NVIDIA-primary) systems where
+  the integrated adapter can't drive the compositor surface.
+  *(Thanks @YKesX, PR #3.)*
+
+---
+
 ## [0.4.0] — 2026-06-29
 
 A usability release: missing glyphs now render, you can select & copy inside
