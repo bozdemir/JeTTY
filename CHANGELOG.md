@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.2] — 2026-06-29
+
+A discoverability release for the Shift+drag selection added in 0.4.0.
+
+### Added
+- **Contextual "Hold Shift to select" toast** — when you drag (without Shift)
+  inside an app that grabbed the mouse (Claude Code, vim, htop, tmux), JeTTY
+  briefly shows a centered hint telling you to hold Shift, right at the moment
+  you're trying to select. Throttled, self-dismissing, no idle-CPU cost.
+- **Shift+drag is now documented** in the in-app Help overlay (the "?" button)
+  and the README keybindings table + feature list. The Help overlay's summon row
+  also notes the hotkey is configurable.
+
+---
+
 ## [0.4.1] — 2026-06-29
 
 ### Added
