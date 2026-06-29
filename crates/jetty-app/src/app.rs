@@ -263,6 +263,11 @@ pub struct App {
     /// and this pass blits it to the surface (passthrough for now). Built in
     /// `resumed` with the surface format; `None` until then.
     crt: Option<jetty_render::Crt>,
+    /// Optional GPU caret glow/ripple pass (Task 12). Additive halo + expanding
+    /// ring around the cursor cell on each keystroke burst. Built in `resumed`
+    /// with the surface format; dispatched only when `fx.caret_glow_enabled` AND
+    /// `caret_anim.is_some()` AND the cursor is visible — zero cost otherwise.
+    caret_fx: Option<jetty_render::CaretFx>,
     /// Surface-sized offscreen color texture used ONLY while a Tier-B effect is
     /// summoning: the scene is rendered into this, then the effect samples it and
     /// writes the displaced/blurred result to the surface. `None` until built in
@@ -689,6 +694,7 @@ impl App {
             liquid: None,
             focus: None,
             crt: None,
+            caret_fx: None,
             offscreen: None,
             summon_effect: SummonEffect::Bayer,
             window_mode: WindowMode::Center,
@@ -2724,6 +2730,10 @@ impl ApplicationHandler<AppEvent> for App {
             // CRT post-effect (passthrough for now). Same surface format as the
             // rest of the pipeline so the blit-to-surface target matches.
             self.crt = Some(jetty_render::Crt::new(&g.device, g.format));
+            // Caret glow/ripple (Task 12). Built unconditionally so the toggle
+            // can be flipped at runtime without a restart; dispatched only when
+            // `fx.caret_glow_enabled` is true (zero cost when off).
+            self.caret_fx = Some(jetty_render::CaretFx::new(&g.device, g.format));
             self.summon_pending = true;
             self.summon_settle_until =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
@@ -4120,6 +4130,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let phosphor = self.phosphor.as_ref();
                 let liquid = self.liquid.as_ref();
                 let focus = self.focus.as_ref();
+                let caret_fx = self.caret_fx.as_ref();
                 let crt = self.crt.as_ref();
                 let offscreen = self.offscreen.as_ref();
                 // CRT enable flag, captured before the mutable gpu/text borrow.
@@ -4574,6 +4585,61 @@ impl ApplicationHandler<AppEvent> for App {
                     {
                         if let Some(w) = &self.window {
                             w.request_redraw();
+                        }
+                    }
+                    // Caret glow/ripple pass (Task 12). Additive GPU burst at the
+                    // cursor position on each keystroke. Dispatched only when the
+                    // toggle is on AND an animation is live AND the cursor is visible.
+                    //
+                    // Target is always `scene_view`, which routes correctly for all
+                    // three compositing cases:
+                    //   CRT ON:   scene_view == offscreen → glow composites into the
+                    //             offscreen; the CRT pass below samples and re-rounds
+                    //             the corners. Glow gets full CRT treatment.
+                    //   CRT OFF:  scene_view == &view (surface) → glow goes directly
+                    //             onto the surface after the corner mask above.
+                    //             Alpha=0 output keeps corner transparency intact.
+                    //   Tier-B:   scene_view == offscreen (Tier-B owns it) → glow is
+                    //             baked into the offscreen; the Tier-B effect displaces/
+                    //             blurs it along with the rest of the scene.
+                    //
+                    // No new redraw scheduling — the caret_anim guard in the self-drive
+                    // block above already keeps frames coming while the burst is live.
+                    if self.fx.caret_glow_enabled {
+                        if let (Some(cfx), Some(t_val)) = (caret_fx, caret_t) {
+                            if snap.cursor_visible
+                                && snap.cursor_col < snap.cols
+                                && snap.cursor_row < snap.rows
+                            {
+                                // Cursor cell centre in physical pixels. x and y both
+                                // start from (0,0) at the top-left of the viewport,
+                                // matching @builtin(position) in the WGSL fragment.
+                                // Mirrors text.rs:585-596's cursor_left/top formula.
+                                let cursor_px_x = snap.cursor_col as f32 * cell_w
+                                    + cell_w * 0.5;
+                                let cursor_px_y = snap.cursor_row as f32 * cell_h
+                                    + grid_top + slide_y_offset + cell_h * 0.5;
+                                cfx.apply(
+                                    &gpu.device,
+                                    &gpu.queue,
+                                    scene_view,
+                                    &jetty_render::CaretFxUniform {
+                                        resolution: [width as f32, height as f32],
+                                        cursor_px: [cursor_px_x, cursor_px_y],
+                                        cell: [cell_w, cell_h],
+                                        t: t_val,
+                                        // Tasteful default intensity; bright enough to
+                                        // be visible, subtle enough not to dominate.
+                                        intensity: 0.5,
+                                        color: [
+                                            caret_flash_color[0],
+                                            caret_flash_color[1],
+                                            caret_flash_color[2],
+                                            0.0, // pad
+                                        ],
+                                    },
+                                );
+                            }
                         }
                     }
                     // CRT post-pass: when CRT is active (enabled AND not bypassed by
