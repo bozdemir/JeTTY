@@ -984,6 +984,7 @@ name = "jetty-core"
 version = "0.0.0"
 dependencies = [
  "alacritty_terminal",
+ "libc",
  "portable-pty",
 ]
 

@@ -33,6 +33,55 @@ impl Drop for PtySession {
     }
 }
 
+/// Decide which shell to launch, in priority order:
+/// 1. the explicit `shell` config override, when non-empty;
+/// 2. `$SHELL` (the conventional source), when set & non-empty;
+/// 3. the current user's login shell from the passwd database (so a user who
+///    `chsh`'d to zsh works even when `$SHELL` is unset in a GUI launch);
+/// 4. `/bin/bash` as a last resort.
+fn resolve_shell(override_shell: Option<String>) -> String {
+    if let Some(s) = override_shell {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    if let Ok(s) = std::env::var("SHELL") {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    if let Some(s) = passwd_shell() {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    "/bin/bash".to_string()
+}
+
+/// The current user's login shell (`pw_shell`) from the passwd database, or
+/// `None` if it can't be resolved. One-shot at spawn; `getpwuid` returns a
+/// pointer into a static buffer, copied out immediately.
+#[cfg(unix)]
+fn passwd_shell() -> Option<String> {
+    use std::ffi::CStr;
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() {
+            return None;
+        }
+        let sh = (*pw).pw_shell;
+        if sh.is_null() {
+            return None;
+        }
+        CStr::from_ptr(sh).to_str().ok().map(str::to_string)
+    }
+}
+
+#[cfg(not(unix))]
+fn passwd_shell() -> Option<String> {
+    None
+}
+
 impl PtySession {
     /// Spawn a PTY running the user's shell.
     ///
@@ -40,13 +89,22 @@ impl PtySession {
     /// arrives from the PTY (and once more on EOF/error). Use it to wake the
     /// application's event loop immediately so query replies (DSR/DA/etc.) are
     /// sent back to the shell within ~1ms instead of waiting for a polling tick.
-    pub fn spawn(cols: u16, rows: u16, on_data: impl Fn() + Send + 'static) -> std::io::Result<PtySession> {
+    ///
+    /// `shell_override` is the `shell` config key: when non-empty it wins over
+    /// every auto-detection, so a user whose login shell (`$SHELL`/passwd) is
+    /// bash but who lives in zsh can set `shell = "/usr/bin/zsh"`.
+    pub fn spawn(
+        cols: u16,
+        rows: u16,
+        shell_override: Option<String>,
+        on_data: impl Fn() + Send + 'static,
+    ) -> std::io::Result<PtySession> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let shell = resolve_shell(shell_override);
         let mut cmd = CommandBuilder::new(shell);
         // Advertise a capable terminal so shells (and prompts like p10k) run
         // their capability probes and emit truecolor; without TERM set, those

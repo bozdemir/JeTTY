@@ -137,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // replies (DSR/DA/etc.) back to the PTY, which is what clears the
         // startup red "x".
         use std::io::Write;
-        let pty = jetty_core::PtySession::spawn(cols as u16, rows as u16, || {})?;
+        let pty = jetty_core::PtySession::spawn(cols as u16, rows as u16, None, || {})?;
         let mut w = pty.writer();
 
         // ~3.5s startup settle: 700 iterations of 5ms.

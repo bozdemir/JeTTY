@@ -280,6 +280,9 @@ pub struct App {
     /// Global summon hotkey string (e.g. "F9", "F12", "Ctrl+Shift+F12"). Parsed
     /// by `global_hotkey`'s own `HotKey::from_str`. Default "F9".
     summon_hotkey: String,
+    /// Shell to launch (the `shell` config key). Empty = auto-detect
+    /// ($SHELL → passwd → /bin/bash); a path forces that shell.
+    shell: String,
     /// Cached tab-bar metadata (title, is-active), rebuilt only when the tab
     /// titles or the active index change. Avoids cloning every tab title on
     /// every RedrawRequested (incl. animation frames) — speed-first hot path.
@@ -639,6 +642,7 @@ impl App {
             focus_autohide: true,
             launch_at_login: false,
             summon_hotkey: "F9".to_string(),
+            shell: String::new(),
             cached_top_flush: false,
             cached_tabs_meta: Vec::new(),
             cached_tabs_sig: u64::MAX,
@@ -745,6 +749,7 @@ impl App {
         // stored config bool.
         app.launch_at_login = autostart_file_exists();
         app.summon_hotkey = cfg.summon_hotkey;
+        app.shell = cfg.shell;
         app.welcome_open = cfg.show_welcome;
         app.cfg_show_welcome = cfg.show_welcome;
         app.show_perf_hud = cfg.show_perf_hud;
@@ -774,6 +779,7 @@ impl App {
             focus_autohide: self.focus_autohide,
             launch_at_login: self.launch_at_login,
             summon_hotkey: self.summon_hotkey.clone(),
+            shell: self.shell.clone(),
             tab_bar_position: if self.tab_bar_bottom { "bottom" } else { "top" }.to_string(),
             // show_welcome/show_perf_hud are startup preferences (no runtime UI
             // toggles them), cached at startup — write them back from memory so a
@@ -899,13 +905,24 @@ impl App {
         }
     }
 
+    /// The configured shell override for `PtySession::spawn`: `None` when the
+    /// `shell` config key is empty (auto-detect), else the configured path.
+    fn opt_shell(&self) -> Option<String> {
+        if self.shell.is_empty() {
+            None
+        } else {
+            Some(self.shell.clone())
+        }
+    }
+
     /// Spawn a new tab sized to the current grid, themed like the others, make it
     /// active, and redraw. The new PTY shares the same wake proxy so one
     /// `AppEvent::Wake` drains every tab.
     fn new_tab(&mut self) {
         let (cols, rows) = self.grid_dims();
         let proxy_wake = self.proxy.clone();
-        let pty = match PtySession::spawn(cols as u16, rows as u16, move || {
+        let shell = self.opt_shell();
+        let pty = match PtySession::spawn(cols as u16, rows as u16, shell, move || {
             let _ = proxy_wake.send_event(AppEvent::Wake);
         }) {
             Ok(p) => p,
@@ -2268,8 +2285,9 @@ impl ApplicationHandler<AppEvent> for App {
         // resized to the real cols/rows once the cell size is known.
         let font_handle = std::thread::spawn(TextLayer::build_font_system);
         let proxy_wake = self.proxy.clone();
+        let shell = self.opt_shell();
         let pty_handle = std::thread::spawn(move || {
-            PtySession::spawn(FALLBACK_COLS as u16, FALLBACK_ROWS as u16, move || {
+            PtySession::spawn(FALLBACK_COLS as u16, FALLBACK_ROWS as u16, shell, move || {
                 let _ = proxy_wake.send_event(AppEvent::Wake);
             })
         });

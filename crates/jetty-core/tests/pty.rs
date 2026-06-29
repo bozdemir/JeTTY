@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn pty_echoes_written_bytes() {
-    let pty = PtySession::spawn(80, 24, || {}).expect("spawn");
+    let pty = PtySession::spawn(80, 24, None, || {}).expect("spawn");
     {
         let mut w = pty.writer();
         // cooked PTY echoes typed input back; send a line.
@@ -31,7 +31,7 @@ fn child_exit_is_detected() {
     // When the shell exits (Ctrl+D / `exit`), the reader thread sees EOF on the
     // PTY master and must flag it so the app can close the window instead of
     // freezing on a dead shell. Drive that path by telling the shell to exit.
-    let pty = PtySession::spawn(80, 24, || {}).expect("spawn");
+    let pty = PtySession::spawn(80, 24, None, || {}).expect("spawn");
     {
         let mut w = pty.writer();
         use std::io::Write;

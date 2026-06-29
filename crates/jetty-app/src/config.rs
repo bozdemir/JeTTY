@@ -62,6 +62,12 @@ pub struct Config {
     /// Parsed by `global_hotkey`'s `HotKey::from_str`. Config-only (no panel UI).
     #[serde(default = "default_summon_hotkey")]
     pub summon_hotkey: String,
+    /// Shell to launch. Empty (default) = auto-detect: `$SHELL`, then the
+    /// passwd login shell, then `/bin/bash`. Set an absolute path (e.g.
+    /// "/usr/bin/zsh", "/usr/bin/fish") to force a specific shell — useful when
+    /// your login shell is bash but you live in another shell. Config-only.
+    #[serde(default = "default_shell")]
+    pub shell: String,
     /// Tab-bar position: "top" (default) or "bottom". Orthogonal to
     /// `window_mode` — usable in both Center and Dropdown modes.
     #[serde(default = "default_tab_bar_position")]
@@ -77,6 +83,10 @@ pub struct Config {
     /// entirely.
     #[serde(default = "default_show_perf_hud")]
     pub show_perf_hud: bool,
+}
+
+fn default_shell() -> String {
+    String::new()
 }
 
 fn default_summon_effect() -> String {
@@ -149,6 +159,7 @@ impl Default for Config {
             focus_autohide: default_focus_autohide(),
             launch_at_login: default_launch_at_login(),
             summon_hotkey: default_summon_hotkey(),
+            shell: default_shell(),
             tab_bar_position: default_tab_bar_position(),
             show_welcome: default_show_welcome(),
             show_perf_hud: default_show_perf_hud(),
@@ -270,6 +281,7 @@ mod tests {
             focus_autohide: false,
             launch_at_login: false,
             summon_hotkey: "F12".to_string(),
+            shell: "/usr/bin/zsh".to_string(),
             tab_bar_position: "bottom".to_string(),
             show_welcome: false,
             show_perf_hud: false,
@@ -299,6 +311,7 @@ mod tests {
             focus_autohide: true,
             launch_at_login: true,
             summon_hotkey: "F9".to_string(),
+            shell: String::new(),
             tab_bar_position: "bottom".to_string(),
             show_welcome: true,
             show_perf_hud: true,
