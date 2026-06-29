@@ -254,7 +254,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // --- Pass 2: render the grid text on top of the painted background (load) ---
-    text.render_to(&device, &queue, &view, width, height, &snap, false, 0.0)?;
+    text.render_to(&device, &queue, &view, width, height, &snap, false, 0.0, None, [0.0, 0.0, 0.0])?;
 
     // --- Draw scrollbar quad (and optionally the settings panel) over the text ---
     {

@@ -347,6 +347,10 @@ pub struct App {
     /// Start instant of the active summon (crystallize) animation, or None when
     /// idle. While Some, the redraw loop self-drives frames; None = idle 0 CPU.
     summon_anim: Option<std::time::Instant>,
+    /// Start instant of the active caret flash+pulse animation, or None when idle.
+    /// Set on every printable keystroke (re-armed each time); cleared when t≥1.
+    /// While Some, the redraw loop self-drives frames via Poll; None = idle 0 CPU.
+    caret_anim: Option<std::time::Instant>,
     /// Set when a summon is requested; the summon clock (`summon_anim`) starts on
     /// the first redraw AFTER the window is actually shown. On macOS a freshly
     /// shown window can take a beat to present — starting the clock at
@@ -709,6 +713,7 @@ impl App {
             wayland_warned: false,
             crt_clock: std::time::Instant::now(),
             summon_anim: None,
+            caret_anim: None,
             summon_pending: false,
             summon_settle_until: None,
             settings_paint_until: None,
@@ -2551,7 +2556,8 @@ impl ApplicationHandler<AppEvent> for App {
             || self.summon_pending
             || self.pending_dock_frames > 0
             || self.pending_center_frames > 0
-            || self.fx.crt_anim_live();
+            || self.fx.crt_anim_live()
+            || self.caret_anim.is_some();
         if main_pending {
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -3947,6 +3953,13 @@ impl ApplicationHandler<AppEvent> for App {
                         let w = &mut self.tabs[self.active].writer;
                         let _ = w.write_all(&bytes);
                         let _ = w.flush();
+                        // Trigger caret flash+pulse on printable keystrokes.
+                        if self.fx.caret_flash_enabled && is_printable_keystroke(&bytes) {
+                            self.caret_anim = Some(std::time::Instant::now());
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                        }
                     }
                     input::KeyAction::None => {}
                 }
@@ -4136,6 +4149,15 @@ impl ApplicationHandler<AppEvent> for App {
                     let a = self.current_theme().palette[4];
                     [a[0] as f32 / 255.0, a[1] as f32 / 255.0, a[2] as f32 / 255.0]
                 };
+                // Caret flash+pulse progress: t∈[0,1]. Captured and expired before
+                // the mutable gpu/text borrow so self can be mutated freely here.
+                let caret_flash_color = self.fx.caret_flash_color;
+                let caret_t = self.caret_anim.map(|s| {
+                    (s.elapsed().as_secs_f32() / (self.fx.caret_flash_ms / 1000.0)).min(1.0)
+                });
+                if caret_t == Some(1.0) {
+                    self.caret_anim = None;
+                }
                 let (Some(gpu), Some(text), Some(chrome_text), Some(quad)) =
                     (&mut self.gpu, &mut self.text, &mut self.chrome_text, &mut self.quad)
                 else {
@@ -4241,6 +4263,8 @@ impl ApplicationHandler<AppEvent> for App {
                         &snap,
                         false,
                         grid_top + slide_y_offset,
+                        caret_t,
+                        caret_flash_color,
                     );
                     // Pass 3: the tab bar (translated to its actual y) over the grid.
                     quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &bar.quads);
@@ -4546,6 +4570,7 @@ impl ApplicationHandler<AppEvent> for App {
                         || self.slide_anim.is_some()
                         || hint_live
                         || crt_anim_live
+                        || self.caret_anim.is_some()
                     {
                         if let Some(w) = &self.window {
                             w.request_redraw();
@@ -4919,6 +4944,32 @@ fn dock_window_top(win: &Arc<Window>, width_pct: f32, height_pct: f32) {
     }
 }
 
+/// Returns `true` when `bytes` represent a printable keystroke that should
+/// trigger the caret flash+pulse effect.
+///
+/// Rejects:
+/// - empty slices
+/// - anything starting with `0x1b` (escape sequences: arrows, F-keys, CSI, etc.)
+/// - single bytes < 0x20 (control characters: Enter=0x0d, Tab=0x09, etc.)
+/// - single byte `0x7f` (Backspace/Delete)
+///
+/// Accepts ordinary printable ASCII and multi-byte UTF-8 sequences (which can
+/// only occur as actual text — they never start with a control byte).
+fn is_printable_keystroke(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    // Standalone Escape or any escape sequence (CSI, SS3, etc.)
+    if bytes[0] == 0x1b {
+        return false;
+    }
+    // Single-byte control characters (< 0x20) or DEL (0x7f)
+    if bytes.len() == 1 && (bytes[0] < 0x20 || bytes[0] == 0x7f) {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod resize_zone_tests {
     use super::{resize_zone_at, ResizeZone};
@@ -5014,5 +5065,56 @@ mod index_adjust_tests {
         let mut idx: Option<usize> = None;
         App::adjust_index_after_remove(&mut idx, 0);
         assert_eq!(idx, None);
+    }
+}
+
+#[cfg(test)]
+mod printable_keystroke_tests {
+    use super::is_printable_keystroke;
+
+    #[test]
+    fn printable_ascii_lowercase() {
+        assert!(is_printable_keystroke(b"a"));
+    }
+
+    #[test]
+    fn printable_ascii_uppercase() {
+        assert!(is_printable_keystroke(b"A"));
+    }
+
+    #[test]
+    fn printable_utf8_multibyte() {
+        // '£' is U+00A3, encoded as 0xC2 0xA3 in UTF-8.
+        assert!(is_printable_keystroke("£".as_bytes()));
+    }
+
+    #[test]
+    fn empty_is_not_printable() {
+        assert!(!is_printable_keystroke(b""));
+    }
+
+    #[test]
+    fn escape_sequence_arrow_up_is_not_printable() {
+        assert!(!is_printable_keystroke(b"\x1b[A"));
+    }
+
+    #[test]
+    fn enter_is_not_printable() {
+        assert!(!is_printable_keystroke(b"\r"));
+    }
+
+    #[test]
+    fn tab_is_not_printable() {
+        assert!(!is_printable_keystroke(b"\t"));
+    }
+
+    #[test]
+    fn backspace_del_is_not_printable() {
+        assert!(!is_printable_keystroke(b"\x7f"));
+    }
+
+    #[test]
+    fn ctrl_c_is_not_printable() {
+        assert!(!is_printable_keystroke(b"\x03"));
     }
 }

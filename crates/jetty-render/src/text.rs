@@ -412,6 +412,8 @@ impl TextLayer {
         snapshot: &GridSnapshot,
         clear: bool,
         top_offset: f32,
+        caret_t: Option<f32>,
+        caret_flash_color: [f32; 3],
     ) -> Result<(), PrepareError> {
         // Build per-cell color spans: one (&str slice, Attrs) pair per cell.
         // We build a single String containing all text, then collect borrowed slices from it.
@@ -560,14 +562,48 @@ impl TextLayer {
             && snapshot.cursor_col < snapshot.cols;
         if snapshot.cursor_visible && cursor_in_bounds {
             let [cr, cg, cb] = snapshot.cursor_rgb;
+            // Caret flash+pulse: modulate color and scale during the animation burst.
+            // When caret_t is None this branch is skipped and rendering is unchanged.
+            let (cursor_color, cursor_scale, cursor_left, cursor_top) =
+                if let Some(t) = caret_t {
+                    // ease-out quadratic: fast rise, slow finish
+                    let e = 1.0 - (1.0 - t) * (1.0 - t);
+                    // Color: lerp cursor_rgb → caret_flash_color by e
+                    let [fr, fg, fb] = caret_flash_color;
+                    let lerp_ch = |base: u8, target: f32, frac: f32| -> u8 {
+                        let b = base as f32 / 255.0;
+                        ((b + (target - b) * frac) * 255.0).round().clamp(0.0, 255.0) as u8
+                    };
+                    let r = lerp_ch(cr, fr, e);
+                    let g = lerp_ch(cg, fg, e);
+                    let b = lerp_ch(cb, fb, e);
+                    // Scale: bump = 4·e·(1−e), peaks at e=0.5 (~1.15×), returns to 1 at e=1
+                    let bump = 4.0 * e * (1.0 - e);
+                    let scale = 1.0 + 0.15 * bump;
+                    // Keep glyph centered on its cell by offsetting origin inward
+                    // by half of the extra width/height the scaling adds.
+                    let left = snapshot.cursor_col as f32 * self.cell_w
+                        - (scale - 1.0) * self.cell_w * 0.5;
+                    let top = snapshot.cursor_row as f32 * self.cell_h + top_offset
+                        - (scale - 1.0) * self.cell_h * 0.5;
+                    (Color::rgb(r, g, b), scale, left, top)
+                } else {
+                    // No animation — exact original behavior (byte-identical path).
+                    (
+                        Color::rgb(cr, cg, cb),
+                        1.0_f32,
+                        snapshot.cursor_col as f32 * self.cell_w,
+                        snapshot.cursor_row as f32 * self.cell_h + top_offset,
+                    )
+                };
             areas.push(TextArea {
                 buffer: &self.cursor_buffer,
-                left: snapshot.cursor_col as f32 * self.cell_w,
-                top: snapshot.cursor_row as f32 * self.cell_h + top_offset,
-                scale: 1.0,
+                left: cursor_left,
+                top: cursor_top,
+                scale: cursor_scale,
                 bounds: win_bounds,
                 // Color::rgba is not available in this glyphon version; use rgb.
-                default_color: Color::rgb(cr, cg, cb),
+                default_color: cursor_color,
                 custom_glyphs: &[],
             });
         }
@@ -831,7 +867,7 @@ impl TextLayer {
             return Ok(());
         };
         // Self-contained path: this pass owns the frame clear.
-        self.render_to(&gpu.device, &gpu.queue, &view, gpu.config.width, gpu.config.height, snapshot, true, 0.0)?;
+        self.render_to(&gpu.device, &gpu.queue, &view, gpu.config.width, gpu.config.height, snapshot, true, 0.0, None, [0.0, 0.0, 0.0])?;
         frame.present();
         Ok(())
     }
