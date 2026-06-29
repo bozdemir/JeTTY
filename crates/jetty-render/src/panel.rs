@@ -50,6 +50,8 @@ pub struct PanelGeom {
     pub dropdown_width_handle: Rect,
     /// "Auto-hide on focus loss" toggle pill.
     pub autohide_toggle: Rect,
+    /// "Launch at login" toggle pill (bottom band, below the THEME cards).
+    pub launch_login_toggle: Rect,
     // ── UI (chrome) FONT section ──────────────────────────────────────────────
     /// UI-font-size decrement button ("−").
     pub ui_font_minus: Rect,
@@ -117,6 +119,11 @@ pub(crate) const CHAR_W_FALLBACK: f32 = 9.8;
 /// the theme cards shift down by exactly that, so the layout below is unchanged
 /// in relative terms (the pinned ordering/containment tests still hold). The old
 /// cards bottom (py+814) becomes py+1056, leaving the same ~46px bottom margin.
+///
+/// The "LAUNCH AT LOGIN" toggle band was then appended at the very BOTTOM, 12px
+/// below the theme-card grid (py+1068..py+1096), so NO existing element moves. It
+/// fits inside the ~46px slack the panel already had below the cards, so PANEL_H
+/// stays 1102 (= band bottom py+1096 + 6px margin); no growth was required.
 pub const PANEL_W: f32 = 380.0;
 pub const PANEL_H: f32 = 1102.0;
 
@@ -157,6 +164,9 @@ pub fn build_panel(
     dropdown_width_pct: f32,
     is_dropdown: bool,
     focus_autohide: bool,
+    // `launch_at_login`: drives the bottom "LAUNCH AT LOGIN" toggle pill (accent
+    //   when ON). The app derives this from the XDG autostart file's existence.
+    launch_at_login: bool,
     // ── UI (chrome) FONT section inputs ──
     // `ui_font_size`: the TRUE UI font size in logical points (10..=28). Drives
     //   the "Npt" readout and the live "Aa" specimen size; NOT clamped here (the
@@ -245,8 +255,13 @@ pub fn build_panel(
     //  py+678            Theme cards — 2-col × 3-row grid:
     //                    col_w=(348−8)/2=170; card_h=40; gap=8
     //                    row0 at py+678..py+718; row1 at py+726..py+766; row2 at py+774..py+814
-    //  py+814..py+820   6px bottom margin
-    //  PANEL_H = 820 + 6 = 826  → use 860 to leave a small extra margin
+    //  NOTE: THEME + cards actually sit UI_SECTION_SHIFT(242) lower than the
+    //  py-offsets sketched just above (the "FONT" list is followed by the UI FONT
+    //  section before THEME). Real positions: "THEME" label at py+900; cards
+    //  py+920..py+1056 (3 rows).
+    //  py+1068 .. py+1096  Launch-at-login band (CAPS label + toggle pill at py+1068, h=28)
+    //  py+1096..py+1102   6px bottom margin
+    //  PANEL_H = 1096 + 6 = 1102  (the new band fit in the pre-existing slack)
     //  (PANEL_W/PANEL_H are module-level pub consts above)
 
     // Center, then apply the user drag offset, then clamp to screen edges.
@@ -480,8 +495,16 @@ pub fn build_panel(
 
     // Compute bottom of last card for PANEL_H sanity — last card row for 5 items:
     // row = (4/2) = 2, bottom = card_top + 2*(40+8) + 40 = card_top + 136.
-    // card_top = py+678+SHIFT(242) = py+920, so bottom = py+1056. PANEL_H=1102
-    // gives a 46px margin. ✓
+    // card_top = py+678+SHIFT(242) = py+920, so bottom = py+1056.
+
+    // --- Launch-at-login band (py+1068 .. py+1096), bottom of the panel ---
+    // Placed 12px below the theme-card grid bottom (py+1056) so NO existing
+    // element moves. CAPS label at py+1068; toggle pill at the right (h=28),
+    // mirroring the auto-hide pill. Accent when ON. Pill bottom py+1096 →
+    // PANEL_H = 1096 + 6 = 1102 (consumes the slack the panel already had).
+    let launch_login_pill_col: [u8; 4] = if launch_at_login { accent_col } else { btn_fill };
+    let launch_login_toggle =
+        Rect::rounded(px + PANEL_W - 16.0 - 56.0, py + 1068.0, 56.0, 28.0, launch_login_pill_col, 14.0);
 
     // --- Build quads in draw order ---
     // Order: dim, border, bg, buttons, filled-track portions, tracks, handles,
@@ -522,6 +545,9 @@ pub fn build_panel(
 
     // Auto-hide toggle pill.
     quads.push(autohide_toggle);
+
+    // Launch-at-login toggle pill (bottom band).
+    quads.push(launch_login_toggle);
 
     // Font-size buttons.
     quads.push(font_minus);
@@ -822,6 +848,21 @@ pub fn build_panel(
         ));
     }
 
+    // LAUNCH AT LOGIN band (py+1068) — CAPS header with ON/OFF pill label,
+    // mirroring the auto-hide band.
+    labels.push(("LAUNCH AT LOGIN".to_string(), px + 16.0, py + 1068.0, text_header));
+    let (launch_pill_text, launch_pill_col) = if launch_at_login {
+        ("ON", [20u8, 20, 20])
+    } else {
+        ("OFF", text_btn)
+    };
+    labels.push((
+        launch_pill_text.to_string(),
+        launch_login_toggle.x + 16.0,
+        launch_login_toggle.y + 6.0,
+        launch_pill_col,
+    ));
+
     // --- PanelGeom for hit-testing ---
     let panel_rect = Rect {
         x: px,
@@ -857,6 +898,7 @@ pub fn build_panel(
         dropdown_width_track,
         dropdown_width_handle,
         autohide_toggle,
+        launch_login_toggle,
         ui_font_minus,
         ui_font_plus,
         ui_font_reset,
@@ -911,6 +953,7 @@ mod tests {
             0.7,             // dropdown_width_pct
             true,            // is_dropdown
             false,           // focus_autohide
+            false,           // launch_at_login
             18.0,            // ui_font_size (true, not capped)
             &ui_families,
             "",              // selected_ui_family ("" = System Sans)
@@ -1073,6 +1116,30 @@ mod tests {
             first_card_top >= ui_rows_bottom - 0.5,
             "theme cards ({first_card_top}) overlap the ui_font rows ({ui_rows_bottom})"
         );
+
+        // The launch-at-login pill must sit BELOW every theme card (it's the
+        // bottom band) and stay inside the panel.
+        let last_card_bottom = g.chips.iter().map(|r| r.y + r.h).fold(0.0_f32, f32::max);
+        let ll = &g.launch_login_toggle;
+        assert!(
+            ll.y >= last_card_bottom - 0.5,
+            "launch_login pill ({}) overlaps the theme cards ({last_card_bottom})",
+            ll.y
+        );
+        assert!(
+            ll.y + ll.h <= g.panel.y + g.panel.h + 0.5,
+            "launch_login pill bottom ({}) spills past the panel bottom ({})",
+            ll.y + ll.h,
+            g.panel.y + g.panel.h
+        );
+        // It also must not overlap the right-aligned font/ui-font buttons above it
+        // (different bands, but assert horizontal pill placement matches autohide).
+        assert!(
+            (ll.x - g.autohide_toggle.x).abs() < 0.5,
+            "launch_login pill x ({}) != autohide pill x ({})",
+            ll.x,
+            g.autohide_toggle.x
+        );
     }
 
     #[test]
@@ -1108,7 +1175,7 @@ mod tests {
             "OPACITY", "CORNER RADIUS", "SUMMON EFFECT", "WINDOW MODE",
             "TAB BAR", "DROPDOWN HEIGHT", "DROPDOWN WIDTH",
             "AUTO-HIDE ON FOCUS LOSS", "FONT SIZE", "FONT",
-            "UI FONT SIZE", "UI FONT", "THEME",
+            "UI FONT SIZE", "UI FONT", "THEME", "LAUNCH AT LOGIN",
         ] {
             assert!(
                 all_text.iter().any(|s| s == expected),

@@ -283,6 +283,8 @@ pub enum MouseAction {
     StartDropdownWidthDrag,
     /// User clicked the "Auto-hide on focus loss" toggle pill.
     ToggleFocusAutoHide,
+    /// User clicked the "Launch at login" toggle pill (bottom band).
+    ToggleLaunchAtLogin,
     /// User pressed on the title bar (not on any widget) — start dialog drag.
     StartDialogDrag,
     /// User clicked inside the panel but not on any widget — swallow the event.
@@ -383,6 +385,10 @@ pub fn decide_mouse_press(
         // Auto-hide toggle pill.
         if point_in(&g.autohide_toggle, cx, cy) {
             return MouseAction::ToggleFocusAutoHide;
+        }
+        // Launch-at-login toggle pill (bottom band).
+        if point_in(&g.launch_login_toggle, cx, cy) {
+            return MouseAction::ToggleLaunchAtLogin;
         }
         // Font-family list rows.
         for (i, row) in g.font_rows.iter().enumerate() {
@@ -838,6 +844,7 @@ mod tests {
         jetty_render::build_panel(
             1920, 1280, 0.97, 0, 15.0, &mono, "JetBrains Mono", 0,
             8.0, "Phosphor", "Center", "Top", 0.5, 1.0, false, true,
+            false, // launch_at_login
             18.0, &ui, "", 0,
             0.0, 0.0, &theme, 9.8, // char_w scale-1 fallback
         )

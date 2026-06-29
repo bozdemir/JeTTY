@@ -52,6 +52,16 @@ pub struct Config {
     /// Hide the window on focus loss (Yakuake-style auto-hide). Default ON.
     #[serde(default = "default_focus_autohide")]
     pub focus_autohide: bool,
+    /// Launch JeTTY at login via the freedesktop XDG autostart standard (a
+    /// `.desktop` file under `~/.config/autostart/`). Default OFF. The autostart
+    /// file's existence is the source of truth at runtime; this stored bool is a
+    /// mirror.
+    #[serde(default = "default_launch_at_login")]
+    pub launch_at_login: bool,
+    /// Global summon hotkey, e.g. "F9" (default), "F12", or "Ctrl+Shift+F12".
+    /// Parsed by `global_hotkey`'s `HotKey::from_str`. Config-only (no panel UI).
+    #[serde(default = "default_summon_hotkey")]
+    pub summon_hotkey: String,
     /// Tab-bar position: "top" (default) or "bottom". Orthogonal to
     /// `window_mode` — usable in both Center and Dropdown modes.
     #[serde(default = "default_tab_bar_position")]
@@ -87,6 +97,14 @@ fn default_dropdown_width_pct() -> f32 {
 
 fn default_focus_autohide() -> bool {
     true
+}
+
+fn default_launch_at_login() -> bool {
+    false
+}
+
+fn default_summon_hotkey() -> String {
+    "F9".to_string()
 }
 
 fn default_tab_bar_position() -> String {
@@ -129,6 +147,8 @@ impl Default for Config {
             dropdown_height_pct: default_dropdown_height_pct(),
             dropdown_width_pct: default_dropdown_width_pct(),
             focus_autohide: default_focus_autohide(),
+            launch_at_login: default_launch_at_login(),
+            summon_hotkey: default_summon_hotkey(),
             tab_bar_position: default_tab_bar_position(),
             show_welcome: default_show_welcome(),
             show_perf_hud: default_show_perf_hud(),
@@ -192,6 +212,8 @@ mod tests {
         assert_eq!(c.dropdown_height_pct, 0.50);
         assert_eq!(c.dropdown_width_pct, 1.0);
         assert!(c.focus_autohide);
+        assert!(!c.launch_at_login);
+        assert_eq!(c.summon_hotkey, "F9");
         assert_eq!(c.tab_bar_position, "top");
         assert!(c.show_welcome);
         assert!(c.show_perf_hud);
@@ -215,6 +237,10 @@ mod tests {
         assert_eq!(c.dropdown_height_pct, 0.50);
         assert_eq!(c.dropdown_width_pct, 1.0);
         assert!(c.focus_autohide);
+        // An older config without launch_at_login still loads as false (OFF).
+        assert!(!c.launch_at_login);
+        // An older config without summon_hotkey still loads as "F9".
+        assert_eq!(c.summon_hotkey, "F9");
         // An older config without tab_bar_position still loads as "top".
         assert_eq!(c.tab_bar_position, "top");
         // An older config without show_welcome still loads as true.
@@ -242,6 +268,8 @@ mod tests {
             dropdown_height_pct: 0.6,
             dropdown_width_pct: 1.0,
             focus_autohide: false,
+            launch_at_login: false,
+            summon_hotkey: "F12".to_string(),
             tab_bar_position: "bottom".to_string(),
             show_welcome: false,
             show_perf_hud: false,
@@ -269,6 +297,8 @@ mod tests {
             dropdown_height_pct: 0.5,
             dropdown_width_pct: 1.0,
             focus_autohide: true,
+            launch_at_login: true,
+            summon_hotkey: "F9".to_string(),
             tab_bar_position: "bottom".to_string(),
             show_welcome: true,
             show_perf_hud: true,

@@ -274,6 +274,12 @@ pub struct App {
     pending_center_pos: Option<winit::dpi::PhysicalPosition<i32>>,
     /// Hide the window on focus loss (Yakuake auto-hide). Default ON.
     focus_autohide: bool,
+    /// Launch JeTTY at login via the XDG autostart `.desktop` file. The file's
+    /// existence is the source of truth; this mirrors it for the Settings pill.
+    launch_at_login: bool,
+    /// Global summon hotkey string (e.g. "F9", "F12", "Ctrl+Shift+F12"). Parsed
+    /// by `global_hotkey`'s own `HotKey::from_str`. Default "F9".
+    summon_hotkey: String,
     /// Cached tab-bar metadata (title, is-active), rebuilt only when the tab
     /// titles or the active index change. Avoids cloning every tab title on
     /// every RedrawRequested (incl. animation frames) — speed-first hot path.
@@ -631,6 +637,8 @@ impl App {
             pending_center_frames: 0,
             pending_center_pos: None,
             focus_autohide: true,
+            launch_at_login: false,
+            summon_hotkey: "F9".to_string(),
             cached_top_flush: false,
             cached_tabs_meta: Vec::new(),
             cached_tabs_sig: u64::MAX,
@@ -732,6 +740,11 @@ impl App {
         app.dropdown_height_pct = cfg.dropdown_height_pct.clamp(0.25, 1.0);
         app.dropdown_width_pct = cfg.dropdown_width_pct.clamp(0.2, 1.0);
         app.focus_autohide = cfg.focus_autohide;
+        // The autostart FILE's existence is the source of truth (so the toggle
+        // reflects reality even if the file was changed externally), not the
+        // stored config bool.
+        app.launch_at_login = autostart_file_exists();
+        app.summon_hotkey = cfg.summon_hotkey;
         app.welcome_open = cfg.show_welcome;
         app.cfg_show_welcome = cfg.show_welcome;
         app.show_perf_hud = cfg.show_perf_hud;
@@ -759,6 +772,8 @@ impl App {
             dropdown_height_pct: self.dropdown_height_pct,
             dropdown_width_pct: self.dropdown_width_pct,
             focus_autohide: self.focus_autohide,
+            launch_at_login: self.launch_at_login,
+            summon_hotkey: self.summon_hotkey.clone(),
             tab_bar_position: if self.tab_bar_bottom { "bottom" } else { "top" }.to_string(),
             // show_welcome/show_perf_hud are startup preferences (no runtime UI
             // toggles them), cached at startup — write them back from memory so a
@@ -1701,6 +1716,7 @@ impl App {
             self.dropdown_height_pct,
             self.dropdown_width_pct,
             self.window_mode == WindowMode::Dropdown, self.focus_autohide,
+            self.launch_at_login,
             self.ui_font_logical, &self.ui_font_families, &self.ui_font_family,
             self.ui_font_scroll_offset,
             0.0, 0.0, &theme, self.settings_char_w(),
@@ -1720,6 +1736,7 @@ impl App {
         let dropdown_width_pct = self.dropdown_width_pct;
         let is_dropdown = self.window_mode == WindowMode::Dropdown;
         let focus_autohide = self.focus_autohide;
+        let launch_at_login = self.launch_at_login;
         let tab_bar_name = if self.tab_bar_bottom { "Bottom" } else { "Top" };
         // Clone the small inputs build_panel needs so we can borrow the render
         // stack mutably below without overlapping the immutable self borrows.
@@ -1751,6 +1768,7 @@ impl App {
             width, height, opacity, theme_idx, font_logical,
             &families, &family, font_scroll_offset, corner_radius, summon_name,
             window_mode_name, tab_bar_name, dropdown_height_pct, dropdown_width_pct, is_dropdown, focus_autohide,
+            launch_at_login,
             ui_font_logical, &ui_families, &ui_family, ui_font_scroll_offset,
             0.0, 0.0, &theme, char_w,
         );
@@ -1912,6 +1930,12 @@ impl App {
             }
             input::MouseAction::ToggleFocusAutoHide => {
                 self.focus_autohide = !self.focus_autohide;
+            }
+            input::MouseAction::ToggleLaunchAtLogin => {
+                self.launch_at_login = !self.launch_at_login;
+                // Write/remove the XDG autostart .desktop file to match. The file's
+                // existence is the source of truth; persist() (below) mirrors it.
+                set_launch_at_login(self.launch_at_login);
             }
             // The OS title bar moves the window now; in-panel drag/consume are no-ops.
             input::MouseAction::StartDialogDrag
@@ -2429,23 +2453,28 @@ impl ApplicationHandler<AppEvent> for App {
         if self.hotkey_manager.is_none() {
             self.hotkey_manager = Some(());
             let proxy_hotkey = self.proxy.clone();
+            let summon_hotkey = self.summon_hotkey.clone();
             std::thread::spawn(move || {
+                use std::str::FromStr;
                 let manager = match global_hotkey::GlobalHotKeyManager::new() {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("global hotkey F9 unavailable (Wayland? already grabbed?) — {e}");
+                        eprintln!("global hotkey {summon_hotkey} unavailable (Wayland? already grabbed?) — {e}");
                         return;
                     }
                 };
-                let hotkey = global_hotkey::hotkey::HotKey::new(
-                    None,
-                    global_hotkey::hotkey::Code::F9,
-                );
+                // Parse the configured string with global_hotkey's own parser
+                // (handles "F9", "F12", and even "Ctrl+Shift+F12"); fall back to F9.
+                let hotkey = global_hotkey::hotkey::HotKey::from_str(&summon_hotkey)
+                    .unwrap_or_else(|e| {
+                        eprintln!("invalid summon_hotkey {summon_hotkey:?} ({e}); falling back to F9");
+                        global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::F9)
+                    });
                 if let Err(e) = manager.register(hotkey) {
-                    eprintln!("global hotkey F9 unavailable (Wayland? already grabbed?) — {e}");
+                    eprintln!("global hotkey {summon_hotkey} unavailable (Wayland? already grabbed?) — {e}");
                     return;
                 }
-                // Forward F9-pressed events to the winit loop. Keeps `manager`
+                // Forward summon-key-pressed events to the winit loop. Keeps `manager`
                 // alive for the program lifetime (this loop never returns).
                 let rx = global_hotkey::GlobalHotKeyEvent::receiver();
                 loop {
@@ -3040,6 +3069,7 @@ impl ApplicationHandler<AppEvent> for App {
                     | input::MouseAction::StartDropdownDrag
                     | input::MouseAction::StartDropdownWidthDrag
                     | input::MouseAction::ToggleFocusAutoHide
+                    | input::MouseAction::ToggleLaunchAtLogin
                     | input::MouseAction::StartDialogDrag
                     | input::MouseAction::ConsumePanel => {}
                     input::MouseAction::StartScrollbarDrag { grab_dy } => {
@@ -4066,6 +4096,64 @@ fn selection_bg_for(theme: &jetty_core::Theme) -> [u8; 3] {
         ((bg[1] as u16 + accent[1] as u16 * 2) / 3) as u8,
         ((bg[2] as u16 + accent[2] as u16 * 2) / 3) as u8,
     ]
+}
+
+/// Path to the XDG autostart entry: `$XDG_CONFIG_HOME/autostart/jetty.desktop`,
+/// falling back to `~/.config/autostart/jetty.desktop`. This is the freedesktop
+/// standard honored by KDE/GNOME/any DE — no desktop-environment-specific code.
+fn autostart_path() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from(".config"));
+    base.join("autostart").join("jetty.desktop")
+}
+
+/// True when the autostart `.desktop` file exists — the source of truth for the
+/// "Launch at login" toggle state at startup.
+fn autostart_file_exists() -> bool {
+    autostart_path().exists()
+}
+
+/// Write (enabled) or remove (disabled) the XDG autostart `.desktop` file.
+/// Best-effort: logs a one-line error and never panics.
+fn set_launch_at_login(enabled: bool) {
+    let path = autostart_path();
+    if enabled {
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!("launch-at-login: could not create {}: {e}", dir.display());
+                return;
+            }
+        }
+        // Use the absolute path of the current executable so the entry works
+        // regardless of install location; fall back to the bare "jetty" name.
+        let exec = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| "jetty".to_string());
+        let contents = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=JeTTY\n\
+             GenericName=Terminal Emulator\n\
+             Comment=Blazing-fast GPU terminal with a center-summon hotkey (autostart: holds the F9 grab)\n\
+             Exec={exec}\n\
+             Icon=jetty\n\
+             Terminal=false\n\
+             Categories=System;TerminalEmulator;Utility;\n\
+             StartupWMClass=jetty\n\
+             X-GNOME-Autostart-enabled=true\n"
+        );
+        if let Err(e) = std::fs::write(&path, contents) {
+            eprintln!("launch-at-login: could not write {}: {e}", path.display());
+        }
+    } else if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("launch-at-login: could not remove {}: {e}", path.display());
+        }
+    }
 }
 
 /// Scrollbar thumb color derived from the active theme: theme fg at alpha 160.
