@@ -3,10 +3,10 @@ use crate::Rect;
 /// Hit-testing geometry exposed for the upcoming mouse-interaction task.
 pub struct PanelGeom {
     pub panel: Rect,
-    /// The 4 tab-strip hit rects ("Look", "Fonts", "Window", "Shell"), in order.
+    /// The 5 tab-strip hit rects ("Look", "Fonts", "Window", "Shell", "Effects"), in order.
     /// A press in `tab_rects[i]` selects tab `i`. These are ALWAYS live (present
     /// regardless of the active tab) so the user can switch tabs.
-    pub tab_rects: [Rect; 4],
+    pub tab_rects: [Rect; 5],
     pub slider_track: Rect,
     pub slider_handle: Rect,
     pub chips: Vec<Rect>,
@@ -105,9 +105,9 @@ const MAX_FONT_ROWS: usize = 5;
 /// bound the panel's vertical growth from the new section.
 const MAX_UI_FONT_ROWS: usize = 4;
 
-/// The four settings-tab labels, in order. The active tab's bands are the only
+/// The five settings-tab labels, in order. The active tab's bands are the only
 /// ones laid out on-screen; every other tab's widgets are positioned offscreen.
-const TAB_NAMES: [&str; 4] = ["Look", "Fonts", "Window", "Shell"];
+const TAB_NAMES: [&str; 5] = ["Look", "Fonts", "Window", "Shell", "Effects"];
 
 /// Y at which an INACTIVE tab's band tops are placed. Far offscreen so every
 /// rect derived from such a band lands well past the panel (and the screen):
@@ -128,18 +128,19 @@ pub(crate) const CHAR_W_FALLBACK: f32 = 9.8;
 /// sized to these (+ border) — see `SETTINGS_WIN_*` in jetty-app. Growing the
 /// panel here automatically resizes that window.
 ///
-/// The panel is organised into FOUR tabs (a strip of clickable labels sits just
+/// The panel is organised into FIVE tabs (a strip of clickable labels sits just
 /// under the title): only the active tab's bands are laid out, so PANEL_H is
 /// sized to the TALLEST tab rather than the sum of every band:
 ///
-/// * Tab 0 "Look"   — opacity slider, corner-radius slider, theme cards.
-/// * Tab 1 "Fonts"  — font-size, font-family list, UI-font-size + "Aa" specimen,
-///                    UI-font-family list. (TALLEST tab — drives PANEL_H.)
-/// * Tab 2 "Window" — summon effect, window mode, dropdown height, dropdown
-///                    width, tab-bar position, auto-hide toggle.
-/// * Tab 3 "Shell"  — shell picker, launch-at-login toggle.
+/// * Tab 0 "Look"    — opacity slider, corner-radius slider, theme cards.
+/// * Tab 1 "Fonts"   — font-size, font-family list, UI-font-size + "Aa" specimen,
+///                     UI-font-family list. (TALLEST tab — drives PANEL_H.)
+/// * Tab 2 "Window"  — summon effect, window mode, dropdown height, dropdown
+///                     width, tab-bar position, auto-hide toggle.
+/// * Tab 3 "Shell"   — shell picker, launch-at-login toggle.
+/// * Tab 4 "Effects" — (empty scaffold; widgets land in Task 4).
 ///
-/// All four tabs share one `content_top` (py+100) and lay their bands out
+/// All five tabs share one `content_top` (py+100) and lay their bands out
 /// top-down from there. The Fonts tab's last UI-font row bottoms at ~py+520, so
 /// PANEL_H = 560 leaves a comfortable bottom margin; shorter tabs simply have
 /// empty space below their last band.
@@ -204,11 +205,11 @@ pub fn build_panel(
     //   "System default" when the `shell` config key is empty. Drives the SHELL
     //   cycler band's centered name, mirroring `window_mode_name`.
     shell_display: &str,
-    // `active_tab`: 0..=3 — which tab's bands are laid out (see TAB_NAMES). Values
-    //   above 3 are clamped to 3. Session-only; not persisted.
+    // `active_tab`: 0..=4 — which tab's bands are laid out (see TAB_NAMES). Values
+    //   above 4 are clamped to 4. Session-only; not persisted.
     active_tab: usize,
 ) -> PanelView {
-    let active_tab = active_tab.min(3);
+    let active_tab = active_tab.min(4);
 
     // --- Theme-derived panel chrome colors ---
     // All panel colors are derived from the ACTIVE theme so the settings window
@@ -304,6 +305,11 @@ pub fn build_panel(
             t_tabbar = content_top + 192.0;
             t_autohide = content_top + 240.0;
         }
+        3 => {
+            t_shell = content_top;
+            t_launch = content_top + 48.0;
+        }
+        4 => { /* Effects: filled in Task 4 */ }
         _ => {
             t_shell = content_top;
             t_launch = content_top + 48.0;
@@ -334,12 +340,12 @@ pub fn build_panel(
         ..Default::default()
     };
 
-    // --- Tab strip (py+50 .. py+82): 4 evenly distributed clickable labels ---
+    // --- Tab strip (py+50 .. py+82): 5 evenly distributed clickable labels ---
     // Labels baseline at py+56; the active tab gets a 2px accent underline at
     // py+78. The hit rects span the full cell so the whole label area is clickable.
-    let tab_w = (PANEL_W - 32.0) / 4.0;
+    let tab_w = (PANEL_W - 32.0) / 5.0;
     let tab_strip_y = py + 56.0;
-    let mut tab_rects: [Rect; 4] = [Rect::default(); 4];
+    let mut tab_rects: [Rect; 5] = [Rect::default(); 5];
     for (i, r) in tab_rects.iter_mut().enumerate() {
         let cell_x = px + 16.0 + i as f32 * tab_w;
         *r = Rect {
@@ -1043,7 +1049,7 @@ mod tests {
     #[test]
     fn panel_fits_on_screen_at_various_sizes() {
         // Screen sizes that can fully contain the panel (PANEL_H=560, PANEL_W=380).
-        for tab in 0..4 {
+        for tab in 0..5 {
             for (w, h) in [(1920u32, 1200u32), (1600, 900), (2560, 1440), (1440, 700)] {
                 let pv = panel_tab(w, h, tab);
                 let g = &pv.geom;
@@ -1072,10 +1078,10 @@ mod tests {
 
     #[test]
     fn tab_strip_present_and_active_highlighted() {
-        for tab in 0..4 {
+        for tab in 0..5 {
             let pv = panel_tab(1920, 1080, tab);
             let g = &pv.geom;
-            // All 4 tab hit rects exist, are inside the panel horizontally, and sit
+            // All 5 tab hit rects exist, are inside the panel horizontally, and sit
             // in the strip band (below the title, above content).
             for (i, r) in g.tab_rects.iter().enumerate() {
                 assert!(
@@ -1084,7 +1090,7 @@ mod tests {
                 );
                 assert!(r.y > g.panel.y, "tab_rect[{i}] not below panel top");
             }
-            // The 4 tab labels are present.
+            // The 5 tab labels are present.
             let all_text: Vec<String> = pv.labels.iter().map(|l| l.0.clone()).collect();
             for name in &TAB_NAMES {
                 assert!(all_text.iter().any(|s| s == name), "missing tab label {name}");
@@ -1095,7 +1101,7 @@ mod tests {
     #[test]
     fn only_active_tab_widgets_are_on_screen() {
         // The opacity slider belongs to tab 0 only; it must be offscreen on others.
-        for tab in 0..4 {
+        for tab in 0..5 {
             let pv = panel_tab(1920, 1080, tab);
             let g = &pv.geom;
             assert_eq!(
@@ -1173,7 +1179,7 @@ mod tests {
         // For each tab, the visible bands run strictly top-down with no overlap and
         // every band fits within the panel rect. We pick one representative rect per
         // band (for side-by-side controls, the left/primary one) in layout order.
-        let representatives: [Vec<fn(&PanelGeom) -> Rect>; 4] = [
+        let representatives: [Vec<fn(&PanelGeom) -> Rect>; 5] = [
             // Tab 0 "Look": opacity track, radius track, first card, last card.
             vec![
                 |g| g.slider_track,
@@ -1203,6 +1209,8 @@ mod tests {
             ],
             // Tab 3 "Shell": shell cycler, launch toggle.
             vec![|g| g.shell_prev, |g| g.launch_login_toggle],
+            // Tab 4 "Effects": no widgets yet (Task 4).
+            vec![],
         ];
 
         for (tab, reps) in representatives.iter().enumerate() {
@@ -1253,7 +1261,7 @@ mod tests {
     #[test]
     fn caps_headers_present_per_tab() {
         // Each tab carries only its own CAPS headers.
-        let expected: [&[&str]; 4] = [
+        let expected: [&[&str]; 5] = [
             &["OPACITY", "CORNER RADIUS", "THEME"],
             &["FONT SIZE", "FONT", "UI FONT SIZE", "UI FONT"],
             &[
@@ -1261,6 +1269,7 @@ mod tests {
                 "DROPDOWN WIDTH", "AUTO-HIDE ON FOCUS LOSS",
             ],
             &["SHELL", "LAUNCH AT LOGIN"],
+            &[], // Tab 4 "Effects": no CAPS headers yet (widgets land in Task 4).
         ];
         for (tab, headers) in expected.iter().enumerate() {
             let pv = panel_tab(1920, 1080, tab);
@@ -1326,7 +1335,7 @@ mod tests {
     #[test]
     fn specimen_offscreen_when_fonts_tab_inactive() {
         // On non-Fonts tabs the "Aa" specimen must be offscreen (not drawn).
-        for tab in [0usize, 2, 3] {
+        for tab in [0usize, 2, 3, 4] {
             let pv = panel_tab(1920, 1080, tab);
             assert!(
                 pv.ui_specimen_pos.1 >= 1.0e5,

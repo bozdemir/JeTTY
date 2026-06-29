@@ -2031,7 +2031,7 @@ impl App {
             input::MouseAction::SetSettingsTab(i) => {
                 // Session-only tab switch: change the active tab and redraw the
                 // settings window. Not persisted (resets to Look on restart).
-                self.settings_tab = i.min(3);
+                self.settings_tab = i.min(4);
                 if let Some(w) = &self.settings_window {
                     w.request_redraw();
                 }
