@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] — 2026-06-29
+
+A customization release: the window chrome now has its own font.
+
+### Added
+- **Separate UI (chrome) font** — pick a family and size for ALL window chrome
+  (tab titles, the bottom status bar, the right-click menu, the Settings panel,
+  help overlay, dialogs, the welcome splash), independent of the terminal grid
+  font. New `ui_font_family` (default `""` = the platform's proportional sans)
+  and `ui_font_size` (10–28pt, default 16) config keys.
+- **"UI FONT" Settings section** — a size −/+/reset control with a live, true-size
+  "Aa" specimen and a scrollable proportional-family picker (with a
+  "System Sans (default)" row).
+
+### Changed
+- A UI-font size change resizes the chrome in place (no fontconfig rescan) and a
+  family change swaps without a rescan; neither reflows the terminal grid, so the
+  hot path and ~0% idle are untouched. The default look is unchanged: with the
+  empty-string default the chrome renders exactly as in 0.2.0 (the platform sans
+  lacks the ⇧⌃⚡⚙ symbol glyphs, so symbol-bearing chrome stays in the mono Nerd
+  Font until a named UI family is chosen).
+
+---
+
 ## [0.2.0] — 2026-06-27
 
 A polish + correctness release: a redesigned, elegant tab bar, a proper bottom
