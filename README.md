@@ -86,7 +86,7 @@ cargo build --release
 ./target/release/jetty
 ```
 
-Renders through **Metal**. Summon with **F9** — on Mac keyboards where the function-row keys default to media actions, press `fn`+`F9` so the OS delivers F9. You can also bind `jetty` to a shortcut via a launcher (the first press launches JeTTY; each subsequent press toggles the running instance via the single-instance socket — `jetty --toggle` and plain `jetty` behave identically). A locally built binary is not quarantined, so there's no Gatekeeper prompt. *(Prebuilt `.app` / `.dmg` are on the [roadmap](#-roadmap).)*
+Renders through **Metal**. Summon with **F9** — on Mac keyboards where the function-row keys default to media actions, press `fn`+`F9` so the OS delivers F9. You can also bind `jetty --toggle` to a shortcut via a launcher (the first press launches JeTTY; each subsequent press toggles the running instance via the single-instance socket). A locally built binary is not quarantined, so there's no Gatekeeper prompt. *(Prebuilt `.app` / `.dmg` are on the [roadmap](#-roadmap).)*
 
 ### 🐧 Linux — one-line installer (prebuilt, no toolchain)
 
@@ -119,7 +119,7 @@ cargo build --release && ./target/release/jetty
 ### Global summon hotkey
 
 - **X11** — `F9` works immediately, no setup.
-- **Wayland** — Wayland routes global shortcuts through the compositor, so bind a key to `jetty` (the first press launches JeTTY, and each subsequent press toggles the running instance via the single-instance socket). See [`docs/global-hotkey.md`](docs/global-hotkey.md). The `--toggle` suffix is optional and behaves identically to plain `jetty`. *(Note: in Dropdown mode, top-edge anchoring relies on window positioning, which the compositor controls on Wayland — it works fully on X11.)*
+- **Wayland** — Wayland routes global shortcuts through the compositor, so bind **`jetty --toggle`** to a key (first press launches JeTTY; each press after toggles the running instance via the single-instance socket; `--show` / `--hide` set the state explicitly). See [`docs/global-hotkey.md`](docs/global-hotkey.md). *(Note: in Dropdown mode, top-edge anchoring relies on window positioning, which the compositor controls on Wayland — it works fully on X11.)*
 
 ## ⌨️ Keybindings
 

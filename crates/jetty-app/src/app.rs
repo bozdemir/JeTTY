@@ -14,8 +14,10 @@ use crate::{clipboard, input};
 pub enum AppEvent {
     /// PTY data is ready — drain and redraw.
     Wake,
-    /// F9 global hotkey was pressed — toggle window visibility.
+    /// Summon hotkey / `jetty --toggle` — toggle window visibility.
     ToggleVisibility,
+    /// `jetty --show` / `--hide` — set window visibility explicitly.
+    SetVisible(bool),
 }
 
 /// Window-summon reveal effect, selectable in Settings and persisted in config.
@@ -1574,8 +1576,23 @@ impl App {
     /// When summoning (making visible), the window is re-centred on its
     /// current monitor, focused, and redrawn. The PTY keeps running while the
     /// window is hidden — nothing is killed or suspended.
-    fn toggle_visibility(&mut self, _event_loop: &ActiveEventLoop) {
-        self.visible = !self.visible;
+    fn toggle_visibility(&mut self, event_loop: &ActiveEventLoop) {
+        self.set_visibility(!self.visible, event_loop);
+    }
+
+    fn set_visibility(&mut self, want: bool, _event_loop: &ActiveEventLoop) {
+        // A redundant `--show` (already visible) just raises/focuses; a redundant
+        // `--hide` (already hidden) is a no-op.
+        if want == self.visible {
+            if want {
+                if let Some(win) = &self.window {
+                    win.focus_window();
+                    win.request_redraw();
+                }
+            }
+            return;
+        }
+        self.visible = want;
         let mode = self.window_mode;
         if let Some(win) = &self.window {
             if self.visible {
@@ -2540,6 +2557,9 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::ToggleVisibility => {
                 self.toggle_visibility(event_loop);
+            }
+            AppEvent::SetVisible(want) => {
+                self.set_visibility(want, event_loop);
             }
         }
     }

@@ -43,15 +43,16 @@ enum ConnectResult {
     Other,
 }
 
-/// Try to connect to a live Jetty instance and send a toggle message.
-/// Returns the connection outcome so the caller can decide whether to unlink.
-fn try_toggle_running_instance(sock_path: &str) -> ConnectResult {
+/// Connect to a live Jetty instance and forward a summon command (`toggle`,
+/// `show`, or `hide`). Returns the outcome so the caller can decide whether to
+/// unlink a stale socket or become the primary.
+fn forward_command(sock_path: &str, cmd: &str) -> ConnectResult {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
 
     match UnixStream::connect(sock_path) {
         Ok(mut stream) => {
-            let _ = stream.write_all(b"toggle");
+            let _ = stream.write_all(cmd.as_bytes());
             let _ = stream.flush();
             ConnectResult::Forwarded
         }
@@ -83,14 +84,13 @@ fn libc_econnrefused() -> i32 {
 }
 
 pub fn run() {
-    // CLI flags that print and EXIT before launching the GUI. Without this,
-    // `jetty --version` (or any unknown flag a user reflexively tries) fell
-    // through and LAUNCHED the terminal instead of printing — surprising for a
-    // command-line tool. `--toggle` is intentionally NOT handled here: it is an
-    // alias for plain `jetty` (toggle a running instance / else launch), driven
-    // by the single-instance IPC logic below.
+    // CLI: --version/--help print and exit; --toggle/--show/--hide select the
+    // summon command forwarded to a running instance. The compositor-bound
+    // `jetty --toggle` is the cross-platform summon path — every X11/Wayland
+    // compositor, no portal or DE-specific code.
     let version = env!("CARGO_PKG_VERSION");
     let build = option_env!("JETTY_BUILD").unwrap_or("dev");
+    let mut cmd = "toggle";
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--version" | "-version" | "-V" | "version" => {
@@ -102,52 +102,42 @@ pub fn run() {
                     "JeTTY {version} — a blazing-fast GPU terminal with a global summon hotkey.\n\n\
                      USAGE:\n    jetty [FLAGS]\n\n\
                      FLAGS:\n\
-                     \x20   --toggle     Toggle a running instance (or launch one); same as plain `jetty`.\n\
+                     \x20   --toggle     Show/hide a running instance (or launch one); same as plain `jetty`.\n\
+                     \x20   --show       Summon a running instance (or launch one).\n\
+                     \x20   --hide       Hide a running instance.\n\
                      \x20   --version    Print version and exit.\n\
                      \x20   --help       Print this help and exit.\n\n\
-                     Run with no flags to launch. Press F9 to summon/hide (fn+F9 on macOS).\n\
+                     Bind `jetty --toggle` to a key in your compositor to summon from anywhere.\n\
                      Settings: Ctrl+Shift+P. Config: ~/.config/jetty/config.toml"
                 );
                 std::process::exit(0);
             }
-            _ => {} // unknown args (incl. --toggle) fall through to normal launch
+            "--toggle" => cmd = "toggle",
+            "--show" => cmd = "show",
+            "--hide" => cmd = "hide",
+            _ => {}
         }
     }
-
-    // One-line build banner so a user can confirm which build they are running.
-    // JETTY_BUILD is injected at compile time (e.g. the git short SHA via
-    // `JETTY_BUILD=$(git rev-parse --short HEAD) cargo build`); falls back to
-    // "dev" for plain local builds.
-    eprintln!(
-        "jetty {} ({})",
-        env!("CARGO_PKG_VERSION"),
-        option_env!("JETTY_BUILD").unwrap_or("dev")
-    );
 
     let sock_path = ipc_socket_path();
 
-    // Single-instance: always attempt to forward a toggle to a running instance.
-    // This means both `jetty` and `jetty --toggle` behave the same way when an
-    // instance is already running — toggle that instance and exit.
-    // On the very first launch there is no live instance, so we fall through to
-    // becoming the primary.
-    //
-    // TOCTOU safety: we only unlink the socket when `connect` returned
-    // ECONNREFUSED (provably stale), never when a live primary owns it.
-    // This prevents the race where two concurrent cold-start processes both
-    // unlink-then-bind and one deletes the other's freshly-bound socket.
-    match try_toggle_running_instance(&sock_path) {
-        ConnectResult::Forwarded => {
-            std::process::exit(0);
-        }
+    // Secondary invocation: forward the command to the running primary and exit.
+    // No banner, no GUI setup — a compositor-bound keypress stays instant.
+    // TOCTOU-safe: only unlink the socket on ECONNREFUSED (provably stale), never
+    // when a live primary owns it (which would race two concurrent cold starts).
+    match forward_command(&sock_path, cmd) {
+        ConnectResult::Forwarded => return,
         ConnectResult::Stale => {
-            // Socket file exists but nobody is listening — safe to remove.
             std::fs::remove_file(&sock_path).ok();
         }
-        ConnectResult::NoSocket | ConnectResult::Other => {
-            // Nothing to remove; proceed to bind.
-        }
+        ConnectResult::NoSocket | ConnectResult::Other => {}
     }
+    // No live instance: `--hide` has nothing to hide; toggle/show launch.
+    if cmd == "hide" {
+        return;
+    }
+
+    eprintln!("jetty {version} ({build})");
 
     // No live instance found — become the primary. Bind directly (stale file
     // was already removed above when detected; NoSocket/Other means no file or
@@ -168,11 +158,9 @@ pub fn run() {
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    // Spawn the IPC accept thread (primary only). Any incoming connection
-    // triggers a ToggleVisibility event regardless of message content.
-    // This gives Wayland users a working toggle via `jetty --toggle` bound to
-    // F9 in their compositor settings, sharing the same code path as the X11
-    // global-hotkey grab.
+    // IPC accept thread (primary only): map each forwarded command to an event.
+    // `show`/`hide` set visibility explicitly; anything else toggles. Shares the
+    // summon code path with the X11 global-hotkey grab.
     if let Some(listener) = listener {
         let proxy_ipc = proxy.clone();
         let sock_cleanup = sock_path.clone();
@@ -180,15 +168,17 @@ pub fn run() {
             for stream in listener.incoming() {
                 if let Ok(mut s) = stream {
                     let mut buf = [0u8; 16];
-                    let _ = std::io::Read::read(&mut s, &mut buf);
-                    // Any incoming message means "toggle". If the proxy is gone
-                    // (event loop exited), stop listening.
-                    if proxy_ipc.send_event(AppEvent::ToggleVisibility).is_err() {
+                    let n = std::io::Read::read(&mut s, &mut buf).unwrap_or(0);
+                    let event = match &buf[..n] {
+                        b"show" => AppEvent::SetVisible(true),
+                        b"hide" => AppEvent::SetVisible(false),
+                        _ => AppEvent::ToggleVisibility,
+                    };
+                    if proxy_ipc.send_event(event).is_err() {
                         break;
                     }
                 }
             }
-            // Clean up the socket when the accept loop ends.
             let _ = std::fs::remove_file(&sock_cleanup);
         });
     }

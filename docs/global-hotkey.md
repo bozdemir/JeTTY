@@ -15,42 +15,37 @@ in Dropdown mode), takes keyboard focus, and replays the reveal effect.
 
 ## Wayland
 
-Global key grabs are not available to regular apps on Wayland. Instead, Jetty
-uses a single-instance IPC toggle: bind the `jetty` command to a key in your
-compositor.
+Global key grabs are not available to regular apps on Wayland (by design). Bind
+**`jetty --toggle`** to a key in your compositor: the first press launches Jetty,
+and each press after toggles the running instance over a Unix socket
+(`$XDG_RUNTIME_DIR/jetty.sock`, falling back to `/tmp/jetty.sock`), so it shows or
+hides instantly. Use `jetty --show` / `jetty --hide` instead for a dedicated
+summon / dismiss key. The control invocation forwards the command and exits
+immediately — no window, no GUI work.
 
-When a Jetty instance is already running, launching `jetty` again connects to
-the running instance over a Unix socket (`$XDG_RUNTIME_DIR/jetty.sock`, falling
-back to `/tmp/jetty.sock` if `XDG_RUNTIME_DIR` is unset), sends a toggle
-message, and exits immediately — so the running window shows or hides instantly.
-
-If no instance is running, `jetty` starts a fresh instance (so the first key
-press launches Jetty; subsequent presses toggle it).
-
-Note: Jetty does not currently parse command-line flags. `jetty --toggle` and
-plain `jetty` behave identically (extra arguments are ignored); use plain
-`jetty` in your binding.
+This is a generic, compositor-independent path — no portal, no
+desktop-environment-specific code, works on every compositor.
 
 ### KDE Plasma (Wayland)
 
 System Settings → Shortcuts → Custom Shortcuts → New → Global Shortcut →
-Command: `jetty`, Trigger: F9
+Command: `jetty --toggle`, Trigger: F9
 
 ### GNOME (Wayland)
 
 Settings → Keyboard → View and Customize Shortcuts → Custom Shortcuts →
-Add shortcut, Command: `jetty`, Shortcut: F9
+Add shortcut, Command: `jetty --toggle`, Shortcut: F9
 
 ### Sway / i3 (Wayland/X11)
 
 ```
-bindsym F9 exec jetty
+bindsym F9 exec jetty --toggle
 ```
 
 ### Hyprland
 
 ```
-bind = , F9, exec, jetty
+bind = , F9, exec, jetty --toggle
 ```
 
 ## macOS
@@ -64,12 +59,12 @@ System Settings → Keyboard.
 macOS requires Jetty to be granted Accessibility (and on some versions Input
 Monitoring) permission before a system-wide key tap is delivered: System
 Settings → Privacy & Security → Accessibility → enable Jetty. Without this the
-F9 grab is silently inactive; the IPC `jetty` toggle still works as a fallback
-(bind `jetty` to a shortcut via a launcher).
+F9 grab is silently inactive; the IPC toggle still works as a fallback
+(bind `jetty --toggle` to a shortcut via a launcher).
 
 Known limitation: macOS global-hotkey support is best-effort (the manager is
 registered off the main thread, which upstream documents as fragile on macOS).
-If F9 does not toggle, bind the `jetty` command to a shortcut via a launcher,
+If F9 does not toggle, bind `jetty --toggle` to a shortcut via a launcher,
 as on Wayland.
 
 ## Notes
