@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.1] — 2026-06-29
+
+### Added
+- `jetty --version` / `--help` now print and exit instead of launching the GUI.
+
+### Changed
+- Render hot path no longer allocates a per-frame spans `Vec` (~0.5 MB at full
+  screen) — the per-cell spans are passed to glyphon as an iterator; shaping is
+  byte-identical. `jetty-bench` gained a `cpu prep` / `gpu exec` split and a
+  `JETTY_BENCH_GPU=high` selector, confirming the grid render is CPU-prep-bound.
+
+### Thanks
+- The render allocation finding + bench tooling came from @YKesX (PR #2).
+
+---
+
 ## [0.3.0] — 2026-06-29
 
 A customization release: the window chrome now has its own font.

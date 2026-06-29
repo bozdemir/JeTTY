@@ -83,6 +83,37 @@ fn libc_econnrefused() -> i32 {
 }
 
 pub fn run() {
+    // CLI flags that print and EXIT before launching the GUI. Without this,
+    // `jetty --version` (or any unknown flag a user reflexively tries) fell
+    // through and LAUNCHED the terminal instead of printing — surprising for a
+    // command-line tool. `--toggle` is intentionally NOT handled here: it is an
+    // alias for plain `jetty` (toggle a running instance / else launch), driven
+    // by the single-instance IPC logic below.
+    let version = env!("CARGO_PKG_VERSION");
+    let build = option_env!("JETTY_BUILD").unwrap_or("dev");
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--version" | "-version" | "-V" | "version" => {
+                println!("jetty {version} ({build})");
+                std::process::exit(0);
+            }
+            "--help" | "-help" | "-h" | "help" => {
+                println!(
+                    "JeTTY {version} — a blazing-fast GPU terminal with a global summon hotkey.\n\n\
+                     USAGE:\n    jetty [FLAGS]\n\n\
+                     FLAGS:\n\
+                     \x20   --toggle     Toggle a running instance (or launch one); same as plain `jetty`.\n\
+                     \x20   --version    Print version and exit.\n\
+                     \x20   --help       Print this help and exit.\n\n\
+                     Run with no flags to launch. Press F9 to summon/hide (fn+F9 on macOS).\n\
+                     Settings: Ctrl+Shift+P. Config: ~/.config/jetty/config.toml"
+                );
+                std::process::exit(0);
+            }
+            _ => {} // unknown args (incl. --toggle) fall through to normal launch
+        }
+    }
+
     // One-line build banner so a user can confirm which build they are running.
     // JETTY_BUILD is injected at compile time (e.g. the git short SHA via
     // `JETTY_BUILD=$(git rev-parse --short HEAD) cargo build`); falls back to
