@@ -2672,7 +2672,10 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
                 // --- Text selection drag continuation ---
-                if self.selecting && !self.active_tab().terminal.mouse_mode() {
+                // Gated on `selecting` alone: it is set only when a local selection
+                // actually began (mouse reporting off, or Shift held to override it),
+                // so a Shift-drag over a mouse-mode app still extends the selection.
+                if self.selecting {
                     if let Some((line, col)) = self.cursor_cell_0() {
                         self.active_tab_mut().terminal.selection_update(line, col);
                         if let Some(win) = &self.window {
@@ -3055,7 +3058,12 @@ impl ApplicationHandler<AppEvent> for App {
                         // The click landed in the terminal area (not a panel or
                         // scrollbar widget). When the app enabled mouse reporting,
                         // forward the press; otherwise start a text selection.
-                        if self.active_tab().terminal.mouse_mode() {
+                        //
+                        // Holding Shift OVERRIDES mouse reporting and forces a local
+                        // text selection — the standard terminal convention (Konsole/
+                        // xterm/kitty) so you can still select & copy inside TUIs that
+                        // grab the mouse (Claude Code, vim, htop, tmux).
+                        if self.active_tab().terminal.mouse_mode() && !self.modifiers.shift_key() {
                             self.send_mouse_report(input::MouseEvent::LeftPress);
                         } else {
                             // Clear prior selection and begin a new one.
@@ -3112,6 +3120,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // the settings window now.)
                 let was_dragging = self.dragging_scrollbar;
                 self.dragging_scrollbar = false;
+                // Capture before the block below clears it: a release that ended a
+                // local selection must NOT also emit a mouse report to the app (the
+                // matching press was never forwarded — e.g. a Shift-drag selection
+                // over a mouse-mode TUI).
+                let was_selecting = self.selecting;
 
                 // End text selection and copy-on-select.
                 if self.selecting {
@@ -3138,7 +3151,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // not re-check widget hit-testing here: the matching press was
                 // only forwarded when it landed in the terminal area (action ==
                 // None), so a non-drag release pairs with that forwarded press.
-                if !was_dragging && self.active_tab().terminal.mouse_mode() {
+                if !was_dragging && !was_selecting && self.active_tab().terminal.mouse_mode() {
                     self.send_mouse_report(input::MouseEvent::LeftRelease);
                 }
             }
