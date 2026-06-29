@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0] — 2026-06-29
+
+A Settings redesign release.
+
+### Added
+- **Tabbed Settings panel** — the long, scroll-heavy Settings dialog is now
+  organized into 4 tabs: **Look** (theme, opacity, corner radius), **Fonts**
+  (terminal + UI font size & family), **Window** (summon effect, window mode,
+  dropdown size, tab-bar position, auto-hide), and **Shell** (shell picker,
+  launch at login). The panel is now ~half the height (560 vs 1142px); only the
+  active tab's controls show.
+- **Shell picker in Settings** — a `‹ … ›` selector under the Shell tab that
+  detects installed shells from `/etc/shells` (deduped by basename) and lets you
+  pick one, persisted to the `shell` config key. "System default" = auto-detect.
+  New tabs use the choice; existing shells are untouched.
+
+### Fixed
+- **Explicit copy now clears the selection** — after Ctrl+Shift+C or the
+  right-click Copy menu, the selection highlight no longer lingers (it was
+  especially stuck over mouse-reporting apps like Claude Code, where a click
+  can't clear it). Copy-on-select still keeps the highlight.
+
+---
+
 ## [0.4.2] — 2026-06-29
 
 A discoverability release for the Shift+drag selection added in 0.4.0.
