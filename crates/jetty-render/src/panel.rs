@@ -754,9 +754,12 @@ pub fn build_panel(
 
     // RGB mini-track x positions: R at fx_track_x, G and B offset by 120 px each.
     //   108 px track + 12 px gap = 120 px per column; 3 × 108 + 2 × 12 = 348. ✓
-    let rgb_r_x = fx_track_x;
-    let rgb_g_x = fx_track_x + 120.0;
-    let rgb_b_x = fx_track_x + 240.0;
+    // RGB mini-sliders for TINT/COLOR: start AFTER the section header (which sits
+    // at px+16) so the header label and the "R" sub-label/slider never collide.
+    // Three 88px sliders + 14px gaps fit from fx_track_x+56 to the right margin.
+    let rgb_r_x = fx_track_x + 56.0;
+    let rgb_g_x = fx_track_x + 158.0;
+    let rgb_b_x = fx_track_x + 260.0;
 
     // ── CRT ENABLED toggle (band 1) ──
     let crt_en_col = if effects.crt_enabled { accent_col } else { btn_fill };
@@ -780,10 +783,10 @@ pub fn build_panel(
     macro_rules! fx_mini_slider {
         ($bx:expr, $band_y:expr, $frac:expr) => {{
             let frac = ($frac as f32).clamp(0.0, 1.0);
-            let track  = Rect::rounded($bx, $band_y + 24.0, 108.0, 6.0, slider_track_col, 3.0);
-            let fill_w = (frac * (108.0 - 14.0) + 7.0).max(6.0).min(108.0);
+            let track  = Rect::rounded($bx, $band_y + 24.0, 88.0, 6.0, slider_track_col, 3.0);
+            let fill_w = (frac * (88.0 - 14.0) + 7.0).max(6.0).min(88.0);
             let fill   = Rect::rounded($bx, $band_y + 24.0, fill_w, 6.0, accent_fill, 3.0);
-            let hx     = $bx + frac * (108.0 - 14.0);
+            let hx     = $bx + frac * (88.0 - 14.0);
             let handle = Rect::rounded(hx, $band_y + 18.0, 14.0, 18.0, accent_col, 4.0);
             (track, fill, handle)
         }};
@@ -802,15 +805,16 @@ pub fn build_panel(
     let (crt_tint_g_track, crt_tint_g_fill, crt_tint_g_handle) = fx_mini_slider!(rgb_g_x, t_fx_tint, effects.crt_scanline_tint[1]);
     let (crt_tint_b_track, crt_tint_b_fill, crt_tint_b_handle) = fx_mini_slider!(rgb_b_x, t_fx_tint, effects.crt_scanline_tint[2]);
 
-    // CRT animation toggle pills (band 9): ROLL / FLKR / JITR
-    // Three pills evenly spaced across the 348 px track area:
-    //   3 × 56 px pills + 2 × 90 px gaps = 348 px. ✓
+    // CRT animation toggle pills (band 9): ROLL / FLKR / JITR.
+    // Start AFTER the "ANIMATE" header (px+16) so the header and the first pill
+    // don't collide: three 56px pills spread from fx_track_x+74 to the right
+    // margin (jitter ends at fx_track_x+348 = the right edge).
     let roll_col    = if effects.crt_animate_roll { accent_col } else { btn_fill };
     let flicker_col = if effects.crt_flicker      { accent_col } else { btn_fill };
     let jitter_col  = if effects.crt_jitter       { accent_col } else { btn_fill };
-    let crt_roll_toggle    = Rect::rounded(fx_track_x,                t_fx_anim, 56.0, 28.0, roll_col,    14.0);
-    let crt_flicker_toggle = Rect::rounded(fx_track_x + 56.0 + 90.0, t_fx_anim, 56.0, 28.0, flicker_col, 14.0);
-    let crt_jitter_toggle  = Rect::rounded(fx_track_x + 292.0,       t_fx_anim, 56.0, 28.0, jitter_col,  14.0);
+    let crt_roll_toggle    = Rect::rounded(fx_track_x + 74.0,  t_fx_anim, 56.0, 28.0, roll_col,    14.0);
+    let crt_flicker_toggle = Rect::rounded(fx_track_x + 183.0, t_fx_anim, 56.0, 28.0, flicker_col, 14.0);
+    let crt_jitter_toggle  = Rect::rounded(fx_track_x + 292.0, t_fx_anim, 56.0, 28.0, jitter_col,  14.0);
 
     // Caret toggles (bands 11, 12): caret_flash_enabled, caret_glow_enabled.
     let caret_flash_col = if effects.caret_flash_enabled { accent_col } else { btn_fill };
