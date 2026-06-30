@@ -1163,6 +1163,35 @@ impl App {
         }
     }
 
+    /// Move a detached window's tab back into the main window (reattach),
+    /// closing the detached OS window in the process.
+    ///
+    /// `dw.tab` is bound out of `dw` *before* `dw` is allowed to drop, so the
+    /// `Tab` (PTY + shell child) survives — dropping `DetachedWindow` while it
+    /// still owned the tab would reap the shell. The window/GPU surface still
+    /// gets torn down correctly when `dw` drops at the end of this function.
+    fn reattach_tab(&mut self, pos: usize) {
+        if pos >= self.detached.len() {
+            return;
+        }
+        let dw = self.detached.remove(pos);
+        let mut tab = dw.tab; // move the Tab out before `dw` drops
+
+        // Reflow to the MAIN window's grid (tab bar accounted for).
+        let (cols, rows) = self.grid_dims();
+        tab.terminal.resize(cols, rows);
+        tab.pty.resize(cols as u16, rows as u16);
+
+        self.tabs.push(tab);
+        self.active = crate::detached::reattach_index(self.tabs.len());
+        self.apply_theme();
+
+        // `dw` drops here: detached window + GPU surface are closed/destroyed.
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
     /// Adjust an `Option<usize>` index after the tab at `removed` is removed:
     /// clear it if it pointed AT the removed tab; decrement it if it pointed to a
     /// later tab (so it keeps referring to the same logical tab).
@@ -2163,9 +2192,8 @@ impl App {
     ) {
         match event {
             WindowEvent::RedrawRequested => self.render_detached_window(pos),
-            // TODO(Task 7): reattach instead of dropping.
             WindowEvent::CloseRequested if pos < self.detached.len() => {
-                self.detached.remove(pos);
+                self.reattach_tab(pos);
             }
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
                 let Some(dw) = self.detached.get_mut(pos) else { return };
@@ -2208,7 +2236,8 @@ impl App {
                     // Ctrl+Shift+D is reserved for reattach (Task 7). Don't
                     // forward it to the PTY in the meantime.
                     input::KeyAction::DetachTab => {
-                        // TODO(Task 7): reattach this detached window.
+                        self.reattach_tab(pos);
+                        return;
                     }
                     input::KeyAction::Send(bytes) => {
                         let _ = dw.tab.writer.write_all(&bytes);
