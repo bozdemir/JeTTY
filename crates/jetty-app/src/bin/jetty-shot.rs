@@ -565,6 +565,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // --- CRT post-process (JETTY_SHOT_CRT) ---
+    // Run the REAL CRT GPU pass (curvature/scanlines/shadow-mask/bloom/chromatic/
+    // vignette) onto a SECOND texture, sampling the rendered scene — mirroring the
+    // Tier-B sample-then-readback pattern. Lets the harness capture the CRT look
+    // headlessly (e.g. the neofetch hero). Params are env-overridable.
+    let crt_tex = if std::env::var("JETTY_SHOT_CRT").is_ok() {
+        let getf = |k: &str, d: f32| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(d);
+        let ct = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("jetty-shot-crt"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let ct_view = ct.create_view(&wgpu::TextureViewDescriptor::default());
+        // Sample the current scene: the Tier-B output if one ran, else the frame.
+        let src_view = match &tier_b_tex {
+            Some(t) => t.create_view(&wgpu::TextureViewDescriptor::default()),
+            None => texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        };
+        eprintln!("jetty-shot: applying CRT post-process (GPU pass)");
+        let crt = jetty_render::Crt::new(&device, format);
+        crt.apply(&device, &queue, &ct_view, &src_view, width, height, &jetty_render::CrtUniform {
+            resolution: [width as f32, height as f32],
+            curvature: getf("JETTY_SHOT_CRT_CURVATURE", 0.24),
+            scanline: getf("JETTY_SHOT_CRT_SCANLINE", 0.55),
+            mask: getf("JETTY_SHOT_CRT_MASK", 0.32),
+            bloom: getf("JETTY_SHOT_CRT_BLOOM", 0.45),
+            chromatic: getf("JETTY_SHOT_CRT_CHROMATIC", 0.22),
+            vignette: getf("JETTY_SHOT_CRT_VIGNETTE", 0.45),
+            tint: [1.0, 1.0, 1.0, 0.0],
+            corner_radius: getf("JETTY_SHOT_CRT_RADIUS", 0.0),
+            time: 0.0,
+            flags: 0,
+            _pad0: 0.0,
+        });
+        Some(ct)
+    } else {
+        None
+    };
+
     // --- Read back to CPU ---
     // wgpu requires bytes_per_row to be a multiple of 256.
     let unpadded = width * 4;
@@ -584,7 +628,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read back the Tier-B effect output when one ran (it sampled `texture` and
     // wrote the displaced/blurred result into its own texture); otherwise the
     // scene texture itself.
-    let readback_tex = tier_b_tex.as_ref().unwrap_or(&texture);
+    let readback_tex = crt_tex.as_ref().or(tier_b_tex.as_ref()).unwrap_or(&texture);
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: readback_tex,

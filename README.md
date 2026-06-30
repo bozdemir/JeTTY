@@ -43,6 +43,7 @@
   - **Center** — drops into the middle of your screen.
   - **Dropdown** — slides down from the top edge, full screen width, Yakuake/Guake style, with adjustable width & height.
 - ✨ **Summon effects** — five self-written GPU reveal shaders, selectable in settings: **Phosphor Ignition** (default — CRT power-on), **Bayer Crystallize**, **Liquid Drop**, **Focus Pull**, or **None**.
+- 📺 **Visual effects** — an optional **CRT** mode (curvature, scanlines, shadow-mask, bloom, chromatic aberration, vignette + animated roll/flicker/jitter) and a **caret flash/glow**, all under a dedicated **Effects** settings tab. Off by default, so the default look and ~0% idle CPU are untouched.
 - 🗂️ **Tabs** — `Ctrl+Shift+T` new, `Ctrl+Shift+W` close (with confirm), `Ctrl+Tab` / `Ctrl+1‒9` switch, double-click to rename.
 - 🎨 **5 beloved themes** — Catppuccin Mocha (default), Tokyo Night, Gruvbox Dark, Dracula, and Onyx, with exact community palettes. Every UI surface (panel, menus, tab bar, welcome, confirm dialogs) re-skins with the active theme.
 - 🪟 **Custom-decorated window** — borderless client-side decorations, our own title bar, rounded corners (radius slider), runtime opacity.
@@ -64,11 +65,13 @@
 | **Onyx** | **Settings (theme cards)** |
 | <img src="assets/screenshots/onyx.png" width="400"> | <img src="assets/screenshots/settings.png" width="400"> |
 
-| Summon effect (Phosphor Ignition) | Live perf HUD |
+| CRT effect (curvature · scanlines · bloom · vignette) | Summon effect (Phosphor Ignition) |
 |:---:|:---:|
-| <img src="assets/screenshots/phosphor.png" width="400"> | <img src="assets/screenshots/perf-hud.png" width="400"> |
+| <img src="assets/screenshots/crt.png" width="400"> | <img src="assets/screenshots/phosphor.png" width="400"> |
 
-*(Screenshots pending regeneration for Onyx, perf-HUD, and updated settings panel — see `docs/perf-budget.md` for the regeneration commands.)*
+| Live perf HUD | |
+|:---:|:---:|
+| <img src="assets/screenshots/perf-hud.png" width="400"> | |
 
 ## 🚀 Install
 
