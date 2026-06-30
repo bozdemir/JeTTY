@@ -257,11 +257,14 @@ pub(crate) const CHAR_W_FALLBACK: f32 = 9.8;
 ///
 /// * Tab 0 "Look"    — opacity slider, corner-radius slider, theme cards.
 /// * Tab 1 "Fonts"   — font-size, font-family list, UI-font-size + "Aa" specimen,
-///                     UI-font-family list. (TALLEST tab — drives PANEL_H.)
+///                     UI-font-family list. (TALLEST non-scrolling tab — drives PANEL_H.)
 /// * Tab 2 "Window"  — summon effect, window mode, dropdown height, dropdown
 ///                     width, tab-bar position, auto-hide toggle.
 /// * Tab 3 "Shell"   — shell picker, launch-at-login toggle.
-/// * Tab 4 "Effects" — (empty scaffold; widgets land in Task 4).
+/// * Tab 4 "Effects" — CRT controls (enable + curvature/scanline/mask/bloom/
+///                     chromatic/vignette/tint/animate) and Caret flash/glow.
+///                     Its content exceeds PANEL_H, so this tab alone scrolls
+///                     (GPU-clipped to the viewport; see `effects_viewport`).
 ///
 /// All five tabs share one `content_top` (py+100) and lay their bands out
 /// top-down from there. The Fonts tab's last UI-font row bottoms at ~py+520, so

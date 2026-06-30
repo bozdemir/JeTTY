@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0] — 2026-06-30
+
+A visual-effects release.
+
+### Added
+- **CRT effect** — an optional retro CRT look: screen curvature, scanlines,
+  shadow-mask, bloom, chromatic aberration, vignette, and scanline tint, plus
+  animated roll / flicker / jitter. All **off by default**, fully tunable.
+- **Caret flash & glow** — a brief flash when the caret moves (on by default, but
+  it only animates for ~130 ms per move, so idle stays ~0% CPU) and an optional
+  additive glow burst at the cursor on each keystroke.
+- **Effects settings tab** — a 5th Settings tab grouping all the CRT + caret
+  controls. It's the one scrolling tab (its content exceeds the panel height),
+  GPU-clipped to the viewport.
+- **macOS `.app` icon** — `scripts/make-macos-app.sh` now bundles the Dock/Finder
+  icon.
+
+### Notes
+- The default look and the ~0% idle profile are unchanged: CRT is off, and the
+  caret flash self-drives redraws only while a flash is live, returning to a true
+  idle the moment it clears.
+
+---
+
 ## [0.5.0] — 2026-06-29
 
 A Settings redesign release.

@@ -955,14 +955,14 @@ dependencies = [
 
 [[package]]
 name = "jetty"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "jetty-app",
 ]
 
 [[package]]
 name = "jetty-app"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arboard",
  "dirs",
