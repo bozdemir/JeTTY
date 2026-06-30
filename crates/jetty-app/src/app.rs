@@ -1143,12 +1143,15 @@ impl App {
             &self.font_family,
         );
 
-        // Reflow the moved tab to the detached window's grid.
-        // `grid_dims()` reads the MAIN window's GPU surface + TextLayer for cell
-        // sizes. Since the detached window was built to the same pixel size and
-        // uses the same font, the resulting cols/rows match what the detached
-        // window will compute on its first Resized event — no duplication of math.
-        let (cols, rows) = self.grid_dims();
+        // Reflow the moved tab to the detached window's grid. A detached window
+        // is a BARE terminal — no tab bar, no status bar — so its grid fills the
+        // whole client area; use the detached window's OWN GPU surface size and
+        // cell size (not `self.grid_dims()`, which subtracts the main window's
+        // tab bar height and would under-size the detached grid by ~2 rows).
+        let (cw, ch) = dw.text.cell_size();
+        let (cols, rows) = crate::detached::grid_dims(
+            dw.gpu.config.width as f32, dw.gpu.config.height as f32, cw, ch, SCROLLBAR_GUTTER,
+        );
         dw.tab.terminal.resize(cols, rows);
         dw.tab.pty.resize(cols as u16, rows as u16);
 

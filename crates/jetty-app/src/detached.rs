@@ -25,6 +25,18 @@ pub fn reattach_index(tabs_len_after_push: usize) -> usize {
     tabs_len_after_push.saturating_sub(1)
 }
 
+/// Cols/rows for a BARE detached terminal window (no tab bar, no status bar):
+/// the grid fills the whole client area minus the scrollbar gutter. `width_px`/
+/// `height_px` are physical pixels; `cell_w`/`cell_h` the glyph cell size.
+pub(crate) fn grid_dims(width_px: f32, height_px: f32, cell_w: f32, cell_h: f32, scrollbar_gutter: f32) -> (usize, usize) {
+    if cell_w <= 0.0 || cell_h <= 0.0 {
+        return (80, 24); // fallback, matches app.rs FALLBACK_COLS/ROWS
+    }
+    let cols = ((width_px - scrollbar_gutter) / cell_w).floor().max(2.0) as usize;
+    let rows = (height_px / cell_h).floor().max(1.0) as usize;
+    (cols, rows)
+}
+
 // ── DetachedWindow ────────────────────────────────────────────────────────────
 
 use std::sync::Arc;
@@ -161,5 +173,17 @@ mod tests {
     fn reattached_tab_becomes_active_last() {
         // after pushing onto a vec that now has length 3, active index is 2
         assert_eq!(reattach_index(3), 2);
+    }
+
+    #[test]
+    fn detached_grid_dims_fills_client_area_minus_gutter() {
+        // No tab bar, no status bar: only the scrollbar gutter is subtracted
+        // from width; height is used in full.
+        assert_eq!(grid_dims(800.0, 600.0, 10.0, 20.0, 14.0), (78, 30));
+    }
+
+    #[test]
+    fn detached_grid_dims_zero_cell_falls_back_to_default() {
+        assert_eq!(grid_dims(800.0, 600.0, 0.0, 0.0, 14.0), (80, 24));
     }
 }
