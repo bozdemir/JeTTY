@@ -200,11 +200,11 @@ const SCROLLBAR_GUTTER: f32 = jetty_render::SCROLLBAR_W + 4.0;
 
 /// A single terminal session: its grid model, PTY, writer, and tab title. One
 /// `Tab` per visible tab. Per-tab scroll/selection live inside `terminal`.
-struct Tab {
-    terminal: Terminal,
-    pty: PtySession,
-    writer: Box<dyn Write + Send>,
-    title: String,
+pub(crate) struct Tab {
+    pub(crate) terminal: Terminal,
+    pub(crate) pty: PtySession,
+    pub(crate) writer: Box<dyn Write + Send>,
+    pub(crate) title: String,
 }
 
 /// Logical size of the separate Settings window — DERIVED from the panel size
