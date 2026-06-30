@@ -57,10 +57,15 @@ pub(crate) struct DetachedWindow {
     /// Terminal-font TextLayer for the tab's grid content.
     pub text: TextLayer,
     /// UI-font TextLayer for window chrome (title, status bar, overlays).
+    /// Reserved for future chrome parity with the main window (a detached window
+    /// currently renders a bare terminal, so this is built but not yet read).
+    #[allow(dead_code)]
     pub chrome_text: TextLayer,
     pub quad: QuadLayer,
     /// Surface-sized offscreen render target (same descriptor as
-    /// `App::make_offscreen`). Required for CRT and Tier-B summon effects.
+    /// `App::make_offscreen`). Reserved for future CRT and Tier-B summon effects
+    /// in detached windows (built now for parity; not yet read by the bare renderer).
+    #[allow(dead_code)]
     pub offscreen: (wgpu::Texture, wgpu::TextureView),
     /// The single terminal session owned by this detached window.
     pub tab: Tab,
