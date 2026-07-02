@@ -6309,10 +6309,15 @@ fn set_launch_at_login(enabled: bool) {
         }
         // Use the absolute path of the current executable so the entry works
         // regardless of install location; fall back to the bare "jetty" name.
-        let exec = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(str::to_string))
-            .unwrap_or_else(|| "jetty".to_string());
+        // Quoted/escaped per the Desktop Entry spec: a path with a space would
+        // otherwise be parsed as program + argument (autostart silently dead),
+        // and a literal '%' would be consumed as a field code.
+        let exec = desktop_exec_arg(
+            &std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string))
+                .unwrap_or_else(|| "jetty".to_string()),
+        );
         let contents = format!(
             "[Desktop Entry]\n\
              Type=Application\n\
@@ -6334,6 +6339,25 @@ fn set_launch_at_login(enabled: bool) {
             eprintln!("launch-at-login: could not remove {}: {e}", path.display());
         }
     }
+}
+
+/// Quote one argument for a `.desktop` `Exec=` line per the freedesktop
+/// Desktop Entry spec: the argument is double-quoted with `"`, `` ` ``, `$`
+/// and `\` backslash-escaped inside the quotes (quoting rules), and every
+/// literal `%` doubled to `%%` (field-code escaping, applied to the whole Exec
+/// value). Without this, a binary at a path containing a space is parsed as
+/// program + argument and autostart silently launches nothing.
+fn desktop_exec_arg(path: &str) -> String {
+    let mut s = String::with_capacity(path.len() + 2);
+    s.push('"');
+    for c in path.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            s.push('\\');
+        }
+        s.push(c);
+    }
+    s.push('"');
+    s.replace('%', "%%")
 }
 
 /// Display name for a `shell` config value: "System default" for the empty
@@ -6660,6 +6684,40 @@ mod index_adjust_tests {
         let mut idx: Option<usize> = None;
         App::adjust_index_after_remove(&mut idx, 0);
         assert_eq!(idx, None);
+    }
+}
+
+#[cfg(test)]
+mod desktop_exec_arg_tests {
+    use super::desktop_exec_arg;
+
+    #[test]
+    fn plain_path_is_quoted_verbatim() {
+        assert_eq!(desktop_exec_arg("/usr/local/bin/jetty"), "\"/usr/local/bin/jetty\"");
+    }
+
+    #[test]
+    fn path_with_spaces_stays_one_argument() {
+        // The spec parses an unquoted space as an argument separator; quoting
+        // keeps "/home/user/My Builds/jetty" a single program path.
+        assert_eq!(
+            desktop_exec_arg("/home/user/My Builds/jetty"),
+            "\"/home/user/My Builds/jetty\"",
+        );
+    }
+
+    #[test]
+    fn percent_is_field_code_escaped() {
+        // A literal % must be written %% or the DE consumes it as a field code.
+        assert_eq!(desktop_exec_arg("/opt/100%/jetty"), "\"/opt/100%%/jetty\"");
+    }
+
+    #[test]
+    fn reserved_chars_are_backslash_escaped_inside_quotes() {
+        assert_eq!(
+            desktop_exec_arg(r#"/odd/pa"th/$HOME/`x`/back\slash/jetty"#),
+            "\"/odd/pa\\\"th/\\$HOME/\\`x\\`/back\\\\slash/jetty\"",
+        );
     }
 }
 

@@ -193,19 +193,29 @@ impl Default for EffectsConfig {
     }
 }
 
+/// Sanitize an `f32` loaded from config: a non-finite value (NaN/±inf — TOML
+/// 1.x allows literal `nan`, and `f32::clamp` PROPAGATES NaN, silently
+/// defeating every load-time clamp) falls back to `default`; a finite value is
+/// returned unchanged for the caller's normal clamp.
+fn finite_or(v: f32, default: f32) -> f32 {
+    if v.is_finite() { v } else { default }
+}
+
 impl EffectsConfig {
-    /// Clamp every numeric field into its valid range. Called on load.
+    /// Clamp every numeric field into its valid range, replacing non-finite
+    /// values (NaN/±inf survive TOML parsing and pass through `clamp`) with the
+    /// field's default. Called on load.
     pub fn clamped(mut self) -> Self {
-        let c01 = |v: f32| v.clamp(0.0, 1.0);
-        self.crt_curvature = c01(self.crt_curvature);
-        self.crt_scanline = c01(self.crt_scanline);
-        self.crt_mask = c01(self.crt_mask);
-        self.crt_bloom = c01(self.crt_bloom);
-        self.crt_chromatic = c01(self.crt_chromatic);
-        self.crt_vignette = c01(self.crt_vignette);
-        for ch in &mut self.crt_scanline_tint { *ch = c01(*ch); }
-        for ch in &mut self.caret_flash_color { *ch = c01(*ch); }
-        self.caret_flash_ms = self.caret_flash_ms.clamp(60.0, 400.0);
+        let c01 = |v: f32, d: f32| finite_or(v, d).clamp(0.0, 1.0);
+        self.crt_curvature = c01(self.crt_curvature, ef_curvature());
+        self.crt_scanline = c01(self.crt_scanline, ef_scanline());
+        self.crt_mask = c01(self.crt_mask, ef_mask());
+        self.crt_bloom = c01(self.crt_bloom, ef_bloom());
+        self.crt_chromatic = c01(self.crt_chromatic, ef_chromatic());
+        self.crt_vignette = c01(self.crt_vignette, ef_vignette());
+        for ch in &mut self.crt_scanline_tint { *ch = c01(*ch, 1.0); }
+        for ch in &mut self.caret_flash_color { *ch = c01(*ch, 1.0); }
+        self.caret_flash_ms = finite_or(self.caret_flash_ms, ef_flash_ms()).clamp(60.0, 400.0);
         self
     }
 
@@ -261,13 +271,33 @@ impl Config {
         base.join("jetty").join("config.toml")
     }
 
+    /// Replace every non-finite float with its default. TOML 1.x allows a
+    /// literal `nan` and the toml crate deserializes it, while `f32::clamp`
+    /// PROPAGATES NaN — so a hand-edited `opacity = nan` sailed through every
+    /// load-time clamp (invisible window, collapsed grid, NaN shader uniforms)
+    /// and `save()` persisted it right back. Finite values pass through
+    /// untouched; the normal range clamps in `App::new` still apply after.
+    fn sanitize_floats(&mut self) {
+        self.opacity = finite_or(self.opacity, 1.0);
+        self.font_size = finite_or(self.font_size, 16.0);
+        self.ui_font_size = finite_or(self.ui_font_size, default_ui_font_size());
+        self.corner_radius = finite_or(self.corner_radius, 10.0);
+        self.dropdown_height_pct =
+            finite_or(self.dropdown_height_pct, default_dropdown_height_pct());
+        self.dropdown_width_pct =
+            finite_or(self.dropdown_width_pct, default_dropdown_width_pct());
+        // Effects floats are sanitized by `EffectsConfig::clamped` (see load()).
+    }
+
     /// Load settings from disk. A missing file or any parse error yields
-    /// `Config::default()` — this never panics.
+    /// `Config::default()`; non-finite floats fall back to their defaults —
+    /// this never panics.
     pub fn load() -> Config {
         let path = Self::path();
         match std::fs::read_to_string(&path) {
             Ok(s) => {
                 let mut cfg: Config = toml::from_str(&s).unwrap_or_default();
+                cfg.sanitize_floats();
                 cfg.effects = cfg.effects.clamped();
                 cfg
             }
@@ -275,17 +305,51 @@ impl Config {
         }
     }
 
-    /// Persist settings to disk. Creates the parent directory if needed. All
-    /// errors are ignored: a failed write must never crash the terminal.
+    /// Persist settings to disk ATOMICALLY. Creates the parent directory if
+    /// needed. All errors are ignored: a failed write must never crash the
+    /// terminal.
     pub fn save(&self) {
         let path = Self::path();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Ok(s) = toml::to_string_pretty(self) {
-            let _ = std::fs::write(&path, s);
+            let _ = write_atomic(&path, s.as_bytes());
         }
     }
+}
+
+/// Write `data` to `path` atomically: write + fsync a temp file in the SAME
+/// directory, then `rename` it over the destination. `persist()` runs on every
+/// settings click / font hotkey / slider release, and the previous plain
+/// `fs::write` (truncate-then-write) left an empty/partial config.toml if the
+/// process died mid-write — which `load()` then silently replaced with full
+/// defaults, losing every setting. The temp name is PID-suffixed so two
+/// processes never share one temp file; rename is atomic on POSIX, so readers
+/// always see either the old or the new complete file.
+fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent dir")
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.toml");
+    let tmp = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        // Flush file contents to disk BEFORE the rename so a crash/power loss
+        // right after the rename can't leave a zero-length "new" file.
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        // Best-effort cleanup of the temp file on any failure.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -456,6 +520,82 @@ corner_radius = 8.0
         let e = EffectsConfig { crt_curvature: 9.0, crt_bloom: -1.0, caret_flash_ms: 5000.0, ..Default::default() }.clamped();
         assert!(e.crt_curvature <= 1.0 && e.crt_bloom >= 0.0);
         assert!(e.caret_flash_ms <= 400.0);
+    }
+
+    #[test]
+    fn nan_floats_fall_back_to_defaults() {
+        // TOML 1.x parses a literal `nan`, and f32::clamp propagates NaN — so
+        // sanitize_floats must replace every non-finite float with its default.
+        let toml = "theme = \"dracula\"\nopacity = nan\nfont_size = nan\n\
+                    font_family = \"MesloLGS NF\"\ncorner_radius = nan\n\
+                    ui_font_size = inf\ndropdown_height_pct = -inf\n";
+        let mut cfg: Config = toml::from_str(toml).expect("nan parses in toml 1.x");
+        assert!(cfg.opacity.is_nan(), "premise: toml yields NaN");
+        cfg.sanitize_floats();
+        assert_eq!(cfg.opacity, 1.0);
+        assert_eq!(cfg.font_size, 16.0);
+        assert_eq!(cfg.corner_radius, 10.0);
+        assert_eq!(cfg.ui_font_size, 16.0);
+        assert_eq!(cfg.dropdown_height_pct, 0.50);
+        assert_eq!(cfg.dropdown_width_pct, 1.0);
+    }
+
+    #[test]
+    fn sanitize_keeps_finite_values_untouched() {
+        let mut cfg = Config {
+            opacity: 0.42,
+            font_size: 13.0,
+            corner_radius: 3.0,
+            ..Config::default()
+        };
+        cfg.sanitize_floats();
+        assert_eq!(cfg.opacity, 0.42);
+        assert_eq!(cfg.font_size, 13.0);
+        assert_eq!(cfg.corner_radius, 3.0);
+    }
+
+    #[test]
+    fn effects_clamp_replaces_nan_with_defaults() {
+        let e = EffectsConfig {
+            crt_curvature: f32::NAN,
+            crt_bloom: f32::INFINITY,
+            caret_flash_ms: f32::NAN,
+            crt_scanline_tint: [f32::NAN, 0.5, 1.0],
+            ..Default::default()
+        }
+        .clamped();
+        assert_eq!(e.crt_curvature, ef_curvature());
+        assert_eq!(e.crt_bloom, ef_bloom(), "non-finite (inf) falls back to the default");
+        assert_eq!(e.caret_flash_ms, ef_flash_ms());
+        assert_eq!(e.crt_scanline_tint, [1.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_and_cleans_temp() {
+        let dir = std::env::temp_dir().join(format!("jetty-atomic-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "old").unwrap();
+        write_atomic(&path, b"new contents").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new contents");
+        // No temp file left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file must be renamed away");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_creates_fresh_file() {
+        let dir = std::env::temp_dir().join(format!("jetty-atomic-new-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
