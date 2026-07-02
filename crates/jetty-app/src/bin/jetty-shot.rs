@@ -23,14 +23,24 @@ use std::io::BufWriter;
 
 use jetty_render::{QuadLayer, TextLayer};
 
+/// A boolean shot flag is ON only when set to a non-empty value other than "0",
+/// matching the JETTY_SHOT_DETACHED / JETTY_SHOT_PANEL_* semantics so a harness
+/// can turn a mode off with `=0` instead of the mode staying on for any value.
+fn env_flag(k: &str) -> bool {
+    std::env::var(k).map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_path =
         std::env::var("JETTY_SHOT_OUT").unwrap_or_else(|_| "/tmp/jetty-shot.png".to_string());
 
     // Window size is overridable so the harness can reproduce narrow-window
     // layouts (e.g. help/panel fit) — JETTY_SHOT_WIDTH / JETTY_SHOT_HEIGHT.
-    let width: u32 = std::env::var("JETTY_SHOT_WIDTH").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
-    let height: u32 = std::env::var("JETTY_SHOT_HEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(640);
+    // Clamp to 1..=8192 (the wgpu::Limits::default() max_texture_dimension_2d
+    // requested below): 0 or an oversized value would trip a wgpu validation
+    // panic deep inside create_texture instead of a usable render.
+    let width: u32 = std::env::var("JETTY_SHOT_WIDTH").ok().and_then(|s| s.parse().ok()).map(|v: u32| v.clamp(1, 8192)).unwrap_or(1000);
+    let height: u32 = std::env::var("JETTY_SHOT_HEIGHT").ok().and_then(|s| s.parse().ok()).map(|v: u32| v.clamp(1, 8192)).unwrap_or(640);
     // Allow headless renders at different font sizes so the test harness can
     // verify that font-size changes produce a different cell grid.
     let font_size: f32 = std::env::var("JETTY_FONT_SIZE")
@@ -141,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Terminal::new picks up JETTY_THEME and JETTY_OPACITY from the environment.
     let mut terminal = jetty_core::Terminal::new(cols, rows);
 
-    if std::env::var("JETTY_SHOT_PTY").is_ok() {
+    if env_flag("JETTY_SHOT_PTY") {
         // Drive a REAL shell offscreen so we can see the live startup prompt
         // (e.g. zsh+p10k) settle exactly as in the running app. This feeds the
         // shell's output into the terminal and writes the terminal's query
@@ -412,14 +422,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut panel_title_labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
 
         // JETTY_SHOT_MENU — render the right-click context menu for visual checks.
-        if std::env::var("JETTY_SHOT_MENU").is_ok() {
+        if env_flag("JETTY_SHOT_MENU") {
             let menu = jetty_render::build_context_menu(620.0, 120.0, width, height, Some(1), terminal.theme(), chrome_char_w);
             rects.extend(menu.quads);
             panel_labels.extend(menu.labels);
         }
 
         // JETTY_SHOT_HELP — render the Keyboard Shortcuts help overlay.
-        if std::env::var("JETTY_SHOT_HELP").is_ok() {
+        if env_flag("JETTY_SHOT_HELP") {
             let help = jetty_render::build_help_overlay(width, height, terminal.theme(), chrome_char_w);
             rects.extend(help.quads);
             panel_labels.extend(help.labels);
@@ -428,7 +438,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // JETTY_SHOT_TABBAR — render a sample tab strip (3 tabs, one active, plus
         // the window controls) over the top of the frame so the rounded tabs +
         // borders can be inspected.
-        if std::env::var("JETTY_SHOT_TABBAR").is_ok() {
+        if env_flag("JETTY_SHOT_TABBAR") {
             let tabs = [
                 ("Tab 1".to_string(), true),
                 ("Tab 2".to_string(), false),
@@ -548,7 +558,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // JETTY_SHOT_WELCOME — render the neofetch-style welcome splash overlay
         // (ASCII logo + info rows + 16-color swatch + tip) so the logo legibility
         // and layout can be eyeballed headlessly.
-        if std::env::var("JETTY_SHOT_WELCOME").is_ok() {
+        if env_flag("JETTY_SHOT_WELCOME") {
             let splash = jetty_render::build_welcome_overlay(
                 width,
                 height,
@@ -564,14 +574,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // JETTY_SHOT_CONFIRM — render the "Close this tab?" confirmation popup.
-        if std::env::var("JETTY_SHOT_CONFIRM").is_ok() {
+        if env_flag("JETTY_SHOT_CONFIRM") {
             let popup = jetty_render::build_confirm_close(width, height, "Tab 2", terminal.theme(), chrome_char_w);
             rects.extend(popup.quads);
             panel_labels.extend(popup.labels);
         }
 
         // JETTY_SHOT_QUIT — render the whole-app "Quit JeTTY?" confirmation popup.
-        if std::env::var("JETTY_SHOT_QUIT").is_ok() {
+        if env_flag("JETTY_SHOT_QUIT") {
             let popup = jetty_render::build_confirm(
                 width, height, "Quit JeTTY? — all tabs will close", terminal.theme(), chrome_char_w,
             );
@@ -585,10 +595,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // quads through the chrome layer (at the UI size), so they don't scale with
         // the terminal font (this is what proves BUG 1 is fixed across JETTY_FONT_SIZE).
         if !panel_labels.is_empty() {
-            let _ = chrome_text.render_overlays(&device, &queue, &view, width, height, &panel_labels);
+            chrome_text.render_overlays(&device, &queue, &view, width, height, &panel_labels)?;
         }
         if !panel_title_labels.is_empty() {
-            let _ = chrome_text.render_overlays_sans(&device, &queue, &view, width, height, &panel_title_labels);
+            chrome_text.render_overlays_sans(&device, &queue, &view, width, height, &panel_title_labels)?;
         }
         // Live "Aa" specimen at the TRUE UI size (chrome_text is at the UI size in
         // the harness), drawn over the capped panel-text pass — mirrors the app's
@@ -596,10 +606,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the TITLE path so the `""` default previews the platform sans.
         if let Some((sx, sy)) = ui_specimen_pos {
             let accent = terminal.theme().palette[4];
-            let _ = chrome_text.render_overlays_sans(
+            chrome_text.render_overlays_sans(
                 &device, &queue, &view, width, height,
                 &[("Aa".to_string(), sx, sy, [accent[0], accent[1], accent[2]])],
-            );
+            )?;
         }
     }
 
@@ -648,7 +658,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            // TEXTURE_BINDING so a following CRT pass can SAMPLE this Tier-B
+            // output (JETTY_SHOT_LIQUID_T/_FOCUS_T + JETTY_SHOT_CRT combined).
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view_b = tex_b.create_view(&wgpu::TextureViewDescriptor::default());
@@ -680,7 +694,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // vignette) onto a SECOND texture, sampling the rendered scene — mirroring the
     // Tier-B sample-then-readback pattern. Lets the harness capture the CRT look
     // headlessly (e.g. the neofetch hero). Params are env-overridable.
-    let crt_tex = if std::env::var("JETTY_SHOT_CRT").is_ok() {
+    let crt_tex = if env_flag("JETTY_SHOT_CRT") {
         let getf = |k: &str, d: f32| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(d);
         let ct = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("jetty-shot-crt"),
@@ -729,7 +743,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // wgpu requires bytes_per_row to be a multiple of 256.
     let unpadded = width * 4;
     let align: u32 = 256;
-    let padded = ((unpadded + align - 1) / align) * align;
+    let padded = unpadded.div_ceil(align) * align;
 
     let buffer_size = (padded * height) as u64;
     let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -794,7 +808,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // live app, for both the main and the detached window.
     // JETTY_SHOT_DROPDOWN — verify Dropdown mode's BOTTOM-only rounding: the two
     // top corners are square (top-flush), only the bottom corners round.
-    let dropdown = std::env::var("JETTY_SHOT_DROPDOWN").is_ok();
+    let dropdown = env_flag("JETTY_SHOT_DROPDOWN");
     if corner_radius > 0.0 && crt_tex.is_none() {
         let (r_tl, r_tr) = if dropdown { (0.0, 0.0) } else { (corner_radius, corner_radius) };
         eprintln!(
@@ -847,7 +861,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Checkerboard background
                 let tile_x = x / TILE;
                 let tile_y = y / TILE;
-                let checker = if (tile_x + tile_y) % 2 == 0 { DARK } else { LIGHT };
+                let checker = if (tile_x + tile_y).is_multiple_of(2) { DARK } else { LIGHT };
                 let dst_r = checker[0] as f32 / 255.0;
                 let dst_g = checker[1] as f32 / 255.0;
                 let dst_b = checker[2] as f32 / 255.0;

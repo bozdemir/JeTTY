@@ -2,10 +2,12 @@
 //!
 //! Stores the small subset of UI state the user can tweak (theme, opacity,
 //! font size + family, corner radius) as a TOML file under the OS config dir
-//! (`~/.config/jetty/config.toml` on Linux). Loading is best-effort: a missing
-//! file or any parse error falls back to `Config::default()` and never panics.
-//! Saving is also best-effort: directory-create and write errors are ignored so
-//! a read-only home can never crash the terminal.
+//! (`~/.config/jetty/config.toml` on Linux). Loading is best-effort and never
+//! panics: a missing file falls back to `Config::default()`, and an unparseable
+//! file is preserved aside (`config.toml.bad`) before defaults load in memory —
+//! so a single typo can never silently reset (and then overwrite) the config.
+//! Saving is also best-effort: directory-create and write errors are logged but
+//! never crash the terminal (a read-only home degrades gracefully).
 
 use serde::{Deserialize, Serialize};
 
@@ -13,12 +15,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// Theme preset name (must match a `jetty_core::theme::PRESETS` entry).
+    #[serde(default = "default_theme")]
     pub theme: String,
     /// Background opacity in 0.0..=1.0.
+    #[serde(default = "default_opacity")]
     pub opacity: f32,
     /// Logical font size in points.
+    #[serde(default = "default_font_size")]
     pub font_size: f32,
     /// Monospace font family name.
+    #[serde(default = "default_font_family")]
     pub font_family: String,
     /// UI (chrome) font family — tab titles, status bar, menus, panel, help,
     /// dialogs, welcome. SEPARATE from the terminal `font_family`. An empty
@@ -33,6 +39,7 @@ pub struct Config {
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: f32,
     /// Window corner radius in logical px (0..=24).
+    #[serde(default = "default_corner_radius")]
     pub corner_radius: f32,
     /// Window-summon reveal effect: "none", "bayer", "phosphor", "liquid", or
     /// "focus" (the last two are Tier-B effects that sample the rendered frame).
@@ -87,6 +94,26 @@ pub struct Config {
     /// compatible: old configs without `[effects]` load with all defaults.
     #[serde(default)]
     pub effects: EffectsConfig,
+}
+
+fn default_theme() -> String {
+    "catppuccin_mocha".to_string()
+}
+
+fn default_opacity() -> f32 {
+    1.0
+}
+
+fn default_font_size() -> f32 {
+    16.0
+}
+
+fn default_font_family() -> String {
+    "MesloLGS NF".to_string()
+}
+
+fn default_corner_radius() -> f32 {
+    10.0
 }
 
 fn default_shell() -> String {
@@ -236,13 +263,13 @@ impl EffectsConfig {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            theme: "catppuccin_mocha".to_string(),
-            opacity: 1.0,
-            font_size: 16.0,
-            font_family: "MesloLGS NF".to_string(),
+            theme: default_theme(),
+            opacity: default_opacity(),
+            font_size: default_font_size(),
+            font_family: default_font_family(),
             ui_font_family: default_ui_font_family(),
             ui_font_size: default_ui_font_size(),
-            corner_radius: 10.0,
+            corner_radius: default_corner_radius(),
             summon_effect: default_summon_effect(),
             window_mode: default_window_mode(),
             dropdown_height_pct: default_dropdown_height_pct(),
@@ -289,19 +316,41 @@ impl Config {
         // Effects floats are sanitized by `EffectsConfig::clamped` (see load()).
     }
 
-    /// Load settings from disk. A missing file or any parse error yields
-    /// `Config::default()`; non-finite floats fall back to their defaults —
-    /// this never panics.
+    /// Load settings from disk. A missing file yields `Config::default()`;
+    /// non-finite floats fall back to their defaults — this never panics.
+    ///
+    /// A file that FAILS to parse is NOT silently reset: doing so would let the
+    /// next `save()` overwrite the user's config with defaults, permanently
+    /// losing everything over a single typo. Instead we preserve the original
+    /// aside (`config.toml.bad`), log, and load in-memory defaults — so the
+    /// user's settings remain recoverable and a fresh `save()` starts clean.
     pub fn load() -> Config {
         let path = Self::path();
-        match std::fs::read_to_string(&path) {
-            Ok(s) => {
-                let mut cfg: Config = toml::from_str(&s).unwrap_or_default();
+        let s = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return Config::default(),
+        };
+        match toml::from_str::<Config>(&s) {
+            Ok(mut cfg) => {
                 cfg.sanitize_floats();
                 cfg.effects = cfg.effects.clamped();
                 cfg
             }
-            Err(_) => Config::default(),
+            Err(e) => {
+                eprintln!("jetty: config parse error at {}: {e}", path.display());
+                let bad = path.with_extension("toml.bad");
+                match std::fs::rename(&path, &bad) {
+                    Ok(()) => eprintln!(
+                        "jetty: preserved your unparsed config at {} (using defaults)",
+                        bad.display()
+                    ),
+                    Err(e) => eprintln!(
+                        "jetty: could not preserve unparsed config as {}: {e}",
+                        bad.display()
+                    ),
+                }
+                Config::default()
+            }
         }
     }
 
@@ -311,10 +360,18 @@ impl Config {
     pub fn save(&self) {
         let path = Self::path();
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!("jetty: could not create config dir {}: {e}", dir.display());
+                return;
+            }
         }
-        if let Ok(s) = toml::to_string_pretty(self) {
-            let _ = write_atomic(&path, s.as_bytes());
+        match toml::to_string_pretty(self) {
+            Ok(s) => {
+                if let Err(e) = write_atomic(&path, s.as_bytes()) {
+                    eprintln!("jetty: could not save config to {}: {e}", path.display());
+                }
+            }
+            Err(e) => eprintln!("jetty: could not serialize config: {e}"),
         }
     }
 }
@@ -337,13 +394,21 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("config.toml");
     let tmp = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
-    let result = (|| {
+    let result = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;
         // Flush file contents to disk BEFORE the rename so a crash/power loss
         // right after the rename can't leave a zero-length "new" file.
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        // fsync the parent directory so the rename (the directory-entry update)
+        // is itself durable: without it, a power loss just after rename() can
+        // lose the new dirent on ext4/xfs and leave the OLD file — or nothing.
+        // Best-effort: some platforms/filesystems don't support directory fsync.
+        if let Ok(dir_file) = std::fs::File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
+        Ok(())
     })();
     if result.is_err() {
         // Best-effort cleanup of the temp file on any failure.
@@ -600,11 +665,14 @@ corner_radius = 8.0
 
     #[test]
     fn effects_config_roundtrips_through_toml() {
-        let mut e = EffectsConfig::default();
-        e.crt_enabled = true; e.crt_curvature = 0.42; e.crt_flicker = true;
-        e.caret_flash_color = [0.1, 0.2, 0.3];
-        let mut cfg = Config::default();
-        cfg.effects = e.clone();
+        let e = EffectsConfig {
+            crt_enabled: true,
+            crt_curvature: 0.42,
+            crt_flicker: true,
+            caret_flash_color: [0.1, 0.2, 0.3],
+            ..EffectsConfig::default()
+        };
+        let cfg = Config { effects: e.clone(), ..Config::default() };
         let s = toml::to_string(&cfg).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(back.effects, e);

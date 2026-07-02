@@ -201,6 +201,59 @@ pub struct PanelGeom {
     pub content_bottom: f32,
 }
 
+impl PanelGeom {
+    /// Scale every geometric field from `build_panel`'s logical layout space into
+    /// physical pixels by `s`. Index / flag fields (`*_scroll_offset`,
+    /// `theme_open`) are left untouched. Called once at the end of `build_panel`;
+    /// the caller skips it entirely when `s == 1.0` so scale-1 output is unchanged.
+    fn scale(&mut self, s: f32) {
+        fn sr(r: &mut Rect, s: f32) {
+            r.x *= s;
+            r.y *= s;
+            r.w *= s;
+            r.h *= s;
+            r.radius *= s;
+        }
+        macro_rules! scale_fields {
+            ($($f:ident),* $(,)?) => { $( sr(&mut self.$f, s); )* };
+        }
+        scale_fields!(
+            panel, slider_track, slider_handle, theme_combo, theme_scroll_up,
+            theme_scroll_down, font_minus, font_plus, font_reset, title_bar,
+            font_scroll_up, font_scroll_down, radius_track, radius_handle,
+            summon_prev, summon_next, win_mode_prev, win_mode_next, tab_bar_prev,
+            tab_bar_next, dropdown_track, dropdown_handle, dropdown_width_track,
+            dropdown_width_handle, autohide_toggle, launch_login_toggle, shell_prev,
+            shell_next, ui_font_minus, ui_font_plus, ui_font_reset,
+            ui_font_scroll_up, ui_font_scroll_down, crt_enabled_toggle,
+            crt_curvature_track, crt_curvature_handle, crt_scanline_track,
+            crt_scanline_handle, crt_mask_track, crt_mask_handle, crt_bloom_track,
+            crt_bloom_handle, crt_chromatic_track, crt_chromatic_handle,
+            crt_vignette_track, crt_vignette_handle, crt_tint_r_track,
+            crt_tint_r_handle, crt_tint_g_track, crt_tint_g_handle, crt_tint_b_track,
+            crt_tint_b_handle, crt_roll_toggle, crt_flicker_toggle, crt_jitter_toggle,
+            caret_flash_toggle, caret_glow_toggle, caret_dur_track, caret_dur_handle,
+            caret_color_r_track, caret_color_r_handle, caret_color_g_track,
+            caret_color_g_handle, caret_color_b_track, caret_color_b_handle,
+        );
+        for r in &mut self.tab_rects {
+            sr(r, s);
+        }
+        for r in &mut self.theme_rows {
+            sr(r, s);
+        }
+        for r in &mut self.font_rows {
+            sr(r, s);
+        }
+        for r in &mut self.ui_font_rows {
+            sr(r, s);
+        }
+        self.effects_content_h *= s;
+        self.content_top *= s;
+        self.content_bottom *= s;
+    }
+}
+
 /// Full description of how to draw the settings panel for one frame.
 pub struct PanelView {
     /// Chrome rects in draw order (border → bg → hairlines → control fills →
@@ -299,14 +352,14 @@ pub(crate) const CHAR_W_FALLBACK: f32 = 9.8;
 ///
 /// * Tab 0 "Look"    — opacity slider, corner-radius slider, theme dropdown.
 /// * Tab 1 "Fonts"   — font-size, font-family list, UI-font-size + "Aa" specimen,
-///                     UI-font-family list. (TALLEST non-scrolling tab — drives PANEL_H.)
+///   UI-font-family list. (TALLEST non-scrolling tab — drives PANEL_H.)
 /// * Tab 2 "Window"  — summon effect, window mode, dropdown height, dropdown
-///                     width, tab-bar position, auto-hide toggle.
+///   width, tab-bar position, auto-hide toggle.
 /// * Tab 3 "Shell"   — shell picker, launch-at-login toggle.
 /// * Tab 4 "Effects" — CRT controls (enable + curvature/scanline/mask/bloom/
-///                     chromatic/vignette/tint/animate) and Caret flash/glow.
-///                     Its content exceeds PANEL_H, so this tab alone scrolls
-///                     (GPU-clipped to the viewport; see `effects_viewport`).
+///   chromatic/vignette/tint/animate) and Caret flash/glow.
+///   Its content exceeds PANEL_H, so this tab alone scrolls
+///   (GPU-clipped to the viewport; see `effects_viewport`).
 ///
 /// All five tabs share one `content_top` (py + CONTENT_TOP_OFFSET) and lay their
 /// bands out top-down from there. A fixed footer band (FOOTER_H) with a hairline
@@ -323,8 +376,8 @@ const CW: f32 = PANEL_W - 2.0 * PAD; // 380
 
 /// Y-offset from the panel's top edge to the scrollable content area (title bar
 /// + tab strip chrome + breathing room). Single-sourced here so
-/// `EFFECTS_VISIBLE_H` and the `content_top` local in `build_panel` can both
-/// derive from it.
+///   `EFFECTS_VISIBLE_H` and the `content_top` local in `build_panel` can both
+///   derive from it.
 const CONTENT_TOP_OFFSET: f32 = 96.0;
 
 /// Height of the fixed footer band at the panel bottom (hairline + hint text).
@@ -443,6 +496,30 @@ pub fn build_panel(
 ) -> PanelView {
     let active_tab = active_tab.min(4);
 
+    // ── HiDPI layout scale ────────────────────────────────────────────────────
+    // The panel's window is created at a LOGICAL size (SETTINGS_WIN_* = PANEL_W/H
+    // + border) but `build_panel` receives the PHYSICAL surface size and a
+    // PHYSICAL, DPI-scaled chrome advance (`char_w`). Laying the fixed-px
+    // constants out directly against the physical surface leaves every control the
+    // designed logical size while the glyphs are `char_w` (≈scale×) wide, so text
+    // overflows its control on HiDPI. Instead we lay the whole panel out in a
+    // LOGICAL space — as if `char_w == CHAR_W_FALLBACK` — and scale the finished
+    // geometry by `dpi` on the way out, so controls/rows/text stay proportional at
+    // any DPI. `dpi` is recovered from the measured advance (the only scale signal
+    // available without a signature change); at scale 1 the tests pass
+    // `CHAR_W_FALLBACK`, so `dpi == 1.0` and every output below is byte-identical.
+    // NOTE: `char_w` is the CAPPED settings advance (jetty-app caps the panel body
+    // font to [13,17] pt), so for very large UI fonts the panel scales with the
+    // capped text, not the raw font — it stays bounded rather than filling more of
+    // its window. The settings window itself is sized in jetty-app (not editable
+    // here); this fix corrects the intra-panel proportions, which is the visible
+    // breakage. Physical inputs (drag, scroll) are converted to logical here.
+    let dpi = (char_w / CHAR_W_FALLBACK).max(0.1);
+    let char_w = CHAR_W_FALLBACK;
+    let dx = dx / dpi;
+    let dy = dy / dpi;
+    let effects_scroll = effects_scroll / dpi;
+
     // --- Theme-derived panel chrome colors ---
     // All panel colors are derived from the ACTIVE theme so the settings window
     // re-skins itself when the theme changes (instead of staying a fixed dark
@@ -509,8 +586,9 @@ pub fn build_panel(
     let on_accent: [u8; 3] = [tbg[0], tbg[1], tbg[2]];
 
     // Center, then apply the user drag offset, then clamp to screen edges.
-    let sw = screen_w as f32;
-    let sh = screen_h as f32;
+    // Logical surface size (physical / dpi): the layout below is entirely logical.
+    let sw = screen_w as f32 / dpi;
+    let sh = screen_h as f32 / dpi;
     let px = (((sw - PANEL_W) / 2.0).floor() + dx).clamp(0.0, (sw - PANEL_W).max(0.0));
     let py = (((sh - PANEL_H) / 2.0).floor() + dy).clamp(0.0, (sh - PANEL_H).max(0.0));
 
@@ -805,7 +883,7 @@ pub fn build_panel(
     // Live "Aa" specimen anchor. The app overdraws "Aa" here at the TRUE UI size
     // AFTER the capped panel-text pass. Offscreen unless the Fonts tab is active,
     // so the "Aa" is only drawn on that tab.
-    let ui_specimen_pos = if active_tab == 1 {
+    let mut ui_specimen_pos = if active_tab == 1 {
         (px + PAD, t_uifontsize + 40.0)
     } else {
         (px + PAD, OFF)
@@ -1518,7 +1596,7 @@ pub fn build_panel(
         color: [0, 0, 0, 0], // color not used for hit-testing
         ..Default::default()
     };
-    let geom = PanelGeom {
+    let mut geom = PanelGeom {
         panel: panel_rect,
         tab_rects,
         slider_track,
@@ -1598,10 +1676,55 @@ pub fn build_panel(
         content_bottom: content_top + visible_h,
     };
 
-    // Viewport for the Effects tab scissor / text-clip pass.
+    // ── Scale the logical layout to physical px ────────────────────────────────
+    // At scale 1 (`dpi == 1.0`, i.e. tests / scale-1 displays) this is skipped so
+    // the output is byte-identical to the pre-HiDPI layout; otherwise every quad,
+    // label and hit-rect is scaled uniformly so it lands where the DPI-scaled
+    // glyphs are drawn.
+    if dpi != 1.0 {
+        let sr = |r: &mut Rect| {
+            r.x *= dpi;
+            r.y *= dpi;
+            r.w *= dpi;
+            r.h *= dpi;
+            r.radius *= dpi;
+        };
+        for q in quads.iter_mut() {
+            sr(q);
+        }
+        for q in effects_quads.iter_mut() {
+            sr(q);
+        }
+        for l in labels.iter_mut() {
+            l.1 *= dpi;
+            l.2 *= dpi;
+        }
+        for l in effects_labels.iter_mut() {
+            l.1 *= dpi;
+            l.2 *= dpi;
+        }
+        geom.scale(dpi);
+        ui_specimen_pos.0 *= dpi;
+        ui_specimen_pos.1 *= dpi;
+    }
+
+    // Viewport for the Effects tab scissor / text-clip pass, in PHYSICAL px and
+    // intersected with the surface so `set_scissor_rect` can never exceed the
+    // render target (which is a wgpu validation error → uncaptured-error panic).
+    // The settings window is non-resizable, but tiling WMs (i3/sway/dwm) ignore
+    // that hint and can force a surface smaller than the panel; clamp (and skip
+    // the pass entirely if the visible intersection is empty).
     // `None` on other tabs so the caller skips the scissored pass entirely.
     let effects_viewport = if active_tab == 4 {
-        Some([px as u32, content_top as u32, PANEL_W as u32, visible_h as u32])
+        let vx = (px * dpi).max(0.0);
+        let vy = (content_top * dpi).max(0.0);
+        let vw = (PANEL_W * dpi).min(screen_w as f32 - vx);
+        let vh = (visible_h * dpi).min(screen_h as f32 - vy);
+        if vw >= 1.0 && vh >= 1.0 {
+            Some([vx as u32, vy as u32, vw as u32, vh as u32])
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -1683,6 +1806,86 @@ mod tests {
     /// Tab-0 ("Look") panel, the most commonly asserted layout.
     fn default_panel(screen_w: u32, screen_h: u32) -> PanelView {
         panel_tab(screen_w, screen_h, 0)
+    }
+
+    /// Build a panel with an explicit chrome advance (drives the HiDPI layout
+    /// scale) so the DPI path can be exercised. `char_w == CHAR_W_FALLBACK` is
+    /// scale 1; `2×CHAR_W_FALLBACK` on a 2× surface must reproduce the scale-1
+    /// layout scaled by exactly 2.
+    fn panel_scaled(screen_w: u32, screen_h: u32, char_w: f32, active_tab: usize) -> PanelView {
+        let theme = jetty_core::Theme::by_name("catppuccin_mocha");
+        let families: Vec<String> = vec!["JetBrains Mono".to_string(), "Fira Code".to_string()];
+        let ui_families: Vec<String> =
+            vec!["System Sans (default)".to_string(), "Inter".to_string()];
+        build_panel(
+            screen_w, screen_h, 0.97, 0, 15.0, &families, "JetBrains Mono", 0, 8.0,
+            "Phosphor", "Dropdown", "Top", 0.5, 0.7, true, false, false, 18.0,
+            &ui_families, "", 0, 0.0, 0.0, &theme, char_w, "zsh", active_tab,
+            &EffectsParams::default(), 0.0, false, 0,
+        )
+    }
+
+    #[test]
+    fn hidpi_layout_is_exact_2x_of_scale1() {
+        // A 2× DPI surface with a 2× chrome advance must yield geometry that is
+        // exactly twice the scale-1 layout — proving every quad/label/hit-rect is
+        // scaled (a missed field would break proportionality on HiDPI only).
+        for tab in 0..5 {
+            let one = panel_scaled(1200, 900, CHAR_W_FALLBACK, tab);
+            let two = panel_scaled(2400, 1800, 2.0 * CHAR_W_FALLBACK, tab);
+            assert_eq!(one.quads.len(), two.quads.len());
+            for (a, b) in one.quads.iter().zip(&two.quads) {
+                assert!((b.x - 2.0 * a.x).abs() < 1e-2, "quad x not 2× at tab {tab}");
+                assert!((b.y - 2.0 * a.y).abs() < 1e-2, "quad y not 2× at tab {tab}");
+                assert!((b.w - 2.0 * a.w).abs() < 1e-2, "quad w not 2× at tab {tab}");
+                assert!((b.h - 2.0 * a.h).abs() < 1e-2, "quad h not 2× at tab {tab}");
+                assert!((b.radius - 2.0 * a.radius).abs() < 1e-2, "quad r not 2× at tab {tab}");
+            }
+            assert_eq!(one.effects_quads.len(), two.effects_quads.len());
+            for (a, b) in one.effects_quads.iter().zip(&two.effects_quads) {
+                assert!((b.x - 2.0 * a.x).abs() < 1e-2 && (b.y - 2.0 * a.y).abs() < 1e-2);
+                assert!((b.w - 2.0 * a.w).abs() < 1e-2 && (b.h - 2.0 * a.h).abs() < 1e-2);
+            }
+            for (a, b) in one.labels.iter().zip(&two.labels) {
+                assert_eq!(a.0, b.0, "label text differs at tab {tab}");
+                assert!((b.1 - 2.0 * a.1).abs() < 1e-2, "label x not 2× at tab {tab}");
+                assert!((b.2 - 2.0 * a.2).abs() < 1e-2, "label y not 2× at tab {tab}");
+            }
+            // A representative sample of hit-rects across every tab's controls.
+            let gr1 = &one.geom;
+            let gr2 = &two.geom;
+            for (a, b) in [
+                (gr1.panel, gr2.panel),
+                (gr1.tab_rects[0], gr2.tab_rects[0]),
+                (gr1.tab_rects[4], gr2.tab_rects[4]),
+                (gr1.slider_handle, gr2.slider_handle),
+                (gr1.theme_combo, gr2.theme_combo),
+                (gr1.font_plus, gr2.font_plus),
+                (gr1.summon_next, gr2.summon_next),
+                (gr1.autohide_toggle, gr2.autohide_toggle),
+                (gr1.shell_prev, gr2.shell_prev),
+                (gr1.crt_curvature_handle, gr2.crt_curvature_handle),
+                (gr1.caret_color_b_track, gr2.caret_color_b_track),
+            ] {
+                assert!((b.x - 2.0 * a.x).abs() < 1e-2, "geom x not 2× at tab {tab}");
+                assert!((b.y - 2.0 * a.y).abs() < 1e-2, "geom y not 2× at tab {tab}");
+                assert!((b.w - 2.0 * a.w).abs() < 1e-2, "geom w not 2× at tab {tab}");
+            }
+        }
+    }
+
+    #[test]
+    fn effects_viewport_clamped_to_surface() {
+        // Effects tab on a surface far SHORTER than the panel needs (a tiling WM
+        // forcing a small tile): the scissor rect must stay within the surface or
+        // be skipped, never exceeding it (which would panic wgpu validation).
+        for (w, h) in [(600u32, 400u32), (300, 200), (420, 120), (1000, 700)] {
+            let pv = panel_scaled(w, h, CHAR_W_FALLBACK, 4);
+            if let Some([vx, vy, vw, vh]) = pv.effects_viewport {
+                assert!(vx + vw <= w, "scissor right {} > surface {w}", vx + vw);
+                assert!(vy + vh <= h, "scissor bottom {} > surface {h}", vy + vh);
+            }
+        }
     }
 
     /// The visible (on-screen) rects for the active tab — drops any rect pushed
@@ -1876,6 +2079,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn each_tab_bands_stack_without_overlap_and_fit() {
         // For each tab, the visible bands run strictly top-down with no overlap and
         // every band fits within the panel rect. We pick one representative rect per

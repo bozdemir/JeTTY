@@ -69,10 +69,19 @@ done
 [ -f "$src/assets/jetty.desktop" ] && install -Dm644 "$src/assets/jetty.desktop" "$PREFIX/share/applications/jetty.desktop"
 
 # Absolute Exec= so the launcher entry works even when $PREFIX/bin is off the
-# session PATH (common for ~/.local installs without PATH update).
+# session PATH (common for ~/.local installs without PATH update). The path is
+# quoted/escaped per the Desktop Entry spec (double-quoted; \ " ` $ escaped;
+# % doubled to %%) — matching the app's autostart Exec — so a $PREFIX with a
+# space or reserved char yields a working launcher instead of a silent no-op.
 desktop="$PREFIX/share/applications/jetty.desktop"
 if [ -f "$desktop" ]; then
-  sed -i.bak "s|^Exec=jetty|Exec=$PREFIX/bin/jetty|" "$desktop" 2>/dev/null && rm -f "$desktop.bak"
+  esc="$(printf '%s' "$PREFIX/bin/jetty" \
+    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/`/\\`/g' -e 's/\$/\\$/g' -e 's/%/%%/g')"
+  # Rewrite via awk (ENVIRON, no escape processing) so reserved chars in the
+  # replacement never corrupt a sed program/replacement.
+  NEWEXEC="Exec=\"$esc\"" awk \
+    '/^Exec=jetty/ { print ENVIRON["NEWEXEC"] substr($0, length("Exec=jetty") + 1); next } { print }' \
+    "$desktop" > "$desktop.tmp" && mv "$desktop.tmp" "$desktop"
 fi
 
 gtk-update-icon-cache "$PREFIX/share/icons/hicolor" >/dev/null 2>&1 || true

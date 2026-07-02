@@ -208,6 +208,23 @@ const STATUS_H: f32 = 22.0;
 /// width + a few px of breathing room.
 const SCROLLBAR_GUTTER: f32 = jetty_render::SCROLLBAR_W + 4.0;
 
+/// Maximum bytes of PTY output fed into one tab's terminal per drain pass. Under
+/// an output flood (`yes`, `cat huge.log`) the PTY reader thread enqueues data
+/// far faster than the VT parser consumes it; draining the channel to empty in
+/// one go would never return to the winit loop (no redraws, no keyboard — the
+/// user could not even Ctrl+C the flood, and the backlog grows unbounded). The
+/// drain stops after this many bytes; the reader queued one Wake per chunk, so
+/// the next Wake continues where this left off while input events interleave.
+const PTY_DRAIN_BUDGET: usize = 2 * 1024 * 1024;
+
+/// Wrap period (seconds) for the CRT animation phase before it is narrowed to
+/// f32. The three sub-effects all use INTEGER angular frequencies (roll 6,
+/// flicker 50, jitter 80 & 13 rad/s — see `crt.rs`), so every whole multiple of
+/// TAU is a seamless wrap point. Wrapping keeps the value small so f32's 24-bit
+/// mantissa never coarsens the animation step after long uptime (an un-wrapped
+/// `elapsed().as_secs_f32()` degrades into visible stutter after ~1.5 days).
+const CRT_PHASE_WRAP: f64 = std::f64::consts::TAU;
+
 /// A single terminal session: its grid model, PTY, writer, and tab title. One
 /// `Tab` per visible tab. Per-tab scroll/selection live inside `terminal`.
 pub(crate) struct Tab {
@@ -849,8 +866,15 @@ impl App {
             // avoids the costly whole-system probe at startup.
             perf_sys: sysinfo::System::new(),
             perf_pid: sysinfo::get_current_pid().unwrap_or(sysinfo::Pid::from(0)),
-            // Force the first CPU refresh to run on the first HUD frame.
-            last_cpu_at: std::time::Instant::now() - std::time::Duration::from_secs(2),
+            // Force the first CPU refresh to run on the first HUD frame. Use
+            // checked_sub: within ~2s of boot the monotonic clock can be < 2s,
+            // and the plain `Instant - Duration` panics on underflow (an app
+            // launched at login on a fast-booting system would crash before the
+            // first window). Falling back to `now` just defers the first refresh
+            // by ≤1s — harmless.
+            last_cpu_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(2))
+                .unwrap_or_else(std::time::Instant::now),
             perf_cpu: 0.0,
             vt_bytes: 0,
             vt_bytes_at_window_start: 0,
@@ -1204,6 +1228,9 @@ impl App {
         if !crate::detached::can_detach(self.tabs.len()) {
             return; // keep at least one tab in the main window
         }
+        // Original active index, kept so the detach can be fully unwound if the
+        // detached window's GPU/window init fails (see the Err arm below).
+        let prev_active = self.active;
         let Some(mut tab) = crate::detached::take_tab(&mut self.tabs, idx) else {
             return;
         };
@@ -1252,8 +1279,11 @@ impl App {
         // Focused(true), so set this now, before the window is created.
         self.switching_to_detached = true;
 
-        // Build the detached window with the same font settings as the main window.
-        let mut dw = crate::detached::DetachedWindow::new(
+        // Build the detached window with the same font settings as the main
+        // window. On GPU/window init failure the constructor hands the tab back
+        // intact: re-insert it where it came from, restore the active index, and
+        // abort the detach — never panic (which would SIGKILL every shell).
+        let mut dw = match crate::detached::DetachedWindow::new(
             event_loop,
             tab,
             w_logical,
@@ -1262,7 +1292,19 @@ impl App {
             self.ui_font_logical,
             &self.font_family,
             &self.ui_font_family,
-        );
+        ) {
+            Ok(dw) => dw,
+            Err(tab) => {
+                let at = idx.min(self.tabs.len());
+                self.tabs.insert(at, tab);
+                self.active = prev_active.min(self.tabs.len().saturating_sub(1));
+                self.switching_to_detached = false;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                return;
+            }
+        };
 
         // Drag-out placement: put the new window's top-left at the release
         // cursor's global position, clamped so it stays on the monitor. When no
@@ -1270,11 +1312,33 @@ impl App {
         // set_outer_position is a no-op (accepted degradation, no DE code).
         if let Some((gx, gy)) = drop_global {
             let ws = dw.window.outer_size();
-            let (x, y) = match dw
+            // Pick the monitor that actually CONTAINS the release point, not the
+            // freshly-created window's default monitor (usually the primary) —
+            // otherwise a drop on a secondary monitor clamps back onto the
+            // primary. Fall back to the nearest monitor by centre distance, then
+            // to current_monitor().
+            let target = dw
                 .window
-                .current_monitor()
-                .or_else(|| dw.window.available_monitors().next())
-            {
+                .available_monitors()
+                .find(|m| {
+                    let p = m.position();
+                    let s = m.size();
+                    (gx as i32) >= p.x
+                        && (gx as i32) < p.x + s.width as i32
+                        && (gy as i32) >= p.y
+                        && (gy as i32) < p.y + s.height as i32
+                })
+                .or_else(|| {
+                    dw.window.available_monitors().min_by_key(|m| {
+                        let p = m.position();
+                        let s = m.size();
+                        let cx = p.x as i64 + s.width as i64 / 2;
+                        let cy = p.y as i64 + s.height as i64 / 2;
+                        (gx as i64 - cx).pow(2) + (gy as i64 - cy).pow(2)
+                    })
+                })
+                .or_else(|| dw.window.current_monitor());
+            let (x, y) = match target {
                 Some(mon) => {
                     let mp = mon.position();
                     let ms = mon.size();
@@ -1669,13 +1733,38 @@ impl App {
         let bracketed = tab.terminal.bracketed_paste();
         let w = &mut tab.writer;
         if bracketed {
+            // Strip any embedded end-paste marker (ESC[201~) from the payload so
+            // pasted content can never terminate the bracketed-paste guard early
+            // and inject the remainder as typed commands (the classic paste
+            // injection; xterm/iTerm2/alacritty all do this).
+            let clean = Self::strip_paste_end(text.as_bytes());
             let _ = w.write_all(b"\x1b[200~");
-        }
-        let _ = w.write_all(text.as_bytes());
-        if bracketed {
+            let _ = w.write_all(&clean);
             let _ = w.write_all(b"\x1b[201~");
+        } else {
+            let _ = w.write_all(text.as_bytes());
         }
         let _ = w.flush();
+    }
+
+    /// Remove every embedded bracketed-paste END marker (`ESC[201~`) from
+    /// `bytes`. Borrows unchanged when the marker is absent (the common case),
+    /// so a normal paste pays no allocation. Checks the OUTPUT tail after each
+    /// byte so a marker cannot re-form across a removed one (e.g. the crafted
+    /// `ESC[2` + `ESC[201~` + `01~`).
+    fn strip_paste_end(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+        const END: &[u8] = b"\x1b[201~";
+        if bytes.len() < END.len() || !bytes.windows(END.len()).any(|w| w == END) {
+            return std::borrow::Cow::Borrowed(bytes);
+        }
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            out.push(b);
+            if out.ends_with(END) {
+                out.truncate(out.len() - END.len());
+            }
+        }
+        std::borrow::Cow::Owned(out)
     }
 
     /// Encode a mouse event and write it to the PTY. Used only when the running
@@ -1739,10 +1828,20 @@ impl App {
     /// handler's detached-window loop, so both paths drain identically.
     fn drain_one_tab(tab: &mut Tab, vt_read: &mut u64) -> bool {
         let mut had = false;
-        while let Ok(chunk) = tab.pty.output().try_recv() {
-            *vt_read += chunk.len() as u64;
-            tab.terminal.feed(&chunk);
-            had = true;
+        // Feed at most PTY_DRAIN_BUDGET bytes this pass so a flood can't starve
+        // the event loop (see the const's doc). Any remaining chunks are drained
+        // by the Wakes the reader already queued for them.
+        let mut fed = 0usize;
+        while fed < PTY_DRAIN_BUDGET {
+            match tab.pty.output().try_recv() {
+                Ok(chunk) => {
+                    *vt_read += chunk.len() as u64;
+                    fed += chunk.len();
+                    tab.terminal.feed(&chunk);
+                    had = true;
+                }
+                Err(_) => break,
+            }
         }
         // Flush any query replies (DSR/DA, etc.) this tab produced back to its
         // own PTY so the shell's startup probes succeed.
@@ -2090,7 +2189,7 @@ impl App {
                         // (mirrors pending_dock_frames) or the saved spot is lost.
                         match self.last_pos {
                             Some(pos) => {
-                                let _ = win.set_outer_position(pos);
+                                win.set_outer_position(pos);
                                 self.pending_center_pos = Some(pos);
                                 self.pending_center_frames = 5;
                             }
@@ -2134,6 +2233,12 @@ impl App {
                 self.summon_anim = None;
                 self.summon_pending = false;
                 win.set_visible(false);
+                // The matching button-release never arrives once hidden — clear
+                // the terminal drag state so it doesn't resume stuck on the next
+                // summon (mirrors autohide_main_window; the F9/IPC hide path
+                // reaches here too).
+                self.selecting = false;
+                self.dragging_scrollbar = false;
             }
         }
     }
@@ -2153,11 +2258,20 @@ impl App {
             return;
         }
 
-        let window = jetty_platform::build_fixed_window(
+        let window = match jetty_platform::build_fixed_window(
             event_loop,
             "JeTTY — Settings",
             (SETTINGS_WIN_W, SETTINGS_WIN_H),
-        );
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                // Window creation can fail at runtime (X resource/fd exhaustion,
+                // compositor restart). Abort opening Settings instead of killing
+                // the whole app; the terminal keeps running.
+                eprintln!("jetty: failed to open settings window: {e}");
+                return;
+            }
+        };
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
         let gpu = GpuContext::new(window.clone(), size.width, size.height);
@@ -2501,7 +2615,6 @@ impl App {
                     // Ctrl+Shift+D in a detached window reattaches its tab.
                     input::KeyAction::DetachTab => {
                         self.reattach_tab(pos);
-                        return;
                     }
                     // Scrollback paging on THIS window's own terminal (plain
                     // PageUp/Down on the primary screen, Shift+PageUp/Down
@@ -2703,11 +2816,16 @@ impl App {
                                 if is_double {
                                     dw.window.set_maximized(!dw.window.is_maximized());
                                     dw.last_bar_click = None;
-                                } else if dw.window.outer_position().is_ok() {
+                                } else if let Ok(op) = dw.window.outer_position() {
                                     // Manual drag: record the press offset; the
                                     // CursorMoved arm moves the window and the
-                                    // Released arm checks drop-to-reattach.
+                                    // Released arm checks drop-to-reattach. Also
+                                    // record the GLOBAL press point so the release
+                                    // only counts as a reattach after real
+                                    // movement (a plain click just raises).
                                     dw.bar_drag = Some(dw.cursor);
+                                    dw.bar_drag_start =
+                                        Some((op.x as f64 + dw.cursor.0, op.y as f64 + dw.cursor.1));
                                 } else {
                                     // Wayland: no readable outer position — fall
                                     // back to the compositor drag. Drop-to-reattach
@@ -2758,13 +2876,31 @@ impl App {
                 // MAIN window's tab-bar strip, reattach; otherwise it was a move.
                 let drop_global = {
                     let Some(dw) = self.detached.get_mut(pos) else { return };
+                    let start = dw.bar_drag_start.take();
                     if dw.bar_drag.take().is_none() {
                         return;
                     }
-                    dw.window
+                    let global = dw
+                        .window
                         .outer_position()
                         .ok()
-                        .map(|o| (o.x as f64 + dw.cursor.0, o.y as f64 + dw.cursor.1))
+                        .map(|o| (o.x as f64 + dw.cursor.0, o.y as f64 + dw.cursor.1));
+                    // Require real movement (>5px, matching the double-click slop)
+                    // before a release counts as drop-to-reattach; a sub-threshold
+                    // press/release is a plain click that must not tear the tab
+                    // down — critical when the detached bar overlaps the main
+                    // window's tab-bar band.
+                    match (global, start) {
+                        (Some(g), Some(s)) => {
+                            let moved = ((g.0 - s.0).powi(2) + (g.1 - s.1).powi(2)).sqrt();
+                            if moved > 5.0 {
+                                Some(g)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => global,
+                    }
                 };
                 if let Some((gx, gy)) = drop_global {
                     if self.visible {
@@ -2844,11 +2980,87 @@ impl App {
                 // resumes stuck (same discipline as the main window's auto-hide).
                 if let Some(dw) = self.detached.get_mut(pos) {
                     dw.bar_drag = None;
+                    dw.bar_drag_start = None;
                     dw.menu_open = None;
                     dw.menu_hover = None;
                     dw.menu_rects.clear();
                     dw.last_bar_click = None;
                 }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Wheel scrolling in a detached window (the main window handles
+                // this at the sibling arm). Accumulate fractional deltas exactly
+                // like the main window, then either forward wheel mouse reports
+                // (mouse-mode app, not over the scrollbar) or scroll THIS
+                // window's own scrollback.
+                let delta_lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y * 3.0,
+                    MouseScrollDelta::PixelDelta(p) => {
+                        const CELL_H: f64 = 20.0;
+                        (p.y / CELL_H) as f32
+                    }
+                };
+                let lines = self.scroll_accum.add(delta_lines);
+                if lines == 0 {
+                    return;
+                }
+                let status_h = self.status_h();
+                let Some(dw) = self.detached.get_mut(pos) else { return };
+                let (w, h) = (dw.gpu.config.width, dw.gpu.config.height);
+                // Wheeling over the scrollbar always scrolls the host scrollback
+                // even in mouse-mode apps (mirrors the main window).
+                let over_scrollbar = {
+                    let rows = dw.tab.terminal.rows();
+                    let off = dw.tab.terminal.scroll_offset();
+                    let max = dw.tab.terminal.scroll_max();
+                    jetty_render::scrollbar_rect_geom(rows, off, max, w, h, TABBAR_H, status_h, [0, 0, 0, 0])
+                        .map(|r| {
+                            let cx = dw.cursor.0 as f32;
+                            cx >= r.x && cx <= r.x + r.w
+                        })
+                        .unwrap_or(false)
+                };
+                if dw.tab.terminal.mouse_mode() && !over_scrollbar {
+                    let event = if lines > 0 {
+                        input::MouseEvent::WheelUp
+                    } else {
+                        input::MouseEvent::WheelDown
+                    };
+                    let notches = ((lines.abs() + 2) / 3).clamp(1, 8);
+                    let (cw, ch) = dw.text.cell_size();
+                    if cw > 0.0 && ch > 0.0 {
+                        let cols = dw.tab.terminal.cols().saturating_sub(1);
+                        let rows = dw.tab.terminal.rows().saturating_sub(1);
+                        let col = ((dw.cursor.0 as f32 / cw).floor() as i64).clamp(0, cols as i64) as usize;
+                        let gy = (dw.cursor.1 as f32 - TABBAR_H).max(0.0);
+                        let row = ((gy / ch).floor() as i64).clamp(0, rows as i64) as usize;
+                        let sgr = dw.tab.terminal.mouse_sgr();
+                        for _ in 0..notches {
+                            let bytes = input::encode_mouse(event, col, row, sgr);
+                            let _ = dw.tab.writer.write_all(&bytes);
+                        }
+                        let _ = dw.tab.writer.flush();
+                    }
+                } else {
+                    dw.tab.terminal.scroll_lines(lines);
+                    dw.window.request_redraw();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // Moved to a different-DPI monitor: re-scale the fonts in place
+                // (no fontconfig rescan) and arm the debounced reflow — the
+                // surface resize + grid reflow follow in the Resized event
+                // (mirrors the main window's arm). Without this a detached window
+                // keeps its creation-time physical font size and mis-scales.
+                let scale = scale_factor as f32;
+                let font_logical = self.font_logical;
+                let ui_font_logical = self.ui_font_logical;
+                let Some(dw) = self.detached.get_mut(pos) else { return };
+                dw.text.set_font_size(font_logical * scale);
+                dw.chrome_text.set_font_size(ui_font_logical * scale);
+                dw.reflow_pending_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(120));
+                dw.window.request_redraw();
             }
             _ => {}
         }
@@ -2870,16 +3082,12 @@ impl App {
         // Drain this tab's PTY output into its terminal before snapshotting.
         // Detached tabs are no longer in `self.tabs`, so the main `drain_pty`
         // loop never sees them — without this the detached grid would stay
-        // frozen at whatever it looked like the instant it was detached.
-        // Mirrors the per-tab body of `drain_pty`.
-        while let Ok(chunk) = dw.tab.pty.output().try_recv() {
-            dw.tab.terminal.feed(&chunk);
-        }
-        let replies = dw.tab.terminal.drain_pty_writes();
-        if !replies.is_empty() {
-            let _ = dw.tab.writer.write_all(&replies);
-            let _ = dw.tab.writer.flush();
-        }
+        // frozen at whatever it looked like the instant it was detached. Uses
+        // the shared, byte-budgeted `drain_one_tab` (same flood protection as
+        // the main window); any capped remainder is drained by the Wakes the
+        // reader queued, which re-request this window's redraw.
+        let mut vt_read: u64 = 0;
+        Self::drain_one_tab(&mut dw.tab, &mut vt_read);
 
         // Snapshot + theme + chrome inputs are read before the mutable
         // gpu/text/quad borrow below (same pattern as the main RedrawRequested).
@@ -2897,7 +3105,7 @@ impl App {
         // SAME settings the main window renders with (visual parity).
         let corner_radius = self.corner_radius;
         let fx = self.fx.clone();
-        let crt_time = self.crt_clock.elapsed().as_secs_f32();
+        let crt_time = (self.crt_clock.elapsed().as_secs_f64() % CRT_PHASE_WRAP) as f32;
         let crt_anim_live = fx.crt_anim_live();
 
         let Some(dw) = self.detached.get_mut(pos) else { return };
@@ -3795,7 +4003,11 @@ impl ApplicationHandler<AppEvent> for App {
             })
         });
 
-        let window = jetty_platform::build_window(event_loop, "JeTTY", (1000, 640));
+        // Startup: a failure to create the main window is genuinely fatal (there
+        // is nothing to fall back to), so surface it as a clean panic here — the
+        // runtime detach/settings call sites handle their `Err` gracefully.
+        let window = jetty_platform::build_window(event_loop, "JeTTY", (1000, 640))
+            .expect("create_window failed");
         // Allow IME on the terminal window (winit disables it by default):
         // without this, CJK/complex input methods can never commit text and
         // dead-key composition is degraded. Commits arrive as
@@ -4012,14 +4224,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // Forward summon-key-pressed events to the winit loop. Keeps `manager`
                 // alive for the program lifetime (this loop never returns).
                 let rx = global_hotkey::GlobalHotKeyEvent::receiver();
-                loop {
-                    match rx.recv() {
-                        Ok(ev) => {
-                            if ev.state == global_hotkey::HotKeyState::Pressed {
-                                let _ = proxy_hotkey.send_event(AppEvent::ToggleVisibility);
-                            }
-                        }
-                        Err(_) => break,
+                while let Ok(ev) = rx.recv() {
+                    if ev.state == global_hotkey::HotKeyState::Pressed {
+                        let _ = proxy_hotkey.send_event(AppEvent::ToggleVisibility);
                     }
                 }
                 drop(manager);
@@ -4119,6 +4326,16 @@ impl ApplicationHandler<AppEvent> for App {
         // reattach are added in later tasks.
         if let Some(pos) = self.detached.iter().position(|d| d.window.id() == id) {
             self.handle_detached_event(pos, event_loop, event);
+            return;
+        }
+        // Anything not addressed to a live child window is meant for the main
+        // window — but only if the id actually matches it. Events still queued
+        // for a window just dropped this pump (settings closed, a detached
+        // window removed after its shell exited, a reattach) would otherwise be
+        // handled AS IF they targeted the main terminal (a stale CloseRequested
+        // popping the quit dialog, a stale Focused(false) scheduling an
+        // auto-hide of the focused terminal). Drop them.
+        if self.window.as_ref().map(|w| w.id()) != Some(id) {
             return;
         }
         match event {
@@ -4243,7 +4460,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // otherwise dismiss a fast (None/Bayer) summon as it appears.
                     && self
                         .summon_settle_until
-                        .map_or(true, |d| std::time::Instant::now() >= d)
+                        .is_none_or(|d| std::time::Instant::now() >= d)
                     && !to_settings
                     && !to_detached
                 {
@@ -5023,7 +5240,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some((px, py)) = grab_press {
                     let moved = ((self.cursor.0 - px).powi(2) + (self.cursor.1 - py).powi(2)).sqrt();
                     let now = std::time::Instant::now();
-                    let off_cooldown = self.shift_hint_cooldown.map_or(true, |t| now >= t);
+                    let off_cooldown = self.shift_hint_cooldown.is_none_or(|t| now >= t);
                     if moved > 8.0 && off_cooldown {
                         self.shift_hint_until = Some(now + std::time::Duration::from_millis(3500));
                         self.shift_hint_cooldown = Some(now + std::time::Duration::from_secs(25));
@@ -5034,7 +5251,39 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Middle, .. } => {
-                // Middle-click: paste from clipboard (same as right-click).
+                // Middle-click paste (X11 primary-selection idiom). Unlike the
+                // Left arm this used to skip every gate, so it pasted into a
+                // shell hidden behind a modal popup and over the tab bar. Honor
+                // the same modal/hit checks:
+                //  - any modal open (slide/confirm/help/menus) → swallow;
+                //  - only paste over the terminal grid, never the chrome strips;
+                //  - when the app grabbed the mouse (mouse_mode) and Shift is not
+                //    held, the button belongs to the app — do NOT inject a paste.
+                if self.slide_anim.is_some()
+                    || self.confirm_quit
+                    || self.confirm_close.is_some()
+                    || self.help_open
+                    || self.context_menu.is_some()
+                    || self.tab_menu.is_some()
+                    || self.tabs.is_empty()
+                {
+                    return;
+                }
+                let height = self.gpu.as_ref().map(|g| g.config.height as f32);
+                let Some(height) = height else { return };
+                let cy = self.cursor.1 as f32;
+                let grid_top = self.grid_top_offset();
+                let grid_bottom = if self.tab_bar_bottom {
+                    self.tabbar_y(height)
+                } else {
+                    height - self.status_h()
+                };
+                if cy < grid_top || cy >= grid_bottom {
+                    return;
+                }
+                if self.active_tab().terminal.mouse_mode() && !self.modifiers.shift_key() {
+                    return;
+                }
                 if let Some(text) = clipboard::get() {
                     self.paste_text(&text);
                 }
@@ -5107,6 +5356,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // Tab during an Alt+Tab switch). Those keys were never typed at
                 // this window — ignore them so no garbage reaches the PTY.
                 if is_synthetic {
+                    return;
+                }
+                // The last tab's shell can exit mid-pump (close_exited_tabs
+                // emptied self.tabs and called event_loop.exit()), yet winit
+                // still delivers queued key events this iteration. active_tab()
+                // and self.tabs[self.active] would panic on an empty vec — bail
+                // (mirrors the Ime::Commit / RedrawRequested guards).
+                if self.tabs.is_empty() {
                     return;
                 }
                 // --- Quit confirmation popup captures Enter / Esc (highest priority) ---
@@ -5248,7 +5505,7 @@ impl ApplicationHandler<AppEvent> for App {
                     event.text.as_ref().and_then(|t| {
                         if !t.is_empty()
                             && t.chars().all(|c| !c.is_control())
-                            && t.chars().any(|c| !c.is_ascii())
+                            && !t.is_ascii()
                         {
                             Some(t.as_bytes().to_vec())
                         } else {
@@ -5268,7 +5525,7 @@ impl ApplicationHandler<AppEvent> for App {
                 );
                 let action = match composed.or(dead_key) {
                     Some(bytes) => input::KeyAction::Send(bytes),
-                    None => input::decide_key(ctrl, shift, alt, event.physical_key.clone(), &event.logical_key, false, app_cursor, alt_screen),
+                    None => input::decide_key(ctrl, shift, alt, event.physical_key, &event.logical_key, false, app_cursor, alt_screen),
                 };
                 if self.debug {
                     let action_name = match &action {
@@ -5435,28 +5692,47 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 // IME commit (CJK input methods, dead-key composition routed
-                // through the IME): send the composed text to the PTY as TYPED
-                // text — no bracketed-paste wrapping. Preedit is not rendered
-                // (Commit-only IME support); Enabled/Preedit/Disabled are
-                // intentionally ignored below.
-                if !text.is_empty() && !self.tabs.is_empty() {
-                    if self.welcome_open {
-                        self.welcome_open = false;
-                    }
-                    // Same discipline as the Send arm: jump to the live bottom
-                    // so the user sees their input.
-                    self.active_tab_mut().terminal.scroll_to_bottom();
-                    let w = &mut self.tabs[self.active].writer;
-                    let _ = w.write_all(text.as_bytes());
-                    let _ = w.flush();
-                    if (self.fx.caret_flash_enabled || self.fx.caret_glow_enabled)
-                        && is_printable_keystroke(text.as_bytes())
-                    {
-                        self.caret_anim = Some(std::time::Instant::now());
+                // through the IME). It must honor the SAME modal priority chain
+                // as KeyboardInput, or composed text leaks into the shell behind
+                // a rename box / confirm popup (CJK users could not type non-ASCII
+                // tab names at all). Preedit is not rendered (Commit-only IME
+                // support); Enabled/Preedit/Disabled are intentionally ignored.
+                if text.is_empty() || self.tabs.is_empty() {
+                    return;
+                }
+                // Inline tab rename captures the commit into the title buffer
+                // (mirrors the renaming arm of KeyboardInput).
+                if self.renaming.is_some() {
+                    for ch in text.chars() {
+                        if !ch.is_control() {
+                            self.rename_buf.push(ch);
+                        }
                     }
                     if let Some(win) = &self.window {
                         win.request_redraw();
                     }
+                    return;
+                }
+                // Quit / close-tab confirmation popups are modal — drop it.
+                if self.confirm_quit || self.confirm_close.is_some() {
+                    return;
+                }
+                if self.welcome_open {
+                    self.welcome_open = false;
+                }
+                // Same discipline as the Send arm: jump to the live bottom
+                // so the user sees their input.
+                self.active_tab_mut().terminal.scroll_to_bottom();
+                let w = &mut self.tabs[self.active].writer;
+                let _ = w.write_all(text.as_bytes());
+                let _ = w.flush();
+                if (self.fx.caret_flash_enabled || self.fx.caret_glow_enabled)
+                    && is_printable_keystroke(text.as_bytes())
+                {
+                    self.caret_anim = Some(std::time::Instant::now());
+                }
+                if let Some(win) = &self.window {
+                    win.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -5480,7 +5756,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.pending_center_frames > 0 && self.window_mode == WindowMode::Center {
                     self.pending_center_frames -= 1;
                     if let (Some(win), Some(pos)) = (&self.window, self.pending_center_pos) {
-                        let _ = win.set_outer_position(pos);
+                        win.set_outer_position(pos);
                         if self.pending_center_frames > 0 {
                             win.request_redraw();
                         }
@@ -5551,7 +5827,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let welcome_open = self.welcome_open;
                 let shift_hint_show = self
                     .shift_hint_until
-                    .map_or(false, |t| std::time::Instant::now() < t);
+                    .is_some_and(|t| std::time::Instant::now() < t);
                 // Backend name for the welcome overlay (captured before the mutable
                 // gpu borrow; falls back to "?" when gpu is not yet available).
                 let gpu_backend_name: String = self
@@ -5605,7 +5881,7 @@ impl ApplicationHandler<AppEvent> for App {
                         let stale = self
                             .offscreen
                             .as_ref()
-                            .map_or(true, |(t, _)| t.width() != gw || t.height() != gh);
+                            .is_none_or(|(t, _)| t.width() != gw || t.height() != gh);
                         if stale {
                             if let Some(g) = &self.gpu {
                                 self.offscreen = Some(Self::make_offscreen(g));
@@ -5844,8 +6120,15 @@ impl ApplicationHandler<AppEvent> for App {
                         let pill_w = tw + pad * 2.0;
                         let pill_h = 26.0;
                         let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
-                        let pill_y =
-                            (height as f32 - status_h - 14.0 - pill_h).max(0.0) + slide_y_offset;
+                        // Sit the pill above the bottom-mode tab bar too, not just
+                        // the status strip, or it draws over the tab titles.
+                        let pill_y = (height as f32
+                            - status_h
+                            - if tab_bar_bottom { TABBAR_H } else { 0.0 }
+                            - 14.0
+                            - pill_h)
+                            .max(0.0)
+                            + slide_y_offset;
                         let c = theme.cursor;
                         let pill = jetty_render::Rect::rounded(
                             pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
@@ -5881,11 +6164,12 @@ impl ApplicationHandler<AppEvent> for App {
                         // Clip the splash to the grid area so it never draws over a
                         // bottom tab bar (e.g. on a very short window): drop swatch
                         // quads / label rows below the grid bottom and trim a quad
-                        // that straddles the edge.
+                        // that straddles the edge. The status strip is always
+                        // reserved; the tab bar only in bottom mode.
                         let grid_bottom = if tab_bar_bottom {
-                            (height as f32 - TABBAR_H).max(0.0)
+                            (height as f32 - TABBAR_H - status_h).max(0.0)
                         } else {
-                            height as f32
+                            (height as f32 - status_h).max(0.0)
                         };
                         splash.quads.retain(|q| q.y < grid_bottom);
                         for q in &mut splash.quads {
@@ -6144,7 +6428,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // sub-effect is on. Idle CPU returns to ~0 once all have cleared.
                     let hint_live = self
                         .shift_hint_until
-                        .map_or(false, |t| std::time::Instant::now() < t);
+                        .is_some_and(|t| std::time::Instant::now() < t);
                     // CRT animation self-drive: keep painting ONLY while CRT is on
                     // AND at least one of roll/flicker/jitter is toggled on. Static
                     // CRT (enabled, all three off) does NOT match here, so it stays
@@ -6220,7 +6504,8 @@ impl ApplicationHandler<AppEvent> for App {
                                     // output is identical to the static look (each
                                     // animated term collapses to its static value),
                                     // so static CRT is byte-identical here.
-                                    time: self.crt_clock.elapsed().as_secs_f32(),
+                                    time: (self.crt_clock.elapsed().as_secs_f64()
+                                        % CRT_PHASE_WRAP) as f32,
                                     flags: (if self.fx.crt_animate_roll {
                                         jetty_render::CRT_FLAG_ROLL
                                     } else {
@@ -6769,5 +7054,45 @@ mod printable_keystroke_tests {
     #[test]
     fn ctrl_c_is_not_printable() {
         assert!(!is_printable_keystroke(b"\x03"));
+    }
+}
+
+#[cfg(test)]
+mod paste_sanitize_tests {
+    use super::App;
+
+    #[test]
+    fn plain_text_borrows_unchanged() {
+        let s = "echo hello\nworld\t!";
+        let out = App::strip_paste_end(s.as_bytes());
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&*out, s.as_bytes());
+    }
+
+    #[test]
+    fn embedded_end_marker_is_removed() {
+        // The classic injection: an ESC[201~ in the payload would otherwise
+        // terminate the bracketed-paste guard and run the rest as commands.
+        let out = App::strip_paste_end(b"a\x1b[201~rm -rf ~\n");
+        assert_eq!(&*out, b"arm -rf ~\n");
+        assert!(!contains(&out, b"\x1b[201~"));
+    }
+
+    #[test]
+    fn reformed_marker_across_removal_is_defeated() {
+        // Crafted so a naive single-pass removal would re-form ESC[201~ by
+        // concatenating the surrounding bytes.
+        let out = App::strip_paste_end(b"\x1b[2\x1b[201~01~");
+        assert!(!contains(&out, b"\x1b[201~"));
+    }
+
+    #[test]
+    fn multiple_markers_all_removed() {
+        let out = App::strip_paste_end(b"\x1b[201~x\x1b[201~y\x1b[201~");
+        assert_eq!(&*out, b"xy");
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
     }
 }

@@ -42,7 +42,10 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let te = 1.0 - pow(1.0 - t, 3.0);              // cubic-out ring radius
     let ring_r = te * 0.75;
     let dr = dist - ring_r;
-    let envelope = exp(-pow(dr / 0.08, 2.0));        // only the wavefront ring is active
+    // Square manually: `dr` is negative inside the ring and pow(x, 2.0) is
+    // spec-indeterminate (→ NaN on some drivers) for a negative base.
+    let e = dr / 0.08;
+    let envelope = exp(-e * e);                      // only the wavefront ring is active
     let amp = 0.025 * pow(1.0 - t, 2.0);             // decays to 0 at t=1
     // Guard the center pixel: normalize(vec2(0,0)) is NaN, which would corrupt
     // the exact-center fragment. Fall back to a zero direction there.
@@ -218,8 +221,14 @@ impl LiquidDrop {
                 label: Some("liquid-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: dst_view,
+                    // REPLACE + fullscreen triangle overwrites every pixel, so Clear
+                    // (not Load) is identical output while sparing tile-based GPUs a
+                    // full-surface load each animation frame.
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,

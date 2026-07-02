@@ -64,6 +64,7 @@ pub fn tearing(cursor_y: f32, bar_y: f32, bar_h: f32, threshold: f32) -> bool {
 /// when `tab_bar_bottom` — just above the status strip at the bottom (the same
 /// band `App::tabbar_y` computes). `main_x/main_y` is the main window's outer
 /// position; `main_w/main_h` its physical surface size.
+#[allow(clippy::too_many_arguments)]
 pub fn main_tabbar_contains(
     gx: f64,
     gy: f64,
@@ -205,6 +206,13 @@ pub(crate) struct DetachedWindow {
     /// ours (needed for drop-to-reattach). `None` when not dragging (including
     /// the Wayland `drag_window()` fallback, where the compositor owns the drag).
     pub bar_drag: Option<(f64, f64)>,
+    /// GLOBAL cursor position (physical px) at the top-bar press that armed
+    /// `bar_drag`. Drop-to-reattach requires the release to have moved more than
+    /// a few px from here — a sub-threshold press/release is a plain click (raise
+    /// the window), NOT a tear-out. Without this, a plain click on a detached
+    /// title bar that overlaps the main window's tab-bar band would reattach the
+    /// tab. `None` when no bar drag is in progress.
+    pub bar_drag_start: Option<(f64, f64)>,
     /// Cached resize-edge zone so `set_cursor` fires only on zone changes
     /// (mirrors `App::resize_cursor` for the borderless main window).
     pub resize_zone: crate::app::ResizeZone,
@@ -234,6 +242,17 @@ impl DetachedWindow {
     /// `ui_font_family` the chrome family (`""` = platform sans, same as
     /// `App::ui_font_family`). Both sizes are scaled by the new window's
     /// `scale_factor` before being passed to `TextLayer`, matching `App::resumed`.
+    ///
+    /// Returns `Err(tab)` — handing the `Tab` back intact — when the OS window
+    /// or the GPU context cannot be created at runtime (both fail for real,
+    /// non-fatal reasons: X resource exhaustion, no adapter that can present
+    /// this surface, a `request_device` hiccup). The caller re-inserts the tab
+    /// and aborts the detach instead of the whole app aborting and SIGKILLing
+    /// every shell.
+    // The Err payload is the whole `Tab`, deliberately handed back for
+    // re-insertion; this init runs once per detach, never on a hot path.
+    #[allow(clippy::result_large_err)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         event_loop: &ActiveEventLoop,
         tab: Tab,
@@ -243,13 +262,19 @@ impl DetachedWindow {
         ui_font_logical: f32,
         font_family: &str,
         ui_font_family: &str,
-    ) -> Self {
+    ) -> Result<Self, Tab> {
         // Title the OS window from the tab (mirrors how the tab bar displays it).
-        let window = jetty_platform::build_window(
+        let window = match jetty_platform::build_window(
             event_loop,
             &tab.title,
             (w_logical, h_logical),
-        );
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("jetty: failed to create detached window: {e}");
+                return Err(tab);
+            }
+        };
         // Allow IME so CJK/dead-key commits reach this window's PTY too
         // (mirrors the main terminal window; commits are handled in
         // `handle_detached_event`'s `Ime::Commit` arm).
@@ -259,9 +284,15 @@ impl DetachedWindow {
         let scale = window.scale_factor() as f32;
 
         // GPU context — identical call to App::resumed (`app.rs` ~2722) and
-        // `toggle_settings_window` (`app.rs` ~1800).
-        let gpu = GpuContext::new(window.clone(), size.width, size.height)
-            .expect("DetachedWindow: GPU init failed — no suitable adapter");
+        // `toggle_settings_window` (`app.rs` ~1800). Failure hands the tab back
+        // (the main + settings windows handle the same None gracefully).
+        let gpu = match GpuContext::new(window.clone(), size.width, size.height) {
+            Some(g) => g,
+            None => {
+                eprintln!("jetty: detached window GPU init failed — no suitable adapter");
+                return Err(tab);
+            }
+        };
 
         // Terminal content layer — mirrors `TextLayer::new_with_family` used in
         // `App::resumed` (`app.rs` ~2728): terminal font at logical × scale_factor.
@@ -313,7 +344,7 @@ impl DetachedWindow {
         window.focus_window();
         window.request_redraw();
 
-        Self {
+        Ok(Self {
             window,
             gpu,
             text,
@@ -327,13 +358,14 @@ impl DetachedWindow {
             tab,
             cursor: (0.0, 0.0),
             bar_drag: None,
+            bar_drag_start: None,
             resize_zone: crate::app::ResizeZone::None,
             menu_open: None,
             menu_rects: Vec::new(),
             menu_hover: None,
             close_hover: false,
             last_bar_click: None,
-        }
+        })
     }
 }
 

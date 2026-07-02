@@ -89,12 +89,11 @@ pub fn decide_key(
     }
 
     // Rule 2: Escape → close panel if open, otherwise forward ESC byte.
-    if matches!(logical, Key::Named(NamedKey::Escape)) {
-        if panel_open {
+    if matches!(logical, Key::Named(NamedKey::Escape))
+        && panel_open {
             return KeyAction::ClosePanel;
         }
         // Fall through: key_to_bytes(Escape) will produce Send(vec![0x1b]).
-    }
 
     // Rules 3-5 + panel toggle: Ctrl+Shift hotkeys keyed by PHYSICAL key, which
     // is layout-independent. Ctrl+Shift+O toggles the Settings panel and works on
@@ -149,6 +148,15 @@ pub fn decide_key(
     // * Plain PageUp/Down on the PRIMARY screen → host scrollback, as before.
     if let Key::Named(page @ (NamedKey::PageUp | NamedKey::PageDown)) = logical {
         let up = *page == NamedKey::PageUp;
+        // Ctrl/Alt+PageUp/Down → xterm modified tilde form (`\e[5;m~` / `\e[6;m~`)
+        // so apps see the modifier (vim :tabnext on Ctrl+PageDown, tmux
+        // `bind -n C-PgUp`, less/htop) — on BOTH screens. Plain and Shift+Page keep
+        // host scrollback (Shift being the standard escape hatch).
+        if ctrl || alt {
+            let n = if up { 5 } else { 6 };
+            let m = 1 + (shift as u8) + ((alt as u8) << 1) + ((ctrl as u8) << 2);
+            return KeyAction::Send(format!("\x1b[{n};{m}~").into_bytes());
+        }
         if !shift && alt_screen {
             return KeyAction::Send(if up {
                 b"\x1b[5~".to_vec()
@@ -176,12 +184,16 @@ pub fn decide_key(
         }
     }
 
-    // Ctrl+<letter> → control byte (Ctrl+C = 0x03 SIGINT, Ctrl+D = EOF, Ctrl+Z,
-    // Ctrl+L clear, ...). Also the remaining "C0" symbol combos: Ctrl+Space = NUL
-    // (0x00), Ctrl+[ = ESC (0x1b), Ctrl+\ = FS (0x1c), Ctrl+] = GS (0x1d). Keyed by
-    // PHYSICAL position so it is layout-independent. Must come before the plain
-    // key_to_bytes fallback, which would otherwise send the literal character
-    // instead of the control code.
+    // Ctrl+<letter/symbol> → control byte (Ctrl+C = 0x03 SIGINT, Ctrl+D = EOF,
+    // Ctrl+Z, Ctrl+L clear, ...). Must come before the plain key_to_bytes
+    // fallback, which would otherwise send the literal character.
+    //
+    // Keyed on the LOGICAL character, not the physical position: physical codes
+    // are hardware QWERTY positions, so keying letters on them sends the wrong
+    // control code on Dvorak/AZERTY/QWERTZ — Ctrl at the key LABELED C must be
+    // 0x03, not TAB. Fall back to the physical position (ctrl_byte) only when the
+    // logical key is non-ASCII (Cyrillic/Greek/CJK) or Unidentified; ctrl_byte
+    // also owns the C0 symbol combos Ctrl+Space/[/\/] (NUL/ESC/FS/GS).
     //
     // Applies REGARDLESS of shift: Ctrl+Shift+C == Ctrl+C for control purposes
     // (both → 0x03). The explicit Ctrl+Shift app shortcuts (O/T/Equal/Minus) are
@@ -190,22 +202,35 @@ pub fn decide_key(
     // When Alt/Meta is also held, the control byte is ESC-prefixed (the classic
     // "Meta sends Escape" convention), e.g. Ctrl+Alt+b → ESC + 0x02.
     //
-    // Ctrl+/ and Ctrl+_ → 0x1f (US: unit separator — readline/emacs undo).
-    // Keyed on the LOGICAL character, not the physical position: physical Slash
-    // produces "-" on e.g. German layouts (which must keep falling through to
-    // the literal "-"), and "_" reaches here only on layouts where it is not
-    // Ctrl+Shift+Minus (that chord is intercepted above as OpacityDown).
+    // Symbol control bytes are keyed on the logical character too: "/"|"_" → 0x1f
+    // (US unit separator — readline/emacs undo), "@" → 0x00 (NUL), "^" → 0x1e (RS),
+    // "?" → 0x7f (DEL). Physical Slash produces "-" on German layouts (which must
+    // keep falling through to the literal "-"), and "_" reaches here only when it
+    // is not Ctrl+Shift+Minus (that chord is intercepted above as OpacityDown).
     if ctrl {
-        if let Key::Character(s) = logical {
-            if matches!(s.as_str(), "/" | "_") {
-                if alt {
-                    return KeyAction::Send(vec![0x1b, 0x1f]);
+        let logical_byte = match logical {
+            Key::Character(s) if s.chars().count() == 1 => {
+                let c = s.chars().next().unwrap();
+                if c.is_ascii_alphabetic() {
+                    Some(c.to_ascii_uppercase() as u8 - b'A' + 1)
+                } else {
+                    match c {
+                        '/' | '_' => Some(0x1f),
+                        '@' => Some(0x00),
+                        '^' => Some(0x1e),
+                        '?' => Some(0x7f),
+                        _ => None,
+                    }
                 }
-                return KeyAction::Send(vec![0x1f]);
             }
+            _ => None,
+        };
+        if let Some(b) = logical_byte {
+            if alt {
+                return KeyAction::Send(vec![0x1b, b]);
+            }
+            return KeyAction::Send(vec![b]);
         }
-    }
-    if ctrl {
         if let PhysicalKey::Code(code) = physical {
             if let Some(b) = ctrl_byte(code) {
                 if alt {
@@ -214,6 +239,15 @@ pub fn decide_key(
                 return KeyAction::Send(vec![b]);
             }
         }
+    }
+
+    // Ctrl+Backspace → 0x08 (BS), distinct from plain / Alt Backspace (0x7f) so
+    // editors can bind delete-word-backward. ESC-prefixed when Alt is also held.
+    if ctrl && matches!(logical, Key::Named(NamedKey::Backspace)) {
+        if alt {
+            return KeyAction::Send(vec![0x1b, 0x08]);
+        }
+        return KeyAction::Send(vec![0x08]);
     }
 
     // Modified arrows + back-tab. When any of Ctrl/Shift/Alt is held with an arrow,
@@ -241,6 +275,12 @@ pub fn decide_key(
         // `\e[3;<mod>~`). Without these, Shift+Home (select-to-line-start) and
         // Ctrl+Delete (delete-word-forward) collapsed to the plain sequences and
         // apps could not see the modifiers at all.
+        // Shift+Insert (no Ctrl/Alt) is the universal terminal paste chord,
+        // handled by the host — never forwarded as `\e[2;2~`. Ctrl/Alt+Insert keep
+        // the modified tilde form below.
+        if shift && !ctrl && !alt && matches!(logical, Key::Named(NamedKey::Insert)) {
+            return KeyAction::Paste;
+        }
         let m = 1 + (shift as u8) + ((alt as u8) << 1) + ((ctrl as u8) << 2);
         match logical {
             Key::Named(NamedKey::Home) => {
@@ -256,6 +296,34 @@ pub fn decide_key(
                 return KeyAction::Send(format!("\x1b[3;{m}~").into_bytes());
             }
             _ => {}
+        }
+        // Modified function keys: F1–F4 use the CSI-1 letter form (`\e[1;{m}P..S`),
+        // F5–F12 the CSI tilde form (`\e[{n};{m}~`). Without these any modified
+        // F-key collapses to the unmodified sequence (Shift+F5 → plain `\e[15~`),
+        // and Alt+F-key would get a double-ESC from the Meta fallback below.
+        let fkey_final = match logical {
+            Key::Named(NamedKey::F1) => Some('P'),
+            Key::Named(NamedKey::F2) => Some('Q'),
+            Key::Named(NamedKey::F3) => Some('R'),
+            Key::Named(NamedKey::F4) => Some('S'),
+            _ => None,
+        };
+        if let Some(fin) = fkey_final {
+            return KeyAction::Send(format!("\x1b[1;{m}{fin}").into_bytes());
+        }
+        let fkey_num = match logical {
+            Key::Named(NamedKey::F5) => Some(15),
+            Key::Named(NamedKey::F6) => Some(17),
+            Key::Named(NamedKey::F7) => Some(18),
+            Key::Named(NamedKey::F8) => Some(19),
+            Key::Named(NamedKey::F9) => Some(20),
+            Key::Named(NamedKey::F10) => Some(21),
+            Key::Named(NamedKey::F11) => Some(23),
+            Key::Named(NamedKey::F12) => Some(24),
+            _ => None,
+        };
+        if let Some(n) = fkey_num {
+            return KeyAction::Send(format!("\x1b[{n};{m}~").into_bytes());
         }
         if shift && !ctrl && !alt && matches!(logical, Key::Named(NamedKey::Tab)) {
             return KeyAction::Send(b"\x1b[Z".to_vec());
@@ -1495,13 +1563,13 @@ mod tests {
         let pv = ui_panel();
         let g = &pv.geom;
         // Row 0 maps to SetUiFont(offset+0) = SetUiFont(0) (the System Sans row).
-        let r0 = g.ui_font_rows[0].clone();
+        let r0 = g.ui_font_rows[0];
         assert_eq!(
             decide_mouse_press(Some(g), None, r0.x + 4.0, r0.y + r0.h / 2.0),
             MouseAction::SetUiFont(g.ui_font_scroll_offset),
         );
         // Row 2 maps to SetUiFont(offset+2).
-        let r2 = g.ui_font_rows[2].clone();
+        let r2 = g.ui_font_rows[2];
         assert_eq!(
             decide_mouse_press(Some(g), None, r2.x + 4.0, r2.y + r2.h / 2.0),
             MouseAction::SetUiFont(g.ui_font_scroll_offset + 2),

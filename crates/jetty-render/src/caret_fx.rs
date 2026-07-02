@@ -223,11 +223,11 @@ impl CaretFx {
     /// rounded corners — an additive pass after the mask would put nonzero RGB
     /// into alpha=0 corner pixels, which PreMultiplied compositors display):
     /// - CRT ON:    `scene_view` (the offscreen) — the CRT pass then processes
-    ///              and rounds corners. Glow gets full CRT treatment.
+    ///   and rounds corners. Glow gets full CRT treatment.
     /// - CRT OFF:   `scene_view` (== surface view) — the corner mask runs
-    ///              after this pass and clips the glow to the window shape.
+    ///   after this pass and clips the glow to the window shape.
     /// - Tier-B:    `scene_view` (== offscreen) — the Tier-B effect resamples
-    ///              it; glow is displaced/blurred like the rest of the scene.
+    ///   it; glow is displaced/blurred like the rest of the scene.
     pub fn apply(
         &self,
         device: &wgpu::Device,

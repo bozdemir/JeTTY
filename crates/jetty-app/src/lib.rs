@@ -9,25 +9,57 @@ use winit::event_loop::{ControlFlow, EventLoop};
 
 /// Unix-socket path used for single-instance IPC. Any running primary Jetty
 /// instance listens here; secondary invocations (including `jetty --toggle`)
-/// connect and send a toggle message, then exit immediately.
+/// connect and send a summon message, then exit immediately.
 ///
-/// When `XDG_RUNTIME_DIR` is set (the normal case on systemd/logind systems),
-/// that directory is already per-user, so a plain `jetty.sock` name is fine.
-/// When it is unset, we fall back to `/tmp` but UID-namespace the filename via
-/// `$USER` so two users can't collide or hijack each other's socket.
+/// The socket lives inside a per-user, non-world-writable directory (see
+/// [`ipc_runtime_dir`]) so no other local user can pre-bind our path — which
+/// would silently swallow every summon (a DoS) and leak our commands — or squat
+/// the lock. We never place the socket directly in world-writable `/tmp`.
 fn ipc_socket_path() -> String {
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return format!("{runtime_dir}/jetty.sock");
+    ipc_runtime_dir()
+        .join("jetty.sock")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// A per-user, non-world-writable directory to hold the IPC socket + lock.
+///
+/// `$XDG_RUNTIME_DIR` is a per-user 0700 tmpfs on logind systems and the ideal
+/// home for a Unix socket. When it is unset (always on macOS, common on minimal
+/// Linux) we must NOT fall back to bare `/tmp`: it is world-writable, so another
+/// local user could pre-bind our (otherwise predictable) socket path or squat
+/// the lock. Instead we use a private `jetty` subdir of the user's cache dir
+/// (under `$HOME`, already per-user), and only as a last resort a 0700 subdir of
+/// the system temp dir. Because the socket then lives in a directory only we can
+/// traverse, any socket found there is ours by construction — that directory
+/// permission authenticates the peer, standing in for an explicit uid check
+/// (which would need a libc dependency this crate does not carry).
+fn ipc_runtime_dir() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !dir.is_empty() {
+            return std::path::PathBuf::from(dir);
+        }
     }
-    // XDG_RUNTIME_DIR unset: namespace by $USER (or fall back to the raw UID
-    // read from /proc/self/loginuid so the name is still unique per user even
-    // without a $USER env var, and without requiring any libc dependency).
-    let user_tag = std::env::var("USER").unwrap_or_else(|_| {
-        std::fs::read_to_string("/proc/self/loginuid")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "unknown".to_string())
-    });
-    format!("/tmp/jetty-{user_tag}.sock")
+
+    // Private per-user dir under the cache directory (~/.cache on Linux,
+    // ~/Library/Caches on macOS): inside $HOME, so not world-writable.
+    if let Some(cache) = dirs::cache_dir() {
+        let dir = cache.join("jetty");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            return dir;
+        }
+    }
+
+    // Last resort (no runtime dir and no cache/home): a 0700 subdir of the
+    // system temp dir. Tighten perms so it is at least not world-writable.
+    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+    let dir = std::env::temp_dir().join(format!("jetty-{user}"));
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    dir
 }
 
 /// Outcome of an IPC connect attempt.
@@ -106,6 +138,20 @@ fn try_acquire_primary_lock(lock_path: &str) -> Option<std::fs::File> {
     }
 }
 
+/// Unlink `path` only if it is still the exact socket inode we bound (`ident` =
+/// its dev+ino at bind time). Prevents deleting a socket a DIFFERENT primary
+/// rebound at the same path, and is a no-op when this process never bound
+/// (`ident` is `None`, e.g. the lock-timeout degraded path).
+fn remove_socket_if_ours(path: &str, ident: Option<(u64, u64)>) {
+    use std::os::unix::fs::MetadataExt;
+    let Some((dev, ino)) = ident else { return };
+    if let Ok(m) = std::fs::metadata(path) {
+        if (m.dev(), m.ino()) == (dev, ino) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 pub fn run() {
     // CLI: --version/--help print and exit; --toggle/--show/--hide select the
     // summon command forwarded to a running instance. The compositor-bound
@@ -114,13 +160,16 @@ pub fn run() {
     let version = env!("CARGO_PKG_VERSION");
     let build = option_env!("JETTY_BUILD").unwrap_or("dev");
     let mut cmd = "toggle";
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            "--version" | "-version" | "-V" | "version" => {
+    // args_os + to_str: std::env::args() panics on non-UTF8 argv; a bad byte in
+    // an unknown arg should be ignored like any other unrecognized flag, not
+    // abort the process before any window or IPC handling.
+    for arg in std::env::args_os().skip(1) {
+        match arg.to_str() {
+            Some("--version") | Some("-version") | Some("-V") | Some("version") => {
                 println!("jetty {version} ({build})");
                 std::process::exit(0);
             }
-            "--help" | "-help" | "-h" | "help" => {
+            Some("--help") | Some("-help") | Some("-h") | Some("help") => {
                 println!(
                     "JeTTY {version} — a blazing-fast GPU terminal with a global summon hotkey.\n\n\
                      USAGE:\n    jetty [FLAGS]\n\n\
@@ -135,9 +184,9 @@ pub fn run() {
                 );
                 std::process::exit(0);
             }
-            "--toggle" => cmd = "toggle",
-            "--show" => cmd = "show",
-            "--hide" => cmd = "hide",
+            Some("--toggle") => cmd = "toggle",
+            Some("--show") => cmd = "show",
+            Some("--hide") => cmd = "hide",
             _ => {}
         }
     }
@@ -202,6 +251,13 @@ pub fn run() {
     let listener: Option<std::os::unix::net::UnixListener> =
         match std::os::unix::net::UnixListener::bind(&sock_path) {
             Ok(l) => {
+                // Restrict the socket to the owner (defense in depth; the
+                // enclosing directory is already 0700).
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &sock_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
                 eprintln!("jetty: IPC socket bound at {sock_path}");
                 Some(l)
             }
@@ -210,6 +266,15 @@ pub fn run() {
                 None
             }
         };
+    // Identify the socket inode we just bound so cleanup only ever unlinks OUR
+    // socket — never one a different primary rebound at the same path (e.g.
+    // after a tmp cleaner aged ours out and we ran degraded without binding).
+    let bound_ident: Option<(u64, u64)> = if listener.is_some() {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&sock_path).ok().map(|m| (m.dev(), m.ino()))
+    } else {
+        None
+    };
     // Hold the primary lock for the process lifetime (released by the kernel
     // on exit). Leaking the File keeps the descriptor — and the lock — alive.
     std::mem::forget(lock_file);
@@ -225,21 +290,28 @@ pub fn run() {
         let proxy_ipc = proxy.clone();
         let sock_cleanup = sock_path.clone();
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                if let Ok(mut s) = stream {
-                    let mut buf = [0u8; 16];
-                    let n = std::io::Read::read(&mut s, &mut buf).unwrap_or(0);
-                    let event = match &buf[..n] {
-                        b"show" => AppEvent::SetVisible(true),
-                        b"hide" => AppEvent::SetVisible(false),
-                        _ => AppEvent::ToggleVisibility,
-                    };
-                    if proxy_ipc.send_event(event).is_err() {
-                        break;
-                    }
+            for mut s in listener.incoming().flatten() {
+                // Bound the read so an idle/half-open client (e.g. `nc -U`)
+                // can't wedge this serial accept loop and silently kill
+                // summon IPC.
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(250)));
+                let mut buf = [0u8; 16];
+                let n = std::io::Read::read(&mut s, &mut buf).unwrap_or(0);
+                if n == 0 {
+                    // Zero-byte connect or read timeout: never toggle.
+                    continue;
+                }
+                let event = match &buf[..n] {
+                    b"show" => AppEvent::SetVisible(true),
+                    b"hide" => AppEvent::SetVisible(false),
+                    b"toggle" => AppEvent::ToggleVisibility,
+                    _ => continue, // unknown command: no-op, don't toggle
+                };
+                if proxy_ipc.send_event(event).is_err() {
+                    break;
                 }
             }
-            let _ = std::fs::remove_file(&sock_cleanup);
+            remove_socket_if_ours(&sock_cleanup, bound_ident);
         });
     }
 
@@ -247,8 +319,9 @@ pub fn run() {
     event_loop.run_app(&mut app).expect("run_app");
 
     // Best-effort cleanup on normal exit. Crashes are handled by the
-    // remove-stale-on-bind logic at the start of the next launch.
-    let _ = std::fs::remove_file(&sock_path);
+    // remove-stale-on-bind logic at the start of the next launch. Only unlink
+    // the socket if it is still the one WE bound.
+    remove_socket_if_ours(&sock_path, bound_ident);
 }
 
 #[cfg(test)]

@@ -722,7 +722,7 @@ fn nav_editing_keys_send_xterm_sequences() {
         (NamedKey::Insert, b"\x1b[2~"),
     ];
     for (k, want) in cases {
-        let a = decide_key(false, false, false, phys(KeyCode::Home), &named(k.clone()), false, false, false);
+        let a = decide_key(false, false, false, phys(KeyCode::Home), &named(*k), false, false, false);
         assert_eq!(a, send(want), "key {:?}", k);
     }
 }
@@ -736,7 +736,7 @@ fn function_keys_send_xterm_sequences() {
         (NamedKey::F12, b"\x1b[24~"),
     ];
     for (k, want) in cases {
-        let a = decide_key(false, false, false, phys(KeyCode::F1), &named(k.clone()), false, false, false);
+        let a = decide_key(false, false, false, phys(KeyCode::F1), &named(*k), false, false, false);
         assert_eq!(a, send(want), "key {:?}", k);
     }
 }
@@ -929,4 +929,85 @@ fn effects_widgets_inactive_on_look_tab() {
     let action = decide_mouse_press(Some(&g), None, 400.0, 400.0);
     // A click at (400,400) on tab 0 (Look) should NOT be a ToggleCrt.
     assert_ne!(action, MouseAction::ToggleCrt);
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard/VT encoding fixes (input group)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ctrl_letter_keyed_on_logical_char_not_physical() {
+    // Dvorak: the key that TYPES 'c' sits at physical KeyI. Ctrl+that must send
+    // 0x03 (SIGINT), keyed on the LOGICAL char, not the physical QWERTY position
+    // (which would wrongly send 0x09 TAB).
+    let a = decide_key(true, false, false, phys(KeyCode::KeyI), &Key::Character("c".into()), false, false, false);
+    assert_eq!(a, send(&[3]));
+    // Unidentified physical + logical letter still yields the control byte.
+    let b = decide_key(
+        true, false, false,
+        PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified),
+        &Key::Character("z".into()),
+        false, false, false,
+    );
+    assert_eq!(b, send(&[26]));
+}
+
+#[test]
+fn ctrl_caret_at_question_send_c0_bytes() {
+    // Ctrl+Shift+6 (logical "^") → 0x1e RS (vim Ctrl+^ alternate-file toggle).
+    let caret = decide_key(true, true, false, phys(KeyCode::Digit6), &Key::Character("^".into()), false, false, false);
+    assert_eq!(caret, send(&[0x1e]));
+    // Ctrl+Shift+2 (logical "@") → 0x00 NUL.
+    let at = decide_key(true, true, false, phys(KeyCode::Digit2), &Key::Character("@".into()), false, false, false);
+    assert_eq!(at, send(&[0x00]));
+    // Ctrl+Shift+/ (logical "?") → 0x7f DEL.
+    let q = decide_key(true, true, false, phys(KeyCode::Slash), &Key::Character("?".into()), false, false, false);
+    assert_eq!(q, send(&[0x7f]));
+}
+
+#[test]
+fn modified_page_keys_send_xterm_tilde_form() {
+    // Ctrl+PageDown → `\e[6;5~` (vim :tabnext, tmux C-PgDn) — even on the primary
+    // screen (no longer hijacked into host scroll).
+    let ctrl_pgdn = decide_key(true, false, false, phys(KeyCode::PageDown), &named(NamedKey::PageDown), false, false, false);
+    assert_eq!(ctrl_pgdn, send(b"\x1b[6;5~"));
+    // Alt+PageUp → `\e[5;3~`.
+    let alt_pgup = decide_key(false, false, true, phys(KeyCode::PageUp), &named(NamedKey::PageUp), false, false, false);
+    assert_eq!(alt_pgup, send(b"\x1b[5;3~"));
+    // On the alt screen too: Ctrl+PageUp → `\e[5;5~`, not the plain `\e[5~`.
+    let ctrl_pgup_alt = decide_key(true, false, false, phys(KeyCode::PageUp), &named(NamedKey::PageUp), false, false, true);
+    assert_eq!(ctrl_pgup_alt, send(b"\x1b[5;5~"));
+}
+
+#[test]
+fn shift_insert_pastes_ctrl_alt_insert_keep_tilde() {
+    // Shift+Insert is the universal terminal paste chord — handled by the host.
+    let a = decide_key(false, true, false, phys(KeyCode::Insert), &named(NamedKey::Insert), false, false, false);
+    assert_eq!(a, KeyAction::Paste);
+    // Ctrl+Insert keeps the modified tilde form (mod = 5).
+    let ctrl_ins = decide_key(true, false, false, phys(KeyCode::Insert), &named(NamedKey::Insert), false, false, false);
+    assert_eq!(ctrl_ins, send(b"\x1b[2;5~"));
+}
+
+#[test]
+fn ctrl_backspace_sends_bs_not_del() {
+    let ctrl_bs = decide_key(true, false, false, phys(KeyCode::Backspace), &named(NamedKey::Backspace), false, false, false);
+    assert_eq!(ctrl_bs, send(&[0x08]));
+    // Plain Backspace stays 0x7f (unchanged).
+    let plain = decide_key(false, false, false, phys(KeyCode::Backspace), &named(NamedKey::Backspace), false, false, false);
+    assert_eq!(plain, send(&[0x7f]));
+}
+
+#[test]
+fn modified_function_keys_carry_modifier() {
+    // Shift+F5 → `\e[15;2~`, Ctrl+F1 → `\e[1;5P`, Alt+F4 → `\e[1;3S`.
+    let shift_f5 = decide_key(false, true, false, phys(KeyCode::F5), &named(NamedKey::F5), false, false, false);
+    assert_eq!(shift_f5, send(b"\x1b[15;2~"));
+    let ctrl_f1 = decide_key(true, false, false, phys(KeyCode::F1), &named(NamedKey::F1), false, false, false);
+    assert_eq!(ctrl_f1, send(b"\x1b[1;5P"));
+    let alt_f4 = decide_key(false, false, true, phys(KeyCode::F4), &named(NamedKey::F4), false, false, false);
+    assert_eq!(alt_f4, send(b"\x1b[1;3S"));
+    // Plain (unmodified) F-keys keep their original sequences.
+    let plain_f5 = decide_key(false, false, false, phys(KeyCode::F5), &named(NamedKey::F5), false, false, false);
+    assert_eq!(plain_f5, send(b"\x1b[15~"));
 }

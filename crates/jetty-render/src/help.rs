@@ -96,10 +96,26 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme, cha
         .unwrap_or(0) as f32;
     let content_w = longest_chars * char_w;
 
+    // The vertical / padding metrics are FIXED logical px, but the chrome line box
+    // is `ceil(font_size * 1.3)` with `font_size = ui_font_logical * scale`, so it
+    // grows with DPI just like `char_w` does. Scale every vertical metric (ideals
+    // AND floors) by the same factor the text uses — `char_w` relative to the
+    // ~9.8px scale-1 advance — so rows never overlap their neighbour on a 2×
+    // display. At scale 1 (`char_w ≈ 9.8`) `vscale == 1` and the layout is
+    // unchanged.
+    let vscale = (char_w / 9.8).max(0.1);
+    let pad_ideal = PAD_IDEAL * vscale;
+    let title_h_ideal = TITLE_H_IDEAL * vscale;
+    let row_h_ideal = ROW_H_IDEAL * vscale;
+    let pad_min_v = PAD_MIN_V * vscale;
+    let title_h_min = TITLE_H_MIN * vscale;
+    let row_h_min = ROW_H_MIN * vscale;
+    let min_pad = MIN_PAD * vscale;
+
     let rows = HELP_ROWS.len() as f32;
     // Ideal content height; if it exceeds the window, scale the vertical metrics
     // down by a single factor (clamped so each metric keeps its readable floor).
-    let ideal_h = PAD_IDEAL + TITLE_H_IDEAL + rows * ROW_H_IDEAL + PAD_IDEAL;
+    let ideal_h = pad_ideal + title_h_ideal + rows * row_h_ideal + pad_ideal;
     let avail_h = sh.max(0.0);
     let scale = if ideal_h > avail_h && ideal_h > 0.0 {
         (avail_h / ideal_h).clamp(0.0, 1.0)
@@ -107,12 +123,19 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme, cha
         1.0
     };
     // Apply the scale, then enforce per-metric floors so text stays legible.
-    let pad_v = (PAD_IDEAL * scale).max(PAD_MIN_V);
-    let title_h = (TITLE_H_IDEAL * scale).max(TITLE_H_MIN);
-    let row_h = (ROW_H_IDEAL * scale).max(ROW_H_MIN);
+    let pad_v = (pad_ideal * scale).max(pad_min_v);
+    let title_h = (title_h_ideal * scale).max(title_h_min);
+    let mut row_h = (row_h_ideal * scale).max(row_h_min);
+    // Last resort: on a window too short even for the floored metrics, shrink the
+    // row pitch BELOW its readable floor so every row still lands inside the
+    // clamped panel rather than being drawn off the window bottom (the floors
+    // alone can total more than a very short window's height).
+    if 2.0 * pad_v + title_h + rows * row_h > avail_h && rows > 0.0 {
+        row_h = ((avail_h - 2.0 * pad_v - title_h) / rows).clamp(1.0, row_h);
+    }
     // Recompute the actual height from the (possibly floored) metrics, then clamp
     // to the window so the panel can never exceed it.
-    let panel_h = (pad_v + title_h + rows * row_h + pad_v).min(avail_h.max(0.0));
+    let panel_h = (2.0 * pad_v + title_h + rows * row_h).min(avail_h.max(0.0));
     // `PAD` is the vertical text padding (top inset for the title).
     let pad_top = pad_v;
 
@@ -124,13 +147,13 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme, cha
     // clamped to x>=0), never clipping a row.
     const MARGIN: f32 = 16.0;
     let max_panel_w = (sw - MARGIN * 2.0).max(0.0);
-    let min_panel_w = content_w + MIN_PAD * 2.0;
-    let ideal_w = content_w + PAD_IDEAL * 2.0;
+    let min_panel_w = content_w + min_pad * 2.0;
+    let ideal_w = content_w + pad_ideal * 2.0;
     // Prefer ideal, clamp down toward the window, but never below the hard floor.
     let panel_w = ideal_w.min(max_panel_w).max(min_panel_w);
     // Effective horizontal padding after sizing: split the leftover space, but
-    // never below MIN_PAD.
-    let pad_x = ((panel_w - content_w) / 2.0).clamp(MIN_PAD, PAD_IDEAL);
+    // never below min_pad.
+    let pad_x = ((panel_w - content_w) / 2.0).clamp(min_pad, pad_ideal);
 
     let px = ((sw - panel_w) / 2.0).max(0.0).floor();
     let py = ((sh - panel_h) / 2.0).max(0.0).floor();

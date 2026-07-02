@@ -155,8 +155,9 @@ pub fn build_tab_bar_ex(
     let mut quads: Vec<Rect> = Vec::new();
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
     let mut title_labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
-    let mut tab_rects: Vec<Rect> = Vec::new();
-    let mut close_rects: Vec<Rect> = Vec::new();
+    // Sized to the full tab count and index-aligned below (see the draw loop).
+    let mut tab_rects: Vec<Rect>;
+    let mut close_rects: Vec<Rect>;
 
     // Bar background spanning the full width.
     quads.push(Rect { x: 0.0, y: 0.0, w: sw, h, color: bg, ..Default::default() });
@@ -212,6 +213,19 @@ pub fn build_tab_bar_ex(
     let drawn = tabs.len().min(max_visible);
     let overflow = tabs.len().saturating_sub(drawn);
 
+    // Window the drawn range around the ACTIVE tab so it is ALWAYS visible — the
+    // overflow window is not fixed to the head of the list. If the active index is
+    // beyond the head window, slide the window so the active tab sits at its right
+    // edge. Hit-rects stay index-aligned with ABSOLUTE tab indices (tabs outside
+    // the window get an offscreen sentinel) because the app maps a clicked rect's
+    // position straight to a tab index.
+    let active_idx = tabs.iter().position(|(_, a)| *a).unwrap_or(0);
+    let start = if active_idx >= drawn {
+        (active_idx + 1 - drawn).min(tabs.len().saturating_sub(drawn))
+    } else {
+        0
+    };
+
     // Frameless pill geometry. The active/renaming tab is a single soft rounded
     // pill (no border, no leading marker); inactive tabs draw nothing — just their
     // dim title — so the strip reads as light, modern text-tabs rather than a row
@@ -225,8 +239,14 @@ pub fn build_tab_bar_ex(
     // box + left title pad + a little right breathing room.
     let max_chars = (((tab_w - CLOSE_W - TITLE_PAD - 8.0) / char_w).floor() as usize).max(2);
 
+    // Hit-rects are index-aligned to ABSOLUTE tab indices; off-window tabs get an
+    // offscreen sentinel (0-width, far left) so a click can never match them.
+    let offscreen = Rect { x: -1.0e6, y: 0.0, w: 0.0, h: 0.0, color: [0, 0, 0, 0], ..Default::default() };
+    tab_rects = vec![offscreen; tabs.len()];
+    close_rects = vec![offscreen; tabs.len()];
+
     let mut x = left;
-    for (i, (title, active)) in tabs.iter().take(drawn).enumerate() {
+    for (i, (title, active)) in tabs.iter().enumerate().skip(start).take(drawn) {
         let being_renamed = matches!(renaming, Some((ri, _)) if ri == i);
         let is_on = *active || being_renamed;
 
@@ -269,9 +289,9 @@ pub fn build_tab_bar_ex(
         // Close hit-box (kept while renaming so indices stay aligned). Color is
         // unused for hit-testing.
         let close_x = x + tab_w - CLOSE_W - 4.0;
-        close_rects.push(Rect { x: close_x, y: 0.0, w: CLOSE_W, h, color: [0, 0, 0, 0], ..Default::default() });
+        close_rects[i] = Rect { x: close_x, y: 0.0, w: CLOSE_W, h, color: [0, 0, 0, 0], ..Default::default() };
 
-        tab_rects.push(Rect { x, y: 0.0, w: tab_w, h, color: [0, 0, 0, 0], ..Default::default() });
+        tab_rects[i] = Rect { x, y: 0.0, w: tab_w, h, color: [0, 0, 0, 0], ..Default::default() };
         x += tab_w;
     }
 
@@ -516,6 +536,30 @@ mod tests {
         if bar.plus_rect.x + bar.plus_rect.w <= controls_left {
             assert!(bar.plus_rect.x + bar.plus_rect.w <= controls_left);
         }
+    }
+
+    #[test]
+    fn active_tab_always_drawn_even_when_overflowing() {
+        // 20 tabs can't all fit in 800px; the active tab is far past the head
+        // window. It must still be laid out on-screen, and its hit-rect must stay
+        // index-aligned with its absolute tab index.
+        let active = 15usize;
+        let tabs: Vec<(String, bool)> =
+            (0..20).map(|i| (format!("Tab {i}"), i == active)).collect();
+        let bar = build_tab_bar(800, &tabs, &theme());
+        // One hit-rect per tab (absolute-index-aligned for the click→tab mapping).
+        assert_eq!(bar.tab_rects.len(), 20);
+        let controls_left = 800.0 - STRIP_PAD - CONTROLS_W;
+        let r = bar.tab_rects[active];
+        assert!(
+            r.x >= 0.0 && r.x + r.w <= controls_left + 0.5,
+            "active tab not visible on the strip: x={} w={}",
+            r.x,
+            r.w
+        );
+        // A head tab that scrolled out of the window is parked offscreen so it
+        // can't be clicked to a wrong index.
+        assert!(bar.tab_rects[0].x < 0.0, "scrolled-out head tab should be offscreen");
     }
 
     #[test]

@@ -144,11 +144,11 @@ mod tests {
     }
 
     /// Scale-1 char advance used in tests.
-    const TEST_char_w: f32 = 9.8;
+    const TEST_CHAR_W: f32 = 9.8;
 
     #[test]
     fn popup_is_centered_and_has_buttons() {
-        let p = build_confirm_close(1000, 700, "Tab 1", &theme(), TEST_char_w);
+        let p = build_confirm_close(1000, 700, "Tab 1", &theme(), TEST_CHAR_W);
         assert!(p.panel.x >= 0.0 && p.panel.y >= 0.0);
         assert!(p.panel.x + p.panel.w <= 1000.0 + 0.5);
         // Close button sits left of Cancel.
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn long_title_is_truncated() {
         let long = "a".repeat(80);
-        let p = build_confirm_close(1000, 700, &long, &theme(), TEST_char_w);
+        let p = build_confirm_close(1000, 700, &long, &theme(), TEST_CHAR_W);
         let prompt = &p.labels[0].0;
         assert!(prompt.contains('…'), "long title should be truncated: {prompt}");
         assert!(p.panel.x + p.panel.w <= 1000.0 + 0.5);
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn generic_confirm_shows_prompt() {
-        let p = build_confirm(1000, 700, "Quit JeTTY?", &theme(), TEST_char_w);
+        let p = build_confirm(1000, 700, "Quit JeTTY?", &theme(), TEST_CHAR_W);
         assert!(p.labels.iter().any(|l| l.0.contains("Quit JeTTY?")));
     }
 }

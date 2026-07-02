@@ -13,6 +13,10 @@ pub struct GpuContext {
     /// match the chosen surface `alpha_mode` (true for PreMultiplied, false for
     /// PostMultiplied/Opaque). See `default_bg_clear`.
     pub premultiply_clear: bool,
+    /// Max 2D texture dimension the device enforces. Surface `width`/`height` are
+    /// clamped to this so `Surface::configure` never fails validation on very large
+    /// (multi-monitor) windows.
+    max_dim: u32,
 }
 
 impl GpuContext {
@@ -41,12 +45,14 @@ impl GpuContext {
         // This is the dominant cold-start win (~78ms off gpu_init on the Intel Arc).
         // If no Vulkan adapter is found (no working ICD), fall back to all backends.
         let make_instance_surface_adapter = |backends: wgpu::Backends|
-            -> Option<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
+            -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter), String> {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends,
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
-            let surface = instance.create_surface(window.clone()).ok()?;
+            let surface = instance
+                .create_surface(window.clone())
+                .map_err(|e| format!("surface creation failed: {e}"))?;
             // Default: prefer the integrated GPU (LowPower) — a terminal needs no
             // discrete power, and on hybrid X11 setups driving the dGPU via Vulkan
             // can crash the compositor. JETTY_GPU=high overrides to the discrete
@@ -55,15 +61,19 @@ impl GpuContext {
                 power_preference: power,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
-            })).ok()?;
-            Some((instance, surface, adapter))
+            })).map_err(|e| format!("no compatible adapter: {e}"))?;
+            Ok((instance, surface, adapter))
         };
+        // Vulkan is tried first; on non-Vulkan systems its failure is expected, so
+        // only the all-backends fallback's error is surfaced. That error names the
+        // step that actually failed (surface creation vs adapter request) instead of
+        // always reporting "no adapter".
         let (instance, surface, adapter) = match make_instance_surface_adapter(wgpu::Backends::VULKAN) {
-            Some(t) => t,
-            None => match make_instance_surface_adapter(wgpu::Backends::all()) {
-                Some(t) => t,
-                None => {
-                    eprintln!("jetty: GPU init failed (no adapter); running without rendering");
+            Ok(t) => t,
+            Err(_) => match make_instance_surface_adapter(wgpu::Backends::all()) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("jetty: GPU init failed ({e}); running without rendering");
                     return None;
                 }
             },
@@ -83,7 +93,12 @@ impl GpuContext {
         let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("jetty-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            // Request exactly what the adapter reports: `Limits::default()` makes
+            // `request_device` fail on downlevel adapters (GL/GLES fallback,
+            // Raspberry Pi V3D) whose limits sit below the defaults, and also caps
+            // max_texture_dimension_2d at 8192 on capable GPUs. The renderer needs
+            // nothing above the adapter's own limits.
+            required_limits: adapter.limits(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
             ..Default::default()
@@ -94,6 +109,20 @@ impl GpuContext {
                 return None;
             }
         };
+
+        // wgpu routes Surface::configure (and other) validation failures to the
+        // device error sink, which panics by default. A mismatched adapter — e.g. an
+        // iGPU that cannot present to a dGPU-driven compositor (see the JETTY_GPU
+        // note above) — would abort the process here instead of degrading. Install a
+        // non-fatal handler so such failures log and the app keeps running (with no
+        // rendering) rather than crashing.
+        device.on_uncaptured_error(Arc::new(|e: wgpu::Error| {
+            eprintln!("jetty: wgpu error: {e}");
+        }));
+
+        // Surface width/height must not exceed the device's max 2D texture
+        // dimension, or `Surface::configure` fails validation.
+        let max_dim = device.limits().max_texture_dimension_2d;
 
         let caps = surface.get_capabilities(&adapter);
         // Prefer an sRGB format; if the driver reports no formats at all (e.g. an
@@ -138,8 +167,8 @@ impl GpuContext {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: width.max(1),
-            height: height.max(1),
+            width: width.clamp(1, max_dim),
+            height: height.clamp(1, max_dim),
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode,
             view_formats: vec![],
@@ -150,13 +179,13 @@ impl GpuContext {
         // Capture the backend name for display in the Welcome overlay.
         let backend_name = format!("{:?}", adapter.get_info().backend);
 
-        Some(Self { surface, device, queue, config, format, backend_name, premultiply_clear })
+        Some(Self { surface, device, queue, config, format, backend_name, premultiply_clear, max_dim })
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
         if w > 0 && h > 0 {
-            self.config.width = w;
-            self.config.height = h;
+            self.config.width = w.min(self.max_dim);
+            self.config.height = h.min(self.max_dim);
             self.surface.configure(&self.device, &self.config);
         }
     }
@@ -184,12 +213,18 @@ impl GpuContext {
                     wgpu::CurrentSurfaceTexture::Success(t)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
                     other => {
-                        // Reconfigure did not recover the surface. Log rather than
-                        // spinning silently so the failure is observable.
-                        eprintln!(
-                            "jetty: surface lost and reconfigure did not recover it ({other:?}); \
-                             skipping frame (surface recreation not yet supported)"
-                        );
+                        // Reconfigure did not recover the surface. Log only once per
+                        // process: the caret animation drives continuous redraws, so
+                        // an every-frame log would flood stderr/journald without bound
+                        // while the surface stays lost.
+                        use std::sync::Once;
+                        static LOST_ONCE: Once = Once::new();
+                        LOST_ONCE.call_once(|| {
+                            eprintln!(
+                                "jetty: surface lost and reconfigure did not recover it ({other:?}); \
+                                 skipping frames (surface recreation not yet supported)"
+                            );
+                        });
                         return None;
                     }
                 }

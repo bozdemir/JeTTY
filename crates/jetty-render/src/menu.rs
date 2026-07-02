@@ -23,12 +23,16 @@ pub const MENU_HINTS: [&str; 5] = ["⇧⌃C", "⇧⌃V", "", "⌃L", "⇧⌃W"];
 
 // --- Layout constants ---
 //
-// MENU_W must accommodate the widest row: "Close Tab" (9 chars ≈ 88 px)
-// plus left-pad (10) plus right-pad (10) plus the hint "⇧⌃W" (3 glyphs;
-// unicode glyphs are wider than ASCII — measured ~20 px at chrome advance
-// 9.8 px/char × 1.6 scale ≈ ~22 px) plus gap between label and hint (~20 px).
-// Target ≈ 10 + 88 + 20 + 22 + 10 = 150 … add margin → 210 px.
+// Fixed minimum card width (the historical value that fits the standard menu at
+// the scale-1 chrome advance). `build_menu` uses this only as a FLOOR: the real
+// width is measured from the items with the passed `char_w` so that on HiDPI /
+// large UI fonts (where `char_w` grows) the card widens to keep the shortcut hint
+// from overlapping the label.
 const MENU_W: f32 = 210.0;
+/// Inner left/right padding of the menu card (px, logical).
+const MENU_HPAD: f32 = 10.0;
+/// Minimum gap between a label's right edge and its right-aligned hint (px).
+const MENU_LABEL_HINT_GAP: f32 = 20.0;
 const ROW_H: f32 = 28.0;
 /// Extra vertical gap inserted between "Select All" (idx 2) and "Clear"
 /// (idx 3) to house the separator line.
@@ -123,6 +127,24 @@ pub fn build_menu(
     let n_seps = sep_before.iter().filter(|&&s| s > 0 && s < n_items).count();
     let menu_h = ROW_H * n_items as f32 + SEP_GAP * n_seps as f32;
 
+    // Card width measured from the widest row so the hint never overlaps the label
+    // on HiDPI / large UI fonts (`char_w` scales with those). Each row needs
+    // left-pad + label + [gap + hint] + right-pad; hint glyphs (⇧ ⌃) render ~1.25×
+    // an ASCII cell, matching the hint layout below. Floored at MENU_W so the
+    // standard menu at the scale-1 advance is unchanged.
+    let menu_w = items
+        .iter()
+        .map(|(label, hint)| {
+            let label_w = label.chars().count() as f32 * char_w;
+            let hint_extra = if hint.is_empty() {
+                0.0
+            } else {
+                MENU_LABEL_HINT_GAP + hint.chars().count() as f32 * (char_w * 1.25)
+            };
+            2.0 * MENU_HPAD + label_w + hint_extra
+        })
+        .fold(MENU_W, f32::max);
+
     // --- Theme-derived menu colors (mirrors panel.rs::build_panel) ---
     let tbg = theme.bg;
     let tfg = theme.fg;
@@ -150,7 +172,7 @@ pub fn build_menu(
     };
 
     // Clamp so the full menu (plus border) stays on-screen.
-    let total_w = MENU_W + BORDER * 2.0;
+    let total_w = menu_w + BORDER * 2.0;
     let total_h = menu_h + BORDER * 2.0;
     let mx = x.min(sw - total_w).max(0.0);
     let my = y.min(sh - total_h).max(0.0);
@@ -167,7 +189,7 @@ pub fn build_menu(
         item_rects.push(Rect {
             x: cx,
             y: cy + row_y_in(i, sep_before),
-            w: MENU_W,
+            w: menu_w,
             h: ROW_H,
             color: row_bg,
             ..Default::default()
@@ -181,7 +203,7 @@ pub fn build_menu(
     quads.push(Rect::rounded(mx, my, total_w, total_h, border_col, 8.0));
 
     // Background panel (rounded; hover rows stay sharp inside).
-    quads.push(Rect::rounded(cx, cy, MENU_W, menu_h, menu_bg, 6.0));
+    quads.push(Rect::rounded(cx, cy, menu_w, menu_h, menu_bg, 6.0));
 
     // Hover highlight quad (drawn on top of background, under labels). The top
     // and bottom rows get the bg's corner radius so the highlight doesn't square
@@ -192,7 +214,7 @@ pub fn build_menu(
             quads.push(Rect {
                 x: cx,
                 y: cy + row_y_in(idx, sep_before),
-                w: MENU_W,
+                w: menu_w,
                 h: ROW_H,
                 color: hover_col,
                 radius,
@@ -207,7 +229,7 @@ pub fn build_menu(
         quads.push(Rect {
             x: cx + 10.0,
             y: sep_y,
-            w: MENU_W - 20.0,
+            w: menu_w - 20.0,
             h: 1.0,
             color: sep_col,
             radius: 0.0,
@@ -226,7 +248,7 @@ pub fn build_menu(
             // scales correctly on HiDPI (at scale 1, 9.8 * 1.25 ≈ 12.25 px —
             // the same as the former hardcoded 12.0 estimate).
             let hint_w = hint.chars().count() as f32 * (char_w * 1.25);
-            let hint_x = cx + MENU_W - 10.0 - hint_w;
+            let hint_x = cx + menu_w - 10.0 - hint_w;
             labels.push((hint.to_string(), hint_x, label_y, hint_col));
         }
     }
@@ -273,6 +295,24 @@ mod tests {
             top_of_3 > bottom_of_2,
             "rect[3] must start below rect[2] bottom (gap = {})",
             top_of_3 - bottom_of_2
+        );
+    }
+
+    #[test]
+    fn hint_does_not_overlap_label_on_hidpi() {
+        // At a 2× chrome advance the fixed 210px card is too narrow ("Close Tab"
+        // plus its hint would collide); the card must widen so the right-aligned
+        // hint stays clear of the label.
+        let big = 2.0 * TEST_CHAR_W;
+        let menu = build_context_menu(100.0, 100.0, 3000, 2000, None, &theme(), big);
+        let label = menu.labels.iter().find(|l| l.0 == "Close Tab").expect("label");
+        let hint = menu.labels.iter().find(|l| l.0 == "⇧⌃W").expect("hint");
+        let label_right = label.1 + "Close Tab".chars().count() as f32 * big;
+        assert!(
+            hint.1 >= label_right,
+            "hint overlaps label on HiDPI: hint_x={} label_right={}",
+            hint.1,
+            label_right
         );
     }
 

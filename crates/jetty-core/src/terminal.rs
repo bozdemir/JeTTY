@@ -5,10 +5,11 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config, Term, point_to_viewport, viewport_to_point};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Pack `cols`/`rows` into a single `u32` (cols in the high 16 bits) so the
 /// `Terminal` and its moved-away `EventProxy` can share live geometry through
@@ -33,11 +34,12 @@ struct EventProxy {
     /// so `resize()` keeps these replies current after the proxy is moved into
     /// `Term` (alacritty has no public listener setter).
     geom: Arc<AtomicU32>,
-    /// Theme snapshot used to answer OSC `ColorRequest` queries with sensible
-    /// colors. Captured at construction; runtime theme changes don't need to be
-    /// reflected here since these replies only affect the shell's capability
-    /// probing, not rendering.
-    theme: Theme,
+    /// Live theme used to answer OSC `ColorRequest` queries (OSC 10/11/12/4;n;?).
+    /// Real apps (nvim/fzf/delta/tmux) probe OSC 11 to detect a dark/light
+    /// background, so the reply must track runtime theme changes — not a copy
+    /// frozen at construction. Shared with the owning `Terminal` and updated in
+    /// place by `set_theme` (alacritty exposes no public listener setter).
+    theme: Arc<Mutex<Theme>>,
     /// Set to `true` when the terminal reports the child process (the shell)
     /// has exited (`Event::ChildExit`) or requests shutdown (`Event::Exit`).
     /// Shared with the owning `Terminal` so the app can close the window.
@@ -52,12 +54,13 @@ impl EventProxy {
     /// `NamedColor` discriminants (`Foreground = 256`, `Background = 257`,
     /// `Cursor = 258`). Anything else falls back to the default foreground.
     fn color_for_index(&self, index: usize) -> Rgb {
+        let theme = self.theme.lock().unwrap();
         let [r, g, b] = match index {
-            0..=255 => index_to_rgb(&self.theme, index as u8),
-            256 => self.theme.fg,            // NamedColor::Foreground
-            257 => [self.theme.bg[0], self.theme.bg[1], self.theme.bg[2]], // Background
-            258 => self.theme.cursor,        // NamedColor::Cursor
-            _ => self.theme.fg,
+            0..=255 => index_to_rgb(&theme, index as u8),
+            256 => theme.fg,            // NamedColor::Foreground
+            257 => [theme.bg[0], theme.bg[1], theme.bg[2]], // Background
+            258 => theme.cursor,        // NamedColor::Cursor
+            _ => theme.fg,
         };
         Rgb { r, g, b }
     }
@@ -72,15 +75,18 @@ impl EventListener for EventProxy {
             }
             // \e[14t (text area size in pixels) / \e[18t (size in cells).
             // The formatter turns a WindowSize into the proper escape reply.
-            // Cell pixel sizes are not meaningful for our renderer, so we use a
-            // small constant; the cell/col/line counts are what shells care about.
+            // We do not track the live font metrics here, but apps that use \e[14t
+            // to derive a cell aspect ratio (chafa/timg/notcurses/viu for image
+            // rendering) get vertically-squashed output from a 1x1 (square) cell.
+            // Report a typical ~1:2 monospace cell so the derived aspect is sane;
+            // the cell/col/line counts are what shells actually care about.
             Event::TextAreaSizeRequest(fmt) => {
                 let g = self.geom.load(Ordering::Relaxed);
                 let window_size = WindowSize {
                     num_lines: (g & 0xFFFF) as u16,
                     num_cols: (g >> 16) as u16,
-                    cell_width: 1,
-                    cell_height: 1,
+                    cell_width: 8,
+                    cell_height: 16,
                 };
                 let _ = self.tx.send(fmt(window_size).into_bytes());
             }
@@ -125,6 +131,10 @@ pub struct Terminal {
     cols: usize,
     rows: usize,
     theme: Theme,
+    /// The active theme shared with the `EventProxy` so OSC color-query replies
+    /// reflect runtime theme changes. Kept in lockstep with `theme` by
+    /// `set_theme` (the proxy holds the other `Arc` clone).
+    theme_shared: Arc<Mutex<Theme>>,
     /// Receives the terminal's write-back bytes (replies to host queries).
     pty_write_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     /// Set to `true` once the shell child process exits; shared with the
@@ -153,7 +163,9 @@ impl Terminal {
         // Apply opacity override from JETTY_OPACITY (float 0.0..1.0).
         // This multiplies into the theme bg alpha, enabling composited transparency.
         if let Ok(op_str) = std::env::var("JETTY_OPACITY") {
-            if let Ok(opacity) = op_str.parse::<f32>() {
+            // Reject NaN (which parses fine but survives clamp() and yields a fully
+            // transparent, invisible window); mirrors the config.rs NaN guard.
+            if let Some(opacity) = op_str.parse::<f32>().ok().filter(|v| v.is_finite()) {
                 // Clamp to a VISIBLE floor (0.1), matching the app/settings path —
                 // a literal JETTY_OPACITY=0 would otherwise load a fully transparent
                 // (invisible) window that reads as a launch failure.
@@ -167,15 +179,16 @@ impl Terminal {
         // dimensions into the u16 that WindowSize expects.
         let child_exited = Arc::new(AtomicBool::new(false));
         let geom = Arc::new(AtomicU32::new(pack_geom(cols, rows)));
+        let theme_shared = Arc::new(Mutex::new(theme.clone()));
         let proxy = EventProxy {
             tx,
             geom: Arc::clone(&geom),
-            theme: theme.clone(),
+            theme: Arc::clone(&theme_shared),
             child_exited: Arc::clone(&child_exited),
         };
         let term = Term::new(config, &size, proxy);
 
-        Terminal { term, parser: Processor::new(), cols, rows, theme, pty_write_rx, child_exited, geom }
+        Terminal { term, parser: Processor::new(), cols, rows, theme, theme_shared, pty_write_rx, child_exited, geom }
     }
 
     /// Drain all currently-pending write-back byte chunks emitted by the
@@ -190,8 +203,11 @@ impl Terminal {
         out
     }
 
-    /// Replace the active theme at runtime.
+    /// Replace the active theme at runtime. Also refreshes the copy shared with
+    /// the `EventProxy` so subsequent OSC 10/11/12/4 color-query replies reflect
+    /// the new theme (e.g. so nvim/fzf detect the right background).
     pub fn set_theme(&mut self, theme: Theme) {
+        *self.theme_shared.lock().unwrap() = theme.clone();
         self.theme = theme;
     }
 
@@ -208,6 +224,10 @@ impl Terminal {
         let mut cells = vec![CellSnapshot::default(); self.cols * self.rows];
         let content = self.term.renderable_content();
         let display_offset = content.display_offset;
+        // Dynamic OSC 4/10/11/12 palette overrides (pywal, base16 hooks, etc.)
+        // are stored in the Term's color table; consult it so redefined colors
+        // actually change on screen, falling back to the static theme.
+        let colors = self.term.colors();
 
         // Iterate over all visible cells. Each item has point in terminal coordinates
         // (line 0 = top of current viewport when display_offset=0; negative = history).
@@ -218,8 +238,8 @@ impl Terminal {
                 let col = vp.column.0;
                 if row < self.rows && col < self.cols {
                     let cell = item.cell;
-                    let mut fg = resolve_rgb(&self.theme, cell.fg);
-                    let mut bg = resolve_rgb(&self.theme, cell.bg);
+                    let mut fg = resolve_rgb(&self.theme, colors, cell.fg);
+                    let mut bg = resolve_rgb(&self.theme, colors, cell.bg);
                     // Reverse video (`\e[7m`, also used by selections and `ls`
                     // highlights): swap fg/bg after resolving to RGB so the cell
                     // renders inverted once backgrounds are painted.
@@ -237,6 +257,14 @@ impl Terminal {
                             (fg[1] as f32 * 0.66) as u8,
                             (fg[2] as f32 * 0.66) as u8,
                         ];
+                    }
+                    // SGR 8 (conceal): the glyph must not be readable (password
+                    // echoes, secret-masking TUIs). Paint the foreground with the
+                    // cell's background so the character is invisible while its
+                    // background/layout are preserved. Done after INVERSE/DIM so it
+                    // wins over whatever ended up as fg.
+                    if cell.flags.contains(Flags::HIDDEN) {
+                        fg = bg;
                     }
                     // A double-width glyph occupies two grid cells: the WIDE_CHAR
                     // cell holds the actual char, and the following
@@ -300,6 +328,17 @@ impl Terminal {
         let scroll_offset = grid.display_offset();
         let scroll_max = grid.history_size();
 
+        // Honor OSC 11 (background) / OSC 12 (cursor) dynamic overrides, keeping
+        // the theme's background alpha; fall back to the theme when unset.
+        let bg_rgba = match colors[257] {
+            Some(rgb) => [rgb.r, rgb.g, rgb.b, self.theme.bg[3]],
+            None => self.theme.bg,
+        };
+        let cursor_rgb = match colors[258] {
+            Some(rgb) => [rgb.r, rgb.g, rgb.b],
+            None => self.theme.cursor,
+        };
+
         GridSnapshot {
             cols: self.cols,
             rows: self.rows,
@@ -307,8 +346,8 @@ impl Terminal {
             cursor_row,
             cursor_col,
             cursor_visible,
-            bg_rgba: self.theme.bg,
-            cursor_rgb: self.theme.cursor,
+            bg_rgba,
+            cursor_rgb,
             scroll_offset,
             scroll_max,
         }
@@ -529,9 +568,21 @@ fn index_to_rgb(theme: &Theme, i: u8) -> [u8; 3] {
 }
 
 /// Map an alacritty cell color to RGB using the active theme.
-/// True-color is exact; named and indexed colors resolve through the theme palette.
-fn resolve_rgb(theme: &Theme, color: alacritty_terminal::vte::ansi::Color) -> [u8; 3] {
+/// True-color is exact; named and indexed colors resolve through the theme
+/// palette, unless a dynamic OSC 4/10/11/12 override is present in `colors`
+/// (indexed by the same slot numbering as alacritty's color table), which wins.
+fn resolve_rgb(theme: &Theme, colors: &Colors, color: alacritty_terminal::vte::ansi::Color) -> [u8; 3] {
     use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    // Indexed and named colors map onto slots in the override table (Indexed(i)
+    // -> i, Named(n) -> n as usize); a Some entry is a runtime redefinition.
+    let override_slot = match color {
+        Color::Indexed(i) => Some(i as usize),
+        Color::Named(n) => Some(n as usize),
+        Color::Spec(_) => None,
+    };
+    if let Some(rgb) = override_slot.and_then(|slot| colors[slot]) {
+        return [rgb.r, rgb.g, rgb.b];
+    }
     match color {
         Color::Spec(rgb) => [rgb.r, rgb.g, rgb.b],
         Color::Indexed(i) => index_to_rgb(theme, i),
@@ -799,5 +850,53 @@ mod tests {
         assert_eq!(snap.cell(0, 0).c, '世', "wide char in column 0");
         assert_eq!(snap.cell(0, 1).c, ' ', "spacer column blanked");
         assert_eq!(snap.cell(0, 2).c, 'X', "following char in column 2");
+    }
+
+    #[test]
+    fn concealed_text_is_hidden() {
+        // SGR 8 (conceal) must render the glyph invisibly by painting the
+        // foreground with the cell's own background; the bg itself is unchanged.
+        let mut plain = Terminal::new(20, 5);
+        plain.feed(b"S");
+        let normal = *plain.snapshot().cell(0, 0);
+
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[8mS");
+        let hidden = *t.snapshot().cell(0, 0);
+        assert_eq!(hidden.fg, hidden.bg, "concealed fg must equal its bg (invisible)");
+        assert_eq!(hidden.bg, normal.bg, "concealed cell bg should be unchanged");
+    }
+
+    #[test]
+    fn osc_background_query_reflects_runtime_theme() {
+        // After set_theme, an OSC 11 (background) query must reply with the
+        // CURRENT theme, not the one captured at construction.
+        let mut t = Terminal::new(20, 5);
+        t.set_theme(crate::theme::gruvbox_dark());
+        // OSC 11 ; ? BEL — report the background color.
+        t.feed(b"\x1b]11;?\x07");
+        let reply = String::from_utf8(t.drain_pty_writes()).unwrap();
+        // gruvbox_dark bg is [40, 40, 40] = 0x28 → "rgb:2828/2828/2828".
+        assert!(
+            reply.contains("2828/2828/2828"),
+            "OSC 11 reply should carry the new theme bg; got {reply:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_palette_override_changes_displayed_color() {
+        // An OSC 4 redefinition of a palette color must change what is drawn,
+        // not be silently stored and ignored.
+        let mut t = Terminal::new(20, 5);
+        // OSC 4 ; 1 ; #00ff00 BEL — redefine palette index 1 (red) to green.
+        t.feed(b"\x1b]4;1;#00ff00\x07");
+        // SGR 31 selects palette index 1 as the foreground.
+        t.feed(b"\x1b[31mX");
+        let snap = t.snapshot();
+        assert_eq!(
+            snap.cell(0, 0).fg,
+            [0, 255, 0],
+            "OSC 4 override should change the displayed fg"
+        );
     }
 }

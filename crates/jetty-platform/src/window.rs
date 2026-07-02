@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use winit::dpi::LogicalSize;
+use winit::error::OsError;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Icon, Window};
 
@@ -22,7 +23,17 @@ fn app_icon() -> Option<Icon> {
 
 /// Build the main window: a borderless (client-side decorations) window with
 /// our custom titlebar + the JeTTY app icon.
-pub fn build_window(event_loop: &ActiveEventLoop, title: &str, size: (u32, u32)) -> Arc<Window> {
+///
+/// Returns the OS error on failure instead of panicking: this builder is also
+/// used at runtime (tab detach), where a transient window-creation failure (X
+/// server fd/resource exhaustion, compositor restart, WM limits) must abort
+/// only that action, not kill every shell in the app. The startup call site can
+/// still treat an `Err` as fatal.
+pub fn build_window(
+    event_loop: &ActiveEventLoop,
+    title: &str,
+    size: (u32, u32),
+) -> Result<Arc<Window>, OsError> {
     let attrs = Window::default_attributes()
         .with_title(title)
         .with_window_icon(app_icon())
@@ -34,20 +45,23 @@ pub fn build_window(event_loop: &ActiveEventLoop, title: &str, size: (u32, u32))
         // keeps the runtime opacity working and the rounded corners.
         .with_decorations(false)
         .with_transparent(true);
-    Arc::new(event_loop.create_window(attrs).expect("create_window failed"))
+    event_loop.create_window(attrs).map(Arc::new)
 }
 
 /// Build a fixed-size, non-resizable utility window (e.g. the settings dialog).
 /// A normal decorated OS window the user can move anywhere; also carries the icon.
+///
+/// Returns the OS error on failure (used at runtime on every settings-window
+/// open) so a transient failure aborts only that action rather than panicking.
 pub fn build_fixed_window(
     event_loop: &ActiveEventLoop,
     title: &str,
     size: (u32, u32),
-) -> Arc<Window> {
+) -> Result<Arc<Window>, OsError> {
     let attrs = Window::default_attributes()
         .with_title(title)
         .with_window_icon(app_icon())
         .with_inner_size(LogicalSize::new(size.0, size.1))
         .with_resizable(false);
-    Arc::new(event_loop.create_window(attrs).expect("create_window failed"))
+    event_loop.create_window(attrs).map(Arc::new)
 }

@@ -401,6 +401,12 @@ impl Crt {
         // width/height so callers don't have to compute it twice.
         let mut uniform = *u;
         uniform.resolution = [width as f32, height as f32];
+        // Wrap the animation phase into [0, 2π) before the f32 write. Every shader
+        // rate (6/13/50/80 rad/s) is an integer, so wrapping at 2π preserves every
+        // sin() phase exactly while keeping `time` small — otherwise f32 precision
+        // decays with uptime and the roll/flicker/jitter animation quantizes into
+        // visible strobing after a few days of a terminal being left open.
+        uniform.time = (u.time as f64 % std::f64::consts::TAU) as f32;
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
 
         // Rebuild the bind group only when the src view changes (resize);
@@ -440,8 +446,11 @@ impl Crt {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: dst,
                     resolve_target: None,
+                    // REPLACE + fullscreen triangle overwrites every pixel, so Clear
+                    // (not Load) is identical output while sparing tile-based GPUs a
+                    // full-surface load every frame the CRT pass runs.
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,

@@ -8,8 +8,16 @@ pub struct PtySession {
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     rx: Receiver<Vec<u8>>,
     exited: Arc<AtomicBool>,
-    /// The shell child. `Option` so `Drop` can move it to a reaper thread.
-    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    /// Kills the shell child on `Drop`. The child itself lives on the waiter
+    /// thread (which owns `wait()` and reaps it); Drop only signals the kill so
+    /// the event loop never blocks on the grace period. `killer.kill()` sends a
+    /// single SIGHUP — see `Drop` for the SIGKILL escalation that backs it up.
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    /// The shell's PID, captured before the child moved to the waiter thread.
+    /// `Drop` uses it (unix) to escalate to SIGKILL when the shell ignores the
+    /// initial SIGHUP, so a HUP-ignoring shell can't leak its process plus the
+    /// blocked waiter/reader threads and master fd forever.
+    pid: Option<u32>,
     /// Feeds the dedicated WRITER thread (see `writer()`): the UI thread sends
     /// byte buffers here and the thread — which owns the blocking Write half —
     /// performs the actual fd writes. Kept on the session so `writer()` can be
@@ -49,20 +57,33 @@ impl Write for ChannelWriter {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        // Reap the shell child so closing a tab (or `exit` / Ctrl+D) doesn't leak a
-        // `<defunct>` zombie for the life of the process — previously `_child`'s
-        // Drop neither killed nor waited, so a long-lived summon terminal leaked a
-        // PID slot per closed tab. We kill+wait on a DETACHED thread so the event
-        // loop never blocks on the SIGKILL/wait grace period. Killing the shell
-        // also closes the slave, so the reader thread hits EOF and drops its master
-        // clone; with the master itself dropped, the kernel then SIGHUPs any
-        // lingering foreground job (vim/top/build) on the controlling terminal.
-        // `kill()` on an already-exited child errors harmlessly (ignored); `wait()`
-        // still reaps it.
-        if let Some(mut child) = self.child.take() {
+        // Two-stage reap so closing a tab (or `exit` / Ctrl+D) never leaks a
+        // `<defunct>` zombie, a blocked waiter/reader thread, or the master fd —
+        // previously the child's Drop neither killed nor waited, leaking a PID
+        // slot per closed tab. Stage 1: SIGHUP now (via `killer`); a well-behaved
+        // shell exits, which makes the waiter thread's `child.wait()` return and
+        // reap it without blocking the event loop. Killing the shell closes the
+        // slave, and dropping `self.master` right after closes the master, so the
+        // kernel also SIGHUPs any lingering foreground job (vim/top/build) on the
+        // controlling terminal. `kill()` on an already-exited child is ignored.
+        let _ = self.killer.kill();
+        // Stage 2: if the shell IGNORES SIGHUP (`trap '' HUP`) and is still
+        // unreaped after a grace period, escalate to an uncatchable SIGKILL so it
+        // can't leak forever (portable-pty's cloned killer only sends SIGHUP, so
+        // we restore the escalation the owning `Child::kill` used to provide).
+        // Guarded by `exited` — which the waiter sets only AFTER it reaps — so we
+        // never signal a PID that was reaped and possibly recycled. Detached
+        // thread so Drop never blocks.
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            let exited = Arc::clone(&self.exited);
             std::thread::spawn(move || {
-                let _ = child.kill();
-                let _ = child.wait();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                if !exited.load(Ordering::SeqCst) {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
             });
         }
     }
@@ -117,6 +138,41 @@ fn passwd_shell() -> Option<String> {
     None
 }
 
+/// The user's home directory: `$HOME`, else the passwd `pw_dir`. Used to start
+/// GUI-launched shells in home instead of the filesystem root (see `spawn`).
+fn home_dir() -> Option<String> {
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() {
+            return Some(h);
+        }
+    }
+    passwd_home()
+}
+
+/// The current user's home (`pw_dir`) from the passwd database, mirroring
+/// `passwd_shell` — a GUI launch can have `$HOME` present but this is the same
+/// authoritative source used for the login shell.
+#[cfg(unix)]
+fn passwd_home() -> Option<String> {
+    use std::ffi::CStr;
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() {
+            return None;
+        }
+        let dir = (*pw).pw_dir;
+        if dir.is_null() {
+            return None;
+        }
+        CStr::from_ptr(dir).to_str().ok().map(str::to_string)
+    }
+}
+
+#[cfg(not(unix))]
+fn passwd_home() -> Option<String> {
+    None
+}
+
 impl PtySession {
     /// Spawn a PTY running the user's shell.
     ///
@@ -153,7 +209,17 @@ impl PtySession {
         // quick-summon terminal; session restore isn't wanted. Harmless/ignored
         // on Linux, so set it unconditionally (no platform-specific code).
         cmd.env("SHELL_SESSIONS_DISABLE", "1");
-        let child = pair
+        // GUI launches (Finder/Dock/.desktop) start the app with cwd `/`; unlike
+        // Terminal.app/iTerm2/kitty we don't want new shells opening in the
+        // filesystem root. Only override in that case — a shell launched from a
+        // terminal in some project directory should still inherit that directory.
+        if std::env::current_dir().map(|p| p == std::path::Path::new("/")).unwrap_or(false)
+        {
+            if let Some(home) = home_dir() {
+                cmd.cwd(home);
+            }
+        }
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -167,10 +233,17 @@ impl PtySession {
         // preserved (single channel → single consumer). The loop ends when all
         // senders drop (session + writers gone) or a write errors (child
         // exited → EIO); either way the Write half drops and closes cleanly.
-        let mut pty_writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut pty_writer = match pair.master.take_writer() {
+            Ok(w) => w,
+            Err(e) => {
+                // Reap the child we just spawned before bailing (realistic under
+                // fd exhaustion), or its Drop — which neither kills nor waits —
+                // leaves a `<defunct>` zombie for the life of the process.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::other(e.to_string()));
+            }
+        };
         let (write_tx, write_rx) = channel::<Vec<u8>>();
         std::thread::spawn(move || {
             while let Ok(chunk) = write_rx.recv() {
@@ -181,24 +254,36 @@ impl PtySession {
             }
         });
 
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::other(e.to_string()));
+            }
+        };
         let (tx, rx) = channel::<Vec<u8>>();
         let exited = Arc::new(AtomicBool::new(false));
-        let exited_reader = Arc::clone(&exited);
+        // Shared so BOTH the reader thread (per-chunk / EOF wakes) and the waiter
+        // thread (exit wake) can drive it. `spawn`'s `on_data` is only `Send`, so
+        // it can't be cloned across threads directly; the `Mutex` makes it
+        // shareable. Contention is nil — the waiter locks exactly once (at exit).
+        let on_data = Arc::new(Mutex::new(on_data));
+
+        let on_data_reader = Arc::clone(&on_data);
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
-                        // EOF or error means the shell closed the PTY (the user
-                        // pressed Ctrl+D or ran `exit`). Flag it BEFORE waking the
-                        // app so its post-drain child-exit check sees it and closes
-                        // the window instead of hanging on a dead shell.
-                        exited_reader.store(true, Ordering::SeqCst);
-                        on_data();
+                        // EOF/error on the master: the slave's last fd closed.
+                        // This is NOT by itself proof the shell exited — a job
+                        // that redirects all its std fds away
+                        // (`exec >/dev/null 2>&1 </dev/null`) triggers EIO here
+                        // while the shell is still alive — so we do NOT flag
+                        // `exited`; the waiter thread's `child.wait()` is the
+                        // authoritative exit signal. Wake the app once and stop.
+                        (*on_data_reader.lock().unwrap())();
                         break;
                     }
                     Ok(n) => {
@@ -208,17 +293,34 @@ impl PtySession {
                         // Wake the app IMMEDIATELY so drain_pty runs and any
                         // query replies (\\e[6n CPR etc.) are written back to
                         // the shell within ~1ms, well inside p10k's timeout.
-                        on_data();
+                        (*on_data_reader.lock().unwrap())();
                     }
                 }
             }
+        });
+
+        // Authoritative exit detection, wait-based like xterm/kitty: block on the
+        // child until the shell process actually dies — even when a background
+        // job that inherited the slave keeps the master open, so the reader never
+        // sees EOF — then reap it, flag `exited`, and wake the app so it closes
+        // the tab. `Drop` kills via `killer`, which makes this `wait()` return.
+        let killer = child.clone_killer();
+        let pid = child.process_id();
+        let exited_waiter = Arc::clone(&exited);
+        let on_data_waiter = Arc::clone(&on_data);
+        std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+            exited_waiter.store(true, Ordering::SeqCst);
+            (*on_data_waiter.lock().unwrap())();
         });
 
         Ok(PtySession {
             master: Arc::new(Mutex::new(pair.master)),
             rx,
             exited,
-            child: Some(child),
+            killer,
+            pid,
             write_tx,
         })
     }
@@ -227,9 +329,13 @@ impl PtySession {
         &self.rx
     }
 
-    /// Whether the shell child has exited — the reader thread saw EOF/error on
-    /// the PTY master (Ctrl+D / `exit`). The app polls this after draining the
-    /// output to close the window instead of freezing on a dead shell.
+    /// Whether the shell child has exited. A dedicated waiter thread blocks on
+    /// `child.wait()` and sets this the moment the shell process dies — even if a
+    /// background job that inherited the slave keeps the PTY master open (so the
+    /// reader never sees EOF), and NOT prematurely when a live shell merely
+    /// redirects its std fds away (which EOFs the master). The app polls this
+    /// after draining the output to close the window instead of freezing on a
+    /// dead shell.
     pub fn child_exited(&self) -> bool {
         self.exited.load(Ordering::SeqCst)
     }

@@ -232,8 +232,14 @@ impl FocusPull {
                 label: Some("focus-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: dst_view,
+                    // REPLACE + fullscreen triangle overwrites every pixel, so Clear
+                    // (not Load) is identical output while sparing tile-based GPUs a
+                    // full-surface load each animation frame.
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,

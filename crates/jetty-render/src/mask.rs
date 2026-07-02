@@ -155,6 +155,7 @@ impl CornerMask {
     /// `<= 0` the pass is skipped entirely (square window, byte-identical to
     /// before). In Dropdown mode the two top radii are zeroed so only the bottom
     /// corners round.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
         device: &wgpu::Device,
@@ -219,6 +220,7 @@ impl CornerMask {
 /// pixels. 1.0 fully inside, 0.0 fully outside, with a ~1px feather across the
 /// boundary. Mirrors the shader's per-quadrant SDF so the headless `jetty-shot`
 /// (CPU compositing) applies the SAME mask as the live GPU pass.
+#[allow(clippy::too_many_arguments)]
 pub fn rounded_rect_coverage_per(
     x: f32,
     y: f32,

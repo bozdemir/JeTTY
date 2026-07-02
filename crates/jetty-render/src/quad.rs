@@ -259,6 +259,7 @@ impl QuadLayer {
     ///
     /// Unlike `render`, this always runs (even with no rects) so the clear is not
     /// skipped on a screen made entirely of default-bg cells.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_clear(
         &mut self,
         device: &wgpu::Device,
@@ -272,6 +273,7 @@ impl QuadLayer {
         self.render_inner(device, queue, view, screen_w, screen_h, rects, Some(clear_color), None);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_inner(
         &mut self,
         device: &wgpu::Device,
@@ -346,6 +348,7 @@ impl QuadLayer {
     /// **scissor rect** that clips drawing to `[x, y, w, h]` in physical pixels.
     /// Used for the Effects-tab content area so widgets scrolled above/below the
     /// visible region are hardware-clipped and never bleed into the chrome.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_load_scissored(
         &mut self,
         device: &wgpu::Device,
@@ -459,6 +462,7 @@ pub const SCROLLBAR_W: f32 = 14.0;
 /// Compute the scrollbar thumb rectangle from raw geometry values.
 /// This is the canonical geometry computation shared by drawing and hit-testing.
 /// Returns `None` when `scroll_max == 0` (nothing to scroll).
+#[allow(clippy::too_many_arguments)]
 pub fn scrollbar_rect_geom(
     rows: usize,
     scroll_offset: usize,

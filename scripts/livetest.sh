@@ -21,14 +21,20 @@ trap cleanup EXIT
 
 sleep 3   # let zsh + p10k initialize and the window map
 
-WID=$(xdotool search --sync --name JeTTY 2>/dev/null | tail -1)
+WID=$(timeout 15 xdotool search --sync --name JeTTY 2>/dev/null | tail -1)
 if [ -z "$WID" ]; then
   echo "ERROR: Jetty window not found"; tail -5 "$LOG"; exit 1
 fi
 
-xdotool windowactivate --sync "$WID" 2>/dev/null
+timeout 5 xdotool windowactivate --sync "$WID" 2>/dev/null
 sleep 0.4
-xdotool type --delay 90 "$KEYS"   # XTEST to the focused (Jetty) window
+# On the real display, XTEST goes to whatever is focused — bail out rather than
+# type the test string into the user's other windows if activation didn't stick
+# (WM focus-stealing prevention, or no _NET_ACTIVE_WINDOW support).
+if [ "$(xdotool getactivewindow 2>/dev/null)" != "$WID" ]; then
+  echo "ERROR: could not focus JeTTY window (WID=$WID)"; tail -5 "$LOG"; exit 1
+fi
+xdotool type --delay 90 -- "$KEYS"   # XTEST to the focused (Jetty) window
 sleep 1.2
 
 # Capture only the Jetty window region.

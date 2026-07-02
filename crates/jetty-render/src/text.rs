@@ -4,6 +4,7 @@ use glyphon::{
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use jetty_core::GridSnapshot;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use wgpu::MultisampleState;
 
@@ -49,6 +50,20 @@ impl ChromeFamily {
     }
 }
 
+/// How a grid cell's char must be drawn relative to the PRIMARY terminal font.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CellRoute {
+    /// The primary font covers the char at a single cell width — lay it out inline
+    /// in the main grid run.
+    Inline,
+    /// The primary font either lacks the glyph (tofu box under `Shaping::Basic`), or
+    /// renders it double-width (a CJK glyph advances ~2 cells and would shift every
+    /// following column of the row if laid out inline). Either way, blank the cell in
+    /// the main run and overdraw the real glyph from its own buffer at the exact cell
+    /// origin, keeping the grid aligned regardless of the glyph's advance.
+    Overdraw,
+}
+
 pub struct TextLayer {
     font_system: FontSystem,
     swash: SwashCache,
@@ -79,22 +94,34 @@ pub struct TextLayer {
     /// Taken out via `mem::take` during the frame and put back at the end.
     text_scratch: String,
     cell_ranges_scratch: Vec<(usize, usize, Color)>,
-    /// Glyph-coverage cache: does the PRIMARY terminal font (`font_family`) have a
-    /// real glyph for this char? A char the primary font lacks (e.g. Claude Code's
-    /// `⏵⏵` U+23F5) renders as a tofu box under `Shaping::Basic`, which does NO
-    /// font fallback. Probed lazily on the hot path (only non-ASCII, on miss) and
-    /// read every frame. Cleared when `font_family` changes (coverage is per-font).
-    glyph_coverage: std::collections::HashMap<char, bool>,
-    /// Scratch buffer used only to probe glyph coverage (shape one char, inspect
-    /// the resulting glyph id). Reused across frames.
+    /// Per-char routing cache for the PRIMARY terminal font (`font_family`): does the
+    /// char lay out inline, or must it be blanked and overdrawn (missing glyph — e.g.
+    /// Claude Code's `⏵⏵` U+23F5 — OR a double-width CJK glyph)? Probed lazily on the
+    /// hot path (only non-ASCII, on miss) and read every frame. Cleared when
+    /// `font_family` changes (routing is per-font).
+    glyph_route: std::collections::HashMap<char, CellRoute>,
+    /// Scratch buffer used only to probe glyph coverage/advance (shape one char,
+    /// inspect the resulting glyph id and width). Reused across frames.
     coverage_buffer: Buffer,
-    /// Growable pool of single-glyph buffers that draw the fallback glyphs (the
-    /// chars the primary font lacks) on top of the blanked grid cell, shaped with
-    /// `Shaping::Advanced` so cosmic-text's font fallback supplies the glyph.
-    fallback_buffers: Vec<Buffer>,
-    /// Per-frame scratch: `(pixel_x, pixel_y, char, rgb)` for each cell whose glyph
-    /// is missing from the primary font and must be overdrawn from a fallback font.
+    /// Shaped single-glyph buffers for the overdraw path, keyed by char so a char
+    /// repeated across the grid shares one shaped buffer and an unchanged frame
+    /// re-shapes nothing. Shaped with `Shaping::Advanced` so cosmic-text's font
+    /// fallback supplies a glyph the primary font lacks (or the primary font's own
+    /// double-width glyph). Cleared on `set_font_family`/`set_font_size` (glyphs are
+    /// per family + size).
+    fallback_glyphs: std::collections::HashMap<char, Buffer>,
+    /// Per-frame scratch: `(pixel_x, pixel_y, char, rgb)` for each cell drawn via the
+    /// overdraw path (missing glyph or double-width) and overdrawn from `fallback_glyphs`.
     fallback_cells_scratch: Vec<(f32, f32, char, [u8; 3])>,
+    /// Monotonic counter bumped whenever a change invalidates the grid buffer's shaped
+    /// content (font family, font size, resize). Folded into `last_grid_hash` so such
+    /// a change always forces a re-shape even when the grid text/colors are unchanged.
+    shape_gen: u64,
+    /// Content fingerprint of the grid last uploaded via `set_rich_text` (folds
+    /// `shape_gen`, surface dims, per-cell chars and colors). When the current frame's
+    /// fingerprint matches, the grid is byte-identical, so `set_rich_text`/`set_size`
+    /// are skipped and cosmic-text's cached per-line shaping is reused by `prepare`.
+    last_grid_hash: Option<u64>,
 }
 
 impl TextLayer {
@@ -195,10 +222,12 @@ impl TextLayer {
             ui_family: ChromeFamily::Sans,
             text_scratch: String::new(),
             cell_ranges_scratch: Vec::new(),
-            glyph_coverage: std::collections::HashMap::new(),
+            glyph_route: std::collections::HashMap::new(),
             coverage_buffer,
-            fallback_buffers: Vec::new(),
+            fallback_glyphs: std::collections::HashMap::new(),
             fallback_cells_scratch: Vec::new(),
+            shape_gen: 0,
+            last_grid_hash: None,
         }
     }
 
@@ -267,9 +296,12 @@ impl TextLayer {
     /// The caller must call `reflow()` and `request_redraw()` after this.
     pub fn set_font_family(&mut self, name: &str) {
         self.font_family = Arc::from(name);
-        // Coverage is per-font: a glyph present in the old family may be missing
-        // in the new one (and vice versa). Drop the cache so it re-probes.
-        self.glyph_coverage.clear();
+        // Routing is per-font: a glyph present/single-width in the old family may be
+        // missing/double-width in the new one. Drop the caches so they re-probe, and
+        // bump the shape generation so the grid re-shapes even if its text is unchanged.
+        self.glyph_route.clear();
+        self.fallback_glyphs.clear();
+        self.shape_gen = self.shape_gen.wrapping_add(1);
         // Re-measure cell width with the new family.
         self.cell_w = measure_advance_family(&mut self.font_system, self.metrics, name);
         // Reset cursor buffer glyph so the block cursor uses the new family.
@@ -346,6 +378,10 @@ impl TextLayer {
         // active chrome family, so a UI-font SIZE change re-derives chrome_char_w.
         self.cell_w = self.measure_chrome_advance();
         self.cell_h = line_height;
+        // Cached fallback glyphs were shaped at the old size; drop them and force a
+        // grid re-shape at the new metrics.
+        self.fallback_glyphs.clear();
+        self.shape_gen = self.shape_gen.wrapping_add(1);
     }
 
     /// Returns the currently active font family name.
@@ -360,39 +396,50 @@ impl TextLayer {
     pub fn resize(&mut self, gpu: &GpuContext) {
         // None width keeps wrapping disabled after resize.
         self.buffer.set_size(&mut self.font_system, None, None);
+        // set_size cleared the height bound; force the next frame to re-bound the
+        // layout height and re-shape the grid.
+        self.shape_gen = self.shape_gen.wrapping_add(1);
         let _ = gpu; // size not used for wrapping; viewport is updated per-frame
     }
 
-    /// Does the primary terminal font have a real glyph for `c`? ASCII is always
-    /// covered; other chars are probed once — shaped with the primary family under
-    /// `Shaping::Basic`, which does NOT fall back, so a resulting glyph id of 0
-    /// (`.notdef`, the tofu box) means the font lacks the char — then cached. The
-    /// caller blanks missing-glyph cells on the main grid and overdraws them from a
-    /// fallback font, so the real glyph is shown (like Konsole/Qt), not a box.
-    fn covers(&mut self, c: char) -> bool {
+    /// How the primary terminal font must render `c` on the grid (see `CellRoute`).
+    /// ASCII is always `Inline`. Other chars are probed once — shaped with the primary
+    /// family under `Shaping::Basic` (no fallback) — and cached: a glyph id of 0
+    /// (`.notdef`, the tofu box) means the font lacks the char, and an advance wider
+    /// than ~1.5 cells means a double-width glyph that would shift the row if laid out
+    /// inline. Both take the `Overdraw` route (blanked here, overdrawn at the exact
+    /// cell origin so the real glyph shows, aligned, like Konsole/Qt).
+    fn route(&mut self, c: char) -> CellRoute {
         if (c as u32) < 0x80 {
-            return true;
+            return CellRoute::Inline;
         }
-        if let Some(&v) = self.glyph_coverage.get(&c) {
+        if let Some(&v) = self.glyph_route.get(&c) {
             return v;
         }
         let fam = Arc::clone(&self.font_family);
+        let cell_w = self.cell_w;
         let mut tmp = [0u8; 4];
         let s = c.encode_utf8(&mut tmp);
         let attrs = Attrs::new().family(Family::Name(&fam));
         self.coverage_buffer
             .set_text(&mut self.font_system, s, &attrs, Shaping::Basic, None);
-        let covered = self
+        let route = self
             .coverage_buffer
             .layout_runs()
             .flat_map(|run| run.glyphs.iter())
             .next()
-            .map(|g| g.glyph_id != 0)
-            // No glyph laid out at all (e.g. zero-width/control) — leave it to the
-            // main grid; don't try to fall back.
-            .unwrap_or(true);
-        self.glyph_coverage.insert(c, covered);
-        covered
+            .map(|g| {
+                if g.glyph_id == 0 || g.w > cell_w * 1.5 {
+                    CellRoute::Overdraw
+                } else {
+                    CellRoute::Inline
+                }
+            })
+            // No glyph laid out at all (e.g. zero-width/control) — leave it inline for
+            // the main grid; don't try to overdraw.
+            .unwrap_or(CellRoute::Inline);
+        self.glyph_route.insert(c, route);
+        route
     }
 
     /// Renders the terminal grid to an arbitrary TextureView (offscreen or on-screen).
@@ -402,6 +449,7 @@ impl TextLayer {
     /// first (legacy self-contained behavior). When false it uses `LoadOp::Load`
     /// so it draws ON TOP of an already-painted background — used by callers that
     /// run a per-cell background quad pass (which owns the clear) before the text.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_to(
         &mut self,
         device: &wgpu::Device,
@@ -431,74 +479,107 @@ impl TextLayer {
         let cell_w = self.cell_w;
         let cell_h = self.cell_h;
 
+        // Content fingerprint for this frame (see `last_grid_hash`): folds the shape
+        // generation, surface dims, every cell's char (via `text`, hashed below) and
+        // fg color. An identical grid skips the whole grid re-shape further down.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.shape_gen.hash(&mut hasher);
+        width.hash(&mut hasher);
+        height.hash(&mut hasher);
+
         for row in 0..snapshot.rows {
+            // Run-length coalesce consecutive same-fg cells into ONE span per run:
+            // cosmic-text's set_rich_text allocates (and clones the family string)
+            // per span, and a terminal row has only a handful of color changes.
+            // Shaping is byte-identical under Shaping::Basic — color is not part of
+            // shaping and every monospace glyph advances exactly one cell regardless.
+            let mut run_start = text.len();
+            let mut run_color: Option<Color> = None;
             for col in 0..snapshot.cols {
                 let cell = snapshot.cell(row, col);
-                let start = text.len();
-                // A glyph the primary font lacks would render as a tofu box under
-                // Shaping::Basic (no fallback). Blank the cell on the main grid so
-                // it stays exactly one column wide, and record it for a fallback
-                // overdraw — the real glyph is drawn on top, aligned. ASCII and
-                // already-blank cells skip the (cached) probe entirely.
-                if cell.c != ' ' && cell.c != '\0' && !self.covers(cell.c) {
-                    text.push(' ');
+                cell.fg.hash(&mut hasher);
+                // A glyph the primary font lacks (tofu box under Shaping::Basic, no
+                // fallback) or renders double-width (a CJK glyph advances ~2 cells and
+                // would shift the rest of the row) is blanked on the main grid so it
+                // stays exactly one column wide, and recorded for an overdraw — the
+                // real glyph is drawn on top, aligned. ASCII and already-blank cells
+                // skip the (cached) probe entirely.
+                let overdraw = cell.c != ' '
+                    && cell.c != '\0'
+                    && self.route(cell.c) == CellRoute::Overdraw;
+                if overdraw {
                     fallback_cells.push((
                         col as f32 * cell_w,
                         row as f32 * cell_h,
                         cell.c,
                         cell.fg,
                     ));
-                } else {
-                    text.push(cell.c);
                 }
-                let end = text.len();
-                cell_ranges.push((
-                    start,
-                    end,
-                    Color::rgb(cell.fg[0], cell.fg[1], cell.fg[2]),
-                ));
+                let color = Color::rgb(cell.fg[0], cell.fg[1], cell.fg[2]);
+                if run_color != Some(color) {
+                    if let Some(pc) = run_color {
+                        cell_ranges.push((run_start, text.len(), pc));
+                    }
+                    run_start = text.len();
+                    run_color = Some(color);
+                }
+                text.push(if overdraw { ' ' } else { cell.c });
             }
-            // Include the newline as its own span: set_rich_text builds the text
-            // FROM the spans, so without this the line breaks were dropped and the
-            // whole grid collapsed onto one very long line.
+            // Flush the row's final run, then include the newline as its own span:
+            // set_rich_text builds the text FROM the spans, so without the '\n' the
+            // line breaks were dropped and the whole grid collapsed onto one line.
+            if let Some(pc) = run_color {
+                cell_ranges.push((run_start, text.len(), pc));
+            }
             let nl_start = text.len();
             text.push('\n');
-            let nl_end = text.len();
-            cell_ranges.push((nl_start, nl_end, Color::rgb(220, 220, 220)));
+            cell_ranges.push((nl_start, text.len(), Color::rgb(220, 220, 220)));
         }
+
+        // Finish the fingerprint with the chars, then decide whether the grid buffer
+        // can be reused as-is (skip the re-shape) this frame.
+        text.hash(&mut hasher);
+        let grid_hash = hasher.finish();
+        let grid_unchanged = self.last_grid_hash == Some(grid_hash);
+        self.last_grid_hash = Some(grid_hash);
 
         // Clone the Arc (a refcount bump, not a string copy) so the family name
         // can be borrowed by every span without re-borrowing self.
         let family_name = Arc::clone(&self.font_family);
 
-        // Bound the layout height to the surface so cosmic-text lays out ALL
-        // rows. With height = None it shapes only the first visible line, which
-        // made every row after the first disappear.
-        self.buffer
-            .set_size(&mut self.font_system, None, Some(height as f32));
+        // Skip the grid re-shape entirely when nothing that affects it changed —
+        // caret-flash/CRT/scrollbar-only frames redraw identical grid text, and
+        // cosmic-text's per-line shape cache in `self.buffer` is still valid. Only
+        // the (expensive) set_size + set_rich_text are gated; the cursor, fallback
+        // overdraws and prepare/render below all still run every frame.
+        if !grid_unchanged {
+            // Bound the layout height to the surface so cosmic-text lays out ALL
+            // rows. With height = None it shapes only the first visible line, which
+            // made every row after the first disappear.
+            self.buffer
+                .set_size(&mut self.font_system, None, Some(height as f32));
 
-        let default_attrs = Attrs::new().family(Family::Name(&family_name));
-        // Shaping::Basic avoids kerning/ligatures so every glyph lands exactly
-        // one cell-width apart — essential for a terminal grid.
-        //
-        // Pass the per-cell spans — (&str slice of `text`, Attrs) — as a LAZY
-        // iterator straight into set_rich_text. glyphon takes `IntoIterator`, so
-        // there is no need to collect into a Vec first: at a full screen that Vec
-        // was ~rows*cols * sizeof((&str, Attrs)) (~0.5 MB) allocated and written
-        // every frame on the render hot path. The iterator yields the same spans
-        // in the same order, so shaping is byte-identical.
-        self.buffer.set_rich_text(
-            &mut self.font_system,
-            cell_ranges.iter().map(|(s, e, color)| {
-                (
-                    &text[*s..*e],
-                    Attrs::new().family(Family::Name(&family_name)).color(*color),
-                )
-            }),
-            &default_attrs,
-            Shaping::Basic,
-            None,
-        );
+            let default_attrs = Attrs::new().family(Family::Name(&family_name));
+            // Shaping::Basic avoids kerning/ligatures so every glyph lands exactly
+            // one cell-width apart — essential for a terminal grid.
+            //
+            // Pass the coalesced spans — (&str slice of `text`, Attrs) — as a LAZY
+            // iterator straight into set_rich_text. glyphon takes `IntoIterator`, so
+            // there is no need to collect into a Vec first. The iterator yields the
+            // spans in order, so shaping is byte-identical.
+            self.buffer.set_rich_text(
+                &mut self.font_system,
+                cell_ranges.iter().map(|(s, e, color)| {
+                    (
+                        &text[*s..*e],
+                        Attrs::new().family(Family::Name(&family_name)).color(*color),
+                    )
+                }),
+                &default_attrs,
+                Shaping::Basic,
+                None,
+            );
+        }
 
         // The spans iterator is consumed and its borrows on `text`/`cell_ranges`/
         // `family_name` are released; return the scratch buffers to self for reuse
@@ -507,30 +588,26 @@ impl TextLayer {
         self.text_scratch = text;
         self.cell_ranges_scratch = cell_ranges;
 
-        // Fallback glyph prep: shape each missing-glyph char in its OWN single-glyph
-        // buffer with Shaping::Advanced, so cosmic-text falls back to a font that
-        // HAS the glyph. Each is drawn at its exact cell origin in the SAME
-        // prepare() below, so it shifts no neighbor — the grid stays aligned.
-        // Usually empty (the only hot-path cost is the cached coverage probes), so
-        // this whole block is skipped.
+        // Overdraw glyph prep: shape each DISTINCT char once into a cached per-char
+        // buffer with Shaping::Advanced, so cosmic-text either falls back to a font
+        // that HAS the glyph or uses the primary font's own double-width glyph. Cached
+        // across frames (cleared on family/size change), so a char repeated across the
+        // grid — e.g. full-screen CJK — shapes only once and an unchanged frame shapes
+        // nothing. Each is drawn at its exact cell origin in the SAME prepare() below,
+        // so it shifts no neighbor. Usually empty, so this whole block is skipped.
         if !fallback_cells.is_empty() {
-            while self.fallback_buffers.len() < fallback_cells.len() {
-                let mut b = Buffer::new(&mut self.font_system, self.metrics);
-                b.set_size(&mut self.font_system, None, None);
-                self.fallback_buffers.push(b);
-            }
             let fam = Arc::clone(&self.font_family);
             let metrics = self.metrics;
-            for (i, (_x, _y, c, _rgb)) in fallback_cells.iter().enumerate() {
-                let buf = &mut self.fallback_buffers[i];
-                // Pooled buffers retain old metrics across frames; push current
-                // metrics so a font-size change takes effect immediately.
-                buf.set_metrics(&mut self.font_system, metrics);
-                buf.set_size(&mut self.font_system, None, None);
-                let mut tmp = [0u8; 4];
-                let s = c.encode_utf8(&mut tmp);
-                let attrs = Attrs::new().family(Family::Name(&fam));
-                buf.set_text(&mut self.font_system, s, &attrs, Shaping::Advanced, None);
+            for (_x, _y, c, _rgb) in fallback_cells.iter() {
+                if !self.fallback_glyphs.contains_key(c) {
+                    let mut buf = Buffer::new(&mut self.font_system, metrics);
+                    buf.set_size(&mut self.font_system, None, None);
+                    let mut tmp = [0u8; 4];
+                    let s = c.encode_utf8(&mut tmp);
+                    let attrs = Attrs::new().family(Family::Name(&fam));
+                    buf.set_text(&mut self.font_system, s, &attrs, Shaping::Advanced, None);
+                    self.fallback_glyphs.insert(*c, buf);
+                }
             }
         }
 
@@ -581,8 +658,12 @@ impl TextLayer {
                     let r = lerp_ch(cr, fr, bump);
                     let g = lerp_ch(cg, fg, bump);
                     let b = lerp_ch(cb, fb, bump);
-                    // Scale: peaks at bump=1 (~1.15×), returns to 1 at bump=0 (t=1)
-                    let scale = 1.0 + 0.15 * bump;
+                    // Scale: peaks at bump=1 (~1.15×), returns to 1 at bump=0 (t=1).
+                    // Quantize the scale to discrete steps: the cursor glyph's atlas
+                    // CacheKey folds font_size*scale, so a continuously-varying scale
+                    // would mint a brand-new (permanently-cached) atlas entry every
+                    // animation frame. Bucketing bounds it to a handful of keys.
+                    let scale = 1.0 + 0.15 * ((bump * 8.0).round() / 8.0);
                     // Keep glyph centered on its cell by offsetting origin inward
                     // by half of the extra width/height the scaling adds.
                     let left = snapshot.cursor_col as f32 * self.cell_w
@@ -613,29 +694,48 @@ impl TextLayer {
 
         // Fallback glyphs: drawn ON TOP of the blanked cells, at the exact cell
         // origin, in this same prepare() — so they never shift a neighbor.
-        for (i, (x, y, _c, rgb)) in fallback_cells.iter().enumerate() {
-            areas.push(TextArea {
-                buffer: &self.fallback_buffers[i],
-                left: *x,
-                top: *y + top_offset,
-                scale: 1.0,
-                bounds: win_bounds,
-                default_color: Color::rgb(rgb[0], rgb[1], rgb[2]),
-                custom_glyphs: &[],
-            });
+        for (x, y, c, rgb) in fallback_cells.iter() {
+            if let Some(buffer) = self.fallback_glyphs.get(c) {
+                areas.push(TextArea {
+                    buffer,
+                    left: *x,
+                    top: *y + top_offset,
+                    scale: 1.0,
+                    bounds: win_bounds,
+                    default_color: Color::rgb(rgb[0], rgb[1], rgb[2]),
+                    custom_glyphs: &[],
+                });
+            }
         }
 
-        self.renderer.prepare(
+        // Prepare the atlas. If it reports AtlasFull, unpin every glyph (trim) so LRU
+        // eviction can reclaim space, then retry once — without this a long session
+        // eventually wedges with permanently-blank text (the atlas is also trimmed at
+        // the end of every frame below, which is what keeps eviction working at all).
+        let mut prepared = self.renderer.prepare(
             device,
             queue,
             &mut self.font_system,
             &mut self.atlas,
             &self.viewport,
-            areas,
+            areas.iter().cloned(),
             &mut self.swash,
-        )?;
+        );
+        if prepared == Err(PrepareError::AtlasFull) {
+            self.atlas.trim();
+            prepared = self.renderer.prepare(
+                device,
+                queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                areas.iter().cloned(),
+                &mut self.swash,
+            );
+        }
         // areas is consumed; return the scratch Vec for reuse next frame.
         self.fallback_cells_scratch = fallback_cells;
+        prepared?;
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("text") });
@@ -675,6 +775,10 @@ impl TextLayer {
             }
         }
         queue.submit(Some(encoder.finish()));
+        // Unpin this frame's glyphs so the NEXT prepare can LRU-evict stale ones.
+        // glyphon pins every rendered glyph in `glyphs_in_use` and only trim() clears
+        // it; without this per-frame trim the atlas grows unbounded until AtlasFull.
+        self.atlas.trim();
         Ok(())
     }
 
@@ -684,6 +788,7 @@ impl TextLayer {
     ///
     /// `labels` is a slice of `(text, x, y, rgb_color)` tuples.
     /// Returns `Ok(())` immediately when `labels` is empty.
+    #[allow(clippy::too_many_arguments)]
     fn render_overlays_inner(
         &mut self,
         device: &wgpu::Device,
@@ -798,6 +903,8 @@ impl TextLayer {
             }
         }
         queue.submit(Some(encoder.finish()));
+        // Unpin this frame's glyphs so the next prepare can LRU-evict (see render_to).
+        self.atlas.trim();
         Ok(())
     }
 
@@ -838,6 +945,7 @@ impl TextLayer {
     /// are suppressed by the glyphon `TextArea.bounds` mechanism — no GPU work is
     /// wasted on off-screen text. Used for the Effects-tab scrolled content so
     /// labels that scroll above/below the content viewport are clipped.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_overlays_clipped(
         &mut self,
         device: &wgpu::Device,
