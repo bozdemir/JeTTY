@@ -364,6 +364,124 @@ pub fn build_tab_bar_ex(
     }
 }
 
+// ── Detached-window top bar ──────────────────────────────────────────────────
+
+/// Geometry + draw data for a DETACHED window's top bar: the tab's title as a
+/// single active pill on the left, and a lone close "✕" control on the right.
+/// Same visual language (heights, pill, colors, control cell) as the main tab
+/// bar, minus the multi-tab affordances ("+", overflow, min/max, settings).
+pub struct DetachedBar {
+    /// Quads in draw order: bar background, title pill, optional ✕ hover.
+    pub quads: Vec<Rect>,
+    /// Monospace chrome labels: the close "✕" glyph.
+    pub labels: Vec<(String, f32, f32, [u8; 3])>,
+    /// The title label, rendered in the proportional sans like main tab titles.
+    pub title_labels: Vec<(String, f32, f32, [u8; 3])>,
+    /// Hit-test rect for the close "✕" (triggers the close→reattach path).
+    pub close_rect: Rect,
+}
+
+/// Hit-test rect for a detached window's close "✕": the rightmost CTRL_W cell
+/// of the TABBAR_H strip, inset by STRIP_PAD — the same cell the main window's
+/// close control occupies. Exposed separately so the app's hover tracking can
+/// hit-test without building the whole bar.
+pub fn detached_close_rect(width: u32) -> Rect {
+    Rect {
+        x: width as f32 - STRIP_PAD - CTRL_W,
+        y: 0.0,
+        w: CTRL_W,
+        h: TABBAR_H,
+        color: [0, 0, 0, 0],
+        ..Default::default()
+    }
+}
+
+/// Build the top bar of a DETACHED window: bar background, the tab title as an
+/// active pill (it is always the "active tab" of its window), and the close
+/// "✕" at the right (red highlight when `close_hover`). `char_w` is the
+/// measured chrome-font advance, as in `build_tab_bar_ex`.
+pub fn build_detached_bar(
+    width: u32,
+    title: &str,
+    theme: &Theme,
+    close_hover: bool,
+    char_w: f32,
+) -> DetachedBar {
+    let sw = width as f32;
+    let h = TABBAR_H;
+
+    // Same theme-derived surface language as build_tab_bar_ex.
+    let bg = [theme.bg[0], theme.bg[1], theme.bg[2], 255];
+    let fg = theme.fg;
+    let nl = |t: f32| -> [u8; 3] {
+        [
+            (bg[0] as f32 + (fg[0] as f32 - bg[0] as f32) * t) as u8,
+            (bg[1] as f32 + (fg[1] as f32 - bg[1] as f32) * t) as u8,
+            (bg[2] as f32 + (fg[2] as f32 - bg[2] as f32) * t) as u8,
+        ]
+    };
+    let n = |t: f32| -> [u8; 4] {
+        let c = nl(t);
+        [c[0], c[1], c[2], 255]
+    };
+    let pill_fill = n(0.12); // same soft lifted pill as the active main tab
+
+    let mut quads: Vec<Rect> = Vec::new();
+    let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
+    let mut title_labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
+
+    // Bar background spanning the full width.
+    quads.push(Rect { x: 0.0, y: 0.0, w: sw, h, color: bg, ..Default::default() });
+
+    // Title pill on the left — same geometry constants as a main-window tab,
+    // clamped so it never runs under the close control.
+    const TAB_RADIUS: f32 = 8.0;
+    const TAB_INSET: f32 = 4.0;
+    const TAB_VPAD: f32 = 6.0;
+    const TITLE_PAD: f32 = 13.0;
+    let left = STRIP_PAD;
+    let controls_left = (sw - STRIP_PAD - CTRL_W).max(left);
+    let tab_w = TAB_W.min((controls_left - left).max(0.0));
+    if tab_w > TAB_INSET * 2.0 {
+        quads.push(Rect::rounded(
+            left + TAB_INSET,
+            TAB_VPAD,
+            tab_w - TAB_INSET * 2.0,
+            h - TAB_VPAD * 2.0,
+            pill_fill,
+            TAB_RADIUS,
+        ));
+        let max_chars = (((tab_w - TITLE_PAD - 8.0) / char_w).floor() as usize).max(2);
+        let shown: String = if title.chars().count() > max_chars {
+            let mut s: String = title.chars().take(max_chars.saturating_sub(1)).collect();
+            s.push('…');
+            s
+        } else {
+            title.to_string()
+        };
+        title_labels.push((shown, left + TITLE_PAD, 9.0, fg));
+    }
+
+    // Close "✕" at the right — red hover background, white glyph on hover
+    // (identical treatment to the main window's close control).
+    let close_rect = detached_close_rect(width);
+    if close_hover {
+        let red = theme.palette[1];
+        quads.push(Rect {
+            x: close_rect.x,
+            y: 0.0,
+            w: CTRL_W,
+            h,
+            color: [red[0], red[1], red[2], 255],
+            ..Default::default()
+        });
+    }
+    let close_fg = if close_hover { [0xFF, 0xFF, 0xFF] } else { fg };
+    labels.push(("✕".to_string(), close_rect.x + 8.0, 9.0, close_fg));
+
+    DetachedBar { quads, labels, title_labels, close_rect }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +664,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn detached_bar_close_parked_at_right() {
+        let bar = build_detached_bar(1000, "Tab 2", &theme(), false, CHROME_CHAR_W);
+        // The ✕ occupies the rightmost control cell, inset by STRIP_PAD.
+        assert!((bar.close_rect.x + bar.close_rect.w - (1000.0 - STRIP_PAD)).abs() < 0.01);
+        assert!((bar.close_rect.w - CTRL_W).abs() < 0.01);
+        assert_eq!(bar.close_rect.h, TABBAR_H);
+        // It matches the standalone hit-test helper the app uses for hover.
+        let cr = detached_close_rect(1000);
+        assert_eq!(cr.x, bar.close_rect.x);
+        // The ✕ glyph is emitted.
+        assert!(bar.labels.iter().any(|l| l.0 == "✕"));
+    }
+
+    #[test]
+    fn detached_bar_shows_title_pill() {
+        let bar = build_detached_bar(1000, "Build logs", &theme(), false, CHROME_CHAR_W);
+        // Title present in the sans title labels.
+        assert!(bar.title_labels.iter().any(|l| l.0 == "Build logs"));
+        // Bar bg + pill are both emitted (≥ 2 quads).
+        assert!(bar.quads.len() >= 2);
+    }
+
+    #[test]
+    fn detached_bar_close_hover_paints_theme_red() {
+        let hot = build_detached_bar(1000, "Tab 2", &theme(), true, CHROME_CHAR_W);
+        let red = theme().palette[1];
+        assert!(hot.quads.iter().any(|q| q.color == [red[0], red[1], red[2], 255]));
+        // Glyph flips to white on hover.
+        assert!(hot.labels.iter().any(|l| l.0 == "✕" && l.3 == [0xFF, 0xFF, 0xFF]));
+    }
+
+    #[test]
+    fn detached_bar_long_title_truncates_with_ellipsis() {
+        let long = "a very long detached tab title that cannot fit";
+        let bar = build_detached_bar(1000, long, &theme(), false, CHROME_CHAR_W);
+        let label = &bar.title_labels[0].0;
+        assert!(label.ends_with('…'), "expected truncation, got {label:?}");
     }
 
     #[test]

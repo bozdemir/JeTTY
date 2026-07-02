@@ -25,15 +25,25 @@ pub fn reattach_index(tabs_len_after_push: usize) -> usize {
     tabs_len_after_push.saturating_sub(1)
 }
 
-/// Cols/rows for a BARE detached terminal window (no tab bar, no status bar):
-/// the grid fills the whole client area minus the scrollbar gutter. `width_px`/
-/// `height_px` are physical pixels; `cell_w`/`cell_h` the glyph cell size.
-pub(crate) fn grid_dims(width_px: f32, height_px: f32, cell_w: f32, cell_h: f32, scrollbar_gutter: f32) -> (usize, usize) {
+/// Cols/rows for a detached terminal window with chrome: the grid fills the
+/// client area minus the scrollbar gutter (width), the top bar (`top_bar_h`,
+/// normally TABBAR_H) and the bottom status strip (`status_h`, 0 when the perf
+/// HUD is off). `width_px`/`height_px` are physical pixels; `cell_w`/`cell_h`
+/// the glyph cell size. Mirrors the main window's `grid_dims`/`reflow` math.
+pub(crate) fn grid_dims(
+    width_px: f32,
+    height_px: f32,
+    cell_w: f32,
+    cell_h: f32,
+    scrollbar_gutter: f32,
+    top_bar_h: f32,
+    status_h: f32,
+) -> (usize, usize) {
     if cell_w <= 0.0 || cell_h <= 0.0 {
         return (80, 24); // fallback, matches app.rs FALLBACK_COLS/ROWS
     }
     let cols = ((width_px - scrollbar_gutter) / cell_w).floor().max(2.0) as usize;
-    let rows = (height_px / cell_h).floor().max(1.0) as usize;
+    let rows = ((height_px - top_bar_h - status_h) / cell_h).floor().max(1.0) as usize;
     (cols, rows)
 }
 
@@ -62,25 +72,40 @@ use crate::app::Tab;
 /// (window, GPU context, text/quad layers, offscreen texture). Mirrors the
 /// per-window resources that the main `App` holds for the main window.
 ///
-/// No tab bar is present — a detached window always contains exactly one tab.
+/// A detached window always contains exactly one tab; its chrome is a slim top
+/// bar (title + close ✕, draggable to move) and — when the perf HUD is on — the
+/// same bottom status strip as the main window.
 pub(crate) struct DetachedWindow {
     pub window: Arc<Window>,
     pub gpu: GpuContext,
     /// Terminal-font TextLayer for the tab's grid content.
     pub text: TextLayer,
-    /// UI-font TextLayer for window chrome (title, status bar, overlays).
-    /// Reserved for future chrome parity with the main window (a detached window
-    /// currently renders a bare terminal, so this is built but not yet read).
-    #[allow(dead_code)]
+    /// UI-font TextLayer for window chrome (title, close ✕, status bar, menu).
     pub chrome_text: TextLayer,
     pub quad: QuadLayer,
     /// Surface-sized offscreen render target (same descriptor as
     /// `App::make_offscreen`). Reserved for future CRT and Tier-B summon effects
-    /// in detached windows (built now for parity; not yet read by the bare renderer).
+    /// in detached windows (built now for parity; not yet read by the renderer).
     #[allow(dead_code)]
     pub offscreen: (wgpu::Texture, wgpu::TextureView),
     /// The single terminal session owned by this detached window.
     pub tab: Tab,
+    /// Last known cursor position inside THIS window (physical px).
+    pub cursor: (f64, f64),
+    /// Manual top-bar drag: `Some(local cursor at press)` while the bar is held.
+    /// Each CursorMoved computes `global_cursor = outer_position + local` and
+    /// moves the window to `global_cursor - offset`, so the RELEASE event is
+    /// ours (needed for drop-to-reattach). `None` when not dragging (including
+    /// the Wayland `drag_window()` fallback, where the compositor owns the drag).
+    pub bar_drag: Option<(f64, f64)>,
+    /// Cached resize-edge zone so `set_cursor` fires only on zone changes
+    /// (mirrors `App::resize_cursor` for the borderless main window).
+    pub resize_zone: crate::app::ResizeZone,
+    /// Whether the cursor is over the close ✕ (drives the red hover highlight).
+    pub close_hover: bool,
+    /// Time + position of the last left press on the top bar, for the
+    /// double-click → maximize toggle (mirrors `App::last_strip_click`).
+    pub last_bar_click: Option<(std::time::Instant, f32, f32)>,
 }
 
 impl DetachedWindow {
@@ -91,9 +116,10 @@ impl DetachedWindow {
     ///
     /// `font_logical` and `ui_font_logical` are the caller's current logical font
     /// sizes (same values stored in `App::font_logical` and `App::ui_font_logical`).
-    /// `font_family` is the terminal font family (same as `App::font_family`).
-    /// Both are scaled by the new window's `scale_factor` before being passed to
-    /// `TextLayer`, matching how `App::resumed` builds the main-window layers.
+    /// `font_family` is the terminal font family (same as `App::font_family`);
+    /// `ui_font_family` the chrome family (`""` = platform sans, same as
+    /// `App::ui_font_family`). Both sizes are scaled by the new window's
+    /// `scale_factor` before being passed to `TextLayer`, matching `App::resumed`.
     pub(crate) fn new(
         event_loop: &ActiveEventLoop,
         tab: Tab,
@@ -102,6 +128,7 @@ impl DetachedWindow {
         font_logical: f32,
         ui_font_logical: f32,
         font_family: &str,
+        ui_font_family: &str,
     ) -> Self {
         // Title the OS window from the tab (mirrors how the tab bar displays it).
         let window = jetty_platform::build_window(
@@ -124,10 +151,16 @@ impl DetachedWindow {
             &gpu.device, &gpu.queue, gpu.format, font_logical * scale, font_family,
         );
         // Chrome layer — mirrors the chrome TextLayer built in `App::resumed`
-        // (`app.rs` ~2801): UI font at ui_font_logical × scale_factor.
-        let chrome_text = TextLayer::new_with_family(
+        // (`app.rs` ~2801): UI font at ui_font_logical × scale_factor, with the
+        // chrome family applied via `set_ui_family` (no fontconfig rescan).
+        let mut chrome_text = TextLayer::new_with_family(
             &gpu.device, &gpu.queue, gpu.format, ui_font_logical * scale, font_family,
         );
+        chrome_text.set_ui_family(if ui_font_family.is_empty() {
+            None
+        } else {
+            Some(ui_font_family)
+        });
         // Quad layer — same call as both sites in `app.rs` (~1823, ~2735).
         let quad = QuadLayer::new(&gpu.device, gpu.format);
 
@@ -156,7 +189,20 @@ impl DetachedWindow {
         window.focus_window();
         window.request_redraw();
 
-        Self { window, gpu, text, chrome_text, quad, offscreen, tab }
+        Self {
+            window,
+            gpu,
+            text,
+            chrome_text,
+            quad,
+            offscreen,
+            tab,
+            cursor: (0.0, 0.0),
+            bar_drag: None,
+            resize_zone: crate::app::ResizeZone::None,
+            close_hover: false,
+            last_bar_click: None,
+        }
     }
 }
 
@@ -193,15 +239,23 @@ mod tests {
     }
 
     #[test]
-    fn detached_grid_dims_fills_client_area_minus_gutter() {
-        // No tab bar, no status bar: only the scrollbar gutter is subtracted
-        // from width; height is used in full.
-        assert_eq!(grid_dims(800.0, 600.0, 10.0, 20.0, 14.0), (78, 30));
+    fn detached_grid_dims_reserves_top_bar_and_status_strip() {
+        // Chrome heights: 36px top bar + 22px status strip → rows shrink;
+        // width still only loses the scrollbar gutter.
+        // cols = floor((800-14)/10) = 78; rows = floor((600-36-22)/20) = 27.
+        assert_eq!(grid_dims(800.0, 600.0, 10.0, 20.0, 14.0, 36.0, 22.0), (78, 27));
+    }
+
+    #[test]
+    fn detached_grid_dims_no_status_strip_when_hud_off() {
+        // status_h = 0 (perf HUD off): only the top bar is reserved.
+        // rows = floor((600-36)/20) = 28.
+        assert_eq!(grid_dims(800.0, 600.0, 10.0, 20.0, 14.0, 36.0, 0.0), (78, 28));
     }
 
     #[test]
     fn detached_grid_dims_zero_cell_falls_back_to_default() {
-        assert_eq!(grid_dims(800.0, 600.0, 0.0, 0.0, 14.0), (80, 24));
+        assert_eq!(grid_dims(800.0, 600.0, 0.0, 0.0, 14.0, 36.0, 22.0), (80, 24));
     }
 
     #[test]

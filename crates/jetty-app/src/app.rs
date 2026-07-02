@@ -572,15 +572,16 @@ pub struct App {
     /// first hide; the first open is centered.
     last_pos: Option<winit::dpi::PhysicalPosition<i32>>,
     /// All open detached terminal windows (one `Tab` each). Created by
-    /// `detach_active_tab`; dropped (closing the OS window and reaping the PTY)
+    /// `detach_tab`; dropped (closing the OS window and reaping the PTY)
     /// when `reattach_tab` or the window's CloseRequested removes the entry.
     detached: Vec<crate::detached::DetachedWindow>,
 }
 
-/// Which resize zone (if any) the cursor is over on the borderless main window.
+/// Which resize zone (if any) the cursor is over on a borderless window (the
+/// main window and every detached window share this).
 /// Corners take priority over edges; `None` means a normal cursor / no resize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResizeZone {
+pub(crate) enum ResizeZone {
     None,
     West,
     East,
@@ -594,7 +595,7 @@ enum ResizeZone {
 
 impl ResizeZone {
     /// The winit resize direction for this zone (None for `ResizeZone::None`).
-    fn direction(self) -> Option<winit::window::ResizeDirection> {
+    pub(crate) fn direction(self) -> Option<winit::window::ResizeDirection> {
         use winit::window::ResizeDirection as D;
         Some(match self {
             ResizeZone::None => return None,
@@ -610,7 +611,7 @@ impl ResizeZone {
     }
 
     /// The cursor icon matching this resize zone.
-    fn cursor_icon(self) -> winit::window::CursorIcon {
+    pub(crate) fn cursor_icon(self) -> winit::window::CursorIcon {
         use winit::window::CursorIcon as C;
         match self {
             ResizeZone::None => C::Default,
@@ -626,7 +627,7 @@ impl ResizeZone {
 /// of physical size `w`×`h`. Edges are within `EDGE` px of a side; corners
 /// within `CORNER` px of a corner. Corners take priority over edges. Returns
 /// `ResizeZone::None` when the cursor is in the interior.
-fn resize_zone_at(cx: f32, cy: f32, w: u32, h: u32) -> ResizeZone {
+pub(crate) fn resize_zone_at(cx: f32, cy: f32, w: u32, h: u32) -> ResizeZone {
     const EDGE: f32 = 6.0;
     const CORNER: f32 = 12.0;
     let w = w as f32;
@@ -1107,21 +1108,32 @@ impl App {
         }
     }
 
-    /// Move the active tab out of the main window into a new `DetachedWindow`.
+    /// Move tab `idx` out of the main window into a new `DetachedWindow`.
     ///
     /// Guarded by `can_detach`: requires ≥ 2 tabs so the main window is never left
     /// empty. The `Tab` (PTY + terminal grid) is moved by value; the shell is never
-    /// restarted.
-    fn detach_active_tab(&mut self, event_loop: &ActiveEventLoop) {
+    /// restarted. Ctrl+Shift+D passes the active index; the tab context menu
+    /// passes an arbitrary one.
+    fn detach_tab(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
         if !crate::detached::can_detach(self.tabs.len()) {
             return; // keep at least one tab in the main window
         }
-        let idx = self.active;
         let Some(mut tab) = crate::detached::take_tab(&mut self.tabs, idx) else {
             return;
         };
-        // Keep the main window's active index valid after the removal.
-        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        // Keep the main window's active index valid after the removal, and keep
+        // index-bearing UI state aligned with the removed tab (same fix-ups as
+        // `close_tab` — the tab left this window either way).
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len().saturating_sub(1);
+        } else if self.active > idx {
+            self.active -= 1;
+        }
+        Self::adjust_index_after_remove(&mut self.renaming, idx);
+        Self::adjust_index_after_remove(&mut self.confirm_close, idx);
+        if self.renaming.is_none() {
+            self.rename_buf.clear();
+        }
 
         // Apply the current theme to the detached tab before it leaves.
         tab.terminal.set_theme(self.current_theme());
@@ -1154,16 +1166,22 @@ impl App {
             self.font_logical,
             self.ui_font_logical,
             &self.font_family,
+            &self.ui_font_family,
         );
 
-        // Reflow the moved tab to the detached window's grid. A detached window
-        // is a BARE terminal — no tab bar, no status bar — so its grid fills the
-        // whole client area; use the detached window's OWN GPU surface size and
-        // cell size (not `self.grid_dims()`, which subtracts the main window's
-        // tab bar height and would under-size the detached grid by ~2 rows).
+        // Reflow the moved tab to the detached window's grid: the client area
+        // minus its own chrome (top bar + status strip when the perf HUD is on)
+        // and the scrollbar gutter. Use the detached window's OWN GPU surface
+        // size and cell size (not `self.grid_dims()` — different surface).
         let (cw, ch) = dw.text.cell_size();
         let (cols, rows) = crate::detached::grid_dims(
-            dw.gpu.config.width as f32, dw.gpu.config.height as f32, cw, ch, SCROLLBAR_GUTTER,
+            dw.gpu.config.width as f32,
+            dw.gpu.config.height as f32,
+            cw,
+            ch,
+            SCROLLBAR_GUTTER,
+            TABBAR_H,
+            self.status_h(),
         );
         dw.tab.terminal.resize(cols, rows);
         dw.tab.pty.resize(cols as u16, rows as u16);
@@ -2201,10 +2219,10 @@ impl App {
         }
     }
 
-    /// Route a `WindowEvent` addressed to the detached window at `self.detached[pos]`.
-    /// Only rendering is handled here (Task 5 scope) — keyboard input and resize
-    /// reflow are wired up in Task 6, and reattach (the proper meaning of the
-    /// window's close button) lands in Task 7. All other events are no-ops for now.
+    /// Route a `WindowEvent` addressed to the detached window at `self.detached[pos]`:
+    /// rendering, keyboard, resize reflow, the top-bar chrome (close→reattach,
+    /// manual drag-to-move, double-click maximize), borderless resize edges, the
+    /// Reattach/Copy/Paste context menu, and drop-to-reattach on drag release.
     fn handle_detached_event(
         &mut self,
         pos: usize,
@@ -2254,8 +2272,7 @@ impl App {
                     ),
                 };
                 match action {
-                    // Ctrl+Shift+D is reserved for reattach (Task 7). Don't
-                    // forward it to the PTY in the meantime.
+                    // Ctrl+Shift+D in a detached window reattaches its tab.
                     input::KeyAction::DetachTab => {
                         self.reattach_tab(pos);
                         return;
@@ -2272,14 +2289,23 @@ impl App {
                 }
             }
             WindowEvent::Resized(size) => {
+                let status_h = self.status_h();
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 dw.gpu.resize(size.width, size.height);
-                // Bare window: no tab bar / status bar to subtract, same
-                // convention as `detach_active_tab`'s initial sizing and
-                // `detached::grid_dims`.
+                dw.text.resize(&dw.gpu);
+                dw.chrome_text.resize(&dw.gpu);
+                // Chrome heights: the top bar plus (when the perf HUD is on)
+                // the bottom status strip — same convention as `detach_tab`'s
+                // initial sizing and the main window's `reflow`.
                 let (cw, ch) = dw.text.cell_size();
                 let (cols, rows) = crate::detached::grid_dims(
-                    size.width as f32, size.height as f32, cw, ch, SCROLLBAR_GUTTER,
+                    size.width as f32,
+                    size.height as f32,
+                    cw,
+                    ch,
+                    SCROLLBAR_GUTTER,
+                    TABBAR_H,
+                    status_h,
                 );
                 dw.tab.terminal.resize(cols, rows);
                 dw.tab.pty.resize(cols as u16, rows as u16);
@@ -2287,6 +2313,108 @@ impl App {
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let Some(dw) = self.detached.get_mut(pos) else { return };
+                dw.cursor = (position.x, position.y);
+                // --- Manual top-bar drag (move the window ourselves) ---
+                // global_cursor = outer_position + local cursor; the window's new
+                // top-left is global_cursor - the press offset. Doing this manually
+                // (instead of win.drag_window()) keeps the RELEASE event in OUR
+                // queue, which drop-to-reattach needs. On Wayland outer_position()
+                // errs — but then bar_drag is never set (see the press handler),
+                // so this arm is unreachable there.
+                if let Some((ox, oy)) = dw.bar_drag {
+                    if let Ok(outer) = dw.window.outer_position() {
+                        let nx = outer.x + (position.x - ox).round() as i32;
+                        let ny = outer.y + (position.y - oy).round() as i32;
+                        dw.window
+                            .set_outer_position(winit::dpi::PhysicalPosition::new(nx, ny));
+                    }
+                    return;
+                }
+                let (w, h) = (dw.gpu.config.width, dw.gpu.config.height);
+                let cx = position.x as f32;
+                let cy = position.y as f32;
+                // --- Resize-edge cursor feedback (borderless window) ---
+                let zone = resize_zone_at(cx, cy, w, h);
+                if zone != dw.resize_zone {
+                    dw.resize_zone = zone;
+                    dw.window.set_cursor(zone.cursor_icon());
+                }
+                // --- Close ✕ hover highlight ---
+                let hover = input::point_in(&jetty_render::detached_close_rect(w), cx, cy);
+                if hover != dw.close_hover {
+                    dw.close_hover = hover;
+                    dw.window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                // Decide inside the dw borrow, act on `self` afterwards.
+                let reattach = {
+                    let Some(dw) = self.detached.get_mut(pos) else { return };
+                    let (cx, cy) = (dw.cursor.0 as f32, dw.cursor.1 as f32);
+                    let (w, h) = (dw.gpu.config.width, dw.gpu.config.height);
+                    // --- Resize edges: corners > edges, before the bar. ---
+                    let zone = resize_zone_at(cx, cy, w, h);
+                    if let Some(dir) = zone.direction() {
+                        let _ = dw.window.drag_resize_window(dir);
+                        return;
+                    }
+                    // --- Top bar: close ✕ → reattach; empty bar → move. ---
+                    if cy < TABBAR_H {
+                        if input::point_in(&jetty_render::detached_close_rect(w), cx, cy) {
+                            true
+                        } else {
+                            // Double-click on the bar toggles maximize (same
+                            // ~400ms/5px window as the main strip).
+                            let now = std::time::Instant::now();
+                            let is_double = matches!(
+                                dw.last_bar_click,
+                                Some((t, px, py))
+                                    if now.duration_since(t)
+                                        <= std::time::Duration::from_millis(400)
+                                        && (cx - px).abs() <= 5.0
+                                        && (cy - py).abs() <= 5.0
+                            );
+                            dw.last_bar_click = Some((now, cx, cy));
+                            if is_double {
+                                dw.window.set_maximized(!dw.window.is_maximized());
+                                dw.last_bar_click = None;
+                            } else if dw.window.outer_position().is_ok() {
+                                // Manual drag: record the press offset; the
+                                // CursorMoved arm moves the window from it.
+                                dw.bar_drag = Some(dw.cursor);
+                            } else {
+                                // Wayland: no readable outer position — fall
+                                // back to the compositor drag.
+                                let _ = dw.window.drag_window();
+                            }
+                            return;
+                        }
+                    } else {
+                        // Grid-area press: nothing to do (no selection wiring
+                        // in detached windows yet).
+                        return;
+                    }
+                };
+                if reattach {
+                    self.reattach_tab(pos);
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                // End of a manual top-bar drag: the window stays where the last
+                // CursorMoved put it.
+                let Some(dw) = self.detached.get_mut(pos) else { return };
+                dw.bar_drag = None;
             }
             WindowEvent::Focused(true) if pos < self.detached.len() => {
                 // OUR detached window now holds focus: record it and keep the
@@ -2304,19 +2432,25 @@ impl App {
                 if self.last_focused_window == Some(self.detached[pos].window.id()) {
                     self.last_focused_window = None;
                 }
+                // If focus left mid-interaction, the matching release/click may
+                // never arrive — clear the per-window drag state so nothing
+                // resumes stuck (same discipline as the main window's auto-hide).
+                if let Some(dw) = self.detached.get_mut(pos) {
+                    dw.bar_drag = None;
+                    dw.last_bar_click = None;
+                }
             }
             _ => {}
         }
     }
 
-    /// Render a detached window's single tab as a BARE terminal: no tab bar, no
-    /// status bar, grid top offset 0, the grid fills the whole client area minus
-    /// the scrollbar gutter. Mirrors the main window's terminal draw passes from
-    /// the `RedrawRequested` arm of `window_event` (clear + per-cell background
-    /// quads, then glyphs, then the scrollbar) using the detached window's OWN
-    /// `gpu`/`text`/`quad`/`offscreen` — every other main-window pass (tab bar,
-    /// status bar, overlays, summon/CRT effects) is intentionally omitted, since
-    /// a detached window has none of that chrome.
+    /// Render a detached window: its single tab's grid plus the window chrome —
+    /// a top bar (title pill + close ✕, TABBAR_H tall), the bottom status strip
+    /// (perf HUD) when `show_perf_hud`, and the Reattach/Copy/Paste context menu
+    /// when open. Mirrors the main window's terminal draw passes from the
+    /// `RedrawRequested` arm of `window_event` using the detached window's OWN
+    /// `gpu`/`text`/`chrome_text`/`quad` — the remaining main-window passes
+    /// (overlays, summon/CRT effects) are intentionally omitted.
     fn render_detached_window(&mut self, pos: usize) {
         let Some(dw) = self.detached.get_mut(pos) else { return };
 
@@ -2334,30 +2468,38 @@ impl App {
             let _ = dw.tab.writer.flush();
         }
 
-        // Snapshot + theme are read before the mutable gpu/text/quad borrow below
-        // (same pattern the main RedrawRequested arm uses for `snap`/`theme`).
+        // Snapshot + theme + chrome inputs are read before the mutable
+        // gpu/text/quad borrow below (same pattern as the main RedrawRequested).
         let snap = dw.tab.terminal.snapshot();
+        let title = dw.tab.title.clone();
+        let close_hover = dw.close_hover;
         let theme = self.current_theme();
+        let status_h = self.status_h();
+        // Same global HUD string the main status bar shows (built on the main
+        // window's frames). Reading the cache never wakes anything.
+        let perf_label = self.perf_label.clone();
 
         let Some(dw) = self.detached.get_mut(pos) else { return };
         let gpu = &mut dw.gpu;
         let text = &mut dw.text;
+        let chrome_text = &mut dw.chrome_text;
         let quad = &mut dw.quad;
 
         let Some((frame, view)) = gpu.acquire_frame() else { return };
         let width = gpu.config.width;
         let height = gpu.config.height;
 
-        // Bare terminal: no tab bar, no status bar — the grid starts at y=0.
-        const GRID_TOP: f32 = 0.0;
+        // The grid sits below the top bar (and above the status strip).
+        let grid_top = TABBAR_H;
 
         let (cell_w, cell_h) = text.cell_size();
+        let chrome_char_w = chrome_text.cell_size().0;
         let selection_bg = selection_bg_for(&theme);
         let scrollbar_thumb = scrollbar_thumb_for(&theme);
 
         // Pass 1: clear to the theme bg and paint per-cell background quads
         // (reverse-video / colored backgrounds / selection) under the text.
-        let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, GRID_TOP, selection_bg);
+        let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, grid_top, selection_bg);
         quad.render_clear(
             &gpu.device,
             &gpu.queue,
@@ -2367,16 +2509,59 @@ impl App {
             &bg_rects,
             jetty_render::default_bg_clear(&snap, gpu.premultiply_clear),
         );
-        // Pass 2: glyphs on top of the painted background. No caret flash in a
-        // detached window yet (caret/keyboard wiring is Task 6).
+        // Pass 2: glyphs on top of the painted background, offset by the bar.
         let _ = text.render_to(
-            &gpu.device, &gpu.queue, &view, width, height, &snap, false, GRID_TOP, None,
+            &gpu.device, &gpu.queue, &view, width, height, &snap, false, grid_top, None,
             [0.0, 0.0, 0.0],
         );
-        // Pass 3: scrollbar, spanning the full grid height (no status bar to
-        // reserve room for in a detached window).
-        if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, GRID_TOP, 0.0, scrollbar_thumb) {
+        // Pass 3: the top bar (title pill + close ✕) over the grid.
+        let bar = jetty_render::build_detached_bar(width, &title, &theme, close_hover, chrome_char_w);
+        quad.render(&gpu.device, &gpu.queue, &view, width, height, &bar.quads);
+        if !bar.labels.is_empty() {
+            let _ = chrome_text.render_overlays(
+                &gpu.device, &gpu.queue, &view, width, height, &bar.labels,
+            );
+        }
+        if !bar.title_labels.is_empty() {
+            // Title in the platform's proportional sans, like main tab titles.
+            let _ = chrome_text.render_overlays_sans(
+                &gpu.device, &gpu.queue, &view, width, height, &bar.title_labels,
+            );
+        }
+        // Pass 4: scrollbar, spanning the grid area between the bars.
+        if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, grid_top, status_h, scrollbar_thumb) {
             quad.render(&gpu.device, &gpu.queue, &view, width, height, &[r]);
+        }
+        // Pass 5: bottom STATUS strip (perf HUD) when enabled — the same slim
+        // theme-derived strip as the main window; it may show the same global
+        // HUD string (built by the main window's frames).
+        if status_h > 0.0 {
+            let sy = height as f32 - status_h;
+            let tb = theme.bg;
+            let tf = theme.fg;
+            let nl = |t: f32| -> [u8; 4] {
+                [
+                    (tb[0] as f32 + (tf[0] as f32 - tb[0] as f32) * t) as u8,
+                    (tb[1] as f32 + (tf[1] as f32 - tb[1] as f32) * t) as u8,
+                    (tb[2] as f32 + (tf[2] as f32 - tb[2] as f32) * t) as u8,
+                    255,
+                ]
+            };
+            let strip = jetty_render::Rect {
+                x: 0.0, y: sy, w: width as f32, h: status_h,
+                color: nl(0.05), ..Default::default()
+            };
+            quad.render(&gpu.device, &gpu.queue, &view, width, height, &[strip]);
+            if let Some(perf) = perf_label.as_deref() {
+                let perf_w = perf.chars().count() as f32 * chrome_char_w;
+                let px = (width as f32 - perf_w - 12.0).max(8.0);
+                let dim = nl(0.5);
+                let py = sy + (status_h - 16.0) / 2.0;
+                let _ = chrome_text.render_overlays(
+                    &gpu.device, &gpu.queue, &view, width, height,
+                    &[(perf.to_string(), px, py, [dim[0], dim[1], dim[2]])],
+                );
+            }
         }
         frame.present();
     }
@@ -4291,7 +4476,7 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                     input::KeyAction::DetachTab => {
-                        self.detach_active_tab(event_loop);
+                        self.detach_tab(self.active, event_loop);
                     }
                     input::KeyAction::NextTab => {
                         self.switch_tab(true);

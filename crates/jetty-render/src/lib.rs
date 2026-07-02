@@ -30,6 +30,7 @@ pub use menu::{build_context_menu, ContextMenu};
 pub use help::{build_help_overlay, HelpOverlay, HELP_ROWS};
 pub use confirm::{build_confirm, build_confirm_close, ConfirmPopup};
 pub use tabbar::{
-    build_tab_bar, build_tab_bar_ex, CtrlHover, TabBar, CONTROLS_W, STRIP_PAD, TABBAR_H,
+    build_detached_bar, build_tab_bar, build_tab_bar_ex, detached_close_rect, CtrlHover,
+    DetachedBar, TabBar, CONTROLS_W, STRIP_PAD, TABBAR_H,
 };
 pub use welcome::{build_welcome_overlay, WelcomeOverlay};

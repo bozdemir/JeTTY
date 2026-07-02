@@ -10,6 +10,10 @@
 ///                    default 16). Drives ALL chrome (tab bar/status/menu/panel/
 ///                    help/confirm/welcome) and the panel's live "Aa" specimen.
 ///   JETTY_SHOT_UI_FONT — UI (chrome) font family (default "" = platform sans).
+///   JETTY_SHOT_DETACHED — "1" renders the DETACHED-window chrome: top bar
+///                    (title + ✕), grid offset below it, bottom status strip.
+///                    JETTY_SHOT_DETACHED_TITLE / _HOVER tweak title and the
+///                    ✕ hover state.
 ///
 /// If the terminal bg alpha < 255, the rendered image is composited over a
 /// checkerboard (alternating 16px squares of [40,40,40] and [90,90,90]) so
@@ -121,8 +125,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     eprintln!("jetty-shot: {} monospace families found (e.g. {:?})", mono_families.len(), mono_families.first());
 
+    // JETTY_SHOT_DETACHED=1 — render the DETACHED-window chrome: the top bar
+    // (title pill + close ✕), the grid offset below it, and the bottom status
+    // strip, mirroring App::render_detached_window for visual verification.
+    let detached_shot = std::env::var("JETTY_SHOT_DETACHED").map(|v| v != "0").unwrap_or(false);
+    let shot_grid_top: f32 = if detached_shot { jetty_render::TABBAR_H } else { 0.0 };
+    let shot_status_h: f32 = if detached_shot { 22.0 } else { 0.0 };
+
     let cols = (width as f32 / cell_w).floor().max(1.0) as usize;
-    let rows = (height as f32 / cell_h).floor().max(1.0) as usize;
+    let rows = (((height as f32 - shot_grid_top - shot_status_h) / cell_h).floor()).max(1.0) as usize;
 
     eprintln!("jetty-shot: grid = {cols}x{rows} cells (cell {cell_w:.1}x{cell_h:.1}px)");
 
@@ -240,7 +251,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ((terminal.theme().bg[1] as u16 + sel_accent[1] as u16 * 2) / 3) as u8,
         ((terminal.theme().bg[2] as u16 + sel_accent[2] as u16 * 2) / 3) as u8,
     ];
-    let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, 0.0, sel_bg);
+    let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, shot_grid_top, sel_bg);
     quad.render_clear(
         &device,
         &queue,
@@ -254,7 +265,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // --- Pass 2: render the grid text on top of the painted background (load) ---
-    text.render_to(&device, &queue, &view, width, height, &snap, false, 0.0, None, [0.0, 0.0, 0.0])?;
+    text.render_to(&device, &queue, &view, width, height, &snap, false, shot_grid_top, None, [0.0, 0.0, 0.0])?;
 
     // --- Draw scrollbar quad (and optionally the settings panel) over the text ---
     {
@@ -263,7 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sb_fg = terminal.theme().fg;
         let sb_mix = |i: usize| (sb_bg[i] as f32 + (sb_fg[i] as f32 - sb_bg[i] as f32) * 0.35) as u8;
         let sb_thumb = [sb_mix(0), sb_mix(1), sb_mix(2), 210];
-        if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, 0.0, 0.0, sb_thumb) {
+        if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, shot_grid_top, shot_status_h, sb_thumb) {
             rects.push(r);
         }
 
@@ -449,6 +460,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "jetty-shot: JETTY_SHOT_TABBAR rendered 3 sample tabs ({})",
                 if tab_bar_bottom { "BOTTOM" } else { "top" }
             );
+        }
+
+        // JETTY_SHOT_DETACHED — render the DETACHED-window chrome: top bar with
+        // the tab title + close ✕ (JETTY_SHOT_DETACHED_HOVER=1 for the red hover
+        // state), and the bottom status strip with a sample perf HUD — mirroring
+        // App::render_detached_window (the grid above was already offset by
+        // TABBAR_H and shortened by the status strip).
+        if detached_shot {
+            let close_hover =
+                std::env::var("JETTY_SHOT_DETACHED_HOVER").map(|v| v != "0").unwrap_or(false);
+            let title = std::env::var("JETTY_SHOT_DETACHED_TITLE")
+                .unwrap_or_else(|_| "Tab 2".to_string());
+            let bar = jetty_render::build_detached_bar(
+                width, &title, terminal.theme(), close_hover, chrome_char_w,
+            );
+            rects.extend(bar.quads);
+            panel_labels.extend(bar.labels);
+            panel_title_labels.extend(bar.title_labels);
+
+            // Bottom STATUS strip with a sample HUD string (same slim strip as
+            // the main window; a detached window may show the same global HUD).
+            let perf = std::env::var("JETTY_SHOT_PERF")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "⚡ 5.1 ms · 190 fps · 0.5% CPU · 155 MB/s".to_string());
+            let sy = (height as f32 - shot_status_h).max(0.0);
+            let tb = terminal.theme().bg;
+            let tf = terminal.theme().fg;
+            let nl = |t: f32| -> [u8; 4] {
+                [
+                    (tb[0] as f32 + (tf[0] as f32 - tb[0] as f32) * t) as u8,
+                    (tb[1] as f32 + (tf[1] as f32 - tb[1] as f32) * t) as u8,
+                    (tb[2] as f32 + (tf[2] as f32 - tb[2] as f32) * t) as u8,
+                    255,
+                ]
+            };
+            rects.push(jetty_render::Rect {
+                x: 0.0, y: sy, w: width as f32, h: shot_status_h, color: nl(0.05), ..Default::default()
+            });
+            let perf_w = perf.chars().count() as f32 * chrome_char_w;
+            let px = (width as f32 - perf_w - 12.0).max(8.0);
+            let dim = nl(0.5);
+            panel_labels.push((perf, px, sy + (shot_status_h - 16.0) / 2.0, [dim[0], dim[1], dim[2]]));
+
+            eprintln!("jetty-shot: JETTY_SHOT_DETACHED rendered detached-window chrome (title={title:?}, hover={close_hover})");
         }
 
         // JETTY_SHOT_WELCOME — render the neofetch-style welcome splash overlay
