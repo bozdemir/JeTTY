@@ -345,7 +345,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(0),
                 &jetty_render::EffectsParams::default(),
-                0.0, // effects_scroll (screenshots always start at top)
+                // JETTY_SHOT_PANEL_FX_SCROLL — Effects-tab scroll offset in px
+                // (test-only; clamped like the app does; default 0 = top).
+                std::env::var("JETTY_SHOT_PANEL_FX_SCROLL")
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .map(|v| {
+                        v.clamp(
+                            0.0,
+                            (jetty_render::EFFECTS_CONTENT_H - jetty_render::EFFECTS_VISIBLE_H)
+                                .max(0.0),
+                        )
+                    })
+                    .unwrap_or(0.0),
                 // JETTY_SHOT_PANEL_THEME_OPEN=1 expands the theme dropdown; the
                 // scroll offset comes from JETTY_SHOT_PANEL_THEME_SCROLL (test-only).
                 std::env::var("JETTY_SHOT_PANEL_THEME_OPEN").map(|s| s != "0").unwrap_or(false),
@@ -355,15 +367,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or(0),
             );
             rects.extend(pv.quads);
-            rects.extend(pv.effects_quads);
+            // Effects-tab content is scissored to the content viewport in the
+            // live app. The harness has no per-pass scissor, so clip the quads
+            // in software (rect ∩ viewport) and drop out-of-viewport labels —
+            // otherwise scrolled-out widgets would leak over the footer/panel
+            // edge in shots and misrepresent the real render.
+            let mut lab = pv.labels;
+            if let Some(vp) = pv.effects_viewport {
+                let (vt, vb) = (vp[1] as f32, (vp[1] + vp[3]) as f32);
+                for mut q in pv.effects_quads {
+                    let top = q.y.max(vt);
+                    let bottom = (q.y + q.h).min(vb);
+                    if bottom - top > 0.5 {
+                        q.h = bottom - top;
+                        if (q.y - top).abs() > 0.01 {
+                            q.y = top;
+                            q.radius = 0.0; // clipped edge: drop rounding
+                        }
+                        rects.push(q);
+                    }
+                }
+                lab.extend(
+                    pv.effects_labels
+                        .into_iter()
+                        .filter(|l| l.2 >= vt - 1.0 && l.2 + 16.0 <= vb + 1.0),
+                );
+            } else {
+                rects.extend(pv.effects_quads);
+                lab.extend(pv.effects_labels);
+            }
             // The live "Aa" specimen is drawn at the TRUE UI size via chrome_text
             // (here chrome_text IS at the UI size), so capture its baseline.
             ui_specimen_pos = Some(pv.ui_specimen_pos);
             eprintln!(
                 "jetty-shot: panel enabled (opacity={opacity:.2}, theme_idx={theme_idx}, font_size={font_size}, ui_font_size={ui_font_size}, offset=({panel_dx},{panel_dy}))"
             );
-            let mut lab = pv.labels;
-            lab.extend(pv.effects_labels);
             lab
         } else {
             Vec::new()

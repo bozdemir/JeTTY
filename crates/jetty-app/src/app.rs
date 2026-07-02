@@ -3220,7 +3220,7 @@ impl App {
                         MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
                         MouseScrollDelta::PixelDelta(p) => -(p.y as f32),
                     };
-                    // max_scroll = EFFECTS_CONTENT_H − EFFECTS_VISIBLE_H = 652.0 − 460.0 = 192.0
+                    // max_scroll = EFFECTS_CONTENT_H − EFFECTS_VISIBLE_H = 716.0 − 460.0 = 256.0
                     let max_scroll = (jetty_render::EFFECTS_CONTENT_H
                         - jetty_render::EFFECTS_VISIBLE_H).max(0.0);
                     self.effects_scroll = (self.effects_scroll + delta_px).clamp(0.0, max_scroll);

@@ -74,14 +74,14 @@ pub struct PanelGeom {
     pub font_minus: Rect,
     /// Font-size increment button ("+").
     pub font_plus: Rect,
-    /// Font-size reset button ("reset").
+    /// Font-size reset button ("Reset").
     pub font_reset: Rect,
     /// One Rect per visible font-family row in the font picker list.
     /// Index i maps to `families[font_scroll_offset + i]`.
     pub font_rows: Vec<Rect>,
     /// The scroll offset into the families list at the time of rendering.
     pub font_scroll_offset: usize,
-    /// The draggable title-bar strip at the top of the panel (~36px tall).
+    /// The draggable title-bar strip at the top of the panel (~44px tall).
     /// A left-press here that does NOT hit any widget starts a dialog drag.
     pub title_bar: Rect,
     /// ▲ scroll button — decrements font_scroll_offset.
@@ -112,9 +112,9 @@ pub struct PanelGeom {
     pub dropdown_width_track: Rect,
     /// Dropdown-width slider handle.
     pub dropdown_width_handle: Rect,
-    /// "Auto-hide on focus loss" toggle pill.
+    /// "Auto-hide on focus loss" toggle switch.
     pub autohide_toggle: Rect,
-    /// "Launch at login" toggle pill.
+    /// "Launch at login" toggle switch.
     pub launch_login_toggle: Rect,
     /// Shell-picker "‹" (previous) cycle button.
     pub shell_prev: Rect,
@@ -125,7 +125,7 @@ pub struct PanelGeom {
     pub ui_font_minus: Rect,
     /// UI-font-size increment button ("+").
     pub ui_font_plus: Rect,
-    /// UI-font-size reset button ("rst").
+    /// UI-font-size reset button ("Reset").
     pub ui_font_reset: Rect,
     /// One Rect per visible UI-font-family row. Index i maps to
     /// `ui_families[ui_font_scroll_offset + i]` (index 0 = "System Sans").
@@ -139,7 +139,7 @@ pub struct PanelGeom {
 
     // ── Effects-tab geometry ──────────────────────────────────────────────────
     // All rects are OFF (1e6) when the Effects tab is not active.
-    /// "CRT ENABLED" master toggle pill.
+    /// "CRT ENABLED" master toggle switch.
     pub crt_enabled_toggle: Rect,
     /// CRT curvature slider track and handle.
     pub crt_curvature_track: Rect,
@@ -166,13 +166,13 @@ pub struct PanelGeom {
     pub crt_tint_g_handle: Rect,
     pub crt_tint_b_track: Rect,
     pub crt_tint_b_handle: Rect,
-    /// CRT animation toggle pills (roll / flicker / jitter), three on one band.
+    /// CRT animation toggle chips (roll / flicker / jitter), three on one band.
     pub crt_roll_toggle: Rect,
     pub crt_flicker_toggle: Rect,
     pub crt_jitter_toggle: Rect,
-    /// Caret flash-enabled toggle pill.
+    /// Caret flash-enabled toggle switch.
     pub caret_flash_toggle: Rect,
-    /// Caret glow-enabled toggle pill.
+    /// Caret glow-enabled toggle switch.
     pub caret_glow_toggle: Rect,
     /// Caret flash-duration slider track and handle (maps 60..=400 ms → 0..1).
     pub caret_dur_track: Rect,
@@ -185,29 +185,30 @@ pub struct PanelGeom {
     pub caret_color_b_track: Rect,
     pub caret_color_b_handle: Rect,
     /// Total pixel height of the Effects tab's content region:
-    /// `last_band_bottom − content_top`. Stored for the scroll task (Task 6).
-    /// Independent of screen size; always 652.0 (14 bands × 44 px pitch + 36 px
-    /// for the last slider handle's bottom offset).
+    /// `last_band_bottom − content_top`. Stored for the scroll task.
+    /// Independent of screen size; always `EFFECTS_CONTENT_H` (716.0 =
+    /// 14 bands × 48 px pitch + 44 px for the last band's slider bottom).
     pub effects_content_h: f32,
 
     // ── Scroll viewport bounds (used by hit-testing for the Effects tab) ──────
     /// Y coordinate (physical px) where the scrollable content area begins, i.e.
-    /// `panel.y + 100`. Clicks above this row must not trigger Effects widgets
-    /// even if an Effects rect has scrolled into that region.
+    /// `panel.y + CONTENT_TOP_OFFSET`. Clicks above this row must not trigger
+    /// Effects widgets even if an Effects rect has scrolled into that region.
     pub content_top: f32,
-    /// Y coordinate (physical px) of the panel's bottom edge, i.e.
-    /// `panel.y + PANEL_H`. Clicks at or below this row are outside the panel.
+    /// Y coordinate (physical px) where the scrollable content area ends — the
+    /// top of the footer band, i.e. `content_top + EFFECTS_VISIBLE_H`. Clicks at
+    /// or below this row are outside the Effects viewport.
     pub content_bottom: f32,
 }
 
 /// Full description of how to draw the settings panel for one frame.
 pub struct PanelView {
-    /// Chrome rects in draw order (border → bg → chip highlights → chip fills →
-    /// opacity/radius tracks → scrollbar indicator).  These are rendered WITHOUT
-    /// a scissor so the panel chrome is always fully visible.
+    /// Chrome rects in draw order (border → bg → hairlines → control fills →
+    /// slider tracks → list cards/rows).  These are rendered WITHOUT a scissor
+    /// so the panel chrome is always fully visible.
     pub quads: Vec<Rect>,
     /// Chrome text labels: title, tab strip, section headers for non-Effects tabs,
-    /// font/window/shell widget values.  Rendered without clip bounds.
+    /// font/window/shell widget values, footer hint.  Rendered without clip bounds.
     pub labels: Vec<(String, f32, f32, [u8; 3])>,
     /// Effects-tab widget rects (CRT + Caret group), including the scrollbar
     /// indicator as the last element.  Empty when `active_tab != 4`.  Rendered
@@ -243,7 +244,7 @@ const MAX_UI_FONT_ROWS: usize = 4;
 
 /// Maximum number of theme rows shown at once in the open theme dropdown. With
 /// more presets than this the list scrolls via `theme_scroll_offset`. Sized so
-/// the expanded list still fits inside PANEL_H below the combo header.
+/// the expanded menu still fits inside PANEL_H below the combo header.
 const MAX_THEME_ROWS: usize = 9;
 
 /// The 8 ANSI palette indices shown as the per-theme swatch strip (the 8 "normal"
@@ -307,28 +308,62 @@ pub(crate) const CHAR_W_FALLBACK: f32 = 9.8;
 ///                     Its content exceeds PANEL_H, so this tab alone scrolls
 ///                     (GPU-clipped to the viewport; see `effects_viewport`).
 ///
-/// All five tabs share one `content_top` (py+100) and lay their bands out
-/// top-down from there. The Fonts tab's last UI-font row bottoms at ~py+520, so
-/// PANEL_H = 560 leaves a comfortable bottom margin; shorter tabs simply have
-/// empty space below their last band.
-pub const PANEL_W: f32 = 380.0;
-pub const PANEL_H: f32 = 560.0;
+/// All five tabs share one `content_top` (py + CONTENT_TOP_OFFSET) and lay their
+/// bands out top-down from there. A fixed footer band (FOOTER_H) with a hairline
+/// and a hint anchors the bottom edge so shorter tabs still read as a complete,
+/// bounded sheet rather than trailing off into dead space.
+pub const PANEL_W: f32 = 420.0;
+pub const PANEL_H: f32 = 592.0;
+
+/// Horizontal padding between the panel edge and content (the 8-px grid ×2.5;
+/// every band, slider, and list aligns to `px + PAD` / `px + PANEL_W − PAD`).
+const PAD: f32 = 20.0;
+/// Content width: `PANEL_W − 2·PAD`.
+const CW: f32 = PANEL_W - 2.0 * PAD; // 380
 
 /// Y-offset from the panel's top edge to the scrollable content area (title bar
-/// + tab strip chrome). Single-sourced here so `EFFECTS_VISIBLE_H` and the
-/// `content_top` local in `build_panel` can both derive from it.
-const CONTENT_TOP_OFFSET: f32 = 100.0;
+/// + tab strip chrome + breathing room). Single-sourced here so
+/// `EFFECTS_VISIBLE_H` and the `content_top` local in `build_panel` can both
+/// derive from it.
+const CONTENT_TOP_OFFSET: f32 = 96.0;
 
-/// Total pixel height of the Effects-tab content region (14 bands × 44 px pitch
-/// + 36 px for the last slider handle's bottom offset). Single source of truth
-/// for the scroll clamp in `App` and the scrollbar indicator in `build_panel`.
-/// Value: `14 × 44 + 36 = 652.0`.
-pub const EFFECTS_CONTENT_H: f32 = 14.0 * 44.0 + 36.0;
+/// Height of the fixed footer band at the panel bottom (hairline + hint text).
+/// The Effects scroll viewport ends where the footer begins.
+const FOOTER_H: f32 = 36.0;
 
-/// Visible height of the Effects-tab content viewport (the panel height minus the
-/// chrome strip). Scroll is clamped to `[0, EFFECTS_CONTENT_H − EFFECTS_VISIBLE_H]`
-/// = `[0, 192.0]`. Value: `PANEL_H − CONTENT_TOP_OFFSET = 460.0`.
-pub const EFFECTS_VISIBLE_H: f32 = PANEL_H - CONTENT_TOP_OFFSET;
+/// Shared control metrics: every button, cycler, stepper and combo is CTL_H
+/// tall with the same corner radius, so the whole panel reads as one system.
+const CTL_H: f32 = 28.0;
+const R_CTL: f32 = 6.0;
+
+/// Toggle-switch metrics (a knob-in-track switch replaces the old ON/OFF pill).
+const SW_W: f32 = 44.0;
+const SW_H: f32 = 24.0;
+
+/// List rows (font / UI-font pickers) inside their inset card.
+const ROW_H: f32 = 24.0;
+const ROW_GAP: f32 = 2.0;
+/// Inner padding of list cards (and the open theme menu).
+const LIST_PAD: f32 = 5.0;
+
+/// Theme-dropdown row height (taller than plain list rows: swatch strip inside).
+const THEME_ROW_H: f32 = 28.0;
+const THEME_ROW_GAP: f32 = 2.0;
+
+/// Effects-tab band pitch (uniform; sliders and toggles share it).
+const FX_PITCH: f32 = 48.0;
+
+/// Total pixel height of the Effects-tab content region (14 band pitches +
+/// 44 px for the last band's slider bottom + breathing room). Single source of
+/// truth for the scroll clamp in `App` and the scrollbar indicator in
+/// `build_panel`. Value: `14 × 48 + 44 = 716.0`.
+pub const EFFECTS_CONTENT_H: f32 = 14.0 * FX_PITCH + 44.0;
+
+/// Visible height of the Effects-tab content viewport (the panel height minus
+/// the top chrome and the footer band). Scroll is clamped to
+/// `[0, EFFECTS_CONTENT_H − EFFECTS_VISIBLE_H]`.
+/// Value: `PANEL_H − CONTENT_TOP_OFFSET − FOOTER_H = 460.0`.
+pub const EFFECTS_VISIBLE_H: f32 = PANEL_H - CONTENT_TOP_OFFSET - FOOTER_H;
 
 
 /// Build the settings panel for the given screen size, opacity (0.1..=1.0),
@@ -362,7 +397,7 @@ pub fn build_panel(
     dropdown_width_pct: f32,
     is_dropdown: bool,
     focus_autohide: bool,
-    // `launch_at_login`: drives the "LAUNCH AT LOGIN" toggle pill (accent when
+    // `launch_at_login`: drives the "LAUNCH AT LOGIN" toggle switch (accent when
     //   ON). The app derives this from the XDG autostart file's existence.
     launch_at_login: bool,
     // ── UI (chrome) FONT section inputs ──
@@ -390,7 +425,7 @@ pub fn build_panel(
     active_tab: usize,
     // `effects`: visual-effect parameters from the app's runtime `EffectsConfig`
     //   mirror (`App.fx`). Used on the Effects tab (4) to position widget handles
-    //   and toggle pill states. Ignored on other tabs (bands are at OFF).
+    //   and toggle switch states. Ignored on other tabs (bands are at OFF).
     effects: &EffectsParams,
     // `effects_scroll`: vertical scroll offset (physical px, 0 = top) for the
     //   Effects tab.  Subtracted from every `t_fx_*` band top when active_tab==4
@@ -412,7 +447,9 @@ pub fn build_panel(
     // All panel colors are derived from the ACTIVE theme so the settings window
     // re-skins itself when the theme changes (instead of staying a fixed dark
     // gray). `lerp` blends bg→fg by `t` for shades that keep contrast on both
-    // dark and light themes.
+    // dark and light themes. Accent (palette blue) is reserved for ACTIVE /
+    // SELECTED state only: the tab underline, slider fills+knobs, switches that
+    // are ON, and the selected list row.
     let tbg = theme.bg; // [r,g,b,a]
     let tfg = theme.fg; // [r,g,b]
     let accent = theme.palette[4]; // blue accent
@@ -423,40 +460,53 @@ pub fn build_panel(
             (tbg[2] as f32 + (tfg[2] as f32 - tbg[2] as f32) * t).round() as u8,
         ]
     };
+    let lerp4 = |t: f32, a: u8| -> [u8; 4] {
+        let c = lerp(t);
+        [c[0], c[1], c[2], a]
+    };
     // Panel surface: a slightly lifted shade of the theme bg, made nearly opaque.
-    let panel_bg3 = lerp(0.06);
-    let panel_bg: [u8; 4] = [panel_bg3[0], panel_bg3[1], panel_bg3[2], 242];
+    let panel_bg: [u8; 4] = lerp4(0.06, 246);
     // Border: a lighter shade so the panel reads as a card on any theme.
-    let border3 = lerp(0.30);
-    let panel_border: [u8; 4] = [border3[0], border3[1], border3[2], 255];
-    // Button fills: a mid shade between bg and fg.
-    let btn3 = lerp(0.14);
-    let btn_fill: [u8; 4] = [btn3[0], btn3[1], btn3[2], 255];
+    let panel_border: [u8; 4] = lerp4(0.22, 255);
+    // Hairline separators (under the tab strip, above the footer, section rules).
+    let hairline: [u8; 4] = lerp4(0.14, 255);
+    // Control fills: one shade for every button/cycler/stepper/combo.
+    let ctl_fill: [u8; 4] = lerp4(0.10, 255);
+    // Thin separators INSIDE segmented controls (cycler / stepper).
+    let seg_sep: [u8; 4] = lerp4(0.20, 255);
     // Slider track: dim shade.
-    let track3 = lerp(0.18);
-    let slider_track_col: [u8; 4] = [track3[0], track3[1], track3[2], 255];
-    // Accent for handles / selection highlights.
+    let slider_track_col: [u8; 4] = lerp4(0.16, 255);
+    // Inset list-card well (font/UI-font pickers): slightly darker than the panel.
+    let card_fill: [u8; 4] = lerp4(0.02, 255);
+    // Open theme menu surface: slightly lifted so it floats over the panel.
+    let menu_fill: [u8; 4] = lerp4(0.09, 255);
+    let menu_border: [u8; 4] = lerp4(0.28, 255);
+    // Accent for handles / switch-on / selection.
     let accent_col: [u8; 4] = [accent[0], accent[1], accent[2], 255];
     // Accent fill for the "filled" (left) portion of slider tracks.
-    // Uses a slightly translucent accent so the track gradient reads clearly.
     let accent_fill: [u8; 4] = [accent[0], accent[1], accent[2], 200];
-    // Selected font-row background: a dim accent blend.
+    // Selected list-row background: a calm accent tint (≈25% accent over bg).
     let row_sel: [u8; 4] = [
-        ((tbg[0] as u16 + accent[0] as u16 * 2) / 3) as u8,
-        ((tbg[1] as u16 + accent[1] as u16 * 2) / 3) as u8,
-        ((tbg[2] as u16 + accent[2] as u16 * 2) / 3) as u8,
+        ((tbg[0] as u16 * 3 + accent[0] as u16) / 4) as u8,
+        ((tbg[1] as u16 * 3 + accent[1] as u16) / 4) as u8,
+        ((tbg[2] as u16 * 3 + accent[2] as u16) / 4) as u8,
         255,
     ];
-    // Unselected font-row background: a faint lift over the panel bg.
-    let row_unsel3 = lerp(0.10);
-    let row_unsel: [u8; 4] = [row_unsel3[0], row_unsel3[1], row_unsel3[2], 220];
-    // Text colors.
+    // Switch knob colors: bg-toned on the accent track (ON), dim on the idle track.
+    let knob_on: [u8; 4] = [tbg[0], tbg[1], tbg[2], 255];
+    let knob_off3 = lerp(0.55);
+    let knob_off: [u8; 4] = [knob_off3[0], knob_off3[1], knob_off3[2], 255];
+    // Text colors — the hierarchy: values (main) > rows (dim) > CAPS headers.
     let text_main = tfg;
-    let text_dim = lerp(0.70);
-    let text_btn = lerp(0.78);
-    // Section headers (CAPS) use a slightly dimmer shade than body text so they
-    // read as labels rather than values, matching the design's "muted CAPS" look.
-    let text_header = lerp(0.55);
+    let text_dim = lerp(0.72);
+    let text_btn = lerp(0.75);
+    // Section headers (CAPS) are the QUIETEST text on the sheet so they read as
+    // labels; the right-aligned values in text_main carry the optical weight.
+    let text_header = lerp(0.52);
+    // Inline helper/hint text (footer, per-setting descriptions).
+    let text_hint = lerp(0.42);
+    // Chip/pill text on an accent fill (theme bg so it contrasts the accent).
+    let on_accent: [u8; 3] = [tbg[0], tbg[1], tbg[2]];
 
     // Center, then apply the user drag offset, then clamp to screen edges.
     let sw = screen_w as f32;
@@ -465,24 +515,28 @@ pub fn build_panel(
     let py = (((sh - PANEL_H) / 2.0).floor() + dy).clamp(0.0, (sh - PANEL_H).max(0.0));
 
     // ── Per-band tops ────────────────────────────────────────────────────────
-    // Every band keeps its existing internal (sub-element) layout relative to a
-    // single "band top" Y. For the ACTIVE tab the band tops run top-down from
+    // Every band keeps its internal (sub-element) layout relative to a single
+    // "band top" Y. For the ACTIVE tab the band tops run top-down from
     // `content_top`; for every other tab they are OFF (offscreen), so all rects
     // and labels derived from them fall far offscreen and can neither be hit-tested
     // nor seen. This keeps app.rs's hit-test logic tab-agnostic.
     //
-    //   Tab 0 "Look":   opacity(48) · corner-radius(48) · theme cards(grid)
-    //   Tab 1 "Fonts":  font-size(60) · font list(154) · UI-size+specimen(90) · UI list
-    //   Tab 2 "Window": summon · win-mode · drop-h · drop-w · tab-bar · auto-hide (48 each)
-    //   Tab 3 "Shell":  shell cycler(48) · launch-at-login toggle
-    let content_top = py + 100.0;
+    // Band pitches (8-px grid): single-line control rows 48, slider rows 56,
+    // list sections (header + card) per their row count.
+    //
+    //   Tab 0 "Look":   opacity(56) · corner-radius(56) · theme combo(+menu)
+    //   Tab 1 "Fonts":  size stepper(44) · font list(184) · UI stepper+Aa(84) · UI list
+    //   Tab 2 "Window": summon(48) · win-mode(48) · drop-h(56) · drop-w(56) ·
+    //                   tab-bar(48) · auto-hide
+    //   Tab 3 "Shell":  shell cycler + hint(56) · launch-at-login + hint
+    let content_top = py + CONTENT_TOP_OFFSET;
     let (mut t_opacity, mut t_radius, mut t_theme) = (OFF, OFF, OFF);
     let (mut t_fontsize, mut t_fontlist, mut t_uifontsize, mut t_uifontlist) =
         (OFF, OFF, OFF, OFF);
     let (mut t_summon, mut t_winmode, mut t_droph, mut t_dropw, mut t_tabbar, mut t_autohide) =
         (OFF, OFF, OFF, OFF, OFF, OFF);
     let (mut t_shell, mut t_launch) = (OFF, OFF);
-    // Effects-tab band tops (15 bands, 44 px pitch each).
+    // Effects-tab band tops (15 bands, FX_PITCH px pitch each).
     // Naming: t_fx_<widget>. OFF when tab 4 is not active.
     let (mut t_fx_crt_hdr, mut t_fx_crt_en, mut t_fx_curv, mut t_fx_scan,
          mut t_fx_mask,    mut t_fx_bloom,  mut t_fx_chroma, mut t_fx_vignette,
@@ -493,53 +547,53 @@ pub fn build_panel(
     match active_tab {
         0 => {
             t_opacity = content_top;
-            t_radius = content_top + 48.0;
-            t_theme = content_top + 96.0;
+            t_radius = content_top + 56.0;
+            t_theme = content_top + 112.0;
         }
         1 => {
             t_fontsize = content_top;
-            t_fontlist = content_top + 60.0;
-            t_uifontsize = content_top + 214.0;
-            t_uifontlist = content_top + 304.0;
+            t_fontlist = content_top + 44.0;
+            t_uifontsize = content_top + 228.0;
+            t_uifontlist = content_top + 312.0;
         }
         2 => {
             t_summon = content_top;
             t_winmode = content_top + 48.0;
             t_droph = content_top + 96.0;
-            t_dropw = content_top + 144.0;
-            t_tabbar = content_top + 192.0;
-            t_autohide = content_top + 240.0;
+            t_dropw = content_top + 152.0;
+            t_tabbar = content_top + 208.0;
+            t_autohide = content_top + 256.0;
         }
         3 => {
             t_shell = content_top;
-            t_launch = content_top + 48.0;
+            t_launch = content_top + 64.0;
         }
         4 => {
-            // 15 bands × 44 px pitch, top-to-bottom from content_top.
+            // 15 bands × FX_PITCH px pitch, top-to-bottom from content_top.
             // `effects_scroll` (physical px) is subtracted from each band top so
             // the drawn positions and the PanelGeom hit-rects are identical —
             // the caller (App) has already clamped it to [0, max_scroll].
             // The OFF sentinel for inactive tabs is NOT modified here.
             let s = effects_scroll; // shorthand
-            t_fx_crt_hdr  = content_top             - s;     // band 0: "CRT" section header
-            t_fx_crt_en   = content_top +  1.0*44.0 - s;    // band 1: crt_enabled toggle
-            t_fx_curv     = content_top +  2.0*44.0 - s;    // band 2: crt_curvature slider
-            t_fx_scan     = content_top +  3.0*44.0 - s;    // band 3: crt_scanline slider
-            t_fx_mask     = content_top +  4.0*44.0 - s;    // band 4: crt_mask slider
-            t_fx_bloom    = content_top +  5.0*44.0 - s;    // band 5: crt_bloom slider
-            t_fx_chroma   = content_top +  6.0*44.0 - s;    // band 6: crt_chromatic slider
-            t_fx_vignette = content_top +  7.0*44.0 - s;    // band 7: crt_vignette slider
-            t_fx_tint     = content_top +  8.0*44.0 - s;    // band 8: crt_scanline_tint RGB
-            t_fx_anim     = content_top +  9.0*44.0 - s;    // band 9: roll/flicker/jitter pills
-            t_fx_caret_hdr= content_top + 10.0*44.0 - s;   // band 10: "CARET" section header
-            t_fx_flash    = content_top + 11.0*44.0 - s;   // band 11: caret_flash_enabled toggle
-            t_fx_glow     = content_top + 12.0*44.0 - s;   // band 12: caret_glow_enabled toggle
-            t_fx_dur      = content_top + 13.0*44.0 - s;   // band 13: caret_flash_ms slider
-            t_fx_color    = content_top + 14.0*44.0 - s;   // band 14: caret_flash_color RGB
+            t_fx_crt_hdr  = content_top                  - s; // band 0: "CRT" section header
+            t_fx_crt_en   = content_top +  1.0*FX_PITCH - s; // band 1: crt_enabled switch
+            t_fx_curv     = content_top +  2.0*FX_PITCH - s; // band 2: crt_curvature slider
+            t_fx_scan     = content_top +  3.0*FX_PITCH - s; // band 3: crt_scanline slider
+            t_fx_mask     = content_top +  4.0*FX_PITCH - s; // band 4: crt_mask slider
+            t_fx_bloom    = content_top +  5.0*FX_PITCH - s; // band 5: crt_bloom slider
+            t_fx_chroma   = content_top +  6.0*FX_PITCH - s; // band 6: crt_chromatic slider
+            t_fx_vignette = content_top +  7.0*FX_PITCH - s; // band 7: crt_vignette slider
+            t_fx_tint     = content_top +  8.0*FX_PITCH - s; // band 8: crt_scanline_tint RGB
+            t_fx_anim     = content_top +  9.0*FX_PITCH - s; // band 9: roll/flicker/jitter chips
+            t_fx_caret_hdr= content_top + 10.0*FX_PITCH - s; // band 10: "CARET" section header
+            t_fx_flash    = content_top + 11.0*FX_PITCH - s; // band 11: caret_flash_enabled switch
+            t_fx_glow     = content_top + 12.0*FX_PITCH - s; // band 12: caret_glow_enabled switch
+            t_fx_dur      = content_top + 13.0*FX_PITCH - s; // band 13: caret_flash_ms slider
+            t_fx_color    = content_top + 14.0*FX_PITCH - s; // band 14: caret_flash_color RGB
         }
         _ => {
             t_shell = content_top;
-            t_launch = content_top + 48.0;
+            t_launch = content_top + 64.0;
         }
     }
 
@@ -553,214 +607,241 @@ pub fn build_panel(
 
     // --- Border + background ---
     let border_rect = Rect::rounded(
-        px - 2.0, py - 2.0, PANEL_W + 4.0, PANEL_H + 4.0, panel_border, 10.0,
+        px - 2.0, py - 2.0, PANEL_W + 4.0, PANEL_H + 4.0, panel_border, 11.0,
     );
-    let bg_rect = Rect::rounded(px, py, PANEL_W, PANEL_H, panel_bg, 8.0);
+    let bg_rect = Rect::rounded(px, py, PANEL_W, PANEL_H, panel_bg, 9.0);
 
-    // --- Title bar (draggable handle: py+0 .. py+36) ---
+    // --- Title bar (draggable handle: py+0 .. py+44) ---
     let title_bar = Rect {
         x: px,
         y: py,
         w: PANEL_W,
-        h: 36.0,
+        h: 44.0,
         color: [0, 0, 0, 0], // drawn via bg; color unused for hit-test
         ..Default::default()
     };
 
-    // --- Tab strip (py+50 .. py+82): 5 evenly distributed clickable labels ---
-    // Labels baseline at py+56; the active tab gets a 2px accent underline at
-    // py+78. The hit rects span the full cell so the whole label area is clickable.
-    let tab_w = (PANEL_W - 32.0) / 5.0;
-    let tab_strip_y = py + 56.0;
+    // --- Tab strip (py+44 .. py+76) ---
+    // Leading-aligned cells sized to their label (text + adaptive side padding),
+    // sitting on a full-width hairline at py+76; the active tab carries a 2-px
+    // accent underline exactly as wide as its label (+8) that meets the hairline.
+    let tab_names_chars: [f32; 5] = {
+        let mut a = [0.0; 5];
+        for (i, n) in TAB_NAMES.iter().enumerate() {
+            a[i] = n.chars().count() as f32;
+        }
+        a
+    };
+    let tabs_text_w: f32 = tab_names_chars.iter().map(|c| c * char_w).sum();
+    // Adaptive per-side cell padding: use the slack left of CW, capped to 14 px
+    // so the strip stays leading-aligned (never stretches to fill).
+    let tab_pad = ((CW - tabs_text_w) / 10.0).clamp(4.0, 14.0);
+    let tab_strip_y = py + 52.0; // label baseline
     let mut tab_rects: [Rect; 5] = [Rect::default(); 5];
-    for (i, r) in tab_rects.iter_mut().enumerate() {
-        let cell_x = px + 16.0 + i as f32 * tab_w;
-        *r = Rect {
-            x: cell_x,
-            y: py + 50.0,
-            w: tab_w,
-            h: 30.0,
-            color: [0, 0, 0, 0],
-            ..Default::default()
-        };
+    {
+        let mut cx = px + PAD - tab_pad; // first label still starts at px+PAD
+        for (i, r) in tab_rects.iter_mut().enumerate() {
+            let cell_w = tab_names_chars[i] * char_w + 2.0 * tab_pad;
+            *r = Rect {
+                x: cx,
+                y: py + 44.0,
+                w: cell_w,
+                h: 32.0,
+                color: [0, 0, 0, 0],
+                ..Default::default()
+            };
+            cx += cell_w;
+        }
     }
 
-    // Helper: right-align a text value on the section-header row.
-    // Returns the x-position such that the text's right edge sits at px+PANEL_W-16.
+    // Helper: right-align a text value against the content right edge.
     let right_x = |text: &str| -> f32 {
         let w = text.chars().count() as f32 * char_w;
-        px + PANEL_W - 16.0 - w
+        px + PANEL_W - PAD - w
+    };
+    // Helper: center `text` inside [left, left+width].
+    let center_x = |text: &str, left: f32, width: f32| -> f32 {
+        left + (width - text.chars().count() as f32 * char_w) * 0.5
     };
 
-    // --- Opacity band (Look) ---
-    // CAPS label + value on the header row (t_opacity); track at +24 (h=6); handle
-    // at +18 (h=18). The filled left portion of the track shows progress.
-    let slider_track = Rect::rounded(px + 16.0, t_opacity + 24.0, 348.0, 6.0, slider_track_col, 3.0);
+    // ── Shared control constructors ──────────────────────────────────────────
+    // Full-width slider: CAPS header + right value on line 1, a 4-px track with
+    // a 16-px round knob on line 2. Returns (hit, track, fill, handle): `hit` is
+    // a taller invisible strip stored in PanelGeom so the thin track stays an
+    // easy click/drag target; only track/fill/handle are drawn.
+    let track_x = px + PAD;
+    let slider_at = |t: f32, frac: f32| -> (Rect, Rect, Rect, Rect) {
+        let frac = frac.clamp(0.0, 1.0);
+        let hit = Rect {
+            x: track_x, y: t + 22.0, w: CW, h: 20.0,
+            color: [0, 0, 0, 0], ..Default::default()
+        };
+        let track = Rect::rounded(track_x, t + 30.0, CW, 4.0, slider_track_col, 2.0);
+        let fill_w = (frac * (CW - 16.0) + 8.0).clamp(4.0, CW);
+        let fill = Rect::rounded(track_x, t + 30.0, fill_w, 4.0, accent_fill, 2.0);
+        let handle = Rect::rounded(track_x + frac * (CW - 16.0), t + 24.0, 16.0, 16.0, accent_col, 8.0);
+        (hit, track, fill, handle)
+    };
+    // 90-px RGB mini-slider (same knob language, smaller).
+    let mini_slider_at = |bx: f32, t: f32, frac: f32| -> (Rect, Rect, Rect, Rect) {
+        let frac = frac.clamp(0.0, 1.0);
+        let hit = Rect {
+            x: bx, y: t + 22.0, w: 90.0, h: 20.0,
+            color: [0, 0, 0, 0], ..Default::default()
+        };
+        let track = Rect::rounded(bx, t + 30.0, 90.0, 4.0, slider_track_col, 2.0);
+        let fill_w = (frac * (90.0 - 14.0) + 7.0).clamp(4.0, 90.0);
+        let fill = Rect::rounded(bx, t + 30.0, fill_w, 4.0, accent_fill, 2.0);
+        let handle = Rect::rounded(bx + frac * (90.0 - 14.0), t + 25.0, 14.0, 14.0, accent_col, 7.0);
+        (hit, track, fill, handle)
+    };
+    // Toggle switch: knob-in-track, right-aligned on its band. Returns
+    // (track, knob); the track rect doubles as the hit target in PanelGeom.
+    let switch_x = px + PANEL_W - PAD - SW_W;
+    let switch_at = |t: f32, on: bool| -> (Rect, Rect) {
+        let track_col = if on { accent_col } else { slider_track_col };
+        let track = Rect::rounded(switch_x, t + 2.0, SW_W, SW_H, track_col, SW_H / 2.0);
+        let (kx, kc) = if on {
+            (switch_x + SW_W - 21.0, knob_on)
+        } else {
+            (switch_x + 3.0, knob_off)
+        };
+        let knob = Rect::rounded(kx, t + 5.0, 18.0, 18.0, kc, 9.0);
+        (track, knob)
+    };
+
+    // ── Cycler: one segmented control  [<] value [>]  right-aligned ──────────
+    const CYC_W: f32 = 210.0;
+    const CYC_SEG: f32 = 32.0;
+    let cyc_x = px + PANEL_W - PAD - CYC_W;
+    let cycle_prev_x = cyc_x; // left segment
+    let cycle_next_x = cyc_x + CYC_W - CYC_SEG; // right segment
+    let cycler_at = |t: f32| -> (Rect, Rect, Rect) {
+        let body = Rect::rounded(cyc_x, t, CYC_W, CTL_H, ctl_fill, R_CTL);
+        let prev = Rect {
+            x: cycle_prev_x, y: t, w: CYC_SEG, h: CTL_H,
+            color: [0, 0, 0, 0], ..Default::default()
+        };
+        let next = Rect {
+            x: cycle_next_x, y: t, w: CYC_SEG, h: CTL_H,
+            color: [0, 0, 0, 0], ..Default::default()
+        };
+        (body, prev, next)
+    };
+
+    // ── Stepper: one segmented control  [−] value [+]  (+ Reset) ─────────────
+    const STEP_W: f32 = 116.0;
+    const STEP_SEG: f32 = 36.0;
+    const RESET_W: f32 = 64.0;
+    let step_x = px + PANEL_W - PAD - STEP_W;
+    let reset_x = step_x - 8.0 - RESET_W;
+    let stepper_at = |t: f32| -> (Rect, Rect, Rect, Rect) {
+        let body = Rect::rounded(step_x, t, STEP_W, CTL_H, ctl_fill, R_CTL);
+        let minus = Rect {
+            x: step_x, y: t, w: STEP_SEG, h: CTL_H,
+            color: [0, 0, 0, 0], ..Default::default()
+        };
+        let plus = Rect {
+            x: step_x + STEP_W - STEP_SEG, y: t, w: STEP_SEG, h: CTL_H,
+            color: [0, 0, 0, 0], ..Default::default()
+        };
+        let reset = Rect::rounded(reset_x, t, RESET_W, CTL_H, ctl_fill, R_CTL);
+        (body, minus, plus, reset)
+    };
+
+    // --- Look tab: opacity + corner-radius sliders ---
     let frac = ((opacity - 0.1) / 0.9).clamp(0.0, 1.0);
-    let handle_x = px + 16.0 + frac * (348.0 - 14.0);
-    let slider_handle = Rect::rounded(handle_x, t_opacity + 18.0, 14.0, 18.0, accent_col, 4.0);
-    let opacity_fill_w = (frac * (348.0 - 14.0) + 7.0).max(6.0).min(348.0);
-    let opacity_fill = Rect::rounded(px + 16.0, t_opacity + 24.0, opacity_fill_w, 6.0, accent_fill, 3.0);
-
-    // --- Corner-radius band (Look) ---
-    // Radius range is [0, 24] px.
+    let (slider_track, opacity_track_q, opacity_fill, slider_handle) = slider_at(t_opacity, frac);
     const RADIUS_MAX: f32 = 24.0;
-    let radius_track = Rect::rounded(px + 16.0, t_radius + 24.0, 348.0, 6.0, slider_track_col, 3.0);
     let r_frac = (corner_radius / RADIUS_MAX).clamp(0.0, 1.0);
-    let radius_handle_x = px + 16.0 + r_frac * (348.0 - 14.0);
-    let radius_handle = Rect::rounded(radius_handle_x, t_radius + 18.0, 14.0, 18.0, accent_col, 4.0);
-    let radius_fill_w = (r_frac * (348.0 - 14.0) + 7.0).max(6.0).min(348.0);
-    let radius_fill = Rect::rounded(px + 16.0, t_radius + 24.0, radius_fill_w, 6.0, accent_fill, 3.0);
+    let (radius_track, radius_track_q, radius_fill, radius_handle) = slider_at(t_radius, r_frac);
 
-    // Shared x-positions for the ‹ / › cycle buttons (Summon/WinMode/TabBar/Shell).
-    let cycle_prev_x = px + 200.0;
-    let cycle_next_x = px + PANEL_W - 16.0 - 28.0; // rightmost
+    // --- Window tab: cyclers ---
+    let (summon_body, summon_prev, summon_next) = cycler_at(t_summon);
+    let (winmode_body, win_mode_prev, win_mode_next) = cycler_at(t_winmode);
+    let (tabbar_body, tab_bar_prev, tab_bar_next) = cycler_at(t_tabbar);
 
-    // --- Summon-effect band (Window) ---
-    // CAPS label at t_summon; ‹ name › cycle control INLINE on the same row,
-    // right-aligned (button h=28 centred on the header text → top at t_summon-6).
-    let summon_btn_y = t_summon - 6.0;
-    let summon_prev = Rect::rounded(cycle_prev_x, summon_btn_y, 28.0, 28.0, btn_fill, 4.0);
-    let summon_next = Rect::rounded(cycle_next_x, summon_btn_y, 28.0, 28.0, btn_fill, 4.0);
-
-    // --- Window-mode band (Window) ---
-    let winmode_btn_y = t_winmode - 6.0;
-    let win_mode_prev = Rect::rounded(cycle_prev_x, winmode_btn_y, 28.0, 28.0, btn_fill, 4.0);
-    let win_mode_next = Rect::rounded(cycle_next_x, winmode_btn_y, 28.0, 28.0, btn_fill, 4.0);
-
-    // --- Tab-bar band (Window) ---
-    let tabbar_btn_y = t_tabbar - 6.0;
-    let tab_bar_prev = Rect::rounded(cycle_prev_x, tabbar_btn_y, 28.0, 28.0, btn_fill, 4.0);
-    let tab_bar_next = Rect::rounded(cycle_next_x, tabbar_btn_y, 28.0, 28.0, btn_fill, 4.0);
-
-    // --- Dropdown-height band (Window) ---
-    // CAPS label + value at t_droph; track at +24 (h=6); handle at +18 (h=18).
-    // Range 25%..100%. Grayed (treated as no-op) when mode==Center.
-    let dropdown_track = Rect::rounded(px + 16.0, t_droph + 24.0, 348.0, 6.0, slider_track_col, 3.0);
+    // --- Window tab: dropdown height / width sliders ---
     let dh_frac = ((dropdown_height_pct - 0.25) / 0.75).clamp(0.0, 1.0);
-    let dropdown_handle_x = px + 16.0 + dh_frac * (348.0 - 14.0);
-    let dropdown_handle = Rect::rounded(dropdown_handle_x, t_droph + 18.0, 14.0, 18.0, accent_col, 4.0);
-    let dh_fill_w = (dh_frac * (348.0 - 14.0) + 7.0).max(6.0).min(348.0);
-    let dh_fill = Rect::rounded(px + 16.0, t_droph + 24.0, dh_fill_w, 6.0, accent_fill, 3.0);
-
-    // --- Dropdown-width band (Window) ---
-    // Range 20%..100%. Grayed (treated as no-op) when mode==Center.
-    let dropdown_width_track = Rect::rounded(px + 16.0, t_dropw + 24.0, 348.0, 6.0, slider_track_col, 3.0);
+    let (dropdown_track, dh_track_q, dh_fill, dropdown_handle) = slider_at(t_droph, dh_frac);
     let dw_frac = ((dropdown_width_pct - 0.2) / 0.8).clamp(0.0, 1.0);
-    let dropdown_width_handle_x = px + 16.0 + dw_frac * (348.0 - 14.0);
-    let dropdown_width_handle = Rect::rounded(dropdown_width_handle_x, t_dropw + 18.0, 14.0, 18.0, accent_col, 4.0);
-    let dw_fill_w = (dw_frac * (348.0 - 14.0) + 7.0).max(6.0).min(348.0);
-    let dw_fill = Rect::rounded(px + 16.0, t_dropw + 24.0, dw_fill_w, 6.0, accent_fill, 3.0);
+    let (dropdown_width_track, dw_track_q, dw_fill, dropdown_width_handle) =
+        slider_at(t_dropw, dw_frac);
 
-    // --- Auto-hide band (Window) ---
-    // CAPS label at t_autohide; toggle pill at the right (h=28). Accent when ON.
-    let autohide_pill_col: [u8; 4] = if focus_autohide { accent_col } else { btn_fill };
-    let autohide_toggle = Rect::rounded(px + PANEL_W - 16.0 - 56.0, t_autohide, 56.0, 28.0, autohide_pill_col, 14.0);
+    // --- Window tab: auto-hide switch ---
+    let (autohide_toggle, autohide_knob) = switch_at(t_autohide, focus_autohide);
 
-    // --- Font-size band (Fonts) ---
-    // CAPS label + value at t_fontsize; buttons at +20 (h=28).
-    let font_btn_y = t_fontsize + 20.0;
-    let font_minus_x = px + 200.0;
-    let font_plus_x  = font_minus_x + 36.0;
-    let font_reset_x = font_plus_x  + 36.0;
+    // --- Fonts tab: terminal font-size stepper ---
+    let (font_step_body, font_minus, font_plus, font_reset) = stepper_at(t_fontsize);
 
-    let font_minus = Rect::rounded(font_minus_x, font_btn_y, 28.0, 28.0, btn_fill, 4.0);
-    let font_plus = Rect::rounded(font_plus_x, font_btn_y, 28.0, 28.0, btn_fill, 4.0);
-    let font_reset = Rect::rounded(font_reset_x, font_btn_y, 44.0, 28.0, btn_fill, 4.0);
+    // --- Fonts tab: font-family list (header row + inset card) ---
+    // Scroll arrows live on the header row, right-aligned; the "n/total"
+    // counter sits just left of them.
+    let arrow_dn_x = px + PANEL_W - PAD - 22.0;
+    let arrow_up_x = arrow_dn_x - 26.0;
+    let font_scroll_up = Rect::rounded(arrow_up_x, t_fontlist - 1.0, 22.0, 22.0, ctl_fill, R_CTL);
+    let font_scroll_down = Rect::rounded(arrow_dn_x, t_fontlist - 1.0, 22.0, 22.0, ctl_fill, R_CTL);
 
-    // --- Font scroll buttons (▲ / ▼) on the "FONT" header row (Fonts) ---
-    let scroll_btn_y = t_fontlist - 2.0;
-    let scroll_down_x = px + PANEL_W - 16.0 - 20.0;        // ▼ rightmost
-    let scroll_up_x   = scroll_down_x - 24.0;               // ▲ left of ▼
-    let font_scroll_up = Rect::rounded(scroll_up_x, scroll_btn_y, 20.0, 20.0, btn_fill, 4.0);
-    let font_scroll_down = Rect::rounded(scroll_down_x, scroll_btn_y, 20.0, 20.0, btn_fill, 4.0);
-
-    // --- Font-family list (Fonts) ---
-    // "FONT" header at t_fontlist; rows start at +22. 5 rows × (22+2) = 120px.
-    const ROW_H: f32 = 22.0;
-    const ROW_GAP: f32 = 2.0;
-    let list_top = t_fontlist + 22.0;
-    let list_x = px + 16.0;
-    let list_w = PANEL_W - 32.0;
-
+    let list_x = px + PAD;
+    let card_h = |rows: usize| -> f32 {
+        2.0 * LIST_PAD + rows as f32 * ROW_H + rows.saturating_sub(1) as f32 * ROW_GAP
+    };
+    let font_card = Rect::rounded(
+        list_x, t_fontlist + 24.0, CW, card_h(MAX_FONT_ROWS), card_fill, 8.0,
+    );
     let offset = font_scroll_offset.min(families.len().saturating_sub(1));
     let visible_count = (families.len().saturating_sub(offset)).min(MAX_FONT_ROWS);
-
+    let row_x = list_x + LIST_PAD;
+    let row_w = CW - 2.0 * LIST_PAD;
     let mut font_row_rects: Vec<Rect> = Vec::with_capacity(visible_count);
     for i in 0..visible_count {
-        let row_y = list_top + i as f32 * (ROW_H + ROW_GAP);
-        let family_idx = offset + i;
-        let is_selected = families.get(family_idx).map(|n| n.as_str()) == Some(selected_family);
-        let row_color = if is_selected { row_sel } else { row_unsel };
-        font_row_rects.push(Rect::rounded(list_x, row_y, list_w, ROW_H, row_color, 3.0));
+        let row_y = font_card.y + LIST_PAD + i as f32 * (ROW_H + ROW_GAP);
+        font_row_rects.push(Rect::rounded(row_x, row_y, row_w, ROW_H, row_sel, 5.0));
     }
 
-    // ── UI (chrome) FONT size band + "Aa" specimen (Fonts) ───────────────────
-    //  t_uifontsize       "UI FONT SIZE" CAPS header + right-aligned "Npt" readout
-    //  t_uifontsize+20    − / + / rst buttons (h=28)
-    //  t_uifontsize+58    live "Aa" specimen baseline (drawn at the TRUE ui_font_size)
-    let ui_font_btn_y = t_uifontsize + 20.0;
-    let ui_font_minus_x = px + 200.0;
-    let ui_font_plus_x = ui_font_minus_x + 36.0;
-    let ui_font_reset_x = ui_font_plus_x + 36.0;
-    let ui_font_minus = Rect::rounded(ui_font_minus_x, ui_font_btn_y, 28.0, 28.0, btn_fill, 4.0);
-    let ui_font_plus = Rect::rounded(ui_font_plus_x, ui_font_btn_y, 28.0, 28.0, btn_fill, 4.0);
-    let ui_font_reset = Rect::rounded(ui_font_reset_x, ui_font_btn_y, 44.0, 28.0, btn_fill, 4.0);
+    // ── Fonts tab: UI (chrome) font stepper + "Aa" specimen ──────────────────
+    let (ui_step_body, ui_font_minus, ui_font_plus, ui_font_reset) = stepper_at(t_uifontsize);
 
-    // Live "Aa" specimen baseline. The app overdraws "Aa" here at the TRUE UI size
+    // Live "Aa" specimen anchor. The app overdraws "Aa" here at the TRUE UI size
     // AFTER the capped panel-text pass. Offscreen unless the Fonts tab is active,
     // so the "Aa" is only drawn on that tab.
     let ui_specimen_pos = if active_tab == 1 {
-        (px + 16.0, t_uifontsize + 58.0)
+        (px + PAD, t_uifontsize + 40.0)
     } else {
-        (px + 16.0, OFF)
+        (px + PAD, OFF)
     };
 
-    // ── UI (chrome) FONT family list (Fonts) ─────────────────────────────────
-    //  t_uifontlist       "UI FONT" list header + ▲/▼ scroll arrows + "(shown/total)"
-    //  t_uifontlist+22    4 family rows × (22+2)
-    let ui_scroll_btn_y = t_uifontlist - 2.0;
-    let ui_scroll_down_x = px + PANEL_W - 16.0 - 20.0;
-    let ui_scroll_up_x = ui_scroll_down_x - 24.0;
-    let ui_font_scroll_up = Rect::rounded(ui_scroll_up_x, ui_scroll_btn_y, 20.0, 20.0, btn_fill, 4.0);
-    let ui_font_scroll_down = Rect::rounded(ui_scroll_down_x, ui_scroll_btn_y, 20.0, 20.0, btn_fill, 4.0);
-
-    // UI FONT family list — 4 rows. Index 0 of ui_families is "System Sans".
-    let ui_list_top = t_uifontlist + 22.0;
+    // ── Fonts tab: UI font-family list (header row + inset card) ─────────────
+    let ui_font_scroll_up =
+        Rect::rounded(arrow_up_x, t_uifontlist - 1.0, 22.0, 22.0, ctl_fill, R_CTL);
+    let ui_font_scroll_down =
+        Rect::rounded(arrow_dn_x, t_uifontlist - 1.0, 22.0, 22.0, ctl_fill, R_CTL);
+    let ui_card = Rect::rounded(
+        list_x, t_uifontlist + 24.0, CW, card_h(MAX_UI_FONT_ROWS), card_fill, 8.0,
+    );
     let ui_offset = ui_font_scroll_offset.min(ui_families.len().saturating_sub(1));
     let ui_visible_count = (ui_families.len().saturating_sub(ui_offset)).min(MAX_UI_FONT_ROWS);
     let mut ui_font_row_rects: Vec<Rect> = Vec::with_capacity(ui_visible_count);
     for i in 0..ui_visible_count {
-        let row_y = ui_list_top + i as f32 * (ROW_H + ROW_GAP);
-        let family_idx = ui_offset + i;
-        // Index 0 = "System Sans (default)" → maps to "" (empty selection).
-        let row_value: &str = if family_idx == 0 {
-            ""
-        } else {
-            ui_families.get(family_idx).map(|n| n.as_str()).unwrap_or("")
-        };
-        let is_selected = row_value == selected_ui_family;
-        let row_color = if is_selected { row_sel } else { row_unsel };
-        ui_font_row_rects.push(Rect::rounded(list_x, row_y, list_w, ROW_H, row_color, 3.0));
+        let row_y = ui_card.y + LIST_PAD + i as f32 * (ROW_H + ROW_GAP);
+        ui_font_row_rects.push(Rect::rounded(row_x, row_y, row_w, ROW_H, row_sel, 5.0));
     }
 
     // --- Theme picker — collapsible dropdown combo (Look) ---
-    // "THEME" header at t_theme. Below it a full-width "combo" button shows the
-    // ACTIVE theme's display name + an 8-swatch ANSI strip + a ▼ caret. Clicking it
-    // toggles `theme_dropdown_open`. When open, an overlay list of EVERY preset
-    // (name + 8 swatches each) is laid out below, the active one highlighted, with
-    // ▲/▼ scroll arrows when the list exceeds MAX_THEME_ROWS. The list quads/labels
+    // "THEME" header at t_theme. Below it a full-width "combo" control shows the
+    // ACTIVE theme's display name + an 8-swatch ANSI strip + a caret. Clicking it
+    // toggles `theme_dropdown_open`. When open, a floating menu of presets (name +
+    // swatches, selected row accent-tinted with an accent edge) is laid out below,
+    // with header-row ▲/▼ arrows when the list overflows. The menu quads/labels
     // are emitted LAST so they overlay anything sitting below the theme band.
     let presets = jetty_core::theme::PRESETS;
     let num_presets = presets.len();
 
-    const THEME_ROW_H: f32 = 26.0;
-    const THEME_ROW_GAP: f32 = 2.0;
-    let combo_x = px + 16.0;
-    let combo_w = PANEL_W - 32.0; // 348
-    let combo_h = THEME_ROW_H + 2.0;
-    let combo_y = t_theme + 20.0;
-    let theme_combo = Rect::rounded(combo_x, combo_y, combo_w, combo_h, btn_fill, 6.0);
+    let combo_x = px + PAD;
+    let combo_w = CW;
+    let combo_h = 30.0;
+    let combo_y = t_theme + 24.0;
+    let theme_combo = Rect::rounded(combo_x, combo_y, combo_w, combo_h, ctl_fill, R_CTL);
 
     // Visible-row + scroll math (only meaningful when the list is open).
     let theme_offset = theme_scroll_offset.min(num_presets.saturating_sub(1));
@@ -769,151 +850,106 @@ pub fn build_panel(
     } else {
         0
     };
-    let theme_list_top = combo_y + combo_h + 4.0;
+    let menu_top = combo_y + combo_h + 6.0;
+    let menu_h = 2.0 * LIST_PAD
+        + theme_visible as f32 * THEME_ROW_H
+        + theme_visible.saturating_sub(1) as f32 * THEME_ROW_GAP;
     let mut theme_row_rects: Vec<Rect> = Vec::with_capacity(theme_visible);
     for i in 0..theme_visible {
-        let row_y = theme_list_top + i as f32 * (THEME_ROW_H + THEME_ROW_GAP);
-        let preset_idx = theme_offset + i;
-        let is_selected = preset_idx == theme_idx;
-        let row_color = if is_selected { row_sel } else { row_unsel };
-        theme_row_rects.push(Rect::rounded(combo_x, row_y, combo_w, THEME_ROW_H, row_color, 4.0));
+        let row_y = menu_top + LIST_PAD + i as f32 * (THEME_ROW_H + THEME_ROW_GAP);
+        theme_row_rects.push(Rect::rounded(row_x, row_y, row_w, THEME_ROW_H, row_sel, 5.0));
     }
-    // ▲/▼ scroll arrows sit on the combo header's right edge, but only when the
-    // list is open AND overflows. Otherwise they go offscreen (never hit-testable).
+    // ▲/▼ scroll arrows sit on the "THEME" header row, right-aligned — same
+    // pattern as the font lists — but only when the list is open AND overflows.
+    // Otherwise they go offscreen (never hit-testable).
     let theme_has_scroll = theme_dropdown_open && num_presets > MAX_THEME_ROWS;
     let (theme_scroll_up, theme_scroll_down) = if theme_has_scroll {
-        let by = t_theme - 2.0; // on the "THEME" header row, right-aligned
-        let dn_x = px + PANEL_W - 16.0 - 20.0;
-        let up_x = dn_x - 24.0;
         (
-            Rect::rounded(up_x, by, 20.0, 20.0, btn_fill, 4.0),
-            Rect::rounded(dn_x, by, 20.0, 20.0, btn_fill, 4.0),
+            Rect::rounded(arrow_up_x, t_theme - 1.0, 22.0, 22.0, ctl_fill, R_CTL),
+            Rect::rounded(arrow_dn_x, t_theme - 1.0, 22.0, 22.0, ctl_fill, R_CTL),
         )
     } else {
         (
-            Rect::rounded(OFF, OFF, 20.0, 20.0, btn_fill, 4.0),
-            Rect::rounded(OFF, OFF, 20.0, 20.0, btn_fill, 4.0),
+            Rect::rounded(OFF, OFF, 22.0, 22.0, ctl_fill, R_CTL),
+            Rect::rounded(OFF, OFF, 22.0, 22.0, ctl_fill, R_CTL),
         )
     };
 
-    // --- Launch-at-login band (Shell) ---
-    // CAPS label at t_launch; toggle pill at the right (h=28). Accent when ON.
-    let launch_login_pill_col: [u8; 4] = if launch_at_login { accent_col } else { btn_fill };
-    let launch_login_toggle =
-        Rect::rounded(px + PANEL_W - 16.0 - 56.0, t_launch, 56.0, 28.0, launch_login_pill_col, 14.0);
-
-    // --- Shell band (Shell) ---
-    // CAPS label + ‹ name › cycler, MIRRORING the SUMMON EFFECT / WINDOW MODE
-    // bands exactly (same ‹/› button rects, same name-centering).
-    let shell_btn_y = t_shell - 6.0;
-    let shell_prev = Rect::rounded(cycle_prev_x, shell_btn_y, 28.0, 28.0, btn_fill, 4.0);
-    let shell_next = Rect::rounded(cycle_next_x, shell_btn_y, 28.0, 28.0, btn_fill, 4.0);
+    // --- Shell tab: shell cycler + launch-at-login switch ---
+    let (shell_body, shell_prev, shell_next) = cycler_at(t_shell);
+    let (launch_login_toggle, launch_knob) = switch_at(t_launch, launch_at_login);
 
     // ── Effects tab (tab 4) widget geometry ───────────────────────────────────
-    // Patterns reused from existing bands:
-    //   • Full-width slider (348 px track): opacity slider pattern (lines above).
-    //   • Toggle pill (56×28, radius 14): autohide_toggle / launch_login_toggle.
-    //   • RGB mini-slider triple: three 108 px tracks + 12 px gaps = 348 px total.
-    //     3×108 + 2×12 = 324 + 24 = 348. Handle: 14×18 (same as full slider).
-    //
+    // Same control language as everywhere else: full-width sliders, knob
+    // switches, and 56×24 text chips for the three animation toggles.
     // When active_tab ≠ 4, all band tops are OFF so every derived rect lands
     // far offscreen and can never be hit-tested or seen.
 
-    // ── Helper values ──
-    let fx_track_x = px + 16.0;        // left edge of full-width slider track
-    let fx_pill_x  = px + PANEL_W - 16.0 - 56.0; // right-aligned single toggle pill
+    // RGB mini-slider columns: three 90-px tracks at +80/+185/+290 from the left
+    // content edge (right edge of the B column == content right edge).
+    let rgb_r_x = track_x + 80.0;
+    let rgb_g_x = track_x + 185.0;
+    let rgb_b_x = track_x + 290.0;
 
-    // RGB mini-track x positions: R at fx_track_x, G and B offset by 120 px each.
-    //   108 px track + 12 px gap = 120 px per column; 3 × 108 + 2 × 12 = 348. ✓
-    // RGB mini-sliders for TINT/COLOR: start AFTER the section header (which sits
-    // at px+16) so the header label and the "R" sub-label/slider never collide.
-    // Three 88px sliders + 14px gaps fit from fx_track_x+56 to the right margin.
-    let rgb_r_x = fx_track_x + 56.0;
-    let rgb_g_x = fx_track_x + 158.0;
-    let rgb_b_x = fx_track_x + 260.0;
-
-    // ── CRT ENABLED toggle (band 1) ──
-    let crt_en_col = if effects.crt_enabled { accent_col } else { btn_fill };
-    let crt_enabled_toggle = Rect::rounded(fx_pill_x, t_fx_crt_en, 56.0, 28.0, crt_en_col, 14.0);
-
-    // ── Macro-like inline for a full-width [0,1] slider ──
-    // Returns (track, fill, handle). Track at band_y+24; handle at band_y+18.
-    macro_rules! fx_slider {
-        ($band_y:expr, $frac:expr) => {{
-            let frac = ($frac as f32).clamp(0.0, 1.0);
-            let track  = Rect::rounded(fx_track_x, $band_y + 24.0, 348.0, 6.0, slider_track_col, 3.0);
-            let fill_w = (frac * (348.0 - 14.0) + 7.0).max(6.0).min(348.0);
-            let fill   = Rect::rounded(fx_track_x, $band_y + 24.0, fill_w, 6.0, accent_fill, 3.0);
-            let hx     = fx_track_x + frac * (348.0 - 14.0);
-            let handle = Rect::rounded(hx, $band_y + 18.0, 14.0, 18.0, accent_col, 4.0);
-            (track, fill, handle)
-        }};
-    }
-
-    // ── Macro-like inline for a 108-px RGB mini-slider ──
-    macro_rules! fx_mini_slider {
-        ($bx:expr, $band_y:expr, $frac:expr) => {{
-            let frac = ($frac as f32).clamp(0.0, 1.0);
-            let track  = Rect::rounded($bx, $band_y + 24.0, 88.0, 6.0, slider_track_col, 3.0);
-            let fill_w = (frac * (88.0 - 14.0) + 7.0).max(6.0).min(88.0);
-            let fill   = Rect::rounded($bx, $band_y + 24.0, fill_w, 6.0, accent_fill, 3.0);
-            let hx     = $bx + frac * (88.0 - 14.0);
-            let handle = Rect::rounded(hx, $band_y + 18.0, 14.0, 18.0, accent_col, 4.0);
-            (track, fill, handle)
-        }};
-    }
+    // ── CRT ENABLED switch (band 1) ──
+    let (crt_enabled_toggle, crt_en_knob) = switch_at(t_fx_crt_en, effects.crt_enabled);
 
     // CRT sliders (bands 2–7): curvature, scanline, mask, bloom, chromatic, vignette.
-    let (crt_curvature_track,  crt_curvature_fill,  crt_curvature_handle)  = fx_slider!(t_fx_curv,     effects.crt_curvature);
-    let (crt_scanline_track,   crt_scanline_fill,   crt_scanline_handle)   = fx_slider!(t_fx_scan,     effects.crt_scanline);
-    let (crt_mask_track,       crt_mask_fill,       crt_mask_handle)       = fx_slider!(t_fx_mask,     effects.crt_mask);
-    let (crt_bloom_track,      crt_bloom_fill,      crt_bloom_handle)      = fx_slider!(t_fx_bloom,    effects.crt_bloom);
-    let (crt_chromatic_track,  crt_chromatic_fill,  crt_chromatic_handle)  = fx_slider!(t_fx_chroma,   effects.crt_chromatic);
-    let (crt_vignette_track,   crt_vignette_fill,   crt_vignette_handle)   = fx_slider!(t_fx_vignette, effects.crt_vignette);
+    let (crt_curvature_track, crt_curv_q, crt_curvature_fill, crt_curvature_handle) =
+        slider_at(t_fx_curv, effects.crt_curvature);
+    let (crt_scanline_track, crt_scan_q, crt_scanline_fill, crt_scanline_handle) =
+        slider_at(t_fx_scan, effects.crt_scanline);
+    let (crt_mask_track, crt_mask_q, crt_mask_fill, crt_mask_handle) =
+        slider_at(t_fx_mask, effects.crt_mask);
+    let (crt_bloom_track, crt_bloom_q, crt_bloom_fill, crt_bloom_handle) =
+        slider_at(t_fx_bloom, effects.crt_bloom);
+    let (crt_chromatic_track, crt_chroma_q, crt_chromatic_fill, crt_chromatic_handle) =
+        slider_at(t_fx_chroma, effects.crt_chromatic);
+    let (crt_vignette_track, crt_vig_q, crt_vignette_fill, crt_vignette_handle) =
+        slider_at(t_fx_vignette, effects.crt_vignette);
 
     // CRT scanline tint RGB mini-sliders (band 8).
-    let (crt_tint_r_track, crt_tint_r_fill, crt_tint_r_handle) = fx_mini_slider!(rgb_r_x, t_fx_tint, effects.crt_scanline_tint[0]);
-    let (crt_tint_g_track, crt_tint_g_fill, crt_tint_g_handle) = fx_mini_slider!(rgb_g_x, t_fx_tint, effects.crt_scanline_tint[1]);
-    let (crt_tint_b_track, crt_tint_b_fill, crt_tint_b_handle) = fx_mini_slider!(rgb_b_x, t_fx_tint, effects.crt_scanline_tint[2]);
+    let (crt_tint_r_track, crt_tint_r_q, crt_tint_r_fill, crt_tint_r_handle) =
+        mini_slider_at(rgb_r_x, t_fx_tint, effects.crt_scanline_tint[0]);
+    let (crt_tint_g_track, crt_tint_g_q, crt_tint_g_fill, crt_tint_g_handle) =
+        mini_slider_at(rgb_g_x, t_fx_tint, effects.crt_scanline_tint[1]);
+    let (crt_tint_b_track, crt_tint_b_q, crt_tint_b_fill, crt_tint_b_handle) =
+        mini_slider_at(rgb_b_x, t_fx_tint, effects.crt_scanline_tint[2]);
 
-    // CRT animation toggle pills (band 9): ROLL / FLKR / JITR.
-    // Start AFTER the "ANIMATE" header (px+16) so the header and the first pill
-    // don't collide: three 56px pills spread from fx_track_x+74 to the right
-    // margin (jitter ends at fx_track_x+348 = the right edge).
-    let roll_col    = if effects.crt_animate_roll { accent_col } else { btn_fill };
-    let flicker_col = if effects.crt_flicker      { accent_col } else { btn_fill };
-    let jitter_col  = if effects.crt_jitter       { accent_col } else { btn_fill };
-    let crt_roll_toggle    = Rect::rounded(fx_track_x + 74.0,  t_fx_anim, 56.0, 28.0, roll_col,    14.0);
-    let crt_flicker_toggle = Rect::rounded(fx_track_x + 183.0, t_fx_anim, 56.0, 28.0, flicker_col, 14.0);
-    let crt_jitter_toggle  = Rect::rounded(fx_track_x + 292.0, t_fx_anim, 56.0, 28.0, jitter_col,  14.0);
+    // CRT animation toggle chips (band 9): ROLL / FLKR / JITR, right-aligned.
+    const CHIP_W: f32 = 56.0;
+    const CHIP_H: f32 = 24.0;
+    let chip_x2 = px + PANEL_W - PAD - CHIP_W;
+    let chip_x1 = chip_x2 - CHIP_W - 8.0;
+    let chip_x0 = chip_x1 - CHIP_W - 8.0;
+    let roll_col    = if effects.crt_animate_roll { accent_col } else { ctl_fill };
+    let flicker_col = if effects.crt_flicker      { accent_col } else { ctl_fill };
+    let jitter_col  = if effects.crt_jitter       { accent_col } else { ctl_fill };
+    let crt_roll_toggle    = Rect::rounded(chip_x0, t_fx_anim + 2.0, CHIP_W, CHIP_H, roll_col,    CHIP_H / 2.0);
+    let crt_flicker_toggle = Rect::rounded(chip_x1, t_fx_anim + 2.0, CHIP_W, CHIP_H, flicker_col, CHIP_H / 2.0);
+    let crt_jitter_toggle  = Rect::rounded(chip_x2, t_fx_anim + 2.0, CHIP_W, CHIP_H, jitter_col,  CHIP_H / 2.0);
 
-    // Caret toggles (bands 11, 12): caret_flash_enabled, caret_glow_enabled.
-    let caret_flash_col = if effects.caret_flash_enabled { accent_col } else { btn_fill };
-    let caret_glow_col  = if effects.caret_glow_enabled  { accent_col } else { btn_fill };
-    let caret_flash_toggle = Rect::rounded(fx_pill_x, t_fx_flash, 56.0, 28.0, caret_flash_col, 14.0);
-    let caret_glow_toggle  = Rect::rounded(fx_pill_x, t_fx_glow,  56.0, 28.0, caret_glow_col,  14.0);
+    // Caret switches (bands 11, 12): caret_flash_enabled, caret_glow_enabled.
+    let (caret_flash_toggle, caret_flash_knob) = switch_at(t_fx_flash, effects.caret_flash_enabled);
+    let (caret_glow_toggle, caret_glow_knob) = switch_at(t_fx_glow, effects.caret_glow_enabled);
 
     // Caret flash-duration slider (band 13): maps 60..=400 ms → 0..1.
     let caret_dur_frac = ((effects.caret_flash_ms - 60.0) / (400.0 - 60.0)).clamp(0.0, 1.0);
-    let (caret_dur_track, caret_dur_fill, caret_dur_handle) = {
-        let frac   = caret_dur_frac;
-        let track  = Rect::rounded(fx_track_x, t_fx_dur + 24.0, 348.0, 6.0, slider_track_col, 3.0);
-        let fill_w = (frac * (348.0 - 14.0) + 7.0).max(6.0).min(348.0);
-        let fill   = Rect::rounded(fx_track_x, t_fx_dur + 24.0, fill_w, 6.0, accent_fill, 3.0);
-        let hx     = fx_track_x + frac * (348.0 - 14.0);
-        let handle = Rect::rounded(hx, t_fx_dur + 18.0, 14.0, 18.0, accent_col, 4.0);
-        (track, fill, handle)
-    };
+    let (caret_dur_track, caret_dur_q, caret_dur_fill, caret_dur_handle) =
+        slider_at(t_fx_dur, caret_dur_frac);
 
     // Caret flash-color RGB mini-sliders (band 14).
-    let (caret_color_r_track, caret_color_r_fill, caret_color_r_handle) = fx_mini_slider!(rgb_r_x, t_fx_color, effects.caret_flash_color[0]);
-    let (caret_color_g_track, caret_color_g_fill, caret_color_g_handle) = fx_mini_slider!(rgb_g_x, t_fx_color, effects.caret_flash_color[1]);
-    let (caret_color_b_track, caret_color_b_fill, caret_color_b_handle) = fx_mini_slider!(rgb_b_x, t_fx_color, effects.caret_flash_color[2]);
+    let (caret_color_r_track, caret_col_r_q, caret_color_r_fill, caret_color_r_handle) =
+        mini_slider_at(rgb_r_x, t_fx_color, effects.caret_flash_color[0]);
+    let (caret_color_g_track, caret_col_g_q, caret_color_g_fill, caret_color_g_handle) =
+        mini_slider_at(rgb_g_x, t_fx_color, effects.caret_flash_color[1]);
+    let (caret_color_b_track, caret_col_b_q, caret_color_b_fill, caret_color_b_handle) =
+        mini_slider_at(rgb_b_x, t_fx_color, effects.caret_flash_color[2]);
 
     // Effects content height and visible height come from the module-level
     // `pub const`s so the App's scroll clamp and this scrollbar indicator
     // are guaranteed to use identical values.
-    let effects_content_h = EFFECTS_CONTENT_H; // 652.0
+    let effects_content_h = EFFECTS_CONTENT_H; // 716.0
     let visible_h = EFFECTS_VISIBLE_H;          // 460.0
 
     // --- Build quads in draw order ---
@@ -925,90 +961,121 @@ pub fn build_panel(
     quads.push(border_rect);
     quads.push(bg_rect);
 
-    // Active-tab underline bar under the tab strip.
+    // Tab-strip baseline hairline (full panel width) + active-tab underline.
+    quads.push(Rect {
+        x: px,
+        y: py + 75.0,
+        w: PANEL_W,
+        h: 1.0,
+        color: hairline,
+        ..Default::default()
+    });
     {
-        let name = TAB_NAMES[active_tab];
-        let text_w = name.chars().count() as f32 * char_w;
-        let cell_x = px + 16.0 + active_tab as f32 * tab_w;
-        let bar_w = text_w + 10.0;
-        let bar_x = cell_x + (tab_w - bar_w) * 0.5;
-        quads.push(Rect {
-            x: bar_x,
-            y: py + 78.0,
-            w: bar_w,
-            h: 2.0,
-            color: accent_col,
-            ..Default::default()
-        });
+        let cell = &tab_rects[active_tab];
+        let text_w = tab_names_chars[active_tab] * char_w;
+        let bar_w = text_w + 8.0;
+        quads.push(Rect::rounded(
+            cell.x + (cell.w - bar_w) * 0.5,
+            py + 74.0,
+            bar_w,
+            2.0,
+            accent_col,
+            1.0,
+        ));
     }
 
-    // Summon-effect cycle buttons.
-    quads.push(summon_prev);
-    quads.push(summon_next);
+    // Footer band: hairline above the hint row (fixed to the panel bottom).
+    quads.push(Rect {
+        x: px,
+        y: py + PANEL_H - FOOTER_H,
+        w: PANEL_W,
+        h: 1.0,
+        color: hairline,
+        ..Default::default()
+    });
 
-    // Window-mode cycle buttons.
-    quads.push(win_mode_prev);
-    quads.push(win_mode_next);
+    // Segmented-control separators, pushed after each body fill.
+    let seg_line = |x: f32, t: f32| -> Rect {
+        Rect {
+            x,
+            y: t + 7.0,
+            w: 1.0,
+            h: CTL_H - 14.0,
+            color: seg_sep,
+            ..Default::default()
+        }
+    };
 
-    // Tab-bar position cycle buttons.
-    quads.push(tab_bar_prev);
-    quads.push(tab_bar_next);
+    // Cyclers (Window + Shell tabs): body + the two inner separators.
+    for body in [&summon_body, &winmode_body, &tabbar_body, &shell_body] {
+        quads.push(*body);
+        quads.push(seg_line(body.x + CYC_SEG, body.y));
+        quads.push(seg_line(body.x + CYC_W - CYC_SEG, body.y));
+    }
 
-    // Dropdown-height slider (track → filled portion → handle).
-    // Grayed to ~0.4 alpha when the window mode is Center (control is a no-op).
+    // Dropdown-height / width sliders. Grayed to ~0.4 alpha when the window mode
+    // is Center (the two controls are no-ops there).
     let dim_alpha = |mut r: Rect| -> Rect {
         if !is_dropdown {
             r.color[3] = (r.color[3] as f32 * 0.4).round() as u8;
         }
         r
     };
-    quads.push(dim_alpha(dropdown_track));
-    quads.push(dim_alpha(dh_fill));       // accent-filled left portion
+    quads.push(dim_alpha(dh_track_q));
+    quads.push(dim_alpha(dh_fill));
     quads.push(dim_alpha(dropdown_handle));
-
-    // Dropdown-width slider (track → filled portion → handle). Grayed identically.
-    quads.push(dim_alpha(dropdown_width_track));
-    quads.push(dim_alpha(dw_fill));       // accent-filled left portion
+    quads.push(dim_alpha(dw_track_q));
+    quads.push(dim_alpha(dw_fill));
     quads.push(dim_alpha(dropdown_width_handle));
 
-    // Auto-hide toggle pill.
+    // Switches (Window + Shell tabs).
     quads.push(autohide_toggle);
-
-    // Launch-at-login toggle pill.
+    quads.push(autohide_knob);
     quads.push(launch_login_toggle);
-
-    // Shell-picker cycle buttons.
-    quads.push(shell_prev);
-    quads.push(shell_next);
+    quads.push(launch_knob);
 
     // ── Effects-tab quads (populate effects_quads; empty when tab ≠ 4) ────────
     // When active_tab == 4 the band tops carry the scroll offset, so these rects
     // are at their scrolled positions. The caller renders them with a hardware
     // scissor rect (`effects_viewport`) so overflow is GPU-clipped.
-    // When active_tab ≠ 4 ALL t_fx_* are at OFF (1e6) so the rects land far
-    // offscreen — we skip pushing them entirely (they'd be culled anyway, but
-    // keeping effects_quads empty simplifies the render path).
     if active_tab == 4 {
-        // Draw order per slider band: track → fill → handle (same as opacity slider).
+        // Section hairlines beside the "CRT" / "CARET" headers.
+        let section_rule = |t: f32, chars: f32| -> Rect {
+            Rect {
+                x: track_x + chars * char_w + 12.0,
+                y: t + 8.0,
+                w: (px + PANEL_W - PAD) - (track_x + chars * char_w + 12.0),
+                h: 1.0,
+                color: hairline,
+                ..Default::default()
+            }
+        };
+        effects_quads.push(section_rule(t_fx_crt_hdr, 3.0));
+        effects_quads.push(section_rule(t_fx_caret_hdr, 5.0));
+
         effects_quads.push(crt_enabled_toggle);
-        effects_quads.push(crt_curvature_track);  effects_quads.push(crt_curvature_fill);  effects_quads.push(crt_curvature_handle);
-        effects_quads.push(crt_scanline_track);   effects_quads.push(crt_scanline_fill);   effects_quads.push(crt_scanline_handle);
-        effects_quads.push(crt_mask_track);       effects_quads.push(crt_mask_fill);       effects_quads.push(crt_mask_handle);
-        effects_quads.push(crt_bloom_track);      effects_quads.push(crt_bloom_fill);      effects_quads.push(crt_bloom_handle);
-        effects_quads.push(crt_chromatic_track);  effects_quads.push(crt_chromatic_fill);  effects_quads.push(crt_chromatic_handle);
-        effects_quads.push(crt_vignette_track);   effects_quads.push(crt_vignette_fill);   effects_quads.push(crt_vignette_handle);
-        effects_quads.push(crt_tint_r_track);     effects_quads.push(crt_tint_r_fill);     effects_quads.push(crt_tint_r_handle);
-        effects_quads.push(crt_tint_g_track);     effects_quads.push(crt_tint_g_fill);     effects_quads.push(crt_tint_g_handle);
-        effects_quads.push(crt_tint_b_track);     effects_quads.push(crt_tint_b_fill);     effects_quads.push(crt_tint_b_handle);
+        effects_quads.push(crt_en_knob);
+        // Draw order per slider band: track → fill → handle.
+        effects_quads.push(crt_curv_q);   effects_quads.push(crt_curvature_fill); effects_quads.push(crt_curvature_handle);
+        effects_quads.push(crt_scan_q);   effects_quads.push(crt_scanline_fill);  effects_quads.push(crt_scanline_handle);
+        effects_quads.push(crt_mask_q);   effects_quads.push(crt_mask_fill);      effects_quads.push(crt_mask_handle);
+        effects_quads.push(crt_bloom_q);  effects_quads.push(crt_bloom_fill);     effects_quads.push(crt_bloom_handle);
+        effects_quads.push(crt_chroma_q); effects_quads.push(crt_chromatic_fill); effects_quads.push(crt_chromatic_handle);
+        effects_quads.push(crt_vig_q);    effects_quads.push(crt_vignette_fill);  effects_quads.push(crt_vignette_handle);
+        effects_quads.push(crt_tint_r_q); effects_quads.push(crt_tint_r_fill);    effects_quads.push(crt_tint_r_handle);
+        effects_quads.push(crt_tint_g_q); effects_quads.push(crt_tint_g_fill);    effects_quads.push(crt_tint_g_handle);
+        effects_quads.push(crt_tint_b_q); effects_quads.push(crt_tint_b_fill);    effects_quads.push(crt_tint_b_handle);
         effects_quads.push(crt_roll_toggle);
         effects_quads.push(crt_flicker_toggle);
         effects_quads.push(crt_jitter_toggle);
         effects_quads.push(caret_flash_toggle);
+        effects_quads.push(caret_flash_knob);
         effects_quads.push(caret_glow_toggle);
-        effects_quads.push(caret_dur_track);      effects_quads.push(caret_dur_fill);      effects_quads.push(caret_dur_handle);
-        effects_quads.push(caret_color_r_track);  effects_quads.push(caret_color_r_fill);  effects_quads.push(caret_color_r_handle);
-        effects_quads.push(caret_color_g_track);  effects_quads.push(caret_color_g_fill);  effects_quads.push(caret_color_g_handle);
-        effects_quads.push(caret_color_b_track);  effects_quads.push(caret_color_b_fill);  effects_quads.push(caret_color_b_handle);
+        effects_quads.push(caret_glow_knob);
+        effects_quads.push(caret_dur_q);    effects_quads.push(caret_dur_fill);     effects_quads.push(caret_dur_handle);
+        effects_quads.push(caret_col_r_q);  effects_quads.push(caret_color_r_fill); effects_quads.push(caret_color_r_handle);
+        effects_quads.push(caret_col_g_q);  effects_quads.push(caret_color_g_fill); effects_quads.push(caret_color_g_handle);
+        effects_quads.push(caret_col_b_q);  effects_quads.push(caret_color_b_fill); effects_quads.push(caret_color_b_handle);
 
         // ── Scrollbar indicator ──────────────────────────────────────────────
         // Thin accent rect on the right edge of the content viewport, sized and
@@ -1019,64 +1086,77 @@ pub fn build_panel(
             let indicator_h = (visible_h * visible_h / effects_content_h).max(10.0);
             let t = effects_scroll / max_scroll;
             let indicator_y = content_top + t * (visible_h - indicator_h);
-            let ind_col: [u8; 4] = [accent[0], accent[1], accent[2], 160];
+            let ind_col: [u8; 4] = [accent[0], accent[1], accent[2], 150];
             effects_quads.push(Rect::rounded(
-                px + PANEL_W - 6.0, indicator_y, 4.0, indicator_h, ind_col, 2.0,
+                px + PANEL_W - 8.0, indicator_y, 4.0, indicator_h, ind_col, 2.0,
             ));
         }
     }
 
-    // Font-size buttons.
-    quads.push(font_minus);
-    quads.push(font_plus);
-    quads.push(font_reset);
+    // Font-size steppers (terminal + UI): body, separators, reset button.
+    for (body, reset) in [(&font_step_body, &font_reset), (&ui_step_body, &ui_font_reset)] {
+        quads.push(*reset);
+        quads.push(*body);
+        quads.push(seg_line(body.x + STEP_SEG, body.y));
+        quads.push(seg_line(body.x + STEP_W - STEP_SEG, body.y));
+    }
 
-    // Font-family scroll buttons (▲ / ▼).
+    // Font-list scroll buttons + inset cards + selected rows.
     quads.push(font_scroll_up);
     quads.push(font_scroll_down);
-
-    // Font-family list background rows.
-    quads.extend_from_slice(&font_row_rects);
-
-    // UI (chrome) FONT section: size buttons, scroll buttons, family rows.
-    quads.push(ui_font_minus);
-    quads.push(ui_font_plus);
-    quads.push(ui_font_reset);
+    quads.push(font_card);
+    for (i, row) in font_row_rects.iter().enumerate() {
+        let family_idx = offset + i;
+        let is_selected =
+            families.get(family_idx).map(|n| n.as_str()) == Some(selected_family);
+        if is_selected {
+            quads.push(*row);
+            quads.push(Rect::rounded(row.x, row.y + 3.0, 3.0, row.h - 6.0, accent_col, 1.5));
+        }
+    }
     quads.push(ui_font_scroll_up);
     quads.push(ui_font_scroll_down);
-    quads.extend_from_slice(&ui_font_row_rects);
+    quads.push(ui_card);
+    for (i, row) in ui_font_row_rects.iter().enumerate() {
+        let family_idx = ui_offset + i;
+        let row_value: &str = if family_idx == 0 {
+            ""
+        } else {
+            ui_families.get(family_idx).map(|n| n.as_str()).unwrap_or("")
+        };
+        if row_value == selected_ui_family {
+            quads.push(*row);
+            quads.push(Rect::rounded(row.x, row.y + 3.0, 3.0, row.h - 6.0, accent_col, 1.5));
+        }
+    }
 
     // --- Theme combo header (collapsed, always shown on the Look tab) ---
-    // Accent selection ring, the combo fill, then the ACTIVE theme's swatch strip.
-    // The name + caret are emitted in the label pass.
+    // Control fill, then the ACTIVE theme's swatch strip; name + caret are
+    // emitted in the label pass.
     let active_theme_idx = theme_idx.min(num_presets - 1);
-    quads.push(Rect::rounded(
-        theme_combo.x - 2.0, theme_combo.y - 2.0,
-        theme_combo.w + 4.0, theme_combo.h + 4.0, accent_col, 8.0,
-    ));
     quads.push(theme_combo);
     {
         let active = jetty_core::Theme::by_name(presets[active_theme_idx]);
-        let caret_x = theme_combo.x + theme_combo.w - 18.0;
-        let strip_left = caret_x - 8.0 - THEME_STRIP_W;
+        let caret_x = theme_combo.x + theme_combo.w - 20.0;
+        let strip_left = caret_x - 10.0 - THEME_STRIP_W;
         push_theme_swatches(&mut quads, strip_left, theme_combo.y + theme_combo.h / 2.0, &active);
     }
 
-    // --- Theme dropdown list (open) — emitted as a floating menu over empty space
-    // below the combo. Backing panel first, then rows + their swatch strips, then
-    // the scroll-arrow button fills.
+    // --- Theme dropdown list (open) — a floating menu over the space below the
+    // combo: border ring → menu surface → selected-row tint/edge → swatches →
+    // scroll-arrow button fills.
     if theme_dropdown_open {
-        if let (Some(first), Some(last)) = (theme_row_rects.first(), theme_row_rects.last()) {
-            let pad = 4.0;
-            quads.push(Rect::rounded(
-                first.x - pad, first.y - pad,
-                first.w + 2.0 * pad, (last.y + last.h) - first.y + 2.0 * pad,
-                panel_bg, 6.0,
-            ));
-        }
+        quads.push(Rect::rounded(
+            combo_x - 1.0, menu_top - 1.0, combo_w + 2.0, menu_h + 2.0, menu_border, 9.0,
+        ));
+        quads.push(Rect::rounded(combo_x, menu_top, combo_w, menu_h, menu_fill, 8.0));
         for (i, row) in theme_row_rects.iter().enumerate() {
-            quads.push(*row);
-            let t = jetty_core::Theme::by_name(presets[theme_offset + i]);
+            let preset_idx = theme_offset + i;
+            if preset_idx == theme_idx {
+                quads.push(*row);
+                quads.push(Rect::rounded(row.x, row.y + 4.0, 3.0, row.h - 8.0, accent_col, 1.5));
+            }
+            let t = jetty_core::Theme::by_name(presets[preset_idx]);
             let strip_left = row.x + row.w - 10.0 - THEME_STRIP_W;
             push_theme_swatches(&mut quads, strip_left, row.y + row.h / 2.0, &t);
         }
@@ -1086,13 +1166,11 @@ pub fn build_panel(
         }
     }
 
-    // Opacity slider: dim track, then accent-filled left portion, then handle.
-    quads.push(slider_track);
+    // Opacity + corner-radius sliders: dim track, accent fill, knob.
+    quads.push(opacity_track_q);
     quads.push(opacity_fill);
     quads.push(slider_handle);
-
-    // Corner-radius slider: same pattern.
-    quads.push(radius_track);
+    quads.push(radius_track_q);
     quads.push(radius_fill);
     quads.push(radius_handle);
 
@@ -1103,42 +1181,50 @@ pub fn build_panel(
     let mut effects_labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
 
     // Title.
-    labels.push(("Settings".to_string(), px + 16.0, py + 12.0, text_main));
+    labels.push(("Settings".to_string(), px + PAD, py + 14.0, text_main));
 
-    // Tab strip labels — active tab accent-colored, others dim.
+    // Tab strip labels — active tab in main text (the accent underline carries
+    // the "active" signal), inactive tabs muted.
     for (i, name) in TAB_NAMES.iter().enumerate() {
-        let cell_x = px + 16.0 + i as f32 * tab_w;
-        let text_w = name.chars().count() as f32 * char_w;
-        let label_x = cell_x + (tab_w - text_w) * 0.5;
-        let col = if i == active_tab { accent } else { text_header };
+        let cell = &tab_rects[i];
+        let text_w = tab_names_chars[i] * char_w;
+        let label_x = cell.x + (cell.w - text_w) * 0.5;
+        let col = if i == active_tab { text_main } else { text_header };
         labels.push((name.to_string(), label_x, tab_strip_y, col));
     }
+
+    // Footer hint.
+    labels.push((
+        "Esc to close · drag title to move".to_string(),
+        px + PAD,
+        py + PANEL_H - 26.0,
+        text_hint,
+    ));
+
+    // Segment-glyph helpers (chevrons/steppers centered in their segments).
+    let seg_glyph_x = |seg_x: f32, seg_w: f32| seg_x + (seg_w - char_w) * 0.5;
 
     // OPACITY header — CAPS with right-aligned "97%" value.
     let pct = (opacity * 100.0).round() as i32;
     let pct_str = format!("{}%", pct);
-    labels.push(("OPACITY".to_string(), px + 16.0, t_opacity, text_header));
+    labels.push(("OPACITY".to_string(), px + PAD, t_opacity, text_header));
     labels.push((pct_str.clone(), right_x(&pct_str), t_opacity, text_main));
 
     // CORNER RADIUS header — CAPS with right-aligned "Npx" value.
     let radius_px = corner_radius.round() as i32;
     let radius_str = format!("{}px", radius_px);
-    labels.push(("CORNER RADIUS".to_string(), px + 16.0, t_radius, text_header));
+    labels.push(("CORNER RADIUS".to_string(), px + PAD, t_radius, text_header));
     labels.push((radius_str.clone(), right_x(&radius_str), t_radius, text_main));
 
-    // Helper: center a (possibly truncated) cycle-name label between the ‹ and ›
-    // buttons. The gap runs from [cycle_prev_x+28] to [cycle_next_x]; we clamp
-    // the x so a long name never overruns either button.
-    let cycle_gap_left  = cycle_prev_x + 28.0; // right edge of ‹ button
-    let cycle_gap_right = cycle_next_x;         // left edge of › button
-    let cycle_gap_w     = cycle_gap_right - cycle_gap_left;
+    // Helper: center a (possibly truncated) cycler value between its chevrons.
+    let cycle_gap_left = cyc_x + CYC_SEG;
+    let cycle_gap_w = CYC_W - 2.0 * CYC_SEG;
     let cycle_max_chars = if char_w > 0.0 {
         ((cycle_gap_w / char_w).floor() as usize).max(3)
     } else {
         11
     };
     let center_cycle = |name: &str| -> (String, f32) {
-        // Truncate long names to avoid overrunning the buttons.
         let shown: String = if name.chars().count() > cycle_max_chars {
             let mut s: String = name.chars().take(cycle_max_chars - 1).collect();
             s.push('…');
@@ -1146,133 +1232,133 @@ pub fn build_panel(
         } else {
             name.to_string()
         };
-        let text_w = shown.chars().count() as f32 * char_w;
-        let x = (cycle_gap_left + (cycle_gap_w - text_w) * 0.5)
-            .clamp(cycle_gap_left, (cycle_gap_right - text_w).max(cycle_gap_left));
+        let x = center_x(&shown, cycle_gap_left, cycle_gap_w)
+            .clamp(cycle_gap_left, (cycle_gap_left + cycle_gap_w).max(cycle_gap_left));
         (shown, x)
     };
+    // Emit one cycler's labels: chevrons + centered value on the control row.
+    let push_cycler_labels = |labels: &mut Vec<(String, f32, f32, [u8; 3])>,
+                                  t: f32,
+                                  value: &str| {
+        let (shown, name_x) = center_cycle(value);
+        labels.push((shown, name_x, t + 6.0, text_main));
+        labels.push(("<".to_string(), seg_glyph_x(cycle_prev_x, CYC_SEG), t + 6.0, text_btn));
+        labels.push((">".to_string(), seg_glyph_x(cycle_next_x, CYC_SEG), t + 6.0, text_btn));
+    };
 
-    // SUMMON EFFECT band (Window) — CAPS header.
-    labels.push(("SUMMON EFFECT".to_string(), px + 16.0, t_summon, text_header));
-    {
-        let (shown, name_x) = center_cycle(summon_effect_name);
-        labels.push((shown, name_x, summon_btn_y + 6.0, text_main));
-    }
-    labels.push(("<".to_string(), cycle_prev_x + 9.0, summon_btn_y + 6.0, text_btn));
-    labels.push((">".to_string(), cycle_next_x + 9.0, summon_btn_y + 6.0, text_btn));
-
-    // WINDOW MODE band (Window) — CAPS header.
-    labels.push(("WINDOW MODE".to_string(), px + 16.0, t_winmode, text_header));
-    {
-        let (shown, name_x) = center_cycle(window_mode_name);
-        labels.push((shown, name_x, winmode_btn_y + 6.0, text_main));
-    }
-    labels.push(("<".to_string(), cycle_prev_x + 9.0, winmode_btn_y + 6.0, text_btn));
-    labels.push((">".to_string(), cycle_next_x + 9.0, winmode_btn_y + 6.0, text_btn));
+    // SUMMON EFFECT / WINDOW MODE / TAB BAR bands (Window) — CAPS headers with
+    // the segmented cycler on the same row.
+    labels.push(("SUMMON EFFECT".to_string(), px + PAD, t_summon + 6.0, text_header));
+    push_cycler_labels(&mut labels, t_summon, summon_effect_name);
+    labels.push(("WINDOW MODE".to_string(), px + PAD, t_winmode + 6.0, text_header));
+    push_cycler_labels(&mut labels, t_winmode, window_mode_name);
+    labels.push(("TAB BAR".to_string(), px + PAD, t_tabbar + 6.0, text_header));
+    push_cycler_labels(&mut labels, t_tabbar, tab_bar_name);
 
     // DROPDOWN HEIGHT band (Window) — CAPS header + right-aligned value.
-    let dh_text = if is_dropdown { text_header } else { text_btn };
-    let dh_val_text = if is_dropdown { text_main } else { text_btn };
+    let dh_text = if is_dropdown { text_header } else { text_hint };
+    let dh_val_text = if is_dropdown { text_main } else { text_hint };
     let dh_pct = (dropdown_height_pct * 100.0).round() as i32;
     let dh_str = format!("{}%", dh_pct);
-    labels.push(("DROPDOWN HEIGHT".to_string(), px + 16.0, t_droph, dh_text));
+    labels.push(("DROPDOWN HEIGHT".to_string(), px + PAD, t_droph, dh_text));
     labels.push((dh_str.clone(), right_x(&dh_str), t_droph, dh_val_text));
 
     // DROPDOWN WIDTH band (Window) — CAPS header + right-aligned value.
-    let dw_text = if is_dropdown { text_header } else { text_btn };
-    let dw_val_text = if is_dropdown { text_main } else { text_btn };
     let dw_pct = (dropdown_width_pct * 100.0).round() as i32;
     let dw_str = format!("{}%", dw_pct);
-    labels.push(("DROPDOWN WIDTH".to_string(), px + 16.0, t_dropw, dw_text));
-    labels.push((dw_str.clone(), right_x(&dw_str), t_dropw, dw_val_text));
+    labels.push(("DROPDOWN WIDTH".to_string(), px + PAD, t_dropw, dh_text));
+    labels.push((dw_str.clone(), right_x(&dw_str), t_dropw, dh_val_text));
 
-    // TAB BAR band (Window) — CAPS header.
-    labels.push(("TAB BAR".to_string(), px + 16.0, t_tabbar, text_header));
-    {
-        let (shown, name_x) = center_cycle(tab_bar_name);
-        labels.push((shown, name_x, tabbar_btn_y + 6.0, text_main));
-    }
-    labels.push(("<".to_string(), cycle_prev_x + 9.0, tabbar_btn_y + 6.0, text_btn));
-    labels.push((">".to_string(), cycle_next_x + 9.0, tabbar_btn_y + 6.0, text_btn));
+    // AUTO-HIDE band (Window) — CAPS header; the switch itself is stateful.
+    labels.push(("AUTO-HIDE ON FOCUS LOSS".to_string(), px + PAD, t_autohide + 6.0, text_header));
 
-    // AUTO-HIDE band (Window) — CAPS header with ON/OFF pill label.
-    labels.push(("AUTO-HIDE ON FOCUS LOSS".to_string(), px + 16.0, t_autohide, text_header));
-    let (pill_text, pill_col) = if focus_autohide {
-        ("ON", [20u8, 20, 20])
-    } else {
-        ("OFF", text_btn)
+    // Emit one stepper's labels: − / value / + / Reset.
+    let push_stepper_labels = |labels: &mut Vec<(String, f32, f32, [u8; 3])>,
+                                   t: f32,
+                                   value: &str| {
+        labels.push((
+            value.to_string(),
+            center_x(value, step_x + STEP_SEG, STEP_W - 2.0 * STEP_SEG),
+            t + 6.0,
+            text_main,
+        ));
+        labels.push(("-".to_string(), seg_glyph_x(step_x, STEP_SEG), t + 6.0, text_btn));
+        labels.push((
+            "+".to_string(),
+            seg_glyph_x(step_x + STEP_W - STEP_SEG, STEP_SEG),
+            t + 6.0,
+            text_btn,
+        ));
+        labels.push((
+            "Reset".to_string(),
+            center_x("Reset", reset_x, RESET_W),
+            t + 6.0,
+            text_btn,
+        ));
     };
-    labels.push((
-        pill_text.to_string(),
-        autohide_toggle.x + 16.0,
-        autohide_toggle.y + 6.0,
-        pill_col,
-    ));
 
-    // FONT SIZE band (Fonts) — CAPS header + right-aligned "Npt" value.
-    let fs_display = font_size.round() as i32;
-    let fs_str = format!("{}pt", fs_display);
-    labels.push(("FONT SIZE".to_string(), px + 16.0, t_fontsize, text_header));
-    labels.push((fs_str.clone(), right_x(&fs_str), t_fontsize, text_main));
+    // FONT SIZE band (Fonts) — CAPS header + stepper with the "Npt" value inside.
+    let fs_str = format!("{}pt", font_size.round() as i32);
+    labels.push(("FONT SIZE".to_string(), px + PAD, t_fontsize + 6.0, text_header));
+    push_stepper_labels(&mut labels, t_fontsize, &fs_str);
 
-    // Font button labels.
-    labels.push(("-".to_string(),  font_minus_x + 9.0,  font_btn_y + 6.0,  text_btn));
-    labels.push(("+".to_string(),  font_plus_x  + 8.0,  font_btn_y + 6.0,  text_btn));
-    labels.push(("rst".to_string(), font_reset_x + 6.0, font_btn_y + 6.0,  text_btn));
+    // List-section header helper: CAPS header + n/total counter + ▲▼ arrows.
+    let push_list_header = |labels: &mut Vec<(String, f32, f32, [u8; 3])>,
+                                t: f32,
+                                title: &str,
+                                shown_to: usize,
+                                total: usize,
+                                overflows: bool| {
+        labels.push((title.to_string(), px + PAD, t, text_header));
+        labels.push(("^".to_string(), arrow_up_x + 6.0, t + 2.0, text_btn));
+        labels.push(("v".to_string(), arrow_dn_x + 6.0, t + 2.0, text_btn));
+        if overflows {
+            let hint = format!("{}/{}", shown_to, total);
+            let hint_w = hint.chars().count() as f32 * char_w;
+            labels.push((hint, arrow_up_x - 10.0 - hint_w, t, text_hint));
+        }
+    };
 
-    // FONT list header (Fonts) — CAPS header; list starts at +22.
-    labels.push(("FONT".to_string(), px + 16.0, t_fontlist, text_header));
-
-    // Scroll button labels (▲ / ▼).
-    labels.push(("^".to_string(), scroll_up_x   + 6.0, scroll_btn_y + 4.0, text_btn));
-    labels.push(("v".to_string(), scroll_down_x + 6.0, scroll_btn_y + 4.0, text_btn));
-
-    // Font-family row labels.
-    for i in 0..visible_count {
+    // FONT list (Fonts).
+    push_list_header(
+        &mut labels,
+        t_fontlist,
+        "FONT",
+        offset + visible_count,
+        families.len(),
+        families.len() > MAX_FONT_ROWS,
+    );
+    for (i, row) in font_row_rects.iter().enumerate() {
         let family_idx = offset + i;
         if let Some(name) = families.get(family_idx) {
-            let row_y = list_top + i as f32 * (ROW_H + ROW_GAP) + 4.0;
             let is_selected = name.as_str() == selected_family;
             let text_color: [u8; 3] = if is_selected { text_main } else { text_dim };
             // Char-boundary-safe truncation (multibyte-safe).
-            let display = if name.chars().count() > 36 {
-                let truncated: String = name.chars().take(34).collect();
+            let display = if name.chars().count() > 34 {
+                let truncated: String = name.chars().take(32).collect();
                 format!("{}…", truncated)
             } else {
                 name.clone()
             };
-            labels.push((display, list_x + 6.0, row_y, text_color));
+            labels.push((display, row.x + 12.0, row.y + 4.0, text_color));
         }
     }
 
-    // Scroll hint if there are more families than visible rows.
-    if families.len() > MAX_FONT_ROWS {
-        let hint = format!("({}/{})", offset + visible_count, families.len());
-        let scroll_up_left = px + PANEL_W - 60.0;
-        let hint_w = hint.chars().count() as f32 * char_w;
-        let hint_x = scroll_up_left - 6.0 - hint_w;
-        labels.push((hint, hint_x, t_fontlist, text_dim));
-    }
-
     // ── UI FONT section labels (Fonts) ──
-    // UI FONT SIZE header + right-aligned "Npt" readout (TRUE size).
-    let ui_fs_display = ui_font_size.round() as i32;
-    let ui_fs_str = format!("{}pt", ui_fs_display);
-    labels.push(("UI FONT SIZE".to_string(), px + 16.0, t_uifontsize, text_header));
-    labels.push((ui_fs_str.clone(), right_x(&ui_fs_str), t_uifontsize, text_main));
-    labels.push(("-".to_string(),  ui_font_minus_x + 9.0, ui_font_btn_y + 6.0, text_btn));
-    labels.push(("+".to_string(),  ui_font_plus_x  + 8.0, ui_font_btn_y + 6.0, text_btn));
-    labels.push(("rst".to_string(), ui_font_reset_x + 6.0, ui_font_btn_y + 6.0, text_btn));
+    let ui_fs_str = format!("{}pt", ui_font_size.round() as i32);
+    labels.push(("UI FONT SIZE".to_string(), px + PAD, t_uifontsize + 6.0, text_header));
+    push_stepper_labels(&mut labels, t_uifontsize, &ui_fs_str);
 
-    // UI FONT family list header + scroll arrows.
-    labels.push(("UI FONT".to_string(), px + 16.0, t_uifontlist, text_header));
-    labels.push(("^".to_string(), ui_scroll_up_x   + 6.0, ui_scroll_btn_y + 4.0, text_btn));
-    labels.push(("v".to_string(), ui_scroll_down_x + 6.0, ui_scroll_btn_y + 4.0, text_btn));
-
-    // UI-font-family row labels (row 0 = "System Sans (default)" → "").
-    for i in 0..ui_visible_count {
+    push_list_header(
+        &mut labels,
+        t_uifontlist,
+        "UI FONT",
+        ui_offset + ui_visible_count,
+        ui_families.len(),
+        ui_families.len() > MAX_UI_FONT_ROWS,
+    );
+    for (i, row) in ui_font_row_rects.iter().enumerate() {
         let family_idx = ui_offset + i;
-        let row_y = ui_list_top + i as f32 * (ROW_H + ROW_GAP) + 4.0;
         let (name, row_value): (&str, &str) = if family_idx == 0 {
             ("System Sans (default)", "")
         } else {
@@ -1281,30 +1367,21 @@ pub fn build_panel(
         };
         let is_selected = row_value == selected_ui_family;
         let text_color: [u8; 3] = if is_selected { text_main } else { text_dim };
-        let display = if name.chars().count() > 36 {
-            let truncated: String = name.chars().take(34).collect();
+        let display = if name.chars().count() > 34 {
+            let truncated: String = name.chars().take(32).collect();
             format!("{}…", truncated)
         } else {
             name.to_string()
         };
-        labels.push((display, list_x + 6.0, row_y, text_color));
+        labels.push((display, row.x + 12.0, row.y + 4.0, text_color));
     }
 
-    // Scroll hint for the UI-font list if more entries than visible rows.
-    if ui_families.len() > MAX_UI_FONT_ROWS {
-        let hint = format!("({}/{})", ui_offset + ui_visible_count, ui_families.len());
-        let scroll_up_left = px + PANEL_W - 60.0;
-        let hint_w = hint.chars().count() as f32 * char_w;
-        let hint_x = scroll_up_left - 6.0 - hint_w;
-        labels.push((hint, hint_x, t_uifontlist, text_dim));
-    }
-
-    // THEME band (Look) — CAPS header.
-    labels.push(("THEME".to_string(), px + 16.0, t_theme, text_header));
+    // THEME band (Look) — CAPS header (+ scroll arrows/counter when open+overflow).
+    labels.push(("THEME".to_string(), px + PAD, t_theme, text_header));
 
     // Truncate a display name to fit the combo/row width (leaving room for swatches).
     let fit_theme_name = |name: &str| -> String {
-        const MAX_CHARS: usize = 18;
+        const MAX_CHARS: usize = 22;
         if name.chars().count() > MAX_CHARS {
             let s: String = name.chars().take(MAX_CHARS - 1).collect();
             format!("{}…", s)
@@ -1318,58 +1395,49 @@ pub fn build_panel(
         let active = jetty_core::Theme::by_name(presets[active_theme_idx]);
         labels.push((
             fit_theme_name(active.display_name),
-            theme_combo.x + 10.0,
+            theme_combo.x + 12.0,
             theme_combo.y + 7.0,
             text_main,
         ));
         let caret = if theme_dropdown_open { "^" } else { "v" };
         labels.push((
             caret.to_string(),
-            theme_combo.x + theme_combo.w - 16.0,
+            theme_combo.x + theme_combo.w - 20.0,
             theme_combo.y + 7.0,
             text_btn,
         ));
     }
 
-    // Open list: per-row theme name labels + scroll arrows + "(shown/total)" hint.
+    // Open menu: per-row theme name labels + scroll arrows + "shown/total" hint.
     if theme_dropdown_open {
         for (i, row) in theme_row_rects.iter().enumerate() {
             let preset_idx = theme_offset + i;
             let name = jetty_core::Theme::by_name(presets[preset_idx]).display_name;
             let col = if preset_idx == theme_idx { text_main } else { text_dim };
-            labels.push((fit_theme_name(name), row.x + 10.0, row.y + 5.0, col));
+            labels.push((fit_theme_name(name), row.x + 12.0, row.y + 6.0, col));
         }
         if theme_has_scroll {
-            labels.push(("^".to_string(), theme_scroll_up.x + 6.0, theme_scroll_up.y + 4.0, text_btn));
-            labels.push(("v".to_string(), theme_scroll_down.x + 6.0, theme_scroll_down.y + 4.0, text_btn));
-            let hint = format!("({}/{})", theme_offset + theme_visible, num_presets);
+            labels.push(("^".to_string(), theme_scroll_up.x + 6.0, theme_scroll_up.y + 3.0, text_btn));
+            labels.push(("v".to_string(), theme_scroll_down.x + 6.0, theme_scroll_down.y + 3.0, text_btn));
+            let hint = format!("{}/{}", theme_offset + theme_visible, num_presets);
             let hint_w = hint.chars().count() as f32 * char_w;
-            labels.push((hint, theme_scroll_up.x - 6.0 - hint_w, t_theme, text_dim));
+            labels.push((hint, arrow_up_x - 10.0 - hint_w, t_theme, text_hint));
         }
     }
 
-    // LAUNCH AT LOGIN band (Shell) — CAPS header with ON/OFF pill label.
-    labels.push(("LAUNCH AT LOGIN".to_string(), px + 16.0, t_launch, text_header));
-    let (launch_pill_text, launch_pill_col) = if launch_at_login {
-        ("ON", [20u8, 20, 20])
-    } else {
-        ("OFF", text_btn)
-    };
-    labels.push((
-        launch_pill_text.to_string(),
-        launch_login_toggle.x + 16.0,
-        launch_login_toggle.y + 6.0,
-        launch_pill_col,
-    ));
+    // SHELL band (Shell) — CAPS header + segmented cycler + helper line.
+    labels.push(("SHELL".to_string(), px + PAD, t_shell + 6.0, text_header));
+    push_cycler_labels(&mut labels, t_shell, shell_display);
+    labels.push(("Applies to new tabs".to_string(), px + PAD, t_shell + 34.0, text_hint));
 
-    // SHELL band (Shell) — CAPS header with a ‹ name › cycler.
-    labels.push(("SHELL".to_string(), px + 16.0, shell_btn_y + 6.0, text_header));
-    {
-        let (shown, name_x) = center_cycle(shell_display);
-        labels.push((shown, name_x, shell_btn_y + 6.0, text_main));
-    }
-    labels.push(("<".to_string(), cycle_prev_x + 9.0, shell_btn_y + 6.0, text_btn));
-    labels.push((">".to_string(), cycle_next_x + 9.0, shell_btn_y + 6.0, text_btn));
+    // LAUNCH AT LOGIN band (Shell) — CAPS header + switch + helper line.
+    labels.push(("LAUNCH AT LOGIN".to_string(), px + PAD, t_launch + 6.0, text_header));
+    labels.push((
+        "Adds a desktop autostart entry".to_string(),
+        px + PAD,
+        t_launch + 34.0,
+        text_hint,
+    ));
 
     // ── Effects-tab labels (into effects_labels; empty when tab ≠ 4) ────────
     // When active_tab == 4, band tops carry the scroll offset so label Y
@@ -1377,20 +1445,18 @@ pub fn build_panel(
     // with TextArea.bounds = content viewport so labels outside the viewport
     // are suppressed by glyphon.
     if active_tab == 4 {
-        // Section header "CRT" (band 0).
-        effects_labels.push(("CRT".to_string(), px + 16.0, t_fx_crt_hdr, text_header));
+        // Section headers "CRT" / "CARET" (bands 0, 10) — main-text CAPS with a
+        // hairline rule to the right (pushed in the quad pass above).
+        effects_labels.push(("CRT".to_string(), px + PAD, t_fx_crt_hdr, text_main));
+        effects_labels.push(("CARET".to_string(), px + PAD, t_fx_caret_hdr, text_main));
 
-        // CRT ENABLED band (band 1) — header + pill ON/OFF label.
-        effects_labels.push(("CRT ENABLED".to_string(), px + 16.0, t_fx_crt_en, text_header));
-        {
-            let (txt, col) = if effects.crt_enabled { ("ON", [20u8, 20, 20]) } else { ("OFF", text_btn) };
-            effects_labels.push((txt.to_string(), crt_enabled_toggle.x + 16.0, crt_enabled_toggle.y + 6.0, col));
-        }
+        // CRT ENABLED band (band 1) — header + switch (stateful, no text).
+        effects_labels.push(("CRT ENABLED".to_string(), px + PAD, t_fx_crt_en + 6.0, text_header));
 
         // CRT slider bands (2–7): CAPS header + right-aligned "N%" value.
         macro_rules! fx_slider_label {
             ($label:expr, $band_y:expr, $val:expr) => {
-                effects_labels.push(($label.to_string(), px + 16.0, $band_y, text_header));
+                effects_labels.push(($label.to_string(), px + PAD, $band_y, text_header));
                 let pct = ($val * 100.0).round() as i32;
                 let pct_str = format!("{}%", pct);
                 effects_labels.push((pct_str.clone(), right_x(&pct_str), $band_y, text_main));
@@ -1403,49 +1469,41 @@ pub fn build_panel(
         fx_slider_label!("CHROMATIC", t_fx_chroma,   effects.crt_chromatic);
         fx_slider_label!("VIGNETTE",  t_fx_vignette, effects.crt_vignette);
 
-        // CRT scanline-tint RGB triple (band 8): section header + "R"/"G"/"B" sub-labels.
-        effects_labels.push(("TINT".to_string(), px + 16.0, t_fx_tint, text_header));
-        effects_labels.push(("R".to_string(), rgb_r_x,        t_fx_tint, text_dim));
-        effects_labels.push(("G".to_string(), rgb_g_x,        t_fx_tint, text_dim));
-        effects_labels.push(("B".to_string(), rgb_b_x,        t_fx_tint, text_dim));
+        // CRT scanline-tint RGB triple (band 8): section header + R/G/B sub-labels.
+        effects_labels.push(("TINT".to_string(), px + PAD, t_fx_tint, text_header));
+        effects_labels.push(("R".to_string(), rgb_r_x, t_fx_tint, text_dim));
+        effects_labels.push(("G".to_string(), rgb_g_x, t_fx_tint, text_dim));
+        effects_labels.push(("B".to_string(), rgb_b_x, t_fx_tint, text_dim));
 
-        // CRT animation pills (band 9): header + three pill labels.
-        effects_labels.push(("ANIMATE".to_string(), px + 16.0, t_fx_anim, text_header));
-        {
-            let (rt, rc) = if effects.crt_animate_roll { ("ROLL",  [20u8, 20, 20]) } else { ("ROLL",  text_btn) };
-            let (ft, fc) = if effects.crt_flicker      { ("FLKR",  [20u8, 20, 20]) } else { ("FLKR",  text_btn) };
-            let (jt, jc) = if effects.crt_jitter       { ("JITR",  [20u8, 20, 20]) } else { ("JITR",  text_btn) };
-            effects_labels.push((rt.to_string(), crt_roll_toggle.x    + 8.0, crt_roll_toggle.y    + 6.0, rc));
-            effects_labels.push((ft.to_string(), crt_flicker_toggle.x + 8.0, crt_flicker_toggle.y + 6.0, fc));
-            effects_labels.push((jt.to_string(), crt_jitter_toggle.x  + 8.0, crt_jitter_toggle.y  + 6.0, jc));
+        // CRT animation chips (band 9): header + three chip labels.
+        effects_labels.push(("ANIMATE".to_string(), px + PAD, t_fx_anim + 6.0, text_header));
+        for (chip, on, txt) in [
+            (&crt_roll_toggle, effects.crt_animate_roll, "ROLL"),
+            (&crt_flicker_toggle, effects.crt_flicker, "FLKR"),
+            (&crt_jitter_toggle, effects.crt_jitter, "JITR"),
+        ] {
+            let col = if on { on_accent } else { text_btn };
+            effects_labels.push((
+                txt.to_string(),
+                center_x(txt, chip.x, chip.w),
+                chip.y + 4.0,
+                col,
+            ));
         }
 
-        // Section header "CARET" (band 10).
-        effects_labels.push(("CARET".to_string(), px + 16.0, t_fx_caret_hdr, text_header));
-
-        // CARET FLASH ENABLED toggle (band 11).
-        effects_labels.push(("FLASH".to_string(), px + 16.0, t_fx_flash, text_header));
-        {
-            let (txt, col) = if effects.caret_flash_enabled { ("ON", [20u8, 20, 20]) } else { ("OFF", text_btn) };
-            effects_labels.push((txt.to_string(), caret_flash_toggle.x + 16.0, caret_flash_toggle.y + 6.0, col));
-        }
-
-        // CARET GLOW ENABLED toggle (band 12).
-        effects_labels.push(("GLOW".to_string(), px + 16.0, t_fx_glow, text_header));
-        {
-            let (txt, col) = if effects.caret_glow_enabled { ("ON", [20u8, 20, 20]) } else { ("OFF", text_btn) };
-            effects_labels.push((txt.to_string(), caret_glow_toggle.x + 16.0, caret_glow_toggle.y + 6.0, col));
-        }
+        // CARET FLASH / GLOW switches (bands 11, 12).
+        effects_labels.push(("FLASH".to_string(), px + PAD, t_fx_flash + 6.0, text_header));
+        effects_labels.push(("GLOW".to_string(), px + PAD, t_fx_glow + 6.0, text_header));
 
         // FLASH MS slider (band 13): maps 60..=400 → shows raw ms value.
-        effects_labels.push(("FLASH MS".to_string(), px + 16.0, t_fx_dur, text_header));
+        effects_labels.push(("FLASH MS".to_string(), px + PAD, t_fx_dur, text_header));
         {
             let ms_str = format!("{}ms", effects.caret_flash_ms.round() as i32);
             effects_labels.push((ms_str.clone(), right_x(&ms_str), t_fx_dur, text_main));
         }
 
-        // CARET flash-color RGB triple (band 14): section header + "R"/"G"/"B" sub-labels.
-        effects_labels.push(("COLOR".to_string(), px + 16.0, t_fx_color, text_header));
+        // CARET flash-color RGB triple (band 14): section header + R/G/B sub-labels.
+        effects_labels.push(("COLOR".to_string(), px + PAD, t_fx_color, text_header));
         effects_labels.push(("R".to_string(), rgb_r_x, t_fx_color, text_dim));
         effects_labels.push(("G".to_string(), rgb_g_x, t_fx_color, text_dim));
         effects_labels.push(("B".to_string(), rgb_b_x, t_fx_color, text_dim));
@@ -1537,7 +1595,7 @@ pub fn build_panel(
         caret_color_b_handle,
         effects_content_h,
         content_top,
-        content_bottom: py + PANEL_H,
+        content_bottom: content_top + visible_h,
     };
 
     // Viewport for the Effects tab scissor / text-clip pass.
@@ -1635,7 +1693,7 @@ mod tests {
 
     #[test]
     fn panel_fits_on_screen_at_various_sizes() {
-        // Screen sizes that can fully contain the panel (PANEL_H=560, PANEL_W=380).
+        // Screen sizes that can fully contain the panel (PANEL_H=592, PANEL_W=420).
         for tab in 0..5 {
             for (w, h) in [(1920u32, 1200u32), (1600, 900), (2560, 1440), (1440, 700)] {
                 let pv = panel_tab(w, h, tab);
@@ -1668,14 +1726,18 @@ mod tests {
         for tab in 0..5 {
             let pv = panel_tab(1920, 1080, tab);
             let g = &pv.geom;
-            // All 5 tab hit rects exist, are inside the panel horizontally, and sit
-            // in the strip band (below the title, above content).
+            // All 5 tab hit rects exist, are inside the panel horizontally, sit
+            // in the strip band (below the title, above content), and run
+            // strictly left-to-right without overlapping.
+            let mut prev_right = g.panel.x;
             for (i, r) in g.tab_rects.iter().enumerate() {
                 assert!(
                     r.x >= g.panel.x && r.x + r.w <= g.panel.x + g.panel.w + 0.5,
                     "tab_rect[{i}] x out of panel"
                 );
                 assert!(r.y > g.panel.y, "tab_rect[{i}] not below panel top");
+                assert!(r.x + 0.5 >= prev_right, "tab_rect[{i}] overlaps its neighbour");
+                prev_right = r.x + r.w;
             }
             // The 5 tab labels are present.
             let all_text: Vec<String> = pv.labels.iter().map(|l| l.0.clone()).collect();
@@ -1757,7 +1819,13 @@ mod tests {
                 row.y + row.h <= panel.y + panel.h + 0.5,
                 "row {i} spills past the panel bottom"
             );
-            assert!((row.x - g.theme_combo.x).abs() < 0.5, "row {i} x != combo x");
+            // Rows are inset inside the floating menu but never poke outside the
+            // combo's horizontal span.
+            assert!(row.x + 0.5 >= g.theme_combo.x, "row {i} left of the menu");
+            assert!(
+                row.x + row.w <= g.theme_combo.x + g.theme_combo.w + 0.5,
+                "row {i} overflows the menu"
+            );
             prev_bottom = row.y + row.h;
         }
         // With more presets than MAX_THEME_ROWS the scroll arrows are live.
@@ -1819,8 +1887,8 @@ mod tests {
                 |g| g.radius_track,
                 |g| g.theme_combo,
             ],
-            // Tab 1 "Fonts": font-size button, font scroll, last font row,
-            //                ui-size button, ui scroll, last ui row.
+            // Tab 1 "Fonts": font-size stepper, font scroll, last font row,
+            //                ui-size stepper, ui scroll, last ui row.
             vec![
                 |g| g.font_minus,
                 |g| g.font_scroll_up,
@@ -1841,11 +1909,11 @@ mod tests {
             ],
             // Tab 3 "Shell": shell cycler, launch toggle.
             vec![|g| g.shell_prev, |g| g.launch_login_toggle],
-            // Tab 4 "Effects": CRT-section bands (0–9) fit within the 560 px panel
-            // at 1920×1080 (py=260, content_top=360, panel bottom=820).
-            // Caret bands (11–14) overflow past 820 px — that is expected and
-            // handled by the scroll task (Task 6). Only the CRT bands are listed
-            // here so the "fits within panel" assertion holds.
+            // Tab 4 "Effects": CRT-section bands (1–9) fit within the panel at
+            // 1920×1080 (py=244, content_top=340, panel bottom=836). Caret bands
+            // (11–14) overflow past the viewport — that is expected and handled
+            // by the scroll mechanism. Only the CRT bands are listed here so the
+            // "fits within panel" assertion holds.
             vec![
                 |g: &PanelGeom| g.crt_enabled_toggle,   // band 1
                 |g: &PanelGeom| g.crt_curvature_track,  // band 2
@@ -1855,7 +1923,7 @@ mod tests {
                 |g: &PanelGeom| g.crt_chromatic_track,  // band 6
                 |g: &PanelGeom| g.crt_vignette_track,   // band 7
                 |g: &PanelGeom| g.crt_tint_r_track,     // band 8 (RGB triple – leftmost)
-                |g: &PanelGeom| g.crt_roll_toggle,      // band 9 (leftmost pill)
+                |g: &PanelGeom| g.crt_roll_toggle,      // band 9 (leftmost chip)
             ],
         ];
 
@@ -1883,18 +1951,24 @@ mod tests {
     }
 
     #[test]
-    fn theme_dropdown_rows_are_full_width_single_column() {
-        // Rows are a single full-width column (unlike the old 2-col card grid):
-        // every visible row shares the combo's x and width.
+    fn theme_dropdown_rows_share_geometry() {
+        // Rows are a single column inside the floating menu: every visible row
+        // shares the same x and width, and rows never overflow the footer band
+        // (the menu floats over content, not over the panel edge).
         let pv = panel_tab_ex(1920, 1080, 0, true, 0);
         let g = &pv.geom;
         assert!(g.theme_rows.len() >= 2);
-        let x0 = g.theme_combo.x;
-        let w0 = g.theme_combo.w;
+        let x0 = g.theme_rows[0].x;
+        let w0 = g.theme_rows[0].w;
         for (i, row) in g.theme_rows.iter().enumerate() {
-            assert!((row.x - x0).abs() < 0.5, "row {i} x != combo x");
-            assert!((row.w - w0).abs() < 0.5, "row {i} w != combo w");
+            assert!((row.x - x0).abs() < 0.5, "row {i} x differs");
+            assert!((row.w - w0).abs() < 0.5, "row {i} w differs");
         }
+        let last = g.theme_rows.last().unwrap();
+        assert!(
+            last.y + last.h <= g.panel.y + PANEL_H - FOOTER_H + 0.5,
+            "open theme menu spills into the footer band"
+        );
     }
 
     #[test]
@@ -1935,7 +2009,8 @@ mod tests {
     #[test]
     fn right_aligned_values_in_labels() {
         // Opacity/corner-radius values live on tab 0; font size on tab 1; dropdown
-        // height on tab 2. Each must appear as a separate right-aligned label.
+        // height on tab 2. Each must appear as a separate value label (readouts
+        // sit on the header row or inside the stepper control).
         let t0: Vec<String> = panel_tab(1920, 1080, 0).labels.iter().map(|l| l.0.clone()).collect();
         assert!(t0.iter().any(|s| s == "97%"), "missing opacity value label");
         assert!(t0.iter().any(|s| s == "8px"), "missing corner radius value label");
@@ -1945,6 +2020,18 @@ mod tests {
 
         let t2: Vec<String> = panel_tab(1920, 1080, 2).labels.iter().map(|l| l.0.clone()).collect();
         assert!(t2.iter().any(|s| s == "50%"), "missing dropdown height value label");
+    }
+
+    #[test]
+    fn footer_hint_present_on_every_tab() {
+        // The footer band (hairline + hint) anchors the panel bottom on all tabs.
+        for tab in 0..5 {
+            let pv = panel_tab(1920, 1080, tab);
+            assert!(
+                pv.labels.iter().any(|l| l.0.contains("Esc to close")),
+                "tab {tab} missing footer hint"
+            );
+        }
     }
 
     #[test]
@@ -1972,12 +2059,12 @@ mod tests {
             all_text.iter().any(|s| s == "System Sans (default)"),
             "missing synthetic System Sans row"
         );
-        // The specimen baseline is below the UI-font-size buttons and above the list.
+        // The specimen anchor is below the UI-font-size stepper and above the list.
         let (sx, sy) = pv.ui_specimen_pos;
         assert!(sx >= panel.x && sx <= panel.x + panel.w, "specimen x out of panel");
         assert!(
             sy > g.ui_font_minus.y + g.ui_font_minus.h && sy < g.ui_font_rows[0].y,
-            "specimen baseline ({sy}) not between the size buttons and the family list"
+            "specimen anchor ({sy}) not between the size stepper and the family list"
         );
     }
 

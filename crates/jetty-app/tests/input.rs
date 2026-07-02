@@ -757,11 +757,14 @@ fn effects_panel_geom() -> jetty_render::PanelGeom {
     make_panel_geom_tab(4)
 }
 
-/// Build PanelGeom for the Effects tab scrolled to maximum offset (192 px).
+/// Build PanelGeom for the Effects tab scrolled to maximum offset.
 /// This brings the Caret section (bands 11–14) fully into the content viewport.
 fn effects_panel_geom_scrolled() -> jetty_render::PanelGeom {
-    // max_scroll = effects_content_h - visible_h = 652 - 460 = 192 px.
-    make_panel_geom_tab_scroll(4, 192.0)
+    // max_scroll = EFFECTS_CONTENT_H - EFFECTS_VISIBLE_H (derive, don't hardcode).
+    make_panel_geom_tab_scroll(
+        4,
+        (jetty_render::EFFECTS_CONTENT_H - jetty_render::EFFECTS_VISIBLE_H).max(0.0),
+    )
 }
 
 /// Click the center of `rect` against the Effects panel and return the action.
@@ -838,7 +841,7 @@ fn effects_animation_toggles_hit_test() {
 #[test]
 fn effects_caret_flash_toggle_hit_test() {
     // Caret section (band 11) is below the viewport at scroll=0.
-    // Scroll to max (192 px) to bring it into view.
+    // Scroll to max to bring it into view.
     let g = effects_panel_geom_scrolled();
     assert_eq!(click(&g, &g.caret_flash_toggle), MouseAction::ToggleCaretFlash);
 }
