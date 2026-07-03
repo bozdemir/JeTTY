@@ -220,6 +220,27 @@ impl Terminal {
         self.parser.advance(&mut self.term, bytes);
     }
 
+    /// Deadline of a pending synchronized update (DEC mode 2026, `CSI ?2026h`),
+    /// or `None` when no sync is active.
+    ///
+    /// vte 0.15's `Processor` buffers all bytes received during a synchronized
+    /// update and only flushes them on the matching ESU (`CSI ?2026l`) or when
+    /// the embedder polls this deadline and calls [`Terminal::flush_sync`]. An
+    /// app that sends a BSU and then crashes/pauses mid-redraw (nvim, zellij)
+    /// would otherwise freeze the display until 2 MiB accumulate; the app must
+    /// schedule a wakeup at this instant and force-flush on expiry.
+    pub fn sync_deadline(&self) -> Option<std::time::Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    /// Force-terminate a pending synchronized update, flushing every byte that
+    /// was buffered since the BSU back through the parser so the screen updates.
+    /// A no-op when no sync is active. Call this once [`Terminal::sync_deadline`]
+    /// has elapsed.
+    pub fn flush_sync(&mut self) {
+        self.parser.stop_sync(&mut self.term);
+    }
+
     pub fn snapshot(&self) -> GridSnapshot {
         let mut cells = vec![CellSnapshot::default(); self.cols * self.rows];
         let content = self.term.renderable_content();
@@ -273,6 +294,17 @@ impl Terminal {
                     // preceding cell already visually spans both columns via the
                     // font, so we force the spacer to a blank to keep columns
                     // aligned (preserving the spacer's own bg).
+                    // KNOWN LIMITATION (F24): alacritty stores combining marks /
+                    // zero-width chars (e.g. NFD accents, U+0301) in the cell's
+                    // `zerowidth()` extra storage, separate from `cell.c`. We copy
+                    // only the base `cell.c` here, so a decomposed "é" renders as a
+                    // bare "e" (visible e.g. on macOS NFD `ls` output). Carrying the
+                    // marks would require making the per-cell `CellSnapshot` (which is
+                    // `Copy` and allocated cols×rows every frame) hold a variable-
+                    // length char list AND reshaping base+marks in the render hot
+                    // path — a cost we deliberately avoid to protect idle/throughput.
+                    // `selection_to_string` DOES preserve them, so copied text is
+                    // correct even though the on-screen base glyph is not composed.
                     let c = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                         ' '
                     } else {
@@ -418,6 +450,29 @@ impl Terminal {
         self.term.mode().intersects(TermMode::MOUSE_MODE)
     }
 
+    /// Whether the app enabled button-event (drag) mouse tracking (`\e[?1002h`,
+    /// `TermMode::MOUSE_DRAG`) — motion is reported only while a button is held.
+    pub fn mouse_drag(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::MOUSE_DRAG)
+    }
+
+    /// Whether the app enabled any-event motion tracking (`\e[?1003h`,
+    /// `TermMode::MOUSE_MOTION`) — every pointer move is reported.
+    pub fn mouse_motion(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::MOUSE_MOTION)
+    }
+
+    /// Whether alternate-scroll is enabled (`TermMode::ALTERNATE_SCROLL`, on by
+    /// default; togglable via `\e[?1007h/l`). When set and the terminal is on the
+    /// alternate screen with mouse reporting off, the host must translate wheel
+    /// ticks into cursor-key (Up/Down) sequences so pagers/editors scroll.
+    pub fn alternate_scroll(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::ALTERNATE_SCROLL)
+    }
+
     /// Whether the running application requested SGR-encoded mouse reports
     /// (`\e[?1006h`). We only emit SGR-format reports, so this gates whether
     /// mouse events should be forwarded at all.
@@ -487,22 +542,33 @@ impl Terminal {
 
     /// Start a Simple text selection at the given viewport cell (0-based).
     ///
+    /// `left_half` is whether the pointer is in the LEFT half of the cell; it
+    /// picks the cell `Side` (Left/Right) exactly as alacritty does from the
+    /// sub-cell x position. Deriving the side from the pointer (rather than
+    /// hardcoding Left at press / Right at update) is what makes reverse
+    /// (right-to-left / bottom-to-top) drags keep both endpoint cells — a
+    /// hardcoded Left/Right pair makes `to_range` swap the anchors on a backward
+    /// drag and then trim one cell off each end.
+    ///
     /// The viewport row is converted to a terminal `Point` accounting for the
     /// current display offset, mirroring `snapshot()`'s mapping. Any prior
     /// selection is cleared.
-    pub fn selection_start(&mut self, viewport_line: usize, col: usize) {
+    pub fn selection_start(&mut self, viewport_line: usize, col: usize, left_half: bool) {
         let display_offset = self.term.grid().display_offset();
         let pt = viewport_to_point(display_offset, Point::new(viewport_line, Column(col)));
-        self.term.selection = Some(Selection::new(SelectionType::Simple, pt, Side::Left));
+        let side = if left_half { Side::Left } else { Side::Right };
+        self.term.selection = Some(Selection::new(SelectionType::Simple, pt, side));
     }
 
     /// Update the end of the current selection to the given viewport cell.
+    /// `left_half` is the sub-cell x side (see [`Terminal::selection_start`]).
     /// Does nothing if no selection is active.
-    pub fn selection_update(&mut self, viewport_line: usize, col: usize) {
+    pub fn selection_update(&mut self, viewport_line: usize, col: usize, left_half: bool) {
         let display_offset = self.term.grid().display_offset();
         let pt = viewport_to_point(display_offset, Point::new(viewport_line, Column(col)));
+        let side = if left_half { Side::Left } else { Side::Right };
         if let Some(sel) = self.term.selection.as_mut() {
-            sel.update(pt, Side::Right);
+            sel.update(pt, side);
         }
     }
 
@@ -803,9 +869,9 @@ mod tests {
         // the covered cells have `selected == true` while others are false.
         let mut t = Terminal::new(20, 5);
         t.feed(b"hello");
-        // Start at viewport (0, 0), update to (0, 4) → selects "hello".
-        t.selection_start(0, 0);
-        t.selection_update(0, 4);
+        // Start at viewport (0, 0) left half, update to (0, 4) right half → "hello".
+        t.selection_start(0, 0, true);
+        t.selection_update(0, 4, false);
         assert_eq!(t.selection_text().as_deref(), Some("hello"),
             "selection_text should return 'hello'");
         let snap = t.snapshot();
@@ -823,6 +889,65 @@ mod tests {
             assert!(!snap2.cell(0, col).selected,
                 "cell (0, {col}) should not be selected after clear");
         }
+    }
+
+    #[test]
+    fn reverse_drag_keeps_both_endpoints() {
+        // Regression (F4): pressing on the last char and dragging left to the
+        // first must keep BOTH endpoint cells. With the side derived from the
+        // sub-cell x position (press in the right half, release in the left
+        // half) a backward drag over "hello" selects all of "hello", not "ell".
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"hello");
+        // Press in the RIGHT half of 'o' (col 4), drag to the LEFT half of 'h' (col 0).
+        t.selection_start(0, 4, false);
+        t.selection_update(0, 0, true);
+        assert_eq!(t.selection_text().as_deref(), Some("hello"),
+            "reverse drag must not drop the endpoint cells");
+    }
+
+    #[test]
+    fn sync_update_buffers_until_flush() {
+        // Regression (F1): after a BSU (CSI ?2026h) the parser buffers all
+        // subsequent bytes; they must not appear until an ESU OR the embedder
+        // force-flushes on the sync deadline.
+        let mut t = Terminal::new(20, 5);
+        assert!(t.sync_deadline().is_none(), "no sync pending initially");
+        t.feed(b"\x1b[?2026h"); // BSU: begin synchronized update
+        assert!(t.sync_deadline().is_some(), "BSU must arm a sync deadline");
+        t.feed(b"hidden");
+        // The buffered text is NOT yet on screen.
+        assert!(!t.snapshot().row_text(0).starts_with("hidden"),
+            "bytes after BSU stay buffered until flush");
+        // Force-flush (what the app does when the deadline elapses).
+        t.flush_sync();
+        assert!(t.sync_deadline().is_none(), "flush clears the sync deadline");
+        assert!(t.snapshot().row_text(0).starts_with("hidden"),
+            "flush_sync must make buffered output visible");
+    }
+
+    #[test]
+    fn alternate_scroll_on_by_default() {
+        // Regression (F3): alacritty enables ALTERNATE_SCROLL by default, so a
+        // host must translate wheel→arrows on the alt screen. Apps can disable
+        // it with \e[?1007l.
+        let mut t = Terminal::new(20, 5);
+        assert!(t.alternate_scroll(), "alternate-scroll on by default");
+        t.feed(b"\x1b[?1007l");
+        assert!(!t.alternate_scroll(), "alternate-scroll off after \\e[?1007l");
+    }
+
+    #[test]
+    fn mouse_drag_and_motion_modes() {
+        // Regression (F5): 1002 (button-drag) and 1003 (any-motion) must be
+        // distinguishable so the app knows when to emit motion reports.
+        let mut t = Terminal::new(20, 5);
+        assert!(!t.mouse_drag() && !t.mouse_motion());
+        t.feed(b"\x1b[?1002h");
+        assert!(t.mouse_drag(), "1002 → drag reporting");
+        assert!(t.mouse_mode(), "drag mode counts as mouse mode");
+        t.feed(b"\x1b[?1002l\x1b[?1003h");
+        assert!(t.mouse_motion(), "1003 → any-motion reporting");
     }
 
     #[test]

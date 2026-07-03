@@ -1,8 +1,21 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+
+/// Hard ceiling on bytes queued to a session's writer thread but not yet
+/// written to the fd. Normal use never approaches this: the writer thread
+/// drains the channel at fd speed, so `queued` sits near zero. It only fills
+/// when the child stops reading its stdin AND something keeps producing output
+/// — the classic case being a `yes $'\e[6n'` / hostile-content query flood
+/// where the terminal auto-answers every CPR/DA into the queue while the
+/// blocked child never drains the ~4 KiB kernel tty buffer. The old unbounded
+/// channel grew by GBs/min until the OOM killer took the whole app (F13). We
+/// bound it at 64 MiB — far above any realistic keystroke burst or single
+/// paste, so legitimate writes are never dropped, yet low enough that a
+/// pathological reply loop caps in a few seconds instead of exhausting RAM.
+const PTY_WRITE_QUEUE_CAP: usize = 64 * 1024 * 1024;
 
 pub struct PtySession {
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
@@ -24,6 +37,15 @@ pub struct PtySession {
     /// called any number of times; the thread exits (dropping the Write half)
     /// once every sender clone is gone or a write fails (child exited → EIO).
     write_tx: Sender<Vec<u8>>,
+    /// Bytes currently queued to the writer thread but not yet written to the
+    /// fd. Shared with every [`ChannelWriter`] so writes past
+    /// [`PTY_WRITE_QUEUE_CAP`] are dropped instead of growing the queue to OOM
+    /// (F13). The writer thread decrements it as it drains each chunk.
+    write_queued: Arc<AtomicUsize>,
+    /// One-line notice to surface in the terminal when the configured shell
+    /// override could not be launched and `spawn` fell back to another shell
+    /// (F2). `None` when the requested/auto-detected shell started normally.
+    startup_notice: Option<String>,
 }
 
 /// `Write` adapter handed to the app: forwards buffers to the PTY writer
@@ -34,6 +56,8 @@ pub struct PtySession {
 /// a no-op — the writer thread flushes after every chunk.
 struct ChannelWriter {
     tx: Sender<Vec<u8>>,
+    /// Shared byte counter (see [`PtySession::write_queued`]).
+    queued: Arc<AtomicUsize>,
 }
 
 impl Write for ChannelWriter {
@@ -41,7 +65,21 @@ impl Write for ChannelWriter {
         if buf.is_empty() {
             return Ok(0);
         }
+        // Bound the queue: once more than PTY_WRITE_QUEUE_CAP bytes are pending
+        // (the child has stopped reading and something is flooding the queue),
+        // drop this buffer rather than grow toward OOM. We report it as fully
+        // written so a hostile query-reply loop can't turn into an error storm
+        // either; normal writes never reach the cap. This keeps the never-block
+        // guarantee for legitimate writes while making the flood self-limiting.
+        let queued = self.queued.load(Ordering::Relaxed);
+        if queued.saturating_add(buf.len()) > PTY_WRITE_QUEUE_CAP {
+            return Ok(buf.len());
+        }
+        self.queued.fetch_add(buf.len(), Ordering::Relaxed);
         self.tx.send(buf.to_vec()).map_err(|_| {
+            // Roll back the reservation; the consumer is gone so nothing will
+            // decrement it otherwise.
+            self.queued.fetch_sub(buf.len(), Ordering::Relaxed);
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "pty writer thread closed",
@@ -89,29 +127,37 @@ impl Drop for PtySession {
     }
 }
 
-/// Decide which shell to launch, in priority order:
+/// Ordered list of shell candidates to try, most-preferred first:
 /// 1. the explicit `shell` config override, when non-empty;
 /// 2. `$SHELL` (the conventional source), when set & non-empty;
 /// 3. the current user's login shell from the passwd database (so a user who
 ///    `chsh`'d to zsh works even when `$SHELL` is unset in a GUI launch);
-/// 4. `/bin/bash` as a last resort.
-fn resolve_shell(override_shell: Option<String>) -> String {
-    if let Some(s) = override_shell {
-        if !s.is_empty() {
-            return s;
+/// 4. `/bin/bash`, then `/bin/sh` as last resorts.
+///
+/// `spawn` walks this list and launches the first candidate that actually
+/// starts, so a persisted override that no longer exists (the shell was
+/// uninstalled or moved) can no longer brick startup — it falls back to a
+/// working shell instead of failing to open any window (F2). Duplicates and
+/// empties are dropped so the fallback chain is tried at most once each.
+fn shell_candidates(override_shell: Option<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: String| {
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
         }
+    };
+    if let Some(s) = override_shell {
+        push(s);
     }
     if let Ok(s) = std::env::var("SHELL") {
-        if !s.is_empty() {
-            return s;
-        }
+        push(s);
     }
     if let Some(s) = passwd_shell() {
-        if !s.is_empty() {
-            return s;
-        }
+        push(s);
     }
-    "/bin/bash".to_string()
+    push("/bin/bash".to_string());
+    push("/bin/sh".to_string());
+    out
 }
 
 /// The current user's login shell (`pw_shell`) from the passwd database, or
@@ -195,35 +241,74 @@ impl PtySession {
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        let shell = resolve_shell(shell_override);
-        let mut cmd = CommandBuilder::new(shell);
-        // Advertise a capable terminal so shells (and prompts like p10k) run
-        // their capability probes and emit truecolor; without TERM set, those
-        // capability checks fail and the prompt renders the red "x".
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        // Disable macOS's shell-session save/restore (/etc/zshrc writes
-        // ~/.zsh_sessions/<id>.session and sources it on the next launch). A
-        // window-close can interrupt the save, leaving a malformed file that the
-        // next shell tries to run — e.g. `command not found: Saving`. JeTTY is a
-        // quick-summon terminal; session restore isn't wanted. Harmless/ignored
-        // on Linux, so set it unconditionally (no platform-specific code).
-        cmd.env("SHELL_SESSIONS_DISABLE", "1");
-        // GUI launches (Finder/Dock/.desktop) start the app with cwd `/`; unlike
-        // Terminal.app/iTerm2/kitty we don't want new shells opening in the
-        // filesystem root. Only override in that case — a shell launched from a
-        // terminal in some project directory should still inherit that directory.
-        if std::env::current_dir().map(|p| p == std::path::Path::new("/")).unwrap_or(false)
-        {
-            if let Some(home) = home_dir() {
-                cmd.cwd(home);
+        // The shell the caller explicitly requested (config `shell` override),
+        // remembered so we can tell whether the launch fell back to another one.
+        let requested = shell_override.clone().filter(|s| !s.is_empty());
+        let candidates = shell_candidates(shell_override);
+
+        // Build a fully-configured CommandBuilder for a given shell path. Kept as
+        // a closure so every fallback candidate gets the identical environment.
+        let make_cmd = |shell: &str| {
+            let mut cmd = CommandBuilder::new(shell);
+            // Advertise a capable terminal so shells (and prompts like p10k) run
+            // their capability probes and emit truecolor; without TERM set, those
+            // capability checks fail and the prompt renders the red "x".
+            cmd.env("TERM", "xterm-256color");
+            cmd.env("COLORTERM", "truecolor");
+            // Disable macOS's shell-session save/restore (/etc/zshrc writes
+            // ~/.zsh_sessions/<id>.session and sources it on the next launch). A
+            // window-close can interrupt the save, leaving a malformed file that
+            // the next shell tries to run — e.g. `command not found: Saving`.
+            // JeTTY is a quick-summon terminal; session restore isn't wanted.
+            // Harmless/ignored on Linux, so set it unconditionally.
+            cmd.env("SHELL_SESSIONS_DISABLE", "1");
+            // GUI launches (Finder/Dock/.desktop) start the app with cwd `/`;
+            // unlike Terminal.app/iTerm2/kitty we don't want new shells opening
+            // in the filesystem root. Only override in that case — a shell
+            // launched from a terminal in a project dir keeps that directory.
+            if std::env::current_dir().map(|p| p == std::path::Path::new("/")).unwrap_or(false)
+            {
+                if let Some(home) = home_dir() {
+                    cmd.cwd(home);
+                }
+            }
+            cmd
+        };
+
+        // Try each candidate until one actually spawns. A persisted override
+        // that no longer exists on disk (uninstalled/moved) must NOT prevent a
+        // usable window — fall through to $SHELL/passwd/bash/sh instead (F2).
+        let mut child = None;
+        let mut launched_shell = String::new();
+        let mut last_err = None;
+        for shell in &candidates {
+            match pair.slave.spawn_command(make_cmd(shell)) {
+                Ok(c) => {
+                    child = Some(c);
+                    launched_shell = shell.clone();
+                    break;
+                }
+                Err(e) => last_err = Some(e.to_string()),
             }
         }
-        let mut child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut child = match child {
+            Some(c) => c,
+            None => {
+                return Err(std::io::Error::other(
+                    last_err.unwrap_or_else(|| "no shell could be spawned".to_string()),
+                ));
+            }
+        };
         drop(pair.slave);
+
+        // If the user asked for a specific shell and we ended up on a different
+        // one, surface a one-line notice so the fallback is not silent.
+        let startup_notice = match requested {
+            Some(req) if req != launched_shell => Some(format!(
+                "jetty: shell \"{req}\" could not be started — using \"{launched_shell}\" instead.",
+            )),
+            _ => None,
+        };
 
         // Dedicated WRITER thread (mirrors the reader thread below): it owns
         // the blocking Write half of the master; the UI thread only ever sends
@@ -245,9 +330,16 @@ impl PtySession {
             }
         };
         let (write_tx, write_rx) = channel::<Vec<u8>>();
+        let write_queued = Arc::new(AtomicUsize::new(0));
+        let write_queued_thread = Arc::clone(&write_queued);
         std::thread::spawn(move || {
             while let Ok(chunk) = write_rx.recv() {
-                if pty_writer.write_all(&chunk).is_err() {
+                let n = chunk.len();
+                let write_ok = pty_writer.write_all(&chunk).is_ok();
+                // Release the reservation as soon as the bytes leave the queue,
+                // whether or not the fd write succeeded (a failure ends the loop).
+                write_queued_thread.fetch_sub(n, Ordering::Relaxed);
+                if !write_ok {
                     break;
                 }
                 let _ = pty_writer.flush();
@@ -322,7 +414,16 @@ impl PtySession {
             killer,
             pid,
             write_tx,
+            write_queued,
+            startup_notice,
         })
+    }
+
+    /// A one-line notice describing a shell fallback (the configured `shell`
+    /// override could not be launched), or `None` when the intended shell
+    /// started normally. The app surfaces this in the fresh terminal (F2).
+    pub fn startup_notice(&self) -> Option<&str> {
+        self.startup_notice.as_deref()
     }
 
     pub fn output(&self) -> &Receiver<Vec<u8>> {
@@ -349,7 +450,10 @@ impl PtySession {
     /// no-op (the writer thread flushes each chunk). May be called any number
     /// of times.
     pub fn writer(&self) -> Box<dyn Write + Send> {
-        Box::new(ChannelWriter { tx: self.write_tx.clone() })
+        Box::new(ChannelWriter {
+            tx: self.write_tx.clone(),
+            queued: Arc::clone(&self.write_queued),
+        })
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
@@ -366,12 +470,40 @@ impl PtySession {
 mod tests {
     use super::*;
 
+    fn mk_writer(tx: Sender<Vec<u8>>) -> ChannelWriter {
+        ChannelWriter { tx, queued: Arc::new(AtomicUsize::new(0)) }
+    }
+
+    #[test]
+    fn shell_candidates_always_end_with_a_working_fallback() {
+        // Regression (F2): a dead override must not be the only candidate — the
+        // auto-detect chain (bash/sh) is always appended so a usable shell can
+        // still launch.
+        let list = shell_candidates(Some("/nonexistent/fish".to_string()));
+        assert_eq!(list.first().map(String::as_str), Some("/nonexistent/fish"),
+            "override tried first");
+        assert!(list.iter().any(|s| s == "/bin/bash" || s == "/bin/sh"),
+            "fallback chain must always be present; got {list:?}");
+    }
+
+    #[test]
+    fn shell_candidates_dedupe_and_drop_empties() {
+        // An empty override is ignored; duplicates (e.g. $SHELL == /bin/bash)
+        // are not tried twice.
+        let list = shell_candidates(Some(String::new()));
+        assert!(!list.iter().any(|s| s.is_empty()), "no empty candidates");
+        let mut seen = std::collections::HashSet::new();
+        for s in &list {
+            assert!(seen.insert(s), "no duplicate candidate {s:?}");
+        }
+    }
+
     #[test]
     fn channel_writer_preserves_order() {
         // The bracketed-paste triple (prefix, payload, suffix) must arrive at
         // the writer thread in exactly the order it was written.
         let (tx, rx) = channel::<Vec<u8>>();
-        let mut w = ChannelWriter { tx };
+        let mut w = mk_writer(tx);
         w.write_all(b"\x1b[200~").unwrap();
         w.write_all(b"hello").unwrap();
         w.write_all(b"\x1b[201~").unwrap();
@@ -389,10 +521,45 @@ mod tests {
         // nothing consumes them yet (the C14 freeze scenario): write returns
         // immediately with the full length.
         let (tx, rx) = channel::<Vec<u8>>();
-        let mut w = ChannelWriter { tx };
+        let mut w = mk_writer(tx);
         let big = vec![b'x'; 1 << 20]; // 1 MiB, far beyond the ~64KB kernel buffer
         assert_eq!(w.write(&big).unwrap(), big.len());
         assert_eq!(rx.try_recv().unwrap().len(), 1 << 20);
+    }
+
+    #[test]
+    fn channel_writer_drops_past_cap_without_blocking_or_erroring() {
+        // Regression (F13): once the queue exceeds PTY_WRITE_QUEUE_CAP (the
+        // child stopped reading and a reply flood keeps producing), further
+        // writes are DROPPED — reported as written, never blocking, never
+        // erroring — so memory stays bounded instead of growing to OOM.
+        let (tx, rx) = channel::<Vec<u8>>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let mut w = ChannelWriter { tx, queued: Arc::clone(&queued) };
+        // Nothing consumes `rx`, so `queued` only ever grows here.
+        let chunk = vec![b'q'; 1 << 20]; // 1 MiB per write
+        let mut sent = 0usize;
+        for _ in 0..200 {
+            // Each call must return Ok(len) — never Err, never block.
+            assert_eq!(w.write(&chunk).unwrap(), chunk.len());
+            if queued.load(Ordering::Relaxed) >= PTY_WRITE_QUEUE_CAP - chunk.len() {
+                sent += 1;
+                // A few more writes past the cap must still succeed as no-ops.
+                assert_eq!(w.write(&chunk).unwrap(), chunk.len());
+            } else {
+                sent += 1;
+            }
+        }
+        assert!(sent > 0);
+        // The actually-queued bytes never exceeded the cap.
+        assert!(
+            queued.load(Ordering::Relaxed) <= PTY_WRITE_QUEUE_CAP,
+            "queued bytes must stay under the cap; got {}",
+            queued.load(Ordering::Relaxed)
+        );
+        // And the messages that were enqueued sum to <= the cap.
+        let total: usize = rx.try_iter().map(|v| v.len()).sum();
+        assert!(total <= PTY_WRITE_QUEUE_CAP, "enqueued bytes exceeded cap");
     }
 
     #[test]
@@ -401,7 +568,7 @@ mod tests {
         // with BrokenPipe instead of panicking or silently vanishing.
         let (tx, rx) = channel::<Vec<u8>>();
         drop(rx);
-        let mut w = ChannelWriter { tx };
+        let mut w = mk_writer(tx);
         let err = w.write_all(b"x").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
@@ -409,7 +576,7 @@ mod tests {
     #[test]
     fn channel_writer_empty_write_sends_nothing() {
         let (tx, rx) = channel::<Vec<u8>>();
-        let mut w = ChannelWriter { tx };
+        let mut w = mk_writer(tx);
         assert_eq!(w.write(b"").unwrap(), 0);
         assert!(rx.try_recv().is_err(), "no message for a zero-length write");
     }
@@ -419,8 +586,9 @@ mod tests {
         // writer() may now be called more than once; all clones feed the same
         // ordered queue (per-session ordering is what the terminal relies on).
         let (tx, rx) = channel::<Vec<u8>>();
-        let mut a = ChannelWriter { tx: tx.clone() };
-        let mut b = ChannelWriter { tx };
+        let queued = Arc::new(AtomicUsize::new(0));
+        let mut a = ChannelWriter { tx: tx.clone(), queued: Arc::clone(&queued) };
+        let mut b = ChannelWriter { tx, queued };
         a.write_all(b"1").unwrap();
         b.write_all(b"2").unwrap();
         a.write_all(b"3").unwrap();

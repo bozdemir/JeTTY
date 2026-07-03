@@ -100,6 +100,17 @@ pub fn decide_key(
     // every layout — unlike Ctrl+, which on a Turkish layout reports as Backslash
     // (not Comma), so it never matched.
     if ctrl && shift {
+        // Opacity: prefer the LOGICAL character so the binding follows the
+        // engraved key on every layout (Turkish-Q, QWERTZ), mirroring the font
+        // bindings below. On Turkish-Q the '-'-engraved key is physical Equal, so
+        // a pure physical match inverted the direction (Ctrl+Shift+'-' → up).
+        if let Key::Character(s) = logical {
+            match s.as_str() {
+                "+" | "=" => return KeyAction::OpacityUp,
+                "-" | "_" => return KeyAction::OpacityDown,
+                _ => {}
+            }
+        }
         match physical {
             // KeyP is the dedicated "open Settings dialog" hotkey.
             // KeyO is kept as an alias for backwards compatibility.
@@ -113,6 +124,8 @@ pub fn decide_key(
             PhysicalKey::Code(KeyCode::KeyW) => return KeyAction::CloseTab,
             PhysicalKey::Code(KeyCode::KeyD) => return KeyAction::DetachTab,
             PhysicalKey::Code(KeyCode::Tab) => return KeyAction::PrevTab,
+            // Physical fallback for layouts where the logical char above is
+            // unreliable (US: Shift+Equal → '+', Shift+Minus → '_').
             PhysicalKey::Code(KeyCode::Equal) => return KeyAction::OpacityUp,
             PhysicalKey::Code(KeyCode::Minus) => return KeyAction::OpacityDown,
             PhysicalKey::Code(KeyCode::KeyC) => return KeyAction::Copy,
@@ -171,11 +184,24 @@ pub fn decide_key(
         };
     }
 
-    // Font-size bindings: Ctrl (no shift) + Equal/Minus/Digit0.
-    // These must be checked BEFORE the ctrl_byte fallback so they are never
-    // swallowed as a raw control code. Ctrl+Shift+Equal/Minus are already
+    // Font-size bindings: Ctrl (no shift) + '+'/'='/'-'/'0'.
+    // Keyed on the LOGICAL character first so the binding follows the engraved
+    // key on every layout — on Turkish-Q the '-'-engraved key is physical Equal,
+    // so a pure physical match made Ctrl+'-' GROW the font (the inverse of what
+    // README/help promise); on QWERTZ '-' is physical Slash, so Ctrl+'-' typed a
+    // literal '-'. The physical positions remain as a fallback for layouts where
+    // the logical char is unreliable. Checked BEFORE the ctrl_byte fallback so
+    // they are never swallowed as a raw control code; Ctrl+Shift+'='/'-' are
     // handled above as OpacityUp/Down and never reach here.
     if ctrl && !shift {
+        if let Key::Character(s) = logical {
+            match s.as_str() {
+                "+" | "=" => return KeyAction::FontUp,
+                "-" => return KeyAction::FontDown,
+                "0" => return KeyAction::FontReset,
+                _ => {}
+            }
+        }
         match physical {
             PhysicalKey::Code(KeyCode::Equal) => return KeyAction::FontUp,
             PhysicalKey::Code(KeyCode::Minus) => return KeyAction::FontDown,
@@ -793,6 +819,17 @@ pub fn cursor_key_bytes(key: &Key, app_cursor: bool) -> Option<Vec<u8>> {
     Some(vec![0x1b, prefix, final_byte])
 }
 
+/// Byte sequence for a single wheel-driven scroll step on the alternate screen
+/// (ALTERNATE_SCROLL): an Up (`up == true`) or Down arrow, DECCKM-aware. A
+/// compliant host translates wheel ticks to arrow keys when a pager/editor owns
+/// the alt screen with mouse reporting off, so `less`/`man`/`git log` scroll
+/// (F3). This is the arrow-key analogue of [`cursor_key_bytes`].
+pub fn arrow_scroll_bytes(up: bool, app_cursor: bool) -> Vec<u8> {
+    let final_byte = if up { b'A' } else { b'B' };
+    let prefix = if app_cursor { b'O' } else { b'[' };
+    vec![0x1b, prefix, final_byte]
+}
+
 /// Translate a winit logical key into the byte sequence a terminal expects.
 /// This is the single source of truth — both `app.rs` and tests use it.
 ///
@@ -940,6 +977,11 @@ pub enum MouseEvent {
     WheelUp,
     /// Wheel scrolled down (button 65).
     WheelDown,
+    /// Pointer motion report (modes 1002 button-drag / 1003 any-motion). The
+    /// `button` is the BASE button code held during the move (0 left, 1 middle,
+    /// 2 right, 3 = no button); the encoder adds the 0x20 motion bit. Emitted
+    /// once per cell change while the app requested motion reporting.
+    Motion { button: u8 },
 }
 
 /// The button-code half of a mouse event, shared by both the SGR and X10
@@ -955,6 +997,9 @@ fn mouse_button_code(event: MouseEvent) -> (u8, bool) {
         MouseEvent::LeftRelease => (0, true),
         MouseEvent::WheelUp => (64, false),
         MouseEvent::WheelDown => (65, false),
+        // Motion adds the 0x20 (32) "motion" bit to the held-button base code:
+        // left-drag → 32, no-button any-motion → 35. Reported as a press (`M`).
+        MouseEvent::Motion { button } => (button.wrapping_add(32), false),
     }
 }
 
@@ -1048,6 +1093,55 @@ mod tests {
             false, false, false,
         );
         assert_eq!(action, KeyAction::FontDown);
+    }
+
+    #[test]
+    fn turkish_q_ctrl_minus_is_font_down_not_up() {
+        // Regression (F21): on Turkish-Q the '-'-engraved key is physical Equal.
+        // Ctrl at that key must SHRINK the font (logical '-'), not grow it.
+        let action = decide_key(
+            true, false, false,
+            make_physical(KeyCode::Equal), // physical position of the '-' key
+            &make_logical_char("-"),        // engraved/produced character
+            false, false, false,
+        );
+        assert_eq!(action, KeyAction::FontDown, "logical '-' must win over physical Equal");
+    }
+
+    #[test]
+    fn turkish_q_ctrl_shift_minus_is_opacity_down_not_up() {
+        // Regression (F21): the opacity chord must follow the engraved key too.
+        let action = decide_key(
+            true, true, false,
+            make_physical(KeyCode::Equal),
+            &make_logical_char("-"),
+            false, false, false,
+        );
+        assert_eq!(action, KeyAction::OpacityDown);
+    }
+
+    #[test]
+    fn qwertz_ctrl_minus_is_font_down_not_literal() {
+        // Regression (F21): on German QWERTZ '-' sits at physical Slash; keying
+        // on the logical char makes Ctrl+'-' shrink the font instead of typing
+        // a literal '-' into the shell.
+        let action = decide_key(
+            true, false, false,
+            make_physical(KeyCode::Slash),
+            &make_logical_char("-"),
+            false, false, false,
+        );
+        assert_eq!(action, KeyAction::FontDown);
+    }
+
+    #[test]
+    fn motion_report_sets_the_motion_bit() {
+        // Regression (F5): a left-drag motion report (SGR) carries button 32
+        // (base 0 + 0x20 motion bit); a no-button any-motion report carries 35.
+        let left = encode_sgr_mouse(MouseEvent::Motion { button: 0 }, 5, 7);
+        assert_eq!(left, b"\x1b[<32;5;7M".to_vec());
+        let none = encode_sgr_mouse(MouseEvent::Motion { button: 3 }, 1, 1);
+        assert_eq!(none, b"\x1b[<35;1;1M".to_vec());
     }
 
     #[test]

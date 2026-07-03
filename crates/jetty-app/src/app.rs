@@ -1697,20 +1697,29 @@ impl App {
     }
 
     /// Convert the current cursor pixel position into 0-based viewport cell
-    /// coordinates `(line, col)` clamped to the terminal grid. Returns `None`
-    /// when the renderer is not yet available.
-    fn cursor_cell_0(&self) -> Option<(usize, usize)> {
+    /// coordinates `(line, col)` clamped to the terminal grid, plus whether the
+    /// pointer is in the LEFT half of its cell. Returns `None` when the renderer
+    /// is not yet available.
+    ///
+    /// Selection start/update derive the cell `Side` from `left_half` (F4):
+    /// hardcoding Left-at-press / Right-at-update dropped the endpoint cells on a
+    /// reverse (right-to-left / bottom-to-top) drag.
+    fn cursor_cell_0_side(&self) -> Option<(usize, usize, bool)> {
         let (cell_w, cell_h) = self.text.as_ref()?.cell_size();
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return None;
         }
         let cols = self.active_tab().terminal.cols().saturating_sub(1);
         let rows = self.active_tab().terminal.rows().saturating_sub(1);
-        // Subtract the grid's pixel origin (0 at bottom, TABBAR_H at top).
         let y = (self.cursor.1 as f32 - self.grid_top_offset()).max(0.0);
-        let col = ((self.cursor.0 as f32 / cell_w).floor() as i64).clamp(0, cols as i64) as usize;
+        let x = self.cursor.0 as f32;
+        let col_f = (x / cell_w).floor();
+        let col = (col_f as i64).clamp(0, cols as i64) as usize;
         let line = ((y / cell_h).floor() as i64).clamp(0, rows as i64) as usize;
-        Some((line, col))
+        // Sub-cell x fraction: the pointer is in the left half when it sits in
+        // the first half-cell-width past the cell's left edge.
+        let left_half = (x - col_f * cell_w) < cell_w * 0.5;
+        Some((line, col, left_half))
     }
 
     /// Paste `text` to the ACTIVE tab's PTY, wrapping in bracketed-paste
@@ -4586,8 +4595,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // actually began (mouse reporting off, or Shift held to override it),
                 // so a Shift-drag over a mouse-mode app still extends the selection.
                 if self.selecting {
-                    if let Some((line, col)) = self.cursor_cell_0() {
-                        self.active_tab_mut().terminal.selection_update(line, col);
+                    if let Some((line, col, left_half)) = self.cursor_cell_0_side() {
+                        self.active_tab_mut().terminal.selection_update(line, col, left_half);
                         if let Some(win) = &self.window {
                             win.request_redraw();
                         }
@@ -5059,8 +5068,8 @@ impl ApplicationHandler<AppEvent> for App {
                         } else {
                             // Clear prior selection and begin a new one.
                             self.active_tab_mut().terminal.selection_clear();
-                            if let Some((line, col)) = self.cursor_cell_0() {
-                                self.active_tab_mut().terminal.selection_start(line, col);
+                            if let Some((line, col, left_half)) = self.cursor_cell_0_side() {
+                                self.active_tab_mut().terminal.selection_start(line, col, left_half);
                             }
                             self.selecting = true;
                             if let Some(win) = &self.window {
@@ -5289,6 +5298,13 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                // The last tab's shell can exit mid-pump (close_exited_tabs
+                // emptied self.tabs), yet winit still delivers this iteration's
+                // queued wheel events; active_tab() would panic on an empty vec.
+                // Mirror the KeyboardInput/Ime guards (F29).
+                if self.tabs.is_empty() {
+                    return;
+                }
                 // Positive y = wheel up = scroll into history (older output).
                 // Deltas are ACCUMULATED (fractionally) across events: slow
                 // touchpad scrolling arrives as many sub-line deltas that a
