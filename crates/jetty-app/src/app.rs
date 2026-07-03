@@ -1164,6 +1164,10 @@ impl App {
         let writer = pty.writer();
         let mut terminal = Terminal::new(cols, rows);
         terminal.set_theme(self.current_theme());
+        // Surface the shell-fallback notice here too (F2).
+        if let Some(notice) = pty.startup_notice() {
+            terminal.feed(format!("\x1b[33m{notice}\x1b[0m\r\n").as_bytes());
+        }
         let title = format!("Tab {}", self.tabs.len() + 1);
         self.tabs.push(Tab { terminal, pty, writer, title });
         self.active = self.tabs.len() - 1;
@@ -1323,49 +1327,71 @@ impl App {
         // cursor's global position, clamped so it stays on the monitor. When no
         // monitor info is available, use the raw position; on Wayland
         // set_outer_position is a no-op (accepted degradation, no DE code).
+        //
+        // MIXED-DPI (F9): `drop_global` is main-window-scale physical px (main
+        // outer_position + cursor), but each monitor's position()/size() is in
+        // ITS OWN scale's physical px — on a mixed-DPI macOS setup those spaces
+        // are not comparable, so the containment test picked the wrong monitor and
+        // the clamp pinned the window off the drop point. Do the whole
+        // containment+clamp in scale-INDEPENDENT LOGICAL points (a single unified
+        // desktop space on both macOS and X11) and set a LogicalPosition, so winit
+        // maps it back per the target display. At a uniform scale (X11) this is a
+        // no-op, so the working path is unchanged.
         if let Some((gx, gy)) = drop_global {
+            let main_scale = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0);
+            // Drop point and window size in logical points.
+            let drop_lx = gx / main_scale;
+            let drop_ly = gy / main_scale;
+            let dw_scale = dw.window.scale_factor();
             let ws = dw.window.outer_size();
-            // Pick the monitor that actually CONTAINS the release point, not the
-            // freshly-created window's default monitor (usually the primary) —
-            // otherwise a drop on a secondary monitor clamps back onto the
-            // primary. Fall back to the nearest monitor by centre distance, then
-            // to current_monitor().
+            let win_lw = ws.width as f64 / dw_scale;
+            let win_lh = ws.height as f64 / dw_scale;
+            // A monitor's logical rect = its physical rect / its OWN scale.
+            let mon_logical = |m: &winit::monitor::MonitorHandle| {
+                let p = m.position();
+                let s = m.size();
+                let sc = m.scale_factor();
+                (p.x as f64 / sc, p.y as f64 / sc, s.width as f64 / sc, s.height as f64 / sc)
+            };
+            let contains = |m: &winit::monitor::MonitorHandle| {
+                let (mx, my, mw, mh) = mon_logical(m);
+                drop_lx >= mx && drop_lx < mx + mw && drop_ly >= my && drop_ly < my + mh
+            };
             let target = dw
                 .window
                 .available_monitors()
-                .find(|m| {
-                    let p = m.position();
-                    let s = m.size();
-                    (gx as i32) >= p.x
-                        && (gx as i32) < p.x + s.width as i32
-                        && (gy as i32) >= p.y
-                        && (gy as i32) < p.y + s.height as i32
-                })
+                .find(contains)
                 .or_else(|| {
-                    dw.window.available_monitors().min_by_key(|m| {
-                        let p = m.position();
-                        let s = m.size();
-                        let cx = p.x as i64 + s.width as i64 / 2;
-                        let cy = p.y as i64 + s.height as i64 / 2;
-                        (gx as i64 - cx).pow(2) + (gy as i64 - cy).pow(2)
+                    dw.window.available_monitors().min_by(|a, b| {
+                        let d = |m: &winit::monitor::MonitorHandle| {
+                            let (mx, my, mw, mh) = mon_logical(m);
+                            let cx = mx + mw / 2.0;
+                            let cy = my + mh / 2.0;
+                            (drop_lx - cx).powi(2) + (drop_ly - cy).powi(2)
+                        };
+                        d(a).total_cmp(&d(b))
                     })
                 })
                 .or_else(|| dw.window.current_monitor());
-            let (x, y) = match target {
+            let (lx, ly) = match target {
                 Some(mon) => {
-                    let mp = mon.position();
-                    let ms = mon.size();
-                    crate::detached::clamp_pos(
-                        gx as i32,
-                        gy as i32,
-                        ws.width,
-                        ws.height,
-                        (mp.x, mp.y, ms.width, ms.height),
-                    )
+                    let (mx, my, mw, mh) = mon_logical(&mon);
+                    // Clamp the top-left (in logical points) so the whole window
+                    // stays on the target monitor. Sub-pixel logical placement is
+                    // irrelevant, so round to integers and reuse clamp_pos.
+                    let (cx, cy) = crate::detached::clamp_pos(
+                        drop_lx.round() as i32,
+                        drop_ly.round() as i32,
+                        win_lw.round() as u32,
+                        win_lh.round() as u32,
+                        (mx.round() as i32, my.round() as i32, mw.round() as u32, mh.round() as u32),
+                    );
+                    (cx as f64, cy as f64)
                 }
-                None => (gx as i32, gy as i32),
+                None => (drop_lx, drop_ly),
             };
-            dw.window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+            dw.window
+                .set_outer_position(winit::dpi::LogicalPosition::new(lx, ly));
         }
 
         // Reflow the moved tab to the detached window's grid: the client area
@@ -2441,6 +2467,13 @@ impl App {
         self.dragging_dropdown = false;
         self.dragging_dropdown_width = false;
         self.active_fx_drag = None;
+        // Collapse the Look-tab theme dropdown so reopening Settings starts with
+        // it closed (its "collapsed unless the user opens it" session semantics).
+        // The Escape / OS-close paths bypass handle_settings_action where the
+        // collapse normally happens, so without this the panel reopened with the
+        // menu already popped open at a stale scroll offset (F28).
+        self.theme_dropdown_open = false;
+        self.theme_scroll_offset = 0;
         if self.debug {
             eprintln!("SETTINGS window closed");
         }
@@ -2686,6 +2719,50 @@ impl App {
                 let ctrl = self.modifiers.control_key();
                 let shift = self.modifiers.shift_key();
                 let alt = self.modifiers.alt_key();
+                // macOS Cmd shortcuts in a detached window (F11) — same swallow +
+                // standard-chord handling as the main window, acting on THIS
+                // window's tab where it makes sense.
+                if self.modifiers.super_key() && !ctrl && !alt {
+                    if let winit::keyboard::Key::Character(s) = &event.logical_key {
+                        match s.as_str() {
+                            "c" | "C" => {
+                                if let Some(dw) = self.detached.get_mut(pos) {
+                                    let copied = dw
+                                        .tab
+                                        .terminal
+                                        .selection_text()
+                                        .filter(|t| !t.is_empty());
+                                    if let Some(text) = copied {
+                                        clipboard::set(&text);
+                                        dw.tab.terminal.selection_clear();
+                                        dw.window.request_redraw();
+                                    }
+                                }
+                            }
+                            "v" | "V" => {
+                                if let Some(text) = clipboard::get() {
+                                    if let Some(dw) = self.detached.get_mut(pos) {
+                                        Self::paste_to_tab(&mut dw.tab, &text);
+                                    }
+                                }
+                            }
+                            "a" | "A" => {
+                                if let Some(dw) = self.detached.get_mut(pos) {
+                                    dw.tab.terminal.select_all();
+                                    dw.window.request_redraw();
+                                }
+                            }
+                            "t" | "T" => self.new_tab(),
+                            "w" | "W" => self.reattach_tab(pos, event_loop),
+                            "+" | "=" => self.set_font_size(self.font_logical + 1.0),
+                            "-" => self.set_font_size(self.font_logical - 1.0),
+                            "0" => self.set_font_size(FONT_LOGICAL_DEFAULT),
+                            "," => self.toggle_settings_window(event_loop),
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
                 let (app_cursor, alt_screen) = {
                     let Some(dw) = self.detached.get(pos) else { return };
                     (dw.tab.terminal.app_cursor_keys(), dw.tab.terminal.alt_screen())
@@ -3186,17 +3263,28 @@ impl App {
                 };
                 if let Some((gx, gy)) = drop_global {
                     if self.visible {
+                        // Convert the detached-window release point and the main
+                        // window's outer rect BOTH into scale-independent LOGICAL
+                        // points before the band test, so a drop from a
+                        // different-DPI monitor lands correctly (F9). At a uniform
+                        // scale this is identity, so the X11 path is unchanged.
+                        let dw_scale = self
+                            .detached
+                            .get(pos)
+                            .map(|d| d.window.scale_factor())
+                            .unwrap_or(1.0);
                         if let (Some(win), Some(gpu)) = (&self.window, &self.gpu) {
                             if let Ok(mp) = win.outer_position() {
+                                let main_scale = win.scale_factor();
                                 if crate::detached::main_tabbar_contains(
-                                    gx,
-                                    gy,
-                                    mp.x,
-                                    mp.y,
-                                    gpu.config.width,
-                                    gpu.config.height,
-                                    TABBAR_H,
-                                    self.status_h(),
+                                    gx / dw_scale,
+                                    gy / dw_scale,
+                                    mp.x as f64 / main_scale,
+                                    mp.y as f64 / main_scale,
+                                    gpu.config.width as f64 / main_scale,
+                                    gpu.config.height as f64 / main_scale,
+                                    TABBAR_H as f64,
+                                    self.status_h() as f64,
                                     self.tab_bar_bottom,
                                 ) {
                                     self.reattach_tab(pos, event_loop);
@@ -4614,6 +4702,11 @@ impl ApplicationHandler<AppEvent> for App {
         };
         pty.resize(cols as u16, rows as u16);
         terminal.resize(cols, rows);
+        // Surface a one-line notice if the configured shell was unavailable and
+        // spawn fell back to another shell, so the fallback is not silent (F2).
+        if let Some(notice) = pty.startup_notice() {
+            terminal.feed(format!("\x1b[33m{notice}\x1b[0m\r\n").as_bytes());
+        }
         let writer = pty.writer();
         self.tabs.push(Tab { terminal, pty, writer, title: "Tab 1".to_string() });
         self.active = 0;
@@ -5561,6 +5654,20 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                // Modal gates (F38): unlike the Left arm (and the v0.10 Middle
+                // arm), the Right arm used to open its menu on top of a modal
+                // dialog, mid-summon-slide, or after the last tab exited. Consume
+                // the click while any modal is up / the scene is sliding / tabs is
+                // empty, so no menu appears over a quit/close-confirm or the help,
+                // and no menu opens at coordinates the slide has shifted.
+                if self.slide_anim.is_some()
+                    || self.confirm_quit
+                    || self.confirm_close.is_some()
+                    || self.help_open
+                    || self.tabs.is_empty()
+                {
+                    return;
+                }
                 // Right-click: open the context menu (Copy / Paste / Select All).
                 // Settings now live in a separate window, so the main terminal is
                 // always free to show its context menu.
@@ -6003,6 +6110,56 @@ impl ApplicationHandler<AppEvent> for App {
                 let ctrl = self.modifiers.control_key();
                 let shift = self.modifiers.shift_key();
                 let alt = self.modifiers.alt_key();
+                // macOS Cmd (winit `super_key()`) shortcuts. decide_key only knows
+                // ctrl/shift/alt, so a bare Cmd+C/V/A/W/T/Q/... fell through to
+                // key_to_bytes and typed a literal letter into the shell (F11).
+                // Handle the standard editing/tab/font chords and SWALLOW every
+                // other Cmd chord so none leaks to the PTY. Keyed on the logical
+                // char (layout-tolerant). On Linux this key is Super (usually
+                // WM-grabbed, rarely delivered) — handling it uniformly is
+                // DE-independent and harmless. Ctrl/Alt+Cmd combos fall through.
+                if self.modifiers.super_key() && !ctrl && !alt {
+                    if let winit::keyboard::Key::Character(s) = &event.logical_key {
+                        match s.as_str() {
+                            "c" | "C" => {
+                                let copied = self
+                                    .active_tab()
+                                    .terminal
+                                    .selection_text()
+                                    .filter(|t| !t.is_empty());
+                                if let Some(text) = copied {
+                                    clipboard::set(&text);
+                                    self.active_tab_mut().terminal.selection_clear();
+                                    if let Some(w) = &self.window { w.request_redraw(); }
+                                }
+                            }
+                            "v" | "V" => {
+                                if let Some(text) = clipboard::get() {
+                                    self.paste_text(&text);
+                                }
+                            }
+                            "a" | "A" => {
+                                self.active_tab_mut().terminal.select_all();
+                                if let Some(w) = &self.window { w.request_redraw(); }
+                            }
+                            "t" | "T" => self.new_tab(),
+                            "w" | "W" => {
+                                self.confirm_close = Some(self.active);
+                                if let Some(w) = &self.window { w.request_redraw(); }
+                            }
+                            "q" | "Q" => {
+                                self.confirm_quit = true;
+                                if let Some(w) = &self.window { w.request_redraw(); }
+                            }
+                            "+" | "=" => self.set_font_size(self.font_logical + 1.0),
+                            "-" => self.set_font_size(self.font_logical - 1.0),
+                            "0" => self.set_font_size(FONT_LOGICAL_DEFAULT),
+                            "," => self.toggle_settings_window(event_loop),
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
                 let app_cursor = self.active_tab().terminal.app_cursor_keys();
                 let alt_screen = self.active_tab().terminal.alt_screen();
                 // Escape in the main window never closes the settings window

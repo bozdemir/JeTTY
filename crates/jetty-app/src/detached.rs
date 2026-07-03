@@ -63,30 +63,35 @@ pub fn tearing(cursor_y: f32, bar_y: f32, bar_h: f32, threshold: f32) -> bool {
 /// tab-bar strip: the band `tabbar_h` tall at the top of the main window, or —
 /// when `tab_bar_bottom` — just above the status strip at the bottom (the same
 /// band `App::tabbar_y` computes). `main_x/main_y` is the main window's outer
-/// position; `main_w/main_h` its physical surface size.
+/// position; `main_w/main_h` its surface size.
+///
+/// All coordinates must be in ONE consistent unit space. The caller passes
+/// scale-independent LOGICAL points so a drop from a detached window on a
+/// DIFFERENT-DPI monitor is tested against the main window's band in the same
+/// units (mixing per-window physical scales made the band test miss — F9).
 #[allow(clippy::too_many_arguments)]
 pub fn main_tabbar_contains(
     gx: f64,
     gy: f64,
-    main_x: i32,
-    main_y: i32,
-    main_w: u32,
-    main_h: u32,
-    tabbar_h: f32,
-    status_h: f32,
+    main_x: f64,
+    main_y: f64,
+    main_w: f64,
+    main_h: f64,
+    tabbar_h: f64,
+    status_h: f64,
     tab_bar_bottom: bool,
 ) -> bool {
-    let lx = gx - main_x as f64;
-    let ly = gy - main_y as f64;
-    if lx < 0.0 || lx > main_w as f64 {
+    let lx = gx - main_x;
+    let ly = gy - main_y;
+    if lx < 0.0 || lx > main_w {
         return false;
     }
     let bar_y = if tab_bar_bottom {
-        (main_h as f32 - tabbar_h - status_h).max(0.0) as f64
+        (main_h - tabbar_h - status_h).max(0.0)
     } else {
         0.0
     };
-    ly >= bar_y && ly < bar_y + tabbar_h as f64
+    ly >= bar_y && ly < bar_y + tabbar_h
 }
 
 /// Clamp a window top-left `(x, y)` so a `win_w`×`win_h` window stays inside
@@ -469,18 +474,18 @@ mod tests {
     #[test]
     fn main_tabbar_hit_top_mode() {
         // Main window at (100, 50), 1000×640, bar at top (y 50..86 global).
-        assert!(main_tabbar_contains(500.0, 60.0, 100, 50, 1000, 640, 36.0, 22.0, false));
-        assert!(!main_tabbar_contains(500.0, 90.0, 100, 50, 1000, 640, 36.0, 22.0, false), "below the band");
-        assert!(!main_tabbar_contains(50.0, 60.0, 100, 50, 1000, 640, 36.0, 22.0, false), "left of the window");
-        assert!(!main_tabbar_contains(1150.0, 60.0, 100, 50, 1000, 640, 36.0, 22.0, false), "right of the window");
+        assert!(main_tabbar_contains(500.0, 60.0, 100.0, 50.0, 1000.0, 640.0, 36.0, 22.0, false));
+        assert!(!main_tabbar_contains(500.0, 90.0, 100.0, 50.0, 1000.0, 640.0, 36.0, 22.0, false), "below the band");
+        assert!(!main_tabbar_contains(50.0, 60.0, 100.0, 50.0, 1000.0, 640.0, 36.0, 22.0, false), "left of the window");
+        assert!(!main_tabbar_contains(1150.0, 60.0, 100.0, 50.0, 1000.0, 640.0, 36.0, 22.0, false), "right of the window");
     }
 
     #[test]
     fn main_tabbar_hit_bottom_mode_respects_status_strip() {
         // Bottom mode: band sits at h - 36 - 22 = 582..618 local → 632..668 global.
-        assert!(main_tabbar_contains(500.0, 640.0, 100, 50, 1000, 640, 36.0, 22.0, true));
-        assert!(!main_tabbar_contains(500.0, 60.0, 100, 50, 1000, 640, 36.0, 22.0, true), "top band is not a target in bottom mode");
-        assert!(!main_tabbar_contains(500.0, 680.0, 100, 50, 1000, 640, 36.0, 22.0, true), "the status strip below the band is not a target");
+        assert!(main_tabbar_contains(500.0, 640.0, 100.0, 50.0, 1000.0, 640.0, 36.0, 22.0, true));
+        assert!(!main_tabbar_contains(500.0, 60.0, 100.0, 50.0, 1000.0, 640.0, 36.0, 22.0, true), "top band is not a target in bottom mode");
+        assert!(!main_tabbar_contains(500.0, 680.0, 100.0, 50.0, 1000.0, 640.0, 36.0, 22.0, true), "the status strip below the band is not a target");
     }
 
     // ── on-screen clamp for the drop-placed window ──────────────────────────

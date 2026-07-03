@@ -255,6 +255,30 @@ mod tests {
     }
 
     #[test]
+    fn rows_do_not_overlap_in_the_readable_range() {
+        // Evaluation of F40 (SPLIT): the row PITCH must stay at or above the
+        // chrome font ink height (~= font_size = ROW_H_MIN at scale 1) for every
+        // window height down to the point where the floored metrics still fit —
+        // so adjacent rows never overlap in the readable range. Below that the
+        // builder DELIBERATELY tightens the pitch (last-resort branch) to keep all
+        // rows on-screen rather than clip, which is documented, intentional
+        // behaviour for an extreme (<~381px) window and not exercised here.
+        let ink_floor = 16.0_f32; // ROW_H_MIN == font_size at scale 1 (vscale==1)
+        for h in [420u32, 480, 560, 700, 900] {
+            let overlay = build_help_overlay(700, h, &theme(), TEST_CHAR_W);
+            // labels[0] is the title; labels[1..] are the shortcut rows in order.
+            let ys: Vec<f32> = overlay.labels[1..].iter().map(|(_t, _x, y, _c)| *y).collect();
+            for pair in ys.windows(2) {
+                let pitch = pair[1] - pair[0];
+                assert!(
+                    pitch >= ink_floor - 0.01,
+                    "adjacent help rows overlap at height {h}: pitch {pitch} < {ink_floor}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn single_column_rows() {
         // No row contains the two-column "·" separator anymore.
         for r in HELP_ROWS.iter() {
