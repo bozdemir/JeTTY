@@ -5188,6 +5188,13 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                // The last tab's shell can exit mid-pump (close_exited_tabs emptied
+                // self.tabs), yet winit still delivers this iteration's queued
+                // press; the grid-press branch calls active_tab() which panics on
+                // an empty vec. Mirror the KeyboardInput/MouseWheel guards (F29).
+                if self.tabs.is_empty() {
+                    return;
+                }
                 let (w, h) = if let Some(gpu) = &self.gpu {
                     (gpu.config.width, gpu.config.height)
                 } else {
