@@ -268,6 +268,13 @@ pub struct App {
     window: Option<Arc<Window>>,
     /// Whether the window is currently visible (toggled by F9).
     visible: bool,
+    /// Whether the main window is occluded or minimized (`WindowEvent::Occluded(true)`
+    /// or the minimize button/WM iconify). Distinct from `visible` (the F9 summon
+    /// toggle): a window can be `visible == true` yet fully hidden behind others or
+    /// iconified. Every self-driven animation/redraw gates on
+    /// `visible && !main_occluded` so a hidden/minimized window returns to true
+    /// idle instead of burning CPU rendering invisible frames (F8/F16/F17/F18).
+    main_occluded: bool,
     /// Whether the F9 global-hotkey worker has been launched. The manager itself
     /// is kept alive inside that worker thread (it never returns), so we only need
     /// a launched-once sentinel here rather than holding the manager on the App.
@@ -767,6 +774,7 @@ impl App {
             proxy,
             window: None,
             visible: true,
+            main_occluded: false,
             hotkey_manager: None,
             gpu: None,
             text: None,
@@ -1676,6 +1684,13 @@ impl App {
     /// confused otherwise). Returns `None` when the renderer (and thus cell
     /// metrics) is not yet available or no tab exists.
     fn cursor_cell(&self) -> Option<(usize, usize)> {
+        self.cell_at_pixel(self.cursor.0, self.cursor.1)
+    }
+
+    /// Like [`cursor_cell`] but for an arbitrary pixel position (1-based, clamped
+    /// to the grid). Used to detect cross-cell pointer motion for mouse motion
+    /// reports (F5).
+    fn cell_at_pixel(&self, px: f64, py: f64) -> Option<(usize, usize)> {
         if self.tabs.is_empty() {
             return None;
         }
@@ -1685,9 +1700,9 @@ impl App {
         }
         // Subtract the grid's pixel origin before dividing (0 when the bar is at
         // the bottom, TABBAR_H when at the top).
-        let y = self.cursor.1 as f32 - self.grid_top_offset();
+        let y = py as f32 - self.grid_top_offset();
         Some(input::cell_at_clamped(
-            self.cursor.0 as f32,
+            px as f32,
             y,
             cell_w,
             cell_h,
@@ -2160,6 +2175,13 @@ impl App {
         // terminal drag state so it doesn't resume stuck on the next summon.
         self.selecting = false;
         self.dragging_scrollbar = false;
+        // Clear the remaining self-drive terms whose ONLY expiry point is inside
+        // RedrawRequested — which a hidden (orderOut) window never receives on
+        // macOS — so they can't pin about_to_wait in Poll and spin 100% CPU while
+        // hidden (F18). Re-armed naturally on the next keystroke/summon.
+        self.caret_anim = None;
+        self.pending_dock_frames = 0;
+        self.pending_center_frames = 0;
     }
 
     /// Toggle window visibility (F9 / Yakuake-style summon).
@@ -2248,6 +2270,12 @@ impl App {
                 // reaches here too).
                 self.selecting = false;
                 self.dragging_scrollbar = false;
+                // Clear the self-drive terms whose only expiry is in
+                // RedrawRequested (never delivered to a hidden macOS window) so
+                // they don't pin Poll and spin 100% CPU while hidden (F18).
+                self.caret_anim = None;
+                self.pending_dock_frames = 0;
+                self.pending_center_frames = 0;
             }
         }
     }
@@ -2568,6 +2596,15 @@ impl App {
     ) {
         match event {
             WindowEvent::RedrawRequested => self.render_detached_window(pos),
+            WindowEvent::Occluded(occluded) if pos < self.detached.len() => {
+                // Track per-window occlusion/minimize so a hidden detached window
+                // stops self-driving CRT/caret animation and PTY-output redraws
+                // (F8/F17). On un-occlude, repaint once.
+                self.detached[pos].occluded = occluded;
+                if !occluded {
+                    self.detached[pos].window.request_redraw();
+                }
+            }
             WindowEvent::CloseRequested if pos < self.detached.len() => {
                 self.reattach_tab(pos);
             }
@@ -2971,6 +3008,9 @@ impl App {
                 // Settings window suppresses auto-hide.
                 self.last_focused_window = Some(self.detached[pos].window.id());
                 self.switching_to_detached = true;
+                // Focus implies on-screen: clear any stale occluded flag in case
+                // the WM skipped Occluded(false) on restore (F17).
+                self.detached[pos].occluded = false;
                 // Cancel any scheduled main-window auto-hide: focus moved to one
                 // of OUR windows (this arm can arrive AFTER the main FocusOut on
                 // X11 — the exact race the deferred hide exists for).
@@ -3009,12 +3049,14 @@ impl App {
                         (p.y / CELL_H) as f32
                     }
                 };
-                let lines = self.scroll_accum.add(delta_lines);
+                let status_h = self.status_h();
+                let Some(dw) = self.detached.get_mut(pos) else { return };
+                // Use THIS window's own accumulator so a leftover fraction never
+                // bleeds across windows (F26) — the shared self.scroll_accum did.
+                let lines = dw.scroll_accum.add(delta_lines);
                 if lines == 0 {
                     return;
                 }
-                let status_h = self.status_h();
-                let Some(dw) = self.detached.get_mut(pos) else { return };
                 let (w, h) = (dw.gpu.config.width, dw.gpu.config.height);
                 // Wheeling over the scrollbar always scrolls the host scrollback
                 // even in mouse-mode apps (mirrors the main window).
@@ -3029,6 +3071,7 @@ impl App {
                         })
                         .unwrap_or(false)
                 };
+                let (cw, ch) = dw.text.cell_size();
                 if dw.tab.terminal.mouse_mode() && !over_scrollbar {
                     let event = if lines > 0 {
                         input::MouseEvent::WheelUp
@@ -3036,13 +3079,20 @@ impl App {
                         input::MouseEvent::WheelDown
                     };
                     let notches = ((lines.abs() + 2) / 3).clamp(1, 8);
-                    let (cw, ch) = dw.text.cell_size();
                     if cw > 0.0 && ch > 0.0 {
-                        let cols = dw.tab.terminal.cols().saturating_sub(1);
-                        let rows = dw.tab.terminal.rows().saturating_sub(1);
-                        let col = ((dw.cursor.0 as f32 / cw).floor() as i64).clamp(0, cols as i64) as usize;
                         let gy = (dw.cursor.1 as f32 - TABBAR_H).max(0.0);
-                        let row = ((gy / ch).floor() as i64).clamp(0, rows as i64) as usize;
+                        // 1-based cell coords: the encoders are 1-based, so the
+                        // old 0-based col/row named the cell one row up / one col
+                        // left of the pointer (F12). cell_at_clamped adds the +1,
+                        // matching the main window's cursor_cell() path.
+                        let (col, row) = input::cell_at_clamped(
+                            dw.cursor.0 as f32,
+                            gy,
+                            cw,
+                            ch,
+                            dw.tab.terminal.cols(),
+                            dw.tab.terminal.rows(),
+                        );
                         let sgr = dw.tab.terminal.mouse_sgr();
                         for _ in 0..notches {
                             let bytes = input::encode_mouse(event, col, row, sgr);
@@ -3050,6 +3100,19 @@ impl App {
                         }
                         let _ = dw.tab.writer.flush();
                     }
+                } else if !over_scrollbar
+                    && dw.tab.terminal.alt_screen()
+                    && dw.tab.terminal.alternate_scroll()
+                {
+                    // ALTERNATE_SCROLL: wheel → Up/Down arrows on the alt screen
+                    // so less/man/git log scroll here too (F3), mirroring main.
+                    let app_cursor = dw.tab.terminal.app_cursor_keys();
+                    let seq = input::arrow_scroll_bytes(lines > 0, app_cursor);
+                    let steps = (lines.unsigned_abs() as usize).clamp(1, 12);
+                    for _ in 0..steps {
+                        let _ = dw.tab.writer.write_all(&seq);
+                    }
+                    let _ = dw.tab.writer.flush();
                 } else {
                     dw.tab.terminal.scroll_lines(lines);
                     dw.window.request_redraw();
@@ -3301,7 +3364,9 @@ impl App {
         // Self-drive the next frame ONLY while the caret flash is mid-burst or
         // an animated CRT sub-effect is on — the same damage-driven gates as the
         // main window (app.rs ~5654). Idle returns to 0-CPU once both clear.
-        if dw.caret_anim.is_some() || crt_anim_live {
+        // Also gated on the window not being occluded/minimized so a hidden
+        // detached window returns to true idle instead of self-driving forever (F8).
+        if !dw.occluded && (dw.caret_anim.is_some() || crt_anim_live) {
             dw.window.request_redraw();
         }
     }
@@ -3824,6 +3889,57 @@ impl App {
             _ => {}
         }
     }
+
+    /// Earliest pending synchronized-update (`CSI ?2026`) deadline across every
+    /// window (main tabs + detached), or `None`. Folded into `about_to_wait`'s
+    /// single-wake schedule so a stuck BSU is force-flushed on time (F1) — no
+    /// busy polling, damage-driven exactly like `reflow_pending_at`.
+    fn sync_wake_at(&self) -> Option<std::time::Instant> {
+        let mut earliest: Option<std::time::Instant> = None;
+        let mut merge = |d: Option<std::time::Instant>| {
+            if let Some(d) = d {
+                earliest = Some(match earliest {
+                    Some(e) if e <= d => e,
+                    _ => d,
+                });
+            }
+        };
+        for tab in &self.tabs {
+            merge(tab.terminal.sync_deadline());
+        }
+        for dw in &self.detached {
+            merge(dw.tab.terminal.sync_deadline());
+        }
+        earliest
+    }
+
+    /// Force-terminate any window's synchronized update whose 150 ms deadline has
+    /// elapsed, so bytes buffered since an unmatched BSU (`CSI ?2026h`) become
+    /// visible instead of freezing the display until 2 MiB accumulate or an ESU
+    /// arrives (F1 — e.g. an nvim/zellij that paused mid-redraw). Requests a
+    /// redraw on each affected, actually-visible window.
+    fn flush_expired_syncs(&mut self, now: std::time::Instant) {
+        let active = self.active;
+        let main_visible = self.visible && !self.main_occluded;
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if tab.terminal.sync_deadline().is_some_and(|d| now >= d) {
+                tab.terminal.flush_sync();
+                if i == active && main_visible {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+            }
+        }
+        for dw in &mut self.detached {
+            if dw.tab.terminal.sync_deadline().is_some_and(|d| now >= d) {
+                dw.tab.terminal.flush_sync();
+                if !dw.occluded {
+                    dw.window.request_redraw();
+                }
+            }
+        }
+    }
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -3835,6 +3951,10 @@ impl ApplicationHandler<AppEvent> for App {
     /// `Wait` (idle 0 CPU) the instant nothing is pending. On X11/Wayland this is
     /// just a brief Poll burst during the animation (redraws already deliver).
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Force-flush any elapsed synchronized update (CSI ?2026) FIRST so a
+        // stuck BSU can't freeze the terminal; the next pending one is scheduled
+        // via WaitUntil below (F1).
+        self.flush_expired_syncs(std::time::Instant::now());
         // Debounced font-size reflow: when the deadline set by `set_font_size`
         // has elapsed (the user stopped pressing Ctrl+/-), issue ONE pty.resize
         // (via `reflow`) so the shell gets a single SIGWINCH instead of one per
@@ -3897,31 +4017,42 @@ impl ApplicationHandler<AppEvent> for App {
         // (0-CPU idle). When animation is ON it selects Poll, which Fifo present
         // throttles to ~60fps vsync — exactly how summon/slide animate on macOS,
         // where a `request_redraw` issued under Wait is not delivered until input.
-        // The CRT-animation term is gated on the window being VISIBLE: a hidden
-        // dropdown must not keep the loop in Poll rendering invisible frames
-        // forever (a permanent CPU+GPU burn violating the 0-CPU-idle design);
-        // summoning the window resumes the animation (free-running clock).
+        // The self-driven animation terms (CRT + caret flash) are gated on the
+        // window being EFFECTIVELY VISIBLE — shown (F9) AND not occluded/minimized.
+        // A hidden dropdown OR a minimized/occluded window must not keep the loop
+        // in Poll rendering invisible frames forever (a permanent CPU+GPU burn
+        // violating the 0-CPU-idle design; F8/F16/F17/F18). Summoning or restoring
+        // the window resumes the animation (free-running clock). The summon/slide/
+        // dock/center terms self-terminate in a handful of frames, so they stay
+        // ungated (they only run while a show is in progress).
+        let main_visible = self.visible && !self.main_occluded;
         let main_pending = self.summon_anim.is_some()
             || self.slide_anim.is_some()
             || self.summon_pending
             || self.pending_dock_frames > 0
             || self.pending_center_frames > 0
-            || (self.visible && self.fx.crt_anim_live())
-            || self.caret_anim.is_some();
+            || (main_visible && self.fx.crt_anim_live())
+            || (main_visible && self.caret_anim.is_some());
         if main_pending {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
         }
-        // Detached windows animate under the SAME gates: an animated CRT
-        // sub-effect (shared setting) or a live caret-flash burst in one of
-        // them. False whenever no detached window exists or nothing animates,
-        // so this term can never force Poll at idle (0-CPU preserved).
-        let detached_pending = (!self.detached.is_empty() && self.fx.crt_anim_live())
-            || self.detached.iter().any(|d| d.caret_anim.is_some());
+        // Detached windows animate under the SAME gates, PER WINDOW: an animated
+        // CRT sub-effect (shared setting) or a live caret-flash burst — but ONLY
+        // for windows that are not occluded/minimized, so a minimized detached
+        // window returns to true idle instead of burning a core forever (F8/F17).
+        // False whenever no visible detached window animates (0-CPU preserved).
+        let crt_live = self.fx.crt_anim_live();
+        let detached_pending = self
+            .detached
+            .iter()
+            .any(|d| !d.occluded && (crt_live || d.caret_anim.is_some()));
         if detached_pending {
             for dw in &self.detached {
-                dw.window.request_redraw();
+                if !dw.occluded && (crt_live || dw.caret_anim.is_some()) {
+                    dw.window.request_redraw();
+                }
             }
         }
         let settings_pending = self.settings_window.is_some()
@@ -3958,6 +4089,13 @@ impl ApplicationHandler<AppEvent> for App {
         }
         // The scheduled focus-loss auto-hide (elapsed ones ran above).
         if let Some(d) = self.pending_autohide_at {
+            merge_wake(&mut wake_at, d);
+        }
+        // Pending synchronized-update (CSI ?2026) flush deadline: wake exactly
+        // once at the soonest so a stuck BSU is force-flushed on time. Any
+        // already-elapsed deadline was flushed at the top of this fn, so this is
+        // strictly in the future or None (F1).
+        if let Some(d) = self.sync_wake_at() {
             merge_wake(&mut wake_at, d);
         }
         // Idle-HUD one-shot: flip the HUD from its last live value to an honest
@@ -4265,7 +4403,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // produced data (or query replies were sent). Background tabs still
                 // drained above but don't trigger a repaint. When idle, the 100ms
                 // heartbeat drains nothing and we skip the redraw entirely.
-                if had_data {
+                // Also gated on the window being EFFECTIVELY VISIBLE (shown + not
+                // occluded/minimized): a hidden dropdown running `cat bigfile`
+                // must keep draining (so the shell never blocks) but must NOT run
+                // the full render pipeline into an unmapped surface (F16).
+                if had_data && self.visible && !self.main_occluded {
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -4280,7 +4422,10 @@ impl ApplicationHandler<AppEvent> for App {
                 let mut exited_detached: Vec<usize> = Vec::new();
                 for (i, dw) in self.detached.iter_mut().enumerate() {
                     let had = Self::drain_one_tab(&mut dw.tab, &mut vt_read);
-                    if had {
+                    // Same damage-driven + visibility discipline as the main
+                    // window: drain always (keep the shell unblocked) but only
+                    // repaint a detached window that isn't occluded/minimized (F16).
+                    if had && !dw.occluded {
                         dw.window.request_redraw();
                     }
                     // Shell exit (Ctrl+D / `exit`) inside a detached window closes
@@ -4354,6 +4499,19 @@ impl ApplicationHandler<AppEvent> for App {
                     win.request_redraw();
                 }
             }
+            WindowEvent::Occluded(occluded) => {
+                // The compositor tells us the main window is fully hidden behind
+                // others (or minimized on platforms that report it here). Track it
+                // so every self-driven animation/redraw stops (F17) — a minimized
+                // window with CRT animation would otherwise Poll-spin forever. On
+                // un-occlude, request one redraw to repaint the freshly-shown surface.
+                self.main_occluded = occluded;
+                if !occluded {
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
+                    }
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
@@ -4419,6 +4577,10 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::Focused(true) => {
                 // The main terminal window gained focus.
                 self.last_focused_window = Some(id);
+                // Focus implies the window is on-screen again: clear any stale
+                // occluded/minimized flag in case the WM skipped Occluded(false)
+                // on restore, so animations/redraws resume (F17).
+                self.main_occluded = false;
                 // A scheduled auto-hide is void: focus is back on us.
                 self.pending_autohide_at = None;
                 // Any pending "switching to a sibling window" latch is over too.
@@ -4489,6 +4651,34 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let prev = self.cursor;
                 self.cursor = (position.x, position.y);
+                // --- Mouse motion / drag reports (modes 1002 / 1003) (F5) ---
+                // When the app enabled button-drag (1002) or any-motion (1003)
+                // reporting, emit one motion report per cell change — mirroring
+                // the press/release SGR path. Suppressed while a local Shift
+                // selection is in progress so drag-select still works over a
+                // mouse-mode app. tmux pane-resize and nvim visual-drag rely on
+                // this; previously only press/release were forwarded.
+                if !self.selecting && !self.tabs.is_empty() {
+                    let (drag, motion) = {
+                        let t = &self.active_tab().terminal;
+                        (t.mouse_drag(), t.mouse_motion())
+                    };
+                    if drag || motion {
+                        // A forwarded, still-held left press marks the left button
+                        // as down (mouse_grab_press is taken on release).
+                        let left_held = self.mouse_grab_press.is_some();
+                        // 1002 reports only while a button is held; 1003 reports
+                        // any motion (base 3 == no button when nothing is held).
+                        if motion || left_held {
+                            let new_cell = self.cell_at_pixel(position.x, position.y);
+                            let prev_cell = self.cell_at_pixel(prev.0, prev.1);
+                            if new_cell.is_some() && new_cell != prev_cell {
+                                let base = if left_held { 0u8 } else { 3u8 };
+                                self.send_mouse_report(input::MouseEvent::Motion { button: base });
+                            }
+                        }
+                    }
+                }
                 // --- Resize-edge cursor feedback (borderless window) ---
                 // Only update the cursor when the zone changes, never while a host
                 // drag (scrollbar / selection) is in progress, and never while a
@@ -4885,6 +5075,10 @@ impl ApplicationHandler<AppEvent> for App {
                         if let Some(win) = &self.window {
                             win.set_minimized(true);
                         }
+                        // Some WMs don't send Occluded on iconify — mark it here
+                        // too so animations stop immediately (F17). Restoring the
+                        // window delivers Focused/Occluded(false), which clears it.
+                        self.main_occluded = true;
                         return;
                     }
 
@@ -5358,6 +5552,24 @@ impl ApplicationHandler<AppEvent> for App {
                         for _ in 0..notches {
                             self.send_mouse_report(event);
                         }
+                    } else if !over_scrollbar
+                        && self.active_tab().terminal.alt_screen()
+                        && self.active_tab().terminal.alternate_scroll()
+                    {
+                        // ALTERNATE_SCROLL (F3): alt-screen pagers/editors
+                        // (less/man/git log) have no host scrollback, so a bare
+                        // scroll_lines() is a no-op. Translate wheel ticks into
+                        // Up/Down arrow-key sequences (DECCKM-aware), one arrow
+                        // per line of scroll, bounded so a big touchpad fling
+                        // can't flood the PTY.
+                        let app_cursor = self.active_tab().terminal.app_cursor_keys();
+                        let seq = input::arrow_scroll_bytes(lines > 0, app_cursor);
+                        let steps = (lines.unsigned_abs() as usize).clamp(1, 12);
+                        let w = &mut self.tabs[self.active].writer;
+                        for _ in 0..steps {
+                            let _ = w.write_all(&seq);
+                        }
+                        let _ = w.flush();
                     } else {
                         self.active_tab_mut().terminal.scroll_lines(lines);
                         if let Some(w) = &self.window {
@@ -5752,6 +5964,16 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Hidden (F9) window: never run the full render pipeline
+                // (snapshot → shaping → GPU passes → present) into an unmapped
+                // surface. PTY draining continues on the Wake path, so the shell
+                // stays unblocked; we simply don't paint invisible frames (F16).
+                // Occluded/minimized-but-shown windows are covered by the
+                // per-source redraw gates plus acquire_frame returning None, so
+                // they need no blanket early-out here.
+                if !self.visible {
+                    return;
+                }
                 // Re-assert the Dropdown dock AFTER the window is mapped: X11/KWin
                 // ignores a set_outer_position issued before the window is realized
                 // (it would land centered), so re-apply the top-strip geometry on

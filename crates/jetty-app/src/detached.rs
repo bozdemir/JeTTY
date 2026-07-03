@@ -228,6 +228,15 @@ pub(crate) struct DetachedWindow {
     /// Time + position of the last left press on the top bar, for the
     /// double-click → maximize toggle (mirrors `App::last_strip_click`).
     pub last_bar_click: Option<(std::time::Instant, f32, f32)>,
+    /// Whether this detached window is occluded/minimized
+    /// (`WindowEvent::Occluded(true)` or WM iconify). Every self-driven redraw
+    /// (CRT/caret animation, PTY-output redraw) gates on `!occluded` so a hidden
+    /// detached window returns to true idle instead of rendering forever (F8/F17).
+    pub occluded: bool,
+    /// Per-window fractional wheel-scroll accumulator. Separate from the main
+    /// window's `App::scroll_accum` so a leftover fraction in one window never
+    /// bleeds into another's scroll (F26).
+    pub scroll_accum: crate::input::ScrollAccumulator,
 }
 
 impl DetachedWindow {
@@ -365,6 +374,8 @@ impl DetachedWindow {
             menu_hover: None,
             close_hover: false,
             last_bar_click: None,
+            occluded: false,
+            scroll_accum: crate::input::ScrollAccumulator::new(),
         })
     }
 }
