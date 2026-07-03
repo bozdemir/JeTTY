@@ -2052,6 +2052,18 @@ impl App {
         // p10k prompts) collapse into a single reflow.
         self.reflow_pending_at =
             Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
+        // Propagate to detached windows for visual parity (theme/opacity already
+        // do). Each uses its OWN scale_factor; the grid+PTY reflow is debounced
+        // via reflow_pending_at so the shell gets one SIGWINCH after the burst,
+        // exactly like the main window (F7/F20). Without this a detached window
+        // kept its detach-time font until a DPI change snapped it.
+        let reflow_at = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        for dw in &mut self.detached {
+            let dscale = dw.window.scale_factor() as f32;
+            dw.text.set_font_size(clamped * dscale);
+            dw.reflow_pending_at = Some(reflow_at);
+            dw.window.request_redraw();
+        }
         self.persist();
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -2064,6 +2076,14 @@ impl App {
         self.font_family = name;
         if let Some(text) = &mut self.text {
             text.set_font_family(&self.font_family);
+        }
+        // Detached windows: swap their terminal font too, then debounce their
+        // grid/PTY reflow (family changes cell width → cols/rows) (F7/F20).
+        let reflow_at = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        for dw in &mut self.detached {
+            dw.text.set_font_family(&self.font_family);
+            dw.reflow_pending_at = Some(reflow_at);
+            dw.window.request_redraw();
         }
         // The chrome is now DECOUPLED from the terminal font: it follows the
         // separate `ui_font_family`/`ui_font_logical` (set via `set_ui_font_*`),
@@ -2109,6 +2129,15 @@ impl App {
         if let Some(sp) = self.settings_specimen_text.as_mut() {
             sp.set_font_size(self.ui_font_logical * settings_scale);
         }
+        // Detached windows: resize THEIR chrome font (title/status/menu) at each
+        // window's own scale. No grid reflow — chrome size is orthogonal to
+        // cols/rows (F7/F20).
+        let ui_logical = self.ui_font_logical;
+        for dw in &mut self.detached {
+            let dscale = dw.window.scale_factor() as f32;
+            dw.chrome_text.set_font_size(ui_logical * dscale);
+            dw.window.request_redraw();
+        }
         self.persist();
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -2140,6 +2169,12 @@ impl App {
         }
         if let Some(sp) = self.settings_specimen_text.as_mut() {
             sp.set_ui_family(fam);
+        }
+        // Detached windows: swap THEIR chrome family too. No grid reflow —
+        // chrome family is orthogonal to cols/rows (F7/F20).
+        for dw in &mut self.detached {
+            dw.chrome_text.set_ui_family(fam);
+            dw.window.request_redraw();
         }
         self.persist();
         if let Some(w) = &self.window {
@@ -2591,7 +2626,7 @@ impl App {
     fn handle_detached_event(
         &mut self,
         pos: usize,
-        _event_loop: &ActiveEventLoop,
+        event_loop: &ActiveEventLoop,
         event: WindowEvent,
     ) {
         match event {
@@ -2615,17 +2650,16 @@ impl App {
                 if is_synthetic {
                     return;
                 }
-                let Some(dw) = self.detached.get_mut(pos) else { return };
                 // Same modifier/decode pipeline as the main window's
-                // `KeyboardInput` arm (app.rs ~4043-4076), except `app_cursor`/
-                // `alt_screen` are sourced from THIS window's own terminal, not
-                // the main one, and `panel_open` is always false — detached
-                // windows have no settings panel.
+                // `KeyboardInput` arm, except `app_cursor`/`alt_screen` are sourced
+                // from THIS window's own terminal and `panel_open` is always false.
                 let ctrl = self.modifiers.control_key();
                 let shift = self.modifiers.shift_key();
                 let alt = self.modifiers.alt_key();
-                let app_cursor = dw.tab.terminal.app_cursor_keys();
-                let alt_screen = dw.tab.terminal.alt_screen();
+                let (app_cursor, alt_screen) = {
+                    let Some(dw) = self.detached.get(pos) else { return };
+                    (dw.tab.terminal.app_cursor_keys(), dw.tab.terminal.alt_screen())
+                };
                 // macOS Option-compose: see the matching comment on the main
                 // window's arm — Alt + a composed non-ASCII glyph is sent as
                 // text instead of being ESC-prefixed by decide_key.
@@ -2657,6 +2691,69 @@ impl App {
                         alt_screen,
                     ),
                 };
+                // App-WIDE shortcuts advertised in README/help now work in a
+                // detached window too (they were dropped by the `_ => {}` arm — F39).
+                // Handled via `self`, so they must run BEFORE the `dw` borrow below;
+                // each returns. Font/opacity changes reach the detached window live
+                // via the setters' propagation (F7/F20).
+                match &action {
+                    input::KeyAction::TogglePanel => {
+                        self.toggle_settings_window(event_loop);
+                        return;
+                    }
+                    input::KeyAction::NewTab => {
+                        self.new_tab();
+                        return;
+                    }
+                    input::KeyAction::NextTab => {
+                        self.switch_tab(true);
+                        return;
+                    }
+                    input::KeyAction::PrevTab => {
+                        self.switch_tab(false);
+                        return;
+                    }
+                    input::KeyAction::SelectTab(n) => {
+                        self.select_tab(*n);
+                        return;
+                    }
+                    // "Close tab" for a single-tab detached window = reattach it to
+                    // the main window (its ✕ semantics), never losing the shell.
+                    input::KeyAction::CloseTab => {
+                        self.reattach_tab(pos);
+                        return;
+                    }
+                    input::KeyAction::FontUp => {
+                        self.set_font_size(self.font_logical + 1.0);
+                        return;
+                    }
+                    input::KeyAction::FontDown => {
+                        self.set_font_size(self.font_logical - 1.0);
+                        return;
+                    }
+                    input::KeyAction::FontReset => {
+                        self.set_font_size(FONT_LOGICAL_DEFAULT);
+                        return;
+                    }
+                    input::KeyAction::OpacityUp => {
+                        self.opacity = (self.opacity + 0.05).min(1.0);
+                        self.apply_theme();
+                        self.persist();
+                        if let Some(w) = &self.window { w.request_redraw(); }
+                        for dw in &self.detached { dw.window.request_redraw(); }
+                        return;
+                    }
+                    input::KeyAction::OpacityDown => {
+                        self.opacity = (self.opacity - 0.05).max(0.1);
+                        self.apply_theme();
+                        self.persist();
+                        if let Some(w) = &self.window { w.request_redraw(); }
+                        for dw in &self.detached { dw.window.request_redraw(); }
+                        return;
+                    }
+                    _ => {}
+                }
+                let Some(dw) = self.detached.get_mut(pos) else { return };
                 match action {
                     // Ctrl+Shift+D in a detached window reattaches its tab.
                     input::KeyAction::DetachTab => {
@@ -2703,6 +2800,10 @@ impl App {
                         }
                         let _ = dw.tab.writer.write_all(&bytes);
                         let _ = dw.tab.writer.flush();
+                        // Any real keystroke jumps this window's view back to the
+                        // live bottom, same as the main window's Send arm — else
+                        // typing while scrolled up into scrollback goes blind (F30).
+                        dw.tab.terminal.scroll_to_bottom();
                         // Caret flash on printable keystrokes — same trigger as
                         // the main window (app.rs ~5010), on THIS window's own
                         // burst clock. Glow is main-window-only (its CaretFx
@@ -2727,6 +2828,8 @@ impl App {
                     let Some(dw) = self.detached.get_mut(pos) else { return };
                     let _ = dw.tab.writer.write_all(text.as_bytes());
                     let _ = dw.tab.writer.flush();
+                    // Snap to the live bottom on commit, same as the Send arm (F30).
+                    dw.tab.terminal.scroll_to_bottom();
                     if caret_flash_enabled && is_printable_keystroke(text.as_bytes()) {
                         dw.caret_anim = Some(std::time::Instant::now());
                     }
@@ -2759,6 +2862,7 @@ impl App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let Some(dw) = self.detached.get_mut(pos) else { return };
+                let prev = dw.cursor;
                 dw.cursor = (position.x, position.y);
                 // --- Manual top-bar drag (move the window ourselves) ---
                 // global_cursor = outer_position + local cursor; the window's new
@@ -2802,6 +2906,45 @@ impl App {
                 if hover != dw.close_hover {
                     dw.close_hover = hover;
                     dw.window.request_redraw();
+                }
+                // --- Text-selection drag continuation / mouse motion reports ---
+                // Mirrors the main window (F37/F5): extend a local selection, or —
+                // for a mouse-reporting app — emit one motion report per cell change.
+                let (cw, ch) = dw.text.cell_size();
+                if cw > 0.0 && ch > 0.0 {
+                    if dw.selecting {
+                        let cols = dw.tab.terminal.cols().saturating_sub(1);
+                        let rows = dw.tab.terminal.rows().saturating_sub(1);
+                        let gy = (cy - TABBAR_H).max(0.0);
+                        let col_f = (cx / cw).floor();
+                        let col = (col_f as i64).clamp(0, cols as i64) as usize;
+                        let line = ((gy / ch).floor() as i64).clamp(0, rows as i64) as usize;
+                        let left_half = (cx - col_f * cw) < cw * 0.5;
+                        dw.tab.terminal.selection_update(line, col, left_half);
+                        dw.window.request_redraw();
+                    } else {
+                        let drag = dw.tab.terminal.mouse_drag();
+                        let motion = dw.tab.terminal.mouse_motion();
+                        let left_held = dw.mouse_grab_press.is_some();
+                        if (drag || motion) && (motion || left_held) {
+                            let cols_n = dw.tab.terminal.cols();
+                            let rows_n = dw.tab.terminal.rows();
+                            let new_cell = input::cell_at_clamped(
+                                cx, (cy - TABBAR_H).max(0.0), cw, ch, cols_n, rows_n);
+                            let prev_cell = input::cell_at_clamped(
+                                prev.0 as f32, (prev.1 as f32 - TABBAR_H).max(0.0), cw, ch, cols_n, rows_n);
+                            if new_cell != prev_cell {
+                                let base = if left_held { 0u8 } else { 3u8 };
+                                let sgr = dw.tab.terminal.mouse_sgr();
+                                let bytes = input::encode_mouse(
+                                    input::MouseEvent::Motion { button: base },
+                                    new_cell.0, new_cell.1, sgr,
+                                );
+                                let _ = dw.tab.writer.write_all(&bytes);
+                                let _ = dw.tab.writer.flush();
+                            }
+                        }
+                    }
                 }
             }
             WindowEvent::MouseInput {
@@ -2881,8 +3024,39 @@ impl App {
                                 return;
                             }
                         } else {
-                            // Grid-area press: nothing to do (no selection wiring
-                            // in detached windows yet).
+                            // Grid-area press (F37): forward a mouse report to a
+                            // mouse-reporting app (unless Shift overrides), else
+                            // begin a local text selection — same as the main window.
+                            let (cw, ch) = dw.text.cell_size();
+                            if cw > 0.0 && ch > 0.0 {
+                                let mouse_mode = dw.tab.terminal.mouse_mode();
+                                let shift = self.modifiers.shift_key();
+                                let gy = (cy - TABBAR_H).max(0.0);
+                                if mouse_mode && !shift {
+                                    let (col, row) = input::cell_at_clamped(
+                                        cx, gy, cw, ch,
+                                        dw.tab.terminal.cols(), dw.tab.terminal.rows(),
+                                    );
+                                    let sgr = dw.tab.terminal.mouse_sgr();
+                                    let bytes = input::encode_mouse(
+                                        input::MouseEvent::LeftPress, col, row, sgr,
+                                    );
+                                    let _ = dw.tab.writer.write_all(&bytes);
+                                    let _ = dw.tab.writer.flush();
+                                    dw.mouse_grab_press = Some(dw.cursor);
+                                } else {
+                                    dw.tab.terminal.selection_clear();
+                                    let cols = dw.tab.terminal.cols().saturating_sub(1);
+                                    let rows = dw.tab.terminal.rows().saturating_sub(1);
+                                    let col_f = (cx / cw).floor();
+                                    let col = (col_f as i64).clamp(0, cols as i64) as usize;
+                                    let line = ((gy / ch).floor() as i64).clamp(0, rows as i64) as usize;
+                                    let left_half = (cx - col_f * cw) < cw * 0.5;
+                                    dw.tab.terminal.selection_start(line, col, left_half);
+                                    dw.selecting = true;
+                                    dw.window.request_redraw();
+                                }
+                            }
                             return;
                         }
                     }
@@ -2918,6 +3092,38 @@ impl App {
                 button: MouseButton::Left,
                 ..
             } => {
+                // Grid-area release (F37): finish a local selection (copy-on-select)
+                // or forward the mouse release report — mutually exclusive with a
+                // top-bar drag, so handle it first and return. Mirrors the main
+                // window's release logic.
+                {
+                    let Some(dw) = self.detached.get_mut(pos) else { return };
+                    if dw.selecting {
+                        dw.selecting = false;
+                        match dw.tab.terminal.selection_text() {
+                            Some(text) if !text.is_empty() => clipboard::set(&text),
+                            // Empty drag (plain click) — clear the highlight.
+                            _ => dw.tab.terminal.selection_clear(),
+                        }
+                        dw.window.request_redraw();
+                        return;
+                    }
+                    if dw.mouse_grab_press.take().is_some() {
+                        let (cw, ch) = dw.text.cell_size();
+                        if cw > 0.0 && ch > 0.0 {
+                            let gy = (dw.cursor.1 as f32 - TABBAR_H).max(0.0);
+                            let (col, row) = input::cell_at_clamped(
+                                dw.cursor.0 as f32, gy, cw, ch,
+                                dw.tab.terminal.cols(), dw.tab.terminal.rows());
+                            let sgr = dw.tab.terminal.mouse_sgr();
+                            let bytes = input::encode_mouse(
+                                input::MouseEvent::LeftRelease, col, row, sgr);
+                            let _ = dw.tab.writer.write_all(&bytes);
+                            let _ = dw.tab.writer.flush();
+                        }
+                        return;
+                    }
+                }
                 // End of a manual top-bar drag: if the global cursor landed on the
                 // MAIN window's tab-bar strip, reattach; otherwise it was a move.
                 let drop_global = {

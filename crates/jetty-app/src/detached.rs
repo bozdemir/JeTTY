@@ -237,6 +237,13 @@ pub(crate) struct DetachedWindow {
     /// window's `App::scroll_accum` so a leftover fraction in one window never
     /// bleeds into another's scroll (F26).
     pub scroll_accum: crate::input::ScrollAccumulator,
+    /// Whether a local text selection drag is in progress in this window (F37).
+    /// Mirrors `App::selecting` for the main window.
+    pub selecting: bool,
+    /// Where a no-Shift left press was forwarded to a mouse-reporting app in this
+    /// window; `Some` marks the left button as held for motion reports (F5/F37).
+    /// Taken on release. Mirrors `App::mouse_grab_press`.
+    pub mouse_grab_press: Option<(f64, f64)>,
 }
 
 impl DetachedWindow {
@@ -376,6 +383,8 @@ impl DetachedWindow {
             last_bar_click: None,
             occluded: false,
             scroll_accum: crate::input::ScrollAccumulator::new(),
+            selecting: false,
+            mouse_grab_press: None,
         })
     }
 }
