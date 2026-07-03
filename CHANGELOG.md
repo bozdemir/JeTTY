@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.10.0] — 2026-07-03
+
+A correctness + hardening release. A whole-codebase multi-agent audit
+(22 finders → 149 adversarial verifiers) confirmed 79 issues; 68 were fixed
+and the diff was re-reviewed for regressions before release. No behavior you
+rely on changes — things that used to crash, leak, or misrender no longer do.
+
+### Security
+- **Paste-injection blocked** — pasted text now has embedded bracketed-paste
+  end markers (`ESC[201~`) stripped, so a crafted clipboard payload can no
+  longer break out of the paste guard and run commands.
+- **Single-instance IPC socket hardened** — moved from a predictable
+  world-writable `/tmp` path to a per-user `0700` runtime directory
+  (`$XDG_RUNTIME_DIR`), with a bounded accept-read and inode-guarded cleanup
+  so it can't be squatted, wedged by an idle client, or unlink a live socket
+  owned by another instance.
+
+### Fixed
+- **Output floods can't freeze the UI or run away on memory** — `yes`,
+  `cat huge.log`, or a runaway build now feed the terminal in bounded slices,
+  keeping input and redraw responsive (Ctrl+C still reaches the shell).
+- **Config is never silently reset** — a malformed `config.toml` is preserved
+  as `config.toml.bad` and defaults load in memory, instead of the old file
+  being wiped and overwritten; partial hand-written configs load per field.
+- **Detaching a tab can't crash the app** — if the OS window or GPU context
+  fails, the tab is kept and the detach is cancelled instead of aborting the
+  whole process (which killed every shell).
+- **Text no longer silently blanks out** — the glyph atlas is trimmed again
+  (it previously grew until full, then stopped rendering text); wide CJK
+  characters keep every following column aligned.
+- **Color-scheme queries reflect the live theme** — OSC 10/11/12/4 replies
+  follow theme changes; SGR 8 concealed text is actually hidden.
+- **No more crashes on odd states** — guarded GPU surface/texture sizing,
+  oversized-window resize, non-UTF8 argv, a boot-time clock underflow, and a
+  key delivered after the last shell exits.
+- **Keyboard encoding** — Ctrl+letter is correct on non-QWERTY layouts,
+  Cmd/Super combos no longer leak literal letters into the shell, Shift+Insert
+  pastes, and Ctrl/Alt+PageUp/PageDown carry their modifiers.
+- **Shells are reliably reaped on tab close** — a wait-based reaper detects
+  real exit even when a background job holds the PTY open, with a SIGHUP →
+  guarded-SIGKILL escalation so a HUP-ignoring shell can't leak.
+
+### Changed
+- **HiDPI chrome** — the Settings panel, context menu, and help overlay scale
+  with the UI font on fractional/2× displays instead of overlapping.
+- **Detached windows** now handle the mouse wheel and DPI/scale-factor changes,
+  and a tab torn out onto a second monitor stays there.
+
 ## [0.9.0] — 2026-07-01
 
 A polish + hardening release: detached windows reach full visual parity, the
@@ -400,4 +448,5 @@ center-summon / Yakuake-style dropdown hotkey.
 
 ---
 
+[0.10.0]: https://github.com/bozdemir/JeTTY/releases/tag/v0.10.0
 [0.1.0]: https://github.com/bozdemir/JeTTY/releases/tag/v0.1.0
