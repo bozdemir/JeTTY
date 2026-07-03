@@ -125,16 +125,37 @@ fn libc_econnrefused() -> i32 {
 /// automatically when the holder exits — INCLUDING crashes/SIGKILL — so there
 /// is no stale-lock state to detect or clean up (the on-disk file may linger,
 /// but an unlocked file is trivially re-lockable).
-fn try_acquire_primary_lock(lock_path: &str) -> Option<std::fs::File> {
-    let f = std::fs::OpenOptions::new()
+/// Outcome of a single primary-lock attempt. Distinguishing "held by a live
+/// peer" from "the lock file can never be created" matters: the former means a
+/// primary exists (retry/forward), the latter is a permanently degraded
+/// environment where retrying just burns the whole 2 s deadline (F34).
+enum LockAttempt {
+    /// We now hold the exclusive lock; keep the `File` for the process lifetime.
+    Acquired(std::fs::File),
+    /// The lock file exists but another (live) process holds the lock.
+    Held,
+    /// The lock file could not even be opened/created (stale `XDG_RUNTIME_DIR`
+    /// pointing at a removed path, a read-only or foreign-owned dir). This is a
+    /// permanent error for this launch — there is nothing to wait for.
+    Unavailable,
+}
+
+fn try_acquire_primary_lock(lock_path: &str) -> LockAttempt {
+    let f = match std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(lock_path)
-        .ok()?;
+    {
+        Ok(f) => f,
+        // open() failed permanently (ENOENT: parent gone, EACCES: not ours).
+        // Do NOT collapse this into "lock held" — that made every cold start
+        // spin the full 2 s retry loop before the first window appeared (F34).
+        Err(_) => return LockAttempt::Unavailable,
+    };
     match f.try_lock() {
-        Ok(()) => Some(f),
-        Err(_) => None,
+        Ok(()) => LockAttempt::Acquired(f),
+        Err(_) => LockAttempt::Held,
     }
 }
 
@@ -217,8 +238,23 @@ pub fn run() {
     let lock_path = format!("{sock_path}.lock");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let lock_file: Option<std::fs::File> = loop {
-        if let Some(f) = try_acquire_primary_lock(&lock_path) {
-            break Some(f);
+        match try_acquire_primary_lock(&lock_path) {
+            LockAttempt::Acquired(f) => break Some(f),
+            LockAttempt::Unavailable => {
+                // The lock file can never be created here. Retrying would just
+                // spin the full 2 s for nothing — degrade to a lockless bind NOW
+                // so the first frame is not delayed 2 s (F34). No reachable
+                // primary exists in this environment (the socket lives under the
+                // same broken dir), so a lockless bind is safe.
+                eprintln!(
+                    "jetty: single-instance lock at {lock_path} is unavailable; \
+                     proceeding without it"
+                );
+                break None;
+            }
+            // Held: a live peer owns the lock (the kernel releases it on ANY exit).
+            // Fall through to retry-forward below.
+            LockAttempt::Held => {}
         }
         // Another instance is mid-startup: give it a beat, then try forwarding.
         std::thread::sleep(std::time::Duration::from_millis(25));
@@ -226,13 +262,18 @@ pub fn run() {
             return;
         }
         if std::time::Instant::now() >= deadline {
-            // Could not lock and nobody answers: degrade to today's behavior
-            // (attempt the bind; a failure just disables single-instance IPC).
+            // Reaching the deadline means the lock was HELD on every iteration
+            // (Acquired/Unavailable both break out), i.e. a live primary exists
+            // but we could never reach its socket — its socket file was removed
+            // out from under it. Booting a second primary here would split-brain
+            // (two windows, two config writers, the hotkey and --toggle driving
+            // different instances) — the very bug the lock exists to prevent.
+            // Refuse to duplicate; the existing instance is alive (F23).
             eprintln!(
-                "jetty: could not acquire the single-instance lock at {lock_path}; \
-                 proceeding without it"
+                "jetty: another instance holds the lock but its IPC socket at \
+                 {sock_path} is unreachable; not starting a second instance"
             );
-            break None;
+            return;
         }
     };
 
@@ -326,7 +367,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod primary_lock_tests {
-    use super::try_acquire_primary_lock;
+    use super::{try_acquire_primary_lock, LockAttempt};
 
     fn tmp_lock_path(tag: &str) -> String {
         std::env::temp_dir()
@@ -339,14 +380,15 @@ mod primary_lock_tests {
     fn lock_is_exclusive_while_held() {
         let path = tmp_lock_path("excl");
         let first = try_acquire_primary_lock(&path);
-        assert!(first.is_some(), "first acquire must succeed");
+        assert!(matches!(first, LockAttempt::Acquired(_)), "first acquire must succeed");
         // flock-style locks are per open-file-description, so a second open —
         // even in the same process — must be refused while the first is held.
         // This is exactly the two-concurrent-cold-starts race: only one may
-        // enter the unlink+bind section.
+        // enter the unlink+bind section. It must report Held (a live peer), NOT
+        // Unavailable — the lock FILE opens fine (F34).
         assert!(
-            try_acquire_primary_lock(&path).is_none(),
-            "second acquire must fail while the lock is held"
+            matches!(try_acquire_primary_lock(&path), LockAttempt::Held),
+            "second acquire must report Held while the lock is held"
         );
         drop(first);
         let _ = std::fs::remove_file(&path);
@@ -356,10 +398,10 @@ mod primary_lock_tests {
     fn lock_is_reacquirable_after_release() {
         let path = tmp_lock_path("realock");
         let first = try_acquire_primary_lock(&path);
-        assert!(first.is_some());
+        assert!(matches!(first, LockAttempt::Acquired(_)));
         drop(first); // holder exits → kernel releases the lock (no stale state)
         assert!(
-            try_acquire_primary_lock(&path).is_some(),
+            matches!(try_acquire_primary_lock(&path), LockAttempt::Acquired(_)),
             "lock must be free again once the holder is gone"
         );
         let _ = std::fs::remove_file(&path);
@@ -371,7 +413,19 @@ mod primary_lock_tests {
         // kernel lock died with its holder, so acquiring must succeed.
         let path = tmp_lock_path("leftover");
         std::fs::write(&path, b"").unwrap();
-        assert!(try_acquire_primary_lock(&path).is_some());
+        assert!(matches!(try_acquire_primary_lock(&path), LockAttempt::Acquired(_)));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unavailable_when_lock_file_cannot_be_created() {
+        // Regression (F34): a lock path whose parent dir cannot exist must report
+        // Unavailable (a permanent error → degrade immediately), NOT Held (which
+        // spun the full 2 s retry loop before the first window appeared).
+        let path = "/nonexistent-jetty-dir-xyz/jetty.sock.lock";
+        assert!(matches!(
+            try_acquire_primary_lock(path),
+            LockAttempt::Unavailable
+        ));
     }
 }

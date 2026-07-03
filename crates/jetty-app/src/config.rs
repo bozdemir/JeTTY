@@ -386,6 +386,16 @@ impl Config {
 /// always see either the old or the new complete file.
 fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
+    // If `path` is a symlink (common dotfiles setup: ~/.config/jetty/config.toml
+    // → ~/dotfiles/jetty/config.toml), resolve it and atomic-rename over the
+    // TARGET, not the link. A rename onto the link path replaces the symlink
+    // itself with a plain file, silently detaching the dotfiles repo — every
+    // later setting change stops reaching it and the next `stow`/`chezmoi` sync
+    // reverts them (F33). canonicalize errs when the path doesn't exist yet
+    // (first save) — then we keep the original path and create it normally.
+    let path: std::path::PathBuf =
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = path.as_path();
     let dir = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent dir")
     })?;
@@ -400,6 +410,16 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         // Flush file contents to disk BEFORE the rename so a crash/power loss
         // right after the rename can't leave a zero-length "new" file.
         f.sync_all()?;
+        // Preserve the destination's existing permissions (don't reset to the
+        // temp's default 0644) so a user's chmod on config.toml survives (F33).
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(path) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &tmp,
+                std::fs::Permissions::from_mode(meta.permissions().mode()),
+            );
+        }
         std::fs::rename(&tmp, path)?;
         // fsync the parent directory so the rename (the directory-entry update)
         // is itself durable: without it, a power loss just after rename() can
@@ -420,6 +440,35 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_preserves_symlinked_config() {
+        // Regression (F33): saving through a symlinked config.toml (dotfiles
+        // setup) must update the TARGET and keep the symlink, not replace the
+        // link with a plain file.
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("jetty_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("real_config.toml");
+        std::fs::write(&target, b"old").unwrap();
+        let link = base.join("config.toml");
+        symlink(&target, &link).unwrap();
+
+        write_atomic(&link, b"new-data").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the config path must remain a symlink after save"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"new-data",
+            "the symlink target must receive the update"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn default_has_sensible_values() {

@@ -7153,22 +7153,36 @@ fn set_launch_at_login(enabled: bool) {
 }
 
 /// Quote one argument for a `.desktop` `Exec=` line per the freedesktop
-/// Desktop Entry spec: the argument is double-quoted with `"`, `` ` ``, `$`
-/// and `\` backslash-escaped inside the quotes (quoting rules), and every
-/// literal `%` doubled to `%%` (field-code escaping, applied to the whole Exec
-/// value). Without this, a binary at a path containing a space is parsed as
-/// program + argument and autostart silently launches nothing.
+/// Desktop Entry spec. Two escaping passes in the spec's order:
+///
+/// 1. QUOTING: double-quote the argument, prefixing a backslash before each
+///    reserved char (`"`, `` ` ``, `$`, `\`).
+/// 2. STRING escape (applied AFTER quoting per the spec's note): the general
+///    string-value escape rule doubles every backslash. So a literal `$` inside
+///    the quotes is written `\\$` and a literal backslash four backslashes.
+///
+/// Then every literal `%` is doubled to `%%` (field-code escaping, whole value).
+///
+/// Without pass 2, a path containing `$ " `` ` `` \` emitted `\$`/`\``, which
+/// GLib's GKeyFile treats as an invalid escape sequence and rejects — so GNOME
+/// autostart silently launched nothing (F35). (Spaces already worked: no
+/// backslash is introduced for them.)
 fn desktop_exec_arg(path: &str) -> String {
-    let mut s = String::with_capacity(path.len() + 2);
-    s.push('"');
+    // Pass 1: quoting.
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
     for c in path.chars() {
         if matches!(c, '"' | '`' | '$' | '\\') {
-            s.push('\\');
+            quoted.push('\\');
         }
-        s.push(c);
+        quoted.push(c);
     }
-    s.push('"');
-    s.replace('%', "%%")
+    quoted.push('"');
+    // Pass 2: string escape — double every backslash (the structural quotes are
+    // not backslashes, so they are untouched).
+    let string_escaped = quoted.replace('\\', "\\\\");
+    // Field-code escaping over the whole value.
+    string_escaped.replace('%', "%%")
 }
 
 /// Display name for a `shell` config value: "System default" for the empty
@@ -7538,11 +7552,25 @@ mod desktop_exec_arg_tests {
     }
 
     #[test]
-    fn reserved_chars_are_backslash_escaped_inside_quotes() {
-        assert_eq!(
-            desktop_exec_arg(r#"/odd/pa"th/$HOME/`x`/back\slash/jetty"#),
-            "\"/odd/pa\\\"th/\\$HOME/\\`x\\`/back\\\\slash/jetty\"",
-        );
+    fn reserved_chars_get_double_backslash_string_escape() {
+        // Regression (F35): the spec's general string-escape rule is applied on
+        // top of the quoting rule, so a literal `$`/`` ` ``/`"` inside the quotes
+        // is written with TWO backslashes and a literal backslash with FOUR.
+        // GKeyFile rejects the old single-backslash `\$` as an invalid escape and
+        // GNOME autostart then launches nothing.
+        let out = desktop_exec_arg("/p/$x/`y`/a\\b/j");
+        let expected = String::from("\"")
+            + "/p/"
+            + "\\\\$"          // \\$  → literal $
+            + "x/"
+            + "\\\\`" + "y" + "\\\\`" // \\`y\\`
+            + "/a"
+            + "\\\\\\\\"       // \\\\ → literal backslash
+            + "b/j"
+            + "\"";
+        assert_eq!(out, expected);
+        // The invalid single-backslash `\$` escape must NOT appear.
+        assert!(out.contains("\\\\$"), "literal $ must be doubly escaped");
     }
 }
 
