@@ -340,7 +340,11 @@ const OFF: f32 = 1.0e6;
 /// Referenced by tests in this module; the `#[cfg(test)]` gating causes the
 /// compiler to warn about dead code in non-test builds, hence the allow.
 #[allow(dead_code)]
-pub(crate) const CHAR_W_FALLBACK: f32 = 9.8;
+/// Reference chrome cell advance (scale-1). `build_panel` lays out in LOGICAL
+/// space as if `char_w == CHAR_W_FALLBACK` and scales by `dpi = char_w /
+/// CHAR_W_FALLBACK`. Exposed so callers (e.g. the Effects-tab scroll clamp in
+/// app.rs) can express bounds in the SAME dpi units the panel consumes (F10).
+pub const CHAR_W_FALLBACK: f32 = 9.8;
 
 /// Settings-panel dimensions in logical px. The separate Settings OS window is
 /// sized to these (+ border) — see `SETTINGS_WIN_*` in jetty-app. Growing the

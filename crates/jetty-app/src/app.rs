@@ -3779,9 +3779,16 @@ impl App {
                         MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
                         MouseScrollDelta::PixelDelta(p) => -(p.y as f32),
                     };
-                    // max_scroll = EFFECTS_CONTENT_H − EFFECTS_VISIBLE_H = 716.0 − 460.0 = 256.0
+                    // `effects_scroll` accumulates in PHYSICAL px, but build_panel
+                    // divides it by `dpi = settings_char_w / CHAR_W_FALLBACK` to
+                    // lay bands out in LOGICAL space. So the clamp bound (a LOGICAL
+                    // content/viewport delta) must be scaled by the SAME dpi, or on
+                    // HiDPI the bottom bands (caret RGB sliders) stayed unreachable
+                    // and on sub-1× the scroll overshot into blank space (F10).
+                    let dpi = (self.settings_char_w() / jetty_render::CHAR_W_FALLBACK).max(0.1);
                     let max_scroll = (jetty_render::EFFECTS_CONTENT_H
-                        - jetty_render::EFFECTS_VISIBLE_H).max(0.0);
+                        - jetty_render::EFFECTS_VISIBLE_H).max(0.0)
+                        * dpi;
                     self.effects_scroll = (self.effects_scroll + delta_px).clamp(0.0, max_scroll);
                     if let Some(w) = &self.settings_window {
                         w.request_redraw();
@@ -5025,12 +5032,14 @@ impl ApplicationHandler<AppEvent> for App {
                         .map(|(i, t)| (t.title.clone(), i == self.active))
                         .collect();
                     let rename_ref = self.renaming.map(|i| (i, self.rename_buf.as_str()));
-                    // Reserve the SAME perf-HUD width the last render used, so the
-                    // tab/close hit-rects align with what's drawn (the HUD only
-                    // shrinks the tab area; window controls are unaffected).
-                    let perf_ref = self.perf_label.as_deref();
+                    // Build with perf=None to MATCH the drawn bar (the perf HUD
+                    // moved to the bottom status strip, so the drawn tab bar
+                    // reserves no HUD width — see the RedrawRequested build). Passing
+                    // self.perf_label here reserved ~250px of phantom width and
+                    // shrank the hit tab_w below the drawn tab_w, so clicks near a
+                    // tab's right edge / on ✕ / on + landed on the wrong tab (F19).
                     let mut bar = jetty_render::build_tab_bar_ex(
-                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, perf_ref, self.chrome_char_w(),
+                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, None, self.chrome_char_w(),
                     );
                     // build_tab_bar_ex lays the bar out at y 0..TABBAR_H; shift its
                     // hit-test rects down to the bar's actual position (bottom mode).
@@ -5301,9 +5310,10 @@ impl ApplicationHandler<AppEvent> for App {
                         .map(|(i, t)| (t.title.clone(), i == self.active))
                         .collect();
                     let rename_ref = self.renaming.map(|i| (i, self.rename_buf.as_str()));
-                    let perf_ref = self.perf_label.as_deref();
+                    // perf=None to match the DRAWN bar (HUD lives in the status
+                    // strip); passing perf_label mis-sized the hit-rects (F19).
                     let mut bar = jetty_render::build_tab_bar_ex(
-                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, perf_ref, self.chrome_char_w(),
+                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, None, self.chrome_char_w(),
                     );
                     if bar_y != 0.0 {
                         translate_bar_rects(&mut bar, bar_y);

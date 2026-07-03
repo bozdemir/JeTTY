@@ -142,7 +142,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shot_grid_top: f32 = if detached_shot { jetty_render::TABBAR_H } else { 0.0 };
     let shot_status_h: f32 = if detached_shot { 22.0 } else { 0.0 };
 
-    let cols = (width as f32 / cell_w).floor().max(1.0) as usize;
+    // Reserve the scrollbar gutter EXACTLY like the live windows
+    // (app.rs grid_dims / detached.rs), so a screenshot builds the same column
+    // count the user sees and never lays text UNDER the drawn scrollbar (F22).
+    // SCROLLBAR_GUTTER = jetty_render::SCROLLBAR_W (14) + 4.
+    let scrollbar_gutter = jetty_render::SCROLLBAR_W + 4.0;
+    let cols = ((width as f32 - scrollbar_gutter) / cell_w).floor().max(2.0) as usize;
     let rows = (((height as f32 - shot_grid_top - shot_status_h) / cell_h).floor()).max(1.0) as usize;
 
     eprintln!("jetty-shot: grid = {cols}x{rows} cells (cell {cell_w:.1}x{cell_h:.1}px)");

@@ -64,6 +64,36 @@ enum CellRoute {
     Overdraw,
 }
 
+/// Upper bound on the number of distinct shaped fallback (overdraw) glyph
+/// buffers kept cached. Sits well above any single frame's distinct-fallback
+/// count (a maximized grid is a few thousand cells), so eviction only ever
+/// trims glyphs from long-past frames, never currently-visible ones (F25).
+const FALLBACK_GLYPH_CAP: usize = 4096;
+
+/// Evict oldest entries from a FIFO-ordered cache down to `cap`, never removing
+/// a key present in `visible` (chars drawn this frame). A visible key scanned
+/// during eviction is rotated to the back (treated as most-recent) instead of
+/// dropped. Pure + generic so it is unit-testable independent of cosmic-text
+/// `Buffer`. (F25)
+fn evict_fifo_cache<V>(
+    map: &mut std::collections::HashMap<char, V>,
+    order: &mut std::collections::VecDeque<char>,
+    visible: &std::collections::HashSet<char>,
+    cap: usize,
+) {
+    let mut scanned = 0usize;
+    let cap_scan = order.len();
+    while map.len() > cap && scanned < cap_scan {
+        let Some(old) = order.pop_front() else { break };
+        scanned += 1;
+        if visible.contains(&old) {
+            order.push_back(old);
+        } else {
+            map.remove(&old);
+        }
+    }
+}
+
 pub struct TextLayer {
     font_system: FontSystem,
     swash: SwashCache,
@@ -110,6 +140,11 @@ pub struct TextLayer {
     /// double-width glyph). Cleared on `set_font_family`/`set_font_size` (glyphs are
     /// per family + size).
     fallback_glyphs: std::collections::HashMap<char, Buffer>,
+    /// Insertion order of `fallback_glyphs` keys, used to evict the oldest
+    /// entries once the cache exceeds `FALLBACK_GLYPH_CAP` so a session scrolling
+    /// through a large CJK/emoji corpus can't accumulate shaped buffers without
+    /// bound (F25). Chars visible in the current frame are never evicted.
+    fallback_order: std::collections::VecDeque<char>,
     /// Per-frame scratch: `(pixel_x, pixel_y, char, rgb)` for each cell drawn via the
     /// overdraw path (missing glyph or double-width) and overdrawn from `fallback_glyphs`.
     fallback_cells_scratch: Vec<(f32, f32, char, [u8; 3])>,
@@ -225,6 +260,7 @@ impl TextLayer {
             glyph_route: std::collections::HashMap::new(),
             coverage_buffer,
             fallback_glyphs: std::collections::HashMap::new(),
+            fallback_order: std::collections::VecDeque::new(),
             fallback_cells_scratch: Vec::new(),
             shape_gen: 0,
             last_grid_hash: None,
@@ -301,6 +337,7 @@ impl TextLayer {
         // bump the shape generation so the grid re-shapes even if its text is unchanged.
         self.glyph_route.clear();
         self.fallback_glyphs.clear();
+        self.fallback_order.clear();
         self.shape_gen = self.shape_gen.wrapping_add(1);
         // Re-measure cell width with the new family.
         self.cell_w = measure_advance_family(&mut self.font_system, self.metrics, name);
@@ -372,6 +409,15 @@ impl TextLayer {
             Shaping::Basic,
             None,
         );
+        // Re-metric the coverage probe buffer too (F6). `route()` shapes the probed
+        // char in `coverage_buffer` and compares its advance against the CURRENT
+        // `cell_w`; leaving the probe buffer at the construction-time size made a
+        // wide (CJK) glyph misroute after a >~33% size/DPI change, permanently
+        // shifting that row's columns. The verdict is cached in `glyph_route`, so
+        // that must be cleared here as well or the misroute survives a size reset.
+        self.coverage_buffer.set_metrics(&mut self.font_system, self.metrics);
+        self.coverage_buffer.set_size(&mut self.font_system, None, None);
+        self.glyph_route.clear();
         // Re-measure the cell at the new size. For the terminal layer (`ui_family`
         // == Sans, never set away from default) this measures the monospace
         // `font_family` — the grid cell. For the chrome layer it measures the
@@ -381,6 +427,7 @@ impl TextLayer {
         // Cached fallback glyphs were shaped at the old size; drop them and force a
         // grid re-shape at the new metrics.
         self.fallback_glyphs.clear();
+        self.fallback_order.clear();
         self.shape_gen = self.shape_gen.wrapping_add(1);
     }
 
@@ -607,7 +654,24 @@ impl TextLayer {
                     let attrs = Attrs::new().family(Family::Name(&fam));
                     buf.set_text(&mut self.font_system, s, &attrs, Shaping::Advanced, None);
                     self.fallback_glyphs.insert(*c, buf);
+                    self.fallback_order.push_back(*c);
                 }
+            }
+            // Evict the oldest cached buffers once the map exceeds the cap, so a
+            // session scrolling through a large CJK/emoji corpus can't accumulate
+            // shaped buffers unbounded (F25). Never evict a char visible THIS
+            // frame (it was just needed and is drawn below). The cap sits well
+            // above any single frame's distinct-fallback-char count, so this only
+            // trims chars from long-past frames; it runs only when over cap.
+            if self.fallback_glyphs.len() > FALLBACK_GLYPH_CAP {
+                let visible: std::collections::HashSet<char> =
+                    fallback_cells.iter().map(|(_, _, c, _)| *c).collect();
+                evict_fifo_cache(
+                    &mut self.fallback_glyphs,
+                    &mut self.fallback_order,
+                    &visible,
+                    FALLBACK_GLYPH_CAP,
+                );
             }
         }
 
@@ -994,4 +1058,52 @@ fn measure_advance_family(font_system: &mut FontSystem, metrics: Metrics, family
         .next()
         .and_then(|run| run.glyphs.iter().map(|g| g.w).next())
         .unwrap_or(metrics.font_size * 0.6)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    #[test]
+    fn evict_fifo_bounds_map_and_keeps_visible() {
+        // Regression (F25): the fallback-glyph cache must stay bounded, evicting
+        // the OLDEST non-visible entries while never dropping a char drawn this
+        // frame.
+        let mut map: HashMap<char, ()> = HashMap::new();
+        let mut order: VecDeque<char> = VecDeque::new();
+        // Insert 10 distinct chars 'a'..'j' in order.
+        for c in "abcdefghij".chars() {
+            map.insert(c, ());
+            order.push_back(c);
+        }
+        // 'a' and 'b' are the oldest but 'a' is visible this frame → keep it.
+        let visible: HashSet<char> = ['a', 'z'].into_iter().collect();
+        evict_fifo_cache(&mut map, &mut order, &visible, 6);
+        assert!(map.len() <= 6, "map bounded to cap; got {}", map.len());
+        assert!(map.contains_key(&'a'), "visible 'a' must survive eviction");
+        assert!(!map.contains_key(&'b'), "oldest non-visible 'b' evicted");
+    }
+
+    #[test]
+    fn evict_fifo_noop_under_cap() {
+        let mut map: HashMap<char, ()> = "abc".chars().map(|c| (c, ())).collect();
+        let mut order: VecDeque<char> = "abc".chars().collect();
+        let visible = HashSet::new();
+        evict_fifo_cache(&mut map, &mut order, &visible, 10);
+        assert_eq!(map.len(), 3, "no eviction while under cap");
+    }
+
+    #[test]
+    fn evict_fifo_terminates_when_all_visible() {
+        // If every over-cap entry is visible, eviction must not loop forever —
+        // it rotates them and stops after one full scan (the cap may be exceeded
+        // this frame, which is fine; next frame's set differs).
+        let mut map: HashMap<char, ()> = "abcde".chars().map(|c| (c, ())).collect();
+        let mut order: VecDeque<char> = "abcde".chars().collect();
+        let visible: HashSet<char> = "abcde".chars().collect();
+        evict_fifo_cache(&mut map, &mut order, &visible, 2);
+        assert_eq!(map.len(), 5, "all-visible entries are retained, no hang");
+        assert_eq!(order.len(), 5, "order queue preserved");
+    }
 }
