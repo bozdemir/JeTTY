@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.0] — 2026-07-03
+
+A deep correctness + hardening release: a 124-agent audit surfaced 40 bugs, each
+double/triple-verified, then fixed and regression-reviewed before shipping.
+
+### Fixed — critical
+- **Synchronized-update (DEC 2026) freeze** — an unmatched Begin-Sync (e.g.
+  `kill -9` an nvim/zellij mid-redraw) buffered all further output invisibly and
+  hung the tab. The 150 ms sync timeout is now serviced (damage-driven, no spin).
+- **A dead persisted `shell` no longer bricks startup** — spawn walks a fallback
+  chain (config → `$SHELL` → passwd → bash → sh) and shows a one-line notice
+  instead of exiting before a window appears.
+
+### Fixed — terminal correctness
+- **Mouse wheel now scrolls alt-screen apps** (`less`/`man`/`git log`) via
+  ALTERNATE_SCROLL → arrow keys; **mouse drag/motion reports** (modes 1002/1003)
+  are now emitted, so tmux/nvim mouse dragging works.
+- Right-to-left / bottom-to-top drag selection no longer drops the end cells
+  (selection side is read from the sub-cell pointer position).
+- Detached-window wheel reports are cell-accurate (were off by one).
+
+### Fixed — input & platform
+- **macOS Cmd shortcuts** (Cmd+C/V/A/W/T/Q and font/opacity) actually work now
+  instead of typing literal letters into the shell.
+- Font & opacity hotkeys are keyed on the logical character, so they work in the
+  documented direction on Turkish-Q, German-QWERTZ, and other layouts.
+
+### Fixed — idle CPU & windows
+- Hidden / minimized / occluded windows return to true ~0 % idle — no invisible
+  render burn from CRT animation, caret bursts, dock/center nudges, or PTY-output
+  wakes (now gated on real visibility via `Occluded` tracking).
+- Detached windows: live font / UI-font propagation, text selection + click
+  forwarding, type-to-bottom, and the advertised keyboard shortcuts now work.
+- Focus auto-hide fires correctly when focus leaves JeTTY through a
+  detached/Settings window; closing the last main tab keeps detached shells
+  alive; several focus/summon/monitor edge cases fixed.
+
+### Fixed — HiDPI, config, misc
+- HiDPI unit fixes: tab-tear drop placement, drop-to-reattach hit-testing, and
+  the Effects-tab scroll clamp are now consistent across mixed-DPI setups.
+- Bounded PTY write queue — a pathological terminal-query flood can no longer
+  OOM the app (normal typing/paste is unaffected).
+- Atomic config saves preserve a symlinked `config.toml` (dotfiles) and its
+  mode; the autostart `.desktop` Exec is escaped per the Desktop Entry spec.
+- Wheel/click no longer panics on an empty-tab race; unbounded glyph-fallback
+  cache is now capped; scrollbar-drag and touchpad-scroll state no longer leak
+  across tabs/windows; and ~a dozen more edge cases.
+
+---
+
 ## [0.10.0] — 2026-07-03
 
 A correctness + hardening release. A whole-codebase multi-agent audit
