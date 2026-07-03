@@ -1189,7 +1189,7 @@ impl App {
             }
             // Adopt the first detached tab (its window closes; the shell
             // survives) and continue with the normal fix-ups below.
-            self.reattach_tab(0);
+            self.reattach_tab(0, event_loop);
         }
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
@@ -1264,6 +1264,11 @@ impl App {
         self.tab_menu_rects.clear();
         self.tab_menu_labels.clear();
         self.tab_drag = None;
+        // A selection drag in progress belonged to the tab that just left; without
+        // clearing this, every later CursorMoved would stretch the NOW-active
+        // tab's stale selection and the release would clobber the clipboard with
+        // text the user never selected. Same fix-up close_tab does (F27).
+        self.selecting = false;
 
         // Apply the current theme to the detached tab before it leaves.
         tab.terminal.set_theme(self.current_theme());
@@ -1395,7 +1400,7 @@ impl App {
     /// `Tab` (PTY + shell child) survives — dropping `DetachedWindow` while it
     /// still owned the tab would reap the shell. The window/GPU surface still
     /// gets torn down correctly when `dw` drops at the end of this function.
-    fn reattach_tab(&mut self, pos: usize) {
+    fn reattach_tab(&mut self, pos: usize, event_loop: &ActiveEventLoop) {
         if pos >= self.detached.len() {
             return;
         }
@@ -1418,6 +1423,15 @@ impl App {
         self.tabs.push(tab);
         self.active = crate::detached::reattach_index(self.tabs.len());
         self.apply_theme();
+
+        // If the main window is hidden (e.g. the last main tab's shell exited
+        // while hidden and close_exited_tabs reattached a detached tab to keep its
+        // shell alive), summon it — otherwise the user's live shell would be
+        // parked in an invisible window, looking dead until the next F9 (F15). The
+        // drag-to-reattach path only runs while visible, so this is a no-op there.
+        if !self.visible {
+            self.set_visibility(true, event_loop);
+        }
 
         // `dw` drops here: detached window + GPU surface are closed/destroyed.
         if let Some(w) = &self.window {
@@ -1979,7 +1993,7 @@ impl App {
                 event_loop.exit();
                 return false;
             }
-            self.reattach_tab(0);
+            self.reattach_tab(0, event_loop);
         }
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
@@ -2233,6 +2247,11 @@ impl App {
         // `--hide` (already hidden) is a no-op.
         if want == self.visible {
             if want {
+                // An explicit summon supersedes any scheduled focus-loss auto-hide,
+                // even on this early-return path — otherwise a `jetty --show` landing
+                // inside the grace window let the just-summoned terminal hide ≤100ms
+                // later if the WM's FocusIn didn't beat the deadline (F31).
+                self.pending_autohide_at = None;
                 if let Some(win) = &self.window {
                     win.focus_window();
                     win.request_redraw();
@@ -2254,12 +2273,23 @@ impl App {
                         // mapped, so re-assert it on the next few post-map redraws
                         // (mirrors pending_dock_frames) or the saved spot is lost.
                         match self.last_pos {
-                            Some(pos) => {
+                            // Only restore a saved position that still lands on a
+                            // connected monitor. If the monitor was unplugged while
+                            // hidden, the verbatim restore (plus the 5-frame
+                            // re-assertion) would map the window off-screen and
+                            // fight any WM rescue — center on a live monitor
+                            // instead and forget the stale spot (F32).
+                            Some(pos) if pos_on_some_monitor(win, pos) => {
                                 win.set_outer_position(pos);
                                 self.pending_center_pos = Some(pos);
                                 self.pending_center_frames = 5;
                             }
-                            None => center_window(win),
+                            _ => {
+                                center_window(win);
+                                self.pending_center_pos = None;
+                                self.pending_center_frames = 0;
+                                self.last_pos = None;
+                            }
                         }
                     }
                     WindowMode::Dropdown => {
@@ -2641,7 +2671,7 @@ impl App {
                 }
             }
             WindowEvent::CloseRequested if pos < self.detached.len() => {
-                self.reattach_tab(pos);
+                self.reattach_tab(pos, event_loop);
             }
             WindowEvent::KeyboardInput { event, is_synthetic, .. } if event.state.is_pressed() => {
                 // Ignore X11's synthetic focus-gain key presses (keys physically
@@ -2720,7 +2750,7 @@ impl App {
                     // "Close tab" for a single-tab detached window = reattach it to
                     // the main window (its ✕ semantics), never losing the shell.
                     input::KeyAction::CloseTab => {
-                        self.reattach_tab(pos);
+                        self.reattach_tab(pos, event_loop);
                         return;
                     }
                     input::KeyAction::FontUp => {
@@ -2757,7 +2787,7 @@ impl App {
                 match action {
                     // Ctrl+Shift+D in a detached window reattaches its tab.
                     input::KeyAction::DetachTab => {
-                        self.reattach_tab(pos);
+                        self.reattach_tab(pos, event_loop);
                     }
                     // Scrollback paging on THIS window's own terminal (plain
                     // PageUp/Down on the primary screen, Shift+PageUp/Down
@@ -3062,7 +3092,7 @@ impl App {
                     }
                 };
                 match act {
-                    Act::Reattach => self.reattach_tab(pos),
+                    Act::Reattach => self.reattach_tab(pos, event_loop),
                     Act::Copy => {
                         if let Some(dw) = self.detached.get_mut(pos) {
                             let copied = dw
@@ -3169,7 +3199,7 @@ impl App {
                                     self.status_h(),
                                     self.tab_bar_bottom,
                                 ) {
-                                    self.reattach_tab(pos);
+                                    self.reattach_tab(pos, event_loop);
                                 }
                             }
                         }
@@ -3240,6 +3270,27 @@ impl App {
                     dw.menu_hover = None;
                     dw.menu_rects.clear();
                     dw.last_bar_click = None;
+                    // A selection/press drag can't see its release once focus is
+                    // gone — clear it so it doesn't resume stuck (F14).
+                    dw.selecting = false;
+                    dw.mouse_grab_press = None;
+                }
+                // F14: focus is leaving THIS detached window. If it departs to a
+                // foreign app (not another JeTTY window), the main dropdown must
+                // auto-hide too — SCHEDULE the same deferred hide the main
+                // window's Focused(false) uses. Any JeTTY window regaining focus
+                // within the grace cancels it (its Focused(true) clears
+                // pending_autohide_at). Without this, focus leaving JeTTY via a
+                // detached/Settings sibling left the terminal on top forever.
+                if self.focus_autohide
+                    && self.visible
+                    && self.summon_anim.is_none()
+                    && !self.summon_pending
+                {
+                    self.pending_autohide_at = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_millis(AUTOHIDE_GRACE_MS),
+                    );
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -4097,6 +4148,27 @@ impl App {
                 self.switching_to_settings = false;
                 if self.last_focused_window == self.settings_window.as_ref().map(|w| w.id()) {
                     self.last_focused_window = None;
+                }
+                // A held slider/drag can never see its button release once focus is
+                // gone — clear every drag latch so sliders don't keep tracking the
+                // cursor with no button held after focus returns (F36).
+                self.dragging_slider = false;
+                self.dragging_radius = false;
+                self.dragging_dropdown = false;
+                self.dragging_dropdown_width = false;
+                self.active_fx_drag = None;
+                // F14: focus leaving the Settings window to a foreign app must
+                // auto-hide the main dropdown too — schedule the deferred hide;
+                // any JeTTY window regaining focus cancels it (Focused(true)).
+                if self.focus_autohide
+                    && self.visible
+                    && self.summon_anim.is_none()
+                    && !self.summon_pending
+                {
+                    self.pending_autohide_at = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_millis(AUTOHIDE_GRACE_MS),
+                    );
                 }
             }
             _ => {}
@@ -7229,6 +7301,20 @@ fn translate_bar_rects(bar: &mut jetty_render::TabBar, dy: f32) {
 /// Centre `win` on its current monitor (or the first available monitor if the
 /// current one cannot be determined). No-ops gracefully if no monitor info is
 /// available.
+/// Whether `pos` (a window outer top-left, physical px) lies within some
+/// currently-connected monitor. Used to reject a saved Center-mode position that
+/// now falls on a since-disconnected monitor (F32).
+fn pos_on_some_monitor(win: &Arc<Window>, pos: winit::dpi::PhysicalPosition<i32>) -> bool {
+    win.available_monitors().any(|m| {
+        let p = m.position();
+        let s = m.size();
+        pos.x >= p.x
+            && pos.x < p.x + s.width as i32
+            && pos.y >= p.y
+            && pos.y < p.y + s.height as i32
+    })
+}
+
 fn center_window(win: &Arc<Window>) {
     let mon = win
         .current_monitor()
