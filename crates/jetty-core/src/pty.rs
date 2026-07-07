@@ -219,6 +219,57 @@ fn passwd_home() -> Option<String> {
     None
 }
 
+/// Current working directory of a live process by PID, or `None` when it
+/// can't be read (process gone, permission, unsupported OS) or the directory
+/// no longer exists.
+#[cfg(target_os = "linux")]
+fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    // /proc resolves symlinks; a deleted cwd reads as "/path (deleted)" and
+    // fails the is_dir filter.
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok().filter(|p| p.is_dir())
+}
+
+#[cfg(target_os = "macos")]
+fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    // SAFETY: the buffer is sized and aligned for proc_vnodepathinfo; the
+    // kernel writes at most `size` bytes and returns the count written, so
+    // ret == size proves the struct is fully initialized.
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if ret != size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    // SAFETY: vip_path is declared [[c_char; 32]; 32] (libc flattens the C
+    // char[MAXPATHLEN] to dodge an old-rustc array limit) — 1024 contiguous
+    // bytes, NUL-terminated by the kernel. Read it as one flat buffer.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(info.pvi_cdir.vip_path.as_ptr().cast::<u8>(), 1024)
+    };
+    let len = bytes.iter().position(|&b| b == 0)?;
+    if len == 0 {
+        return None;
+    }
+    let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..len]));
+    if path.is_dir() { Some(path) } else { None }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    let _ = pid;
+    None
+}
+
 impl PtySession {
     /// Spawn a PTY running the user's shell.
     ///
@@ -230,16 +281,25 @@ impl PtySession {
     /// `shell_override` is the `shell` config key: when non-empty it wins over
     /// every auto-detection, so a user whose login shell (`$SHELL`/passwd) is
     /// bash but who lives in zsh can set `shell = "/usr/bin/zsh"`.
+    ///
+    /// `cwd` is the directory the new shell should start in — typically the
+    /// requesting tab's shell cwd sampled at action time. `None` (or a
+    /// directory that has since vanished) keeps today's behavior: jetty's own
+    /// cwd, or home for GUI launches that start at `/`.
     pub fn spawn(
         cols: u16,
         rows: u16,
         shell_override: Option<String>,
+        cwd: Option<std::path::PathBuf>,
         on_data: impl Fn() + Send + 'static,
     ) -> std::io::Result<PtySession> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // A vanished directory silently degrades to existing behavior;
+        // portable-pty re-guards (non-dir → home) at exec time.
+        let cwd = cwd.filter(|d| d.is_dir());
 
         // The shell the caller explicitly requested (config `shell` override),
         // remembered so we can tell whether the launch fell back to another one.
@@ -262,11 +322,17 @@ impl PtySession {
             // JeTTY is a quick-summon terminal; session restore isn't wanted.
             // Harmless/ignored on Linux, so set it unconditionally.
             cmd.env("SHELL_SESSIONS_DISABLE", "1");
-            // GUI launches (Finder/Dock/.desktop) start the app with cwd `/`;
-            // unlike Terminal.app/iTerm2/kitty we don't want new shells opening
-            // in the filesystem root. Only override in that case — a shell
-            // launched from a terminal in a project dir keeps that directory.
-            if std::env::current_dir().map(|p| p == std::path::Path::new("/")).unwrap_or(false)
+            // An explicit cwd (inherited from the requesting tab) wins.
+            // Otherwise: GUI launches (Finder/Dock/.desktop) start the app
+            // with cwd `/`; unlike Terminal.app/iTerm2/kitty we don't want new
+            // shells opening in the filesystem root. Only override in that
+            // case — a shell launched from a terminal in a project dir keeps
+            // that directory.
+            if let Some(dir) = &cwd {
+                cmd.cwd(dir);
+            } else if std::env::current_dir()
+                .map(|p| p == std::path::Path::new("/"))
+                .unwrap_or(false)
             {
                 if let Some(home) = home_dir() {
                     cmd.cwd(home);
@@ -439,6 +505,17 @@ impl PtySession {
     /// dead shell.
     pub fn child_exited(&self) -> bool {
         self.exited.load(Ordering::SeqCst)
+    }
+
+    /// CWD of the shell process (not its foreground child), or `None` when it
+    /// exited or can't be read; callers use it to spawn sibling shells in the
+    /// same directory. The exit guard (set only after the waiter reaps)
+    /// ensures we never read a recycled PID's cwd.
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        if self.child_exited() {
+            return None;
+        }
+        self.pid.and_then(pid_cwd)
     }
 
     /// Returns a writer for the PTY (send keystrokes to the shell).

@@ -1185,14 +1185,24 @@ impl App {
         }
     }
 
+    /// Spawn a new tab in the main window starting in the active tab's shell
+    /// cwd, sampled at the instant of the action (the shell's own pid, not its
+    /// foreground child — by design). Falls back to spawn-dir behavior when it
+    /// can't be read.
+    fn new_tab(&mut self) {
+        let cwd = self.tabs.get(self.active).and_then(|t| t.pty.cwd());
+        self.new_tab_with_cwd(cwd);
+    }
+
     /// Spawn a new tab sized to the current grid, themed like the others, make it
     /// active, and redraw. The new PTY shares the same wake proxy so one
-    /// `AppEvent::Wake` drains every tab.
-    fn new_tab(&mut self) {
+    /// `AppEvent::Wake` drains every tab. `cwd` is the directory the new shell
+    /// starts in (`None` = today's spawn-dir/home behavior).
+    fn new_tab_with_cwd(&mut self, cwd: Option<std::path::PathBuf>) {
         let (cols, rows) = self.grid_dims();
         let proxy_wake = self.proxy.clone();
         let shell = self.opt_shell();
-        let pty = match PtySession::spawn(cols as u16, rows as u16, shell, move || {
+        let pty = match PtySession::spawn(cols as u16, rows as u16, shell, cwd, move || {
             let _ = proxy_wake.send_event(AppEvent::Wake);
         }) {
             Ok(p) => p,
@@ -2824,7 +2834,13 @@ impl App {
                                     dw.window.request_redraw();
                                 }
                             }
-                            "t" | "T" => self.new_tab(),
+                            "t" | "T" => {
+                                // Inherit THIS detached tab's cwd; the new tab
+                                // still opens in the main window as today.
+                                let cwd =
+                                    self.detached.get(pos).and_then(|dw| dw.tab.pty.cwd());
+                                self.new_tab_with_cwd(cwd);
+                            }
                             "w" | "W" => self.reattach_tab(pos, event_loop),
                             "+" | "=" => self.set_font_size(self.font_logical + 1.0),
                             "-" => self.set_font_size(self.font_logical - 1.0),
@@ -2881,7 +2897,10 @@ impl App {
                         return;
                     }
                     input::KeyAction::NewTab => {
-                        self.new_tab();
+                        // Inherit THIS detached tab's cwd; the new tab still
+                        // opens in the main window as today.
+                        let cwd = self.detached.get(pos).and_then(|dw| dw.tab.pty.cwd());
+                        self.new_tab_with_cwd(cwd);
                         return;
                     }
                     input::KeyAction::NextTab => {
@@ -4598,7 +4617,7 @@ impl ApplicationHandler<AppEvent> for App {
         let proxy_wake = self.proxy.clone();
         let shell = self.opt_shell();
         let pty_handle = std::thread::spawn(move || {
-            PtySession::spawn(FALLBACK_COLS as u16, FALLBACK_ROWS as u16, shell, move || {
+            PtySession::spawn(FALLBACK_COLS as u16, FALLBACK_ROWS as u16, shell, None, move || {
                 let _ = proxy_wake.send_event(AppEvent::Wake);
             })
         });
