@@ -1,4 +1,4 @@
-use crate::snapshot::{CellSnapshot, GridSnapshot, SearchHit};
+use crate::snapshot::{attr, CellSnapshot, CursorShapeSnap, GridSnapshot, SearchHit};
 use crate::theme::Theme;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -442,7 +442,62 @@ impl Terminal {
                     } else {
                         cell.c
                     };
-                    cells[row * self.cols + col] = CellSnapshot { c, fg, bg, selected: false };
+                    // Pack the SGR text attributes we render (bold/italic/strike +
+                    // underline style). BLINK (SGR 5/6) is intentionally NOT here:
+                    // alacritty_terminal 0.26 drops the blink bit at the VT engine
+                    // and a blink timer would fight ~0% idle (same non-goal as
+                    // ligatures). DIM_BOLD contains the BOLD bit, so a dim+bold cell
+                    // reads as bold via `contains(BOLD)`.
+                    let flags = cell.flags;
+                    let mut attrs = 0u8;
+                    if flags.contains(Flags::BOLD) {
+                        attrs |= attr::BOLD;
+                    }
+                    if flags.contains(Flags::ITALIC) {
+                        attrs |= attr::ITALIC;
+                    }
+                    if flags.contains(Flags::STRIKEOUT) {
+                        attrs |= attr::STRIKE;
+                    }
+                    // Underline style: most cells have none, so gate the five style
+                    // tests behind a single ALL_UNDERLINES check. Priority ladder
+                    // matches how the styles are mutually exclusive in the SGR model
+                    // (the most specific colon-subparam form wins).
+                    if flags.intersects(Flags::ALL_UNDERLINES) {
+                        let ul = if flags.contains(Flags::UNDERCURL) {
+                            attr::UL_UNDERCURL
+                        } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+                            attr::UL_DOTTED
+                        } else if flags.contains(Flags::DASHED_UNDERLINE) {
+                            attr::UL_DASHED
+                        } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+                            attr::UL_DOUBLE
+                        } else {
+                            attr::UL_SINGLE
+                        };
+                        attrs |= ul << attr::UL_SHIFT;
+                    }
+                    // Underline color: SGR 58 (per-cell, stored in CellExtra) when
+                    // set, otherwise the FINAL resolved fg (post INVERSE/DIM/HIDDEN)
+                    // — so a reverse-video underline uses the swapped fg, and a
+                    // HIDDEN (conceal) cell whose fg==bg draws an invisible underline.
+                    // Deliberate: the underline tracks the visible glyph color.
+                    let mut uline = cell
+                        .underline_color()
+                        .map(|c| resolve_rgb(&self.theme, colors, c))
+                        .unwrap_or(fg);
+                    // WIDE_CHAR_SPACER: inherit the preceding base cell's attrs+uline
+                    // so an underline/strike/bold spans the FULL width of a CJK glyph
+                    // rather than only its left half. display_iter yields the base
+                    // cell (col-1) before the spacer, so it is already stored. The
+                    // spacer keeps its own bg (painted above) and blank char.
+                    if flags.contains(Flags::WIDE_CHAR_SPACER) && col > 0 {
+                        let base = &cells[row * self.cols + col - 1];
+                        attrs = base.attrs;
+                        uline = base.uline;
+                    }
+                    cells[row * self.cols + col] =
+                        CellSnapshot { c, fg, bg, uline, attrs, selected: false };
                 }
             }
         }
@@ -485,6 +540,16 @@ impl Terminal {
         // visible. Also hide the cursor when it has scrolled out of the viewport.
         let cursor_visible = content.cursor.shape != CursorShape::Hidden && cursor_in_view;
 
+        // Renderable cursor SHAPE (DECSCUSR `CSI Ps SP q`): 1/2 block, 3/4
+        // underline, 5/6 beam. Hidden is folded into `cursor_visible` above, so
+        // it maps to the Block default (never drawn while invisible).
+        let cursor_shape = match content.cursor.shape {
+            CursorShape::Underline => CursorShapeSnap::Underline,
+            CursorShape::Beam => CursorShapeSnap::Beam,
+            CursorShape::HollowBlock => CursorShapeSnap::HollowBlock,
+            CursorShape::Block | CursorShape::Hidden => CursorShapeSnap::Block,
+        };
+
         // Scrollbar data: display_offset is how many lines we're scrolled up
         // (0 = at bottom). history_size() is the number of lines in the scrollback
         // buffer (total_lines - screen_lines), which is the maximum scroll offset.
@@ -514,6 +579,7 @@ impl Terminal {
             cursor_rgb,
             scroll_offset,
             scroll_max,
+            cursor_shape,
         }
     }
 
@@ -1144,6 +1210,7 @@ fn resolve_rgb(theme: &Theme, colors: &Colors, color: alacritty_terminal::vte::a
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::{attr, CursorShapeSnap};
 
     #[test]
     fn cursor_visible_by_default() {
@@ -1207,6 +1274,113 @@ mod tests {
         t.feed(b"hello world");
         let snap = t.snapshot();
         assert_eq!(&snap.row_text(0)[..11], "hello world");
+    }
+
+    #[test]
+    fn plain_cell_has_no_attrs() {
+        // A plain ASCII cell carries no attributes and its underline color falls
+        // back to fg (so a later underline draws in the glyph color by default).
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"A");
+        let cell = *t.snapshot().cell(0, 0);
+        assert_eq!(cell.attrs, 0);
+        assert!(!cell.is_bold() && !cell.is_italic() && !cell.is_strike());
+        assert_eq!(cell.underline_style(), attr::UL_NONE);
+        assert_eq!(cell.uline, cell.fg, "plain underline color should equal fg");
+    }
+
+    #[test]
+    fn flags_map_to_attr_bits() {
+        // \e[1m bold, \e[3m italic, \e[1;3m bold+italic, \e[9m strike.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[1mB\x1b[0m\x1b[3mI\x1b[0m\x1b[1;3mX\x1b[0m\x1b[9mS\x1b[0m");
+        let snap = t.snapshot();
+        let b = snap.cell(0, 0);
+        assert!(b.is_bold() && !b.is_italic() && !b.is_strike(), "cell 0 should be bold only");
+        let i = snap.cell(0, 1);
+        assert!(i.is_italic() && !i.is_bold() && !i.is_strike(), "cell 1 should be italic only");
+        let x = snap.cell(0, 2);
+        assert!(x.is_bold() && x.is_italic(), "cell 2 should be bold+italic");
+        let s = snap.cell(0, 3);
+        assert!(s.is_strike() && !s.is_bold() && !s.is_italic(), "cell 3 should be strike only");
+    }
+
+    #[test]
+    fn underline_styles_decode() {
+        // Single \e[4m, double \e[4:2m, undercurl \e[4:3m, dotted \e[4:4m,
+        // dashed \e[4:5m. NOTE: \e[21m is CancelBold in vte, NOT double underline.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[4mU\x1b[0m\x1b[4:2mD\x1b[0m\x1b[4:3mC\x1b[0m\x1b[4:4mo\x1b[0m\x1b[4:5mh\x1b[0m");
+        let snap = t.snapshot();
+        assert_eq!(snap.cell(0, 0).underline_style(), attr::UL_SINGLE);
+        assert_eq!(snap.cell(0, 1).underline_style(), attr::UL_DOUBLE);
+        assert_eq!(snap.cell(0, 2).underline_style(), attr::UL_UNDERCURL);
+        assert_eq!(snap.cell(0, 3).underline_style(), attr::UL_DOTTED);
+        assert_eq!(snap.cell(0, 4).underline_style(), attr::UL_DASHED);
+    }
+
+    #[test]
+    fn double_underline_needs_colon_form_not_sgr_21() {
+        // Guard the amendment: \e[21m must NOT produce a double underline.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[21mX\x1b[0m");
+        assert_eq!(t.snapshot().cell(0, 0).underline_style(), attr::UL_NONE);
+    }
+
+    #[test]
+    fn colored_underline_uses_sgr_58() {
+        // \e[58;2;255;0;0m sets the underline color; \e[4m turns underline on.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[58;2;255;0;0m\x1b[4mX\x1b[0m");
+        let cell = *t.snapshot().cell(0, 0);
+        assert_eq!(cell.underline_style(), attr::UL_SINGLE);
+        assert_eq!(cell.uline, [255, 0, 0], "explicit SGR 58 underline color");
+        // A plainly underlined cell (no SGR 58) falls back to fg.
+        let mut t2 = Terminal::new(20, 5);
+        t2.feed(b"\x1b[4mY\x1b[0m");
+        let c2 = *t2.snapshot().cell(0, 0);
+        assert_eq!(c2.uline, c2.fg);
+    }
+
+    #[test]
+    fn inverse_underline_uses_swapped_fg() {
+        // Reverse-video (\e[7m) swaps fg/bg BEFORE uline falls back to fg, so the
+        // underline color is the swapped (visible) fg. A conceal cell (fg==bg)
+        // therefore draws an invisible underline.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[7m\x1b[4mX\x1b[0m");
+        let cell = *t.snapshot().cell(0, 0);
+        assert_eq!(cell.uline, cell.fg, "inverse underline uses the swapped fg");
+        assert_eq!(cell.fg, cell.uline);
+    }
+
+    #[test]
+    fn cursor_shape_from_decscusr() {
+        // DECSCUSR: \e[1 q block, \e[3 q underline, \e[5 q beam.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[1 q");
+        assert_eq!(t.snapshot().cursor_shape, CursorShapeSnap::Block);
+        t.feed(b"\x1b[3 q");
+        assert_eq!(t.snapshot().cursor_shape, CursorShapeSnap::Underline);
+        t.feed(b"\x1b[5 q");
+        assert_eq!(t.snapshot().cursor_shape, CursorShapeSnap::Beam);
+        // Hiding the cursor still reports invisible regardless of shape.
+        t.feed(b"\x1b[?25l");
+        assert!(!t.snapshot().cursor_visible);
+    }
+
+    #[test]
+    fn wide_char_spacer_inherits_attrs() {
+        // A bold+underlined CJK glyph must carry its attrs onto the WIDE_CHAR_SPACER
+        // so the decoration spans both columns, not just the left half.
+        let mut t = Terminal::new(20, 5);
+        t.feed("\x1b[1m\x1b[4m世\x1b[0m".as_bytes());
+        let snap = t.snapshot();
+        let base = snap.cell(0, 0);
+        let spacer = snap.cell(0, 1);
+        assert!(base.is_bold() && base.underline_style() == attr::UL_SINGLE);
+        assert_eq!(spacer.attrs, base.attrs, "spacer inherits base attrs");
+        assert_eq!(spacer.uline, base.uline, "spacer inherits base underline color");
     }
 
     #[test]
