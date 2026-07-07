@@ -2272,15 +2272,18 @@ impl App {
     /// tab's query replies back to its own PTY. Background tabs must keep draining
     /// so their shells never block on a full pipe.
     ///
-    /// Returns `(active_had_data, activity_changed, exited)` where
+    /// Returns `(active_had_data, chrome_changed, exited)` where
     /// `active_had_data` is true if the ACTIVE tab consumed bytes (so the caller
-    /// redraws), `activity_changed` is true if an INACTIVE tab's activity
-    /// indicator transitioned (so the tab bar needs a repaint), and `exited` is
-    /// the list of tab indices whose child exited this tick (caller closes them
-    /// after, to avoid mutating `tabs` while iterating).
+    /// redraws), `chrome_changed` is true if the tab bar needs a repaint — an
+    /// INACTIVE tab's activity indicator transitioned, or ANY tab's title was
+    /// changed by an OSC 0/2 (a background tab whose indicator is already lit
+    /// yields no activity transition, yet its new title must still reach the
+    /// tab bar / OS title — F1/F14) — and `exited` is the list of tab indices
+    /// whose child exited this tick (caller closes them after, to avoid
+    /// mutating `tabs` while iterating).
     fn drain_pty(&mut self) -> (bool, bool, Vec<usize>) {
         let mut active_had_data = false;
-        let mut activity_changed = false;
+        let mut chrome_changed = false;
         let mut exited: Vec<usize> = Vec::new();
         // Perf-HUD VT throughput: count bytes read this drain into a local
         // (avoids a self borrow inside the &mut self.tabs loop), folded into the
@@ -2288,7 +2291,8 @@ impl App {
         // windows in the render path.
         let mut vt_read: u64 = 0;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
-            let had = Self::drain_one_tab(tab, &mut vt_read);
+            let (had, title_changed) = Self::drain_one_tab(tab, &mut vt_read);
+            chrome_changed |= title_changed;
             // Consume the bell flag for EVERY tab (active included) so it never
             // goes stale; only INACTIVE tabs surface it as an indicator. Bell is
             // sticky (never downgraded by later output); Output only lights a
@@ -2305,7 +2309,7 @@ impl App {
                 };
                 if new != tab.activity {
                     tab.activity = new;
-                    activity_changed = true;
+                    chrome_changed = true;
                 }
             }
             if i == self.active && had {
@@ -2316,19 +2320,24 @@ impl App {
             }
         }
         self.vt_bytes += vt_read;
-        (active_had_data, activity_changed, exited)
+        (active_had_data, chrome_changed, exited)
     }
 
     /// Drain one tab's PTY output into its terminal, and flush any query
     /// replies (DSR/DA, etc.) the terminal produced back to the PTY. Returns
-    /// whether the tab fed any bytes or sent any reply (i.e. "had data").
+    /// `(had, title_changed)`: whether the tab fed any bytes or sent any
+    /// reply (i.e. "had data"), and whether an OSC 0/2 changed the tab title.
+    /// The title is reported SEPARATELY because folding it into `had` only
+    /// guaranteed a redraw for the ACTIVE tab — an inactive tab whose
+    /// activity dot was already lit produced no transition, so its new title
+    /// never repainted the tab bar or the OS/taskbar title (F1/F14).
     /// `vt_read` accumulates bytes read, for the perf-HUD VT throughput
     /// counter; callers that don't track that (e.g. detached windows) pass a
     /// throwaway local.
     ///
     /// Shared by `drain_pty` (per `self.tabs` entry) and the `AppEvent::Wake`
     /// handler's detached-window loop, so both paths drain identically.
-    fn drain_one_tab(tab: &mut Tab, vt_read: &mut u64) -> bool {
+    fn drain_one_tab(tab: &mut Tab, vt_read: &mut u64) -> (bool, bool) {
         let mut had = false;
         // Feed at most PTY_DRAIN_BUDGET bytes this pass so a flood can't starve
         // the event loop (see the const's doc). Any remaining chunks are drained
@@ -2355,19 +2364,21 @@ impl App {
         }
         // Apply any pending shell-set title (OSC 0/2). Event-driven: rides this
         // drain pass only, zero idle cost (a lock-free flag check when clean).
-        // Setting `had` forces a redraw at every call site even when the OSC
-        // arrived with no visible grid change.
+        // Reported as its own flag so every call site can force the tab-bar /
+        // OS-title repaint even when the OSC arrived with no grid change and
+        // no activity-indicator transition (F1/F14).
+        let mut title_changed = false;
         if let Some(update) = tab.terminal.take_title_update() {
             if let Some(new_title) =
                 resolve_title(update, tab.manually_renamed, &tab.default_title)
             {
                 if new_title != tab.title {
                     tab.title = new_title;
-                    had = true;
+                    title_changed = true;
                 }
             }
         }
-        had
+        (had, title_changed)
     }
 
     /// Update the live perf-HUD metrics and return the formatted HUD string, or
@@ -5520,7 +5531,7 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, ev: AppEvent) {
         match ev {
             AppEvent::Wake => {
-                let (had_data, activity_changed, exited) = self.drain_pty();
+                let (had_data, chrome_changed, exited) = self.drain_pty();
                 // A tab whose shell exited (Ctrl+D / `exit`) closes THAT tab,
                 // Yakuake-style; if it was the last tab, close_exited_tabs exits
                 // the loop. The waker fires ~10x/s, so we react within a frame.
@@ -5543,10 +5554,13 @@ impl ApplicationHandler<AppEvent> for App {
                 // occluded/minimized): a hidden dropdown running `cat bigfile`
                 // must keep draining (so the shell never blocks) but must NOT run
                 // the full render pipeline into an unmapped surface (F16).
-                // `activity_changed` fires only on indicator TRANSITIONS (at
-                // most None->Output->Bell between views), so a flooding
-                // background tab costs one extra redraw total, not one per Wake.
-                if (had_data || activity_changed) && self.visible && !self.main_occluded {
+                // `chrome_changed` fires only on indicator TRANSITIONS (at
+                // most None->Output->Bell between views) or on an actual tab
+                // TITLE change (bounded by how often the shell rewrites it),
+                // so a flooding background tab costs one extra redraw total,
+                // not one per Wake — while a background OSC 0/2 title update
+                // still reaches the tab bar and taskbar title (F1/F14).
+                if (had_data || chrome_changed) && self.visible && !self.main_occluded {
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -5567,7 +5581,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let mut vt_read: u64 = 0;
                 let mut exited_detached: Vec<usize> = Vec::new();
                 for (i, dw) in self.detached.iter_mut().enumerate() {
-                    let had = Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+                    let (had, title_changed) = Self::drain_one_tab(&mut dw.tab, &mut vt_read);
                     // Consume the bell so a reattach never shows a phantom Bell
                     // dot. Detached windows draw no indicator by design: the tab
                     // IS the visible, active tab of its own window.
@@ -5577,8 +5591,10 @@ impl ApplicationHandler<AppEvent> for App {
                     dw.sync_os_title();
                     // Same damage-driven + visibility discipline as the main
                     // window: drain always (keep the shell unblocked) but only
-                    // repaint a detached window that isn't occluded/minimized (F16).
-                    if had && !dw.occluded {
+                    // repaint a detached window that isn't occluded/minimized
+                    // (F16). A title-only change repaints too: the detached
+                    // top bar draws the title (F1/F14).
+                    if (had || title_changed) && !dw.occluded {
                         dw.window.request_redraw();
                         // Grid content changed under an ACTIVE Ctrl+hover in this
                         // window: revalidate the cached spans at the same cell
@@ -7421,7 +7437,9 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 // Drain every tab so background shells keep running; close any
                 // whose child exited as part of the output we just drained.
-                let (had, _activity_changed, exited) = self.drain_pty();
+                // (chrome changes are picked up by this same frame's
+                // tabs_meta()/tab_activity snapshot below, so the flag is moot here.)
+                let (had, _chrome_changed, exited) = self.drain_pty();
                 if !self.close_exited_tabs(exited, event_loop) {
                     return;
                 }
