@@ -1319,6 +1319,11 @@ impl App {
         if i >= self.tabs.len() {
             return;
         }
+        if i == self.active {
+            // The searched (active) tab is going away; the bar must not stay
+            // open silently retargeting whichever tab becomes active (F2/F7).
+            self.search_close();
+        }
         self.tabs.remove(i);
         if self.tabs.is_empty() {
             if self.detached.is_empty() {
@@ -1576,6 +1581,9 @@ impl App {
         if pos >= self.detached.len() {
             return;
         }
+        // The reattached tab becomes the active one below: close the search
+        // bar and clear the outgoing active tab's state first (F2/F7/F15).
+        self.search_close();
         let dw = self.detached.remove(pos);
         // Drop focus bookkeeping that pointed at the now-destroyed detached window
         // so the main window's auto-hide guard doesn't keep suppressing on a stale
@@ -1642,12 +1650,37 @@ impl App {
         }
     }
 
+    /// Close the scrollback-search bar and clear the ACTIVE tab's search
+    /// state (query, compiled regex, matches). The single close path for
+    /// Esc / ✕ / Ctrl+Shift+F — and for every active-tab change while the
+    /// bar is open (tab switch/select/reattach/close): the bar targets the
+    /// active tab, so leaving a searched tab in the background would strand
+    /// a compiled regex + match list on it, and `Terminal::resize` would
+    /// re-scan that tab's ENTIRE scrollback on every reflow forever
+    /// (F2/F7/F15 — an invisible, permanent resize-path slowdown).
+    fn search_close(&mut self) {
+        if !self.search_open {
+            return;
+        }
+        self.search_open = false;
+        // Tolerate an empty tabs vec (reattach-from-close_exited_tabs path).
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.terminal.search_clear();
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
     /// Switch to the next (`+1`) or previous (`-1`) tab, wrapping around.
     fn switch_tab(&mut self, forward: bool) {
         let n = self.tabs.len();
         if n <= 1 {
             return;
         }
+        // The search bar targets the ACTIVE tab: close it (clearing the
+        // outgoing tab's regex/matches) before the index moves (F2/F7/F15).
+        self.search_close();
         self.active = if forward {
             (self.active + 1) % n
         } else {
@@ -1705,7 +1738,13 @@ impl App {
         if self.tabs.is_empty() {
             return;
         }
-        self.active = n.min(self.tabs.len() - 1);
+        let target = n.min(self.tabs.len() - 1);
+        if target != self.active {
+            // Active tab changes: close the search bar and clear the OUTGOING
+            // tab's search state before the index moves (F2/F7/F15).
+            self.search_close();
+        }
+        self.active = target;
         // A pending text selection belongs to the previous tab's grid; reset it.
         self.selecting = false;
         // Same for any fractional wheel remainder (it was that tab's scroll).
@@ -2392,6 +2431,11 @@ impl App {
     fn close_exited_tabs(&mut self, mut exited: Vec<usize>, event_loop: &ActiveEventLoop) -> bool {
         if exited.is_empty() {
             return true;
+        }
+        if exited.contains(&self.active) {
+            // The searched (active) tab's shell exited: close the bar before
+            // the removals below retarget it (same invariant as close_tab).
+            self.search_close();
         }
         exited.sort_unstable();
         exited.dedup();
@@ -6100,11 +6144,7 @@ impl ApplicationHandler<AppEvent> for App {
                         w, self.grid_top_offset(), &theme, self.chrome_char_w(), &q, cur, total,
                     );
                     if input::point_in(&bar.close_rect, cx, cy) {
-                        self.search_open = false;
-                        self.active_tab_mut().terminal.search_clear();
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
+                        self.search_close();
                         return;
                     }
                     if input::point_in(&bar.panel, cx, cy) {
@@ -6889,17 +6929,12 @@ impl ApplicationHandler<AppEvent> for App {
                         && shift
                         && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyF))
                     {
-                        self.search_open = false;
-                        self.active_tab_mut().terminal.search_clear();
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        self.search_close();
                         return;
                     }
                     match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
-                            self.search_open = false;
-                            self.active_tab_mut().terminal.search_clear();
+                            self.search_close();
                         }
                         Key::Named(NamedKey::Enter) | Key::Named(NamedKey::F3) => {
                             // Enter/F3 = older (up through history); +Shift = newer.
@@ -7093,14 +7128,19 @@ impl ApplicationHandler<AppEvent> for App {
                         self.detach_tab(self.active, event_loop, None);
                     }
                     input::KeyAction::SearchToggle => {
-                        // Opening with a query still set on this tab re-shows
-                        // its existing matches (intentional); closing clears.
-                        self.search_open = !self.search_open;
-                        if !self.search_open {
-                            self.active_tab_mut().terminal.search_clear();
-                        }
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
+                        if self.search_open {
+                            self.search_close();
+                        } else {
+                            self.search_open = true;
+                            // Every close path clears, so the bar normally
+                            // opens empty; should query state somehow survive
+                            // on this tab, re-collect so stale Points (the
+                            // scrollback rotated while closed) never render.
+                            // No-op when no query is set.
+                            self.active_tab_mut().terminal.search_refresh();
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
                         }
                     }
                     input::KeyAction::NextTab => {
