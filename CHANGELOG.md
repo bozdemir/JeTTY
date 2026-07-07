@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.0] — 2026-07-07
+
+The "text attributes" release: JeTTY now renders the SGR attributes it used to
+silently drop. Designed from a verified blueprint, stress-tested by two design
+critics, then adversarially reviewed before shipping.
+
+### Added
+- **Bold and italic** are now rendered (real font faces, not faux weight/skew),
+  including bold-italic. Monospace alignment is guaranteed — glyph advances are
+  snapped to the cell grid, so bold text can never shift a column, on any font.
+- **Underline styles** — single, double, dotted, dashed, and **undercurl**, plus
+  **colored underlines** (SGR 58), so nvim / LSP / spellcheck diagnostics show
+  their red/colored squiggles.
+- **Strikethrough** (SGR 9).
+- **Clickable links now actually underline** — v0.12 added Ctrl+click / OSC 8
+  link detection, but nothing drew the underline; it's now rendered.
+- **Cursor shape** follows `DECSCUSR` (`\e[N q`): block, beam, or underline, and
+  a hollow block when the window is unfocused. Drawn as GPU quads.
+
+### Notes
+- Bold/italic on fallback (CJK/emoji) glyphs render at regular weight/upright for
+  now. **Blink (SGR 5/6) remains intentionally unsupported** — the VT engine
+  drops the bit and a blink timer would fight the ~0% idle-CPU design (same call
+  as ligatures). No idle-CPU or hot-path regression: decorations are cached and
+  only the cursor rebuilds per frame.
+
+---
+
 ## [0.12.2] — 2026-07-07
 
 ### Fixed

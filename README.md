@@ -56,6 +56,7 @@
 - 📊 **Live performance HUD** — an optional tab-bar overlay showing frame ms · fps · CPU% · VT MB/s in real time, and an honest "idle" state when the app settles (never forces a redraw — idle stays ~0% CPU). Toggle with `show_perf_hud`.
 - 👋 **Welcome overlay** — a neofetch-style splash on first launch (accent ASCII logo + version/backend), dismissed on the first key/click/Esc. Toggle with `show_welcome`.
 - 🖥️ **Desktop-independent** — X11 **and** Wayland, KDE / GNOME / any compositor, every distro. **No DE-specific code**, no compositor libraries.
+- 🅱️ **Full text attributes** — **bold**, *italic*, and every underline style: single, double, dotted, dashed, and **undercurl** (with per-run colors, so nvim/LSP diagnostics render their red squiggles), plus strikethrough. Monospace alignment is preserved (glyph advances snap to the cell grid). Cursor shape follows the shell: block / beam / underline (`DECSCUSR`), hollow when unfocused.
 - ✅ **A real terminal** — true-color, answers host queries (DSR/DA), proper `TERM`, window resize with grid reflow, configurable scrollback (1k–100k lines), Ctrl+D closes cleanly.
 
 ## 📸 Screenshots
