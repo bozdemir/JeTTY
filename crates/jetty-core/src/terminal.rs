@@ -341,6 +341,11 @@ impl Terminal {
     ///   no-op on unchanged titles, and manual renames are flagged app-side).
     pub fn set_scrollback_lines(&mut self, lines: usize) {
         self.term.set_options(Config { scrolling_history: lines, ..Default::default() });
+        // A shrink freed trimmed history rows, so stored search-match Points
+        // can reference lines that no longer exist (wrong counter, Enter/F3
+        // jumping to a clamped top-of-history). Re-collect, exactly like
+        // `resize` does for reflow; cheap no-op when no search is active (F11).
+        self.search_refresh();
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -646,6 +651,14 @@ impl Terminal {
         // wide-glyph wrap. See Terminal::new.
         let cols = cols.max(2);
         let rows = rows.max(1);
+        // Unchanged dimensions: nothing reflows, so the grid, PTY geometry and
+        // any stored search matches all stay valid — skip Term::resize AND the
+        // full-history search re-collect below. App::reflow() resizes EVERY
+        // tab per (debounced) window-resize event, so this guard keeps
+        // same-size calls free on the interactive resize path (F15).
+        if cols == self.cols && rows == self.rows {
+            return;
+        }
         self.cols = cols;
         self.rows = rows;
         // Publish the new geometry to the shared atomic BEFORE Term::resize so
@@ -1712,6 +1725,50 @@ mod tests {
         let (cur, total) = t.search_counter();
         assert_eq!(total, 2, "both occurrences survive the reflow");
         assert!(cur >= 1 && cur <= total);
+    }
+
+    #[test]
+    fn search_survives_scrollback_shrink() {
+        // F11: a live scrollback shrink frees trimmed history rows; stored
+        // match Points into those rows must be re-collected, not kept.
+        let mut t = Terminal::new(40, 5);
+        for i in 0..200 {
+            t.feed(format!("error {i}\r\n").as_bytes());
+        }
+        let (_, total) = t.search_set_query("error");
+        assert!(total > 50, "expected matches across history; got {total}");
+        t.set_scrollback_lines(10);
+        let (cur, total_after) = t.search_counter();
+        assert!(
+            total_after < total,
+            "match total must drop with the freed history ({total} -> {total_after})"
+        );
+        assert!(cur >= 1 && cur <= total_after, "current index stays in range");
+        // The refreshed list must equal a from-scratch re-collect (i.e. no
+        // stale Points into freed lines survive).
+        let fresh = t.search_set_query("error").1;
+        assert_eq!(total_after, fresh, "refresh must match a fresh re-collect");
+        // Navigation over the shrunk history stays within the valid range.
+        t.search_nav(true);
+        assert!(t.scroll_offset() <= t.scroll_max());
+    }
+
+    #[test]
+    fn same_size_resize_is_a_noop() {
+        // F15 hardening: App::reflow() resizes every tab per debounced window
+        // resize; a same-dims call must not reflow, move the viewport, or
+        // re-collect search matches.
+        let mut t = Terminal::new(20, 5);
+        for i in 0..30 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let (_, total) = t.search_set_query("line");
+        t.scroll_lines(5);
+        let offset = t.scroll_offset();
+        t.resize(20, 5);
+        assert_eq!((t.cols, t.rows), (20, 5));
+        assert_eq!(t.scroll_offset(), offset, "same-size resize must not move the viewport");
+        assert_eq!(t.search_counter().1, total, "matches unchanged by a same-size resize");
     }
 
     #[test]
