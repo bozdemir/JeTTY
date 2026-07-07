@@ -551,14 +551,16 @@ impl TextLayer {
                 // stays exactly one column wide, and recorded for an overdraw — the
                 // real glyph is drawn on top, aligned. ASCII and already-blank cells
                 // skip the (cached) probe entirely.
-                let overdraw = cell.c != ' '
-                    && cell.c != '\0'
-                    && self.route(cell.c) == CellRoute::Overdraw;
+                // alacritty stores a literal '\t' in the cell at a tab stop (so
+                // copies preserve tabs); control chars have no glyph, so render
+                // them as blanks instead of routing them to the overdraw (tofu).
+                let ch = if cell.c.is_control() { ' ' } else { cell.c };
+                let overdraw = ch != ' ' && self.route(ch) == CellRoute::Overdraw;
                 if overdraw {
                     fallback_cells.push((
                         col as f32 * cell_w,
                         row as f32 * cell_h,
-                        cell.c,
+                        ch,
                         cell.fg,
                     ));
                 }
@@ -570,7 +572,7 @@ impl TextLayer {
                     run_start = text.len();
                     run_color = Some(color);
                 }
-                text.push(if overdraw { ' ' } else { cell.c });
+                text.push(if overdraw { ' ' } else { ch });
             }
             // Flush the row's final run, then include the newline as its own span:
             // set_rich_text builds the text FROM the spans, so without the '\n' the
