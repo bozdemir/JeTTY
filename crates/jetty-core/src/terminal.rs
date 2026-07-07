@@ -481,11 +481,15 @@ impl Terminal {
                     // set, otherwise the FINAL resolved fg (post INVERSE/DIM/HIDDEN)
                     // — so a reverse-video underline uses the swapped fg, and a
                     // HIDDEN (conceal) cell whose fg==bg draws an invisible underline.
-                    // Deliberate: the underline tracks the visible glyph color.
-                    let mut uline = cell
-                        .underline_color()
-                        .map(|c| resolve_rgb(&self.theme, colors, c))
-                        .unwrap_or(fg);
+                    // Deliberate: the underline tracks the visible glyph color. Gate
+                    // the underline_color() lookup behind the underline flag: it is
+                    // never read without an underline, so most cells skip it (SPEED).
+                    let mut uline = fg;
+                    if flags.intersects(Flags::ALL_UNDERLINES) {
+                        if let Some(c) = cell.underline_color() {
+                            uline = resolve_rgb(&self.theme, colors, c);
+                        }
+                    }
                     // WIDE_CHAR_SPACER: inherit the preceding base cell's attrs+uline
                     // so an underline/strike/bold spans the FULL width of a CJK glyph
                     // rather than only its left half. display_iter yields the base
