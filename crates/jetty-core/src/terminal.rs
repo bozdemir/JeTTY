@@ -44,6 +44,13 @@ struct EventProxy {
     /// has exited (`Event::ChildExit`) or requests shutdown (`Event::Exit`).
     /// Shared with the owning `Terminal` so the app can close the window.
     child_exited: Arc<AtomicBool>,
+    /// Pending OSC 0/2 title update, shared with the owning `Terminal`:
+    /// `Some(Some(t))` = new title, `Some(None)` = reset to default, `None` =
+    /// nothing pending. Multiple OSCs within one drain coalesce last-wins.
+    title_update: Arc<Mutex<Option<Option<String>>>>,
+    /// Cheap "a title update is pending" flag so the drain path can skip the
+    /// mutex entirely in the common no-title case.
+    title_dirty: Arc<AtomicBool>,
 }
 
 impl EventProxy {
@@ -101,8 +108,19 @@ impl EventListener for EventProxy {
             Event::ChildExit(_) | Event::Exit => {
                 self.child_exited.store(true, Ordering::SeqCst);
             }
-            // Bell/Title/Wakeup/ClipboardStore/MouseCursorDirty and the rest are
-            // intentionally ignored for now (Title/Bell are a later concern).
+            // OSC 0/2 shell-set title (also XTWINOPS 22/23 title-stack pops).
+            // Stored in a single slot so a flood of title OSCs coalesces
+            // last-wins; the app applies it on its PTY-drain path.
+            Event::Title(t) => {
+                *self.title_update.lock().unwrap() = Some(Some(t));
+                self.title_dirty.store(true, Ordering::Release);
+            }
+            Event::ResetTitle => {
+                *self.title_update.lock().unwrap() = Some(None);
+                self.title_dirty.store(true, Ordering::Release);
+            }
+            // Bell/Wakeup/ClipboardStore/MouseCursorDirty and the rest are
+            // intentionally ignored for now (Bell is a later concern).
             _ => {}
         }
     }
@@ -143,6 +161,11 @@ pub struct Terminal {
     /// Live geometry shared with the `EventProxy` so `\e[14t`/`\e[18t` replies
     /// stay correct after a resize.
     geom: Arc<AtomicU32>,
+    /// Pending shell-set title slot shared with the `EventProxy`; consumed by
+    /// [`Terminal::take_title_update`].
+    title_update: Arc<Mutex<Option<Option<String>>>>,
+    /// Fast pending-title flag shared with the `EventProxy` (see above).
+    title_dirty: Arc<AtomicBool>,
 }
 
 impl Terminal {
@@ -180,15 +203,31 @@ impl Terminal {
         let child_exited = Arc::new(AtomicBool::new(false));
         let geom = Arc::new(AtomicU32::new(pack_geom(cols, rows)));
         let theme_shared = Arc::new(Mutex::new(theme.clone()));
+        let title_update = Arc::new(Mutex::new(None));
+        let title_dirty = Arc::new(AtomicBool::new(false));
         let proxy = EventProxy {
             tx,
             geom: Arc::clone(&geom),
             theme: Arc::clone(&theme_shared),
             child_exited: Arc::clone(&child_exited),
+            title_update: Arc::clone(&title_update),
+            title_dirty: Arc::clone(&title_dirty),
         };
         let term = Term::new(config, &size, proxy);
 
-        Terminal { term, parser: Processor::new(), cols, rows, theme, theme_shared, pty_write_rx, child_exited, geom }
+        Terminal {
+            term,
+            parser: Processor::new(),
+            cols,
+            rows,
+            theme,
+            theme_shared,
+            pty_write_rx,
+            child_exited,
+            geom,
+            title_update,
+            title_dirty,
+        }
     }
 
     /// Drain all currently-pending write-back byte chunks emitted by the
@@ -201,6 +240,28 @@ impl Terminal {
             out.extend_from_slice(&chunk);
         }
         out
+    }
+
+    /// Take the pending shell-set title update, if any (OSC 0/2, or an
+    /// XTWINOPS title-stack pop). Returns:
+    /// * `None` — nothing pending (the common case; a lock-free flag check).
+    /// * `Some(Some(title))` — the shell set a new (sanitized) title.
+    /// * `Some(None)` — reset to the default title (explicit reset, or a title
+    ///   that sanitized to empty, e.g. `\e]0;\a`).
+    ///
+    /// Consuming: a second call returns `None` until the next OSC arrives.
+    /// Multiple OSCs between calls coalesce last-wins. NOTE: RIS (`\ec`) clears
+    /// alacritty's internal title WITHOUT emitting an event, so a stale title
+    /// survives a `reset` until the next OSC (upstream behavior).
+    pub fn take_title_update(&mut self) -> Option<Option<String>> {
+        if !self.title_dirty.swap(false, Ordering::Acquire) {
+            return None;
+        }
+        self.title_update
+            .lock()
+            .unwrap()
+            .take()
+            .map(|u| u.and_then(|s| sanitize_title(&s)))
     }
 
     /// Replace the active theme at runtime. Also refreshes the copy shared with
@@ -226,9 +287,10 @@ impl Terminal {
     ///   the exact same `..Default::default()` construction as `Terminal::new`;
     ///   a future non-default field there must be mirrored here or it would be
     ///   silently reverted.
-    /// * `set_options` also emits `Event::Title`/`ResetTitle` via the
-    ///   `EventProxy` — currently ignored by its catch-all arm, but wiring
-    ///   those events up later would make this call spuriously reset titles.
+    /// * `set_options` also re-emits the CURRENT title (`Event::Title`/
+    ///   `ResetTitle`) via the `EventProxy`. That is benign: the re-emitted
+    ///   value equals what's already displayed (the app's apply path is a
+    ///   no-op on unchanged titles, and manual renames are flagged app-side).
     pub fn set_scrollback_lines(&mut self, lines: usize) {
         self.term.set_options(Config { scrolling_history: lines, ..Default::default() });
     }
@@ -629,6 +691,18 @@ impl Terminal {
     }
 }
 
+/// Sanitize a shell-provided OSC 0/2 title: strip control characters
+/// (ESC/BEL/C0/DEL — nothing a shell legitimately puts in a title), cap at 256
+/// chars (char-boundary safe by construction; the cap also bounds the per-tab
+/// title hashing in the app's tab-bar cache), and trim whitespace. Returns
+/// `None` when the result is empty, which the caller must treat as "reset to
+/// the default title" (vte delivers `\e]0;\a` as `Title("")`, not `ResetTitle`).
+fn sanitize_title(s: &str) -> Option<String> {
+    let t: String = s.chars().filter(|c| !c.is_control()).take(256).collect();
+    let t = t.trim();
+    if t.is_empty() { None } else { Some(t.to_string()) }
+}
+
 /// Convert a 256-color palette index to RGB (standard xterm scheme):
 /// 0..=15 from the theme palette, 16..=231 the 6x6x6 cube, 232..=255 the grayscale ramp.
 fn index_to_rgb(theme: &Theme, i: u8) -> [u8; 3] {
@@ -1023,6 +1097,52 @@ mod tests {
             reply.contains("2828/2828/2828"),
             "OSC 11 reply should carry the new theme bg; got {reply:?}"
         );
+    }
+
+    #[test]
+    fn osc_title_sets_pending_update() {
+        let mut t = Terminal::new(20, 5);
+        assert_eq!(t.take_title_update(), None, "nothing pending initially");
+        t.feed(b"\x1b]2;hello\x07");
+        assert_eq!(t.take_title_update(), Some(Some("hello".to_string())));
+        assert_eq!(t.take_title_update(), None, "update is consumed by take");
+    }
+
+    #[test]
+    fn osc_title_st_terminator() {
+        // OSC 0 (icon+title) with an ST (\e\\) terminator instead of BEL.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]0;world\x1b\\");
+        assert_eq!(t.take_title_update(), Some(Some("world".to_string())));
+    }
+
+    #[test]
+    fn osc_empty_title_is_reset() {
+        // vte delivers `\e]2;\a` as Title("") — an empty title must map to a
+        // reset (Some(None)), not a literal empty string.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]2;\x07");
+        assert_eq!(t.take_title_update(), Some(None));
+    }
+
+    #[test]
+    fn osc_title_sanitized() {
+        // Control chars are stripped; over-long titles are capped at 256 chars.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]2;a\x01b\x08c\x7fd\x07");
+        assert_eq!(t.take_title_update(), Some(Some("abcd".to_string())));
+        let long = "x".repeat(1000);
+        t.feed(format!("\x1b]2;{long}\x07").as_bytes());
+        let got = t.take_title_update().flatten().unwrap();
+        assert!(got.chars().count() <= 256, "title capped at 256 chars");
+    }
+
+    #[test]
+    fn osc_title_coalesces_last_wins() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]2;a\x07\x1b]2;b\x07");
+        assert_eq!(t.take_title_update(), Some(Some("b".to_string())));
+        assert_eq!(t.take_title_update(), None, "coalesced into one update");
     }
 
     #[test]
