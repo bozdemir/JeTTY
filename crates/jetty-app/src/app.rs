@@ -108,6 +108,37 @@ impl SummonEffect {
     }
 }
 
+/// Scrollback-cycler steps. 100_000 is alacritty's own UI max (and the config
+/// clamp ceiling): at ≤24 B/cell a fully-filled 100k×120-col history is
+/// ~290 MB per tab, so do not raise it without revisiting memory.
+const SCROLLBACK_STEPS: [usize; 6] = [1_000, 5_000, 10_000, 25_000, 50_000, 100_000];
+
+/// The next/previous scrollback step (wraps like `SummonEffect::cycle`). A
+/// hand-edited config value between steps first snaps to its NEAREST step,
+/// then moves ±1 — so the first click from e.g. 12_345 lands on a canonical
+/// value instead of jumping erratically.
+fn cycle_scrollback(cur: usize, forward: bool) -> usize {
+    let i = SCROLLBACK_STEPS
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, &s)| s.abs_diff(cur))
+        .map(|(i, _)| i)
+        .unwrap_or(2);
+    let n = SCROLLBACK_STEPS.len();
+    let j = if forward { (i + 1) % n } else { (i + n - 1) % n };
+    SCROLLBACK_STEPS[j]
+}
+
+/// Display form of a scrollback value: whole thousands render as "Nk" (the
+/// cycler steps), anything else (a hand-edited config value) verbatim.
+fn format_scrollback(n: usize) -> String {
+    if n >= 1000 && n % 1000 == 0 {
+        format!("{}k", n / 1000)
+    } else {
+        n.to_string()
+    }
+}
+
 /// How F9 summons the window. Mirrors `SummonEffect`'s ORDER/cycle/from_config
 /// pattern. `Center` re-summons centered (or at the last position); `Dropdown`
 /// is a Yakuake-style top-anchored full-width strip that slides down.
@@ -346,6 +377,10 @@ pub struct App {
     pending_center_pos: Option<winit::dpi::PhysicalPosition<i32>>,
     /// Hide the window on focus loss (Yakuake auto-hide). Default ON.
     focus_autohide: bool,
+    /// Scrollback history limit in lines (config `scrollback_lines`, clamped
+    /// 100..=100_000, default 10_000). Applied live to every tab (main +
+    /// detached) when changed via the Settings cycler.
+    scrollback_lines: usize,
     /// Launch JeTTY at login via the XDG autostart `.desktop` file. The file's
     /// existence is the source of truth; this mirrors it for the Settings pill.
     launch_at_login: bool,
@@ -798,6 +833,7 @@ impl App {
             pending_center_frames: 0,
             pending_center_pos: None,
             focus_autohide: true,
+            scrollback_lines: 10_000,
             launch_at_login: false,
             summon_hotkey: "F9".to_string(),
             shell: String::new(),
@@ -929,6 +965,9 @@ impl App {
         app.dropdown_height_pct = cfg.dropdown_height_pct.clamp(0.25, 1.0);
         app.dropdown_width_pct = cfg.dropdown_width_pct.clamp(0.2, 1.0);
         app.focus_autohide = cfg.focus_autohide;
+        // Re-clamp for belt-and-suspenders (mirrors the opacity/font clamps
+        // above); Config::load's sanitize pass already applied this range.
+        app.scrollback_lines = cfg.scrollback_lines.clamp(100, 100_000);
         // The autostart FILE's existence is the source of truth (so the toggle
         // reflects reality even if the file was changed externally), not the
         // stored config bool.
@@ -967,6 +1006,7 @@ impl App {
             summon_hotkey: self.summon_hotkey.clone(),
             shell: self.shell.clone(),
             tab_bar_position: if self.tab_bar_bottom { "bottom" } else { "top" }.to_string(),
+            scrollback_lines: self.scrollback_lines,
             // show_welcome/show_perf_hud are startup preferences (no runtime UI
             // toggles them), cached at startup — write them back from memory so a
             // settings change never re-reads the config file (persist() used to do
@@ -1164,6 +1204,11 @@ impl App {
         let writer = pty.writer();
         let mut terminal = Terminal::new(cols, rows);
         terminal.set_theme(self.current_theme());
+        // Apply the configured scrollback cap (guard skips the no-op
+        // set_options round-trip on the 10k default path).
+        if self.scrollback_lines != 10_000 {
+            terminal.set_scrollback_lines(self.scrollback_lines);
+        }
         // Surface the shell-fallback notice here too (F2).
         if let Some(notice) = pty.startup_notice() {
             terminal.feed(format!("\x1b[33m{notice}\x1b[0m\r\n").as_bytes());
@@ -1684,6 +1729,31 @@ impl App {
         }
         self.tab_bar_bottom = bottom;
         self.persist();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+        if let Some(w) = &self.settings_window {
+            w.request_redraw();
+        }
+    }
+
+    /// Set the scrollback history limit: persist it and live-apply to EVERY
+    /// open tab — main window and detached windows alike (the whole-codebase
+    /// sweep; a detached tab carries its Terminal, so it must not be skipped).
+    /// The main window is redrawn too: a shrink can move/shrink the scrollbar.
+    fn set_scrollback_lines(&mut self, lines: usize) {
+        if self.scrollback_lines == lines {
+            return;
+        }
+        self.scrollback_lines = lines;
+        self.persist();
+        for tab in &mut self.tabs {
+            tab.terminal.set_scrollback_lines(lines);
+        }
+        for dw in &mut self.detached {
+            dw.tab.terminal.set_scrollback_lines(lines);
+            dw.window.request_redraw();
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -2506,6 +2576,7 @@ impl App {
             self.corner_radius, self.summon_effect.display_name(),
             self.window_mode.display_name(),
             if self.tab_bar_bottom { "Bottom" } else { "Top" },
+            &format_scrollback(self.scrollback_lines),
             self.dropdown_height_pct,
             self.dropdown_width_pct,
             self.window_mode == WindowMode::Dropdown, self.focus_autohide,
@@ -2537,6 +2608,7 @@ impl App {
         let focus_autohide = self.focus_autohide;
         let launch_at_login = self.launch_at_login;
         let tab_bar_name = if self.tab_bar_bottom { "Bottom" } else { "Top" };
+        let scrollback_name = format_scrollback(self.scrollback_lines);
         // Clone the small inputs build_panel needs so we can borrow the render
         // stack mutably below without overlapping the immutable self borrows.
         let families = self.font_families.clone();
@@ -2589,7 +2661,7 @@ impl App {
         let pv = jetty_render::build_panel(
             width, height, opacity, theme_idx, font_logical,
             &families, &family, font_scroll_offset, corner_radius, summon_name,
-            window_mode_name, tab_bar_name, dropdown_height_pct, dropdown_width_pct, is_dropdown, focus_autohide,
+            window_mode_name, tab_bar_name, &scrollback_name, dropdown_height_pct, dropdown_width_pct, is_dropdown, focus_autohide,
             launch_at_login,
             ui_font_logical, &ui_families, &ui_family, ui_font_scroll_offset,
             0.0, 0.0, &theme, char_w,
@@ -3834,6 +3906,14 @@ impl App {
                 // Only two positions, so prev and next both toggle.
                 self.set_tab_bar_bottom(!self.tab_bar_bottom);
             }
+            input::MouseAction::ScrollbackPrev => {
+                let v = cycle_scrollback(self.scrollback_lines, false);
+                self.set_scrollback_lines(v);
+            }
+            input::MouseAction::ScrollbackNext => {
+                let v = cycle_scrollback(self.scrollback_lines, true);
+                self.set_scrollback_lines(v);
+            }
             input::MouseAction::CycleShellPrev => {
                 self.cycle_shell(false);
             }
@@ -4689,6 +4769,11 @@ impl ApplicationHandler<AppEvent> for App {
         // p10k's cursor-position / capability queries which have tight timeouts.
         let mut terminal = Terminal::new(cols, rows);
         terminal.set_theme(self.current_theme());
+        // Apply the configured scrollback cap (guard skips the no-op
+        // set_options round-trip on the 10k default path).
+        if self.scrollback_lines != 10_000 {
+            terminal.set_scrollback_lines(self.scrollback_lines);
+        }
         // Join the PTY worker (forked in parallel with the GPU block) and resize
         // it from the provisional grid to the real cols/rows now that the cell
         // size is known.
@@ -5591,6 +5676,8 @@ impl ApplicationHandler<AppEvent> for App {
                     | input::MouseAction::WinModeNext
                     | input::MouseAction::TabBarPrev
                     | input::MouseAction::TabBarNext
+                    | input::MouseAction::ScrollbackPrev
+                    | input::MouseAction::ScrollbackNext
                     | input::MouseAction::StartDropdownDrag
                     | input::MouseAction::StartDropdownWidthDrag
                     | input::MouseAction::ToggleFocusAutoHide
@@ -7786,6 +7873,33 @@ mod printable_keystroke_tests {
     #[test]
     fn ctrl_c_is_not_printable() {
         assert!(!is_printable_keystroke(b"\x03"));
+    }
+}
+
+#[cfg(test)]
+mod scrollback_cycle_tests {
+    use super::{cycle_scrollback, format_scrollback, SCROLLBACK_STEPS};
+
+    #[test]
+    fn cycle_scrollback_snaps_and_wraps() {
+        // Exact steps move ±1 with wraparound (SummonEffect::cycle semantics).
+        assert_eq!(cycle_scrollback(10_000, true), 25_000);
+        assert_eq!(cycle_scrollback(100_000, true), 1_000, "forward wraps");
+        assert_eq!(cycle_scrollback(1_000, false), 100_000, "backward wraps");
+        // A hand-edited value snaps to its NEAREST step, then steps.
+        assert_eq!(cycle_scrollback(12_345, true), 25_000);
+        assert_eq!(cycle_scrollback(12_345, false), 5_000);
+    }
+
+    #[test]
+    fn format_scrollback_steps_and_verbatim() {
+        // Every cycler step renders in "Nk" form.
+        for s in SCROLLBACK_STEPS {
+            assert_eq!(format_scrollback(s), format!("{}k", s / 1000));
+        }
+        // Hand-edited values render verbatim.
+        assert_eq!(format_scrollback(12_345), "12345");
+        assert_eq!(format_scrollback(100), "100");
     }
 }
 

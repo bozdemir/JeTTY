@@ -443,6 +443,10 @@ pub enum MouseAction {
     TabBarPrev,
     /// User clicked the tab-bar "›" button — cycle the tab-bar position.
     TabBarNext,
+    /// User clicked the scrollback "‹" button — previous scrollback-lines step.
+    ScrollbackPrev,
+    /// User clicked the scrollback "›" button — next scrollback-lines step.
+    ScrollbackNext,
     /// User pressed on the Dropdown-height slider handle or track — start drag.
     StartDropdownDrag,
     /// User pressed on the Dropdown-width slider handle or track — start drag.
@@ -607,6 +611,13 @@ pub fn decide_mouse_press(
         }
         if point_in(&g.tab_bar_next, cx, cy) {
             return MouseAction::TabBarNext;
+        }
+        // Scrollback-lines cycle buttons.
+        if point_in(&g.scrollback_prev, cx, cy) {
+            return MouseAction::ScrollbackPrev;
+        }
+        if point_in(&g.scrollback_next, cx, cy) {
+            return MouseAction::ScrollbackNext;
         }
         // Dropdown-height slider handle or track.
         if point_in(&g.dropdown_handle, cx, cy) || point_in(&g.dropdown_track, cx, cy) {
@@ -1612,7 +1623,7 @@ mod tests {
         ];
         jetty_render::build_panel(
             1920, 1280, 0.97, 0, 15.0, &mono, "JetBrains Mono", 0,
-            8.0, "Phosphor", "Center", "Top", 0.5, 1.0, false, true,
+            8.0, "Phosphor", "Center", "Top", "10k", 0.5, 1.0, false, true,
             false, // launch_at_login
             18.0, &ui, "", 0,
             0.0, 0.0, &theme, 9.8, // char_w scale-1 fallback
@@ -1677,6 +1688,25 @@ mod tests {
         let g = &pv.geom;
         assert_eq!(click_rect(g, &g.shell_prev), MouseAction::CycleShellPrev);
         assert_eq!(click_rect(g, &g.shell_next), MouseAction::CycleShellNext);
+    }
+
+    #[test]
+    fn scrollback_cycler_clicks_decode() {
+        // The scrollback band lives on the Window tab (2).
+        let pv = panel_for_tab(2);
+        let g = &pv.geom;
+        assert_eq!(click_rect(g, &g.scrollback_prev), MouseAction::ScrollbackPrev);
+        assert_eq!(click_rect(g, &g.scrollback_next), MouseAction::ScrollbackNext);
+        // A click on the cycler BODY between the chevrons is not a scrollback
+        // action (the value area is inert).
+        let mid_x = (g.scrollback_prev.x + g.scrollback_prev.w
+            + g.scrollback_next.x) / 2.0;
+        let mid_y = g.scrollback_prev.y + g.scrollback_prev.h / 2.0;
+        let act = decide_mouse_press(Some(g), None, mid_x, mid_y);
+        assert!(
+            act != MouseAction::ScrollbackPrev && act != MouseAction::ScrollbackNext,
+            "cycler body must not decode to a scrollback action, got {act:?}"
+        );
     }
 
     #[test]

@@ -521,7 +521,7 @@ fn make_panel_geom_full(
     let ui_families = ["System Sans (default)".to_string()];
     jetty_render::build_panel(
         1000, 640, 0.7, 1, 16.0, &[], "", 0, 10.0, "Bayer",
-        "Center", "Top", 0.50, 1.0, false, true,
+        "Center", "Top", "10k", 0.50, 1.0, false, true,
         false, // launch_at_login
         16.0, &ui_families, "", 0,
         0.0, 0.0, &theme, 9.8,

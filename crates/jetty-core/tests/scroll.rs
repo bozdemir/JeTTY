@@ -49,6 +49,45 @@ fn make_term_with_lines(cols: usize, rows: usize, count: usize) -> Terminal {
 }
 
 #[test]
+fn set_scrollback_shrink_caps_and_frees_history() {
+    // 20 cols, 5 rows, ~300 lines → well over 100 lines of history.
+    let mut term = make_term_with_lines(20, 5, 300);
+    assert!(term.scroll_max() > 100, "premise: >100 history lines before shrink");
+
+    term.set_scrollback_lines(100);
+    assert_eq!(term.scroll_max(), 100, "shrink must cap history at the new limit");
+
+    // Scrolling to the very top must clamp within the new cap.
+    term.scroll_lines(1000);
+    assert!(
+        term.scroll_offset() <= 100,
+        "scroll_offset {} exceeds the shrunk cap",
+        term.scroll_offset()
+    );
+}
+
+#[test]
+fn set_scrollback_grow_raises_cap_for_new_lines() {
+    let mut term = make_term_with_lines(20, 5, 300);
+    term.set_scrollback_lines(50);
+    assert_eq!(term.scroll_max(), 50, "shrink to 50 first");
+
+    // Growing raises the cap but cannot restore already-trimmed lines.
+    term.set_scrollback_lines(200);
+    assert_eq!(
+        term.scroll_max(),
+        50,
+        "growing must NOT restore trimmed history"
+    );
+
+    // New output accumulates up to the raised cap.
+    for i in 0..300 {
+        term.feed(format!("G{}\r\n", i).as_bytes());
+    }
+    assert_eq!(term.scroll_max(), 200, "new lines fill up to the raised cap");
+}
+
+#[test]
 fn scrollback_bottom_shows_last_lines() {
     // 20 cols, 5 rows, feed 10 lines → rows 0..4 of the snapshot at bottom
     // should contain the last 5 lines (L5..L9).

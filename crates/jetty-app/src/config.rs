@@ -79,6 +79,13 @@ pub struct Config {
     /// `window_mode` — usable in both Center and Dropdown modes.
     #[serde(default = "default_tab_bar_position")]
     pub tab_bar_position: String,
+    /// Scrollback history limit in lines (default 10_000). Clamped on load to
+    /// 100..=100_000 — the ceiling is alacritty's own UI max; at ≤24 B/cell a
+    /// fully-filled 100k-line history costs hundreds of MB per tab, so raising
+    /// it further needs a memory revisit. Hand-edited values are kept verbatim
+    /// (the Settings cycler snaps to its nearest step only when clicked).
+    #[serde(default = "default_scrollback_lines")]
+    pub scrollback_lines: usize,
     /// Show the neofetch-style welcome splash on launch (dismissed on first input).
     /// Default `true`. Set to `false` to skip the splash entirely.
     #[serde(default = "default_show_welcome")]
@@ -150,6 +157,10 @@ fn default_summon_hotkey() -> String {
 
 fn default_tab_bar_position() -> String {
     "top".to_string()
+}
+
+fn default_scrollback_lines() -> usize {
+    10_000
 }
 
 fn default_show_welcome() -> bool {
@@ -279,6 +290,7 @@ impl Default for Config {
             summon_hotkey: default_summon_hotkey(),
             shell: default_shell(),
             tab_bar_position: default_tab_bar_position(),
+            scrollback_lines: default_scrollback_lines(),
             show_welcome: default_show_welcome(),
             show_perf_hud: default_show_perf_hud(),
             effects: EffectsConfig::default(),
@@ -313,6 +325,10 @@ impl Config {
             finite_or(self.dropdown_height_pct, default_dropdown_height_pct());
         self.dropdown_width_pct =
             finite_or(self.dropdown_width_pct, default_dropdown_width_pct());
+        // Not a float, but this fn is the single sanitize entry point (the name
+        // predates non-float sanitizing): keep hand-edited values verbatim, only
+        // clamp to the supported range.
+        self.scrollback_lines = self.scrollback_lines.clamp(100, 100_000);
         // Effects floats are sanitized by `EffectsConfig::clamped` (see load()).
     }
 
@@ -547,6 +563,7 @@ mod tests {
             summon_hotkey: "F12".to_string(),
             shell: "/usr/bin/zsh".to_string(),
             tab_bar_position: "bottom".to_string(),
+            scrollback_lines: 25_000,
             show_welcome: false,
             show_perf_hud: false,
             effects: EffectsConfig::default(),
@@ -578,6 +595,7 @@ mod tests {
             summon_hotkey: "F9".to_string(),
             shell: String::new(),
             tab_bar_position: "bottom".to_string(),
+            scrollback_lines: 10_000,
             show_welcome: true,
             show_perf_hud: true,
             effects: EffectsConfig::default(),
@@ -666,6 +684,29 @@ corner_radius = 8.0
         assert_eq!(cfg.opacity, 0.42);
         assert_eq!(cfg.font_size, 13.0);
         assert_eq!(cfg.corner_radius, 3.0);
+    }
+
+    #[test]
+    fn scrollback_lines_clamped_by_sanitize() {
+        // Too small clamps up to the floor.
+        let mut low = Config { scrollback_lines: 5, ..Config::default() };
+        low.sanitize_floats();
+        assert_eq!(low.scrollback_lines, 100);
+
+        // Too large clamps down to alacritty's own UI max.
+        let mut high = Config { scrollback_lines: 1_000_000, ..Config::default() };
+        high.sanitize_floats();
+        assert_eq!(high.scrollback_lines, 100_000);
+
+        // In-range hand-edited values are kept verbatim (no step snapping).
+        let mut mid = Config { scrollback_lines: 12_345, ..Config::default() };
+        mid.sanitize_floats();
+        assert_eq!(mid.scrollback_lines, 12_345);
+
+        // The default roundtrips through TOML unchanged.
+        let s = toml::to_string(&Config::default()).expect("serialize");
+        let back: Config = toml::from_str(&s).expect("parse");
+        assert_eq!(back.scrollback_lines, 10_000);
     }
 
     #[test]

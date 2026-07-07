@@ -216,6 +216,23 @@ impl Terminal {
         &self.theme
     }
 
+    /// Change the scrollback history limit LIVE. Shrinking frees the trimmed
+    /// history rows and clamps the scroll offset; growing only raises the cap —
+    /// already-trimmed lines cannot be restored (new output accumulates up to
+    /// the new limit).
+    ///
+    /// Constraints (both must hold if either construction site changes):
+    /// * `set_options` replaces the ENTIRE alacritty `Config`, so this must use
+    ///   the exact same `..Default::default()` construction as `Terminal::new`;
+    ///   a future non-default field there must be mirrored here or it would be
+    ///   silently reverted.
+    /// * `set_options` also emits `Event::Title`/`ResetTitle` via the
+    ///   `EventProxy` — currently ignored by its catch-all arm, but wiring
+    ///   those events up later would make this call spuriously reset titles.
+    pub fn set_scrollback_lines(&mut self, lines: usize) {
+        self.term.set_options(Config { scrolling_history: lines, ..Default::default() });
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
     }

@@ -104,6 +104,10 @@ pub struct PanelGeom {
     pub tab_bar_prev: Rect,
     /// Tab-bar-position "›" (next) cycle button.
     pub tab_bar_next: Rect,
+    /// Scrollback-lines "‹" (previous) cycle button.
+    pub scrollback_prev: Rect,
+    /// Scrollback-lines "›" (next) cycle button.
+    pub scrollback_next: Rect,
     /// Dropdown-height slider track.
     pub dropdown_track: Rect,
     /// Dropdown-height slider handle.
@@ -222,7 +226,8 @@ impl PanelGeom {
             theme_scroll_down, font_minus, font_plus, font_reset, title_bar,
             font_scroll_up, font_scroll_down, radius_track, radius_handle,
             summon_prev, summon_next, win_mode_prev, win_mode_next, tab_bar_prev,
-            tab_bar_next, dropdown_track, dropdown_handle, dropdown_width_track,
+            tab_bar_next, scrollback_prev, scrollback_next,
+            dropdown_track, dropdown_handle, dropdown_width_track,
             dropdown_width_handle, autohide_toggle, launch_login_toggle, shell_prev,
             shell_next, ui_font_minus, ui_font_plus, ui_font_reset,
             ui_font_scroll_up, ui_font_scroll_down, crt_enabled_toggle,
@@ -358,7 +363,7 @@ pub const CHAR_W_FALLBACK: f32 = 9.8;
 /// * Tab 1 "Fonts"   — font-size, font-family list, UI-font-size + "Aa" specimen,
 ///   UI-font-family list. (TALLEST non-scrolling tab — drives PANEL_H.)
 /// * Tab 2 "Window"  — summon effect, window mode, dropdown height, dropdown
-///   width, tab-bar position, auto-hide toggle.
+///   width, tab-bar position, scrollback lines, auto-hide toggle.
 /// * Tab 3 "Shell"   — shell picker, launch-at-login toggle.
 /// * Tab 4 "Effects" — CRT controls (enable + curvature/scanline/mask/bloom/
 ///   chromatic/vignette/tint/animate) and Caret flash/glow.
@@ -450,6 +455,10 @@ pub fn build_panel(
     summon_effect_name: &str,
     window_mode_name: &str,
     tab_bar_name: &str,
+    // `scrollback_name`: display form of the scrollback-lines limit ("10k",
+    //   or a hand-edited value verbatim). Drives the SCROLLBACK LINES cycler
+    //   band's centered value, mirroring `tab_bar_name`.
+    scrollback_name: &str,
     dropdown_height_pct: f32,
     dropdown_width_pct: f32,
     is_dropdown: bool,
@@ -609,14 +618,15 @@ pub fn build_panel(
     //   Tab 0 "Look":   opacity(56) · corner-radius(56) · theme combo(+menu)
     //   Tab 1 "Fonts":  size stepper(44) · font list(184) · UI stepper+Aa(84) · UI list
     //   Tab 2 "Window": summon(48) · win-mode(48) · drop-h(56) · drop-w(56) ·
-    //                   tab-bar(48) · auto-hide
+    //                   tab-bar(48) · scrollback(48) · auto-hide
     //   Tab 3 "Shell":  shell cycler + hint(56) · launch-at-login + hint
     let content_top = py + CONTENT_TOP_OFFSET;
     let (mut t_opacity, mut t_radius, mut t_theme) = (OFF, OFF, OFF);
     let (mut t_fontsize, mut t_fontlist, mut t_uifontsize, mut t_uifontlist) =
         (OFF, OFF, OFF, OFF);
-    let (mut t_summon, mut t_winmode, mut t_droph, mut t_dropw, mut t_tabbar, mut t_autohide) =
-        (OFF, OFF, OFF, OFF, OFF, OFF);
+    let (mut t_summon, mut t_winmode, mut t_droph, mut t_dropw, mut t_tabbar,
+         mut t_scrollback, mut t_autohide) =
+        (OFF, OFF, OFF, OFF, OFF, OFF, OFF);
     let (mut t_shell, mut t_launch) = (OFF, OFF);
     // Effects-tab band tops (15 bands, FX_PITCH px pitch each).
     // Naming: t_fx_<widget>. OFF when tab 4 is not active.
@@ -644,7 +654,8 @@ pub fn build_panel(
             t_droph = content_top + 96.0;
             t_dropw = content_top + 152.0;
             t_tabbar = content_top + 208.0;
-            t_autohide = content_top + 256.0;
+            t_scrollback = content_top + 256.0;
+            t_autohide = content_top + 304.0;
         }
         3 => {
             t_shell = content_top;
@@ -842,6 +853,7 @@ pub fn build_panel(
     let (summon_body, summon_prev, summon_next) = cycler_at(t_summon);
     let (winmode_body, win_mode_prev, win_mode_next) = cycler_at(t_winmode);
     let (tabbar_body, tab_bar_prev, tab_bar_next) = cycler_at(t_tabbar);
+    let (scrollback_body, scrollback_prev, scrollback_next) = cycler_at(t_scrollback);
 
     // --- Window tab: dropdown height / width sliders ---
     let dh_frac = ((dropdown_height_pct - 0.25) / 0.75).clamp(0.0, 1.0);
@@ -1089,7 +1101,7 @@ pub fn build_panel(
     };
 
     // Cyclers (Window + Shell tabs): body + the two inner separators.
-    for body in [&summon_body, &winmode_body, &tabbar_body, &shell_body] {
+    for body in [&summon_body, &winmode_body, &tabbar_body, &scrollback_body, &shell_body] {
         quads.push(*body);
         quads.push(seg_line(body.x + CYC_SEG, body.y));
         quads.push(seg_line(body.x + CYC_W - CYC_SEG, body.y));
@@ -1336,6 +1348,8 @@ pub fn build_panel(
     push_cycler_labels(&mut labels, t_winmode, window_mode_name);
     labels.push(("TAB BAR".to_string(), px + PAD, t_tabbar + 6.0, text_header));
     push_cycler_labels(&mut labels, t_tabbar, tab_bar_name);
+    labels.push(("SCROLLBACK LINES".to_string(), px + PAD, t_scrollback + 6.0, text_header));
+    push_cycler_labels(&mut labels, t_scrollback, scrollback_name);
 
     // DROPDOWN HEIGHT band (Window) — CAPS header + right-aligned value.
     let dh_text = if is_dropdown { text_header } else { text_hint };
@@ -1627,6 +1641,8 @@ pub fn build_panel(
         win_mode_next,
         tab_bar_prev,
         tab_bar_next,
+        scrollback_prev,
+        scrollback_next,
         dropdown_track,
         dropdown_handle,
         dropdown_width_track,
@@ -1786,6 +1802,7 @@ mod tests {
             "Phosphor",      // summon_effect_name
             "Dropdown",      // window_mode_name
             "Top",           // tab_bar_name
+            "10k",           // scrollback_name
             0.5,             // dropdown_height_pct
             0.7,             // dropdown_width_pct
             true,            // is_dropdown
@@ -1823,7 +1840,7 @@ mod tests {
             vec!["System Sans (default)".to_string(), "Inter".to_string()];
         build_panel(
             screen_w, screen_h, 0.97, 0, 15.0, &families, "JetBrains Mono", 0, 8.0,
-            "Phosphor", "Dropdown", "Top", 0.5, 0.7, true, false, false, 18.0,
+            "Phosphor", "Dropdown", "Top", "10k", 0.5, 0.7, true, false, false, 18.0,
             &ui_families, "", 0, 0.0, 0.0, &theme, char_w, "zsh", active_tab,
             &EffectsParams::default(), 0.0, false, 0,
         )
@@ -2106,13 +2123,14 @@ mod tests {
                 |g| *g.ui_font_rows.last().unwrap(),
             ],
             // Tab 2 "Window": summon, win-mode, drop-h track, drop-w track,
-            //                 tab-bar, auto-hide.
+            //                 tab-bar, scrollback, auto-hide.
             vec![
                 |g| g.summon_prev,
                 |g| g.win_mode_prev,
                 |g| g.dropdown_track,
                 |g| g.dropdown_width_track,
                 |g| g.tab_bar_prev,
+                |g| g.scrollback_prev,
                 |g| g.autohide_toggle,
             ],
             // Tab 3 "Shell": shell cycler, launch toggle.
@@ -2186,8 +2204,8 @@ mod tests {
             &["OPACITY", "CORNER RADIUS", "THEME"],
             &["FONT SIZE", "FONT", "UI FONT SIZE", "UI FONT"],
             &[
-                "SUMMON EFFECT", "WINDOW MODE", "TAB BAR", "DROPDOWN HEIGHT",
-                "DROPDOWN WIDTH", "AUTO-HIDE ON FOCUS LOSS",
+                "SUMMON EFFECT", "WINDOW MODE", "TAB BAR", "SCROLLBACK LINES",
+                "DROPDOWN HEIGHT", "DROPDOWN WIDTH", "AUTO-HIDE ON FOCUS LOSS",
             ],
             &["SHELL", "LAUNCH AT LOGIN"],
             // Tab 4 "Effects": section headers + every widget CAPS label.

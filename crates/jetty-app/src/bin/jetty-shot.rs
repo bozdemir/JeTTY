@@ -335,6 +335,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::env::var("JETTY_SHOT_PANEL_EFFECT").unwrap_or_else(|_| "Bayer".to_string()).as_str(),
                 std::env::var("JETTY_SHOT_PANEL_WINMODE").unwrap_or_else(|_| "Center".to_string()).as_str(),
                 if std::env::var("JETTY_TAB_BAR").map(|v| v == "bottom").unwrap_or(false) { "Bottom" } else { "Top" },
+                // JETTY_SHOT_PANEL_SCROLLBACK sets the SCROLLBACK LINES band's
+                // display value (test-only; defaults to "10k").
+                std::env::var("JETTY_SHOT_PANEL_SCROLLBACK")
+                    .unwrap_or_else(|_| "10k".to_string())
+                    .as_str(),
                 std::env::var("JETTY_SHOT_PANEL_DH").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.50),
                 std::env::var("JETTY_SHOT_PANEL_DW").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0),
                 std::env::var("JETTY_SHOT_PANEL_WINMODE").map(|m| m == "Dropdown").unwrap_or(false),
@@ -353,7 +358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::env::var("JETTY_SHOT_PANEL_SHELL")
                     .unwrap_or_else(|_| "System default".to_string())
                     .as_str(),
-                // JETTY_SHOT_PANEL_TAB (0..=3) selects the active settings tab
+                // JETTY_SHOT_PANEL_TAB (0..=4) selects the active settings tab
                 // (test-only; defaults to 0 = "Look").
                 std::env::var("JETTY_SHOT_PANEL_TAB")
                     .ok()
