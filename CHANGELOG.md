@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.12.1] — 2026-07-07
+
+### Fixed
+- **`dir` / `ls -C` no longer print tofu boxes between columns** — the VT
+  layer stores a literal `\t` in the cell at each tab stop (so copies
+  preserve tabs); the renderer was routing that control char to the
+  missing-glyph overdraw. Control-char cells now render as blanks.
+- **Tab-rename caret is a plain `|`** — the previous `▏` (U+258F) was a tofu
+  box on UI fonts without the Block Elements range.
+
+---
+
 ## [0.12.0] — 2026-07-07
 
 A feature release: the table-stakes terminal features JeTTY was still missing —
