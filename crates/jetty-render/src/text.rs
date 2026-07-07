@@ -915,7 +915,14 @@ impl TextLayer {
             // keeps today's split (titles → sans, rest → mono Nerd Font) so the
             // default look — including symbol glyphs — is byte-identical.
             let attrs = Attrs::new().family(ui_family.as_family(is_title, &mono_fallback));
-            buf.set_text(&mut self.font_system, text, &attrs, Shaping::Basic, None);
+            // Shaping::Advanced: chrome text now carries user/shell-controlled
+            // strings (OSC tab titles, search queries, rename buffers), so it
+            // needs cosmic-text's font fallback — under Basic every glyph the
+            // chrome family lacks (emoji, CJK, symbols on a custom UI font)
+            // rendered as a tofu box. Chrome is proportional overlay text with
+            // no grid-alignment constraint, and overlays only shape on rendered
+            // frames (idle draws nothing), so Advanced is safe here.
+            buf.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
         }
 
         // Second pass: build TextAreas with shared refs (no mutation of font_system needed).

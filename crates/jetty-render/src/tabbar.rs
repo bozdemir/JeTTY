@@ -1,5 +1,50 @@
 use crate::Rect;
 use jetty_core::Theme;
+use unicode_width::UnicodeWidthChar;
+
+/// Display cells a char occupies in the bar (wide CJK/emoji = 2). Titles are
+/// shell-controlled (OSC 0/2) and chrome shaping falls back across fonts, so
+/// truncation must count cells, not chars — a char count lets wide glyphs
+/// overflow the tab pill.
+fn cell_width(c: char) -> usize {
+    c.width().unwrap_or(0)
+}
+
+/// Total display cells of `s`.
+fn display_cells(s: &str) -> usize {
+    s.chars().map(cell_width).sum()
+}
+
+/// Longest prefix of `s` that fits in `max` display cells.
+fn take_cells(s: &str, max: usize) -> String {
+    let mut used = 0;
+    let mut out = String::new();
+    for c in s.chars() {
+        let w = cell_width(c);
+        if used + w > max {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out
+}
+
+/// Longest suffix of `s` that fits in `max` display cells (rename keeps the tail
+/// so the caret stays visible).
+fn tail_cells(s: &str, max: usize) -> String {
+    let mut used = 0;
+    let mut start = s.len();
+    for (i, c) in s.char_indices().rev() {
+        let w = cell_width(c);
+        if used + w > max {
+            break;
+        }
+        used += w;
+        start = i;
+    }
+    s[start..].to_string()
+}
 
 /// Height of the tab bar in physical pixels. The terminal grid is offset down by
 /// this amount; pixel↔cell math for the main grid subtracts it.
@@ -281,17 +326,12 @@ pub fn build_tab_bar_ex(
         if being_renamed {
             // Live edit buffer + trailing caret, front-truncated so the caret stays.
             let buf = match renaming { Some((_, b)) => b, None => "" };
-            let mut shown: String = if buf.chars().count() > max_chars - 1 {
-                let skip = buf.chars().count() - (max_chars - 1);
-                buf.chars().skip(skip).collect()
-            } else {
-                buf.to_string()
-            };
+            let mut shown = tail_cells(buf, max_chars - 1);
             shown.push('|'); // ASCII caret: every UI font has it (U+258F was tofu on fonts without Block Elements)
             title_labels.push((shown, title_x, 9.0, label_color));
         } else {
-            let shown: String = if title.chars().count() > max_chars {
-                let mut s: String = title.chars().take(max_chars - 1).collect();
+            let shown: String = if display_cells(title) > max_chars {
+                let mut s = take_cells(title, max_chars - 1);
                 s.push('…');
                 s
             } else {
@@ -528,8 +568,8 @@ pub fn build_detached_bar(
             TAB_RADIUS,
         ));
         let max_chars = (((tab_w - TITLE_PAD - 8.0) / char_w).floor() as usize).max(2);
-        let shown: String = if title.chars().count() > max_chars {
-            let mut s: String = title.chars().take(max_chars.saturating_sub(1)).collect();
+        let shown: String = if display_cells(title) > max_chars {
+            let mut s = take_cells(title, max_chars.saturating_sub(1));
             s.push('…');
             s
         } else {
@@ -564,6 +604,22 @@ mod tests {
 
     fn theme() -> Theme {
         Theme::by_name("catppuccin_mocha")
+    }
+
+    #[test]
+    fn cell_truncation_counts_display_width_not_chars() {
+        // 5 CJK chars = 10 display cells; a char count would keep all 5 in an
+        // 8-cell budget and overflow the pill.
+        assert_eq!(display_cells("你好世界啊"), 10);
+        assert_eq!(take_cells("你好世界啊", 8), "你好世界");
+        // Odd budget: a wide char that would straddle the limit is dropped.
+        assert_eq!(take_cells("你好世界啊", 7), "你好世");
+        assert_eq!(take_cells("abc", 8), "abc");
+        // Rename keeps the tail so the caret stays visible.
+        assert_eq!(tail_cells("burak@omen:~/Bozkurt", 5), "zkurt");
+        assert_eq!(tail_cells("ab你好", 5), "b你好");
+        // Zero-width chars occupy no budget.
+        assert_eq!(display_cells("a\u{200b}b"), 2);
     }
 
     #[test]
