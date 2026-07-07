@@ -161,6 +161,13 @@ pub struct TextLayer {
     /// fingerprint matches, the grid is byte-identical, so `set_rich_text`/`set_size`
     /// are skipped and cosmic-text's cached per-line shaping is reused by `prepare`.
     last_grid_hash: Option<u64>,
+    /// Cached underline/strikethrough quads and the key they were built for:
+    /// `(grid_decoration_key, cell_w bits, cell_h bits, y_offset bits)`. Rebuilt
+    /// only when that changes, so a caret-flash / CRT / scrollbar-only animate
+    /// frame (same grid) reuses them — decorations never rebuild per frame; only
+    /// the CURSOR quads do (drawn app-side). Consumed via `decoration_rects()`.
+    deco_rects: Vec<crate::quad::Rect>,
+    deco_cache_key: Option<(u64, u32, u32, u32)>,
 }
 
 impl TextLayer {
@@ -277,6 +284,8 @@ impl TextLayer {
             fallback_cells_scratch: Vec::new(),
             shape_gen: 0,
             last_grid_hash: None,
+            deco_rects: Vec::new(),
+            deco_cache_key: None,
         }
     }
 
@@ -468,6 +477,13 @@ impl TextLayer {
         self.buffer.monospace_width()
     }
 
+    /// The cached underline/strikethrough quads for the last rendered frame, built
+    /// at the `top_offset` passed to `render_to`. The caller appends these to its
+    /// Pass-4 quad batch (they draw over the glyphs, under the cursor).
+    pub fn decoration_rects(&self) -> &[crate::quad::Rect] {
+        &self.deco_rects
+    }
+
     pub fn resize(&mut self, gpu: &GpuContext) {
         // None width keeps wrapping disabled after resize.
         self.buffer.set_size(&mut self.font_system, None, None);
@@ -561,6 +577,11 @@ impl TextLayer {
         self.shape_gen.hash(&mut hasher);
         width.hash(&mut hasher);
         height.hash(&mut hasher);
+        // Separate fingerprint for the underline/strike quads (folded in the SAME
+        // per-cell loop, so no extra pass): captures decoration state that the
+        // shape hash deliberately excludes, so an underline-only change still
+        // rebuilds decorations without forcing a re-shape.
+        let mut deco_hasher = std::collections::hash_map::DefaultHasher::new();
 
         for row in 0..snapshot.rows {
             // Run-length coalesce consecutive same-fg cells into ONE span per run:
@@ -578,6 +599,7 @@ impl TextLayer {
                 // different face), while strike/underline/underline-color must NOT
                 // (they are quads). SPEED: keeps underline changes off the re-shape.
                 cell.shape_bits().hash(&mut hasher);
+                crate::quad::fold_decoration(&mut deco_hasher, cell);
                 // A glyph the primary font lacks (tofu box under Shaping::Basic, no
                 // fallback) or renders double-width (a CJK glyph advances ~2 cells and
                 // would shift the rest of the row) is blanked on the main grid so it
@@ -688,6 +710,29 @@ impl TextLayer {
         drop(family_name);
         self.text_scratch = text;
         self.cell_ranges_scratch = cell_ranges;
+
+        // Rebuild the cached underline/strike quads only when the decoration
+        // content OR the cell metrics / grid offset changed. On a caret-flash /
+        // CRT / scrollbar-only frame (same grid, same offset) this is a cheap key
+        // compare and the previously-built rects are reused (SPEED: decorations
+        // stay off the animate-only path; only the cursor quad rebuilds per frame).
+        let deco_key = (
+            deco_hasher.finish(),
+            cell_w.to_bits(),
+            cell_h.to_bits(),
+            top_offset.to_bits(),
+        );
+        if self.deco_cache_key != Some(deco_key) {
+            self.deco_rects.clear();
+            crate::quad::text_decoration_rects(
+                snapshot,
+                cell_w,
+                cell_h,
+                top_offset,
+                &mut self.deco_rects,
+            );
+            self.deco_cache_key = Some(deco_key);
+        }
 
         // Overdraw glyph prep: shape each DISTINCT char once into a cached per-char
         // buffer with Shaping::Advanced, so cosmic-text either falls back to a font
