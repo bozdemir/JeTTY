@@ -331,6 +331,19 @@ fn next_activity(
     }
 }
 
+/// Whether the Shift+drag hint pill should draw in the window identified by
+/// `id`: the shared hint must be live (`now < t`) AND tagged with THIS
+/// window — one drag must not light the pill in every window that happens to
+/// repaint during the 3.5s (F4). Generic over the id type so it is
+/// unit-testable without a winit `WindowId`.
+fn shift_hint_live_in<I: PartialEq>(
+    hint: Option<(std::time::Instant, I)>,
+    id: I,
+    now: std::time::Instant,
+) -> bool {
+    hint.is_some_and(|(t, wid)| wid == id && now < t)
+}
+
 /// Logical size of the separate Settings window — DERIVED from the panel size
 /// (+ 4px border) so it always fits exactly. Growing the panel (adding a settings
 /// row in `build_panel`) resizes this window automatically; the bottom rows
@@ -601,9 +614,13 @@ pub struct App {
     /// of being rounded to 0 and dropped. Reset on tab switch so one tab's
     /// remainder never bleeds into another.
     scroll_accum: input::ScrollAccumulator,
-    /// While `Some(t)` and `now < t`, the "Hold Shift to select" toast is drawn.
-    shift_hint_until: Option<std::time::Instant>,
+    /// While `Some((t, id))` and `now < t`, the "Hold Shift to select" toast
+    /// is drawn — ONLY in window `id`, the one the no-Shift drag happened in.
+    /// The timer is shared, but untagged it made EVERY window (main and all
+    /// detached) draw the pill and self-drive frames for the 3.5s (F4).
+    shift_hint_until: Option<(std::time::Instant, winit::window::WindowId)>,
     /// Throttle: the toast won't re-arm until `now` passes this instant.
+    /// Deliberately GLOBAL across windows (one hint per 25s app-wide).
     shift_hint_cooldown: Option<std::time::Instant>,
     /// Whether the user is currently dragging the scrollbar thumb.
     dragging_scrollbar: bool,
@@ -3901,16 +3918,19 @@ impl App {
                         }
                         // A no-Shift DRAG over a mouse-reporting app: the user
                         // was likely trying to select — surface the Shift+drag
-                        // hint, same threshold as main. The hint/cooldown fields
-                        // are shared App state, so the throttle stays global
-                        // across all windows.
+                        // hint, same threshold as main. The COOLDOWN is shared
+                        // App state (global throttle across all windows); the
+                        // visible flag is tagged with THIS window's id so only
+                        // the window the drag happened in draws the pill (F4).
                         let moved =
                             ((dw.cursor.0 - px).powi(2) + (dw.cursor.1 - py).powi(2)).sqrt();
                         let now = std::time::Instant::now();
                         let off_cooldown = self.shift_hint_cooldown.is_none_or(|t| now >= t);
                         if moved > 8.0 && off_cooldown {
-                            self.shift_hint_until =
-                                Some(now + std::time::Duration::from_millis(3500));
+                            self.shift_hint_until = Some((
+                                now + std::time::Duration::from_millis(3500),
+                                dw.window.id(),
+                            ));
                             self.shift_hint_cooldown =
                                 Some(now + std::time::Duration::from_secs(25));
                             dw.window.request_redraw();
@@ -4255,11 +4275,11 @@ impl App {
         // Same global HUD string the main status bar shows (built on the main
         // window's frames). Reading the cache never wakes anything.
         let perf_label = self.perf_label.clone();
-        // Shift+drag hint toast — the same shared flag the main window's Pass 4c
-        // reads, so the hint shows in whichever window the drag happened.
-        let shift_hint_show = self
-            .shift_hint_until
-            .is_some_and(|t| std::time::Instant::now() < t);
+        // Shift+drag hint toast — the shared timer is tagged with the window
+        // the drag happened in; captured here (Copy) and compared against
+        // THIS window's id after the dw borrow below, so only that window
+        // draws the pill (F4).
+        let shift_hint_until = self.shift_hint_until;
         // Effects inputs, captured before the mutable dw borrow below — the
         // SAME settings the main window renders with (visual parity).
         let corner_radius = self.corner_radius;
@@ -4268,6 +4288,8 @@ impl App {
         let crt_anim_live = fx.crt_anim_live();
 
         let Some(dw) = self.detached.get_mut(pos) else { return };
+        let shift_hint_show =
+            shift_hint_live_in(shift_hint_until, dw.window.id(), std::time::Instant::now());
         // Caret flash progress on THIS window's burst clock: t∈[0,1], expired at
         // 1.0 — mirrors the main window's caret_t handling (app.rs ~5214).
         let caret_t = dw.caret_anim.map(|s| {
@@ -6813,9 +6835,15 @@ impl ApplicationHandler<AppEvent> for App {
                     let now = std::time::Instant::now();
                     let off_cooldown = self.shift_hint_cooldown.is_none_or(|t| now >= t);
                     if moved > 8.0 && off_cooldown {
-                        self.shift_hint_until = Some(now + std::time::Duration::from_millis(3500));
-                        self.shift_hint_cooldown = Some(now + std::time::Duration::from_secs(25));
                         if let Some(win) = &self.window {
+                            // Tagged with the MAIN window's id: only this
+                            // window draws the pill (F4).
+                            self.shift_hint_until = Some((
+                                now + std::time::Duration::from_millis(3500),
+                                win.id(),
+                            ));
+                            self.shift_hint_cooldown =
+                                Some(now + std::time::Duration::from_secs(25));
                             win.request_redraw();
                         }
                     }
@@ -7641,9 +7669,12 @@ impl ApplicationHandler<AppEvent> for App {
                     Vec::new()
                 };
                 let welcome_open = self.welcome_open;
-                let shift_hint_show = self
-                    .shift_hint_until
-                    .is_some_and(|t| std::time::Instant::now() < t);
+                // Pill only when the hint is live AND belongs to THIS (the
+                // main) window — a detached-window drag must not light it
+                // here (F4).
+                let shift_hint_show = self.window.as_ref().is_some_and(|w| {
+                    shift_hint_live_in(self.shift_hint_until, w.id(), std::time::Instant::now())
+                });
                 // Backend name for the welcome overlay (captured before the mutable
                 // gpu borrow; falls back to "?" when gpu is not yet available).
                 let gpu_backend_name: String = self
@@ -8292,9 +8323,15 @@ impl ApplicationHandler<AppEvent> for App {
                     // Shift+drag hint toast is still showing (so it repaints away on
                     // expiry instead of freezing on screen), OR an animated CRT
                     // sub-effect is on. Idle CPU returns to ~0 once all have cleared.
-                    let hint_live = self
-                        .shift_hint_until
-                        .is_some_and(|t| std::time::Instant::now() < t);
+                    // Self-drive only when the hint belongs to THIS window;
+                    // a detached window's pill drives its own frames (F4).
+                    let hint_live = self.window.as_ref().is_some_and(|w| {
+                        shift_hint_live_in(
+                            self.shift_hint_until,
+                            w.id(),
+                            std::time::Instant::now(),
+                        )
+                    });
                     // CRT animation self-drive: keep painting ONLY while CRT is on
                     // AND at least one of roll/flicker/jitter is toggled on. Static
                     // CRT (enabled, all three off) does NOT match here, so it stays
@@ -9117,5 +9154,29 @@ mod activity_transition_tests {
         assert_eq!(next_activity(ActNone, true, true, true), Bell);
         // and never clears an already-lit indicator.
         assert_eq!(next_activity(Output, true, false, true), Output);
+    }
+}
+
+#[cfg(test)]
+mod shift_hint_tests {
+    use super::shift_hint_live_in;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn live_only_in_the_tagged_window() {
+        let now = Instant::now();
+        let hint = Some((now + Duration::from_millis(3500), 7u32));
+        // F4: the window the drag happened in shows the pill...
+        assert!(shift_hint_live_in(hint, 7u32, now));
+        // ...every other window does not.
+        assert!(!shift_hint_live_in(hint, 8u32, now));
+    }
+
+    #[test]
+    fn expired_or_absent_hint_is_dead_everywhere() {
+        let now = Instant::now();
+        let expired = Some((now - Duration::from_millis(1), 7u32));
+        assert!(!shift_hint_live_in(expired, 7u32, now));
+        assert!(!shift_hint_live_in(None, 7u32, now));
     }
 }
