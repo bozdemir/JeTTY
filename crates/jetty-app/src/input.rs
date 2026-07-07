@@ -32,6 +32,8 @@ pub enum KeyAction {
     Copy,
     /// Paste from the clipboard into the PTY (Ctrl+Shift+V).
     Paste,
+    /// Toggle the scrollback-search bar (Ctrl+Shift+F).
+    SearchToggle,
     /// Raw bytes to write to the PTY.
     Send(Vec<u8>),
     None,
@@ -59,6 +61,7 @@ pub enum KeyAction {
 /// 2. Escape                    → ClosePanel if panel open, else Send(ESC)
 /// 3. Ctrl+Shift+O              → TogglePanel
 /// 4. Ctrl+Shift+T              → CycleTheme
+///    4b. Ctrl+Shift+F         → SearchToggle (scrollback-search bar)
 /// 5. Ctrl+Shift+Equal          → OpacityUp
 /// 6. Ctrl+Shift+Minus          → OpacityDown
 /// 7. PageUp                    → ScrollPageUp (primary screen) / `\e[5~` (alt screen)
@@ -123,6 +126,9 @@ pub fn decide_key(
             PhysicalKey::Code(KeyCode::KeyT) => return KeyAction::NewTab,
             PhysicalKey::Code(KeyCode::KeyW) => return KeyAction::CloseTab,
             PhysicalKey::Code(KeyCode::KeyD) => return KeyAction::DetachTab,
+            // Scrollback search — must be intercepted before ctrl_byte, which
+            // would otherwise send 0x06 (ACK) to the PTY.
+            PhysicalKey::Code(KeyCode::KeyF) => return KeyAction::SearchToggle,
             PhysicalKey::Code(KeyCode::Tab) => return KeyAction::PrevTab,
             // Physical fallback for layouts where the logical char above is
             // unreliable (US: Shift+Equal → '+', Shift+Minus → '_').
@@ -1233,6 +1239,30 @@ mod tests {
             false, false, false,
         );
         assert_eq!(action, KeyAction::DetachTab);
+    }
+
+    #[test]
+    fn ctrl_shift_f_is_search_toggle() {
+        let action = decide_key(
+            true, true, false,
+            make_physical(KeyCode::KeyF),
+            &make_logical_char("F"),
+            false, false, false,
+        );
+        assert_eq!(action, KeyAction::SearchToggle);
+    }
+
+    #[test]
+    fn ctrl_f_without_shift_still_sends_ack() {
+        // Regression guard: plain Ctrl+F must keep sending 0x06 (ACK) to the
+        // PTY (readline forward-char); only Ctrl+SHIFT+F opens the search bar.
+        let action = decide_key(
+            true, false, false,
+            make_physical(KeyCode::KeyF),
+            &make_logical_char("f"),
+            false, false, false,
+        );
+        assert_eq!(action, KeyAction::Send(vec![0x06]));
     }
 
     #[test]

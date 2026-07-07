@@ -681,6 +681,14 @@ pub struct App {
     /// top of everything in the main window; dismissed by Esc, the "?" button,
     /// or a click outside the panel.
     help_open: bool,
+    /// Whether the scrollback-search bar (Ctrl+Shift+F) is open on the ACTIVE
+    /// tab of the main window (detached windows are out of scope). While open,
+    /// keys edit the query; Esc / ✕ / Ctrl+Shift+F close it and clear matches.
+    search_open: bool,
+    /// Last streaming refresh of the open search's matches (throttled to
+    /// 150ms on the PTY-drain path so heavy output never re-scans history
+    /// every frame). `None` until the first refresh.
+    search_refresh_at: Option<std::time::Instant>,
     /// When `Some(i)`, a "Close this tab?" confirmation popup is open for tab `i`.
     /// The × click / Ctrl+Shift+W / Ctrl+D set this instead of closing immediately;
     /// Enter (or the Close button) confirms, Esc (or Cancel / click-outside) clears.
@@ -989,6 +997,8 @@ impl App {
             perf_idle_shown: false,
             perf_label: None,
             help_open: false,
+            search_open: false,
+            search_refresh_at: None,
             confirm_close: None,
             confirm_quit: false,
             last_pos: None,
@@ -1398,6 +1408,15 @@ impl App {
         // text the user never selected. Same fix-up close_tab does (F27).
         self.selecting = false;
 
+        // Search state travels inside the Terminal, but detached windows
+        // never render it: if the searched (active) tab is leaving, close the
+        // bar and drop its matches so no invisible state rides along. The bar
+        // stays open (showing the next tab's usually-empty query) only when a
+        // NON-active tab is detached via its context menu.
+        if self.search_open && idx == prev_active {
+            self.search_open = false;
+            tab.terminal.search_clear();
+        }
         // Apply the current theme to the detached tab before it leaves.
         tab.terminal.set_theme(self.current_theme());
         // The tab becomes the visible tab of its own window; drop any pending
@@ -3246,6 +3265,13 @@ impl App {
                         self.persist();
                         if let Some(w) = &self.window { w.request_redraw(); }
                         for dw in &self.detached { dw.window.request_redraw(); }
+                        return;
+                    }
+                    // Scrollback search is main-window-only this release: a
+                    // detached window swallows the chord as a clean no-op —
+                    // it never sends 0x06 to the PTY and never opens the
+                    // main-window bar while unfocused.
+                    input::KeyAction::SearchToggle => {
                         return;
                     }
                     _ => {}
@@ -6059,6 +6085,33 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
 
+                // --- Search bar (NON-modal for the mouse): ✕ closes+clears, a
+                // click inside the panel is swallowed, clicks OUTSIDE fall
+                // through so terminal selection keeps working. Built with the
+                // SAME args as the draw call for hit parity. ---
+                if self.search_open {
+                    let theme = self.current_theme();
+                    let (q, cur, total) = {
+                        let t = &self.active_tab().terminal;
+                        let (cur, total) = t.search_counter();
+                        (t.search_query().to_string(), cur, total)
+                    };
+                    let bar = jetty_render::build_search_bar(
+                        w, self.grid_top_offset(), &theme, self.chrome_char_w(), &q, cur, total,
+                    );
+                    if input::point_in(&bar.close_rect, cx, cy) {
+                        self.search_open = false;
+                        self.active_tab_mut().terminal.search_clear();
+                        if let Some(win) = &self.window {
+                            win.request_redraw();
+                        }
+                        return;
+                    }
+                    if input::point_in(&bar.panel, cx, cy) {
+                        return;
+                    }
+                }
+
                 // --- Resize edges (borderless window): highest priority after the
                 // modal context menu. Corners > edges; a press in a resize zone
                 // starts an OS-driven resize and consumes the click so it never
@@ -6820,6 +6873,77 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     return;
                 }
+                // --- Scrollback-search bar captures all keys while open ---
+                // (after the help-Esc block, so help keeps Esc priority).
+                // Printable keys edit the query incrementally; Enter/F3 step
+                // older, Shift+Enter/Shift+F3 newer; Backspace pops; Esc /
+                // Ctrl+Shift+F close and CLEAR (no query retention). Every
+                // other Ctrl/Cmd chord is swallowed (alacritty-style) so
+                // nothing leaks to the shell while the bar owns the keyboard.
+                if self.search_open {
+                    use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+                    let ctrl = self.modifiers.control_key();
+                    let shift = self.modifiers.shift_key();
+                    let sup = self.modifiers.super_key();
+                    if ctrl
+                        && shift
+                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyF))
+                    {
+                        self.search_open = false;
+                        self.active_tab_mut().terminal.search_clear();
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            self.search_open = false;
+                            self.active_tab_mut().terminal.search_clear();
+                        }
+                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::F3) => {
+                            // Enter/F3 = older (up through history); +Shift = newer.
+                            self.active_tab_mut().terminal.search_nav(!shift);
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            let mut q = self.active_tab().terminal.search_query().to_string();
+                            q.pop();
+                            self.active_tab_mut().terminal.search_set_query(&q);
+                        }
+                        _ => {
+                            // Ctrl+Shift+V (and macOS Cmd+V) pastes into the query.
+                            let is_paste = (ctrl
+                                && shift
+                                && matches!(
+                                    event.physical_key,
+                                    PhysicalKey::Code(KeyCode::KeyV)
+                                ))
+                                || (sup
+                                    && !ctrl
+                                    && matches!(&event.logical_key,
+                                        Key::Character(s) if s.as_str() == "v" || s.as_str() == "V"));
+                            if is_paste {
+                                if let Some(text) = clipboard::get() {
+                                    let mut q =
+                                        self.active_tab().terminal.search_query().to_string();
+                                    q.extend(text.chars().filter(|c| !c.is_control()));
+                                    self.active_tab_mut().terminal.search_set_query(&q);
+                                }
+                            } else if ctrl || sup {
+                                // Swallow other Ctrl/Cmd chords while the bar is open.
+                            } else if let Some(t) = &event.text {
+                                let mut q =
+                                    self.active_tab().terminal.search_query().to_string();
+                                q.extend(t.chars().filter(|c| !c.is_control()));
+                                self.active_tab_mut().terminal.search_set_query(&q);
+                            }
+                        }
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 let ctrl = self.modifiers.control_key();
                 let shift = self.modifiers.shift_key();
                 let alt = self.modifiers.alt_key();
@@ -6933,6 +7057,7 @@ impl ApplicationHandler<AppEvent> for App {
                         input::KeyAction::Copy => "Copy",
 
                         input::KeyAction::Paste => "Paste",
+                        input::KeyAction::SearchToggle => "SearchToggle",
                         input::KeyAction::Send(_) => "Send",
                         input::KeyAction::None => "None",
                     };
@@ -6966,6 +7091,17 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     input::KeyAction::DetachTab => {
                         self.detach_tab(self.active, event_loop, None);
+                    }
+                    input::KeyAction::SearchToggle => {
+                        // Opening with a query still set on this tab re-shows
+                        // its existing matches (intentional); closing clears.
+                        self.search_open = !self.search_open;
+                        if !self.search_open {
+                            self.active_tab_mut().terminal.search_clear();
+                        }
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
                     }
                     input::KeyAction::NextTab => {
                         self.switch_tab(true);
@@ -7102,6 +7238,17 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     return;
                 }
+                // The scrollback-search bar captures IME commits so CJK users
+                // can type queries (mirrors the KeyboardInput search arm).
+                if self.search_open {
+                    let mut q = self.active_tab().terminal.search_query().to_string();
+                    q.extend(text.chars().filter(|c| !c.is_control()));
+                    self.active_tab_mut().terminal.search_set_query(&q);
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
+                    }
+                    return;
+                }
                 // Quit / close-tab confirmation popups are modal — drop it.
                 if self.confirm_quit || self.confirm_close.is_some() {
                     return;
@@ -7172,12 +7319,25 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 // Drain every tab so background shells keep running; close any
                 // whose child exited as part of the output we just drained.
-                let (_had, _activity_changed, exited) = self.drain_pty();
+                let (had, _activity_changed, exited) = self.drain_pty();
                 if !self.close_exited_tabs(exited, event_loop) {
                     return;
                 }
                 if self.tabs.is_empty() {
                     return;
+                }
+                // Streaming search refresh: stored match Points go stale as
+                // output rotates the scrollback. Re-collect at most every
+                // 150ms, only while the bar is open and only when this frame
+                // actually drained output — event-driven, zero cost otherwise.
+                if had
+                    && self.search_open
+                    && self
+                        .search_refresh_at
+                        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(150))
+                {
+                    self.active_tab_mut().terminal.search_refresh();
+                    self.search_refresh_at = Some(std::time::Instant::now());
                 }
                 // SINGLE clearing point for the activity indicator: the active
                 // tab is on screen this frame, so its pending dot is consumed.
@@ -7232,6 +7392,21 @@ impl ApplicationHandler<AppEvent> for App {
                 let tab_menu_hover = self.tab_menu_hover;
                 let tab_menu_labels = self.tab_menu_labels.clone();
                 let help_open = self.help_open;
+                // Search bar draw data + visible match highlights, captured
+                // before the mutable gpu/text borrow. Both empty/None while
+                // the bar is closed (one bool branch on the hot path).
+                let search_ui: Option<(String, usize, usize)> = if self.search_open {
+                    let t = &self.active_tab().terminal;
+                    let (cur, total) = t.search_counter();
+                    Some((t.search_query().to_string(), cur, total))
+                } else {
+                    None
+                };
+                let search_hits = if self.search_open {
+                    self.active_tab().terminal.search_viewport_hits()
+                } else {
+                    Vec::new()
+                };
                 let welcome_open = self.welcome_open;
                 let shift_hint_show = self
                     .shift_hint_until
@@ -7436,7 +7611,14 @@ impl ApplicationHandler<AppEvent> for App {
                     let (cell_w, cell_h) = text.cell_size();
                     let selection_bg = selection_bg_for(&theme);
                     let scrollbar_thumb = scrollbar_thumb_for(&theme);
-                    let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, grid_top + slide_y_offset, selection_bg);
+                    let mut bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, grid_top + slide_y_offset, selection_bg);
+                    if !search_hits.is_empty() {
+                        // Appended AFTER the selection rects so the match tint
+                        // wins where they overlap; still under the glyphs.
+                        bg_rects.extend(jetty_render::search_hit_rects(
+                            &search_hits, cell_w, cell_h, grid_top + slide_y_offset, &theme,
+                        ));
+                    }
                     quad.render_clear(
                         &gpu.device,
                         &gpu.queue,
@@ -7574,6 +7756,22 @@ impl ApplicationHandler<AppEvent> for App {
                             &gpu.device, &gpu.queue, scene_view, width, height,
                             &[(hint.to_string(), pill_x + pad, ty, [20, 20, 20])],
                         );
+                    }
+                    // Pass 4d: the scrollback-search bar (Ctrl+Shift+F) — a
+                    // themed pill at the top-right of the grid. Rides the
+                    // dropdown slide like its neighbours and is drawn BEFORE
+                    // the context menu / help / confirm passes so modals keep
+                    // visual priority over it.
+                    if let Some((q, cur, total)) = &search_ui {
+                        let sb = jetty_render::build_search_bar(
+                            width, grid_top + slide_y_offset, &theme, chrome_char_w, q, *cur, *total,
+                        );
+                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &sb.quads);
+                        if !sb.labels.is_empty() {
+                            let _ = chrome_text.render_overlays(
+                                &gpu.device, &gpu.queue, scene_view, width, height, &sb.labels,
+                            );
+                        }
                     }
                     // Pass 4b: welcome splash — drawn over the grid but UNDER all
                     // modals (context menu, help, confirm popups). Only shown when

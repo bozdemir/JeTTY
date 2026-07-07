@@ -24,6 +24,11 @@
 ///                    `link_at(row,col)` to stderr (URL under that cell, OSC 8
 ///                    or plain text) and draw the app's themed Ctrl+hover
 ///                    underline for the hit.
+///   JETTY_SHOT_SEARCH — scrollback-search self-test: set this query on the
+///                    terminal after the input (and any JETTY_SHOT_SCROLL) is
+///                    applied, print the "cur/total" counter to stderr, draw
+///                    the match highlights (current match tinted stronger) and
+///                    the themed search bar at the top-right of the grid.
 ///
 /// If the terminal bg alpha < 255, the rendered image is composited over a
 /// checkerboard (alternating 16px squares of [40,40,40] and [90,90,90]) so
@@ -239,6 +244,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // JETTY_SHOT_SEARCH — scrollback-search self-test: set the query on the
+    // terminal (incremental smart-case literal search; auto-scrolls to the
+    // current match), mirroring what Ctrl+Shift+F + typing does in the app.
+    let search_query = std::env::var("JETTY_SHOT_SEARCH").ok().filter(|s| !s.is_empty());
+    if let Some(q) = &search_query {
+        let (cur, total) = terminal.search_set_query(q);
+        eprintln!("jetty-shot: JETTY_SHOT_SEARCH={q:?} → match {cur}/{total}");
+    }
+
     // JETTY_SHOT_LINK_HOVER="row,col" — Ctrl+hover link self-test: report the
     // link under that 0-based viewport cell on stderr (so a harness can assert
     // the matched URL) and draw the SAME themed underline quads the app draws.
@@ -292,7 +306,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ((terminal.theme().bg[1] as u16 + sel_accent[1] as u16 * 2) / 3) as u8,
         ((terminal.theme().bg[2] as u16 + sel_accent[2] as u16 * 2) / 3) as u8,
     ];
-    let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, shot_grid_top, sel_bg);
+    let mut bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, shot_grid_top, sel_bg);
+    if search_query.is_some() {
+        // Same pass-1 placement as the app: match tints under the glyphs,
+        // appended after the selection rects so they win where overlapping.
+        bg_rects.extend(jetty_render::search_hit_rects(
+            &terminal.search_viewport_hits(),
+            cell_w,
+            cell_h,
+            shot_grid_top,
+            terminal.theme(),
+        ));
+    }
     quad.render_clear(
         &device,
         &queue,
@@ -473,6 +498,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Tab titles render in the proportional sans (Family::SansSerif); collect
         // them separately so the harness renders them like the live app does.
         let mut panel_title_labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
+
+        // JETTY_SHOT_SEARCH — the themed search bar (top-right of the grid),
+        // built with the SAME builder + args as the app's draw call.
+        if let Some(q) = &search_query {
+            let (cur, total) = terminal.search_counter();
+            let sb = jetty_render::build_search_bar(
+                width, shot_grid_top, terminal.theme(), chrome_char_w, q, cur, total,
+            );
+            rects.extend(sb.quads);
+            panel_labels.extend(sb.labels);
+        }
 
         // JETTY_SHOT_MENU — render the right-click context menu for visual checks.
         if env_flag("JETTY_SHOT_MENU") {

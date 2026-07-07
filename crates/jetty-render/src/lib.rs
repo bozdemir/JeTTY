@@ -14,6 +14,7 @@ mod focus;
 mod crt;
 mod welcome;
 mod caret_fx;
+mod search_bar;
 pub use gpu::GpuContext;
 pub use text::TextLayer;
 pub use quad::{QuadLayer, Rect, cell_bg_rects, default_bg_clear, scrollbar_rect, scrollbar_rect_geom, scrollbar_offset_from_cursor, SCROLLBAR_W};
@@ -34,3 +35,4 @@ pub use tabbar::{
     DetachedBar, TabActivity, TabBar, CONTROLS_W, STRIP_PAD, TABBAR_H,
 };
 pub use welcome::{build_welcome_overlay, WelcomeOverlay};
+pub use search_bar::{build_search_bar, search_hit_rects, SearchBar};

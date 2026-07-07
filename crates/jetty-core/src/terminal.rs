@@ -1,11 +1,12 @@
-use crate::snapshot::{CellSnapshot, GridSnapshot};
+use crate::snapshot::{CellSnapshot, GridSnapshot, SearchHit};
 use crate::theme::Theme;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, point_to_viewport, viewport_to_point};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -177,7 +178,26 @@ pub struct Terminal {
     /// Pending-bell flag shared with the `EventProxy` (`Event::Bell`);
     /// consumed by [`Terminal::take_bell`].
     bell: Arc<AtomicBool>,
+    /// The active scrollback-search query (what the user typed, capped at
+    /// [`SEARCH_MAX_QUERY`] chars). Empty = no active search.
+    search_query: String,
+    /// Compiled smart-case literal regex for `search_query` (None when the
+    /// query is empty or failed to compile — both render as "0/0").
+    search_regex: Option<RegexSearch>,
+    /// All matches across history+viewport, topmost→bottommost, capped at
+    /// [`SEARCH_MAX_MATCHES`]. Match `Point`s go stale as scrollback rotates;
+    /// the app calls [`Terminal::search_refresh`] (throttled) on output.
+    search_matches: Vec<Match>,
+    /// Index into `search_matches` of the CURRENT match (the counter's "n").
+    search_current: usize,
 }
+
+/// Maximum scrollback-search query length in chars (bounds per-keystroke DFA
+/// builds and the search-bar layout).
+pub const SEARCH_MAX_QUERY: usize = 256;
+/// Maximum number of collected search matches; the counter shows "5000+"
+/// when this cap is hit.
+pub const SEARCH_MAX_MATCHES: usize = 5000;
 
 /// A link found under the pointer by [`Terminal::link_at`]: the target URI
 /// plus where to underline it in the viewport.
@@ -251,6 +271,10 @@ impl Terminal {
             title_update,
             title_dirty,
             bell,
+            search_query: String::new(),
+            search_regex: None,
+            search_matches: Vec::new(),
+            search_current: 0,
         }
     }
 
@@ -634,6 +658,9 @@ impl Terminal {
         // existing lines, preserves scrollback, and adjusts the cursor position.
         let new_size = Size { cols, lines: rows };
         self.term.resize(new_size);
+        // Reflow moved every line; stored search-match Points are stale now.
+        // Cheap no-op when no search is active.
+        self.search_refresh();
     }
 
     /// Whether the shell child process has exited (or the terminal requested
@@ -814,6 +841,214 @@ impl Terminal {
         sel.update(bottom, Side::Right);
         self.term.selection = Some(sel);
     }
+
+    /// Set (or replace) the scrollback-search query and recompute all matches.
+    ///
+    /// The query is a LITERAL string (regex metachars are escaped) compiled
+    /// with alacritty's built-in smart-case: an all-lowercase query matches
+    /// case-insensitively, any uppercase char makes it case-sensitive. The
+    /// query is truncated to [`SEARCH_MAX_QUERY`] chars and matches are capped
+    /// at [`SEARCH_MAX_MATCHES`]. The current match becomes the bottom-most
+    /// match at or above the viewport bottom (nearest as the user reads up)
+    /// and the view scrolls to it if off-screen.
+    ///
+    /// Returns `(current 1-based, total)`, `(0, 0)` when there is no match
+    /// (empty query, failed compile, or genuinely nothing found).
+    pub fn search_set_query(&mut self, query: &str) -> (usize, usize) {
+        self.search_query = query.chars().take(SEARCH_MAX_QUERY).collect();
+        self.search_regex = None;
+        self.search_matches.clear();
+        self.search_current = 0;
+        if self.search_query.is_empty() {
+            return (0, 0);
+        }
+        let pattern = escape_regex_literal(&self.search_query);
+        // A failed compile (shouldn't happen for an escaped literal, but the
+        // DFA has size limits) renders as "no matches" rather than an error.
+        let Ok(regex) = RegexSearch::new(&pattern) else {
+            return (0, 0);
+        };
+        self.search_regex = Some(regex);
+        self.search_collect();
+        if self.search_matches.is_empty() {
+            return (0, 0);
+        }
+        // Current = the last match starting at or above the viewport bottom
+        // (matches are topmost→bottommost); fall back to the last one.
+        let display_offset = self.term.grid().display_offset();
+        let bottom_line = self.rows as i32 - 1 - display_offset as i32;
+        self.search_current = self
+            .search_matches
+            .iter()
+            .rposition(|m| m.start().line.0 <= bottom_line)
+            .unwrap_or(self.search_matches.len() - 1);
+        self.search_scroll_to_current();
+        (self.search_current + 1, self.search_matches.len())
+    }
+
+    /// Clear all scrollback-search state (query, matches, highlights).
+    pub fn search_clear(&mut self) {
+        self.search_query.clear();
+        self.search_regex = None;
+        self.search_matches.clear();
+        self.search_current = 0;
+    }
+
+    /// Step the current match: `forward` (Enter/F3) moves UP through history
+    /// (toward older output), `!forward` moves back down; both wrap. Scrolls
+    /// the view so the new current match is visible. Returns the counter.
+    pub fn search_nav(&mut self, forward: bool) -> (usize, usize) {
+        let len = self.search_matches.len();
+        if len == 0 {
+            return (0, 0);
+        }
+        // Matches are ordered topmost→bottommost, so "older" = smaller index.
+        self.search_current = if forward {
+            (self.search_current + len - 1) % len
+        } else {
+            (self.search_current + 1) % len
+        };
+        self.search_scroll_to_current();
+        (self.search_current + 1, len)
+    }
+
+    /// Whether a search query is currently set.
+    pub fn search_is_active(&self) -> bool {
+        !self.search_query.is_empty()
+    }
+
+    /// The active search query (empty when no search is set).
+    pub fn search_query(&self) -> &str {
+        &self.search_query
+    }
+
+    /// `(current 1-based, total)` — `(0, 0)` when there are no matches.
+    pub fn search_counter(&self) -> (usize, usize) {
+        if self.search_matches.is_empty() {
+            (0, 0)
+        } else {
+            (self.search_current + 1, self.search_matches.len())
+        }
+    }
+
+    /// Recompute matches with the existing query — called (throttled) after
+    /// new PTY output and after a resize, because stored match `Point`s go
+    /// stale when scrollback rotates or the grid reflows. Keeps the current
+    /// index pointed at the nearest surviving match; never scrolls (streaming
+    /// output must not fight the user's viewport).
+    pub fn search_refresh(&mut self) {
+        if self.search_regex.is_none() {
+            return;
+        }
+        let old_start: Option<Point> =
+            self.search_matches.get(self.search_current).map(|m| *m.start());
+        self.search_collect();
+        self.search_current = match (old_start, self.search_matches.len()) {
+            (_, 0) => 0,
+            (None, len) => len - 1,
+            (Some(p), len) => self
+                .search_matches
+                .partition_point(|m| *m.start() < p)
+                .min(len - 1),
+        };
+    }
+
+    /// Visible match segments in viewport coordinates, split per row for
+    /// wrapped matches, with the current match flagged. O(visible hits) via a
+    /// binary search over the (ordered) match list — cheap per redraw.
+    pub fn search_viewport_hits(&self) -> Vec<SearchHit> {
+        if self.search_matches.is_empty() {
+            return Vec::new();
+        }
+        let display_offset = self.term.grid().display_offset();
+        let top_line = -(display_offset as i32);
+        let bottom_line = self.rows as i32 - 1 - display_offset as i32;
+        // Matches are disjoint and ordered, so end-lines are monotonic too.
+        let first = self
+            .search_matches
+            .partition_point(|m| m.end().line.0 < top_line);
+        let mut hits = Vec::new();
+        for (i, m) in self.search_matches.iter().enumerate().skip(first) {
+            let (s, e) = (*m.start(), *m.end());
+            if s.line.0 > bottom_line {
+                break;
+            }
+            for line in s.line.0..=e.line.0 {
+                let col_start = if line == s.line.0 { s.column.0 } else { 0 };
+                let col_end = if line == e.line.0 {
+                    e.column.0
+                } else {
+                    self.cols.saturating_sub(1)
+                };
+                if let Some(vp) =
+                    point_to_viewport(display_offset, Point::new(Line(line), Column(col_start)))
+                {
+                    if vp.line < self.rows {
+                        hits.push(SearchHit {
+                            row: vp.line,
+                            col_start,
+                            col_end,
+                            is_current: i == self.search_current,
+                        });
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    /// Re-collect `search_matches` from the whole grid with the compiled
+    /// regex (topmost→bottommost, capped at [`SEARCH_MAX_MATCHES`]).
+    fn search_collect(&mut self) {
+        self.search_matches.clear();
+        let Some(regex) = self.search_regex.as_mut() else {
+            return;
+        };
+        let grid = self.term.grid();
+        let start = Point::new(grid.topmost_line(), Column(0));
+        let end = Point::new(grid.bottommost_line(), grid.last_column());
+        self.search_matches.extend(
+            RegexIter::new(start, end, Direction::Right, &self.term, regex)
+                .take(SEARCH_MAX_MATCHES),
+        );
+    }
+
+    /// Scroll so the current match is visible: no-op when it already is,
+    /// otherwise center it (clamped to the valid scroll range).
+    fn search_scroll_to_current(&mut self) {
+        let Some(m) = self.search_matches.get(self.search_current) else {
+            return;
+        };
+        let start = *m.start();
+        let display_offset = self.term.grid().display_offset();
+        if let Some(vp) = point_to_viewport(display_offset, start) {
+            if vp.line < self.rows {
+                return;
+            }
+        }
+        // Desired offset centers the match: viewport row rows/2 shows term
+        // line (rows/2 - offset), so offset = rows/2 - match_line.
+        let max = self.scroll_max() as i32;
+        let target = (self.rows as i32 / 2 - start.line.0).clamp(0, max);
+        self.scroll_to_offset(target as usize);
+    }
+}
+
+/// Escape ASCII regex metacharacters so a user query is matched literally
+/// (alacritty's `RegexSearch` always treats the pattern as a regex). Escaping
+/// never adds an uppercase char, so smart-case is preserved.
+fn escape_regex_literal(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    for c in query.chars() {
+        if matches!(
+            c,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Sanitize a shell-provided OSC 0/2 title: strip control characters
@@ -1373,6 +1608,144 @@ mod tests {
         assert_eq!(hit.uri, "https://x.io/a");
         assert_eq!(hit.spans, vec![(0, 5, 18)]);
         assert!(t.link_at(0, 0).is_none(), "the CJK cell is not a link");
+    }
+
+    #[test]
+    fn search_finds_literal_matches() {
+        let mut t = Terminal::new(40, 10);
+        t.feed(b"error one\r\nok fine\r\nerror two\r\nnothing\r\nerror three\r\n");
+        let (cur, total) = t.search_set_query("error");
+        assert_eq!(total, 3, "three literal occurrences");
+        assert!((1..=3).contains(&cur), "current is 1-based within range");
+        let hits = t.search_viewport_hits();
+        assert_eq!(hits.len(), 3, "all three matches visible");
+        for h in &hits {
+            assert_eq!(h.col_end - h.col_start + 1, 5, "each hit spans 'error'");
+        }
+    }
+
+    #[test]
+    fn search_escapes_regex_metachars() {
+        let mut t = Terminal::new(40, 5);
+        t.feed(b"1x5 125 1.5");
+        let (_, total) = t.search_set_query("1.5");
+        assert_eq!(total, 1, "'.' must be literal: only '1.5' matches");
+        let hits = t.search_viewport_hits();
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].col_start, hits[0].col_end), (8, 10));
+    }
+
+    #[test]
+    fn search_smart_case() {
+        let mut t = Terminal::new(40, 5);
+        t.feed(b"ERROR here");
+        let (_, total) = t.search_set_query("error");
+        assert_eq!(total, 1, "lowercase query is case-insensitive");
+
+        let mut t = Terminal::new(40, 5);
+        t.feed(b"error here");
+        let (_, total) = t.search_set_query("Error");
+        assert_eq!(total, 0, "uppercase in the query makes it case-sensitive");
+    }
+
+    #[test]
+    fn search_nav_wraps() {
+        let mut t = Terminal::new(40, 10);
+        t.feed(b"aaa\r\nbbb\r\naaa\r\nccc\r\naaa\r\n");
+        let (start, total) = t.search_set_query("aaa");
+        assert_eq!(total, 3);
+        // Three forward steps over three matches wrap back to the start.
+        t.search_nav(true);
+        t.search_nav(true);
+        let (cur, _) = t.search_nav(true);
+        assert_eq!(cur, start, "3 forward navs over 3 matches wrap around");
+        // And one forward + one backward is a no-op.
+        t.search_nav(true);
+        let (cur, _) = t.search_nav(false);
+        assert_eq!(cur, start, "forward then backward returns to start");
+    }
+
+    #[test]
+    fn search_scrolls_to_history_match() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"needle here\r\n");
+        for i in 0..50 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let (cur, total) = t.search_set_query("needle");
+        assert_eq!((cur, total), (1, 1));
+        assert!(t.scroll_offset() > 0, "view must scroll up to the history match");
+        let hits = t.search_viewport_hits();
+        assert!(
+            hits.iter().any(|h| h.is_current && h.row < t.rows()),
+            "current hit must be within the viewport after the scroll; got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn search_empty_query_clears() {
+        let mut t = Terminal::new(40, 5);
+        t.feed(b"error error");
+        let (_, total) = t.search_set_query("error");
+        assert_eq!(total, 2);
+        assert_eq!(t.search_set_query(""), (0, 0));
+        assert_eq!(t.search_counter(), (0, 0));
+        assert!(t.search_viewport_hits().is_empty());
+        assert!(!t.search_is_active());
+        // search_clear likewise.
+        t.search_set_query("error");
+        t.search_clear();
+        assert_eq!(t.search_counter(), (0, 0));
+        assert!(t.search_viewport_hits().is_empty());
+        assert_eq!(t.search_query(), "");
+    }
+
+    #[test]
+    fn search_survives_resize() {
+        let mut t = Terminal::new(40, 5);
+        t.feed(b"alpha beta\r\nalpha gamma\r\n");
+        let (_, total) = t.search_set_query("alpha");
+        assert_eq!(total, 2);
+        t.resize(10, 3);
+        // Matches were recomputed against the reflowed grid — no panic, and
+        // the counter stays consistent.
+        let (cur, total) = t.search_counter();
+        assert_eq!(total, 2, "both occurrences survive the reflow");
+        assert!(cur >= 1 && cur <= total);
+    }
+
+    #[test]
+    fn search_refresh_after_feed() {
+        let mut t = Terminal::new(40, 10);
+        t.feed(b"error one\r\n");
+        let (_, total) = t.search_set_query("error");
+        assert_eq!(total, 1);
+        t.feed(b"error two\r\nerror three\r\n");
+        t.search_refresh();
+        let (_, total) = t.search_counter();
+        assert_eq!(total, 3, "refresh picks up matches in new output");
+    }
+
+    #[test]
+    fn search_current_hit_flagged() {
+        let mut t = Terminal::new(40, 10);
+        t.feed(b"foo\r\nfoo\r\nfoo\r\n");
+        let (_, total) = t.search_set_query("foo");
+        assert_eq!(total, 3);
+        let hits = t.search_viewport_hits();
+        assert_eq!(
+            hits.iter().filter(|h| h.is_current).count(),
+            1,
+            "exactly one visible hit carries is_current"
+        );
+    }
+
+    #[test]
+    fn search_query_capped() {
+        let mut t = Terminal::new(40, 5);
+        let long = "x".repeat(1000);
+        t.search_set_query(&long);
+        assert_eq!(t.search_query().chars().count(), SEARCH_MAX_QUERY);
     }
 
     #[test]

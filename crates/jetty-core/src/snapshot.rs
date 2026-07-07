@@ -13,6 +13,20 @@ impl Default for CellSnapshot {
     }
 }
 
+/// One visible scrollback-search match segment in VIEWPORT coordinates
+/// (`row` 0 = top visible line; `col_end` inclusive). A match spanning
+/// multiple wrapped rows yields one `SearchHit` per row. Produced by
+/// `Terminal::search_viewport_hits`; consumed by the highlight-rect builder.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SearchHit {
+    pub row: usize,
+    pub col_start: usize,
+    pub col_end: usize,
+    /// Whether this segment belongs to the CURRENT match (the one the
+    /// counter points at) — rendered with a stronger tint.
+    pub is_current: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct GridSnapshot {
     pub cols: usize,
