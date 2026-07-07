@@ -1407,6 +1407,9 @@ impl App {
         self.tab_menu_rects.clear();
         self.tab_menu_labels.clear();
         self.tab_drag = None;
+        // A new tab is under the pointer: revalidate the cached Ctrl+hover
+        // underline against ITS grid (Ctrl+Shift+W keeps Ctrl held) (F12).
+        self.update_link_hover(true);
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -1617,6 +1620,9 @@ impl App {
 
         self.detached.push(dw);
 
+        // A different tab now sits under the main-window pointer (Ctrl+Shift+D
+        // keeps Ctrl held): revalidate the cached Ctrl+hover underline (F12).
+        self.update_link_hover(true);
         // Redraw the main window so the tab bar reflects the removed tab.
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -1668,6 +1674,9 @@ impl App {
             self.set_visibility(true, event_loop);
         }
 
+        // The reattached tab is now the active one under the pointer:
+        // revalidate the cached Ctrl+hover underline against its grid (F12).
+        self.update_link_hover(true);
         // `dw` drops here: detached window + GPU surface are closed/destroyed.
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -1744,6 +1753,10 @@ impl App {
         self.selecting = false;
         // Same for any fractional wheel remainder (it was that tab's scroll).
         self.scroll_accum.reset();
+        // And the cached link hover — Ctrl+Tab keeps Ctrl held (no
+        // ModifiersChanged) and the hovered CELL is unchanged, so without the
+        // forced recompute tab 1's underline ghosts over tab 2's text (F12).
+        self.update_link_hover(true);
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -2575,6 +2588,12 @@ impl App {
         // repaints are self-inflicted, not "unseen output" — arm the activity
         // grace so drain_pty doesn't light false dots on every resize (F3).
         self.reflow_resized_at = Some(std::time::Instant::now());
+        // The grid just reflowed under a possibly-held Ctrl+hover: the cached
+        // underline spans are in OLD-grid cell coords and the same (line,col)
+        // cell index would skip the lazy recompute — revalidate now, exactly
+        // like the scroll/tab-switch paths do (F6). No-op unless a link
+        // modifier is held.
+        self.update_link_hover(true);
     }
 
     /// Change the font size at runtime. `new_logical` is clamped to [6.0, 48.0].
@@ -2615,6 +2634,16 @@ impl App {
             dw.text.set_font_size(clamped * dscale);
             dw.reflow_pending_at = Some(reflow_at);
             dw.window.request_redraw();
+        }
+        // FontUp/Down/Reset are Ctrl chords — the link modifier is BY
+        // DEFINITION held when they fire, and the cell metrics just changed
+        // in-place: cached underline spans would draw at the new cell size in
+        // old-grid coords, and a same-index hovered cell would suppress the
+        // lazy recompute. Revalidate every window's hover now (F6); the
+        // debounced reflow() revalidates again when the grid snaps.
+        self.update_link_hover(true);
+        for pos in 0..self.detached.len() {
+            self.update_detached_link_hover(pos, true);
         }
         self.persist();
         if let Some(w) = &self.window {
@@ -5109,7 +5138,10 @@ impl ApplicationHandler<AppEvent> for App {
         {
             let status_h = self.status_h();
             let now = std::time::Instant::now();
-            for dw in &mut self.detached {
+            // Indexed loop (not iter_mut) so the reflowed window's cached
+            // Ctrl+hover can be revalidated via &mut self below (F6).
+            for pos in 0..self.detached.len() {
+                let dw = &mut self.detached[pos];
                 if dw.reflow_pending_at.is_some_and(|d| now >= d) {
                     dw.reflow_pending_at = None;
                     let (cw, ch) = dw.text.cell_size();
@@ -5125,6 +5157,9 @@ impl ApplicationHandler<AppEvent> for App {
                     dw.tab.terminal.resize(cols, rows);
                     dw.tab.pty.resize(cols as u16, rows as u16);
                     dw.window.request_redraw();
+                    // Same post-reflow hover revalidation as the main
+                    // window's reflow() (F6); no-op unless Ctrl is held.
+                    self.update_detached_link_hover(pos, true);
                 }
             }
         }
