@@ -459,6 +459,14 @@ pub fn cell_bg_rects(
 /// right (a gutter) so content never renders underneath the scrollbar.
 pub const SCROLLBAR_W: f32 = 14.0;
 
+/// Gap (px) between the scrollbar track ends and the bars, so the thumb stays
+/// clear of the tab bar / window controls. Shared by the thumb geometry and
+/// the drag inverse below so drawing and dragging can never disagree.
+pub(crate) const SCROLLBAR_GAP: f32 = 4.0;
+
+/// Minimum thumb height (px) so a huge scrollback still leaves a grabbable thumb.
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
 /// Compute the scrollbar thumb rectangle from raw geometry values.
 /// This is the canonical geometry computation shared by drawing and hit-testing.
 /// Returns `None` when `scroll_max == 0` (nothing to scroll).
@@ -481,14 +489,14 @@ pub fn scrollbar_rect_geom(
     // `screen_h - top_offset` overshot in BOTTOM-bar mode (top_offset = 0): the
     // scrollbar ran the full height and collided with the bottom window controls
     // (the ✕). A small GAP also keeps the thumb clear of the bar / controls.
-    const GAP: f32 = 4.0; // keep in sync with apply_scroll_from_cursor
-    let track_top = top_offset + GAP;
+    let track_top = top_offset + SCROLLBAR_GAP;
     // `bottom_reserve` is the height reserved at the bottom for the status bar
     // (the perf HUD) — the track must stop above it so the thumb never runs under
     // the status bar. 0 when there is no status bar.
-    let track_h = (screen_h as f32 - crate::TABBAR_H - bottom_reserve - GAP * 2.0).max(0.0);
+    let track_h =
+        (screen_h as f32 - crate::TABBAR_H - bottom_reserve - SCROLLBAR_GAP * 2.0).max(0.0);
     let total = rows + scroll_max;
-    let thumb_h = (track_h * rows as f32 / total as f32).max(24.0);
+    let thumb_h = (track_h * rows as f32 / total as f32).max(SCROLLBAR_MIN_THUMB);
     let frac = (scroll_max - scroll_offset) as f32 / scroll_max as f32;
     let travel = (track_h - thumb_h).max(0.0);
     let thumb_y = track_top + frac * travel;
@@ -501,6 +509,42 @@ pub fn scrollbar_rect_geom(
         color: thumb,
         ..Default::default()
     })
+}
+
+/// Map an absolute cursor y (physical px) to a scroll offset during a
+/// scrollbar drag — the pure inverse of `scrollbar_rect_geom`'s thumb
+/// placement (the round-trip is unit-tested). `grab_dy` is the thumb-local y
+/// offset captured at press so the thumb never jumps under the pointer.
+/// Returns `None` when there is no history (`scroll_max == 0`) or the thumb
+/// fills the track (no travel — tiny window).
+pub fn scrollbar_offset_from_cursor(
+    cursor_y: f32,
+    grab_dy: f32,
+    rows: usize,
+    scroll_max: usize,
+    screen_h: u32,
+    top_offset: f32,
+    bottom_reserve: f32,
+) -> Option<usize> {
+    if scroll_max == 0 {
+        return None;
+    }
+    // Deliberate asymmetry, mirroring scrollbar_rect_geom: the track HEIGHT
+    // always subtracts TABBAR_H (the bar takes that height whichever side it
+    // sits on) while the thumb ORIGIN uses `top_offset` (0 in bottom-bar mode).
+    let track_h =
+        (screen_h as f32 - crate::TABBAR_H - bottom_reserve - SCROLLBAR_GAP * 2.0).max(0.0);
+    let total = rows + scroll_max;
+    let thumb_h = (track_h * rows as f32 / total as f32).max(SCROLLBAR_MIN_THUMB);
+    let travel = track_h - thumb_h;
+    if travel <= 0.0 {
+        return None;
+    }
+    let thumb_top = ((cursor_y - top_offset - SCROLLBAR_GAP) - grab_dy).clamp(0.0, travel);
+    // frac=0 → thumb at top → scroll_offset=max (oldest history)
+    // frac=1 → thumb at bottom → scroll_offset=0 (live bottom)
+    let frac = thumb_top / travel;
+    Some(((1.0 - frac) * scroll_max as f32).round() as usize)
 }
 
 pub fn scrollbar_rect(
@@ -521,4 +565,65 @@ pub fn scrollbar_rect(
         bottom_reserve,
         thumb,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrollbar_offset_from_cursor_none_when_no_history() {
+        // No scrollback → nothing to drag.
+        assert_eq!(
+            scrollbar_offset_from_cursor(100.0, 0.0, 40, 0, 640, 36.0, 0.0),
+            None
+        );
+        // Window so short the (min-height) thumb fills the track → no travel.
+        assert_eq!(
+            scrollbar_offset_from_cursor(40.0, 0.0, 1000, 1, 44, 36.0, 0.0),
+            None
+        );
+    }
+
+    #[test]
+    fn scrollbar_offset_from_cursor_track_ends() {
+        let (rows, max, h, top, bottom) = (40usize, 200usize, 640u32, 36.0f32, 22.0f32);
+        // Cursor at the track top (top_offset + GAP) → oldest history.
+        let track_top = top + SCROLLBAR_GAP;
+        assert_eq!(
+            scrollbar_offset_from_cursor(track_top, 0.0, rows, max, h, top, bottom),
+            Some(max)
+        );
+        // Beyond the top end clamps to the same extreme.
+        assert_eq!(
+            scrollbar_offset_from_cursor(-500.0, 0.0, rows, max, h, top, bottom),
+            Some(max)
+        );
+        // At/below the track bottom → live bottom (offset 0), clamped too.
+        assert_eq!(
+            scrollbar_offset_from_cursor(h as f32, 0.0, rows, max, h, top, bottom),
+            Some(0)
+        );
+        assert_eq!(
+            scrollbar_offset_from_cursor(h as f32 + 500.0, 0.0, rows, max, h, top, bottom),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn scrollbar_offset_round_trips_with_rect_geom() {
+        // Drawing (rect_geom) and dragging (offset_from_cursor) must agree
+        // forever: feeding a drawn thumb's y back recovers the same offset.
+        let (rows, max, w, h, top, bottom) = (40usize, 200usize, 800u32, 640u32, 36.0f32, 22.0f32);
+        for off in [0usize, 50, 123, 200] {
+            let rect = scrollbar_rect_geom(rows, off, max, w, h, top, bottom, [0, 0, 0, 0])
+                .expect("thumb rect");
+            let rec = scrollbar_offset_from_cursor(rect.y, 0.0, rows, max, h, top, bottom)
+                .expect("offset");
+            assert!(
+                (rec as i64 - off as i64).abs() <= 1,
+                "offset {off} round-tripped to {rec}"
+            );
+        }
+    }
 }

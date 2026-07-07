@@ -252,6 +252,12 @@ pub(crate) struct DetachedWindow {
     /// window; `Some` marks the left button as held for motion reports (F5/F37).
     /// Taken on release. Mirrors `App::mouse_grab_press`.
     pub mouse_grab_press: Option<(f64, f64)>,
+    /// Whether the scrollbar thumb is being dragged in THIS window. Mirrors
+    /// `App::dragging_scrollbar` for the main window.
+    pub dragging_scrollbar: bool,
+    /// Thumb-local y grab offset captured at drag start, so the thumb never
+    /// jumps under the pointer. Mirrors `App::drag_grab_dy`.
+    pub drag_grab_dy: f32,
 }
 
 impl DetachedWindow {
@@ -395,6 +401,8 @@ impl DetachedWindow {
             scroll_accum: crate::input::ScrollAccumulator::new(),
             selecting: false,
             mouse_grab_press: None,
+            dragging_scrollbar: false,
+            drag_grab_dy: 0.0,
         })
     }
 

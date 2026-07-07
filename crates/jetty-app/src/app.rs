@@ -1692,33 +1692,19 @@ impl App {
     /// Compute the scroll offset from the current cursor position during a drag.
     /// `w` and `h` are the current surface dimensions in physical pixels.
     fn apply_scroll_from_cursor(&mut self, w: u32, h: u32) {
-        let max = self.active_tab().terminal.scroll_max();
-        if max == 0 {
-            return;
-        }
-        // The scrollbar track spans the grid area (always TABBAR_H shorter than
-        // the surface, whichever side the bar is on), minus a small GAP at each
-        // end. Must match scrollbar_rect_geom so the drawn thumb and the drag map
-        // agree.
-        const GAP: f32 = 4.0;
-        let track_h = (h as f32 - TABBAR_H - self.status_h() - GAP * 2.0).max(0.0);
-        // Recompute thumb height the same way as the geometry function.
         let rows = self.active_tab().terminal.rows();
-        let total = rows + max;
-        let thumb_h = (track_h * rows as f32 / total as f32).max(24.0);
-
-        let travel = track_h - thumb_h;
-        if travel <= 0.0 {
-            return;
+        let max = self.active_tab().terminal.scroll_max();
+        if let Some(offset) = jetty_render::scrollbar_offset_from_cursor(
+            self.cursor.1 as f32,
+            self.drag_grab_dy,
+            rows,
+            max,
+            h,
+            self.grid_top_offset(),
+            self.status_h(),
+        ) {
+            self.active_tab_mut().terminal.scroll_to_offset(offset);
         }
-
-        // Cursor y is absolute; subtract the grid origin so 0 == track top.
-        let thumb_top = ((self.cursor.1 as f32 - self.grid_top_offset() - GAP) - self.drag_grab_dy).clamp(0.0, travel);
-        // frac=0 → thumb at top → scroll_offset=max (oldest history)
-        // frac=1 → thumb at bottom → scroll_offset=0 (live bottom)
-        let frac = thumb_top / travel;
-        let offset = ((1.0 - frac) * max as f32).round() as usize;
-        self.active_tab_mut().terminal.scroll_to_offset(offset);
         // suppress unused warning on w
         let _ = w;
     }
@@ -1909,17 +1895,15 @@ impl App {
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return None;
         }
-        let cols = self.active_tab().terminal.cols().saturating_sub(1);
-        let rows = self.active_tab().terminal.rows().saturating_sub(1);
         let y = (self.cursor.1 as f32 - self.grid_top_offset()).max(0.0);
-        let x = self.cursor.0 as f32;
-        let col_f = (x / cell_w).floor();
-        let col = (col_f as i64).clamp(0, cols as i64) as usize;
-        let line = ((y / cell_h).floor() as i64).clamp(0, rows as i64) as usize;
-        // Sub-cell x fraction: the pointer is in the left half when it sits in
-        // the first half-cell-width past the cell's left edge.
-        let left_half = (x - col_f * cell_w) < cell_w * 0.5;
-        Some((line, col, left_half))
+        Some(input::cell_at_0_side(
+            self.cursor.0 as f32,
+            y,
+            cell_w,
+            cell_h,
+            self.active_tab().terminal.cols(),
+            self.active_tab().terminal.rows(),
+        ))
     }
 
     /// Paste `text` to the ACTIVE tab's PTY, wrapping in bracketed-paste
@@ -3160,6 +3144,8 @@ impl App {
                 self.modifiers = m.state();
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // &self method — must be read before the dw (self.detached) borrow.
+                let status_h = self.status_h();
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 let prev = dw.cursor;
                 dw.cursor = (position.x, position.y);
@@ -3194,17 +3180,37 @@ impl App {
                     }
                     return;
                 }
-                // --- Resize-edge cursor feedback (borderless window) ---
-                let zone = resize_zone_at(cx, cy, w, h);
-                if zone != dw.resize_zone {
-                    dw.resize_zone = zone;
-                    dw.window.set_cursor(zone.cursor_icon());
-                }
-                // --- Close ✕ hover highlight ---
-                let hover = input::point_in(&jetty_render::detached_close_rect(w), cx, cy);
-                if hover != dw.close_hover {
-                    dw.close_hover = hover;
+                // --- Scrollbar drag continuation (host widget) ---
+                // Never emits motion reports: the drag is a host interaction,
+                // not app input. Mirrors the main window's dragging_scrollbar.
+                if dw.dragging_scrollbar {
+                    let rows = dw.tab.terminal.rows();
+                    let max = dw.tab.terminal.scroll_max();
+                    if let Some(o) = jetty_render::scrollbar_offset_from_cursor(
+                        cy, dw.drag_grab_dy, rows, max, h, TABBAR_H, status_h,
+                    ) {
+                        dw.tab.terminal.scroll_to_offset(o);
+                    }
                     dw.window.request_redraw();
+                    return;
+                }
+                // Resize-edge / close-✕ hover feedback is suppressed while a
+                // selection drag is in progress (a scrollbar drag returned
+                // above) — parity with main: the cursor must not flip to a
+                // resize arrow mid-drag.
+                if !dw.selecting {
+                    // --- Resize-edge cursor feedback (borderless window) ---
+                    let zone = resize_zone_at(cx, cy, w, h);
+                    if zone != dw.resize_zone {
+                        dw.resize_zone = zone;
+                        dw.window.set_cursor(zone.cursor_icon());
+                    }
+                    // --- Close ✕ hover highlight ---
+                    let hover = input::point_in(&jetty_render::detached_close_rect(w), cx, cy);
+                    if hover != dw.close_hover {
+                        dw.close_hover = hover;
+                        dw.window.request_redraw();
+                    }
                 }
                 // --- Text-selection drag continuation / mouse motion reports ---
                 // Mirrors the main window (F37/F5): extend a local selection, or —
@@ -3212,13 +3218,11 @@ impl App {
                 let (cw, ch) = dw.text.cell_size();
                 if cw > 0.0 && ch > 0.0 {
                     if dw.selecting {
-                        let cols = dw.tab.terminal.cols().saturating_sub(1);
-                        let rows = dw.tab.terminal.rows().saturating_sub(1);
                         let gy = (cy - TABBAR_H).max(0.0);
-                        let col_f = (cx / cw).floor();
-                        let col = (col_f as i64).clamp(0, cols as i64) as usize;
-                        let line = ((gy / ch).floor() as i64).clamp(0, rows as i64) as usize;
-                        let left_half = (cx - col_f * cw) < cw * 0.5;
+                        let (line, col, left_half) = input::cell_at_0_side(
+                            cx, gy, cw, ch,
+                            dw.tab.terminal.cols(), dw.tab.terminal.rows(),
+                        );
                         dw.tab.terminal.selection_update(line, col, left_half);
                         dw.window.request_redraw();
                     } else {
@@ -3258,6 +3262,8 @@ impl App {
                     Copy,
                     Paste,
                 }
+                // &self method — must be read before the dw (self.detached) borrow.
+                let status_h = self.status_h();
                 let act = {
                     let Some(dw) = self.detached.get_mut(pos) else { return };
                     let (cx, cy) = (dw.cursor.0 as f32, dw.cursor.1 as f32);
@@ -3323,6 +3329,40 @@ impl App {
                                 return;
                             }
                         } else {
+                            // --- Scrollbar thumb drag / track jump ---
+                            // Hit-tested BEFORE mouse reports and selection, the
+                            // same priority as the main window's press handler.
+                            let rows = dw.tab.terminal.rows();
+                            let off = dw.tab.terminal.scroll_offset();
+                            let max = dw.tab.terminal.scroll_max();
+                            // Color is irrelevant for hit-test geometry.
+                            let sb = jetty_render::scrollbar_rect_geom(
+                                rows, off, max, w, h, TABBAR_H, status_h, [0, 0, 0, 0],
+                            );
+                            match input::decide_mouse_press(None, sb.as_ref(), cx, cy) {
+                                input::MouseAction::StartScrollbarDrag { grab_dy } => {
+                                    dw.dragging_scrollbar = true;
+                                    dw.drag_grab_dy = grab_dy;
+                                    return;
+                                }
+                                input::MouseAction::ScrollbarTrackJump => {
+                                    // Jump the thumb's CENTER to the click, then
+                                    // keep dragging from there (mirrors main).
+                                    dw.dragging_scrollbar = true;
+                                    dw.drag_grab_dy =
+                                        sb.as_ref().map(|r| r.h / 2.0).unwrap_or(0.0);
+                                    if let Some(o) = jetty_render::scrollbar_offset_from_cursor(
+                                        cy, dw.drag_grab_dy, rows, max, h, TABBAR_H, status_h,
+                                    ) {
+                                        dw.tab.terminal.scroll_to_offset(o);
+                                    }
+                                    dw.window.request_redraw();
+                                    return;
+                                }
+                                // Panel variants are unreachable (panel = None);
+                                // anything else falls through to the grid press.
+                                _ => {}
+                            }
                             // Grid-area press (F37): forward a mouse report to a
                             // mouse-reporting app (unless Shift overrides), else
                             // begin a local text selection — same as the main window.
@@ -3345,12 +3385,10 @@ impl App {
                                     dw.mouse_grab_press = Some(dw.cursor);
                                 } else {
                                     dw.tab.terminal.selection_clear();
-                                    let cols = dw.tab.terminal.cols().saturating_sub(1);
-                                    let rows = dw.tab.terminal.rows().saturating_sub(1);
-                                    let col_f = (cx / cw).floor();
-                                    let col = (col_f as i64).clamp(0, cols as i64) as usize;
-                                    let line = ((gy / ch).floor() as i64).clamp(0, rows as i64) as usize;
-                                    let left_half = (cx - col_f * cw) < cw * 0.5;
+                                    let (line, col, left_half) = input::cell_at_0_side(
+                                        cx, gy, cw, ch,
+                                        dw.tab.terminal.cols(), dw.tab.terminal.rows(),
+                                    );
                                     dw.tab.terminal.selection_start(line, col, left_half);
                                     dw.selecting = true;
                                     dw.window.request_redraw();
@@ -3397,6 +3435,14 @@ impl App {
                 // window's release logic.
                 {
                     let Some(dw) = self.detached.get_mut(pos) else { return };
+                    // A release ending a scrollbar drag is a host-widget
+                    // interaction: it must never end a selection, emit a mouse
+                    // report, or count as a bar-drag drop (mirrors main's
+                    // was_dragging guard).
+                    if dw.dragging_scrollbar {
+                        dw.dragging_scrollbar = false;
+                        return;
+                    }
                     if dw.selecting {
                         dw.selecting = false;
                         match dw.tab.terminal.selection_text() {
@@ -3407,7 +3453,7 @@ impl App {
                         dw.window.request_redraw();
                         return;
                     }
-                    if dw.mouse_grab_press.take().is_some() {
+                    if let Some((px, py)) = dw.mouse_grab_press.take() {
                         let (cw, ch) = dw.text.cell_size();
                         if cw > 0.0 && ch > 0.0 {
                             let gy = (dw.cursor.1 as f32 - TABBAR_H).max(0.0);
@@ -3419,6 +3465,22 @@ impl App {
                                 input::MouseEvent::LeftRelease, col, row, sgr);
                             let _ = dw.tab.writer.write_all(&bytes);
                             let _ = dw.tab.writer.flush();
+                        }
+                        // A no-Shift DRAG over a mouse-reporting app: the user
+                        // was likely trying to select — surface the Shift+drag
+                        // hint, same threshold as main. The hint/cooldown fields
+                        // are shared App state, so the throttle stays global
+                        // across all windows.
+                        let moved =
+                            ((dw.cursor.0 - px).powi(2) + (dw.cursor.1 - py).powi(2)).sqrt();
+                        let now = std::time::Instant::now();
+                        let off_cooldown = self.shift_hint_cooldown.is_none_or(|t| now >= t);
+                        if moved > 8.0 && off_cooldown {
+                            self.shift_hint_until =
+                                Some(now + std::time::Duration::from_millis(3500));
+                            self.shift_hint_cooldown =
+                                Some(now + std::time::Duration::from_secs(25));
+                            dw.window.request_redraw();
                         }
                         return;
                     }
@@ -3517,6 +3579,36 @@ impl App {
                 dw.menu_rects = menu.item_rects;
                 dw.window.request_redraw();
             }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } => {
+                // Middle-click paste, mirroring the main window's arm with this
+                // window's equivalent gates:
+                //  - the context menu (this window's only modal) open → swallow;
+                //  - only paste over the terminal grid, never the chrome strips;
+                //  - when the app grabbed the mouse (mouse_mode) and Shift is not
+                //    held, the button belongs to the app — do NOT inject a paste.
+                // Pastes the CLIPBOARD selection (same source as main).
+                let shift = self.modifiers.shift_key();
+                let status_h = self.status_h();
+                let Some(dw) = self.detached.get_mut(pos) else { return };
+                if dw.menu_open.is_some() {
+                    return;
+                }
+                let cy = dw.cursor.1 as f32;
+                let h = dw.gpu.config.height as f32;
+                if cy < TABBAR_H || cy >= h - status_h {
+                    return;
+                }
+                if dw.tab.terminal.mouse_mode() && !shift {
+                    return;
+                }
+                if let Some(text) = clipboard::get() {
+                    Self::paste_to_tab(&mut dw.tab, &text);
+                }
+            }
             WindowEvent::Focused(true) if pos < self.detached.len() => {
                 // OUR detached window now holds focus: record it and keep the
                 // switch flag set so the main window's Focused(false) auto-hide
@@ -3554,6 +3646,7 @@ impl App {
                     // gone — clear it so it doesn't resume stuck (F14).
                     dw.selecting = false;
                     dw.mouse_grab_press = None;
+                    dw.dragging_scrollbar = false;
                 }
                 // F14: focus is leaving THIS detached window. If it departs to a
                 // foreign app (not another JeTTY window), the main dropdown must
@@ -3712,6 +3805,11 @@ impl App {
         // Same global HUD string the main status bar shows (built on the main
         // window's frames). Reading the cache never wakes anything.
         let perf_label = self.perf_label.clone();
+        // Shift+drag hint toast — the same shared flag the main window's Pass 4c
+        // reads, so the hint shows in whichever window the drag happened.
+        let shift_hint_show = self
+            .shift_hint_until
+            .is_some_and(|t| std::time::Instant::now() < t);
         // Effects inputs, captured before the mutable dw borrow below — the
         // SAME settings the main window renders with (visual parity).
         let corner_radius = self.corner_radius;
@@ -3835,6 +3933,29 @@ impl App {
                 );
             }
         }
+        // Pass 5b: Shift+drag hint toast — the main window's Pass 4c pill,
+        // byte-for-byte, positioned above the status strip (the detached bar is
+        // always on top, so no bottom-bar / slide offset terms apply). Drawn
+        // only on frames where the 3.5s flag is live — no steady-state cost.
+        if shift_hint_show {
+            let hint = "Hold Shift while dragging to select text";
+            let tw = hint.chars().count() as f32 * chrome_char_w;
+            let pad = 14.0;
+            let pill_w = tw + pad * 2.0;
+            let pill_h = 26.0;
+            let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
+            let pill_y = (height as f32 - status_h - 14.0 - pill_h).max(0.0);
+            let c = theme.cursor;
+            let pill = jetty_render::Rect::rounded(
+                pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
+            );
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill]);
+            let ty = pill_y + (pill_h - 16.0) / 2.0;
+            let _ = chrome_text.render_overlays(
+                &gpu.device, &gpu.queue, scene_view, width, height,
+                &[(hint.to_string(), pill_x + pad, ty, [20, 20, 20])],
+            );
+        }
         // Pass 6: the Reattach/Copy/Paste context menu on top of everything.
         if let Some((mx, my)) = menu_open {
             let items: Vec<(&str, &str)> = crate::detached::DETACHED_MENU_ITEMS
@@ -3900,12 +4021,15 @@ impl App {
             );
         }
         frame.present();
-        // Self-drive the next frame ONLY while the caret flash is mid-burst or
-        // an animated CRT sub-effect is on — the same damage-driven gates as the
-        // main window (app.rs ~5654). Idle returns to 0-CPU once both clear.
-        // Also gated on the window not being occluded/minimized so a hidden
-        // detached window returns to true idle instead of self-driving forever (F8).
-        if !dw.occluded && (dw.caret_anim.is_some() || crt_anim_live) {
+        // Self-drive the next frame ONLY while the caret flash is mid-burst, an
+        // animated CRT sub-effect is on, or the Shift+drag hint toast is still
+        // showing (so it repaints away on expiry instead of freezing on screen)
+        // — the same damage-driven gates as the main window (its RedrawRequested
+        // has the identical hint_live term). Idle returns to 0-CPU once all
+        // clear. Also gated on the window not being occluded/minimized so a
+        // hidden detached window returns to true idle instead of self-driving
+        // forever (F8).
+        if !dw.occluded && (dw.caret_anim.is_some() || crt_anim_live || shift_hint_show) {
             dw.window.request_redraw();
         }
     }

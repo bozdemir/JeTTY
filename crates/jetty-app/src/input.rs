@@ -945,6 +945,30 @@ pub fn cell_at_clamped(
     )
 }
 
+/// Convert a pixel position to 0-based viewport cell coordinates
+/// `(line, col, left_half)` CLAMPED to the grid. `y_grid` is grid-relative
+/// (the caller subtracts the bar origin and floors at 0). `left_half` is
+/// whether the pointer sits in the LEFT half of its cell — selection
+/// start/update derive the endpoint `Side` from it (F4): hardcoding
+/// Left-at-press / Right-at-update dropped the endpoint cells on a reverse
+/// drag. Callers guarantee `cell_w`/`cell_h` > 0.
+pub fn cell_at_0_side(
+    x: f32,
+    y_grid: f32,
+    cell_w: f32,
+    cell_h: f32,
+    cols: usize,
+    rows: usize,
+) -> (usize, usize, bool) {
+    let col_f = (x / cell_w).floor();
+    let col = (col_f as i64).clamp(0, cols.saturating_sub(1) as i64) as usize;
+    let line = ((y_grid / cell_h).floor() as i64).clamp(0, rows.saturating_sub(1) as i64) as usize;
+    // Sub-cell x fraction: the pointer is in the left half when it sits in
+    // the first half-cell-width past the cell's left edge.
+    let left_half = (x - col_f * cell_w) < cell_w * 0.5;
+    (line, col, left_half)
+}
+
 /// Dead-key / compose fallback for the plain printable-send path.
 ///
 /// When a dead-key sequence composes (e.g. `'` then `e` on US-International),
@@ -1497,6 +1521,31 @@ mod tests {
     #[test]
     fn cell_at_clamped_negative_clamps_to_one() {
         assert_eq!(cell_at_clamped(-5.0, -5.0, 10.0, 10.0, 80, 24), (1, 1));
+    }
+
+    // ── 0-based selection cell + sub-cell side (shared by all windows) ──────
+
+    #[test]
+    fn cell_at_0_side_interior_and_halves() {
+        // 10×20 cells, 80×24 grid: y=30 → line 1, x≈25 → col 2 (0-based).
+        // Exactly the half-width boundary counts as the RIGHT half.
+        assert_eq!(cell_at_0_side(25.0, 30.0, 10.0, 20.0, 80, 24), (1, 2, false));
+        assert_eq!(cell_at_0_side(24.9, 30.0, 10.0, 20.0, 80, 24), (1, 2, true));
+        assert_eq!(cell_at_0_side(25.1, 30.0, 10.0, 20.0, 80, 24), (1, 2, false));
+        assert_eq!(cell_at_0_side(21.0, 30.0, 10.0, 20.0, 80, 24), (1, 2, true));
+    }
+
+    #[test]
+    fn cell_at_0_side_clamps_to_grid() {
+        // Negative coordinates clamp to the first cell.
+        let (line, col, _) = cell_at_0_side(-5.0, -5.0, 10.0, 20.0, 80, 24);
+        assert_eq!((line, col), (0, 0));
+        // Beyond the last cell clamps to the last line/column.
+        let (line, col, _) = cell_at_0_side(9000.0, 9000.0, 10.0, 20.0, 80, 24);
+        assert_eq!((line, col), (23, 79));
+        // Degenerate 0×0 grid must not panic (saturating_sub path).
+        let (line, col, _) = cell_at_0_side(25.0, 30.0, 10.0, 20.0, 0, 0);
+        assert_eq!((line, col), (0, 0));
     }
 
     // ── Dead-key composed text override (C3) ────────────────────────────────

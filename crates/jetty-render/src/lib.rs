@@ -16,7 +16,7 @@ mod welcome;
 mod caret_fx;
 pub use gpu::GpuContext;
 pub use text::TextLayer;
-pub use quad::{QuadLayer, Rect, cell_bg_rects, default_bg_clear, scrollbar_rect, scrollbar_rect_geom, SCROLLBAR_W};
+pub use quad::{QuadLayer, Rect, cell_bg_rects, default_bg_clear, scrollbar_rect, scrollbar_rect_geom, scrollbar_offset_from_cursor, SCROLLBAR_W};
 pub use panel::{build_panel, EffectsParams, PanelView, PanelGeom, PANEL_W, PANEL_H,
                 EFFECTS_CONTENT_H, EFFECTS_VISIBLE_H, CHAR_W_FALLBACK};
 pub use mask::{CornerMask, rounded_rect_coverage, rounded_rect_coverage_per};
