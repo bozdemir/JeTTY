@@ -2,7 +2,7 @@ use crate::snapshot::{CellSnapshot, GridSnapshot};
 use crate::theme::Theme;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
@@ -177,6 +177,16 @@ pub struct Terminal {
     /// Pending-bell flag shared with the `EventProxy` (`Event::Bell`);
     /// consumed by [`Terminal::take_bell`].
     bell: Arc<AtomicBool>,
+}
+
+/// A link found under the pointer by [`Terminal::link_at`]: the target URI
+/// plus where to underline it in the viewport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkHit {
+    pub uri: String,
+    /// Viewport underline spans: `(row, col_start, col_end)` inclusive,
+    /// clipped to the visible grid.
+    pub spans: Vec<(usize, usize, usize)>,
 }
 
 impl Terminal {
@@ -682,6 +692,102 @@ impl Terminal {
         self.term.selection_to_string()
     }
 
+    /// Find a link at the given 0-based viewport cell, or `None`.
+    ///
+    /// Checks the cell's OSC 8 hyperlink first (fully wired by
+    /// alacritty_terminal via `Cell::hyperlink()`), then falls back to
+    /// plain-text detection: the WRAPLINE-assembled logical line around the
+    /// hovered row (capped at [`crate::url::MAX_WRAP_WALK`] rows each way) is
+    /// scanned by [`crate::url::find_url_at`]. Spans are recomputed from a
+    /// fresh grid on every call — callers must never store terminal `Point`s
+    /// across grid changes (history can shrink between hover and recompute).
+    pub fn link_at(&self, viewport_line: usize, col: usize) -> Option<LinkHit> {
+        let viewport_line = viewport_line.min(self.rows.saturating_sub(1));
+        let col = col.min(self.cols.saturating_sub(1));
+        let grid = self.term.grid();
+        let display_offset = grid.display_offset();
+        let pt = viewport_to_point(display_offset, Point::new(viewport_line, Column(col)));
+
+        // OSC 8 branch: underline the visible cells carrying the same link id
+        // (id equality groups multi-segment links exactly as the app emitted
+        // them; id-less links share one generated id per OSC run).
+        if let Some(link) = grid[pt].hyperlink() {
+            let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+            for vp_row in 0..self.rows {
+                let line = viewport_to_point(display_offset, Point::new(vp_row, Column(0))).line;
+                for c in 0..self.cols {
+                    let same = grid[Point::new(line, Column(c))]
+                        .hyperlink()
+                        .is_some_and(|h| h.id() == link.id());
+                    if same {
+                        match spans.last_mut() {
+                            Some(s) if s.0 == vp_row && s.2 + 1 == c => s.2 = c,
+                            _ => spans.push((vp_row, c, c)),
+                        }
+                    }
+                }
+            }
+            return Some(LinkHit { uri: link.uri().to_string(), spans });
+        }
+
+        // Plain-text branch: assemble the logical (unwrapped) line. A row
+        // continues onto the next when ITS last cell carries WRAPLINE.
+        let last_col = Column(self.cols - 1);
+        let wrapped = |l: i32| grid[Line(l)][last_col].flags.contains(Flags::WRAPLINE);
+        let mut start_line = pt.line.0;
+        let top = grid.topmost_line().0;
+        for _ in 0..crate::url::MAX_WRAP_WALK {
+            if start_line > top && wrapped(start_line - 1) {
+                start_line -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut end_line = pt.line.0;
+        let bottom = grid.bottommost_line().0;
+        for _ in 0..crate::url::MAX_WRAP_WALK {
+            if end_line < bottom && wrapped(end_line) {
+                end_line += 1;
+            } else {
+                break;
+            }
+        }
+        // Exactly `cols` chars per row so char index i maps back to cell
+        // (start_line + i/cols, i % cols); wide-char spacers blank to ' '
+        // (same rule as `snapshot`) to keep cell/char indices aligned.
+        let mut chars: Vec<char> =
+            Vec::with_capacity((end_line - start_line + 1) as usize * self.cols);
+        for l in start_line..=end_line {
+            let row = &grid[Line(l)];
+            for c in 0..self.cols {
+                let cell = &row[Column(c)];
+                chars.push(if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    ' '
+                } else {
+                    cell.c
+                });
+            }
+        }
+        let idx = (pt.line.0 - start_line) as usize * self.cols + col;
+        let (s, e) = crate::url::find_url_at(&chars, idx)?;
+        let uri: String = chars[s..e].iter().collect();
+        // Map the char range back to viewport spans, keeping only visible rows.
+        let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+        for i in s..e {
+            let term_line = start_line + (i / self.cols) as i32;
+            let c = i % self.cols;
+            if let Some(vp) = point_to_viewport(display_offset, Point::new(Line(term_line), Column(c))) {
+                if vp.line < self.rows {
+                    match spans.last_mut() {
+                        Some(sp) if sp.0 == vp.line && sp.2 + 1 == c => sp.2 = c,
+                        _ => spans.push((vp.line, c, c)),
+                    }
+                }
+            }
+        }
+        Some(LinkHit { uri, spans })
+    }
+
     /// Whether the terminal has bracketed paste mode enabled (`\e[?2004h`).
     pub fn bracketed_paste(&self) -> bool {
         use alacritty_terminal::term::TermMode;
@@ -702,7 +808,6 @@ impl Terminal {
         // `history_size()` lines of scrollback live above line 0.
         // We want to start at the very top of history and end at the last row.
         // alacritty's Line type is a newtype over i32 (via index::Line).
-        use alacritty_terminal::index::Line;
         let top = Point::new(Line(-(history as i32)), Column(0));
         let bottom = Point::new(Line(rows as i32 - 1), Column(cols.saturating_sub(1)));
         let mut sel = Selection::new(SelectionType::Simple, top, Side::Left);
@@ -1179,6 +1284,95 @@ mod tests {
         t.feed(b"\x1b]2;a\x07\x1b]2;b\x07");
         assert_eq!(t.take_title_update(), Some(Some("b".to_string())));
         assert_eq!(t.take_title_update(), None, "coalesced into one update");
+    }
+
+    #[test]
+    fn link_at_plain_url_single_row() {
+        let mut t = Terminal::new(60, 5);
+        t.feed(b"see https://example.com/page now");
+        // "https://example.com/page" occupies cols 4..=27.
+        let hit = t.link_at(0, 10).expect("URL under cursor");
+        assert_eq!(hit.uri, "https://example.com/page");
+        assert_eq!(hit.spans, vec![(0, 4, 27)]);
+        // Every column of the URL hits; the surrounding text misses.
+        for c in 4..=27 {
+            assert!(t.link_at(0, c).is_some(), "col {c} should hit");
+        }
+        assert!(t.link_at(0, 0).is_none(), "'see' is not a link");
+        assert!(t.link_at(0, 30).is_none(), "'now' is not a link");
+    }
+
+    #[test]
+    fn link_at_wrapped_url_spans_both_rows() {
+        // 20 cols: the 26-char URL wraps onto a second visual row (WRAPLINE).
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"https://example.com/abcdef");
+        // Hover the SECOND visual row: the full unwrapped URL must come back.
+        let hit = t.link_at(1, 2).expect("wrapped URL under cursor");
+        assert_eq!(hit.uri, "https://example.com/abcdef");
+        assert_eq!(hit.spans, vec![(0, 0, 19), (1, 0, 5)]);
+        // Hovering the first row yields the same hit.
+        assert_eq!(t.link_at(0, 5), Some(hit));
+    }
+
+    #[test]
+    fn link_at_explicit_newline_does_not_join_rows() {
+        // A real \r\n between two charset runs must NOT merge them (no
+        // WRAPLINE), unlike the wrapped case above.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"foo/bar.baz\r\nhttps://x.io");
+        let hit = t.link_at(1, 3).expect("URL on row 1");
+        assert_eq!(hit.uri, "https://x.io");
+        assert_eq!(hit.spans, vec![(1, 0, 11)]);
+        assert!(t.link_at(0, 3).is_none(), "row 0 alone is not a URL");
+    }
+
+    #[test]
+    fn link_at_osc8_hyperlink() {
+        let mut t = Terminal::new(40, 5);
+        t.feed(b"\x1b]8;;https://example.com\x1b\\click me\x1b]8;;\x1b\\ plain");
+        let hit = t.link_at(0, 2).expect("OSC 8 link under 'click'");
+        assert_eq!(hit.uri, "https://example.com");
+        // Exactly the 8 label cells ("click me"), nothing after the OSC close.
+        assert_eq!(hit.spans, vec![(0, 0, 7)]);
+        assert!(t.link_at(0, 10).is_none(), "'plain' carries no link");
+    }
+
+    #[test]
+    fn link_at_non_link_cell_is_none() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"hello world");
+        assert!(t.link_at(0, 2).is_none());
+        assert!(t.link_at(3, 0).is_none(), "empty row");
+    }
+
+    #[test]
+    fn link_at_scrolled_viewport_maps_history() {
+        let mut t = Terminal::new(30, 5);
+        t.feed(b"https://early.example/x\r\n");
+        for i in 0..30 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        // At the live bottom the URL is out of view.
+        assert!(t.link_at(0, 3).is_none());
+        // Scroll to the very top of history: the URL is viewport row 0 again.
+        t.scroll_lines(1000);
+        let hit = t.link_at(0, 3).expect("URL in scrollback");
+        assert_eq!(hit.uri, "https://early.example/x");
+        assert_eq!(hit.spans, vec![(0, 0, 22)]);
+    }
+
+    #[test]
+    fn link_at_after_wide_chars_keeps_alignment() {
+        // Two CJK cells (each WIDE_CHAR + spacer) precede the URL; the spacer
+        // → ' ' rule keeps char indices == cell columns.
+        let mut t = Terminal::new(30, 5);
+        t.feed("世界 https://x.io/a".as_bytes());
+        // 世(0)+spacer(1) 界(2)+spacer(3) space(4) URL cols 5..=18.
+        let hit = t.link_at(0, 8).expect("URL after CJK text");
+        assert_eq!(hit.uri, "https://x.io/a");
+        assert_eq!(hit.spans, vec![(0, 5, 18)]);
+        assert!(t.link_at(0, 0).is_none(), "the CJK cell is not a link");
     }
 
     #[test]
