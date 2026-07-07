@@ -592,6 +592,14 @@ pub struct App {
     active_fx_drag: Option<FxSlider>,
     /// Whether the user is currently dragging a text selection with the mouse.
     selecting: bool,
+    /// The link under the pointer while the link modifier (Ctrl; also Cmd on
+    /// macOS) is held — drawn as an underline and opened on click. Cached
+    /// app-side keyed on `link_hover_cell`; spans are revalidated on grid
+    /// change (never terminal `Point`s, which history trimming invalidates).
+    link_hover: Option<jetty_core::LinkHit>,
+    /// The hovered 0-based grid cell `(line, col)` the cache above was
+    /// computed for; hover recompute is skipped while the cell is unchanged.
+    link_hover_cell: Option<(usize, usize)>,
     /// Whether JETTY_DEBUG is set — enables input/panel state logging to stderr.
     debug: bool,
     /// When Some, the right-click context menu is open at this physical-pixel position.
@@ -809,6 +817,23 @@ pub(crate) fn resize_zone_at(cx: f32, cy: f32, w: u32, h: u32) -> ResizeZone {
     ResizeZone::None
 }
 
+/// Whether the link-trigger modifier is held: Ctrl on every platform, PLUS
+/// Cmd (Super) additionally on macOS only — the platform's link convention.
+/// `cfg!` keeps both arms compiled on both OSes.
+fn link_modifier_held(m: &winit::keyboard::ModifiersState) -> bool {
+    m.control_key() || (cfg!(target_os = "macos") && m.super_key())
+}
+
+/// Scheme allowlist for Ctrl+click-to-open: only http/https/file may reach
+/// the platform opener (never javascript:/mailto:/arbitrary handlers).
+/// ASCII case-insensitive, pure — unit-tested without spawning anything.
+fn url_scheme_allowed(url: &str) -> bool {
+    ["http://", "https://", "file://"]
+        .iter()
+        // `get` (not slicing) so a multibyte char at the boundary can't panic.
+        .any(|p| url.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p)))
+}
+
 impl App {
     pub fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
         // Resolve initial theme index from JETTY_THEME env var.
@@ -926,6 +951,8 @@ impl App {
             dragging_radius: false,
             active_fx_drag: None,
             selecting: false,
+            link_hover: None,
+            link_hover_cell: None,
             debug,
             context_menu: None,
             menu_item_rects: Vec::new(),
@@ -1664,6 +1691,8 @@ impl App {
         self.selecting = false;
         // Same for any fractional wheel remainder (it was that tab's scroll).
         self.scroll_accum.reset();
+        // And the cached link hover — recompute against the NEW tab's grid.
+        self.update_link_hover(true);
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -1705,6 +1734,9 @@ impl App {
         ) {
             self.active_tab_mut().terminal.scroll_to_offset(offset);
         }
+        // Scrollbar interaction moved the viewport: refresh (in practice,
+        // clear — the drag gate) the link hover so no stale underline rides it.
+        self.update_link_hover(true);
         // suppress unused warning on w
         let _ = w;
     }
@@ -1904,6 +1936,188 @@ impl App {
             self.active_tab().terminal.cols(),
             self.active_tab().terminal.rows(),
         ))
+    }
+
+    /// The cursor icon the main window should show for `zone`: the link
+    /// pointer wins over the default arrow, resize arrows win over both.
+    fn desired_cursor(&self, zone: ResizeZone) -> winit::window::CursorIcon {
+        if zone == ResizeZone::None && self.link_hover.is_some() {
+            winit::window::CursorIcon::Pointer
+        } else {
+            zone.cursor_icon()
+        }
+    }
+
+    /// Recompute (or clear) the main window's Ctrl+hover link state. Fully
+    /// event-driven: zero work unless the link modifier is held, and the
+    /// terminal is only scanned when the hovered CELL changed (`force` skips
+    /// that cache — used when the grid/viewport moved under a still pointer).
+    fn update_link_hover(&mut self, force: bool) {
+        // Same modal predicate as the resize-cursor block in CursorMoved.
+        let modal_open = self.confirm_quit
+            || self.confirm_close.is_some()
+            || self.help_open
+            || self.context_menu.is_some()
+            || self.tab_menu.is_some();
+        let gated = link_modifier_held(&self.modifiers)
+            && !self.tabs.is_empty()
+            && !self.selecting
+            && !self.dragging_scrollbar
+            && self.tab_drag.is_none()
+            && !modal_open;
+        // Cursor must be over the grid band (same bounds as the Middle-click
+        // paste arm): below the top chrome, above the bottom strips.
+        let in_grid = gated
+            && self
+                .gpu
+                .as_ref()
+                .map(|g| {
+                    let h = g.config.height as f32;
+                    let cy = self.cursor.1 as f32;
+                    let grid_bottom = if self.tab_bar_bottom {
+                        self.tabbar_y(h)
+                    } else {
+                        h - self.status_h()
+                    };
+                    cy >= self.grid_top_offset() && cy < grid_bottom
+                })
+                .unwrap_or(false);
+        if !in_grid {
+            self.link_hover_cell = None;
+            if self.link_hover.take().is_some() {
+                if let Some(win) = &self.window {
+                    win.set_cursor(self.desired_cursor(self.resize_cursor));
+                    win.request_redraw();
+                }
+            }
+            return;
+        }
+        let Some((line, col, _)) = self.cursor_cell_0_side() else {
+            return;
+        };
+        if !force && self.link_hover_cell == Some((line, col)) {
+            return;
+        }
+        let was_some = self.link_hover.is_some();
+        self.link_hover = self.active_tab().terminal.link_at(line, col);
+        self.link_hover_cell = Some((line, col));
+        if let Some(win) = &self.window {
+            if was_some != self.link_hover.is_some() {
+                win.set_cursor(self.desired_cursor(self.resize_cursor));
+            }
+            // Redraw whenever the underline could have (dis)appeared or moved.
+            if was_some || self.link_hover.is_some() {
+                win.request_redraw();
+            }
+        }
+    }
+
+    /// Clear the Ctrl+hover link state on the main window AND every detached
+    /// window. `ModifiersChanged` is delivered per-focused-window only, so a
+    /// modifier release must sweep all windows or an unfocused one keeps a
+    /// stale underline.
+    fn clear_all_link_hovers(&mut self) {
+        self.link_hover_cell = None;
+        if self.link_hover.take().is_some() {
+            if let Some(win) = &self.window {
+                win.set_cursor(self.resize_cursor.cursor_icon());
+                win.request_redraw();
+            }
+        }
+        for dw in &mut self.detached {
+            dw.link_hover_cell = None;
+            if dw.link_hover.take().is_some() {
+                dw.window.set_cursor(dw.resize_zone.cursor_icon());
+                dw.window.request_redraw();
+            }
+        }
+    }
+
+    /// Recompute (or clear) the Ctrl+hover link state of detached window
+    /// `pos` — the detached mirror of [`App::update_link_hover`], using that
+    /// window's own cursor/geometry (grid origin `TABBAR_H`, its own modal =
+    /// the context menu).
+    fn update_detached_link_hover(&mut self, pos: usize, force: bool) {
+        let held = link_modifier_held(&self.modifiers);
+        let status_h = self.status_h();
+        let Some(dw) = self.detached.get_mut(pos) else { return };
+        let (cw, ch) = dw.text.cell_size();
+        let cy = dw.cursor.1 as f32;
+        let h = dw.gpu.config.height as f32;
+        let gated = held
+            && !dw.selecting
+            && !dw.dragging_scrollbar
+            && dw.bar_drag.is_none()
+            && dw.menu_open.is_none()
+            && cw > 0.0
+            && ch > 0.0
+            && cy >= TABBAR_H
+            && cy < h - status_h;
+        if !gated {
+            dw.link_hover_cell = None;
+            if dw.link_hover.take().is_some() {
+                dw.window.set_cursor(dw.resize_zone.cursor_icon());
+                dw.window.request_redraw();
+            }
+            return;
+        }
+        let gy = (cy - TABBAR_H).max(0.0);
+        let (line, col, _) = input::cell_at_0_side(
+            dw.cursor.0 as f32,
+            gy,
+            cw,
+            ch,
+            dw.tab.terminal.cols(),
+            dw.tab.terminal.rows(),
+        );
+        if !force && dw.link_hover_cell == Some((line, col)) {
+            return;
+        }
+        let was_some = dw.link_hover.is_some();
+        dw.link_hover = dw.tab.terminal.link_at(line, col);
+        dw.link_hover_cell = Some((line, col));
+        if was_some != dw.link_hover.is_some() {
+            dw.window.set_cursor(
+                if dw.link_hover.is_some() && dw.resize_zone == ResizeZone::None {
+                    winit::window::CursorIcon::Pointer
+                } else {
+                    dw.resize_zone.cursor_icon()
+                },
+            );
+        }
+        if was_some || dw.link_hover.is_some() {
+            dw.window.request_redraw();
+        }
+    }
+
+    /// Open `url` with the platform opener (`open` on macOS, `xdg-open`
+    /// elsewhere — OS-level cfg only, never DE-specific), spawned fully
+    /// detached with all three stdio fds null. Restricted to the
+    /// http/https/file allowlist; a missing opener degrades to an stderr line.
+    fn open_url(url: &str) {
+        if !url_scheme_allowed(url) {
+            eprintln!("jetty: refusing to open URL with disallowed scheme: {url}");
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        let cmd = "open";
+        #[cfg(not(target_os = "macos"))]
+        let cmd = "xdg-open";
+        match std::process::Command::new(cmd)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            // Reap the short-lived child off-thread so it never zombies.
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => eprintln!("jetty: failed to spawn {cmd} for URL: {e}"),
+        }
     }
 
     /// Paste `text` to the ACTIVE tab's PTY, wrapping in bracketed-paste
@@ -3037,6 +3251,9 @@ impl App {
                     _ => {}
                 }
                 let Some(dw) = self.detached.get_mut(pos) else { return };
+                // Set when the viewport moved under the pointer this event, so
+                // the link hover is refreshed AFTER the dw borrow ends.
+                let mut viewport_moved = false;
                 match action {
                     // Ctrl+Shift+D in a detached window reattaches its tab.
                     input::KeyAction::DetachTab => {
@@ -3048,10 +3265,12 @@ impl App {
                     input::KeyAction::ScrollPageUp => {
                         dw.tab.terminal.scroll_page(true);
                         dw.window.request_redraw();
+                        viewport_moved = true;
                     }
                     input::KeyAction::ScrollPageDown => {
                         dw.tab.terminal.scroll_page(false);
                         dw.window.request_redraw();
+                        viewport_moved = true;
                     }
                     input::KeyAction::Copy => {
                         // Same copy-then-clear flow as the main window.
@@ -3102,6 +3321,9 @@ impl App {
                     // this MVP — ignored in a detached window.
                     _ => {}
                 }
+                if viewport_moved {
+                    self.update_detached_link_hover(pos, true);
+                }
             }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 // IME commit → typed text to THIS window's PTY (no bracketed
@@ -3142,6 +3364,14 @@ impl App {
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
+                // Same discipline as the main window's arm: press arms THIS
+                // window's hover; release sweeps every window (the event is
+                // delivered per-focused-window only).
+                if link_modifier_held(&self.modifiers) {
+                    self.update_detached_link_hover(pos, true);
+                } else {
+                    self.clear_all_link_hovers();
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 // &self method — must be read before the dw (self.detached) borrow.
@@ -3191,6 +3421,11 @@ impl App {
                     ) {
                         dw.tab.terminal.scroll_to_offset(o);
                     }
+                    // The drag scrolls content under any hovered link — drop
+                    // the underline rather than let it ride the wrong text
+                    // (mirrors main's apply_scroll_from_cursor refresh).
+                    dw.link_hover_cell = None;
+                    dw.link_hover = None;
                     dw.window.request_redraw();
                     return;
                 }
@@ -3203,7 +3438,15 @@ impl App {
                     let zone = resize_zone_at(cx, cy, w, h);
                     if zone != dw.resize_zone {
                         dw.resize_zone = zone;
-                        dw.window.set_cursor(zone.cursor_icon());
+                        // Link-aware, like main: the Pointer survives leaving a
+                        // resize edge while a link is still hovered.
+                        dw.window.set_cursor(
+                            if zone == ResizeZone::None && dw.link_hover.is_some() {
+                                winit::window::CursorIcon::Pointer
+                            } else {
+                                zone.cursor_icon()
+                            },
+                        );
                     }
                     // --- Close ✕ hover highlight ---
                     let hover = input::point_in(&jetty_render::detached_close_rect(w), cx, cy);
@@ -3249,6 +3492,8 @@ impl App {
                         }
                     }
                 }
+                // --- Ctrl+hover link tracking (mirrors the main window) ---
+                self.update_detached_link_hover(pos, false);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -3371,6 +3616,19 @@ impl App {
                                 let mouse_mode = dw.tab.terminal.mouse_mode();
                                 let shift = self.modifiers.shift_key();
                                 let gy = (cy - TABBAR_H).max(0.0);
+                                // Ctrl+click on a link opens it and consumes the
+                                // click (same precedence as the main window:
+                                // Shift still forces selection).
+                                if link_modifier_held(&self.modifiers) && !shift {
+                                    let (line, col, _) = input::cell_at_0_side(
+                                        cx, gy, cw, ch,
+                                        dw.tab.terminal.cols(), dw.tab.terminal.rows(),
+                                    );
+                                    if let Some(hit) = dw.tab.terminal.link_at(line, col) {
+                                        Self::open_url(&hit.uri);
+                                        return;
+                                    }
+                                }
                                 if mouse_mode && !shift {
                                     let (col, row) = input::cell_at_clamped(
                                         cx, gy, cw, ch,
@@ -3647,6 +3905,13 @@ impl App {
                     dw.selecting = false;
                     dw.mouse_grab_press = None;
                     dw.dragging_scrollbar = false;
+                    // A link underline can't clear itself while unfocused (the
+                    // modifier release is delivered elsewhere) — drop it now.
+                    dw.link_hover_cell = None;
+                    if dw.link_hover.take().is_some() {
+                        dw.window.set_cursor(dw.resize_zone.cursor_icon());
+                        dw.window.request_redraw();
+                    }
                 }
                 // F14: focus is leaving THIS detached window. If it departs to a
                 // foreign app (not another JeTTY window), the main dropdown must
@@ -3746,6 +4011,8 @@ impl App {
                 } else {
                     dw.tab.terminal.scroll_lines(lines);
                     dw.window.request_redraw();
+                    // Viewport moved under a stationary pointer (mirrors main).
+                    self.update_detached_link_hover(pos, true);
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -3800,6 +4067,14 @@ impl App {
         let close_hover = dw.close_hover;
         let menu_open = dw.menu_open;
         let menu_hover = dw.menu_hover;
+        // Ctrl+hover link underline spans, snapshotted before the wide
+        // gpu/text/quad borrows below (same pattern as the main window).
+        let link_spans: Option<Vec<(usize, usize, usize)>> =
+            if link_modifier_held(&self.modifiers) {
+                dw.link_hover.as_ref().map(|h| h.spans.clone())
+            } else {
+                None
+            };
         let theme = self.current_theme();
         let status_h = self.status_h();
         // Same global HUD string the main status bar shows (built on the main
@@ -3898,9 +4173,29 @@ impl App {
                 &gpu.device, &gpu.queue, scene_view, width, height, &bar.title_labels,
             );
         }
-        // Pass 4: scrollbar, spanning the grid area between the bars.
+        // Pass 4: scrollbar, spanning the grid area between the bars, plus the
+        // Ctrl+hover link underline in the same quad pass (same formula as the
+        // main window: grid_top = TABBAR_H here, no slide offset).
+        let mut pass4: Vec<jetty_render::Rect> = Vec::new();
         if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, grid_top, status_h, scrollbar_thumb) {
-            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[r]);
+            pass4.push(r);
+        }
+        if let Some(spans) = &link_spans {
+            let th = (cell_h * 0.06).round().max(1.0);
+            let p12 = theme.palette[12];
+            let link_color = [p12[0], p12[1], p12[2], 255];
+            for &(row, c0, c1) in spans {
+                pass4.push(jetty_render::Rect::new(
+                    c0 as f32 * cell_w,
+                    grid_top + (row as f32 + 1.0) * cell_h - th,
+                    (c1 - c0 + 1) as f32 * cell_w,
+                    th,
+                    link_color,
+                ));
+            }
+        }
+        if !pass4.is_empty() {
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pass4);
         }
         // Pass 5: bottom STATUS strip (perf HUD) when enabled — the same slim
         // theme-derived strip as the main window; it may show the same global
@@ -5131,6 +5426,13 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
+                    // Grid content changed under an ACTIVE Ctrl+hover: revalidate
+                    // the cached spans so the underline tracks (or vanishes with)
+                    // the moved text. Only runs while a link is hovered — zero
+                    // cost on the idle/no-hover drain path.
+                    if self.link_hover.is_some() {
+                        self.update_link_hover(true);
+                    }
                 }
                 // Detached windows aren't in `self.tabs`, so the loop above never
                 // sees them — without this, a detached window's live shell output
@@ -5154,6 +5456,18 @@ impl ApplicationHandler<AppEvent> for App {
                     // repaint a detached window that isn't occluded/minimized (F16).
                     if had && !dw.occluded {
                         dw.window.request_redraw();
+                        // Grid content changed under an ACTIVE Ctrl+hover in this
+                        // window: revalidate the cached spans at the same cell
+                        // (mirrors the main window's Wake-drain recompute; only
+                        // runs while a link is hovered).
+                        if dw.link_hover.is_some() {
+                            if let Some((line, col)) = dw.link_hover_cell {
+                                dw.link_hover = dw.tab.terminal.link_at(line, col);
+                                if dw.link_hover.is_none() {
+                                    dw.window.set_cursor(dw.resize_zone.cursor_icon());
+                                }
+                            }
+                        }
                     }
                     // Shell exit (Ctrl+D / `exit`) inside a detached window closes
                     // THAT window — never reattach an exited shell. Unlike the main
@@ -5300,6 +5614,15 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
+                // Arm the link hover on modifier press at the current cursor;
+                // a release sweeps EVERY window (this event is per-focused-
+                // window only, so an unfocused sibling would otherwise keep a
+                // stale underline).
+                if link_modifier_held(&self.modifiers) {
+                    self.update_link_hover(true);
+                } else {
+                    self.clear_all_link_hovers();
+                }
             }
             WindowEvent::Focused(true) => {
                 // The main terminal window gained focus.
@@ -5328,6 +5651,15 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.tab_drag.take().is_some() {
                     if let Some(win) = &self.window {
                         win.set_cursor(winit::window::CursorIcon::Default);
+                    }
+                }
+                // A link underline can't clear itself while unfocused (the
+                // modifier release is delivered elsewhere) — drop it now.
+                self.link_hover_cell = None;
+                if self.link_hover.take().is_some() {
+                    if let Some(win) = &self.window {
+                        win.set_cursor(self.resize_cursor.cursor_icon());
+                        win.request_redraw();
                     }
                 }
                 // Yakuake-style auto-hide: hide when the window loses focus, but
@@ -5427,7 +5759,9 @@ impl ApplicationHandler<AppEvent> for App {
                         if zone != self.resize_cursor {
                             self.resize_cursor = zone;
                             if let Some(win) = &self.window {
-                                win.set_cursor(zone.cursor_icon());
+                                // Link-aware: the Pointer survives leaving a
+                                // resize edge while a link is still hovered.
+                                win.set_cursor(self.desired_cursor(zone));
                             }
                         }
                     }
@@ -5535,6 +5869,8 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                 }
+                // --- Ctrl+hover link tracking (cached on the hovered cell) ---
+                self.update_link_hover(false);
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 // The last tab's shell can exit mid-pump (close_exited_tabs emptied
@@ -5984,6 +6320,20 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                     input::MouseAction::None => {
+                        // Ctrl+click (also Cmd+click on macOS) on a detected link
+                        // opens it and consumes the click entirely: no mouse report
+                        // (our SGR encoder carries no modifier bits anyway) and no
+                        // selection start. Shift still wins for selection, so
+                        // Ctrl+Shift+click/drag is unchanged. Recomputed at press
+                        // time — a click without a prior hover move still works.
+                        if link_modifier_held(&self.modifiers) && !self.modifiers.shift_key() {
+                            if let Some((line, col, _)) = self.cursor_cell_0_side() {
+                                if let Some(hit) = self.active_tab().terminal.link_at(line, col) {
+                                    Self::open_url(&hit.uri);
+                                    return;
+                                }
+                            }
+                        }
                         // The click landed in the terminal area (not a panel or
                         // scrollbar widget). When the app enabled mouse reporting,
                         // forward the press; otherwise start a text selection.
@@ -6330,6 +6680,9 @@ impl ApplicationHandler<AppEvent> for App {
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
+                        // The viewport moved under a stationary pointer: the
+                        // hovered CELL is unchanged but its content is not.
+                        self.update_link_hover(true);
                     }
                 }
             }
@@ -6644,12 +6997,15 @@ impl ApplicationHandler<AppEvent> for App {
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
+                        // Viewport moved under the pointer (see MouseWheel).
+                        self.update_link_hover(true);
                     }
                     input::KeyAction::ScrollPageDown => {
                         self.active_tab_mut().terminal.scroll_page(false);
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
+                        self.update_link_hover(true);
                     }
                     input::KeyAction::FontUp => {
                         self.set_font_size(self.font_logical + 1.0);
@@ -6970,6 +7326,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // captured before the mutable gpu/text borrow below.
                 let status_h = self.status_h();
                 let cursor = self.cursor;
+                // Ctrl+hover link underline spans, snapshotted before the
+                // gpu/text/quad borrows (drawn only while the modifier is held).
+                let link_spans: Option<Vec<(usize, usize, usize)>> =
+                    if link_modifier_held(&self.modifiers) {
+                        self.link_hover.as_ref().map(|h| h.spans.clone())
+                    } else {
+                        None
+                    };
                 // Theme accent for the reveal glow (captured before the mutable
                 // gpu/text/quad borrow below).
                 let summon_accent: [f32; 3] = {
@@ -7116,13 +7480,31 @@ impl ApplicationHandler<AppEvent> for App {
                             &gpu.device, &gpu.queue, scene_view, width, height, &bar.title_labels,
                         );
                     }
-                    // Pass 4: scrollbar (spans the grid area below the bar).
+                    // Pass 4: scrollbar (spans the grid area below the bar),
+                    // plus the Ctrl+hover link underline in the same quad pass
+                    // (zero text-layer / grid-hash impact).
                     let mut rects: Vec<jetty_render::Rect> = Vec::new();
                     if let Some(mut r) =
                         jetty_render::scrollbar_rect(&snap, width, height, grid_top, status_h, scrollbar_thumb)
                     {
                         r.y += slide_y_offset;
                         rects.push(r);
+                    }
+                    if let Some(spans) = &link_spans {
+                        // Thickness from the PHYSICAL cell height (HiDPI-correct),
+                        // floored at 1px; color = the active theme's bright blue.
+                        let th = (cell_h * 0.06).round().max(1.0);
+                        let p12 = theme.palette[12];
+                        let link_color = [p12[0], p12[1], p12[2], 255];
+                        for &(row, c0, c1) in spans {
+                            rects.push(jetty_render::Rect::new(
+                                c0 as f32 * cell_w,
+                                grid_top + slide_y_offset + (row as f32 + 1.0) * cell_h - th,
+                                (c1 - c0 + 1) as f32 * cell_w,
+                                th,
+                                link_color,
+                            ));
+                        }
                     }
                     quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &rects);
 
@@ -8176,6 +8558,32 @@ mod scrollback_cycle_tests {
         // Hand-edited values render verbatim.
         assert_eq!(format_scrollback(12_345), "12345");
         assert_eq!(format_scrollback(100), "100");
+    }
+}
+
+#[cfg(test)]
+mod url_open_tests {
+    use super::url_scheme_allowed;
+
+    #[test]
+    fn allows_http_https_file_case_insensitively() {
+        assert!(url_scheme_allowed("http://example.com"));
+        assert!(url_scheme_allowed("https://example.com/a?b=c"));
+        assert!(url_scheme_allowed("file:///tmp/report.html"));
+        assert!(url_scheme_allowed("HTTPS://EXAMPLE.COM"));
+        assert!(url_scheme_allowed("HtTp://x.io"));
+    }
+
+    #[test]
+    fn rejects_everything_else() {
+        assert!(!url_scheme_allowed("javascript:alert(1)"));
+        assert!(!url_scheme_allowed("mailto:me@example.com"));
+        assert!(!url_scheme_allowed("ftp://example.com"));
+        assert!(!url_scheme_allowed(""));
+        assert!(!url_scheme_allowed("example.com"));
+        // Scheme must be a PREFIX, and multibyte text can't panic the check.
+        assert!(!url_scheme_allowed("xhttps://example.com"));
+        assert!(!url_scheme_allowed("héllo→"));
     }
 }
 

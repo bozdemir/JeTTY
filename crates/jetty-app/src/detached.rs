@@ -258,6 +258,12 @@ pub(crate) struct DetachedWindow {
     /// Thumb-local y grab offset captured at drag start, so the thumb never
     /// jumps under the pointer. Mirrors `App::drag_grab_dy`.
     pub drag_grab_dy: f32,
+    /// The link under the pointer while the link modifier is held in THIS
+    /// window (underlined; opened on click). Mirrors `App::link_hover`.
+    pub link_hover: Option<jetty_core::LinkHit>,
+    /// The hovered 0-based grid cell the cache above was computed for.
+    /// Mirrors `App::link_hover_cell`.
+    pub link_hover_cell: Option<(usize, usize)>,
 }
 
 impl DetachedWindow {
@@ -403,6 +409,8 @@ impl DetachedWindow {
             mouse_grab_press: None,
             dragging_scrollbar: false,
             drag_grab_dy: 0.0,
+            link_hover: None,
+            link_hover_cell: None,
         })
     }
 

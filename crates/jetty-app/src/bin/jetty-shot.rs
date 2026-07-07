@@ -20,6 +20,10 @@
 ///                    (title + ✕), grid offset below it, bottom status strip.
 ///                    JETTY_SHOT_DETACHED_TITLE / _HOVER tweak title and the
 ///                    ✕ hover state.
+///   JETTY_SHOT_LINK_HOVER — "row,col" (0-based viewport cell): print
+///                    `link_at(row,col)` to stderr (URL under that cell, OSC 8
+///                    or plain text) and draw the app's themed Ctrl+hover
+///                    underline for the hit.
 ///
 /// If the terminal bg alpha < 255, the rendered image is composited over a
 /// checkerboard (alternating 16px squares of [40,40,40] and [90,90,90]) so
@@ -235,6 +239,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // JETTY_SHOT_LINK_HOVER="row,col" — Ctrl+hover link self-test: report the
+    // link under that 0-based viewport cell on stderr (so a harness can assert
+    // the matched URL) and draw the SAME themed underline quads the app draws.
+    let link_hit: Option<jetty_core::LinkHit> =
+        std::env::var("JETTY_SHOT_LINK_HOVER").ok().and_then(|s| {
+            let mut it = s.splitn(2, ',');
+            let row = it.next()?.trim().parse::<usize>().ok()?;
+            let col = it.next()?.trim().parse::<usize>().ok()?;
+            let hit = terminal.link_at(row, col);
+            eprintln!(
+                "jetty-shot: link_at({row},{col}) = {:?}",
+                hit.as_ref().map(|h| &h.uri)
+            );
+            hit
+        });
+
     let snap = terminal.snapshot();
 
     let bg_alpha = snap.bg_rgba[3];
@@ -297,6 +317,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sb_thumb = [sb_mix(0), sb_mix(1), sb_mix(2), 210];
         if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, shot_grid_top, shot_status_h, sb_thumb) {
             rects.push(r);
+        }
+
+        // JETTY_SHOT_LINK_HOVER underline: same formula/color as the app's
+        // Pass 4 (theme bright blue, thickness from the physical cell height).
+        if let Some(hit) = &link_hit {
+            let th = (cell_h * 0.06).round().max(1.0);
+            let p12 = terminal.theme().palette[12];
+            let link_color = [p12[0], p12[1], p12[2], 255];
+            for &(row, c0, c1) in &hit.spans {
+                rects.push(jetty_render::Rect::new(
+                    c0 as f32 * cell_w,
+                    shot_grid_top + (row as f32 + 1.0) * cell_h - th,
+                    (c1 - c0 + 1) as f32 * cell_w,
+                    th,
+                    link_color,
+                ));
+            }
         }
 
         // Baseline for the live "Aa" UI-font specimen, set when the panel is built.
