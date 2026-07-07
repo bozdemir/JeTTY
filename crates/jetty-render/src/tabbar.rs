@@ -287,7 +287,7 @@ pub fn build_tab_bar_ex(
             } else {
                 buf.to_string()
             };
-            shown.push('▏');
+            shown.push('|'); // ASCII caret: every UI font has it (U+258F was tofu on fonts without Block Elements)
             title_labels.push((shown, title_x, 9.0, label_color));
         } else {
             let shown: String = if title.chars().count() > max_chars {
@@ -655,7 +655,7 @@ mod tests {
         let tabs = [("Old".to_string(), true)];
         let bar = build_tab_bar_ex(800, &tabs, &theme(), Some((0, "New")), CtrlHover::None, None, CHROME_CHAR_W, &[]);
         // Renaming shows the edit buffer + caret in the sans TITLE labels.
-        let buf = bar.title_labels.iter().find(|l| l.0.contains('▏'));
+        let buf = bar.title_labels.iter().find(|l| l.0.contains('|'));
         assert!(buf.is_some(), "no caret label found");
         assert!(buf.unwrap().0.starts_with("New"));
     }
