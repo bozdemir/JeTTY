@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.12.2] — 2026-07-07
+
+### Fixed
+- **Chrome/UI text gets font fallback** — tab titles (now shell-controlled via
+  OSC), search queries, and rename buffers are shaped with fallback, so emoji,
+  CJK, and symbols missing from the UI font render as real glyphs instead of
+  tofu boxes. No idle cost (overlays only shape on rendered frames).
+- **Tab-label truncation counts display width** — wide CJK/emoji titles no
+  longer overflow the tab pill (main, rename, and detached title bars).
+
+---
+
 ## [0.12.1] — 2026-07-07
 
 ### Fixed
