@@ -1,7 +1,7 @@
 use crate::gpu::GpuContext;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, PrepareError, Resolution, Shaping,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
 use jetty_core::GridSnapshot;
 use std::hash::{Hash, Hasher};
@@ -123,7 +123,11 @@ pub struct TextLayer {
     /// reallocating ~rows*cols heap items every frame (speed-first hot path).
     /// Taken out via `mem::take` during the frame and put back at the end.
     text_scratch: String,
-    cell_ranges_scratch: Vec<(usize, usize, Color)>,
+    /// `(byte_start, byte_end, fg color, shape_bits)` per coalesced run.
+    /// `shape_bits` = `attrs & SHAPE_MASK` (BOLD|ITALIC) — the run breaks when it
+    /// changes so each run carries a single weight/style. STRIKE / underline never
+    /// break a run (they are drawn as quads, not shaped).
+    cell_ranges_scratch: Vec<(usize, usize, Color, u8)>,
     /// Per-char routing cache for the PRIMARY terminal font (`font_family`): does the
     /// char lay out inline, or must it be blanked and overdrawn (missing glyph — e.g.
     /// Claude Code's `⏵⏵` U+23F5 — OR a double-width CJK glyph)? Probed lazily on the
@@ -238,6 +242,15 @@ impl TextLayer {
         let cell_w = measure_advance_family(&mut font_system, metrics, family);
         let cell_h = line_height;
 
+        // Snap every grid glyph's advance to the cell width. cosmic-text rounds
+        // each glyph's x_advance to the nearest `cell_w` (shape.rs), which keeps
+        // a real Bold/Italic face — or any stray wide/fallback glyph — column-
+        // aligned even when its natural advance differs from Regular. This is the
+        // alignment guarantee that lets us render real bold/italic faces (v0.13
+        // amendment). Set ONLY on the grid buffer; the chrome overlay buffers are
+        // proportional (Shaping::Advanced) and never get this.
+        buffer.set_monospace_width(&mut font_system, Some(cell_w));
+
         Self {
             font_system,
             swash,
@@ -341,6 +354,9 @@ impl TextLayer {
         self.shape_gen = self.shape_gen.wrapping_add(1);
         // Re-measure cell width with the new family.
         self.cell_w = measure_advance_family(&mut self.font_system, self.metrics, name);
+        // Re-snap the grid buffer's monospace advance to the new cell width so a
+        // bold/italic run in the new family stays column-aligned.
+        self.buffer.set_monospace_width(&mut self.font_system, Some(self.cell_w));
         // Reset cursor buffer glyph so the block cursor uses the new family.
         let cursor_attrs = Attrs::new().family(Family::Name(&self.font_family));
         self.cursor_buffer.set_text(
@@ -424,6 +440,11 @@ impl TextLayer {
         // active chrome family, so a UI-font SIZE change re-derives chrome_char_w.
         self.cell_w = self.measure_chrome_advance();
         self.cell_h = line_height;
+        // Re-snap the grid buffer's monospace advance to the new cell width. (On a
+        // chrome layer `self.buffer` is unused — chrome renders via overlay_buffers
+        // — so this only matters for the terminal grid layer, where it keeps
+        // bold/italic aligned after a font-size / DPI change.)
+        self.buffer.set_monospace_width(&mut self.font_system, Some(self.cell_w));
         // Cached fallback glyphs were shaped at the old size; drop them and force a
         // grid re-shape at the new metrics.
         self.fallback_glyphs.clear();
@@ -438,6 +459,13 @@ impl TextLayer {
 
     pub fn cell_size(&self) -> (f32, f32) {
         (self.cell_w, self.cell_h)
+    }
+
+    /// The grid buffer's monospace snap width (`Some(cell_w)` once set). Exposed
+    /// for the alignment self-test / inspection; the grid glyph advances are
+    /// rounded to this so real bold/italic faces stay column-aligned.
+    pub fn grid_monospace_width(&self) -> Option<f32> {
+        self.buffer.monospace_width()
     }
 
     pub fn resize(&mut self, gpu: &GpuContext) {
@@ -541,10 +569,15 @@ impl TextLayer {
             // Shaping is byte-identical under Shaping::Basic — color is not part of
             // shaping and every monospace glyph advances exactly one cell regardless.
             let mut run_start = text.len();
-            let mut run_color: Option<Color> = None;
+            let mut run_key: Option<(Color, u8)> = None;
             for col in 0..snapshot.cols {
                 let cell = snapshot.cell(row, col);
                 cell.fg.hash(&mut hasher);
+                // Fold ONLY the shaping-affecting bits (BOLD|ITALIC) into the grid
+                // fingerprint: a color-identical bold toggle must re-shape (a
+                // different face), while strike/underline/underline-color must NOT
+                // (they are quads). SPEED: keeps underline changes off the re-shape.
+                cell.shape_bits().hash(&mut hasher);
                 // A glyph the primary font lacks (tofu box under Shaping::Basic, no
                 // fallback) or renders double-width (a CJK glyph advances ~2 cells and
                 // would shift the rest of the row) is blanked on the main grid so it
@@ -565,24 +598,25 @@ impl TextLayer {
                     ));
                 }
                 let color = Color::rgb(cell.fg[0], cell.fg[1], cell.fg[2]);
-                if run_color != Some(color) {
-                    if let Some(pc) = run_color {
-                        cell_ranges.push((run_start, text.len(), pc));
+                let key = (color, cell.shape_bits());
+                if run_key != Some(key) {
+                    if let Some((pc, pb)) = run_key {
+                        cell_ranges.push((run_start, text.len(), pc, pb));
                     }
                     run_start = text.len();
-                    run_color = Some(color);
+                    run_key = Some(key);
                 }
                 text.push(if overdraw { ' ' } else { ch });
             }
             // Flush the row's final run, then include the newline as its own span:
             // set_rich_text builds the text FROM the spans, so without the '\n' the
             // line breaks were dropped and the whole grid collapsed onto one line.
-            if let Some(pc) = run_color {
-                cell_ranges.push((run_start, text.len(), pc));
+            if let Some((pc, pb)) = run_key {
+                cell_ranges.push((run_start, text.len(), pc, pb));
             }
             let nl_start = text.len();
             text.push('\n');
-            cell_ranges.push((nl_start, text.len(), Color::rgb(220, 220, 220)));
+            cell_ranges.push((nl_start, text.len(), Color::rgb(220, 220, 220), 0));
         }
 
         // Finish the fingerprint with the chars, then decide whether the grid buffer
@@ -618,10 +652,28 @@ impl TextLayer {
             // spans in order, so shaping is byte-identical.
             self.buffer.set_rich_text(
                 &mut self.font_system,
-                cell_ranges.iter().map(|(s, e, color)| {
+                cell_ranges.iter().map(|(s, e, color, shape)| {
+                    // BOLD -> real Bold face, ITALIC -> real Italic face, under
+                    // Shaping::Basic. Monospace alignment is guaranteed by
+                    // set_monospace_width(cell_w) (below), which snaps every glyph's
+                    // advance onto the cell grid regardless of the matched face.
+                    let weight = if shape & jetty_core::attr::BOLD != 0 {
+                        Weight::BOLD
+                    } else {
+                        Weight::NORMAL
+                    };
+                    let style = if shape & jetty_core::attr::ITALIC != 0 {
+                        Style::Italic
+                    } else {
+                        Style::Normal
+                    };
                     (
                         &text[*s..*e],
-                        Attrs::new().family(Family::Name(&family_name)).color(*color),
+                        Attrs::new()
+                            .family(Family::Name(&family_name))
+                            .color(*color)
+                            .weight(weight)
+                            .style(style),
                     )
                 }),
                 &default_attrs,

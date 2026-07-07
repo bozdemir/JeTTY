@@ -148,3 +148,62 @@ impl GridSnapshot {
         (0..self.cols).map(|c| self.cell(row, c).c).collect::<String>()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a cell with the given attribute byte for the pure-seam tests.
+    fn cell_with(attrs: u8) -> CellSnapshot {
+        CellSnapshot { attrs, ..Default::default() }
+    }
+
+    #[test]
+    fn cellsnapshot_is_16_bytes() {
+        // The +4 bytes over the old 12 are entirely `uline`; `attrs` fits the
+        // existing padding. Documented as the accepted per-cell cost.
+        assert_eq!(std::mem::size_of::<CellSnapshot>(), 16);
+    }
+
+    #[test]
+    fn shape_bits_reacts_to_bold_and_italic_only() {
+        // BOLD and ITALIC are the ONLY bits that change shaping, so they are the
+        // only ones the grid re-shape fingerprint folds. Strike / every underline
+        // style / the reserved bits must NOT change shape_bits (no needless
+        // re-shape when an underline toggles — SPEED constraint #1).
+        let plain = cell_with(0);
+        assert_eq!(plain.shape_bits(), 0);
+        assert_ne!(cell_with(attr::BOLD).shape_bits(), plain.shape_bits());
+        assert_ne!(cell_with(attr::ITALIC).shape_bits(), plain.shape_bits());
+        assert_ne!(
+            cell_with(attr::BOLD | attr::ITALIC).shape_bits(),
+            cell_with(attr::BOLD).shape_bits()
+        );
+        // Strike and each underline style leave shape_bits untouched.
+        assert_eq!(cell_with(attr::STRIKE).shape_bits(), plain.shape_bits());
+        for ul in [
+            attr::UL_SINGLE,
+            attr::UL_DOUBLE,
+            attr::UL_UNDERCURL,
+            attr::UL_DOTTED,
+            attr::UL_DASHED,
+        ] {
+            assert_eq!(cell_with(ul << attr::UL_SHIFT).shape_bits(), plain.shape_bits());
+        }
+        // A bold cell that also gains an underline still re-shapes only on the bold.
+        let bold = cell_with(attr::BOLD);
+        let bold_underlined = cell_with(attr::BOLD | (attr::UL_SINGLE << attr::UL_SHIFT));
+        assert_eq!(bold.shape_bits(), bold_underlined.shape_bits());
+    }
+
+    #[test]
+    fn underline_style_round_trips_through_the_bitfield() {
+        for ul in 0..=5u8 {
+            let cell = cell_with(ul << attr::UL_SHIFT);
+            assert_eq!(cell.underline_style(), ul);
+        }
+        // The underline field does not bleed into bold/italic/strike.
+        let cell = cell_with(attr::UL_DASHED << attr::UL_SHIFT);
+        assert!(!cell.is_bold() && !cell.is_italic() && !cell.is_strike());
+    }
+}
