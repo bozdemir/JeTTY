@@ -498,6 +498,7 @@ pub fn grid_decoration_key(snap: &jetty_core::GridSnapshot) -> u64 {
 /// `[x0, x0+run_w)` with its bottom edge at `bottom`. Single/double are wide
 /// quads; dotted/dashed/undercurl are small patterned quads. `color` is the
 /// resolved underline color (uline, already falling back to fg cell-side).
+#[allow(clippy::too_many_arguments)]
 fn emit_underline(
     out: &mut Vec<Rect>,
     style: u8,

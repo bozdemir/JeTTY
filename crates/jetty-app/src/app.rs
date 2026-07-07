@@ -489,6 +489,11 @@ pub struct App {
     /// The id of the most recently focused window (main or settings). Used to
     /// suppress auto-hide when focus moved to our own Settings window.
     last_focused_window: Option<WindowId>,
+    /// Whether the MAIN terminal window currently holds OS focus. Tracked from
+    /// its `Focused(true)/(false)` events (last_focused_window is unreliable for
+    /// this — it stays set to the main id after focus leaves when auto-hide is
+    /// off). Drives the unfocused-hollow cursor.
+    main_focused: bool,
     /// Set when the Settings window gains focus; consumed by the main window's
     /// Focused(false) to suppress auto-hide even when X11 delivers the main
     /// Focused(false) BEFORE the settings Focused(true) (the last_focused_window
@@ -976,6 +981,7 @@ impl App {
             cached_tabs_sig: u64::MAX,
             applied_main_os_title: "JeTTY".to_string(),
             last_focused_window: None,
+            main_focused: false,
             switching_to_settings: false,
             switching_to_detached: false,
             pending_autohide_at: None,
@@ -4069,6 +4075,7 @@ impl App {
                 // Settings window suppresses auto-hide.
                 self.last_focused_window = Some(self.detached[pos].window.id());
                 self.switching_to_detached = true;
+                self.detached[pos].focused = true;
                 // Focus implies on-screen: clear any stale occluded flag in case
                 // the WM skipped Occluded(false) on restore (F17).
                 self.detached[pos].occluded = false;
@@ -4082,6 +4089,7 @@ impl App {
                 // main Focused(false) (focus actually left Jetty) is not mistaken
                 // for a switch-to-detached and the terminal hides as it should.
                 self.switching_to_detached = false;
+                self.detached[pos].focused = false;
                 if self.last_focused_window == Some(self.detached[pos].window.id()) {
                     self.last_focused_window = None;
                 }
@@ -4299,6 +4307,9 @@ impl App {
             dw.caret_anim = None;
         }
         let caret_t_for_flash = if fx.caret_flash_enabled { caret_t } else { None };
+        // Window focus drives the unfocused-hollow cursor (captured before the
+        // gpu/text/quad borrows below).
+        let focused = dw.focused;
         // Corner radius in physical px (HiDPI-correct, same scaling as main).
         let scale = dw.window.scale_factor() as f32;
         let corner_radius_px = corner_radius * scale;
@@ -4351,10 +4362,8 @@ impl App {
             jetty_render::default_bg_clear(&snap, gpu.premultiply_clear),
         );
         // Pass 2: glyphs on top of the painted background, offset by the bar.
-        // Caret flash rides this window's own burst clock (parity with main).
         let _ = text.render_to(
             &gpu.device, &gpu.queue, scene_view, width, height, &snap, false, grid_top,
-            caret_t_for_flash, fx.caret_flash_color,
         );
         // Pass 3: the top bar (title pill + close ✕) over the grid.
         let bar = jetty_render::build_detached_bar(width, &title, &theme, close_hover, chrome_char_w);
@@ -4370,27 +4379,28 @@ impl App {
                 &gpu.device, &gpu.queue, scene_view, width, height, &bar.title_labels,
             );
         }
-        // Pass 4: scrollbar, spanning the grid area between the bars, plus the
-        // Ctrl+hover link underline in the same quad pass (same formula as the
-        // main window: grid_top = TABBAR_H here, no slide offset).
+        // Pass 4: scrollbar, SGR decorations (underline/strike), the Ctrl+hover /
+        // OSC 8 link underline, and the cursor — one quad pass (grid_top = TABBAR_H
+        // here, no slide offset). Identical treatment to the main window.
         let mut pass4: Vec<jetty_render::Rect> = Vec::new();
         if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, grid_top, status_h, scrollbar_thumb) {
             pass4.push(r);
         }
+        pass4.extend_from_slice(text.decoration_rects());
         if let Some(spans) = &link_spans {
-            let th = (cell_h * 0.06).round().max(1.0);
             let p12 = theme.palette[12];
-            let link_color = [p12[0], p12[1], p12[2], 255];
-            for &(row, c0, c1) in spans {
-                pass4.push(jetty_render::Rect::new(
-                    c0 as f32 * cell_w,
-                    grid_top + (row as f32 + 1.0) * cell_h - th,
-                    (c1 - c0 + 1) as f32 * cell_w,
-                    th,
-                    link_color,
-                ));
-            }
+            pass4.extend(jetty_render::link_underline_rects(
+                spans,
+                [p12[0], p12[1], p12[2], 255],
+                cell_w,
+                cell_h,
+                grid_top,
+            ));
         }
+        // Cursor last so it draws over the glyphs + decorations.
+        pass4.extend(jetty_render::cursor_rects(
+            &snap, cell_w, cell_h, grid_top, focused, caret_t_for_flash, fx.caret_flash_color,
+        ));
         if !pass4.is_empty() {
             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pass4);
         }
@@ -5874,6 +5884,7 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::Focused(true) => {
                 // The main terminal window gained focus.
                 self.last_focused_window = Some(id);
+                self.main_focused = true;
                 // Focus implies the window is on-screen again: clear any stale
                 // occluded/minimized flag in case the WM skipped Occluded(false)
                 // on restore, so animations/redraws resume (F17).
@@ -5893,6 +5904,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::Focused(false) => {
+                self.main_focused = false;
                 // A held tab drag can never see its release once focus is gone —
                 // clear it (and its grabbing cursor) so it doesn't resume stuck.
                 if self.tab_drag.take().is_some() {
@@ -7793,6 +7805,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // color/scale modulation in text.rs, even if caret_anim is armed.
                 let caret_t_for_flash =
                     if self.fx.caret_flash_enabled { caret_t } else { None };
+                // Window focus drives the unfocused-hollow cursor (captured before
+                // the mutable gpu/text borrow below).
+                let main_focused = self.main_focused;
                 let (Some(gpu), Some(text), Some(chrome_text), Some(quad)) =
                     (&mut self.gpu, &mut self.text, &mut self.chrome_text, &mut self.quad)
                 else {
@@ -7906,8 +7921,6 @@ impl ApplicationHandler<AppEvent> for App {
                         &snap,
                         false,
                         grid_top + slide_y_offset,
-                        caret_t_for_flash,
-                        caret_flash_color,
                     );
                     // Pass 3: the tab bar (translated to its actual y) over the grid.
                     quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &bar.quads);
@@ -7926,9 +7939,12 @@ impl ApplicationHandler<AppEvent> for App {
                             &gpu.device, &gpu.queue, scene_view, width, height, &bar.title_labels,
                         );
                     }
-                    // Pass 4: scrollbar (spans the grid area below the bar),
-                    // plus the Ctrl+hover link underline in the same quad pass
-                    // (zero text-layer / grid-hash impact).
+                    // Pass 4: scrollbar (spans the grid area below the bar), the
+                    // SGR text decorations (underline/strike), the Ctrl+hover / OSC 8
+                    // link underline, and the cursor — all in one quad pass (zero
+                    // text-layer / grid-hash impact). Decorations are cached in the
+                    // text layer (rebuilt only on a grid change); only the cursor
+                    // quad rebuilds per frame (for the caret flash).
                     let mut rects: Vec<jetty_render::Rect> = Vec::new();
                     if let Some(mut r) =
                         jetty_render::scrollbar_rect(&snap, width, height, grid_top, status_h, scrollbar_thumb)
@@ -7936,22 +7952,31 @@ impl ApplicationHandler<AppEvent> for App {
                         r.y += slide_y_offset;
                         rects.push(r);
                     }
+                    // SGR underline/strike (built at the same grid offset as the text).
+                    rects.extend_from_slice(text.decoration_rects());
                     if let Some(spans) = &link_spans {
-                        // Thickness from the PHYSICAL cell height (HiDPI-correct),
-                        // floored at 1px; color = the active theme's bright blue.
-                        let th = (cell_h * 0.06).round().max(1.0);
+                        // The single shared link-underline geometry (color = the
+                        // active theme's bright blue). This is what finally makes the
+                        // Ctrl+hover / OSC 8 link underline VISIBLE.
                         let p12 = theme.palette[12];
-                        let link_color = [p12[0], p12[1], p12[2], 255];
-                        for &(row, c0, c1) in spans {
-                            rects.push(jetty_render::Rect::new(
-                                c0 as f32 * cell_w,
-                                grid_top + slide_y_offset + (row as f32 + 1.0) * cell_h - th,
-                                (c1 - c0 + 1) as f32 * cell_w,
-                                th,
-                                link_color,
-                            ));
-                        }
+                        rects.extend(jetty_render::link_underline_rects(
+                            spans,
+                            [p12[0], p12[1], p12[2], 255],
+                            cell_w,
+                            cell_h,
+                            grid_top + slide_y_offset,
+                        ));
                     }
+                    // Cursor last so it draws over the glyphs + decorations.
+                    rects.extend(jetty_render::cursor_rects(
+                        &snap,
+                        cell_w,
+                        cell_h,
+                        grid_top + slide_y_offset,
+                        main_focused,
+                        caret_t_for_flash,
+                        caret_flash_color,
+                    ));
                     quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &rects);
 
                     // Pass 4a: bottom STATUS BAR (the perf HUD, OFF the tab row).

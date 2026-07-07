@@ -196,6 +196,9 @@ pub(crate) struct DetachedWindow {
     /// Caret flash burst clock for keystrokes typed in THIS window (mirrors
     /// `App::caret_anim` for the main window). `None` = no burst live.
     pub caret_anim: Option<std::time::Instant>,
+    /// Whether THIS detached window holds OS focus (from its Focused events).
+    /// Drives the unfocused-hollow cursor, per-window like the main one.
+    pub focused: bool,
     /// When `Some`, a grid+PTY reflow is scheduled for this instant (mirrors
     /// `App::reflow_pending_at`): a border drag fires many Resized events, and
     /// reflow+SIGWINCH per event scatters p10k's prompt — the surface resizes
@@ -390,6 +393,9 @@ impl DetachedWindow {
             corner_mask,
             crt,
             caret_anim: None,
+            // A freshly-detached window is created focused (the WM focuses it on
+            // map); its Focused events keep this current thereafter.
+            focused: true,
             reflow_pending_at: None,
             // build_window above already titled the OS window from tab.title.
             applied_os_title: tab.title.clone(),

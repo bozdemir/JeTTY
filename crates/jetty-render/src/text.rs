@@ -101,7 +101,6 @@ pub struct TextLayer {
     viewport: Viewport,
     renderer: TextRenderer,
     buffer: Buffer,
-    cursor_buffer: Buffer,
     // Retained for future use (e.g., rescaling on DPI change in Task 7+).
     #[allow(dead_code)]
     metrics: Metrics,
@@ -229,17 +228,8 @@ impl TextLayer {
         // None width disables line wrapping so columns stay on the monospace grid.
         buffer.set_size(&mut font_system, None, None);
 
-        // Cursor buffer: a single full-block glyph used to draw the block cursor.
-        let mut cursor_buffer = Buffer::new(&mut font_system, metrics);
-        cursor_buffer.set_size(&mut font_system, None, None);
-        let cursor_attrs = Attrs::new().family(Family::Name(family));
-        cursor_buffer.set_text(
-            &mut font_system,
-            "\u{2588}",
-            &cursor_attrs,
-            Shaping::Basic,
-            None,
-        );
+        // The cursor is drawn as a QuadLayer rect (see `quad::cursor_rects`), not a
+        // text-atlas block glyph, so there is no cursor buffer to build here.
 
         // Scratch buffer for glyph-coverage probing (see `covers`).
         let mut coverage_buffer = Buffer::new(&mut font_system, metrics);
@@ -265,7 +255,6 @@ impl TextLayer {
             viewport,
             renderer,
             buffer,
-            cursor_buffer,
             metrics,
             cell_w,
             cell_h,
@@ -366,15 +355,6 @@ impl TextLayer {
         // Re-snap the grid buffer's monospace advance to the new cell width so a
         // bold/italic run in the new family stays column-aligned.
         self.buffer.set_monospace_width(&mut self.font_system, Some(self.cell_w));
-        // Reset cursor buffer glyph so the block cursor uses the new family.
-        let cursor_attrs = Attrs::new().family(Family::Name(&self.font_family));
-        self.cursor_buffer.set_text(
-            &mut self.font_system,
-            "\u{2588}",
-            &cursor_attrs,
-            Shaping::Basic,
-            None,
-        );
     }
 
     /// Change the CHROME (UI-overlay) font family at runtime. `None` or an empty
@@ -424,16 +404,6 @@ impl TextLayer {
         self.metrics = Metrics::new(font_size, line_height);
         self.buffer.set_metrics(&mut self.font_system, self.metrics);
         self.buffer.set_size(&mut self.font_system, None, None);
-        self.cursor_buffer.set_metrics(&mut self.font_system, self.metrics);
-        self.cursor_buffer.set_size(&mut self.font_system, None, None);
-        let cursor_attrs = Attrs::new().family(Family::Name(&self.font_family));
-        self.cursor_buffer.set_text(
-            &mut self.font_system,
-            "\u{2588}",
-            &cursor_attrs,
-            Shaping::Basic,
-            None,
-        );
         // Re-metric the coverage probe buffer too (F6). `route()` shapes the probed
         // char in `coverage_buffer` and compares its advance against the CURRENT
         // `cell_w`; leaving the probe buffer at the construction-time size made a
@@ -551,8 +521,6 @@ impl TextLayer {
         snapshot: &GridSnapshot,
         clear: bool,
         top_offset: f32,
-        caret_t: Option<f32>,
-        caret_flash_color: [f32; 3],
     ) -> Result<(), PrepareError> {
         // Build per-cell color spans: one (&str slice, Attrs) pair per cell.
         // We build a single String containing all text, then collect borrowed slices from it.
@@ -793,67 +761,12 @@ impl TextLayer {
             custom_glyphs: &[],
         };
 
-        // Build a Vec of TextAreas; cursor and scrollbar are pushed when applicable.
-        let mut areas: Vec<TextArea> = vec![text_area];
+        // Build a Vec of TextAreas; fallback overdraws and scrollbar are pushed
+        // when applicable. The CURSOR is no longer a text glyph here — it is drawn
+        // as a QuadLayer rect app-side (see `quad::cursor_rects`) so it can take an
+        // arbitrary shape (block/beam/underline/hollow) and ride the caret flash.
 
-        // Block cursor area when the cursor is visible and within bounds.
-        // Apps that hide the cursor (DECTCEM `\e[?25l`) clear `cursor_visible`.
-        let cursor_in_bounds = snapshot.cursor_row < snapshot.rows
-            && snapshot.cursor_col < snapshot.cols;
-        if snapshot.cursor_visible && cursor_in_bounds {
-            let [cr, cg, cb] = snapshot.cursor_rgb;
-            // Caret flash+pulse: modulate color and scale during the animation burst.
-            // When caret_t is None this branch is skipped and rendering is unchanged.
-            let (cursor_color, cursor_scale, cursor_left, cursor_top) =
-                if let Some(t) = caret_t {
-                    // ease-out quadratic: fast rise, slow finish
-                    let e = 1.0 - (1.0 - t) * (1.0 - t);
-                    // bump = 4·e·(1−e): rises to 1 at e=0.5, returns to 0 at e=1.
-                    // Both color and scale use the same bump so the color returns
-                    // to cursor_rgb by t=1 (no snap at the end of the burst).
-                    let bump = 4.0 * e * (1.0 - e);
-                    // Color: lerp cursor_rgb → caret_flash_color by bump
-                    let [fr, fg, fb] = caret_flash_color;
-                    let lerp_ch = |base: u8, target: f32, frac: f32| -> u8 {
-                        let b = base as f32 / 255.0;
-                        ((b + (target - b) * frac) * 255.0).round().clamp(0.0, 255.0) as u8
-                    };
-                    let r = lerp_ch(cr, fr, bump);
-                    let g = lerp_ch(cg, fg, bump);
-                    let b = lerp_ch(cb, fb, bump);
-                    // Scale: peaks at bump=1 (~1.15×), returns to 1 at bump=0 (t=1).
-                    // Quantize the scale to discrete steps: the cursor glyph's atlas
-                    // CacheKey folds font_size*scale, so a continuously-varying scale
-                    // would mint a brand-new (permanently-cached) atlas entry every
-                    // animation frame. Bucketing bounds it to a handful of keys.
-                    let scale = 1.0 + 0.15 * ((bump * 8.0).round() / 8.0);
-                    // Keep glyph centered on its cell by offsetting origin inward
-                    // by half of the extra width/height the scaling adds.
-                    let left = snapshot.cursor_col as f32 * self.cell_w
-                        - (scale - 1.0) * self.cell_w * 0.5;
-                    let top = snapshot.cursor_row as f32 * self.cell_h + top_offset
-                        - (scale - 1.0) * self.cell_h * 0.5;
-                    (Color::rgb(r, g, b), scale, left, top)
-                } else {
-                    // No animation — exact original behavior (byte-identical path).
-                    (
-                        Color::rgb(cr, cg, cb),
-                        1.0_f32,
-                        snapshot.cursor_col as f32 * self.cell_w,
-                        snapshot.cursor_row as f32 * self.cell_h + top_offset,
-                    )
-                };
-            areas.push(TextArea {
-                buffer: &self.cursor_buffer,
-                left: cursor_left,
-                top: cursor_top,
-                scale: cursor_scale,
-                bounds: win_bounds,
-                // Color::rgba is not available in this glyphon version; use rgb.
-                default_color: cursor_color,
-                custom_glyphs: &[],
-            });
-        }
+        let mut areas: Vec<TextArea> = vec![text_area];
 
         // Fallback glyphs: drawn ON TOP of the blanked cells, at the exact cell
         // origin, in this same prepare() — so they never shift a neighbor.
@@ -1148,7 +1061,7 @@ impl TextLayer {
             return Ok(());
         };
         // Self-contained path: this pass owns the frame clear.
-        self.render_to(&gpu.device, &gpu.queue, &view, gpu.config.width, gpu.config.height, snapshot, true, 0.0, None, [0.0, 0.0, 0.0])?;
+        self.render_to(&gpu.device, &gpu.queue, &view, gpu.config.width, gpu.config.height, snapshot, true, 0.0)?;
         frame.present();
         Ok(())
     }

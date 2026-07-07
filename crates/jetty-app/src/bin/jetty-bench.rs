@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     // warm up (shader/pipeline compile, atlas upload)
-    text.render_to(&device, &queue, &view, width, height, &snap, true, 0.0, None, [0.0, 0.0, 0.0])?;
+    text.render_to(&device, &queue, &view, width, height, &snap, true, 0.0)?;
     device.poll(wgpu::PollType::wait_indefinitely())?;
 
     // Split each frame into CPU-prep (build spans + shape + glyphon prepare +
@@ -125,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t4 = Instant::now();
     for _ in 0..n_frames {
         let c = Instant::now();
-        text.render_to(&device, &queue, &view, width, height, &snap, true, 0.0, None, [0.0, 0.0, 0.0])?;
+        text.render_to(&device, &queue, &view, width, height, &snap, true, 0.0)?;
         cpu_accum += c.elapsed().as_secs_f64();
         device.poll(wgpu::PollType::wait_indefinitely())?;
     }

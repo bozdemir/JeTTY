@@ -6,6 +6,19 @@
 ///   JETTY_SHOT_INPUT — ANSI bytes to feed the terminal (default: built-in
 ///                    sample). With JETTY_SHOT_TABBAR, an OSC 0/2 title in the
 ///                    input (`\e]2;my title\a`) retitles the first tab.
+///   JETTY_SHOT_ATTRS — "1" feeds a built-in TEXT-ATTRIBUTE self-test sample
+///                    (used only when JETTY_SHOT_INPUT is unset): a plain
+///                    reference row + the same text bold+italic (column-alignment
+///                    check), then every underline style (single / \e[4:2m double
+///                    / \e[4:3m undercurl / \e[4:4m dotted / \e[4:5m dashed), a
+///                    colored undercurl (SGR 58), strikethrough, and combos — so
+///                    a single screenshot verifies bold/italic/underline/strike +
+///                    the monospace invariant.
+///   JETTY_SHOT_CURSOR_UNFOCUSED — "1" draws the cursor as if the window is
+///                    UNFOCUSED (a Block cursor becomes a hollow box). The cursor
+///                    SHAPE itself comes from the snapshot, so append a DECSCUSR
+///                    to JETTY_SHOT_INPUT (`\e[1 q` block, `\e[3 q` underline,
+///                    `\e[5 q` beam) to screenshot each shape.
 ///   JETTY_THEME      — theme name (picked up automatically via Terminal::new)
 ///   JETTY_OPACITY    — opacity 0.0..1.0 (picked up automatically via Terminal::new)
 ///   JETTY_SHOT_UI_FONT_SIZE — UI (chrome) font size in logical pt (10..28,
@@ -65,8 +78,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(16.0);
 
     let default_input = "\x1b[1;32muser@host\x1b[0m:\x1b[1;34m~/jetty\x1b[0m$ ls --color\r\n\x1b[1;34msrc\x1b[0m  \x1b[33mCargo.toml\x1b[0m  \x1b[31mREADME.md\x1b[0m\r\n\x1b[1;32muser@host\x1b[0m:\x1b[1;34m~/jetty\x1b[0m$ \r\n";
+    // JETTY_SHOT_ATTRS=1: built-in text-attribute self-test sample (used only when
+    // JETTY_SHOT_INPUT is not set). Row 1 is a PLAIN reference; row 2 is the same
+    // text in bold+italic so columns can be checked for alignment (the monospace
+    // invariant). The remaining rows exercise every underline style (single,
+    // \e[4:2m double, \e[4:3m undercurl, \e[4:4m dotted, \e[4:5m dashed), a colored
+    // undercurl (SGR 58), strikethrough, and combinations. Append a DECSCUSR
+    // (e.g. `\e[5 q`) via JETTY_SHOT_INPUT to also pick a cursor shape.
+    let attrs_sample = "The quick brown fox 0123456789 |\r\n\
+        \x1b[1;3mThe quick brown fox 0123456789 |\x1b[0m\r\n\
+        \x1b[1mBold\x1b[0m \x1b[3mItalic\x1b[0m \x1b[1;3mBoldItalic\x1b[0m plain\r\n\
+        \x1b[4mSingle underline\x1b[0m\r\n\
+        \x1b[4:2mDouble underline\x1b[0m\r\n\
+        \x1b[4:3mUndercurl underline\x1b[0m\r\n\
+        \x1b[4:4mDotted underline\x1b[0m\r\n\
+        \x1b[4:5mDashed underline\x1b[0m\r\n\
+        \x1b[58;2;255;80;80m\x1b[4:3mColored undercurl (LSP red)\x1b[0m\r\n\
+        \x1b[9mStrikethrough text\x1b[0m\r\n\
+        \x1b[1m\x1b[4mBold+underline\x1b[0m  \x1b[3m\x1b[9mItalic+strike\x1b[0m\r\n";
     let input_bytes: Vec<u8> = match std::env::var("JETTY_SHOT_INPUT") {
         Ok(s) => s.into_bytes(),
+        Err(_) if env_flag("JETTY_SHOT_ATTRS") => attrs_sample.as_bytes().to_vec(),
         Err(_) => default_input.as_bytes().to_vec(),
     };
 
@@ -331,7 +363,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // --- Pass 2: render the grid text on top of the painted background (load) ---
-    text.render_to(&device, &queue, &view, width, height, &snap, false, shot_grid_top, None, [0.0, 0.0, 0.0])?;
+    text.render_to(&device, &queue, &view, width, height, &snap, false, shot_grid_top)?;
 
     // --- Draw scrollbar quad (and optionally the settings panel) over the text ---
     {
@@ -344,22 +376,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rects.push(r);
         }
 
-        // JETTY_SHOT_LINK_HOVER underline: same formula/color as the app's
-        // Pass 4 (theme bright blue, thickness from the physical cell height).
+        // SGR text decorations (underline styles + strike), same as the app's
+        // Pass 4 — makes the headless self-test exercise every underline/strike.
+        rects.extend_from_slice(text.decoration_rects());
+
+        // JETTY_SHOT_LINK_HOVER underline: the shared link-underline geometry
+        // (theme bright blue), identical to the app's Pass 4.
         if let Some(hit) = &link_hit {
-            let th = (cell_h * 0.06).round().max(1.0);
             let p12 = terminal.theme().palette[12];
-            let link_color = [p12[0], p12[1], p12[2], 255];
-            for &(row, c0, c1) in &hit.spans {
-                rects.push(jetty_render::Rect::new(
-                    c0 as f32 * cell_w,
-                    shot_grid_top + (row as f32 + 1.0) * cell_h - th,
-                    (c1 - c0 + 1) as f32 * cell_w,
-                    th,
-                    link_color,
-                ));
-            }
+            rects.extend(jetty_render::link_underline_rects(
+                &hit.spans,
+                [p12[0], p12[1], p12[2], 255],
+                cell_w,
+                cell_h,
+                shot_grid_top,
+            ));
         }
+
+        // Cursor as quads (drawn over the glyphs + decorations). Focused unless
+        // JETTY_SHOT_CURSOR_UNFOCUSED is set, so the harness can screenshot the
+        // unfocused-hollow cursor. The shape itself comes from the snapshot
+        // (DECSCUSR in the input, e.g. `\e[5 q` for a beam).
+        let cursor_focused = !env_flag("JETTY_SHOT_CURSOR_UNFOCUSED");
+        rects.extend(jetty_render::cursor_rects(
+            &snap,
+            cell_w,
+            cell_h,
+            shot_grid_top,
+            cursor_focused,
+            None,
+            [0.0, 0.0, 0.0],
+        ));
 
         // Baseline for the live "Aa" UI-font specimen, set when the panel is built.
         let mut ui_specimen_pos: Option<(f32, f32)> = None;
