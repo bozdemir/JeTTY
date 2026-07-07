@@ -248,6 +248,12 @@ const SCROLLBAR_GUTTER: f32 = jetty_render::SCROLLBAR_W + 4.0;
 /// the next Wake continues where this left off while input events interleave.
 const PTY_DRAIN_BUDGET: usize = 2 * 1024 * 1024;
 
+/// Minimum interval between open-search match re-collects while output
+/// streams (each re-collect scans the whole scrollback). Shared by the
+/// render-path throttle, the `about_to_wait` trailing one-shot that services
+/// a refresh the throttle skipped (F10), and its WaitUntil deadline.
+const SEARCH_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// Wrap period (seconds) for the CRT animation phase before it is narrowed to
 /// f32. The three sub-effects all use INTEGER angular frequencies (roll 6,
 /// flicker 50, jitter 80 & 13 rad/s — see `crt.rs`), so every whole multiple of
@@ -686,9 +692,16 @@ pub struct App {
     /// keys edit the query; Esc / ✕ / Ctrl+Shift+F close it and clear matches.
     search_open: bool,
     /// Last streaming refresh of the open search's matches (throttled to
-    /// 150ms on the PTY-drain path so heavy output never re-scans history
-    /// every frame). `None` until the first refresh.
+    /// [`SEARCH_REFRESH_INTERVAL`] on the PTY-drain path so heavy output
+    /// never re-scans history every frame). `None` until the first refresh.
     search_refresh_at: Option<std::time::Instant>,
+    /// True while the open search's stored matches may be stale: set when a
+    /// drain consumed output but the throttle skipped the re-collect, cleared
+    /// by every refresh. While set, `about_to_wait` schedules ONE wake at the
+    /// throttle deadline so a burst that ENDS inside the window still gets a
+    /// trailing refresh (F10) — the flag never exists while idle, so this
+    /// adds zero idle work.
+    search_dirty: bool,
     /// When `Some(i)`, a "Close this tab?" confirmation popup is open for tab `i`.
     /// The × click / Ctrl+Shift+W / Ctrl+D set this instead of closing immediately;
     /// Enter (or the Close button) confirms, Esc (or Cancel / click-outside) clears.
@@ -999,6 +1012,7 @@ impl App {
             help_open: false,
             search_open: false,
             search_refresh_at: None,
+            search_dirty: false,
             confirm_close: None,
             confirm_quit: false,
             last_pos: None,
@@ -1663,6 +1677,7 @@ impl App {
             return;
         }
         self.search_open = false;
+        self.search_dirty = false;
         // Tolerate an empty tabs vec (reattach-from-close_exited_tabs path).
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.terminal.search_clear();
@@ -5067,6 +5082,29 @@ impl ApplicationHandler<AppEvent> for App {
             self.pending_autohide_at = None;
             self.autohide_main_window();
         }
+        // Trailing scrollback-search refresh (F10): a streaming burst that
+        // ended inside the throttle window marked the matches dirty but never
+        // got a re-collect (no later drain carries data), leaving highlights,
+        // counter and Enter-navigation stale indefinitely. Service the skipped
+        // refresh exactly once at the throttle deadline (scheduled via the
+        // WaitUntil merge below); the flag only exists while the bar is open
+        // AND output was drained, so idle stays at zero work.
+        if self.search_open
+            && self.search_dirty
+            && self
+                .search_refresh_at
+                .is_none_or(|t| t.elapsed() >= SEARCH_REFRESH_INTERVAL)
+            && !self.tabs.is_empty()
+        {
+            self.search_dirty = false;
+            self.active_tab_mut().terminal.search_refresh();
+            self.search_refresh_at = Some(std::time::Instant::now());
+            if self.visible && !self.main_occluded {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+        }
         // A pending (debounced) reflow does NOT keep the loop in Poll. The old
         // code folded `reflow_pending_at.is_some()` into `main_pending`, so for up
         // to 250ms after every font/window resize the loop sat in Poll and
@@ -5161,6 +5199,14 @@ impl ApplicationHandler<AppEvent> for App {
         // strictly in the future or None (F1).
         if let Some(d) = self.sync_wake_at() {
             merge_wake(&mut wake_at, d);
+        }
+        // Skipped (throttled) open-search refresh: wake once at the throttle
+        // deadline so the trailing re-collect above runs (F10). An elapsed
+        // deadline was serviced above, so this is strictly in the future.
+        if self.search_open && self.search_dirty {
+            if let Some(t) = self.search_refresh_at {
+                merge_wake(&mut wake_at, t + SEARCH_REFRESH_INTERVAL);
+            }
         }
         // Idle-HUD one-shot: flip the HUD from its last live value to an honest
         // "idle" reading once the app settles, then go fully idle.
@@ -5480,6 +5526,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // the loop. The waker fires ~10x/s, so we react within a frame.
                 if !self.close_exited_tabs(exited, event_loop) {
                     return;
+                }
+                // Output rotated the scrollback under the open search: its
+                // stored match Points are stale until the next (throttled)
+                // re-collect. Marked HERE too — not just in the render-path
+                // drain — because this drain may consume the whole burst,
+                // leaving the following RedrawRequested drain empty (F10).
+                if had_data && self.search_open {
+                    self.search_dirty = true;
                 }
                 // Damage-driven: only request a redraw when the active tab's PTY
                 // produced data (or query replies were sent). Background tabs still
@@ -6937,6 +6991,14 @@ impl ApplicationHandler<AppEvent> for App {
                             self.search_close();
                         }
                         Key::Named(NamedKey::Enter) | Key::Named(NamedKey::F3) => {
+                            // Matches stale after a throttled streaming burst?
+                            // Re-collect FIRST so navigation steps real Points
+                            // instead of scrolling to rotated rows (F10).
+                            if self.search_dirty {
+                                self.search_dirty = false;
+                                self.active_tab_mut().terminal.search_refresh();
+                                self.search_refresh_at = Some(std::time::Instant::now());
+                            }
                             // Enter/F3 = older (up through history); +Shift = newer.
                             self.active_tab_mut().terminal.search_nav(!shift);
                         }
@@ -7368,16 +7430,24 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 // Streaming search refresh: stored match Points go stale as
                 // output rotates the scrollback. Re-collect at most every
-                // 150ms, only while the bar is open and only when this frame
-                // actually drained output — event-driven, zero cost otherwise.
-                if had
+                // SEARCH_REFRESH_INTERVAL, only while the bar is open and only
+                // when output was drained — event-driven, zero cost otherwise.
+                // A drain the throttle skips marks the matches DIRTY instead;
+                // about_to_wait then wakes once at the deadline for a trailing
+                // refresh, so a burst that ends inside the window can't leave
+                // the highlights/counter stale forever (F10).
+                if had && self.search_open {
+                    self.search_dirty = true;
+                }
+                if self.search_dirty
                     && self.search_open
                     && self
                         .search_refresh_at
-                        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(150))
+                        .is_none_or(|t| t.elapsed() >= SEARCH_REFRESH_INTERVAL)
                 {
                     self.active_tab_mut().terminal.search_refresh();
                     self.search_refresh_at = Some(std::time::Instant::now());
+                    self.search_dirty = false;
                 }
                 // SINGLE clearing point for the activity indicator: the active
                 // tab is on screen this frame, so its pending dot is consumed.
