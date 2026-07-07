@@ -12,6 +12,10 @@
 ///                    default 16). Drives ALL chrome (tab bar/status/menu/panel/
 ///                    help/confirm/welcome) and the panel's live "Aa" specimen.
 ///   JETTY_SHOT_UI_FONT — UI (chrome) font family (default "" = platform sans).
+///   JETTY_SHOT_TABBAR_ACTIVITY — comma list aligned with the 3 sample tabs
+///                    (`none|output|bell`, unknown → none), e.g.
+///                    `none,output,bell` — draws the activity/bell dots on the
+///                    inactive tabs for headless inspection.
 ///   JETTY_SHOT_DETACHED — "1" renders the DETACHED-window chrome: top bar
 ///                    (title + ✕), grid offset below it, bottom status strip.
 ///                    JETTY_SHOT_DETACHED_TITLE / _HOVER tweak title and the
@@ -469,6 +473,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     v
                 });
+            // JETTY_SHOT_TABBAR_ACTIVITY — per-tab activity dots (see header).
+            let activity: Vec<jetty_render::TabActivity> =
+                std::env::var("JETTY_SHOT_TABBAR_ACTIVITY")
+                    .map(|v| {
+                        v.split(',')
+                            .map(|s| match s.trim() {
+                                "output" => jetty_render::TabActivity::Output,
+                                "bell" => jetty_render::TabActivity::Bell,
+                                _ => jetty_render::TabActivity::None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            if !activity.is_empty() {
+                eprintln!("jetty-shot: JETTY_SHOT_TABBAR_ACTIVITY = {activity:?}");
+            }
             let mut bar = jetty_render::build_tab_bar_ex(
                 width,
                 &tabs,
@@ -477,6 +497,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 jetty_render::CtrlHover::None,
                 None, // perf HUD now lives in the bottom status bar, not the tab row
                 chrome_char_w,
+                &activity,
             );
             // JETTY_TAB_BAR=bottom — place the bar flush at the window bottom.
             // build_tab_bar lays it out at y 0..TABBAR_H; translate it down.

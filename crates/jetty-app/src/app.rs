@@ -270,6 +270,9 @@ pub(crate) struct Tab {
     /// Once the user commits a manual rename, shell OSC titles are ignored for
     /// this tab forever (manual > auto > default precedence).
     pub(crate) manually_renamed: bool,
+    /// Unseen output/bell that arrived while this tab was INACTIVE, shown as a
+    /// themed dot on its tab label; cleared when it renders as the active tab.
+    pub(crate) activity: jetty_render::TabActivity,
 }
 
 /// Resolve a pending shell title update against the tab's rename state and
@@ -1262,6 +1265,7 @@ impl App {
             default_title: title.clone(),
             title,
             manually_renamed: false,
+            activity: jetty_render::TabActivity::None,
         });
         self.active = self.tabs.len() - 1;
         if let Some(w) = &self.window {
@@ -1369,6 +1373,9 @@ impl App {
 
         // Apply the current theme to the detached tab before it leaves.
         tab.terminal.set_theme(self.current_theme());
+        // The tab becomes the visible tab of its own window; drop any pending
+        // indicator so it can't resurface stale on a later reattach.
+        tab.activity = jetty_render::TabActivity::None;
 
         // Derive LOGICAL window size from the GPU physical surface size.
         // `build_window` takes logical px; dividing by scale_factor converts.
@@ -1533,6 +1540,8 @@ impl App {
         }
         self.switching_to_detached = false;
         let mut tab = dw.tab; // move the Tab out before `dw` drops
+        // It was visible in its own window until now — no unseen activity.
+        tab.activity = jetty_render::TabActivity::None;
 
         // Reflow to the MAIN window's grid (tab bar accounted for).
         let (cols, rows) = self.grid_dims();
@@ -1992,12 +2001,15 @@ impl App {
     /// tab's query replies back to its own PTY. Background tabs must keep draining
     /// so their shells never block on a full pipe.
     ///
-    /// Returns `(active_had_data, exited)` where `active_had_data` is true if the
-    /// ACTIVE tab consumed bytes (so the caller redraws), and `exited` is the list
-    /// of tab indices whose child exited this tick (caller closes them after, to
-    /// avoid mutating `tabs` while iterating).
-    fn drain_pty(&mut self) -> (bool, Vec<usize>) {
+    /// Returns `(active_had_data, activity_changed, exited)` where
+    /// `active_had_data` is true if the ACTIVE tab consumed bytes (so the caller
+    /// redraws), `activity_changed` is true if an INACTIVE tab's activity
+    /// indicator transitioned (so the tab bar needs a repaint), and `exited` is
+    /// the list of tab indices whose child exited this tick (caller closes them
+    /// after, to avoid mutating `tabs` while iterating).
+    fn drain_pty(&mut self) -> (bool, bool, Vec<usize>) {
         let mut active_had_data = false;
+        let mut activity_changed = false;
         let mut exited: Vec<usize> = Vec::new();
         // Perf-HUD VT throughput: count bytes read this drain into a local
         // (avoids a self borrow inside the &mut self.tabs loop), folded into the
@@ -2006,6 +2018,25 @@ impl App {
         let mut vt_read: u64 = 0;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             let had = Self::drain_one_tab(tab, &mut vt_read);
+            // Consume the bell flag for EVERY tab (active included) so it never
+            // goes stale; only INACTIVE tabs surface it as an indicator. Bell is
+            // sticky (never downgraded by later output); Output only lights a
+            // clean tab. Rides the existing event-driven drain — zero idle work.
+            let rang = tab.terminal.take_bell();
+            if i != self.active {
+                use jetty_render::TabActivity;
+                let new = if rang {
+                    TabActivity::Bell
+                } else if had && tab.activity == TabActivity::None {
+                    TabActivity::Output
+                } else {
+                    tab.activity
+                };
+                if new != tab.activity {
+                    tab.activity = new;
+                    activity_changed = true;
+                }
+            }
             if i == self.active && had {
                 active_had_data = true;
             }
@@ -2014,7 +2045,7 @@ impl App {
             }
         }
         self.vt_bytes += vt_read;
-        (active_had_data, exited)
+        (active_had_data, activity_changed, exited)
     }
 
     /// Drain one tab's PTY output into its terminal, and flush any query
@@ -4891,6 +4922,7 @@ impl ApplicationHandler<AppEvent> for App {
             title: "Tab 1".to_string(),
             default_title: "Tab 1".to_string(),
             manually_renamed: false,
+            activity: jetty_render::TabActivity::None,
         });
         self.active = 0;
 
@@ -4953,7 +4985,7 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, ev: AppEvent) {
         match ev {
             AppEvent::Wake => {
-                let (had_data, exited) = self.drain_pty();
+                let (had_data, activity_changed, exited) = self.drain_pty();
                 // A tab whose shell exited (Ctrl+D / `exit`) closes THAT tab,
                 // Yakuake-style; if it was the last tab, close_exited_tabs exits
                 // the loop. The waker fires ~10x/s, so we react within a frame.
@@ -4968,7 +5000,10 @@ impl ApplicationHandler<AppEvent> for App {
                 // occluded/minimized): a hidden dropdown running `cat bigfile`
                 // must keep draining (so the shell never blocks) but must NOT run
                 // the full render pipeline into an unmapped surface (F16).
-                if had_data && self.visible && !self.main_occluded {
+                // `activity_changed` fires only on indicator TRANSITIONS (at
+                // most None->Output->Bell between views), so a flooding
+                // background tab costs one extra redraw total, not one per Wake.
+                if (had_data || activity_changed) && self.visible && !self.main_occluded {
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -4983,6 +5018,10 @@ impl ApplicationHandler<AppEvent> for App {
                 let mut exited_detached: Vec<usize> = Vec::new();
                 for (i, dw) in self.detached.iter_mut().enumerate() {
                     let had = Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+                    // Consume the bell so a reattach never shows a phantom Bell
+                    // dot. Detached windows draw no indicator by design: the tab
+                    // IS the visible, active tab of its own window.
+                    let _ = dw.tab.terminal.take_bell();
                     // OSC titles: sync the OS window title even when occluded
                     // (the taskbar entry of a minimized window must update).
                     dw.sync_os_title();
@@ -5604,6 +5643,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // tab's right edge / on ✕ / on + landed on the wrong tab (F19).
                     let mut bar = jetty_render::build_tab_bar_ex(
                         w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, None, self.chrome_char_w(),
+                        &[], // activity never affects geometry; keeps hit rects == drawn rects
                     );
                     // build_tab_bar_ex lays the bar out at y 0..TABBAR_H; shift its
                     // hit-test rects down to the bar's actual position (bottom mode).
@@ -5894,6 +5934,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // strip); passing perf_label mis-sized the hit-rects (F19).
                     let mut bar = jetty_render::build_tab_bar_ex(
                         w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, None, self.chrome_char_w(),
+                        &[], // activity never affects geometry; keeps hit rects == drawn rects
                     );
                     if bar_y != 0.0 {
                         translate_bar_rects(&mut bar, bar_y);
@@ -6651,13 +6692,22 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 // Drain every tab so background shells keep running; close any
                 // whose child exited as part of the output we just drained.
-                let (_had, exited) = self.drain_pty();
+                let (_had, _activity_changed, exited) = self.drain_pty();
                 if !self.close_exited_tabs(exited, event_loop) {
                     return;
                 }
                 if self.tabs.is_empty() {
                     return;
                 }
+                // SINGLE clearing point for the activity indicator: the active
+                // tab is on screen this frame, so its pending dot is consumed.
+                // Covers every switch path (click, Ctrl+Tab, Ctrl+1..9, close
+                // fix-ups, reattach) because each already requests a redraw.
+                self.tabs[self.active].activity = jetty_render::TabActivity::None;
+                // Per-tab activity for the drawn bar, index-aligned with
+                // tabs_meta (frames are damage-driven; no idle-path allocation).
+                let tab_activity: Vec<jetty_render::TabActivity> =
+                    self.tabs.iter().map(|t| t.activity).collect();
                 // Snapshot the ACTIVE tab and build the tab bar (immutable reads
                 // gathered before borrowing the render stack mutably).
                 let snap = self.active_tab().terminal.snapshot();
@@ -6849,6 +6899,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // so the tab bar is built WITHOUT it (None).
                 let mut bar = jetty_render::build_tab_bar_ex(
                     width, &tabs_meta, &theme, rename_ref, ctrl_hover, None, chrome_char_w,
+                    &tab_activity,
                 );
                 // Translate the bar quads + labels to its actual y (bottom mode)
                 // PLUS the dropdown slide so it moves with the content.
