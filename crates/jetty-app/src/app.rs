@@ -300,6 +300,37 @@ fn resolve_title(
     }
 }
 
+/// Grace window after an app-initiated PTY resize (`App::reflow`) during
+/// which drained output does NOT light an inactive tab's Output dot: the
+/// resize SIGWINCHes every background shell, whose prompt repaint (p10k
+/// repaints unconditionally) would otherwise flag "unseen output" on every
+/// window/font resize — a self-inflicted false positive (F3). Bell is a real
+/// event and is never suppressed.
+const REFLOW_ACTIVITY_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Pure transition for an INACTIVE tab's activity indicator, given what this
+/// drain pass observed. Rules (unit-tested):
+/// * a bell always escalates to `Bell` (sticky — later output never
+///   downgrades it, and the reflow grace never masks it);
+/// * output upgrades `None` → `Output`, unless `suppress_output` (the
+///   post-reflow SIGWINCH grace, F3) is active;
+/// * anything else keeps the current state.
+fn next_activity(
+    current: jetty_render::TabActivity,
+    had_output: bool,
+    rang_bell: bool,
+    suppress_output: bool,
+) -> jetty_render::TabActivity {
+    use jetty_render::TabActivity;
+    if rang_bell {
+        TabActivity::Bell
+    } else if had_output && !suppress_output && current == TabActivity::None {
+        TabActivity::Output
+    } else {
+        current
+    }
+}
+
 /// Logical size of the separate Settings window — DERIVED from the panel size
 /// (+ 4px border) so it always fits exactly. Growing the panel (adding a settings
 /// row in `build_panel`) resizes this window automatically; the bottom rows
@@ -521,6 +552,13 @@ pub struct App {
     /// immediately; `about_to_wait` fires ONE reflow once the user stops, so N
     /// presses coalesce into a single PTY SIGWINCH (avoids stacked p10k prompts).
     reflow_pending_at: Option<std::time::Instant>,
+    /// When the last app-initiated `reflow()` resized the tabs' PTYs. Drains
+    /// within [`REFLOW_ACTIVITY_GRACE`] of it skip the inactive-tab
+    /// None→Output activity upgrade: the resize SIGWINCHed every background
+    /// shell, and their prompt repaints must not light false "unseen output"
+    /// dots on every window/font resize (F3). Never cleared — it simply ages
+    /// out; read only on the (event-driven) drain path, zero idle cost.
+    reflow_resized_at: Option<std::time::Instant>,
     /// Current font family name (runtime-settable via the font picker).
     font_family: String,
     /// Cached sorted monospace family list (populated once TextLayer is built).
@@ -942,6 +980,7 @@ impl App {
             opacity,
             font_logical: FONT_LOGICAL_DEFAULT,
             reflow_pending_at: None,
+            reflow_resized_at: None,
             font_family,
             font_families: Vec::new(),
             font_scroll_offset: 0,
@@ -2290,6 +2329,14 @@ impl App {
         // running total after the loop. Cheap; the rate is derived over ~1s
         // windows in the render path.
         let mut vt_read: u64 = 0;
+        // App-initiated reflow just SIGWINCHed every background shell; their
+        // prompt repaints are about to arrive and are NOT "unseen output" —
+        // suppress the None→Output upgrade for the grace window (F3). One
+        // cheap comparison on the already-non-idle drain path; Bell is real
+        // user-relevant signal and stays through.
+        let suppress_output = self
+            .reflow_resized_at
+            .is_some_and(|t| t.elapsed() < REFLOW_ACTIVITY_GRACE);
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             let (had, title_changed) = Self::drain_one_tab(tab, &mut vt_read);
             chrome_changed |= title_changed;
@@ -2299,14 +2346,7 @@ impl App {
             // clean tab. Rides the existing event-driven drain — zero idle work.
             let rang = tab.terminal.take_bell();
             if i != self.active {
-                use jetty_render::TabActivity;
-                let new = if rang {
-                    TabActivity::Bell
-                } else if had && tab.activity == TabActivity::None {
-                    TabActivity::Output
-                } else {
-                    tab.activity
-                };
+                let new = next_activity(tab.activity, had, rang, suppress_output);
                 if new != tab.activity {
                     tab.activity = new;
                     chrome_changed = true;
@@ -2531,6 +2571,10 @@ impl App {
             tab.terminal.resize(cols, rows);
             tab.pty.resize(cols as u16, rows as u16);
         }
+        // Every background shell just got a SIGWINCH from US: their prompt
+        // repaints are self-inflicted, not "unseen output" — arm the activity
+        // grace so drain_pty doesn't light false dots on every resize (F3).
+        self.reflow_resized_at = Some(std::time::Instant::now());
     }
 
     /// Change the font size at runtime. `new_logical` is clamped to [6.0, 48.0].
@@ -8975,5 +9019,42 @@ mod resolve_title_tests {
     #[test]
     fn reset_restores_default() {
         assert_eq!(resolve_title(None, false, "Tab 2"), Some("Tab 2".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod activity_transition_tests {
+    use super::next_activity;
+    use jetty_render::TabActivity::{Bell, None as ActNone, Output};
+
+    #[test]
+    fn output_lights_a_clean_tab() {
+        assert_eq!(next_activity(ActNone, true, false, false), Output);
+    }
+
+    #[test]
+    fn no_output_keeps_state() {
+        assert_eq!(next_activity(ActNone, false, false, false), ActNone);
+        assert_eq!(next_activity(Output, false, false, false), Output);
+        assert_eq!(next_activity(Bell, false, false, false), Bell);
+    }
+
+    #[test]
+    fn bell_wins_and_is_never_downgraded() {
+        assert_eq!(next_activity(ActNone, true, true, false), Bell);
+        assert_eq!(next_activity(Output, false, true, false), Bell);
+        // Later output never downgrades a Bell.
+        assert_eq!(next_activity(Bell, true, false, false), Bell);
+    }
+
+    #[test]
+    fn reflow_grace_suppresses_the_output_upgrade() {
+        // F3: a SIGWINCH-induced prompt repaint right after an app-initiated
+        // reflow must NOT light the dot...
+        assert_eq!(next_activity(ActNone, true, false, true), ActNone);
+        // ...but it never masks a real bell,
+        assert_eq!(next_activity(ActNone, true, true, true), Bell);
+        // and never clears an already-lit indicator.
+        assert_eq!(next_activity(Output, true, false, true), Output);
     }
 }
