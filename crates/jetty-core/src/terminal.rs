@@ -51,6 +51,9 @@ struct EventProxy {
     /// Cheap "a title update is pending" flag so the drain path can skip the
     /// mutex entirely in the common no-title case.
     title_dirty: Arc<AtomicBool>,
+    /// Set to `true` when the app rings the bell (BEL / ^G, `Event::Bell`).
+    /// Shared with the owning `Terminal`; consumed via [`Terminal::take_bell`].
+    bell: Arc<AtomicBool>,
 }
 
 impl EventProxy {
@@ -119,8 +122,13 @@ impl EventListener for EventProxy {
                 *self.title_update.lock().unwrap() = Some(None);
                 self.title_dirty.store(true, Ordering::Release);
             }
-            // Bell/Wakeup/ClipboardStore/MouseCursorDirty and the rest are
-            // intentionally ignored for now (Bell is a later concern).
+            // BEL (^G): flag it so the app can show an activity indicator on
+            // the tab that rang while inactive.
+            Event::Bell => {
+                self.bell.store(true, Ordering::Relaxed);
+            }
+            // Wakeup/ClipboardStore/MouseCursorDirty and the rest are
+            // intentionally ignored for now.
             _ => {}
         }
     }
@@ -166,6 +174,9 @@ pub struct Terminal {
     title_update: Arc<Mutex<Option<Option<String>>>>,
     /// Fast pending-title flag shared with the `EventProxy` (see above).
     title_dirty: Arc<AtomicBool>,
+    /// Pending-bell flag shared with the `EventProxy` (`Event::Bell`);
+    /// consumed by [`Terminal::take_bell`].
+    bell: Arc<AtomicBool>,
 }
 
 impl Terminal {
@@ -205,6 +216,7 @@ impl Terminal {
         let theme_shared = Arc::new(Mutex::new(theme.clone()));
         let title_update = Arc::new(Mutex::new(None));
         let title_dirty = Arc::new(AtomicBool::new(false));
+        let bell = Arc::new(AtomicBool::new(false));
         let proxy = EventProxy {
             tx,
             geom: Arc::clone(&geom),
@@ -212,6 +224,7 @@ impl Terminal {
             child_exited: Arc::clone(&child_exited),
             title_update: Arc::clone(&title_update),
             title_dirty: Arc::clone(&title_dirty),
+            bell: Arc::clone(&bell),
         };
         let term = Term::new(config, &size, proxy);
 
@@ -227,6 +240,7 @@ impl Terminal {
             geom,
             title_update,
             title_dirty,
+            bell,
         }
     }
 
@@ -619,6 +633,12 @@ impl Terminal {
         self.child_exited.load(Ordering::SeqCst)
     }
 
+    /// True once since the last call if the app rang the bell (BEL / ^G).
+    /// Consuming read: a second call returns `false` until the next bell.
+    pub fn take_bell(&self) -> bool {
+        self.bell.swap(false, Ordering::Relaxed)
+    }
+
     /// Start a Simple text selection at the given viewport cell (0-based).
     ///
     /// `left_half` is whether the pointer is in the LEFT half of the cell; it
@@ -902,6 +922,22 @@ mod tests {
     fn child_exited_false_by_default() {
         let t = Terminal::new(20, 5);
         assert!(!t.child_exited(), "child should not be flagged exited at start");
+    }
+
+    #[test]
+    fn bell_flag_set_by_bel_and_consumed_by_take() {
+        let mut t = Terminal::new(20, 5);
+        assert!(!t.take_bell(), "no bell should be pending at start");
+        t.feed(b"\x07");
+        assert!(t.take_bell(), "BEL should arm the bell flag");
+        assert!(!t.take_bell(), "take_bell is a consuming read");
+    }
+
+    #[test]
+    fn bell_not_set_by_plain_output() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"hello");
+        assert!(!t.take_bell(), "plain output must not ring the bell");
     }
 
     #[test]

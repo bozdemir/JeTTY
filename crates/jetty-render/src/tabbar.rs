@@ -20,6 +20,18 @@ pub const CONTROLS_W: f32 = CTRL_W * 5.0;
 /// the window controls don't sit flush against the rounded window corners.
 pub const STRIP_PAD: f32 = 8.0;
 
+/// Unseen activity on a tab, shown as a small themed dot on INACTIVE tabs.
+/// `Output` = PTY output arrived while the tab was inactive (accent dot);
+/// `Bell` = BEL (^G) rang while inactive (theme-red dot, never downgraded by
+/// later output). Sticky until the tab is viewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabActivity {
+    #[default]
+    None,
+    Output,
+    Bell,
+}
+
 /// Which window-control button (if any) is hovered, for the highlight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CtrlHover {
@@ -70,7 +82,7 @@ pub struct TabBar {
 /// its stored title. `ctrl_hover` selects which window-control button is drawn
 /// highlighted (close hover reads red).
 pub fn build_tab_bar(width: u32, tabs: &[(String, bool)], theme: &Theme) -> TabBar {
-    build_tab_bar_ex(width, tabs, theme, None, CtrlHover::None, None, CHROME_CHAR_W)
+    build_tab_bar_ex(width, tabs, theme, None, CtrlHover::None, None, CHROME_CHAR_W, &[])
 }
 
 /// Fallback chrome-font advance per character (physical px), used when the
@@ -100,6 +112,12 @@ const PERF_MIN_TAB_W: f32 = 110.0;
 /// (from `TextLayer::cell_size().0`). Pass `CHROME_CHAR_W` (9.6) when a real
 /// measurement is not available (scale-1 fallback used by tests and the thin
 /// `build_tab_bar` wrapper).
+///
+/// `activity` is index-aligned with `tabs` (missing indices read as `None`);
+/// inactive tabs with activity get a small themed dot in the title gutter and
+/// a hidden (overflowed) tab's activity tints the "+N" hint. Activity NEVER
+/// affects geometry, so hit-test rebuilds can pass `&[]`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_tab_bar_ex(
     width: u32,
     tabs: &[(String, bool)],
@@ -108,6 +126,7 @@ pub fn build_tab_bar_ex(
     ctrl_hover: CtrlHover,
     perf: Option<&str>,
     char_w: f32,
+    activity: &[TabActivity],
 ) -> TabBar {
     let sw = width as f32;
     let h = TABBAR_H;
@@ -286,6 +305,27 @@ pub fn build_tab_bar_ex(
             labels.push(("×".to_string(), close_x + 4.0, 9.0, x_col));
         }
 
+        // Activity/bell dot on INACTIVE tabs, in the TITLE_PAD gutter left of
+        // the title (dot spans x+4..x+10, title starts at x+13) so the layout
+        // is bit-identical with or without activity. Accent = unseen output,
+        // theme red = bell.
+        let act = activity.get(i).copied().unwrap_or(TabActivity::None);
+        if !is_on && act != TabActivity::None {
+            const DOT_D: f32 = 6.0;
+            let dc = match act {
+                TabActivity::Bell => theme.palette[1],
+                _ => accent,
+            };
+            quads.push(Rect::rounded(
+                x + 4.0,
+                (h - DOT_D) / 2.0,
+                DOT_D,
+                DOT_D,
+                [dc[0], dc[1], dc[2], 255],
+                DOT_D / 2.0,
+            ));
+        }
+
         // Close hit-box (kept while renaming so indices stay aligned). Color is
         // unused for hit-testing.
         let close_x = x + tab_w - CLOSE_W - 4.0;
@@ -309,7 +349,23 @@ pub fn build_tab_bar_ex(
         let hint_x = (tab_area_x - 34.0).max(x + PLUS_W + 4.0);
         let hint_w = format!("+{overflow}").chars().count() as f32 * char_w;
         if hint_x + hint_w <= controls_left {
-            labels.push((format!("+{overflow}"), hint_x, 9.0, dim_fg));
+            // Tint the hint with the strongest activity among the HIDDEN tabs
+            // (Bell > Output) so activity on a scrolled-out tab is never
+            // silently invisible.
+            let hidden_act = (0..start)
+                .chain(start + drawn..tabs.len())
+                .map(|i| activity.get(i).copied().unwrap_or(TabActivity::None))
+                .fold(TabActivity::None, |acc, a| match (acc, a) {
+                    (TabActivity::Bell, _) | (_, TabActivity::Bell) => TabActivity::Bell,
+                    (TabActivity::Output, _) | (_, TabActivity::Output) => TabActivity::Output,
+                    _ => TabActivity::None,
+                });
+            let hint_col = match hidden_act {
+                TabActivity::Bell => theme.palette[1],
+                TabActivity::Output => accent,
+                TabActivity::None => dim_fg,
+            };
+            labels.push((format!("+{overflow}"), hint_x, 9.0, hint_col));
         }
     }
 
@@ -597,7 +653,7 @@ mod tests {
     #[test]
     fn rename_shows_caret() {
         let tabs = [("Old".to_string(), true)];
-        let bar = build_tab_bar_ex(800, &tabs, &theme(), Some((0, "New")), CtrlHover::None, None, CHROME_CHAR_W);
+        let bar = build_tab_bar_ex(800, &tabs, &theme(), Some((0, "New")), CtrlHover::None, None, CHROME_CHAR_W, &[]);
         // Renaming shows the edit buffer + caret in the sans TITLE labels.
         let buf = bar.title_labels.iter().find(|l| l.0.contains('▏'));
         assert!(buf.is_some(), "no caret label found");
@@ -614,8 +670,8 @@ mod tests {
             ("Tab 1".to_string(), true),
             ("Tab 2".to_string(), false),
         ];
-        let with = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, Some(PERF), CHROME_CHAR_W);
-        let without = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W);
+        let with = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, Some(PERF), CHROME_CHAR_W, &[]);
+        let without = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[]);
 
         // The HUD label is present.
         let hud = with.labels.iter().find(|l| l.0 == PERF).expect("HUD label missing");
@@ -649,8 +705,8 @@ mod tests {
             ("Tab 2".to_string(), false),
             ("Tab 3".to_string(), false),
         ];
-        let with = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, Some(PERF), CHROME_CHAR_W);
-        let without = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W);
+        let with = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, Some(PERF), CHROME_CHAR_W, &[]);
+        let without = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[]);
 
         // No HUD label emitted.
         assert!(with.labels.iter().all(|l| l.0 != PERF), "HUD should be hidden");
@@ -673,8 +729,8 @@ mod tests {
         // squashed to its ~64px minimum just to fit the stats readout.
         let tabs: Vec<(String, bool)> =
             (0..4).map(|i| (format!("Tab {i}"), i == 0)).collect();
-        let with = build_tab_bar_ex(900, &tabs, &theme(), None, CtrlHover::None, Some(PERF), CHROME_CHAR_W);
-        let without = build_tab_bar_ex(900, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W);
+        let with = build_tab_bar_ex(900, &tabs, &theme(), None, CtrlHover::None, Some(PERF), CHROME_CHAR_W, &[]);
+        let without = build_tab_bar_ex(900, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[]);
 
         // HUD hidden, layout identical to no-HUD.
         assert!(with.labels.iter().all(|l| l.0 != PERF), "HUD should yield to the tabs");
@@ -753,10 +809,135 @@ mod tests {
     #[test]
     fn close_hover_changes_glyph_color() {
         let tabs = [("Tab 1".to_string(), true)];
-        let hot = build_tab_bar_ex(800, &tabs, &theme(), None, CtrlHover::Close, None, CHROME_CHAR_W);
+        let hot = build_tab_bar_ex(800, &tabs, &theme(), None, CtrlHover::Close, None, CHROME_CHAR_W, &[]);
         // A theme-red hover quad is appended when the close control is hovered.
         let red = theme().palette[1];
         let red_bg = [red[0], red[1], red[2], 255];
         assert!(hot.quads.iter().any(|q| q.color == red_bg));
+    }
+
+    /// The 6px activity dots for a bar built over 3 tabs (tab 0 active).
+    fn dot_quads(bar: &TabBar) -> Vec<Rect> {
+        // Distinguish the dot from other colored quads (e.g. the CTRL_W-wide
+        // close-hover highlight) by its 6.0 width/height.
+        bar.quads
+            .iter()
+            .filter(|q| (q.w - 6.0).abs() < 0.01 && (q.h - 6.0).abs() < 0.01)
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn activity_dot_drawn_with_theme_colors() {
+        let tabs = [
+            ("Tab 1".to_string(), true),
+            ("Tab 2".to_string(), false),
+            ("Tab 3".to_string(), false),
+        ];
+        let bar = build_tab_bar_ex(
+            1000, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W,
+            &[TabActivity::None, TabActivity::Output, TabActivity::Bell],
+        );
+        let accent = theme().palette[4];
+        let red = theme().palette[1];
+        let dots = dot_quads(&bar);
+        assert_eq!(dots.len(), 2, "one dot per inactive tab with activity");
+        assert!(dots.iter().any(|q| q.color == [accent[0], accent[1], accent[2], 255]),
+            "output dot must use the theme accent");
+        assert!(dots.iter().any(|q| q.color == [red[0], red[1], red[2], 255]),
+            "bell dot must use the theme red");
+        // Baseline: no activity → no dots.
+        let base = build_tab_bar_ex(
+            1000, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[],
+        );
+        assert!(dot_quads(&base).is_empty());
+    }
+
+    #[test]
+    fn activity_dot_suppressed_on_active_tab() {
+        let tabs = [
+            ("Tab 1".to_string(), true),
+            ("Tab 2".to_string(), false),
+            ("Tab 3".to_string(), false),
+        ];
+        let bar = build_tab_bar_ex(
+            1000, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W,
+            &[TabActivity::Bell, TabActivity::None, TabActivity::None],
+        );
+        assert!(dot_quads(&bar).is_empty(), "the active tab never shows a dot");
+    }
+
+    #[test]
+    fn activity_does_not_shift_layout() {
+        let tabs = [
+            ("Tab 1".to_string(), true),
+            ("Tab 2".to_string(), false),
+            ("Tab 3".to_string(), false),
+        ];
+        let with = build_tab_bar_ex(
+            1000, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W,
+            &[TabActivity::None, TabActivity::Output, TabActivity::Bell],
+        );
+        let without = build_tab_bar_ex(
+            1000, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[],
+        );
+        // Labels + hit geometry are bit-identical; only the quads differ.
+        assert_eq!(with.title_labels, without.title_labels);
+        assert_eq!(with.labels, without.labels);
+        assert_eq!(with.tab_rects.len(), without.tab_rects.len());
+        for (a, b) in with.tab_rects.iter().zip(&without.tab_rects) {
+            assert!((a.x - b.x).abs() < 0.001 && (a.w - b.w).abs() < 0.001);
+        }
+        for (a, b) in with.close_rects.iter().zip(&without.close_rects) {
+            assert!((a.x - b.x).abs() < 0.001 && (a.w - b.w).abs() < 0.001);
+        }
+        assert!((with.plus_rect.x - without.plus_rect.x).abs() < 0.001);
+    }
+
+    #[test]
+    fn overflow_hint_tinted_when_hidden_tab_has_activity() {
+        // 20 tabs at 800px overflow; tab 19 is scrolled out (window sticks to
+        // the active head) and its Bell must tint the "+N" hint theme-red.
+        let tabs: Vec<(String, bool)> =
+            (0..20).map(|i| (format!("Tab {i}"), i == 0)).collect();
+        let mut activity = vec![TabActivity::None; 20];
+        activity[19] = TabActivity::Bell;
+        let bar = build_tab_bar_ex(
+            800, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &activity,
+        );
+        let hint = |b: &TabBar| {
+            b.labels
+                .iter()
+                .find(|l| {
+                    l.0.len() > 1
+                        && l.0.starts_with('+')
+                        && l.0[1..].chars().all(|c| c.is_ascii_digit())
+                })
+                .cloned()
+        };
+        let red = theme().palette[1];
+        let tinted = hint(&bar).expect("overflow hint missing");
+        assert_eq!(tinted.3, red, "hidden Bell must tint the +N hint red");
+        // All-None keeps the dim blend.
+        let base = build_tab_bar_ex(
+            800, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[],
+        );
+        let plain = hint(&base).expect("overflow hint missing");
+        assert_ne!(plain.3, red);
+        assert_eq!(tinted.1, plain.1, "tint must not move the hint");
+    }
+
+    #[test]
+    fn empty_activity_slice_means_none() {
+        let tabs = [
+            ("Tab 1".to_string(), true),
+            ("Tab 2".to_string(), false),
+        ];
+        let wrapper = build_tab_bar(1000, &tabs, &theme());
+        let ex = build_tab_bar_ex(
+            1000, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[],
+        );
+        assert_eq!(wrapper.quads.len(), ex.quads.len());
+        assert!(dot_quads(&wrapper).is_empty());
     }
 }
