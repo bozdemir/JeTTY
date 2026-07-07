@@ -92,21 +92,38 @@ pub fn find_url_at(chars: &[char], idx: usize) -> Option<(usize, usize)> {
     }
     // (4) Trim trailing punctuation. Closers strip only while unbalanced
     // within the candidate, so `/wiki/Foo_(bar)` keeps its `)` but the `)` of
-    // `(see https://x.io/a)` is dropped.
+    // `(see https://x.io/a)` is dropped. Bracket counts are computed ONCE and
+    // maintained incrementally as chars leave the window, keeping the whole
+    // trim O(N): recounting per stripped closer was O(N²) and a logical line
+    // ending in tens of thousands of `)` chars stalled the event loop
+    // (speed-first rule — this runs synchronously on hover/click).
+    let mut paren_bal = 0isize; // ')' count minus '(' count in [start, end)
+    let mut brack_bal = 0isize; // ']' count minus '[' count in [start, end)
+    for &x in &chars[start..end] {
+        match x {
+            '(' => paren_bal -= 1,
+            ')' => paren_bal += 1,
+            '[' => brack_bal -= 1,
+            ']' => brack_bal += 1,
+            _ => {}
+        }
+    }
     loop {
         let c = chars[end - 1];
         let strip = match c {
             '.' | ',' | ';' | ':' | '!' | '?' | '\'' => true,
-            ')' | ']' => {
-                let open = if c == ')' { '(' } else { '[' };
-                let opens = chars[start..end].iter().filter(|&&x| x == open).count();
-                let closes = chars[start..end].iter().filter(|&&x| x == c).count();
-                closes > opens
-            }
+            ')' => paren_bal > 0, // more ')' than '(' → unbalanced closer
+            ']' => brack_bal > 0,
             _ => false,
         };
         if !strip {
             break;
+        }
+        // The stripped char leaves the window; keep the balances in sync.
+        match c {
+            ')' => paren_bal -= 1,
+            ']' => brack_bal -= 1,
+            _ => {}
         }
         end -= 1;
         if end <= start + scheme_len {
@@ -182,6 +199,43 @@ mod tests {
             url_at("[link](https://x.io/a] end", 10).as_deref(),
             Some("https://x.io/a"),
             "unbalanced ] stripped"
+        );
+    }
+
+    #[test]
+    fn pathological_trailing_closers_trim_in_linear_time() {
+        // A URL followed by tens of thousands of unbalanced ')' (all in the
+        // URI charset, so the candidate window absorbs them). The quadratic
+        // recount-per-stripped-closer version does ~4e8 char compares here;
+        // the incremental-balance version is a single pass (F5 regression).
+        let s = format!("https://x.io/a{}", ")".repeat(20_000));
+        assert_eq!(url_at(&s, 3).as_deref(), Some("https://x.io/a"));
+        // Same for ']' (the other closer kind).
+        let s = format!("https://x.io/a{}", "]".repeat(20_000));
+        assert_eq!(url_at(&s, 3).as_deref(), Some("https://x.io/a"));
+    }
+
+    #[test]
+    fn incremental_balance_matches_recount_semantics() {
+        // Balanced pair inside, one unbalanced closer outside: only the
+        // trailing unbalanced ')' strips.
+        assert_eq!(
+            url_at("https://x.io/(a))", 3).as_deref(),
+            Some("https://x.io/(a)"),
+            "balanced pair kept, trailing unbalanced ')' stripped"
+        );
+        // Mixed trailing closers with interleaved punctuation all trim, and
+        // each kind's balance is tracked independently.
+        assert_eq!(
+            url_at("https://x.io/a).],)", 3).as_deref(),
+            Some("https://x.io/a"),
+            "mixed trailing closers + punctuation fully trimmed"
+        );
+        // Nested balanced brackets survive a run of unbalanced tails.
+        assert_eq!(
+            url_at("https://x.io/[a(b)]))]]", 3).as_deref(),
+            Some("https://x.io/[a(b)]"),
+            "nested balanced brackets kept"
         );
     }
 
