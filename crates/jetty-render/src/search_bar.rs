@@ -18,6 +18,20 @@ pub struct SearchBar {
 /// Right inset between the bar and the scrollbar gutter / window edge.
 const RIGHT_GAP: f32 = 8.0;
 
+/// Display width of one char in chrome-font cells: CJK/fullwidth glyphs
+/// advance ~2 monospace cells, zero-width (combining) chars 0, everything
+/// else 1. Same width classes the terminal grid uses (via alacritty), so the
+/// query the user typed measures here like it renders. Pure ASCII stays
+/// exactly the old `chars().count()` (F8).
+pub(crate) fn char_cells(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Estimated display width of `s` in chrome-font cells (see [`char_cells`]).
+pub(crate) fn display_cells(s: &str) -> usize {
+    s.chars().map(char_cells).sum()
+}
+
 /// Build the search bar for a window `win_w` px wide with the grid starting
 /// at `grid_top` (both physical px). All colors derive from the theme's
 /// bg→fg lerp (same surface language as help.rs) — no hardcoded RGB. All
@@ -68,25 +82,42 @@ pub fn build_search_bar(
     };
     let counter_col = if total == 0 { lerp(0.45) } else { tfg };
 
+    // All text is measured in DISPLAY cells, not chars: CJK/fullwidth query
+    // glyphs (explicitly supported via IME commits) render ~2× the monospace
+    // advance, and char-count measurement made them overflow the pill and
+    // overlap the counter/✕ (F8). ASCII measures identically to before.
     const PREFIX: &str = "Find: ";
-    let prefix_w = PREFIX.chars().count() as f32 * char_w;
+    let prefix_w = display_cells(PREFIX) as f32 * char_w;
     let gap = char_w; // one chrome char between query/counter/close
-    let counter_w = counter.chars().count() as f32 * char_w;
+    let counter_w = display_cells(&counter) as f32 * char_w;
     // Everything except the query text itself.
     let fixed_w = pad + prefix_w + caret_gap + caret_w + gap + counter_w + gap + close_w + pad;
 
     // Clamp the bar to the window, keeping clear of the scrollbar gutter.
     let max_bar_w = (win_w as f32 - SCROLLBAR_W - 16.0).max(0.0);
-    // Tail-truncate the query: show the LAST chars that fit, so the end the
-    // user is typing at stays visible next to the caret.
-    let query_chars = query.chars().count();
-    let avail_chars = (((max_bar_w - fixed_w) / char_w).floor().max(0.0)) as usize;
-    let shown: String = if query_chars > avail_chars {
-        query.chars().skip(query_chars - avail_chars).collect()
+    // Tail-truncate the query: show the LAST chars that fit (by display
+    // width), so the end the user is typing at stays visible next to the
+    // caret.
+    let query_cells = display_cells(query);
+    let avail_cells = (((max_bar_w - fixed_w) / char_w).floor().max(0.0)) as usize;
+    let shown: String = if query_cells > avail_cells {
+        // Walk from the tail, keeping whole chars while their summed display
+        // width still fits the budget.
+        let mut cells = 0usize;
+        let mut tail: Vec<char> = Vec::new();
+        for c in query.chars().rev() {
+            let w = char_cells(c);
+            if cells + w > avail_cells {
+                break;
+            }
+            cells += w;
+            tail.push(c);
+        }
+        tail.iter().rev().collect()
     } else {
         query.to_string()
     };
-    let shown_w = shown.chars().count() as f32 * char_w;
+    let shown_w = display_cells(&shown) as f32 * char_w;
     let bar_w = (fixed_w + shown_w).min(max_bar_w).max(0.0);
 
     let x = (win_w as f32 - bar_w - SCROLLBAR_W - RIGHT_GAP).max(0.0);
@@ -216,6 +247,72 @@ mod tests {
             long.ends_with(find.0.trim_start_matches("Find: ")),
             "shown query must be the tail of the full query"
         );
+    }
+
+    #[test]
+    fn display_cells_classifies_widths() {
+        // ASCII: identical to chars().count() (the fast path must not change).
+        assert_eq!(display_cells("Find: error"), "Find: error".chars().count());
+        // CJK fullwidth: 2 cells per glyph.
+        assert_eq!(display_cells("エラー"), 6);
+        assert_eq!(char_cells('エ'), 2);
+        // Zero-width combining mark adds nothing.
+        assert_eq!(display_cells("e\u{0301}"), 1);
+    }
+
+    #[test]
+    fn cjk_query_measured_by_display_width() {
+        // F8: an 8-char CJK query renders ~16 monospace cells wide; the bar
+        // must budget for that, not for 8. The caret sits AFTER the glyphs
+        // and the query text never reaches the counter.
+        let q = "エラーメッセージ"; // 8 chars, 16 cells
+        let sb = build_search_bar(1000, 36.0, &theme(), TEST_CHAR_W, q, 1, 2);
+        let find = sb.labels.iter().find(|l| l.0.starts_with("Find: ")).unwrap();
+        let est_right = find.1 + display_cells(&find.0) as f32 * TEST_CHAR_W;
+        let panel_right = sb.panel.x + sb.panel.w;
+        assert!(
+            est_right <= panel_right + 0.5,
+            "CJK query text overflows the panel: {est_right} > {panel_right}"
+        );
+        // Caret must clear the full display width of the shown query.
+        let caret = sb
+            .quads
+            .iter()
+            .find(|r| r.w == 2.0)
+            .expect("caret quad (2px wide) present");
+        assert!(
+            caret.x >= est_right - 0.5,
+            "caret {x} sits mid-glyph (query text ends at {est_right})",
+            x = caret.x
+        );
+        // The counter starts after the caret, not under the query glyphs.
+        let counter = sb.labels.iter().find(|l| l.0 == "1/2").unwrap();
+        assert!(
+            counter.1 >= caret.x,
+            "counter at {c} overlaps the query/caret at {x}",
+            c = counter.1,
+            x = caret.x
+        );
+    }
+
+    #[test]
+    fn cjk_long_query_tail_truncated_by_display_width() {
+        // 150 wide chars = 300 cells — far beyond a 500px window's budget.
+        let long: String = "エラー検索".repeat(30);
+        let sb = build_search_bar(500, 36.0, &theme(), TEST_CHAR_W, &long, 1, 1);
+        let panel_right = sb.panel.x + sb.panel.w;
+        for (text, x, _y, _c) in &sb.labels {
+            let est_right = x + display_cells(text) as f32 * TEST_CHAR_W;
+            assert!(
+                est_right <= panel_right + 0.5,
+                "label {text:?} overflows the panel: {est_right} > {panel_right}"
+            );
+        }
+        // Still the TAIL of the query (the caret end the user types at).
+        let find = sb.labels.iter().find(|l| l.0.starts_with("Find: ")).unwrap();
+        let shown = find.0.trim_start_matches("Find: ");
+        assert!(!shown.is_empty(), "some tail of the query must be shown");
+        assert!(long.ends_with(shown), "shown query must be the tail of the input");
     }
 
     #[test]

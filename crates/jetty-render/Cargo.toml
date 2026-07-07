@@ -9,6 +9,9 @@ glyphon = "0.11"
 jetty-core = { path = "../jetty-core" }
 pollster = "0.4"
 raw-window-handle = "0.6"
+# Already in the tree via alacritty_terminal — no new compile unit of note.
+# Used for chrome-text display-width estimates (CJK/fullwidth ≈ 2 cells).
+unicode-width = "0.2"
 wgpu = { version = "29.0", features = ["wgsl"] }
 
 [dev-dependencies]
