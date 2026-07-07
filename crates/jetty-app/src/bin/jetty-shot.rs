@@ -3,7 +3,9 @@
 ///
 /// Config via env:
 ///   JETTY_SHOT_OUT   — output path (default: /tmp/jetty-shot.png)
-///   JETTY_SHOT_INPUT — ANSI bytes to feed the terminal (default: built-in sample)
+///   JETTY_SHOT_INPUT — ANSI bytes to feed the terminal (default: built-in
+///                    sample). With JETTY_SHOT_TABBAR, an OSC 0/2 title in the
+///                    input (`\e]2;my title\a`) retitles the first tab.
 ///   JETTY_THEME      — theme name (picked up automatically via Terminal::new)
 ///   JETTY_OPACITY    — opacity 0.0..1.0 (picked up automatically via Terminal::new)
 ///   JETTY_SHOT_UI_FONT_SIZE — UI (chrome) font size in logical pt (10..28,
@@ -449,8 +451,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the window controls) over the top of the frame so the rounded tabs +
         // borders can be inspected.
         if env_flag("JETTY_SHOT_TABBAR") {
+            // Self-test hook: an OSC 0/2 title inside JETTY_SHOT_INPUT (e.g.
+            // `\e]2;OSC Title\a`) retitles the first tab, so shell-driven
+            // titles can be verified headlessly from the PNG.
+            let osc_title = terminal.take_title_update().flatten();
             let tabs = [
-                ("Tab 1".to_string(), true),
+                (osc_title.unwrap_or_else(|| "Tab 1".to_string()), true),
                 ("Tab 2".to_string(), false),
                 ("Tab 3".to_string(), false),
             ];

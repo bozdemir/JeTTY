@@ -203,6 +203,9 @@ pub(crate) struct DetachedWindow {
     pub reflow_pending_at: Option<std::time::Instant>,
     /// The single terminal session owned by this detached window.
     pub tab: Tab,
+    /// Last string passed to `window.set_title`, so `sync_os_title` is a no-op
+    /// string compare unless the tab's title really changed.
+    pub applied_os_title: String,
     /// Last known cursor position inside THIS window (physical px).
     pub cursor: (f64, f64),
     /// Manual top-bar drag: `Some(local cursor at press)` while the bar is held.
@@ -376,6 +379,8 @@ impl DetachedWindow {
             crt,
             caret_anim: None,
             reflow_pending_at: None,
+            // build_window above already titled the OS window from tab.title.
+            applied_os_title: tab.title.clone(),
             tab,
             cursor: (0.0, 0.0),
             bar_drag: None,
@@ -391,6 +396,18 @@ impl DetachedWindow {
             selecting: false,
             mouse_grab_press: None,
         })
+    }
+
+    /// Keep the OS window title (title bar / taskbar) in sync with the tab's
+    /// display title. Called after each PTY drain — a no-op string compare
+    /// unless the title actually changed, so it adds nothing to the idle path.
+    /// Deliberately NOT gated on occlusion: a minimized window's taskbar entry
+    /// must stay correct too.
+    pub(crate) fn sync_os_title(&mut self) {
+        if self.tab.title != self.applied_os_title {
+            self.window.set_title(&self.tab.title);
+            self.applied_os_title = self.tab.title.clone();
+        }
     }
 }
 

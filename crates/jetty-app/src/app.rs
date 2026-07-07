@@ -262,7 +262,33 @@ pub(crate) struct Tab {
     pub(crate) terminal: Terminal,
     pub(crate) pty: PtySession,
     pub(crate) writer: Box<dyn Write + Send>,
+    /// The DISPLAYED title (tab bar, detached bar/OS title, confirm-close).
     pub(crate) title: String,
+    /// The frozen "Tab N" fallback restored when the shell resets/clears its
+    /// OSC title.
+    pub(crate) default_title: String,
+    /// Once the user commits a manual rename, shell OSC titles are ignored for
+    /// this tab forever (manual > auto > default precedence).
+    pub(crate) manually_renamed: bool,
+}
+
+/// Resolve a pending shell title update against the tab's rename state and
+/// return the new DISPLAY title to apply, or `None` to leave it unchanged.
+/// Precedence: manual rename (permanent) > OSC title > default "Tab N".
+/// `update` is `Terminal::take_title_update`'s inner value: `Some(t)` = shell
+/// set a title, `None` = shell reset/cleared it (restore the default).
+fn resolve_title(
+    update: Option<String>,
+    manually_renamed: bool,
+    default_title: &str,
+) -> Option<String> {
+    if manually_renamed {
+        return None;
+    }
+    match update {
+        Some(t) => Some(t),
+        None => Some(default_title.to_string()),
+    }
 }
 
 /// Logical size of the separate Settings window — DERIVED from the panel size
@@ -403,6 +429,10 @@ pub struct App {
     /// Signature (hash of titles + active index) of `cached_tabs_meta`; when it
     /// differs from the live signature, the cache is rebuilt.
     cached_tabs_sig: u64,
+    /// Last string passed to the main window's `set_title` ("{tab} — JeTTY"),
+    /// so the taskbar/alt-tab title sync in `tabs_meta` is a no-op string
+    /// compare unless the active tab's title really changed.
+    applied_main_os_title: String,
     /// The id of the most recently focused window (main or settings). Used to
     /// suppress auto-hide when focus moved to our own Settings window.
     last_focused_window: Option<WindowId>,
@@ -840,6 +870,7 @@ impl App {
             cached_top_flush: false,
             cached_tabs_meta: Vec::new(),
             cached_tabs_sig: u64::MAX,
+            applied_main_os_title: "JeTTY".to_string(),
             last_focused_window: None,
             switching_to_settings: false,
             switching_to_detached: false,
@@ -1224,7 +1255,14 @@ impl App {
             terminal.feed(format!("\x1b[33m{notice}\x1b[0m\r\n").as_bytes());
         }
         let title = format!("Tab {}", self.tabs.len() + 1);
-        self.tabs.push(Tab { terminal, pty, writer, title });
+        self.tabs.push(Tab {
+            terminal,
+            pty,
+            writer,
+            default_title: title.clone(),
+            title,
+            manually_renamed: false,
+        });
         self.active = self.tabs.len() - 1;
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -1589,6 +1627,20 @@ impl App {
                 .map(|(i, t)| (t.title.clone(), i == self.active))
                 .collect();
             self.cached_tabs_sig = sig;
+            // Sync the main window's OS title to the active tab (the window is
+            // undecorated, so this shows in the taskbar/alt-tab only). Runs
+            // ONLY inside this sig-changed branch — never per-frame — and the
+            // hash covers every title mutation path (OSC, rename, tab switch,
+            // close, reattach) for free.
+            let active_title =
+                self.tabs.get(self.active).map(|t| t.title.as_str()).unwrap_or("JeTTY");
+            let desired = format!("{active_title} — JeTTY");
+            if desired != self.applied_main_os_title {
+                if let Some(w) = &self.window {
+                    w.set_title(&desired);
+                    self.applied_main_os_title = desired;
+                }
+            }
         }
         &self.cached_tabs_meta
     }
@@ -1616,6 +1668,10 @@ impl App {
             let trimmed = self.rename_buf.trim();
             if i < self.tabs.len() && !trimmed.is_empty() {
                 self.tabs[i].title = trimmed.to_string();
+                // Manual rename permanently wins over shell OSC 0/2 titles for
+                // this tab. An empty rename (no-op above) deliberately does NOT
+                // set the flag, so auto-titles stay live.
+                self.tabs[i].manually_renamed = true;
             }
             self.rename_buf.clear();
             if let Some(w) = &self.window {
@@ -1994,6 +2050,20 @@ impl App {
             let _ = tab.writer.write_all(&replies);
             let _ = tab.writer.flush();
             had = true;
+        }
+        // Apply any pending shell-set title (OSC 0/2). Event-driven: rides this
+        // drain pass only, zero idle cost (a lock-free flag check when clean).
+        // Setting `had` forces a redraw at every call site even when the OSC
+        // arrived with no visible grid change.
+        if let Some(update) = tab.terminal.take_title_update() {
+            if let Some(new_title) =
+                resolve_title(update, tab.manually_renamed, &tab.default_title)
+            {
+                if new_title != tab.title {
+                    tab.title = new_title;
+                    had = true;
+                }
+            }
         }
         had
     }
@@ -3596,6 +3666,8 @@ impl App {
         // reader queued, which re-request this window's redraw.
         let mut vt_read: u64 = 0;
         Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+        // OSC titles: keep the OS window title in sync (no-op unless changed).
+        dw.sync_os_title();
 
         // Snapshot + theme + chrome inputs are read before the mutable
         // gpu/text/quad borrow below (same pattern as the main RedrawRequested).
@@ -4812,7 +4884,14 @@ impl ApplicationHandler<AppEvent> for App {
             terminal.feed(format!("\x1b[33m{notice}\x1b[0m\r\n").as_bytes());
         }
         let writer = pty.writer();
-        self.tabs.push(Tab { terminal, pty, writer, title: "Tab 1".to_string() });
+        self.tabs.push(Tab {
+            terminal,
+            pty,
+            writer,
+            title: "Tab 1".to_string(),
+            default_title: "Tab 1".to_string(),
+            manually_renamed: false,
+        });
         self.active = 0;
 
         // Register the F9 global hotkey (Yakuake-style toggle). This only works
@@ -4904,6 +4983,9 @@ impl ApplicationHandler<AppEvent> for App {
                 let mut exited_detached: Vec<usize> = Vec::new();
                 for (i, dw) in self.detached.iter_mut().enumerate() {
                     let had = Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+                    // OSC titles: sync the OS window title even when occluded
+                    // (the taskbar entry of a minimized window must update).
+                    dw.sync_os_title();
                     // Same damage-driven + visibility discipline as the main
                     // window: drain always (keep the shell unblocked) but only
                     // repaint a detached window that isn't occluded/minimized (F16).
@@ -7959,5 +8041,30 @@ mod paste_sanitize_tests {
 
     fn contains(hay: &[u8], needle: &[u8]) -> bool {
         hay.windows(needle.len()).any(|w| w == needle)
+    }
+}
+
+#[cfg(test)]
+mod resolve_title_tests {
+    use super::resolve_title;
+
+    #[test]
+    fn osc_title_applies_when_not_renamed() {
+        assert_eq!(
+            resolve_title(Some("x".to_string()), false, "Tab 2"),
+            Some("x".to_string())
+        );
+    }
+
+    #[test]
+    fn manual_rename_wins_forever() {
+        // Once manually renamed, both new titles and resets are ignored.
+        assert_eq!(resolve_title(Some("x".to_string()), true, "Tab 2"), None);
+        assert_eq!(resolve_title(None, true, "Tab 2"), None);
+    }
+
+    #[test]
+    fn reset_restores_default() {
+        assert_eq!(resolve_title(None, false, "Tab 2"), Some("Tab 2".to_string()));
     }
 }
