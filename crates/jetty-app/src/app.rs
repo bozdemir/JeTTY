@@ -7443,6 +7443,15 @@ impl ApplicationHandler<AppEvent> for App {
                 if text.is_empty() || self.tabs.is_empty() {
                     return;
                 }
+                // Quit / close-tab confirmation popups are modal — drop the
+                // commit. Checked FIRST, before the rename/search consumers,
+                // to mirror the KeyboardInput priority chain exactly: both
+                // popups can be open above the (mouse-non-modal) search bar,
+                // and typed keys are swallowed there while IME commits used
+                // to edit the query behind the popup (F9).
+                if self.confirm_quit || self.confirm_close.is_some() {
+                    return;
+                }
                 // Inline tab rename captures the commit into the title buffer
                 // (mirrors the renaming arm of KeyboardInput).
                 if self.renaming.is_some() {
@@ -7465,10 +7474,6 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(win) = &self.window {
                         win.request_redraw();
                     }
-                    return;
-                }
-                // Quit / close-tab confirmation popups are modal — drop it.
-                if self.confirm_quit || self.confirm_close.is_some() {
                     return;
                 }
                 if self.welcome_open {
