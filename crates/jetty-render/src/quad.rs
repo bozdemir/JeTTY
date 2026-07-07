@@ -725,11 +725,17 @@ pub fn cursor_rects(
             // Center-scale bump about the cell (matches the old glyph scaling).
             let w = cell_w * scale;
             let h = cell_h * scale;
+            let raw_top = base_y - (h - cell_h) * 0.5;
+            // Cursor draws in Pass 4, AFTER the tab bar (Pass 3). On grid row 0 the
+            // flash scale-up would lift the top edge above the grid content top
+            // (y_offset) and paint a sliver over the tab bar. Clamp the top to
+            // y_offset so the bump only ever grows downward into the grid there.
+            let top = raw_top.max(y_offset);
             rects.push(Rect::new(
                 base_x - (w - cell_w) * 0.5,
-                base_y - (h - cell_h) * 0.5,
+                top,
                 w,
-                h,
+                raw_top + h - top,
                 color,
             ));
         }
@@ -1110,6 +1116,31 @@ mod tests {
             scrollbar_offset_from_cursor(h as f32 + 500.0, 0.0, rows, max, h, top, bottom),
             Some(0)
         );
+    }
+
+    #[test]
+    fn block_cursor_flash_never_bleeds_above_grid_top() {
+        // Caret flash scales the Block cursor up to 1.15x. On grid row 0 the top
+        // edge must clamp to y_offset (grid content top) so it can't paint over
+        // the tab bar, which is drawn earlier (Pass 3) than the cursor (Pass 4).
+        let mut g = grid(5, 3);
+        g.cursor_visible = true;
+        let y_offset = 36.0; // tab bar height / grid top
+        // Peak flash bump is at t=0.5.
+        let rects = cursor_rects(&g, 10.0, 20.0, y_offset, true, Some(0.5), [1.0, 1.0, 1.0]);
+        assert_eq!(rects.len(), 1);
+        assert!(
+            rects[0].y >= y_offset - 0.001,
+            "cursor top {} must not rise above grid top {y_offset}",
+            rects[0].y
+        );
+        // A cursor on a lower row keeps the symmetric scale bump (top < base_y).
+        let mut g2 = grid(5, 3);
+        g2.cursor_visible = true;
+        g2.cursor_row = 2;
+        let base_y = y_offset + 2.0 * 20.0;
+        let r2 = cursor_rects(&g2, 10.0, 20.0, y_offset, true, Some(0.5), [1.0, 1.0, 1.0]);
+        assert!(r2[0].y < base_y, "mid-grid cursor still grows upward");
     }
 
     #[test]

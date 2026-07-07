@@ -166,7 +166,7 @@ pub struct TextLayer {
     /// frame (same grid) reuses them — decorations never rebuild per frame; only
     /// the CURSOR quads do (drawn app-side). Consumed via `decoration_rects()`.
     deco_rects: Vec<crate::quad::Rect>,
-    deco_cache_key: Option<(u64, u32, u32, u32)>,
+    deco_cache_key: Option<(u64, u32, u32, u32, u32, u32)>,
 }
 
 impl TextLayer {
@@ -684,11 +684,18 @@ impl TextLayer {
         // CRT / scrollbar-only frame (same grid, same offset) this is a cheap key
         // compare and the previously-built rects are reused (SPEED: decorations
         // stay off the animate-only path; only the cursor quad rebuilds per frame).
+        // Grid dims are part of the key: fold_decoration folds cells positionally
+        // by LINEAR index, so a cell-count-preserving reflow (e.g. 80x24 -> 60x32,
+        // both 1920 cells) can produce an identical decoration fold yet needs
+        // different rects (x/y derive from col=i%cols, row=i/cols). Without cols/rows
+        // the stale rects would be reused for one frame after such a resize.
         let deco_key = (
             deco_hasher.finish(),
             cell_w.to_bits(),
             cell_h.to_bits(),
             top_offset.to_bits(),
+            snapshot.cols as u32,
+            snapshot.rows as u32,
         );
         if self.deco_cache_key != Some(deco_key) {
             self.deco_rects.clear();
