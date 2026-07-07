@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.12.0] — 2026-07-07
+
+A feature release: the table-stakes terminal features JeTTY was still missing —
+search, clickable links, smarter tabs — plus full mouse parity for detached
+windows. Built from per-feature design blueprints, then adversarially reviewed
+(20 raw findings → 15 confirmed → all fixed) before shipping.
+
+### Added
+- **Scrollback search** — `Ctrl+Shift+F` opens a themed search bar: type to
+  search (case-insensitive, live), `Enter`/`F3` jumps to older matches,
+  `Shift+Enter`/`Shift+F3` to newer, with a live `3/17` counter. All visible
+  matches are highlighted, the current one accented, and the view scrolls to
+  it. `Esc` closes. Streaming output never steals your viewport mid-search.
+- **Clickable URLs** — hold `Ctrl` (also `Cmd` on macOS) to underline the link
+  under the pointer; `Ctrl+click` opens it. Supports both OSC 8 hyperlinks and
+  plain-text URLs — wrapped lines are stitched, trailing punctuation trimmed,
+  `http/https/file` schemes only. Works in main *and* detached windows, and
+  costs exactly nothing while the modifier isn't held.
+- **New tabs open in the current tab's directory** — `Ctrl+Shift+T` / `+`
+  inherits the active shell's cwd (Linux `/proc`, macOS `proc_pidinfo`); a
+  vanished directory quietly falls back to the old behavior.
+- **Shell-driven tab titles (OSC 0/2)** — tabs auto-title from your shell,
+  ssh session, or editor; a manual rename (right-click → Rename) always wins.
+  The OS window title follows along as `{tab} — JeTTY`, detached windows too.
+- **Activity & bell indicators** — an inactive tab that prints output gets a
+  small themed dot; a bell gets the urgent color. Cleared the moment you view
+  the tab.
+- **Configurable scrollback** — `scrollback_lines` in `config.toml`
+  (100–100 000, default 10 000) plus a cycler in Settings → Window
+  (1k/5k/10k/25k/50k/100k). Applies live to every tab, detached included.
+- **Detached windows: full mouse parity** — text selection (including
+  Shift+drag over mouse-reporting TUIs and copy-on-select), middle-click
+  paste, wheel scrolling with alt-screen arrow translation, and a real
+  scrollbar (drag + track-jump), plus the contextual Shift+drag hint.
+
+### Fixed (pre-release adversarial review)
+- Background-tab title changes now repaint the tab bar even when the activity
+  dot is already lit; detached and attached windows behave identically.
+- Search state can no longer leak onto background tabs via tab switch / close /
+  reattach — closing the bar clears everywhere, so no hidden full-history
+  regex re-scans on resize. Same-size terminal resizes are now no-ops.
+- Search matches refresh after a streaming burst (trailing refresh, no idle
+  polling) and after a live scrollback shrink.
+- Window/font resizes no longer light a false "unseen output" dot on every
+  inactive tab (SIGWINCH prompt repaints are ignored for a short window).
+- The Shift+drag hint appears only in the window where the drag happened.
+- URL trailing-punctuation trimming is linear-time (a pathological line of
+  brackets can't stall the event loop); Ctrl+click only fires on the cell
+  actually under the pointer; stale link underlines clear on font-size change,
+  tab switch, and detach/reattach.
+- The search bar measures CJK/double-width queries by display width; IME
+  commits respect the modal-popup priority chain.
+
+---
+
 ## [0.11.0] — 2026-07-03
 
 A deep correctness + hardening release: a 124-agent audit surfaced 40 bugs, each

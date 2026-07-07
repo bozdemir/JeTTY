@@ -44,17 +44,19 @@
   - **Dropdown** — slides down from the top edge, full screen width, Yakuake/Guake style, with adjustable width & height.
 - ✨ **Summon effects** — five self-written GPU reveal shaders, selectable in settings: **Phosphor Ignition** (default — CRT power-on), **Bayer Crystallize**, **Liquid Drop**, **Focus Pull**, or **None**.
 - 📺 **Visual effects** — an optional **CRT** mode (curvature, scanlines, shadow-mask, bloom, chromatic aberration, vignette + animated roll/flicker/jitter) and a **caret flash/glow**, all under a dedicated **Effects** settings tab. Off by default, so the default look and ~0% idle CPU are untouched.
-- 🗂️ **Tabs** — `Ctrl+Shift+T` new, `Ctrl+Shift+W` close (with confirm), `Ctrl+Tab` / `Ctrl+1‒9` switch, double-click to rename, right-click for a **Detach / Rename / Close** menu.
-- 🪟➡️ **Detachable tabs** — `Ctrl+Shift+D`, the tab's right-click menu, or simply **dragging a tab off the bar** pops it into its own window (with its own title bar and status strip); reattach with `Ctrl+Shift+D`, the window's right-click menu, closing it, or **dropping it back onto the main tab bar**.
+- 🗂️ **Tabs** — `Ctrl+Shift+T` new (**opens in the current tab's directory**), `Ctrl+Shift+W` close (with confirm), `Ctrl+Tab` / `Ctrl+1‒9` switch, double-click to rename, right-click for a **Detach / Rename / Close** menu. Tabs **auto-title from the shell** (OSC 0/2 — a manual rename always wins), and inactive tabs show an **activity / bell dot**.
+- 🔎 **Scrollback search** — `Ctrl+Shift+F`: incremental, case-insensitive, every visible match highlighted, `Enter`/`F3` / `Shift+F3` to jump older/newer, live `3/17` counter.
+- 🔗 **Clickable links** — hold **Ctrl** (also ⌘ on macOS) to underline the URL under the pointer, **Ctrl+click** opens it in your browser — plain-text URLs *and* OSC 8 hyperlinks.
+- 🪟➡️ **Detachable tabs** — `Ctrl+Shift+D`, the tab's right-click menu, or simply **dragging a tab off the bar** pops it into its own window (with its own title bar and status strip); reattach with `Ctrl+Shift+D`, the window's right-click menu, closing it, or **dropping it back onto the main tab bar**. Detached windows have **full mouse parity**: selection, wheel, scrollbar, middle-click paste.
 - 🎨 **22 built-in themes** — Catppuccin (Mocha/Macchiato), Tokyo Night, Gruvbox, Dracula, Onyx, Nord, Solarized (dark/light), One Dark, Monokai (+Pro), Everforest, Rosé Pine, Kanagawa, Material, Ayu (dark/mirage), Tomorrow Night, Oceanic Next, GitHub Dark, Palenight — exact community palettes, picked from a scrollable dropdown with live color previews. Every UI surface re-skins with the active theme.
 - 🪟 **Custom-decorated window** — borderless client-side decorations, our own title bar, rounded corners (radius slider), runtime opacity.
 - 🔤 **Live font control** — change font **size** (`Ctrl + +/-/0`) and **family** (any installed monospace) at runtime, no restart.
 - 📋 **Selection & clipboard** — drag to select (auto-copies), **Shift+drag** to select even inside mouse-aware TUIs (vim/htop/tmux/Claude Code), right-click **Copy / Paste / Select All** menu, `Ctrl+Shift+C/V`, middle-click paste, bracketed-paste aware.
-- ⚙️ **Settings dialog** — `Ctrl+Shift+P` opens a movable dialog (theme, opacity, corner radius, summon effect, window mode, dropdown size, tab-bar position, focus auto-hide, welcome splash, performance HUD, font) — all **persisted** to `~/.config/jetty/config.toml`.
+- ⚙️ **Settings dialog** — `Ctrl+Shift+P` opens a movable dialog (theme, opacity, corner radius, summon effect, window mode, dropdown size, tab-bar position, scrollback size, shell, focus auto-hide, welcome splash, performance HUD, font) — all **persisted** to `~/.config/jetty/config.toml`.
 - 📊 **Live performance HUD** — an optional tab-bar overlay showing frame ms · fps · CPU% · VT MB/s in real time, and an honest "idle" state when the app settles (never forces a redraw — idle stays ~0% CPU). Toggle with `show_perf_hud`.
 - 👋 **Welcome overlay** — a neofetch-style splash on first launch (accent ASCII logo + version/backend), dismissed on the first key/click/Esc. Toggle with `show_welcome`.
 - 🖥️ **Desktop-independent** — X11 **and** Wayland, KDE / GNOME / any compositor, every distro. **No DE-specific code**, no compositor libraries.
-- ✅ **A real terminal** — true-color, answers host queries (DSR/DA), proper `TERM`, window resize with grid reflow, 10k-line scrollback, Ctrl+D closes cleanly.
+- ✅ **A real terminal** — true-color, answers host queries (DSR/DA), proper `TERM`, window resize with grid reflow, configurable scrollback (1k–100k lines), Ctrl+D closes cleanly.
 
 ## 📸 Screenshots
 
