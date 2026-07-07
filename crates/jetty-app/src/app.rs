@@ -3787,8 +3787,14 @@ impl App {
                                 let gy = (cy - TABBAR_H).max(0.0);
                                 // Ctrl+click on a link opens it and consumes the
                                 // click (same precedence as the main window:
-                                // Shift still forces selection).
-                                if link_modifier_held(&self.modifiers) && !shift {
+                                // Shift still forces selection). Same grid-band
+                                // gate as update_detached_link_hover — a click on
+                                // the bottom status strip must not open a
+                                // clamped bottom-row URL (F13).
+                                if link_modifier_held(&self.modifiers)
+                                    && !shift
+                                    && cy < h as f32 - status_h
+                                {
                                     let (line, col, _) = input::cell_at_0_side(
                                         cx, gy, cw, ch,
                                         dw.tab.terminal.cols(), dw.tab.terminal.rows(),
@@ -6568,11 +6574,26 @@ impl ApplicationHandler<AppEvent> for App {
                         // selection start. Shift still wins for selection, so
                         // Ctrl+Shift+click/drag is unchanged. Recomputed at press
                         // time — a click without a prior hover move still works.
+                        // Gated on the SAME grid band as update_link_hover:
+                        // cursor_cell_0_side CLAMPS into the grid, so a click on
+                        // the status strip (or bottom-mode tab bar) would open a
+                        // bottom-row URL no underline ever advertised (F13).
                         if link_modifier_held(&self.modifiers) && !self.modifiers.shift_key() {
-                            if let Some((line, col, _)) = self.cursor_cell_0_side() {
-                                if let Some(hit) = self.active_tab().terminal.link_at(line, col) {
-                                    Self::open_url(&hit.uri);
-                                    return;
+                            let grid_bottom = if self.tab_bar_bottom {
+                                self.tabbar_y(h as f32)
+                            } else {
+                                h as f32 - self.status_h()
+                            };
+                            let in_grid =
+                                cy >= self.grid_top_offset() && cy < grid_bottom;
+                            if in_grid {
+                                if let Some((line, col, _)) = self.cursor_cell_0_side() {
+                                    if let Some(hit) =
+                                        self.active_tab().terminal.link_at(line, col)
+                                    {
+                                        Self::open_url(&hit.uri);
+                                        return;
+                                    }
                                 }
                             }
                         }
