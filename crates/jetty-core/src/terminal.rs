@@ -160,6 +160,13 @@ const MAX_MARKS: usize = 4096;
 /// The exact OSC 133 introducer the scanner matches after `ESC ]`.
 const OSC133_PREFIX: &[u8] = b"133;";
 
+/// Upper clamp for a parsed OSC 133 D exit code. Shell exit statuses are 8-bit
+/// (0..=255; a signal death reports 128+signum), so anything larger is
+/// non-conformant. Clamping here keeps the running parse from overflowing `u32`
+/// on a crafted `D;<many digits>` and guarantees the later `as i32` cast stays
+/// non-negative (a wrong-sign code could otherwise flip the failed/ok verdict).
+const EXIT_CODE_MAX: u32 = 255;
+
 /// State of the tiny OSC-133-only scanner, carried across [`Terminal::feed`]
 /// calls so a mark split across PTY chunks resumes mid-sequence. Every non-Ground
 /// state is mid-escape; Ground uses a `memchr(ESC)` fast path, so a stream with
@@ -241,10 +248,31 @@ pub struct Terminal {
     /// Absolute grid-line index of the active-region top (grid `Line(0)`).
     /// Advanced by `history_size()` growth in [`Terminal::advance_slice`] /
     /// [`Terminal::flush_sync`]; the stable anchor that lets OSC 133 prompt marks
-    /// survive scrolling. EXACT for the whole unsaturated-scrollback lifetime
-    /// (marks past the cap age out anyway). FROZEN while the alt screen is active
-    /// and across an alt-screen toggle (that history change is not a scroll).
+    /// survive scrolling. Only its DIFFERENCES with a mark's absolute line matter,
+    /// so its absolute offset is arbitrary — what has to hold is that it advances
+    /// by exactly the number of lines scrolled off the top between a mark's bind
+    /// and every later read.
+    ///
+    /// That holds EXACTLY for the whole unsaturated-scrollback lifetime (the
+    /// common case). It CANNOT hold once the primary scrollback ring saturates:
+    /// `history_size()` pins at [`Terminal::scrollback_limit`] while real scroll
+    /// continues, so the delta becomes unobservable (alacritty 0.26 exposes no
+    /// saturation-proof scroll counter). Rather than drift and paint markers on
+    /// wrong rows, saturation latches [`Terminal::saturated`] and drops the marks
+    /// (correct-or-absent). FROZEN while the alt screen is active and across an
+    /// alt-screen toggle (that history change is not a scroll).
     abs_top: i64,
+    /// The configured scrollback cap (mirrors the alacritty `Config`'s
+    /// `scrolling_history`; kept in lockstep by `new`/`set_scrollback_lines`).
+    /// `history_size()` saturates at this value, which is exactly when `abs_top`
+    /// can no longer track lines scrolled off the top.
+    scrollback_limit: usize,
+    /// Latched once the primary scrollback fills to `scrollback_limit`: past that
+    /// point `abs_top` can no longer count scrolled-off lines, so mark positions
+    /// are untrustworthy. While set, marks are dropped and never (re)bound or
+    /// rendered. Cleared again if history later falls below the cap (a scrollback
+    /// clear / shrink), where fresh marks resume tracking exactly.
+    saturated: bool,
     /// OSC 133 scanner state, persisted across `feed` calls (chunk boundaries).
     scan: OscScan,
     /// Per-tab semantic prompt marks (OSC 133 A/B/C/D), append order == ascending
@@ -277,7 +305,8 @@ impl Terminal {
         let cols = cols.max(2);
         let rows = rows.max(1);
         let size = Size { cols, lines: rows };
-        let config = Config { scrolling_history: 10_000, ..Default::default() };
+        let scrollback_limit = 10_000;
+        let config = Config { scrolling_history: scrollback_limit, ..Default::default() };
         let (tx, pty_write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
         // Load theme from JETTY_THEME env var; default to "catppuccin_mocha".
@@ -336,6 +365,8 @@ impl Terminal {
             search_matches: Vec::new(),
             search_current: 0,
             abs_top: 0,
+            scrollback_limit,
+            saturated: false,
             scan: OscScan::Ground,
             marks: VecDeque::new(),
         }
@@ -404,6 +435,11 @@ impl Terminal {
     ///   no-op on unchanged titles, and manual renames are flagged app-side).
     pub fn set_scrollback_lines(&mut self, lines: usize) {
         self.term.set_options(Config { scrolling_history: lines, ..Default::default() });
+        // Keep the saturation model in lockstep with the live cap. A shrink can
+        // pull us to/over the (smaller) cap; a grow can lift us back under it and
+        // re-enable exact tracking for future marks.
+        self.scrollback_limit = lines;
+        self.refresh_saturation();
         // A shrink freed trimmed history rows, so stored search-match Points
         // can reference lines that no longer exist (wrong counter, Enter/F3
         // jumping to a clamped top-of-history). Re-collect, exactly like
@@ -505,12 +541,18 @@ impl Terminal {
                         i += 1;
                     }
                     b'0'..=b'9' if in_code && !code_done => {
-                        self.scan = OscScan::Payload {
-                            letter,
-                            code: Some(code.unwrap_or(0).saturating_mul(10) + (b - b'0') as u32),
-                            in_code,
-                            code_done,
-                        };
+                        // FULLY saturating, then clamp to the 0..=255 byte range a
+                        // shell exit status actually occupies (POSIX wait status is
+                        // 8-bit; signals show as 128+signum, still < 256). A crafted
+                        // `\e]133;D;9999999999\a` must neither panic (overflow-checks
+                        // on in dev) nor wrap to a garbage/negative code in release —
+                        // it clamps to 255 (nonzero → still classified "failed").
+                        let next = code
+                            .unwrap_or(0)
+                            .saturating_mul(10)
+                            .saturating_add((b - b'0') as u32)
+                            .min(EXIT_CODE_MAX);
+                        self.scan = OscScan::Payload { letter, code: Some(next), in_code, code_done };
                         i += 1;
                     }
                     _ => {
@@ -569,6 +611,31 @@ impl Terminal {
         } else {
             self.on_history_shrunk(h1);
         }
+        // Once the ring saturates, `history_size()` pins at the cap while real
+        // scroll keeps happening, so the abs_top delta above under-counts (this
+        // very feed can already have scrolled a mark off the counted range). We
+        // cannot recover the lost count — so latch and drop marks rather than
+        // render them on drifting rows. See `refresh_saturation`.
+        self.refresh_saturation();
+    }
+
+    /// Recompute the saturation latch from the live history depth. On the
+    /// transition into saturation, purge marks (any of them may already have
+    /// drifted). No-op while on the alt screen (its grid has no primary
+    /// scrollback; saturation of the primary is re-evaluated on return).
+    fn refresh_saturation(&mut self) {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        // `history_size()` is capped at `scrollback_limit`, so `>=` fires exactly
+        // when the ring is full. A `scrollback_limit` of 0 (no scrollback) is
+        // "always saturated": scrolled-off lines are lost, so marks cannot be
+        // tracked — correctly disabling the feature.
+        let now_saturated = self.term.grid().history_size() >= self.scrollback_limit;
+        if now_saturated && !self.saturated {
+            self.marks.clear();
+        }
+        self.saturated = now_saturated;
     }
 
     /// Handle a non-scroll history shrink on the PRIMARY screen (a destructive
@@ -597,6 +664,11 @@ impl Terminal {
     /// snippet both emitting A cannot create two blocks.
     fn bind_mark(&mut self, letter: u8, exit: Option<i32>) {
         if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        // Past scrollback saturation we can no longer place a mark's row reliably;
+        // refuse to bind (absent) rather than record a mark that will drift.
+        if self.saturated {
             return;
         }
         let abs = self.abs_top + self.term.grid().cursor.point.line.0 as i64;
@@ -651,7 +723,10 @@ impl Terminal {
     /// hot loop is untouched (SPEED). Uses the SAME `display_offset` mapping as
     /// `snapshot()`.
     pub fn failed_prompt_rows(&self) -> Vec<u16> {
-        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+        // On the alt screen, or once scrollback saturation has made mark rows
+        // untrustworthy, render nothing (correct-or-absent). `saturated` implies
+        // `marks` is already empty, but the guard states the intent.
+        if self.saturated || self.term.mode().contains(TermMode::ALT_SCREEN) {
             return Vec::new();
         }
         let display_offset = self.term.grid().display_offset() as i64;
@@ -675,7 +750,10 @@ impl Terminal {
     /// (shell integration never enabled), on the alt screen, and at the ends
     /// (clamps, never wraps).
     pub fn jump_prompt(&mut self, forward: bool) -> bool {
-        if self.term.mode().contains(TermMode::ALT_SCREEN) || self.marks.is_empty() {
+        // No target on the alt screen, past saturation (marks untrustworthy /
+        // cleared), or with no marks at all.
+        if self.saturated || self.term.mode().contains(TermMode::ALT_SCREEN) || self.marks.is_empty()
+        {
             return false;
         }
         let display_offset = self.term.grid().display_offset() as i64;
@@ -1094,6 +1172,20 @@ impl Terminal {
         // Reflow moved every line; stored search-match Points are stale now.
         // Cheap no-op when no search is active.
         self.search_refresh();
+        // A reflow REWRAPS logical lines: a mark's physical row genuinely moves by
+        // an amount unrelated to any scroll, so its stored absolute line no longer
+        // points at its prompt. `Term::resize` also changes `history_size()`
+        // outside `track_abs_top`, breaking the abs_top⇄history relationship. Since
+        // the anchors are now meaningless, DROP the marks (correct-or-absent — the
+        // next prompt re-marks) and re-establish a clean anchor so future marks and
+        // pruning are exact again. Skip the re-anchor on the alt screen: its grid
+        // has ~no history, so `history_size()` there would corrupt the primary
+        // `abs_top` (which is frozen for the alt session).
+        self.marks.clear();
+        if !self.term.mode().contains(TermMode::ALT_SCREEN) {
+            self.abs_top = self.term.grid().history_size() as i64;
+            self.refresh_saturation();
+        }
     }
 
     /// Whether the shell child process has exited (or the terminal requested
@@ -2397,6 +2489,24 @@ mod tests {
         assert_eq!(parse(b"\x1b]133;D;130\x07"), Some(130));
         assert_eq!(parse(b"\x1b]133;D;1;aid=7\x07"), Some(1), "aid must not become 17 or 1*10+7");
         assert_eq!(parse(b"\x1b]133;D;;aid=7\x07"), None, "empty code is unknown");
+        // F1: a crafted overflowing code must not panic (overflow-checks on in
+        // dev) or wrap (release); it clamps to the 8-bit exit-status range.
+        assert_eq!(parse(b"\x1b]133;D;255\x07"), Some(255), "top of the byte range");
+        assert_eq!(parse(b"\x1b]133;D;256\x07"), Some(255), "clamped to 255");
+        assert_eq!(parse(b"\x1b]133;D;9999999999\x07"), Some(255), "no overflow, clamped");
+    }
+
+    #[test]
+    fn osc133_overflowing_exit_code_no_panic_still_failed() {
+        // F1 focused: the u32 accumulator would overflow-panic in dev without the
+        // fully-saturating parse. The result must be sane AND classified failed.
+        let mut t = Terminal::new(40, 5);
+        t.feed(b"\x1b]133;A\x07");
+        t.feed(b"\x1b]133;D;9999999999\x07"); // 10 digits: overflows u32 unclamped
+        assert_eq!(t.marks.back().unwrap().exit, Some(255), "clamped, not wrapped/garbage");
+        assert_eq!(t.failed_prompt_rows(), vec![0], "a huge (nonzero) code is still failed");
+        // The `as i32` cast used downstream must stay non-negative (no sign flip).
+        assert!(t.marks.back().unwrap().exit.unwrap() > 0);
     }
 
     #[test]
@@ -2603,8 +2713,11 @@ mod tests {
 
     #[test]
     fn sync_defers_mark_but_abs_top_stays_exact() {
-        // Documented sync edge (F1): a 133 inside a BSU binds at parse-arrival;
-        // flush_sync must keep abs_top exactly tracking history (no drift).
+        // Documented sync edge: a 133 inside a BSU binds at parse-arrival;
+        // flush_sync must keep abs_top exactly tracking history (no drift). This
+        // exercises the UNSATURATED regime (few lines, default 10k cap), where
+        // `abs_top == history_size()` holds exactly and marks are placed precisely
+        // — the common case the feature guarantees.
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b[?2026h"); // BSU
         t.feed(b"\x1b]133;A\x07\x1b]133;D;1\x07");
@@ -2615,7 +2728,111 @@ mod tests {
             t.feed(format!("z{i}\r\n").as_bytes());
         }
         t.scroll_to_bottom();
+        assert!(!t.saturated, "12 lines under a 10k cap never saturates");
         assert_eq!(t.abs_top, t.scroll_max() as i64, "abs_top tracks history exactly after sync");
+    }
+
+    #[test]
+    fn saturated_scrollback_invalidates_marks_never_wrong_row() {
+        // F2: once the ring saturates, history_size() pins at the cap while output
+        // keeps scrolling, so abs_top can no longer track the prompt. The mark must
+        // be INVALIDATED (correct-or-absent) — NEVER painted on a drifting row.
+        let mut t = Terminal::new(20, 5);
+        t.set_scrollback_lines(30); // small cap so saturation is reachable in-test
+        t.feed(b"a\r\nb\r\n"); // prep so the prompt isn't on the top row
+        t.feed(b"\x1b]133;A\x07\x1b]133;D;1\x07");
+        // Common case still exact while unsaturated: the failed prompt renders on
+        // its real row and tracks scrolling into history.
+        assert!(!t.saturated);
+        assert_eq!(t.failed_prompt_rows(), vec![2], "exact placement pre-saturation");
+        let prompt_abs = t.marks.back().unwrap().prompt;
+        // Now blow well past the 30-line cap. history_size() saturates and freezes.
+        for i in 0..80 {
+            t.feed(format!("out {i}\r\n").as_bytes());
+        }
+        assert!(t.saturated, "80 lines over a 30 cap saturates the ring");
+        // abs_top froze at the cap (30) while ~80 lines really scrolled — exactly
+        // the drift that used to mis-place the marker. The mark's absolute line now
+        // sits far BELOW the frozen abs_top, so any prompt−abs_top mapping is
+        // meaningless: hence the mark must be gone rather than rendered.
+        assert_eq!(t.abs_top, 30, "abs_top pinned at the cap once saturated");
+        assert!(prompt_abs < t.abs_top, "the mark drifted below the frozen anchor");
+        // NEVER a wrong row: marks are dropped, so nothing renders anywhere in the
+        // buffer (bottom, mid-scroll, or top of history).
+        assert!(t.marks.is_empty(), "possibly-drifted marks are purged at saturation");
+        assert!(t.failed_prompt_rows().is_empty(), "no marker at the live bottom");
+        t.scroll_lines(1000);
+        assert!(t.failed_prompt_rows().is_empty(), "no marker anywhere in history either");
+        t.scroll_to_bottom();
+        assert!(!t.jump_prompt(false), "no jump target once saturated");
+        // A fresh prompt while saturated must NOT bind a mark that would drift.
+        t.feed(b"\x1b]133;A\x07\x1b]133;D;1\x07");
+        assert!(t.marks.is_empty(), "no new marks bound while saturated");
+        assert!(t.failed_prompt_rows().is_empty());
+    }
+
+    #[test]
+    fn saturation_clears_then_recovers_on_shrink() {
+        // F2 continued: dropping the cap below the live depth relatches, and a
+        // later grow (fresh, exact tracking) lets new marks work again.
+        let mut t = Terminal::new(20, 5);
+        t.set_scrollback_lines(20);
+        for i in 0..60 {
+            t.feed(format!("x{i}\r\n").as_bytes());
+        }
+        assert!(t.saturated, "saturated at the 20 cap");
+        // Raise the cap far above the live history: no longer saturated, so exact
+        // tracking resumes and a new failed prompt renders on its true row.
+        t.set_scrollback_lines(10_000);
+        assert!(!t.saturated, "cap now far above live depth");
+        t.feed(b"\x1b]133;A\x07\x1b]133;D;1\x07");
+        assert_eq!(t.marks.len(), 1, "marks bind again once tracking is exact");
+        assert_eq!(t.failed_prompt_rows().len(), 1, "and render on the real row");
+    }
+
+    #[test]
+    fn resize_clears_marks_and_reanchors_never_wrong_row() {
+        // F3: App::reflow() calls resize() on every window/font change. Reflow
+        // rewraps logical lines (a prompt's physical row moves) and changes
+        // history_size() outside track_abs_top. Pre-existing marks must be CLEARED
+        // (their anchor is invalid) — never left to map to a continuation/unrelated
+        // row — and abs_top re-anchored so future marks stay exact.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"prep\r\n");
+        t.feed(b"\x1b]133;A\x07\x1b]133;D;1\x07");
+        assert_eq!(t.failed_prompt_rows(), vec![1], "placed before resize");
+        // A real reflow (both dims change, as a font/window resize does).
+        t.resize(12, 8);
+        assert!(t.marks.is_empty(), "reflow invalidates the anchor → marks cleared");
+        assert!(t.failed_prompt_rows().is_empty(), "nothing painted on a wrong row");
+        assert!(!t.jump_prompt(false), "no stale jump target after reflow");
+        // abs_top re-anchored to the clean invariant on the primary screen.
+        assert_eq!(t.abs_top, t.term.grid().history_size() as i64, "abs_top re-anchored");
+        // Future marks are exact again: a fresh failed prompt lands on its row.
+        t.feed(b"\x1b]133;A\x07\x1b]133;D;1\x07");
+        assert_eq!(t.marks.len(), 1);
+        let row = t.failed_prompt_rows();
+        assert_eq!(row.len(), 1, "new mark renders on exactly one real row");
+        // And that mark then survives scrolling correctly (tracking works post-resize).
+        for i in 0..12 {
+            t.feed(format!("p{i}\r\n").as_bytes());
+        }
+        assert!(t.failed_prompt_rows().is_empty(), "scrolled off the bottom");
+        t.scroll_lines(1000);
+        assert_eq!(t.failed_prompt_rows().len(), 1, "reappears in history at its true row");
+    }
+
+    #[test]
+    fn same_size_resize_keeps_marks() {
+        // The F15 same-dims no-op must NOT wipe marks: the common case is "no
+        // resize since the mark was made", and App::reflow() resizes every tab on
+        // any window event — a no-op resize has to stay a no-op for marks too.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]133;A\x07\x1b]133;D;1\x07");
+        assert_eq!(t.marks.len(), 1);
+        t.resize(20, 5); // identical dimensions
+        assert_eq!(t.marks.len(), 1, "a no-op resize preserves marks");
+        assert_eq!(t.failed_prompt_rows(), vec![0], "still on its real row");
     }
 
     #[test]
