@@ -671,6 +671,27 @@ pub fn link_underline_rects(
         .collect()
 }
 
+/// Slim left-edge accent bars marking OSC 133 failed-command (`D;<nonzero>`)
+/// prompt rows — an IDE "changed line" style gutter tick. `rows` are 0-based
+/// VIEWPORT rows already filtered to the visible grid (typically empty).
+/// `width_px` is the physical bar width (HiDPI-scaled by the caller); drawn at
+/// x=0, rounded so it reads as an accent rather than a hard block. Shared by the
+/// main window, detached windows, and jetty-shot so all three stay identical.
+pub fn failed_marker_rects(
+    rows: &[u16],
+    cell_h: f32,
+    y_offset: f32,
+    width_px: f32,
+    color: [u8; 4],
+) -> Vec<Rect> {
+    let radius = (width_px * 0.5).min(cell_h * 0.5);
+    rows.iter()
+        .map(|&row| {
+            Rect::rounded(0.0, y_offset + row as f32 * cell_h, width_px, cell_h, color, radius)
+        })
+        .collect()
+}
+
 /// Build the cursor quad(s) for the current frame — the ONE per-frame quad
 /// rebuild (everything else is cached), because the caret flash animates.
 ///

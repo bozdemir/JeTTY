@@ -3464,6 +3464,15 @@ impl App {
                         dw.window.request_redraw();
                         viewport_moved = true;
                     }
+                    // OSC 133 prompt jump on THIS window's own terminal (parity
+                    // with the main window). No marks / at-the-end = no-op.
+                    input::KeyAction::PrevPrompt | input::KeyAction::NextPrompt => {
+                        let forward = action == input::KeyAction::NextPrompt;
+                        if dw.tab.terminal.jump_prompt(forward) {
+                            dw.window.request_redraw();
+                            viewport_moved = true;
+                        }
+                    }
                     input::KeyAction::Copy => {
                         // Same copy-then-clear flow as the main window.
                         let copied = dw
@@ -4310,6 +4319,9 @@ impl App {
         // Window focus drives the unfocused-hollow cursor (captured before the
         // gpu/text/quad borrows below).
         let focused = dw.focused;
+        // OSC 133 failed-command marker rows for THIS window's tab (captured
+        // before the mutable dw borrows below; parity with the main window).
+        let failed_rows = dw.tab.terminal.failed_prompt_rows();
         // Corner radius in physical px (HiDPI-correct, same scaling as main).
         let scale = dw.window.scale_factor() as f32;
         let corner_radius_px = corner_radius * scale;
@@ -4385,6 +4397,16 @@ impl App {
         let mut pass4: Vec<jetty_render::Rect> = Vec::new();
         if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, grid_top, status_h, scrollbar_thumb) {
             pass4.push(r);
+        }
+        // OSC 133 failed-command marker (identical treatment to the main window).
+        if !failed_rows.is_empty() {
+            pass4.extend(jetty_render::failed_marker_rects(
+                &failed_rows,
+                cell_h,
+                grid_top,
+                (3.0 * scale).round().max(2.0),
+                theme.failed_marker_color(),
+            ));
         }
         pass4.extend_from_slice(text.decoration_rects());
         if let Some(spans) = &link_spans {
@@ -7311,6 +7333,8 @@ impl ApplicationHandler<AppEvent> for App {
 
                         input::KeyAction::Paste => "Paste",
                         input::KeyAction::SearchToggle => "SearchToggle",
+                        input::KeyAction::PrevPrompt => "PrevPrompt",
+                        input::KeyAction::NextPrompt => "NextPrompt",
                         input::KeyAction::Send(_) => "Send",
                         input::KeyAction::None => "None",
                     };
@@ -7400,6 +7424,18 @@ impl ApplicationHandler<AppEvent> for App {
                             w.request_redraw();
                         }
                         self.update_link_hover(true);
+                    }
+                    // OSC 133 prompt jump (Ctrl+Shift+Z prev / Ctrl+Shift+X next).
+                    // Zero marks / at-the-end = pure no-op (jump_prompt returns
+                    // false), so nothing redraws or moves the link hover then.
+                    input::KeyAction::PrevPrompt | input::KeyAction::NextPrompt => {
+                        let forward = action == input::KeyAction::NextPrompt;
+                        if self.active_tab_mut().terminal.jump_prompt(forward) {
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            self.update_link_hover(true);
+                        }
                     }
                     input::KeyAction::FontUp => {
                         self.set_font_size(self.font_logical + 1.0);
@@ -7680,6 +7716,9 @@ impl ApplicationHandler<AppEvent> for App {
                 } else {
                     Vec::new()
                 };
+                // OSC 133 failed-command marker rows (captured before the mutable
+                // gpu render borrow, like search_hits). Empty in the common case.
+                let failed_rows = self.active_tab().terminal.failed_prompt_rows();
                 let welcome_open = self.welcome_open;
                 // Pill only when the hint is live AND belongs to THIS (the
                 // main) window — a detached-window drag must not light it
@@ -7951,6 +7990,19 @@ impl ApplicationHandler<AppEvent> for App {
                     {
                         r.y += slide_y_offset;
                         rects.push(r);
+                    }
+                    // OSC 133 failed-command marker: a themed, high-contrast
+                    // left-edge accent bar on each visible failed prompt row.
+                    // Width in physical px (HiDPI-correct, same `scale` as the
+                    // corner mask); rides the dropdown slide via slide_y_offset.
+                    if !failed_rows.is_empty() {
+                        rects.extend(jetty_render::failed_marker_rects(
+                            &failed_rows,
+                            cell_h,
+                            grid_top + slide_y_offset,
+                            (3.0 * scale).round().max(2.0),
+                            theme.failed_marker_color(),
+                        ));
                     }
                     // SGR underline/strike (built at the same grid offset as the text).
                     rects.extend_from_slice(text.decoration_rects());

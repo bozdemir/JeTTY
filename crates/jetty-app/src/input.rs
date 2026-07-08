@@ -34,6 +34,10 @@ pub enum KeyAction {
     Paste,
     /// Toggle the scrollback-search bar (Ctrl+Shift+F).
     SearchToggle,
+    /// Jump the viewport to the previous (older) OSC 133 prompt (Ctrl+Shift+Z).
+    PrevPrompt,
+    /// Jump the viewport to the next (newer) OSC 133 prompt (Ctrl+Shift+X).
+    NextPrompt,
     /// Raw bytes to write to the PTY.
     Send(Vec<u8>),
     None,
@@ -129,6 +133,12 @@ pub fn decide_key(
             // Scrollback search — must be intercepted before ctrl_byte, which
             // would otherwise send 0x06 (ACK) to the PTY.
             PhysicalKey::Code(KeyCode::KeyF) => return KeyAction::SearchToggle,
+            // Prompt jump (OSC 133): Ctrl+Shift+Z prev / Ctrl+Shift+X next.
+            // Intercepted here so KeyZ/KeyX never fall through to the ctrl-byte
+            // path (which would send 0x1a / 0x18 to the PTY). Plain Ctrl+Z /
+            // Ctrl+X are unaffected — they lack Shift and are handled below.
+            PhysicalKey::Code(KeyCode::KeyZ) => return KeyAction::PrevPrompt,
+            PhysicalKey::Code(KeyCode::KeyX) => return KeyAction::NextPrompt,
             PhysicalKey::Code(KeyCode::Tab) => return KeyAction::PrevTab,
             // Physical fallback for layouts where the logical char above is
             // unreliable (US: Shift+Equal → '+', Shift+Minus → '_').
@@ -1147,6 +1157,52 @@ mod tests {
             false, false, false,
         );
         assert_eq!(action, KeyAction::FontDown, "logical '-' must win over physical Equal");
+    }
+
+    #[test]
+    fn ctrl_shift_z_is_prev_prompt_not_sub() {
+        // Ctrl+Shift+Z must be PrevPrompt and never leak 0x1a (SUB) to the PTY.
+        let action = decide_key(
+            true, true, false,
+            make_physical(KeyCode::KeyZ),
+            &make_logical_char("Z"),
+            false, false, false,
+        );
+        assert_eq!(action, KeyAction::PrevPrompt);
+        assert_ne!(action, KeyAction::Send(vec![0x1a]));
+    }
+
+    #[test]
+    fn ctrl_shift_x_is_next_prompt_not_can() {
+        // Ctrl+Shift+X must be NextPrompt and never leak 0x18 (CAN) to the PTY.
+        let action = decide_key(
+            true, true, false,
+            make_physical(KeyCode::KeyX),
+            &make_logical_char("X"),
+            false, false, false,
+        );
+        assert_eq!(action, KeyAction::NextPrompt);
+        assert_ne!(action, KeyAction::Send(vec![0x18]));
+    }
+
+    #[test]
+    fn plain_ctrl_z_and_x_still_send_control_bytes() {
+        // Regression guard: WITHOUT shift, Ctrl+Z / Ctrl+X keep their control
+        // bytes (SUB 0x1a / CAN 0x18) — prompt-jump only steals the Shift chord.
+        let z = decide_key(
+            true, false, false,
+            make_physical(KeyCode::KeyZ),
+            &make_logical_char("z"),
+            false, false, false,
+        );
+        assert_eq!(z, KeyAction::Send(vec![0x1a]));
+        let x = decide_key(
+            true, false, false,
+            make_physical(KeyCode::KeyX),
+            &make_logical_char("x"),
+            false, false, false,
+        );
+        assert_eq!(x, KeyAction::Send(vec![0x18]));
     }
 
     #[test]
