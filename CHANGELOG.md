@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.14.0] — 2026-07-08
+
+Shell integration (OSC 133). Designed from a verified blueprint, stress-tested
+by two design critics, then adversarially reviewed — with the marks model held
+to a strict "correct or absent, never wrong" bar.
+
+### Added
+- **Failed-command marker** — a themed, high-contrast bar on the prompt row of
+  any command that exited non-zero, so failures are obvious when you scroll back.
+- **Prompt jump** — `Ctrl+Shift+Z` / `Ctrl+Shift+X` scroll to the previous /
+  next shell prompt.
+- **`jetty --print-shell-integration <zsh|bash|fish>`** — prints a snippet you
+  opt into from your rc file. It **never edits your dotfiles**. zsh is
+  powerlevel10k-aware (set `POWERLEVEL9K_TERM_SHELL_INTEGRATION=true` and JeTTY
+  reads p10k's own marks); bash rides `PROMPT_COMMAND` only (no `DEBUG`-trap
+  clobber); fish uses events. JeTTY advertises itself via `JETTY`, `JETTY_BIN`,
+  `TERM_PROGRAM=jetty`.
+
+  ```sh
+  # ~/.zshrc
+  [[ -n "$JETTY" ]] && command -v jetty >/dev/null 2>&1 && source <(jetty --print-shell-integration zsh) 2>/dev/null
+  ```
+
+### Notes
+- OSC 133 is intercepted directly (alacritty's VT engine drops it) with an O(n)
+  scanner on the PTY-drain path — no idle/hot-path cost.
+- Prompt marks are exact for the common case (default 10k-line scrollback, no
+  resize since the mark was made). By design they **degrade to absent — never
+  wrong** in two cases: after a window/font resize (reflow rewraps, so marks are
+  cleared and re-made on the next prompt), and once the scrollback fills to its
+  cap (marks pause until history drops below the cap). JeTTY never draws a marker
+  on the wrong row.
+- `Ctrl+Shift+Z` / `Ctrl+Shift+X` are now consumed for prompt-jump (plain
+  `Ctrl+Z` / `Ctrl+X` still send `0x1a` / `0x18`).
+- Inside `tmux`/`screen`, OSC 133 reaches the multiplexer, not JeTTY, unless its
+  passthrough is configured.
+
+---
+
 ## [0.13.0] — 2026-07-07
 
 The "text attributes" release: JeTTY now renders the SGR attributes it used to
