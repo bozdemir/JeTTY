@@ -7,8 +7,9 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
-use alacritty_terminal::term::{Config, Term, point_to_viewport, viewport_to_point};
+use alacritty_terminal::term::{Config, Term, TermMode, point_to_viewport, viewport_to_point};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -152,6 +153,53 @@ impl Dimensions for Size {
     }
 }
 
+/// Maximum retained OSC 133 command blocks per tab (memory bound; ~40 B each,
+/// so ≤ ~160 KB worst case). Pruned to the live scrollback window on every bind.
+const MAX_MARKS: usize = 4096;
+
+/// The exact OSC 133 introducer the scanner matches after `ESC ]`.
+const OSC133_PREFIX: &[u8] = b"133;";
+
+/// State of the tiny OSC-133-only scanner, carried across [`Terminal::feed`]
+/// calls so a mark split across PTY chunks resumes mid-sequence. Every non-Ground
+/// state is mid-escape; Ground uses a `memchr(ESC)` fast path, so a stream with
+/// no escapes costs one SIMD scan per feed and nothing per byte. The terminator
+/// set `{0x07 BEL, 0x18 CAN, 0x1A SUB, 0x1B ESC}` and the `;` separator match
+/// vte 0.15's OSC framing exactly (advance_osc_string), so there are no false
+/// splits with adjacent OSC 0/8/4 sequences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscScan {
+    /// Not inside an escape; scan forward to the next ESC via memchr.
+    Ground,
+    /// Saw ESC; a following `]` (0x5d) opens an OSC.
+    Esc,
+    /// Inside `ESC ]`, matching the `133;` prefix byte by byte (`n` matched).
+    Prefix { n: u8 },
+    /// Matched `133;`; collecting the letter (A/B/C/D) and the first `;code`.
+    /// `code_done` is set by a SECOND `;` so `aid=<n>` params never corrupt the
+    /// exit code (only the first param after the letter is the exit status).
+    Payload { letter: u8, code: Option<u32>, in_code: bool, code_done: bool },
+    /// Inside some OTHER OSC (title/hyperlink/color); skip to its terminator.
+    Skip,
+}
+
+/// One shell command's OSC 133 semantic marks. `prompt`/`input`/`output` are
+/// ABSOLUTE grid-line indices (`abs_top`-relative; survive scrolling); `exit`
+/// comes from `D;<code>` (None = unknown). FAILED iff `finished && exit == Some(n != 0)`.
+#[derive(Clone, Copy, Debug)]
+struct CmdBlock {
+    /// OSC 133 A — the prompt line (where the failed marker renders).
+    prompt: i64,
+    /// OSC 133 B — input start (refinement; unused by the two shipped features).
+    input: Option<i64>,
+    /// OSC 133 C — command-output start.
+    output: Option<i64>,
+    /// OSC 133 D exit code (None = no/empty/non-numeric code → unknown).
+    exit: Option<i32>,
+    /// Set once a D arrives (or a later A closes an abandoned command, e.g. ^C).
+    finished: bool,
+}
+
 pub struct Terminal {
     term: Term<EventProxy>,
     parser: Processor,
@@ -190,6 +238,18 @@ pub struct Terminal {
     search_matches: Vec<Match>,
     /// Index into `search_matches` of the CURRENT match (the counter's "n").
     search_current: usize,
+    /// Absolute grid-line index of the active-region top (grid `Line(0)`).
+    /// Advanced by `history_size()` growth in [`Terminal::advance_slice`] /
+    /// [`Terminal::flush_sync`]; the stable anchor that lets OSC 133 prompt marks
+    /// survive scrolling. EXACT for the whole unsaturated-scrollback lifetime
+    /// (marks past the cap age out anyway). FROZEN while the alt screen is active
+    /// and across an alt-screen toggle (that history change is not a scroll).
+    abs_top: i64,
+    /// OSC 133 scanner state, persisted across `feed` calls (chunk boundaries).
+    scan: OscScan,
+    /// Per-tab semantic prompt marks (OSC 133 A/B/C/D), append order == ascending
+    /// `abs_top`-relative line, pruned to the live scrollback window on each bind.
+    marks: VecDeque<CmdBlock>,
 }
 
 /// Maximum scrollback-search query length in chars (bounds per-keystroke DFA
@@ -275,6 +335,9 @@ impl Terminal {
             search_regex: None,
             search_matches: Vec::new(),
             search_current: 0,
+            abs_top: 0,
+            scan: OscScan::Ground,
+            marks: VecDeque::new(),
         }
     }
 
@@ -346,10 +409,290 @@ impl Terminal {
         // jumping to a clamped top-of-history). Re-collect, exactly like
         // `resize` does for reflow; cheap no-op when no search is active (F11).
         self.search_refresh();
+        // A shrink also removes OLD history above `Line(0)` (which does NOT move,
+        // so `abs_top` is unchanged): drop marks whose absolute line no longer
+        // exists in the smaller live window.
+        let history = self.term.grid().history_size();
+        self.prune_marks(history);
     }
 
+    /// Feed PTY bytes to the terminal, intercepting OSC 133 semantic-prompt
+    /// marks on the way through (alacritty_terminal 0.26 / vte 0.15 drop 133).
+    ///
+    /// SPEED (#1): in `Ground` this is one `memchr(ESC)` per feed with zero
+    /// per-byte work; a stream carrying no 133 reaches `advance_slice` exactly
+    /// once (the whole buffer). Only inside an escape does the per-byte state
+    /// machine run. Each input byte reaches alacritty exactly once (`start` is
+    /// the first un-flushed byte); the scanner sub-advances alacritty up to AND
+    /// INCLUDING a 133's terminator so the grid is caught up before the cursor
+    /// line is read, then drops the (unhandled) 133 harmlessly.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.term, bytes);
+        let mut i = 0;
+        let mut start = 0; // first byte not yet handed to alacritty
+        while i < bytes.len() {
+            if matches!(self.scan, OscScan::Ground) {
+                match memchr::memchr(0x1b, &bytes[i..]) {
+                    None => break, // no more escapes: flush the tail after the loop
+                    Some(off) => {
+                        i += off + 1; // step past the ESC
+                        self.scan = OscScan::Esc;
+                        continue;
+                    }
+                }
+            }
+            let b = bytes[i];
+            match self.scan {
+                // Ground is handled by the memchr fast path above.
+                OscScan::Ground => unreachable!(),
+                OscScan::Esc => {
+                    self.scan = match b {
+                        0x5d => OscScan::Prefix { n: 0 }, // ']' opens an OSC
+                        0x1b => OscScan::Esc,             // ESC ESC: restart escape scan
+                        _ => OscScan::Ground,             // some other escape; resync
+                    };
+                    i += 1;
+                }
+                OscScan::Prefix { n } => {
+                    match b {
+                        // A bare ESC aborts this OSC AND begins a new escape (vte
+                        // parity) — so `ESC]133; <ESC> ]133;A BEL` still binds A.
+                        0x1b => self.scan = OscScan::Esc,
+                        // OSC ended before matching `133;` (e.g. `ESC]133 BEL`).
+                        0x07 | 0x18 | 0x1a => self.scan = OscScan::Ground,
+                        _ if b == OSC133_PREFIX[n as usize] => {
+                            let n2 = n + 1;
+                            self.scan = if n2 as usize == OSC133_PREFIX.len() {
+                                OscScan::Payload {
+                                    letter: 0,
+                                    code: None,
+                                    in_code: false,
+                                    code_done: false,
+                                }
+                            } else {
+                                OscScan::Prefix { n: n2 }
+                            };
+                        }
+                        // Some other OSC (title/hyperlink/color): skip to its end.
+                        _ => self.scan = OscScan::Skip,
+                    }
+                    i += 1;
+                }
+                OscScan::Payload { letter, code, in_code, code_done } => match b {
+                    // BEL / CAN / SUB / ESC(=ST) all end the OSC (vte parity).
+                    0x07 | 0x18 | 0x1a | 0x1b => {
+                        let is_esc = b == 0x1b;
+                        let k = i + 1;
+                        // Catch alacritty up to & including the terminator, then
+                        // read the cursor NOW (OSC 133 never moves it, so the line
+                        // is identical whether read in this feed or a later split).
+                        self.advance_slice(&bytes[start..k]);
+                        self.bind_mark(letter, code.map(|c| c as i32));
+                        // ESC leaves alacritty in Escape state and may begin a new
+                        // sequence (the trailing `\` of an ST is consumed there).
+                        self.scan = if is_esc { OscScan::Esc } else { OscScan::Ground };
+                        start = k;
+                        i = k;
+                    }
+                    b';' => {
+                        // First `;` opens the code field; a SECOND `;` closes it so
+                        // `aid=<n>` (p10k) never bleeds into the exit code.
+                        self.scan = OscScan::Payload {
+                            letter,
+                            code,
+                            in_code: true,
+                            code_done: in_code || code_done,
+                        };
+                        i += 1;
+                    }
+                    b'0'..=b'9' if in_code && !code_done => {
+                        self.scan = OscScan::Payload {
+                            letter,
+                            code: Some(code.unwrap_or(0).saturating_mul(10) + (b - b'0') as u32),
+                            in_code,
+                            code_done,
+                        };
+                        i += 1;
+                    }
+                    _ => {
+                        // First byte after `133;` is the A/B/C/D letter. A
+                        // non-digit inside the code field (e.g. `k=v`) makes the
+                        // exit code unknown (None), closed so trailing digits do
+                        // not resurrect it.
+                        self.scan = if letter == 0 && !in_code {
+                            OscScan::Payload { letter: b, code, in_code, code_done }
+                        } else if in_code && !code_done {
+                            OscScan::Payload { letter, code: None, in_code, code_done: true }
+                        } else {
+                            OscScan::Payload { letter, code, in_code, code_done }
+                        };
+                        i += 1;
+                    }
+                },
+                OscScan::Skip => {
+                    self.scan = match b {
+                        0x1b => OscScan::Esc,             // ST: ends this OSC, new escape
+                        0x07 | 0x18 | 0x1a => OscScan::Ground,
+                        _ => OscScan::Skip,
+                    };
+                    i += 1;
+                }
+            }
+        }
+        if start < bytes.len() {
+            self.advance_slice(&bytes[start..]);
+        }
+    }
+
+    /// The ONLY place bytes reach alacritty; also where `abs_top` is maintained.
+    /// `history_size()` grows by exactly the scrolled-line count until the buffer
+    /// saturates, so `abs_top` is EXACT for the whole unsaturated lifetime.
+    fn advance_slice(&mut self, s: &[u8]) {
+        let alt_before = self.term.mode().contains(TermMode::ALT_SCREEN);
+        let h0 = self.term.grid().history_size();
+        self.parser.advance(&mut self.term, s);
+        let alt_after = self.term.mode().contains(TermMode::ALT_SCREEN);
+        let h1 = self.term.grid().history_size();
+        self.track_abs_top(alt_before, alt_after, h0, h1);
+    }
+
+    /// Fold a `history_size` delta into `abs_top`, honoring the alt screen.
+    /// Entering/leaving the alt screen (vim/less/htop) changes `history_size`
+    /// WITHOUT scrolling, and while on the alt screen its history churn is not
+    /// the primary scrollback — so `abs_top` (and every mark) is FROZEN across an
+    /// alt-screen toggle and for its whole duration, resuming cleanly on return.
+    fn track_abs_top(&mut self, alt_before: bool, alt_after: bool, h0: usize, h1: usize) {
+        if alt_before != alt_after || alt_after {
+            return;
+        }
+        if h1 >= h0 {
+            self.abs_top += (h1 - h0) as i64;
+        } else {
+            self.on_history_shrunk(h1);
+        }
+    }
+
+    /// Handle a non-scroll history shrink on the PRIMARY screen (a destructive
+    /// reset `RIS`/`\ec`, or a scrollback clear `\e[3J`): `Line(0)` does not move,
+    /// so `abs_top` stays monotonic; drop marks whose line no longer exists. The
+    /// next prompt re-marks.
+    fn on_history_shrunk(&mut self, history_size: usize) {
+        self.prune_marks(history_size);
+    }
+
+    /// Drop marks outside the live window `[abs_top - history_size, abs_top + rows)`
+    /// and cap the total (defensive). Called on every A-bind and on a shrink.
+    fn prune_marks(&mut self, history_size: usize) {
+        let min_abs = self.abs_top - history_size as i64;
+        let max_abs = self.abs_top + self.rows as i64;
+        self.marks.retain(|m| m.prompt >= min_abs && m.prompt < max_abs);
+        while self.marks.len() > MAX_MARKS {
+            self.marks.pop_front();
+        }
+    }
+
+    /// Record an OSC 133 mark for the given sub-command letter (and D's exit
+    /// code). Reads the cursor's absolute line immediately after the terminator
+    /// has been advanced. No-op on the alt screen (OSC 133 inside a TUI is
+    /// meaningless). Coalesces a duplicate A on the same line so p10k + our own
+    /// snippet both emitting A cannot create two blocks.
+    fn bind_mark(&mut self, letter: u8, exit: Option<i32>) {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        let abs = self.abs_top + self.term.grid().cursor.point.line.0 as i64;
+        match letter {
+            b'A' => {
+                // Dedup double-emission (p10k's own integration + ours).
+                if let Some(last) = self.marks.back() {
+                    if last.prompt == abs && !last.finished {
+                        return;
+                    }
+                }
+                // A new prompt closes any previous still-open block (a command
+                // that never emitted D, e.g. ^C at the prompt) as unknown.
+                if let Some(last) = self.marks.back_mut() {
+                    last.finished = true;
+                }
+                self.marks.push_back(CmdBlock {
+                    prompt: abs,
+                    input: None,
+                    output: None,
+                    exit: None,
+                    finished: false,
+                });
+                let history = self.term.grid().history_size();
+                self.prune_marks(history);
+            }
+            b'B' => {
+                if let Some(last) = self.marks.back_mut() {
+                    last.input = Some(abs);
+                }
+            }
+            b'C' => {
+                if let Some(last) = self.marks.back_mut() {
+                    last.output = Some(abs);
+                }
+            }
+            b'D' => {
+                // Bind to the most-recent still-open block (shells emit strictly
+                // A…B…C…D, so "most recent open" is correct even with gaps).
+                if let Some(block) = self.marks.iter_mut().rev().find(|m| !m.finished) {
+                    block.exit = exit;
+                    block.finished = true;
+                }
+            }
+            _ => {} // unknown 133 sub-command: ignore
+        }
+    }
+
+    /// Viewport rows (0-based) of currently-visible FAILED-command prompts
+    /// (`D;<nonzero>`), for the themed left-edge marker. Empty in the common case
+    /// and on the alt screen. Kept OFF the per-cell `GridSnapshot` so the render
+    /// hot loop is untouched (SPEED). Uses the SAME `display_offset` mapping as
+    /// `snapshot()`.
+    pub fn failed_prompt_rows(&self) -> Vec<u16> {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return Vec::new();
+        }
+        let display_offset = self.term.grid().display_offset() as i64;
+        let mut rows = Vec::new();
+        for m in &self.marks {
+            if !(m.finished && matches!(m.exit, Some(code) if code != 0)) {
+                continue;
+            }
+            let grid_line = m.prompt - self.abs_top;
+            let vp = grid_line + display_offset;
+            if vp >= 0 && (vp as usize) < self.rows {
+                rows.push(vp as u16);
+            }
+        }
+        rows
+    }
+
+    /// Scroll the viewport to the previous (`forward == false`, older) or next
+    /// (`forward == true`, newer) OSC 133 prompt, landing it at viewport row 0.
+    /// Returns whether the viewport moved. PURE NO-OP when there are no marks
+    /// (shell integration never enabled), on the alt screen, and at the ends
+    /// (clamps, never wraps).
+    pub fn jump_prompt(&mut self, forward: bool) -> bool {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) || self.marks.is_empty() {
+            return false;
+        }
+        let display_offset = self.term.grid().display_offset() as i64;
+        // Absolute line currently at viewport row 0 (top visible line).
+        let viewport_top_abs = self.abs_top - display_offset;
+        let target = if forward {
+            self.marks.iter().map(|m| m.prompt).filter(|&p| p > viewport_top_abs).min()
+        } else {
+            self.marks.iter().map(|m| m.prompt).filter(|&p| p < viewport_top_abs).max()
+        };
+        let Some(target) = target else {
+            return false; // clamp at the ends (no wrap)
+        };
+        let desired = (self.abs_top - target).clamp(0, self.scroll_max() as i64) as usize;
+        let before = self.scroll_offset();
+        self.scroll_to_offset(desired);
+        self.scroll_offset() != before
     }
 
     /// Deadline of a pending synchronized update (DEC mode 2026, `CSI ?2026h`),
@@ -370,7 +713,14 @@ impl Terminal {
     /// A no-op when no sync is active. Call this once [`Terminal::sync_deadline`]
     /// has elapsed.
     pub fn flush_sync(&mut self) {
+        // The buffered lines become real here, so bracket `abs_top` the same way
+        // `advance_slice` does (a sync block that scrolled must advance abs_top).
+        let alt_before = self.term.mode().contains(TermMode::ALT_SCREEN);
+        let h0 = self.term.grid().history_size();
         self.parser.stop_sync(&mut self.term);
+        let alt_after = self.term.mode().contains(TermMode::ALT_SCREEN);
+        let h1 = self.term.grid().history_size();
+        self.track_abs_top(alt_before, alt_after, h0, h1);
     }
 
     pub fn snapshot(&self) -> GridSnapshot {
@@ -1998,5 +2348,283 @@ mod tests {
             [0, 255, 0],
             "OSC 4 override should change the displayed fg"
         );
+    }
+
+    // ── OSC 133 semantic-prompt scanner + marks (v0.14.0) ──────────────────────
+
+    #[test]
+    fn osc133_a_records_prompt_mark_and_drops_the_osc() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]133;A\x07hello");
+        assert_eq!(t.marks.len(), 1, "OSC 133 A records one prompt mark");
+        assert_eq!(t.marks.back().unwrap().prompt, 0, "prompt at the cursor's line");
+        // The 133 is dropped (not printed); the text after it renders normally.
+        assert!(t.snapshot().row_text(0).starts_with("hello"),
+            "the 133 must be consumed, leaving 'hello' at col 0");
+    }
+
+    #[test]
+    fn osc133_d_nonzero_flags_failed() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]133;A\x07");
+        t.feed(b"\x1b]133;C\x07");
+        t.feed(b"\x1b]133;D;1\x07");
+        assert_eq!(t.failed_prompt_rows(), vec![0], "D;1 marks the prompt failed");
+    }
+
+    #[test]
+    fn osc133_d_zero_and_absent_not_failed() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]133;A\x07\x1b]133;D;0\x07");
+        assert!(t.failed_prompt_rows().is_empty(), "exit 0 is not failed");
+        let mut t2 = Terminal::new(20, 5);
+        t2.feed(b"\x1b]133;A\x07\x1b]133;D\x07");
+        assert!(t2.failed_prompt_rows().is_empty(), "a bare D (no code) is not failed");
+    }
+
+    #[test]
+    fn osc133_exit_code_parses_only_first_param() {
+        // BLOCKING 2: `aid=<n>` (p10k) must never corrupt the exit code.
+        let parse = |seq: &[u8]| -> Option<i32> {
+            let mut t = Terminal::new(40, 5);
+            t.feed(b"\x1b]133;A\x07");
+            t.feed(seq);
+            t.marks.back().unwrap().exit
+        };
+        assert_eq!(parse(b"\x1b]133;D\x07"), None);
+        assert_eq!(parse(b"\x1b]133;D;0\x07"), Some(0));
+        assert_eq!(parse(b"\x1b]133;D;1\x07"), Some(1));
+        assert_eq!(parse(b"\x1b]133;D;130\x07"), Some(130));
+        assert_eq!(parse(b"\x1b]133;D;1;aid=7\x07"), Some(1), "aid must not become 17 or 1*10+7");
+        assert_eq!(parse(b"\x1b]133;D;;aid=7\x07"), None, "empty code is unknown");
+    }
+
+    #[test]
+    fn osc133_bel_and_st_terminators_are_equivalent() {
+        let mut a = Terminal::new(20, 5);
+        a.feed(b"\x1b]133;A\x07"); // BEL
+        let mut b = Terminal::new(20, 5);
+        b.feed(b"\x1b]133;A\x1b\\"); // ST (ESC \)
+        assert_eq!(a.marks.len(), 1);
+        assert_eq!(b.marks.len(), 1);
+        assert_eq!(a.marks.back().unwrap().prompt, b.marks.back().unwrap().prompt);
+        // Neither leaks the ST trailing backslash into the grid.
+        assert!(a.snapshot().row_text(0).trim().is_empty());
+        assert!(b.snapshot().row_text(0).trim().is_empty(), "ST '\\' must not print");
+    }
+
+    #[test]
+    fn osc133_split_across_feeds_binds_once() {
+        // The scanner state persists across feed() calls (chunk boundaries).
+        let seq = b"\x1b]133;A\x07";
+        let mut t = Terminal::new(20, 5);
+        for &byte in seq {
+            t.feed(&[byte]);
+        }
+        assert_eq!(t.marks.len(), 1, "byte-split A binds exactly one mark");
+        // A failed D;1 split at EVERY boundary must still flag failed.
+        let full = b"\x1b]133;D;1\x07";
+        for cut in 1..full.len() {
+            let mut t = Terminal::new(20, 5);
+            t.feed(b"\x1b]133;A\x07");
+            t.feed(&full[..cut]);
+            t.feed(&full[cut..]);
+            assert_eq!(t.failed_prompt_rows(), vec![0], "split at byte {cut} still flags failed");
+        }
+    }
+
+    #[test]
+    fn osc133_esc_abort_then_restart_binds() {
+        // Amendment improvement 1: a bare ESC mid-133 aborts it AND restarts
+        // escape scanning, so an immediately following ESC]133;A still binds.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]133;\x1b]133;A\x07");
+        assert_eq!(t.marks.len(), 1, "the aborted 133; binds nothing; the restarted 133;A binds one");
+    }
+
+    #[test]
+    fn osc133_not_confused_by_adjacent_oscs() {
+        let mut t = Terminal::new(40, 5);
+        t.feed(b"\x1b]0;the title\x07"); // OSC 0 title
+        t.feed(b"\x1b]133;A\x07"); // our prompt mark
+        t.feed(b"\x1b]8;;https://ex.io\x1b\\link\x1b]8;;\x1b\\"); // OSC 8 hyperlink
+        t.feed(b"\x1b]4;1;#00ff00\x07"); // OSC 4 palette override
+        t.feed(b"\x1b]133;D;1\x07"); // failed
+        assert_eq!(t.marks.len(), 1, "exactly one prompt mark among adjacent OSCs");
+        assert_eq!(t.failed_prompt_rows(), vec![0]);
+        // The title OSC still worked (no false split swallowed it).
+        assert_eq!(t.take_title_update(), Some(Some("the title".to_string())));
+        // The OSC 8 hyperlink is intact.
+        let hit = t.link_at(0, 1).expect("hyperlink survived interleaving");
+        assert_eq!(hit.uri, "https://ex.io");
+        // The OSC 4 override applied.
+        t.feed(b"\x1b[31mZ");
+        assert_eq!(t.snapshot().cell(0, 4).fg, [0, 255, 0], "OSC 4 override still took effect");
+    }
+
+    #[test]
+    fn osc133_malformed_letter_only_and_no_letter() {
+        // `133;A;aid=7` binds A (extra params ignored).
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]133;A;aid=7\x07");
+        assert_eq!(t.marks.len(), 1);
+        assert_eq!(t.marks.back().unwrap().prompt, 0);
+        // `133;` with no letter is a harmless no-op.
+        let mut t2 = Terminal::new(20, 5);
+        t2.feed(b"\x1b]133;\x07");
+        assert!(t2.marks.is_empty(), "no letter → no mark");
+    }
+
+    #[test]
+    fn mark_survives_scroll_and_maps_to_viewport() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"prep\r\n"); // content so the prompt is not on the very top line
+        t.feed(b"\x1b]133;A\x07");
+        t.feed(b"\x1b]133;D;1\x07");
+        assert_eq!(t.failed_prompt_rows().len(), 1, "visible at the bottom");
+        // Push output so the marked prompt scrolls up into history.
+        for i in 0..10 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        assert!(t.failed_prompt_rows().is_empty(), "off-screen at the live bottom");
+        // Scroll to the very top of history: the marker reappears.
+        t.scroll_lines(1000);
+        assert_eq!(t.failed_prompt_rows().len(), 1, "marker tracks the prompt into history");
+        // Back to the bottom: hidden again.
+        t.scroll_to_bottom();
+        assert!(t.failed_prompt_rows().is_empty());
+    }
+
+    #[test]
+    fn mark_ages_out_at_scrollback_shrink() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]133;A\x07\x1b]133;D;1\x07");
+        assert_eq!(t.marks.len(), 1);
+        for i in 0..200 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let abs_top_before = t.abs_top;
+        // Shrink hard: the old mark's line no longer exists in the window.
+        t.set_scrollback_lines(10);
+        assert!(t.marks.is_empty(), "aged-out mark is pruned");
+        // A shrink removes OLD history above Line(0), which does not move, so
+        // abs_top stays monotonic (it now exceeds the smaller history_size).
+        assert_eq!(t.abs_top, abs_top_before, "abs_top is monotonic across a shrink");
+        // No panic / negative index on the now-empty mark list.
+        assert!(t.failed_prompt_rows().is_empty());
+        assert!(!t.jump_prompt(false));
+    }
+
+    #[test]
+    fn jump_prompt_prev_next_and_clamps() {
+        let mut t = Terminal::new(20, 5);
+        let mut add_prompt = |t: &mut Terminal, tag: char| {
+            t.feed(b"\x1b]133;A\x07");
+            t.feed(b"\x1b]133;D;0\x07");
+            for i in 0..6 {
+                t.feed(format!("{tag}{i}\r\n").as_bytes());
+            }
+        };
+        add_prompt(&mut t, 'a');
+        add_prompt(&mut t, 'b');
+        add_prompt(&mut t, 'c');
+        assert_eq!(t.marks.len(), 3);
+        t.scroll_to_bottom();
+        // Step to each older prompt; the offset must strictly increase.
+        assert!(t.jump_prompt(false), "prev → 3rd prompt");
+        let o1 = t.scroll_offset();
+        assert!(t.jump_prompt(false), "prev → 2nd prompt");
+        let o2 = t.scroll_offset();
+        assert!(o2 > o1, "older prompt is further up ({o1} < {o2})");
+        assert!(t.jump_prompt(false), "prev → 1st prompt");
+        let o3 = t.scroll_offset();
+        assert!(o3 > o2);
+        // Past the oldest: clamp (no wrap, no move).
+        assert!(!t.jump_prompt(false), "no prompt older than the first");
+        assert_eq!(t.scroll_offset(), o3, "clamped at the top");
+        // Forward steps back toward the bottom.
+        assert!(t.jump_prompt(true), "next → a newer prompt");
+        assert!(t.scroll_offset() < o3);
+    }
+
+    #[test]
+    fn jump_prompt_zero_marks_is_pure_noop() {
+        // BLOCKING/amendment 4: never scroll-to-bottom on an empty mark list.
+        let mut t = Terminal::new(20, 5);
+        for i in 0..10 {
+            t.feed(format!("y{i}\r\n").as_bytes());
+        }
+        t.scroll_lines(3);
+        let off = t.scroll_offset();
+        assert!(!t.jump_prompt(true), "no marks → no-op");
+        assert!(!t.jump_prompt(false), "no marks → no-op");
+        assert_eq!(t.scroll_offset(), off, "viewport unchanged with zero marks");
+    }
+
+    #[test]
+    fn jump_prompt_noop_on_alt_screen() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]133;A\x07\x1b]133;D;0\x07");
+        for i in 0..10 {
+            t.feed(format!("x{i}\r\n").as_bytes());
+        }
+        t.feed(b"\x1b[?1049h"); // enter alt screen
+        let off = t.scroll_offset();
+        assert!(!t.jump_prompt(false), "no jump while a TUI owns the display");
+        assert_eq!(t.scroll_offset(), off);
+    }
+
+    #[test]
+    fn alt_screen_freezes_abs_top_and_marks() {
+        // BLOCKING 1: entering/leaving the alt screen must NOT corrupt abs_top
+        // or wipe marks; both are frozen for the alt screen's duration.
+        let mut t = Terminal::new(20, 5);
+        for i in 0..20 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        t.feed(b"\x1b]133;A\x07");
+        t.feed(b"\x1b]133;D;1\x07");
+        let abs_top_before = t.abs_top;
+        let marks_before: Vec<i64> = t.marks.iter().map(|m| m.prompt).collect();
+        let rows_before = t.failed_prompt_rows();
+        assert!(!marks_before.is_empty());
+        // Enter, churn, emit an (ignored) 133, and leave the alt screen.
+        t.feed(b"\x1b[?1049h");
+        for i in 0..30 {
+            t.feed(format!("tui {i}\r\n").as_bytes());
+        }
+        t.feed(b"\x1b]133;A\x07"); // must be ignored on the alt screen
+        t.feed(b"\x1b[?1049l");
+        assert_eq!(t.abs_top, abs_top_before, "abs_top frozen across the alt screen");
+        let marks_after: Vec<i64> = t.marks.iter().map(|m| m.prompt).collect();
+        assert_eq!(marks_after, marks_before, "marks unchanged across the alt screen");
+        assert_eq!(t.failed_prompt_rows(), rows_before, "marker maps to the same rows");
+    }
+
+    #[test]
+    fn sync_defers_mark_but_abs_top_stays_exact() {
+        // Documented sync edge (F1): a 133 inside a BSU binds at parse-arrival;
+        // flush_sync must keep abs_top exactly tracking history (no drift).
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[?2026h"); // BSU
+        t.feed(b"\x1b]133;A\x07\x1b]133;D;1\x07");
+        t.feed(b"buffered line\r\n");
+        t.flush_sync();
+        // Continue with a real scroll and confirm the invariant abs_top == history.
+        for i in 0..12 {
+            t.feed(format!("z{i}\r\n").as_bytes());
+        }
+        t.scroll_to_bottom();
+        assert_eq!(t.abs_top, t.scroll_max() as i64, "abs_top tracks history exactly after sync");
+    }
+
+    #[test]
+    fn double_a_emission_coalesces() {
+        // p10k's own integration + our snippet both emitting A on one prompt line
+        // must not create two blocks.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]133;A\x07");
+        t.feed(b"\x1b]133;A\x07"); // same line, duplicate
+        assert_eq!(t.marks.len(), 1, "duplicate A on the same line is coalesced");
     }
 }

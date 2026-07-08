@@ -6,6 +6,11 @@ edition = "2021"
 [dependencies]
 alacritty_terminal = "0.26"
 portable-pty = "0.9"
+# SIMD-fast ESC scanning for the O(n) OSC-133 fast path in `Terminal::feed`.
+# Already transitive via alacritty/regex; declared direct so the scanner can
+# use it. The double-scan of plain text (our memchr + vte's own) is an accepted
+# O(n) tradeoff — the PTY drain is not the throughput bottleneck.
+memchr = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

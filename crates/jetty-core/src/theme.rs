@@ -50,6 +50,30 @@ impl Theme {
             _ => catppuccin_mocha(),
         }
     }
+
+    /// A guaranteed-visible error red for the OSC 133 failed-command marker.
+    ///
+    /// Raw ANSI red (`palette[1]`) is low-contrast on several presets (the
+    /// Solarized family), so this picks whichever of ANSI red (`palette[1]`) or
+    /// ANSI bright red (`palette[9]`) reads best against the background: the
+    /// brighter red on a dark background, the deeper red on a light one. Returned
+    /// with full alpha so the left-edge accent bar is crisp on every theme.
+    pub fn failed_marker_color(&self) -> [u8; 4] {
+        let lum = |c: [u8; 3]| 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32;
+        let bg_l = lum([self.bg[0], self.bg[1], self.bg[2]]);
+        let red = self.palette[1];
+        let bright = self.palette[9];
+        // Light background (luma > ~140): the darker red contrasts more; dark
+        // background: the brighter red pops.
+        let base = if bg_l > 140.0 {
+            if lum(red) <= lum(bright) { red } else { bright }
+        } else if lum(bright) >= lum(red) {
+            bright
+        } else {
+            red
+        };
+        [base[0], base[1], base[2], 255]
+    }
 }
 
 /// Catppuccin Mocha — the soothing pastel dark theme (catppuccin.com). Default.
