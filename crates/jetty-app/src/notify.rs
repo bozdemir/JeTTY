@@ -42,6 +42,14 @@ pub enum NotifyMsg {
 /// thread or growing without bound (amendments §5b).
 const NOTIFY_QUEUE_BOUND: usize = 16;
 
+/// Hard ceiling on how long the worker waits for ONE `show()` (the blocking
+/// D-Bus round trip). zbus applies no default reply timeout and notify-rust owns
+/// its connection, so a daemon that ACCEPTS the call but never replies would
+/// otherwise wedge the worker forever. We run each delivery on a throwaway thread
+/// and abandon it after this deadline — the strand dies with the process; the
+/// NEXT notification still fires (amendments §5b).
+const NOTIFY_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A cheap, clonable handle to the notification worker. `fire()` is non-blocking.
 #[derive(Clone)]
 pub struct Notifier {
@@ -75,7 +83,21 @@ pub fn spawn_notifier() -> Notifier {
         .spawn(move || {
             for msg in rx {
                 let NotifyMsg::Fire { summary, body, critical } = msg;
-                show(&summary, &body, critical);
+                // Deliver on a throwaway thread and wait at most NOTIFY_CALL_TIMEOUT.
+                // In the normal case (fast daemon) the delivery finishes in a few ms
+                // and `recv_timeout` returns immediately; a wedged daemon strands
+                // only that one thread (harmless — it completes or dies with the
+                // process) and the worker moves on to the next message. The upstream
+                // bounded queue + per-tab anti-spam keep the spawn rate low, so this
+                // is not the resource-hungry "thread per notification" case.
+                let (done_tx, done_rx) = sync_channel::<()>(1);
+                let _ = std::thread::Builder::new()
+                    .name("jetty-notify-send".into())
+                    .spawn(move || {
+                        show(&summary, &body, critical);
+                        let _ = done_tx.try_send(());
+                    });
+                let _ = done_rx.recv_timeout(NOTIFY_CALL_TIMEOUT);
             }
         });
     Notifier { tx }
