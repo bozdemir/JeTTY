@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod detached;
+mod shell_integration;
 pub mod clipboard;
 pub mod input;
 
@@ -180,6 +181,31 @@ pub fn run() {
     // compositor, no portal or DE-specific code.
     let version = env!("CARGO_PKG_VERSION");
     let build = option_env!("JETTY_BUILD").unwrap_or("dev");
+    // Advertise the real release version to spawned shells (`$JETTY` /
+    // `$TERM_PROGRAM_VERSION`); jetty-core alone only knows its placeholder.
+    jetty_core::set_advertised_version(version);
+
+    // `--print-shell-integration <zsh|bash|fish>`: emit the OSC 133 opt-in
+    // snippet and exit, BEFORE any IPC/GUI. Safe arg parsing — no panic on a
+    // missing/non-UTF8 argument; a bad/absent shell prints usage to stderr and
+    // exits 2. Handled here (not the loop below) so it can read the next token.
+    {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        if let Some(pos) = args.iter().position(|a| a.as_os_str() == "--print-shell-integration") {
+            let shell = args.get(pos + 1).and_then(|a| a.to_str());
+            match shell.and_then(shell_integration::snippet_for) {
+                Some(snippet) => {
+                    print!("{snippet}");
+                    std::process::exit(0);
+                }
+                None => {
+                    eprintln!("jetty: usage: jetty --print-shell-integration <zsh|bash|fish>");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
+
     let mut cmd = "toggle";
     // args_os + to_str: std::env::args() panics on non-UTF8 argv; a bad byte in
     // an unknown arg should be ignored like any other unrecognized flag, not
@@ -199,9 +225,15 @@ pub fn run() {
                      \x20   --show       Summon a running instance (or launch one).\n\
                      \x20   --hide       Hide a running instance.\n\
                      \x20   --version    Print version and exit.\n\
-                     \x20   --help       Print this help and exit.\n\n\
+                     \x20   --help       Print this help and exit.\n\
+                     \x20   --print-shell-integration <zsh|bash|fish>\n\
+                     \x20                Print the OSC 133 shell-integration snippet to stdout.\n\n\
                      Bind `jetty --toggle` to a key in your compositor to summon from anywhere.\n\
-                     Settings: Ctrl+Shift+P. Config: ~/.config/jetty/config.toml"
+                     Settings: Ctrl+Shift+P. Config: ~/.config/jetty/config.toml\n\
+                     Shell integration (prompt marks + Ctrl+Shift+Z/X jump). Add to your rc file:\n\
+                     \x20 zsh:  [[ -n \"$JETTY\" ]] && command -v jetty >/dev/null 2>&1 && source <(jetty --print-shell-integration zsh) 2>/dev/null\n\
+                     \x20 bash: [[ -n \"$JETTY\" ]] && command -v jetty >/dev/null 2>&1 && source <(jetty --print-shell-integration bash) 2>/dev/null\n\
+                     \x20 fish: test -n \"$JETTY\"; and command -q jetty; and jetty --print-shell-integration fish | source"
                 );
                 std::process::exit(0);
             }

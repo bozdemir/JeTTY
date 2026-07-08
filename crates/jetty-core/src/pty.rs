@@ -2,7 +2,27 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// The version JeTTY advertises to child shells via `TERM_PROGRAM_VERSION` and
+/// `JETTY`. The binary sets this once at startup (its real release version); the
+/// headless shot and tests fall back to the crate version.
+static ADVERTISED_VERSION: OnceLock<String> = OnceLock::new();
+
+/// Record the version JeTTY advertises to spawned shells (call once at startup
+/// from the app binary so the shell's `$JETTY` / `$TERM_PROGRAM_VERSION` carry
+/// the true release version rather than jetty-core's placeholder).
+pub fn set_advertised_version(version: &str) {
+    let _ = ADVERTISED_VERSION.set(version.to_string());
+}
+
+/// The advertised version, defaulting to the crate version when unset.
+fn advertised_version() -> String {
+    ADVERTISED_VERSION
+        .get()
+        .cloned()
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
 
 /// Hard ceiling on bytes queued to a session's writer thread but not yet
 /// written to the fd. Normal use never approaches this: the writer thread
@@ -322,6 +342,17 @@ impl PtySession {
             // JeTTY is a quick-summon terminal; session restore isn't wanted.
             // Harmless/ignored on Linux, so set it unconditionally.
             cmd.env("SHELL_SESSIONS_DISABLE", "1");
+            // Shell-integration handshake (OSC 133). Advertise JeTTY so an opt-in
+            // rc snippet can activate ONLY under JeTTY and feature-detect it, and
+            // hand the shell an absolute path to this exe so the snippet needs no
+            // PATH lookup: `source <($JETTY_BIN --print-shell-integration zsh)`.
+            let ver = advertised_version();
+            cmd.env("TERM_PROGRAM", "jetty");
+            cmd.env("TERM_PROGRAM_VERSION", &ver);
+            cmd.env("JETTY", &ver);
+            if let Ok(exe) = std::env::current_exe() {
+                cmd.env("JETTY_BIN", exe);
+            }
             // An explicit cwd (inherited from the requesting tab) wins.
             // Otherwise: GUI launches (Finder/Dock/.desktop) start the app
             // with cwd `/`; unlike Terminal.app/iTerm2/kitty we don't want new
