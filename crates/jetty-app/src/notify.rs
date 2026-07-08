@@ -240,4 +240,35 @@ mod tests {
         assert_eq!(fmt_duration(Duration::from_secs(3661)), "1h 1m");
         assert_eq!(fmt_duration(Duration::from_secs(600)), "10m 0s");
     }
+
+    #[test]
+    fn spawn_notifier_send_does_not_block_or_panic() {
+        // The worker + non-blocking fire() path: many rapid fires must return
+        // immediately (bounded queue drops overflow) and never panic, whether or
+        // not a daemon is present.
+        let n = spawn_notifier();
+        for i in 0..100 {
+            n.fire(format!("t{i}"), String::new(), i % 2 == 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "delivers a REAL desktop notification; run manually: \
+                cargo test -p jetty-app --lib notify::tests::smoke -- --ignored --nocapture"]
+    fn smoke_delivers_a_real_notification() {
+        // Manual verification that the worker reaches the freedesktop daemon.
+        let n = spawn_notifier();
+        n.fire(
+            "Tab 2 · cargo — finished · 1m 12s".to_string(),
+            "Compiling jetty-app v0.15.0".to_string(),
+            false,
+        );
+        n.fire(
+            "Tab 3 · make — failed (exit 2) · 8s".to_string(),
+            "make: *** [all] Error 2".to_string(),
+            true,
+        );
+        // Give the worker time to complete the blocking D-Bus round trip.
+        std::thread::sleep(Duration::from_millis(800));
+    }
 }
