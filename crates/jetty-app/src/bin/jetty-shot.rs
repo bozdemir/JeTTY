@@ -508,6 +508,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::env::var("JETTY_SHOT_PANEL_SHELL")
                     .unwrap_or_else(|_| "System default".to_string())
                     .as_str(),
+                // RUN & NOTIFY section (Shell tab, v0.15): default representative
+                // state for the headless shot (on, all-commands, 10s, no summon).
+                &jetty_render::NotifyParams::default(),
                 // JETTY_SHOT_PANEL_TAB (0..=4) selects the active settings tab
                 // (test-only; defaults to 0 = "Look").
                 std::env::var("JETTY_SHOT_PANEL_TAB")

@@ -23,6 +23,28 @@ pub struct EffectsParams {
     pub caret_flash_color: [f32; 3],
 }
 
+/// Run & Notify parameters forwarded from the `App` runtime mirror, for the
+/// Shell tab's "RUN & NOTIFY" section. Kept here so `jetty-render` receives the
+/// state through `build_panel` without depending on `jetty-app`.
+#[derive(Debug, Clone, Copy)]
+pub struct NotifyParams {
+    /// Master toggle: notify when a command finishes.
+    pub enabled: bool,
+    /// Notify only on failed commands.
+    pub only_on_failure: bool,
+    /// Minimum SUCCESS-command duration to notify on, in seconds (drives the
+    /// cycler's centered value, e.g. "10s" / "1m").
+    pub min_seconds: u64,
+    /// Raise + focus (auto-summon) when hidden and a command finishes.
+    pub auto_summon: bool,
+}
+
+impl Default for NotifyParams {
+    fn default() -> Self {
+        NotifyParams { enabled: true, only_on_failure: false, min_seconds: 10, auto_summon: false }
+    }
+}
+
 impl Default for EffectsParams {
     fn default() -> Self {
         EffectsParams {
@@ -124,6 +146,17 @@ pub struct PanelGeom {
     pub shell_prev: Rect,
     /// Shell-picker "›" (next) cycle button.
     pub shell_next: Rect,
+    // ── Shell tab: RUN & NOTIFY section (v0.15) ───────────────────────────────
+    /// "Notify on command finish" master toggle switch.
+    pub notify_toggle: Rect,
+    /// "Only on failure" toggle switch.
+    pub notify_failure_toggle: Rect,
+    /// Minimum-duration cycler "‹" (previous) button.
+    pub notify_dur_prev: Rect,
+    /// Minimum-duration cycler "›" (next) button.
+    pub notify_dur_next: Rect,
+    /// "Auto-summon when hidden" toggle switch.
+    pub auto_summon_toggle: Rect,
     // ── UI (chrome) FONT section ──────────────────────────────────────────────
     /// UI-font-size decrement button ("−").
     pub ui_font_minus: Rect,
@@ -229,7 +262,9 @@ impl PanelGeom {
             tab_bar_next, scrollback_prev, scrollback_next,
             dropdown_track, dropdown_handle, dropdown_width_track,
             dropdown_width_handle, autohide_toggle, launch_login_toggle, shell_prev,
-            shell_next, ui_font_minus, ui_font_plus, ui_font_reset,
+            shell_next, notify_toggle, notify_failure_toggle, notify_dur_prev,
+            notify_dur_next, auto_summon_toggle,
+            ui_font_minus, ui_font_plus, ui_font_reset,
             ui_font_scroll_up, ui_font_scroll_down, crt_enabled_toggle,
             crt_curvature_track, crt_curvature_handle, crt_scanline_track,
             crt_scanline_handle, crt_mask_track, crt_mask_handle, crt_bloom_track,
@@ -486,6 +521,10 @@ pub fn build_panel(
     //   "System default" when the `shell` config key is empty. Drives the SHELL
     //   cycler band's centered name, mirroring `window_mode_name`.
     shell_display: &str,
+    // `notify`: Run & Notify state (v0.15) for the Shell tab's RUN & NOTIFY
+    //   section — two toggles, a minimum-duration cycler, and the auto-summon
+    //   toggle. Ignored on other tabs (bands are OFF).
+    notify: &NotifyParams,
     // `active_tab`: 0..=4 — which tab's bands are laid out (see TAB_NAMES). Values
     //   above 4 are clamped to 4. Session-only; not persisted.
     active_tab: usize,
@@ -628,6 +667,9 @@ pub fn build_panel(
          mut t_scrollback, mut t_autohide) =
         (OFF, OFF, OFF, OFF, OFF, OFF, OFF);
     let (mut t_shell, mut t_launch) = (OFF, OFF);
+    // Shell tab: RUN & NOTIFY section band tops (v0.15). OFF when tab ≠ 3.
+    let (mut t_notify_hdr, mut t_notify, mut t_notify_fail, mut t_notify_dur, mut t_auto_summon) =
+        (OFF, OFF, OFF, OFF, OFF);
     // Effects-tab band tops (15 bands, FX_PITCH px pitch each).
     // Naming: t_fx_<widget>. OFF when tab 4 is not active.
     let (mut t_fx_crt_hdr, mut t_fx_crt_en, mut t_fx_curv, mut t_fx_scan,
@@ -660,6 +702,15 @@ pub fn build_panel(
         3 => {
             t_shell = content_top;
             t_launch = content_top + 64.0;
+            // RUN & NOTIFY section: a quiet header (+ rule + one-line hint), then
+            // two toggles, the minimum-duration cycler, and the auto-summon toggle.
+            // 48-px pitch for the single-line controls; ends ~content_top+368,
+            // well inside the 460-px Shell content region (PANEL_H fits, no growth).
+            t_notify_hdr = content_top + 132.0;
+            t_notify = content_top + 176.0;
+            t_notify_fail = content_top + 224.0;
+            t_notify_dur = content_top + 272.0;
+            t_auto_summon = content_top + 320.0;
         }
         4 => {
             // 15 bands × FX_PITCH px pitch, top-to-bottom from content_top.
@@ -973,6 +1024,25 @@ pub fn build_panel(
     let (shell_body, shell_prev, shell_next) = cycler_at(t_shell);
     let (launch_login_toggle, launch_knob) = switch_at(t_launch, launch_at_login);
 
+    // --- Shell tab: RUN & NOTIFY section (v0.15) ---
+    // Two switches, the minimum-duration cycler, and the auto-summon switch, all
+    // via the shared switch_at/cycler_at builders so they inherit the panel's
+    // theme colors, char_w-scaled layout, and corner radius (HiDPI-correct).
+    let (notify_toggle, notify_knob) = switch_at(t_notify, notify.enabled);
+    let (notify_failure_toggle, notify_failure_knob) = switch_at(t_notify_fail, notify.only_on_failure);
+    let (notify_dur_body, notify_dur_prev, notify_dur_next) = cycler_at(t_notify_dur);
+    let (auto_summon_toggle, auto_summon_knob) = switch_at(t_auto_summon, notify.auto_summon);
+    // Section-header hairline rule to the right of "RUN & NOTIFY" (7 chars wide
+    // header → account for its glyphs). Drawn only on the Shell tab (t is OFF else).
+    let notify_rule = Rect {
+        x: px + PAD + 12.0 * char_w + 12.0,
+        y: t_notify_hdr + 8.0,
+        w: ((px + PANEL_W - PAD) - (px + PAD + 12.0 * char_w + 12.0)).max(0.0),
+        h: 1.0,
+        color: hairline,
+        ..Default::default()
+    };
+
     // ── Effects tab (tab 4) widget geometry ───────────────────────────────────
     // Same control language as everywhere else: full-width sliders, knob
     // switches, and 56×24 text chips for the three animation toggles.
@@ -1101,7 +1171,10 @@ pub fn build_panel(
     };
 
     // Cyclers (Window + Shell tabs): body + the two inner separators.
-    for body in [&summon_body, &winmode_body, &tabbar_body, &scrollback_body, &shell_body] {
+    for body in [
+        &summon_body, &winmode_body, &tabbar_body, &scrollback_body, &shell_body,
+        &notify_dur_body,
+    ] {
         quads.push(*body);
         quads.push(seg_line(body.x + CYC_SEG, body.y));
         quads.push(seg_line(body.x + CYC_W - CYC_SEG, body.y));
@@ -1127,6 +1200,14 @@ pub fn build_panel(
     quads.push(autohide_knob);
     quads.push(launch_login_toggle);
     quads.push(launch_knob);
+    // Shell tab: RUN & NOTIFY section header rule + switches (v0.15).
+    quads.push(notify_rule);
+    quads.push(notify_toggle);
+    quads.push(notify_knob);
+    quads.push(notify_failure_toggle);
+    quads.push(notify_failure_knob);
+    quads.push(auto_summon_toggle);
+    quads.push(auto_summon_knob);
 
     // ── Effects-tab quads (populate effects_quads; empty when tab ≠ 4) ────────
     // When active_tab == 4 the band tops carry the scroll offset, so these rects
@@ -1535,6 +1616,27 @@ pub fn build_panel(
         text_hint,
     ));
 
+    // RUN & NOTIFY section (Shell, v0.15) — section header + two switches, a
+    // minimum-duration cycler, and the auto-summon switch. Needs OSC 133 shell
+    // integration to fire; plain bash (no bash-preexec) is failure-only.
+    labels.push(("RUN & NOTIFY".to_string(), px + PAD, t_notify_hdr, text_main));
+    labels.push((
+        "Notify when a command finishes while hidden".to_string(),
+        px + PAD,
+        t_notify_hdr + 18.0,
+        text_hint,
+    ));
+    labels.push(("NOTIFY ON FINISH".to_string(), px + PAD, t_notify + 6.0, text_header));
+    labels.push(("ONLY ON FAILURE".to_string(), px + PAD, t_notify_fail + 6.0, text_header));
+    labels.push(("MINIMUM DURATION".to_string(), px + PAD, t_notify_dur + 6.0, text_header));
+    let dur_name = if notify.min_seconds >= 60 && notify.min_seconds.is_multiple_of(60) {
+        format!("{}m", notify.min_seconds / 60)
+    } else {
+        format!("{}s", notify.min_seconds)
+    };
+    push_cycler_labels(&mut labels, t_notify_dur, &dur_name);
+    labels.push(("AUTO-SUMMON WHEN HIDDEN".to_string(), px + PAD, t_auto_summon + 6.0, text_header));
+
     // ── Effects-tab labels (into effects_labels; empty when tab ≠ 4) ────────
     // When active_tab == 4, band tops carry the scroll offset so label Y
     // positions already reflect scrolling. The caller renders effects_labels
@@ -1651,6 +1753,11 @@ pub fn build_panel(
         launch_login_toggle,
         shell_prev,
         shell_next,
+        notify_toggle,
+        notify_failure_toggle,
+        notify_dur_prev,
+        notify_dur_next,
+        auto_summon_toggle,
         ui_font_minus,
         ui_font_plus,
         ui_font_reset,
@@ -1816,6 +1923,7 @@ mod tests {
             &theme,
             CHAR_W_FALLBACK, // char_w (scale-1 default for tests)
             "zsh",           // shell_display
+            &NotifyParams::default(), // Run & Notify (defaults: on, 10s, all, no summon)
             active_tab,
             &EffectsParams::default(), // effects (defaults: CRT off, caret flash on)
             0.0,             // effects_scroll (default: top)
@@ -1841,7 +1949,8 @@ mod tests {
         build_panel(
             screen_w, screen_h, 0.97, 0, 15.0, &families, "JetBrains Mono", 0, 8.0,
             "Phosphor", "Dropdown", "Top", "10k", 0.5, 0.7, true, false, false, 18.0,
-            &ui_families, "", 0, 0.0, 0.0, &theme, char_w, "zsh", active_tab,
+            &ui_families, "", 0, 0.0, 0.0, &theme, char_w, "zsh",
+            &NotifyParams::default(), active_tab,
             &EffectsParams::default(), 0.0, false, 0,
         )
     }
@@ -1996,6 +2105,17 @@ mod tests {
                 is_visible(&g.shell_prev),
                 tab == 3,
                 "shell_prev visibility wrong on tab {tab}"
+            );
+            // RUN & NOTIFY controls (v0.15) live on the Shell tab (3) only.
+            assert_eq!(
+                is_visible(&g.notify_toggle),
+                tab == 3,
+                "notify_toggle visibility wrong on tab {tab}"
+            );
+            assert_eq!(
+                is_visible(&g.auto_summon_toggle),
+                tab == 3,
+                "auto_summon_toggle visibility wrong on tab {tab}"
             );
             // crt_enabled_toggle lives on tab 4 only.
             assert_eq!(

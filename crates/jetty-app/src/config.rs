@@ -101,6 +101,40 @@ pub struct Config {
     /// compatible: old configs without `[effects]` load with all defaults.
     #[serde(default)]
     pub effects: EffectsConfig,
+    // ── Run & Notify (v0.15) ──────────────────────────────────────────────────
+    /// Notify (freedesktop toast + taskbar/dock urgency) when a command finishes
+    /// while JeTTY is hidden/unfocused. Default ON — but inert until the user
+    /// wires up OSC 133 shell integration, so a default install never notifies.
+    /// Each key is `#[serde(default)]`, so an older config (missing them) loads
+    /// with these defaults, exactly like every other flat key.
+    #[serde(default = "default_notify_on_command_finish")]
+    pub notify_on_command_finish: bool,
+    /// Minimum command duration (seconds) to notify on SUCCESS. Failures may ping
+    /// below this (see the notifier's failure floor). Clamped 1..=86_400 on load.
+    #[serde(default = "default_notify_min_seconds")]
+    pub notify_min_seconds: u64,
+    /// Only notify on FAILED commands (nonzero exit). Default off. Note: plain
+    /// bash (no bash-preexec) emits no duration, so it is failure-only regardless.
+    #[serde(default = "default_notify_only_on_failure")]
+    pub notify_only_on_failure: bool,
+    /// Raise + focus JeTTY (and activate the firing tab) when a command finishes,
+    /// but ONLY when it is fully hidden — never steal focus mid-typing. Default
+    /// OFF. Inherits `notify_only_on_failure` (so it can be a failures-only summon).
+    #[serde(default = "default_auto_summon_on_finish")]
+    pub auto_summon_on_finish: bool,
+}
+
+fn default_notify_on_command_finish() -> bool {
+    true
+}
+fn default_notify_min_seconds() -> u64 {
+    10
+}
+fn default_notify_only_on_failure() -> bool {
+    false
+}
+fn default_auto_summon_on_finish() -> bool {
+    false
 }
 
 fn default_theme() -> String {
@@ -294,6 +328,10 @@ impl Default for Config {
             show_welcome: default_show_welcome(),
             show_perf_hud: default_show_perf_hud(),
             effects: EffectsConfig::default(),
+            notify_on_command_finish: default_notify_on_command_finish(),
+            notify_min_seconds: default_notify_min_seconds(),
+            notify_only_on_failure: default_notify_only_on_failure(),
+            auto_summon_on_finish: default_auto_summon_on_finish(),
         }
     }
 }
@@ -329,6 +367,9 @@ impl Config {
         // predates non-float sanitizing): keep hand-edited values verbatim, only
         // clamp to the supported range.
         self.scrollback_lines = self.scrollback_lines.clamp(100, 100_000);
+        // Notify minimum duration: keep hand-edited values verbatim within a sane
+        // range (≥1s so a 0 can't make every command "long"; ≤1 day ceiling).
+        self.notify_min_seconds = self.notify_min_seconds.clamp(1, 86_400);
         // Effects floats are sanitized by `EffectsConfig::clamped` (see load()).
     }
 
@@ -567,6 +608,10 @@ mod tests {
             show_welcome: false,
             show_perf_hud: false,
             effects: EffectsConfig::default(),
+            notify_on_command_finish: false,
+            notify_min_seconds: 30,
+            notify_only_on_failure: true,
+            auto_summon_on_finish: true,
         };
         let s = toml::to_string_pretty(&c).expect("serialize");
         let back: Config = toml::from_str(&s).expect("deserialize");
@@ -599,6 +644,10 @@ mod tests {
             show_welcome: true,
             show_perf_hud: true,
             effects: EffectsConfig::default(),
+            notify_on_command_finish: true,
+            notify_min_seconds: 10,
+            notify_only_on_failure: false,
+            auto_summon_on_finish: false,
         };
         std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
         let s = std::fs::read_to_string(&path).unwrap();
@@ -645,6 +694,38 @@ corner_radius = 8.0
 "#;
         let cfg: Config = toml::from_str(toml).expect("must load");
         assert_eq!(cfg.effects, EffectsConfig::default());
+    }
+
+    #[test]
+    fn old_config_without_notify_keys_loads_with_defaults() {
+        // A config predating v0.15 must load with the Run & Notify defaults, so an
+        // upgrade is transparent (notifications ON, 10s, all-commands, no summon).
+        let toml = r#"theme = "default"
+opacity = 1.0
+font_size = 14.0
+font_family = "monospace"
+corner_radius = 8.0
+"#;
+        let cfg: Config = toml::from_str(toml).expect("must load");
+        assert!(cfg.notify_on_command_finish, "notify defaults ON");
+        assert_eq!(cfg.notify_min_seconds, 10);
+        assert!(!cfg.notify_only_on_failure);
+        assert!(!cfg.auto_summon_on_finish, "auto-summon defaults OFF");
+    }
+
+    #[test]
+    fn notify_min_seconds_is_clamped() {
+        // 0 → 1 (never let a 0 make every command "long"); a huge value → 1-day cap.
+        let mut c = Config { notify_min_seconds: 0, ..Config::default() };
+        c.sanitize_floats();
+        assert_eq!(c.notify_min_seconds, 1);
+        let mut c = Config { notify_min_seconds: 10_000_000, ..Config::default() };
+        c.sanitize_floats();
+        assert_eq!(c.notify_min_seconds, 86_400);
+        // A sane hand-edited value passes through verbatim.
+        let mut c = Config { notify_min_seconds: 45, ..Config::default() };
+        c.sanitize_floats();
+        assert_eq!(c.notify_min_seconds, 45);
     }
 
     #[test]

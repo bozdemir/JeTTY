@@ -475,6 +475,17 @@ pub enum MouseAction {
     CycleShellPrev,
     /// User clicked the shell-picker "›" button — cycle to the next shell.
     CycleShellNext,
+    // ── Shell tab: RUN & NOTIFY (v0.15) ────────────────────────────────────────
+    /// User clicked the "Notify on command finish" master toggle.
+    ToggleNotifyOnFinish,
+    /// User clicked the "Only on failure" toggle.
+    ToggleNotifyOnlyFailure,
+    /// User clicked the minimum-duration cycler "‹" — previous step.
+    NotifyDurPrev,
+    /// User clicked the minimum-duration cycler "›" — next step.
+    NotifyDurNext,
+    /// User clicked the "Auto-summon when hidden" toggle.
+    ToggleAutoSummon,
     // ── Effects tab widgets ────────────────────────────────────────────────────
     /// User clicked the "CRT enabled" master toggle pill.
     ToggleCrt,
@@ -651,12 +662,28 @@ pub fn decide_mouse_press(
         if point_in(&g.launch_login_toggle, cx, cy) {
             return MouseAction::ToggleLaunchAtLogin;
         }
-        // Shell-picker cycle buttons (bottom-most band).
+        // Shell-picker cycle buttons.
         if point_in(&g.shell_prev, cx, cy) {
             return MouseAction::CycleShellPrev;
         }
         if point_in(&g.shell_next, cx, cy) {
             return MouseAction::CycleShellNext;
+        }
+        // RUN & NOTIFY section (Shell tab, v0.15).
+        if point_in(&g.notify_toggle, cx, cy) {
+            return MouseAction::ToggleNotifyOnFinish;
+        }
+        if point_in(&g.notify_failure_toggle, cx, cy) {
+            return MouseAction::ToggleNotifyOnlyFailure;
+        }
+        if point_in(&g.notify_dur_prev, cx, cy) {
+            return MouseAction::NotifyDurPrev;
+        }
+        if point_in(&g.notify_dur_next, cx, cy) {
+            return MouseAction::NotifyDurNext;
+        }
+        if point_in(&g.auto_summon_toggle, cx, cy) {
+            return MouseAction::ToggleAutoSummon;
         }
         // Font-family list rows.
         for (i, row) in g.font_rows.iter().enumerate() {
@@ -1763,6 +1790,7 @@ mod tests {
             18.0, &ui, "", 0,
             0.0, 0.0, &theme, 9.8, // char_w scale-1 fallback
             "System default", // shell_display
+            &jetty_render::NotifyParams::default(), // Run & Notify (v0.15)
             active_tab,
             &jetty_render::EffectsParams::default(),
             0.0, // effects_scroll (default: top)
@@ -1823,6 +1851,21 @@ mod tests {
         let g = &pv.geom;
         assert_eq!(click_rect(g, &g.shell_prev), MouseAction::CycleShellPrev);
         assert_eq!(click_rect(g, &g.shell_next), MouseAction::CycleShellNext);
+    }
+
+    #[test]
+    fn notify_controls_hit_test() {
+        // RUN & NOTIFY controls also live on the Shell tab (3, v0.15).
+        let pv = panel_for_tab(3);
+        let g = &pv.geom;
+        assert_eq!(click_rect(g, &g.notify_toggle), MouseAction::ToggleNotifyOnFinish);
+        assert_eq!(
+            click_rect(g, &g.notify_failure_toggle),
+            MouseAction::ToggleNotifyOnlyFailure
+        );
+        assert_eq!(click_rect(g, &g.notify_dur_prev), MouseAction::NotifyDurPrev);
+        assert_eq!(click_rect(g, &g.notify_dur_next), MouseAction::NotifyDurNext);
+        assert_eq!(click_rect(g, &g.auto_summon_toggle), MouseAction::ToggleAutoSummon);
     }
 
     #[test]

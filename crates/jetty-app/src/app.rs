@@ -129,6 +129,24 @@ fn cycle_scrollback(cur: usize, forward: bool) -> usize {
     SCROLLBACK_STEPS[j]
 }
 
+/// Notify minimum-duration cycler steps, in seconds (v0.15). "I stepped away"
+/// granularity: 5s … 5m. A hand-edited config value snaps to its nearest step
+/// on the first click, then moves ±1 (wraps), mirroring `cycle_scrollback`.
+const NOTIFY_MIN_STEPS: [u64; 6] = [5, 10, 30, 60, 120, 300];
+
+/// The next/previous notify-minimum step (wraps).
+fn cycle_notify_min(cur: u64, forward: bool) -> u64 {
+    let i = NOTIFY_MIN_STEPS
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, &s)| s.abs_diff(cur))
+        .map(|(i, _)| i)
+        .unwrap_or(1);
+    let n = NOTIFY_MIN_STEPS.len();
+    let j = if forward { (i + 1) % n } else { (i + n - 1) % n };
+    NOTIFY_MIN_STEPS[j]
+}
+
 /// Display form of a scrollback value: whole thousands render as "Nk" (the
 /// cycler steps), anything else (a hand-edited config value) verbatim.
 fn format_scrollback(n: usize) -> String {
@@ -606,6 +624,19 @@ pub struct App {
     /// startup; written back to `Config.effects` by `persist()`. UI/renderer tasks
     /// read and write fields here; the next `persist()` call flushes them to disk.
     fx: crate::config::EffectsConfig,
+    // ── Run & Notify (v0.15) runtime mirrors of the persisted config keys ──────
+    /// Notify (toast + taskbar/dock urgency) when a command finishes while JeTTY
+    /// is hidden/unfocused. Mirrors `Config.notify_on_command_finish`; the whole
+    /// feature is inert unless OSC 133 shell integration is enabled.
+    notify_on_finish: bool,
+    /// Minimum SUCCESS-command duration (seconds) to notify on (failures may ping
+    /// below it — see the notifier's failure floor). Mirrors `notify_min_seconds`.
+    notify_min_seconds: u64,
+    /// Only notify (and auto-summon) on FAILED commands. Mirrors `notify_only_on_failure`.
+    notify_only_on_failure: bool,
+    /// Raise + focus JeTTY and activate the firing tab when a command finishes —
+    /// ONLY when fully hidden. Opt-in, default OFF. Mirrors `auto_summon_on_finish`.
+    auto_summon_on_finish: bool,
     /// Track held modifier keys so Ctrl+Shift combos can be detected.
     modifiers: winit::keyboard::ModifiersState,
     /// Last known cursor position in physical pixels.
@@ -1016,6 +1047,11 @@ impl App {
             settings_tab: 0,
             effects_scroll: 0.0,
             fx: crate::config::EffectsConfig::default(),
+            // Run & Notify: overridden by config below; safe defaults here.
+            notify_on_finish: true,
+            notify_min_seconds: 10,
+            notify_only_on_failure: false,
+            auto_summon_on_finish: false,
             modifiers: winit::keyboard::ModifiersState::empty(),
             cursor: (0.0, 0.0),
             mouse_grab_press: None,
@@ -1125,6 +1161,12 @@ impl App {
         app.cfg_show_welcome = cfg.show_welcome;
         app.show_perf_hud = cfg.show_perf_hud;
         app.fx = cfg.effects.clone();
+        // Run & Notify: mirror the persisted keys (min-seconds re-clamped for
+        // belt-and-suspenders; Config::load's sanitize already applied the range).
+        app.notify_on_finish = cfg.notify_on_command_finish;
+        app.notify_min_seconds = cfg.notify_min_seconds.clamp(1, 86_400);
+        app.notify_only_on_failure = cfg.notify_only_on_failure;
+        app.auto_summon_on_finish = cfg.auto_summon_on_finish;
 
         // Apply the initial theme+opacity so Terminal::new env defaults are
         // overridden by our managed state (avoids double-reads from env).
@@ -1163,6 +1205,10 @@ impl App {
             show_welcome: self.cfg_show_welcome,
             show_perf_hud: self.show_perf_hud,
             effects: self.fx.clone(),
+            notify_on_command_finish: self.notify_on_finish,
+            notify_min_seconds: self.notify_min_seconds,
+            notify_only_on_failure: self.notify_only_on_failure,
+            auto_summon_on_finish: self.auto_summon_on_finish,
         }
         .save();
     }
@@ -3079,6 +3125,12 @@ impl App {
             self.ui_font_scroll_offset,
             0.0, 0.0, &theme, self.settings_char_w(),
             &self.shell_display(),
+            &jetty_render::NotifyParams {
+                enabled: self.notify_on_finish,
+                only_on_failure: self.notify_only_on_failure,
+                min_seconds: self.notify_min_seconds,
+                auto_summon: self.auto_summon_on_finish,
+            },
             self.settings_tab,
             &fx,
             self.effects_scroll,
@@ -3142,6 +3194,13 @@ impl App {
         let effects_scroll = self.effects_scroll;
         let theme_dropdown_open = self.theme_dropdown_open;
         let theme_scroll_offset = self.theme_scroll_offset;
+        // Run & Notify params captured before the mutable render-stack borrow.
+        let notify_params = jetty_render::NotifyParams {
+            enabled: self.notify_on_finish,
+            only_on_failure: self.notify_only_on_failure,
+            min_seconds: self.notify_min_seconds,
+            auto_summon: self.auto_summon_on_finish,
+        };
         let (Some(gpu), Some(text), Some(quad), Some(specimen)) = (
             &mut self.settings_gpu,
             &mut self.settings_text,
@@ -3160,6 +3219,7 @@ impl App {
             ui_font_logical, &ui_families, &ui_family, ui_font_scroll_offset,
             0.0, 0.0, &theme, char_w,
             &shell_display,
+            &notify_params,
             settings_tab,
             &fx,
             effects_scroll,
@@ -4689,6 +4749,23 @@ impl App {
             }
             input::MouseAction::CycleShellNext => {
                 self.cycle_shell(true);
+            }
+            // RUN & NOTIFY toggles/cycler (Shell tab, v0.15). Each flips a mirror
+            // field; the shared persist()/redraw below flushes and repaints.
+            input::MouseAction::ToggleNotifyOnFinish => {
+                self.notify_on_finish = !self.notify_on_finish;
+            }
+            input::MouseAction::ToggleNotifyOnlyFailure => {
+                self.notify_only_on_failure = !self.notify_only_on_failure;
+            }
+            input::MouseAction::NotifyDurPrev => {
+                self.notify_min_seconds = cycle_notify_min(self.notify_min_seconds, false);
+            }
+            input::MouseAction::NotifyDurNext => {
+                self.notify_min_seconds = cycle_notify_min(self.notify_min_seconds, true);
+            }
+            input::MouseAction::ToggleAutoSummon => {
+                self.auto_summon_on_finish = !self.auto_summon_on_finish;
             }
             input::MouseAction::StartDropdownDrag => {
                 // No-op in Center mode (the slider is grayed/disabled there).
@@ -6589,6 +6666,11 @@ impl ApplicationHandler<AppEvent> for App {
                     | input::MouseAction::ToggleLaunchAtLogin
                     | input::MouseAction::CycleShellPrev
                     | input::MouseAction::CycleShellNext
+                    | input::MouseAction::ToggleNotifyOnFinish
+                    | input::MouseAction::ToggleNotifyOnlyFailure
+                    | input::MouseAction::NotifyDurPrev
+                    | input::MouseAction::NotifyDurNext
+                    | input::MouseAction::ToggleAutoSummon
                     | input::MouseAction::ToggleCrt
                     | input::MouseAction::ToggleCrtRoll
                     | input::MouseAction::ToggleCrtFlicker
@@ -9103,6 +9185,18 @@ mod scrollback_cycle_tests {
         // Hand-edited values render verbatim.
         assert_eq!(format_scrollback(12_345), "12345");
         assert_eq!(format_scrollback(100), "100");
+    }
+
+    #[test]
+    fn cycle_notify_min_snaps_and_wraps() {
+        use super::cycle_notify_min;
+        // Exact steps move ±1 with wraparound.
+        assert_eq!(cycle_notify_min(10, true), 30);
+        assert_eq!(cycle_notify_min(300, true), 5, "forward wraps");
+        assert_eq!(cycle_notify_min(5, false), 300, "backward wraps");
+        // A hand-edited value snaps to its nearest step, then steps.
+        assert_eq!(cycle_notify_min(50, true), 120); // nearest is 60 → next 120
+        assert_eq!(cycle_notify_min(50, false), 30); // nearest is 60 → prev 30
     }
 }
 
