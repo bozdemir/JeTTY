@@ -2576,13 +2576,36 @@ impl App {
     /// the idle/no-shell-integration path.
     fn dispatch_completions(&mut self, event_loop: &ActiveEventLoop) {
         let enabled = self.notify_on_finish;
+        // Snapshot "is the user watching the main window" ONCE for this batch. An
+        // auto-summon triggered by an earlier tab flips self.visible mid-loop; without
+        // the snapshot every LATER completion in the same ~100ms drain would see
+        // watching==true and be gated out, and the user would land on the wrong tab.
+        let main_watching = self.main_user_watching();
+        // First failure wins the summon; else the last firing tab.
+        let mut summon_target: Option<usize> = None;
+        let mut summon_is_failure = false;
         for i in 0..self.tabs.len() {
             let completions = self.tabs[i].terminal.take_completions();
             if enabled {
                 for c in completions {
-                    self.maybe_notify_main(i, c, event_loop);
+                    if let Some(failed) = self.maybe_notify_main(i, c, main_watching) {
+                        if self.auto_summon_on_finish && !self.visible {
+                            if failed && !summon_is_failure {
+                                summon_target = Some(i);
+                                summon_is_failure = true;
+                            } else if !summon_is_failure {
+                                summon_target = Some(i);
+                            }
+                        }
+                    }
                 }
             }
+        }
+        // At most ONE auto-summon for the whole batch, AFTER gating every tab against
+        // the pre-loop snapshot (so no sibling completion is suppressed).
+        if let Some(tab) = summon_target {
+            self.select_tab(tab);
+            self.set_visibility(true, event_loop);
         }
         for i in 0..self.detached.len() {
             let completions = self.detached[i].tab.terminal.take_completions();
@@ -2622,16 +2645,17 @@ impl App {
         }
     }
 
-    /// Gate + fire a notification for a MAIN-window tab's completion, and — when
-    /// opted in — auto-summon to the firing tab. `event_loop` is threaded for the
-    /// summon path (the same one F9 uses).
+    /// Gate + fire a notification for a MAIN-window tab's completion. `watching` is
+    /// the batch-start snapshot of `main_user_watching()` (so an auto-summon earlier
+    /// in the same drain can't suppress this tab). Returns `Some(failed)` when a
+    /// notification fired (the caller decides the single batch auto-summon), or
+    /// `None` when gated out.
     fn maybe_notify_main(
         &mut self,
         tab: usize,
         c: jetty_core::CommandCompletion,
-        event_loop: &ActiveEventLoop,
-    ) {
-        let watching = self.main_user_watching();
+        watching: bool,
+    ) -> Option<bool> {
         let key = NotifyKey::MainTab(tab);
         let since_last = self.notify_last_at.get(&key).map(|t| t.elapsed());
         if !crate::notify::should_notify(
@@ -2643,7 +2667,7 @@ impl App {
             since_last,
             NOTIFY_MIN_GAP,
         ) {
-            return;
+            return None;
         }
         self.notify_last_at.insert(key, std::time::Instant::now());
         let failed = matches!(c.exit_code, Some(code) if code != 0);
@@ -2654,16 +2678,7 @@ impl App {
         if let Some(w) = &self.window {
             w.request_user_attention(Some(attention_for(failed)));
         }
-        // Auto-summon (opt-in, default OFF). ONLY when FULLY HIDDEN — never yank a
-        // visible-but-unfocused window forward while the user types in another app.
-        // Activate the firing tab so they land on the right one, then raise+focus
-        // via the same summon path as F9. The gate above already honored
-        // only_on_failure, so a failures-only config summons only on failures.
-        // Anti-spam (recorded above) bounds repeated focus-steals.
-        if self.auto_summon_on_finish && !self.visible {
-            self.select_tab(tab);
-            self.set_visibility(true, event_loop);
-        }
+        Some(failed)
     }
 
     /// Gate + fire a notification for a DETACHED window's completion. Gated on

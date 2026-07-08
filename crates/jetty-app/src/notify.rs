@@ -21,7 +21,9 @@
 //! reaper uses per-child pidfds — never a global `SIGCHLD` handler. So no PTY
 //! child's exit status can be stolen (verified against async-process 2.5).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// One notification for the worker to fire.
@@ -42,13 +44,12 @@ pub enum NotifyMsg {
 /// thread or growing without bound (amendments §5b).
 const NOTIFY_QUEUE_BOUND: usize = 16;
 
-/// Hard ceiling on how long the worker waits for ONE `show()` (the blocking
-/// D-Bus round trip). zbus applies no default reply timeout and notify-rust owns
-/// its connection, so a daemon that ACCEPTS the call but never replies would
-/// otherwise wedge the worker forever. We run each delivery on a throwaway thread
-/// and abandon it after this deadline — the strand dies with the process; the
-/// NEXT notification still fires (amendments §5b).
-const NOTIFY_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Max delivery threads alive at once. A daemon that ACCEPTS the D-Bus Notify
+/// call but never replies (zbus applies no default reply timeout) would strand
+/// the delivering thread forever; we cap how many such strands can accumulate so
+/// a long hidden session under a pathological daemon can't leak threads without
+/// bound. Beyond the cap, further toasts are shed (the winit urgency still fired).
+const MAX_INFLIGHT_SENDS: usize = 4;
 
 /// A cheap, clonable handle to the notification worker. `fire()` is non-blocking.
 #[derive(Clone)]
@@ -72,32 +73,34 @@ impl Notifier {
 ///
 /// The worker blocks on `recv` (the reactor thread `zbus` later starts idles at
 /// epoll-wait — ~0% idle, no busy loop) and exits when the last `Notifier` — held
-/// by the `App` — drops. One reused worker (vs. a thread per toast) bounds
-/// resource use under spam and preserves ordering.
+/// by the `App` — drops. The blocking `show()` runs on a short-lived delivery
+/// thread so a slow daemon never stalls the worker; an `AtomicUsize` caps how many
+/// deliveries can be in flight at once, so a daemon that accepts-but-never-replies
+/// can strand at most `MAX_INFLIGHT_SENDS` threads (then toasts shed) instead of
+/// leaking one per completion for the life of the process.
 pub fn spawn_notifier() -> Notifier {
     let (tx, rx) = sync_channel::<NotifyMsg>(NOTIFY_QUEUE_BOUND);
     // If the thread fails to spawn, `fire()` still degrades cleanly: sends land on
     // a live channel whose receiver is gone → dropped (the urgency hint remains).
+    let inflight = Arc::new(AtomicUsize::new(0));
     let _ = std::thread::Builder::new()
         .name("jetty-notify".into())
         .spawn(move || {
             for msg in rx {
                 let NotifyMsg::Fire { summary, body, critical } = msg;
-                // Deliver on a throwaway thread and wait at most NOTIFY_CALL_TIMEOUT.
-                // In the normal case (fast daemon) the delivery finishes in a few ms
-                // and `recv_timeout` returns immediately; a wedged daemon strands
-                // only that one thread (harmless — it completes or dies with the
-                // process) and the worker moves on to the next message. The upstream
-                // bounded queue + per-tab anti-spam keep the spawn rate low, so this
-                // is not the resource-hungry "thread per notification" case.
-                let (done_tx, done_rx) = sync_channel::<()>(1);
+                // Shed rather than spawn once too many deliveries are already
+                // stranded (pathological non-replying daemon) — bounds threads.
+                if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT_SENDS {
+                    continue;
+                }
+                inflight.fetch_add(1, Ordering::Relaxed);
+                let inflight = Arc::clone(&inflight);
                 let _ = std::thread::Builder::new()
                     .name("jetty-notify-send".into())
                     .spawn(move || {
                         show(&summary, &body, critical);
-                        let _ = done_tx.try_send(());
+                        inflight.fetch_sub(1, Ordering::Relaxed);
                     });
-                let _ = done_rx.recv_timeout(NOTIFY_CALL_TIMEOUT);
             }
         });
     Notifier { tx }
