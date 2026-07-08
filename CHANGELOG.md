@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.15.0] — 2026-07-08
+
+**Run & Notify** — the summon terminal's superpower. Designed from a verified
+blueprint, stress-tested by two design critics, then adversarially reviewed.
+
+### Added
+- **Command-completion notifications** — when a command finishes while you're
+  *not* watching JeTTY (hidden or unfocused), you get a native desktop
+  notification naming the **tab**, the **exit code**, the **duration**, and the
+  command's **last output line**, plus a taskbar/dock **urgency** hint. It never
+  fires while you're looking, and only for commands past a threshold.
+  - Config: `notify_on_command_finish` (default on), `notify_min_seconds`
+    (default 10), `notify_only_on_failure` (default off), and
+    `auto_summon_on_finish` (default off — bring the window back on finish).
+    All live in Settings → Shell.
+  - Built on v0.14's OSC 133 marks: zero idle/hot-path cost (fires only on the
+    completion event), and the D-Bus toast runs off the UI thread so a slow or
+    absent notification daemon can never stall the terminal. DE-independent
+    (any freedesktop daemon: KDE, GNOME, dunst, mako, …).
+
+### Fixed
+- Removed a fabricated perf-HUD string from the self-test/screenshot path — the
+  HUD now renders only from real measured values.
+
+### Notes
+- **Plain bash** (without `bash-preexec`) reports no command duration, so it
+  gets **failure-only** notifications; zsh / fish / powerlevel10k report full
+  duration and notify on success too.
+- **macOS** gets the guaranteed dock-bounce urgency; rich toasts there need an
+  app bundle (future). Linux gets the full desktop notification.
+
+---
+
 ## [0.14.0] — 2026-07-08
 
 Shell integration (OSC 133). Designed from a verified blueprint, stress-tested
