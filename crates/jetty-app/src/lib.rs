@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod detached;
+mod notify;
 mod shell_integration;
 pub mod clipboard;
 pub mod input;

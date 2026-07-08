@@ -147,6 +147,55 @@ fn cycle_notify_min(cur: u64, forward: bool) -> u64 {
     NOTIFY_MIN_STEPS[j]
 }
 
+/// Per-tab/window anti-spam floor for command-finish notifications: a single tab
+/// pings at most once per this window. A DIFFERENT tab/window is NEVER suppressed
+/// (keys are per tab/window), so a burst of finishes across tabs each ping — the
+/// exact multi-tab summon use case (amendments §2).
+const NOTIFY_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Anti-spam key for command-finish notifications: identifies which surface last
+/// fired. Main tabs key on their index; detached windows on their stable id.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum NotifyKey {
+    MainTab(usize),
+    Detached(WindowId),
+}
+
+/// Build a command-finish notification's `(summary, body)`. The summary NAMES the
+/// firing tab (amendments §1) plus the status and, when known, the duration; the
+/// body is the command's last output line.
+fn build_notification_text(
+    label: &str,
+    c: &jetty_core::CommandCompletion,
+    failed: bool,
+) -> (String, String) {
+    let dur = c.duration.map(crate::notify::fmt_duration).unwrap_or_default();
+    let status = if failed {
+        match c.exit_code {
+            Some(code) => format!("failed (exit {code})"),
+            None => "failed".to_string(),
+        }
+    } else {
+        "finished".to_string()
+    };
+    let summary = if dur.is_empty() {
+        format!("{label} — {status}")
+    } else {
+        format!("{label} — {status} · {dur}")
+    };
+    (summary, c.last_line.clone())
+}
+
+/// The winit taskbar/dock urgency level for a completion: `Critical` (persistent /
+/// dock-bounce) on failure, `Informational` on success.
+fn attention_for(failed: bool) -> winit::window::UserAttentionType {
+    if failed {
+        winit::window::UserAttentionType::Critical
+    } else {
+        winit::window::UserAttentionType::Informational
+    }
+}
+
 /// Display form of a scrollback value: whole thousands render as "Nk" (the
 /// cycler steps), anything else (a hand-edited config value) verbatim.
 fn format_scrollback(n: usize) -> String {
@@ -637,6 +686,15 @@ pub struct App {
     /// Raise + focus JeTTY and activate the firing tab when a command finishes —
     /// ONLY when fully hidden. Opt-in, default OFF. Mirrors `auto_summon_on_finish`.
     auto_summon_on_finish: bool,
+    /// Handle to the off-UI-thread notification worker. Cheap to clone; a `fire()`
+    /// is a non-blocking `try_send` (dropped on a full queue). The worker exits
+    /// when this last handle drops with the `App`.
+    notifier: crate::notify::Notifier,
+    /// Last time each tab/window fired a command-finish notification, for PER-tab
+    /// anti-spam (a different tab is never suppressed by another's recent ping).
+    /// Keyed by `NotifyKey`; entries are tiny and bounded by the live tab/window
+    /// count in practice.
+    notify_last_at: std::collections::HashMap<NotifyKey, std::time::Instant>,
     /// Track held modifier keys so Ctrl+Shift combos can be detected.
     modifiers: winit::keyboard::ModifiersState,
     /// Last known cursor position in physical pixels.
@@ -1052,6 +1110,10 @@ impl App {
             notify_min_seconds: 10,
             notify_only_on_failure: false,
             auto_summon_on_finish: false,
+            // Long-lived notification worker (idles at recv; the zbus reactor it
+            // later starts idles at epoll-wait — no busy loop, ~0% idle preserved).
+            notifier: crate::notify::spawn_notifier(),
+            notify_last_at: std::collections::HashMap::new(),
             modifiers: winit::keyboard::ModifiersState::empty(),
             cursor: (0.0, 0.0),
             mouse_grab_press: None,
@@ -2501,6 +2563,127 @@ impl App {
             }
         }
         (had, title_changed)
+    }
+
+    /// Poll every tab (main + detached) for OSC 133 command completions surfaced
+    /// by the just-finished drain, and fire notifications for the ones that pass
+    /// the gate. Called after BOTH drain sites — the `Wake` handler (incl. its
+    /// detached-drain loop) AND `RedrawRequested` — so a completion in a hidden
+    /// window still pings (amendments §3). Index-based iteration avoids an
+    /// `iter_mut` vs `&self` borrow conflict. `take_completions()` is drained
+    /// unconditionally (even when disabled) so nothing accumulates; it early-outs
+    /// to an empty `Vec` in the common (no-completion) case, so this is ~free on
+    /// the idle/no-shell-integration path.
+    fn dispatch_completions(&mut self, event_loop: &ActiveEventLoop) {
+        let enabled = self.notify_on_finish;
+        for i in 0..self.tabs.len() {
+            let completions = self.tabs[i].terminal.take_completions();
+            if enabled {
+                for c in completions {
+                    self.maybe_notify_main(i, c, event_loop);
+                }
+            }
+        }
+        for i in 0..self.detached.len() {
+            let completions = self.detached[i].tab.terminal.take_completions();
+            if enabled {
+                for c in completions {
+                    self.maybe_notify_detached(i, c);
+                }
+            }
+        }
+    }
+
+    /// Whether the user is actively looking at the MAIN window right now — never
+    /// ping then. Handles the post-summon focus lag: `set_visibility(true)` flips
+    /// `self.visible` immediately but `self.main_focused` only on the later WM
+    /// `Focused(true)`, so a just-summoned window still inside its settle window
+    /// counts as "watching" (a completion in that gap must not ping — amendments
+    /// adopted §1).
+    fn main_user_watching(&self) -> bool {
+        if !self.visible || self.main_occluded {
+            return false;
+        }
+        let settling = self
+            .summon_settle_until
+            .is_some_and(|t| std::time::Instant::now() < t);
+        self.main_focused || settling
+    }
+
+    /// A label that NAMES a main tab (amendments §1): its displayed title, prefixed
+    /// with "Tab N · " only when the shell/user gave it a non-default title (so a
+    /// bare default "Tab 3" isn't doubled).
+    fn main_tab_label(&self, i: usize) -> String {
+        let tab = &self.tabs[i];
+        if tab.title == tab.default_title {
+            tab.title.clone()
+        } else {
+            format!("Tab {} · {}", i + 1, tab.title)
+        }
+    }
+
+    /// Gate + fire a notification for a MAIN-window tab's completion. `event_loop`
+    /// is threaded for the opt-in auto-summon path (added in a later commit).
+    fn maybe_notify_main(
+        &mut self,
+        tab: usize,
+        c: jetty_core::CommandCompletion,
+        _event_loop: &ActiveEventLoop,
+    ) {
+        let watching = self.main_user_watching();
+        let key = NotifyKey::MainTab(tab);
+        let since_last = self.notify_last_at.get(&key).map(|t| t.elapsed());
+        if !crate::notify::should_notify(
+            watching,
+            c.duration,
+            c.exit_code,
+            self.notify_min_seconds,
+            self.notify_only_on_failure,
+            since_last,
+            NOTIFY_MIN_GAP,
+        ) {
+            return;
+        }
+        self.notify_last_at.insert(key, std::time::Instant::now());
+        let failed = matches!(c.exit_code, Some(code) if code != 0);
+        let (summary, body) = build_notification_text(&self.main_tab_label(tab), &c, failed);
+        self.notifier.fire(summary, body, failed);
+        // Taskbar/dock urgency baseline — the guaranteed macOS signal (dock bounce)
+        // and a cross-DE hint on Linux even where no notification daemon runs.
+        if let Some(w) = &self.window {
+            w.request_user_attention(Some(attention_for(failed)));
+        }
+    }
+
+    /// Gate + fire a notification for a DETACHED window's completion. Gated on
+    /// THAT window's own `focused`/`occluded` (amendments §2) — a detached window
+    /// has no F9 hide, so "watching" == focused and not occluded.
+    fn maybe_notify_detached(&mut self, pos: usize, c: jetty_core::CommandCompletion) {
+        let (watching, wid) = {
+            let dw = &self.detached[pos];
+            (dw.focused && !dw.occluded, dw.window.id())
+        };
+        let key = NotifyKey::Detached(wid);
+        let since_last = self.notify_last_at.get(&key).map(|t| t.elapsed());
+        if !crate::notify::should_notify(
+            watching,
+            c.duration,
+            c.exit_code,
+            self.notify_min_seconds,
+            self.notify_only_on_failure,
+            since_last,
+            NOTIFY_MIN_GAP,
+        ) {
+            return;
+        }
+        self.notify_last_at.insert(key, std::time::Instant::now());
+        let failed = matches!(c.exit_code, Some(code) if code != 0);
+        let label = format!("{} (detached)", self.detached[pos].tab.title);
+        let (summary, body) = build_notification_text(&label, &c, failed);
+        self.notifier.fire(summary, body, failed);
+        self.detached[pos]
+            .window
+            .request_user_attention(Some(attention_for(failed)));
     }
 
     /// Update the live perf-HUD metrics and return the formatted HUD string, or
@@ -4148,6 +4331,9 @@ impl App {
                 // Focus implies on-screen: clear any stale occluded flag in case
                 // the WM skipped Occluded(false) on restore (F17).
                 self.detached[pos].occluded = false;
+                // Clear any command-finish urgency raised on THIS detached window
+                // (X11 latches it until cleared; parity with the main window).
+                self.detached[pos].window.request_user_attention(None);
                 // Cancel any scheduled main-window auto-hide: focus moved to one
                 // of OUR windows (this arm can arrive AFTER the main FocusOut on
                 // X11 — the exact race the deferred hide exists for).
@@ -5855,6 +6041,12 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                 }
+                // Fire "command finished" notifications for OSC 133 completions the
+                // drains above surfaced. Placed AFTER both the main drain and the
+                // detached-drain loop so completions from EITHER are dispatched
+                // (amendments §3) — and this is the hidden-window path, the flagship
+                // use case (no RedrawRequested arrives while hidden).
+                self.dispatch_completions(event_loop);
             }
             AppEvent::ToggleVisibility => {
                 self.toggle_visibility(event_loop);
@@ -5996,9 +6188,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // stuck true and silently disable auto-hide.
                 self.switching_to_detached = false;
                 self.switching_to_settings = false;
-                // macOS first-paint nudge (see the settings window above): ensure a
-                // frame is drawn once the window is actually shown + focused.
+                // Clear any taskbar/dock urgency we raised on a command-finish
+                // notification: X11 latches XUrgencyHint until explicitly cleared,
+                // so without this the taskbar entry stays lit after the user
+                // returns. A no-op where none was set / unsupported (Wayland).
                 if let Some(w) = &self.window {
+                    w.request_user_attention(None);
+                    // macOS first-paint nudge (see the settings window above): ensure
+                    // a frame is drawn once the window is actually shown + focused.
                     w.request_redraw();
                 }
             }
@@ -7709,6 +7906,11 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.tabs.is_empty() {
                     return;
                 }
+                // Fire notifications for any completion THIS drain surfaced (the
+                // window-visible path; the hidden path is handled in the Wake arm).
+                // Idempotent with the Wake dispatch: take_completions() drains, so
+                // whichever drain produced the completion fires it exactly once.
+                self.dispatch_completions(event_loop);
                 // Streaming search refresh: stored match Points go stale as
                 // output rotates the scrollback. Re-collect at most every
                 // SEARCH_REFRESH_INTERVAL, only while the bar is open and only
