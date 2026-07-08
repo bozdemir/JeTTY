@@ -622,15 +622,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ("Tab 2".to_string(), false),
                 ("Tab 3".to_string(), false),
             ];
-            // JETTY_SHOT_PERF — inject a sample perf-HUD string to eyeball the
-            // right-aligned HUD placement (defaults to the design-04 hero value).
+            // JETTY_SHOT_PERF — render the perf HUD ONLY when a human supplies
+            // real, measured numbers (read off the live HUD, same glyph/format).
+            // A headless one-shot cannot honestly measure fps/CPU/throughput, so
+            // there is NO fabricated fallback: unset/empty ⇒ no HUD is drawn.
             let perf_owned: Option<String> = std::env::var("JETTY_SHOT_PERF")
                 .ok()
-                .map(|v| if v.is_empty() {
-                    "⚡ 5.1 ms · 190 fps · 0.5% CPU · 155 MB/s".to_string()
-                } else {
-                    v
-                });
+                .filter(|v| !v.is_empty());
             // JETTY_SHOT_TABBAR_ACTIVITY — per-tab activity dots (see header).
             let activity: Vec<jetty_render::TabActivity> =
                 std::env::var("JETTY_SHOT_TABBAR_ACTIVITY")
@@ -722,12 +720,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             panel_labels.extend(bar.labels);
             panel_title_labels.extend(bar.title_labels);
 
-            // Bottom STATUS strip with a sample HUD string (same slim strip as
-            // the main window; a detached window may show the same global HUD).
-            let perf = std::env::var("JETTY_SHOT_PERF")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "⚡ 5.1 ms · 190 fps · 0.5% CPU · 155 MB/s".to_string());
+            // Bottom STATUS strip (same slim strip as the main window). The perf
+            // HUD label is drawn ONLY when JETTY_SHOT_PERF supplies real, measured
+            // values — no fabricated fallback (a headless shot cannot honestly
+            // measure fps/CPU/throughput). The strip itself always renders.
+            let perf = std::env::var("JETTY_SHOT_PERF").ok().filter(|v| !v.is_empty());
             let sy = (height as f32 - shot_status_h).max(0.0);
             let tb = terminal.theme().bg;
             let tf = terminal.theme().fg;
@@ -742,10 +739,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rects.push(jetty_render::Rect {
                 x: 0.0, y: sy, w: width as f32, h: shot_status_h, color: nl(0.05), ..Default::default()
             });
-            let perf_w = perf.chars().count() as f32 * chrome_char_w;
-            let px = (width as f32 - perf_w - 12.0).max(8.0);
-            let dim = nl(0.5);
-            panel_labels.push((perf, px, sy + (shot_status_h - 16.0) / 2.0, [dim[0], dim[1], dim[2]]));
+            if let Some(perf) = perf {
+                let perf_w = perf.chars().count() as f32 * chrome_char_w;
+                let px = (width as f32 - perf_w - 12.0).max(8.0);
+                let dim = nl(0.5);
+                panel_labels.push((perf, px, sy + (shot_status_h - 16.0) / 2.0, [dim[0], dim[1], dim[2]]));
+            }
 
             eprintln!("jetty-shot: JETTY_SHOT_DETACHED rendered detached-window chrome (title={title:?}, hover={close_hover})");
         }
