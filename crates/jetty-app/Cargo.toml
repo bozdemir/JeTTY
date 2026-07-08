@@ -20,13 +20,16 @@ dirs = "6.0.0"
 # /proc or mach). Minimal feature set: only the `system` module (processes/CPU),
 # with disk/network/component/user probes disabled to keep the build light.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
-# Desktop "command finished" notifications. DE-independent by design:
-#   * Linux  — the `z` feature is the PURE-RUST zbus freedesktop backend, talking
-#     to whatever notification daemon is running (KDE, GNOME, dunst, mako, …) over
-#     org.freedesktop.Notifications. No GTK/glib, no C libdbus, no tokio. NO KDE/
-#     GNOME-specific API.  (Verified via `cargo tree`: adds zbus + the smol async
-#     stack; `image` stays out — `default-features=false` drops it.)
-#   * macOS  — the `z`/`d` features are cfg'd off; notify-rust builds its native
-#     mac-notification-sys backend automatically. (Best-effort there; the winit
-#     dock-bounce urgency is the guaranteed macOS signal.)
+# Desktop "command finished" notifications — Linux/BSD ONLY (freedesktop).
+#   The `z` feature is the PURE-RUST zbus backend, talking to whatever notification
+#   daemon is running (KDE, GNOME, dunst, mako, …) over org.freedesktop.Notifications.
+#   No GTK/glib, no C libdbus, no tokio. NO KDE/GNOME-specific API. (Verified via
+#   `cargo tree`: adds zbus + the smol async stack; `image` stays out.)
+#
+#   Deliberately NOT a dependency on macOS: notify-rust's mac backend
+#   (mac-notification-sys) is suppressed/mis-attributed for a NON-BUNDLED binary
+#   anyway (best-effort only, needs a .app bundle — future), and its Objective-C
+#   build script breaks a Linux→macOS cross-check. On macOS the GUARANTEED signal
+#   is the winit request_user_attention dock bounce (no dep required); see notify.rs.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 notify-rust = { version = "4", default-features = false, features = ["z"] }

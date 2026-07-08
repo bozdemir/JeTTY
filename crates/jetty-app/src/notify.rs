@@ -6,12 +6,13 @@
 //! overflow is dropped (the winit taskbar-urgency baseline still informs the
 //! user). See `v015-amendments.md` §5.
 //!
-//! DE-independence: on Linux the `notify-rust` `z` (pure-Rust `zbus`) backend
+//! DE-independence: on Linux/BSD the `notify-rust` `z` (pure-Rust `zbus`) backend
 //! talks to whatever freedesktop notification daemon is running (KDE, GNOME,
 //! dunst, mako, swaync, …) over `org.freedesktop.Notifications`. NO KDE/GNOME-
-//! specific API. On macOS the toast is best-effort (a non-bundled binary is mis-
-//! attributed/suppressed); the guaranteed macOS signal is the winit dock-bounce
-//! urgency fired on the UI thread by `app.rs`, not this module.
+//! specific API. On macOS `notify-rust` is NOT a dependency (its ObjC backend is
+//! suppressed for a non-bundled binary and needs a `.app` bundle — future), so
+//! `show()` is a no-op there and the guaranteed macOS signal is the winit
+//! dock-bounce urgency fired on the UI thread by `app.rs`, not this module.
 //!
 //! PTY-child safety: the `z` backend pulls `zbus → async-io/async-process`, but
 //! `async-process`'s reaper is behind a `OnceLock` that is only initialized when
@@ -99,18 +100,11 @@ fn show(summary: &str, body: &str, critical: bool) {
         .show();
 }
 
-/// macOS: BEST-EFFORT / degraded. A non-bundled binary is mis-attributed or
-/// suppressed by the notification center, so a failure here is silent and never
-/// blocks. The guaranteed macOS signal is the winit dock-bounce urgency fired by
-/// `app.rs`. Full macOS toasts need a `.app` bundle (future).
-#[cfg(target_os = "macos")]
-fn show(summary: &str, body: &str, _critical: bool) {
-    use notify_rust::Notification;
-    let _ = Notification::new().summary(summary).body(body).show();
-}
-
-/// Other platforms (not a build target): no-op so the crate still compiles.
-#[cfg(not(unix))]
+/// macOS (and any non-freedesktop platform): no-op. `notify-rust` is not a
+/// dependency here — a non-bundled binary's ObjC toast is suppressed/mis-
+/// attributed anyway, and full macOS toasts need a `.app` bundle (future). The
+/// guaranteed macOS signal is the winit dock-bounce urgency fired by `app.rs`.
+#[cfg(not(all(unix, not(target_os = "macos"))))]
 fn show(_summary: &str, _body: &str, _critical: bool) {}
 
 /// Short floor for FAILURE notifications that carry a KNOWN duration: an instant
