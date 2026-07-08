@@ -2622,13 +2622,14 @@ impl App {
         }
     }
 
-    /// Gate + fire a notification for a MAIN-window tab's completion. `event_loop`
-    /// is threaded for the opt-in auto-summon path (added in a later commit).
+    /// Gate + fire a notification for a MAIN-window tab's completion, and — when
+    /// opted in — auto-summon to the firing tab. `event_loop` is threaded for the
+    /// summon path (the same one F9 uses).
     fn maybe_notify_main(
         &mut self,
         tab: usize,
         c: jetty_core::CommandCompletion,
-        _event_loop: &ActiveEventLoop,
+        event_loop: &ActiveEventLoop,
     ) {
         let watching = self.main_user_watching();
         let key = NotifyKey::MainTab(tab);
@@ -2652,6 +2653,16 @@ impl App {
         // and a cross-DE hint on Linux even where no notification daemon runs.
         if let Some(w) = &self.window {
             w.request_user_attention(Some(attention_for(failed)));
+        }
+        // Auto-summon (opt-in, default OFF). ONLY when FULLY HIDDEN — never yank a
+        // visible-but-unfocused window forward while the user types in another app.
+        // Activate the firing tab so they land on the right one, then raise+focus
+        // via the same summon path as F9. The gate above already honored
+        // only_on_failure, so a failures-only config summons only on failures.
+        // Anti-spam (recorded above) bounds repeated focus-steals.
+        if self.auto_summon_on_finish && !self.visible {
+            self.select_tab(tab);
+            self.set_visibility(true, event_loop);
         }
     }
 
