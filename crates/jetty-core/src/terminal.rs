@@ -205,7 +205,33 @@ struct CmdBlock {
     exit: Option<i32>,
     /// Set once a D arrives (or a later A closes an abandoned command, e.g. ^C).
     finished: bool,
+    /// Monotonic instant stamped at the C mark (command start), so a duration can
+    /// be computed at D. `None` when no C was seen this block (e.g. plain bash,
+    /// which emits only A+D) — the completion then carries an unknown duration.
+    started_at: Option<std::time::Instant>,
 }
+
+/// One finished shell command, surfaced from an OSC 133 `D` mark. The tab index /
+/// window is attributed by `jetty-app` (it owns the tab→window mapping); this
+/// struct is per-terminal. Drained on the existing PTY-drain pass via
+/// [`Terminal::take_completions`] — no new event, no poll, no idle cost.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandCompletion {
+    /// `D;<code>`. `None` = the shell sent no / an empty / a non-numeric code
+    /// (unknown). A clamped byte (0..=255); nonzero ⇒ the command FAILED.
+    pub exit_code: Option<i32>,
+    /// `D − C` wall time. `None` = no C mark this block (bash without preexec),
+    /// so the duration is unknown and the notifier degrades to failure-only.
+    pub duration: Option<std::time::Duration>,
+    /// Last non-empty line of the command's output region, trimmed + capped
+    /// (the notification body). Empty string when the region was blank.
+    pub last_line: String,
+}
+
+/// Defensive cap on buffered, undrained completions (a misbehaving flood can't
+/// grow `Terminal.completed` without bound). Far above the ~1 completion/drain
+/// steady state.
+const MAX_PENDING_COMPLETIONS: usize = 32;
 
 pub struct Terminal {
     term: Term<EventProxy>,
@@ -278,6 +304,12 @@ pub struct Terminal {
     /// Per-tab semantic prompt marks (OSC 133 A/B/C/D), append order == ascending
     /// `abs_top`-relative line, pruned to the live scrollback window on each bind.
     marks: VecDeque<CmdBlock>,
+    /// Command completions discovered during `feed()` (OSC 133 `D`). Drained by
+    /// the app on the PTY-drain pass via [`Terminal::take_completions`]. Empty in
+    /// the common case; bounded by [`MAX_PENDING_COMPLETIONS`]. A plain `Vec` on
+    /// `&mut self` (not an `Arc`/atomic like `bell`) is correct: `D` is handled by
+    /// our own scanner inside `feed(&mut self)`, never the async `EventProxy`.
+    completed: Vec<CommandCompletion>,
 }
 
 /// Maximum scrollback-search query length in chars (bounds per-keystroke DFA
@@ -369,6 +401,7 @@ impl Terminal {
             saturated: false,
             scan: OscScan::Ground,
             marks: VecDeque::new(),
+            completed: Vec::new(),
         }
     }
 
@@ -691,6 +724,7 @@ impl Terminal {
                     output: None,
                     exit: None,
                     finished: false,
+                    started_at: None,
                 });
                 let history = self.term.grid().history_size();
                 self.prune_marks(history);
@@ -703,14 +737,35 @@ impl Terminal {
             b'C' => {
                 if let Some(last) = self.marks.back_mut() {
                     last.output = Some(abs);
+                    // Command START: stamp the monotonic clock so `D` can compute a
+                    // duration. One `Instant::now()`, once per command, on the
+                    // already-off-hot-path OSC-133 scanner (never per byte).
+                    last.started_at = Some(std::time::Instant::now());
                 }
             }
             b'D' => {
                 // Bind to the most-recent still-open block (shells emit strictly
                 // A…B…C…D, so "most recent open" is correct even with gaps).
+                let mut done = false;
+                let mut duration = None;
                 if let Some(block) = self.marks.iter_mut().rev().find(|m| !m.finished) {
                     block.exit = exit;
                     block.finished = true;
+                    // `Some(elapsed)` iff a C was seen this block; `None` otherwise
+                    // (bash without preexec) → the completion reports unknown time.
+                    duration = block.started_at.map(|t| t.elapsed());
+                    done = true;
+                }
+                // Emit a completion ONLY when a matching open block existed (a
+                // spurious lone D produces nothing). The mutable `marks` borrow
+                // above has ended, so reading the grid / pushing is conflict-free.
+                if done {
+                    let last_line = self.last_output_line();
+                    self.completed.push(CommandCompletion { exit_code: exit, duration, last_line });
+                    // Bound undrained completions; drop the oldest on overflow.
+                    if self.completed.len() > MAX_PENDING_COMPLETIONS {
+                        self.completed.remove(0);
+                    }
                 }
             }
             _ => {} // unknown 133 sub-command: ignore
@@ -1199,6 +1254,57 @@ impl Terminal {
     /// Consuming read: a second call returns `false` until the next bell.
     pub fn take_bell(&self) -> bool {
         self.bell.swap(false, Ordering::Relaxed)
+    }
+
+    /// Drain the command completions collected since the last call (OSC 133 `D`
+    /// marks discovered during `feed()`). Empty in the common case — a fast
+    /// `is_empty` check avoids allocating — so this rides the existing PTY-drain
+    /// pass at zero idle cost. Consuming: a second call returns an empty `Vec`.
+    pub fn take_completions(&mut self) -> Vec<CommandCompletion> {
+        if self.completed.is_empty() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.completed)
+        }
+    }
+
+    /// Text of the last non-empty grid row at/above the cursor, trimmed and
+    /// capped — the notification body. Called ONCE per command (at `D`), never on
+    /// the per-byte path. Precmd emits `D` then `A`, so at `D` the cursor sits
+    /// just below the command's final output; the bottom-most non-empty row
+    /// at/above it is that command's last output line. A wrapped long line
+    /// returns only its bottom physical row (acceptable). Only base `cell.c` is
+    /// read (same combining-mark limit as `snapshot`).
+    fn last_output_line(&self) -> String {
+        const MAX_SCAN_ROWS: i32 = 64; // bound the upward walk
+        const MAX_CHARS: usize = 200;
+        let grid = self.term.grid();
+        // Clamp every index into the LIVE grid range before indexing: alacritty's
+        // `Grid` panics on an out-of-range `Line` (including negative below the
+        // history top), so a near-empty grid or a top-of-history cursor must never
+        // reach `grid[Line(l)]` with an invalid `l`.
+        let top = grid.topmost_line().0;
+        let bottom = grid.bottommost_line().0;
+        let cursor_line = grid.cursor.point.line.0.clamp(top, bottom);
+        let lo = (cursor_line - MAX_SCAN_ROWS).max(top);
+        for l in (lo..=cursor_line).rev() {
+            let row = &grid[Line(l)];
+            let mut s = String::new();
+            for c in 0..self.cols {
+                let cell = &row[Column(c)];
+                // Skip the trailing half of a wide (CJK) glyph so the base char
+                // isn't doubled; matches the snapshot/URL cell-walk convention.
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                s.push(cell.c);
+            }
+            let t = s.trim();
+            if !t.is_empty() {
+                return t.chars().take(MAX_CHARS).collect();
+            }
+        }
+        String::new()
     }
 
     /// Start a Simple text selection at the given viewport cell (0-based).
@@ -2843,5 +2949,118 @@ mod tests {
         t.feed(b"\x1b]133;A\x07");
         t.feed(b"\x1b]133;A\x07"); // same line, duplicate
         assert_eq!(t.marks.len(), 1, "duplicate A on the same line is coalesced");
+    }
+
+    // ── OSC 133 command-completion event (v0.15 Run & Notify) ─────────────────
+
+    #[test]
+    fn completion_success_with_c_has_duration_and_last_line() {
+        // Full A…C…output…D;0: one completion, exit 0, a (Some) duration, and the
+        // last non-empty output row as `last_line`.
+        let mut t = Terminal::new(40, 6);
+        t.feed(b"\x1b]133;A\x07"); // prompt
+        t.feed(b"\x1b]133;C\x07"); // command start (stamps started_at)
+        t.feed(b"building...\r\n");
+        t.feed(b"done ok\r\n");
+        t.feed(b"\x1b]133;D;0\x07"); // done, success
+        let done = t.take_completions();
+        assert_eq!(done.len(), 1, "exactly one completion");
+        assert_eq!(done[0].exit_code, Some(0));
+        assert!(done[0].duration.is_some(), "C→D duration present");
+        assert_eq!(done[0].last_line, "done ok", "last non-empty output row");
+        assert!(t.take_completions().is_empty(), "drains (second call empty)");
+    }
+
+    #[test]
+    fn completion_failure_reports_nonzero_exit() {
+        let mut t = Terminal::new(40, 6);
+        t.feed(b"\x1b]133;A\x07\x1b]133;C\x07");
+        t.feed(b"boom\r\n");
+        t.feed(b"\x1b]133;D;1\x07");
+        let done = t.take_completions();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].exit_code, Some(1), "failure exit surfaced");
+    }
+
+    #[test]
+    fn completion_bash_shape_a_then_d_has_no_duration() {
+        // Plain bash emits A and D but no C — the completion must carry a KNOWN
+        // exit but an UNKNOWN (None) duration (drives the notifier's failure-only
+        // fallback).
+        let mut t = Terminal::new(40, 6);
+        t.feed(b"\x1b]133;A\x07");
+        t.feed(b"oops\r\n");
+        t.feed(b"\x1b]133;D;2\x07");
+        let done = t.take_completions();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].exit_code, Some(2));
+        assert!(done[0].duration.is_none(), "no C ⇒ unknown duration");
+    }
+
+    #[test]
+    fn completion_exit_code_stays_clamped_through_the_new_path() {
+        // Regression: the D;<huge> clamp (0..=255) must still hold when the code
+        // flows into a completion.
+        let mut t = Terminal::new(40, 6);
+        t.feed(b"\x1b]133;A\x07\x1b]133;C\x07");
+        t.feed(b"\x1b]133;D;9999999999\x07");
+        let done = t.take_completions();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].exit_code, Some(255), "clamped to the byte ceiling");
+    }
+
+    #[test]
+    fn completion_last_line_blank_region_is_empty_no_panic() {
+        // A command that produced no output: last_line is "" and nothing panics
+        // (bounds guard on a near-empty grid / low cursor).
+        let mut t = Terminal::new(40, 6);
+        t.feed(b"\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07");
+        let done = t.take_completions();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].last_line, "", "blank output region ⇒ empty body");
+    }
+
+    #[test]
+    fn completion_last_line_caps_at_200_chars() {
+        let mut t = Terminal::new(400, 4); // wide grid so the long line fits one row
+        t.feed(b"\x1b]133;A\x07\x1b]133;C\x07");
+        let long = "x".repeat(250);
+        t.feed(long.as_bytes());
+        t.feed(b"\r\n\x1b]133;D;0\x07");
+        let done = t.take_completions();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].last_line.chars().count(), 200, "capped at 200 chars");
+    }
+
+    #[test]
+    fn completion_top_of_history_cursor_never_panics() {
+        // Bounds guard: a D with the cursor at the very top of a fresh grid must
+        // not index an out-of-range Line (alacritty panics on that).
+        let mut t = Terminal::new(20, 3);
+        t.feed(b"\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07");
+        let _ = t.take_completions(); // reaching here (no panic) is the assertion
+    }
+
+    #[test]
+    fn no_completion_on_alt_screen() {
+        // OSC 133 inside a TUI (alt screen) is ignored — no completion emitted.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[?1049h"); // enter alt screen
+        t.feed(b"\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert!(t.take_completions().is_empty(), "alt-screen D produces nothing");
+    }
+
+    #[test]
+    fn completions_are_bounded() {
+        // A flood of D marks the app never drains cannot grow `completed` without
+        // bound.
+        let mut t = Terminal::new(20, 5);
+        for _ in 0..(MAX_PENDING_COMPLETIONS + 40) {
+            t.feed(b"\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07");
+        }
+        assert!(
+            t.completed.len() <= MAX_PENDING_COMPLETIONS,
+            "undrained completions stay bounded"
+        );
     }
 }
