@@ -37,6 +37,12 @@
 ///                    `link_at(row,col)` to stderr (URL under that cell, OSC 8
 ///                    or plain text) and draw the app's themed Ctrl+hover
 ///                    underline for the hit.
+///   JETTY_SHOT_OSC133 — "1" feeds a scripted OSC 133 A/C/D;<exit> sequence (a
+///                    FAILED command, a passing one, then another failed one)
+///                    after the input, so the PNG shows the themed left-edge
+///                    failed-command marker on each failed prompt row. Combine
+///                    with JETTY_SHOT_SCROLL to verify the marker tracks the
+///                    correct viewport row after the mark scrolls into history.
 ///   JETTY_SHOT_SEARCH — scrollback-search self-test: set this query on the
 ///                    terminal after the input (and any JETTY_SHOT_SCROLL) is
 ///                    applied, print the "cur/total" counter to stderr, draw
@@ -266,6 +272,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminal.feed(&input_bytes);
     }
 
+    // JETTY_SHOT_OSC133 — headless self-test of the OSC 133 pipeline: feed a
+    // scripted A/C/D;<exit> sequence (a FAILED command then a passing one) so the
+    // rendered PNG shows the themed left-edge failed-command marker on the failed
+    // prompt's row. Combine with JETTY_SHOT_SCROLL to verify the marker tracks
+    // the correct viewport row after the mark scrolls into history.
+    if env_flag("JETTY_SHOT_OSC133") {
+        // Failed command on the current prompt row → renders the marker.
+        terminal.feed(b"\x1b]133;A\x07$ false\x1b]133;C\x07\r\n\x1b]133;D;1\x07");
+        // A passing command below it (D;0) → no marker (contrast check).
+        terminal.feed(b"\x1b]133;A\x07$ echo ok\x1b]133;C\x07\r\nok\r\n\x1b]133;D;0\x07");
+        // A third, failed again, so the shot shows two states cleanly.
+        terminal.feed(b"\x1b]133;A\x07$ grep nope\x1b]133;C\x07\r\ngrep: nope: no match\r\n\x1b]133;D;2\x07");
+        eprintln!("jetty-shot: JETTY_SHOT_OSC133 fed a scripted A/C/D failed+ok+failed sequence");
+    }
+
     // Optional: scroll the view before snapshotting (JETTY_SHOT_SCROLL, i32, positive = up).
     if let Ok(scroll_str) = std::env::var("JETTY_SHOT_SCROLL") {
         if let Ok(n) = scroll_str.parse::<i32>() {
@@ -374,6 +395,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sb_thumb = [sb_mix(0), sb_mix(1), sb_mix(2), 210];
         if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, shot_grid_top, shot_status_h, sb_thumb) {
             rects.push(r);
+        }
+
+        // OSC 133 failed-command marker (JETTY_SHOT_OSC133): the same themed
+        // left-edge accent bar the app draws, so the headless PNG verifies the
+        // whole pipeline (scanner → marks → visible-row mapping → render).
+        let failed_rows = terminal.failed_prompt_rows();
+        if !failed_rows.is_empty() {
+            rects.extend(jetty_render::failed_marker_rects(
+                &failed_rows,
+                cell_h,
+                shot_grid_top,
+                3.0,
+                terminal.theme().failed_marker_color(),
+            ));
         }
 
         // SGR text decorations (underline styles + strike), same as the app's
