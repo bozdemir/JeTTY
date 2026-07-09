@@ -24,7 +24,7 @@ pub struct EffectsParams {
 }
 
 /// Run & Notify parameters forwarded from the `App` runtime mirror, for the
-/// Shell tab's "RUN & NOTIFY" section. Kept here so `jetty-render` receives the
+/// Shell tab's "Run & Notify" section. Kept here so `jetty-render` receives the
 /// state through `build_panel` without depending on `jetty-app`.
 #[derive(Debug, Clone, Copy)]
 pub struct NotifyParams {
@@ -176,7 +176,7 @@ pub struct PanelGeom {
 
     // ── Effects-tab geometry ──────────────────────────────────────────────────
     // All rects are OFF (1e6) when the Effects tab is not active.
-    /// "CRT ENABLED" master toggle switch.
+    /// "CRT enabled" master toggle switch.
     pub crt_enabled_toggle: Rect,
     /// CRT curvature slider track and handle.
     pub crt_curvature_track: Rect,
@@ -498,7 +498,7 @@ pub fn build_panel(
     dropdown_width_pct: f32,
     is_dropdown: bool,
     focus_autohide: bool,
-    // `launch_at_login`: drives the "LAUNCH AT LOGIN" toggle switch (accent when
+    // `launch_at_login`: drives the "Launch at login" toggle switch (accent when
     //   ON). The app derives this from the XDG autostart file's existence.
     launch_at_login: bool,
     // ── UI (chrome) FONT section inputs ──
@@ -702,15 +702,16 @@ pub fn build_panel(
         3 => {
             t_shell = content_top;
             t_launch = content_top + 64.0;
-            // RUN & NOTIFY section: a quiet header (+ rule + one-line hint), then
+            // Run & Notify section: a quiet header (+ rule + one-line hint), then
             // two toggles, the minimum-duration cycler, and the auto-summon toggle.
-            // 48-px pitch for the single-line controls; ends ~content_top+368,
-            // well inside the 460-px Shell content region (PANEL_H fits, no growth).
-            t_notify_hdr = content_top + 132.0;
-            t_notify = content_top + 176.0;
-            t_notify_fail = content_top + 224.0;
-            t_notify_dur = content_top + 272.0;
-            t_auto_summon = content_top + 320.0;
+            // Extra gap above the header separates it from the Launch section; 48-px
+            // pitch for the single-line controls; ends ~content_top+364, well inside
+            // the 460-px Shell content region (PANEL_H fits, no growth).
+            t_notify_hdr = content_top + 150.0;
+            t_notify = content_top + 196.0;
+            t_notify_fail = content_top + 244.0;
+            t_notify_dur = content_top + 292.0;
+            t_auto_summon = content_top + 340.0;
         }
         4 => {
             // 15 bands × FX_PITCH px pitch, top-to-bottom from content_top.
@@ -729,7 +730,7 @@ pub fn build_panel(
             t_fx_vignette = content_top +  7.0*FX_PITCH - s; // band 7: crt_vignette slider
             t_fx_tint     = content_top +  8.0*FX_PITCH - s; // band 8: crt_scanline_tint RGB
             t_fx_anim     = content_top +  9.0*FX_PITCH - s; // band 9: roll/flicker/jitter chips
-            t_fx_caret_hdr= content_top + 10.0*FX_PITCH - s; // band 10: "CARET" section header
+            t_fx_caret_hdr= content_top + 10.0*FX_PITCH - s; // band 10: "Caret" section header
             t_fx_flash    = content_top + 11.0*FX_PITCH - s; // band 11: caret_flash_enabled switch
             t_fx_glow     = content_top + 12.0*FX_PITCH - s; // band 12: caret_glow_enabled switch
             t_fx_dur      = content_top + 13.0*FX_PITCH - s; // band 13: caret_flash_ms slider
@@ -973,7 +974,7 @@ pub fn build_panel(
     }
 
     // --- Theme picker — collapsible dropdown combo (Look) ---
-    // "THEME" header at t_theme. Below it a full-width "combo" control shows the
+    // "Theme" header at t_theme. Below it a full-width "combo" control shows the
     // ACTIVE theme's display name + an 8-swatch ANSI strip + a caret. Clicking it
     // toggles `theme_dropdown_open`. When open, a floating menu of presets (name +
     // swatches, selected row accent-tinted with an accent edge) is laid out below,
@@ -1005,7 +1006,7 @@ pub fn build_panel(
         let row_y = menu_top + LIST_PAD + i as f32 * (THEME_ROW_H + THEME_ROW_GAP);
         theme_row_rects.push(Rect::rounded(row_x, row_y, row_w, THEME_ROW_H, row_sel, 5.0));
     }
-    // ▲/▼ scroll arrows sit on the "THEME" header row, right-aligned — same
+    // ▲/▼ scroll arrows sit on the "Theme" header row, right-aligned — same
     // pattern as the font lists — but only when the list is open AND overflows.
     // Otherwise they go offscreen (never hit-testable).
     let theme_has_scroll = theme_dropdown_open && num_presets > MAX_THEME_ROWS;
@@ -1033,7 +1034,7 @@ pub fn build_panel(
     let (notify_failure_toggle, notify_failure_knob) = switch_at(t_notify_fail, notify.only_on_failure);
     let (notify_dur_body, notify_dur_prev, notify_dur_next) = cycler_at(t_notify_dur);
     let (auto_summon_toggle, auto_summon_knob) = switch_at(t_auto_summon, notify.auto_summon);
-    // Section-header hairline rule to the right of "RUN & NOTIFY" (7 chars wide
+    // Section-header hairline rule to the right of "Run & Notify" (7 chars wide
     // header → account for its glyphs). Drawn only on the Shell tab (t is OFF else).
     let notify_rule = Rect {
         x: px + PAD + 12.0 * char_w + 12.0,
@@ -1081,8 +1082,8 @@ pub fn build_panel(
     let (crt_tint_b_track, crt_tint_b_q, crt_tint_b_fill, crt_tint_b_handle) =
         mini_slider_at(rgb_b_x, t_fx_tint, effects.crt_scanline_tint[2]);
 
-    // CRT animation toggle chips (band 9): ROLL / FLKR / JITR, right-aligned.
-    const CHIP_W: f32 = 56.0;
+    // CRT animation toggle chips (band 9): Roll / Flicker / Jitter, right-aligned.
+    const CHIP_W: f32 = 72.0;
     const CHIP_H: f32 = 24.0;
     let chip_x2 = px + PANEL_W - PAD - CHIP_W;
     let chip_x1 = chip_x2 - CHIP_W - 8.0;
@@ -1215,7 +1216,7 @@ pub fn build_panel(
     // are at their scrolled positions. The caller renders them with a hardware
     // scissor rect (`effects_viewport`) so overflow is GPU-clipped.
     if active_tab == 4 {
-        // Section hairlines beside the "CRT" / "CARET" headers.
+        // Section hairlines beside the "CRT" / "Caret" headers.
         let section_rule = |t: f32, chars: f32| -> Rect {
             Rect {
                 x: track_x + chars * char_w + 12.0,
@@ -1383,13 +1384,13 @@ pub fn build_panel(
     // OPACITY header — CAPS with right-aligned "97%" value.
     let pct = (opacity * 100.0).round() as i32;
     let pct_str = format!("{}%", pct);
-    labels.push(("OPACITY".to_string(), px + PAD, t_opacity, text_header));
+    labels.push(("Opacity".to_string(), px + PAD, t_opacity, text_header));
     labels.push((pct_str.clone(), right_x(&pct_str), t_opacity, text_main));
 
     // CORNER RADIUS header — CAPS with right-aligned "Npx" value.
     let radius_px = corner_radius.round() as i32;
     let radius_str = format!("{}px", radius_px);
-    labels.push(("CORNER RADIUS".to_string(), px + PAD, t_radius, text_header));
+    labels.push(("Corner radius".to_string(), px + PAD, t_radius, text_header));
     labels.push((radius_str.clone(), right_x(&radius_str), t_radius, text_main));
 
     // Helper: center a (possibly truncated) cycler value between its chevrons.
@@ -1424,13 +1425,13 @@ pub fn build_panel(
 
     // SUMMON EFFECT / WINDOW MODE / TAB BAR bands (Window) — CAPS headers with
     // the segmented cycler on the same row.
-    labels.push(("SUMMON EFFECT".to_string(), px + PAD, t_summon + 6.0, text_header));
+    labels.push(("Summon effect".to_string(), px + PAD, t_summon + 6.0, text_header));
     push_cycler_labels(&mut labels, t_summon, summon_effect_name);
-    labels.push(("WINDOW MODE".to_string(), px + PAD, t_winmode + 6.0, text_header));
+    labels.push(("Window mode".to_string(), px + PAD, t_winmode + 6.0, text_header));
     push_cycler_labels(&mut labels, t_winmode, window_mode_name);
-    labels.push(("TAB BAR".to_string(), px + PAD, t_tabbar + 6.0, text_header));
+    labels.push(("Tab bar".to_string(), px + PAD, t_tabbar + 6.0, text_header));
     push_cycler_labels(&mut labels, t_tabbar, tab_bar_name);
-    labels.push(("SCROLLBACK LINES".to_string(), px + PAD, t_scrollback + 6.0, text_header));
+    labels.push(("Scrollback lines".to_string(), px + PAD, t_scrollback + 6.0, text_header));
     push_cycler_labels(&mut labels, t_scrollback, scrollback_name);
 
     // DROPDOWN HEIGHT band (Window) — CAPS header + right-aligned value.
@@ -1438,17 +1439,17 @@ pub fn build_panel(
     let dh_val_text = if is_dropdown { text_main } else { text_hint };
     let dh_pct = (dropdown_height_pct * 100.0).round() as i32;
     let dh_str = format!("{}%", dh_pct);
-    labels.push(("DROPDOWN HEIGHT".to_string(), px + PAD, t_droph, dh_text));
+    labels.push(("Dropdown height".to_string(), px + PAD, t_droph, dh_text));
     labels.push((dh_str.clone(), right_x(&dh_str), t_droph, dh_val_text));
 
     // DROPDOWN WIDTH band (Window) — CAPS header + right-aligned value.
     let dw_pct = (dropdown_width_pct * 100.0).round() as i32;
     let dw_str = format!("{}%", dw_pct);
-    labels.push(("DROPDOWN WIDTH".to_string(), px + PAD, t_dropw, dh_text));
+    labels.push(("Dropdown width".to_string(), px + PAD, t_dropw, dh_text));
     labels.push((dw_str.clone(), right_x(&dw_str), t_dropw, dh_val_text));
 
     // AUTO-HIDE band (Window) — CAPS header; the switch itself is stateful.
-    labels.push(("AUTO-HIDE ON FOCUS LOSS".to_string(), px + PAD, t_autohide + 6.0, text_header));
+    labels.push(("Auto-hide on focus loss".to_string(), px + PAD, t_autohide + 6.0, text_header));
 
     // Emit one stepper's labels: − / value / + / Reset.
     let push_stepper_labels = |labels: &mut Vec<(String, f32, f32, [u8; 3])>,
@@ -1477,7 +1478,7 @@ pub fn build_panel(
 
     // FONT SIZE band (Fonts) — CAPS header + stepper with the "Npt" value inside.
     let fs_str = format!("{}pt", font_size.round() as i32);
-    labels.push(("FONT SIZE".to_string(), px + PAD, t_fontsize + 6.0, text_header));
+    labels.push(("Font size".to_string(), px + PAD, t_fontsize + 6.0, text_header));
     push_stepper_labels(&mut labels, t_fontsize, &fs_str);
 
     // List-section header helper: CAPS header + n/total counter + ▲▼ arrows.
@@ -1501,7 +1502,7 @@ pub fn build_panel(
     push_list_header(
         &mut labels,
         t_fontlist,
-        "FONT",
+        "Font",
         offset + visible_count,
         families.len(),
         families.len() > MAX_FONT_ROWS,
@@ -1524,13 +1525,13 @@ pub fn build_panel(
 
     // ── UI FONT section labels (Fonts) ──
     let ui_fs_str = format!("{}pt", ui_font_size.round() as i32);
-    labels.push(("UI FONT SIZE".to_string(), px + PAD, t_uifontsize + 6.0, text_header));
+    labels.push(("UI font size".to_string(), px + PAD, t_uifontsize + 6.0, text_header));
     push_stepper_labels(&mut labels, t_uifontsize, &ui_fs_str);
 
     push_list_header(
         &mut labels,
         t_uifontlist,
-        "UI FONT",
+        "UI font",
         ui_offset + ui_visible_count,
         ui_families.len(),
         ui_families.len() > MAX_UI_FONT_ROWS,
@@ -1555,7 +1556,7 @@ pub fn build_panel(
     }
 
     // THEME band (Look) — CAPS header (+ scroll arrows/counter when open+overflow).
-    labels.push(("THEME".to_string(), px + PAD, t_theme, text_header));
+    labels.push(("Theme".to_string(), px + PAD, t_theme, text_header));
 
     // Truncate a display name to fit the combo/row width (leaving room for swatches).
     let fit_theme_name = |name: &str| -> String {
@@ -1604,12 +1605,12 @@ pub fn build_panel(
     }
 
     // SHELL band (Shell) — CAPS header + segmented cycler + helper line.
-    labels.push(("SHELL".to_string(), px + PAD, t_shell + 6.0, text_header));
+    labels.push(("Shell".to_string(), px + PAD, t_shell + 6.0, text_header));
     push_cycler_labels(&mut labels, t_shell, shell_display);
     labels.push(("Applies to new tabs".to_string(), px + PAD, t_shell + 34.0, text_hint));
 
     // LAUNCH AT LOGIN band (Shell) — CAPS header + switch + helper line.
-    labels.push(("LAUNCH AT LOGIN".to_string(), px + PAD, t_launch + 6.0, text_header));
+    labels.push(("Launch at login".to_string(), px + PAD, t_launch + 6.0, text_header));
     labels.push((
         "Adds a desktop autostart entry".to_string(),
         px + PAD,
@@ -1620,25 +1621,25 @@ pub fn build_panel(
     // RUN & NOTIFY section (Shell, v0.15) — section header + two switches, a
     // minimum-duration cycler, and the auto-summon switch. Needs OSC 133 shell
     // integration to fire; plain bash (no bash-preexec) is failure-only.
-    labels.push(("RUN & NOTIFY".to_string(), px + PAD, t_notify_hdr, text_main));
+    labels.push(("Run & Notify".to_string(), px + PAD, t_notify_hdr, text_main));
     labels.push((
         // Kept short so it never overflows the panel's content box — see the
         // `all_panel_labels_fit_within_content_width` test that guards this class.
         "Notify on finish while hidden".to_string(),
         px + PAD,
-        t_notify_hdr + 18.0,
+        t_notify_hdr + 23.0,
         text_hint,
     ));
-    labels.push(("NOTIFY ON FINISH".to_string(), px + PAD, t_notify + 6.0, text_header));
-    labels.push(("ONLY ON FAILURE".to_string(), px + PAD, t_notify_fail + 6.0, text_header));
-    labels.push(("MINIMUM DURATION".to_string(), px + PAD, t_notify_dur + 6.0, text_header));
+    labels.push(("Notify on finish".to_string(), px + PAD, t_notify + 6.0, text_header));
+    labels.push(("Only on failure".to_string(), px + PAD, t_notify_fail + 6.0, text_header));
+    labels.push(("Minimum duration".to_string(), px + PAD, t_notify_dur + 6.0, text_header));
     let dur_name = if notify.min_seconds >= 60 && notify.min_seconds.is_multiple_of(60) {
         format!("{}m", notify.min_seconds / 60)
     } else {
         format!("{}s", notify.min_seconds)
     };
     push_cycler_labels(&mut labels, t_notify_dur, &dur_name);
-    labels.push(("AUTO-SUMMON WHEN HIDDEN".to_string(), px + PAD, t_auto_summon + 6.0, text_header));
+    labels.push(("Auto-summon when hidden".to_string(), px + PAD, t_auto_summon + 6.0, text_header));
 
     // ── Effects-tab labels (into effects_labels; empty when tab ≠ 4) ────────
     // When active_tab == 4, band tops carry the scroll offset so label Y
@@ -1646,13 +1647,13 @@ pub fn build_panel(
     // with TextArea.bounds = content viewport so labels outside the viewport
     // are suppressed by glyphon.
     if active_tab == 4 {
-        // Section headers "CRT" / "CARET" (bands 0, 10) — main-text CAPS with a
+        // Section headers "CRT" / "Caret" (bands 0, 10) — main-text CAPS with a
         // hairline rule to the right (pushed in the quad pass above).
         effects_labels.push(("CRT".to_string(), px + PAD, t_fx_crt_hdr, text_main));
-        effects_labels.push(("CARET".to_string(), px + PAD, t_fx_caret_hdr, text_main));
+        effects_labels.push(("Caret".to_string(), px + PAD, t_fx_caret_hdr, text_main));
 
         // CRT ENABLED band (band 1) — header + switch (stateful, no text).
-        effects_labels.push(("CRT ENABLED".to_string(), px + PAD, t_fx_crt_en + 6.0, text_header));
+        effects_labels.push(("CRT enabled".to_string(), px + PAD, t_fx_crt_en + 6.0, text_header));
 
         // CRT slider bands (2–7): CAPS header + right-aligned "N%" value.
         macro_rules! fx_slider_label {
@@ -1663,25 +1664,25 @@ pub fn build_panel(
                 effects_labels.push((pct_str.clone(), right_x(&pct_str), $band_y, text_main));
             };
         }
-        fx_slider_label!("CURVATURE", t_fx_curv,     effects.crt_curvature);
-        fx_slider_label!("SCANLINE",  t_fx_scan,     effects.crt_scanline);
-        fx_slider_label!("MASK",      t_fx_mask,     effects.crt_mask);
-        fx_slider_label!("BLOOM",     t_fx_bloom,    effects.crt_bloom);
-        fx_slider_label!("CHROMATIC", t_fx_chroma,   effects.crt_chromatic);
-        fx_slider_label!("VIGNETTE",  t_fx_vignette, effects.crt_vignette);
+        fx_slider_label!("Curvature", t_fx_curv,     effects.crt_curvature);
+        fx_slider_label!("Scanline",  t_fx_scan,     effects.crt_scanline);
+        fx_slider_label!("Mask",      t_fx_mask,     effects.crt_mask);
+        fx_slider_label!("Bloom",     t_fx_bloom,    effects.crt_bloom);
+        fx_slider_label!("Chromatic", t_fx_chroma,   effects.crt_chromatic);
+        fx_slider_label!("Vignette",  t_fx_vignette, effects.crt_vignette);
 
         // CRT scanline-tint RGB triple (band 8): section header + R/G/B sub-labels.
-        effects_labels.push(("TINT".to_string(), px + PAD, t_fx_tint, text_header));
+        effects_labels.push(("Tint".to_string(), px + PAD, t_fx_tint, text_header));
         effects_labels.push(("R".to_string(), rgb_r_x, t_fx_tint, text_dim));
         effects_labels.push(("G".to_string(), rgb_g_x, t_fx_tint, text_dim));
         effects_labels.push(("B".to_string(), rgb_b_x, t_fx_tint, text_dim));
 
         // CRT animation chips (band 9): header + three chip labels.
-        effects_labels.push(("ANIMATE".to_string(), px + PAD, t_fx_anim + 6.0, text_header));
+        effects_labels.push(("Animate".to_string(), px + PAD, t_fx_anim + 6.0, text_header));
         for (chip, on, txt) in [
-            (&crt_roll_toggle, effects.crt_animate_roll, "ROLL"),
-            (&crt_flicker_toggle, effects.crt_flicker, "FLKR"),
-            (&crt_jitter_toggle, effects.crt_jitter, "JITR"),
+            (&crt_roll_toggle, effects.crt_animate_roll, "Roll"),
+            (&crt_flicker_toggle, effects.crt_flicker, "Flicker"),
+            (&crt_jitter_toggle, effects.crt_jitter, "Jitter"),
         ] {
             let col = if on { on_accent } else { text_btn };
             effects_labels.push((
@@ -1693,18 +1694,18 @@ pub fn build_panel(
         }
 
         // CARET FLASH / GLOW switches (bands 11, 12).
-        effects_labels.push(("FLASH".to_string(), px + PAD, t_fx_flash + 6.0, text_header));
-        effects_labels.push(("GLOW".to_string(), px + PAD, t_fx_glow + 6.0, text_header));
+        effects_labels.push(("Flash".to_string(), px + PAD, t_fx_flash + 6.0, text_header));
+        effects_labels.push(("Glow".to_string(), px + PAD, t_fx_glow + 6.0, text_header));
 
         // FLASH MS slider (band 13): maps 60..=400 → shows raw ms value.
-        effects_labels.push(("FLASH MS".to_string(), px + PAD, t_fx_dur, text_header));
+        effects_labels.push(("Flash (ms)".to_string(), px + PAD, t_fx_dur, text_header));
         {
             let ms_str = format!("{}ms", effects.caret_flash_ms.round() as i32);
             effects_labels.push((ms_str.clone(), right_x(&ms_str), t_fx_dur, text_main));
         }
 
         // CARET flash-color RGB triple (band 14): section header + R/G/B sub-labels.
-        effects_labels.push(("COLOR".to_string(), px + PAD, t_fx_color, text_header));
+        effects_labels.push(("Color".to_string(), px + PAD, t_fx_color, text_header));
         effects_labels.push(("R".to_string(), rgb_r_x, t_fx_color, text_dim));
         effects_labels.push(("G".to_string(), rgb_g_x, t_fx_color, text_dim));
         effects_labels.push(("B".to_string(), rgb_b_x, t_fx_color, text_dim));
@@ -2347,18 +2348,18 @@ mod tests {
     fn caps_headers_present_per_tab() {
         // Each tab carries only its own CAPS headers.
         let expected: [&[&str]; 5] = [
-            &["OPACITY", "CORNER RADIUS", "THEME"],
-            &["FONT SIZE", "FONT", "UI FONT SIZE", "UI FONT"],
+            &["Opacity", "Corner radius", "Theme"],
+            &["Font size", "Font", "UI font size", "UI font"],
             &[
-                "SUMMON EFFECT", "WINDOW MODE", "TAB BAR", "SCROLLBACK LINES",
-                "DROPDOWN HEIGHT", "DROPDOWN WIDTH", "AUTO-HIDE ON FOCUS LOSS",
+                "Summon effect", "Window mode", "Tab bar", "Scrollback lines",
+                "Dropdown height", "Dropdown width", "Auto-hide on focus loss",
             ],
-            &["SHELL", "LAUNCH AT LOGIN"],
+            &["Shell", "Launch at login"],
             // Tab 4 "Effects": section headers + every widget CAPS label.
             &[
-                "CRT", "CRT ENABLED", "CURVATURE", "SCANLINE", "MASK",
-                "BLOOM", "CHROMATIC", "VIGNETTE", "TINT", "ANIMATE",
-                "CARET", "FLASH", "GLOW", "FLASH MS", "COLOR",
+                "CRT", "CRT enabled", "Curvature", "Scanline", "Mask",
+                "Bloom", "Chromatic", "Vignette", "Tint", "Animate",
+                "Caret", "Flash", "Glow", "Flash (ms)", "Color",
             ],
         ];
         for (tab, headers) in expected.iter().enumerate() {
