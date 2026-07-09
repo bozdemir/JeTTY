@@ -9,6 +9,10 @@ mod watch;
 pub mod themes;
 pub mod clipboard;
 pub mod input;
+/// Zero-cost-when-off real-window perf instrumentation (`JETTY_PERF_LOG=1`). Public
+/// so `main.rs` can stamp process start and the `jetty-bench` bin can reuse the
+/// shared percentile/env seams.
+pub mod perf;
 
 use app::AppEvent;
 use winit::event_loop::{ControlFlow, EventLoop};

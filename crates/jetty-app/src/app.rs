@@ -869,6 +869,12 @@ pub struct App {
     /// the tab/close hit-rects line up with what's drawn. `None` when the HUD is
     /// disabled or hidden (too-narrow window). Not perf-critical (clone on render).
     perf_label: Option<String>,
+    /// Real-window perf instrumentation (`JETTY_PERF_LOG=1`): input latency,
+    /// exec→first-frame cold start, idle RSS. `perf.on` is a plain bool read ONCE
+    /// from the environment at construction; when false every stamp site below is a
+    /// single predictable-false branch and the hot paths are byte-identical. See
+    /// `crate::perf`.
+    perf: crate::perf::Perf,
 
     /// Whether the in-window "Keyboard Shortcuts" help overlay is open. Drawn on
     /// top of everything in the main window; dismissed by Esc, the "?" button,
@@ -1220,6 +1226,7 @@ impl App {
             perf_idle_at: None,
             perf_idle_shown: false,
             perf_label: None,
+            perf: crate::perf::Perf::from_env(),
             help_open: false,
             search_open: false,
             search_refresh_at: None,
@@ -5773,6 +5780,12 @@ impl ApplicationHandler<AppEvent> for App {
     /// `Wait` (idle 0 CPU) the instant nothing is pending. On X11/Wayland this is
     /// just a brief Poll burst during the animation (redraws already deliver).
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Input-latency percentile emit (JETTY_PERF_LOG only): runs HERE, off the
+        // timed present path, so printing a batch never stalls the frame it measured
+        // (observer-effect fix). Emits at most once per REPORT_EVERY new samples.
+        if self.perf.on {
+            self.perf.maybe_report();
+        }
         // Force-flush any elapsed synchronized update (CSI ?2026) FIRST so a
         // stuck BSU can't freeze the terminal; the next pending one is scheduled
         // via WaitUntil below (F1).
@@ -6001,6 +6014,27 @@ impl ApplicationHandler<AppEvent> for App {
         } else {
             winit::event_loop::ControlFlow::Wait
         };
+        // Idle RSS (JETTY_PERF_LOG only): sampled ONCE, the first time the loop
+        // settles to a true `Wait` after the prompt is up (≥750ms since exec, so the
+        // shell has drawn its prompt). Reuses the HUD's sysinfo handle; latches, so
+        // it costs one syscall for the whole session and nothing thereafter. Zero
+        // cost when off (guarded by `perf.on`). RSS includes shared pages (not PSS).
+        if self.perf.on
+            && !self.perf.idle_rss_logged
+            && self.perf.first_frame_logged
+            && matches!(control_flow, winit::event_loop::ControlFlow::Wait)
+            && crate::perf::process_start().is_none_or(|t| {
+                t.elapsed() >= std::time::Duration::from_millis(750)
+            })
+        {
+            self.perf.idle_rss_logged = true;
+            if let Some(bytes) = crate::perf::current_rss_bytes() {
+                eprintln!(
+                    "jetty-perf: idle RSS {:.1} MB (resident set incl. shared pages, not PSS; via sysinfo)",
+                    bytes as f64 / (1024.0 * 1024.0)
+                );
+            }
+        }
         event_loop.set_control_flow(control_flow);
     }
 
@@ -6296,6 +6330,13 @@ impl ApplicationHandler<AppEvent> for App {
         match ev {
             AppEvent::Wake => {
                 let (had_data, chrome_changed, exited) = self.drain_pty();
+                // Input-latency echo signal (JETTY_PERF_LOG only): the Wake drain is
+                // usually where the shell's keystroke echo is consumed (before the
+                // redraw re-drains empty), so mark it here too. Gated on `perf.on`;
+                // drain_pty/drain_one_tab themselves stay byte-identical.
+                if self.perf.on && had_data {
+                    self.perf.note_active_output();
+                }
                 // A tab whose shell exited (Ctrl+D / `exit`) closes THAT tab,
                 // Yakuake-style; if it was the last tab, close_exited_tabs exits
                 // the loop. The waker fires ~10x/s, so we react within a frame.
@@ -8144,6 +8185,15 @@ impl ApplicationHandler<AppEvent> for App {
                         let w = &mut self.tabs[self.active].writer;
                         let _ = w.write_all(&bytes);
                         let _ = w.flush();
+                        // Input-latency START stamp (JETTY_PERF_LOG only): record the
+                        // keystroke instant so the frame that reflects its echo can
+                        // measure keypress→glyph. Gated on `perf.on` (a bool read once
+                        // at startup) → the default path pays one predictable-false
+                        // branch, no Instant::now(). Arms only at a quiescent prompt
+                        // (main window). See crate::perf.
+                        if self.perf.on {
+                            self.perf.note_key_send();
+                        }
                         // Trigger caret flash+pulse on printable keystrokes.
                         // Arm the shared burst clock when EITHER caret effect is on;
                         // each consumer is independently gated on its own toggle.
@@ -8271,6 +8321,12 @@ impl ApplicationHandler<AppEvent> for App {
                 // (chrome changes are picked up by this same frame's
                 // tabs_meta()/tab_activity snapshot below, so the flag is moot here.)
                 let (had, _chrome_changed, exited) = self.drain_pty();
+                // Input-latency echo signal (JETTY_PERF_LOG only): if this drain
+                // consumed active-tab output, refresh the quiescent clock and mark
+                // any armed keystroke's echo as seen. Gated on `perf.on`.
+                if self.perf.on && had {
+                    self.perf.note_active_output();
+                }
                 if !self.close_exited_tabs(exited, event_loop) {
                     return;
                 }
@@ -8551,6 +8607,17 @@ impl ApplicationHandler<AppEvent> for App {
                         l.2 += bar_offset;
                     }
                 }
+                // Input-latency PRIMARY stamp (JETTY_PERF_LOG only): the frame's CPU
+                // data is now fully built and we're about to acquire the swapchain —
+                // which in Fifo (vsync) blocks at `acquire_frame` below. Capturing
+                // here yields keypress→frame-ready WITHOUT the display-cadence wait.
+                // Peek only (the pending key is consumed after present). Gated on
+                // `perf.on` → one predictable-false branch on the default path.
+                let perf_ready_ms = if self.perf.on {
+                    self.perf.pending_elapsed_ms()
+                } else {
+                    None
+                };
                 if let Some((frame, view)) = gpu.acquire_frame() {
                     // Tier-B routing: when a Liquid/Focus effect is ACTIVELY
                     // summoning (t in [0,1)) AND the offscreen texture exists,
@@ -9158,7 +9225,34 @@ impl ApplicationHandler<AppEvent> for App {
                             );
                         }
                     }
+                    // Input-latency SECONDARY stamp (JETTY_PERF_LOG only): captured
+                    // AFTER the vsync-throttled acquire + GPU-pass submit, just before
+                    // present → keypress→pre-present. The Vec push + any emit happen
+                    // AFTER present() below so the measurement never perturbs the
+                    // frame it is timing (observer-effect fix).
+                    let perf_present_ms = if self.perf.on {
+                        self.perf.pending_elapsed_ms()
+                    } else {
+                        None
+                    };
                     frame.present();
+                    if self.perf.on {
+                        if let (Some(ready), Some(present)) = (perf_ready_ms, perf_present_ms) {
+                            self.perf.record_latency(ready, present);
+                        }
+                        // Genuine exec→first-frame + display refresh, logged once.
+                        // This main-window present is the true cold-start first frame
+                        // (the settings/detached presents are user-triggered later).
+                        if !self.perf.first_frame_logged {
+                            let hz = self
+                                .window
+                                .as_ref()
+                                .and_then(|w| w.current_monitor())
+                                .and_then(|m| m.refresh_rate_millihertz())
+                                .map(|mhz| mhz as f32 / 1000.0);
+                            self.perf.log_first_frame(hz);
+                        }
+                    }
                 }
                 // Restore the tab-metadata cache taken above so it persists across
                 // frames (its signature still matches, so it won't rebuild).
