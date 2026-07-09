@@ -3,6 +3,10 @@ mod config;
 mod detached;
 mod notify;
 mod shell_integration;
+mod watch;
+/// User theme loading + registry rebuild. Public so the `jetty-shot` self-test
+/// binary can seed user themes before resolving `JETTY_THEME`.
+pub mod themes;
 pub mod clipboard;
 pub mod input;
 

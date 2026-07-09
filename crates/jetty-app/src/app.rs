@@ -18,6 +18,9 @@ pub enum AppEvent {
     ToggleVisibility,
     /// `jetty --show` / `--hide` — set window visibility explicitly.
     SetVisible(bool),
+    /// A watched config/theme file changed (from the `notify` watcher). Debounced
+    /// and applied from `about_to_wait`; carries no payload (the reload re-reads).
+    ConfigChanged,
 }
 
 /// Window-summon reveal effect, selectable in Settings and persisted in config.
@@ -621,11 +624,20 @@ pub struct App {
     tabs: Vec<Tab>,
     /// Index of the active tab into `tabs`.
     active: usize,
-    /// Index into jetty_core::theme::PRESETS for the current theme.
+    /// Ordered index into the theme registry (`jetty_core::theme::theme_list()` —
+    /// built-ins + user themes) for the current theme. Re-resolved by NAME and
+    /// re-clamped on every config/theme reload, so adding/removing a theme file never
+    /// leaves it dangling.
     theme_idx: usize,
+    /// The RAW resolved active theme (registry-resolved, WITHOUT the global opacity
+    /// applied). Cached so the render hot path (`current_theme`, called every frame
+    /// by the tab bar / modals) never locks the theme registry or re-resolves per
+    /// frame (amendment T1). Recomputed ONLY in `apply_theme` (i.e. on a theme_idx
+    /// change) and on reload; `current_theme` clones it and stamps the live opacity.
+    active_theme: jetty_core::Theme,
     /// Whether the Look-tab theme dropdown is expanded. Session-only (not persisted).
     theme_dropdown_open: bool,
-    /// First visible row index into PRESETS when the theme dropdown is open.
+    /// First visible row index into the theme list when the dropdown is open.
     theme_scroll_offset: usize,
     /// Background opacity (0.0..=1.0); modifies theme bg alpha at runtime.
     opacity: f32,
@@ -673,6 +685,32 @@ pub struct App {
     /// startup; written back to `Config.effects` by `persist()`. UI/renderer tasks
     /// read and write fields here; the next `persist()` call flushes them to disk.
     fx: crate::config::EffectsConfig,
+    // ── SSH-ready & yours (v0.16) ──────────────────────────────────────────────
+    /// Allow OSC 52 clipboard PASTE (remote READ of the local clipboard). Mirrors
+    /// `Config.osc52_allow_paste`; default OFF (secure). Applied to a tab's terminal
+    /// at spawn (and live on reload).
+    osc52_allow_paste: bool,
+    /// Whether config/theme hot-reload is enabled (mirrors `Config.hot_reload`). When
+    /// false the watcher is never spawned (or is dropped on a live turn-off).
+    hot_reload: bool,
+    /// The `notify` file-watcher handle. MUST be kept alive for the process lifetime
+    /// (dropping it stops watching). `None` when hot-reload is off. Named with a
+    /// leading `_` intent, but read on a live turn-off to drop it.
+    config_watcher: Option<::notify::RecommendedWatcher>,
+    /// Set true ONLY for the duration of `reload_config_and_themes`. While set,
+    /// `persist()` is a NO-OP — so a reload applying live keys through the normal
+    /// setters can never write config.toml, making the watcher loop-free BY
+    /// CONSTRUCTION (amendment H2), independent of the hash guard.
+    reloading: bool,
+    /// Hash of the exact string content of the last config.toml WE wrote (via
+    /// `persist`). A reload whose on-disk content hashes to this value is our own
+    /// write echoing back through the watcher → skipped (the secondary loop guard
+    /// after `reloading`). `Cell` so `persist(&self)` can record it.
+    last_written_config_hash: std::cell::Cell<Option<u64>>,
+    /// When `Some`, a debounced config/theme reload is due at this instant. Set by a
+    /// `ConfigChanged` event (coalescing an editor's write/rename/chmod burst); the
+    /// reload runs once from `about_to_wait` when the deadline passes, then clears.
+    pending_reload_at: Option<std::time::Instant>,
     // ── Run & Notify (v0.15) runtime mirrors of the persisted config keys ──────
     /// Notify (toast + taskbar/dock urgency) when a command finishes while JeTTY
     /// is hidden/unfocused. Mirrors `Config.notify_on_command_finish`; the whole
@@ -1006,12 +1044,15 @@ fn url_scheme_allowed(url: &str) -> bool {
 
 impl App {
     pub fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
-        // Resolve initial theme index from JETTY_THEME env var.
+        // Seed the theme registry (built-ins + user themes) BEFORE any theme
+        // resolution below (amendment T4): otherwise a `JETTY_THEME`/config value
+        // naming a USER theme would resolve to idx 0 and the custom default be lost.
+        crate::themes::rebuild_registry();
+
+        // Resolve initial theme index from JETTY_THEME env var (consults the
+        // registry, so a user theme name resolves too).
         let theme_name = std::env::var("JETTY_THEME").unwrap_or_default();
-        let theme_idx = jetty_core::theme::PRESETS
-            .iter()
-            .position(|&n| n == theme_name.as_str())
-            .unwrap_or(0);
+        let theme_idx = jetty_core::theme_index(&theme_name).unwrap_or(0);
 
         // Resolve initial opacity from JETTY_OPACITY env var.
         let opacity = std::env::var("JETTY_OPACITY")
@@ -1087,6 +1128,9 @@ impl App {
             tabs: Vec::new(),
             active: 0,
             theme_idx,
+            // Placeholder; `apply_theme()` at the end of `new` recomputes it from the
+            // config-resolved theme_idx. Resolved via the registry (seeded above).
+            active_theme: jetty_core::theme_at(theme_idx),
             theme_dropdown_open: false,
             theme_scroll_offset: 0,
             opacity,
@@ -1105,6 +1149,13 @@ impl App {
             settings_tab: 0,
             effects_scroll: 0.0,
             fx: crate::config::EffectsConfig::default(),
+            // v0.16 — overridden by config below; safe defaults here.
+            osc52_allow_paste: false,
+            hot_reload: true,
+            config_watcher: None,
+            reloading: false,
+            last_written_config_hash: std::cell::Cell::new(None),
+            pending_reload_at: None,
             // Run & Notify: overridden by config below; safe defaults here.
             notify_on_finish: true,
             notify_min_seconds: 10,
@@ -1190,7 +1241,7 @@ impl App {
         // size/family are consumed later by `resumed` when it builds the
         // TextLayer; theme+opacity are pushed into the terminals by apply_theme.
         let cfg = crate::config::Config::load();
-        if let Some(i) = jetty_core::theme::PRESETS.iter().position(|&n| n == cfg.theme.as_str()) {
+        if let Some(i) = jetty_core::theme_index(&cfg.theme) {
             app.theme_idx = i;
         }
         // Clamp opacity to a VISIBLE floor: a persisted 0.0 would load a fully
@@ -1229,9 +1280,12 @@ impl App {
         app.notify_min_seconds = cfg.notify_min_seconds.clamp(1, 86_400);
         app.notify_only_on_failure = cfg.notify_only_on_failure;
         app.auto_summon_on_finish = cfg.auto_summon_on_finish;
+        app.osc52_allow_paste = cfg.osc52_allow_paste;
+        app.hot_reload = cfg.hot_reload;
 
         // Apply the initial theme+opacity so Terminal::new env defaults are
-        // overridden by our managed state (avoids double-reads from env).
+        // overridden by our managed state (avoids double-reads from env). Also
+        // populates the `active_theme` cache from the config-resolved theme_idx.
         app.apply_theme();
         app
     }
@@ -1240,8 +1294,17 @@ impl App {
     /// Called whenever a setting changes (theme, opacity, font size/family,
     /// corner radius). Best-effort and cheap; errors are swallowed by `save`.
     fn persist(&self) {
-        crate::config::Config {
-            theme: jetty_core::theme::PRESETS[self.theme_idx].to_string(),
+        // Never write config.toml while applying a reload: that would re-trigger the
+        // watcher (a burst of atomic writes) and risk a loop. Combined with the
+        // hash guard, this makes reload loop-free BY CONSTRUCTION (amendment H2).
+        if self.reloading {
+            return;
+        }
+        let cfg = crate::config::Config {
+            // The current theme's stable name (registry-resolved; a user theme keeps
+            // its own name). `active_theme` is kept in lockstep with `theme_idx` by
+            // `apply_theme`, so this is the selected theme without a registry lock.
+            theme: self.active_theme.name.to_string(),
             opacity: self.opacity,
             font_size: self.font_logical,
             font_family: self.font_family.clone(),
@@ -1271,8 +1334,17 @@ impl App {
             notify_min_seconds: self.notify_min_seconds,
             notify_only_on_failure: self.notify_only_on_failure,
             auto_summon_on_finish: self.auto_summon_on_finish,
+            osc52_allow_paste: self.osc52_allow_paste,
+            hot_reload: self.hot_reload,
+        };
+        // Record the hash of the EXACT string we're about to write so the watcher's
+        // echo of our own save is recognized and skipped on reload (secondary loop
+        // guard). `save()` re-serializes the same deterministic string, so this hash
+        // matches the on-disk bytes the reload will read.
+        if let Ok(s) = toml::to_string_pretty(&cfg) {
+            self.last_written_config_hash.set(Some(hash_config_str(&s)));
         }
-        .save();
+        cfg.save();
     }
 
     /// Select a new window-summon reveal effect: persist it, fire a one-shot
@@ -1305,24 +1377,33 @@ impl App {
         &mut self.tabs[self.active]
     }
 
-    /// Build the current theme from `theme_idx` with `opacity` applied to its bg
-    /// alpha. Shared by `apply_theme` and the tab bar.
+    /// The current theme with the global `opacity` applied to its bg alpha.
+    ///
+    /// HOT PATH (amendment T1): called every frame by the tab bar / modals. It clones
+    /// the CACHED `active_theme` (registry-resolved once in `apply_theme`) and stamps
+    /// the live opacity — it never locks the theme registry or re-resolves per frame.
+    /// Opacity is applied here (not baked into the cache) so an opacity change is live
+    /// without invalidating the cache.
     fn current_theme(&self) -> jetty_core::Theme {
-        let mut t = jetty_core::Theme::by_name(jetty_core::theme::PRESETS[self.theme_idx]);
+        let mut t = self.active_theme.clone();
         t.bg[3] = (self.opacity.clamp(0.0, 1.0) * 255.0) as u8;
         t
     }
 
     /// Largest valid `theme_scroll_offset` so the open dropdown's last page is full.
     fn max_theme_scroll(&self) -> usize {
-        jetty_core::theme::PRESETS.len().saturating_sub(MAX_THEME_ROWS)
+        jetty_core::theme_count().saturating_sub(MAX_THEME_ROWS)
     }
 
-    /// Build the current theme from `theme_idx`, apply `opacity` to its bg
-    /// alpha, and push it into EVERY tab's terminal — including the tabs living
-    /// in detached windows, so a live theme/opacity change repaints them too
-    /// (visual parity: one redraw request each, no polling).
+    /// Re-resolve the cached `active_theme` from `theme_idx` (via the registry, never
+    /// direct-indexing — a stale idx falls back safely), apply `opacity`, and push
+    /// the themed palette into EVERY tab's terminal — including the tabs living in
+    /// detached windows, so a live theme/opacity change repaints them too (visual
+    /// parity: one redraw request each, no polling). Non-persisting (safe on reload).
     fn apply_theme(&mut self) {
+        // Refresh the cache from the current index (registry-resolved; `theme_at`
+        // never panics on a stale/out-of-range index).
+        self.active_theme = jetty_core::theme_at(self.theme_idx);
         let t = self.current_theme();
         for tab in &mut self.tabs {
             tab.terminal.set_theme(t.clone());
@@ -1330,6 +1411,200 @@ impl App {
         for dw in &mut self.detached {
             dw.tab.terminal.set_theme(t.clone());
             dw.window.request_redraw();
+        }
+    }
+
+    /// Apply a debounced config + themes hot-reload. Runs on the UI thread from
+    /// `about_to_wait`. Non-destructive and loop-free by construction:
+    ///
+    /// * THEMES are ALWAYS rebuilt + reapplied (amendment T3): editing the active
+    ///   theme file leaves config.toml untouched, so the config hash-skip must not
+    ///   gate the repaint. `theme_idx` is re-resolved by NAME and re-clamped against
+    ///   the rebuilt registry (amendment T2), then `apply_theme` repaints all tabs +
+    ///   detached with the (possibly changed) palette.
+    /// * CONFIG is parsed NON-DESTRUCTIVELY (amendment H1): a parse error keeps the
+    ///   in-memory state and waits for the next event — never `.bad`, never defaults.
+    ///   A file whose content hashes to our own last write is skipped (self-write
+    ///   echo). `self.reloading` disables `persist()` for the whole apply, so no live
+    ///   key can write config.toml back (amendment H2 — loop-free by construction).
+    fn reload_config_and_themes(&mut self) {
+        self.reloading = true;
+
+        // (A) Themes — always. Rebuild the registry from disk, then re-resolve the
+        // active theme BY NAME against it (indices may have shifted) and repaint.
+        crate::themes::rebuild_registry();
+        let cur_name = self.active_theme.name.to_string();
+        self.theme_idx = jetty_core::theme_index(&cur_name)
+            .unwrap_or(0)
+            .min(jetty_core::theme_count().saturating_sub(1));
+        self.apply_theme(); // refreshes active_theme (new palette) + fans out to all surfaces
+
+        // (B) Config — non-destructive, hash-guarded.
+        if let Ok(s) = std::fs::read_to_string(crate::config::Config::config_path()) {
+            let h = hash_config_str(&s);
+            // Skip our own write echoing back through the watcher.
+            if self.last_written_config_hash.get() != Some(h) {
+                if let Some(cfg) = crate::config::Config::parse_reload(&s) {
+                    self.apply_reloaded_config(cfg);
+                }
+                // Record the observed hash so an identical later hand-save no-ops too.
+                self.last_written_config_hash.set(Some(h));
+            }
+        }
+
+        self.reloading = false;
+        // Repaint chrome (theme/settings) once the reload settled.
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+        if let Some(w) = &self.settings_window {
+            w.request_redraw();
+        }
+    }
+
+    /// Apply an externally-edited `Config` LIVE, diffing against current in-memory
+    /// state and touching only changed keys. Runs with `self.reloading == true`, so
+    /// every setter it calls is non-persisting (they early-return in `persist`).
+    ///
+    /// Keys mid-DRAG in the Settings panel are skipped (amendment H4): the in-flight
+    /// interactive value wins over a concurrent external edit. `summon_hotkey` and
+    /// `launch_at_login` are RESTART/external-only and deliberately NOT applied here.
+    fn apply_reloaded_config(&mut self, cfg: crate::config::Config) {
+        let eps = f32::EPSILON;
+
+        // Theme (by name → registry index; never direct-index).
+        if let Some(idx) = jetty_core::theme_index(&cfg.theme) {
+            if idx != self.theme_idx {
+                self.theme_idx = idx;
+                self.apply_theme();
+            }
+        }
+        // Opacity — skip while the user is dragging the opacity slider (H4).
+        if !self.dragging_slider {
+            let op = cfg.opacity.clamp(0.1, 1.0);
+            if (op - self.opacity).abs() > eps {
+                self.opacity = op;
+                self.apply_theme();
+            }
+        }
+        // Terminal font size / family (real setter cores rebuild the atlas + reflow).
+        let fs = cfg.font_size.clamp(6.0, 48.0);
+        if (fs - self.font_logical).abs() > eps {
+            self.set_font_size(fs);
+        }
+        if cfg.font_family != self.font_family {
+            self.set_font_family(cfg.font_family.clone());
+        }
+        // UI (chrome) font size / family.
+        let ufs = cfg.ui_font_size.clamp(UI_FONT_MIN, UI_FONT_MAX);
+        if (ufs - self.ui_font_logical).abs() > eps {
+            self.set_ui_font_size(ufs);
+        }
+        if cfg.ui_font_family != self.ui_font_family {
+            self.set_ui_font_family(cfg.ui_font_family.clone());
+        }
+        // Corner radius — skip while dragging the radius slider (H4).
+        if !self.dragging_radius {
+            let cr = cfg.corner_radius.clamp(0.0, 24.0);
+            if (cr - self.corner_radius).abs() > eps {
+                self.corner_radius = cr;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+        }
+        // Summon effect: ASSIGN directly (NOT set_summon_effect, which fires a one-
+        // shot preview animation on every reload — amendment).
+        let se = SummonEffect::from_config(&cfg.summon_effect);
+        if se != self.summon_effect {
+            self.summon_effect = se;
+        }
+        // Window mode: needs the real setter (docks/undocks; a bare assign is only
+        // half-applied).
+        let wm = WindowMode::from_config(&cfg.window_mode);
+        if wm != self.window_mode {
+            self.set_window_mode(wm);
+        }
+        // Tab-bar position.
+        let bottom = cfg.tab_bar_position == "bottom";
+        if bottom != self.tab_bar_bottom {
+            self.set_tab_bar_bottom(bottom);
+        }
+        // Dropdown height/width — skip the one being dragged (H4); re-dock a docked
+        // window on change.
+        if !self.dragging_dropdown {
+            let dh = cfg.dropdown_height_pct.clamp(0.25, 1.0);
+            if (dh - self.dropdown_height_pct).abs() > eps {
+                self.dropdown_height_pct = dh;
+                self.redock_if_dropdown();
+            }
+        }
+        if !self.dragging_dropdown_width {
+            let dw = cfg.dropdown_width_pct.clamp(0.2, 1.0);
+            if (dw - self.dropdown_width_pct).abs() > eps {
+                self.dropdown_width_pct = dw;
+                self.redock_if_dropdown();
+            }
+        }
+        // Focus auto-hide.
+        self.focus_autohide = cfg.focus_autohide;
+        // Scrollback (live to every tab + detached).
+        let sb = cfg.scrollback_lines.clamp(100, 100_000);
+        if sb != self.scrollback_lines {
+            self.set_scrollback_lines(sb);
+        }
+        // Perf HUD: changes the reserved status-bar height → grid rows, so reflow.
+        if cfg.show_perf_hud != self.show_perf_hud {
+            self.show_perf_hud = cfg.show_perf_hud;
+            self.reflow();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+        // Visual effects — skip while a Effects slider is being dragged (H4).
+        if self.active_fx_drag.is_none() && cfg.effects != self.fx {
+            self.fx = cfg.effects.clone();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            for dw in &self.detached {
+                dw.window.request_redraw();
+            }
+        }
+        // Run & Notify mirrors.
+        self.notify_on_finish = cfg.notify_on_command_finish;
+        self.notify_min_seconds = cfg.notify_min_seconds.clamp(1, 86_400);
+        self.notify_only_on_failure = cfg.notify_only_on_failure;
+        self.auto_summon_on_finish = cfg.auto_summon_on_finish;
+        // OSC 52 paste: apply LIVE to every existing tab (the setter preserves each
+        // tab's scrollback), so it is not merely "new tabs only".
+        if cfg.osc52_allow_paste != self.osc52_allow_paste {
+            self.osc52_allow_paste = cfg.osc52_allow_paste;
+            for tab in &mut self.tabs {
+                tab.terminal.set_osc52_allow_paste(cfg.osc52_allow_paste);
+            }
+            for dw in &mut self.detached {
+                dw.tab.terminal.set_osc52_allow_paste(cfg.osc52_allow_paste);
+            }
+        }
+        // Hot-reload toggle: turning it OFF live drops the watcher (stops watching).
+        // Turning it ON when it was off is restart-only (no watcher exists to detect
+        // the change) — documented.
+        self.hot_reload = cfg.hot_reload;
+        if !self.hot_reload {
+            self.config_watcher = None;
+        }
+    }
+
+    /// Re-dock the main window to the top strip when it is a visible Dropdown — used
+    /// after a live dropdown width/height change so it re-docks immediately.
+    fn redock_if_dropdown(&mut self) {
+        if self.visible && self.window_mode == WindowMode::Dropdown {
+            if let Some(w) = &self.window {
+                dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
+                self.pending_dock_frames = 5;
+                w.request_redraw();
+            }
         }
     }
 
@@ -1469,6 +1744,9 @@ impl App {
         let writer = pty.writer();
         let mut terminal = Terminal::new(cols, rows);
         terminal.set_theme(self.current_theme());
+        // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
+        // Applied at spawn so new tabs pick up the current setting.
+        terminal.set_osc52_allow_paste(self.osc52_allow_paste);
         // Apply the configured scrollback cap (guard skips the no-op
         // set_options round-trip on the 10k default path).
         if self.scrollback_lines != 10_000 {
@@ -2560,6 +2838,28 @@ impl App {
                     tab.title = new_title;
                     title_changed = true;
                 }
+            }
+        }
+        // OSC 52 COPY: a remote/tmux/nvim asked to set the system clipboard. Ride
+        // this same drain pass (main + detached both drain here) — lock-free flag
+        // check when clean, so zero idle cost. `crate::clipboard::set` is a free fn
+        // (no self borrow), so this is conflict-free inside `drain_one_tab`.
+        if let Some(text) = tab.terminal.take_clipboard_store() {
+            crate::clipboard::set(&text);
+        }
+        // OSC 52 PASTE (load): a program asked to READ the clipboard. Only ever
+        // present when the user enabled `osc52_allow_paste` (else alacritty denies it
+        // and no request reaches us). Read the clipboard, CAP the reply length, format
+        // via alacritty's supplied formatter, and write it back to the PTY.
+        if let Some(fmt) = tab.terminal.take_clipboard_load() {
+            if let Some(mut text) = crate::clipboard::get() {
+                if text.len() > jetty_core::OSC52_MAX_BYTES {
+                    text.truncate(floor_char_boundary(&text, jetty_core::OSC52_MAX_BYTES));
+                }
+                let reply = fmt(&text);
+                let _ = tab.writer.write_all(reply.as_bytes());
+                let _ = tab.writer.flush();
+                had = true;
             }
         }
         (had, title_changed)
@@ -4861,7 +5161,7 @@ impl App {
                 self.corner_radius = self.radius_from_cursor(cx, &geom.radius_track);
             }
             input::MouseAction::SetTheme(i) => {
-                if i < jetty_core::theme::PRESETS.len() {
+                if i < jetty_core::theme_count() {
                     self.theme_idx = i;
                     self.apply_theme();
                 }
@@ -5521,6 +5821,16 @@ impl ApplicationHandler<AppEvent> for App {
             self.pending_autohide_at = None;
             self.autohide_main_window();
         }
+        // Debounced config/theme hot-reload: the burst settled (no newer
+        // ConfigChanged pushed the deadline out) — apply it once. (The deadline is
+        // routed through WaitUntil below, so idle stays at zero work.)
+        if self
+            .pending_reload_at
+            .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            self.pending_reload_at = None;
+            self.reload_config_and_themes();
+        }
         // Trailing scrollback-search refresh (F10): a streaming burst that
         // ended inside the throttle window marked the matches dirty but never
         // got a re-collect (no later drain carries data), leaving highlights,
@@ -5630,6 +5940,11 @@ impl ApplicationHandler<AppEvent> for App {
         }
         // The scheduled focus-loss auto-hide (elapsed ones ran above).
         if let Some(d) = self.pending_autohide_at {
+            merge_wake(&mut wake_at, d);
+        }
+        // The debounced config/theme reload deadline (elapsed ones ran above), so
+        // the loop wakes exactly once to apply it instead of polling.
+        if let Some(d) = self.pending_reload_at {
             merge_wake(&mut wake_at, d);
         }
         // Pending synchronized-update (CSI ?2026) flush deadline: wake exactly
@@ -5865,6 +6180,9 @@ impl ApplicationHandler<AppEvent> for App {
         // p10k's cursor-position / capability queries which have tight timeouts.
         let mut terminal = Terminal::new(cols, rows);
         terminal.set_theme(self.current_theme());
+        // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
+        // Applied at spawn so new tabs pick up the current setting.
+        terminal.set_osc52_allow_paste(self.osc52_allow_paste);
         // Apply the configured scrollback cap (guard skips the no-op
         // set_options round-trip on the 10k default path).
         if self.scrollback_lines != 10_000 {
@@ -5951,6 +6269,14 @@ impl ApplicationHandler<AppEvent> for App {
         // while virtually eliminating idle CPU waste. Real responsiveness now
         // comes from the on_data wake above, not from this tick.
         spawn_waker(self.proxy.clone());
+
+        // Config/theme hot-reload watcher (unless disabled). OS-event-driven, so its
+        // thread blocks in the kernel and adds ZERO idle CPU. The returned handle is
+        // stored so it lives for the process lifetime (dropping it stops watching).
+        if self.hot_reload && self.config_watcher.is_none() {
+            self.config_watcher = crate::watch::spawn_config_watcher(self.proxy.clone());
+        }
+
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -6079,6 +6405,15 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::SetVisible(want) => {
                 self.set_visibility(want, event_loop);
+            }
+            AppEvent::ConfigChanged => {
+                // Debounce an editor's write/rename/chmod burst: schedule ONE reload
+                // shortly ahead and coalesce (a newer event just pushes it out). The
+                // actual reload runs from `about_to_wait` when the deadline passes —
+                // no disk read here. `about_to_wait` folds this into its WaitUntil
+                // deadline, so idle stays at zero work (one wake, then back to Wait).
+                self.pending_reload_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
             }
         }
     }
@@ -8825,6 +9160,30 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 
+/// Largest byte index `<= max` that is a char boundary of `s` (a stable stand-in for
+/// the unstable `str::floor_char_boundary`). Used to cap an OSC 52 paste reply
+/// without splitting a multibyte char, which would make `String::truncate` panic.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if s.len() <= max {
+        return s.len();
+    }
+    let mut b = max;
+    while b > 0 && !s.is_char_boundary(b) {
+        b -= 1;
+    }
+    b
+}
+
+/// Hash a config-file string to a `u64` (self-write guard for hot-reload). Content-
+/// based and dependency-free; only equality matters, so the exact algorithm is
+/// irrelevant as long as it is deterministic within a process run.
+fn hash_config_str(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 fn spawn_waker(proxy: EventLoopProxy<AppEvent>) {
     // Slow safety heartbeat: 100ms is sufficient for any time-based UI ticking.
     // Responsiveness for PTY data (including p10k query replies) is now driven
@@ -9577,5 +9936,84 @@ mod shift_hint_tests {
         let expired = Some((now - Duration::from_millis(1), 7u32));
         assert!(!shift_hint_live_in(expired, 7u32, now));
         assert!(!shift_hint_live_in(None, 7u32, now));
+    }
+}
+
+#[cfg(test)]
+mod hot_reload_tests {
+    use super::{floor_char_boundary, hash_config_str};
+
+    /// The self-write guard: a reload is IGNORED iff the on-disk content hashes to
+    /// the value we last wrote (our own save echoing back through the watcher).
+    fn is_own_write(observed: u64, last_written: Option<u64>) -> bool {
+        last_written == Some(observed)
+    }
+
+    #[test]
+    fn self_write_hash_guard() {
+        let a = "theme = \"dracula\"\nopacity = 0.9\n";
+        let b = "theme = \"nord\"\nopacity = 0.9\n";
+        // Deterministic within a run: identical content → identical hash.
+        assert_eq!(hash_config_str(a), hash_config_str(a));
+        assert_ne!(hash_config_str(a), hash_config_str(b));
+        // Our own write echoing back is recognized and skipped...
+        assert!(is_own_write(hash_config_str(a), Some(hash_config_str(a))));
+        // ...an EXTERNAL edit (different content) is applied.
+        assert!(!is_own_write(hash_config_str(b), Some(hash_config_str(a))));
+        // No prior write recorded → never treated as our own.
+        assert!(!is_own_write(hash_config_str(a), None));
+    }
+
+    #[test]
+    fn osc52_reply_cap_never_splits_a_char() {
+        // The paste-reply cap must land on a char boundary so String::truncate can't
+        // panic on a multibyte char straddling the cap.
+        let s = "a£b€c"; // '£' is 2 bytes, '€' is 3 bytes
+        for max in 0..=s.len() + 2 {
+            let b = floor_char_boundary(s, max);
+            assert!(b <= s.len());
+            assert!(s.is_char_boundary(b), "cap {max} landed mid-char at {b}");
+        }
+        // A cap at/after the end returns the full length.
+        assert_eq!(floor_char_boundary(s, s.len()), s.len());
+        assert_eq!(floor_char_boundary(s, s.len() + 10), s.len());
+    }
+
+    /// Which config keys apply LIVE on hot-reload vs require a RESTART/external action.
+    /// Mirrors `apply_reloaded_config` (live keys are applied there; `summon_hotkey`
+    /// and `launch_at_login` are deliberately skipped). Test-only classifier so the
+    /// documented contract is locked in.
+    fn is_restart_only(key: &str) -> bool {
+        matches!(key, "summon_hotkey" | "launch_at_login")
+    }
+
+    #[test]
+    fn live_vs_restart_key_classification() {
+        // Restart/external-only keys.
+        assert!(is_restart_only("summon_hotkey"));
+        assert!(is_restart_only("launch_at_login"));
+        // Everything else applies live on reload.
+        for k in [
+            "theme",
+            "opacity",
+            "font_size",
+            "font_family",
+            "ui_font_size",
+            "ui_font_family",
+            "corner_radius",
+            "summon_effect",
+            "window_mode",
+            "tab_bar_position",
+            "dropdown_height_pct",
+            "dropdown_width_pct",
+            "focus_autohide",
+            "scrollback_lines",
+            "show_perf_hud",
+            "effects",
+            "osc52_allow_paste",
+            "hot_reload",
+        ] {
+            assert!(!is_restart_only(k), "{k} should be live-appliable");
+        }
     }
 }
