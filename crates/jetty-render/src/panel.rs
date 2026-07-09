@@ -979,8 +979,9 @@ pub fn build_panel(
     // swatches, selected row accent-tinted with an accent edge) is laid out below,
     // with header-row ▲/▼ arrows when the list overflows. The menu quads/labels
     // are emitted LAST so they overlay anything sitting below the theme band.
-    let presets = jetty_core::theme::PRESETS;
-    let num_presets = presets.len();
+    // Theme list length = built-ins + user-imported themes (registry-backed). Falls
+    // back to the 22 built-ins when the registry is unseeded (e.g. panel unit tests).
+    let num_presets = jetty_core::theme_count();
 
     let combo_x = px + PAD;
     let combo_w = CW;
@@ -1308,10 +1309,10 @@ pub fn build_panel(
     // --- Theme combo header (collapsed, always shown on the Look tab) ---
     // Control fill, then the ACTIVE theme's swatch strip; name + caret are
     // emitted in the label pass.
-    let active_theme_idx = theme_idx.min(num_presets - 1);
+    let active_theme_idx = theme_idx.min(num_presets.saturating_sub(1));
     quads.push(theme_combo);
     {
-        let active = jetty_core::Theme::by_name(presets[active_theme_idx]);
+        let active = jetty_core::theme_at(active_theme_idx);
         let caret_x = theme_combo.x + theme_combo.w - 20.0;
         let strip_left = caret_x - 10.0 - THEME_STRIP_W;
         push_theme_swatches(&mut quads, strip_left, theme_combo.y + theme_combo.h / 2.0, &active);
@@ -1331,7 +1332,7 @@ pub fn build_panel(
                 quads.push(*row);
                 quads.push(Rect::rounded(row.x, row.y + 4.0, 3.0, row.h - 8.0, accent_col, 1.5));
             }
-            let t = jetty_core::Theme::by_name(presets[preset_idx]);
+            let t = jetty_core::theme_at(preset_idx);
             let strip_left = row.x + row.w - 10.0 - THEME_STRIP_W;
             push_theme_swatches(&mut quads, strip_left, row.y + row.h / 2.0, &t);
         }
@@ -1569,9 +1570,9 @@ pub fn build_panel(
 
     // Combo header label: active theme name (left) + ▼ / ▲ caret (right).
     {
-        let active = jetty_core::Theme::by_name(presets[active_theme_idx]);
+        let active = jetty_core::theme_at(active_theme_idx);
         labels.push((
-            fit_theme_name(active.display_name),
+            fit_theme_name(&active.display_name),
             theme_combo.x + 12.0,
             theme_combo.y + 7.0,
             text_main,
@@ -1589,9 +1590,9 @@ pub fn build_panel(
     if theme_dropdown_open {
         for (i, row) in theme_row_rects.iter().enumerate() {
             let preset_idx = theme_offset + i;
-            let name = jetty_core::Theme::by_name(presets[preset_idx]).display_name;
+            let name = jetty_core::theme_at(preset_idx).display_name;
             let col = if preset_idx == theme_idx { text_main } else { text_dim };
-            labels.push((fit_theme_name(name), row.x + 12.0, row.y + 6.0, col));
+            labels.push((fit_theme_name(&name), row.x + 12.0, row.y + 6.0, col));
         }
         if theme_has_scroll {
             labels.push(("^".to_string(), theme_scroll_up.x + 6.0, theme_scroll_up.y + 3.0, text_btn));

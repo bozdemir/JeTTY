@@ -65,6 +65,10 @@ fn env_flag(k: &str) -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Seed the theme registry (built-ins + user themes) so a JETTY_THEME naming a
+    // user-imported theme resolves in Terminal::new / the panel — same as the app.
+    jetty_app::themes::rebuild_registry();
+
     let out_path =
         std::env::var("JETTY_SHOT_OUT").unwrap_or_else(|_| "/tmp/jetty-shot.png".to_string());
 
@@ -454,10 +458,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|v| v.clamp(0.1, 1.0))
                 .unwrap_or(1.0);
             let theme_name = std::env::var("JETTY_THEME").unwrap_or_default();
-            let theme_idx = jetty_core::theme::PRESETS
-                .iter()
-                .position(|&n| n == theme_name.as_str())
-                .unwrap_or(0);
+            let theme_idx = jetty_core::theme_index(&theme_name).unwrap_or(0);
 
             // JETTY_SHOT_PANEL_OFFSET="dx,dy" — two f32 (default "0,0").
             // Lets the caller verify the moveable-dialog path at an offset.
