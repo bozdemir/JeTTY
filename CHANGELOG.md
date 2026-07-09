@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.16.0] — 2026-07-09
+
+**SSH-ready & yours** — three daily-driver features that remove reasons to reach
+for another terminal. Designed from a verified blueprint, stress-tested by two
+design critics (9 blocking issues caught pre-implementation), then adversarially
+reviewed.
+
+### Added
+- **OSC 52 clipboard** — copy from inside `ssh` / `tmux` / `nvim` (or any program
+  that emits OSC 52) straight to your **local** system clipboard. Write is on by
+  default; **remote paste/read is opt-in** (`osc52_allow_paste`, default off) so a
+  remote host can't silently exfiltrate your clipboard. Committed text is capped
+  at 100 KiB.
+- **User / importable themes** — drop a `~/.config/jetty/themes/*.toml` palette
+  (16 ANSI colors + fg/bg/cursor/selection) and it shows up in the theme picker;
+  a user theme can **shadow** a built-in of the same name. Malformed theme files
+  are skipped (and logged), never crash.
+- **Config hot-reload** — edit `~/.config/jetty/config.toml` (or a theme file)
+  while JeTTY is running and it **applies live** — theme, opacity, font, effects,
+  scrollback, and more — no restart. It watches the *canonical* file (so symlinked
+  dotfiles work), never fights its own writes, and **never rewrites or resets your
+  config** on a bad edit (it just waits for the next valid save). `summon_hotkey`
+  and `launch_at_login` still take effect on restart.
+
+### Notes
+- The file watcher is OS-event-driven (inotify / FSEvents) — zero idle CPU.
+- Dependency added: `notify` (cross-platform file watching; no GTK/glib).
+
+---
+
 ## [0.15.0] — 2026-07-08
 
 **Run & Notify** — the summon terminal's superpower. Designed from a verified
