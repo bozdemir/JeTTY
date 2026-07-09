@@ -5,6 +5,8 @@ use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 pub enum KeyAction {
     TogglePanel,
     ClosePanel,
+    /// Open the fuzzy command palette (Ctrl+Shift+P / macOS Cmd+Shift+P).
+    OpenPalette,
     /// Open a new terminal tab (Ctrl+Shift+T).
     NewTab,
     /// Close the active tab (Ctrl+Shift+W).
@@ -63,7 +65,8 @@ pub enum KeyAction {
 /// The rules mirror `app.rs` exactly:
 /// 1. Ctrl+, (no shift)         → TogglePanel
 /// 2. Escape                    → ClosePanel if panel open, else Send(ESC)
-/// 3. Ctrl+Shift+O              → TogglePanel
+/// 3. Ctrl+Shift+P              → OpenPalette (command palette)
+///    3b. Ctrl+Shift+O          → TogglePanel (Settings — kept as an alias)
 /// 4. Ctrl+Shift+T              → CycleTheme
 ///    4b. Ctrl+Shift+F         → SearchToggle (scrollback-search bar)
 /// 5. Ctrl+Shift+Equal          → OpacityUp
@@ -119,9 +122,10 @@ pub fn decide_key(
             }
         }
         match physical {
-            // KeyP is the dedicated "open Settings dialog" hotkey.
-            // KeyO is kept as an alias for backwards compatibility.
-            PhysicalKey::Code(KeyCode::KeyP) => return KeyAction::TogglePanel,
+            // KeyP opens the fuzzy command palette (VSCode/Sublime muscle memory).
+            // Settings stays reachable via Ctrl+Shift+O (kept below), Ctrl+, ,
+            // macOS Cmd+, , and an "Open Settings…" palette entry.
+            PhysicalKey::Code(KeyCode::KeyP) => return KeyAction::OpenPalette,
             PhysicalKey::Code(KeyCode::KeyO) => return KeyAction::TogglePanel,
             // Tabs: Ctrl+Shift+T opens a new tab; Ctrl+Shift+W closes the active
             // one. Ctrl+Shift+D detaches the active tab or reattaches a detached one.
@@ -1289,6 +1293,43 @@ mod tests {
             false, false, false,
         );
         assert_eq!(action, KeyAction::OpacityUp);
+    }
+
+    #[test]
+    fn ctrl_shift_p_opens_the_command_palette() {
+        // Ctrl+Shift+P is repurposed from Settings to the command palette.
+        let action = decide_key(
+            true, true, false,
+            make_physical(KeyCode::KeyP),
+            &make_logical_char("P"),
+            false, false, false,
+        );
+        assert_eq!(action, KeyAction::OpenPalette);
+    }
+
+    #[test]
+    fn ctrl_shift_o_still_toggles_settings() {
+        // Settings remains reachable via the Ctrl+Shift+O alias.
+        let action = decide_key(
+            true, true, false,
+            make_physical(KeyCode::KeyO),
+            &make_logical_char("O"),
+            false, false, false,
+        );
+        assert_eq!(action, KeyAction::TogglePanel);
+    }
+
+    #[test]
+    fn plain_ctrl_p_still_sends_control_byte() {
+        // Regression guard: plain Ctrl+P (no shift) keeps sending 0x10 (DLE) to
+        // the PTY (readline previous-history); only Ctrl+SHIFT+P opens the palette.
+        let action = decide_key(
+            true, false, false,
+            make_physical(KeyCode::KeyP),
+            &make_logical_char("p"),
+            false, false, false,
+        );
+        assert_eq!(action, KeyAction::Send(vec![0x10]));
     }
 
     #[test]

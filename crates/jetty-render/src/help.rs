@@ -11,7 +11,7 @@ pub const HELP_ROWS: [&str; 23] = [
     "Ctrl+1..9 — Jump to tab",
     "Ctrl+Shift+D / drag tab off bar — Detach / reattach (right-click tab for menu)",
     "Double-click tab / top bar — Rename / Maximize",
-    "Ctrl+Shift+P — Settings",
+    "Ctrl+Shift+P — Command palette   (Settings: Ctrl+Shift+O / Ctrl+,)",
     "Ctrl+= / Ctrl+- / Ctrl+0 — Font size",
     "Ctrl+Shift+= / Ctrl+Shift+- — Transparency",
     "Ctrl+Shift+C / Ctrl+Shift+V — Copy / Paste",

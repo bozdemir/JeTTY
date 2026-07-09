@@ -928,6 +928,25 @@ pub struct App {
     tab_menu_rects: Vec<jetty_render::Rect>,
     /// Tab-menu item currently under the cursor (hover highlight).
     tab_menu_hover: Option<usize>,
+
+    // --- Command palette (Ctrl+Shift+P / macOS Cmd+Shift+P) ---
+    /// Whether the fuzzy command palette overlay is open on the MAIN window.
+    /// While open it captures ALL keyboard + mouse input (single-overlay-owns-
+    /// keys). Zero cost when closed: the registry/filtered vecs are empty and the
+    /// overlay is neither built nor drawn (one bool test on the hot path).
+    palette_open: bool,
+    /// The typed query. Refiltered only on a keystroke — never per frame.
+    palette_query: String,
+    /// Index of the highlighted row within `palette_filtered`.
+    palette_selected: usize,
+    /// First visible row (scroll offset) into `palette_filtered`.
+    palette_scroll: usize,
+    /// The action registry, rebuilt FRESH on open (never per frame / in
+    /// apply_theme, which auto-repeats on opacity) and dropped on close.
+    palette_registry: Vec<crate::palette::PaletteEntry>,
+    /// The current fuzzy hits (resolved PaletteCmd + title + matched indices),
+    /// recomputed on each keystroke. Enter runs the stored cmd, never a stale idx.
+    palette_filtered: Vec<crate::palette::PaletteHit>,
 }
 
 /// A left-button drag that began on tab `idx` in the main tab bar. `tearing`
@@ -1240,6 +1259,12 @@ impl App {
             tab_menu_labels: Vec::new(),
             tab_menu_rects: Vec::new(),
             tab_menu_hover: None,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_selected: 0,
+            palette_scroll: 0,
+            palette_registry: Vec::new(),
+            palette_filtered: Vec::new(),
         };
         // Persisted user settings override the env-derived defaults (but env
         // vars still seed the initial values above, so an explicit JETTY_* can
@@ -2158,6 +2183,249 @@ impl App {
         }
         if let Some(w) = &self.window {
             w.request_redraw();
+        }
+    }
+
+    // ── Command palette ──────────────────────────────────────────────────────
+
+    /// (Re)build the palette registry FRESH and open the overlay. Building on
+    /// open (~50 short entries) — not incrementally and NOT in `apply_theme`
+    /// (which auto-repeats on opacity) — keeps the dynamic theme/tab/detach
+    /// entries current at zero per-frame cost. Dismisses every peer overlay so
+    /// exactly one overlay owns keys + draws on top.
+    fn open_palette(&mut self) {
+        self.dismiss_menus();
+        self.help_open = false;
+        self.welcome_open = false;
+        let themes = jetty_core::theme_list();
+        let tabs: Vec<String> = self.tabs.iter().map(|t| t.title.clone()).collect();
+        let detached: Vec<String> = self.detached.iter().map(|d| d.tab.title.clone()).collect();
+        self.palette_registry = crate::palette::build_registry(&themes, &tabs, &detached);
+        self.palette_query.clear();
+        self.palette_open = true;
+        self.refilter_palette();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Recompute the fuzzy hit list from the current query. Called ONLY on open +
+    /// each keystroke — never per frame. Resets the selection/scroll to the top.
+    fn refilter_palette(&mut self) {
+        self.palette_filtered = crate::palette::filter(&self.palette_registry, &self.palette_query);
+        self.palette_selected = 0;
+        self.palette_scroll = 0;
+    }
+
+    /// Close the palette and free its transient state, so nothing is allocated
+    /// while it is closed.
+    fn close_palette(&mut self) {
+        if !self.palette_open {
+            return;
+        }
+        self.palette_open = false;
+        self.palette_query.clear();
+        self.palette_filtered = Vec::new();
+        self.palette_registry = Vec::new();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Move the palette selection by `delta` rows (clamped), keeping it inside the
+    /// `MAX_PALETTE_ROWS` scroll window.
+    fn palette_move(&mut self, delta: isize) {
+        let n = self.palette_filtered.len();
+        if n == 0 {
+            return;
+        }
+        let next = (self.palette_selected as isize + delta).clamp(0, n as isize - 1) as usize;
+        self.palette_selected = next;
+        let win = jetty_render::MAX_PALETTE_ROWS;
+        if next < self.palette_scroll {
+            self.palette_scroll = next;
+        } else if next >= self.palette_scroll + win {
+            self.palette_scroll = next + 1 - win;
+        }
+    }
+
+    /// Toggle the perf HUD. Extracted so every caller shares the reflow: the HUD
+    /// reserves grid rows via `status_h`, so a bare flag flip would leave the grid
+    /// the wrong size (a bare `= !; persist; redraw` is a bug — see the config
+    /// reload path, which reflows for the same reason).
+    fn toggle_perf_hud(&mut self) {
+        self.show_perf_hud = !self.show_perf_hud;
+        self.reflow();
+        self.persist();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Redraw the main window plus every detached and the settings window — used
+    /// by palette actions that change a shared visual (theme/opacity/effects).
+    fn redraw_main_and_detached(&self) {
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+        for dw in &self.detached {
+            dw.window.request_redraw();
+        }
+        if let Some(w) = &self.settings_window {
+            w.request_redraw();
+        }
+    }
+
+    /// Run a resolved palette command by invoking the EXISTING app action for it.
+    /// The palette is already closed by the caller. Index-bearing variants are
+    /// `.get()`-guarded (bounds-checked) so a tab/theme that vanished between open
+    /// and Enter is a clean no-op — belt-and-suspenders on top of build-on-open.
+    fn run_palette_cmd(&mut self, cmd: crate::palette::PaletteCmd, event_loop: &ActiveEventLoop) {
+        use crate::palette::PaletteCmd as C;
+        match cmd {
+            C::NewTab => self.new_tab(),
+            C::CloseTab => {
+                self.confirm_close = Some(self.active);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            C::NextTab => self.switch_tab(true),
+            C::PrevTab => self.switch_tab(false),
+            C::DetachTab => self.detach_tab(self.active, event_loop, None),
+            C::OpenSettings => {
+                // Open (never toggle-closed): don't dismiss an already-open panel.
+                if self.settings_window.is_none() {
+                    self.toggle_settings_window(event_loop);
+                }
+            }
+            C::FontUp => self.set_font_size(self.font_logical + 1.0),
+            C::FontDown => self.set_font_size(self.font_logical - 1.0),
+            C::FontReset => self.set_font_size(FONT_LOGICAL_DEFAULT),
+            C::OpacityUp => {
+                self.opacity = (self.opacity + 0.05).min(1.0);
+                self.apply_theme();
+                self.persist();
+                self.redraw_main_and_detached();
+            }
+            C::OpacityDown => {
+                self.opacity = (self.opacity - 0.05).max(0.1);
+                self.apply_theme();
+                self.persist();
+                self.redraw_main_and_detached();
+            }
+            C::ToggleCrt => {
+                self.fx.crt_enabled = !self.fx.crt_enabled;
+                self.persist();
+                self.redraw_main_and_detached();
+            }
+            C::ToggleCrtRoll => {
+                self.fx.crt_animate_roll = !self.fx.crt_animate_roll;
+                self.persist();
+                self.redraw_main_and_detached();
+            }
+            C::ToggleCrtFlicker => {
+                self.fx.crt_flicker = !self.fx.crt_flicker;
+                self.persist();
+                self.redraw_main_and_detached();
+            }
+            C::ToggleCrtJitter => {
+                self.fx.crt_jitter = !self.fx.crt_jitter;
+                self.persist();
+                self.redraw_main_and_detached();
+            }
+            C::ToggleCaretFlash => {
+                self.fx.caret_flash_enabled = !self.fx.caret_flash_enabled;
+                self.persist();
+                self.redraw_main_and_detached();
+            }
+            C::ToggleCaretGlow => {
+                self.fx.caret_glow_enabled = !self.fx.caret_glow_enabled;
+                self.persist();
+                self.redraw_main_and_detached();
+            }
+            C::TogglePerfHud => self.toggle_perf_hud(),
+            C::ShowWelcome => {
+                self.welcome_open = true;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            C::Search => {
+                if !self.search_open {
+                    self.search_open = true;
+                    self.active_tab_mut().terminal.search_refresh();
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            C::PrevPrompt => {
+                if self.active_tab_mut().terminal.jump_prompt(false) {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    self.update_link_hover(true);
+                }
+            }
+            C::NextPrompt => {
+                if self.active_tab_mut().terminal.jump_prompt(true) {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    self.update_link_hover(true);
+                }
+            }
+            C::Copy => {
+                let copied = self
+                    .active_tab()
+                    .terminal
+                    .selection_text()
+                    .filter(|t| !t.is_empty());
+                if let Some(text) = copied {
+                    clipboard::set(&text);
+                    self.active_tab_mut().terminal.selection_clear();
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+            }
+            C::Paste => {
+                if let Some(text) = clipboard::get() {
+                    self.paste_text(&text);
+                }
+            }
+            C::ToggleLaunchAtLogin => {
+                self.launch_at_login = !self.launch_at_login;
+                set_launch_at_login(self.launch_at_login);
+                self.persist();
+            }
+            C::Hide => self.set_visibility(false, event_loop),
+            C::Quit => {
+                self.confirm_quit = true;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            // Index-bearing dynamic actions: `.get()`-guard against a stale index.
+            C::SetTheme(i) => {
+                if i < jetty_core::theme_count() {
+                    self.theme_idx = i;
+                    self.apply_theme();
+                    self.persist();
+                    self.redraw_main_and_detached();
+                }
+            }
+            C::SelectTab(i) => {
+                if i < self.tabs.len() {
+                    self.select_tab(i);
+                }
+            }
+            C::Reattach(i) => {
+                if i < self.detached.len() {
+                    self.reattach_tab(i, event_loop);
+                }
+            }
         }
     }
 
@@ -4024,6 +4292,13 @@ impl App {
                     // it never sends 0x06 to the PTY and never opens the
                     // main-window bar while unfocused.
                     input::KeyAction::SearchToggle => {
+                        return;
+                    }
+                    // The palette is main-window only; keep Ctrl+Shift+P's pre-0.18
+                    // behavior in a detached window (open Settings) so the chord
+                    // isn't silently dropped here.
+                    input::KeyAction::OpenPalette => {
+                        self.toggle_settings_window(event_loop);
                         return;
                     }
                     _ => {}
@@ -6862,6 +7137,58 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
 
+                // --- Command palette captures the mouse while open ---
+                // Swallow every click so none falls through to terminal selection,
+                // the scrollbar, or the ? / window-control buttons (which is exactly
+                // what would let another overlay open over the palette). A click on
+                // a visible row runs it; a click outside the panel closes it.
+                if self.palette_open {
+                    let cx = self.cursor.0 as f32;
+                    let cy = self.cursor.1 as f32;
+                    let theme = self.current_theme();
+                    let cw = self.chrome_char_w();
+                    let first = self.palette_scroll;
+                    let sel = self.palette_selected;
+                    let total = self.palette_filtered.len();
+                    let vis: Vec<(String, Vec<usize>, bool)> = self
+                        .palette_filtered
+                        .iter()
+                        .enumerate()
+                        .skip(first)
+                        .take(jetty_render::MAX_PALETTE_ROWS)
+                        .map(|(i, hh)| (hh.title.clone(), hh.indices.clone(), i == sel))
+                        .collect();
+                    let prows: Vec<jetty_render::PaletteRow> = vis
+                        .iter()
+                        .map(|(t, idx, s)| jetty_render::PaletteRow {
+                            title: t,
+                            match_indices: idx,
+                            selected: *s,
+                        })
+                        .collect();
+                    let pal = jetty_render::build_command_palette(
+                        w, h, &theme, cw, &self.palette_query, &prows, total, first,
+                    );
+                    let mut hit: Option<usize> = None;
+                    for (vi, r) in pal.row_hits.iter().enumerate() {
+                        if input::point_in(r, cx, cy) {
+                            hit = Some(first + vi);
+                            break;
+                        }
+                    }
+                    if let Some(gi) = hit {
+                        let cmd = self.palette_filtered.get(gi).map(|hh| hh.cmd.clone());
+                        self.close_palette();
+                        if let Some(c) = cmd {
+                            self.run_palette_cmd(c, event_loop);
+                        }
+                    } else if !input::point_in(&pal.panel, cx, cy) {
+                        // Click on the dim backdrop closes; inside (non-row) is a no-op.
+                        self.close_palette();
+                    }
+                    return;
+                }
+
                 // --- Quit confirmation popup is modal (highest priority) ---
                 if self.confirm_quit {
                     let cx = self.cursor.0 as f32;
@@ -7383,6 +7710,7 @@ impl ApplicationHandler<AppEvent> for App {
                     || self.confirm_quit
                     || self.confirm_close.is_some()
                     || self.help_open
+                    || self.palette_open
                     || self.tabs.is_empty()
                 {
                     return;
@@ -7620,6 +7948,23 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.tabs.is_empty() {
                     return;
                 }
+                // The palette owns the wheel while open: scroll its list, never
+                // the terminal underneath (swallow so nothing falls through).
+                if self.palette_open {
+                    let step = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => -(y.round() as isize),
+                        MouseScrollDelta::PixelDelta(p) => {
+                            if p.y > 0.0 { -1 } else if p.y < 0.0 { 1 } else { 0 }
+                        }
+                    };
+                    if step != 0 {
+                        self.palette_move(step);
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 // Positive y = wheel up = scroll into history (older output).
                 // Deltas are ACCUMULATED (fractionally) across events: slow
                 // touchpad scrolling arrives as many sub-line deltas that a
@@ -7806,6 +8151,76 @@ impl ApplicationHandler<AppEvent> for App {
                     let _ = i;
                     return;
                 }
+                // --- Command palette captures ALL keys while open ---
+                // Sits above welcome/help/search: once open the palette owns the
+                // keyboard (single-overlay-owns-keys). Type → query, Up/Down →
+                // select, PageUp/Down → page, Enter → run + close, Esc → close,
+                // Backspace → edit, Ctrl+Shift+P / Cmd+Shift+P → toggle closed.
+                // Every other Ctrl/Cmd chord is swallowed so nothing leaks.
+                if self.palette_open {
+                    use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+                    let ctrl = self.modifiers.control_key();
+                    let shift = self.modifiers.shift_key();
+                    let sup = self.modifiers.super_key();
+                    // Toggle closed on the same chord that opened it.
+                    let is_palette_chord = (ctrl
+                        && shift
+                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyP)))
+                        || (sup
+                            && shift
+                            && matches!(&event.logical_key,
+                                Key::Character(s) if s.as_str() == "p" || s.as_str() == "P"));
+                    if is_palette_chord {
+                        self.close_palette();
+                        return;
+                    }
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => self.close_palette(),
+                        Key::Named(NamedKey::Enter) => {
+                            let cmd = self
+                                .palette_filtered
+                                .get(self.palette_selected)
+                                .map(|h| h.cmd.clone());
+                            self.close_palette();
+                            if let Some(c) = cmd {
+                                self.run_palette_cmd(c, event_loop);
+                            }
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowDown) => self.palette_move(1),
+                        Key::Named(NamedKey::ArrowUp) => self.palette_move(-1),
+                        Key::Named(NamedKey::PageDown) => {
+                            self.palette_move(jetty_render::MAX_PALETTE_ROWS as isize)
+                        }
+                        Key::Named(NamedKey::PageUp) => {
+                            self.palette_move(-(jetty_render::MAX_PALETTE_ROWS as isize))
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            self.palette_query.pop();
+                            self.refilter_palette();
+                        }
+                        _ => {
+                            if ctrl || sup {
+                                // Swallow other chords while the palette owns keys.
+                            } else if let Some(t) = &event.text {
+                                let mut changed = false;
+                                for ch in t.chars() {
+                                    if !ch.is_control() {
+                                        self.palette_query.push(ch);
+                                        changed = true;
+                                    }
+                                }
+                                if changed {
+                                    self.refilter_palette();
+                                }
+                            }
+                        }
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 // --- Welcome splash captures Escape (dismiss only, non-modal) ---
                 // Esc dismisses the welcome splash without consuming the key further
                 // (it still falls through to the help/PTY path so the shell also
@@ -7954,6 +8369,9 @@ impl ApplicationHandler<AppEvent> for App {
                                 self.confirm_quit = true;
                                 if let Some(w) = &self.window { w.request_redraw(); }
                             }
+                            // macOS command-palette chord (Cmd+Shift+P). Shift is
+                            // held here, so the logical char is usually "P".
+                            "p" | "P" => self.open_palette(),
                             "+" | "=" => self.set_font_size(self.font_logical + 1.0),
                             "-" => self.set_font_size(self.font_logical - 1.0),
                             "0" => self.set_font_size(FONT_LOGICAL_DEFAULT),
@@ -8007,6 +8425,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let action_name = match &action {
                         input::KeyAction::TogglePanel => "TogglePanel",
                         input::KeyAction::ClosePanel => "ClosePanel",
+                        input::KeyAction::OpenPalette => "OpenPalette",
                         input::KeyAction::NewTab => "NewTab",
                         input::KeyAction::CloseTab => "CloseTab",
                         input::KeyAction::DetachTab => "DetachTab",
@@ -8059,6 +8478,9 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     input::KeyAction::DetachTab => {
                         self.detach_tab(self.active, event_loop, None);
+                    }
+                    input::KeyAction::OpenPalette => {
+                        self.open_palette();
                     }
                     input::KeyAction::SearchToggle => {
                         if self.search_open {
@@ -8235,6 +8657,25 @@ impl ApplicationHandler<AppEvent> for App {
                         if !ch.is_control() {
                             self.rename_buf.push(ch);
                         }
+                    }
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
+                    }
+                    return;
+                }
+                // The command palette captures IME commits into its query
+                // (mirrors the KeyboardInput palette arm; keeps the same modal
+                // priority so composed text never leaks behind the overlay).
+                if self.palette_open {
+                    let mut changed = false;
+                    for ch in text.chars() {
+                        if !ch.is_control() {
+                            self.palette_query.push(ch);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.refilter_palette();
                     }
                     if let Some(win) = &self.window {
                         win.request_redraw();
@@ -8430,6 +8871,26 @@ impl ApplicationHandler<AppEvent> for App {
                 // OSC 133 failed-command marker rows (captured before the mutable
                 // gpu render borrow, like search_hits). Empty in the common case.
                 let failed_rows = self.active_tab().terminal.failed_prompt_rows();
+                // Command-palette draw data, captured (owned) before the mutable
+                // gpu/text borrow so the draw pass borrows nothing off self. None
+                // while closed — one bool test on the hot path, zero allocation.
+                let palette_ui: Option<(String, Vec<(String, Vec<usize>, bool)>, usize, usize)> =
+                    if self.palette_open {
+                        let first = self.palette_scroll;
+                        let sel = self.palette_selected;
+                        let total = self.palette_filtered.len();
+                        let rows: Vec<(String, Vec<usize>, bool)> = self
+                            .palette_filtered
+                            .iter()
+                            .enumerate()
+                            .skip(first)
+                            .take(jetty_render::MAX_PALETTE_ROWS)
+                            .map(|(i, h)| (h.title.clone(), h.indices.clone(), i == sel))
+                            .collect();
+                        Some((self.palette_query.clone(), rows, total, first))
+                    } else {
+                        None
+                    };
                 let welcome_open = self.welcome_open;
                 // Pill only when the hint is live AND belongs to THIS (the
                 // main) window — a detached-window drag must not light it
@@ -8847,6 +9308,7 @@ impl ApplicationHandler<AppEvent> for App {
                         && !help_open
                         && confirm_close.is_none()
                         && !confirm_quit
+                        && palette_ui.is_none()
                     {
                         let mut splash = jetty_render::build_welcome_overlay(
                             width,
@@ -8922,7 +9384,7 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     // Draw the Help overlay (Keyboard Shortcuts) on top of all
                     // else — a dim layer, a bordered panel, and the binding rows.
-                    if help_open {
+                    if help_open && palette_ui.is_none() {
                         let help = jetty_render::build_help_overlay(width, height, &theme, chrome_char_w);
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &help.quads);
                         if !help.labels.is_empty() {
@@ -8959,6 +9421,29 @@ impl ApplicationHandler<AppEvent> for App {
                                 width,
                                 height,
                                 &popup.labels,
+                            );
+                        }
+                    }
+                    // Command palette — drawn LAST (above help/welcome/menus/
+                    // confirm) so the single active overlay owns the top layer.
+                    // Built + drawn strictly inside this Some() branch: nothing when
+                    // closed (zero idle cost).
+                    if let Some((q, prows_data, total, first)) = &palette_ui {
+                        let prows: Vec<jetty_render::PaletteRow> = prows_data
+                            .iter()
+                            .map(|(t, idx, sel)| jetty_render::PaletteRow {
+                                title: t,
+                                match_indices: idx,
+                                selected: *sel,
+                            })
+                            .collect();
+                        let pal = jetty_render::build_command_palette(
+                            width, height, &theme, chrome_char_w, q, &prows, *total, *first,
+                        );
+                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pal.quads);
+                        if !pal.labels.is_empty() {
+                            let _ = chrome_text.render_overlays(
+                                &gpu.device, &gpu.queue, scene_view, width, height, &pal.labels,
                             );
                         }
                     }

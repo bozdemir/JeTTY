@@ -2,6 +2,9 @@ mod app;
 mod config;
 mod detached;
 mod notify;
+/// Command-palette action registry + fuzzy filter. Public so the `jetty-shot`
+/// self-test binary can drive the SAME registry/filter path the app uses.
+pub mod palette;
 mod shell_integration;
 mod watch;
 /// User theme loading + registry rebuild. Public so the `jetty-shot` self-test
