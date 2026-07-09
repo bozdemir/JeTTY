@@ -1,9 +1,11 @@
+pub mod fuzzy;
 mod pty;
 mod snapshot;
 mod terminal;
 pub mod theme;
 pub mod url;
 
+pub use fuzzy::{fuzzy_match, FuzzyMatch};
 pub use pty::{set_advertised_version, PtySession};
 pub use snapshot::{attr, CellSnapshot, CursorShapeSnap, GridSnapshot, SearchHit, SHAPE_MASK};
 pub use terminal::{
