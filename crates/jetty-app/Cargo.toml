@@ -16,6 +16,12 @@ global-hotkey = "0.8.0"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
 dirs = "6.0.0"
+# Cross-platform, OS-event-driven filesystem watcher for config + theme hot-reload
+# (inotify on Linux, FSEvents on macOS, kqueue on BSD). DE-INDEPENDENT — no
+# freedesktop/portal/compositor code — and event-driven, so its backing thread
+# blocks in the kernel and adds ZERO idle CPU (no polling). Referenced as `::notify`
+# in code because jetty-app already has a local `mod notify` (desktop toasts).
+notify = "8"
 # Live perf-HUD CPU% sampling. OS-portable / DE-independent (no hand-rolled
 # /proc or mach). Minimal feature set: only the `system` module (processes/CPU),
 # with disk/network/component/user probes disabled to keep the build light.

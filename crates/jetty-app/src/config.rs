@@ -122,6 +122,28 @@ pub struct Config {
     /// OFF. Inherits `notify_only_on_failure` (so it can be a failures-only summon).
     #[serde(default = "default_auto_summon_on_finish")]
     pub auto_summon_on_finish: bool,
+    // ── SSH-ready & yours (v0.16) ─────────────────────────────────────────────
+    /// Allow OSC 52 clipboard PASTE — i.e. let a program in the terminal (including
+    /// a remote host over SSH) READ the local system clipboard. Default `false`
+    /// (the SECURE default alacritty enforces): OSC 52 COPY always works, but paste
+    /// can exfiltrate whatever is on the clipboard (passwords/tokens), so it is
+    /// strictly opt-in. Applies to newly-spawned tabs.
+    #[serde(default = "default_osc52_allow_paste")]
+    pub osc52_allow_paste: bool,
+    /// Watch `~/.config/jetty/` and hot-reload config + themes live (no restart).
+    /// Default `true`. The watcher is OS-event-driven (inotify/FSEvents), so it adds
+    /// zero idle CPU; set `false` to disable it entirely (a pure escape hatch — no
+    /// watcher thread is spawned). NOTE: `summon_hotkey` and `launch_at_login` are
+    /// RESTART/external-only even with hot-reload on (documented at those keys).
+    #[serde(default = "default_hot_reload")]
+    pub hot_reload: bool,
+}
+
+fn default_osc52_allow_paste() -> bool {
+    false
+}
+fn default_hot_reload() -> bool {
+    true
 }
 
 fn default_notify_on_command_finish() -> bool {
@@ -332,20 +354,52 @@ impl Default for Config {
             notify_min_seconds: default_notify_min_seconds(),
             notify_only_on_failure: default_notify_only_on_failure(),
             auto_summon_on_finish: default_auto_summon_on_finish(),
+            osc52_allow_paste: default_osc52_allow_paste(),
+            hot_reload: default_hot_reload(),
         }
     }
 }
 
 impl Config {
-    /// Resolve the config file path: `<config_dir>/jetty/config.toml`, falling
-    /// back to `~/.config/jetty/config.toml` when `dirs::config_dir()` is
-    /// unavailable.
-    fn path() -> std::path::PathBuf {
+    /// Resolve the JeTTY config DIRECTORY: `<config_dir>/jetty`, falling back to
+    /// `~/.config/jetty` when `dirs::config_dir()` is unavailable. This is the dir
+    /// that holds `config.toml` and the `themes/` subdir; the hot-reload watcher and
+    /// the theme loader both key off it.
+    pub(crate) fn dir() -> std::path::PathBuf {
         let base = dirs::config_dir().unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             std::path::PathBuf::from(home).join(".config")
         });
-        base.join("jetty").join("config.toml")
+        base.join("jetty")
+    }
+
+    /// Resolve the config file path: `<config_dir>/jetty/config.toml`.
+    fn path() -> std::path::PathBuf {
+        Self::dir().join("config.toml")
+    }
+
+    /// The config file path, for the hot-reload watcher / reload reader.
+    pub(crate) fn config_path() -> std::path::PathBuf {
+        Self::path()
+    }
+
+    /// Non-destructive reload parse (amendment H1): parse `s` (already-read file
+    /// content), returning `None` on ANY parse error WITHOUT renaming to `.bad` and
+    /// WITHOUT applying defaults. The destructive `.bad` preservation stays STARTUP-
+    /// only (`load`) — a benign save-race mid-write must never wipe the user's config;
+    /// the caller keeps its in-memory state and waits for the next watcher event.
+    /// Sanitizes floats/effects on success, exactly like `load`, so a reload applies
+    /// the same normalized values. Takes the content (not the path) so the caller can
+    /// hash and parse the SAME bytes (no TOCTOU between the hash and the parse).
+    pub(crate) fn parse_reload(s: &str) -> Option<Config> {
+        match toml::from_str::<Config>(s) {
+            Ok(mut cfg) => {
+                cfg.sanitize_floats();
+                cfg.effects = cfg.effects.clamped();
+                Some(cfg)
+            }
+            Err(_) => None,
+        }
     }
 
     /// Replace every non-finite float with its default. TOML 1.x allows a
@@ -549,6 +603,8 @@ mod tests {
         assert_eq!(c.tab_bar_position, "top");
         assert!(c.show_welcome);
         assert!(c.show_perf_hud);
+        assert!(!c.osc52_allow_paste, "osc52 paste is off by default (secure)");
+        assert!(c.hot_reload, "hot reload is on by default");
     }
 
     #[test]
@@ -612,6 +668,8 @@ mod tests {
             notify_min_seconds: 30,
             notify_only_on_failure: true,
             auto_summon_on_finish: true,
+            osc52_allow_paste: true,
+            hot_reload: false,
         };
         let s = toml::to_string_pretty(&c).expect("serialize");
         let back: Config = toml::from_str(&s).expect("deserialize");
@@ -648,6 +706,8 @@ mod tests {
             notify_min_seconds: 10,
             notify_only_on_failure: false,
             auto_summon_on_finish: false,
+            osc52_allow_paste: false,
+            hot_reload: true,
         };
         std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
         let s = std::fs::read_to_string(&path).unwrap();
@@ -711,6 +771,21 @@ corner_radius = 8.0
         assert_eq!(cfg.notify_min_seconds, 10);
         assert!(!cfg.notify_only_on_failure);
         assert!(!cfg.auto_summon_on_finish, "auto-summon defaults OFF");
+    }
+
+    #[test]
+    fn old_config_without_v016_keys_loads_with_defaults() {
+        // A config predating v0.16 must load with osc52_allow_paste = false (SECURE)
+        // and hot_reload = true (idle-free watcher), so an upgrade is transparent.
+        let toml = r#"theme = "default"
+opacity = 1.0
+font_size = 14.0
+font_family = "monospace"
+corner_radius = 8.0
+"#;
+        let cfg: Config = toml::from_str(toml).expect("must load");
+        assert!(!cfg.osc52_allow_paste, "osc52 paste defaults OFF (secure)");
+        assert!(cfg.hot_reload, "hot reload defaults ON");
     }
 
     #[test]
