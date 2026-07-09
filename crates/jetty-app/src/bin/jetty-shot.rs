@@ -43,6 +43,11 @@
 ///                    failed-command marker on each failed prompt row. Combine
 ///                    with JETTY_SHOT_SCROLL to verify the marker tracks the
 ///                    correct viewport row after the mark scrolls into history.
+///   JETTY_SHOT_PALETTE — command-palette self-test: render the fuzzy command
+///                    palette overlay via the SHARED registry + filter path.
+///                    JETTY_SHOT_PALETTE_QUERY sets the typed query (drives the
+///                    matched-char highlight), JETTY_SHOT_PALETTE_SEL the selected
+///                    row index (auto-scrolled into view).
 ///   JETTY_SHOT_SEARCH — scrollback-search self-test: set this query on the
 ///                    terminal after the input (and any JETTY_SHOT_SCROLL) is
 ///                    applied, print the "cur/total" counter to stderr, draw
@@ -608,6 +613,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let help = jetty_render::build_help_overlay(width, height, terminal.theme(), chrome_char_w);
             rects.extend(help.quads);
             panel_labels.extend(help.labels);
+        }
+
+        // JETTY_SHOT_PALETTE — render the command palette overlay, driven by the
+        // SHARED registry + fuzzy filter path (jetty_app::palette) so the self-test
+        // exercises the real code, not a hand-built list. JETTY_SHOT_PALETTE_QUERY
+        // sets the typed query (drives the fuzzy highlight); JETTY_SHOT_PALETTE_SEL
+        // the selected row index.
+        if env_flag("JETTY_SHOT_PALETTE") {
+            let query = std::env::var("JETTY_SHOT_PALETTE_QUERY").unwrap_or_default();
+            let sel: usize = std::env::var("JETTY_SHOT_PALETTE_SEL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            // A representative registry: the SHARED builder over the live theme
+            // list plus two sample tabs, filtered exactly like the app.
+            let themes = jetty_core::theme_list();
+            let tabs = vec!["Tab 1".to_string(), "Tab 2".to_string()];
+            let registry = jetty_app::palette::build_registry(&themes, &tabs, &[]);
+            let hits = jetty_app::palette::filter(&registry, &query);
+            let total = hits.len();
+            let sel = sel.min(total.saturating_sub(1));
+            let win = jetty_render::MAX_PALETTE_ROWS;
+            let first = if sel >= win { sel + 1 - win } else { 0 };
+            let vis: Vec<(String, Vec<usize>, bool)> = hits
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(win)
+                .map(|(i, h)| (h.title.clone(), h.indices.clone(), i == sel))
+                .collect();
+            let prows: Vec<jetty_render::PaletteRow> = vis
+                .iter()
+                .map(|(t, idx, s)| jetty_render::PaletteRow {
+                    title: t,
+                    match_indices: idx,
+                    selected: *s,
+                })
+                .collect();
+            let pal = jetty_render::build_command_palette(
+                width, height, terminal.theme(), chrome_char_w, &query, &prows, total, first,
+            );
+            rects.extend(pal.quads);
+            panel_labels.extend(pal.labels);
+            eprintln!("jetty-shot: JETTY_SHOT_PALETTE query={query:?} sel={sel} rows={total}");
         }
 
         // JETTY_SHOT_TABBAR — render a sample tab strip (3 tabs, one active, plus
