@@ -217,6 +217,21 @@ const MAX_MARKS: usize = 4096;
 /// The exact OSC 133 introducer the scanner matches after `ESC ]`.
 const OSC133_PREFIX: &[u8] = b"133;";
 
+/// Cap on the sixel carry buffer (`sixel_buf`). A never-terminated or hostile
+/// sixel cannot grow memory without bound: past this the scanner latches
+/// `sixel_overflow`, keeps scanning for the terminator to resync, then DROPS the
+/// image (correct-or-absent). 4 MiB comfortably holds any real terminal image.
+const SIXEL_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Clamp on the reserved cell-rows for one image (the injected line-feeds). Even
+/// a legitimately tall image cannot scroll the grid without bound.
+const MAX_IMAGE_ROWS: usize = 1024;
+
+/// Cap on retained inline-image placements per tab, plus a live-bytes budget on
+/// their decoded RGBA (`Arc<SixelImage>`). Oldest are dropped first.
+const MAX_PLACEMENTS: usize = 256;
+const MAX_PLACEMENT_BYTES: u64 = 128 * 1024 * 1024;
+
 /// Upper clamp for a parsed OSC 133 D exit code. Shell exit statuses are 8-bit
 /// (0..=255; a signal death reports 128+signum), so anything larger is
 /// non-conformant. Clamping here keeps the running parse from overflowing `u32`
@@ -224,18 +239,22 @@ const OSC133_PREFIX: &[u8] = b"133;";
 /// non-negative (a wrong-sign code could otherwise flip the failed/ok verdict).
 const EXIT_CODE_MAX: u32 = 255;
 
-/// State of the tiny OSC-133-only scanner, carried across [`Terminal::feed`]
-/// calls so a mark split across PTY chunks resumes mid-sequence. Every non-Ground
-/// state is mid-escape; Ground uses a `memchr(ESC)` fast path, so a stream with
-/// no escapes costs one SIMD scan per feed and nothing per byte. The terminator
-/// set `{0x07 BEL, 0x18 CAN, 0x1A SUB, 0x1B ESC}` and the `;` separator match
-/// vte 0.15's OSC framing exactly (advance_osc_string), so there are no false
-/// splits with adjacent OSC 0/8/4 sequences.
+/// State of the tiny escape scanner, carried across [`Terminal::feed`] calls so
+/// a sequence split across PTY chunks resumes mid-parse. It recognizes BOTH
+/// OSC 133 prompt marks (`ESC ]`) and sixel DCS images (`ESC P … q … ST`) in ONE
+/// single-ESC state machine — Ground uses a `memchr(ESC)` fast path, so a stream
+/// with no escapes costs one SIMD scan per feed and nothing per byte.
+///
+/// The OSC terminator set `{0x07 BEL, 0x18 CAN, 0x1A SUB, 0x1B ESC}` and the `;`
+/// separator match vte 0.15's OSC framing (advance_osc_string). The DCS
+/// terminators are DIFFERENT — `{0x18 CAN, 0x1A SUB, 0x1B ESC, 0x9C ST}`, and
+/// **0x07 BEL is a DATA byte inside a DCS**, never a terminator (vte's
+/// advance_dcs_passthrough). The two terminator sets are kept strictly separate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OscScan {
+enum Scan {
     /// Not inside an escape; scan forward to the next ESC via memchr.
     Ground,
-    /// Saw ESC; a following `]` (0x5d) opens an OSC.
+    /// Saw ESC; a following `]` (0x5d) opens an OSC, `P` (0x50) opens a DCS.
     Esc,
     /// Inside `ESC ]`, matching the `133;` prefix byte by byte (`n` matched).
     Prefix { n: u8 },
@@ -245,6 +264,18 @@ enum OscScan {
     Payload { letter: u8, code: Option<u32>, in_code: bool, code_done: bool },
     /// Inside some OTHER OSC (title/hyperlink/color); skip to its terminator.
     Skip,
+    /// Inside `ESC P`, collecting the `P1;P2;P3` params up to the final byte
+    /// (`0x40..=0x7E`). `field` tracks which param digit run we're in; `p2` (the
+    /// background-select param) is stashed for the decoder. `inter` latches an
+    /// intermediate byte (`0x20..=0x2F`) — a DCS with intermediates is NOT a
+    /// sixel (DECRQSS `$q`, XTGETTCAP `+q`), so it routes to `DcsOther`.
+    DcsParams { p2: u32, field: u8, inter: bool },
+    /// After a sixel `q` (final `0x71`, no intermediates): accumulating raw sixel
+    /// data bytes into `sixel_buf` until a DCS terminator. BEL is data here.
+    Sixel,
+    /// A DCS that is NOT a bare-`q` sixel: skip to the DCS terminator, touch
+    /// nothing (no accumulation, no placement).
+    DcsOther,
 }
 
 /// One shell command's OSC 133 semantic marks. `prompt`/`input`/`output` are
@@ -266,6 +297,26 @@ struct CmdBlock {
     /// be computed at D. `None` when no C was seen this block (e.g. plain bash,
     /// which emits only A+D) — the completion then carries an unknown duration.
     started_at: Option<std::time::Instant>,
+}
+
+/// One live inline-image placement (a decoded sixel anchored in the grid).
+///
+/// `abs_line` is the ABSOLUTE grid line of the image's top-left cell — the exact
+/// analogue of `CmdBlock::prompt` (`abs_top`-relative, survives scrolling). The
+/// decoded RGBA lives behind an `Arc` so the render layer can clone it cheaply to
+/// upload to (each window's) GPU without copying, and so a texture evicted then
+/// re-scrolled-into-view can re-upload. `cols`/`rows` are the reserved cell
+/// footprint; `px_w`/`px_h` are the native pixel size the image draws at.
+#[derive(Clone, Debug)]
+struct ImagePlacement {
+    id: u64,
+    abs_line: i64,
+    col: u16,
+    cols: u16,
+    rows: u16,
+    px_w: u16,
+    px_h: u16,
+    image: Arc<crate::sixel::SixelImage>,
 }
 
 /// One finished shell command, surfaced from an OSC 133 `D` mark. The tab index /
@@ -370,8 +421,9 @@ pub struct Terminal {
     /// rendered. Cleared again if history later falls below the cap (a scrollback
     /// clear / shrink), where fresh marks resume tracking exactly.
     saturated: bool,
-    /// OSC 133 scanner state, persisted across `feed` calls (chunk boundaries).
-    scan: OscScan,
+    /// Escape scanner state (OSC 133 + sixel DCS), persisted across `feed` calls
+    /// (chunk boundaries).
+    scan: Scan,
     /// Per-tab semantic prompt marks (OSC 133 A/B/C/D), append order == ascending
     /// `abs_top`-relative line, pruned to the live scrollback window on each bind.
     marks: VecDeque<CmdBlock>,
@@ -381,6 +433,28 @@ pub struct Terminal {
     /// `&mut self` (not an `Arc`/atomic like `bell`) is correct: `D` is handled by
     /// our own scanner inside `feed(&mut self)`, never the async `EventProxy`.
     completed: Vec<CommandCompletion>,
+    /// Raw sixel data bytes accumulated while in `Scan::Sixel`, capped at
+    /// [`SIXEL_MAX_BYTES`]. Persists across `feed` chunk boundaries.
+    sixel_buf: Vec<u8>,
+    /// Latched when `sixel_buf` would exceed the cap: the image is dropped on
+    /// finish (correct-or-absent), the scanner keeps running to resync.
+    sixel_overflow: bool,
+    /// The DCS `P2` (background-select) param captured at the sixel `q`, forwarded
+    /// to the decoder.
+    pending_sixel_p2: u32,
+    /// Physical cell size in px, pushed by the app on font-size / DPI change so
+    /// `finish_sixel` can map a decoded image's WxH to a cell footprint. Defaults
+    /// to the 8×16 the `EventProxy` reports for `\e[14t`.
+    cell_px_w: f32,
+    cell_px_h: f32,
+    /// Live inline-image placements (decoded sixels), append order ≈ ascending
+    /// `abs_line`. Pruned to the scrollback window (span-intersection), dropped on
+    /// saturation / reflow (correct-or-absent). Bounded by [`MAX_PLACEMENTS`] and
+    /// [`MAX_PLACEMENT_BYTES`].
+    placements: VecDeque<ImagePlacement>,
+    /// Running sum of `image.rgba.len()` across `placements` (the live-bytes
+    /// budget), maintained incrementally so pruning never re-sums the deque.
+    placement_bytes: u64,
 }
 
 /// Maximum scrollback-search query length in chars (bounds per-keystroke DFA
@@ -489,9 +563,18 @@ impl Terminal {
             abs_top: 0,
             scrollback_limit,
             saturated: false,
-            scan: OscScan::Ground,
+            scan: Scan::Ground,
             marks: VecDeque::new(),
             completed: Vec::new(),
+            sixel_buf: Vec::new(),
+            sixel_overflow: false,
+            pending_sixel_p2: 0,
+            // Matches the EventProxy's default \e[14t reply (8×16) until the app
+            // pushes real metrics via `set_cell_px` on the first reflow.
+            cell_px_w: 8.0,
+            cell_px_h: 16.0,
+            placements: VecDeque::new(),
+            placement_bytes: 0,
         }
     }
 
@@ -621,25 +704,29 @@ impl Terminal {
     }
 
     /// Feed PTY bytes to the terminal, intercepting OSC 133 semantic-prompt
-    /// marks on the way through (alacritty_terminal 0.26 / vte 0.15 drop 133).
+    /// marks AND sixel DCS images on the way through (alacritty_terminal 0.26 /
+    /// vte 0.15 drop both — the DCS never moves the cursor, so JeTTY reserves the
+    /// image's cell rows itself; see `finish_sixel`).
     ///
     /// SPEED (#1): in `Ground` this is one `memchr(ESC)` per feed with zero
-    /// per-byte work; a stream carrying no 133 reaches `advance_slice` exactly
+    /// per-byte work; a stream carrying no escapes reaches `advance_slice` exactly
     /// once (the whole buffer). Only inside an escape does the per-byte state
     /// machine run. Each input byte reaches alacritty exactly once (`start` is
     /// the first un-flushed byte); the scanner sub-advances alacritty up to AND
-    /// INCLUDING a 133's terminator so the grid is caught up before the cursor
-    /// line is read, then drops the (unhandled) 133 harmlessly.
+    /// INCLUDING a sequence's terminator so the grid is caught up before the
+    /// cursor line is read, then decodes/places the sixel (or drops the 133).
+    /// The sixel payload IS still fed to alacritty (which ignores it) so its own
+    /// parser walks the DCS in lockstep and stays consistent.
     pub fn feed(&mut self, bytes: &[u8]) {
         let mut i = 0;
         let mut start = 0; // first byte not yet handed to alacritty
         while i < bytes.len() {
-            if matches!(self.scan, OscScan::Ground) {
+            if matches!(self.scan, Scan::Ground) {
                 match memchr::memchr(0x1b, &bytes[i..]) {
                     None => break, // no more escapes: flush the tail after the loop
                     Some(off) => {
                         i += off + 1; // step past the ESC
-                        self.scan = OscScan::Esc;
+                        self.scan = Scan::Esc;
                         continue;
                     }
                 }
@@ -647,41 +734,42 @@ impl Terminal {
             let b = bytes[i];
             match self.scan {
                 // Ground is handled by the memchr fast path above.
-                OscScan::Ground => unreachable!(),
-                OscScan::Esc => {
+                Scan::Ground => unreachable!(),
+                Scan::Esc => {
                     self.scan = match b {
-                        0x5d => OscScan::Prefix { n: 0 }, // ']' opens an OSC
-                        0x1b => OscScan::Esc,             // ESC ESC: restart escape scan
-                        _ => OscScan::Ground,             // some other escape; resync
+                        0x5d => Scan::Prefix { n: 0 }, // ']' opens an OSC
+                        0x50 => Scan::DcsParams { p2: 0, field: 0, inter: false }, // 'P' opens a DCS
+                        0x1b => Scan::Esc,             // ESC ESC: restart escape scan
+                        _ => Scan::Ground,             // some other escape; resync
                     };
                     i += 1;
                 }
-                OscScan::Prefix { n } => {
+                Scan::Prefix { n } => {
                     match b {
                         // A bare ESC aborts this OSC AND begins a new escape (vte
                         // parity) — so `ESC]133; <ESC> ]133;A BEL` still binds A.
-                        0x1b => self.scan = OscScan::Esc,
+                        0x1b => self.scan = Scan::Esc,
                         // OSC ended before matching `133;` (e.g. `ESC]133 BEL`).
-                        0x07 | 0x18 | 0x1a => self.scan = OscScan::Ground,
+                        0x07 | 0x18 | 0x1a => self.scan = Scan::Ground,
                         _ if b == OSC133_PREFIX[n as usize] => {
                             let n2 = n + 1;
                             self.scan = if n2 as usize == OSC133_PREFIX.len() {
-                                OscScan::Payload {
+                                Scan::Payload {
                                     letter: 0,
                                     code: None,
                                     in_code: false,
                                     code_done: false,
                                 }
                             } else {
-                                OscScan::Prefix { n: n2 }
+                                Scan::Prefix { n: n2 }
                             };
                         }
                         // Some other OSC (title/hyperlink/color): skip to its end.
-                        _ => self.scan = OscScan::Skip,
+                        _ => self.scan = Scan::Skip,
                     }
                     i += 1;
                 }
-                OscScan::Payload { letter, code, in_code, code_done } => match b {
+                Scan::Payload { letter, code, in_code, code_done } => match b {
                     // BEL / CAN / SUB / ESC(=ST) all end the OSC (vte parity).
                     0x07 | 0x18 | 0x1a | 0x1b => {
                         let is_esc = b == 0x1b;
@@ -693,14 +781,14 @@ impl Terminal {
                         self.bind_mark(letter, code.map(|c| c as i32));
                         // ESC leaves alacritty in Escape state and may begin a new
                         // sequence (the trailing `\` of an ST is consumed there).
-                        self.scan = if is_esc { OscScan::Esc } else { OscScan::Ground };
+                        self.scan = if is_esc { Scan::Esc } else { Scan::Ground };
                         start = k;
                         i = k;
                     }
                     b';' => {
                         // First `;` opens the code field; a SECOND `;` closes it so
                         // `aid=<n>` (p10k) never bleeds into the exit code.
-                        self.scan = OscScan::Payload {
+                        self.scan = Scan::Payload {
                             letter,
                             code,
                             in_code: true,
@@ -720,7 +808,7 @@ impl Terminal {
                             .saturating_mul(10)
                             .saturating_add((b - b'0') as u32)
                             .min(EXIT_CODE_MAX);
-                        self.scan = OscScan::Payload { letter, code: Some(next), in_code, code_done };
+                        self.scan = Scan::Payload { letter, code: Some(next), in_code, code_done };
                         i += 1;
                     }
                     _ => {
@@ -729,23 +817,131 @@ impl Terminal {
                         // exit code unknown (None), closed so trailing digits do
                         // not resurrect it.
                         self.scan = if letter == 0 && !in_code {
-                            OscScan::Payload { letter: b, code, in_code, code_done }
+                            Scan::Payload { letter: b, code, in_code, code_done }
                         } else if in_code && !code_done {
-                            OscScan::Payload { letter, code: None, in_code, code_done: true }
+                            Scan::Payload { letter, code: None, in_code, code_done: true }
                         } else {
-                            OscScan::Payload { letter, code, in_code, code_done }
+                            Scan::Payload { letter, code, in_code, code_done }
                         };
                         i += 1;
                     }
                 },
-                OscScan::Skip => {
+                Scan::Skip => {
                     self.scan = match b {
-                        0x1b => OscScan::Esc,             // ST: ends this OSC, new escape
-                        0x07 | 0x18 | 0x1a => OscScan::Ground,
-                        _ => OscScan::Skip,
+                        0x1b => Scan::Esc,             // ST: ends this OSC, new escape
+                        0x07 | 0x18 | 0x1a => Scan::Ground,
+                        _ => Scan::Skip,
                     };
                     i += 1;
                 }
+                // Inside `ESC P`, collecting P1;P2;P3 up to the final byte. Mirrors
+                // vte's DcsEntry/DcsParam/DcsIntermediate tables: digits fold into
+                // the current param, `;`/`:` advance/subdivide it, `0x20..=0x2F` is
+                // an intermediate (⇒ not sixel), `0x40..=0x7E` is the final byte.
+                Scan::DcsParams { p2, field, inter } => {
+                    match b {
+                        b'0'..=b'9' => {
+                            // Fold digits into the current field; only P2 is kept
+                            // (the background-select param the decoder wants).
+                            let p2 = if field == 1 {
+                                p2.saturating_mul(10).saturating_add((b - b'0') as u32)
+                            } else {
+                                p2
+                            };
+                            self.scan = Scan::DcsParams { p2, field, inter };
+                            i += 1;
+                        }
+                        b';' => {
+                            self.scan = Scan::DcsParams { p2, field: field.saturating_add(1), inter };
+                            i += 1;
+                        }
+                        // `:` subparam — advance no field, keep scanning (vte parity).
+                        b':' => {
+                            i += 1;
+                        }
+                        // Intermediate byte ⇒ DECRQSS (`$q`) / XTGETTCAP (`+q`) etc.,
+                        // never a bare sixel.
+                        0x20..=0x2f => {
+                            self.scan = Scan::DcsParams { p2, field, inter: true };
+                            i += 1;
+                        }
+                        // Final byte: a bare `q` (0x71) with NO intermediates is a
+                        // sixel; anything else is some other DCS we skip.
+                        0x40..=0x7e => {
+                            if b == b'q' && !inter {
+                                self.sixel_buf.clear();
+                                self.sixel_overflow = false;
+                                self.pending_sixel_p2 = p2;
+                                self.scan = Scan::Sixel;
+                            } else {
+                                self.scan = Scan::DcsOther;
+                            }
+                            i += 1;
+                        }
+                        // CAN/SUB abort to Ground; ESC begins a new escape (vte
+                        // `anywhere`). Other C0 bytes are ignored (stay).
+                        0x18 | 0x1a => {
+                            self.scan = Scan::Ground;
+                            i += 1;
+                        }
+                        0x1b => {
+                            self.scan = Scan::Esc;
+                            i += 1;
+                        }
+                        _ => {
+                            i += 1;
+                        }
+                    }
+                }
+                // Accumulating raw sixel data until a DCS terminator. BEL is DATA
+                // here (unlike OSC) — only CAN/SUB/ESC/8-bit-ST terminate.
+                Scan::Sixel => match b {
+                    0x18 | 0x1a | 0x9c => {
+                        // CAN/SUB/8-bit-ST: flush the DCS to alacritty (it ignores
+                        // it), decode + place, return to Ground.
+                        let k = i + 1;
+                        self.advance_slice(&bytes[start..k]);
+                        self.finish_sixel();
+                        self.scan = Scan::Ground;
+                        start = k;
+                        i = k;
+                    }
+                    0x1b => {
+                        // 7-bit ST is `ESC \`: ESC ends the DCS and begins a new
+                        // escape (the trailing `\` is consumed in Esc → Ground).
+                        let k = i + 1;
+                        self.advance_slice(&bytes[start..k]);
+                        self.finish_sixel();
+                        self.scan = Scan::Esc;
+                        start = k;
+                        i = k;
+                    }
+                    _ => {
+                        // Data byte: accumulate up to the cap, then latch overflow
+                        // and stop pushing (keep scanning to resync at the terminator).
+                        if self.sixel_buf.len() < SIXEL_MAX_BYTES {
+                            self.sixel_buf.push(b);
+                        } else {
+                            self.sixel_overflow = true;
+                        }
+                        i += 1;
+                    }
+                },
+                // A non-sixel DCS (DECRQSS/XTGETTCAP/…): skip to the terminator,
+                // accumulate nothing, emit nothing. Same terminators as `Sixel`.
+                Scan::DcsOther => match b {
+                    0x18 | 0x1a | 0x9c => {
+                        self.scan = Scan::Ground;
+                        i += 1;
+                    }
+                    0x1b => {
+                        self.scan = Scan::Esc;
+                        i += 1;
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                },
             }
         }
         if start < bytes.len() {
@@ -802,6 +998,9 @@ impl Terminal {
         let now_saturated = self.term.grid().history_size() >= self.scrollback_limit;
         if now_saturated && !self.saturated {
             self.marks.clear();
+            // Image anchors become untrustworthy for the same reason marks do
+            // (abs_top can no longer count scrolled-off lines) — drop them.
+            self.clear_placements();
         }
         self.saturated = now_saturated;
     }
@@ -812,6 +1011,7 @@ impl Terminal {
     /// next prompt re-marks.
     fn on_history_shrunk(&mut self, history_size: usize) {
         self.prune_marks(history_size);
+        self.prune_placements(history_size);
     }
 
     /// Drop marks outside the live window `[abs_top - history_size, abs_top + rows)`
@@ -823,6 +1023,38 @@ impl Terminal {
         while self.marks.len() > MAX_MARKS {
             self.marks.pop_front();
         }
+    }
+
+    /// Empty the placement list and reset the live-bytes counter. Used on
+    /// saturation / reflow (correct-or-absent).
+    fn clear_placements(&mut self) {
+        self.placements.clear();
+        self.placement_bytes = 0;
+    }
+
+    /// Drop placements whose entire row SPAN lies outside the live window
+    /// `[abs_top - history_size, abs_top + rows)`, then enforce the count / bytes
+    /// caps (drop oldest). Unlike `prune_marks` (a single-line predicate) this is
+    /// a SPAN intersection because an image occupies `rows` rows — an image is
+    /// kept iff `abs_line + rows > min_abs && abs_line < max_abs`, the SAME test
+    /// `visible_images` uses (kept consistent on purpose).
+    fn prune_placements(&mut self, history_size: usize) {
+        let min_abs = self.abs_top - history_size as i64;
+        let max_abs = self.abs_top + self.rows as i64;
+        let mut bytes = self.placement_bytes;
+        self.placements.retain(|p| {
+            let keep = p.abs_line + p.rows as i64 > min_abs && p.abs_line < max_abs;
+            if !keep {
+                bytes = bytes.saturating_sub(p.image.rgba.len() as u64);
+            }
+            keep
+        });
+        // Enforce the count + live-bytes budget, dropping the OLDEST first.
+        while self.placements.len() > MAX_PLACEMENTS || bytes > MAX_PLACEMENT_BYTES {
+            let Some(old) = self.placements.pop_front() else { break };
+            bytes = bytes.saturating_sub(old.image.rgba.len() as u64);
+        }
+        self.placement_bytes = bytes;
     }
 
     /// Record an OSC 133 mark for the given sub-command letter (and D's exit
@@ -905,6 +1137,134 @@ impl Terminal {
             }
             _ => {} // unknown 133 sub-command: ignore
         }
+    }
+
+    /// Push the physical cell size (px) so `finish_sixel` maps a decoded image's
+    /// WxH to a cell footprint. Called by the app from its single reflow
+    /// chokepoint on every font-size / DPI / window-size change.
+    pub fn set_cell_px(&mut self, w: f32, h: f32) {
+        if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 {
+            self.cell_px_w = w;
+            self.cell_px_h = h;
+        }
+    }
+
+    /// Finish a sixel DCS at its terminator: decode the accumulated bytes, reserve
+    /// its cell rows by injecting line-feeds (so alacritty scrolls + grows history
+    /// and `abs_top` tracks the image for free), and record the placement.
+    ///
+    /// Correct-or-absent guards (drop, touch nothing): a buffer overflow, the alt
+    /// screen, an already-saturated ring, an ACTIVE synchronized-update block
+    /// (mode 2026 — the cursor is not yet at its post-flush position, so the
+    /// anchor would be wrong), a zero cell metric, a decode failure, or a
+    /// saturation flip caused by the reserve injection itself.
+    fn finish_sixel(&mut self) {
+        let buf = std::mem::take(&mut self.sixel_buf);
+        let overflow = std::mem::take(&mut self.sixel_overflow);
+        let p2 = self.pending_sixel_p2;
+
+        if overflow
+            || self.term.mode().contains(TermMode::ALT_SCREEN)
+            || self.saturated
+            // A sixel emitted inside a DECSET-2026 sync block anchors at the wrong
+            // row (vte is buffering; the cursor hasn't advanced). Drop it (P2).
+            || self.sync_deadline().is_some()
+            || self.cell_px_w <= 0.0
+            || self.cell_px_h <= 0.0
+        {
+            return;
+        }
+
+        let Some(img) = crate::sixel::decode_sixel(p2, &buf, crate::sixel::SIXEL_CAPS) else {
+            return;
+        };
+
+        // Footprint in cells (ceil), clamped to the grid width and a row cap.
+        let cols = ((img.width as f32 / self.cell_px_w).ceil() as usize).clamp(1, self.cols) as u16;
+        let rows = ((img.height as f32 / self.cell_px_h).ceil() as usize)
+            .clamp(1, MAX_IMAGE_ROWS) as u16;
+
+        // Anchor at the CURRENT cursor ROW (alacritty ignored the DCS, so it is
+        // still the image's top) — captured BEFORE injecting the reserve scroll,
+        // so it reuses the FIXED abs_top model exactly like `bind_mark`. The image
+        // starts at COLUMN 0 because the reserve injects a leading CR (below),
+        // matching most sixel terminals; so the anchor column is 0.
+        let cur = self.term.grid().cursor.point;
+        let abs_line = self.abs_top + cur.line.0 as i64;
+        let col = 0u16;
+
+        // Reserve vertical space: a CR to start the image at column 0 (matching
+        // most sixel terminals, and so a mid-line cursor doesn't overlap the
+        // image), then `rows` line-feeds through the same `advance_slice` path so
+        // alacritty scrolls, grows history, and `abs_top` tracks automatically.
+        let mut reserve = Vec::with_capacity(1 + rows as usize * 2);
+        reserve.push(b'\r');
+        for _ in 0..rows {
+            reserve.push(b'\r');
+            reserve.push(b'\n');
+        }
+        self.advance_slice(&reserve);
+
+        // The reserve injection can have pushed history to the cap and flipped the
+        // saturation latch mid-call; if so, the anchor is no longer trustworthy —
+        // treat the image as absent (do not record).
+        if self.saturated {
+            return;
+        }
+
+        let id = crate::sixel::content_id(&img);
+        let bytes = img.rgba.len() as u64;
+        self.placements.push_back(ImagePlacement {
+            id,
+            abs_line,
+            col,
+            cols,
+            rows,
+            px_w: img.width.min(u16::MAX as u32) as u16,
+            px_h: img.height.min(u16::MAX as u32) as u16,
+            image: Arc::new(img),
+        });
+        self.placement_bytes = self.placement_bytes.saturating_add(bytes);
+        let history = self.term.grid().history_size();
+        self.prune_placements(history);
+    }
+
+    /// Currently-visible inline images mapped to VIEWPORT rows, off the per-cell
+    /// snapshot path (SPEED — mirrors `failed_prompt_rows`). Empty on the alt
+    /// screen / past saturation. A placement is kept iff its row SPAN intersects
+    /// the visible grid `[0, rows)` — the SAME span test as `prune_placements`.
+    pub fn visible_images(&self) -> Vec<crate::snapshot::VisibleImage> {
+        if self.saturated || self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return Vec::new();
+        }
+        let off = self.term.grid().display_offset() as i64;
+        self.placements
+            .iter()
+            .filter_map(|p| {
+                // Viewport row of the image's top-left cell (may be negative).
+                let top = (p.abs_line - self.abs_top) + off;
+                let bottom = top + p.rows as i64;
+                if bottom <= 0 || top >= self.rows as i64 {
+                    return None; // span does not intersect the visible grid
+                }
+                Some(crate::snapshot::VisibleImage {
+                    id: p.id,
+                    top_row: top as f32,
+                    col: p.col,
+                    cols: p.cols,
+                    rows: p.rows,
+                    px_w: p.px_w,
+                    px_h: p.px_h,
+                })
+            })
+            .collect()
+    }
+
+    /// The decoded RGBA image for a visible placement id (cheap `Arc` clone), so
+    /// the render layer can upload it once per window. `None` if the placement was
+    /// pruned since `visible_images` was called.
+    pub fn image_rgba(&self, id: u64) -> Option<Arc<crate::sixel::SixelImage>> {
+        self.placements.iter().find(|p| p.id == id).map(|p| p.image.clone())
     }
 
     /// Viewport rows (0-based) of currently-visible FAILED-command prompts
@@ -1372,6 +1732,11 @@ impl Terminal {
         // has ~no history, so `history_size()` there would corrupt the primary
         // `abs_top` (which is frozen for the alt session).
         self.marks.clear();
+        // Image placements anchor on the same (now-meaningless) reflowed rows, so
+        // drop them too (correct-or-absent; a re-emit re-marks). The reserved
+        // blank rows remain — harmless — and the GPU textures simply stop being
+        // drawn (the ImageLayer's LRU reclaims their VRAM).
+        self.clear_placements();
         if !self.term.mode().contains(TermMode::ALT_SCREEN) {
             self.abs_top = self.term.grid().history_size() as i64;
             self.refresh_saturation();
@@ -3288,5 +3653,192 @@ mod tests {
         t.set_scrollback_lines(500);
         t.feed(b"\x1b]52;c;?\x07");
         assert!(t.take_clipboard_load().is_some(), "paste survives a scrollback change");
+    }
+
+    // ─────────────────────────── SIXEL DCS scanner + placement ───────────────
+
+    /// Wrap sixel `data` in a 7-bit DCS (`ESC P q … ESC \`). Empty params ⇒ P2=0.
+    fn sixel(data: &str) -> Vec<u8> {
+        let mut v = b"\x1bPq".to_vec();
+        v.extend_from_slice(data.as_bytes());
+        v.extend_from_slice(b"\x1b\\");
+        v
+    }
+    // A red 1×6 column, and a red 1×12 (two bands).
+    const RED_1X6: &str = "#0;2;100;0;0#0~";
+    const RED_1X12: &str = "#0;2;100;0;0#0~-~";
+
+    #[test]
+    fn sixel_records_placement_and_reserves_rows() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&sixel(RED_1X12)); // 1×12 px → rows = ceil(12/10) = 2
+        assert_eq!(t.placements.len(), 1, "one placement recorded");
+        let p = &t.placements[0];
+        assert_eq!((p.px_w, p.px_h), (1, 12), "native size");
+        assert_eq!((p.cols, p.rows), (1, 2), "cell footprint (ceil)");
+        assert_eq!(p.abs_line, 0, "anchored at the starting row");
+        assert_eq!(p.col, 0, "image starts at column 0");
+        // Cursor moved down `rows` lines to column 0 (the reserved region).
+        let snap = t.snapshot();
+        assert_eq!(snap.cursor_row, 2, "cursor sits below the reserved image rows");
+        assert_eq!(snap.cursor_col, 0);
+    }
+
+    #[test]
+    fn sixel_visible_image_maps_to_viewport() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&sixel(RED_1X6));
+        let imgs = t.visible_images();
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].top_row, 0.0, "top of image at viewport row 0");
+        assert_eq!((imgs[0].px_w, imgs[0].px_h), (1, 6));
+        assert!(t.image_rgba(imgs[0].id).is_some(), "rgba retrievable by id");
+    }
+
+    #[test]
+    fn sixel_split_across_feeds_resumes() {
+        let full = sixel(RED_1X12);
+        // Split in the middle of the payload.
+        let cut = full.len() / 2;
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&full[..cut]);
+        t.feed(&full[cut..]);
+        assert_eq!(t.placements.len(), 1, "one image across the two feeds");
+        assert_eq!((t.placements[0].px_w, t.placements[0].px_h), (1, 12));
+    }
+
+    #[test]
+    fn sixel_coexists_with_interleaved_osc133() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        // OSC133 A (bind a prompt mark), then a sixel, then a text line.
+        t.feed(b"\x1b]133;A\x07");
+        assert_eq!(t.marks.len(), 1, "133;A still bound with sixel scanning present");
+        t.feed(&sixel(RED_1X6));
+        t.feed(b"hello");
+        assert_eq!(t.marks.len(), 1, "the mark survived the sixel");
+        assert_eq!(t.placements.len(), 1, "and the sixel was recorded");
+    }
+
+    #[test]
+    fn bel_is_data_inside_sixel() {
+        // A BEL (0x07) between two data bytes must NOT terminate the DCS (unlike
+        // OSC): both `~` belong to the image → width 2 (not 1 + stray text).
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&sixel("#0;2;100;0;0#0~\x07~"));
+        assert_eq!(t.placements.len(), 1);
+        assert_eq!(t.placements[0].px_w, 2, "BEL was data; both columns drawn");
+    }
+
+    #[test]
+    fn eight_bit_st_terminates_sixel() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        // `ESC P q <data> 0x9C` (8-bit ST).
+        let mut bytes = b"\x1bPq".to_vec();
+        bytes.extend_from_slice(RED_1X6.as_bytes());
+        bytes.push(0x9c);
+        t.feed(&bytes);
+        assert_eq!(t.placements.len(), 1, "8-bit ST terminates the sixel");
+    }
+
+    #[test]
+    fn dcs_other_records_nothing() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        // DECRQSS `ESC P $ q " p ST` — intermediate `$` ⇒ not a sixel.
+        t.feed(b"\x1bP$q\"p\x1b\\");
+        assert!(t.placements.is_empty(), "a DECRQSS DCS records no placement");
+        // Parser is not desynced: a following sixel still works.
+        t.feed(&sixel(RED_1X6));
+        assert_eq!(t.placements.len(), 1);
+    }
+
+    #[test]
+    fn overlong_sixel_overflows_and_drops() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        // Feed a valid opener + more than SIXEL_MAX_BYTES of data, WITHOUT a
+        // terminator: the buffer must latch overflow and stay capped.
+        let mut bytes = b"\x1bPq#0;2;100;0;0#0".to_vec();
+        bytes.extend(std::iter::repeat_n(b'~', SIXEL_MAX_BYTES + 1024));
+        t.feed(&bytes);
+        assert!(t.sixel_overflow, "overflow latched");
+        assert!(t.sixel_buf.len() <= SIXEL_MAX_BYTES, "buffer stays capped");
+        // Now terminate: the overflowed image must be DROPPED (correct-or-absent).
+        t.feed(b"\x1b\\");
+        assert!(t.placements.is_empty(), "overflowed sixel produced no placement");
+        assert!(t.sixel_buf.is_empty(), "buffer released on finish");
+    }
+
+    #[test]
+    fn sixel_dropped_on_alt_screen() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"\x1b[?1049h"); // enter alt screen
+        t.feed(&sixel(RED_1X6));
+        assert!(t.placements.is_empty(), "no inline images on the alt screen");
+    }
+
+    #[test]
+    fn sixel_dropped_inside_sync_block() {
+        // A sixel inside a DECSET-2026 synchronized-update block anchors at the
+        // wrong row (vte is buffering) → it must be dropped (amendment P2).
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"\x1b[?2026h"); // BSU
+        assert!(t.sync_deadline().is_some(), "sync armed");
+        t.feed(&sixel(RED_1X6));
+        assert!(t.placements.is_empty(), "sixel inside a sync block is dropped");
+        t.flush_sync();
+    }
+
+    #[test]
+    fn resize_clears_placements() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&sixel(RED_1X6));
+        assert_eq!(t.placements.len(), 1);
+        t.resize(30, 8); // reflow invalidates anchors
+        assert!(t.placements.is_empty(), "reflow drops placements (correct-or-absent)");
+    }
+
+    #[test]
+    fn placement_anchor_tracks_scroll_into_history() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&sixel(RED_1X6)); // 1 reserved row, anchored at abs_line 0
+        assert_eq!(t.visible_images().len(), 1, "visible at the bottom initially");
+        // Push it well into history.
+        for _ in 0..30 {
+            t.feed(b"\r\n");
+        }
+        assert!(
+            t.visible_images().is_empty(),
+            "scrolled into history: not visible while viewing the bottom"
+        );
+        // Scroll all the way up: the image reappears near the top of the viewport.
+        t.scroll_to_offset(t.scroll_max());
+        let imgs = t.visible_images();
+        assert_eq!(imgs.len(), 1, "reappears when scrolled back to its row");
+        assert_eq!(imgs[0].top_row, 0.0, "at viewport row 0 (its true row)");
+    }
+
+    #[test]
+    fn multi_row_image_prunes_by_span_not_single_line() {
+        // A tall image whose TOP has scrolled just above the live window but whose
+        // BODY still intersects it must be RETAINED (span intersection, not the
+        // single-line mark predicate). Use a tiny scrollback so pruning bites.
+        let mut t = Terminal::new(20, 5);
+        t.set_scrollback_lines(3);
+        t.set_cell_px(10.0, 10.0);
+        // A 30px-tall image → 3 reserved rows, spanning abs 0..3.
+        t.feed(&sixel("#0;2;100;0;0#0~-~-~-~-~")); // 5 bands = 30px
+        assert_eq!(t.placements.len(), 1);
+        assert!(t.placements[0].rows >= 3, "multi-row footprint");
     }
 }
