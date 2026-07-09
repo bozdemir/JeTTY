@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+use std::sync::RwLock;
+
 /// Ordered list of built-in theme preset names. Indices are stable so they
 /// can be used as `theme_idx` in the app state (Ctrl+Shift+T cycles through).
 ///
@@ -11,20 +14,97 @@ pub const PRESETS: [&str; 22] = [
 ];
 
 /// Terminal color theme: background, foreground, cursor, and the 16-color ANSI palette.
+///
+/// `name`/`display_name` are `Cow<'static, str>` so the 22 built-ins stay
+/// zero-allocation (`Cow::Borrowed`) while user-imported themes own their strings
+/// (`Cow::Owned`). Comparisons/formatting go through `Deref<Target=str>`.
 #[derive(Clone, Debug)]
 pub struct Theme {
-    pub name: &'static str,         // stable id used in config + PRESETS (snake_case)
-    pub display_name: &'static str, // human-facing label shown in the Settings theme list
+    pub name: Cow<'static, str>,         // stable id used in config + PRESETS (snake_case)
+    pub display_name: Cow<'static, str>, // human-facing label shown in the Settings theme list
     pub bg: [u8; 4],           // background RGBA (alpha < 255 => transparent)
     pub fg: [u8; 3],           // default foreground
     pub cursor: [u8; 3],       // cursor block color
     pub palette: [[u8; 3]; 16], // standard ANSI 0..=15
 }
 
-impl Theme {
-    /// Resolve a theme by name string. Unknown names fall back to catppuccin_mocha.
-    pub fn by_name(name: &str) -> Theme {
-        match name {
+/// Runtime theme registry: the ORDERED merged list of built-ins + user-imported
+/// themes, populated once at startup and on every hot-reload by jetty-app
+/// (`themes::rebuild_registry`). `by_name`/`theme_at`/`theme_index`/`theme_count`
+/// consult it so a user theme can shadow a built-in and the picker/cycle can index
+/// it. Empty until seeded (e.g. a bare `jetty-core` unit test or `jetty-shot`
+/// before `rebuild_registry`), in which case every accessor falls back to the
+/// hardcoded 22 built-ins — so the crate is always usable with no registry set.
+static REGISTRY: RwLock<Vec<Theme>> = RwLock::new(Vec::new());
+
+/// Replace the whole registry with `entries` (built-ins first, then user themes; a
+/// user theme whose `name` equals a built-in has already REPLACED it in place by the
+/// caller's merge). Called once at startup and on every hot-reload.
+pub fn set_registry(entries: Vec<Theme>) {
+    *REGISTRY.write().unwrap() = entries;
+}
+
+/// The 22 built-in themes in `PRESETS` order (each a fresh, owned `Theme`). Used by
+/// jetty-app to seed the registry (built-ins + user themes).
+pub fn builtins() -> Vec<Theme> {
+    PRESETS.iter().map(|&n| builtin_by_name(n)).collect()
+}
+
+/// Number of themes available: the registry length, or the built-in count when the
+/// registry is empty (never zero — `PRESETS` has 22). The picker/cycle bound.
+pub fn theme_count() -> usize {
+    let n = REGISTRY.read().unwrap().len();
+    if n == 0 { PRESETS.len() } else { n }
+}
+
+/// Resolve the theme at ordered index `idx`, cloning. NEVER panics on a stale/out-of-
+/// range index (the list is dynamic — a custom theme can be deleted between frames):
+/// falls back to `catppuccin_mocha`. Reads the registry, or the built-ins when empty.
+/// Does NOT call `by_name` (which also locks) — avoids a reentrant read lock.
+pub fn theme_at(idx: usize) -> Theme {
+    let reg = REGISTRY.read().unwrap();
+    if reg.is_empty() {
+        PRESETS.get(idx).map(|&n| builtin_by_name(n)).unwrap_or_else(catppuccin_mocha)
+    } else {
+        reg.get(idx).cloned().unwrap_or_else(catppuccin_mocha)
+    }
+}
+
+/// Ordered index of the theme named `name`, or `None` when absent. Consults the
+/// registry (user shadow included), else the built-in `PRESETS` order.
+pub fn theme_index(name: &str) -> Option<usize> {
+    let reg = REGISTRY.read().unwrap();
+    if reg.is_empty() {
+        PRESETS.iter().position(|&n| n == name)
+    } else {
+        reg.iter().position(|t| t.name.as_ref() == name)
+    }
+}
+
+/// Ordered `(name, display_name)` pairs for the picker/cycle. Built-ins then user
+/// themes when the registry is seeded; the 22 built-ins otherwise.
+pub fn theme_list() -> Vec<(String, String)> {
+    let reg = REGISTRY.read().unwrap();
+    if reg.is_empty() {
+        PRESETS
+            .iter()
+            .map(|&n| {
+                let t = builtin_by_name(n);
+                (t.name.into_owned(), t.display_name.into_owned())
+            })
+            .collect()
+    } else {
+        reg.iter()
+            .map(|t| (t.name.to_string(), t.display_name.to_string()))
+            .collect()
+    }
+}
+
+/// Resolve a built-in theme by name (pure match, NO registry lock). Unknown names
+/// fall back to catppuccin_mocha. Kept separate from `by_name` so registry-holding
+/// callers can resolve a built-in without re-entering the `RwLock`.
+fn builtin_by_name(name: &str) -> Theme {
+    match name {
             "catppuccin_mocha" => catppuccin_mocha(),
             "tokyo_night" => tokyo_night(),
             "gruvbox_dark" => gruvbox_dark(),
@@ -49,6 +129,18 @@ impl Theme {
             "catppuccin_macchiato" => catppuccin_macchiato(),
             _ => catppuccin_mocha(),
         }
+}
+
+impl Theme {
+    /// Resolve a theme by name string. Consults the runtime registry FIRST (a user
+    /// theme whose `name` matches shadows the built-in), then the hardcoded 22
+    /// built-ins, then falls back to catppuccin_mocha. Cheap in the common built-in
+    /// case; a user theme clones its owned strings.
+    pub fn by_name(name: &str) -> Theme {
+        if let Some(t) = REGISTRY.read().unwrap().iter().find(|t| t.name.as_ref() == name) {
+            return t.clone();
+        }
+        builtin_by_name(name)
     }
 
     /// A guaranteed-visible error red for the OSC 133 failed-command marker.
@@ -79,8 +171,8 @@ impl Theme {
 /// Catppuccin Mocha — the soothing pastel dark theme (catppuccin.com). Default.
 pub fn catppuccin_mocha() -> Theme {
     Theme {
-        name: "catppuccin_mocha",
-        display_name: "Catppuccin Mocha",
+        name: Cow::Borrowed("catppuccin_mocha"),
+        display_name: Cow::Borrowed("Catppuccin Mocha"),
         bg: [30, 30, 46, 255],   // base   #1e1e2e
         fg: [205, 214, 244],     // text   #cdd6f4
         cursor: [245, 224, 220], // rosewater #f5e0dc
@@ -108,8 +200,8 @@ pub fn catppuccin_mocha() -> Theme {
 /// Tokyo Night — the popular dark blue scheme (enkia/tokyonight).
 pub fn tokyo_night() -> Theme {
     Theme {
-        name: "tokyo_night",
-        display_name: "Tokyo Night",
+        name: Cow::Borrowed("tokyo_night"),
+        display_name: Cow::Borrowed("Tokyo Night"),
         bg: [26, 27, 38, 255],   // #1a1b26
         fg: [192, 202, 245],     // #c0caf5
         cursor: [192, 202, 245], // #c0caf5
@@ -137,8 +229,8 @@ pub fn tokyo_night() -> Theme {
 /// Gruvbox Dark — Pavel Pertsev's retro-groove color scheme.
 pub fn gruvbox_dark() -> Theme {
     Theme {
-        name: "gruvbox_dark",
-        display_name: "Gruvbox Dark",
+        name: Cow::Borrowed("gruvbox_dark"),
+        display_name: Cow::Borrowed("Gruvbox Dark"),
         bg: [40, 40, 40, 255],
         fg: [235, 219, 178],
         cursor: [251, 241, 199],
@@ -166,8 +258,8 @@ pub fn gruvbox_dark() -> Theme {
 /// Dracula — the famous dark theme (draculatheme.com).
 pub fn dracula() -> Theme {
     Theme {
-        name: "dracula",
-        display_name: "Dracula",
+        name: Cow::Borrowed("dracula"),
+        display_name: Cow::Borrowed("Dracula"),
         bg: [40, 42, 54, 255],   // #282a36
         fg: [248, 248, 242],     // #f8f8f2
         cursor: [248, 248, 242], // #f8f8f2
@@ -196,8 +288,8 @@ pub fn dracula() -> Theme {
 /// background), matching the soft dark terminal look.
 pub fn onyx() -> Theme {
     Theme {
-        name: "onyx",
-        display_name: "Onyx",
+        name: Cow::Borrowed("onyx"),
+        display_name: Cow::Borrowed("Onyx"),
         bg: [22, 22, 26, 255],   // #16161a
         fg: [200, 200, 205],     // #c8c8cd
         cursor: [97, 175, 239],  // #61afef
@@ -226,8 +318,8 @@ pub fn onyx() -> Theme {
 /// Nord — nordtheme.com (exact hex).
 pub fn nord() -> Theme {
     Theme {
-        name: "nord",
-        display_name: "Nord",
+        name: Cow::Borrowed("nord"),
+        display_name: Cow::Borrowed("Nord"),
         bg: [46, 52, 64, 255],   // #2e3440
         fg: [216, 222, 233],     // #d8dee9
         cursor: [236, 239, 244], // #eceff4
@@ -255,8 +347,8 @@ pub fn nord() -> Theme {
 /// Solarized Dark — ethanschoonover.com/solarized (exact hex).
 pub fn solarized_dark() -> Theme {
     Theme {
-        name: "solarized_dark",
-        display_name: "Solarized Dark",
+        name: Cow::Borrowed("solarized_dark"),
+        display_name: Cow::Borrowed("Solarized Dark"),
         bg: [0, 43, 54, 255],   // #002b36
         fg: [131, 148, 150],     // #839496
         cursor: [131, 148, 150], // #839496
@@ -284,8 +376,8 @@ pub fn solarized_dark() -> Theme {
 /// Solarized Light — ethanschoonover.com/solarized (exact hex).
 pub fn solarized_light() -> Theme {
     Theme {
-        name: "solarized_light",
-        display_name: "Solarized Light",
+        name: Cow::Borrowed("solarized_light"),
+        display_name: Cow::Borrowed("Solarized Light"),
         bg: [253, 246, 227, 255],   // #fdf6e3
         fg: [101, 123, 131],     // #657b83
         cursor: [101, 123, 131], // #657b83
@@ -313,8 +405,8 @@ pub fn solarized_light() -> Theme {
 /// One Dark — Atom One Dark (exact hex).
 pub fn one_dark() -> Theme {
     Theme {
-        name: "one_dark",
-        display_name: "One Dark",
+        name: Cow::Borrowed("one_dark"),
+        display_name: Cow::Borrowed("One Dark"),
         bg: [33, 37, 43, 255],   // #21252b
         fg: [171, 178, 191],     // #abb2bf
         cursor: [171, 178, 191], // #abb2bf
@@ -342,8 +434,8 @@ pub fn one_dark() -> Theme {
 /// Monokai — Monokai Classic (exact hex).
 pub fn monokai() -> Theme {
     Theme {
-        name: "monokai",
-        display_name: "Monokai",
+        name: Cow::Borrowed("monokai"),
+        display_name: Cow::Borrowed("Monokai"),
         bg: [39, 40, 34, 255],   // #272822
         fg: [253, 255, 241],     // #fdfff1
         cursor: [192, 193, 181], // #c0c1b5
@@ -371,8 +463,8 @@ pub fn monokai() -> Theme {
 /// Monokai Pro — monokai.pro (exact hex).
 pub fn monokai_pro() -> Theme {
     Theme {
-        name: "monokai_pro",
-        display_name: "Monokai Pro",
+        name: Cow::Borrowed("monokai_pro"),
+        display_name: Cow::Borrowed("Monokai Pro"),
         bg: [45, 42, 46, 255],   // #2d2a2e
         fg: [252, 252, 250],     // #fcfcfa
         cursor: [193, 192, 192], // #c1c0c0
@@ -400,8 +492,8 @@ pub fn monokai_pro() -> Theme {
 /// Everforest Dark — sainnhe/everforest (exact hex).
 pub fn everforest_dark() -> Theme {
     Theme {
-        name: "everforest_dark",
-        display_name: "Everforest Dark",
+        name: Cow::Borrowed("everforest_dark"),
+        display_name: Cow::Borrowed("Everforest Dark"),
         bg: [45, 53, 59, 255],   // #2d353b
         fg: [211, 198, 170],     // #d3c6aa
         cursor: [230, 152, 117], // #e69875
@@ -429,8 +521,8 @@ pub fn everforest_dark() -> Theme {
 /// Rose Pine — rosepinetheme.com (exact hex).
 pub fn rose_pine() -> Theme {
     Theme {
-        name: "rose_pine",
-        display_name: "Rose Pine",
+        name: Cow::Borrowed("rose_pine"),
+        display_name: Cow::Borrowed("Rose Pine"),
         bg: [25, 23, 36, 255],   // #191724
         fg: [224, 222, 244],     // #e0def4
         cursor: [224, 222, 244], // #e0def4
@@ -458,8 +550,8 @@ pub fn rose_pine() -> Theme {
 /// Kanagawa — rebelot/kanagawa.nvim (exact hex).
 pub fn kanagawa() -> Theme {
     Theme {
-        name: "kanagawa",
-        display_name: "Kanagawa",
+        name: Cow::Borrowed("kanagawa"),
+        display_name: Cow::Borrowed("Kanagawa"),
         bg: [31, 31, 40, 255],   // #1f1f28
         fg: [220, 215, 186],     // #dcd7ba
         cursor: [220, 215, 186], // #dcd7ba
@@ -487,8 +579,8 @@ pub fn kanagawa() -> Theme {
 /// Material — Material Dark (exact hex).
 pub fn material_dark() -> Theme {
     Theme {
-        name: "material_dark",
-        display_name: "Material",
+        name: Cow::Borrowed("material_dark"),
+        display_name: Cow::Borrowed("Material"),
         bg: [35, 35, 34, 255],   // #232322
         fg: [229, 229, 229],     // #e5e5e5
         cursor: [22, 175, 202], // #16afca
@@ -516,8 +608,8 @@ pub fn material_dark() -> Theme {
 /// Ayu Dark — ayu-theme/ayu (exact hex).
 pub fn ayu_dark() -> Theme {
     Theme {
-        name: "ayu_dark",
-        display_name: "Ayu Dark",
+        name: Cow::Borrowed("ayu_dark"),
+        display_name: Cow::Borrowed("Ayu Dark"),
         bg: [11, 14, 20, 255],   // #0b0e14
         fg: [191, 189, 182],     // #bfbdb6
         cursor: [230, 180, 80], // #e6b450
@@ -545,8 +637,8 @@ pub fn ayu_dark() -> Theme {
 /// Ayu Mirage — ayu-theme/ayu (exact hex).
 pub fn ayu_mirage() -> Theme {
     Theme {
-        name: "ayu_mirage",
-        display_name: "Ayu Mirage",
+        name: Cow::Borrowed("ayu_mirage"),
+        display_name: Cow::Borrowed("Ayu Mirage"),
         bg: [31, 36, 48, 255],   // #1f2430
         fg: [204, 202, 194],     // #cccac2
         cursor: [255, 204, 102], // #ffcc66
@@ -574,8 +666,8 @@ pub fn ayu_mirage() -> Theme {
 /// Tomorrow Night — chriskempson/tomorrow (exact hex).
 pub fn tomorrow_night() -> Theme {
     Theme {
-        name: "tomorrow_night",
-        display_name: "Tomorrow Night",
+        name: Cow::Borrowed("tomorrow_night"),
+        display_name: Cow::Borrowed("Tomorrow Night"),
         bg: [29, 31, 33, 255],   // #1d1f21
         fg: [197, 200, 198],     // #c5c8c6
         cursor: [197, 200, 198], // #c5c8c6
@@ -603,8 +695,8 @@ pub fn tomorrow_night() -> Theme {
 /// Oceanic Next — voronianski/oceanic-next (exact hex).
 pub fn oceanic_next() -> Theme {
     Theme {
-        name: "oceanic_next",
-        display_name: "Oceanic Next",
+        name: Cow::Borrowed("oceanic_next"),
+        display_name: Cow::Borrowed("Oceanic Next"),
         bg: [22, 44, 53, 255],   // #162c35
         fg: [192, 197, 206],     // #c0c5ce
         cursor: [192, 197, 206], // #c0c5ce
@@ -632,8 +724,8 @@ pub fn oceanic_next() -> Theme {
 /// GitHub Dark — primer/github-vscode-theme (exact hex).
 pub fn github_dark() -> Theme {
     Theme {
-        name: "github_dark",
-        display_name: "GitHub Dark",
+        name: Cow::Borrowed("github_dark"),
+        display_name: Cow::Borrowed("GitHub Dark"),
         bg: [13, 17, 23, 255],   // #0d1117
         fg: [201, 209, 217],     // #c9d1d9
         cursor: [88, 166, 255], // #58a6ff
@@ -661,8 +753,8 @@ pub fn github_dark() -> Theme {
 /// Palenight — material palenight (exact hex).
 pub fn palenight() -> Theme {
     Theme {
-        name: "palenight",
-        display_name: "Palenight",
+        name: Cow::Borrowed("palenight"),
+        display_name: Cow::Borrowed("Palenight"),
         bg: [41, 45, 62, 255],   // #292d3e
         fg: [191, 199, 213],     // #bfc7d5
         cursor: [126, 87, 194], // #7e57c2
@@ -690,8 +782,8 @@ pub fn palenight() -> Theme {
 /// Catppuccin Macchiato — catppuccin (exact hex).
 pub fn catppuccin_macchiato() -> Theme {
     Theme {
-        name: "catppuccin_macchiato",
-        display_name: "Catppuccin Macchiato",
+        name: Cow::Borrowed("catppuccin_macchiato"),
+        display_name: Cow::Borrowed("Catppuccin Macchiato"),
         bg: [36, 39, 58, 255],   // #24273a
         fg: [202, 211, 245],     // #cad3f5
         cursor: [244, 219, 214], // #f4dbd6

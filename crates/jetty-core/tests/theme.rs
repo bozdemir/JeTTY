@@ -11,13 +11,13 @@ fn every_preset_resolves_and_has_unique_display_name() {
     let mut displays = HashSet::new();
     for &key in jetty_core::theme::PRESETS.iter() {
         let t = Theme::by_name(key);
-        assert_eq!(t.name, key, "by_name({key:?}) must round-trip its key");
+        assert_eq!(t.name.as_ref(), key, "by_name({key:?}) must round-trip its key");
         assert!(!t.display_name.is_empty(), "{key} has an empty display_name");
         assert!(keys.insert(key), "duplicate preset key: {key}");
+        let display = t.display_name.into_owned();
         assert!(
-            displays.insert(t.display_name),
-            "duplicate display_name: {}",
-            t.display_name
+            displays.insert(display.clone()),
+            "duplicate display_name: {display}"
         );
     }
 }
