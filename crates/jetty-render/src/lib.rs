@@ -15,6 +15,7 @@ mod crt;
 mod welcome;
 mod caret_fx;
 mod search_bar;
+mod palette;
 pub use gpu::GpuContext;
 pub use text::TextLayer;
 pub use quad::{QuadLayer, Rect, cell_bg_rects, default_bg_clear, scrollbar_rect, scrollbar_rect_geom, scrollbar_offset_from_cursor, text_decoration_rects, link_underline_rects, failed_marker_rects, grid_decoration_key, cursor_rects, SCROLLBAR_W};
@@ -36,3 +37,4 @@ pub use tabbar::{
 };
 pub use welcome::{build_welcome_overlay, WelcomeOverlay};
 pub use search_bar::{build_search_bar, search_hit_rects, SearchBar};
+pub use palette::{build_command_palette, CommandPalette, PaletteRow, MAX_PALETTE_ROWS};
