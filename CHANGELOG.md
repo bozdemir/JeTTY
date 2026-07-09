@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.18.1] — 2026-07-09
+
+### Changed
+- **Settings panel polish** — control labels are now sentence case ("Opacity",
+  "Window mode", "Notify on finish") instead of ALL-CAPS, for a calmer, more
+  scannable hierarchy; section dividers (Run & Notify, CRT, Caret) stay distinct
+  via color + a hairline rule. The CRT animation chips read **Roll / Flicker /
+  Jitter** in full instead of the cramped FLKR / JITR, and the Run & Notify
+  section got more breathing room. Every tab screenshot-verified.
+
+---
+
 ## [0.18.0] — 2026-07-09
 
 **Command palette.** A keyboard-first fuzzy launcher for everything JeTTY can do.
