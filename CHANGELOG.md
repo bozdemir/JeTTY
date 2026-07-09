@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.18.0] — 2026-07-09
+
+**Command palette.** A keyboard-first fuzzy launcher for everything JeTTY can do.
+Designed from a verified blueprint, stress-tested by two design critics (6
+blocking issues), then adversarially reviewed and screenshot-verified.
+
+### Added
+- **Fuzzy command palette** — `Ctrl+Shift+P` (⌘⇧P on macOS) opens a themed
+  overlay: type to fuzzy-filter ~50 actions, `Up`/`Down` to move, `Enter` to run,
+  `Esc` to close. Actions include new/close/switch/detach tab, **switch to any of
+  the 22+ themes**, toggle CRT / caret / effects, font size, opacity, open
+  Settings, search, jump to prompt, copy/paste, perf HUD, hide, quit, and more —
+  each wired to the existing code path (no duplicated logic). Matched characters
+  are highlighted; the list scrolls. Renders only when open (zero idle cost).
+
+### Changed
+- **`Ctrl+Shift+P` now opens the command palette** (it previously opened
+  Settings). Settings is still one keystroke away: **`Ctrl+Shift+O`** or
+  **`Ctrl+,`** (⌘, on macOS), and there's an **"Open Settings…"** entry in the
+  palette itself.
+
+---
+
 ## [0.17.0] — 2026-07-09
 
 **Speed proof & hardening** — the brand is "Jet", so the numbers that define

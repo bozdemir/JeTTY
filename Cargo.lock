@@ -1212,14 +1212,14 @@ dependencies = [
 
 [[package]]
 name = "jetty"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "jetty-app",
 ]
 
 [[package]]
 name = "jetty-app"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "arboard",
  "dirs",
