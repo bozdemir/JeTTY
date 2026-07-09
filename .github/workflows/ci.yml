@@ -30,3 +30,39 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # Informational perf REPORT (never fails the build in v0.17). It runs the CPU-only
+  # bench and prints the numbers so we can watch the runner's real distribution.
+  # CPU-only avoids GPU-availability / software-rasterizer timing variance on shared
+  # runners — it is display-independent and deterministic. Hard floors calibrated to
+  # a dev machine would false-fail on a slower, sometimes sustained-contended runner,
+  # so gating is a v0.18 follow-up set at ~50% of the observed CI minimum (see
+  # docs/perf-budget.md). `continue-on-error` is belt-and-suspenders on top of the
+  # script's own `exit 0`.
+  perf-report:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Same build deps as build-test. These are orthogonal to the CPU-only runtime
+      # path (which never touches wgpu); kept so the release-profile bench binary
+      # links exactly as shipped.
+      - name: System build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libvulkan-dev libwayland-dev libxkbcommon-dev \
+            libx11-dev libxcb1-dev libfontconfig1-dev libgl1-mesa-dev
+
+      - name: Build bench (release, matches the shipped profile)
+        run: cargo build --release -p jetty-app --bin jetty-bench
+
+      - name: Perf report (CPU-only, informational)
+        run: N=5 scripts/perf-report.sh
