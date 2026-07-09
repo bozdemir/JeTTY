@@ -7919,6 +7919,7 @@ impl ApplicationHandler<AppEvent> for App {
                     || self.confirm_quit
                     || self.confirm_close.is_some()
                     || self.help_open
+                    || self.palette_open
                     || self.context_menu.is_some()
                     || self.tab_menu.is_some()
                     || self.tabs.is_empty()
