@@ -452,7 +452,7 @@ mod tests {
         // finite, NON-NEGATIVE number of ms (a just-spawned test binary can round to
         // ~0 — see the clamp in linux_exec_to_now_ms — so assert >= 0, not > 0).
         let ms = linux_exec_to_now_ms().expect("/proc exec time on linux");
-        assert!(ms >= 0.0 && ms < 3_600_000.0, "implausible process age: {ms} ms");
+        assert!((0.0..3_600_000.0).contains(&ms), "implausible process age: {ms} ms");
     }
 
     #[test]
