@@ -36,6 +36,7 @@ pub struct CommandPalette {
 /// text is measured in DISPLAY cells so wide (CJK) theme/tab titles never
 /// overflow. `rows` is the already-scrolled VISIBLE slice (≤ `MAX_PALETTE_ROWS`);
 /// `first_visible` + `total_matches` drive the scrollbar thumb.
+#[allow(clippy::too_many_arguments)]
 pub fn build_command_palette(
     win_w: u32,
     win_h: u32,
@@ -201,7 +202,7 @@ pub fn build_command_palette(
     }
 
     // --- Scrollbar thumb: only when the list overflows the visible window ---
-    if total_matches > MAX_PALETTE_ROWS && total_matches > 0 && n > 0 {
+    if total_matches > MAX_PALETTE_ROWS && n > 0 {
         let track_top = rows_top;
         let track_h = n as f32 * row_h;
         let visible = n as f32;

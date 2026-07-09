@@ -949,6 +949,10 @@ pub struct App {
     palette_filtered: Vec<crate::palette::PaletteHit>,
 }
 
+/// Owned command-palette draw data, captured before the render borrow:
+/// `(query, visible rows as (title, matched-char indices, selected), total, first_visible)`.
+type PaletteDrawData = (String, Vec<(String, Vec<usize>, bool)>, usize, usize);
+
 /// A left-button drag that began on tab `idx` in the main tab bar. `tearing`
 /// flips true once the cursor moves > `TEAR_THRESHOLD_PX` vertically out of the
 /// strip (and back false if it returns), so a plain click still selects.
@@ -8874,7 +8878,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // Command-palette draw data, captured (owned) before the mutable
                 // gpu/text borrow so the draw pass borrows nothing off self. None
                 // while closed — one bool test on the hot path, zero allocation.
-                let palette_ui: Option<(String, Vec<(String, Vec<usize>, bool)>, usize, usize)> =
+                let palette_ui: Option<PaletteDrawData> =
                     if self.palette_open {
                         let first = self.palette_scroll;
                         let sel = self.palette_selected;

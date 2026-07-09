@@ -101,6 +101,8 @@ pub fn fuzzy_match(needle: &str, haystack: &str) -> Option<FuzzyMatch> {
             let base = MATCH_BASE + boundary_bonus(&h, j);
             let mut best = INVALID;
             let mut best_prev = usize::MAX;
+            // A genuine DP scan over the previous row's reachable positions.
+            #[allow(clippy::needless_range_loop)]
             for jp in (k - 1)..j {
                 if dp[k - 1][jp] <= INVALID {
                     continue;
@@ -125,9 +127,9 @@ pub fn fuzzy_match(needle: &str, haystack: &str) -> Option<FuzzyMatch> {
     // Best final placement of the last needle char.
     let mut best_score = INVALID;
     let mut best_j = usize::MAX;
-    for j in (m - 1)..big {
-        if dp[m - 1][j] > best_score {
-            best_score = dp[m - 1][j];
+    for (j, &s) in dp[m - 1].iter().enumerate().skip(m - 1) {
+        if s > best_score {
+            best_score = s;
             best_j = j;
         }
     }
