@@ -43,6 +43,15 @@
 ///                    failed-command marker on each failed prompt row. Combine
 ///                    with JETTY_SHOT_SCROLL to verify the marker tracks the
 ///                    correct viewport row after the mark scrolls into history.
+///   JETTY_SHOT_SIXEL — inline-image self-test: feed a sixel DCS so the PNG shows
+///                    a real bitmap drawn over the grid (scanner → decode → cell
+///                    reservation → placement → ImageLayer). "1" = a built-in
+///                    30×24 red/green/blue-stripe pattern; any other value is
+///                    treated as a raw sixel BODY (bytes after `q`, before the
+///                    ST). Prints decoded WxH / footprint / anchor row to stderr;
+///                    combine with JETTY_SHOT_SCROLL to verify it tracks into
+///                    history. e.g. `img2sixel img.png` yields a body you can pass
+///                    (strip the leading `\ePq` and trailing `\e\\`).
 ///   JETTY_SHOT_PALETTE — command-palette self-test: render the fuzzy command
 ///                    palette overlay via the SHARED registry + filter path.
 ///                    JETTY_SHOT_PALETTE_QUERY sets the typed query (drives the
@@ -217,6 +226,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Build terminal snapshot ---
     // Terminal::new picks up JETTY_THEME and JETTY_OPACITY from the environment.
     let mut terminal = jetty_core::Terminal::new(cols, rows);
+    // Push the real cell metrics so a fed sixel (JETTY_SHOT_SIXEL) reserves the
+    // correct row footprint — the shot's analogue of App::reflow's set_cell_px.
+    terminal.set_cell_px(cell_w, cell_h);
 
     if env_flag("JETTY_SHOT_PTY") {
         // Drive a REAL shell offscreen so we can see the live startup prompt
@@ -296,6 +308,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("jetty-shot: JETTY_SHOT_OSC133 fed a scripted A/C/D failed+ok+failed sequence");
     }
 
+    // JETTY_SHOT_SIXEL — headless self-test of the inline-image pipeline: feed a
+    // sixel DCS, so the rendered PNG shows a real bitmap drawn over the grid
+    // (scanner → decode → cell reservation → placement → ImageLayer). Set to "1"
+    // for a built-in RGB-stripe pattern, or to a raw sixel BODY (the bytes AFTER
+    // `q`, BEFORE the ST) to render a custom image. Combine with JETTY_SHOT_SCROLL
+    // to verify the image tracks the correct viewport row into history.
+    if let Ok(val) = std::env::var("JETTY_SHOT_SIXEL") {
+        if !val.is_empty() && val != "0" {
+            // A 30×24 image: four 6-px bands of red/green/blue vertical stripes.
+            const BUILTIN_BAND: &str =
+                "#0;2;100;0;0#0!10~#1;2;0;100;0#1!10~#2;2;0;0;100#2!10~";
+            let body = if val == "1" {
+                format!("{BUILTIN_BAND}-{BUILTIN_BAND}-{BUILTIN_BAND}-{BUILTIN_BAND}")
+            } else {
+                val
+            };
+            let mut bytes = b"\x1bPq".to_vec();
+            bytes.extend_from_slice(body.as_bytes());
+            bytes.extend_from_slice(b"\x1b\\"); // 7-bit ST
+            terminal.feed(&bytes);
+            // Report each decoded image: native WxH, cell footprint, anchor row —
+            // so a harness can assert without pixel diffing.
+            let imgs = terminal.visible_images();
+            eprintln!("jetty-shot: JETTY_SHOT_SIXEL fed a sixel → {} image(s)", imgs.len());
+            for vi in &imgs {
+                eprintln!(
+                    "jetty-shot:   image {}x{}px, footprint {}x{} cells, top viewport row {}",
+                    vi.px_w, vi.px_h, vi.cols, vi.rows, vi.top_row
+                );
+            }
+        }
+    }
+
     // Optional: scroll the view before snapshotting (JETTY_SHOT_SCROLL, i32, positive = up).
     if let Ok(scroll_str) = std::env::var("JETTY_SHOT_SCROLL") {
         if let Ok(n) = scroll_str.parse::<i32>() {
@@ -359,6 +404,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     let mut quad = QuadLayer::new(&device, format);
+    let mut image_layer = jetty_render::ImageLayer::new(&device, format);
 
     // --- Pass 1: clear to theme bg + paint per-cell background quads UNDER text ---
     let (cell_w, cell_h) = text.cell_size();
@@ -394,6 +440,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Pass 2: render the grid text on top of the painted background (load) ---
     text.render_to(&device, &queue, &view, width, height, &snap, false, shot_grid_top)?;
+
+    // --- Pass 2b: inline (sixel) images over the grid, at native pixel size,
+    // scissored to the grid area — the same ImageLayer the live app runs, so the
+    // headless PNG exercises the real decode → upload → draw path. ---
+    {
+        let img_data: Vec<(jetty_core::VisibleImage, std::sync::Arc<jetty_core::SixelImage>)> = terminal
+            .visible_images()
+            .into_iter()
+            .filter_map(|vi| terminal.image_rgba(vi.id).map(|img| (vi, img)))
+            .collect();
+        let draws: Vec<jetty_render::ImageDraw> = img_data
+            .iter()
+            .map(|(vi, img)| jetty_render::ImageDraw {
+                id: vi.id,
+                w: img.width,
+                h: img.height,
+                rgba: &img.rgba,
+                dst: [
+                    vi.col as f32 * cell_w,
+                    shot_grid_top + vi.top_row * cell_h,
+                    vi.px_w as f32,
+                    vi.px_h as f32,
+                ],
+                opacity: 1.0,
+            })
+            .collect();
+        let grid_bottom_px = (height as f32 - shot_status_h).max(0.0);
+        let sc_y = shot_grid_top.clamp(0.0, height as f32) as u32;
+        let sc_h = (grid_bottom_px.clamp(0.0, height as f32) as u32).saturating_sub(sc_y);
+        image_layer.render(&device, &queue, &view, width, height, &draws, [0, sc_y, width, sc_h]);
+    }
 
     // --- Draw scrollbar quad (and optionally the settings panel) over the text ---
     {
