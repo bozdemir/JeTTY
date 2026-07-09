@@ -481,6 +481,11 @@ pub struct App {
     /// and this pass applies the full CRT effect pipeline, writing to the surface.
     /// Built in `resumed` with the surface format; `None` until then.
     crt: Option<jetty_render::Crt>,
+    /// Per-window inline-image (sixel) layer on the MAIN device. Draws decoded
+    /// images over the grid into `scene_view` (so CRT / corner-mask / summon
+    /// compositing apply). Detached windows hold their own on their own device.
+    /// Built in `resumed`; `None` until then. Zero cost when no image is visible.
+    image_layer: Option<jetty_render::ImageLayer>,
     /// Optional GPU caret glow/ripple pass (Task 12). Additive halo + expanding
     /// ring around the cursor cell on each keystroke burst. Built in `resumed`
     /// with the surface format; dispatched only when `fx.caret_glow_enabled` AND
@@ -1120,6 +1125,7 @@ impl App {
             focus: None,
             crt: None,
             caret_fx: None,
+            image_layer: None,
             offscreen: None,
             summon_effect: SummonEffect::Bayer,
             window_mode: WindowMode::Center,
@@ -1790,6 +1796,11 @@ impl App {
         let writer = pty.writer();
         let mut terminal = Terminal::new(cols, rows);
         terminal.set_theme(self.current_theme());
+        // Seed the sixel cell-px metric from the live grid font so an image fed
+        // before the first reflow reserves the right number of rows.
+        if let Some((cw, ch)) = self.text.as_ref().map(|t| t.cell_size()) {
+            terminal.set_cell_px(cw, ch);
+        }
         // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
         // Applied at spawn so new tabs pick up the current setting.
         terminal.set_osc52_allow_paste(self.osc52_allow_paste);
@@ -2071,6 +2082,7 @@ impl App {
             self.status_h(),
         );
         dw.tab.terminal.resize(cols, rows);
+        dw.tab.terminal.set_cell_px(cw, ch);
         dw.tab.pty.resize(cols as u16, rows as u16);
 
         self.detached.push(dw);
@@ -2114,6 +2126,9 @@ impl App {
         // Reflow to the MAIN window's grid (tab bar accounted for).
         let (cols, rows) = self.grid_dims();
         tab.terminal.resize(cols, rows);
+        if let Some((cw, ch)) = self.text.as_ref().map(|t| t.cell_size()) {
+            tab.terminal.set_cell_px(cw, ch);
+        }
         tab.pty.resize(cols as u16, rows as u16);
 
         self.tabs.push(tab);
@@ -3449,6 +3464,9 @@ impl App {
         // Reflow every tab so background sessions stay in sync with the window.
         for tab in &mut self.tabs {
             tab.terminal.resize(cols, rows);
+            // Keep the sixel footprint metric current (font/DPI/window change);
+            // this is the single chokepoint every main-window resize funnels through.
+            tab.terminal.set_cell_px(cw, ch);
             tab.pty.resize(cols as u16, rows as u16);
         }
         // Every background shell just got a SIGWINCH from US: their prompt
@@ -5190,6 +5208,15 @@ impl App {
         // OSC 133 failed-command marker rows for THIS window's tab (captured
         // before the mutable dw borrows below; parity with the main window).
         let failed_rows = dw.tab.terminal.failed_prompt_rows();
+        // Visible inline (sixel) images + decoded RGBA (owned; Arc clone), captured
+        // before the mutable dw borrows below — parity with the main window.
+        let images: Vec<(jetty_core::VisibleImage, std::sync::Arc<jetty_core::SixelImage>)> = {
+            let term = &dw.tab.terminal;
+            term.visible_images()
+                .into_iter()
+                .filter_map(|vi| term.image_rgba(vi.id).map(|img| (vi, img)))
+                .collect()
+        };
         // Corner radius in physical px (HiDPI-correct, same scaling as main).
         let scale = dw.window.scale_factor() as f32;
         let corner_radius_px = corner_radius * scale;
@@ -5211,6 +5238,7 @@ impl App {
         let corner_mask = &dw.corner_mask;
         let crt = &dw.crt;
         let offscreen = &dw.offscreen;
+        let image_layer = &mut dw.image_layer;
 
         let Some((frame, view)) = gpu.acquire_frame() else { return };
         let width = gpu.config.width;
@@ -5244,6 +5272,38 @@ impl App {
         // Pass 2: glyphs on top of the painted background, offset by the bar.
         let _ = text.render_to(
             &gpu.device, &gpu.queue, scene_view, width, height, &snap, false, grid_top,
+        );
+        // Pass 2b: inline (sixel) images over the grid text, into scene_view (so
+        // CRT / corner-mask compositing apply). Native pixel size at the anchor,
+        // scissored to the grid area (below the bar, above the status strip),
+        // clamped to the attachment. Parity with the main window.
+        let image_draws: Vec<jetty_render::ImageDraw> = images
+            .iter()
+            .map(|(vi, img)| jetty_render::ImageDraw {
+                id: vi.id,
+                w: img.width,
+                h: img.height,
+                rgba: &img.rgba,
+                dst: [
+                    vi.col as f32 * cell_w,
+                    grid_top + vi.top_row * cell_h,
+                    vi.px_w as f32,
+                    vi.px_h as f32,
+                ],
+                opacity: 1.0,
+            })
+            .collect();
+        let grid_bottom_px = (height as f32 - status_h).max(0.0);
+        let sc_y = grid_top.clamp(0.0, height as f32) as u32;
+        let sc_h = (grid_bottom_px.clamp(0.0, height as f32) as u32).saturating_sub(sc_y);
+        image_layer.render(
+            &gpu.device,
+            &gpu.queue,
+            scene_view,
+            width,
+            height,
+            &image_draws,
+            [0, sc_y, width, sc_h],
         );
         // Pass 3: the top bar (title pill + close ✕) over the grid.
         let bar = jetty_render::build_detached_bar(width, &title, &theme, close_hover, chrome_char_w);
@@ -6106,6 +6166,7 @@ impl ApplicationHandler<AppEvent> for App {
                         status_h,
                     );
                     dw.tab.terminal.resize(cols, rows);
+                    dw.tab.terminal.set_cell_px(cw, ch);
                     dw.tab.pty.resize(cols as u16, rows as u16);
                     dw.window.request_redraw();
                     // Same post-reflow hover revalidation as the main
@@ -6440,6 +6501,9 @@ impl ApplicationHandler<AppEvent> for App {
             // CRT post-effect (passthrough for now). Same surface format as the
             // rest of the pipeline so the blit-to-surface target matches.
             self.crt = Some(jetty_render::Crt::new(&g.device, g.format));
+            // Inline-image (sixel) layer on the main device. Same surface format
+            // as the scene target; zero cost until an image is visible.
+            self.image_layer = Some(jetty_render::ImageLayer::new(&g.device, g.format));
             // Caret glow/ripple (Task 12). Built unconditionally so the toggle
             // can be flipped at runtime without a restart; dispatched only when
             // `fx.caret_glow_enabled` is true (zero cost when off).
@@ -8876,6 +8940,17 @@ impl ApplicationHandler<AppEvent> for App {
                 // OSC 133 failed-command marker rows (captured before the mutable
                 // gpu render borrow, like search_hits). Empty in the common case.
                 let failed_rows = self.active_tab().terminal.failed_prompt_rows();
+                // Visible inline (sixel) images + their decoded RGBA (Arc clone,
+                // cheap), captured OWNED before the mutable render borrow so the
+                // image pass borrows nothing off self. Empty in the common case
+                // (one bool-ish branch on the hot path, zero allocation).
+                let images: Vec<(jetty_core::VisibleImage, std::sync::Arc<jetty_core::SixelImage>)> = {
+                    let term = &self.active_tab().terminal;
+                    term.visible_images()
+                        .into_iter()
+                        .filter_map(|vi| term.image_rgba(vi.id).map(|img| (vi, img)))
+                        .collect()
+                };
                 // Command-palette draw data, captured (owned) before the mutable
                 // gpu/text borrow so the draw pass borrows nothing off self. None
                 // while closed — one bool test on the hot path, zero allocation.
@@ -9024,9 +9099,13 @@ impl ApplicationHandler<AppEvent> for App {
                 // Window focus drives the unfocused-hollow cursor (captured before
                 // the mutable gpu/text borrow below).
                 let main_focused = self.main_focused;
-                let (Some(gpu), Some(text), Some(chrome_text), Some(quad)) =
-                    (&mut self.gpu, &mut self.text, &mut self.chrome_text, &mut self.quad)
-                else {
+                let (Some(gpu), Some(text), Some(chrome_text), Some(quad), Some(image_layer)) = (
+                    &mut self.gpu,
+                    &mut self.text,
+                    &mut self.chrome_text,
+                    &mut self.quad,
+                    &mut self.image_layer,
+                ) else {
                     self.cached_tabs_meta = tabs_meta;
                     return;
                 };
@@ -9148,6 +9227,48 @@ impl ApplicationHandler<AppEvent> for App {
                         &snap,
                         false,
                         grid_top + slide_y_offset,
+                    );
+                    // Pass 2b: inline (sixel) images over the grid text, into
+                    // scene_view (so CRT / corner-mask / summon compositing all
+                    // apply). Each image draws at its NATIVE pixel size at its
+                    // anchor; the pass is scissored to the grid area (clamped to
+                    // the attachment per amendment R3) so images scrolled partly
+                    // off, or wider than the grid, are hardware-clipped. Called
+                    // every frame so VRAM is reclaimed when images leave view; a
+                    // no-image frame is effectively free.
+                    let image_draws: Vec<jetty_render::ImageDraw> = images
+                        .iter()
+                        .map(|(vi, img)| jetty_render::ImageDraw {
+                            id: vi.id,
+                            w: img.width,
+                            h: img.height,
+                            rgba: &img.rgba,
+                            dst: [
+                                vi.col as f32 * cell_w,
+                                grid_top + slide_y_offset + vi.top_row * cell_h,
+                                vi.px_w as f32,
+                                vi.px_h as f32,
+                            ],
+                            opacity: 1.0,
+                        })
+                        .collect();
+                    let grid_bottom_px = if tab_bar_bottom {
+                        (height as f32 - TABBAR_H - status_h).max(0.0)
+                    } else {
+                        (height as f32 - status_h).max(0.0)
+                    };
+                    let sc_top = (grid_top + slide_y_offset).clamp(0.0, height as f32);
+                    let sc_bot = (grid_bottom_px + slide_y_offset).clamp(0.0, height as f32);
+                    let sc_y = sc_top as u32;
+                    let sc_h = (sc_bot as u32).saturating_sub(sc_y);
+                    image_layer.render(
+                        &gpu.device,
+                        &gpu.queue,
+                        scene_view,
+                        width,
+                        height,
+                        &image_draws,
+                        [0, sc_y, width, sc_h],
                     );
                     // Pass 3: the tab bar (translated to its actual y) over the grid.
                     quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &bar.quads);

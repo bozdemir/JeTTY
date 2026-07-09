@@ -193,6 +193,11 @@ pub(crate) struct DetachedWindow {
     /// bind group keyed by the sampled src view — sharing the main window's
     /// instance would thrash the cache between windows.
     pub crt: jetty_render::Crt,
+    /// Per-window inline-image (sixel) layer on THIS window's device. Device-
+    /// scoped GPU resources cannot be shared with the main window's layer
+    /// (amendment R1), so each detached window owns one — same decoded RGBA from
+    /// jetty-core, uploaded to this device on demand.
+    pub image_layer: jetty_render::ImageLayer,
     /// Caret flash burst clock for keystrokes typed in THIS window (mirrors
     /// `App::caret_anim` for the main window). `None` = no burst live.
     pub caret_anim: Option<std::time::Instant>,
@@ -378,6 +383,7 @@ impl DetachedWindow {
         // PER-WINDOW instances (both cache uniforms/bind groups; see field docs).
         let corner_mask = jetty_render::CornerMask::new(&gpu.device, gpu.format);
         let crt = jetty_render::Crt::new(&gpu.device, gpu.format);
+        let image_layer = jetty_render::ImageLayer::new(&gpu.device, gpu.format);
 
         // Focus the new window so it receives keyboard events immediately.
         window.focus_window();
@@ -392,6 +398,7 @@ impl DetachedWindow {
             offscreen,
             corner_mask,
             crt,
+            image_layer,
             caret_anim: None,
             // A freshly-detached window is created focused (the WM focuses it on
             // map); its Focused events keep this current thereafter.
