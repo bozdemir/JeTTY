@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.17.0] — 2026-07-09
+
+**Speed proof & hardening** — the brand is "Jet", so the numbers that define
+terminal speed shouldn't be guesses. This release measures them honestly and
+guards against regressions. Designed from a verified blueprint, stress-tested by
+two design critics (7 blocking issues, all about *measurement honesty*).
+
+### Added
+- **`JETTY_PERF_LOG=1`** — a zero-cost-when-off instrumentation mode that logs, to
+  stderr: input latency (keypress → frame-ready, honestly labelled with what it
+  excludes; sampled at a quiet prompt; percentiles), cold start (genuine
+  exec → first-frame, including pre-main), and idle resident memory. Nothing runs
+  on the hot path when the flag is off.
+- **`JETTY_BENCH_CPU_ONLY=1`** for `jetty-bench` — runs the CPU-side metrics
+  (throughput, snapshot, a `pipeline_1byte_cpu` compute proxy) with no GPU, so it
+  works on a GPU-less CI runner.
+- **CI perf report** — a non-blocking job that runs the CPU-only bench and prints
+  the numbers on every push (hard regression gating comes later, once the runner's
+  real variance is known).
+
+### Changed
+- `docs/perf-budget.md` now carries **real measured numbers** with honest labels
+  (a pipeline-compute proxy is not called "input latency"; the app-side latency
+  line states what it excludes). The stale 154 MB/s throughput figure was **not
+  reproduced** (~118 MB/s median measured) and is corrected with a note — the
+  ≥150 MB/s target is now openly marked unmet, pending investigation.
+- No fabricated numbers anywhere: figures that require the live windowed app are
+  marked "read live" with the command to capture them, not invented.
+
+---
+
 ## [0.16.0] — 2026-07-09
 
 **SSH-ready & yours** — three daily-driver features that remove reasons to reach
