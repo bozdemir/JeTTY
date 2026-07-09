@@ -1594,6 +1594,16 @@ impl App {
         if !self.hot_reload {
             self.config_watcher = None;
         }
+        // Mirror the RESTART-ONLY-EFFECT keys too, so a later panel-driven persist()
+        // round-trips the user's external edit instead of clobbering it with the
+        // stale startup value. Their live EFFECTS stay restart-only (summon_hotkey is
+        // re-read at startup; launch_at_login's source of truth is the autostart file,
+        // so it is deliberately NOT mirrored here) — but the on-disk value must
+        // survive an external edit + a subsequent unrelated Settings change.
+        self.summon_hotkey = cfg.summon_hotkey.clone();
+        self.cfg_show_welcome = cfg.show_welcome;
+        // shell: mirror so new tabs spawned after the reload use the edited shell.
+        self.shell = cfg.shell.clone();
     }
 
     /// Re-dock the main window to the top strip when it is a visible Dropdown — used
@@ -10012,6 +10022,11 @@ mod hot_reload_tests {
             "effects",
             "osc52_allow_paste",
             "hot_reload",
+            // shell (new tabs pick up the edited shell) and show_welcome apply live;
+            // both are also mirrored in apply_reloaded_config so a later persist()
+            // round-trips an external edit instead of clobbering it.
+            "shell",
+            "show_welcome",
         ] {
             assert!(!is_restart_only(k), "{k} should be live-appliable");
         }
