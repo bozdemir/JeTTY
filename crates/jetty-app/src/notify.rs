@@ -267,13 +267,25 @@ mod tests {
     }
 
     #[test]
-    fn spawn_notifier_send_does_not_block_or_panic() {
-        // The worker + non-blocking fire() path: many rapid fires must return
-        // immediately (bounded queue drops overflow) and never panic, whether or
-        // not a daemon is present.
-        let n = spawn_notifier();
-        for i in 0..100 {
+    fn fire_never_blocks_or_panics_when_queue_full_or_worker_gone() {
+        // fire()'s contract: on a full queue OR a dead worker it drops the message
+        // and returns immediately (never blocks, never panics). Verified WITHOUT the
+        // real worker so `cargo test` NEVER delivers a desktop notification — the
+        // real-delivery path is exercised only by the #[ignore]-d smoke test below.
+        // (Regression guard: a plain `spawn_notifier()` here used to spam real
+        // "t0/t1/…" toasts to the developer's desktop on every test run.)
+        // Worker gone: receiver dropped → every send is Disconnected, must not panic.
+        let (tx, rx) = sync_channel::<NotifyMsg>(NOTIFY_QUEUE_BOUND);
+        drop(rx);
+        let n = Notifier { tx };
+        for i in 0..1000 {
             n.fire(format!("t{i}"), String::new(), i % 2 == 0);
+        }
+        // Queue full: live but never-drained receiver → overflow is dropped, no block.
+        let (tx, _rx) = sync_channel::<NotifyMsg>(NOTIFY_QUEUE_BOUND);
+        let n = Notifier { tx };
+        for i in 0..1000 {
+            n.fire(format!("t{i}"), String::new(), false);
         }
     }
 
