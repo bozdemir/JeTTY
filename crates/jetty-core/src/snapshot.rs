@@ -115,6 +115,31 @@ pub struct SearchHit {
     pub is_current: bool,
 }
 
+/// A currently-visible inline sixel image, mapped to VIEWPORT coordinates.
+/// Produced by `Terminal::visible_images` (off the per-cell `GridSnapshot` path,
+/// like `SearchHit`), consumed by the app to build the GPU image-layer draws.
+///
+/// `top_row` is the viewport row of the image's top-left cell and MAY be
+/// negative (the image is partly scrolled above the grid) — the render scissor
+/// clips it. The image is drawn at its NATIVE pixel size (`px_w`×`px_h`), while
+/// `cols`×`rows` describe the reserved cell footprint (used only for the
+/// scroll-anchor span, not the draw rectangle).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VisibleImage {
+    /// Content id (see `sixel::content_id`) — the texture-cache key.
+    pub id: u64,
+    /// Viewport row of the image top-left cell (may be negative).
+    pub top_row: f32,
+    /// Anchor column (grid cell).
+    pub col: u16,
+    /// Reserved footprint in cells.
+    pub cols: u16,
+    pub rows: u16,
+    /// Native image size in physical-ish pixels (the decoded sixel dimensions).
+    pub px_w: u16,
+    pub px_h: u16,
+}
+
 #[derive(Clone, Debug)]
 pub struct GridSnapshot {
     pub cols: usize,
