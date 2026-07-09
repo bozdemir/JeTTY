@@ -7,7 +7,9 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
-use alacritty_terminal::term::{Config, Term, TermMode, point_to_viewport, viewport_to_point};
+use alacritty_terminal::term::{
+    Config, Osc52, Term, TermMode, point_to_viewport, viewport_to_point,
+};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -19,6 +21,21 @@ use std::sync::{Arc, Mutex};
 fn pack_geom(cols: usize, rows: usize) -> u32 {
     ((cols.min(u16::MAX as usize) as u32) << 16) | (rows.min(u16::MAX as usize) as u32)
 }
+
+/// Maximum decoded OSC 52 clipboard-copy payload (bytes) that we COMMIT to the
+/// system clipboard. This is NOT a memory guard: alacritty/vte base64-decode and
+/// UTF-8-validate the whole payload into a `String` BEFORE `Event::ClipboardStore`
+/// reaches us, so the transient allocation is bounded by alacritty's own OSC string
+/// buffer (~2 MiB), not by this cap. The cap only gates the COMMIT — a hostile
+/// remote / stray `cat` cannot flood the real clipboard with megabytes — while 100
+/// KiB comfortably covers real "yank a file" use. Also caps the clipboard→PTY reply
+/// when `osc52_allow_paste` is enabled.
+pub const OSC52_MAX_BYTES: usize = 100 * 1024;
+
+/// Formatter supplied by alacritty with an OSC 52 PASTE (load) request: given the
+/// clipboard text it returns the full `\e]52;…\a` reply to write back to the PTY.
+/// Matches alacritty's `Event::ClipboardLoad` payload type exactly.
+type ClipboardLoadFmt = Arc<dyn Fn(&str) -> String + Send + Sync + 'static>;
 
 /// EventListener that captures the terminal's write-back bytes (replies to
 /// host queries such as DSR/DA, text-area size, and OSC color queries) and
@@ -56,6 +73,22 @@ struct EventProxy {
     /// Set to `true` when the app rings the bell (BEL / ^G, `Event::Bell`).
     /// Shared with the owning `Terminal`; consumed via [`Terminal::take_bell`].
     bell: Arc<AtomicBool>,
+    /// Pending OSC 52 clipboard-COPY text (remote/tmux/nvim asked to set the system
+    /// clipboard). `Some` = text to commit; last-wins coalesce. Committed by the app
+    /// on the drain pass via [`Terminal::take_clipboard_store`]. Only ever set when
+    /// alacritty's `osc52` mode permits copy (OnlyCopy/CopyPaste — the default).
+    clipboard_store: Arc<Mutex<Option<String>>>,
+    /// Cheap "a clipboard-copy is pending" flag so the drain path skips the mutex in
+    /// the common no-copy case (lock-free — zero idle cost).
+    clipboard_dirty: Arc<AtomicBool>,
+    /// Pending OSC 52 clipboard-PASTE (load) request: the reply formatter alacritty
+    /// supplied. Only ever set when `osc52` mode permits paste (OnlyPaste/CopyPaste),
+    /// i.e. only when the user opted into `osc52_allow_paste`. Drained by the app via
+    /// [`Terminal::take_clipboard_load`], which reads the clipboard, formats, and
+    /// writes the reply to the PTY. Off by default (the secure default).
+    clipboard_load: Arc<Mutex<Option<ClipboardLoadFmt>>>,
+    /// Cheap "a clipboard-paste is pending" flag (mirrors `clipboard_dirty`).
+    clipboard_load_dirty: Arc<AtomicBool>,
 }
 
 impl EventProxy {
@@ -129,8 +162,32 @@ impl EventListener for EventProxy {
             Event::Bell => {
                 self.bell.store(true, Ordering::Relaxed);
             }
-            // Wakeup/ClipboardStore/MouseCursorDirty and the rest are
-            // intentionally ignored for now.
+            // OSC 52 COPY: a remote host / tmux / nvim (`"+y`) asked to set the
+            // system clipboard. alacritty already base64-decoded + UTF-8-validated
+            // the payload and only emits this when its `osc52` mode permits copy
+            // (OnlyCopy is JeTTY's default). Coalesce last-wins into a shared slot;
+            // the app commits it on the drain pass. `Selection` (`p`/`s`) is merged
+            // into the system clipboard for v1 (both are permitted remote writes).
+            Event::ClipboardStore(_ty, text) => {
+                // Cap the COMMITTED text (see OSC52_MAX_BYTES): reject an abusive
+                // payload rather than flooding the real clipboard. The transient
+                // decode already happened inside alacritty (bounded by its OSC
+                // buffer), so this is a commit gate, not a memory guard.
+                if text.len() <= OSC52_MAX_BYTES {
+                    *self.clipboard_store.lock().unwrap() = Some(text);
+                    self.clipboard_dirty.store(true, Ordering::Release);
+                }
+            }
+            // OSC 52 PASTE (load): the app running in the PTY asked to READ the
+            // system clipboard. alacritty only emits this when `osc52` permits paste
+            // (OnlyPaste/CopyPaste) — never under the default OnlyCopy — so it is
+            // inert unless the user set `osc52_allow_paste = true`. Stash the reply
+            // formatter; the app reads the clipboard, caps + formats, writes to PTY.
+            Event::ClipboardLoad(_ty, formatter) => {
+                *self.clipboard_load.lock().unwrap() = Some(formatter);
+                self.clipboard_load_dirty.store(true, Ordering::Release);
+            }
+            // Wakeup / MouseCursorDirty and the rest are intentionally ignored.
             _ => {}
         }
     }
@@ -259,6 +316,20 @@ pub struct Terminal {
     /// Pending-bell flag shared with the `EventProxy` (`Event::Bell`);
     /// consumed by [`Terminal::take_bell`].
     bell: Arc<AtomicBool>,
+    /// Pending OSC 52 clipboard-copy text + flag, shared with the `EventProxy`;
+    /// consumed by [`Terminal::take_clipboard_store`].
+    clipboard_store: Arc<Mutex<Option<String>>>,
+    clipboard_dirty: Arc<AtomicBool>,
+    /// Pending OSC 52 clipboard-paste reply formatter + flag, shared with the
+    /// `EventProxy`; consumed by [`Terminal::take_clipboard_load`]. Inert unless
+    /// `osc52_mode` permits paste.
+    clipboard_load: Arc<Mutex<Option<ClipboardLoadFmt>>>,
+    clipboard_load_dirty: Arc<AtomicBool>,
+    /// The OSC 52 mode this terminal was built with. Stored so `set_scrollback_lines`
+    /// (which rebuilds the alacritty `Config`) preserves it instead of silently
+    /// reverting an enabled paste back to the default `OnlyCopy`. Toggled by
+    /// [`Terminal::set_osc52_allow_paste`].
+    osc52_mode: Osc52,
     /// The active scrollback-search query (what the user typed, capped at
     /// [`SEARCH_MAX_QUERY`] chars). Empty = no active search.
     search_query: String,
@@ -338,7 +409,13 @@ impl Terminal {
         let rows = rows.max(1);
         let size = Size { cols, lines: rows };
         let scrollback_limit = 10_000;
-        let config = Config { scrolling_history: scrollback_limit, ..Default::default() };
+        // Default to write-only OSC 52 (alacritty's secure default): remote copy is
+        // accepted, remote paste is denied. `set_osc52_allow_paste` flips this to
+        // CopyPaste when the user opts in. Both `new` and `set_scrollback_lines`
+        // build the Config with THIS value so a scrollback change never reverts it.
+        let osc52_mode = Osc52::OnlyCopy;
+        let config =
+            Config { scrolling_history: scrollback_limit, osc52: osc52_mode, ..Default::default() };
         let (tx, pty_write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
         // Load theme from JETTY_THEME env var; default to "catppuccin_mocha".
@@ -368,6 +445,10 @@ impl Terminal {
         let title_update = Arc::new(Mutex::new(None));
         let title_dirty = Arc::new(AtomicBool::new(false));
         let bell = Arc::new(AtomicBool::new(false));
+        let clipboard_store = Arc::new(Mutex::new(None));
+        let clipboard_dirty = Arc::new(AtomicBool::new(false));
+        let clipboard_load = Arc::new(Mutex::new(None));
+        let clipboard_load_dirty = Arc::new(AtomicBool::new(false));
         let proxy = EventProxy {
             tx,
             geom: Arc::clone(&geom),
@@ -376,6 +457,10 @@ impl Terminal {
             title_update: Arc::clone(&title_update),
             title_dirty: Arc::clone(&title_dirty),
             bell: Arc::clone(&bell),
+            clipboard_store: Arc::clone(&clipboard_store),
+            clipboard_dirty: Arc::clone(&clipboard_dirty),
+            clipboard_load: Arc::clone(&clipboard_load),
+            clipboard_load_dirty: Arc::clone(&clipboard_load_dirty),
         };
         let term = Term::new(config, &size, proxy);
 
@@ -392,6 +477,11 @@ impl Terminal {
             title_update,
             title_dirty,
             bell,
+            clipboard_store,
+            clipboard_dirty,
+            clipboard_load,
+            clipboard_load_dirty,
+            osc52_mode,
             search_query: String::new(),
             search_regex: None,
             search_matches: Vec::new(),
@@ -439,6 +529,44 @@ impl Terminal {
             .map(|u| u.and_then(|s| sanitize_title(&s)))
     }
 
+    /// Take the pending OSC 52 clipboard-COPY text, if any. `None` in the common
+    /// case (a lock-free flag check — zero idle cost). Consuming; multiple copies
+    /// between calls coalesce last-wins. The app writes the returned text to the
+    /// system clipboard (jetty-core does not depend on the clipboard backend).
+    pub fn take_clipboard_store(&mut self) -> Option<String> {
+        if !self.clipboard_dirty.swap(false, Ordering::Acquire) {
+            return None;
+        }
+        self.clipboard_store.lock().unwrap().take()
+    }
+
+    /// Take the pending OSC 52 clipboard-PASTE reply formatter, if any. `None` in the
+    /// common case (a lock-free flag check). Only ever `Some` when the terminal was
+    /// built/toggled to permit paste (`osc52_allow_paste`), so the default (write-
+    /// only) build never yields one. The app reads the system clipboard, caps it,
+    /// calls the formatter, and writes the reply to the PTY.
+    pub fn take_clipboard_load(&mut self) -> Option<ClipboardLoadFmt> {
+        if !self.clipboard_load_dirty.swap(false, Ordering::Acquire) {
+            return None;
+        }
+        self.clipboard_load.lock().unwrap().take()
+    }
+
+    /// Enable or disable OSC 52 clipboard PASTE (remote READ of the local clipboard).
+    /// Copy (write) is always permitted. Paste is a SECURITY trade-off (a remote host
+    /// / stray output can exfiltrate the clipboard), so it is OFF by default; the
+    /// `osc52_allow_paste` config key opts in. Rebuilds the alacritty `Config`
+    /// preserving the current scrollback limit. Idempotent-ish (re-applies set_options
+    /// even when unchanged), so callers may invoke it unconditionally at tab spawn.
+    pub fn set_osc52_allow_paste(&mut self, allow: bool) {
+        self.osc52_mode = if allow { Osc52::CopyPaste } else { Osc52::OnlyCopy };
+        self.term.set_options(Config {
+            scrolling_history: self.scrollback_limit,
+            osc52: self.osc52_mode,
+            ..Default::default()
+        });
+    }
+
     /// Replace the active theme at runtime. Also refreshes the copy shared with
     /// the `EventProxy` so subsequent OSC 10/11/12/4 color-query replies reflect
     /// the new theme (e.g. so nvim/fzf detect the right background).
@@ -467,7 +595,14 @@ impl Terminal {
     ///   value equals what's already displayed (the app's apply path is a
     ///   no-op on unchanged titles, and manual renames are flagged app-side).
     pub fn set_scrollback_lines(&mut self, lines: usize) {
-        self.term.set_options(Config { scrolling_history: lines, ..Default::default() });
+        // Preserve the OSC 52 mode: `..Default::default()` would reset `osc52` to
+        // OnlyCopy, silently reverting an enabled `osc52_allow_paste` on every
+        // scrollback change (amendment O2). Carry the stored mode through.
+        self.term.set_options(Config {
+            scrolling_history: lines,
+            osc52: self.osc52_mode,
+            ..Default::default()
+        });
         // Keep the saturation model in lockstep with the live cap. A shrink can
         // pull us to/over the (smaller) cap; a grow can lift us back under it and
         // re-enable exact tracking for future marks.
@@ -3062,5 +3197,96 @@ mod tests {
             t.completed.len() <= MAX_PENDING_COMPLETIONS,
             "undrained completions stay bounded"
         );
+    }
+
+    // ── OSC 52 clipboard ──────────────────────────────────────────────────────
+
+    #[test]
+    fn osc52_copy_captures_and_coalesces() {
+        // `\e]52;c;<base64("hi")>\a` → the decoded text is captured once, then
+        // consumed (a second drain is None). base64("hi") == "aGk=".
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]52;c;aGk=\x07");
+        assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
+        assert_eq!(t.take_clipboard_store(), None, "consuming: second drain is empty");
+    }
+
+    #[test]
+    fn osc52_copy_coalesces_last_wins() {
+        // Two copies before a drain coalesce to the LAST one.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]52;c;aGk=\x07"); // "hi"
+        t.feed(b"\x1b]52;c;eWE=\x07"); // base64("ya") == "eWE="
+        assert_eq!(t.take_clipboard_store().as_deref(), Some("ya"));
+    }
+
+    #[test]
+    fn osc52_selection_type_routes_to_clipboard() {
+        // The PRIMARY selection form (`p`) is merged into the system clipboard for
+        // v1 (both are permitted remote writes under OnlyCopy).
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]52;p;aGk=\x07");
+        assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn osc52_copy_under_cap_is_accepted() {
+        // A payload decoding to just UNDER the cap is committed. "AAAA" decodes to 3
+        // zero bytes; 34133 reps → 102399 bytes ≤ OSC52_MAX_BYTES (102400).
+        let reps = 34133;
+        let decoded_len = reps * 3;
+        assert!(decoded_len <= OSC52_MAX_BYTES, "premise: within the cap");
+        let mut t = Terminal::new(20, 5);
+        let seq = format!("\x1b]52;c;{}\x07", "AAAA".repeat(reps));
+        t.feed(seq.as_bytes());
+        let got = t.take_clipboard_store();
+        assert_eq!(got.as_ref().map(|s| s.len()), Some(decoded_len));
+    }
+
+    #[test]
+    fn osc52_copy_over_cap_is_rejected() {
+        // A payload decoding to OVER the cap is NOT committed (no clipboard flood).
+        // 34134 reps of "AAAA" → 102402 bytes > OSC52_MAX_BYTES (102400).
+        let reps = 34134;
+        let decoded_len = reps * 3;
+        assert!(decoded_len > OSC52_MAX_BYTES, "premise: payload exceeds the cap");
+        let mut t = Terminal::new(20, 5);
+        let seq = format!("\x1b]52;c;{}\x07", "AAAA".repeat(reps));
+        t.feed(seq.as_bytes());
+        assert_eq!(t.take_clipboard_store(), None, "oversized copy is rejected");
+    }
+
+    #[test]
+    fn osc52_paste_denied_by_default() {
+        // Default build is write-only (OnlyCopy): a paste query `\e]52;c;?\a` is
+        // denied at the alacritty layer, so no load request ever reaches us.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]52;c;?\x07");
+        assert!(t.take_clipboard_load().is_none(), "paste is off by default");
+    }
+
+    #[test]
+    fn osc52_paste_request_captured_when_enabled() {
+        // With paste enabled, a query yields a reply formatter that produces a
+        // well-formed `\e]52;` reply from the provided clipboard text.
+        let mut t = Terminal::new(20, 5);
+        t.set_osc52_allow_paste(true);
+        t.feed(b"\x1b]52;c;?\x07");
+        let fmt = t.take_clipboard_load().expect("paste request captured");
+        let reply = fmt("hi");
+        assert!(reply.starts_with("\x1b]52;"), "reply is an OSC 52 sequence");
+        assert!(reply.contains("aGk="), "reply carries base64(\"hi\")");
+        assert!(t.take_clipboard_load().is_none(), "consuming: second drain is empty");
+    }
+
+    #[test]
+    fn osc52_scrollback_change_preserves_paste_mode() {
+        // Regression (amendment O2): changing scrollback rebuilds the alacritty
+        // Config and must NOT revert an enabled paste back to OnlyCopy.
+        let mut t = Terminal::new(20, 5);
+        t.set_osc52_allow_paste(true);
+        t.set_scrollback_lines(500);
+        t.feed(b"\x1b]52;c;?\x07");
+        assert!(t.take_clipboard_load().is_some(), "paste survives a scrollback change");
     }
 }
