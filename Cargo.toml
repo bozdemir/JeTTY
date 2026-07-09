@@ -4,7 +4,7 @@ members = ["crates/jetty-core", "crates/jetty-render", "crates/jetty-platform", 
 
 [package]
 name = "jetty"
-version = "0.18.1"
+version = "0.19.0"
 edition = "2021"
 description = "A blazing-fast, GPU-accelerated, desktop-environment-independent terminal with a center-summon / Yakuake-style dropdown hotkey."
 authors = ["Burak Ozdemir <bozdemir@gmail.com>"]

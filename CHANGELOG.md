@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.19.0] — 2026-07-09
+
+**Inline images.** JeTTY now renders real bitmaps in the terminal via the Sixel
+protocol — the biggest feature yet. Planned from a verified blueprint,
+stress-tested by three design critics (9 blocking issues, many about decoding
+untrusted image data safely), then adversarially reviewed and screenshot-verified.
+
+### Added
+- **Sixel inline images** — any program that emits Sixel (`img2sixel`,
+  `chafa -f sixel`, a matplotlib sixel backend, `lsix`) draws a real GPU-textured
+  bitmap right in the grid, at native pixel size, on its own line. Images scroll
+  with your scrollback and disappear when scrolled past it. See a photo or a plot
+  without leaving the terminal — including in **detached windows**.
+  - Safe by construction: the decoder is hand-rolled and hardened against
+    malformed / hostile image data (bounded allocation, bounds-checked writes,
+    saturating counts — no panic, no OOM). Image memory is capped with LRU
+    eviction, and there is **zero idle cost** when nothing is on screen.
+  - Colors are correct (RGB and DEC HLS). No new dependencies.
+
+### Notes
+- Scope is Sixel, static images. **Kitty graphics / iTerm2 protocols and
+  animation are planned follow-ups** — the interception, placement, and GPU image
+  layer are built to extend to them.
+
+---
+
 ## [0.18.1] — 2026-07-09
 
 ### Changed
