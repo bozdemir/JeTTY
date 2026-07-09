@@ -1621,7 +1621,9 @@ pub fn build_panel(
     // integration to fire; plain bash (no bash-preexec) is failure-only.
     labels.push(("RUN & NOTIFY".to_string(), px + PAD, t_notify_hdr, text_main));
     labels.push((
-        "Notify when a command finishes while hidden".to_string(),
+        // Kept short so it never overflows the panel's content box — see the
+        // `all_panel_labels_fit_within_content_width` test that guards this class.
+        "Notify on finish while hidden".to_string(),
         px + PAD,
         t_notify_hdr + 18.0,
         text_hint,
@@ -1953,6 +1955,29 @@ mod tests {
             &NotifyParams::default(), active_tab,
             &EffectsParams::default(), 0.0, false, 0,
         )
+    }
+
+    #[test]
+    fn all_panel_labels_fit_within_content_width() {
+        // Guards the recurring class of Settings bug where a label/subtitle spills
+        // past the panel's right border (e.g. an over-long RUN & NOTIFY subtitle).
+        // Every label on every tab, plus the Effects tab's scrolled labels, must end
+        // within the padded content box [px+PAD, px+PANEL_W-PAD]. char_w is the
+        // layout fallback (scale 1); the real glyph advance is ~the same or slightly
+        // narrower, so this is a conservative fit check.
+        let (sw, sh) = (1200u32, 900u32);
+        let px = ((sw as f32 - PANEL_W) / 2.0).floor();
+        let content_right = px + PANEL_W - PAD;
+        for tab in 0..5 {
+            let view = panel_tab(sw, sh, tab);
+            for (text, x, _y, _c) in view.labels.iter().chain(view.effects_labels.iter()) {
+                let right = x + text.chars().count() as f32 * CHAR_W_FALLBACK;
+                assert!(
+                    right <= content_right + 0.5,
+                    "tab {tab}: label {text:?} overflows — right edge {right:.1} > content right {content_right:.1}",
+                );
+            }
+        }
     }
 
     #[test]
