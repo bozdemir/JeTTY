@@ -4961,6 +4961,18 @@ mod tests {
     }
 
     #[test]
+    fn kitty_and_sixel_interleave_independently() {
+        // A sixel DCS and a Kitty APC in ONE buffer both parse to placements
+        // without cross-contaminating the two state machines.
+        let mut t = Terminal::new(30, 8);
+        t.set_cell_px(10.0, 10.0);
+        let mut buf = sixel(RED_1X6);
+        buf.extend_from_slice(&red_rgba_2x2(""));
+        t.feed(&buf);
+        assert_eq!(t.placements.len(), 2, "both a sixel and a Kitty image placed");
+    }
+
+    #[test]
     fn kitty_fuzz_random_apc_never_panics() {
         let mut t = Terminal::new(40, 10);
         t.set_cell_px(10.0, 10.0);
