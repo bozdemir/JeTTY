@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.21.0] — 2026-07-13
+
+**No-mouse text extraction.** Two keyboard-first ways to grab text. Designed from
+a verified blueprint, stress-tested by two design critics (6 blocking issues),
+then adversarially reviewed and screenshot-verified.
+
+### Added
+- **Hint mode** (`Ctrl+Shift+H`) — overlays short home-row labels on every URL,
+  file path, git hash, and IP visible on screen; type a label to **copy** that
+  token to the clipboard (hold **Alt** to open a URL in your browser). `Esc`
+  cancels. Wrapped tokens are captured whole even across the viewport edge.
+- **Keyboard copy-mode** (`Ctrl+Shift+Space`) — a vi-style modal cursor over the
+  viewport and scrollback: motions `h/j/k/l`, `w/b/e` (word), `0/$`, `g/G`,
+  `Ctrl+u/d`; `v` char-select, `V` line-select, `y`/`Enter` to yank + exit,
+  `Esc` to exit. Select and copy exact text without ever touching the mouse.
+- Both are fully remappable via `[keys]`, capture all input while active (no
+  leaks to the shell, even under an IME), and cost nothing when inactive.
+
+---
+
 ## [0.20.0] — 2026-07-13
 
 **Configurable keybindings.** Every shortcut is now yours to remap. Designed from

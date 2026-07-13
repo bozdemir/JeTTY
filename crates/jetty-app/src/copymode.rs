@@ -47,21 +47,27 @@ pub struct CopyMode {
     pub col: usize,
     pub selecting: bool,
     pub line_mode: bool,
-    /// Fixed selection anchor (cursor position when `v`/`V` was pressed).
-    pub anchor_row: usize,
+    /// Fixed selection anchor as an ABSOLUTE buffer line (captured when `v`/`V`
+    /// was pressed). Content-pinned, NOT viewport-pinned: scrolling while
+    /// selecting extends into scrollback instead of sliding the whole selection.
+    pub anchor_line: i32,
     pub anchor_col: usize,
 }
 
 impl CopyMode {
     pub fn new(row: usize, col: usize) -> Self {
-        CopyMode { row, col, selecting: false, line_mode: false, anchor_row: row, anchor_col: col }
+        // `anchor_line` is unused until `begin_select` captures a real one
+        // (guarded by `selecting`), so 0 is a safe placeholder here.
+        CopyMode { row, col, selecting: false, line_mode: false, anchor_line: 0, anchor_col: col }
     }
 
     /// Begin (or restart) a selection anchored at the current cursor cell.
-    pub fn begin_select(&mut self, line_mode: bool) {
+    /// `anchor_line` is the cursor's ABSOLUTE buffer line right now — the app
+    /// computes it from the terminal so the anchor is pinned to content.
+    pub fn begin_select(&mut self, line_mode: bool, anchor_line: i32) {
         self.selecting = true;
         self.line_mode = line_mode;
-        self.anchor_row = self.row;
+        self.anchor_line = anchor_line;
         self.anchor_col = self.col;
     }
 }
@@ -142,10 +148,10 @@ pub fn apply_motion(
 /// so `selection_start` + `selection_update` cover BOTH endpoint cells
 /// inclusively regardless of direction (BLOCKING 2). Returns
 /// `((row, col, left_half), (row, col, left_half))` = (start, end).
-pub fn selection_endpoints(
-    anchor: (usize, usize),
-    cursor: (usize, usize),
-) -> ((usize, usize, bool), (usize, usize, bool)) {
+pub fn selection_endpoints<L: Ord + Copy>(
+    anchor: (L, usize),
+    cursor: (L, usize),
+) -> ((L, usize, bool), (L, usize, bool)) {
     if cursor >= anchor {
         ((anchor.0, anchor.1, true), (cursor.0, cursor.1, false))
     } else {
@@ -340,6 +346,12 @@ mod tests {
         assert_eq!(
             selection_endpoints((2, 5), (2, 5)),
             ((2, 5, true), (2, 5, false))
+        );
+        // Absolute buffer lines (i32) incl. NEGATIVE history lines: a cursor in
+        // scrollback (line -3) before an anchor at line 1 orders correctly.
+        assert_eq!(
+            selection_endpoints((1i32, 4), (-3i32, 2)),
+            ((-3i32, 2, true), (1i32, 4, false))
         );
     }
 }

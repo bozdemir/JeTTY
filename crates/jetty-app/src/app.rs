@@ -2552,12 +2552,20 @@ impl App {
             }
             Key::Character(s) if s.as_str() == "v" || s.as_str() == "V" => {
                 let line = s.as_str() == "V";
-                let now_selecting = if let Some(cm) = self.copy_mode.as_mut() {
+                // Content-pinned anchor: capture the BUFFER line under the cursor
+                // NOW, so scrolling while selecting extends into scrollback rather
+                // than sliding the whole selection with the viewport.
+                let cur_row = self.copy_mode.map(|cm| cm.row);
+                let anchor_line =
+                    cur_row.map(|row| self.active_tab().terminal.viewport_line_to_buffer(row));
+                let now_selecting = if let (Some(cm), Some(anchor_line)) =
+                    (self.copy_mode.as_mut(), anchor_line)
+                {
                     if cm.selecting && cm.line_mode == line {
                         cm.selecting = false;
                         false
                     } else {
-                        cm.begin_select(line);
+                        cm.begin_select(line, anchor_line);
                         true
                     }
                 } else {
@@ -2641,21 +2649,25 @@ impl App {
         if !cm.selecting {
             return;
         }
-        let anchor = (cm.anchor_row, cm.anchor_col);
-        let cursor = (cm.row, cm.col);
+        let anchor = (cm.anchor_line, cm.anchor_col);
         let term = &mut self.active_tab_mut().terminal;
+        // The cursor's CURRENT absolute buffer line (viewport row → buffer at the
+        // present scroll offset); the anchor is already absolute + fixed, so a
+        // scroll extends the selection through scrollback instead of sliding it.
+        let cursor_line = term.viewport_line_to_buffer(cm.row);
+        let cursor = (cursor_line, cm.col);
         if cm.line_mode {
-            let (sr, er) = if cursor >= anchor {
+            let (sr, er) = if cursor.0 >= anchor.0 {
                 (anchor.0, cursor.0)
             } else {
                 (cursor.0, anchor.0)
             };
-            term.selection_start_lines(sr);
-            term.selection_update(er, cm.col, false);
+            term.selection_start_lines_abs(sr);
+            term.selection_update_abs(er, cm.col, false);
         } else {
             let (start, end) = crate::copymode::selection_endpoints(anchor, cursor);
-            term.selection_start(start.0, start.1, start.2);
-            term.selection_update(end.0, end.1, end.2);
+            term.selection_start_abs(start.0, start.1, start.2);
+            term.selection_update_abs(end.0, end.1, end.2);
         }
     }
 

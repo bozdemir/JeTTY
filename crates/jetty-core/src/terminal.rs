@@ -1840,6 +1840,42 @@ impl Terminal {
         }
     }
 
+    /// Convert a viewport row (0 = top of the visible grid) to its ABSOLUTE
+    /// buffer line at the current scroll offset. Copy-mode captures its anchor
+    /// this way so the anchor stays pinned to CONTENT — not the viewport — and
+    /// scrolling extends the selection into scrollback instead of sliding the
+    /// whole selection with the viewport.
+    pub fn viewport_line_to_buffer(&self, viewport_line: usize) -> i32 {
+        let display_offset = self.term.grid().display_offset();
+        viewport_to_point(display_offset, Point::new(viewport_line, Column(0))).line.0
+    }
+
+    /// Like [`Terminal::selection_start`] but anchored at an ABSOLUTE buffer
+    /// line (independent of the scroll offset), so the anchor does not slide as
+    /// the viewport scrolls. `buffer_line` comes from [`viewport_line_to_buffer`].
+    pub fn selection_start_abs(&mut self, buffer_line: i32, col: usize, left_half: bool) {
+        let pt = Point::new(Line(buffer_line), Column(col));
+        let side = if left_half { Side::Left } else { Side::Right };
+        self.term.selection = Some(Selection::new(SelectionType::Simple, pt, side));
+    }
+
+    /// Update the end of the current selection to an ABSOLUTE buffer cell.
+    /// `left_half` is the sub-cell x side (see [`Terminal::selection_start`]).
+    pub fn selection_update_abs(&mut self, buffer_line: i32, col: usize, left_half: bool) {
+        let pt = Point::new(Line(buffer_line), Column(col));
+        let side = if left_half { Side::Left } else { Side::Right };
+        if let Some(sel) = self.term.selection.as_mut() {
+            sel.update(pt, side);
+        }
+    }
+
+    /// Like [`Terminal::selection_start_lines`] but anchored at an ABSOLUTE
+    /// buffer line, so a line-mode copy-mode anchor survives scrolling.
+    pub fn selection_start_lines_abs(&mut self, buffer_line: i32) {
+        let pt = Point::new(Line(buffer_line), Column(0));
+        self.term.selection = Some(Selection::new(SelectionType::Lines, pt, Side::Left));
+    }
+
     /// Clear the active selection.
     pub fn selection_clear(&mut self) {
         self.term.selection = None;
@@ -2750,6 +2786,37 @@ mod tests {
         t.selection_update(0, 0, true);
         assert_eq!(t.selection_text().as_deref(), Some("hello"),
             "reverse drag must not drop the endpoint cells");
+    }
+
+    #[test]
+    fn abs_selection_anchor_survives_scroll_into_history() {
+        // Regression (v0.21 copy-mode): with the anchor captured as an ABSOLUTE
+        // buffer line, scrolling the viewport while selecting must EXTEND the
+        // selection into scrollback — not slide the whole thing with the viewport
+        // (which would cap it at one screen height). Feed 50 lines into a 5-row
+        // screen so plenty of history exists.
+        let mut t = Terminal::new(20, 5);
+        for i in 0..50 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        // Anchor on the last visible row at the live bottom (viewport row 4).
+        let anchor_line = t.viewport_line_to_buffer(4);
+        t.selection_start_abs(anchor_line, 0, true);
+        // Scroll two screens up into history; the copy-mode cursor stays at the
+        // top viewport row, whose buffer line is now ABOVE the anchor.
+        t.scroll_lines(10);
+        let cursor_line = t.viewport_line_to_buffer(0);
+        assert!(
+            cursor_line < anchor_line,
+            "after scrolling, the cursor's buffer line ({cursor_line}) must be above the anchor ({anchor_line})"
+        );
+        t.selection_update_abs(cursor_line, 19, false);
+        let text = t.selection_text().expect("selection should have text after scrolling");
+        // The selection must span MORE than one 5-row screen — the whole point of
+        // a content-pinned anchor is multi-screen scrollback selection.
+        let n = text.lines().count();
+        assert!(n > 5, "content-pinned selection must span >1 screen; got {n} lines: {text:?}");
+        assert!(text.contains("line "), "selection should contain the fed content: {text:?}");
     }
 
     #[test]
