@@ -29,6 +29,13 @@ pub const HELP_ROWS: [&str; 23] = [
     "Esc — Close this help",
 ];
 
+/// The built-in help rows as owned strings. `App` generates its own rows from the
+/// live keymap (so a remap is reflected); this is the default set (used by the
+/// render-crate tests and as a fallback), byte-identical to today's overlay.
+pub fn default_help_rows() -> Vec<String> {
+    HELP_ROWS.iter().map(|s| s.to_string()).collect()
+}
+
 /// Geometry + draw data for the Help overlay.
 pub struct HelpOverlay {
     /// Quads in draw order: full-screen dim, border, background panel.
@@ -46,7 +53,13 @@ pub struct HelpOverlay {
 /// `char_w` is the measured physical-pixel advance of one chrome-font character
 /// (from `TextLayer::cell_size().0`). Pass `9.8` when a real measurement is not
 /// available (scale-1 fallback used by tests).
-pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme, char_w: f32) -> HelpOverlay {
+pub fn build_help_overlay(
+    win_w: u32,
+    win_h: u32,
+    theme: &jetty_core::Theme,
+    char_w: f32,
+    rows: &[String],
+) -> HelpOverlay {
     let sw = win_w as f32;
     let sh = win_h as f32;
 
@@ -90,7 +103,7 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme, cha
 
     // The panel must fit the LONGEST row (and the title). Width = longest text
     // width + padding on both sides.
-    let longest_chars = HELP_ROWS
+    let longest_chars = rows
         .iter()
         .map(|r| r.chars().count())
         .chain(std::iter::once("Keyboard Shortcuts".chars().count()))
@@ -114,10 +127,10 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme, cha
     let row_h_min = ROW_H_MIN * vscale;
     let min_pad = MIN_PAD * vscale;
 
-    let rows = HELP_ROWS.len() as f32;
+    let row_count = rows.len() as f32;
     // Ideal content height; if it exceeds the window, scale the vertical metrics
     // down by a single factor (clamped so each metric keeps its readable floor).
-    let ideal_h = pad_ideal + title_h_ideal + rows * row_h_ideal + pad_ideal;
+    let ideal_h = pad_ideal + title_h_ideal + row_count * row_h_ideal + pad_ideal;
     let avail_h = sh.max(0.0);
     let scale = if ideal_h > avail_h && ideal_h > 0.0 {
         (avail_h / ideal_h).clamp(0.0, 1.0)
@@ -132,12 +145,12 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme, cha
     // row pitch BELOW its readable floor so every row still lands inside the
     // clamped panel rather than being drawn off the window bottom (the floors
     // alone can total more than a very short window's height).
-    if 2.0 * pad_v + title_h + rows * row_h > avail_h && rows > 0.0 {
-        row_h = ((avail_h - 2.0 * pad_v - title_h) / rows).clamp(1.0, row_h);
+    if 2.0 * pad_v + title_h + row_count * row_h > avail_h && row_count > 0.0 {
+        row_h = ((avail_h - 2.0 * pad_v - title_h) / row_count).clamp(1.0, row_h);
     }
     // Recompute the actual height from the (possibly floored) metrics, then clamp
     // to the window so the panel can never exceed it.
-    let panel_h = (2.0 * pad_v + title_h + rows * row_h).min(avail_h.max(0.0));
+    let panel_h = (2.0 * pad_v + title_h + row_count * row_h).min(avail_h.max(0.0));
     // `PAD` is the vertical text padding (top inset for the title).
     let pad_top = pad_v;
 
@@ -186,9 +199,9 @@ pub fn build_help_overlay(win_w: u32, win_h: u32, theme: &jetty_core::Theme, cha
 
     // Shortcut rows (one binding per row → never overflows the panel width).
     let rows_top = py + pad_top + title_h;
-    for (i, row) in HELP_ROWS.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
         let y = rows_top + i as f32 * row_h;
-        labels.push((row.to_string(), px + pad_x, y, row_col));
+        labels.push((row.clone(), px + pad_x, y, row_col));
     }
 
     HelpOverlay { quads, labels, panel }
@@ -207,7 +220,7 @@ mod tests {
 
     #[test]
     fn panel_is_centered_and_on_screen() {
-        let h = build_help_overlay(1000, 700, &theme(), TEST_CHAR_W);
+        let h = build_help_overlay(1000, 700, &theme(), TEST_CHAR_W, &default_help_rows());
         assert!(h.panel.x >= 0.0 && h.panel.y >= 0.0);
         assert!(h.panel.x + h.panel.w <= 1000.0 + 0.5);
         assert!(h.panel.y + h.panel.h <= 700.0 + 0.5);
@@ -223,7 +236,7 @@ mod tests {
         // The estimate uses the same char_w passed to the builder so the panel
         // is always sized to contain the text.
         for w in [320u32, 500, 700, 1000, 1600] {
-            let h = build_help_overlay(w, 700, &theme(), TEST_CHAR_W);
+            let h = build_help_overlay(w, 700, &theme(), TEST_CHAR_W, &default_help_rows());
             let panel_right = h.panel.x + h.panel.w;
             for (text, x, _y, _c) in &h.labels {
                 let est_right = x + text.chars().count() as f32 * TEST_CHAR_W;
@@ -240,7 +253,7 @@ mod tests {
         // At short window heights the overlay must still fit every row on-screen
         // (the lower rows must not clip off the bottom of the window).
         for h in [360u32, 420, 480, 640] {
-            let overlay = build_help_overlay(700, h, &theme(), TEST_CHAR_W);
+            let overlay = build_help_overlay(700, h, &theme(), TEST_CHAR_W, &default_help_rows());
             // The panel itself fits the window.
             assert!(
                 overlay.panel.y >= 0.0 && overlay.panel.y + overlay.panel.h <= h as f32 + 0.5,
@@ -267,7 +280,7 @@ mod tests {
         // behaviour for an extreme (<~381px) window and not exercised here.
         let ink_floor = 16.0_f32; // ROW_H_MIN == font_size at scale 1 (vscale==1)
         for h in [420u32, 480, 560, 700, 900] {
-            let overlay = build_help_overlay(700, h, &theme(), TEST_CHAR_W);
+            let overlay = build_help_overlay(700, h, &theme(), TEST_CHAR_W, &default_help_rows());
             // labels[0] is the title; labels[1..] are the shortcut rows in order.
             let ys: Vec<f32> = overlay.labels[1..].iter().map(|(_t, _x, y, _c)| *y).collect();
             for pair in ys.windows(2) {
@@ -290,7 +303,7 @@ mod tests {
 
     #[test]
     fn lists_core_bindings() {
-        let h = build_help_overlay(1000, 700, &theme(), TEST_CHAR_W);
+        let h = build_help_overlay(1000, 700, &theme(), TEST_CHAR_W, &default_help_rows());
         let joined: String = h.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("F9"));
         assert!(joined.contains("Ctrl+Shift+P"));

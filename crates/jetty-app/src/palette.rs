@@ -41,6 +41,7 @@ pub enum PaletteCmd {
     Copy,
     Paste,
     ToggleLaunchAtLogin,
+    ResetKeybindings,
     Hide,
     Quit,
     SetTheme(usize),
@@ -73,7 +74,7 @@ pub fn build_registry(
     tabs: &[String],
     detached: &[String],
 ) -> Vec<PaletteEntry> {
-    let statics: [(&str, &str, PaletteCmd); 27] = [
+    let statics: [(&str, &str, PaletteCmd); 28] = [
         ("New tab", "create open window shell", PaletteCmd::NewTab),
         ("Close tab", "kill remove", PaletteCmd::CloseTab),
         ("Next tab", "cycle switch forward", PaletteCmd::NextTab),
@@ -99,6 +100,7 @@ pub fn build_registry(
         ("Copy selection", "clipboard yank", PaletteCmd::Copy),
         ("Paste", "clipboard insert", PaletteCmd::Paste),
         ("Toggle launch at login", "autostart startup boot", PaletteCmd::ToggleLaunchAtLogin),
+        ("Reset keybindings to defaults", "shortcut hotkey rebind reset keys", PaletteCmd::ResetKeybindings),
         ("Hide window", "summon dismiss minimize", PaletteCmd::Hide),
         ("Quit JeTTY", "exit close all", PaletteCmd::Quit),
     ];

@@ -687,7 +687,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // JETTY_SHOT_HELP — render the Keyboard Shortcuts help overlay.
         if env_flag("JETTY_SHOT_HELP") {
-            let help = jetty_render::build_help_overlay(width, height, terminal.theme(), chrome_char_w);
+            let help = jetty_render::build_help_overlay(
+                width,
+                height,
+                terminal.theme(),
+                chrome_char_w,
+                &jetty_render::default_help_rows(),
+            );
             rects.extend(help.quads);
             panel_labels.extend(help.labels);
         }
