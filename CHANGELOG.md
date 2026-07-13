@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.20.0] — 2026-07-13
+
+**Configurable keybindings.** Every shortcut is now yours to remap. Designed from
+a verified blueprint, stress-tested by two design critics (6 blocking issues,
+mostly about not breaking today's defaults), then adversarially reviewed.
+
+### Added
+- **`[keys]` config table** — remap any binding (copy/paste, new/close/switch
+  tab, search, detach, prompt-jump, command palette, font size, opacity, select
+  all, quit…) to your own chords in `~/.config/jetty/config.toml`:
+  ```toml
+  [keys]
+  new_tab = "Ctrl+T"
+  paste   = ["Ctrl+Shift+V", "Shift+Insert"]   # multiple accelerators
+  select_all = ""                               # explicitly unbound
+  ```
+  Anything you don't set keeps its **exact current default** (a keymap oracle test
+  proves byte-for-byte parity), it **hot-reloads live** (no restart), and
+  layout-independent bindings (font size on Turkish-Q / QWERTZ) stay independent.
+- Safe by design: a binding that would shadow a **terminal control byte**
+  (`Ctrl+C` SIGINT, `Ctrl+D`…) or a bare printable key is rejected with a warning,
+  so you can't lock yourself out; conflicts are detected at load.
+
+---
+
 ## [0.19.0] — 2026-07-09
 
 **Inline images.** JeTTY now renders real bitmaps in the terminal via the Sixel
