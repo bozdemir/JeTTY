@@ -1950,7 +1950,17 @@ impl App {
         let (cols, rows) = self.grid_dims();
         let proxy_wake = self.proxy.clone();
         let shell = self.opt_shell();
-        let pty = match PtySession::spawn(cols as u16, rows as u16, shell, cwd, move || {
+        // Report the text-area pixel size so image tools scale correctly from the
+        // start (A5); 0 when the font metrics aren't ready yet.
+        let (px_w, px_h) = self
+            .text
+            .as_ref()
+            .map(|t| {
+                let (cw, ch) = t.cell_size();
+                ((cols as f32 * cw).min(65535.0) as u16, (rows as f32 * ch).min(65535.0) as u16)
+            })
+            .unwrap_or((0, 0));
+        let pty = match PtySession::spawn(cols as u16, rows as u16, px_w, px_h, shell, cwd, move || {
             let _ = proxy_wake.send_event(AppEvent::Wake);
         }) {
             Ok(p) => p,
@@ -2249,7 +2259,12 @@ impl App {
         );
         dw.tab.terminal.resize(cols, rows);
         dw.tab.terminal.set_cell_px(cw, ch);
-        dw.tab.pty.resize(cols as u16, rows as u16);
+        dw.tab.pty.resize(
+            cols as u16,
+            rows as u16,
+            (cols as f32 * cw).min(65535.0) as u16,
+            (rows as f32 * ch).min(65535.0) as u16,
+        );
 
         self.detached.push(dw);
 
@@ -2295,7 +2310,12 @@ impl App {
         if let Some((cw, ch)) = self.text.as_ref().map(|t| t.cell_size()) {
             tab.terminal.set_cell_px(cw, ch);
         }
-        tab.pty.resize(cols as u16, rows as u16);
+        tab.pty.resize(
+            cols as u16,
+            rows as u16,
+            self.text.as_ref().map(|t| (cols as f32 * t.cell_size().0).min(65535.0) as u16).unwrap_or(0),
+            self.text.as_ref().map(|t| (rows as f32 * t.cell_size().1).min(65535.0) as u16).unwrap_or(0),
+        );
 
         self.tabs.push(tab);
         self.active = crate::detached::reattach_index(self.tabs.len());
@@ -3961,7 +3981,12 @@ impl App {
             // Keep the sixel footprint metric current (font/DPI/window change);
             // this is the single chokepoint every main-window resize funnels through.
             tab.terminal.set_cell_px(cw, ch);
-            tab.pty.resize(cols as u16, rows as u16);
+            tab.pty.resize(
+                cols as u16,
+                rows as u16,
+                (cols as f32 * cw).min(65535.0) as u16,
+                (rows as f32 * ch).min(65535.0) as u16,
+            );
         }
         // Every background shell just got a SIGWINCH from US: their prompt
         // repaints are self-inflicted, not "unseen output" — arm the activity
@@ -6648,7 +6673,12 @@ impl ApplicationHandler<AppEvent> for App {
                     );
                     dw.tab.terminal.resize(cols, rows);
                     dw.tab.terminal.set_cell_px(cw, ch);
-                    dw.tab.pty.resize(cols as u16, rows as u16);
+                    dw.tab.pty.resize(
+                        cols as u16,
+                        rows as u16,
+                        (cols as f32 * cw).min(65535.0) as u16,
+                        (rows as f32 * ch).min(65535.0) as u16,
+                    );
                     dw.window.request_redraw();
                     // Same post-reflow hover revalidation as the main
                     // window's reflow() (F6); no-op unless Ctrl is held.
@@ -6874,7 +6904,9 @@ impl ApplicationHandler<AppEvent> for App {
         let proxy_wake = self.proxy.clone();
         let shell = self.opt_shell();
         let pty_handle = std::thread::spawn(move || {
-            PtySession::spawn(FALLBACK_COLS as u16, FALLBACK_ROWS as u16, shell, None, move || {
+            // Provisional grid at startup: the real text-area pixel size is set by
+            // the immediate resize once the cell metrics are known (see below).
+            PtySession::spawn(FALLBACK_COLS as u16, FALLBACK_ROWS as u16, 0, 0, shell, None, move || {
                 let _ = proxy_wake.send_event(AppEvent::Wake);
             })
         });
@@ -7067,7 +7099,15 @@ impl ApplicationHandler<AppEvent> for App {
                 return;
             }
         };
-        pty.resize(cols as u16, rows as u16);
+        let (px_w, px_h) = self
+            .text
+            .as_ref()
+            .map(|t| {
+                let (cw, ch) = t.cell_size();
+                ((cols as f32 * cw).min(65535.0) as u16, (rows as f32 * ch).min(65535.0) as u16)
+            })
+            .unwrap_or((0, 0));
+        pty.resize(cols as u16, rows as u16, px_w, px_h);
         terminal.resize(cols, rows);
         // Surface a one-line notice if the configured shell was unavailable and
         // spawn fell back to another shell, so the fallback is not silent (F2).

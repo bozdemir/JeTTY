@@ -309,13 +309,19 @@ impl PtySession {
     pub fn spawn(
         cols: u16,
         rows: u16,
+        px_w: u16,
+        px_h: u16,
         shell_override: Option<String>,
         cwd: Option<std::path::PathBuf>,
         on_data: impl Fn() + Send + 'static,
     ) -> std::io::Result<PtySession> {
         let pty_system = native_pty_system();
+        // Report the text-area pixel size (TIOCGWINSZ ws_xpixel/ws_ypixel) so
+        // image tools that read it (as a fallback to the \e[14t reply) scale to
+        // the real cell metrics. 0 = unknown (provisional spawn; a resize with the
+        // real cell size follows).
         let pair = pty_system
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize { rows, cols, pixel_width: px_w, pixel_height: px_h })
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         // A vanished directory silently degrades to existing behavior;
         // portable-pty re-guards (non-dir → home) at exec time.
@@ -564,12 +570,12 @@ impl PtySession {
         })
     }
 
-    pub fn resize(&self, cols: u16, rows: u16) {
+    pub fn resize(&self, cols: u16, rows: u16, px_w: u16, px_h: u16) {
         let _ = self.master.lock().unwrap().resize(PtySize {
             rows,
             cols,
-            pixel_width: 0,
-            pixel_height: 0,
+            pixel_width: px_w,
+            pixel_height: px_h,
         });
     }
 }

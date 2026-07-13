@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn pty_echoes_written_bytes() {
-    let pty = PtySession::spawn(80, 24, None, None, || {}).expect("spawn");
+    let pty = PtySession::spawn(80, 24, 0, 0, None, None, || {}).expect("spawn");
     {
         let mut w = pty.writer();
         // cooked PTY echoes typed input back; send a line.
@@ -31,7 +31,7 @@ fn child_exit_is_detected() {
     // When the shell exits (Ctrl+D / `exit`), the reader thread sees EOF on the
     // PTY master and must flag it so the app can close the window instead of
     // freezing on a dead shell. Drive that path by telling the shell to exit.
-    let pty = PtySession::spawn(80, 24, None, None, || {}).expect("spawn");
+    let pty = PtySession::spawn(80, 24, 0, 0, None, None, || {}).expect("spawn");
     {
         let mut w = pty.writer();
         use std::io::Write;
@@ -69,7 +69,7 @@ fn spawn_inherits_cwd() {
     // macOS /tmp is a symlink to /private/tmp; compare canonicalized paths.
     let canon = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
     let pty =
-        PtySession::spawn(80, 24, None, Some(dir.clone()), || {}).expect("spawn with cwd");
+        PtySession::spawn(80, 24, 0, 0, None, Some(dir.clone()), || {}).expect("spawn with cwd");
 
     // The spawned shell must report the requested cwd via PtySession::cwd().
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -114,7 +114,7 @@ fn spawn_with_vanished_cwd_falls_back() {
     std::fs::remove_dir(&dir).expect("remove temp dir");
     // A vanished cwd must degrade to the default spawn dir, not fail the tab.
     let pty =
-        PtySession::spawn(80, 24, None, Some(dir.clone()), || {}).expect("spawn must succeed");
+        PtySession::spawn(80, 24, 0, 0, None, Some(dir.clone()), || {}).expect("spawn must succeed");
     std::thread::sleep(Duration::from_millis(300));
     while pty.output().try_recv().is_ok() {}
     assert!(!pty.child_exited(), "shell died after spawn with a vanished cwd");
@@ -123,7 +123,7 @@ fn spawn_with_vanished_cwd_falls_back() {
 
 #[test]
 fn cwd_none_after_exit() {
-    let pty = PtySession::spawn(80, 24, None, None, || {}).expect("spawn");
+    let pty = PtySession::spawn(80, 24, 0, 0, None, None, || {}).expect("spawn");
     {
         let mut w = pty.writer();
         use std::io::Write;
