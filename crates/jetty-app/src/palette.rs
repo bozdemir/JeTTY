@@ -36,6 +36,8 @@ pub enum PaletteCmd {
     TogglePerfHud,
     ShowWelcome,
     Search,
+    HintMode,
+    CopyMode,
     PrevPrompt,
     NextPrompt,
     Copy,
@@ -74,7 +76,7 @@ pub fn build_registry(
     tabs: &[String],
     detached: &[String],
 ) -> Vec<PaletteEntry> {
-    let statics: [(&str, &str, PaletteCmd); 28] = [
+    let statics: [(&str, &str, PaletteCmd); 30] = [
         ("New tab", "create open window shell", PaletteCmd::NewTab),
         ("Close tab", "kill remove", PaletteCmd::CloseTab),
         ("Next tab", "cycle switch forward", PaletteCmd::NextTab),
@@ -95,6 +97,8 @@ pub fn build_registry(
         ("Toggle performance HUD", "fps stats perf meter", PaletteCmd::TogglePerfHud),
         ("Show welcome screen", "splash about neofetch", PaletteCmd::ShowWelcome),
         ("Search scrollback…", "find grep filter", PaletteCmd::Search),
+        ("Hint mode: label URLs/paths", "hint link url path hash copy open keyboard", PaletteCmd::HintMode),
+        ("Copy-mode: keyboard select", "copy mode select vi cursor yank keyboard", PaletteCmd::CopyMode),
         ("Jump to previous prompt", "osc133 shell up", PaletteCmd::PrevPrompt),
         ("Jump to next prompt", "osc133 shell down", PaletteCmd::NextPrompt),
         ("Copy selection", "clipboard yank", PaletteCmd::Copy),

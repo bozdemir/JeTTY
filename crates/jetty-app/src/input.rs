@@ -47,6 +47,12 @@ pub enum KeyAction {
     /// Request application quit (macOS Cmd+Q; remappable). Opens the quit
     /// confirmation.
     Quit,
+    /// Enter hint mode (Ctrl+Shift+H): overlay home-row labels on every visible
+    /// URL / path / git-hash / IPv4 for mouse-free copy (or Alt → open a URL).
+    HintMode,
+    /// Enter keyboard copy-mode (Ctrl+Shift+Space): a modal vi-cursor over the
+    /// viewport + scrollback for keyboard-only text selection and yank.
+    CopyMode,
     /// Raw bytes to write to the PTY.
     Send(Vec<u8>),
     None,
@@ -1128,6 +1134,30 @@ mod tests {
         assert_eq!(
             dk(true, false, true, make_physical(KeyCode::Tab), &Key::Named(NamedKey::Tab), false, false, false),
             KeyAction::NextTab
+        );
+    }
+
+    #[test]
+    fn hint_and_copy_mode_default_chords_resolve() {
+        // Ctrl+Shift+H → HintMode; Ctrl+Shift+Space → CopyMode. Both flow out of
+        // the keymap lookup in decide_key (never the ctrl_byte fallback).
+        assert_eq!(
+            dk(true, true, false, make_physical(KeyCode::KeyH), &make_logical_char("H"), false, false, false),
+            KeyAction::HintMode
+        );
+        assert_eq!(
+            dk(true, true, false, make_physical(KeyCode::Space), &Key::Named(NamedKey::Space), false, false, false),
+            KeyAction::CopyMode
+        );
+        // Ctrl+Space (no Shift) must still reach the PTY as NUL (0x00), NOT CopyMode.
+        assert_eq!(
+            dk(true, false, false, make_physical(KeyCode::Space), &Key::Named(NamedKey::Space), false, false, false),
+            KeyAction::Send(vec![0x00])
+        );
+        // Ctrl+H (no Shift) must still be BS (0x08), NOT HintMode.
+        assert_eq!(
+            dk(true, false, false, make_physical(KeyCode::KeyH), &make_logical_char("h"), false, false, false),
+            KeyAction::Send(vec![0x08])
         );
     }
 

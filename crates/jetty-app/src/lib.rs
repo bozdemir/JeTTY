@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod copymode;
 mod detached;
 mod notify;
 /// Command-palette action registry + fuzzy filter. Public so the `jetty-shot`

@@ -961,11 +961,33 @@ pub struct App {
     /// The current fuzzy hits (resolved PaletteCmd + title + matched indices),
     /// recomputed on each keystroke. Enter runs the stored cmd, never a stale idx.
     palette_filtered: Vec<crate::palette::PaletteHit>,
+
+    // --- Hint mode (Ctrl+Shift+H) + keyboard copy-mode (Ctrl+Shift+Space) ---
+    /// Active hint-mode state (main window + primary screen only). `Some` while
+    /// the labelled URL/path/hash/IPv4 chips are shown; the tokens are scanned
+    /// ONCE on enter (never per frame). Zero cost when closed (one `Option`
+    /// test on the hot path).
+    hint_mode: Option<HintState>,
+    /// Active copy-mode state: a keyboard vi-cursor over the viewport +
+    /// scrollback. `Some` while active; the shell cursor is suppressed and the
+    /// alacritty `Selection` drives the highlight. Zero cost when closed.
+    copy_mode: Option<crate::copymode::CopyMode>,
+}
+
+/// Hint-mode capture state: the scanned tokens, their parallel labels, and the
+/// prefix typed so far (for partial narrowing).
+struct HintState {
+    tokens: Vec<jetty_core::HintToken>,
+    labels: Vec<String>,
+    typed: String,
 }
 
 /// Owned command-palette draw data, captured before the render borrow:
 /// `(query, visible rows as (title, matched-char indices, selected), total, first_visible)`.
 type PaletteDrawData = (String, Vec<(String, Vec<usize>, bool)>, usize, usize);
+/// Hint-mode overlay draw data captured before the mutable render borrow:
+/// the visible `(label, vp_row, col_start)` chips + the typed prefix.
+type HintDrawData = (Vec<(String, usize, usize)>, String);
 
 /// A left-button drag that began on tab `idx` in the main tab bar. `tearing`
 /// flips true once the cursor moves > `TEAR_THRESHOLD_PX` vertically out of the
@@ -1073,6 +1095,42 @@ pub(crate) fn resize_zone_at(cx: f32, cy: f32, w: u32, h: u32) -> ResizeZone {
 /// `cfg!` keeps both arms compiled on both OSes.
 fn link_modifier_held(m: &winit::keyboard::ModifiersState) -> bool {
     m.control_key() || (cfg!(target_os = "macos") && m.super_key())
+}
+
+/// The base ASCII letter a key event denotes for hint-mode narrowing,
+/// INDEPENDENT of Alt/compose (BLOCKING 5): prefer the produced logical letter
+/// (layout-correct), falling back to the physical QWERTY position when
+/// Alt/Option-compose mangled the produced text into a non-letter.
+fn hint_base_letter(
+    physical: winit::keyboard::PhysicalKey,
+    logical: &winit::keyboard::Key,
+) -> Option<char> {
+    use winit::keyboard::{Key, PhysicalKey};
+    if let Key::Character(s) = logical {
+        if s.chars().count() == 1 {
+            let c = s.chars().next().unwrap().to_ascii_lowercase();
+            if c.is_ascii_alphabetic() {
+                return Some(c);
+            }
+        }
+    }
+    if let PhysicalKey::Code(code) = physical {
+        return keycode_letter(code);
+    }
+    None
+}
+
+/// Map a physical letter key (KeyA..KeyZ) to its lowercase QWERTY char.
+fn keycode_letter(code: winit::keyboard::KeyCode) -> Option<char> {
+    use winit::keyboard::KeyCode::*;
+    Some(match code {
+        KeyA => 'a', KeyB => 'b', KeyC => 'c', KeyD => 'd', KeyE => 'e', KeyF => 'f',
+        KeyG => 'g', KeyH => 'h', KeyI => 'i', KeyJ => 'j', KeyK => 'k', KeyL => 'l',
+        KeyM => 'm', KeyN => 'n', KeyO => 'o', KeyP => 'p', KeyQ => 'q', KeyR => 'r',
+        KeyS => 's', KeyT => 't', KeyU => 'u', KeyV => 'v', KeyW => 'w', KeyX => 'x',
+        KeyY => 'y', KeyZ => 'z',
+        _ => return None,
+    })
 }
 
 /// Scheme allowlist for Ctrl+click-to-open: only http/https/file may reach
@@ -1288,6 +1346,8 @@ impl App {
             palette_scroll: 0,
             palette_registry: Vec::new(),
             palette_filtered: Vec::new(),
+            hint_mode: None,
+            copy_mode: None,
         };
         // Persisted user settings override the env-derived defaults (but env
         // vars still seed the initial values above, so an explicit JETTY_* can
@@ -1401,6 +1461,14 @@ impl App {
                 "{} / {} — Prev / next prompt (shell integration)",
                 first(A::PrevPrompt),
                 first(A::NextPrompt)
+            ),
+            format!(
+                "{} — Hint mode: label + copy URLs/paths (Alt = open URL, Esc cancel)",
+                first(A::HintMode)
+            ),
+            format!(
+                "{} — Copy-mode: keyboard select (hjkl w/b/e v/V y=yank, Esc exit)",
+                first(A::CopyMode)
             ),
             "Ctrl+click — Open URL (Ctrl+hover underlines it)".to_string(),
             "Ctrl+L — Clear".to_string(),
@@ -2303,6 +2371,308 @@ impl App {
         }
     }
 
+    // ── Hint mode (Ctrl+Shift+H) + keyboard copy-mode (Ctrl+Shift+Space) ──────
+
+    /// True while another overlay owns the keyboard, so the hint/copy-mode chords
+    /// cannot start a mode (single-owner rule). Palette/search/rename/confirm
+    /// capture the chord BEFORE `decide_key` runs; welcome + help only capture
+    /// Esc, so they are checked explicitly here (amendment 6 — "cannot enter
+    /// while another owns keys", INCLUDING welcome, for parity).
+    fn overlay_owns_keys(&self) -> bool {
+        self.confirm_quit
+            || self.confirm_close.is_some()
+            || self.renaming.is_some()
+            || self.palette_open
+            || self.welcome_open
+            || self.help_open
+            || self.search_open
+    }
+
+    /// Enter hint mode: scan the visible URL/path/hash/IPv4 tokens ONCE and show
+    /// their labels. No-op on the alt screen, while another overlay owns keys, or
+    /// when the scan finds ZERO tokens (n=0 auto-exit — never trap the user in an
+    /// empty mode requiring Esc).
+    fn enter_hint_mode(&mut self) {
+        if self.overlay_owns_keys() || self.copy_mode.is_some() {
+            return;
+        }
+        if self.active_tab().terminal.alt_screen() {
+            return;
+        }
+        let tokens = self.active_tab().terminal.hint_tokens();
+        if tokens.is_empty() {
+            return;
+        }
+        let labels = jetty_core::hints::assign_labels(tokens.len());
+        self.hint_mode = Some(HintState { tokens, labels, typed: String::new() });
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Cancel hint mode (Esc / after firing).
+    fn exit_hint_mode(&mut self) {
+        self.hint_mode = None;
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Handle one key while hint mode owns the keyboard. Letters narrow the typed
+    /// prefix (matched against the BASE ASCII letter, independent of Alt/compose —
+    /// BLOCKING 5); an exact label match COPIES the token (default) or, for a URL
+    /// with Alt held at completion, OPENS it. Esc cancels; Backspace pops; every
+    /// other key is swallowed.
+    fn hint_mode_key(&mut self, physical: winit::keyboard::PhysicalKey, logical: &winit::keyboard::Key) {
+        use winit::keyboard::{Key, NamedKey};
+        match logical {
+            Key::Named(NamedKey::Escape) => {
+                self.exit_hint_mode();
+                return;
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(hs) = self.hint_mode.as_mut() {
+                    hs.typed.pop();
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                return;
+            }
+            _ => {}
+        }
+        let Some(ch) = hint_base_letter(physical, logical) else {
+            return; // non-letter key: swallow
+        };
+        enum Outcome {
+            Fire(jetty_core::HintToken),
+            Narrow(String),
+            Ignore,
+        }
+        let outcome = {
+            let Some(hs) = self.hint_mode.as_ref() else { return };
+            let mut typed = hs.typed.clone();
+            typed.push(ch);
+            if let Some(idx) = hs.labels.iter().position(|l| *l == typed) {
+                Outcome::Fire(hs.tokens[idx].clone())
+            } else if hs.labels.iter().any(|l| l.starts_with(&typed)) {
+                Outcome::Narrow(typed)
+            } else {
+                Outcome::Ignore
+            }
+        };
+        match outcome {
+            Outcome::Fire(tok) => {
+                // Alt is read from the live modifier state at completion,
+                // decoupled from the label letter (BLOCKING 5). Alt = open ONLY
+                // for a URL; every other kind always copies.
+                if tok.kind == jetty_core::TokenKind::Url && self.modifiers.alt_key() {
+                    App::open_url(&tok.text);
+                } else {
+                    crate::clipboard::set(&tok.text);
+                }
+                self.exit_hint_mode();
+            }
+            Outcome::Narrow(t) => {
+                if let Some(hs) = self.hint_mode.as_mut() {
+                    hs.typed = t;
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Outcome::Ignore => {}
+        }
+    }
+
+    /// Enter copy-mode: a keyboard vi-cursor over the viewport + scrollback.
+    /// No-op on the alt screen or while another overlay owns keys. Clears any
+    /// leftover mouse selection on enter so the old highlight never lingers.
+    fn enter_copy_mode(&mut self) {
+        if self.overlay_owns_keys() || self.hint_mode.is_some() {
+            return;
+        }
+        if self.active_tab().terminal.alt_screen() {
+            return;
+        }
+        let snap = self.active_tab().terminal.snapshot();
+        let (row, col) = if snap.cursor_visible {
+            (
+                snap.cursor_row.min(snap.rows.saturating_sub(1)),
+                snap.cursor_col.min(snap.cols.saturating_sub(1)),
+            )
+        } else {
+            (snap.rows.saturating_sub(1), 0)
+        };
+        self.active_tab_mut().terminal.selection_clear();
+        self.copy_mode = Some(crate::copymode::CopyMode::new(row, col));
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Exit copy-mode (Esc / after yank).
+    fn exit_copy_mode(&mut self) {
+        self.copy_mode = None;
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Handle one key while copy-mode owns the keyboard.
+    fn copy_mode_key(&mut self, physical: winit::keyboard::PhysicalKey, logical: &winit::keyboard::Key, ctrl: bool) {
+        use crate::copymode::Motion;
+        use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+        // Ctrl combos: half-page scroll (keyed on physical position, robust vs
+        // control-char logical keys).
+        if ctrl {
+            if let PhysicalKey::Code(code) = physical {
+                match code {
+                    KeyCode::KeyU => self.copy_mode_motion(Motion::HalfPageUp),
+                    KeyCode::KeyD => self.copy_mode_motion(Motion::HalfPageDown),
+                    _ => {}
+                }
+            }
+            return; // swallow every other Ctrl chord
+        }
+        // Non-motion commands.
+        match logical {
+            Key::Named(NamedKey::Escape) => {
+                self.active_tab_mut().terminal.selection_clear();
+                self.exit_copy_mode();
+                return;
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.copy_mode_yank();
+                return;
+            }
+            Key::Character(s) if s.as_str() == "y" => {
+                self.copy_mode_yank();
+                return;
+            }
+            Key::Character(s) if s.as_str() == "v" || s.as_str() == "V" => {
+                let line = s.as_str() == "V";
+                let now_selecting = if let Some(cm) = self.copy_mode.as_mut() {
+                    if cm.selecting && cm.line_mode == line {
+                        cm.selecting = false;
+                        false
+                    } else {
+                        cm.begin_select(line);
+                        true
+                    }
+                } else {
+                    false
+                };
+                if now_selecting {
+                    self.copy_mode_refresh_selection();
+                } else {
+                    self.active_tab_mut().terminal.selection_clear();
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+        let motion = match logical {
+            Key::Named(NamedKey::ArrowLeft) => Some(Motion::Left),
+            Key::Named(NamedKey::ArrowRight) => Some(Motion::Right),
+            Key::Named(NamedKey::ArrowUp) => Some(Motion::Up),
+            Key::Named(NamedKey::ArrowDown) => Some(Motion::Down),
+            Key::Character(s) if s.chars().count() == 1 => match s.chars().next().unwrap() {
+                'h' => Some(Motion::Left),
+                'l' => Some(Motion::Right),
+                'k' => Some(Motion::Up),
+                'j' => Some(Motion::Down),
+                '0' => Some(Motion::LineStart),
+                '$' => Some(Motion::LineEnd),
+                'w' => Some(Motion::WordFwd),
+                'b' => Some(Motion::WordBack),
+                'e' => Some(Motion::WordEnd),
+                'g' => Some(Motion::Top),
+                'G' => Some(Motion::Bottom),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(m) = motion {
+            self.copy_mode_motion(m);
+        }
+        // else: swallow the key (copy-mode owns the keyboard).
+    }
+
+    /// Apply a copy-mode motion: move the cursor, honour the scroll request, and
+    /// re-drive the selection from the (possibly scrolled) viewport coords.
+    fn copy_mode_motion(&mut self, motion: crate::copymode::Motion) {
+        use crate::copymode::ScrollReq;
+        let Some(cm) = self.copy_mode else { return };
+        let (rows, cols) = {
+            let t = &self.active_tab().terminal;
+            (t.rows(), t.cols())
+        };
+        let viewport = self.active_tab().terminal.viewport_rows_chars();
+        let out = crate::copymode::apply_motion(&cm, motion, rows, cols, &viewport);
+        match out.scroll {
+            ScrollReq::None => {}
+            ScrollReq::Lines(n) => self.active_tab_mut().terminal.scroll_lines(n),
+            ScrollReq::Top => {
+                let max = self.active_tab().terminal.scroll_max();
+                self.active_tab_mut().terminal.scroll_to_offset(max);
+            }
+            ScrollReq::Bottom => self.active_tab_mut().terminal.scroll_to_bottom(),
+        }
+        if let Some(cm) = self.copy_mode.as_mut() {
+            cm.row = out.row.min(rows.saturating_sub(1));
+            cm.col = out.col.min(cols.saturating_sub(1));
+        }
+        self.copy_mode_refresh_selection();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Rebuild the alacritty selection from the copy-mode anchor + cursor with
+    /// the DERIVED sub-cell sides (BLOCKING 2) — reading-order start=Left,
+    /// end=Right — so the highlight/yank is inclusive on both ends regardless of
+    /// direction. No-op when not selecting (never clobbers a cleared selection).
+    fn copy_mode_refresh_selection(&mut self) {
+        let Some(cm) = self.copy_mode else { return };
+        if !cm.selecting {
+            return;
+        }
+        let anchor = (cm.anchor_row, cm.anchor_col);
+        let cursor = (cm.row, cm.col);
+        let term = &mut self.active_tab_mut().terminal;
+        if cm.line_mode {
+            let (sr, er) = if cursor >= anchor {
+                (anchor.0, cursor.0)
+            } else {
+                (cursor.0, anchor.0)
+            };
+            term.selection_start_lines(sr);
+            term.selection_update(er, cm.col, false);
+        } else {
+            let (start, end) = crate::copymode::selection_endpoints(anchor, cursor);
+            term.selection_start(start.0, start.1, start.2);
+            term.selection_update(end.0, end.1, end.2);
+        }
+    }
+
+    /// Yank the current selection to the clipboard and exit copy-mode.
+    fn copy_mode_yank(&mut self) {
+        let text = self
+            .active_tab()
+            .terminal
+            .selection_text()
+            .filter(|t| !t.is_empty());
+        if let Some(t) = text {
+            crate::clipboard::set(&t);
+        }
+        self.active_tab_mut().terminal.selection_clear();
+        self.exit_copy_mode();
+    }
+
     // ── Command palette ──────────────────────────────────────────────────────
 
     /// (Re)build the palette registry FRESH and open the overlay. Building on
@@ -2477,6 +2847,10 @@ impl App {
                     w.request_redraw();
                 }
             }
+            // The palette has already closed (run_palette_cmd runs after
+            // close_palette), so overlay_owns_keys() is false and the mode enters.
+            C::HintMode => self.enter_hint_mode(),
+            C::CopyMode => self.enter_copy_mode(),
             C::PrevPrompt => {
                 if self.active_tab_mut().terminal.jump_prompt(false) {
                     if let Some(w) = &self.window {
@@ -4386,6 +4760,14 @@ impl App {
                     // it never sends 0x06 to the PTY and never opens the
                     // main-window bar while unfocused.
                     input::KeyAction::SearchToggle => {
+                        return;
+                    }
+                    // Hint mode + keyboard copy-mode are main-window + primary-
+                    // screen only this release: a detached window swallows the
+                    // chord as a clean no-op (never leaks to the PTY, never opens
+                    // the mode on the unfocused main window), exactly like
+                    // SearchToggle above.
+                    input::KeyAction::HintMode | input::KeyAction::CopyMode => {
                         return;
                     }
                     // The palette is main-window only; keep Ctrl+Shift+P's pre-0.18
@@ -7292,6 +7674,22 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
 
+                // --- Hint mode / copy-mode ---
+                // Hint mode is keyboard-only: swallow the click. Copy-mode exits
+                // on a left press and lets the click fall through to the normal
+                // mouse-selection path (predictable, simple).
+                if self.hint_mode.is_some() {
+                    return;
+                }
+                if self.copy_mode.is_some() {
+                    self.active_tab_mut().terminal.selection_clear();
+                    self.copy_mode = None;
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    // fall through to normal press handling
+                }
+
                 // --- Command palette captures the mouse while open ---
                 // Swallow every click so none falls through to terminal selection,
                 // the scrollbar, or the ? / window-control buttons (which is exactly
@@ -8104,6 +8502,13 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.tabs.is_empty() {
                     return;
                 }
+                // Hint mode / copy-mode own the wheel: swallow it so scrolling
+                // does not slide the labelled tokens out from under their chips
+                // (hint) or desync the keyboard cursor/selection from the content
+                // (copy — use k/j/Ctrl+u/d to move within the mode instead).
+                if self.hint_mode.is_some() || self.copy_mode.is_some() {
+                    return;
+                }
                 // The palette owns the wheel while open: scroll its list, never
                 // the terminal underneath (swallow so nothing falls through).
                 if self.palette_open {
@@ -8378,6 +8783,42 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     return;
                 }
+                // --- Hint mode captures ALL keys while active ---
+                // Sits below the palette (single-overlay-owns-keys): letters
+                // narrow the label prefix, Esc cancels, Backspace pops, the same
+                // chord toggles closed, everything else is swallowed.
+                if self.hint_mode.is_some() {
+                    let ctrl = self.modifiers.control_key();
+                    let shift = self.modifiers.shift_key();
+                    let alt = self.modifiers.alt_key();
+                    let sup = self.modifiers.super_key();
+                    let mods = crate::keymap::Mods::new(ctrl, shift, alt, sup);
+                    if self.keymap.lookup(mods, event.physical_key, &event.logical_key)
+                        == Some(input::KeyAction::HintMode)
+                    {
+                        self.exit_hint_mode();
+                        return;
+                    }
+                    self.hint_mode_key(event.physical_key, &event.logical_key);
+                    return;
+                }
+                // --- Copy-mode captures ALL keys while active ---
+                if self.copy_mode.is_some() {
+                    let ctrl = self.modifiers.control_key();
+                    let shift = self.modifiers.shift_key();
+                    let alt = self.modifiers.alt_key();
+                    let sup = self.modifiers.super_key();
+                    let mods = crate::keymap::Mods::new(ctrl, shift, alt, sup);
+                    if self.keymap.lookup(mods, event.physical_key, &event.logical_key)
+                        == Some(input::KeyAction::CopyMode)
+                    {
+                        self.active_tab_mut().terminal.selection_clear();
+                        self.exit_copy_mode();
+                        return;
+                    }
+                    self.copy_mode_key(event.physical_key, &event.logical_key, ctrl);
+                    return;
+                }
                 // --- Welcome splash captures Escape (dismiss only, non-modal) ---
                 // Esc dismisses the welcome splash without consuming the key further
                 // (it still falls through to the help/PTY path so the shell also
@@ -8560,6 +9001,8 @@ impl ApplicationHandler<AppEvent> for App {
                         input::KeyAction::NextPrompt => "NextPrompt",
                         input::KeyAction::SelectAll => "SelectAll",
                         input::KeyAction::Quit => "Quit",
+                        input::KeyAction::HintMode => "HintMode",
+                        input::KeyAction::CopyMode => "CopyMode",
                         input::KeyAction::Send(_) => "Send",
                         input::KeyAction::None => "None",
                     };
@@ -8712,6 +9155,16 @@ impl ApplicationHandler<AppEvent> for App {
                             w.request_redraw();
                         }
                     }
+                    // Hint / copy-mode enter. Only reached when no other overlay
+                    // owns keys (they capture the chord earlier and swallow it) —
+                    // the enter methods double-check + no-op on the alt screen /
+                    // (hint) an empty token scan.
+                    input::KeyAction::HintMode => {
+                        self.enter_hint_mode();
+                    }
+                    input::KeyAction::CopyMode => {
+                        self.enter_copy_mode();
+                    }
                     input::KeyAction::Send(bytes) => {
                         // Escape closes an open context/tab menu before forwarding to PTY.
                         if bytes == [0x1b]
@@ -8779,6 +9232,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // and typed keys are swallowed there while IME commits used
                 // to edit the query behind the popup (F9).
                 if self.confirm_quit || self.confirm_close.is_some() {
+                    return;
+                }
+                // Hint mode / copy-mode own the keyboard: DROP the commit so a CJK
+                // IME (which routes even Latin letters through Ime::Commit rather
+                // than KeyboardInput) cannot leak typed text to the shell behind
+                // the overlay, nor have the mode's own keys silently fail
+                // (BLOCKING 1). Mirrors the palette/search short-circuits below.
+                if self.hint_mode.is_some() || self.copy_mode.is_some() {
                     return;
                 }
                 // Inline tab rename captures the commit into the title buffer
@@ -8852,6 +9313,21 @@ impl ApplicationHandler<AppEvent> for App {
                 // they need no blanket early-out here.
                 if !self.visible {
                     return;
+                }
+                // Auto-exit hint/copy-mode if a program switched to the alt screen
+                // while a mode was active (a full-screen TUI launched mid-mode):
+                // both modes are primary-screen only, so drop them cleanly rather
+                // than draw stale chips / a cursor over the TUI. Cheap: one bool
+                // test, only when a mode is active.
+                if (self.hint_mode.is_some() || self.copy_mode.is_some())
+                    && !self.tabs.is_empty()
+                    && self.active_tab().terminal.alt_screen()
+                {
+                    if self.copy_mode.is_some() {
+                        self.active_tab_mut().terminal.selection_clear();
+                    }
+                    self.hint_mode = None;
+                    self.copy_mode = None;
                 }
                 // Re-assert the Dropdown dock AFTER the window is mapped: X11/KWin
                 // ignores a set_outer_position issued before the window is realized
@@ -9038,6 +9514,29 @@ impl ApplicationHandler<AppEvent> for App {
                         None
                     };
                 let welcome_open = self.welcome_open;
+                // Hint-mode chips: (label, first-span row, first-span col) for
+                // each token whose label still matches the typed prefix, captured
+                // OWNED before the mutable gpu/text borrow. None while inactive
+                // (one Option test on the hot path, zero allocation).
+                let hint_ui: Option<HintDrawData> =
+                    self.hint_mode.as_ref().map(|hs| {
+                        let typed = hs.typed.clone();
+                        let labeled: Vec<(String, usize, usize)> = hs
+                            .labels
+                            .iter()
+                            .zip(hs.tokens.iter())
+                            .filter(|(lab, _)| typed.is_empty() || lab.starts_with(&typed))
+                            .filter_map(|(lab, tok)| {
+                                tok.spans.first().map(|(r, c, _)| (lab.clone(), *r, *c))
+                            })
+                            .collect();
+                        (labeled, typed)
+                    });
+                // Copy-mode cursor + pill: (row, col, selecting, line_mode). None
+                // while inactive; `copy_mode_active` suppresses the shell cursor.
+                let copy_mode_ui: Option<(usize, usize, bool, bool)> =
+                    self.copy_mode.as_ref().map(|c| (c.row, c.col, c.selecting, c.line_mode));
+                let copy_mode_active = copy_mode_ui.is_some();
                 // Pill only when the hint is live AND belongs to THIS (the
                 // main) window — a detached-window drag must not light it
                 // here (F4).
@@ -9394,16 +9893,32 @@ impl ApplicationHandler<AppEvent> for App {
                             grid_top + slide_y_offset,
                         ));
                     }
-                    // Cursor last so it draws over the glyphs + decorations.
-                    rects.extend(jetty_render::cursor_rects(
-                        &snap,
-                        cell_w,
-                        cell_h,
-                        grid_top + slide_y_offset,
-                        main_focused,
-                        caret_t_for_flash,
-                        caret_flash_color,
-                    ));
+                    // Cursor last so it draws over the glyphs + decorations. In
+                    // copy-mode the shell's block cursor is SUPPRESSED so only the
+                    // copy-mode keyboard cursor shows (two-cursors fix).
+                    if !copy_mode_active {
+                        rects.extend(jetty_render::cursor_rects(
+                            &snap,
+                            cell_w,
+                            cell_h,
+                            grid_top + slide_y_offset,
+                            main_focused,
+                            caret_t_for_flash,
+                            caret_flash_color,
+                        ));
+                    }
+                    // Copy-mode keyboard cursor: a hollow box in the theme cursor
+                    // color at the copy-mode cell.
+                    if let Some((cr, cc, _sel, _lm)) = copy_mode_ui {
+                        rects.extend(jetty_render::copy_cursor_rects(
+                            cr,
+                            cc,
+                            cell_w,
+                            cell_h,
+                            grid_top + slide_y_offset,
+                            theme.cursor,
+                        ));
+                    }
                     quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &rects);
 
                     // Pass 4a: bottom STATUS BAR (the perf HUD, OFF the tab row).
@@ -9486,6 +10001,46 @@ impl ApplicationHandler<AppEvent> for App {
                         if !sb.labels.is_empty() {
                             let _ = chrome_text.render_overlays(
                                 &gpu.device, &gpu.queue, scene_view, width, height, &sb.labels,
+                            );
+                        }
+                    }
+                    // Pass 4e: hint-mode label chips — themed/HiDPI, mirroring the
+                    // search bar's draw (quads then chrome text). Only while active.
+                    if let Some((labeled, typed)) = &hint_ui {
+                        let refs: Vec<(&str, usize, usize)> =
+                            labeled.iter().map(|(l, r, c)| (l.as_str(), *r, *c)).collect();
+                        let ov = jetty_render::build_hint_overlay(
+                            &refs,
+                            cell_w,
+                            cell_h,
+                            grid_top + slide_y_offset,
+                            &theme,
+                            chrome_char_w,
+                            typed,
+                            width,
+                        );
+                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
+                        if !ov.labels.is_empty() {
+                            let _ = chrome_text.render_overlays(
+                                &gpu.device, &gpu.queue, scene_view, width, height, &ov.labels,
+                            );
+                        }
+                    }
+                    // Pass 4f: copy-mode "COPY" pill (top-left, discoverability +
+                    // screenshot-verify surface).
+                    if let Some((_, _, selecting, line_mode)) = copy_mode_ui {
+                        let pill = jetty_render::build_copy_pill(
+                            width,
+                            grid_top + slide_y_offset,
+                            &theme,
+                            chrome_char_w,
+                            line_mode,
+                            selecting,
+                        );
+                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pill.quads);
+                        if !pill.labels.is_empty() {
+                            let _ = chrome_text.render_overlays(
+                                &gpu.device, &gpu.queue, scene_view, width, height, &pill.labels,
                             );
                         }
                     }

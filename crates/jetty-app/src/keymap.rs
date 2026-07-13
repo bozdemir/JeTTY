@@ -178,10 +178,12 @@ pub enum BindableAction {
     FontReset,
     SelectAll,
     Quit,
+    HintMode,
+    CopyMode,
 }
 
 impl BindableAction {
-    pub const ALL: [BindableAction; 28] = [
+    pub const ALL: [BindableAction; 30] = [
         BindableAction::ToggleSettings,
         BindableAction::OpenPalette,
         BindableAction::NewTab,
@@ -210,6 +212,8 @@ impl BindableAction {
         BindableAction::FontReset,
         BindableAction::SelectAll,
         BindableAction::Quit,
+        BindableAction::HintMode,
+        BindableAction::CopyMode,
     ];
 
     /// Stable name for warnings / debugging.
@@ -244,6 +248,8 @@ impl BindableAction {
             FontReset => "font_reset",
             SelectAll => "select_all",
             Quit => "quit",
+            HintMode => "hint_mode",
+            CopyMode => "copy_mode",
         }
     }
 
@@ -279,6 +285,8 @@ impl BindableAction {
             FontReset => KeyAction::FontReset,
             SelectAll => KeyAction::SelectAll,
             Quit => KeyAction::Quit,
+            HintMode => KeyAction::HintMode,
+            CopyMode => KeyAction::CopyMode,
         }
     }
 
@@ -314,6 +322,8 @@ impl BindableAction {
             FontReset => &b.font_reset,
             SelectAll => &b.select_all,
             Quit => &b.quit,
+            HintMode => &b.hint_mode,
+            CopyMode => &b.copy_mode,
         }
     }
 
@@ -405,6 +415,13 @@ impl BindableAction {
                 push_cmd(&mut v, cmd_letter("q"));
                 v
             }
+            // Hint mode (Ctrl+Shift+H) and copy-mode (Ctrl+Shift+Space): both
+            // carry Shift (so the control-byte-shadow guard accepts them) and,
+            // like SearchToggle/DetachTab, have NO macOS Cmd variant — the
+            // Ctrl+Shift chord works on every platform. Both were verified free
+            // in the default set (H and Space are unbound Ctrl+Shift slots).
+            HintMode => vec![ctrl_shift(KeyMatch::Phys(KeyCode::KeyH))],
+            CopyMode => vec![ctrl_shift(KeyMatch::Phys(KeyCode::Space))],
         }
     }
 }
@@ -1243,6 +1260,53 @@ mod tests {
         assert_eq!(
             km.lookup(Mods::new(true, true, false, false), PhysicalKey::Code(KeyCode::KeyD), &ch("D")),
             None
+        );
+    }
+
+    #[test]
+    fn hint_and_copy_mode_default_chords() {
+        // Ctrl+Shift+H → HintMode, Ctrl+Shift+Space → CopyMode, resolved via the
+        // default keymap (H by physical position, Space by physical position).
+        let km = KeyMap::defaults();
+        let cs = Mods::new(true, true, false, false);
+        assert_eq!(
+            km.lookup(cs, PhysicalKey::Code(KeyCode::KeyH), &ch("H")),
+            Some(KeyAction::HintMode)
+        );
+        assert_eq!(
+            km.lookup(cs, PhysicalKey::Code(KeyCode::Space), &Key::Named(winit::keyboard::NamedKey::Space)),
+            Some(KeyAction::CopyMode)
+        );
+        // Alt-insensitive, like the other Ctrl+Shift defaults.
+        let csa = Mods::new(true, true, true, false);
+        assert_eq!(
+            km.lookup(csa, PhysicalKey::Code(KeyCode::KeyH), &ch("H")),
+            Some(KeyAction::HintMode)
+        );
+    }
+
+    #[test]
+    fn hint_copy_mode_remap_and_reject() {
+        // Remap hint_mode to Ctrl+Shift+G: the new chord fires and the default
+        // Ctrl+Shift+H is freed.
+        let km = km_with(|b| b.hint_mode = Some(ChordSpec::One("Ctrl+Shift+G".to_string())));
+        let cs = Mods::new(true, true, false, false);
+        assert_eq!(
+            km.lookup(cs, PhysicalKey::Code(KeyCode::KeyG), &ch("G")),
+            Some(KeyAction::HintMode)
+        );
+        assert_eq!(km.lookup(cs, PhysicalKey::Code(KeyCode::KeyH), &ch("H")), None);
+        // A Ctrl-only remap that drops Shift is rejected as a control-byte shadow
+        // (Ctrl+H = 0x08 BS, Ctrl+Space = NUL must keep reaching the PTY).
+        let km = km_with(|b| {
+            b.hint_mode = Some(ChordSpec::One("Ctrl+H".to_string()));
+            b.copy_mode = Some(ChordSpec::One("Ctrl+Space".to_string()));
+        });
+        assert!(km.warnings().iter().any(|w| w.contains("control byte")));
+        assert_eq!(
+            km.lookup(Mods::new(true, false, false, false), PhysicalKey::Code(KeyCode::KeyH), &ch("h")),
+            None,
+            "Ctrl+H must remain unmapped → BS byte to PTY"
         );
     }
 

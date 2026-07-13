@@ -201,6 +201,8 @@ pub struct KeyBindings {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub font_reset: Option<ChordSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub select_all: Option<ChordSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub quit: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub hint_mode: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub copy_mode: Option<ChordSpec>,
 }
 
 impl KeyBindings {
