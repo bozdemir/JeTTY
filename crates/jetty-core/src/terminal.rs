@@ -381,6 +381,10 @@ struct ImagePlacement {
     /// created from, so `a=d,d=i,i=N` can target it (amendment A6). `None` for
     /// sixel placements and anonymous Kitty transmits.
     kitty_id: Option<u32>,
+    /// Which inline-image protocol created this placement. Lets a Kitty
+    /// delete-all (`d=a`/`d=A`) clear Kitty images — INCLUDING anonymous ones,
+    /// which carry no `kitty_id` — without wiping a coexisting sixel image (M2).
+    is_kitty: bool,
 }
 
 /// One finished shell command, surfaced from an OSC 133 `D` mark. The tab index /
@@ -1140,6 +1144,12 @@ impl Terminal {
         self.parser.advance(&mut self.term, s);
         let alt_after = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h1 = self.term.grid().history_size();
+        // A full-screen TUI took over mid-transfer: abandon any partial Kitty
+        // chunk accumulation (it can no longer be placed — `place_inline_image`
+        // drops on the alt screen). Bounded regardless; this frees it promptly (M5).
+        if !alt_before && alt_after {
+            self.reset_kitty_chunks();
+        }
         self.track_abs_top(alt_before, alt_after, h0, h1);
     }
 
@@ -1411,6 +1421,7 @@ impl Terminal {
             px_h: img.height.min(u16::MAX as u32) as u16,
             image: Arc::new(img),
             kitty_id: None,
+            is_kitty: false,
         });
         self.placement_bytes = self.placement_bytes.saturating_add(bytes);
         let history = self.term.grid().history_size();
@@ -1616,10 +1627,19 @@ impl Terminal {
     /// uppercase also frees stored image data.
     fn kitty_delete(&mut self, cmd: &KittyCmd) {
         match cmd.delete {
-            // `a=d` with no selector, or d=a / d=A: delete all placements. `A`
-            // additionally frees stored images.
+            // `a=d` with no selector, or d=a / d=A: delete all KITTY placements
+            // (never sixel — a Kitty clear must not wipe another protocol's images,
+            // M2). `A` additionally frees stored images.
             0 | b'a' | b'A' => {
-                self.clear_placements();
+                let mut freed = 0u64;
+                self.placements.retain(|p| {
+                    let del = p.is_kitty;
+                    if del {
+                        freed += p.image.rgba.len() as u64;
+                    }
+                    !del
+                });
+                self.placement_bytes = self.placement_bytes.saturating_sub(freed);
                 if cmd.delete == b'A' {
                     self.kitty_images.clear();
                     self.kitty_stored_bytes = 0;
@@ -1741,16 +1761,26 @@ impl Terminal {
         } else {
             cmd.number
         };
+        // Clamp the drawn pixel size to the RESERVED cell box so a mismatched
+        // explicit `c=`/`r=` (smaller than the native image) can never overpaint
+        // the rows below the reservation (M4). No-op for the derived footprint,
+        // where `cols`/`rows` are the ceil of the native pixels so the box already
+        // covers them; only a hostile/hand-crafted small c/r is clamped.
+        let box_w = ((cols as f32) * self.cell_px_w).ceil().min(u16::MAX as f32) as u16;
+        let box_h = ((rows as f32) * self.cell_px_h).ceil().min(u16::MAX as f32) as u16;
+        let px_w = (img.width.min(u16::MAX as u32) as u16).min(box_w);
+        let px_h = (img.height.min(u16::MAX as u32) as u16).min(box_h);
         self.placements.push_back(ImagePlacement {
             id,
             abs_line,
             col,
             cols,
             rows,
-            px_w: img.width.min(u16::MAX as u32) as u16,
-            px_h: img.height.min(u16::MAX as u32) as u16,
+            px_w,
+            px_h,
             image: img.clone(),
             kitty_id: if key != 0 { Some(key) } else { None },
+            is_kitty: true,
         });
         self.placement_bytes = self.placement_bytes.saturating_add(bytes);
         let history = self.term.grid().history_size();
