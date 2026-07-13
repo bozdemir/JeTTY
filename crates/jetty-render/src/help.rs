@@ -3,7 +3,7 @@ use crate::Rect;
 /// The keyboard-shortcut rows shown in the Help overlay — ONE binding per line
 /// (single column) so a row's text can never overflow the panel's width. The
 /// panel width is computed from the longest row below.
-pub const HELP_ROWS: [&str; 23] = [
+pub const HELP_ROWS: [&str; 25] = [
     "F9 (configurable) — Summon / hide",
     "Ctrl+Shift+T — New tab",
     "Ctrl+Shift+W — Close tab",
@@ -17,6 +17,8 @@ pub const HELP_ROWS: [&str; 23] = [
     "Ctrl+Shift+C / Ctrl+Shift+V — Copy / Paste",
     "Ctrl+Shift+F — Search scrollback (Enter/F3 next, Shift+Enter prev, Esc close)",
     "Ctrl+Shift+Z / Ctrl+Shift+X — Prev / next prompt (shell integration)",
+    "Ctrl+Shift+H — Hint mode: label + copy URLs/paths (Alt = open URL, Esc cancel)",
+    "Ctrl+Shift+Space — Copy-mode: keyboard select (hjkl w/b/e v/V y=yank, Esc exit)",
     "Ctrl+click — Open URL (Ctrl+hover underlines it)",
     "Ctrl+L — Clear",
     "PageUp / PageDown — Scroll",
@@ -279,7 +281,11 @@ mod tests {
         // rows on-screen rather than clip, which is documented, intentional
         // behaviour for an extreme (<~381px) window and not exercised here.
         let ink_floor = 16.0_f32; // ROW_H_MIN == font_size at scale 1 (vscale==1)
-        for h in [420u32, 480, 560, 700, 900] {
+        // The readable lower bound rises with the row COUNT: with the hint/copy-
+        // mode rows the overlay now has 25 rows, so the floored metrics
+        // (2·8 + 22 + 25·16 = 438px) need ~440px before the last-resort pitch
+        // tightening kicks in. 480 is the smallest listed height clear of that.
+        for h in [480u32, 560, 700, 900] {
             let overlay = build_help_overlay(700, h, &theme(), TEST_CHAR_W, &default_help_rows());
             // labels[0] is the title; labels[1..] are the shortcut rows in order.
             let ys: Vec<f32> = overlay.labels[1..].iter().map(|(_t, _x, y, _c)| *y).collect();

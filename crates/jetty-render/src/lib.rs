@@ -16,6 +16,7 @@ mod image_layer;
 mod welcome;
 mod caret_fx;
 mod search_bar;
+mod hints;
 mod palette;
 pub use gpu::GpuContext;
 pub use text::TextLayer;
@@ -39,4 +40,5 @@ pub use tabbar::{
 };
 pub use welcome::{build_welcome_overlay, WelcomeOverlay};
 pub use search_bar::{build_search_bar, search_hit_rects, SearchBar};
+pub use hints::{build_copy_pill, build_hint_overlay, copy_cursor_rects, CopyPill, HintOverlay};
 pub use palette::{build_command_palette, CommandPalette, PaletteRow, MAX_PALETTE_ROWS};
