@@ -38,6 +38,13 @@ pub struct SixelImage {
     pub rgba: Vec<u8>,
 }
 
+/// The canonical decoded inline-image type. Sixel and Kitty both produce a
+/// tightly-packed premultiplied-safe RGBA8 buffer; the Kitty code (`kitty.rs`)
+/// uses this alias so its call sites read honestly, while the struct keeps the
+/// `SixelImage` name so `content_id`, `ImagePlacement`, and the render layer stay
+/// unchanged (the misnomer is contained to the type name).
+pub type InlineImage = SixelImage;
+
 /// Hard size caps enforced by [`decode_sixel`]. A decode that would exceed any
 /// of these returns `None` (correct-or-absent). `max_pixels` bounds the RGBA
 /// allocation (`max_pixels * 4` bytes); `max_w`/`max_h` bound each dimension so

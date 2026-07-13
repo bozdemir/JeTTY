@@ -1245,6 +1245,8 @@ dependencies = [
  "alacritty_terminal",
  "libc",
  "memchr",
+ "miniz_oxide",
+ "png 0.17.16",
  "portable-pty",
 ]
 

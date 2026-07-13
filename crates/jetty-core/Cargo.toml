@@ -11,6 +11,13 @@ portable-pty = "0.9"
 # use it. The double-scan of plain text (our memchr + vte's own) is an accepted
 # O(n) tradeoff — the PTY drain is not the throughput bottleneck.
 memchr = "2"
+# Cold-path only: PNG decode (f=100) and zlib inflate (o=z) for the Kitty
+# graphics protocol. NOT a new external dependency — both `png` and its
+# `miniz_oxide` are already in the workspace lockfile (via jetty-app /
+# jetty-platform), so this adds no new download or supply-chain surface. Never
+# touched by the render/feed hot path.
+png = "0.17"
+miniz_oxide = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
