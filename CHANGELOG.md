@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.22.0] — 2026-07-13
+
+**Inline images, the Kitty way.** JeTTY now speaks the Kitty graphics protocol, so
+image tools that target Kitty render a real GPU-textured bitmap right in the grid —
+alongside the Sixel support from v0.19. Designed from a verified blueprint,
+stress-tested by two design critics (4 blocking issues), then adversarially
+reviewed at the code level across three lenses (0 blocking) and screenshot-verified.
+
+### Added
+- **Kitty graphics protocol** (APC `ESC _ G … ESC \`) — transmit + display (`a=t`/
+  `a=T`), transmit-then-put (`a=p` with an image id/number), query (`a=q`), and
+  delete (`a=d`). Formats: **RGB** (`f=24`), **RGBA** (`f=32`), and **PNG**
+  (`f=100`). Payloads may be **chunked** (`m=1`) and **zlib-compressed** (`o=z`).
+  Images place at the cursor, reserve their cell rows, and scroll with the
+  scrollback — in both the main and detached windows.
+- Reuses the v0.19 inline-image engine (per-window GPU textured quads, `abs_top`
+  placement, correct-or-absent pruning), so images survive scrolling and drop
+  cleanly on reflow / alt-screen / saturation.
+
+### What renders
+- `chafa -f kitty <img>` and `timg -p kitty <img>` — **out of the box** (they
+  stream base64).
+- `kitten icat --transfer-mode=stream <img>` — renders (direct base64, `o=z` and
+  chunking supported).
+- `kitten icat <img>` (default) — **not at MVP**: its default local transfer uses
+  a temp file / shared memory (`t=f`/`t=t`/`t=s`), which JeTTY refuses on purpose
+  (an untrusted terminal stream must not open files or shared memory). Pass
+  `--transfer-mode=stream`.
+
+### Safety & scope
+- Every decoder (hand-rolled base64, RGB/RGBA, PNG, zlib inflate) is bounded before
+  it allocates (dimensions capped at 4096×4096 / 16 Mpx, input and output byte caps,
+  chunk-count cap) and never panics on hostile input — the same bar as the Sixel
+  decoder. No new external dependency: `png` and `miniz_oxide` were already vendored.
+- Zero cost when no image is present (one cold scanner branch; the render hot loop is
+  untouched).
+- Documented MVP non-goals (refused cleanly, never crash): file / temp / shared-memory
+  transfer, animation, Unicode placeholders, server-side scale-to-cell-box, 8-bit APC.
+
+---
+
 ## [0.21.0] — 2026-07-13
 
 **No-mouse text extraction.** Two keyboard-first ways to grab text. Designed from
