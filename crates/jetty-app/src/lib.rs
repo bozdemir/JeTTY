@@ -12,6 +12,9 @@ mod watch;
 pub mod themes;
 pub mod clipboard;
 pub mod input;
+/// Configurable keybindings: chord grammar + compiled [`keymap::KeyMap`]. Public
+/// so integration tests can build the default keymap the input path uses.
+pub mod keymap;
 /// Zero-cost-when-off real-window perf instrumentation (`JETTY_PERF_LOG=1`). Public
 /// so `main.rs` can stamp process start and the `jetty-bench` bin can reuse the
 /// shared percentile/env seams.
