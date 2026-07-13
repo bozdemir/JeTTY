@@ -13,12 +13,12 @@ pub(crate) const MAX_WRAP_WALK: usize = 64;
 
 /// Allowed URL schemes, matched case-insensitively. Deliberately restricted
 /// to what the click-to-open path may spawn (`xdg-open`/`open`).
-const SCHEMES: [&str; 3] = ["https://", "http://", "file://"];
+pub(crate) const SCHEMES: [&str; 3] = ["https://", "http://", "file://"];
 
 /// RFC-3986 URI charset (unreserved + gen/sub-delims + `%` escapes). Space is
 /// NOT included: grid rows are space-padded, and a URL must never expand
 /// through the padding into neighboring text.
-fn in_charset(c: char) -> bool {
+pub(crate) fn in_charset(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
             c,
@@ -49,7 +49,7 @@ fn in_charset(c: char) -> bool {
 
 /// If one of [`SCHEMES`] starts (case-insensitively) at `chars[p..]`, return
 /// its length in chars.
-fn scheme_len_at(chars: &[char], p: usize) -> Option<usize> {
+pub(crate) fn scheme_len_at(chars: &[char], p: usize) -> Option<usize> {
     SCHEMES.iter().find_map(|s| {
         (chars.len() >= p + s.len()
             && chars[p..p + s.len()]
@@ -132,6 +132,28 @@ pub fn find_url_at(chars: &[char], idx: usize) -> Option<(usize, usize)> {
     }
     // (5) The hovered cell must still lie inside the trimmed URL.
     (idx >= start && idx < end).then_some((start, end))
+}
+
+/// Find the FIRST plain-text URL starting at or after char index `from`, as a
+/// half-open `(start, end)` char range, or `None` when the rest of the line has
+/// no URL.
+///
+/// Used by the hint-token scanner to walk a logical line scheme-to-scheme in
+/// O(N) rather than calling [`find_url_at`] at every index (which is O(N²)).
+/// Anchoring [`find_url_at`] at each candidate scheme start reuses its exact
+/// window expansion + trailing-punctuation/bracket trimming, so the range
+/// matches what a Ctrl+click at that URL would open.
+pub fn scan_urls_from(chars: &[char], from: usize) -> Option<(usize, usize)> {
+    let mut p = from;
+    while p < chars.len() {
+        if scheme_len_at(chars, p).is_some() {
+            if let Some((s, e)) = find_url_at(chars, p) {
+                return Some((s, e));
+            }
+        }
+        p += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -270,6 +292,21 @@ mod tests {
         // URL flush at the line end after leading text.
         let t = "open https://x.io/a";
         assert_eq!(url_at(t, t.len() - 1).as_deref(), Some("https://x.io/a"));
+    }
+
+    #[test]
+    fn scan_urls_from_finds_successive_urls() {
+        let s = "see https://a.io/x and http://b.io/y done";
+        let cs = chars(s);
+        let (s0, e0) = super::scan_urls_from(&cs, 0).unwrap();
+        assert_eq!(cs[s0..e0].iter().collect::<String>(), "https://a.io/x");
+        // Continue past the first match → the second URL.
+        let (s1, e1) = super::scan_urls_from(&cs, e0).unwrap();
+        assert_eq!(cs[s1..e1].iter().collect::<String>(), "http://b.io/y");
+        // Nothing after the last URL.
+        assert_eq!(super::scan_urls_from(&cs, e1), None);
+        // A line with no scheme at all.
+        assert_eq!(super::scan_urls_from(&chars("just some text /a/b"), 0), None);
     }
 
     #[test]

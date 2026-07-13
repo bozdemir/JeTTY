@@ -1,3 +1,4 @@
+use crate::hints::HintToken;
 use crate::snapshot::{attr, CellSnapshot, CursorShapeSnap, GridSnapshot, SearchHit};
 use crate::theme::Theme;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -1946,6 +1947,145 @@ impl Terminal {
         Some(LinkHit { uri, spans })
     }
 
+    /// Scan every visible URL / file-path / git-hash / IPv4 token for HINT MODE
+    /// (Ctrl+Shift+H). Runs ONCE per key press (never per frame): it assembles
+    /// each visible logical line (WRAPLINE-joined, wide spacers blanked, exactly
+    /// like [`Terminal::link_at`]), [`crate::hints::scan_line`]s it, and maps each
+    /// token back to VIEWPORT `(row, col_start, col_end)` spans (visible rows
+    /// only). A wrapped token straddling the top (row 0) or bottom (row `rows-1`)
+    /// edge extends its WRAPLINE walk BEYOND the viewport (capped at
+    /// [`crate::url::MAX_WRAP_WALK`]) so its `text` is the COMPLETE token even
+    /// though the label anchors on the visible portion. Identical on-screen
+    /// tokens dedup to one entry; the total is capped so the label alphabet stays
+    /// short. Like `link_at`, spans are recomputed from a fresh grid every call —
+    /// never store the returned viewport coords across grid changes.
+    pub fn hint_tokens(&self) -> Vec<HintToken> {
+        const TOKEN_CAP: usize = 100;
+        if self.cols == 0 || self.rows == 0 {
+            return Vec::new();
+        }
+        let grid = self.term.grid();
+        let display_offset = grid.display_offset();
+        let last_col = Column(self.cols - 1);
+        let wrapped = |l: i32| grid[Line(l)][last_col].flags.contains(Flags::WRAPLINE);
+        let top = grid.topmost_line().0;
+        let bottom = grid.bottommost_line().0;
+
+        // Terminal-line range the viewport covers (contiguous).
+        let first_vp = viewport_to_point(display_offset, Point::new(0, Column(0))).line.0;
+        let last_vp =
+            viewport_to_point(display_offset, Point::new(self.rows - 1, Column(0))).line.0;
+
+        // Extend the WRAPLINE walk beyond the viewport at BOTH edges so a token
+        // wrapped in from above / out below is assembled in full (BLOCKING 3).
+        let mut scan_start = first_vp;
+        for _ in 0..crate::url::MAX_WRAP_WALK {
+            if scan_start > top && wrapped(scan_start - 1) {
+                scan_start -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut scan_end = last_vp;
+        for _ in 0..crate::url::MAX_WRAP_WALK {
+            if scan_end < bottom && wrapped(scan_end) {
+                scan_end += 1;
+            } else {
+                break;
+            }
+        }
+
+        let mut tokens: Vec<HintToken> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut gs = scan_start;
+        while gs <= scan_end {
+            // Group consecutive WRAPLINE rows into one logical line.
+            let mut ge = gs;
+            while ge < scan_end && wrapped(ge) {
+                ge += 1;
+            }
+            // Assemble the group's chars: exactly `cols` per row so char index i
+            // maps back to cell (gs + i/cols, i % cols); wide spacers → ' '.
+            let mut chars: Vec<char> =
+                Vec::with_capacity(((ge - gs + 1) as usize) * self.cols);
+            for l in gs..=ge {
+                let row = &grid[Line(l)];
+                for c in 0..self.cols {
+                    let cell = &row[Column(c)];
+                    chars.push(if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        ' '
+                    } else {
+                        cell.c
+                    });
+                }
+            }
+            for (s, e, kind) in crate::hints::scan_line(&chars) {
+                // Map to VISIBLE viewport spans first (a fully off-screen token
+                // — wrapped entirely above/below — is dropped).
+                let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+                for idx in s..e {
+                    let term_line = gs + (idx / self.cols) as i32;
+                    let c = idx % self.cols;
+                    if let Some(vp) =
+                        point_to_viewport(display_offset, Point::new(Line(term_line), Column(c)))
+                    {
+                        if vp.line < self.rows {
+                            match spans.last_mut() {
+                                Some(sp) if sp.0 == vp.line && sp.2 + 1 == c => sp.2 = c,
+                                _ => spans.push((vp.line, c, c)),
+                            }
+                        }
+                    }
+                }
+                if spans.is_empty() {
+                    continue;
+                }
+                let text: String = chars[s..e].iter().collect();
+                if !seen.insert(text.clone()) {
+                    continue; // dedup identical on-screen tokens
+                }
+                tokens.push(HintToken { text, kind, spans });
+                if tokens.len() >= TOKEN_CAP {
+                    return tokens;
+                }
+            }
+            gs = ge + 1;
+        }
+        tokens
+    }
+
+    /// The visible viewport as rows-of-chars (`rows` × `cols`, wide spacers
+    /// blanked to `' '`, blank cells `' '`). Used by copy-mode word motions so
+    /// `w`/`b`/`e` can see neighbouring rows (BLOCKING 4). Keystroke-rate only.
+    pub fn viewport_rows_chars(&self) -> Vec<Vec<char>> {
+        let mut rows = vec![vec![' '; self.cols]; self.rows];
+        let content = self.term.renderable_content();
+        let display_offset = content.display_offset;
+        for item in content.display_iter {
+            if let Some(vp) = point_to_viewport(display_offset, item.point) {
+                if vp.line < self.rows && vp.column.0 < self.cols {
+                    let cell = item.cell;
+                    let c = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        ' '
+                    } else {
+                        cell.c
+                    };
+                    rows[vp.line][vp.column.0] = c;
+                }
+            }
+        }
+        rows
+    }
+
+    /// Start a whole-LINE selection at the given viewport row (copy-mode `V`).
+    /// Builds a `SelectionType::Lines` selection; `selection_update` then extends
+    /// it to the cursor's row. Any prior selection is replaced.
+    pub fn selection_start_lines(&mut self, viewport_line: usize) {
+        let display_offset = self.term.grid().display_offset();
+        let pt = viewport_to_point(display_offset, Point::new(viewport_line, Column(0)));
+        self.term.selection = Some(Selection::new(SelectionType::Lines, pt, Side::Left));
+    }
+
     /// Whether the terminal has bracketed paste mode enabled (`\e[?2004h`).
     pub fn bracketed_paste(&self) -> bool {
         use alacritty_terminal::term::TermMode;
@@ -3840,5 +3980,87 @@ mod tests {
         t.feed(&sixel("#0;2;100;0;0#0~-~-~-~-~")); // 5 bands = 30px
         assert_eq!(t.placements.len(), 1);
         assert!(t.placements[0].rows >= 3, "multi-row footprint");
+    }
+
+    // ── hint mode + copy-mode helpers ────────────────────────────────────────
+
+    #[test]
+    fn hint_tokens_finds_visible_tokens_with_spans() {
+        let mut t = Terminal::new(60, 5);
+        t.feed(b"go https://example.com/page and /etc/hosts done");
+        let toks = t.hint_tokens();
+        let url = toks.iter().find(|h| h.kind == crate::hints::TokenKind::Url).expect("url");
+        assert_eq!(url.text, "https://example.com/page");
+        assert_eq!(url.spans, vec![(0, 3, 26)]);
+        let path = toks.iter().find(|h| h.kind == crate::hints::TokenKind::Path).expect("path");
+        assert_eq!(path.text, "/etc/hosts");
+    }
+
+    #[test]
+    fn hint_tokens_wrapped_url_is_one_full_token() {
+        // 20 cols: a long URL wraps; hint_tokens must return the COMPLETE URL as
+        // one token whose spans cover both visual rows.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"https://example.com/abcdef");
+        let toks = t.hint_tokens();
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].text, "https://example.com/abcdef");
+        assert_eq!(toks[0].spans, vec![(0, 0, 19), (1, 0, 5)]);
+    }
+
+    #[test]
+    fn hint_tokens_dedups_identical_tokens() {
+        let mut t = Terminal::new(40, 5);
+        t.feed(b"https://x.io/a\r\nhttps://x.io/a\r\n");
+        let toks = t.hint_tokens();
+        assert_eq!(toks.iter().filter(|h| h.text == "https://x.io/a").count(), 1);
+    }
+
+    #[test]
+    fn viewport_rows_chars_matches_snapshot_row_text() {
+        let mut t = Terminal::new(20, 4);
+        t.feed(b"alpha\r\nbeta\r\n");
+        let rows = t.viewport_rows_chars();
+        let snap = t.snapshot();
+        assert_eq!(rows.len(), 4);
+        for r in 0..4 {
+            let s: String = rows[r].iter().collect();
+            assert_eq!(s, snap.row_text(r), "row {r}");
+        }
+    }
+
+    /// Copy-mode selection-side derivation (BLOCKING 2): the START endpoint takes
+    /// Side::Left (left_half=true), the END endpoint Side::Right (left_half=false),
+    /// ordered by cursor-vs-anchor reading order. This mirrors the app's per-
+    /// keystroke rebuild.
+    fn cm_select(t: &mut Terminal, anchor: (usize, usize), cursor: (usize, usize)) -> Option<String> {
+        let forward = cursor >= anchor;
+        let (s, e) = if forward { (anchor, cursor) } else { (cursor, anchor) };
+        t.selection_start(s.0, s.1, true); // Left
+        t.selection_update(e.0, e.1, false); // Right
+        t.selection_text()
+    }
+
+    #[test]
+    fn copy_mode_selection_is_inclusive_both_directions() {
+        let mut t = Terminal::new(20, 3);
+        t.feed(b"hello world");
+        // Forward: anchor at 'h' (0,0), cursor at 'o' (0,4) → "hello" inclusive.
+        assert_eq!(cm_select(&mut t, (0, 0), (0, 4)).as_deref(), Some("hello"));
+        // Reverse: anchor at 'o' (0,4), cursor at 'h' (0,0) → same inclusive text.
+        assert_eq!(cm_select(&mut t, (0, 4), (0, 0)).as_deref(), Some("hello"));
+        // Single cell selects exactly that char.
+        assert_eq!(cm_select(&mut t, (0, 6), (0, 6)).as_deref(), Some("w"));
+    }
+
+    #[test]
+    fn selection_start_lines_yields_whole_lines() {
+        let mut t = Terminal::new(20, 4);
+        t.feed(b"first line\r\nsecond\r\n");
+        t.selection_start_lines(0);
+        t.selection_update(1, 3, false);
+        let txt = t.selection_text().expect("line selection");
+        assert!(txt.contains("first line"), "got {txt:?}");
+        assert!(txt.contains("second"), "got {txt:?}");
     }
 }

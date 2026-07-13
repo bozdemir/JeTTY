@@ -1,4 +1,5 @@
 pub mod fuzzy;
+pub mod hints;
 mod pty;
 pub mod sixel;
 mod snapshot;
@@ -7,6 +8,7 @@ pub mod theme;
 pub mod url;
 
 pub use fuzzy::{fuzzy_match, FuzzyMatch};
+pub use hints::{HintToken, TokenKind};
 pub use pty::{set_advertised_version, PtySession};
 pub use sixel::{decode_sixel, SixelCaps, SixelImage, SIXEL_CAPS};
 pub use snapshot::{attr, CellSnapshot, CursorShapeSnap, GridSnapshot, SearchHit, SHAPE_MASK, VisibleImage};
