@@ -62,6 +62,16 @@
 ///                    applied, print the "cur/total" counter to stderr, draw
 ///                    the match highlights (current match tinted stronger) and
 ///                    the themed search bar at the top-right of the grid.
+///   JETTY_SHOT_HINTS — hint-mode self-test: overlay the home-row label chips on
+///                    every visible URL / file-path / git-hash / IPv4 (real
+///                    Terminal::hint_tokens + assign_labels + build_hint_overlay);
+///                    JETTY_SHOT_HINTS_TYPED="s" narrows to matching labels (typed
+///                    prefix dimmed). Feed a token-rich line via JETTY_SHOT_INPUT.
+///   JETTY_SHOT_COPYMODE="row,col" — copy-mode self-test: draw the keyboard cursor
+///                    (hollow box) + the "COPY" pill at (row,col). With
+///                    JETTY_SHOT_COPYMODE_ANCHOR="row,col" also drive a live
+///                    selection anchor→cursor (JETTY_SHOT_COPYMODE_LINE=1 = whole
+///                    lines), rendering the real selection tint.
 ///
 /// If the terminal bg alpha < 255, the rendered image is composited over a
 /// checkerboard (alternating 16px squares of [40,40,40] and [90,90,90]) so
@@ -376,6 +386,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hit
         });
 
+    // JETTY_SHOT_COPYMODE="row,col" — keyboard copy-mode self-test: place the
+    // copy-mode cursor at (row,col). When JETTY_SHOT_COPYMODE_ANCHOR="row,col" is
+    // also set, drive a live selection from the anchor to the cursor (char mode,
+    // or whole-line when JETTY_SHOT_COPYMODE_LINE=1) using the DERIVED sub-cell
+    // sides (reading-order start=Left, end=Right) — so the selection tint renders
+    // through the REAL cell_bg_rects path (snapshot below), exactly like the app.
+    let parse_rc = |s: &str| -> Option<(usize, usize)> {
+        let mut it = s.splitn(2, ',');
+        let r = it.next()?.trim().parse().ok()?;
+        let c = it.next()?.trim().parse().ok()?;
+        Some((r, c))
+    };
+    let copymode_cursor: Option<(usize, usize, bool, bool)> = std::env::var("JETTY_SHOT_COPYMODE")
+        .ok()
+        .and_then(|s| parse_rc(&s))
+        .map(|(r, c)| {
+            let line_mode = env_flag("JETTY_SHOT_COPYMODE_LINE");
+            let mut selecting = false;
+            if let Some(a) = std::env::var("JETTY_SHOT_COPYMODE_ANCHOR").ok().and_then(|s| parse_rc(&s)) {
+                selecting = true;
+                let cursor = (r, c);
+                if line_mode {
+                    let (sr, er) = if cursor >= a { (a.0, cursor.0) } else { (cursor.0, a.0) };
+                    terminal.selection_start_lines(sr);
+                    terminal.selection_update(er, c, false);
+                } else {
+                    let (start, end) = if cursor >= a { (a, cursor) } else { (cursor, a) };
+                    terminal.selection_start(start.0, start.1, true); // Left
+                    terminal.selection_update(end.0, end.1, false); // Right
+                }
+            }
+            eprintln!("jetty-shot: JETTY_SHOT_COPYMODE cursor=({r},{c}) selecting={selecting} line={line_mode}");
+            (r, c, selecting, line_mode)
+        });
+
     let snap = terminal.snapshot();
 
     let bg_alpha = snap.bg_rgba[3];
@@ -519,15 +564,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // unfocused-hollow cursor. The shape itself comes from the snapshot
         // (DECSCUSR in the input, e.g. `\e[5 q` for a beam).
         let cursor_focused = !env_flag("JETTY_SHOT_CURSOR_UNFOCUSED");
-        rects.extend(jetty_render::cursor_rects(
-            &snap,
-            cell_w,
-            cell_h,
-            shot_grid_top,
-            cursor_focused,
-            None,
-            [0.0, 0.0, 0.0],
-        ));
+        // Copy-mode suppresses the shell cursor (only the keyboard cursor shows).
+        if copymode_cursor.is_none() {
+            rects.extend(jetty_render::cursor_rects(
+                &snap,
+                cell_w,
+                cell_h,
+                shot_grid_top,
+                cursor_focused,
+                None,
+                [0.0, 0.0, 0.0],
+            ));
+        }
 
         // Baseline for the live "Aa" UI-font specimen, set when the panel is built.
         let mut ui_specimen_pos: Option<(f32, f32)> = None;
@@ -676,6 +724,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             rects.extend(sb.quads);
             panel_labels.extend(sb.labels);
+        }
+
+        // JETTY_SHOT_HINTS — hint-mode label chips over every visible URL / path /
+        // git-hash / IPv4, via the SAME scan (Terminal::hint_tokens) + label
+        // (assign_labels) + overlay (build_hint_overlay) path the app uses.
+        // JETTY_SHOT_HINTS_TYPED sets a partial prefix to verify narrowing (only
+        // matching labels are shown, with the typed prefix dimmed).
+        if env_flag("JETTY_SHOT_HINTS") {
+            let tokens = terminal.hint_tokens();
+            let labels = jetty_core::hints::assign_labels(tokens.len());
+            let typed = std::env::var("JETTY_SHOT_HINTS_TYPED").unwrap_or_default();
+            let labeled: Vec<(String, usize, usize)> = labels
+                .iter()
+                .zip(tokens.iter())
+                .filter(|(l, _)| typed.is_empty() || l.starts_with(&typed))
+                .filter_map(|(l, t)| t.spans.first().map(|(r, c, _)| (l.clone(), *r, *c)))
+                .collect();
+            let refs: Vec<(&str, usize, usize)> =
+                labeled.iter().map(|(l, r, c)| (l.as_str(), *r, *c)).collect();
+            let ov = jetty_render::build_hint_overlay(
+                &refs, cell_w, cell_h, shot_grid_top, terminal.theme(), chrome_char_w, &typed, width,
+            );
+            rects.extend(ov.quads);
+            panel_labels.extend(ov.labels);
+            eprintln!(
+                "jetty-shot: JETTY_SHOT_HINTS tokens={} labels_shown={}",
+                tokens.len(),
+                refs.len()
+            );
+        }
+
+        // JETTY_SHOT_COPYMODE — the copy-mode keyboard cursor (hollow box) + the
+        // "COPY" pill. The selection tint (when an anchor is set) is already drawn
+        // by the cell_bg_rects path above (the selection was applied pre-snapshot).
+        if let Some((cr, cc, selecting, line_mode)) = copymode_cursor {
+            rects.extend(jetty_render::copy_cursor_rects(
+                cr, cc, cell_w, cell_h, shot_grid_top, terminal.theme().cursor,
+            ));
+            let pill = jetty_render::build_copy_pill(
+                width, shot_grid_top, terminal.theme(), chrome_char_w, line_mode, selecting,
+            );
+            rects.extend(pill.quads);
+            panel_labels.extend(pill.labels);
         }
 
         // JETTY_SHOT_MENU — render the right-click context menu for visual checks.
