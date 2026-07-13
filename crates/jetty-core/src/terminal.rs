@@ -1,4 +1,5 @@
 use crate::hints::HintToken;
+use crate::kitty::KittyCmd;
 use crate::snapshot::{attr, CellSnapshot, CursorShapeSnap, GridSnapshot, SearchHit};
 use crate::theme::Theme;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -21,6 +22,23 @@ use std::sync::{Arc, Mutex};
 /// an `Arc<AtomicU32>` (alacritty exposes no public listener setter).
 fn pack_geom(cols: usize, rows: usize) -> u32 {
     ((cols.min(u16::MAX as usize) as u32) << 16) | (rows.min(u16::MAX as usize) as u32)
+}
+
+/// Turn a Kitty command's RAW payload (already base64-decoded and accumulated)
+/// into a decoded `InlineImage`: apply `o=z` zlib inflate if requested, then
+/// dispatch by `f=` format. `None` on any failure (correct-or-absent). Cold path.
+fn decode_kitty_image(cmd: &KittyCmd, raw: Vec<u8>) -> Option<crate::sixel::InlineImage> {
+    let data = if cmd.compressed {
+        crate::kitty::inflate_zlib(&raw, KITTY_RAW_BUDGET)?
+    } else {
+        raw
+    };
+    match cmd.format {
+        24 => crate::kitty::decode_rgb(cmd.width, cmd.height, &data, crate::sixel::SIXEL_CAPS),
+        32 => crate::kitty::decode_rgba(cmd.width, cmd.height, &data, crate::sixel::SIXEL_CAPS),
+        100 => crate::kitty::decode_png(&data, crate::sixel::SIXEL_CAPS),
+        _ => None,
+    }
 }
 
 /// Maximum decoded OSC 52 clipboard-copy payload (bytes) that we COMMIT to the
@@ -54,6 +72,11 @@ struct EventProxy {
     /// so `resize()` keeps these replies current after the proxy is moved into
     /// `Term` (alacritty has no public listener setter).
     geom: Arc<AtomicU32>,
+    /// Live cell pixel size (cell_w<<16 | cell_h, each rounded to u16), shared
+    /// with the owning `Terminal` so the `\e[14t` text-area-size reply reports the
+    /// REAL cell metrics (amendment A5). Image tools (chafa/timg/kitty) scale to
+    /// this; a wrong (hardcoded 8×16) value makes HiDPI images render undersized.
+    cell_px: Arc<AtomicU32>,
     /// Live theme used to answer OSC `ColorRequest` queries (OSC 10/11/12/4;n;?).
     /// Real apps (nvim/fzf/delta/tmux) probe OSC 11 to detect a dark/light
     /// background, so the reply must track runtime theme changes — not a copy
@@ -128,11 +151,17 @@ impl EventListener for EventProxy {
             // the cell/col/line counts are what shells actually care about.
             Event::TextAreaSizeRequest(fmt) => {
                 let g = self.geom.load(Ordering::Relaxed);
+                // Real cell px shared from the owning Terminal (A5); fall back to
+                // 8×16 only before the first `set_cell_px`. `\e[14t` reports the
+                // text area in PIXELS, so the reply size is cols*cell_w × rows*cell_h.
+                let cp = self.cell_px.load(Ordering::Relaxed);
+                let cell_width = (cp >> 16) as u16;
+                let cell_height = (cp & 0xFFFF) as u16;
                 let window_size = WindowSize {
                     num_lines: (g & 0xFFFF) as u16,
                     num_cols: (g >> 16) as u16,
-                    cell_width: 8,
-                    cell_height: 16,
+                    cell_width: if cell_width == 0 { 8 } else { cell_width },
+                    cell_height: if cell_height == 0 { 16 } else { cell_height },
                 };
                 let _ = self.tx.send(fmt(window_size).into_bytes());
             }
@@ -228,6 +257,28 @@ const SIXEL_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// a legitimately tall image cannot scroll the grid without bound.
 const MAX_IMAGE_ROWS: usize = 1024;
 
+/// Cap on ONE Kitty APC's accumulated control+base64 payload (`apc_buf`), mirroring
+/// [`SIXEL_MAX_BYTES`]. A single APC chunk is ≤ 4096 base64 bytes in practice, so
+/// 4 MiB is generous; a never-terminated / hostile APC latches `apc_overflow`,
+/// keeps scanning to resync, then DROPS (correct-or-absent).
+const APC_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// The RAW (post-base64, post-inflate) decode budget for a Kitty image, shared by
+/// the cross-chunk accumulator and the zlib inflate limit. Reconciles the
+/// transport ceiling with the decoder ceiling (amendment BLOCKING 2): a full HiDPI
+/// window's uncompressed `f=32` RGBA (up to 16 Mpx) can actually reach the decoder.
+/// = `SIXEL_CAPS.max_pixels * 4` = 64 MiB.
+const KITTY_RAW_BUDGET: usize = crate::sixel::SIXEL_CAPS.max_pixels as usize * 4;
+
+/// Hard cap on the number of `m=1` continuation chunks for one image — bounds a
+/// pathological endless-`m=1` stream even below the byte budget.
+const MAX_KITTY_CHUNKS: u32 = 4096;
+
+/// Bounds on the transmit-then-put image registry (`kitty_images`): at most this
+/// many stored images AND this many live decoded bytes; oldest evicted first.
+const MAX_KITTY_STORED: usize = 64;
+const MAX_KITTY_STORED_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Cap on retained inline-image placements per tab, plus a live-bytes budget on
 /// their decoded RGBA (`Arc<SixelImage>`). Oldest are dropped first.
 const MAX_PLACEMENTS: usize = 256;
@@ -277,6 +328,14 @@ enum Scan {
     /// A DCS that is NOT a bare-`q` sixel: skip to the DCS terminator, touch
     /// nothing (no accumulation, no placement).
     DcsOther,
+    /// Saw `ESC _` (APC introducer): expecting the graphics identifier `G` (0x47).
+    ApcIntro,
+    /// Inside `ESC _ G`: accumulating the control+base64 payload into `apc_buf`
+    /// until an APC terminator (ST / CAN / SUB / 8-bit ST). BEL is DATA here.
+    Apc,
+    /// An APC that is NOT `_G…` (some other APC use): skip to the terminator,
+    /// accumulate nothing, emit nothing.
+    ApcOther,
 }
 
 /// One shell command's OSC 133 semantic marks. `prompt`/`input`/`output` are
@@ -318,6 +377,10 @@ struct ImagePlacement {
     px_w: u16,
     px_h: u16,
     image: Arc<crate::sixel::SixelImage>,
+    /// The Kitty protocol image id (`i=`) or number (`I=`) this placement was
+    /// created from, so `a=d,d=i,i=N` can target it (amendment A6). `None` for
+    /// sixel placements and anonymous Kitty transmits.
+    kitty_id: Option<u32>,
 }
 
 /// One finished shell command, surfaced from an OSC 133 `D` mark. The tab index /
@@ -456,6 +519,34 @@ pub struct Terminal {
     /// Running sum of `image.rgba.len()` across `placements` (the live-bytes
     /// budget), maintained incrementally so pruning never re-sums the deque.
     placement_bytes: u64,
+    /// Live cell pixel size shared with the `EventProxy` (cell_w<<16 | cell_h) so
+    /// the `\e[14t` reply reports real metrics (A5). Updated by `set_cell_px`.
+    cell_px: Arc<AtomicU32>,
+    /// A clone of the PTY write-back sender so the scanner (`&mut self`) can enqueue
+    /// Kitty graphics OK/error replies onto the same `pty_write_rx` the app drains.
+    reply_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// Raw control+base64 bytes of the CURRENT Kitty APC, accumulated while in
+    /// `Scan::Apc`, capped at [`APC_MAX_BYTES`]. Persists across `feed` chunk
+    /// boundaries (like `sixel_buf`).
+    apc_buf: Vec<u8>,
+    /// Latched when `apc_buf` would exceed the cap (or a CAN/SUB abort): the APC is
+    /// dropped on finish (correct-or-absent).
+    apc_overflow: bool,
+    /// Accumulated RAW (post-base64, post-inflate-input) bytes across `m=1`
+    /// continuation chunks, bounded by [`KITTY_RAW_BUDGET`]. Empty when no
+    /// multi-chunk transmit is in progress.
+    chunk_buf: Vec<u8>,
+    /// Control keys captured from the FIRST chunk of a multi-chunk transmit; drives
+    /// the final decode/dispatch. `None` when no accumulation is in progress.
+    chunk_meta: Option<KittyCmd>,
+    /// Count of chunks accumulated so far (bounds an endless-`m=1` stream).
+    chunk_count: u32,
+    /// Bounded transmit-then-put image registry: `(i=/I= key, decoded image)`.
+    /// A later `a=p,i=N` displays without re-transmitting. LRU-evicted by count
+    /// and bytes ([`MAX_KITTY_STORED`] / [`MAX_KITTY_STORED_BYTES`]).
+    kitty_images: VecDeque<(u32, Arc<crate::sixel::InlineImage>)>,
+    /// Running sum of `rgba.len()` across `kitty_images` (the registry byte budget).
+    kitty_stored_bytes: u64,
 }
 
 /// Maximum scrollback-search query length in chars (bounds per-keystroke DFA
@@ -492,6 +583,9 @@ impl Terminal {
         let config =
             Config { scrolling_history: scrollback_limit, osc52: osc52_mode, ..Default::default() };
         let (tx, pty_write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // Clone the sender for the synchronous scanner path (Kitty graphics
+        // OK/error replies flow out through the same drain as async proxy replies).
+        let reply_tx = tx.clone();
 
         // Load theme from JETTY_THEME env var; default to "catppuccin_mocha".
         let theme_name = std::env::var("JETTY_THEME").unwrap_or_else(|_| "catppuccin_mocha".to_string());
@@ -516,6 +610,8 @@ impl Terminal {
         // dimensions into the u16 that WindowSize expects.
         let child_exited = Arc::new(AtomicBool::new(false));
         let geom = Arc::new(AtomicU32::new(pack_geom(cols, rows)));
+        // Default cell px = 8×16 (matches the pre-set_cell_px \e[14t fallback).
+        let cell_px = Arc::new(AtomicU32::new((8u32 << 16) | 16));
         let theme_shared = Arc::new(Mutex::new(theme.clone()));
         let title_update = Arc::new(Mutex::new(None));
         let title_dirty = Arc::new(AtomicBool::new(false));
@@ -527,6 +623,7 @@ impl Terminal {
         let proxy = EventProxy {
             tx,
             geom: Arc::clone(&geom),
+            cell_px: Arc::clone(&cell_px),
             theme: Arc::clone(&theme_shared),
             child_exited: Arc::clone(&child_exited),
             title_update: Arc::clone(&title_update),
@@ -576,6 +673,15 @@ impl Terminal {
             cell_px_h: 16.0,
             placements: VecDeque::new(),
             placement_bytes: 0,
+            cell_px,
+            reply_tx,
+            apc_buf: Vec::new(),
+            apc_overflow: false,
+            chunk_buf: Vec::new(),
+            chunk_meta: None,
+            chunk_count: 0,
+            kitty_images: VecDeque::new(),
+            kitty_stored_bytes: 0,
         }
     }
 
@@ -702,6 +808,9 @@ impl Terminal {
         // exists in the smaller live window.
         let history = self.term.grid().history_size();
         self.prune_marks(history);
+        self.prune_placements(history);
+        // Drop any in-progress Kitty chunk accumulation across a scrollback change.
+        self.reset_kitty_chunks();
     }
 
     /// Feed PTY bytes to the terminal, intercepting OSC 133 semantic-prompt
@@ -740,6 +849,7 @@ impl Terminal {
                     self.scan = match b {
                         0x5d => Scan::Prefix { n: 0 }, // ']' opens an OSC
                         0x50 => Scan::DcsParams { p2: 0, field: 0, inter: false }, // 'P' opens a DCS
+                        0x5f => Scan::ApcIntro,        // '_' opens an APC (Kitty graphics)
                         0x1b => Scan::Esc,             // ESC ESC: restart escape scan
                         _ => Scan::Ground,             // some other escape; resync
                     };
@@ -931,6 +1041,77 @@ impl Terminal {
                 // A non-sixel DCS (DECRQSS/XTGETTCAP/…): skip to the terminator,
                 // accumulate nothing, emit nothing. Same terminators as `Sixel`.
                 Scan::DcsOther => match b {
+                    0x18 | 0x1a | 0x9c => {
+                        self.scan = Scan::Ground;
+                        i += 1;
+                    }
+                    0x1b => {
+                        self.scan = Scan::Esc;
+                        i += 1;
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                },
+                // Saw `ESC _`: only `G` (0x47) is a Kitty graphics command; any
+                // other APC use is skipped (touch nothing).
+                Scan::ApcIntro => {
+                    match b {
+                        0x47 => {
+                            self.apc_buf.clear();
+                            self.apc_overflow = false;
+                            self.scan = Scan::Apc;
+                        }
+                        0x1b => self.scan = Scan::Esc, // ESC aborts, new escape
+                        0x18 | 0x1a => self.scan = Scan::Ground, // CAN/SUB abort
+                        _ => self.scan = Scan::ApcOther,
+                    }
+                    i += 1;
+                }
+                // Accumulating a Kitty APC's control+payload until a terminator.
+                // BEL is DATA here (like a DCS). ST/8-bit-ST finish; CAN/SUB abort.
+                Scan::Apc => match b {
+                    0x9c => {
+                        // 8-bit ST: real terminator — flush the APC to vte (which
+                        // swallows it), then decode/place.
+                        let k = i + 1;
+                        self.advance_slice(&bytes[start..k]);
+                        self.finish_kitty_apc();
+                        self.scan = Scan::Ground;
+                        start = k;
+                        i = k;
+                    }
+                    0x18 | 0x1a => {
+                        // CAN/SUB: abort — force the drop path in finish.
+                        let k = i + 1;
+                        self.advance_slice(&bytes[start..k]);
+                        self.apc_overflow = true;
+                        self.finish_kitty_apc();
+                        self.scan = Scan::Ground;
+                        start = k;
+                        i = k;
+                    }
+                    0x1b => {
+                        // 7-bit ST is `ESC \`: ESC ends the APC (the trailing `\`
+                        // is consumed in Esc → Ground).
+                        let k = i + 1;
+                        self.advance_slice(&bytes[start..k]);
+                        self.finish_kitty_apc();
+                        self.scan = Scan::Esc;
+                        start = k;
+                        i = k;
+                    }
+                    _ => {
+                        if self.apc_buf.len() < APC_MAX_BYTES {
+                            self.apc_buf.push(b);
+                        } else {
+                            self.apc_overflow = true;
+                        }
+                        i += 1;
+                    }
+                },
+                // A non-`_G` APC: skip to the terminator, touch nothing.
+                Scan::ApcOther => match b {
                     0x18 | 0x1a | 0x9c => {
                         self.scan = Scan::Ground;
                         i += 1;
@@ -1147,6 +1328,11 @@ impl Terminal {
         if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 {
             self.cell_px_w = w;
             self.cell_px_h = h;
+            // Publish the rounded metric to the shared atomic so the EventProxy's
+            // `\e[14t` reply reports real cell px (A5). Clamp into u16 each.
+            let cw = (w.round() as u32).clamp(1, u16::MAX as u32);
+            let ch = (h.round() as u32).clamp(1, u16::MAX as u32);
+            self.cell_px.store((cw << 16) | ch, Ordering::Relaxed);
         }
     }
 
@@ -1224,6 +1410,347 @@ impl Terminal {
             px_w: img.width.min(u16::MAX as u32) as u16,
             px_h: img.height.min(u16::MAX as u32) as u16,
             image: Arc::new(img),
+            kitty_id: None,
+        });
+        self.placement_bytes = self.placement_bytes.saturating_add(bytes);
+        let history = self.term.grid().history_size();
+        self.prune_placements(history);
+    }
+
+    // ─────────────────────────── Kitty graphics (APC ESC _ G) ────────────────
+
+    /// Clear any in-progress cross-APC chunk accumulation (the highest-risk state).
+    /// Called on abort/overflow/interrupt and on context changes (reflow /
+    /// scrollback change) so a partial transmit can never splice or outlive its
+    /// context. The bounded registry (`kitty_images`) survives — it is separately
+    /// LRU-capped and a later `a=p` may legitimately reference it.
+    fn reset_kitty_chunks(&mut self) {
+        self.chunk_buf.clear();
+        self.chunk_meta = None;
+        self.chunk_count = 0;
+    }
+
+    /// Decode ONE chunk's base64 payload and append the RAW bytes to `chunk_buf`,
+    /// bounded by [`KITTY_RAW_BUDGET`] (amendment BLOCKING 2 — accumulate raw, not
+    /// base64, so a full-window `f=32` image fits). Returns `false` on a base64
+    /// failure or budget overrun (caller aborts).
+    fn accumulate_chunk(&mut self, payload: &[u8]) -> bool {
+        let budget = KITTY_RAW_BUDGET.saturating_sub(self.chunk_buf.len());
+        let Some(raw) = crate::base64::decode_base64(payload, budget) else {
+            return false;
+        };
+        if self.chunk_buf.len().saturating_add(raw.len()) > KITTY_RAW_BUDGET {
+            return false;
+        }
+        self.chunk_buf.extend_from_slice(&raw);
+        true
+    }
+
+    /// Finish a Kitty APC at its terminator: run the cross-chunk state machine,
+    /// then decode/place/store/delete/reply. `apc_overflow` (buffer cap OR a
+    /// CAN/SUB abort) drops everything (correct-or-absent).
+    ///
+    /// Chunk state machine (amendment BLOCKING 1): continuation chunks OMIT the
+    /// action key (`has_action == false`). While an accumulation is in progress,
+    /// only a `!has_action` APC appends/finalizes; ANY `has_action` APC ABORTS the
+    /// partial and is handled fresh — never spliced.
+    fn finish_kitty_apc(&mut self) {
+        let buf = std::mem::take(&mut self.apc_buf);
+        let overflow = std::mem::take(&mut self.apc_overflow);
+
+        if overflow {
+            // A too-large or CAN/SUB-aborted APC drops itself AND any in-progress
+            // accumulation (the abort could be mid-stream).
+            self.reset_kitty_chunks();
+            return;
+        }
+
+        // Split control | ';' payload at the FIRST ';'. No `;` ⇒ control-only
+        // (a delete/query/put with no payload).
+        let (control, payload): (&[u8], &[u8]) = match buf.iter().position(|&c| c == b';') {
+            Some(p) => (&buf[..p], &buf[p + 1..]),
+            None => (&buf[..], &[]),
+        };
+        let cmd = KittyCmd::parse(control);
+
+        if self.chunk_meta.is_some() {
+            if !cmd.has_action {
+                // Continuation chunk: append this chunk's RAW payload.
+                if !self.accumulate_chunk(payload) {
+                    self.reset_kitty_chunks();
+                    return;
+                }
+                self.chunk_count = self.chunk_count.saturating_add(1);
+                if self.chunk_count > MAX_KITTY_CHUNKS {
+                    self.reset_kitty_chunks();
+                    return;
+                }
+                if cmd.more == 0 {
+                    // Finalize under the STORED first-chunk meta.
+                    let meta = self.chunk_meta.take().unwrap();
+                    let raw = std::mem::take(&mut self.chunk_buf);
+                    self.chunk_count = 0;
+                    self.handle_kitty_command(meta, raw);
+                }
+                return;
+            }
+            // has_action while accumulating ⇒ ABORT the partial, then handle
+            // `cmd` fresh below (never splice).
+            self.reset_kitty_chunks();
+        }
+
+        // Fresh command. A first chunk (`m=1` WITH an action) starts accumulation.
+        // An orphan continuation (`m=1`, no action, nothing in progress) is a
+        // stray fragment — ignore it (this also caps an endless-`m=1` stream that
+        // has already aborted its accumulation).
+        if cmd.more == 1 {
+            if !cmd.has_action {
+                return;
+            }
+            self.reset_kitty_chunks();
+            self.chunk_meta = Some(cmd);
+            self.chunk_count = 1;
+            if !self.accumulate_chunk(payload) {
+                self.reset_kitty_chunks();
+            }
+            return;
+        }
+
+        // Single-shot: base64-decode the payload now (bounded), then dispatch.
+        match crate::base64::decode_base64(payload, KITTY_RAW_BUDGET) {
+            Some(raw) => self.handle_kitty_command(cmd, raw),
+            None => self.kitty_reply(&cmd, "EBADF"),
+        }
+    }
+
+    /// Dispatch a finalized Kitty command with its RAW (base64-decoded) payload.
+    /// `raw` is meaningful only for transmit/query; delete/put ignore it.
+    fn handle_kitty_command(&mut self, cmd: KittyCmd, raw: Vec<u8>) {
+        match cmd.action {
+            b'd' => self.kitty_delete(&cmd),
+            b'p' => self.kitty_put(&cmd),
+            b'q' => {
+                // Validate/decode WITHOUT displaying or storing, then reply.
+                if cmd.medium != b'd' {
+                    self.kitty_reply(&cmd, "ENOTSUPP");
+                } else if decode_kitty_image(&cmd, raw).is_some() {
+                    self.kitty_reply(&cmd, "OK");
+                } else {
+                    self.kitty_reply(&cmd, "EBADF");
+                }
+            }
+            b't' | b'T' => {
+                // Only direct base64 transmission is supported (safety: an
+                // untrusted PTY must not make us open files / shm).
+                if cmd.medium != b'd' {
+                    self.kitty_reply(&cmd, "ENOTSUPP");
+                    return;
+                }
+                match decode_kitty_image(&cmd, raw) {
+                    Some(img) => {
+                        let img = Arc::new(img);
+                        // Transmit: store in the registry if addressable.
+                        if cmd.id != 0 || cmd.number != 0 {
+                            self.kitty_store(&cmd, img.clone());
+                        }
+                        // Display on `a=T`.
+                        if cmd.action == b'T' {
+                            self.place_inline_image(&img, &cmd);
+                        }
+                        self.kitty_reply(&cmd, "OK");
+                    }
+                    None => self.kitty_reply(&cmd, "EBADF"),
+                }
+            }
+            // Empty `a=` (action 0) is a malformed command.
+            0 => self.kitty_reply(&cmd, "EINVAL"),
+            // Animation (`a=a`/`a=f`) and any other action: documented non-goal.
+            _ => self.kitty_reply(&cmd, "ENOTSUPP"),
+        }
+    }
+
+    /// Store a decoded image in the transmit-then-put registry, replacing any
+    /// existing entry with the same key and LRU-evicting to stay within both caps.
+    fn kitty_store(&mut self, cmd: &KittyCmd, img: Arc<crate::sixel::InlineImage>) {
+        let key = if cmd.id != 0 { cmd.id } else { cmd.number };
+        if key == 0 {
+            return;
+        }
+        // Replace an existing same-key entry (free its bytes).
+        if let Some(pos) = self.kitty_images.iter().position(|(k, _)| *k == key) {
+            if let Some((_, old)) = self.kitty_images.remove(pos) {
+                self.kitty_stored_bytes =
+                    self.kitty_stored_bytes.saturating_sub(old.rgba.len() as u64);
+            }
+        }
+        self.kitty_stored_bytes = self.kitty_stored_bytes.saturating_add(img.rgba.len() as u64);
+        self.kitty_images.push_back((key, img));
+        while self.kitty_images.len() > MAX_KITTY_STORED
+            || self.kitty_stored_bytes > MAX_KITTY_STORED_BYTES
+        {
+            let Some((_, old)) = self.kitty_images.pop_front() else { break };
+            self.kitty_stored_bytes = self.kitty_stored_bytes.saturating_sub(old.rgba.len() as u64);
+        }
+    }
+
+    /// Display a previously-transmitted image (`a=p,i=N`/`I=N`). Unknown id ⇒
+    /// `ENOENT` and no placement.
+    fn kitty_put(&mut self, cmd: &KittyCmd) {
+        let key = if cmd.id != 0 { cmd.id } else { cmd.number };
+        let found = self
+            .kitty_images
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, i)| i.clone());
+        match found {
+            Some(img) => {
+                self.place_inline_image(&img, cmd);
+                self.kitty_reply(cmd, "OK");
+            }
+            None => self.kitty_reply(cmd, "ENOENT"),
+        }
+    }
+
+    /// Honor the common Kitty delete requests; refuse the exotic ones as a safe
+    /// no-op (amendment A6 / T9). Lowercase selectors delete PLACEMENTS only;
+    /// uppercase also frees stored image data.
+    fn kitty_delete(&mut self, cmd: &KittyCmd) {
+        match cmd.delete {
+            // `a=d` with no selector, or d=a / d=A: delete all placements. `A`
+            // additionally frees stored images.
+            0 | b'a' | b'A' => {
+                self.clear_placements();
+                if cmd.delete == b'A' {
+                    self.kitty_images.clear();
+                    self.kitty_stored_bytes = 0;
+                }
+            }
+            // d=i / d=I: delete placements whose kitty id matches. `I` also frees
+            // the stored image.
+            b'i' | b'I' => {
+                let key = if cmd.id != 0 { cmd.id } else { cmd.number };
+                let mut freed = 0u64;
+                self.placements.retain(|p| {
+                    let del = p.kitty_id == Some(key);
+                    if del {
+                        freed += p.image.rgba.len() as u64;
+                    }
+                    !del
+                });
+                self.placement_bytes = self.placement_bytes.saturating_sub(freed);
+                if cmd.delete == b'I' {
+                    if let Some(pos) = self.kitty_images.iter().position(|(k, _)| *k == key) {
+                        if let Some((_, old)) = self.kitty_images.remove(pos) {
+                            self.kitty_stored_bytes =
+                                self.kitty_stored_bytes.saturating_sub(old.rgba.len() as u64);
+                        }
+                    }
+                }
+            }
+            // Any other selector (by row/column/z/cursor): documented no-op.
+            _ => {}
+        }
+    }
+
+    /// Enqueue a Kitty graphics OK/error reply on the PTY write-back channel,
+    /// honoring the addressability + quiet rules (amendment A10):
+    /// only reply when the command addresses an image (`i=`/`I=`), and never at
+    /// `q>=2`; `q>=1` suppresses OK but still reports errors.
+    fn kitty_reply(&mut self, cmd: &KittyCmd, msg: &str) {
+        // Reply only for addressable commands — prevents a tiny-APC flood from
+        // amplifying 1:1 writes back to a non-reading PTY.
+        if !cmd.addressable() {
+            return;
+        }
+        if cmd.quiet >= 2 {
+            return;
+        }
+        if cmd.quiet >= 1 && msg == "OK" {
+            return;
+        }
+        let mut out = Vec::with_capacity(16 + msg.len());
+        out.extend_from_slice(b"\x1b_G");
+        if cmd.id != 0 {
+            out.extend_from_slice(format!("i={}", cmd.id).as_bytes());
+        } else {
+            out.extend_from_slice(format!("I={}", cmd.number).as_bytes());
+        }
+        out.push(b';');
+        out.extend_from_slice(msg.as_bytes());
+        out.extend_from_slice(b"\x1b\\");
+        let _ = self.reply_tx.send(out);
+    }
+
+    /// Place a decoded Kitty image at the cursor, reusing the sixel reserve-and-
+    /// anchor machinery. Diverges from `finish_sixel` in two documented ways:
+    /// the image anchors at the CURRENT cursor COLUMN (not forced col 0), and the
+    /// reserve omits the sixel leading bare CR. Correct-or-absent guards are
+    /// identical (alt screen / saturation / active sync / zero cell metric).
+    fn place_inline_image(&mut self, img: &Arc<crate::sixel::InlineImage>, cmd: &KittyCmd) {
+        if self.term.mode().contains(TermMode::ALT_SCREEN)
+            || self.saturated
+            || self.sync_deadline().is_some()
+            || self.cell_px_w <= 0.0
+            || self.cell_px_h <= 0.0
+        {
+            return;
+        }
+
+        // Cell footprint: explicit c=/r= override, else derive from pixels (ceil).
+        let (mut cols, rows) = if cmd.cols > 0 && cmd.rows > 0 {
+            (
+                (cmd.cols as usize).clamp(1, self.cols) as u16,
+                (cmd.rows as usize).clamp(1, MAX_IMAGE_ROWS) as u16,
+            )
+        } else {
+            let c = ((img.width as f32 / self.cell_px_w).ceil() as usize).clamp(1, self.cols) as u16;
+            let r = ((img.height as f32 / self.cell_px_h).ceil() as usize)
+                .clamp(1, MAX_IMAGE_ROWS) as u16;
+            (c, r)
+        };
+        // Clamp cols to the grid width unconditionally (A8 — avoid an underflow /
+        // panic when cols > self.cols or self.cols == 0).
+        cols = cols.min(self.cols.max(1) as u16);
+
+        let cur = self.term.grid().cursor.point;
+        let abs_line = self.abs_top + cur.line.0 as i64;
+        // Anchor at the current cursor column, saturating so it can never exceed
+        // the last column that still fits the image (A8).
+        let max_col = (self.cols as u16).saturating_sub(cols);
+        let col = (cur.column.0 as u16).min(max_col);
+
+        // Reserve `rows` lines via CRLF injection (honoring the cursor column, so
+        // no leading bare CR). Feeds the same `advance_slice` path so alacritty
+        // scrolls, grows history, and `abs_top` tracks automatically.
+        let mut reserve = Vec::with_capacity(rows as usize * 2);
+        for _ in 0..rows {
+            reserve.push(b'\r');
+            reserve.push(b'\n');
+        }
+        self.advance_slice(&reserve);
+
+        // A mid-call saturation flip makes the anchor untrustworthy — drop.
+        if self.saturated {
+            return;
+        }
+
+        let id = crate::sixel::content_id(img);
+        let bytes = img.rgba.len() as u64;
+        let key = if cmd.id != 0 {
+            cmd.id
+        } else {
+            cmd.number
+        };
+        self.placements.push_back(ImagePlacement {
+            id,
+            abs_line,
+            col,
+            cols,
+            rows,
+            px_w: img.width.min(u16::MAX as u32) as u16,
+            px_h: img.height.min(u16::MAX as u32) as u16,
+            image: img.clone(),
+            kitty_id: if key != 0 { Some(key) } else { None },
         });
         self.placement_bytes = self.placement_bytes.saturating_add(bytes);
         let history = self.term.grid().history_size();
@@ -1738,6 +2265,9 @@ impl Terminal {
         // blank rows remain — harmless — and the GPU textures simply stop being
         // drawn (the ImageLayer's LRU reclaims their VRAM).
         self.clear_placements();
+        // A reflow also invalidates any in-progress Kitty chunk accumulation
+        // (its anchor context changed) — drop it so it can't splice post-reflow.
+        self.reset_kitty_chunks();
         if !self.term.mode().contains(TermMode::ALT_SCREEN) {
             self.abs_top = self.term.grid().history_size() as i64;
             self.refresh_saturation();
@@ -4129,5 +4659,329 @@ mod tests {
         let txt = t.selection_text().expect("line selection");
         assert!(txt.contains("first line"), "got {txt:?}");
         assert!(txt.contains("second"), "got {txt:?}");
+    }
+
+    // ─────────────────────────── KITTY graphics (APC ESC _ G) ─────────────────
+
+    /// Standard base64 encode (test helper; the decoder is tested in base64.rs).
+    fn b64(data: &[u8]) -> String {
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::new();
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0];
+            let b1 = *chunk.get(1).unwrap_or(&0);
+            let b2 = *chunk.get(2).unwrap_or(&0);
+            let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
+            s.push(A[((n >> 18) & 63) as usize] as char);
+            s.push(A[((n >> 12) & 63) as usize] as char);
+            s.push(if chunk.len() > 1 { A[((n >> 6) & 63) as usize] as char } else { '=' });
+            s.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
+        }
+        s
+    }
+
+    /// Wrap a Kitty APC BODY (bytes AFTER `ESC _ G`, before ST) in a full APC.
+    fn apc(body: &str) -> Vec<u8> {
+        let mut v = b"\x1b_G".to_vec();
+        v.extend_from_slice(body.as_bytes());
+        v.extend_from_slice(b"\x1b\\");
+        v
+    }
+
+    /// A 2×2 opaque-red f=32 RGBA transmit+display command.
+    fn red_rgba_2x2(extra: &str) -> Vec<u8> {
+        let px = [255u8, 0, 0, 255].repeat(4); // 2×2 RGBA
+        let payload = b64(&px);
+        apc(&format!("a=T,f=32,s=2,v=2{extra};{payload}"))
+    }
+
+    #[test]
+    fn kitty_rgba_places_one_image() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&red_rgba_2x2(""));
+        assert_eq!(t.placements.len(), 1, "one placement");
+        let p = &t.placements[0];
+        assert_eq!((p.px_w, p.px_h), (2, 2));
+        assert_eq!(&p.image.rgba[0..4], &[255, 0, 0, 255], "opaque red premultiplied");
+    }
+
+    #[test]
+    fn kitty_rgb_expands_and_places() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        let px = [0u8, 255, 0].repeat(4); // 2×2 green RGB
+        let payload = b64(&px);
+        t.feed(&apc(&format!("a=T,f=24,s=2,v=2;{payload}")));
+        assert_eq!(t.placements.len(), 1);
+        assert_eq!(&t.placements[0].image.rgba[0..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn kitty_explicit_cols_rows_override_footprint() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&red_rgba_2x2(",c=4,r=2"));
+        let p = &t.placements[0];
+        assert_eq!((p.cols, p.rows), (4, 2), "explicit c/r footprint");
+    }
+
+    #[test]
+    fn kitty_anchors_at_cursor_column() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"abc"); // cursor at column 3
+        t.feed(&red_rgba_2x2(""));
+        assert_eq!(t.placements[0].col, 3, "image anchors at the cursor column");
+    }
+
+    #[test]
+    fn kitty_dropped_on_alt_screen() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"\x1b[?1049h");
+        t.feed(&red_rgba_2x2(""));
+        assert!(t.placements.is_empty(), "no Kitty image on the alt screen");
+    }
+
+    #[test]
+    fn kitty_dropped_inside_sync_block() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"\x1b[?2026h");
+        assert!(t.sync_deadline().is_some());
+        t.feed(&red_rgba_2x2(""));
+        assert!(t.placements.is_empty(), "dropped inside a sync block");
+        t.flush_sync();
+    }
+
+    #[test]
+    fn kitty_split_across_feeds_resumes() {
+        // One APC split mid-payload across two feed() calls still assembles.
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        let full = red_rgba_2x2("");
+        let mid = full.len() / 2;
+        t.feed(&full[..mid]);
+        t.feed(&full[mid..]);
+        assert_eq!(t.placements.len(), 1, "resumes across a feed boundary");
+    }
+
+    #[test]
+    fn kitty_non_g_apc_is_ignored() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        // ESC _ q ... ESC \  (an APC that is not a graphics command).
+        t.feed(b"\x1b_qsomething\x1b\\");
+        assert!(t.placements.is_empty(), "non-G APC leaves no placement");
+        // Parser not desynced: a real Kitty image after it still works.
+        t.feed(&red_rgba_2x2(""));
+        assert_eq!(t.placements.len(), 1);
+    }
+
+    #[test]
+    fn kitty_apc_overflow_drops_and_caps() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        let mut bytes = b"\x1b_Ga=T,f=32,s=2,v=2;".to_vec();
+        bytes.extend(std::iter::repeat_n(b'A', APC_MAX_BYTES + 1024));
+        t.feed(&bytes);
+        assert!(t.apc_overflow, "overflow latched");
+        assert!(t.apc_buf.len() <= APC_MAX_BYTES, "buffer stays capped");
+        t.feed(b"\x1b\\");
+        assert!(t.placements.is_empty(), "overflowed APC produced no placement");
+        assert!(t.apc_buf.is_empty(), "buffer released on finish");
+    }
+
+    #[test]
+    fn kitty_two_chunk_rgba_assembles_one_image() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        let px = [10u8, 20, 30, 255].repeat(4); // 2×2 RGBA
+        let payload = b64(&px);
+        let (a, b) = payload.split_at(payload.len() / 2);
+        // First chunk carries full control + m=1; last carries only m=0.
+        t.feed(&apc(&format!("a=T,f=32,s=2,v=2,m=1;{a}")));
+        assert_eq!(t.placements.len(), 0, "not placed until finalized");
+        t.feed(&apc(&format!("m=0;{b}")));
+        assert_eq!(t.placements.len(), 1, "two-chunk image assembles to one placement");
+        assert_eq!((t.placements[0].px_w, t.placements[0].px_h), (2, 2));
+    }
+
+    #[test]
+    fn kitty_interleaved_query_does_not_splice() {
+        // BLOCKING 1: [first m=1] → [a=q,i=9 interleaved] → [continuation m=0]
+        // must NOT splice the query into the accumulating image. The has_action
+        // query aborts the partial; the continuation is then an orphan (dropped).
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        let px = [1u8, 2, 3, 255].repeat(4);
+        let payload = b64(&px);
+        let (a, b) = payload.split_at(payload.len() / 2);
+        t.feed(&apc(&format!("a=T,f=32,s=2,v=2,m=1;{a}")));
+        // Interleaved query (has_action=true) aborts the accumulation.
+        t.feed(&apc("a=q,i=9,f=32,s=1,v=1;AAAA"));
+        // The now-orphaned continuation must not produce a spliced image.
+        t.feed(&apc(&format!("m=0;{b}")));
+        assert!(t.placements.is_empty(), "no spliced image after an interleaved query");
+        // The query still answered (addressable i=9).
+        let replies = t.drain_pty_writes();
+        assert!(!replies.is_empty(), "the interleaved query got a reply");
+    }
+
+    #[test]
+    fn kitty_endless_more_is_bounded() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&apc("a=T,f=32,s=2,v=2,m=1;AAAA"));
+        for _ in 0..(MAX_KITTY_CHUNKS + 10) {
+            t.feed(&apc("m=1;AAAA"));
+        }
+        // Aborted once the chunk count cap was exceeded — no runaway growth.
+        assert!(t.chunk_buf.len() <= KITTY_RAW_BUDGET, "chunk buffer bounded");
+        assert!(t.chunk_meta.is_none(), "accumulation aborted at the cap");
+    }
+
+    #[test]
+    fn kitty_transmit_then_put_round_trips() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        let px = [7u8, 7, 7, 255].repeat(4);
+        let payload = b64(&px);
+        // a=t stores without displaying.
+        t.feed(&apc(&format!("a=t,f=32,s=2,v=2,i=7;{payload}")));
+        assert_eq!(t.placements.len(), 0, "a=t does not display");
+        assert_eq!(t.kitty_images.len(), 1, "stored in the registry");
+        // a=p,i=7 displays it.
+        t.feed(&apc("a=p,i=7"));
+        assert_eq!(t.placements.len(), 1, "a=p displays the stored image");
+    }
+
+    #[test]
+    fn kitty_put_unknown_id_replies_enoent() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&apc("a=p,i=999"));
+        assert!(t.placements.is_empty());
+        let reply = String::from_utf8_lossy(&t.drain_pty_writes()).to_string();
+        assert!(reply.contains("ENOENT"), "got {reply:?}");
+    }
+
+    #[test]
+    fn kitty_registry_evicts_over_cap() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        let px = [1u8, 1, 1, 255].repeat(4);
+        let payload = b64(&px);
+        for id in 1..=(MAX_KITTY_STORED as u32 + 5) {
+            t.feed(&apc(&format!("a=t,f=32,s=2,v=2,i={id};{payload}")));
+        }
+        assert!(t.kitty_images.len() <= MAX_KITTY_STORED, "registry count bounded");
+    }
+
+    #[test]
+    fn kitty_delete_all_clears_placements() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&red_rgba_2x2(",i=3"));
+        assert_eq!(t.placements.len(), 1);
+        t.feed(&apc("a=d,d=a"));
+        assert!(t.placements.is_empty(), "d=a clears all placements");
+    }
+
+    #[test]
+    fn kitty_delete_by_id_targets_only_that_id() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&red_rgba_2x2(",i=3"));
+        t.feed(&red_rgba_2x2(",i=8"));
+        assert_eq!(t.placements.len(), 2);
+        t.feed(&apc("a=d,d=i,i=3"));
+        assert_eq!(t.placements.len(), 1, "only id 3 removed");
+        assert_eq!(t.placements[0].kitty_id, Some(8));
+    }
+
+    #[test]
+    fn kitty_query_replies_ok_and_creates_no_placement() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        let px = [9u8, 9, 9, 255];
+        let payload = b64(&px);
+        t.feed(&apc(&format!("a=q,i=2,f=32,s=1,v=1;{payload}")));
+        assert!(t.placements.is_empty(), "a=q never displays");
+        let reply = String::from_utf8_lossy(&t.drain_pty_writes()).to_string();
+        assert!(reply.contains("i=2;OK"), "got {reply:?}");
+    }
+
+    #[test]
+    fn kitty_ok_reply_respects_quiet() {
+        // q=1 suppresses OK but a later error still reports.
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&red_rgba_2x2(",i=1,q=1"));
+        assert!(t.drain_pty_writes().is_empty(), "q=1 suppresses the OK");
+        // q=1 still reports an ENOENT error.
+        t.feed(&apc("a=p,i=555,q=1"));
+        let reply = String::from_utf8_lossy(&t.drain_pty_writes()).to_string();
+        assert!(reply.contains("ENOENT"), "q=1 still reports errors: {reply:?}");
+        // q=2 suppresses everything, even errors.
+        t.feed(&apc("a=p,i=556,q=2"));
+        assert!(t.drain_pty_writes().is_empty(), "q=2 suppresses errors too");
+    }
+
+    #[test]
+    fn kitty_refuses_file_transfer() {
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&apc("a=T,f=32,s=2,v=2,t=f,i=4;AAAA"));
+        assert!(t.placements.is_empty(), "t=f is refused, no placement");
+        let reply = String::from_utf8_lossy(&t.drain_pty_writes()).to_string();
+        assert!(reply.contains("ENOTSUPP"), "got {reply:?}");
+    }
+
+    #[test]
+    fn kitty_compressed_zlib_rgba_places() {
+        // o=z: the payload is zlib-compressed RGBA (BLOCKING 3).
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        let px = [50u8, 60, 70, 255].repeat(4); // 2×2
+        let comp = miniz_oxide::deflate::compress_to_vec_zlib(&px, 6);
+        let payload = b64(&comp);
+        t.feed(&apc(&format!("a=T,f=32,s=2,v=2,o=z;{payload}")));
+        assert_eq!(t.placements.len(), 1, "o=z RGBA inflates and places");
+    }
+
+    #[test]
+    fn kitty_anonymous_transmit_sends_no_reply() {
+        // A10: an anonymous (no i=/I=) transmit must not amplify replies.
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&red_rgba_2x2("")); // no id
+        assert!(t.drain_pty_writes().is_empty(), "no reply for anonymous transmit");
+    }
+
+    #[test]
+    fn kitty_fuzz_random_apc_never_panics() {
+        let mut t = Terminal::new(40, 10);
+        t.set_cell_px(10.0, 10.0);
+        let mut state: u64 = 0xabcd_1234_5678_9f01;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for _ in 0..300 {
+            let n = (next() % 200) as usize;
+            let mut buf = b"\x1b_G".to_vec();
+            buf.extend((0..n).map(|_| (next() & 0xff) as u8));
+            buf.extend_from_slice(b"\x1b\\");
+            t.feed(&buf);
+            // Invariant: every placement's rgba matches its native dims.
+            for p in &t.placements {
+                assert_eq!(
+                    p.image.rgba.len(),
+                    (p.image.width as usize) * (p.image.height as usize) * 4
+                );
+            }
+        }
     }
 }
