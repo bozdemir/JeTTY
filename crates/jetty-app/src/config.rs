@@ -137,6 +137,78 @@ pub struct Config {
     /// RESTART/external-only even with hot-reload on (documented at those keys).
     #[serde(default = "default_hot_reload")]
     pub hot_reload: bool,
+    /// User keybinding overrides (`[keys]` table). Every action defaults to its
+    /// built-in chord when omitted; `""`/`[]` explicitly UNBINDS an action (the
+    /// chord reverts to its raw terminal meaning). Backward compatible: an old
+    /// config without `[keys]` loads with every default. The whole table is
+    /// skipped on save when empty, so a default install never writes a bare
+    /// `[keys]` header.
+    #[serde(default, skip_serializing_if = "KeyBindings::is_empty")]
+    pub keys: KeyBindings,
+}
+
+/// A single chord string, or an array of chord strings that all trigger the same
+/// action. Accepts both TOML forms (`copy = "Ctrl+Shift+C"` or
+/// `paste = ["Ctrl+Shift+V", "Shift+Insert"]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChordSpec {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ChordSpec {
+    /// The chord strings in this spec (one, or many). An empty string / empty
+    /// array yields no usable chords → the action is explicitly unbound.
+    pub fn chords(&self) -> Vec<&str> {
+        match self {
+            ChordSpec::One(s) => vec![s.as_str()],
+            ChordSpec::Many(v) => v.iter().map(|s| s.as_str()).collect(),
+        }
+    }
+}
+
+/// Per-action keybinding overrides. Each field is `Option<ChordSpec>`: `None`
+/// (the field omitted from `[keys]`) uses the built-in default; `Some` replaces
+/// it. `select_tab_1..9` cover the `Ctrl+1..9` tab jumps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct KeyBindings {
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub toggle_settings: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub open_palette: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub new_tab: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub close_tab: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub detach_tab: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub search_toggle: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub prev_prompt: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub next_prompt: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub prev_tab: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub next_tab: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub select_tab_1: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub select_tab_2: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub select_tab_3: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub select_tab_4: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub select_tab_5: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub select_tab_6: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub select_tab_7: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub select_tab_8: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub select_tab_9: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub copy: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub paste: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub opacity_up: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub opacity_down: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub font_up: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub font_down: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub font_reset: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub select_all: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub quit: Option<ChordSpec>,
+}
+
+impl KeyBindings {
+    /// True when no action is overridden — used to skip serializing a bare,
+    /// empty `[keys]` table on a default install.
+    pub fn is_empty(&self) -> bool {
+        *self == KeyBindings::default()
+    }
 }
 
 fn default_osc52_allow_paste() -> bool {
@@ -356,6 +428,7 @@ impl Default for Config {
             auto_summon_on_finish: default_auto_summon_on_finish(),
             osc52_allow_paste: default_osc52_allow_paste(),
             hot_reload: default_hot_reload(),
+            keys: KeyBindings::default(),
         }
     }
 }
@@ -670,6 +743,7 @@ mod tests {
             auto_summon_on_finish: true,
             osc52_allow_paste: true,
             hot_reload: false,
+            keys: KeyBindings::default(),
         };
         let s = toml::to_string_pretty(&c).expect("serialize");
         let back: Config = toml::from_str(&s).expect("deserialize");
@@ -708,6 +782,7 @@ mod tests {
             auto_summon_on_finish: false,
             osc52_allow_paste: false,
             hot_reload: true,
+            keys: KeyBindings::default(),
         };
         std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
         let s = std::fs::read_to_string(&path).unwrap();
@@ -907,6 +982,66 @@ corner_radius = 8.0
         write_atomic(&path, b"first").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_config_without_keys_table_loads_with_defaults() {
+        // A config predating v0.20 must load with an empty (all-default) [keys].
+        let toml = r#"theme = "default"
+opacity = 1.0
+font_size = 14.0
+font_family = "monospace"
+corner_radius = 8.0
+"#;
+        let cfg: Config = toml::from_str(toml).expect("must load");
+        assert_eq!(cfg.keys, KeyBindings::default());
+        assert!(cfg.keys.is_empty());
+    }
+
+    #[test]
+    fn keys_table_parses_string_and_array_forms() {
+        let toml = r#"theme = "default"
+opacity = 1.0
+font_size = 14.0
+font_family = "monospace"
+corner_radius = 8.0
+
+[keys]
+new_tab = "Ctrl+T"
+paste = ["Ctrl+Shift+V", "Shift+Insert"]
+select_all = ""
+"#;
+        let cfg: Config = toml::from_str(toml).expect("must load");
+        assert_eq!(cfg.keys.new_tab, Some(ChordSpec::One("Ctrl+T".to_string())));
+        assert_eq!(
+            cfg.keys.paste,
+            Some(ChordSpec::Many(vec!["Ctrl+Shift+V".to_string(), "Shift+Insert".to_string()]))
+        );
+        assert_eq!(cfg.keys.select_all, Some(ChordSpec::One(String::new())));
+        assert!(!cfg.keys.is_empty());
+    }
+
+    #[test]
+    fn empty_keys_table_not_serialized() {
+        // A default install must not write a bare [keys] header.
+        let s = toml::to_string_pretty(&Config::default()).expect("serialize");
+        assert!(!s.contains("[keys]"), "empty [keys] must be skipped, got:\n{s}");
+    }
+
+    #[test]
+    fn bad_keys_value_refused_non_destructively_on_reload() {
+        // A wrong TYPE (integer) fails the untagged ChordSpec → parse_reload returns
+        // None (non-destructive: the caller keeps its in-memory state), never bricks.
+        let toml = r#"theme = "default"
+opacity = 1.0
+font_size = 14.0
+font_family = "monospace"
+corner_radius = 8.0
+
+[keys]
+new_tab = 42
+"#;
+        assert!(Config::parse_reload(toml).is_none());
     }
 
     #[test]
