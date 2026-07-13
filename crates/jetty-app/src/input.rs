@@ -1,7 +1,9 @@
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
+use crate::keymap::{KeyMap, Mods};
+
 /// High-level action decoded from a key press event.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum KeyAction {
     TogglePanel,
     ClosePanel,
@@ -40,6 +42,11 @@ pub enum KeyAction {
     PrevPrompt,
     /// Jump the viewport to the next (newer) OSC 133 prompt (Ctrl+Shift+X).
     NextPrompt,
+    /// Select the entire scrollback + screen (macOS Cmd+A; remappable).
+    SelectAll,
+    /// Request application quit (macOS Cmd+Q; remappable). Opens the quit
+    /// confirmation.
+    Quit,
     /// Raw bytes to write to the PTY.
     Send(Vec<u8>),
     None,
@@ -62,115 +69,54 @@ pub enum KeyAction {
 ///   scrollback to page. Shift+PageUp/Down is ALWAYS host scrollback (the
 ///   standard escape hatch).
 ///
-/// The rules mirror `app.rs` exactly:
-/// 1. Ctrl+, (no shift)         → TogglePanel
-/// 2. Escape                    → ClosePanel if panel open, else Send(ESC)
-/// 3. Ctrl+Shift+P              → OpenPalette (command palette)
-///    3b. Ctrl+Shift+O          → TogglePanel (Settings — kept as an alias)
-/// 4. Ctrl+Shift+T              → CycleTheme
-///    4b. Ctrl+Shift+F         → SearchToggle (scrollback-search bar)
-/// 5. Ctrl+Shift+Equal          → OpacityUp
-/// 6. Ctrl+Shift+Minus          → OpacityDown
-/// 7. PageUp                    → ScrollPageUp (primary screen) / `\e[5~` (alt screen)
-/// 8. PageDown                  → ScrollPageDown (primary screen) / `\e[6~` (alt screen)
-/// 9. Ctrl+<letter/symbol> → control byte, regardless of shift (the explicit
-///    Ctrl+Shift shortcuts in rules 3-6 are intercepted first). When Alt is also
-///    held, the control byte is ESC-prefixed (Ctrl+Alt+b → ESC + 0x02).
-/// 10. Alt+<key> that yields bytes → ESC-prefixed Send(esc + bytes)
-/// 11. Otherwise: key_to_bytes  → Send(bytes) or None
+/// Resolution order:
+/// 1. Escape + panel open → ClosePanel (overlay logic, not a keybinding).
+/// 2. `keymap.lookup(mods, physical, logical)` → the discrete app-command chords
+///    (Settings, palette, tabs, copy/paste, search, prompt-jump, font/opacity,
+///    and — on macOS — the folded Cmd chords). The DEFAULT keymap reproduces
+///    today's exact bindings, incl. Alt-don't-care Ctrl+Shift chords.
+/// 3. macOS Cmd swallow: after a keymap MISS, a bare Cmd chord (super && !ctrl
+///    && !alt) returns None (never injected to the PTY).
+/// 4. Everything below is the unchanged raw-encoding fallback: PageUp/PageDown
+///    (alt-screen aware), Ctrl+<letter/symbol> control bytes (ESC-prefixed with
+///    Alt), Ctrl+Backspace, modified arrows/Home/End/Delete/Insert/F-keys,
+///    DECCKM cursor keys, and the key_to_bytes Meta-ESC fallback.
 #[allow(clippy::too_many_arguments)]
 pub fn decide_key(
+    keymap: &KeyMap,
     ctrl: bool,
     shift: bool,
     alt: bool,
+    super_: bool,
     physical: PhysicalKey,
     logical: &Key,
     panel_open: bool,
     app_cursor: bool,
     alt_screen: bool,
 ) -> KeyAction {
-    // Rule 1: Ctrl+, → toggle panel.
-    // Match the PHYSICAL key; keep a logical fallback for platforms where
-    // physical_key is unreliable.
-    let is_comma = matches!(physical, PhysicalKey::Code(KeyCode::Comma))
-        || matches!(logical, Key::Character(s) if s.as_str() == ",");
-    if ctrl && !shift && is_comma {
-        return KeyAction::TogglePanel;
+    // Rule 1 (overlay logic, NOT a keybinding): Escape → close panel if open,
+    // otherwise fall through so key_to_bytes(Escape) produces Send(vec![0x1b]).
+    if matches!(logical, Key::Named(NamedKey::Escape)) && panel_open {
+        return KeyAction::ClosePanel;
     }
 
-    // Rule 2: Escape → close panel if open, otherwise forward ESC byte.
-    if matches!(logical, Key::Named(NamedKey::Escape))
-        && panel_open {
-            return KeyAction::ClosePanel;
-        }
-        // Fall through: key_to_bytes(Escape) will produce Send(vec![0x1b]).
-
-    // Rules 3-5 + panel toggle: Ctrl+Shift hotkeys keyed by PHYSICAL key, which
-    // is layout-independent. Ctrl+Shift+O toggles the Settings panel and works on
-    // every layout — unlike Ctrl+, which on a Turkish layout reports as Backslash
-    // (not Comma), so it never matched.
-    if ctrl && shift {
-        // Opacity: prefer the LOGICAL character so the binding follows the
-        // engraved key on every layout (Turkish-Q, QWERTZ), mirroring the font
-        // bindings below. On Turkish-Q the '-'-engraved key is physical Equal, so
-        // a pure physical match inverted the direction (Ctrl+Shift+'-' → up).
-        if let Key::Character(s) = logical {
-            match s.as_str() {
-                "+" | "=" => return KeyAction::OpacityUp,
-                "-" | "_" => return KeyAction::OpacityDown,
-                _ => {}
-            }
-        }
-        match physical {
-            // KeyP opens the fuzzy command palette (VSCode/Sublime muscle memory).
-            // Settings stays reachable via Ctrl+Shift+O (kept below), Ctrl+, ,
-            // macOS Cmd+, , and an "Open Settings…" palette entry.
-            PhysicalKey::Code(KeyCode::KeyP) => return KeyAction::OpenPalette,
-            PhysicalKey::Code(KeyCode::KeyO) => return KeyAction::TogglePanel,
-            // Tabs: Ctrl+Shift+T opens a new tab; Ctrl+Shift+W closes the active
-            // one. Ctrl+Shift+D detaches the active tab or reattaches a detached one.
-            // Theme switching moved to the Settings window. Ctrl+Shift+Tab cycles to
-            // the previous tab (must be intercepted before ctrl_byte).
-            PhysicalKey::Code(KeyCode::KeyT) => return KeyAction::NewTab,
-            PhysicalKey::Code(KeyCode::KeyW) => return KeyAction::CloseTab,
-            PhysicalKey::Code(KeyCode::KeyD) => return KeyAction::DetachTab,
-            // Scrollback search — must be intercepted before ctrl_byte, which
-            // would otherwise send 0x06 (ACK) to the PTY.
-            PhysicalKey::Code(KeyCode::KeyF) => return KeyAction::SearchToggle,
-            // Prompt jump (OSC 133): Ctrl+Shift+Z prev / Ctrl+Shift+X next.
-            // Intercepted here so KeyZ/KeyX never fall through to the ctrl-byte
-            // path (which would send 0x1a / 0x18 to the PTY). Plain Ctrl+Z /
-            // Ctrl+X are unaffected — they lack Shift and are handled below.
-            PhysicalKey::Code(KeyCode::KeyZ) => return KeyAction::PrevPrompt,
-            PhysicalKey::Code(KeyCode::KeyX) => return KeyAction::NextPrompt,
-            PhysicalKey::Code(KeyCode::Tab) => return KeyAction::PrevTab,
-            // Physical fallback for layouts where the logical char above is
-            // unreliable (US: Shift+Equal → '+', Shift+Minus → '_').
-            PhysicalKey::Code(KeyCode::Equal) => return KeyAction::OpacityUp,
-            PhysicalKey::Code(KeyCode::Minus) => return KeyAction::OpacityDown,
-            PhysicalKey::Code(KeyCode::KeyC) => return KeyAction::Copy,
-            PhysicalKey::Code(KeyCode::KeyV) => return KeyAction::Paste,
-            _ => {}
-        }
+    // Rule 2: the discrete app-command chords, resolved by the compiled keymap.
+    // This ONE lookup replaces every hardcoded interception (Ctrl+, / the Ctrl+Shift
+    // block / Ctrl+Tab & Ctrl+1..9 tab-nav / the font block) AND the old macOS Cmd
+    // block. Everything below is the UNCHANGED raw-encoding fallback for chords no
+    // action claims (control bytes, arrows, nav keys, F-keys, DECCKM, PageUp/Down).
+    let mods = Mods::new(ctrl, shift, alt, super_);
+    if let Some(action) = keymap.lookup(mods, physical, logical) {
+        return action;
     }
 
-    // Tab navigation with Ctrl (no shift): Ctrl+Tab → next tab, Ctrl+1..9 → jump
-    // to that tab. These MUST be intercepted before the ctrl_byte fallback so
-    // they never send a control byte (Ctrl+I / Ctrl+digit) to the PTY.
-    if ctrl && !shift {
-        match physical {
-            PhysicalKey::Code(KeyCode::Tab) => return KeyAction::NextTab,
-            PhysicalKey::Code(KeyCode::Digit1) => return KeyAction::SelectTab(0),
-            PhysicalKey::Code(KeyCode::Digit2) => return KeyAction::SelectTab(1),
-            PhysicalKey::Code(KeyCode::Digit3) => return KeyAction::SelectTab(2),
-            PhysicalKey::Code(KeyCode::Digit4) => return KeyAction::SelectTab(3),
-            PhysicalKey::Code(KeyCode::Digit5) => return KeyAction::SelectTab(4),
-            PhysicalKey::Code(KeyCode::Digit6) => return KeyAction::SelectTab(5),
-            PhysicalKey::Code(KeyCode::Digit7) => return KeyAction::SelectTab(6),
-            PhysicalKey::Code(KeyCode::Digit8) => return KeyAction::SelectTab(7),
-            PhysicalKey::Code(KeyCode::Digit9) => return KeyAction::SelectTab(8),
-            _ => {}
-        }
+    // Rule 2b (macOS Cmd "swallow" safety net — byte-identical): after a keymap
+    // MISS, a bare Cmd chord (`super && !ctrl && !alt`) does NOTHING and is NEVER
+    // injected to the PTY, exactly as the old Cmd block's `_ => {}` arm. On Linux
+    // no Super default is seeded, so bare Super lands here too and is a clean
+    // no-op (as before — it was rarely delivered and always swallowed).
+    if super_ && !ctrl && !alt {
+        return KeyAction::None;
     }
 
     // Rules 6-7: PageUp / PageDown — alt-screen aware.
@@ -204,31 +150,9 @@ pub fn decide_key(
         };
     }
 
-    // Font-size bindings: Ctrl (no shift) + '+'/'='/'-'/'0'.
-    // Keyed on the LOGICAL character first so the binding follows the engraved
-    // key on every layout — on Turkish-Q the '-'-engraved key is physical Equal,
-    // so a pure physical match made Ctrl+'-' GROW the font (the inverse of what
-    // README/help promise); on QWERTZ '-' is physical Slash, so Ctrl+'-' typed a
-    // literal '-'. The physical positions remain as a fallback for layouts where
-    // the logical char is unreliable. Checked BEFORE the ctrl_byte fallback so
-    // they are never swallowed as a raw control code; Ctrl+Shift+'='/'-' are
-    // handled above as OpacityUp/Down and never reach here.
-    if ctrl && !shift {
-        if let Key::Character(s) = logical {
-            match s.as_str() {
-                "+" | "=" => return KeyAction::FontUp,
-                "-" => return KeyAction::FontDown,
-                "0" => return KeyAction::FontReset,
-                _ => {}
-            }
-        }
-        match physical {
-            PhysicalKey::Code(KeyCode::Equal) => return KeyAction::FontUp,
-            PhysicalKey::Code(KeyCode::Minus) => return KeyAction::FontDown,
-            PhysicalKey::Code(KeyCode::Digit0) => return KeyAction::FontReset,
-            _ => {}
-        }
-    }
+    // (Font-size Ctrl+'+'/'='/'-'/'0' and opacity Ctrl+Shift+'±' are now resolved
+    // by the keymap lookup above, preserving the logical-char-first, physical-
+    // fallback resolution that keeps them layout-independent on Turkish-Q/QWERTZ.)
 
     // Ctrl+<letter/symbol> → control byte (Ctrl+C = 0x03 SIGINT, Ctrl+D = EOF,
     // Ctrl+Z, Ctrl+L clear, ...). Must come before the plain key_to_bytes
@@ -321,12 +245,10 @@ pub fn decide_key(
         // `\e[3;<mod>~`). Without these, Shift+Home (select-to-line-start) and
         // Ctrl+Delete (delete-word-forward) collapsed to the plain sequences and
         // apps could not see the modifiers at all.
-        // Shift+Insert (no Ctrl/Alt) is the universal terminal paste chord,
-        // handled by the host — never forwarded as `\e[2;2~`. Ctrl/Alt+Insert keep
-        // the modified tilde form below.
-        if shift && !ctrl && !alt && matches!(logical, Key::Named(NamedKey::Insert)) {
-            return KeyAction::Paste;
-        }
+        // Shift+Insert (no Ctrl/Alt) is the universal terminal paste chord — the
+        // keymap resolves it to Paste above (default binding), so it reaches this
+        // modified-nav block only when the user explicitly UNBOUND paste, in which
+        // case the raw `\e[2;{m}~` form below is the correct passthrough.
         let m = 1 + (shift as u8) + ((alt as u8) << 1) + ((ctrl as u8) << 2);
         match logical {
             Key::Named(NamedKey::Home) => {
@@ -1155,9 +1077,107 @@ mod tests {
         Key::Character(winit::keyboard::SmolStr::new(s))
     }
 
+    /// Oracle harness: run `decide_key` through the DEFAULT keymap with `super_ =
+    /// false`, so the existing (pre-refactor) expectations become a byte-identical
+    /// regression oracle for the default bindings.
+    #[allow(clippy::too_many_arguments)]
+    fn dk(
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        physical: PhysicalKey,
+        logical: &Key,
+        panel_open: bool,
+        app_cursor: bool,
+        alt_screen: bool,
+    ) -> KeyAction {
+        let km = crate::keymap::KeyMap::defaults();
+        decide_key(&km, ctrl, shift, alt, false, physical, logical, panel_open, app_cursor, alt_screen)
+    }
+
+    /// Same as `dk` but with the `super_` (macOS Cmd) bit set — for the swallow +
+    /// Cmd-default oracle.
+    #[allow(clippy::too_many_arguments)]
+    fn dk_super(
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        physical: PhysicalKey,
+        logical: &Key,
+    ) -> KeyAction {
+        let km = crate::keymap::KeyMap::defaults();
+        decide_key(&km, ctrl, shift, alt, true, physical, logical, false, false, false)
+    }
+
+    // ── Oracle: default keymap reproduces today's EXACT mod semantics ─────────
+
+    #[test]
+    fn alt_is_dont_care_for_ctrl_shift_defaults() {
+        // Today's Ctrl+Shift block never tested Alt, so Ctrl+Alt+Shift+T is still
+        // NewTab (the default keymap seeds the Alt-flipped variant).
+        assert_eq!(
+            dk(true, true, true, make_physical(KeyCode::KeyT), &make_logical_char("T"), false, false, false),
+            KeyAction::NewTab
+        );
+        // Ctrl+Alt+= is still FontUp (the font block never tested Alt either).
+        assert_eq!(
+            dk(true, false, true, make_physical(KeyCode::Equal), &make_logical_char("="), false, false, false),
+            KeyAction::FontUp
+        );
+        // Ctrl+Alt+Tab is still NextTab.
+        assert_eq!(
+            dk(true, false, true, make_physical(KeyCode::Tab), &Key::Named(NamedKey::Tab), false, false, false),
+            KeyAction::NextTab
+        );
+    }
+
+    #[test]
+    fn shift_insert_is_paste_via_keymap() {
+        assert_eq!(
+            dk(false, true, false, make_physical(KeyCode::Insert), &Key::Named(NamedKey::Insert), false, false, false),
+            KeyAction::Paste
+        );
+    }
+
+    #[test]
+    fn ctrl_underscore_still_unit_separator_not_font_down() {
+        // Amendment 5: FontDown is '-' only. Ctrl+_ (no shift) must send 0x1f.
+        assert_eq!(
+            dk(true, false, false, make_physical(KeyCode::IntlRo), &make_logical_char("_"), false, false, false),
+            KeyAction::Send(vec![0x1f])
+        );
+    }
+
+    #[test]
+    fn bare_cmd_chord_is_swallowed_not_injected() {
+        // macOS Cmd swallow safety net: an unmapped `super && !ctrl && !alt` chord
+        // returns None (never reaches the PTY), reproducing the old Cmd block.
+        assert_eq!(
+            dk_super(false, false, false, make_physical(KeyCode::KeyB), &make_logical_char("b")),
+            KeyAction::None
+        );
+        // A Named key under Cmd is swallowed too.
+        assert_eq!(
+            dk_super(false, false, false, make_physical(KeyCode::Escape), &Key::Named(NamedKey::Escape)),
+            KeyAction::None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cmd_defaults_resolve_and_are_shift_agnostic() {
+        assert_eq!(dk_super(false, false, false, make_physical(KeyCode::KeyC), &make_logical_char("c")), KeyAction::Copy);
+        assert_eq!(dk_super(false, true, false, make_physical(KeyCode::KeyC), &make_logical_char("C")), KeyAction::Copy);
+        assert_eq!(dk_super(false, false, false, make_physical(KeyCode::KeyP), &make_logical_char("p")), KeyAction::OpenPalette);
+        assert_eq!(dk_super(false, true, false, make_physical(KeyCode::KeyP), &make_logical_char("P")), KeyAction::OpenPalette);
+        assert_eq!(dk_super(false, false, false, make_physical(KeyCode::KeyA), &make_logical_char("a")), KeyAction::SelectAll);
+        assert_eq!(dk_super(false, false, false, make_physical(KeyCode::KeyQ), &make_logical_char("q")), KeyAction::Quit);
+        assert_eq!(dk_super(false, false, false, make_physical(KeyCode::Comma), &make_logical_char(",")), KeyAction::TogglePanel);
+    }
+
     #[test]
     fn ctrl_equal_maps_to_font_up() {
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::Equal),
             &make_logical_char("="),
@@ -1168,7 +1188,7 @@ mod tests {
 
     #[test]
     fn ctrl_minus_maps_to_font_down() {
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::Minus),
             &make_logical_char("-"),
@@ -1181,7 +1201,7 @@ mod tests {
     fn turkish_q_ctrl_minus_is_font_down_not_up() {
         // Regression (F21): on Turkish-Q the '-'-engraved key is physical Equal.
         // Ctrl at that key must SHRINK the font (logical '-'), not grow it.
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::Equal), // physical position of the '-' key
             &make_logical_char("-"),        // engraved/produced character
@@ -1193,7 +1213,7 @@ mod tests {
     #[test]
     fn ctrl_shift_z_is_prev_prompt_not_sub() {
         // Ctrl+Shift+Z must be PrevPrompt and never leak 0x1a (SUB) to the PTY.
-        let action = decide_key(
+        let action = dk(
             true, true, false,
             make_physical(KeyCode::KeyZ),
             &make_logical_char("Z"),
@@ -1206,7 +1226,7 @@ mod tests {
     #[test]
     fn ctrl_shift_x_is_next_prompt_not_can() {
         // Ctrl+Shift+X must be NextPrompt and never leak 0x18 (CAN) to the PTY.
-        let action = decide_key(
+        let action = dk(
             true, true, false,
             make_physical(KeyCode::KeyX),
             &make_logical_char("X"),
@@ -1220,14 +1240,14 @@ mod tests {
     fn plain_ctrl_z_and_x_still_send_control_bytes() {
         // Regression guard: WITHOUT shift, Ctrl+Z / Ctrl+X keep their control
         // bytes (SUB 0x1a / CAN 0x18) — prompt-jump only steals the Shift chord.
-        let z = decide_key(
+        let z = dk(
             true, false, false,
             make_physical(KeyCode::KeyZ),
             &make_logical_char("z"),
             false, false, false,
         );
         assert_eq!(z, KeyAction::Send(vec![0x1a]));
-        let x = decide_key(
+        let x = dk(
             true, false, false,
             make_physical(KeyCode::KeyX),
             &make_logical_char("x"),
@@ -1239,7 +1259,7 @@ mod tests {
     #[test]
     fn turkish_q_ctrl_shift_minus_is_opacity_down_not_up() {
         // Regression (F21): the opacity chord must follow the engraved key too.
-        let action = decide_key(
+        let action = dk(
             true, true, false,
             make_physical(KeyCode::Equal),
             &make_logical_char("-"),
@@ -1253,7 +1273,7 @@ mod tests {
         // Regression (F21): on German QWERTZ '-' sits at physical Slash; keying
         // on the logical char makes Ctrl+'-' shrink the font instead of typing
         // a literal '-' into the shell.
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::Slash),
             &make_logical_char("-"),
@@ -1274,7 +1294,7 @@ mod tests {
 
     #[test]
     fn ctrl_digit0_maps_to_font_reset() {
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::Digit0),
             &make_logical_char("0"),
@@ -1286,7 +1306,7 @@ mod tests {
     #[test]
     fn ctrl_shift_equal_still_opacity_up() {
         // Ctrl+Shift+Equal must remain OpacityUp even after adding FontUp.
-        let action = decide_key(
+        let action = dk(
             true, true, false,
             make_physical(KeyCode::Equal),
             &make_logical_char("="),
@@ -1298,7 +1318,7 @@ mod tests {
     #[test]
     fn ctrl_shift_p_opens_the_command_palette() {
         // Ctrl+Shift+P is repurposed from Settings to the command palette.
-        let action = decide_key(
+        let action = dk(
             true, true, false,
             make_physical(KeyCode::KeyP),
             &make_logical_char("P"),
@@ -1310,7 +1330,7 @@ mod tests {
     #[test]
     fn ctrl_shift_o_still_toggles_settings() {
         // Settings remains reachable via the Ctrl+Shift+O alias.
-        let action = decide_key(
+        let action = dk(
             true, true, false,
             make_physical(KeyCode::KeyO),
             &make_logical_char("O"),
@@ -1323,7 +1343,7 @@ mod tests {
     fn plain_ctrl_p_still_sends_control_byte() {
         // Regression guard: plain Ctrl+P (no shift) keeps sending 0x10 (DLE) to
         // the PTY (readline previous-history); only Ctrl+SHIFT+P opens the palette.
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::KeyP),
             &make_logical_char("p"),
@@ -1334,7 +1354,7 @@ mod tests {
 
     #[test]
     fn ctrl_shift_t_maps_to_new_tab() {
-        let action = decide_key(
+        let action = dk(
             true, true, false,
             make_physical(KeyCode::KeyT),
             &make_logical_char("T"),
@@ -1345,7 +1365,7 @@ mod tests {
 
     #[test]
     fn ctrl_shift_w_maps_to_close_tab() {
-        let action = decide_key(
+        let action = dk(
             true, true, false,
             make_physical(KeyCode::KeyW),
             &make_logical_char("W"),
@@ -1356,7 +1376,7 @@ mod tests {
 
     #[test]
     fn ctrl_shift_d_maps_to_detach_tab() {
-        let action = decide_key(
+        let action = dk(
             true, true, false,
             make_physical(KeyCode::KeyD),
             &make_logical_char("D"),
@@ -1367,7 +1387,7 @@ mod tests {
 
     #[test]
     fn ctrl_shift_f_is_search_toggle() {
-        let action = decide_key(
+        let action = dk(
             true, true, false,
             make_physical(KeyCode::KeyF),
             &make_logical_char("F"),
@@ -1380,7 +1400,7 @@ mod tests {
     fn ctrl_f_without_shift_still_sends_ack() {
         // Regression guard: plain Ctrl+F must keep sending 0x06 (ACK) to the
         // PTY (readline forward-char); only Ctrl+SHIFT+F opens the search bar.
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::KeyF),
             &make_logical_char("f"),
@@ -1391,7 +1411,7 @@ mod tests {
 
     #[test]
     fn ctrl_tab_maps_to_next_tab() {
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::Tab),
             &Key::Named(NamedKey::Tab),
@@ -1402,7 +1422,7 @@ mod tests {
 
     #[test]
     fn ctrl_shift_tab_maps_to_prev_tab() {
-        let action = decide_key(
+        let action = dk(
             true, true, false,
             make_physical(KeyCode::Tab),
             &Key::Named(NamedKey::Tab),
@@ -1413,7 +1433,7 @@ mod tests {
 
     #[test]
     fn ctrl_digit_maps_to_select_tab() {
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::Digit3),
             &make_logical_char("3"),
@@ -1425,7 +1445,7 @@ mod tests {
     #[test]
     fn ctrl_digit0_still_font_reset() {
         // Ctrl+0 must remain FontReset, not a tab jump.
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::Digit0),
             &make_logical_char("0"),
@@ -1438,14 +1458,14 @@ mod tests {
 
     #[test]
     fn page_keys_scroll_on_primary_screen() {
-        let up = decide_key(
+        let up = dk(
             false, false, false,
             make_physical(KeyCode::PageUp),
             &Key::Named(NamedKey::PageUp),
             false, false, false,
         );
         assert_eq!(up, KeyAction::ScrollPageUp);
-        let down = decide_key(
+        let down = dk(
             false, false, false,
             make_physical(KeyCode::PageDown),
             &Key::Named(NamedKey::PageDown),
@@ -1457,14 +1477,14 @@ mod tests {
     #[test]
     fn page_keys_forward_to_pty_on_alt_screen() {
         // less/vim/htop (alt screen): plain PageUp/Down must reach the app.
-        let up = decide_key(
+        let up = dk(
             false, false, false,
             make_physical(KeyCode::PageUp),
             &Key::Named(NamedKey::PageUp),
             false, false, true,
         );
         assert_eq!(up, KeyAction::Send(b"\x1b[5~".to_vec()));
-        let down = decide_key(
+        let down = dk(
             false, false, false,
             make_physical(KeyCode::PageDown),
             &Key::Named(NamedKey::PageDown),
@@ -1476,14 +1496,14 @@ mod tests {
     #[test]
     fn shift_page_keys_always_scroll_even_on_alt_screen() {
         // Shift+PageUp/Down is the standard host-scrollback escape hatch.
-        let up = decide_key(
+        let up = dk(
             false, true, false,
             make_physical(KeyCode::PageUp),
             &Key::Named(NamedKey::PageUp),
             false, false, true,
         );
         assert_eq!(up, KeyAction::ScrollPageUp);
-        let down = decide_key(
+        let down = dk(
             false, true, false,
             make_physical(KeyCode::PageDown),
             &Key::Named(NamedKey::PageDown),
@@ -1496,7 +1516,7 @@ mod tests {
 
     #[test]
     fn ctrl_slash_sends_unit_separator() {
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::Slash),
             &make_logical_char("/"),
@@ -1508,7 +1528,7 @@ mod tests {
     #[test]
     fn ctrl_underscore_sends_unit_separator() {
         // A layout where "_" is produced by some non-Minus physical key.
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::IntlRo),
             &make_logical_char("_"),
@@ -1521,7 +1541,7 @@ mod tests {
     fn ctrl_shift_minus_still_opacity_down() {
         // US: Ctrl+Shift+Minus stays the OpacityDown app shortcut even though
         // its logical character is "_" (the explicit chord wins).
-        let action = decide_key(
+        let action = dk(
             true, true, false,
             make_physical(KeyCode::Minus),
             &make_logical_char("_"),
@@ -1534,7 +1554,7 @@ mod tests {
     fn ctrl_minus_on_physical_slash_is_not_unit_separator() {
         // German layouts: physical Slash produces "-". Ctrl+- there must NOT be
         // hijacked as 0x1f (it is keyed on the logical character, not position).
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::Slash),
             &make_logical_char("-"),
@@ -1547,14 +1567,14 @@ mod tests {
 
     #[test]
     fn shift_home_end_send_modified_csi() {
-        let home = decide_key(
+        let home = dk(
             false, true, false,
             make_physical(KeyCode::Home),
             &Key::Named(NamedKey::Home),
             false, false, false,
         );
         assert_eq!(home, KeyAction::Send(b"\x1b[1;2H".to_vec()));
-        let end = decide_key(
+        let end = dk(
             false, true, false,
             make_physical(KeyCode::End),
             &Key::Named(NamedKey::End),
@@ -1565,7 +1585,7 @@ mod tests {
 
     #[test]
     fn ctrl_delete_sends_modified_tilde_form() {
-        let action = decide_key(
+        let action = dk(
             true, false, false,
             make_physical(KeyCode::Delete),
             &Key::Named(NamedKey::Delete),
@@ -1576,7 +1596,7 @@ mod tests {
 
     #[test]
     fn alt_insert_sends_modified_tilde_form() {
-        let action = decide_key(
+        let action = dk(
             false, false, true,
             make_physical(KeyCode::Insert),
             &Key::Named(NamedKey::Insert),
@@ -1594,7 +1614,7 @@ mod tests {
             (NamedKey::Delete, KeyCode::Delete, &b"\x1b[3~"[..]),
             (NamedKey::Insert, KeyCode::Insert, &b"\x1b[2~"[..]),
         ] {
-            let action = decide_key(
+            let action = dk(
                 false, false, false,
                 make_physical(code),
                 &Key::Named(named),

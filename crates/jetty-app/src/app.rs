@@ -698,6 +698,15 @@ pub struct App {
     /// Whether config/theme hot-reload is enabled (mirrors `Config.hot_reload`). When
     /// false the watcher is never spawned (or is dropped on a live turn-off).
     hot_reload: bool,
+    /// Compiled keybindings (built from `keys` on load / reload). The input path
+    /// does ONE cheap hashmap lookup against this per keypress — never per frame.
+    keymap: crate::keymap::KeyMap,
+    /// The user's raw `[keys]` overrides (mirrors `Config.keys`). Kept so `persist()`
+    /// round-trips them and the "Reset keybindings" palette command can clear them.
+    keys: crate::config::KeyBindings,
+    /// Cached help-overlay rows, regenerated from `keymap` on load/reload so the
+    /// Help panel reflects remaps. Cloned only when the overlay is actually drawn.
+    help_rows: Vec<String>,
     /// The `notify` file-watcher handle. MUST be kept alive for the process lifetime
     /// (dropping it stops watching). `None` when hot-reload is off. Named with a
     /// leading `_` intent, but read on a live turn-off to drop it.
@@ -1187,6 +1196,10 @@ impl App {
             // v0.16 — overridden by config below; safe defaults here.
             osc52_allow_paste: false,
             hot_reload: true,
+            // Placeholder default keymap; rebuilt from cfg.keys below in `new`.
+            keymap: crate::keymap::KeyMap::defaults(),
+            keys: crate::config::KeyBindings::default(),
+            help_rows: Vec::new(),
             config_watcher: None,
             reloading: false,
             last_written_config_hash: std::cell::Cell::new(None),
@@ -1324,12 +1337,82 @@ impl App {
         app.auto_summon_on_finish = cfg.auto_summon_on_finish;
         app.osc52_allow_paste = cfg.osc52_allow_paste;
         app.hot_reload = cfg.hot_reload;
+        // Compile the keybindings (defaults + user `[keys]` overrides). Any invalid
+        // chord / conflict / rejected bind is logged; the rest still apply.
+        app.keys = cfg.keys;
+        app.keymap = crate::keymap::KeyMap::compile(&app.keys);
+        for w in app.keymap.warnings() {
+            eprintln!("jetty: {w}");
+        }
+        app.help_rows = App::compute_help_rows(&app.keymap, &app.summon_hotkey);
 
         // Apply the initial theme+opacity so Terminal::new env defaults are
         // overridden by our managed state (avoids double-reads from env). Also
         // populates the `active_theme` cache from the config-resolved theme_idx.
         app.apply_theme();
         app
+    }
+
+    /// Build the Help overlay rows from the CURRENT keymap (so a remap is
+    /// reflected) plus the static, non-keymap rows (drag / right-click / URL open /
+    /// Ctrl+D EOF / Esc). Called on load + on hot-reload; the result is cached in
+    /// `self.help_rows`, so the render path never re-derives it.
+    fn compute_help_rows(km: &crate::keymap::KeyMap, summon_hotkey: &str) -> Vec<String> {
+        use crate::keymap::BindableAction as A;
+        let all = |a: A| {
+            let v = km.pretty_chords(a);
+            if v.is_empty() { "(unbound)".to_string() } else { v.join(" / ") }
+        };
+        let first = |a: A| {
+            km.pretty_chords(a)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "(unbound)".to_string())
+        };
+        vec![
+            format!("{summon_hotkey} (configurable) — Summon / hide"),
+            format!("{} — New tab", all(A::NewTab)),
+            format!("{} — Close tab", all(A::CloseTab)),
+            format!("{} / {} — Next / Prev tab", first(A::NextTab), first(A::PrevTab)),
+            "Ctrl+1..9 — Jump to tab".to_string(),
+            format!(
+                "{} / drag tab off bar — Detach / reattach (right-click tab for menu)",
+                all(A::DetachTab)
+            ),
+            "Double-click tab / top bar — Rename / Maximize".to_string(),
+            format!(
+                "{} — Command palette   (Settings: {})",
+                first(A::OpenPalette),
+                all(A::ToggleSettings)
+            ),
+            format!(
+                "{} / {} / {} — Font size",
+                first(A::FontUp),
+                first(A::FontDown),
+                first(A::FontReset)
+            ),
+            format!("{} / {} — Transparency", first(A::OpacityUp), first(A::OpacityDown)),
+            format!("{} / {} — Copy / Paste", first(A::Copy), first(A::Paste)),
+            format!(
+                "{} — Search scrollback (Enter/F3 next, Shift+Enter prev, Esc close)",
+                first(A::SearchToggle)
+            ),
+            format!(
+                "{} / {} — Prev / next prompt (shell integration)",
+                first(A::PrevPrompt),
+                first(A::NextPrompt)
+            ),
+            "Ctrl+click — Open URL (Ctrl+hover underlines it)".to_string(),
+            "Ctrl+L — Clear".to_string(),
+            "PageUp / PageDown — Scroll".to_string(),
+            "Left-drag — Select text (auto-copies)".to_string(),
+            "Shift+drag — Select text over mouse apps (vim/htop/Claude Code)".to_string(),
+            "Right-click — Context menu (Copy/Paste/Select All/Clear/Close Tab)".to_string(),
+            "Drag top bar — Move window".to_string(),
+            "Drag edges/corners — Resize".to_string(),
+            "Ctrl+D — Close shell (sends EOF)".to_string(),
+            "Esc — Close this help".to_string(),
+        ]
     }
 
     /// Write the current user-tweakable settings to the on-disk config file.
@@ -1378,6 +1461,9 @@ impl App {
             auto_summon_on_finish: self.auto_summon_on_finish,
             osc52_allow_paste: self.osc52_allow_paste,
             hot_reload: self.hot_reload,
+            // Preserve the user's `[keys]` overrides verbatim (never editable via the
+            // Settings UI — a settings-driven persist must not erase them).
+            keys: self.keys.clone(),
         };
         // Record the hash of the EXACT string we're about to write so the watcher's
         // echo of our own save is recognized and skipped on reload (secondary loop
@@ -1646,6 +1732,18 @@ impl App {
         self.cfg_show_welcome = cfg.show_welcome;
         // shell: mirror so new tabs spawned after the reload use the edited shell.
         self.shell = cfg.shell.clone();
+        // Keybindings — LIVE (not restart-only). Recompile only when the `[keys]`
+        // table actually changed (compare the compiled maps, so an unrelated reload
+        // skips the rebuild). No redraw needed; the next keypress uses the new map.
+        if cfg.keys != self.keys {
+            let new_km = crate::keymap::KeyMap::compile(&cfg.keys);
+            for w in new_km.warnings() {
+                eprintln!("jetty: {w}");
+            }
+            self.keys = cfg.keys.clone();
+            self.keymap = new_km;
+            self.help_rows = App::compute_help_rows(&self.keymap, &self.summon_hotkey);
+        }
     }
 
     /// Re-dock the main window to the top strip when it is a visible Dropdown — used
@@ -2418,6 +2516,16 @@ impl App {
                 self.launch_at_login = !self.launch_at_login;
                 set_launch_at_login(self.launch_at_login);
                 self.persist();
+            }
+            C::ResetKeybindings => {
+                // Clear every user `[keys]` override → back to the built-in defaults.
+                self.keys = crate::config::KeyBindings::default();
+                self.keymap = crate::keymap::KeyMap::compile(&self.keys);
+                self.help_rows = App::compute_help_rows(&self.keymap, &self.summon_hotkey);
+                self.persist();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
             C::Hide => self.set_visibility(false, event_loop),
             C::Quit => {
@@ -4161,56 +4269,14 @@ impl App {
                 let ctrl = self.modifiers.control_key();
                 let shift = self.modifiers.shift_key();
                 let alt = self.modifiers.alt_key();
-                // macOS Cmd shortcuts in a detached window (F11) — same swallow +
-                // standard-chord handling as the main window, acting on THIS
-                // window's tab where it makes sense.
-                if self.modifiers.super_key() && !ctrl && !alt {
-                    if let winit::keyboard::Key::Character(s) = &event.logical_key {
-                        match s.as_str() {
-                            "c" | "C" => {
-                                if let Some(dw) = self.detached.get_mut(pos) {
-                                    let copied = dw
-                                        .tab
-                                        .terminal
-                                        .selection_text()
-                                        .filter(|t| !t.is_empty());
-                                    if let Some(text) = copied {
-                                        clipboard::set(&text);
-                                        dw.tab.terminal.selection_clear();
-                                        dw.window.request_redraw();
-                                    }
-                                }
-                            }
-                            "v" | "V" => {
-                                if let Some(text) = clipboard::get() {
-                                    if let Some(dw) = self.detached.get_mut(pos) {
-                                        Self::paste_to_tab(&mut dw.tab, &text);
-                                    }
-                                }
-                            }
-                            "a" | "A" => {
-                                if let Some(dw) = self.detached.get_mut(pos) {
-                                    dw.tab.terminal.select_all();
-                                    dw.window.request_redraw();
-                                }
-                            }
-                            "t" | "T" => {
-                                // Inherit THIS detached tab's cwd; the new tab
-                                // still opens in the main window as today.
-                                let cwd =
-                                    self.detached.get(pos).and_then(|dw| dw.tab.pty.cwd());
-                                self.new_tab_with_cwd(cwd);
-                            }
-                            "w" | "W" => self.reattach_tab(pos, event_loop),
-                            "+" | "=" => self.set_font_size(self.font_logical + 1.0),
-                            "-" => self.set_font_size(self.font_logical - 1.0),
-                            "0" => self.set_font_size(FONT_LOGICAL_DEFAULT),
-                            "," => self.toggle_settings_window(event_loop),
-                            _ => {}
-                        }
-                    }
-                    return;
-                }
+                // macOS Cmd chords in a detached window are now folded into the
+                // keymap and dispatched below through the SAME action path as the
+                // main window (Copy/Paste/SelectAll/NewTab/CloseTab=reattach/font/
+                // settings). decide_key's keymap lookup preserves the "swallow
+                // unmapped Cmd" safety net. Cmd+Q / Cmd+P stay detached no-ops
+                // (guarded below) — byte-identical with today's detached Cmd block,
+                // which had no q/p arm.
+                let sup = self.modifiers.super_key();
                 let (app_cursor, alt_screen) = {
                     let Some(dw) = self.detached.get(pos) else { return };
                     (dw.tab.terminal.app_cursor_keys(), dw.tab.terminal.alt_screen())
@@ -4230,15 +4296,21 @@ impl App {
                     None
                 };
                 // Dead-key composition fallback — mirrors the main window's arm.
-                let dead_key = input::dead_key_text_override(
-                    ctrl, alt, &event.logical_key, event.text.as_deref(),
-                );
+                // GATED on `!sup` so a bare Cmd chord routes through decide_key's
+                // keymap+swallow instead of being sent as composed text.
+                let dead_key = if sup {
+                    None
+                } else {
+                    input::dead_key_text_override(ctrl, alt, &event.logical_key, event.text.as_deref())
+                };
                 let action = match composed.or(dead_key) {
                     Some(bytes) => input::KeyAction::Send(bytes),
                     None => input::decide_key(
+                        &self.keymap,
                         ctrl,
                         shift,
                         alt,
+                        sup,
                         event.physical_key,
                         &event.logical_key,
                         false,
@@ -4318,9 +4390,18 @@ impl App {
                     }
                     // The palette is main-window only; keep Ctrl+Shift+P's pre-0.18
                     // behavior in a detached window (open Settings) so the chord
-                    // isn't silently dropped here.
+                    // isn't silently dropped here. A bare macOS Cmd+P, however, was a
+                    // swallowed no-op in today's detached Cmd block (no p/q arm) — keep
+                    // it a no-op so the fold is byte-identical (amendment 6).
                     input::KeyAction::OpenPalette => {
-                        self.toggle_settings_window(event_loop);
+                        if !(sup && !ctrl && !alt) {
+                            self.toggle_settings_window(event_loop);
+                        }
+                        return;
+                    }
+                    // Quit only arises from macOS Cmd+Q, which was a swallowed no-op
+                    // in a detached window today — keep it a no-op (amendment 6).
+                    input::KeyAction::Quit => {
                         return;
                     }
                     _ => {}
@@ -4373,6 +4454,12 @@ impl App {
                         if let Some(text) = clipboard::get() {
                             Self::paste_to_tab(&mut dw.tab, &text);
                         }
+                    }
+                    // Folded from the old detached Cmd+A block: select all on THIS
+                    // window's own terminal.
+                    input::KeyAction::SelectAll => {
+                        dw.tab.terminal.select_all();
+                        dw.window.request_redraw();
                     }
                     input::KeyAction::Send(bytes) => {
                         // Escape closes this window's context menu (if open)
@@ -7411,7 +7498,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // it never reaches the tab bar, a resize edge, or the terminal. ---
                 if self.help_open {
                     let theme = self.current_theme();
-                    let help = jetty_render::build_help_overlay(w, h, &theme, self.chrome_char_w());
+                    let help = jetty_render::build_help_overlay(w, h, &theme, self.chrome_char_w(), &self.help_rows);
                     if !input::point_in(&help.panel, cx, cy) {
                         self.help_open = false;
                     }
@@ -8227,18 +8314,19 @@ impl ApplicationHandler<AppEvent> for App {
                 // Backspace → edit, Ctrl+Shift+P / Cmd+Shift+P → toggle closed.
                 // Every other Ctrl/Cmd chord is swallowed so nothing leaks.
                 if self.palette_open {
-                    use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+                    use winit::keyboard::{Key, NamedKey};
                     let ctrl = self.modifiers.control_key();
                     let shift = self.modifiers.shift_key();
+                    let alt = self.modifiers.alt_key();
                     let sup = self.modifiers.super_key();
-                    // Toggle closed on the same chord that opened it.
-                    let is_palette_chord = (ctrl
-                        && shift
-                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyP)))
-                        || (sup
-                            && shift
-                            && matches!(&event.logical_key,
-                                Key::Character(s) if s.as_str() == "p" || s.as_str() == "P"));
+                    // Toggle closed on the SAME chord that opens the palette — routed
+                    // through the keymap so a remapped `open_palette` toggles closed
+                    // consistently (amendment 4).
+                    let mods = crate::keymap::Mods::new(ctrl, shift, alt, sup);
+                    let is_palette_chord = self
+                        .keymap
+                        .lookup(mods, event.physical_key, &event.logical_key)
+                        == Some(input::KeyAction::OpenPalette);
                     if is_palette_chord {
                         self.close_palette();
                         return;
@@ -8328,14 +8416,18 @@ impl ApplicationHandler<AppEvent> for App {
                 // other Ctrl/Cmd chord is swallowed (alacritty-style) so
                 // nothing leaks to the shell while the bar owns the keyboard.
                 if self.search_open {
-                    use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+                    use winit::keyboard::{Key, NamedKey};
                     let ctrl = self.modifiers.control_key();
                     let shift = self.modifiers.shift_key();
+                    let alt = self.modifiers.alt_key();
                     let sup = self.modifiers.super_key();
-                    if ctrl
-                        && shift
-                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyF))
-                    {
+                    // Close on the SAME chord that toggles search — routed through the
+                    // keymap so a remapped `search_toggle` closes consistently (amend. 4).
+                    let mods = crate::keymap::Mods::new(ctrl, shift, alt, sup);
+                    let chord_action = self
+                        .keymap
+                        .lookup(mods, event.physical_key, &event.logical_key);
+                    if chord_action == Some(input::KeyAction::SearchToggle) {
                         self.search_close();
                         return;
                     }
@@ -8361,17 +8453,10 @@ impl ApplicationHandler<AppEvent> for App {
                             self.active_tab_mut().terminal.search_set_query(&q);
                         }
                         _ => {
-                            // Ctrl+Shift+V (and macOS Cmd+V) pastes into the query.
-                            let is_paste = (ctrl
-                                && shift
-                                && matches!(
-                                    event.physical_key,
-                                    PhysicalKey::Code(KeyCode::KeyV)
-                                ))
-                                || (sup
-                                    && !ctrl
-                                    && matches!(&event.logical_key,
-                                        Key::Character(s) if s.as_str() == "v" || s.as_str() == "V"));
+                            // Paste-into-query on the SAME chord the keymap maps to
+                            // Paste (Ctrl+Shift+V / Shift+Insert / macOS Cmd+V, or a
+                            // remap), so a remapped paste works in the search bar too.
+                            let is_paste = chord_action == Some(input::KeyAction::Paste);
                             if is_paste {
                                 if let Some(text) = clipboard::get() {
                                     let mut q =
@@ -8397,59 +8482,13 @@ impl ApplicationHandler<AppEvent> for App {
                 let ctrl = self.modifiers.control_key();
                 let shift = self.modifiers.shift_key();
                 let alt = self.modifiers.alt_key();
-                // macOS Cmd (winit `super_key()`) shortcuts. decide_key only knows
-                // ctrl/shift/alt, so a bare Cmd+C/V/A/W/T/Q/... fell through to
-                // key_to_bytes and typed a literal letter into the shell (F11).
-                // Handle the standard editing/tab/font chords and SWALLOW every
-                // other Cmd chord so none leaks to the PTY. Keyed on the logical
-                // char (layout-tolerant). On Linux this key is Super (usually
-                // WM-grabbed, rarely delivered) — handling it uniformly is
-                // DE-independent and harmless. Ctrl/Alt+Cmd combos fall through.
-                if self.modifiers.super_key() && !ctrl && !alt {
-                    if let winit::keyboard::Key::Character(s) = &event.logical_key {
-                        match s.as_str() {
-                            "c" | "C" => {
-                                let copied = self
-                                    .active_tab()
-                                    .terminal
-                                    .selection_text()
-                                    .filter(|t| !t.is_empty());
-                                if let Some(text) = copied {
-                                    clipboard::set(&text);
-                                    self.active_tab_mut().terminal.selection_clear();
-                                    if let Some(w) = &self.window { w.request_redraw(); }
-                                }
-                            }
-                            "v" | "V" => {
-                                if let Some(text) = clipboard::get() {
-                                    self.paste_text(&text);
-                                }
-                            }
-                            "a" | "A" => {
-                                self.active_tab_mut().terminal.select_all();
-                                if let Some(w) = &self.window { w.request_redraw(); }
-                            }
-                            "t" | "T" => self.new_tab(),
-                            "w" | "W" => {
-                                self.confirm_close = Some(self.active);
-                                if let Some(w) = &self.window { w.request_redraw(); }
-                            }
-                            "q" | "Q" => {
-                                self.confirm_quit = true;
-                                if let Some(w) = &self.window { w.request_redraw(); }
-                            }
-                            // macOS command-palette chord (Cmd+Shift+P). Shift is
-                            // held here, so the logical char is usually "P".
-                            "p" | "P" => self.open_palette(),
-                            "+" | "=" => self.set_font_size(self.font_logical + 1.0),
-                            "-" => self.set_font_size(self.font_logical - 1.0),
-                            "0" => self.set_font_size(FONT_LOGICAL_DEFAULT),
-                            "," => self.toggle_settings_window(event_loop),
-                            _ => {}
-                        }
-                    }
-                    return;
-                }
+                // macOS Cmd (winit `super_key()`) chords are now folded into the
+                // keymap (Copy/Paste/SelectAll/NewTab/CloseTab/Quit/OpenPalette/
+                // font/settings, Shift-agnostic) and dispatched through the SAME
+                // action path below. The old inline Cmd block is gone; decide_key's
+                // keymap lookup preserves the "swallow unmapped Cmd" safety net so
+                // nothing leaks to the PTY.
+                let sup = self.modifiers.super_key();
                 let app_cursor = self.active_tab().terminal.app_cursor_keys();
                 let alt_screen = self.active_tab().terminal.alt_screen();
                 // Escape in the main window never closes the settings window
@@ -8483,12 +8522,17 @@ impl ApplicationHandler<AppEvent> for App {
                 // logical_key still reports the base char, prefer the text —
                 // otherwise the accent is silently dropped. Never fires for
                 // Ctrl/Alt chords or Named keys (see dead_key_text_override).
-                let dead_key = input::dead_key_text_override(
-                    ctrl, alt, &event.logical_key, event.text.as_deref(),
-                );
+                // GATED on `!sup`: a bare Cmd chord must route through decide_key's
+                // keymap+swallow, never be sent as composed text (byte-identical
+                // with the old Cmd block, which returned before this path).
+                let dead_key = if sup {
+                    None
+                } else {
+                    input::dead_key_text_override(ctrl, alt, &event.logical_key, event.text.as_deref())
+                };
                 let action = match composed.or(dead_key) {
                     Some(bytes) => input::KeyAction::Send(bytes),
-                    None => input::decide_key(ctrl, shift, alt, event.physical_key, &event.logical_key, false, app_cursor, alt_screen),
+                    None => input::decide_key(&self.keymap, ctrl, shift, alt, sup, event.physical_key, &event.logical_key, false, app_cursor, alt_screen),
                 };
                 if self.debug {
                     let action_name = match &action {
@@ -8514,6 +8558,8 @@ impl ApplicationHandler<AppEvent> for App {
                         input::KeyAction::SearchToggle => "SearchToggle",
                         input::KeyAction::PrevPrompt => "PrevPrompt",
                         input::KeyAction::NextPrompt => "NextPrompt",
+                        input::KeyAction::SelectAll => "SelectAll",
+                        input::KeyAction::Quit => "Quit",
                         input::KeyAction::Send(_) => "Send",
                         input::KeyAction::None => "None",
                     };
@@ -8648,6 +8694,22 @@ impl ApplicationHandler<AppEvent> for App {
                         // Paste from the clipboard into the PTY.
                         if let Some(text) = clipboard::get() {
                             self.paste_text(&text);
+                        }
+                    }
+                    input::KeyAction::SelectAll => {
+                        // Folded from the old macOS Cmd+A block; also reachable via a
+                        // user remap on any platform.
+                        self.active_tab_mut().terminal.select_all();
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    input::KeyAction::Quit => {
+                        // Folded from the old macOS Cmd+Q block: open the quit
+                        // confirmation (never quit outright), matching today.
+                        self.confirm_quit = true;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
                         }
                     }
                     input::KeyAction::Send(bytes) => {
@@ -8922,6 +8984,10 @@ impl ApplicationHandler<AppEvent> for App {
                 let tab_menu_hover = self.tab_menu_hover;
                 let tab_menu_labels = self.tab_menu_labels.clone();
                 let help_open = self.help_open;
+                // Clone the (cached, keymap-derived) help rows only when the overlay
+                // is actually open — keeps the hot render path allocation-free.
+                let help_rows: Vec<String> =
+                    if help_open { self.help_rows.clone() } else { Vec::new() };
                 // Search bar draw data + visible match highlights, captured
                 // before the mutable gpu/text borrow. Both empty/None while
                 // the bar is closed (one bool branch on the hot path).
@@ -9511,7 +9577,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // Draw the Help overlay (Keyboard Shortcuts) on top of all
                     // else — a dim layer, a bordered panel, and the binding rows.
                     if help_open && palette_ui.is_none() {
-                        let help = jetty_render::build_help_overlay(width, height, &theme, chrome_char_w);
+                        let help = jetty_render::build_help_overlay(width, height, &theme, chrome_char_w, &help_rows);
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &help.quads);
                         if !help.labels.is_empty() {
                             let _ = chrome_text.render_overlays(
@@ -10732,6 +10798,8 @@ mod hot_reload_tests {
             // round-trips an external edit instead of clobbering it.
             "shell",
             "show_welcome",
+            // keybindings recompile live in apply_reloaded_config (not restart-only).
+            "keys",
         ] {
             assert!(!is_restart_only(k), "{k} should be live-appliable");
         }

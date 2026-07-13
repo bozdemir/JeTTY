@@ -2,6 +2,7 @@
 //! No window, no GPU, no display required.
 
 use jetty_app::input::{decide_key, decide_mouse_press, KeyAction, MouseAction};
+use jetty_app::keymap::KeyMap;
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
 // ---------------------------------------------------------------------------
@@ -11,6 +12,24 @@ fn phys(code: KeyCode) -> PhysicalKey {
     PhysicalKey::Code(code)
 }
 
+/// Oracle harness: `decide_key` through the DEFAULT keymap with `super_ = false`.
+/// The pre-refactor expectations below are thus a byte-identical regression oracle
+/// for the default bindings — a user with no `[keys]` config gets today's behavior.
+#[allow(clippy::too_many_arguments)]
+fn dk(
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    physical: PhysicalKey,
+    logical: &Key,
+    panel_open: bool,
+    app_cursor: bool,
+    alt_screen: bool,
+) -> KeyAction {
+    let km = KeyMap::defaults();
+    decide_key(&km, ctrl, shift, alt, false, physical, logical, panel_open, app_cursor, alt_screen)
+}
+
 // ---------------------------------------------------------------------------
 // decide_key tests
 // ---------------------------------------------------------------------------
@@ -18,7 +37,7 @@ fn phys(code: KeyCode) -> PhysicalKey {
 #[test]
 fn ctrl_comma_physical_toggles_panel_closed() {
     // THE Ctrl+, fix: physical Comma, no shift, panel closed.
-    let action = decide_key(
+    let action = dk(
         true,
         false,
         false,
@@ -34,7 +53,7 @@ fn ctrl_comma_physical_toggles_panel_closed() {
 #[test]
 fn ctrl_comma_physical_toggles_panel_open() {
     // Ctrl+, also toggles when panel is already open.
-    let action = decide_key(
+    let action = dk(
         true,
         false,
         false,
@@ -50,7 +69,7 @@ fn ctrl_comma_physical_toggles_panel_open() {
 #[test]
 fn ctrl_comma_logical_fallback_toggles_panel() {
     // Fallback: physical key unknown but logical produces ",".
-    let action = decide_key(
+    let action = dk(
         true,
         false,
         false,
@@ -67,7 +86,7 @@ fn ctrl_comma_logical_fallback_toggles_panel() {
 fn ctrl_shift_o_toggles_panel() {
     // Layout-independent panel toggle. Works on the Turkish layout, where the
     // comma key reports to winit as Backslash (not Comma) so Ctrl+, never matched.
-    let action = decide_key(
+    let action = dk(
         true,
         true,
         false,
@@ -83,29 +102,29 @@ fn ctrl_shift_o_toggles_panel() {
 #[test]
 fn ctrl_c_sends_sigint() {
     // Ctrl+C must send 0x03 (SIGINT), not the literal letter "c".
-    let a = decide_key(true, false, false, phys(KeyCode::KeyC), &Key::Character("c".into()), false, false, false);
+    let a = dk(true, false, false, phys(KeyCode::KeyC), &Key::Character("c".into()), false, false, false);
     assert_eq!(a, KeyAction::Send(vec![3]));
 }
 
 #[test]
 fn ctrl_letters_send_control_bytes() {
     assert_eq!(
-        decide_key(true, false, false, phys(KeyCode::KeyD), &Key::Character("d".into()), false, false, false),
+        dk(true, false, false, phys(KeyCode::KeyD), &Key::Character("d".into()), false, false, false),
         KeyAction::Send(vec![4]) // Ctrl+D = EOF
     );
     assert_eq!(
-        decide_key(true, false, false, phys(KeyCode::KeyZ), &Key::Character("z".into()), false, false, false),
+        dk(true, false, false, phys(KeyCode::KeyZ), &Key::Character("z".into()), false, false, false),
         KeyAction::Send(vec![26]) // Ctrl+Z = suspend
     );
     assert_eq!(
-        decide_key(true, false, false, phys(KeyCode::KeyL), &Key::Character("l".into()), false, false, false),
+        dk(true, false, false, phys(KeyCode::KeyL), &Key::Character("l".into()), false, false, false),
         KeyAction::Send(vec![12]) // Ctrl+L = clear
     );
 }
 
 #[test]
 fn escape_closes_open_panel() {
-    let action = decide_key(
+    let action = dk(
         false,
         false,
         false,
@@ -120,7 +139,7 @@ fn escape_closes_open_panel() {
 
 #[test]
 fn escape_sends_esc_byte_when_panel_closed() {
-    let action = decide_key(
+    let action = dk(
         false,
         false,
         false,
@@ -136,7 +155,7 @@ fn escape_sends_esc_byte_when_panel_closed() {
 #[test]
 fn ctrl_shift_t_opens_new_tab() {
     // Ctrl+Shift+T now opens a new tab (theme switching moved to Settings).
-    let action = decide_key(
+    let action = dk(
         true,
         true,
         false,
@@ -151,7 +170,7 @@ fn ctrl_shift_t_opens_new_tab() {
 
 #[test]
 fn ctrl_shift_equal_increases_opacity() {
-    let action = decide_key(
+    let action = dk(
         true,
         true,
         false,
@@ -166,7 +185,7 @@ fn ctrl_shift_equal_increases_opacity() {
 
 #[test]
 fn ctrl_shift_minus_decreases_opacity() {
-    let action = decide_key(
+    let action = dk(
         true,
         true,
         false,
@@ -181,7 +200,7 @@ fn ctrl_shift_minus_decreases_opacity() {
 
 #[test]
 fn page_up_scrolls_up() {
-    let action = decide_key(
+    let action = dk(
         false,
         false,
         false,
@@ -196,7 +215,7 @@ fn page_up_scrolls_up() {
 
 #[test]
 fn page_down_scrolls_down() {
-    let action = decide_key(
+    let action = dk(
         false,
         false,
         false,
@@ -211,7 +230,7 @@ fn page_down_scrolls_down() {
 
 #[test]
 fn plain_s_sends_byte() {
-    let action = decide_key(
+    let action = dk(
         false,
         false,
         false,
@@ -226,7 +245,7 @@ fn plain_s_sends_byte() {
 
 #[test]
 fn enter_sends_cr() {
-    let action = decide_key(
+    let action = dk(
         false,
         false,
         false,
@@ -243,7 +262,7 @@ fn enter_sends_cr() {
 fn unknown_key_returns_none() {
     // F13 has no xterm mapping (we encode F1–F12); a genuinely unmapped key
     // must still produce no bytes. (F12 is now mapped — see function_keys test.)
-    let action = decide_key(
+    let action = dk(
         false,
         false,
         false,
@@ -263,7 +282,7 @@ fn unknown_key_returns_none() {
 #[test]
 fn alt_b_sends_esc_prefixed_b() {
     // Alt+b → ESC b (meta sends escape). alt = true.
-    let action = decide_key(
+    let action = dk(
         false,
         false,
         true,
@@ -279,7 +298,7 @@ fn alt_b_sends_esc_prefixed_b() {
 #[test]
 fn alt_enter_sends_esc_prefixed_cr() {
     // Alt+Enter → ESC CR (esc + the Enter key bytes).
-    let action = decide_key(
+    let action = dk(
         false,
         false,
         true,
@@ -299,7 +318,7 @@ fn alt_enter_sends_esc_prefixed_cr() {
 #[test]
 fn ctrl_space_sends_nul() {
     // Ctrl+Space → 0x00 (NUL).
-    let action = decide_key(
+    let action = dk(
         true,
         false,
         false,
@@ -315,7 +334,7 @@ fn ctrl_space_sends_nul() {
 #[test]
 fn ctrl_bracket_left_sends_esc() {
     // Ctrl+[ → 0x1b (ESC).
-    let action = decide_key(
+    let action = dk(
         true,
         false,
         false,
@@ -331,7 +350,7 @@ fn ctrl_bracket_left_sends_esc() {
 #[test]
 fn ctrl_backslash_sends_fs() {
     // Ctrl+\ → 0x1c (FS).
-    let action = decide_key(
+    let action = dk(
         true,
         false,
         false,
@@ -347,7 +366,7 @@ fn ctrl_backslash_sends_fs() {
 #[test]
 fn ctrl_bracket_right_sends_gs() {
     // Ctrl+] → 0x1d (GS).
-    let action = decide_key(
+    let action = dk(
         true,
         false,
         false,
@@ -368,7 +387,7 @@ fn ctrl_bracket_right_sends_gs() {
 fn ctrl_alt_b_sends_esc_prefixed_control_byte() {
     // Ctrl+Alt+b must send ESC + 0x02, NOT a bare 0x02. The ESC prefix is the
     // classic "Meta sends Escape" convention applied to the control byte.
-    let action = decide_key(
+    let action = dk(
         true,  // ctrl
         false, // shift
         true,  // alt
@@ -389,7 +408,7 @@ fn ctrl_alt_b_sends_esc_prefixed_control_byte() {
 fn ctrl_shift_c_sends_sigint() {
     // Ctrl+Shift+C is now the "Copy selection" shortcut, not a SIGINT.
     // (Previously it sent 0x03; the new clipboard feature takes priority.)
-    let action = decide_key(
+    let action = dk(
         true, // ctrl
         true, // shift
         false,
@@ -405,7 +424,7 @@ fn ctrl_shift_c_sends_sigint() {
 #[test]
 fn ctrl_shift_v_pastes() {
     // Ctrl+Shift+V is the "Paste" shortcut.
-    let action = decide_key(
+    let action = dk(
         true, // ctrl
         true, // shift
         false,
@@ -422,7 +441,7 @@ fn ctrl_shift_v_pastes() {
 fn ctrl_shift_o_still_toggles_panel() {
     // The explicit Ctrl+Shift+O shortcut must still be intercepted before the
     // ctrl-byte rule, so it toggles the panel rather than sending 0x0f.
-    let action = decide_key(
+    let action = dk(
         true, // ctrl
         true, // shift
         false,
@@ -442,7 +461,7 @@ fn ctrl_shift_o_still_toggles_panel() {
 #[test]
 fn arrow_up_normal_mode_sends_csi() {
     // app_cursor = false → CSI: ESC [ A.
-    let action = decide_key(
+    let action = dk(
         false,
         false,
         false,
@@ -458,7 +477,7 @@ fn arrow_up_normal_mode_sends_csi() {
 #[test]
 fn arrow_up_app_cursor_mode_sends_ss3() {
     // app_cursor = true → SS3: ESC O A.
-    let action = decide_key(
+    let action = dk(
         false,
         false,
         false,
@@ -481,7 +500,7 @@ fn arrow_keys_app_cursor_mode_all_directions() {
         (NamedKey::ArrowLeft, KeyCode::ArrowLeft, b"\x1bOD"),
     ];
     for (named, code, expected) in cases {
-        let action = decide_key(
+        let action = dk(
             false,
             false,
             false,
@@ -723,7 +742,7 @@ fn nav_editing_keys_send_xterm_sequences() {
         (NamedKey::Insert, b"\x1b[2~"),
     ];
     for (k, want) in cases {
-        let a = decide_key(false, false, false, phys(KeyCode::Home), &named(*k), false, false, false);
+        let a = dk(false, false, false, phys(KeyCode::Home), &named(*k), false, false, false);
         assert_eq!(a, send(want), "key {:?}", k);
     }
 }
@@ -737,7 +756,7 @@ fn function_keys_send_xterm_sequences() {
         (NamedKey::F12, b"\x1b[24~"),
     ];
     for (k, want) in cases {
-        let a = decide_key(false, false, false, phys(KeyCode::F1), &named(*k), false, false, false);
+        let a = dk(false, false, false, phys(KeyCode::F1), &named(*k), false, false, false);
         assert_eq!(a, send(want), "key {:?}", k);
     }
 }
@@ -745,31 +764,31 @@ fn function_keys_send_xterm_sequences() {
 #[test]
 fn modified_arrows_use_csi_1_mod_form() {
     // Ctrl+Left = mod 5, Shift+Right = mod 2, Alt+Up = mod 3, Ctrl+Shift+Down = mod 6.
-    let ctrl_left = decide_key(true, false, false, phys(KeyCode::ArrowLeft), &named(NamedKey::ArrowLeft), false, false, false);
+    let ctrl_left = dk(true, false, false, phys(KeyCode::ArrowLeft), &named(NamedKey::ArrowLeft), false, false, false);
     assert_eq!(ctrl_left, send(b"\x1b[1;5D"));
-    let shift_right = decide_key(false, true, false, phys(KeyCode::ArrowRight), &named(NamedKey::ArrowRight), false, false, false);
+    let shift_right = dk(false, true, false, phys(KeyCode::ArrowRight), &named(NamedKey::ArrowRight), false, false, false);
     assert_eq!(shift_right, send(b"\x1b[1;2C"));
-    let alt_up = decide_key(false, false, true, phys(KeyCode::ArrowUp), &named(NamedKey::ArrowUp), false, false, false);
+    let alt_up = dk(false, false, true, phys(KeyCode::ArrowUp), &named(NamedKey::ArrowUp), false, false, false);
     assert_eq!(alt_up, send(b"\x1b[1;3A"));
-    let ctrl_shift_down = decide_key(true, true, false, phys(KeyCode::ArrowDown), &named(NamedKey::ArrowDown), false, false, false);
+    let ctrl_shift_down = dk(true, true, false, phys(KeyCode::ArrowDown), &named(NamedKey::ArrowDown), false, false, false);
     assert_eq!(ctrl_shift_down, send(b"\x1b[1;6B"));
 }
 
 #[test]
 fn plain_arrows_unchanged_in_both_decckm_modes() {
     // No modifier → DECCKM-aware bare arrows (regression guard for the modified branch).
-    let normal = decide_key(false, false, false, phys(KeyCode::ArrowLeft), &named(NamedKey::ArrowLeft), false, false, false);
+    let normal = dk(false, false, false, phys(KeyCode::ArrowLeft), &named(NamedKey::ArrowLeft), false, false, false);
     assert_eq!(normal, send(b"\x1b[D"));
-    let app = decide_key(false, false, false, phys(KeyCode::ArrowLeft), &named(NamedKey::ArrowLeft), false, true, false);
+    let app = dk(false, false, false, phys(KeyCode::ArrowLeft), &named(NamedKey::ArrowLeft), false, true, false);
     assert_eq!(app, send(b"\x1bOD"));
 }
 
 #[test]
 fn shift_tab_sends_back_tab() {
-    let a = decide_key(false, true, false, phys(KeyCode::Tab), &named(NamedKey::Tab), false, false, false);
+    let a = dk(false, true, false, phys(KeyCode::Tab), &named(NamedKey::Tab), false, false, false);
     assert_eq!(a, send(b"\x1b[Z"));
     // Plain Tab still sends a literal TAB.
-    let plain = decide_key(false, false, false, phys(KeyCode::Tab), &named(NamedKey::Tab), false, false, false);
+    let plain = dk(false, false, false, phys(KeyCode::Tab), &named(NamedKey::Tab), false, false, false);
     assert_eq!(plain, send(b"\t"));
 }
 
@@ -941,10 +960,10 @@ fn ctrl_letter_keyed_on_logical_char_not_physical() {
     // Dvorak: the key that TYPES 'c' sits at physical KeyI. Ctrl+that must send
     // 0x03 (SIGINT), keyed on the LOGICAL char, not the physical QWERTY position
     // (which would wrongly send 0x09 TAB).
-    let a = decide_key(true, false, false, phys(KeyCode::KeyI), &Key::Character("c".into()), false, false, false);
+    let a = dk(true, false, false, phys(KeyCode::KeyI), &Key::Character("c".into()), false, false, false);
     assert_eq!(a, send(&[3]));
     // Unidentified physical + logical letter still yields the control byte.
-    let b = decide_key(
+    let b = dk(
         true, false, false,
         PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified),
         &Key::Character("z".into()),
@@ -956,13 +975,13 @@ fn ctrl_letter_keyed_on_logical_char_not_physical() {
 #[test]
 fn ctrl_caret_at_question_send_c0_bytes() {
     // Ctrl+Shift+6 (logical "^") → 0x1e RS (vim Ctrl+^ alternate-file toggle).
-    let caret = decide_key(true, true, false, phys(KeyCode::Digit6), &Key::Character("^".into()), false, false, false);
+    let caret = dk(true, true, false, phys(KeyCode::Digit6), &Key::Character("^".into()), false, false, false);
     assert_eq!(caret, send(&[0x1e]));
     // Ctrl+Shift+2 (logical "@") → 0x00 NUL.
-    let at = decide_key(true, true, false, phys(KeyCode::Digit2), &Key::Character("@".into()), false, false, false);
+    let at = dk(true, true, false, phys(KeyCode::Digit2), &Key::Character("@".into()), false, false, false);
     assert_eq!(at, send(&[0x00]));
     // Ctrl+Shift+/ (logical "?") → 0x7f DEL.
-    let q = decide_key(true, true, false, phys(KeyCode::Slash), &Key::Character("?".into()), false, false, false);
+    let q = dk(true, true, false, phys(KeyCode::Slash), &Key::Character("?".into()), false, false, false);
     assert_eq!(q, send(&[0x7f]));
 }
 
@@ -970,45 +989,45 @@ fn ctrl_caret_at_question_send_c0_bytes() {
 fn modified_page_keys_send_xterm_tilde_form() {
     // Ctrl+PageDown → `\e[6;5~` (vim :tabnext, tmux C-PgDn) — even on the primary
     // screen (no longer hijacked into host scroll).
-    let ctrl_pgdn = decide_key(true, false, false, phys(KeyCode::PageDown), &named(NamedKey::PageDown), false, false, false);
+    let ctrl_pgdn = dk(true, false, false, phys(KeyCode::PageDown), &named(NamedKey::PageDown), false, false, false);
     assert_eq!(ctrl_pgdn, send(b"\x1b[6;5~"));
     // Alt+PageUp → `\e[5;3~`.
-    let alt_pgup = decide_key(false, false, true, phys(KeyCode::PageUp), &named(NamedKey::PageUp), false, false, false);
+    let alt_pgup = dk(false, false, true, phys(KeyCode::PageUp), &named(NamedKey::PageUp), false, false, false);
     assert_eq!(alt_pgup, send(b"\x1b[5;3~"));
     // On the alt screen too: Ctrl+PageUp → `\e[5;5~`, not the plain `\e[5~`.
-    let ctrl_pgup_alt = decide_key(true, false, false, phys(KeyCode::PageUp), &named(NamedKey::PageUp), false, false, true);
+    let ctrl_pgup_alt = dk(true, false, false, phys(KeyCode::PageUp), &named(NamedKey::PageUp), false, false, true);
     assert_eq!(ctrl_pgup_alt, send(b"\x1b[5;5~"));
 }
 
 #[test]
 fn shift_insert_pastes_ctrl_alt_insert_keep_tilde() {
     // Shift+Insert is the universal terminal paste chord — handled by the host.
-    let a = decide_key(false, true, false, phys(KeyCode::Insert), &named(NamedKey::Insert), false, false, false);
+    let a = dk(false, true, false, phys(KeyCode::Insert), &named(NamedKey::Insert), false, false, false);
     assert_eq!(a, KeyAction::Paste);
     // Ctrl+Insert keeps the modified tilde form (mod = 5).
-    let ctrl_ins = decide_key(true, false, false, phys(KeyCode::Insert), &named(NamedKey::Insert), false, false, false);
+    let ctrl_ins = dk(true, false, false, phys(KeyCode::Insert), &named(NamedKey::Insert), false, false, false);
     assert_eq!(ctrl_ins, send(b"\x1b[2;5~"));
 }
 
 #[test]
 fn ctrl_backspace_sends_bs_not_del() {
-    let ctrl_bs = decide_key(true, false, false, phys(KeyCode::Backspace), &named(NamedKey::Backspace), false, false, false);
+    let ctrl_bs = dk(true, false, false, phys(KeyCode::Backspace), &named(NamedKey::Backspace), false, false, false);
     assert_eq!(ctrl_bs, send(&[0x08]));
     // Plain Backspace stays 0x7f (unchanged).
-    let plain = decide_key(false, false, false, phys(KeyCode::Backspace), &named(NamedKey::Backspace), false, false, false);
+    let plain = dk(false, false, false, phys(KeyCode::Backspace), &named(NamedKey::Backspace), false, false, false);
     assert_eq!(plain, send(&[0x7f]));
 }
 
 #[test]
 fn modified_function_keys_carry_modifier() {
     // Shift+F5 → `\e[15;2~`, Ctrl+F1 → `\e[1;5P`, Alt+F4 → `\e[1;3S`.
-    let shift_f5 = decide_key(false, true, false, phys(KeyCode::F5), &named(NamedKey::F5), false, false, false);
+    let shift_f5 = dk(false, true, false, phys(KeyCode::F5), &named(NamedKey::F5), false, false, false);
     assert_eq!(shift_f5, send(b"\x1b[15;2~"));
-    let ctrl_f1 = decide_key(true, false, false, phys(KeyCode::F1), &named(NamedKey::F1), false, false, false);
+    let ctrl_f1 = dk(true, false, false, phys(KeyCode::F1), &named(NamedKey::F1), false, false, false);
     assert_eq!(ctrl_f1, send(b"\x1b[1;5P"));
-    let alt_f4 = decide_key(false, false, true, phys(KeyCode::F4), &named(NamedKey::F4), false, false, false);
+    let alt_f4 = dk(false, false, true, phys(KeyCode::F4), &named(NamedKey::F4), false, false, false);
     assert_eq!(alt_f4, send(b"\x1b[1;3S"));
     // Plain (unmodified) F-keys keep their original sequences.
-    let plain_f5 = decide_key(false, false, false, phys(KeyCode::F5), &named(NamedKey::F5), false, false, false);
+    let plain_f5 = dk(false, false, false, phys(KeyCode::F5), &named(NamedKey::F5), false, false, false);
     assert_eq!(plain_f5, send(b"\x1b[15~"));
 }
