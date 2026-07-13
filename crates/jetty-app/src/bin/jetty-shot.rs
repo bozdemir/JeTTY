@@ -359,6 +359,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // JETTY_SHOT_KITTY — headless self-test of the Kitty graphics pipeline (scanner
+    // → base64 → decode → cell reservation → placement → ImageLayer). Mirrors
+    // JETTY_SHOT_SIXEL. Set to:
+    //   "1"   → a built-in 16×16 four-quadrant RGBA image (f=32, a=T).
+    //   "png" → a built-in 2×2 RGBA PNG fixture (exercises the f=100 path).
+    //   <raw> → a raw APC BODY (bytes AFTER `ESC _ G`, before ST) for custom cases.
+    if let Ok(val) = std::env::var("JETTY_SHOT_KITTY") {
+        if !val.is_empty() && val != "0" {
+            // Standard base64 encoder (no external dep).
+            fn b64(data: &[u8]) -> String {
+                const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                let mut s = String::new();
+                for chunk in data.chunks(3) {
+                    let b0 = chunk[0];
+                    let b1 = *chunk.get(1).unwrap_or(&0);
+                    let b2 = *chunk.get(2).unwrap_or(&0);
+                    let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
+                    s.push(A[((n >> 18) & 63) as usize] as char);
+                    s.push(A[((n >> 12) & 63) as usize] as char);
+                    s.push(if chunk.len() > 1 { A[((n >> 6) & 63) as usize] as char } else { '=' });
+                    s.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
+                }
+                s
+            }
+
+            let body = if val == "1" {
+                // 16×16, four opaque color quadrants (red / green / blue / yellow).
+                let (w, h) = (16u32, 16u32);
+                let mut px = Vec::with_capacity((w * h * 4) as usize);
+                for y in 0..h {
+                    for x in 0..w {
+                        let c = match (x < w / 2, y < h / 2) {
+                            (true, true) => [220, 40, 40],
+                            (false, true) => [40, 200, 40],
+                            (true, false) => [40, 80, 220],
+                            (false, false) => [220, 200, 40],
+                        };
+                        px.extend_from_slice(&[c[0], c[1], c[2], 255]);
+                    }
+                }
+                format!("a=T,f=32,s={w},v={h};{}", b64(&px))
+            } else if val == "png" {
+                // A 2×2 RGBA PNG fixture encoded on the fly (f=100 path).
+                let mut png_bytes = Vec::new();
+                {
+                    let mut enc = png::Encoder::new(&mut png_bytes, 2, 2);
+                    enc.set_color(png::ColorType::Rgba);
+                    enc.set_depth(png::BitDepth::Eight);
+                    let mut w = enc.write_header().unwrap();
+                    let data = [
+                        220, 40, 40, 255, 40, 200, 40, 255, 40, 80, 220, 255, 220, 200, 40, 255,
+                    ];
+                    w.write_image_data(&data).unwrap();
+                }
+                format!("a=T,f=100;{}", b64(&png_bytes))
+            } else {
+                val
+            };
+
+            let mut bytes = b"\x1b_G".to_vec();
+            bytes.extend_from_slice(body.as_bytes());
+            bytes.extend_from_slice(b"\x1b\\"); // 7-bit ST
+            terminal.feed(&bytes);
+            let imgs = terminal.visible_images();
+            eprintln!("jetty-shot: JETTY_SHOT_KITTY fed a Kitty APC → {} image(s)", imgs.len());
+            for vi in &imgs {
+                eprintln!(
+                    "jetty-shot:   image {}x{}px, footprint {}x{} cells, col {}, top viewport row {}",
+                    vi.px_w, vi.px_h, vi.cols, vi.rows, vi.col, vi.top_row
+                );
+            }
+        }
+    }
+
     // Optional: scroll the view before snapshotting (JETTY_SHOT_SCROLL, i32, positive = up).
     if let Ok(scroll_str) = std::env::var("JETTY_SHOT_SCROLL") {
         if let Ok(n) = scroll_str.parse::<i32>() {
