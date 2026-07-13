@@ -737,14 +737,14 @@ fn smol_lower(s: &SmolStr) -> SmolStr {
 /// Would this user chord shadow a needed terminal control byte or lock out
 /// typing? Returns the rejection reason, or `None` when safe.
 fn chord_reject_reason(ch: &Chord) -> Option<String> {
-    // No-modifier printable bind → locks out typing that key.
+    // A no-modifier bind shadows whatever the key normally sends — printable
+    // chars, but ALSO Enter/Tab/Space/Backspace/Escape and the arrow/nav keys a
+    // TUI needs. Only F-keys are safe to bind bare; everything else would lock
+    // that key out of the shell.
     if ch.mods.is_empty() {
-        let printable = match &ch.key {
-            KeyMatch::Logical { .. } => true,
-            KeyMatch::Phys(code) => is_printable_phys(*code),
-        };
-        if printable {
-            return Some("bindings need at least one modifier".to_string());
+        let ok_bare = matches!(&ch.key, KeyMatch::Phys(code) if is_fkey(*code));
+        if !ok_bare {
+            return Some("bindings need a modifier (only F-keys may be bound bare)".to_string());
         }
     }
     // Ctrl-only chord on a C0 control-byte producer → would kill SIGINT/EOF/ESC/…
@@ -763,8 +763,15 @@ fn chord_reject_reason(ch: &Chord) -> Option<String> {
     None
 }
 
-fn is_printable_phys(code: KeyCode) -> bool {
-    us_char(code).is_some()
+/// F1..F24 — the only keys safe to bind WITHOUT a modifier (every other bare key
+/// shadows something the shell/TUI needs: text, Enter/Tab/Space, arrows, nav).
+fn is_fkey(code: KeyCode) -> bool {
+    use KeyCode::*;
+    matches!(
+        code,
+        F1 | F2 | F3 | F4 | F5 | F6 | F7 | F8 | F9 | F10 | F11 | F12 | F13 | F14 | F15 | F16 | F17
+            | F18 | F19 | F20 | F21 | F22 | F23 | F24
+    )
 }
 
 fn is_ctrl_byte_key(code: KeyCode) -> bool {
@@ -1149,6 +1156,28 @@ mod tests {
     fn reject_no_modifier_printable() {
         let km = km_with(|b| b.new_tab = Some(ChordSpec::One("T".to_string())));
         assert!(km.warnings().iter().any(|w| w.contains("modifier")));
+    }
+
+    #[test]
+    fn reject_no_modifier_named_key() {
+        // A bare named key (Enter/Tab/Space/…) shadows what the shell needs — reject.
+        for k in ["Enter", "Tab", "Space", "Backspace", "Escape", "Up"] {
+            let km = km_with(|b| b.new_tab = Some(ChordSpec::One(k.to_string())));
+            assert!(
+                km.warnings().iter().any(|w| w.contains("modifier")),
+                "bare {k} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_no_modifier_fkey() {
+        // F-keys are the one class safe to bind bare.
+        let km = km_with(|b| b.new_tab = Some(ChordSpec::One("F5".to_string())));
+        assert!(
+            !km.warnings().iter().any(|w| w.contains("modifier")),
+            "bare F5 should be accepted"
+        );
     }
 
     #[test]
