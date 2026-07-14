@@ -11221,3 +11221,57 @@ mod hot_reload_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod paint_choke_tests {
+    //! v0.23 central-paint-chokepoint tripwire. A cheap `cargo test` companion to
+    //! `scripts/check-paint-choke.sh` (which does the richer context-aware audit):
+    //! it counts the raw `.request_redraw()` calls that are ALLOWED to remain
+    //! (the two choke definitions + the whitelisted animation/lifecycle self-drive
+    //! sites) and fails if the total moves. Any NEW raw producer `request_redraw`
+    //! bumps the count → this test trips → run the script to see which site leaked,
+    //! then route it through a per-surface paint choke (or, if it is a genuine
+    //! animation self-drive, extend the whitelist AND bump the number here).
+    //!
+    //! This is a TRIPWIRE, not a proof: it counts, it does not classify. It cannot
+    //! catch a swap (removing a whitelisted call while adding a producer one keeps
+    //! the count equal) — the shell script's context check is the real guard.
+
+    fn raw_calls(src: &str) -> usize {
+        // Match the CALL form `…request_redraw();` (with the trailing semicolon) so
+        // this test's own prose/string mentions of the bare `request_redraw()` token
+        // are not counted; also skip comment lines.
+        let needle = concat!(".request_redraw", "();");
+        src.lines()
+            .filter(|l| {
+                let s = l.trim_start();
+                l.contains(needle) && !s.starts_with("//") && !s.starts_with('*')
+            })
+            .count()
+    }
+
+    #[test]
+    fn no_new_raw_request_redraw_in_app() {
+        // 14 = request_main_paint def (1) + request_settings_paint def (1)
+        //    + about_to_wait animation/lifecycle self-drive (7)
+        //    + main render-tail (1) + detached render-tail in render_detached_window (1)
+        //    + dock re-assert (1) + center re-assert (1)
+        //    + main-window-open first-frame nudge on a local `window` binding (1).
+        assert_eq!(
+            raw_calls(include_str!("app.rs")),
+            14,
+            "raw request_redraw count changed in app.rs — run scripts/check-paint-choke.sh"
+        );
+    }
+
+    #[test]
+    fn no_new_raw_request_redraw_in_detached() {
+        // 2 = DetachedWindow::request_paint def (1) + DetachedWindow::new first-frame
+        //     nudge on a local `window` binding (1).
+        assert_eq!(
+            raw_calls(include_str!("detached.rs")),
+            2,
+            "raw request_redraw count changed in detached.rs — run scripts/check-paint-choke.sh"
+        );
+    }
+}
