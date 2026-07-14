@@ -5712,111 +5712,57 @@ impl App {
 
         // The grid sits below the top bar (and above the status strip).
         let grid_top = TABBAR_H;
-
-        let (cell_w, cell_h) = text.cell_size();
         let chrome_char_w = chrome_text.cell_size().0;
-        let selection_bg = selection_bg_for(&theme);
-        let scrollbar_thumb = scrollbar_thumb_for(&theme);
-
-        // Pass 1: clear to the theme bg and paint per-cell background quads
-        // (reverse-video / colored backgrounds / selection) under the text.
-        let bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, grid_top, selection_bg);
-        quad.render_clear(
-            &gpu.device,
-            &gpu.queue,
-            scene_view,
-            width,
-            height,
-            &bg_rects,
-            // Same premultiplied theme-bg-at-opacity clear as the main window,
-            // so a transparent theme is see-through here too.
-            jetty_render::default_bg_clear(&snap, gpu.premultiply_clear),
-        );
-        // Pass 2: glyphs on top of the painted background, offset by the bar.
-        let _ = text.render_to(
-            &gpu.device, &gpu.queue, scene_view, width, height, &snap, false, grid_top,
-        );
-        // Pass 2b: inline (sixel) images over the grid text, into scene_view (so
-        // CRT / corner-mask compositing apply). Native pixel size at the anchor,
-        // scissored to the grid area (below the bar, above the status strip),
-        // clamped to the attachment. Parity with the main window.
-        let image_draws: Vec<jetty_render::ImageDraw> = images
-            .iter()
-            .map(|(vi, img)| jetty_render::ImageDraw {
-                id: vi.id,
-                w: img.width,
-                h: img.height,
-                rgba: &img.rgba,
-                dst: [
-                    vi.col as f32 * cell_w,
-                    grid_top + vi.top_row * cell_h,
-                    vi.px_w as f32,
-                    vi.px_h as f32,
-                ],
-                opacity: 1.0,
-            })
-            .collect();
         let grid_bottom_px = (height as f32 - status_h).max(0.0);
-        let sc_y = grid_top.clamp(0.0, height as f32) as u32;
-        let sc_h = (grid_bottom_px.clamp(0.0, height as f32) as u32).saturating_sub(sc_y);
-        image_layer.render(
-            &gpu.device,
-            &gpu.queue,
+
+        // Passes 1–4 via the shared render core (v0.23 Task 8). The detached
+        // title bar (Pass 3) is the mid-scene chrome, injected between the glyph
+        // and scrollbar/cursor passes exactly as before. `slide_y = 0.0`,
+        // `copy_mode = None/false`, and `search_hits = &[]`, so a detached
+        // window gains NO dropdown slide, NO copy-mode cursor, and no search
+        // tint (BLOCKING 5) — its render is byte-identical to the pre-refactor
+        // body. The main-only caret GLOW / summon reveals live only in the main
+        // caller's tail and never reach here.
+        let scene = GridScene {
+            snap: &snap,
+            theme: &theme,
+            grid_top,
+            slide_y: 0.0,
+            grid_bottom: grid_bottom_px,
+            status_h,
+            scale,
+            search_hits: &[],
+            failed_rows: &failed_rows,
+            link_spans: link_spans.as_ref(),
+            images: &images,
+            focused,
+            caret_t_for_flash,
+            caret_flash_color: fx.caret_flash_color,
+            copy_mode_active: false,
+            copy_mode_ui: None,
+        };
+        render_grid_scene(
+            gpu,
+            text,
+            quad,
+            image_layer,
             scene_view,
             width,
             height,
-            &image_draws,
-            [0, sc_y, width, sc_h],
+            &scene,
+            // Pass 3: the top bar (title pill + close ✕) over the grid.
+            |quad, device, queue, view, w, h| {
+                let bar = jetty_render::build_detached_bar(w, &title, &theme, close_hover, chrome_char_w);
+                quad.render(device, queue, view, w, h, &bar.quads);
+                if !bar.labels.is_empty() {
+                    let _ = chrome_text.render_overlays(device, queue, view, w, h, &bar.labels);
+                }
+                if !bar.title_labels.is_empty() {
+                    // Title in the platform's proportional sans, like main tab titles.
+                    let _ = chrome_text.render_overlays_sans(device, queue, view, w, h, &bar.title_labels);
+                }
+            },
         );
-        // Pass 3: the top bar (title pill + close ✕) over the grid.
-        let bar = jetty_render::build_detached_bar(width, &title, &theme, close_hover, chrome_char_w);
-        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &bar.quads);
-        if !bar.labels.is_empty() {
-            let _ = chrome_text.render_overlays(
-                &gpu.device, &gpu.queue, scene_view, width, height, &bar.labels,
-            );
-        }
-        if !bar.title_labels.is_empty() {
-            // Title in the platform's proportional sans, like main tab titles.
-            let _ = chrome_text.render_overlays_sans(
-                &gpu.device, &gpu.queue, scene_view, width, height, &bar.title_labels,
-            );
-        }
-        // Pass 4: scrollbar, SGR decorations (underline/strike), the Ctrl+hover /
-        // OSC 8 link underline, and the cursor — one quad pass (grid_top = TABBAR_H
-        // here, no slide offset). Identical treatment to the main window.
-        let mut pass4: Vec<jetty_render::Rect> = Vec::new();
-        if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, grid_top, status_h, scrollbar_thumb) {
-            pass4.push(r);
-        }
-        // OSC 133 failed-command marker (identical treatment to the main window).
-        if !failed_rows.is_empty() {
-            pass4.extend(jetty_render::failed_marker_rects(
-                &failed_rows,
-                cell_h,
-                grid_top,
-                (3.0 * scale).round().max(2.0),
-                theme.failed_marker_color(),
-            ));
-        }
-        pass4.extend_from_slice(text.decoration_rects());
-        if let Some(spans) = &link_spans {
-            let p12 = theme.palette[12];
-            pass4.extend(jetty_render::link_underline_rects(
-                spans,
-                [p12[0], p12[1], p12[2], 255],
-                cell_w,
-                cell_h,
-                grid_top,
-            ));
-        }
-        // Cursor last so it draws over the glyphs + decorations.
-        pass4.extend(jetty_render::cursor_rects(
-            &snap, cell_w, cell_h, grid_top, focused, caret_t_for_flash, fx.caret_flash_color,
-        ));
-        if !pass4.is_empty() {
-            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pass4);
-        }
         // Pass 5: bottom STATUS strip (perf HUD) when enabled — the same slim
         // theme-derived strip as the main window; it may show the same global
         // HUD string (built by the main window's frames).
@@ -10383,6 +10329,203 @@ impl ApplicationHandler<AppEvent> for App {
                 self.cached_tabs_meta = tabs_meta;
             }
             _ => {}
+        }
+    }
+}
+
+/// Plain-data inputs to [`render_grid_scene`], grouped to keep the two call
+/// sites (main + detached) readable. GPU resources and the mid-scene chrome
+/// closure are passed separately.
+///
+/// EQUIVALENCE CONTRACT (v0.23 BLOCKING 5): a detached window passes
+/// `slide_y = 0.0`, `search_hits = &[]`, `copy_mode_active = false`, and
+/// `copy_mode_ui = None`. As a result the shared core adds NO dropdown slide
+/// and NO copy-mode cursor for detached — exactly as before. The main-only
+/// caret GLOW, the summon-reveal / Tier-B passes, and the whole overlay +
+/// corner-mask/CRT tail live in the MAIN caller AFTER this core, so a detached
+/// window still gains none of them.
+struct GridScene<'a> {
+    snap: &'a jetty_core::GridSnapshot,
+    theme: &'a jetty_core::Theme,
+    /// Un-slid grid top (0.0 or `TABBAR_H`). The scrollbar is computed at this
+    /// origin and then translated by `slide_y` (main dropdown slide).
+    grid_top: f32,
+    /// Dropdown-slide pixel offset. Always `0.0` for a detached window.
+    slide_y: f32,
+    /// Un-slid grid bottom (image scissor). `slide_y` is added inside the core.
+    grid_bottom: f32,
+    status_h: f32,
+    /// Physical-px scale factor (failed-command marker bar width).
+    scale: f32,
+    /// Search-hit tint source; empty (`&[]`) unless the main search bar is open.
+    search_hits: &'a [jetty_core::SearchHit],
+    failed_rows: &'a [u16],
+    link_spans: Option<&'a Vec<(usize, usize, usize)>>,
+    images: &'a [(jetty_core::VisibleImage, std::sync::Arc<jetty_core::SixelImage>)],
+    focused: bool,
+    caret_t_for_flash: Option<f32>,
+    caret_flash_color: [f32; 3],
+    /// Copy-mode is main-only. Detached passes `false` → the shell cursor is
+    /// never suppressed here.
+    copy_mode_active: bool,
+    /// Copy-mode keyboard cursor. Detached passes `None` → no extra cursor.
+    copy_mode_ui: Option<(usize, usize, bool, bool)>,
+}
+
+/// The genuinely-shared per-window grid render body, extracted from the main
+/// `RedrawRequested` arm ∩ `render_detached_window` (v0.23 Task 8 / BLOCKING 5).
+///
+/// It performs ONLY the common sequence:
+///   Pass 1  clear + per-cell background quads (+ main-only search-hit tint)
+///   Pass 2  glyphs
+///   Pass 2b inline (sixel/kitty) images, scissored to the grid area
+///   Pass 3  CALLER-INJECTED mid-scene chrome (`draw_chrome`) — the main tab
+///           bar or the detached title bar, drawn BETWEEN the glyph pass and
+///           the scrollbar/cursor pass exactly as both windows do today
+///   Pass 4  scrollbar + failed-command markers + SGR decorations + link
+///           underline + cursor (+ main-only copy-mode cursor)
+///
+/// Everything else stays in the caller: the main-only caret GLOW pass, the
+/// summon-reveal / Tier-B routing, the dropdown-slide *decision*, the overlay
+/// stack (search/hint/copy/help/confirm/palette/menus/welcome/status/toast),
+/// and the corner-mask + CRT tail + present + animation self-drive. The slide
+/// OFFSET is threaded through as data (`slide_y`), never a slide the detached
+/// path can accidentally acquire (it passes `0.0`).
+#[allow(clippy::too_many_arguments)]
+fn render_grid_scene(
+    gpu: &GpuContext,
+    text: &mut TextLayer,
+    quad: &mut QuadLayer,
+    image_layer: &mut jetty_render::ImageLayer,
+    scene_view: &wgpu::TextureView,
+    width: u32,
+    height: u32,
+    s: &GridScene,
+    draw_chrome: impl FnOnce(&mut QuadLayer, &wgpu::Device, &wgpu::Queue, &wgpu::TextureView, u32, u32),
+) {
+    let device = &gpu.device;
+    let queue = &gpu.queue;
+    let (cell_w, cell_h) = text.cell_size();
+    // The glyphs/backgrounds/cursor all draw at the slid origin; the scrollbar
+    // is computed at the un-slid `grid_top` and then translated by `slide_y`
+    // (matches both windows' pre-refactor behavior; `slide_y == 0` for detached).
+    let grid_origin_y = s.grid_top + s.slide_y;
+    let selection_bg = selection_bg_for(s.theme);
+    let scrollbar_thumb = scrollbar_thumb_for(s.theme);
+
+    // Pass 1: clear to the (premultiplied, opacity-correct) theme bg and paint
+    // the per-cell background quads under the text. Search-hit tint rects are
+    // appended AFTER the selection rects (main-only; empty for detached) so the
+    // match tint wins where they overlap, still under the glyphs.
+    let mut bg_rects = jetty_render::cell_bg_rects(s.snap, cell_w, cell_h, grid_origin_y, selection_bg);
+    if !s.search_hits.is_empty() {
+        bg_rects.extend(jetty_render::search_hit_rects(
+            s.search_hits, cell_w, cell_h, grid_origin_y, s.theme,
+        ));
+    }
+    quad.render_clear(
+        device, queue, scene_view, width, height, &bg_rects,
+        jetty_render::default_bg_clear(s.snap, gpu.premultiply_clear),
+    );
+
+    // Pass 2: glyphs over the painted background, offset down by the grid origin.
+    let _ = text.render_to(device, queue, scene_view, width, height, s.snap, false, grid_origin_y);
+
+    // Pass 2b: inline images over the grid text, scissored to the grid area
+    // (below the bar, above the status strip / bottom tab bar), clamped to the
+    // attachment. Called every frame so VRAM is reclaimed when images leave view.
+    let image_draws: Vec<jetty_render::ImageDraw> = s
+        .images
+        .iter()
+        .map(|(vi, img)| jetty_render::ImageDraw {
+            id: vi.id,
+            w: img.width,
+            h: img.height,
+            rgba: &img.rgba,
+            dst: [
+                vi.col as f32 * cell_w,
+                grid_origin_y + vi.top_row * cell_h,
+                vi.px_w as f32,
+                vi.px_h as f32,
+            ],
+            opacity: 1.0,
+        })
+        .collect();
+    let sc_top = grid_origin_y.clamp(0.0, height as f32);
+    let sc_bot = (s.grid_bottom + s.slide_y).clamp(0.0, height as f32);
+    let sc_y = sc_top as u32;
+    let sc_h = (sc_bot as u32).saturating_sub(sc_y);
+    image_layer.render(device, queue, scene_view, width, height, &image_draws, [0, sc_y, width, sc_h]);
+
+    // Pass 3: caller-injected mid-scene chrome (main tab bar / detached title
+    // bar), drawn over the grid but under the scrollbar/cursor pass.
+    draw_chrome(quad, device, queue, scene_view, width, height);
+
+    // Pass 4: scrollbar, failed-command markers, SGR decorations, the
+    // Ctrl+hover / OSC 8 link underline, and the cursor — one quad pass.
+    let mut rects: Vec<jetty_render::Rect> = Vec::new();
+    if let Some(mut r) =
+        jetty_render::scrollbar_rect(s.snap, width, height, s.grid_top, s.status_h, scrollbar_thumb)
+    {
+        r.y += s.slide_y;
+        rects.push(r);
+    }
+    if !s.failed_rows.is_empty() {
+        rects.extend(jetty_render::failed_marker_rects(
+            s.failed_rows,
+            cell_h,
+            grid_origin_y,
+            (3.0 * s.scale).round().max(2.0),
+            s.theme.failed_marker_color(),
+        ));
+    }
+    rects.extend_from_slice(text.decoration_rects());
+    if let Some(spans) = s.link_spans {
+        let p12 = s.theme.palette[12];
+        rects.extend(jetty_render::link_underline_rects(
+            spans, [p12[0], p12[1], p12[2], 255], cell_w, cell_h, grid_origin_y,
+        ));
+    }
+    // Cursor last so it draws over glyphs + decorations. In copy-mode (main
+    // only) the shell's block cursor is SUPPRESSED so only the copy-mode
+    // keyboard cursor shows; detached always passes `copy_mode_active = false`.
+    if !s.copy_mode_active {
+        rects.extend(jetty_render::cursor_rects(
+            s.snap, cell_w, cell_h, grid_origin_y, s.focused, s.caret_t_for_flash, s.caret_flash_color,
+        ));
+    }
+    if let Some((cr, cc, _sel, _lm)) = s.copy_mode_ui {
+        rects.extend(jetty_render::copy_cursor_rects(cr, cc, cell_w, cell_h, grid_origin_y, s.theme.cursor));
+    }
+    quad.render(device, queue, scene_view, width, height, &rects);
+}
+
+/// Shared input core (v0.23 Task 9 / amendment I5): a keystroke (or IME commit)
+/// that was NOT consumed by any chrome/overlay → snap the viewport to the live
+/// bottom and write the decoded bytes to this tab's PTY. Deliberately SMALL —
+/// the caret-burst arming (gated on different toggles per window; the glow is
+/// main-only), the perf keystroke stamp, welcome-splash dismissal, and every
+/// modal/menu short-circuit stay in the per-window callers.
+fn write_key_to_pty(tab: &mut Tab, bytes: &[u8]) {
+    // Any real keystroke jumps the view back to the live bottom so typing while
+    // scrolled up into scrollback is visible (F30). Order is irrelevant vs the
+    // PTY write (viewport offset and the PTY writer are independent).
+    tab.terminal.scroll_to_bottom();
+    let _ = tab.writer.write_all(bytes);
+    let _ = tab.writer.flush();
+}
+
+/// Shared wheel-delta → fractional-lines conversion (v0.23 Task 9 / amendment
+/// I5). Byte-identical in the main and detached `MouseWheel` arms; the
+/// accumulation (`ScrollAccumulator::add`) and everything downstream stay
+/// per-window because they read window-specific geometry/state.
+fn wheel_delta_to_lines(delta: MouseScrollDelta) -> f32 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => y * 3.0,
+        MouseScrollDelta::PixelDelta(p) => {
+            // Approximate cell height; 20.0 is a reasonable default.
+            const CELL_H: f64 = 20.0;
+            (p.y / CELL_H) as f32
         }
     }
 }
