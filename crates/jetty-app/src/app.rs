@@ -890,6 +890,18 @@ pub struct App {
     /// `crate::perf`.
     perf: crate::perf::Perf,
 
+    /// Debug missed-paint proof counter (`JETTY_FRAME_LOG=1`, off by default).
+    /// When on, every `frame.present()` (main / detached / settings) bumps
+    /// `frames_presented` and emits a `JETTY_FRAME <n> <surface>` line to stderr,
+    /// so `scripts/verify-idle.sh` can assert a keystroke/PTY burst's FINAL
+    /// mutation was actually presented (a dropped final frame = the count stalls
+    /// before the last mutation; a self-driving hidden window = the count keeps
+    /// climbing with no input). `frame_log` is read ONCE from the environment at
+    /// construction; when false the two-field bump is a single predictable-false
+    /// branch and the present path stays byte-identical (HARD RULE #1).
+    frame_log: bool,
+    frames_presented: u64,
+
     /// Whether the in-window "Keyboard Shortcuts" help overlay is open. Drawn on
     /// top of everything in the main window; dismissed by Esc, the "?" button,
     /// or a click outside the panel.
@@ -1327,6 +1339,8 @@ impl App {
             perf_idle_shown: false,
             perf_label: None,
             perf: crate::perf::Perf::from_env(),
+            frame_log: std::env::var_os("JETTY_FRAME_LOG").is_some(),
+            frames_presented: 0,
             help_open: false,
             search_open: false,
             search_refresh_at: None,
@@ -4578,6 +4592,11 @@ impl App {
                 &[("Aa".to_string(), sx, sy, specimen_rgb)],
             );
             frame.present();
+            // Missed-paint proof counter (JETTY_FRAME_LOG only).
+            if self.frame_log {
+                self.frames_presented += 1;
+                eprintln!("JETTY_FRAME {} settings", self.frames_presented);
+            }
         }
     }
 
@@ -5917,6 +5936,13 @@ impl App {
             );
         }
         frame.present();
+        // Missed-paint proof counter (JETTY_FRAME_LOG only; see the field docs).
+        // `self.frames_presented`/`self.frame_log` are fields disjoint from the
+        // live `dw` borrow of `self.detached`, so this is a plain field bump.
+        if self.frame_log {
+            self.frames_presented += 1;
+            eprintln!("JETTY_FRAME {} detached", self.frames_presented);
+        }
         // Self-drive the next frame ONLY while the caret flash is mid-burst, an
         // animated CRT sub-effect is on, or the Shift+drag hint toast is still
         // showing (so it repaints away on expiry instead of freezing on screen)
@@ -10329,6 +10355,11 @@ impl ApplicationHandler<AppEvent> for App {
                         None
                     };
                     frame.present();
+                    // Missed-paint proof counter (JETTY_FRAME_LOG only).
+                    if self.frame_log {
+                        self.frames_presented += 1;
+                        eprintln!("JETTY_FRAME {} main", self.frames_presented);
+                    }
                     if self.perf.on {
                         if let (Some(ready), Some(present)) = (perf_ready_ms, perf_present_ms) {
                             self.perf.record_latency(ready, present);
