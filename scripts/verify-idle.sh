@@ -55,30 +55,29 @@ done
 [ -x "$APP" ] || { echo "build first: cargo build --release --bin jetty"; exit 2; }
 if [ -z "${DISPLAY:-}" ]; then echo "no DISPLAY — run on the real X11 desktop"; exit 2; fi
 
-# ---- ensure a clean slate (single-instance IPC) ----
-# JeTTY is single-instance: a running primary owns the IPC socket, so launching
-# a second one just FORWARDS a summon to the first and exits — our frame-logged
-# test instance would never start and every frame check would read an empty log.
-# Close any existing JeTTY and clear a stale socket so our launch binds fresh.
-if pgrep -f 'jetty($| )|release/jetty' >/dev/null 2>&1; then
-  echo "note: closing an existing JeTTY so the frame-logged test instance can own the socket…"
-  pkill -f 'target/release/jetty' 2>/dev/null || true
-  pkill -x jetty 2>/dev/null || true
-  sleep 0.6
-fi
-rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/jetty.sock" 2>/dev/null || true
+# ---- isolate the IPC socket (NEVER touch the user's JeTTY) ----
+# JeTTY is single-instance via a per-user socket under $XDG_RUNTIME_DIR. Reusing
+# it would either FORWARD our launch to a running JeTTY (the frame-logged test
+# instance never starts) or — if we killed that instance — kill the very
+# terminal running this script. Give the test instance a PRIVATE runtime dir so
+# it binds its OWN socket, fully independent; nothing to kill. (The X11 window is
+# unaffected by XDG_RUNTIME_DIR.) NOTE: still run this from a NON-JeTTY terminal
+# (a plain konsole/xterm or a TTY) — a summon window can swallow the xdotool
+# focus/keys this harness relies on.
+export XDG_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/jetty-verify.XXXXXX")"
+chmod 700 "$XDG_RUNTIME_DIR"
 
 # ---- launch jetty with the frame counter on ----
 JETTY_FRAME_LOG=1 SHELL=/usr/bin/zsh "$APP" >"$LOG" 2>&1 &
 PID=$!
-cleanup() { kill "$PID" 2>/dev/null; sleep 0.3; kill -9 "$PID" 2>/dev/null; }
+cleanup() { kill "$PID" 2>/dev/null; sleep 0.3; kill -9 "$PID" 2>/dev/null; rm -rf "$XDG_RUNTIME_DIR" 2>/dev/null; }
 trap cleanup EXIT
 sleep 3   # window map + shell init
-# If the launch forwarded to a survivor and exited, the whole test is bogus
-# (an empty frame log reads as "no frame presented"). Catch it explicitly.
+# Catch a genuine launch failure (crash / GPU init error). With the isolated
+# socket above the launch binds fresh, so an immediate exit means a real problem.
 if ! kill -0 "$PID" 2>/dev/null; then
-  echo "ERROR: the test instance exited immediately — a running JeTTY likely hijacked the"
-  echo "launch via IPC. Close ALL JeTTY windows and re-run. Log:"; tail -8 "$LOG"; exit 1
+  echo "ERROR: the test instance exited immediately (crash or GPU init failure). Log:"
+  tail -12 "$LOG"; exit 1
 fi
 if ! grep -q 'JETTY_FRAME' "$LOG" 2>/dev/null && ! grep -qi 'socket bound' "$LOG" 2>/dev/null; then
   echo "WARNING: no frames logged yet after 3s — the frame counter may not be active."
