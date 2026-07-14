@@ -31,7 +31,8 @@
 #          `summon_anim || slide_anim || hint_live || crt_anim_live || caret_anim`
 #     5. dock re-assert  — guarded by `pending_dock_frames > 0`
 #     6. center re-assert — guarded by `pending_center_frames > 0`
-#     7. main-window-open first-frame nudge — a bare local `window` binding
+#     7. settings-window-open first-frame nudge — a bare local `window` binding
+#        (in `open_settings`, right before `self.settings_window = Some(window)`)
 #   detached.rs
 #     8. fn request_paint          — the detached choke DEFINITION
 #     9. detached render-tail self-drive — guarded by
@@ -72,7 +73,12 @@ def allowed_app(i):
     # whitelist 3: entire about_to_wait
     if atw_s <= i < atw_e:
         return True
-    # whitelist 7 / 10-style: bare local `window` binding (window-open nudge)
+    # whitelist 7 / 10-style: bare local `window` binding (window-open nudge).
+    # NOTE (scoped-grep limitation): this rule is NAME-based, not context-based —
+    # a future producer that happens to bind a local `window` and calls
+    # `window.request_redraw();` would evade the choke here. The tripwire COUNT
+    # test + code review are the backstop; keep the local-`window` name reserved
+    # for the two window-open nudges (items 7, 10).
     if re.match(r"^window\.request_redraw\(\);$", s):
         return True
     # whitelist 5/6: dock / center re-assert

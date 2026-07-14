@@ -68,6 +68,10 @@ if [ -z "$WID" ]; then echo "ERROR: JeTTY window not found"; tail -8 "$LOG"; exi
 # ---- helpers ----
 frames() { grep -c 'JETTY_FRAME' "$LOG" 2>/dev/null || echo 0; }
 frames_main() { grep -c 'JETTY_FRAME .* main' "$LOG" 2>/dev/null || echo 0; }
+# Per-surface counts so an occluded-target test can't false-FAIL on a stray
+# present by ANOTHER surface (e.g. a visible main window blinking its caret while
+# the DETACHED window is the one under test). Frame log = `JETTY_FRAME <n> <surface>`.
+frames_detached() { grep -c 'JETTY_FRAME .* detached' "$LOG" 2>/dev/null || echo 0; }
 focus() { xdotool windowactivate --sync "$WID" 2>/dev/null; sleep 0.3; }
 is_focused() { [ "$(xdotool getactivewindow 2>/dev/null)" = "$WID" ]; }
 typek() { xdotool type --delay 40 -- "$1"; }
@@ -143,10 +147,10 @@ typek "yes > /dev/null &"; enter; sleep 0.2   # background flood, no screen outp
 typek "yes"; enter                            # foreground flood TO the terminal
 sleep 1.0
 xdotool windowminimize "$WID"; sleep 1.2      # -> Occluded(true)/iconify path
-f0=$(frames)
+f0=$(frames_main)
 info "sampling CPU for ${OCC_SECONDS}s while minimized + flooding..."
 cmax=$(cpu_max "$OCC_SECONDS")
-f1=$(frames)
+f1=$(frames_main)
 if [ "${f1:-0}" -eq "${f0:-0}" ]; then
   pass "occluded main presented ZERO frames while flooding ($f0 == $f1)"
 else
@@ -164,10 +168,10 @@ note "4. HIDDEN-WITH-OUTPUT (F9 off) — BLOCKING-2 catch"
 focus
 typek "yes"; enter; sleep 1.0
 keyk "$HIDE_KEY"; sleep 1.2                    # global hide (window unmapped)
-f0=$(frames)
+f0=$(frames_main)
 info "sampling CPU for ${OCC_SECONDS}s while hidden + flooding..."
 cmax=$(cpu_max "$OCC_SECONDS")
-f1=$(frames)
+f1=$(frames_main)
 if [ "${f1:-0}" -eq "${f0:-0}" ]; then
   pass "hidden main presented ZERO frames while flooding ($f0 == $f1)"
 else
@@ -191,10 +195,10 @@ else
   xdotool windowactivate --sync "$DWID" 2>/dev/null; sleep 0.4
   xdotool type --delay 40 -- "yes"; xdotool key Return; sleep 1.0
   xdotool windowminimize "$DWID"; sleep 1.2
-  f0=$(frames)
+  f0=$(frames_detached)
   info "sampling CPU for ${OCC_SECONDS}s while detached window minimized + flooding..."
   cmax=$(cpu_max "$OCC_SECONDS")
-  f1=$(frames)
+  f1=$(frames_detached)
   if [ "${f1:-0}" -eq "${f0:-0}" ]; then
     pass "occluded DETACHED window presented ZERO frames while flooding ($f0 == $f1)"
   else
