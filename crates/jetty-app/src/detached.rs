@@ -438,6 +438,27 @@ impl DetachedWindow {
             self.applied_os_title = self.tab.title.clone();
         }
     }
+
+    /// THE per-surface paint choke for this detached window (v0.23 central paint
+    /// chokepoint). Every producer-category `request_redraw` for a detached window
+    /// (PTY output, input, resize, overlay/chrome, sync-flush) routes through here
+    /// instead of calling `self.window.request_redraw()` raw, so there is ONE
+    /// auditable site per surface and a CI grep can assert no raw producer calls
+    /// leak back in.
+    ///
+    /// NON-stateful by design (v0.23): winit already coalesces multiple
+    /// `request_redraw` into a single `RedrawRequested`, so this is a thin, direct
+    /// forward — NO `Cell` flag, NO deferred flush. The deliverable is auditability,
+    /// not fewer syscalls, and a stateful flag would risk a dropped frame across the
+    /// macOS `Wait`/`Poll` seam. `&self`: reads only `self.window`.
+    ///
+    /// This does NOT gate on `self.occluded`: the LOAD-BEARING occlusion gates that
+    /// keep an occluded window at ~0% idle live at the PRODUCER call sites
+    /// (`!dw.occluded` around the Wake-drain redraw, sync-flush, etc.) and MUST stay
+    /// there verbatim — do not move them into this wrapper.
+    pub(crate) fn request_paint(&self) {
+        self.window.request_redraw();
+    }
 }
 
 #[cfg(test)]

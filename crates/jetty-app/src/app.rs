@@ -2781,18 +2781,56 @@ impl App {
         }
     }
 
-    /// Redraw the main window plus every detached and the settings window — used
-    /// by palette actions that change a shared visual (theme/opacity/effects).
-    fn redraw_main_and_detached(&self) {
+    /// THE per-surface paint choke for the MAIN window (v0.23 central paint
+    /// chokepoint). Every producer-category `request_redraw` for the main window
+    /// (input, PTY output, resize, overlays/chrome, sync-flush, lifecycle) routes
+    /// through here instead of a raw `self.window.request_redraw()`, so there is
+    /// ONE auditable site and a CI grep can assert no raw producer calls leak back.
+    ///
+    /// NON-stateful by design (v0.23): winit already coalesces multiple
+    /// `request_redraw` into a single `RedrawRequested`, so this is a thin, direct
+    /// forward — NO `Cell` flag, NO deferred flush (a stateful flag would risk a
+    /// dropped frame across the macOS `Wait`/`Poll` seam). The deliverable is
+    /// auditability, not fewer syscalls.
+    ///
+    /// This does NOT gate on `self.visible`/`self.main_occluded`. The LOAD-BEARING
+    /// visibility/occlusion gates live at the PRODUCER call sites (the Wake-drain
+    /// `self.visible && !self.main_occluded`, sync-flush `main_visible`, etc.) and
+    /// at the `RedrawRequested` `!self.visible` early-out — they MUST stay there
+    /// verbatim. Category-D animation continuation is driven by RAW `request_redraw`
+    /// in `about_to_wait` / the render tail and deliberately does NOT route here.
+    fn request_main_paint(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
-        for dw in &self.detached {
-            dw.window.request_redraw();
-        }
+    }
+
+    /// The per-surface paint choke for the SETTINGS window. Same non-stateful,
+    /// non-gating contract as `request_main_paint`. No-op when Settings is closed
+    /// (mirrors the previous `if let Some(w) = &self.settings_window` guard).
+    fn request_settings_paint(&self) {
         if let Some(w) = &self.settings_window {
             w.request_redraw();
         }
+    }
+
+    /// Fan-out choke: paint the main window, every detached window, and the
+    /// settings window. Used by actions that change a shared visual
+    /// (theme/opacity/effects). `&self`, non-stateful — pure fan-out over the
+    /// per-surface chokes above.
+    fn mark_dirty_all(&self) {
+        self.request_main_paint();
+        for dw in &self.detached {
+            dw.request_paint();
+        }
+        self.request_settings_paint();
+    }
+
+    /// Redraw the main window plus every detached and the settings window — used
+    /// by palette actions that change a shared visual (theme/opacity/effects).
+    /// Thin alias over [`Self::mark_dirty_all`] (kept for its many call sites).
+    fn redraw_main_and_detached(&self) {
+        self.mark_dirty_all();
     }
 
     /// Run a resolved palette command by invoking the EXISTING app action for it.
