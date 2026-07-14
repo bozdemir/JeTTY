@@ -495,6 +495,12 @@ pub struct Terminal {
     /// Per-tab semantic prompt marks (OSC 133 A/B/C/D), append order == ascending
     /// `abs_top`-relative line, pruned to the live scrollback window on each bind.
     marks: VecDeque<CmdBlock>,
+    /// Latched TRUE the first time this tab produces command output (an OSC-133
+    /// `C`). Gates the resize "clean-prompt" clear (p10k-scatter fix): once real
+    /// output exists it must never be wiped, so the clear can only ever fire on a
+    /// tab that has shown nothing but a prompt. Never reset — a resize on a tab
+    /// that ran a command always does the plain reflow. See [`Terminal::resize`].
+    saw_command_output: bool,
     /// Command completions discovered during `feed()` (OSC 133 `D`). Drained by
     /// the app on the PTY-drain pass via [`Terminal::take_completions`]. Empty in
     /// the common case; bounded by [`MAX_PENDING_COMPLETIONS`]. A plain `Vec` on
@@ -667,6 +673,7 @@ impl Terminal {
             saturated: false,
             scan: Scan::Ground,
             marks: VecDeque::new(),
+            saw_command_output: false,
             completed: Vec::new(),
             sixel_buf: Vec::new(),
             sixel_overflow: false,
@@ -1254,6 +1261,20 @@ impl Terminal {
     /// has been advanced. No-op on the alt screen (OSC 133 inside a TUI is
     /// meaningless). Coalesces a duplicate A on the same line so p10k + our own
     /// snippet both emitting A cannot create two blocks.
+    /// True when the tab is idle at a fresh shell prompt with NOTHING but that
+    /// prompt on screen: no command has ever produced output (no OSC-133 `C`), so
+    /// the grid + scrollback hold only prompt line(s). [`Terminal::resize`] uses
+    /// this to wipe-and-let-the-shell-redraw, killing p10k/starship reflow
+    /// prompt-scatter with ZERO risk of clearing real content. Returns false
+    /// without shell integration (no marks), on the alt screen, or past
+    /// scrollback saturation — all of which then take the plain reflow path.
+    fn at_clean_prompt(&self) -> bool {
+        !self.saw_command_output
+            && !self.saturated
+            && !self.term.mode().contains(TermMode::ALT_SCREEN)
+            && self.marks.back().is_some_and(|m| !m.finished)
+    }
+
     fn bind_mark(&mut self, letter: u8, exit: Option<i32>) {
         if self.term.mode().contains(TermMode::ALT_SCREEN) {
             return;
@@ -1301,6 +1322,9 @@ impl Terminal {
                     // already-off-hot-path OSC-133 scanner (never per byte).
                     last.started_at = Some(std::time::Instant::now());
                 }
+                // This tab now holds real command output — latch it so the resize
+                // clean-prompt clear can never wipe content (p10k-scatter fix).
+                self.saw_command_output = true;
             }
             b'D' => {
                 // Bind to the most-recent still-open block (shells emit strictly
@@ -2265,6 +2289,10 @@ impl Terminal {
         if cols == self.cols && rows == self.rows {
             return;
         }
+        // p10k / starship prompt-scatter fix (see the clear after `term.resize`
+        // below). Capture the idle-clean-prompt state NOW, before `term.resize`
+        // clears the marks it depends on.
+        let clean_prompt = self.at_clean_prompt();
         self.cols = cols;
         self.rows = rows;
         // Publish the new geometry to the shared atomic BEFORE Term::resize so
@@ -2277,6 +2305,21 @@ impl Terminal {
         // existing lines, preserves scrollback, and adjusts the cursor position.
         let new_size = Size { cols, lines: rows };
         self.term.resize(new_size);
+        // p10k / starship prompt-scatter fix. alacritty's reflow rewraps a
+        // full-width, absolute-positioned prompt into stray fragments (its
+        // right-aligned segment lands on a wrapped row), and on GROW pulls
+        // prompts that a prior SHRINK pushed into scrollback back into view —
+        // stacking copies, worst on an empty tab. When we were idle at a clean
+        // prompt with no output to lose, WIPE what the reflow just produced — the
+        // rewrapped fragments AND the rows the shrink pushed into scrollback — so
+        // a later grow reveals nothing. In alacritty `\e[2J` scrolls the screen
+        // INTO scrollback, so `\e[3J` (clear scrollback) MUST come LAST. The
+        // SIGWINCH `pty.resize` already sends makes the shell (p10k) repaint
+        // exactly ONE clean prompt. Content-safe: `clean_prompt` is gated on the
+        // tab never having produced command output.
+        if clean_prompt {
+            self.advance_slice(b"\x1b[H\x1b[2J\x1b[3J");
+        }
         // Reflow moved every line; stored search-match Points are stale now.
         // Cheap no-op when no search is active.
         self.search_refresh();
@@ -3253,6 +3296,47 @@ mod tests {
         let mut t = Terminal::new(20, 5);
         t.feed(b"hello");
         assert!(!t.take_bell(), "plain output must not ring the bell");
+    }
+
+    #[test]
+    fn resize_at_clean_prompt_wipes_instead_of_scattering() {
+        // p10k-scatter fix: an EMPTY tab (a lone OSC-133 prompt, no command ever
+        // run) must have its grid wiped on resize so alacritty's reflow leaves no
+        // scattered/stacked prompt fragments. Shrink then grow — the classic
+        // scatter gesture — must end with a CLEAN grid (the real shell would then
+        // repaint one prompt via SIGWINCH; there is no shell here, so a blank grid
+        // proves zero fragments survived the reflow).
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]133;A\x07"); // prompt start (idle at prompt, no command)
+        // A full-width, right-segmented prompt like p10k's (what actually scatters).
+        let mut prompt = String::from("\u{276f} home ~ ");
+        prompt.push_str(&" ".repeat(60));
+        prompt.push('\u{2713}'); // right-aligned check glyph near the edge
+        t.feed(prompt.as_bytes());
+        t.resize(40, 12); // shrink (rewraps / stuffs the prompt into history)
+        t.resize(100, 30); // grow (would reveal the stray copies)
+        let snap = t.snapshot();
+        let prompts = (0..snap.rows).filter(|&r| snap.row_text(r).contains('\u{276f}')).count();
+        assert_eq!(
+            prompts, 0,
+            "a clean-prompt resize must wipe the grid so no prompt fragment survives; found {prompts}"
+        );
+    }
+
+    #[test]
+    fn resize_preserves_real_command_output() {
+        // The clean-prompt clear MUST be content-safe: once a command has produced
+        // output (OSC-133 C), a resize must NOT wipe it — it takes the plain reflow.
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]133;A\x07"); // prompt
+        t.feed(b"\x1b]133;C\x07"); // command output starts -> saw_command_output latched
+        t.feed(b"IMPORTANT_OUTPUT_XYZ\r\n"); // real output that must survive
+        t.feed(b"\x1b]133;A\x07"); // next prompt (idle again, but output exists)
+        t.resize(40, 12);
+        t.resize(100, 30);
+        let snap = t.snapshot();
+        let found = (0..snap.rows).any(|r| snap.row_text(r).contains("IMPORTANT_OUTPUT_XYZ"));
+        assert!(found, "a tab that produced output must never be cleared on resize");
     }
 
     #[test]
