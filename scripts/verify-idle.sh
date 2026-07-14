@@ -55,23 +55,49 @@ done
 [ -x "$APP" ] || { echo "build first: cargo build --release --bin jetty"; exit 2; }
 if [ -z "${DISPLAY:-}" ]; then echo "no DISPLAY — run on the real X11 desktop"; exit 2; fi
 
+# ---- ensure a clean slate (single-instance IPC) ----
+# JeTTY is single-instance: a running primary owns the IPC socket, so launching
+# a second one just FORWARDS a summon to the first and exits — our frame-logged
+# test instance would never start and every frame check would read an empty log.
+# Close any existing JeTTY and clear a stale socket so our launch binds fresh.
+if pgrep -f 'jetty($| )|release/jetty' >/dev/null 2>&1; then
+  echo "note: closing an existing JeTTY so the frame-logged test instance can own the socket…"
+  pkill -f 'target/release/jetty' 2>/dev/null || true
+  pkill -x jetty 2>/dev/null || true
+  sleep 0.6
+fi
+rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/jetty.sock" 2>/dev/null || true
+
 # ---- launch jetty with the frame counter on ----
 JETTY_FRAME_LOG=1 SHELL=/usr/bin/zsh "$APP" >"$LOG" 2>&1 &
 PID=$!
 cleanup() { kill "$PID" 2>/dev/null; sleep 0.3; kill -9 "$PID" 2>/dev/null; }
 trap cleanup EXIT
 sleep 3   # window map + shell init
+# If the launch forwarded to a survivor and exited, the whole test is bogus
+# (an empty frame log reads as "no frame presented"). Catch it explicitly.
+if ! kill -0 "$PID" 2>/dev/null; then
+  echo "ERROR: the test instance exited immediately — a running JeTTY likely hijacked the"
+  echo "launch via IPC. Close ALL JeTTY windows and re-run. Log:"; tail -8 "$LOG"; exit 1
+fi
+if ! grep -q 'JETTY_FRAME' "$LOG" 2>/dev/null && ! grep -qi 'socket bound' "$LOG" 2>/dev/null; then
+  echo "WARNING: no frames logged yet after 3s — the frame counter may not be active."
+  tail -6 "$LOG"
+fi
 
 WID=$(timeout 15 xdotool search --sync --name JeTTY 2>/dev/null | tail -1)
 if [ -z "$WID" ]; then echo "ERROR: JeTTY window not found"; tail -8 "$LOG"; exit 1; fi
 
 # ---- helpers ----
-frames() { grep -c 'JETTY_FRAME' "$LOG" 2>/dev/null || echo 0; }
-frames_main() { grep -c 'JETTY_FRAME .* main' "$LOG" 2>/dev/null || echo 0; }
+# `grep -c` PRINTS "0" AND exits 1 on no match, so `grep -c … || echo 0` emits
+# "0\n0" — which breaks `[ "$f" -eq … ]` ("integer expression expected").
+# Capture via command substitution so each helper yields exactly ONE integer.
+frames() { local c; c=$(grep -c 'JETTY_FRAME' "$LOG" 2>/dev/null); echo "${c:-0}"; }
+frames_main() { local c; c=$(grep -c 'JETTY_FRAME .* main' "$LOG" 2>/dev/null); echo "${c:-0}"; }
 # Per-surface counts so an occluded-target test can't false-FAIL on a stray
 # present by ANOTHER surface (e.g. a visible main window blinking its caret while
 # the DETACHED window is the one under test). Frame log = `JETTY_FRAME <n> <surface>`.
-frames_detached() { grep -c 'JETTY_FRAME .* detached' "$LOG" 2>/dev/null || echo 0; }
+frames_detached() { local c; c=$(grep -c 'JETTY_FRAME .* detached' "$LOG" 2>/dev/null); echo "${c:-0}"; }
 focus() { xdotool windowactivate --sync "$WID" 2>/dev/null; sleep 0.3; }
 is_focused() { [ "$(xdotool getactivewindow 2>/dev/null)" = "$WID" ]; }
 typek() { xdotool type --delay 40 -- "$1"; }
