@@ -9588,171 +9588,68 @@ impl ApplicationHandler<AppEvent> for App {
                     } else {
                         &view
                     };
-                    // Pass 1: clear to the theme bg and paint per-cell background
-                    // quads (reverse-video / colored backgrounds) UNDER the text.
-                    // The grid's bg quads are offset down by the tab bar.
+                    // Cell size is needed both by the shared grid core below and
+                    // by the main-only caret-glow / hint-overlay passes further
+                    // down, so compute it here (a trivial getter; the core reads
+                    // it again internally).
                     let (cell_w, cell_h) = text.cell_size();
-                    let selection_bg = selection_bg_for(&theme);
-                    let scrollbar_thumb = scrollbar_thumb_for(&theme);
-                    let mut bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, grid_top + slide_y_offset, selection_bg);
-                    if !search_hits.is_empty() {
-                        // Appended AFTER the selection rects so the match tint
-                        // wins where they overlap; still under the glyphs.
-                        bg_rects.extend(jetty_render::search_hit_rects(
-                            &search_hits, cell_w, cell_h, grid_top + slide_y_offset, &theme,
-                        ));
-                    }
-                    quad.render_clear(
-                        &gpu.device,
-                        &gpu.queue,
-                        scene_view,
-                        width,
-                        height,
-                        &bg_rects,
-                        // premultiply the clear to match the surface's alpha_mode
-                        // (PreMultiplied on Vulkan, straight on Metal/macOS) so the
-                        // window is correctly see-through on every backend.
-                        jetty_render::default_bg_clear(&snap, gpu.premultiply_clear),
-                    );
-                    // Pass 2: draw glyphs on top of the painted background (load),
-                    // offset down by the tab bar height.
-                    let _ = text.render_to(
-                        &gpu.device,
-                        &gpu.queue,
-                        scene_view,
-                        width,
-                        height,
-                        &snap,
-                        false,
-                        grid_top + slide_y_offset,
-                    );
-                    // Pass 2b: inline (sixel) images over the grid text, into
-                    // scene_view (so CRT / corner-mask / summon compositing all
-                    // apply). Each image draws at its NATIVE pixel size at its
-                    // anchor; the pass is scissored to the grid area (clamped to
-                    // the attachment per amendment R3) so images scrolled partly
-                    // off, or wider than the grid, are hardware-clipped. Called
-                    // every frame so VRAM is reclaimed when images leave view; a
-                    // no-image frame is effectively free.
-                    let image_draws: Vec<jetty_render::ImageDraw> = images
-                        .iter()
-                        .map(|(vi, img)| jetty_render::ImageDraw {
-                            id: vi.id,
-                            w: img.width,
-                            h: img.height,
-                            rgba: &img.rgba,
-                            dst: [
-                                vi.col as f32 * cell_w,
-                                grid_top + slide_y_offset + vi.top_row * cell_h,
-                                vi.px_w as f32,
-                                vi.px_h as f32,
-                            ],
-                            opacity: 1.0,
-                        })
-                        .collect();
                     let grid_bottom_px = if tab_bar_bottom {
                         (height as f32 - TABBAR_H - status_h).max(0.0)
                     } else {
                         (height as f32 - status_h).max(0.0)
                     };
-                    let sc_top = (grid_top + slide_y_offset).clamp(0.0, height as f32);
-                    let sc_bot = (grid_bottom_px + slide_y_offset).clamp(0.0, height as f32);
-                    let sc_y = sc_top as u32;
-                    let sc_h = (sc_bot as u32).saturating_sub(sc_y);
-                    image_layer.render(
-                        &gpu.device,
-                        &gpu.queue,
+                    // Passes 1–4 via the shared render core (v0.23 Task 8). The
+                    // MAIN tab bar (Pass 3) is the mid-scene chrome, injected via
+                    // the closure BETWEEN the glyph and scrollbar/cursor passes —
+                    // exactly where it was drawn before. Main threads its own
+                    // slide offset, search-hit tint, and copy-mode cursor through
+                    // the params, so this is byte-identical to the pre-refactor
+                    // body. The main-only caret GLOW, summon-reveal/Tier-B, and
+                    // the corner-mask/CRT tail all stay BELOW, in this caller.
+                    let scene = GridScene {
+                        snap: &snap,
+                        theme: &theme,
+                        grid_top,
+                        slide_y: slide_y_offset,
+                        grid_bottom: grid_bottom_px,
+                        status_h,
+                        scale,
+                        search_hits: &search_hits,
+                        failed_rows: &failed_rows,
+                        link_spans: link_spans.as_ref(),
+                        images: &images,
+                        focused: main_focused,
+                        caret_t_for_flash,
+                        caret_flash_color,
+                        copy_mode_active,
+                        copy_mode_ui,
+                    };
+                    render_grid_scene(
+                        gpu,
+                        text,
+                        quad,
+                        image_layer,
                         scene_view,
                         width,
                         height,
-                        &image_draws,
-                        [0, sc_y, width, sc_h],
+                        &scene,
+                        // Pass 3: the tab bar (already translated to its actual y
+                        // + dropdown slide above) over the grid.
+                        |quad, device, queue, view, w, h| {
+                            quad.render(device, queue, view, w, h, &bar.quads);
+                            if !bar.labels.is_empty() {
+                                // Chrome: fixed-size layer so the bar text never
+                                // scales with the terminal font (never overflows
+                                // the 36px bar).
+                                let _ = chrome_text.render_overlays(device, queue, view, w, h, &bar.labels);
+                            }
+                            if !bar.title_labels.is_empty() {
+                                // Tab TITLES in the platform's proportional sans;
+                                // the ×/+/overflow/HUD/controls stay monospace.
+                                let _ = chrome_text.render_overlays_sans(device, queue, view, w, h, &bar.title_labels);
+                            }
+                        },
                     );
-                    // Pass 3: the tab bar (translated to its actual y) over the grid.
-                    quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &bar.quads);
-                    if !bar.labels.is_empty() {
-                        // Chrome: fixed-size layer so the bar text never scales with
-                        // the terminal font (and never overflows the 36px bar).
-                        let _ = chrome_text.render_overlays(
-                            &gpu.device, &gpu.queue, scene_view, width, height, &bar.labels,
-                        );
-                    }
-                    if !bar.title_labels.is_empty() {
-                        // Tab TITLES in the platform's proportional sans-serif for an
-                        // elegant UI look — the close ×, "+", overflow hint, perf HUD
-                        // and window controls above stay in the monospace chrome font.
-                        let _ = chrome_text.render_overlays_sans(
-                            &gpu.device, &gpu.queue, scene_view, width, height, &bar.title_labels,
-                        );
-                    }
-                    // Pass 4: scrollbar (spans the grid area below the bar), the
-                    // SGR text decorations (underline/strike), the Ctrl+hover / OSC 8
-                    // link underline, and the cursor — all in one quad pass (zero
-                    // text-layer / grid-hash impact). Decorations are cached in the
-                    // text layer (rebuilt only on a grid change); only the cursor
-                    // quad rebuilds per frame (for the caret flash).
-                    let mut rects: Vec<jetty_render::Rect> = Vec::new();
-                    if let Some(mut r) =
-                        jetty_render::scrollbar_rect(&snap, width, height, grid_top, status_h, scrollbar_thumb)
-                    {
-                        r.y += slide_y_offset;
-                        rects.push(r);
-                    }
-                    // OSC 133 failed-command marker: a themed, high-contrast
-                    // left-edge accent bar on each visible failed prompt row.
-                    // Width in physical px (HiDPI-correct, same `scale` as the
-                    // corner mask); rides the dropdown slide via slide_y_offset.
-                    if !failed_rows.is_empty() {
-                        rects.extend(jetty_render::failed_marker_rects(
-                            &failed_rows,
-                            cell_h,
-                            grid_top + slide_y_offset,
-                            (3.0 * scale).round().max(2.0),
-                            theme.failed_marker_color(),
-                        ));
-                    }
-                    // SGR underline/strike (built at the same grid offset as the text).
-                    rects.extend_from_slice(text.decoration_rects());
-                    if let Some(spans) = &link_spans {
-                        // The single shared link-underline geometry (color = the
-                        // active theme's bright blue). This is what finally makes the
-                        // Ctrl+hover / OSC 8 link underline VISIBLE.
-                        let p12 = theme.palette[12];
-                        rects.extend(jetty_render::link_underline_rects(
-                            spans,
-                            [p12[0], p12[1], p12[2], 255],
-                            cell_w,
-                            cell_h,
-                            grid_top + slide_y_offset,
-                        ));
-                    }
-                    // Cursor last so it draws over the glyphs + decorations. In
-                    // copy-mode the shell's block cursor is SUPPRESSED so only the
-                    // copy-mode keyboard cursor shows (two-cursors fix).
-                    if !copy_mode_active {
-                        rects.extend(jetty_render::cursor_rects(
-                            &snap,
-                            cell_w,
-                            cell_h,
-                            grid_top + slide_y_offset,
-                            main_focused,
-                            caret_t_for_flash,
-                            caret_flash_color,
-                        ));
-                    }
-                    // Copy-mode keyboard cursor: a hollow box in the theme cursor
-                    // color at the copy-mode cell.
-                    if let Some((cr, cc, _sel, _lm)) = copy_mode_ui {
-                        rects.extend(jetty_render::copy_cursor_rects(
-                            cr,
-                            cc,
-                            cell_w,
-                            cell_h,
-                            grid_top + slide_y_offset,
-                            theme.cursor,
-                        ));
-                    }
-                    quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &rects);
 
                     // Pass 4a: bottom STATUS BAR (the perf HUD, OFF the tab row).
                     // A slim strip at the very bottom with the perf metrics
