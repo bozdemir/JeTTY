@@ -1554,12 +1554,8 @@ impl App {
         self.persist();
         // One-shot preview on the main window (self-driving loop handles idle-0).
         self.summon_pending = true;
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
-        if let Some(w) = &self.settings_window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
+        self.request_settings_paint();
     }
 
     /// The active tab. Panics if `tabs` is empty, which only happens before
@@ -1606,7 +1602,7 @@ impl App {
         }
         for dw in &mut self.detached {
             dw.tab.terminal.set_theme(t.clone());
-            dw.window.request_redraw();
+            dw.request_paint();
         }
     }
 
@@ -1650,12 +1646,8 @@ impl App {
 
         self.reloading = false;
         // Repaint chrome (theme/settings) once the reload settled.
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
-        if let Some(w) = &self.settings_window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
+        self.request_settings_paint();
     }
 
     /// Apply an externally-edited `Config` LIVE, diffing against current in-memory
@@ -1704,9 +1696,7 @@ impl App {
             let cr = cfg.corner_radius.clamp(0.0, 24.0);
             if (cr - self.corner_radius).abs() > eps {
                 self.corner_radius = cr;
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
             }
         }
         // Summon effect: ASSIGN directly (NOT set_summon_effect, which fires a one-
@@ -1753,18 +1743,14 @@ impl App {
         if cfg.show_perf_hud != self.show_perf_hud {
             self.show_perf_hud = cfg.show_perf_hud;
             self.reflow();
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.request_main_paint();
         }
         // Visual effects — skip while a Effects slider is being dragged (H4).
         if self.active_fx_drag.is_none() && cfg.effects != self.fx {
             self.fx = cfg.effects.clone();
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.request_main_paint();
             for dw in &self.detached {
-                dw.window.request_redraw();
+                dw.request_paint();
             }
         }
         // Run & Notify mirrors.
@@ -1821,7 +1807,7 @@ impl App {
             if let Some(w) = &self.window {
                 dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
                 self.pending_dock_frames = 5;
-                w.request_redraw();
+                self.request_main_paint();
             }
         }
     }
@@ -1928,9 +1914,7 @@ impl App {
         };
         self.shell = options[next].clone();
         self.persist();
-        if let Some(w) = &self.settings_window {
-            w.request_redraw();
-        }
+        self.request_settings_paint();
     }
 
     /// Spawn a new tab in the main window starting in the active tab's shell
@@ -2000,9 +1984,7 @@ impl App {
             activity: jetty_render::TabActivity::None,
         });
         self.active = self.tabs.len() - 1;
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Close tab `i` (its PtySession Drop kills the child). Fix up `active`. If
@@ -2052,9 +2034,7 @@ impl App {
         // A new tab is under the pointer: revalidate the cached Ctrl+hover
         // underline against ITS grid (Ctrl+Shift+W keeps Ctrl held) (F12).
         self.update_link_hover(true);
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Move tab `idx` out of the main window into a new `DetachedWindow`.
@@ -2165,9 +2145,7 @@ impl App {
                 self.tabs.insert(at, tab);
                 self.active = prev_active.min(self.tabs.len().saturating_sub(1));
                 self.switching_to_detached = false;
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
                 return;
             }
         };
@@ -2272,9 +2250,7 @@ impl App {
         // keeps Ctrl held): revalidate the cached Ctrl+hover underline (F12).
         self.update_link_hover(true);
         // Redraw the main window so the tab bar reflects the removed tab.
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Move a detached window's tab back into the main window (reattach),
@@ -2334,9 +2310,7 @@ impl App {
         // revalidate the cached Ctrl+hover underline against its grid (F12).
         self.update_link_hover(true);
         // `dw` drops here: detached window + GPU surface are closed/destroyed.
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Dismiss the terminal Copy/Paste context menu AND the tab context menu,
@@ -2386,9 +2360,7 @@ impl App {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.terminal.search_clear();
         }
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     // ── Hint mode (Ctrl+Shift+H) + keyboard copy-mode (Ctrl+Shift+Space) ──────
@@ -2425,17 +2397,13 @@ impl App {
         }
         let labels = jetty_core::hints::assign_labels(tokens.len());
         self.hint_mode = Some(HintState { tokens, labels, typed: String::new() });
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Cancel hint mode (Esc / after firing).
     fn exit_hint_mode(&mut self) {
         self.hint_mode = None;
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Handle one key while hint mode owns the keyboard. Letters narrow the typed
@@ -2454,9 +2422,7 @@ impl App {
                 if let Some(hs) = self.hint_mode.as_mut() {
                     hs.typed.pop();
                 }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
                 return;
             }
             _ => {}
@@ -2497,9 +2463,7 @@ impl App {
                 if let Some(hs) = self.hint_mode.as_mut() {
                     hs.typed = t;
                 }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
             }
             Outcome::Ignore => {}
         }
@@ -2526,17 +2490,13 @@ impl App {
         };
         self.active_tab_mut().terminal.selection_clear();
         self.copy_mode = Some(crate::copymode::CopyMode::new(row, col));
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Exit copy-mode (Esc / after yank).
     fn exit_copy_mode(&mut self) {
         self.copy_mode = None;
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Handle one key while copy-mode owns the keyboard.
@@ -2595,9 +2555,7 @@ impl App {
                     self.copy_mode_refresh_selection();
                 } else {
                     self.active_tab_mut().terminal.selection_clear();
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_main_paint();
                 }
                 return;
             }
@@ -2655,9 +2613,7 @@ impl App {
             cm.col = out.col.min(cols.saturating_sub(1));
         }
         self.copy_mode_refresh_selection();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Rebuild the alacritty selection from the copy-mode anchor + cursor with
@@ -2723,9 +2679,7 @@ impl App {
         self.palette_query.clear();
         self.palette_open = true;
         self.refilter_palette();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Recompute the fuzzy hit list from the current query. Called ONLY on open +
@@ -2746,9 +2700,7 @@ impl App {
         self.palette_query.clear();
         self.palette_filtered = Vec::new();
         self.palette_registry = Vec::new();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Move the palette selection by `delta` rows (clamped), keeping it inside the
@@ -2776,9 +2728,7 @@ impl App {
         self.show_perf_hud = !self.show_perf_hud;
         self.reflow();
         self.persist();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// THE per-surface paint choke for the MAIN window (v0.23 central paint
@@ -2843,9 +2793,7 @@ impl App {
             C::NewTab => self.new_tab(),
             C::CloseTab => {
                 self.confirm_close = Some(self.active);
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
             }
             C::NextTab => self.switch_tab(true),
             C::PrevTab => self.switch_tab(false),
@@ -2904,18 +2852,14 @@ impl App {
             C::TogglePerfHud => self.toggle_perf_hud(),
             C::ShowWelcome => {
                 self.welcome_open = true;
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
             }
             C::Search => {
                 if !self.search_open {
                     self.search_open = true;
                     self.active_tab_mut().terminal.search_refresh();
                 }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
             }
             // The palette has already closed (run_palette_cmd runs after
             // close_palette), so overlay_owns_keys() is false and the mode enters.
@@ -2923,17 +2867,13 @@ impl App {
             C::CopyMode => self.enter_copy_mode(),
             C::PrevPrompt => {
                 if self.active_tab_mut().terminal.jump_prompt(false) {
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_main_paint();
                     self.update_link_hover(true);
                 }
             }
             C::NextPrompt => {
                 if self.active_tab_mut().terminal.jump_prompt(true) {
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_main_paint();
                     self.update_link_hover(true);
                 }
             }
@@ -2946,9 +2886,7 @@ impl App {
                 if let Some(text) = copied {
                     clipboard::set(&text);
                     self.active_tab_mut().terminal.selection_clear();
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_main_paint();
                 }
             }
             C::Paste => {
@@ -2967,16 +2905,12 @@ impl App {
                 self.keymap = crate::keymap::KeyMap::compile(&self.keys);
                 self.help_rows = App::compute_help_rows(&self.keymap, &self.summon_hotkey);
                 self.persist();
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
             }
             C::Hide => self.set_visibility(false, event_loop),
             C::Quit => {
                 self.confirm_quit = true;
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
             }
             // Index-bearing dynamic actions: `.get()`-guard against a stale index.
             C::SetTheme(i) => {
@@ -3022,9 +2956,7 @@ impl App {
         // ModifiersChanged) and the hovered CELL is unchanged, so without the
         // forced recompute tab 1's underline ghosts over tab 2's text (F12).
         self.update_link_hover(true);
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Return the cached tab-bar metadata, rebuilding it only when the titles
@@ -3083,9 +3015,7 @@ impl App {
         self.scroll_accum.reset();
         // And the cached link hover — recompute against the NEW tab's grid.
         self.update_link_hover(true);
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Commit an in-progress tab rename: write `rename_buf` back to the tab's
@@ -3102,9 +3032,7 @@ impl App {
                 self.tabs[i].manually_renamed = true;
             }
             self.rename_buf.clear();
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.request_main_paint();
         }
     }
 
@@ -3195,12 +3123,8 @@ impl App {
             }
         }
         self.persist();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
-        if let Some(w) = &self.settings_window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
+        self.request_settings_paint();
     }
 
     /// Flip the tab-bar position (top ↔ bottom): persist it and apply live. The
@@ -3212,12 +3136,8 @@ impl App {
         }
         self.tab_bar_bottom = bottom;
         self.persist();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
-        if let Some(w) = &self.settings_window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
+        self.request_settings_paint();
     }
 
     /// Set the scrollback history limit: persist it and live-apply to EVERY
@@ -3235,14 +3155,10 @@ impl App {
         }
         for dw in &mut self.detached {
             dw.tab.terminal.set_scrollback_lines(lines);
-            dw.window.request_redraw();
+            dw.request_paint();
         }
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
-        if let Some(w) = &self.settings_window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
+        self.request_settings_paint();
     }
 
     /// Returns the measured physical-pixel advance of one chrome-font character
@@ -3377,7 +3293,7 @@ impl App {
             if self.link_hover.take().is_some() {
                 if let Some(win) = &self.window {
                     win.set_cursor(self.desired_cursor(self.resize_cursor));
-                    win.request_redraw();
+                    self.request_main_paint();
                 }
             }
             return;
@@ -3397,7 +3313,7 @@ impl App {
             }
             // Redraw whenever the underline could have (dis)appeared or moved.
             if was_some || self.link_hover.is_some() {
-                win.request_redraw();
+                self.request_main_paint();
             }
         }
     }
@@ -3411,14 +3327,14 @@ impl App {
         if self.link_hover.take().is_some() {
             if let Some(win) = &self.window {
                 win.set_cursor(self.resize_cursor.cursor_icon());
-                win.request_redraw();
+                self.request_main_paint();
             }
         }
         for dw in &mut self.detached {
             dw.link_hover_cell = None;
             if dw.link_hover.take().is_some() {
                 dw.window.set_cursor(dw.resize_zone.cursor_icon());
-                dw.window.request_redraw();
+                dw.request_paint();
             }
         }
     }
@@ -3447,7 +3363,7 @@ impl App {
             dw.link_hover_cell = None;
             if dw.link_hover.take().is_some() {
                 dw.window.set_cursor(dw.resize_zone.cursor_icon());
-                dw.window.request_redraw();
+                dw.request_paint();
             }
             return;
         }
@@ -3476,7 +3392,7 @@ impl App {
             );
         }
         if was_some || dw.link_hover.is_some() {
-            dw.window.request_redraw();
+            dw.request_paint();
         }
     }
 
@@ -3990,9 +3906,7 @@ impl App {
         self.tab_menu_rects.clear();
         self.tab_menu_labels.clear();
         self.tab_drag = None;
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
         true
     }
 
@@ -4075,7 +3989,7 @@ impl App {
             let dscale = dw.window.scale_factor() as f32;
             dw.text.set_font_size(clamped * dscale);
             dw.reflow_pending_at = Some(reflow_at);
-            dw.window.request_redraw();
+            dw.request_paint();
         }
         // FontUp/Down/Reset are Ctrl chords — the link modifier is BY
         // DEFINITION held when they fire, and the cell metrics just changed
@@ -4088,9 +4002,7 @@ impl App {
             self.update_detached_link_hover(pos, true);
         }
         self.persist();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Change the font family at runtime. Updates `font_family`, tells the
@@ -4106,7 +4018,7 @@ impl App {
         for dw in &mut self.detached {
             dw.text.set_font_family(&self.font_family);
             dw.reflow_pending_at = Some(reflow_at);
-            dw.window.request_redraw();
+            dw.request_paint();
         }
         // The chrome is now DECOUPLED from the terminal font: it follows the
         // separate `ui_font_family`/`ui_font_logical` (set via `set_ui_font_*`),
@@ -4115,9 +4027,7 @@ impl App {
         // changes (and avoiding a chrome re-measure on every terminal-font pick).
         self.reflow();
         self.persist();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     /// Change the UI (chrome) font SIZE at runtime, clamped [10, 28]. Resizes the
@@ -4159,17 +4069,13 @@ impl App {
         for dw in &mut self.detached {
             let dscale = dw.window.scale_factor() as f32;
             dw.chrome_text.set_font_size(ui_logical * dscale);
-            dw.window.request_redraw();
+            dw.request_paint();
         }
         self.persist();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
         // Live preview in the settings window (specimen + readout) if it's open.
         self.render_settings_window();
-        if let Some(w) = &self.settings_window {
-            w.request_redraw();
-        }
+        self.request_settings_paint();
     }
 
     /// Change the UI (chrome) font FAMILY at runtime. `""` selects the platform
@@ -4197,16 +4103,12 @@ impl App {
         // chrome family is orthogonal to cols/rows (F7/F20).
         for dw in &mut self.detached {
             dw.chrome_text.set_ui_family(fam);
-            dw.window.request_redraw();
+            dw.request_paint();
         }
         self.persist();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
         self.render_settings_window();
-        if let Some(w) = &self.settings_window {
-            w.request_redraw();
-        }
+        self.request_settings_paint();
     }
 
     /// Perform the Yakuake-style focus-loss auto-hide of the main window.
@@ -4263,7 +4165,7 @@ impl App {
                 self.pending_autohide_at = None;
                 if let Some(win) = &self.window {
                     win.focus_window();
-                    win.request_redraw();
+                    self.request_main_paint();
                 }
             }
             return;
@@ -4322,7 +4224,7 @@ impl App {
                 self.summon_pending = true;
                 self.summon_settle_until =
                     Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
-                win.request_redraw();
+                self.request_main_paint();
             } else {
                 // Remember the current spot before hiding so the next Center
                 // summon restores it. Dropdown re-docks, so last_pos is unused.
@@ -4363,9 +4265,7 @@ impl App {
             self.close_settings_window();
             // Repaint the main window (nothing visual changed there now, but keep
             // it responsive/consistent).
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            self.request_main_paint();
             return;
         }
 
@@ -4699,7 +4599,7 @@ impl App {
                 // (F8/F17). On un-occlude, repaint once.
                 self.detached[pos].occluded = occluded;
                 if !occluded {
-                    self.detached[pos].window.request_redraw();
+                    self.detached[pos].request_paint();
                 }
             }
             WindowEvent::CloseRequested if pos < self.detached.len() => {
@@ -4818,16 +4718,16 @@ impl App {
                         self.opacity = (self.opacity + 0.05).min(1.0);
                         self.apply_theme();
                         self.persist();
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                        for dw in &self.detached { dw.window.request_redraw(); }
+                        self.request_main_paint();
+                        for dw in &self.detached { dw.request_paint(); }
                         return;
                     }
                     input::KeyAction::OpacityDown => {
                         self.opacity = (self.opacity - 0.05).max(0.1);
                         self.apply_theme();
                         self.persist();
-                        if let Some(w) = &self.window { w.request_redraw(); }
-                        for dw in &self.detached { dw.window.request_redraw(); }
+                        self.request_main_paint();
+                        for dw in &self.detached { dw.request_paint(); }
                         return;
                     }
                     // Scrollback search is main-window-only this release: a
@@ -4877,12 +4777,12 @@ impl App {
                     // always; the alt screen arrives here as Send instead).
                     input::KeyAction::ScrollPageUp => {
                         dw.tab.terminal.scroll_page(true);
-                        dw.window.request_redraw();
+                        dw.request_paint();
                         viewport_moved = true;
                     }
                     input::KeyAction::ScrollPageDown => {
                         dw.tab.terminal.scroll_page(false);
-                        dw.window.request_redraw();
+                        dw.request_paint();
                         viewport_moved = true;
                     }
                     // OSC 133 prompt jump on THIS window's own terminal (parity
@@ -4890,7 +4790,7 @@ impl App {
                     input::KeyAction::PrevPrompt | input::KeyAction::NextPrompt => {
                         let forward = action == input::KeyAction::NextPrompt;
                         if dw.tab.terminal.jump_prompt(forward) {
-                            dw.window.request_redraw();
+                            dw.request_paint();
                             viewport_moved = true;
                         }
                     }
@@ -4904,7 +4804,7 @@ impl App {
                         if let Some(text) = copied {
                             clipboard::set(&text);
                             dw.tab.terminal.selection_clear();
-                            dw.window.request_redraw();
+                            dw.request_paint();
                         }
                     }
                     input::KeyAction::Paste => {
@@ -4916,7 +4816,7 @@ impl App {
                     // window's own terminal.
                     input::KeyAction::SelectAll => {
                         dw.tab.terminal.select_all();
-                        dw.window.request_redraw();
+                        dw.request_paint();
                     }
                     input::KeyAction::Send(bytes) => {
                         // Escape closes this window's context menu (if open)
@@ -4925,7 +4825,7 @@ impl App {
                             dw.menu_open = None;
                             dw.menu_hover = None;
                             dw.menu_rects.clear();
-                            dw.window.request_redraw();
+                            dw.request_paint();
                             return;
                         }
                         let _ = dw.tab.writer.write_all(&bytes);
@@ -4942,7 +4842,7 @@ impl App {
                         if self.fx.caret_flash_enabled && is_printable_keystroke(&bytes) {
                             dw.caret_anim = Some(std::time::Instant::now());
                         }
-                        dw.window.request_redraw();
+                        dw.request_paint();
                     }
                     // Every other action (new/close/nav tab, font, opacity,
                     // panel, scroll, ...) is a main-window-only feature for
@@ -4966,7 +4866,7 @@ impl App {
                     if caret_flash_enabled && is_printable_keystroke(text.as_bytes()) {
                         dw.caret_anim = Some(std::time::Instant::now());
                     }
-                    dw.window.request_redraw();
+                    dw.request_paint();
                 }
             }
             WindowEvent::Resized(size) => {
@@ -4988,7 +4888,7 @@ impl App {
                 // computes the grid from the settled surface + cell size).
                 dw.reflow_pending_at =
                     Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
-                dw.window.request_redraw();
+                dw.request_paint();
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
@@ -5034,7 +4934,7 @@ impl App {
                     });
                     if new_hover != dw.menu_hover {
                         dw.menu_hover = new_hover;
-                        dw.window.request_redraw();
+                        dw.request_paint();
                     }
                     return;
                 }
@@ -5054,7 +4954,7 @@ impl App {
                     // (mirrors main's apply_scroll_from_cursor refresh).
                     dw.link_hover_cell = None;
                     dw.link_hover = None;
-                    dw.window.request_redraw();
+                    dw.request_paint();
                     return;
                 }
                 // Resize-edge / close-✕ hover feedback is suppressed while a
@@ -5080,7 +4980,7 @@ impl App {
                     let hover = input::point_in(&jetty_render::detached_close_rect(w), cx, cy);
                     if hover != dw.close_hover {
                         dw.close_hover = hover;
-                        dw.window.request_redraw();
+                        dw.request_paint();
                     }
                 }
                 // --- Text-selection drag continuation / mouse motion reports ---
@@ -5095,7 +4995,7 @@ impl App {
                             dw.tab.terminal.cols(), dw.tab.terminal.rows(),
                         );
                         dw.tab.terminal.selection_update(line, col, left_half);
-                        dw.window.request_redraw();
+                        dw.request_paint();
                     } else {
                         let drag = dw.tab.terminal.mouse_drag();
                         let motion = dw.tab.terminal.mouse_motion();
@@ -5148,7 +5048,7 @@ impl App {
                             cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
                         });
                         dw.menu_rects.clear();
-                        dw.window.request_redraw();
+                        dw.request_paint();
                         // Index → DETACHED_MENU_ITEMS order (Reattach/Copy/Paste).
                         match hit {
                             Some(0) => Act::Reattach,
@@ -5229,7 +5129,7 @@ impl App {
                                     ) {
                                         dw.tab.terminal.scroll_to_offset(o);
                                     }
-                                    dw.window.request_redraw();
+                                    dw.request_paint();
                                     return;
                                 }
                                 // Panel variants are unreachable (panel = None);
@@ -5283,7 +5183,7 @@ impl App {
                                     );
                                     dw.tab.terminal.selection_start(line, col, left_half);
                                     dw.selecting = true;
-                                    dw.window.request_redraw();
+                                    dw.request_paint();
                                 }
                             }
                             return;
@@ -5302,7 +5202,7 @@ impl App {
                             if let Some(text) = copied {
                                 clipboard::set(&text);
                                 dw.tab.terminal.selection_clear();
-                                dw.window.request_redraw();
+                                dw.request_paint();
                             }
                         }
                     }
@@ -5342,7 +5242,7 @@ impl App {
                             // Empty drag (plain click) — clear the highlight.
                             _ => dw.tab.terminal.selection_clear(),
                         }
-                        dw.window.request_redraw();
+                        dw.request_paint();
                         return;
                     }
                     if let Some((px, py)) = dw.mouse_grab_press.take() {
@@ -5375,7 +5275,7 @@ impl App {
                             ));
                             self.shift_hint_cooldown =
                                 Some(now + std::time::Duration::from_secs(25));
-                            dw.window.request_redraw();
+                            dw.request_paint();
                         }
                         return;
                     }
@@ -5472,7 +5372,7 @@ impl App {
                     &[],
                 );
                 dw.menu_rects = menu.item_rects;
-                dw.window.request_redraw();
+                dw.request_paint();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -5552,7 +5452,7 @@ impl App {
                     dw.link_hover_cell = None;
                     if dw.link_hover.take().is_some() {
                         dw.window.set_cursor(dw.resize_zone.cursor_icon());
-                        dw.window.request_redraw();
+                        dw.request_paint();
                     }
                 }
                 // F14: focus is leaving THIS detached window. If it departs to a
@@ -5652,7 +5552,7 @@ impl App {
                     let _ = dw.tab.writer.flush();
                 } else {
                     dw.tab.terminal.scroll_lines(lines);
-                    dw.window.request_redraw();
+                    dw.request_paint();
                     // Viewport moved under a stationary pointer (mirrors main).
                     self.update_detached_link_hover(pos, true);
                 }
@@ -5671,7 +5571,7 @@ impl App {
                 dw.chrome_text.set_font_size(ui_font_logical * scale);
                 dw.reflow_pending_at =
                     Some(std::time::Instant::now() + std::time::Duration::from_millis(120));
-                dw.window.request_redraw();
+                dw.request_paint();
             }
             _ => {}
         }
@@ -6274,9 +6174,7 @@ impl App {
                 // Session-only tab switch: change the active tab and redraw the
                 // settings window. Not persisted (resets to Look on restart).
                 self.settings_tab = i.min(4);
-                if let Some(w) = &self.settings_window {
-                    w.request_redraw();
-                }
+                self.request_settings_paint();
                 // Nothing to persist for a tab switch; return early so we don't
                 // write config or redraw the main terminal needlessly.
                 return;
@@ -6304,17 +6202,13 @@ impl App {
         // Redraw both windows: settings shows the updated control, main shows the
         // new theme/font/opacity live. set_font_size/set_font_family already redraw
         // the main window, but an extra request is harmless and keeps this simple.
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
-        if let Some(w) = &self.settings_window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
+        self.request_settings_paint();
         // Detached windows share the same theme/opacity/radius/CRT settings —
         // repaint them too so every surface reflects the change immediately
         // (one damage-driven request each; no polling).
         for dw in &self.detached {
-            dw.window.request_redraw();
+            dw.request_paint();
         }
     }
 
@@ -6324,9 +6218,7 @@ impl App {
         match event {
             WindowEvent::CloseRequested => {
                 self.close_settings_window();
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
             }
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.settings_gpu {
@@ -6335,9 +6227,7 @@ impl App {
                 if let (Some(gpu), Some(text)) = (&self.settings_gpu, &mut self.settings_text) {
                     text.resize(gpu);
                 }
-                if let Some(w) = &self.settings_window {
-                    w.request_redraw();
-                }
+                self.request_settings_paint();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 let scale = scale_factor as f32;
@@ -6353,9 +6243,7 @@ impl App {
                 if let Some(sp) = self.settings_specimen_text.as_mut() {
                     sp.set_font_size(self.ui_font_logical * scale);
                 }
-                if let Some(w) = &self.settings_window {
-                    w.request_redraw();
-                }
+                self.request_settings_paint();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.settings_cursor = (position.x, position.y);
@@ -6401,16 +6289,12 @@ impl App {
                             }
                         }
                     }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                    if let Some(w) = &self.settings_window {
-                        w.request_redraw();
-                    }
+                    self.request_main_paint();
+                    self.request_settings_paint();
                     // Radius/opacity/CRT sliders apply to detached windows too —
                     // repaint them live during the drag (damage-driven, no polling).
                     for dw in &self.detached {
-                        dw.window.request_redraw();
+                        dw.request_paint();
                     }
                 }
             }
@@ -6434,7 +6318,7 @@ impl App {
                     if let Some(w) = &self.window {
                         dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
                         self.pending_dock_frames = 5;
-                        w.request_redraw();
+                        self.request_main_paint();
                     }
                 }
                 self.dragging_slider = false;
@@ -6474,9 +6358,7 @@ impl App {
                         - jetty_render::EFFECTS_VISIBLE_H).max(0.0)
                         * dpi;
                     self.effects_scroll = (self.effects_scroll + delta_px).clamp(0.0, max_scroll);
-                    if let Some(w) = &self.settings_window {
-                        w.request_redraw();
-                    }
+                    self.request_settings_paint();
                     return;
                 }
                 // ── Font/UI-font list scroll (tabs 1) ────────────────────────────
@@ -6516,9 +6398,7 @@ impl App {
                     } else {
                         self.font_scroll_offset = (self.font_scroll_offset + 1).min(max_offset);
                     }
-                    if let Some(w) = &self.settings_window {
-                        w.request_redraw();
-                    }
+                    self.request_settings_paint();
                 } else if over_ui_list {
                     const MAX_UI_FONT_ROWS: usize = 4;
                     let max_offset = self.ui_font_families.len().saturating_sub(MAX_UI_FONT_ROWS);
@@ -6527,9 +6407,7 @@ impl App {
                     } else {
                         self.ui_font_scroll_offset = (self.ui_font_scroll_offset + 1).min(max_offset);
                     }
-                    if let Some(w) = &self.settings_window {
-                        w.request_redraw();
-                    }
+                    self.request_settings_paint();
                 }
             }
             WindowEvent::KeyboardInput { event, is_synthetic, .. } if event.state.is_pressed() => {
@@ -6541,9 +6419,7 @@ impl App {
                 // Escape closes the settings window.
                 if matches!(event.logical_key, winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)) {
                     self.close_settings_window();
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_main_paint();
                 }
             }
             WindowEvent::Focused(true) => {
@@ -6559,7 +6435,7 @@ impl App {
                     // macOS first-paint nudge: a request_redraw issued while the
                     // window was still being shown can be dropped, leaving it blank
                     // until the user clicks. Re-request now that it is shown+focused.
-                    w.request_redraw();
+                    self.request_settings_paint();
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -6633,21 +6509,26 @@ impl App {
     fn flush_expired_syncs(&mut self, now: std::time::Instant) {
         let active = self.active;
         let main_visible = self.visible && !self.main_occluded;
+        // Collect whether the active tab flushed while the main window is visible;
+        // the `self.request_main_paint()` choke borrows all of `self`, so it cannot
+        // be called inside the `self.tabs.iter_mut()` loop — request once after.
+        let mut main_needs_paint = false;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             if tab.terminal.sync_deadline().is_some_and(|d| now >= d) {
                 tab.terminal.flush_sync();
                 if i == active && main_visible {
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    main_needs_paint = true;
                 }
             }
+        }
+        if main_needs_paint {
+            self.request_main_paint();
         }
         for dw in &mut self.detached {
             if dw.tab.terminal.sync_deadline().is_some_and(|d| now >= d) {
                 dw.tab.terminal.flush_sync();
                 if !dw.occluded {
-                    dw.window.request_redraw();
+                    dw.request_paint();
                 }
             }
         }
@@ -7223,9 +7104,7 @@ impl ApplicationHandler<AppEvent> for App {
             self.config_watcher = crate::watch::spawn_config_watcher(self.proxy.clone());
         }
 
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_main_paint();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, ev: AppEvent) {
@@ -7268,9 +7147,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // not one per Wake — while a background OSC 0/2 title update
                 // still reaches the tab bar and taskbar title (F1/F14).
                 if (had_data || chrome_changed) && self.visible && !self.main_occluded {
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_main_paint();
                     // Grid content changed under an ACTIVE Ctrl+hover: revalidate
                     // the cached spans so the underline tracks (or vanishes with)
                     // the moved text. Only runs while a link is hovered — zero
@@ -7302,7 +7179,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // (F16). A title-only change repaints too: the detached
                     // top bar draws the title (F1/F14).
                     if (had || title_changed) && !dw.occluded {
-                        dw.window.request_redraw();
+                        dw.request_paint();
                         // Grid content changed under an ACTIVE Ctrl+hover in this
                         // window: revalidate the cached spans at the same cell
                         // (mirrors the main window's Wake-drain recompute; only
@@ -7398,9 +7275,7 @@ impl ApplicationHandler<AppEvent> for App {
         match event {
             WindowEvent::CloseRequested => {
                 self.confirm_quit = true;
-                if let Some(win) = &self.window {
-                    win.request_redraw();
-                }
+                self.request_main_paint();
             }
             WindowEvent::Occluded(occluded) => {
                 // The compositor tells us the main window is fully hidden behind
@@ -7410,9 +7285,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // un-occlude, request one redraw to repaint the freshly-shown surface.
                 self.main_occluded = occluded;
                 if !occluded {
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.request_main_paint();
                 }
             }
             WindowEvent::Resized(size) => {
@@ -7445,9 +7318,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // to the new col/row count when the single reflow fires.
                 self.reflow_pending_at =
                     Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // Fired when the window is moved between monitors with different DPI.
@@ -7470,9 +7341,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 self.reflow_pending_at =
                     Some(std::time::Instant::now() + std::time::Duration::from_millis(120));
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
@@ -7510,7 +7379,7 @@ impl ApplicationHandler<AppEvent> for App {
                     w.request_user_attention(None);
                     // macOS first-paint nudge (see the settings window above): ensure
                     // a frame is drawn once the window is actually shown + focused.
-                    w.request_redraw();
+                    self.request_main_paint();
                 }
             }
             WindowEvent::Focused(false) => {
@@ -7528,7 +7397,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.link_hover.take().is_some() {
                     if let Some(win) = &self.window {
                         win.set_cursor(self.resize_cursor.cursor_icon());
-                        win.request_redraw();
+                        self.request_main_paint();
                     }
                 }
                 // Yakuake-style auto-hide: hide when the window loses focus, but
@@ -7649,9 +7518,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let before = ctrl_hover_at(prev.0 as f32, prev.1 as f32, w, bar_y);
                     let after = ctrl_hover_at(position.x as f32, position.y as f32, w, bar_y);
                     if before != after {
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
+                        self.request_main_paint();
                     }
                 }
                 if self.dragging_scrollbar {
@@ -7662,9 +7529,7 @@ impl ApplicationHandler<AppEvent> for App {
                         return;
                     };
                     self.apply_scroll_from_cursor(w, h);
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.request_main_paint();
                 }
                 // --- Tab drag-out (tearing) tracking ---
                 // While a tab is held, flip the tearing state as the cursor
@@ -7705,9 +7570,7 @@ impl ApplicationHandler<AppEvent> for App {
                     });
                     if new_hover != self.tab_menu_hover {
                         self.tab_menu_hover = new_hover;
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
+                        self.request_main_paint();
                     }
                 }
                 // --- Text selection drag continuation ---
@@ -7717,9 +7580,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.selecting {
                     if let Some((line, col, left_half)) = self.cursor_cell_0_side() {
                         self.active_tab_mut().terminal.selection_update(line, col, left_half);
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
+                        self.request_main_paint();
                     }
                 }
                 // --- Context menu hover update ---
@@ -7733,9 +7594,7 @@ impl ApplicationHandler<AppEvent> for App {
                     });
                     if new_hover != self.menu_hover {
                         self.menu_hover = new_hover;
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
+                        self.request_main_paint();
                     }
                 }
                 // --- Ctrl+hover link tracking (cached on the hovered cell) ---
@@ -7774,9 +7633,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.copy_mode.is_some() {
                     self.active_tab_mut().terminal.selection_clear();
                     self.copy_mode = None;
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_main_paint();
                     // fall through to normal press handling
                 }
 
@@ -7847,9 +7704,7 @@ impl ApplicationHandler<AppEvent> for App {
                     {
                         self.confirm_quit = false;
                     }
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.request_main_paint();
                     return;
                 }
 
@@ -7871,9 +7726,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // Cancel button or click-outside cancels.
                         self.confirm_close = None;
                     }
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.request_main_paint();
                     return;
                 }
 
@@ -7909,9 +7762,7 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                     // Hit or not, the menu is closed — consume the click.
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.request_main_paint();
                     return;
                 }
 
@@ -7937,9 +7788,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 if let Some(text) = copied {
                                     clipboard::set(&text);
                                     self.active_tab_mut().terminal.selection_clear();
-                                    if let Some(win) = &self.window {
-                                        win.request_redraw();
-                                    }
+                                    self.request_main_paint();
                                 }
                             }
                             1 => {
@@ -7972,9 +7821,7 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     // Whether we hit an item or clicked outside, the menu is
                     // closed (Take above) — request a redraw and consume the click.
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.request_main_paint();
                     return;
                 }
 
@@ -7990,9 +7837,7 @@ impl ApplicationHandler<AppEvent> for App {
                     if !input::point_in(&help.panel, cx, cy) {
                         self.help_open = false;
                     }
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.request_main_paint();
                     return;
                 }
 
@@ -8080,9 +7925,7 @@ impl ApplicationHandler<AppEvent> for App {
                             self.context_menu = None;
                             self.menu_hover = None;
                         }
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
+                        self.request_main_paint();
                         return;
                     }
                     if input::point_in(&bar.settings_rect, cx, cy) {
@@ -8093,9 +7936,7 @@ impl ApplicationHandler<AppEvent> for App {
                     if input::point_in(&bar.close_rect, cx, cy) {
                         // Confirm before quitting the whole app (closes every tab).
                         self.confirm_quit = true;
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
+                        self.request_main_paint();
                         return;
                     }
                     if input::point_in(&bar.max_rect, cx, cy) {
@@ -8128,9 +7969,7 @@ impl ApplicationHandler<AppEvent> for App {
                         self.commit_rename();
                         // Ask before closing instead of closing immediately.
                         self.confirm_close = Some(i);
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
+                        self.request_main_paint();
                         return;
                     }
                     if input::point_in(&bar.plus_rect, cx, cy) {
@@ -8151,9 +7990,7 @@ impl ApplicationHandler<AppEvent> for App {
                             self.renaming = Some(i);
                             self.rename_buf = self.tabs[i].title.clone();
                             self.last_strip_click = None;
-                            if let Some(win) = &self.window {
-                                win.request_redraw();
-                            }
+                            self.request_main_paint();
                             return;
                         }
                         if is_double {
@@ -8193,9 +8030,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // A click in the grid area dismisses the welcome splash.
                 if self.welcome_open {
                     self.welcome_open = false;
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.request_main_paint();
                 }
 
                 let rows = self.active_tab().terminal.rows();
@@ -8280,9 +8115,7 @@ impl ApplicationHandler<AppEvent> for App {
                         self.dragging_scrollbar = true;
                         self.drag_grab_dy = scrollbar.map(|r| r.h / 2.0).unwrap_or(0.0);
                         self.apply_scroll_from_cursor(w, h);
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
+                        self.request_main_paint();
                     }
                     input::MouseAction::None => {
                         // Ctrl+click (also Cmd+click on macOS) on a detected link
@@ -8335,9 +8168,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 self.active_tab_mut().terminal.selection_start(line, col, left_half);
                             }
                             self.selecting = true;
-                            if let Some(win) = &self.window {
-                                win.request_redraw();
-                            }
+                            self.request_main_paint();
                         }
                     }
                 }
@@ -8420,9 +8251,7 @@ impl ApplicationHandler<AppEvent> for App {
                             cx, cy, w, h, None, &theme, self.chrome_char_w(), &items, &[],
                         );
                         self.tab_menu_rects = menu.item_rects;
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
+                        self.request_main_paint();
                     }
                     return;
                 }
@@ -8446,9 +8275,7 @@ impl ApplicationHandler<AppEvent> for App {
                     );
                     self.menu_item_rects = menu.item_rects;
                 }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_main_paint();
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 // --- Tab drag-out release ---
@@ -8497,9 +8324,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // No selection text → plain click, clear selection.
                         self.active_tab_mut().terminal.selection_clear();
                     }
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.request_main_paint();
                 }
 
                 // The press marker is set ONLY when the matching press was
@@ -8540,7 +8365,7 @@ impl ApplicationHandler<AppEvent> for App {
                             ));
                             self.shift_hint_cooldown =
                                 Some(now + std::time::Duration::from_secs(25));
-                            win.request_redraw();
+                            self.request_main_paint();
                         }
                     }
                 }
@@ -8610,9 +8435,7 @@ impl ApplicationHandler<AppEvent> for App {
                     };
                     if step != 0 {
                         self.palette_move(step);
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        self.request_main_paint();
                     }
                     return;
                 }
@@ -8689,9 +8512,7 @@ impl ApplicationHandler<AppEvent> for App {
                         let _ = w.flush();
                     } else {
                         self.active_tab_mut().terminal.scroll_lines(lines);
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        self.request_main_paint();
                         // The viewport moved under a stationary pointer: the
                         // hovered CELL is unchanged but its content is not.
                         self.update_link_hover(true);
@@ -8724,9 +8545,7 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                         Key::Named(NamedKey::Escape) => {
                             self.confirm_quit = false;
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.request_main_paint();
                             return;
                         }
                         _ => return,
@@ -8749,9 +8568,7 @@ impl ApplicationHandler<AppEvent> for App {
                             self.confirm_close = None;
                             self.context_menu = None;
                             self.menu_hover = None;
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.request_main_paint();
                             return;
                         }
                         // Swallow every other key while the popup is open.
@@ -8774,15 +8591,11 @@ impl ApplicationHandler<AppEvent> for App {
                             self.rename_buf.clear();
                             self.context_menu = None;
                             self.menu_hover = None;
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.request_main_paint();
                         }
                         Key::Named(NamedKey::Backspace) => {
                             self.rename_buf.pop();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.request_main_paint();
                         }
                         _ => {
                             // Append any printable text the key produced.
@@ -8792,9 +8605,7 @@ impl ApplicationHandler<AppEvent> for App {
                                         self.rename_buf.push(ch);
                                     }
                                 }
-                                if let Some(w) = &self.window {
-                                    w.request_redraw();
-                                }
+                                self.request_main_paint();
                             }
                         }
                     }
@@ -8868,9 +8679,7 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                         }
                     }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_main_paint();
                     return;
                 }
                 // --- Hint mode captures ALL keys while active ---
@@ -8934,9 +8743,7 @@ impl ApplicationHandler<AppEvent> for App {
                     self.help_open = false;
                     self.context_menu = None;
                     self.menu_hover = None;
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_main_paint();
                     return;
                 }
                 // --- Scrollback-search bar captures all keys while open ---
@@ -9005,9 +8812,7 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                         }
                     }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_main_paint();
                     return;
                 }
                 let ctrl = self.modifiers.control_key();
@@ -9109,9 +8914,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // ensure the settings window is closed.
                         if self.settings_window.is_some() {
                             self.close_settings_window();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.request_main_paint();
                         }
                     }
                     input::KeyAction::NewTab => {
@@ -9120,9 +8923,7 @@ impl ApplicationHandler<AppEvent> for App {
                     input::KeyAction::CloseTab => {
                         // Ask before closing instead of closing immediately.
                         self.confirm_close = Some(self.active);
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        self.request_main_paint();
                     }
                     input::KeyAction::DetachTab => {
                         self.detach_tab(self.active, event_loop, None);
@@ -9141,9 +8942,7 @@ impl ApplicationHandler<AppEvent> for App {
                             // scrollback rotated while closed) never render.
                             // No-op when no query is set.
                             self.active_tab_mut().terminal.search_refresh();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.request_main_paint();
                         }
                     }
                     input::KeyAction::NextTab => {
@@ -9159,31 +8958,23 @@ impl ApplicationHandler<AppEvent> for App {
                         self.opacity = (self.opacity + 0.05).min(1.0);
                         self.apply_theme();
                         self.persist();
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        self.request_main_paint();
                     }
                     input::KeyAction::OpacityDown => {
                         self.opacity = (self.opacity - 0.05).max(0.1);
                         self.apply_theme();
                         self.persist();
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        self.request_main_paint();
                     }
                     input::KeyAction::ScrollPageUp => {
                         self.active_tab_mut().terminal.scroll_page(true);
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        self.request_main_paint();
                         // Viewport moved under the pointer (see MouseWheel).
                         self.update_link_hover(true);
                     }
                     input::KeyAction::ScrollPageDown => {
                         self.active_tab_mut().terminal.scroll_page(false);
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        self.request_main_paint();
                         self.update_link_hover(true);
                     }
                     // OSC 133 prompt jump (Ctrl+Shift+Z prev / Ctrl+Shift+X next).
@@ -9192,9 +8983,7 @@ impl ApplicationHandler<AppEvent> for App {
                     input::KeyAction::PrevPrompt | input::KeyAction::NextPrompt => {
                         let forward = action == input::KeyAction::NextPrompt;
                         if self.active_tab_mut().terminal.jump_prompt(forward) {
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.request_main_paint();
                             self.update_link_hover(true);
                         }
                     }
@@ -9218,9 +9007,7 @@ impl ApplicationHandler<AppEvent> for App {
                         if let Some(text) = copied {
                             clipboard::set(&text);
                             self.active_tab_mut().terminal.selection_clear();
-                            if let Some(win) = &self.window {
-                                win.request_redraw();
-                            }
+                            self.request_main_paint();
                         }
                     }
                     input::KeyAction::Paste => {
@@ -9233,17 +9020,13 @@ impl ApplicationHandler<AppEvent> for App {
                         // Folded from the old macOS Cmd+A block; also reachable via a
                         // user remap on any platform.
                         self.active_tab_mut().terminal.select_all();
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        self.request_main_paint();
                     }
                     input::KeyAction::Quit => {
                         // Folded from the old macOS Cmd+Q block: open the quit
                         // confirmation (never quit outright), matching today.
                         self.confirm_quit = true;
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        self.request_main_paint();
                     }
                     // Hint / copy-mode enter. Only reached when no other overlay
                     // owns keys (they capture the chord earlier and swallow it) —
@@ -9266,9 +9049,7 @@ impl ApplicationHandler<AppEvent> for App {
                             self.tab_menu_hover = None;
                             self.tab_menu_rects.clear();
                             self.tab_menu_labels.clear();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.request_main_paint();
                             return;
                         }
                         // Esc also dismisses the welcome splash (but still reaches PTY).
@@ -9297,9 +9078,7 @@ impl ApplicationHandler<AppEvent> for App {
                             && is_printable_keystroke(&bytes)
                         {
                             self.caret_anim = Some(std::time::Instant::now());
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.request_main_paint();
                         }
                     }
                     input::KeyAction::None => {}
@@ -9340,9 +9119,7 @@ impl ApplicationHandler<AppEvent> for App {
                             self.rename_buf.push(ch);
                         }
                     }
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.request_main_paint();
                     return;
                 }
                 // The command palette captures IME commits into its query
@@ -9359,9 +9136,7 @@ impl ApplicationHandler<AppEvent> for App {
                     if changed {
                         self.refilter_palette();
                     }
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.request_main_paint();
                     return;
                 }
                 // The scrollback-search bar captures IME commits so CJK users
@@ -9370,9 +9145,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let mut q = self.active_tab().terminal.search_query().to_string();
                     q.extend(text.chars().filter(|c| !c.is_control()));
                     self.active_tab_mut().terminal.search_set_query(&q);
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.request_main_paint();
                     return;
                 }
                 if self.welcome_open {
@@ -9389,9 +9162,7 @@ impl ApplicationHandler<AppEvent> for App {
                 {
                     self.caret_anim = Some(std::time::Instant::now());
                 }
-                if let Some(win) = &self.window {
-                    win.request_redraw();
-                }
+                self.request_main_paint();
             }
             WindowEvent::RedrawRequested => {
                 // Hidden (F9) window: never run the full render pipeline
