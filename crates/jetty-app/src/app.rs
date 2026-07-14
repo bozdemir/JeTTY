@@ -4847,12 +4847,11 @@ impl App {
                             dw.request_paint();
                             return;
                         }
-                        let _ = dw.tab.writer.write_all(&bytes);
-                        let _ = dw.tab.writer.flush();
-                        // Any real keystroke jumps this window's view back to the
-                        // live bottom, same as the main window's Send arm — else
-                        // typing while scrolled up into scrollback goes blind (F30).
-                        dw.tab.terminal.scroll_to_bottom();
+                        // Snap this window's view to the live bottom (else typing
+                        // while scrolled up goes blind, F30) then write to the PTY
+                        // — the shared input core, same as the main Send arm
+                        // (v0.23 Task 9).
+                        write_key_to_pty(&mut dw.tab, &bytes);
                         // Caret flash on printable keystrokes — same trigger as
                         // the main window (app.rs ~5010), on THIS window's own
                         // burst clock. Glow is main-window-only (its CaretFx
@@ -4878,10 +4877,9 @@ impl App {
                 if !text.is_empty() {
                     let caret_flash_enabled = self.fx.caret_flash_enabled;
                     let Some(dw) = self.detached.get_mut(pos) else { return };
-                    let _ = dw.tab.writer.write_all(text.as_bytes());
-                    let _ = dw.tab.writer.flush();
-                    // Snap to the live bottom on commit, same as the Send arm (F30).
-                    dw.tab.terminal.scroll_to_bottom();
+                    // Snap to the live bottom (F30) then write to the PTY — the
+                    // shared input core, same as the Send arm (v0.23 Task 9).
+                    write_key_to_pty(&mut dw.tab, text.as_bytes());
                     if caret_flash_enabled && is_printable_keystroke(text.as_bytes()) {
                         dw.caret_anim = Some(std::time::Instant::now());
                     }
@@ -5498,13 +5496,7 @@ impl App {
                 // like the main window, then either forward wheel mouse reports
                 // (mouse-mode app, not over the scrollbar) or scroll THIS
                 // window's own scrollback.
-                let delta_lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * 3.0,
-                    MouseScrollDelta::PixelDelta(p) => {
-                        const CELL_H: f64 = 20.0;
-                        (p.y / CELL_H) as f32
-                    }
-                };
+                let delta_lines = wheel_delta_to_lines(delta);
                 let status_h = self.status_h();
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 // Use THIS window's own accumulator so a leftover fraction never
@@ -8417,14 +8409,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // per-event round() discarded entirely — the accumulator emits
                 // whole lines and carries the remainder, so gentle scrolls move
                 // both the scrollback and mouse-mode apps.
-                let delta_lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * 3.0,
-                    MouseScrollDelta::PixelDelta(p) => {
-                        // Approximate cell height; use 20.0 as a reasonable default.
-                        const CELL_H: f64 = 20.0;
-                        (p.y / CELL_H) as f32
-                    }
-                };
+                let delta_lines = wheel_delta_to_lines(delta);
                 let lines = self.scroll_accum.add(delta_lines);
                 if lines != 0 {
                     // When the app enabled mouse reporting, forward wheel events
@@ -9029,11 +9014,10 @@ impl ApplicationHandler<AppEvent> for App {
                         if self.welcome_open {
                             self.welcome_open = false;
                         }
-                        // Any real keystroke jumps back to the bottom so the user sees their input.
-                        self.active_tab_mut().terminal.scroll_to_bottom();
-                        let w = &mut self.tabs[self.active].writer;
-                        let _ = w.write_all(&bytes);
-                        let _ = w.flush();
+                        // Any real keystroke jumps back to the bottom so the user
+                        // sees their input, then writes to the PTY (shared input
+                        // core, v0.23 Task 9).
+                        write_key_to_pty(self.active_tab_mut(), &bytes);
                         // Input-latency START stamp (JETTY_PERF_LOG only): record the
                         // keystroke instant so the frame that reflects its echo can
                         // measure keypress→glyph. Gated on `perf.on` (a bool read once
@@ -9123,12 +9107,9 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.welcome_open {
                     self.welcome_open = false;
                 }
-                // Same discipline as the Send arm: jump to the live bottom
-                // so the user sees their input.
-                self.active_tab_mut().terminal.scroll_to_bottom();
-                let w = &mut self.tabs[self.active].writer;
-                let _ = w.write_all(text.as_bytes());
-                let _ = w.flush();
+                // Same discipline as the Send arm: jump to the live bottom then
+                // write to the PTY (shared input core, v0.23 Task 9).
+                write_key_to_pty(self.active_tab_mut(), text.as_bytes());
                 if (self.fx.caret_flash_enabled || self.fx.caret_glow_enabled)
                     && is_printable_keystroke(text.as_bytes())
                 {
