@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.23.0] — 2026-07-15
+
+**Speed-coherence refactor + the p10k resize fix.** An internal release: the
+paint scheduling and the per-window render/input paths are consolidated so the
+~0%-idle invariant is a single auditable choke and the main + detached windows
+share one render core (no more fixing everything twice) — with behavior
+preserved exactly, verified by an adversarial code review and a live proof
+harness. Plus a long-standing user-visible bug is fixed.
+
+### Fixed
+- **p10k / starship prompt-scatter on resize.** Resizing (font `Ctrl +/-` or a
+  window corner-drag) no longer scatters copies of the prompt across the screen.
+  When you're idle at a clean prompt with no output to lose, the reflow is
+  wiped-and-repainted so it leaves no stray fragments; the shell repaints exactly
+  one prompt. Content-safe by construction — a tab that has produced any command
+  output is never cleared.
+
+### Changed (internal — no behavior change)
+- Central paint chokepoint: every producer redraw routes through one per-surface
+  `request_paint()` with a CI grep, so an ungated redraw can't silently regress
+  the ~0%-idle invariant. All load-bearing occlusion/visibility gates preserved
+  verbatim.
+- Shared `render_grid_scene` + input core: the main and detached windows now
+  share one render and input path (main-only passes — caret glow, CRT/Tier-B,
+  dropdown slide, mid-scene chrome — stay caller-injected, so a detached window
+  gains none of them). Eliminates the near-duplicate `render_detached_window`.
+- New `scripts/verify-idle.sh` proof harness + a `JETTY_FRAME_LOG` missed-paint
+  counter for validating the refactor on real hardware.
+
+---
+
 ## [0.22.0] — 2026-07-13
 
 **Inline images, the Kitty way.** JeTTY now speaks the Kitty graphics protocol, so
