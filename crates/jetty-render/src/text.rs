@@ -1002,6 +1002,28 @@ impl TextLayer {
     /// confirm, welcome, window controls). With a `Named` UI family they render in
     /// it; at the `Sans` default they render in the mono Nerd Font (preserving its
     /// symbol glyphs ⇧ ⌃ ⚡ ⚙ ✕ …), exactly as before this feature.
+    /// Measure the ACTUAL rendered width (physical px) of a chrome overlay string
+    /// under the current UI family + size, using the SAME Advanced shaping as
+    /// [`Self::render_overlays`]. Chrome overlays are PROPORTIONAL (no grid snap),
+    /// so `chars().count() * cell_size().0` mis-measures a non-monospace UI font —
+    /// use this to right-align the perf HUD / shift-hint pill correctly.
+    pub fn measure_overlay_width(&mut self, text: &str) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let ui_family = self.ui_family.clone();
+        let mono_fallback = self.font_family.clone();
+        let metrics = self.metrics;
+        let mut b = Buffer::new(&mut self.font_system, metrics);
+        let attrs = Attrs::new().family(ui_family.as_family(false, &mono_fallback));
+        b.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
+        b.set_size(&mut self.font_system, None, Some(metrics.line_height));
+        b.layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .map(|g| g.x + g.w)
+            .fold(0.0_f32, f32::max)
+    }
+
     pub fn render_overlays(
         &mut self,
         device: &wgpu::Device,

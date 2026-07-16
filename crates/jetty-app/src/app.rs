@@ -5842,7 +5842,9 @@ impl App {
             };
             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[strip]);
             if let Some(perf) = perf_label.as_deref() {
-                let perf_w = perf.chars().count() as f32 * chrome_char_w;
+                // Measure the ACTUAL proportional width (chars×cell_w mis-aligns a
+                // non-monospace UI font), same fix as the main perf HUD.
+                let perf_w = chrome_text.measure_overlay_width(perf);
                 let px = (width as f32 - perf_w - 12.0).max(8.0);
                 let dim = nl(0.5);
                 let py = sy + (status_h - 16.0) / 2.0;
@@ -5858,7 +5860,7 @@ impl App {
         // only on frames where the 3.5s flag is live — no steady-state cost.
         if shift_hint_show {
             let hint = "Hold Shift while dragging to select text";
-            let tw = hint.chars().count() as f32 * chrome_char_w;
+            let tw = chrome_text.measure_overlay_width(hint);
             let pad = 14.0;
             let pill_w = tw + pad * 2.0;
             let pill_h = 26.0;
@@ -9722,9 +9724,10 @@ impl ApplicationHandler<AppEvent> for App {
                                 color: nl(0.05), ..Default::default()
                             };
                             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[strip]);
-                            // Right-align the perf text within the strip.
-                            let cw = chrome_text.cell_size().0;
-                            let perf_w = perf.chars().count() as f32 * cw;
+                            // Right-align the perf text within the strip. Measure
+                            // the ACTUAL proportional width (chars×cell_w is wrong
+                            // for a non-monospace UI font — it left-floated the HUD).
+                            let perf_w = chrome_text.measure_overlay_width(perf);
                             let px = (width as f32 - perf_w - 12.0).max(8.0);
                             let dim = nl(0.5);
                             let py = sy + (status_h - 16.0) / 2.0;
@@ -9739,8 +9742,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // they discover the Shift+drag-to-select gesture. Throttled.
                     if shift_hint_show {
                         let hint = "Hold Shift while dragging to select text";
-                        let cw = chrome_text.cell_size().0;
-                        let tw = hint.chars().count() as f32 * cw;
+                        let tw = chrome_text.measure_overlay_width(hint);
                         let pad = 14.0;
                         let pill_w = tw + pad * 2.0;
                         let pill_h = 26.0;

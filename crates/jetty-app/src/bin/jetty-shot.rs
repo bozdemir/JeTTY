@@ -1001,7 +1001,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rects.push(jetty_render::Rect {
                     x: 0.0, y: sy, w: width as f32, h: STATUS_H, color: nl(0.05), ..Default::default()
                 });
-                let perf_w = perf.chars().count() as f32 * chrome_char_w;
+                // Measure the ACTUAL proportional width (matches the app fix).
+                let perf_w = chrome_text.measure_overlay_width(perf);
                 let px = (width as f32 - perf_w - 12.0).max(8.0);
                 let dim = nl(0.5);
                 panel_labels.push((perf.to_string(), px, sy + (STATUS_H - 16.0) / 2.0, [dim[0], dim[1], dim[2]]));
@@ -1049,7 +1050,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 x: 0.0, y: sy, w: width as f32, h: shot_status_h, color: nl(0.05), ..Default::default()
             });
             if let Some(perf) = perf {
-                let perf_w = perf.chars().count() as f32 * chrome_char_w;
+                // Measure the ACTUAL proportional width (matches the app fix).
+                let perf_w = chrome_text.measure_overlay_width(&perf);
                 let px = (width as f32 - perf_w - 12.0).max(8.0);
                 let dim = nl(0.5);
                 panel_labels.push((perf, px, sy + (shot_status_h - 16.0) / 2.0, [dim[0], dim[1], dim[2]]));
