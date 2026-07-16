@@ -796,6 +796,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Tab titles render in the proportional sans (Family::SansSerif); collect
         // them separately so the harness renders them like the live app does.
         let mut panel_title_labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
+        // Welcome splash labels render with the TERMINAL (monospace) layer, not
+        // chrome_text — kept separate so the block-art logo aligns.
+        let mut welcome_labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
 
         // JETTY_SHOT_SEARCH — the themed search bar (top-right of the grid),
         // built with the SAME builder + args as the app's draw call.
@@ -1059,6 +1062,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (ASCII logo + info rows + 16-color swatch + tip) so the logo legibility
         // and layout can be eyeballed headlessly.
         if env_flag("JETTY_SHOT_WELCOME") {
+            // Terminal (monospace) cell metrics — the welcome renders with the
+            // terminal font in the app, so the block-art logo aligns regardless
+            // of the UI font. Mirror that here for a faithful screenshot.
+            let (wcw, wch) = text.cell_size();
             let splash = jetty_render::build_welcome_overlay(
                 width,
                 height,
@@ -1066,10 +1073,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 env!("CARGO_PKG_VERSION"),
                 "Vulkan",
                 terminal.theme(),
-                chrome_char_w,
+                wcw,
+                wch,
             );
             rects.extend(splash.quads);
-            panel_labels.extend(splash.labels);
+            welcome_labels.extend(splash.labels);
             eprintln!("jetty-shot: JETTY_SHOT_WELCOME rendered welcome splash");
         }
 
@@ -1099,6 +1107,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if !panel_title_labels.is_empty() {
             chrome_text.render_overlays_sans(&device, &queue, &view, width, height, &panel_title_labels)?;
+        }
+        // Welcome splash: terminal (monospace) layer so the block-art logo aligns.
+        if !welcome_labels.is_empty() {
+            text.render_overlays(&device, &queue, &view, width, height, &welcome_labels)?;
         }
         // Live "Aa" specimen at the TRUE UI size (chrome_text is at the UI size in
         // the harness), drawn over the capped panel-text pass — mirrors the app's

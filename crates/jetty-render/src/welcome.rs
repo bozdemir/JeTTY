@@ -51,6 +51,7 @@ pub fn build_welcome_overlay(
     backend: &str,
     theme: &jetty_core::Theme,
     char_w: f32,
+    line_h: f32,
 ) -> WelcomeOverlay {
     // --- Theme-derived colors (mirrors help.rs / panel.rs) ---
     // All colors blend the active theme's bg→fg so the overlay re-skins itself
@@ -74,9 +75,11 @@ pub fn build_welcome_overlay(
     let tip_col = lerp(0.35);
 
     // --- Layout constants (physical px) ---
-    // char_w is the caller-supplied measured chrome advance (scale-correct).
-    // Comfortable line height for the info rows.
-    const LINE_H: f32 = 22.0;
+    // `char_w` / `line_h` are the caller-supplied MONOSPACE terminal cell metrics
+    // (advance × line height). The overlay renders with the terminal font — like
+    // real neofetch output — so the block-art logo stays column- AND row-aligned
+    // regardless of the (possibly proportional) UI/chrome font. Spacing the logo
+    // rows by exactly the cell height makes the full-block glyphs tile seamlessly.
     // Top inset from the grid origin.
     const TOP_INSET: f32 = 20.0;
     // Left inset from the window left edge.
@@ -111,8 +114,8 @@ pub fn build_welcome_overlay(
 
     // Compute logo block height so we can vertically center the info rows
     // alongside it (or just start them from the top of the logo).
-    let logo_h = LOGO.len() as f32 * LINE_H;
-    let info_h = info_rows.len() as f32 * LINE_H;
+    let logo_h = LOGO.len() as f32 * line_h;
+    let info_h = info_rows.len() as f32 * line_h;
     // Vertically center the info block relative to the logo block.
     let info_y_offset = ((logo_h - info_h) / 2.0).max(0.0);
 
@@ -151,7 +154,7 @@ pub fn build_welcome_overlay(
     // ASCII logo block (accent-colored).
     let logo_top = grid_top_px + TOP_INSET;
     for (i, line) in LOGO.iter().enumerate() {
-        let y = logo_top + i as f32 * LINE_H;
+        let y = logo_top + i as f32 * line_h;
         labels.push((line.to_string(), LEFT_INSET, y, accent));
     }
 
@@ -159,7 +162,7 @@ pub fn build_welcome_overlay(
     // each to keep layout predictable (no mid-string color changes needed).
     let info_top = logo_top + info_y_offset;
     for (i, (key, val)) in info_rows.iter().enumerate() {
-        let y = info_top + i as f32 * LINE_H;
+        let y = info_top + i as f32 * line_h;
         // Key label.
         let padded_key = format!("{:>width$}{}", key, sep, width = key_col_chars);
         labels.push((padded_key, info_x, y, dim_col));
@@ -191,27 +194,27 @@ mod tests {
 
     #[test]
     fn labels_non_empty() {
-        let w = build_welcome_overlay(1000, 700, 36.0, "0.1.0", "Vulkan", &theme(), TEST_CHAR_W);
+        let w = build_welcome_overlay(1000, 700, 36.0, "0.1.0", "Vulkan", &theme(), TEST_CHAR_W, 22.0);
         assert!(!w.labels.is_empty(), "welcome overlay must have labels");
     }
 
     #[test]
     fn swatch_quad_count_is_16() {
-        let w = build_welcome_overlay(1000, 700, 36.0, "0.1.0", "Vulkan", &theme(), TEST_CHAR_W);
+        let w = build_welcome_overlay(1000, 700, 36.0, "0.1.0", "Vulkan", &theme(), TEST_CHAR_W, 22.0);
         // All quads are swatches (16 ANSI colors).
         assert_eq!(w.quads.len(), 16, "expected exactly 16 swatch quads");
     }
 
     #[test]
     fn content_includes_jetty() {
-        let w = build_welcome_overlay(1000, 700, 36.0, "0.1.0", "Vulkan", &theme(), TEST_CHAR_W);
+        let w = build_welcome_overlay(1000, 700, 36.0, "0.1.0", "Vulkan", &theme(), TEST_CHAR_W, 22.0);
         let joined: String = w.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("JeTTY"), "welcome overlay must mention JeTTY");
     }
 
     #[test]
     fn content_includes_tip() {
-        let w = build_welcome_overlay(1000, 700, 36.0, "0.1.0", "Vulkan", &theme(), TEST_CHAR_W);
+        let w = build_welcome_overlay(1000, 700, 36.0, "0.1.0", "Vulkan", &theme(), TEST_CHAR_W, 22.0);
         let joined: String = w.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("tip:"), "welcome overlay must include a tip line");
     }
@@ -219,20 +222,20 @@ mod tests {
     #[test]
     fn works_at_small_window() {
         // Should not panic at small sizes; we just clip gracefully.
-        let w = build_welcome_overlay(320, 200, 36.0, "0.1.0", "Gl", &theme(), TEST_CHAR_W);
+        let w = build_welcome_overlay(320, 200, 36.0, "0.1.0", "Gl", &theme(), TEST_CHAR_W, 22.0);
         assert_eq!(w.quads.len(), 16);
     }
 
     #[test]
     fn backend_name_appears_in_render_row() {
-        let w = build_welcome_overlay(1000, 700, 36.0, "1.2.3", "Metal", &theme(), TEST_CHAR_W);
+        let w = build_welcome_overlay(1000, 700, 36.0, "1.2.3", "Metal", &theme(), TEST_CHAR_W, 22.0);
         let joined: String = w.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("Metal"), "backend name must appear in Render row");
     }
 
     #[test]
     fn version_appears() {
-        let w = build_welcome_overlay(1000, 700, 36.0, "9.8.7", "Vulkan", &theme(), TEST_CHAR_W);
+        let w = build_welcome_overlay(1000, 700, 36.0, "9.8.7", "Vulkan", &theme(), TEST_CHAR_W, 22.0);
         let joined: String = w.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("9.8.7"), "version must appear in welcome");
     }

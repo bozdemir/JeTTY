@@ -9834,6 +9834,11 @@ impl ApplicationHandler<AppEvent> for App {
                         && !confirm_quit
                         && palette_ui.is_none()
                     {
+                        // Render the neofetch splash with the MONOSPACE terminal
+                        // font (its cell metrics), NOT the chrome/UI font: the
+                        // block-art logo needs fixed advances + row pitch to stay
+                        // aligned, and a proportional UI font garbled it.
+                        let (welcome_cw, welcome_ch) = text.cell_size();
                         let mut splash = jetty_render::build_welcome_overlay(
                             width,
                             height,
@@ -9841,7 +9846,8 @@ impl ApplicationHandler<AppEvent> for App {
                             env!("CARGO_PKG_VERSION"),
                             &gpu_backend_name,
                             &theme,
-                            chrome_char_w,
+                            welcome_cw,
+                            welcome_ch,
                         );
                         // Clip the splash to the grid area so it never draws over a
                         // bottom tab bar (e.g. on a very short window): drop swatch
@@ -9864,7 +9870,9 @@ impl ApplicationHandler<AppEvent> for App {
                             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &splash.quads);
                         }
                         if !splash.labels.is_empty() {
-                            let _ = chrome_text.render_overlays(
+                            // Terminal (monospace) layer so the block-art logo
+                            // aligns regardless of the UI font.
+                            let _ = text.render_overlays(
                                 &gpu.device, &gpu.queue, scene_view, width, height, &splash.labels,
                             );
                         }
