@@ -1440,22 +1440,23 @@ impl App {
                 .next()
                 .unwrap_or_else(|| "(unbound)".to_string())
         };
+        // Sectioned (`## ` header, "" spacer, "KEY — desc" item) so the overlay
+        // renders section headers + aligned key/description columns. Mirrors the
+        // static `jetty_render::HELP_ROWS`, but with LIVE keymap chords.
         vec![
-            format!("{summon_hotkey} (configurable) — Summon / hide"),
+            "## Tabs & windows".to_string(),
             format!("{} — New tab", all(A::NewTab)),
             format!("{} — Close tab", all(A::CloseTab)),
-            format!("{} / {} — Next / Prev tab", first(A::NextTab), first(A::PrevTab)),
-            "Ctrl+1..9 — Jump to tab".to_string(),
+            format!("{} / {} — Next / previous tab", first(A::NextTab), first(A::PrevTab)),
+            "Ctrl+1…9 — Jump to tab".to_string(),
             format!(
-                "{} / drag tab off bar — Detach / reattach (right-click tab for menu)",
+                "{} — Detach / reattach tab   (drag off bar; right-click for menu)",
                 all(A::DetachTab)
             ),
-            "Double-click tab / top bar — Rename / Maximize".to_string(),
-            format!(
-                "{} — Command palette   (Settings: {})",
-                first(A::OpenPalette),
-                all(A::ToggleSettings)
-            ),
+            "Double-click tab / top bar — Rename / maximize".to_string(),
+            "Drag top bar / edges — Move / resize window".to_string(),
+            String::new(),
+            "## Appearance".to_string(),
             format!(
                 "{} / {} / {} — Font size",
                 first(A::FontUp),
@@ -1463,33 +1464,42 @@ impl App {
                 first(A::FontReset)
             ),
             format!("{} / {} — Transparency", first(A::OpacityUp), first(A::OpacityDown)),
-            format!("{} / {} — Copy / Paste", first(A::Copy), first(A::Paste)),
+            format!("{} — Settings", all(A::ToggleSettings)),
+            format!("{} — Command palette", first(A::OpenPalette)),
+            String::new(),
+            "## Clipboard & selection".to_string(),
+            format!("{} / {} — Copy / paste", first(A::Copy), first(A::Paste)),
+            "Left-drag — Select text (auto-copies)".to_string(),
+            "Shift+drag — Select over mouse apps (vim / htop / Claude Code)".to_string(),
+            "Right-click — Context menu".to_string(),
+            String::new(),
+            "## Search & scroll".to_string(),
             format!(
-                "{} — Search scrollback (Enter/F3 next, Shift+Enter prev, Esc close)",
+                "{} — Search scrollback   (Enter next, Shift+Enter prev, Esc close)",
                 first(A::SearchToggle)
             ),
             format!(
-                "{} / {} — Prev / next prompt (shell integration)",
+                "{} / {} — Previous / next prompt",
                 first(A::PrevPrompt),
                 first(A::NextPrompt)
             ),
+            "PageUp / PageDown — Scroll".to_string(),
+            "Ctrl+L — Clear".to_string(),
+            String::new(),
+            "## Keyboard modes & links".to_string(),
             format!(
-                "{} — Hint mode: label + copy URLs/paths (Alt = open URL, Esc cancel)",
+                "{} — Hint mode: copy a URL / path   (Alt = open, Esc cancel)",
                 first(A::HintMode)
             ),
             format!(
-                "{} — Copy-mode: keyboard select (hjkl w/b/e v/V y=yank, Esc exit)",
+                "{} — Copy-mode: keyboard select   (hjkl, v/V, y = yank)",
                 first(A::CopyMode)
             ),
-            "Ctrl+click — Open URL (Ctrl+hover underlines it)".to_string(),
-            "Ctrl+L — Clear".to_string(),
-            "PageUp / PageDown — Scroll".to_string(),
-            "Left-drag — Select text (auto-copies)".to_string(),
-            "Shift+drag — Select text over mouse apps (vim/htop/Claude Code)".to_string(),
-            "Right-click — Context menu (Copy/Paste/Select All/Clear/Close Tab)".to_string(),
-            "Drag top bar — Move window".to_string(),
-            "Drag edges/corners — Resize".to_string(),
-            "Ctrl+D — Close shell (sends EOF)".to_string(),
+            "Ctrl+click — Open URL   (Ctrl+hover underlines)".to_string(),
+            String::new(),
+            "## Other".to_string(),
+            format!("{summon_hotkey} (configurable) — Summon / hide window"),
+            "Ctrl+D — Close shell (EOF)".to_string(),
             "Esc — Close this help".to_string(),
         ]
     }

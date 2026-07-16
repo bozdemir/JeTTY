@@ -3,31 +3,45 @@ use crate::Rect;
 /// The keyboard-shortcut rows shown in the Help overlay — ONE binding per line
 /// (single column) so a row's text can never overflow the panel's width. The
 /// panel width is computed from the longest row below.
-pub const HELP_ROWS: [&str; 25] = [
-    "F9 (configurable) — Summon / hide",
+// Grouped into sections (`## ` = header, "" = blank spacer) with each shortcut
+// as "KEY — description" so the overlay renders headers + aligned key/description
+// columns. `App::compute_help_rows` emits the SAME shape from the live keymap.
+pub const HELP_ROWS: &[&str] = &[
+    "## Tabs & windows",
     "Ctrl+Shift+T — New tab",
     "Ctrl+Shift+W — Close tab",
-    "Ctrl+Tab / Ctrl+Shift+Tab — Next / Prev tab",
-    "Ctrl+1..9 — Jump to tab",
-    "Ctrl+Shift+D / drag tab off bar — Detach / reattach (right-click tab for menu)",
-    "Double-click tab / top bar — Rename / Maximize",
-    "Ctrl+Shift+P — Command palette   (Settings: Ctrl+Shift+O / Ctrl+,)",
+    "Ctrl+Tab / Ctrl+Shift+Tab — Next / previous tab",
+    "Ctrl+1…9 — Jump to tab",
+    "Ctrl+Shift+D — Detach / reattach tab   (drag off bar; right-click for menu)",
+    "Double-click tab / top bar — Rename / maximize",
+    "Drag top bar / edges — Move / resize window",
+    "",
+    "## Appearance",
     "Ctrl+= / Ctrl+- / Ctrl+0 — Font size",
     "Ctrl+Shift+= / Ctrl+Shift+- — Transparency",
-    "Ctrl+Shift+C / Ctrl+Shift+V — Copy / Paste",
-    "Ctrl+Shift+F — Search scrollback (Enter/F3 next, Shift+Enter prev, Esc close)",
-    "Ctrl+Shift+Z / Ctrl+Shift+X — Prev / next prompt (shell integration)",
-    "Ctrl+Shift+H — Hint mode: label + copy URLs/paths (Alt = open URL, Esc cancel)",
-    "Ctrl+Shift+Space — Copy-mode: keyboard select (hjkl w/b/e v/V y=yank, Esc exit)",
-    "Ctrl+click — Open URL (Ctrl+hover underlines it)",
-    "Ctrl+L — Clear",
-    "PageUp / PageDown — Scroll",
+    "Ctrl+Shift+O / Ctrl+, — Settings",
+    "Ctrl+Shift+P — Command palette",
+    "",
+    "## Clipboard & selection",
+    "Ctrl+Shift+C / Ctrl+Shift+V — Copy / paste",
     "Left-drag — Select text (auto-copies)",
-    "Shift+drag — Select text over mouse apps (vim/htop/Claude Code)",
-    "Right-click — Context menu (Copy/Paste/Select All/Clear/Close Tab)",
-    "Drag top bar — Move window",
-    "Drag edges/corners — Resize",
-    "Ctrl+D — Close shell (sends EOF)",
+    "Shift+drag — Select over mouse apps (vim / htop / Claude Code)",
+    "Right-click — Context menu",
+    "",
+    "## Search & scroll",
+    "Ctrl+Shift+F — Search scrollback   (Enter next, Shift+Enter prev, Esc close)",
+    "Ctrl+Shift+Z / Ctrl+Shift+X — Previous / next prompt",
+    "PageUp / PageDown — Scroll",
+    "Ctrl+L — Clear",
+    "",
+    "## Keyboard modes & links",
+    "Ctrl+Shift+H — Hint mode: copy a URL / path   (Alt = open, Esc cancel)",
+    "Ctrl+Shift+Space — Copy-mode: keyboard select   (hjkl, v/V, y = yank)",
+    "Ctrl+click — Open URL   (Ctrl+hover underlines)",
+    "",
+    "## Other",
+    "F9 (configurable) — Summon / hide window",
+    "Ctrl+D — Close shell (EOF)",
     "Esc — Close this help",
 ];
 
@@ -42,10 +56,20 @@ pub fn default_help_rows() -> Vec<String> {
 pub struct HelpOverlay {
     /// Quads in draw order: full-screen dim, border, background panel.
     pub quads: Vec<Rect>,
-    /// Text labels: (text, x, y, rgb) — title then one per shortcut row.
+    /// Text labels: (text, x, y, rgb) — title, then per row a section header, a
+    /// key + a description label, or nothing (a blank spacer).
     pub labels: Vec<(String, f32, f32, [u8; 3])>,
     /// The panel rect (for hit-testing "click outside closes").
     pub panel: Rect,
+}
+
+/// One parsed help row: a section header, a key+description item, or a blank
+/// spacer line between sections. Derived from the flat `&[String]` rows so the
+/// App's live keymap-driven strings and the static `HELP_ROWS` share one format.
+enum HelpEntry {
+    Header(String),
+    Item(String, String),
+    Spacer,
 }
 
 /// Build the centered "Keyboard Shortcuts" help overlay for a window of size
@@ -83,7 +107,12 @@ pub fn build_help_overlay(
     let border3 = lerp(0.30);
     let border_col: [u8; 4] = [border3[0], border3[1], border3[2], 255];
     let title_col = tfg;
-    let row_col = lerp(0.70);
+    // Colour hierarchy so the dialog scans at a glance: section HEADERS in the
+    // theme's cursor/accent hue, KEYS at full foreground brightness so the
+    // shortcut pops, DESCRIPTIONS muted.
+    let header_col = theme.cursor;
+    let key_col = tfg;
+    let desc_col = lerp(0.60);
 
     // The caller supplies the measured chrome-font advance via `char_w`.
     // On scale-1 displays this is ~9.8px (the historical hardcoded estimate);
@@ -105,13 +134,61 @@ pub fn build_help_overlay(
 
     // The panel must fit the LONGEST row (and the title). Width = longest text
     // width + padding on both sides.
-    let longest_chars = rows
+    // Parse the flat rows into a readable structure: a `## `-prefixed row is a
+    // SECTION HEADER, an empty row is a SPACER (blank line between sections), and
+    // everything else is an ITEM split on the first " — " into (key, description)
+    // so the two can be drawn as ALIGNED, colour-differentiated columns instead
+    // of one dense grey line each.
+    let entries: Vec<HelpEntry> = rows
         .iter()
-        .map(|r| r.chars().count())
-        .chain(std::iter::once("Keyboard Shortcuts".chars().count()))
+        .map(|r| {
+            if r.is_empty() {
+                HelpEntry::Spacer
+            } else if let Some(h) = r.strip_prefix("## ") {
+                HelpEntry::Header(h.to_string())
+            } else if let Some((k, d)) = r.split_once(" — ") {
+                HelpEntry::Item(k.trim_end().to_string(), d.trim_start().to_string())
+            } else {
+                HelpEntry::Item(r.clone(), String::new())
+            }
+        })
+        .collect();
+    // Column metrics (in characters): the key column is as wide as the widest
+    // key so every description lines up in a second column; headers/title only
+    // constrain the overall width.
+    let key_chars = entries
+        .iter()
+        .filter_map(|e| match e {
+            HelpEntry::Item(k, _) => Some(k.chars().count()),
+            _ => None,
+        })
         .max()
         .unwrap_or(0) as f32;
-    let content_w = longest_chars * char_w;
+    let desc_chars = entries
+        .iter()
+        .filter_map(|e| match e {
+            HelpEntry::Item(_, d) => Some(d.chars().count()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0) as f32;
+    let header_chars = entries
+        .iter()
+        .filter_map(|e| match e {
+            HelpEntry::Header(h) => Some(h.chars().count()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0) as f32;
+    // Gap between the key and description columns.
+    let col_gap = 2.5 * char_w;
+    let key_col_w = key_chars * char_w;
+    let desc_x_off = key_col_w + col_gap;
+    let two_col_chars = key_chars + 2.5 + desc_chars;
+    let content_w = two_col_chars
+        .max(header_chars)
+        .max("Keyboard Shortcuts".chars().count() as f32)
+        * char_w;
 
     // The vertical / padding metrics are FIXED logical px, but the chrome line box
     // is `ceil(font_size * 1.3)` with `font_size = ui_font_logical * scale`, so it
@@ -129,7 +206,7 @@ pub fn build_help_overlay(
     let row_h_min = ROW_H_MIN * vscale;
     let min_pad = MIN_PAD * vscale;
 
-    let row_count = rows.len() as f32;
+    let row_count = entries.len() as f32;
     // Ideal content height; if it exceeds the window, scale the vertical metrics
     // down by a single factor (clamped so each metric keeps its readable floor).
     let ideal_h = pad_ideal + title_h_ideal + row_count * row_h_ideal + pad_ideal;
@@ -199,11 +276,35 @@ pub fn build_help_overlay(
         title_col,
     ));
 
-    // Shortcut rows (one binding per row → never overflows the panel width).
+    // Rows: section headers (accent), aligned key (bright) + description (muted)
+    // columns, and blank spacers between sections. The description column starts
+    // at a fixed offset so keys and descriptions each line up vertically.
     let rows_top = py + pad_top + title_h;
-    for (i, row) in rows.iter().enumerate() {
+    for (i, e) in entries.iter().enumerate() {
         let y = rows_top + i as f32 * row_h;
-        labels.push((row.clone(), px + pad_x, y, row_col));
+        match e {
+            HelpEntry::Spacer => {}
+            HelpEntry::Header(h) => {
+                labels.push((h.clone(), px + pad_x, y, header_col));
+                // A thin, subtle accent rule under each header crisply separates
+                // the sections (drawn on the panel, beneath the row text).
+                let rule_y = (y + row_h * 0.9).round();
+                quads.push(Rect {
+                    x: px + pad_x,
+                    y: rule_y,
+                    w: (panel_w - pad_x * 2.0).max(0.0),
+                    h: (1.5 * vscale).max(1.0),
+                    color: [header_col[0], header_col[1], header_col[2], 70],
+                    ..Default::default()
+                });
+            }
+            HelpEntry::Item(key, desc) => {
+                labels.push((key.clone(), px + pad_x, y, key_col));
+                if !desc.is_empty() {
+                    labels.push((desc.clone(), px + pad_x + desc_x_off, y, desc_col));
+                }
+            }
+        }
     }
 
     HelpOverlay { quads, labels, panel }
@@ -226,9 +327,11 @@ mod tests {
         assert!(h.panel.x >= 0.0 && h.panel.y >= 0.0);
         assert!(h.panel.x + h.panel.w <= 1000.0 + 0.5);
         assert!(h.panel.y + h.panel.h <= 700.0 + 0.5);
-        // Title + one label per row.
-        assert_eq!(h.labels.len(), HELP_ROWS.len() + 1);
+        // Title first; then at least one label per non-spacer row (items with a
+        // description add a second, key/desc column label).
         assert_eq!(h.labels[0].0, "Keyboard Shortcuts");
+        let non_spacer = HELP_ROWS.iter().filter(|r| !r.is_empty()).count();
+        assert!(h.labels.len() >= non_spacer + 1);
     }
 
     #[test]
@@ -281,14 +384,17 @@ mod tests {
         // rows on-screen rather than clip, which is documented, intentional
         // behaviour for an extreme (<~381px) window and not exercised here.
         let ink_floor = 16.0_f32; // ROW_H_MIN == font_size at scale 1 (vscale==1)
-        // The readable lower bound rises with the row COUNT: with the hint/copy-
-        // mode rows the overlay now has 25 rows, so the floored metrics
-        // (2·8 + 22 + 25·16 = 438px) need ~440px before the last-resort pitch
-        // tightening kicks in. 480 is the smallest listed height clear of that.
-        for h in [480u32, 560, 700, 900] {
+        // The readable lower bound rises with the ENTRY count: the sectioned
+        // overlay now has ~36 entries (headers + items + blank spacers), so the
+        // floored metrics (2·8 + 22 + 36·16 ≈ 614px) need ~620px before the
+        // last-resort pitch tightening kicks in. 640 is the smallest clear of that.
+        for h in [640u32, 760, 900, 1100] {
             let overlay = build_help_overlay(700, h, &theme(), TEST_CHAR_W, &default_help_rows());
-            // labels[0] is the title; labels[1..] are the shortcut rows in order.
-            let ys: Vec<f32> = overlay.labels[1..].iter().map(|(_t, _x, y, _c)| *y).collect();
+            // labels[0] is the title; labels[1..] are the row labels. An item emits
+            // a key AND a description label at the SAME y (side-by-side columns),
+            // so collapse consecutive equal-y labels to get the distinct row pitch.
+            let mut ys: Vec<f32> = overlay.labels[1..].iter().map(|(_t, _x, y, _c)| *y).collect();
+            ys.dedup();
             for pair in ys.windows(2) {
                 let pitch = pair[1] - pair[0];
                 assert!(
