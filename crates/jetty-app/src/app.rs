@@ -414,12 +414,9 @@ fn shift_hint_live_in<I: PartialEq>(
     hint.is_some_and(|(t, wid)| wid == id && now < t)
 }
 
-/// Logical size of the separate Settings window — DERIVED from the panel size
-/// (+ 4px border) so it always fits exactly. Growing the panel (adding a settings
-/// row in `build_panel`) resizes this window automatically; the bottom rows
-/// (theme chips) can never be clipped off a too-short window again.
-const SETTINGS_WIN_W: u32 = jetty_render::PANEL_W as u32 + 4;
-const SETTINGS_WIN_H: u32 = jetty_render::PANEL_H as u32 + 4;
+// The Settings window size is DERIVED at runtime from the panel's scaled size —
+// see `App::desired_settings_logical_size` — so it fits ANY UI font (size or
+// family), not just the default; the window is also user-resizable.
 
 /// Identifies which Effects-tab slider is currently being dragged. One variant
 /// per draggable slider; `None` stored in `App::active_fx_drag` when no drag is
@@ -3199,6 +3196,60 @@ impl App {
             .unwrap_or_else(|| self.chrome_char_w())
     }
 
+    /// Logical size the Settings window needs so the panel — which scales its
+    /// fixed `PANEL_W`×`PANEL_H` layout by `dpi = settings_char_w /
+    /// CHAR_W_FALLBACK` — is never clipped. A larger UI font size OR a wider UI
+    /// family grows the panel, so the window must grow with it (the panel body
+    /// font is capped to `[PANEL_TEXT_MIN, PANEL_TEXT_MAX]`, so this is bounded to
+    /// ~1.3×). Clamped to the monitor so even a huge UI font can't push the
+    /// window off-screen. This is what makes "the bottom rows can never be
+    /// clipped" (see `SETTINGS_WIN_*`) hold for ANY UI font, not just the default.
+    fn desired_settings_logical_size(&self) -> (u32, u32) {
+        let scale = self
+            .settings_window
+            .as_ref()
+            .or(self.window.as_ref())
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0)
+            .max(0.5);
+        // Before the settings text layer exists (first open), estimate the CAPPED
+        // body advance from the main chrome advance (chrome runs at the UNCAPPED
+        // UI size, so scale it down by capped/true).
+        let char_w = if self.settings_text.is_some() {
+            self.settings_char_w()
+        } else {
+            let capped = self.ui_font_logical.clamp(PANEL_TEXT_MIN, PANEL_TEXT_MAX);
+            self.chrome_char_w() * (capped / self.ui_font_logical.max(1.0))
+        };
+        let f = (char_w / (jetty_render::CHAR_W_FALLBACK * scale)).max(1.0);
+        let mut w = (jetty_render::PANEL_W * f).ceil() as u32 + 4;
+        let mut h = (jetty_render::PANEL_H * f).ceil() as u32 + 4;
+        // Never exceed the monitor (leave a margin) so the window stays on-screen.
+        if let Some(mon) = self
+            .settings_window
+            .as_ref()
+            .or(self.window.as_ref())
+            .and_then(|w| w.current_monitor())
+        {
+            let msz = mon.size();
+            let max_w = ((msz.width as f32 / scale) - 40.0).max(200.0) as u32;
+            let max_h = ((msz.height as f32 / scale) - 80.0).max(200.0) as u32;
+            w = w.min(max_w);
+            h = h.min(max_h);
+        }
+        (w, h)
+    }
+
+    /// Resize the open Settings window to fit the panel at the current UI font
+    /// (see [`Self::desired_settings_logical_size`]). No-op when Settings is
+    /// closed. Called after any UI-font size/family change so the window re-fits.
+    fn resize_settings_to_fit(&self) {
+        if let Some(win) = self.settings_window.as_ref() {
+            let (w, h) = self.desired_settings_logical_size();
+            let _ = win.request_inner_size(winit::dpi::LogicalSize::new(w, h));
+        }
+    }
+
     /// Convert the current cursor pixel position into 1-based terminal cell
     /// coordinates `(col, row)` using the renderer's cell size, CLAMPED to the
     /// active grid (`1..=cols`, `1..=rows`) — a click in the scrollbar gutter
@@ -4087,6 +4138,9 @@ impl App {
         }
         self.persist();
         self.request_main_paint();
+        // A different UI size grows/shrinks the panel — re-fit the window so the
+        // bottom rows are never clipped (then live-preview the change).
+        self.resize_settings_to_fit();
         // Live preview in the settings window (specimen + readout) if it's open.
         self.render_settings_window();
         self.request_settings_paint();
@@ -4121,6 +4175,8 @@ impl App {
         }
         self.persist();
         self.request_main_paint();
+        // A wider/narrower UI family changes the panel's scaled width — re-fit.
+        self.resize_settings_to_fit();
         self.render_settings_window();
         self.request_settings_paint();
     }
@@ -4286,7 +4342,7 @@ impl App {
         let window = match jetty_platform::build_fixed_window(
             event_loop,
             "JeTTY — Settings",
-            (SETTINGS_WIN_W, SETTINGS_WIN_H),
+            self.desired_settings_logical_size(),
         ) {
             Ok(w) => w,
             Err(e) => {

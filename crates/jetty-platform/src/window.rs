@@ -48,8 +48,11 @@ pub fn build_window(
     event_loop.create_window(attrs).map(Arc::new)
 }
 
-/// Build a fixed-size, non-resizable utility window (e.g. the settings dialog).
-/// A normal decorated OS window the user can move anywhere; also carries the icon.
+/// Build a decorated utility window (the settings dialog), sized by the caller
+/// to fit its content. RESIZABLE: the caller resizes it live when the panel
+/// grows (e.g. a larger/wider UI font) so nothing is clipped, and the user may
+/// resize it too. A low min-inner-size keeps a programmatic shrink valid while
+/// stopping the user from collapsing it to nothing. Also carries the app icon.
 ///
 /// Returns the OS error on failure (used at runtime on every settings-window
 /// open) so a transient failure aborts only that action rather than panicking.
@@ -62,6 +65,7 @@ pub fn build_fixed_window(
         .with_title(title)
         .with_window_icon(app_icon())
         .with_inner_size(LogicalSize::new(size.0, size.1))
-        .with_resizable(false);
+        .with_min_inner_size(LogicalSize::new(200u32, 200u32))
+        .with_resizable(true);
     event_loop.create_window(attrs).map(Arc::new)
 }
