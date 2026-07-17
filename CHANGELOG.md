@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.23.1] — 2026-07-17
+
+**UI-font polish.** Four fixes so the chrome looks right under any UI font — size
+or family — not just the default. Each was rendered and screenshot-verified.
+
+### Fixed
+- **Settings window auto-sizes to the UI font.** The panel scales with the UI
+  font, but the window was a fixed size, so a larger or wider UI font clipped the
+  bottom rows off-screen. The window now derives its size from the scaled panel
+  (and is user-resizable), so nothing is ever clipped.
+- **Neofetch welcome logo stays aligned.** The block-art "JETTY" logo is
+  monospace ASCII that a proportional UI font garbled. The whole welcome splash
+  now renders in the terminal (monospace) font — like real neofetch output — so
+  it's correct in any UI font.
+- **Perf HUD right-aligns correctly.** The bottom `⚡ ms · fps · CPU% · MB/s`
+  strip measured its width as `chars × cell` (a monospace assumption) and floated
+  left of the edge under a proportional UI font. It now measures the true
+  rendered width and hugs the right edge at any font.
+
+### Changed
+- **Redesigned the Keyboard Shortcuts (`?`) overlay** into grouped sections with
+  a thin accent rule, aligned key / description columns, and a colour hierarchy
+  (header › key › description) — far easier to scan than the old dense list.
+  Remapped chords still show.
+
+---
+
 ## [0.23.0] — 2026-07-15
 
 **Speed-coherence refactor + the p10k resize fix.** An internal release: the
