@@ -1493,6 +1493,12 @@ impl App {
                 all(A::DetachTab)
             ),
             "Double-click tab / top bar — Rename / maximize".to_string(),
+            // BOTH chords when macOS seeds its companion (bare F11 is dead there).
+            // NOTE: the two rows above/below become partly false while fullscreen —
+            // the maximize toggle exits fullscreen instead, and move/resize are
+            // inert. Accepted: the overlay describes the normal windowed state, and
+            // a mode-dependent help overlay would be a worse trade (amendment I-E).
+            format!("{} — Fullscreen (whole monitor)", all(A::ToggleFullscreen)),
             "Drag top bar / edges — Move / resize window".to_string(),
             String::new(),
             "## Appearance".to_string(),
@@ -2984,6 +2990,8 @@ impl App {
                 self.persist();
                 self.request_main_paint();
             }
+            // Main-window only, like Hide: the palette itself is main-window only.
+            C::ToggleFullscreen => self.set_main_fullscreen(!self.main_fullscreen),
             C::Hide => self.set_visibility(false, event_loop),
             C::Quit => {
                 self.confirm_quit = true;
@@ -12076,6 +12084,34 @@ mod fullscreen_helper_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn help_rows_include_fullscreen() {
+        // The live keymap-driven rows and the static mirror must stay
+        // format-identical, and BOTH default chords must appear (`all()`, not
+        // `first()`) — bare F11 is dead on macOS keyboards without standard
+        // function keys, so the companion chord is the discoverable one there.
+        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), "F9");
+        let live = rows
+            .iter()
+            .find(|r| r.contains("Fullscreen (whole monitor)"))
+            .expect("no fullscreen help row");
+        assert!(live.contains("F11"), "{live:?}");
+        assert!(live.contains(" — "), "sectioned 'KEY — desc' shape: {live:?}");
+        if cfg!(target_os = "macos") {
+            assert!(live.contains("Ctrl+") && live.contains("Cmd+"), "{live:?}");
+        }
+        assert!(
+            jetty_render::HELP_ROWS
+                .iter()
+                .any(|r| *r == "F11 — Fullscreen (whole monitor)"),
+            "static HELP_ROWS mirror is missing the fullscreen row"
+        );
+        // It lives in the window/appearance section (the first `## ` block).
+        let idx = rows.iter().position(|r| r == live).unwrap();
+        let header = rows[..idx].iter().rfind(|r| r.starts_with("## ")).unwrap();
+        assert_eq!(header, "## Tabs & windows");
     }
 
     #[test]

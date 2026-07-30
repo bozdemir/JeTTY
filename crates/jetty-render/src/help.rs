@@ -14,6 +14,7 @@ pub const HELP_ROWS: &[&str] = &[
     "Ctrl+1…9 — Jump to tab",
     "Ctrl+Shift+D — Detach / reattach tab   (drag off bar; right-click for menu)",
     "Double-click tab / top bar — Rename / maximize",
+    "F11 — Fullscreen (whole monitor)",
     "Drag top bar / edges — Move / resize window",
     "",
     "## Appearance",

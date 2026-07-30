@@ -44,6 +44,7 @@ pub enum PaletteCmd {
     Paste,
     ToggleLaunchAtLogin,
     ResetKeybindings,
+    ToggleFullscreen,
     Hide,
     Quit,
     SetTheme(usize),
@@ -76,7 +77,7 @@ pub fn build_registry(
     tabs: &[String],
     detached: &[String],
 ) -> Vec<PaletteEntry> {
-    let statics: [(&str, &str, PaletteCmd); 30] = [
+    let statics: [(&str, &str, PaletteCmd); 31] = [
         ("New tab", "create open window shell", PaletteCmd::NewTab),
         ("Close tab", "kill remove", PaletteCmd::CloseTab),
         ("Next tab", "cycle switch forward", PaletteCmd::NextTab),
@@ -105,6 +106,7 @@ pub fn build_registry(
         ("Paste", "clipboard insert", PaletteCmd::Paste),
         ("Toggle launch at login", "autostart startup boot", PaletteCmd::ToggleLaunchAtLogin),
         ("Reset keybindings to defaults", "shortcut hotkey rebind reset keys", PaletteCmd::ResetKeybindings),
+        ("Toggle fullscreen", "full screen maximize f11 whole monitor", PaletteCmd::ToggleFullscreen),
         ("Hide window", "summon dismiss minimize", PaletteCmd::Hide),
         ("Quit JeTTY", "exit close all", PaletteCmd::Quit),
     ];
@@ -193,6 +195,17 @@ mod tests {
         assert!(!r.iter().any(|e| e.title.starts_with("Reattach: ")));
         // Dynamic indices are captured at build time.
         assert!(r.iter().any(|e| e.cmd == PaletteCmd::SelectTab(1)));
+    }
+
+    #[test]
+    fn registry_contains_toggle_fullscreen() {
+        let r = reg();
+        assert!(r.iter().any(|e| e.cmd == PaletteCmd::ToggleFullscreen));
+        // The palette is the discoverability path for a chord that is dead on
+        // macOS keyboards without standard function keys.
+        let hits = filter(&r, "fullscr");
+        assert_eq!(hits[0].cmd, PaletteCmd::ToggleFullscreen, "top hit for 'fullscr'");
+        assert_eq!(hits[0].title, "Toggle fullscreen");
     }
 
     #[test]
