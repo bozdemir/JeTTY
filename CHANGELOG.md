@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.24.0] — 2026-07-17
 
 **Fullscreen.** A third window mode and a per-window `F11` toggle.
 
