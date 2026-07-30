@@ -53,6 +53,10 @@ pub enum KeyAction {
     /// Enter keyboard copy-mode (Ctrl+Shift+Space): a modal vi-cursor over the
     /// viewport + scrollback for keyboard-only text selection and yank.
     CopyMode,
+    /// Toggle OS fullscreen on the window that has focus (F11; macOS also
+    /// Cmd+Ctrl+F). Transient per-window view state — it never writes
+    /// `window_mode`, so it costs no disk I/O on the key path.
+    ToggleFullscreen,
     /// Raw bytes to write to the PTY.
     Send(Vec<u8>),
     None,
@@ -1158,6 +1162,49 @@ mod tests {
         assert_eq!(
             dk(true, false, false, make_physical(KeyCode::KeyH), &make_logical_char("h"), false, false, false),
             KeyAction::Send(vec![0x08])
+        );
+    }
+
+    #[test]
+    fn bare_f11_is_toggle_fullscreen_modified_f11_still_reaches_the_pty() {
+        // THE one deliberate behaviour change of the fullscreen feature: bare F11
+        // no longer sends `\e[23~` — the keymap lookup runs before the F-key
+        // encoder and claims it.
+        assert_eq!(
+            dk(false, false, false, make_physical(KeyCode::F11), &Key::Named(NamedKey::F11), false, false, false),
+            KeyAction::ToggleFullscreen
+        );
+        // The default chord is EXACT, so every MODIFIED F11 still reaches the PTY
+        // as the xterm modified form `\e[23;{m}~` (m = 1 + 1*shift + 2*alt +
+        // 4*ctrl) — the second escape hatch for TUIs, alongside
+        // `[keys] toggle_fullscreen = ""`.
+        for (ctrl, shift, alt, m) in [
+            (false, true, false, 2),
+            (false, false, true, 3),
+            (true, false, false, 5),
+            (true, true, false, 6),
+        ] {
+            assert_eq!(
+                dk(ctrl, shift, alt, make_physical(KeyCode::F11), &Key::Named(NamedKey::F11), false, false, false),
+                KeyAction::Send(format!("\x1b[23;{m}~").into_bytes()),
+                "ctrl={ctrl} shift={shift} alt={alt}"
+            );
+        }
+    }
+
+    #[test]
+    fn f11_pty_passthrough_restored_when_unbound() {
+        // `[keys] toggle_fullscreen = ""` gives bare F11 back to the shell: the
+        // F-key encoder is untouched and still produces `\e[23~`.
+        let mut b = crate::config::KeyBindings::default();
+        b.toggle_fullscreen = Some(crate::config::ChordSpec::One(String::new()));
+        let km = crate::keymap::KeyMap::compile(&b);
+        assert_eq!(
+            decide_key(
+                &km, false, false, false, false,
+                make_physical(KeyCode::F11), &Key::Named(NamedKey::F11), false, false, false
+            ),
+            KeyAction::Send(b"\x1b[23~".to_vec())
         );
     }
 

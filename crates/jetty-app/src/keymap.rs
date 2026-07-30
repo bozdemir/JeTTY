@@ -180,10 +180,12 @@ pub enum BindableAction {
     Quit,
     HintMode,
     CopyMode,
+    /// Declared LAST so it can never win a slot from an existing action.
+    ToggleFullscreen,
 }
 
 impl BindableAction {
-    pub const ALL: [BindableAction; 30] = [
+    pub const ALL: [BindableAction; 31] = [
         BindableAction::ToggleSettings,
         BindableAction::OpenPalette,
         BindableAction::NewTab,
@@ -214,6 +216,7 @@ impl BindableAction {
         BindableAction::Quit,
         BindableAction::HintMode,
         BindableAction::CopyMode,
+        BindableAction::ToggleFullscreen,
     ];
 
     /// Stable name for warnings / debugging.
@@ -250,6 +253,7 @@ impl BindableAction {
             Quit => "quit",
             HintMode => "hint_mode",
             CopyMode => "copy_mode",
+            ToggleFullscreen => "toggle_fullscreen",
         }
     }
 
@@ -287,6 +291,7 @@ impl BindableAction {
             Quit => KeyAction::Quit,
             HintMode => KeyAction::HintMode,
             CopyMode => KeyAction::CopyMode,
+            ToggleFullscreen => KeyAction::ToggleFullscreen,
         }
     }
 
@@ -324,6 +329,7 @@ impl BindableAction {
             Quit => &b.quit,
             HintMode => &b.hint_mode,
             CopyMode => &b.copy_mode,
+            ToggleFullscreen => &b.toggle_fullscreen,
         }
     }
 
@@ -422,6 +428,29 @@ impl BindableAction {
             // in the default set (H and Space are unbound Ctrl+Shift slots).
             HintMode => vec![ctrl_shift(KeyMatch::Phys(KeyCode::KeyH))],
             CopyMode => vec![ctrl_shift(KeyMatch::Phys(KeyCode::Space))],
+            // Bare F11 — the universal fullscreen chord, and the ONLY default
+            // chord that binds an F-key. Legal bare because
+            // `chord_reject_reason` permits F-keys without a modifier
+            // (`is_fkey`), and it shadows no control BYTE. It DOES shadow the
+            // F11 escape SEQUENCE `\e[23~` (input.rs's F-key encoder), which the
+            // keymap lookup runs before — the documented opt-out is
+            // `[keys] toggle_fullscreen = ""`.
+            //
+            // The chord is `exact` (NOT Alt/Shift-loose), so Shift/Ctrl/Alt+F11
+            // still reach the PTY as the xterm modified form `\e[23;{m}~` — a
+            // second escape hatch for TUIs that want the key.
+            //
+            // macOS needs a COMPANION chord: there bare F11 is Mission Control's
+            // "Show Desktop", and on Apple keyboards without "Use F1, F2… as
+            // standard function keys" the physical F11 is Volume Down — the app
+            // never sees the key at all. Cmd+Ctrl+F is the macOS fullscreen
+            // convention; seeded only under macOS via the `push_cmd` idiom, and
+            // the help row uses `all(A::ToggleFullscreen)` so BOTH appear.
+            ToggleFullscreen => {
+                let mut v = vec![Chord::exact(Mods::default(), KeyMatch::Phys(KeyCode::F11))];
+                push_cmd(&mut v, cmd_ctrl_letter("f"));
+                v
+            }
         }
     }
 }
@@ -477,6 +506,17 @@ fn opacity_down_keymatch() -> KeyMatch {
 fn cmd_letter(ch: &str) -> Chord {
     Chord {
         mods: Mods::new(false, false, false, true),
+        key: logical_only(ch),
+        alt_insensitive: false,
+        shift_insensitive: true,
+    }
+}
+
+/// A macOS Cmd+Ctrl chord matching the folded logical letter, Shift-insensitive
+/// (same convention as [`cmd_letter`]). Only Cmd+Ctrl+F uses it today.
+fn cmd_ctrl_letter(ch: &str) -> Chord {
+    Chord {
+        mods: Mods::new(true, false, false, true),
         key: logical_only(ch),
         alt_insensitive: false,
         shift_insensitive: true,
@@ -1308,6 +1348,121 @@ mod tests {
             None,
             "Ctrl+H must remain unmapped → BS byte to PTY"
         );
+    }
+
+    // ── fullscreen (F11) ──────────────────────────────────────────────────────
+
+    #[test]
+    fn default_keymap_binds_bare_f11_to_toggle_fullscreen() {
+        use winit::keyboard::NamedKey;
+        let km = KeyMap::defaults();
+        assert_eq!(
+            km.lookup(
+                Mods::default(),
+                PhysicalKey::Code(KeyCode::F11),
+                &Key::Named(NamedKey::F11)
+            ),
+            Some(KeyAction::ToggleFullscreen)
+        );
+    }
+
+    #[test]
+    fn f11_was_free_and_default_map_has_no_warnings() {
+        // No OTHER default action binds any F-key at all, so bare F11 took a free
+        // slot (and the macOS companion Cmd+Ctrl+F took another).
+        for a in BindableAction::ALL {
+            if a == BindableAction::ToggleFullscreen {
+                continue;
+            }
+            for c in a.default_chords() {
+                if let KeyMatch::Phys(code) = &c.key {
+                    assert!(!is_fkey(*code), "{} binds an F-key by default", a.name());
+                }
+            }
+        }
+        assert!(
+            KeyMap::defaults().warnings().is_empty(),
+            "default keymap must compile without conflicts: {:?}",
+            KeyMap::defaults().warnings()
+        );
+    }
+
+    #[test]
+    fn bare_f11_passes_the_reject_guard() {
+        let c = parse_chord("F11").unwrap();
+        assert!(chord_reject_reason(&c).is_none(), "bare F-keys are bindable");
+        assert_eq!(c.canonical(), "F11");
+        // It is not a Ctrl-only chord, so the control-byte shadow guard is moot.
+        assert!(!c.mods.ctrl_only());
+    }
+
+    #[test]
+    fn macos_companion_chord_is_seeded_only_on_macos() {
+        // Cmd+Ctrl+F: bare F11 is DEAD on macOS (Mission Control "Show Desktop",
+        // and Volume Down on Apple keyboards without standard-function-keys).
+        let chords = BindableAction::ToggleFullscreen.default_chords();
+        let want = if cfg!(target_os = "macos") { 2 } else { 1 };
+        assert_eq!(chords.len(), want);
+        // The primary chord is bare F11 on every platform, and EXACT — so
+        // Shift/Ctrl/Alt+F11 still reach the PTY (see the input.rs test).
+        assert_eq!(chords[0].key, KeyMatch::Phys(KeyCode::F11));
+        assert!(chords[0].mods.is_empty());
+        assert!(!chords[0].alt_insensitive && !chords[0].shift_insensitive);
+        if cfg!(target_os = "macos") {
+            assert!(chords[1].mods.super_ && chords[1].mods.ctrl);
+            assert!(!chords[1].mods.shift && !chords[1].mods.alt);
+        }
+    }
+
+    #[test]
+    fn toggle_fullscreen_is_remappable_and_unbindable() {
+        use winit::keyboard::NamedKey;
+        // Remap: the new chord fires and bare F11 is freed (→ PTY passthrough).
+        let km = km_with(|b| {
+            b.toggle_fullscreen = Some(ChordSpec::One("Ctrl+Shift+Return".to_string()))
+        });
+        assert!(km.warnings().is_empty(), "{:?}", km.warnings());
+        assert_eq!(
+            km.lookup(
+                Mods::new(true, true, false, false),
+                PhysicalKey::Code(KeyCode::Enter),
+                &Key::Named(NamedKey::Enter)
+            ),
+            Some(KeyAction::ToggleFullscreen)
+        );
+        assert_eq!(
+            km.lookup(
+                Mods::default(),
+                PhysicalKey::Code(KeyCode::F11),
+                &Key::Named(NamedKey::F11)
+            ),
+            None
+        );
+        // `toggle_fullscreen = ""` unbinds the action entirely — the documented
+        // escape hatch that gives bare F11 back to the shell.
+        let km = km_with(|b| b.toggle_fullscreen = Some(ChordSpec::One(String::new())));
+        assert_eq!(
+            km.lookup(
+                Mods::default(),
+                PhysicalKey::Code(KeyCode::F11),
+                &Key::Named(NamedKey::F11)
+            ),
+            None
+        );
+        assert!(km.pretty_chords(BindableAction::ToggleFullscreen).is_empty());
+    }
+
+    #[test]
+    fn bindable_action_all_is_exhaustive() {
+        assert_eq!(BindableAction::ALL.len(), 31);
+        for a in BindableAction::ALL {
+            assert_eq!(
+                BindableAction::ALL.iter().filter(|x| **x == a).count(),
+                1,
+                "{} appears more than once in ALL",
+                a.name()
+            );
+        }
     }
 
     #[test]

@@ -209,6 +209,8 @@ pub struct KeyBindings {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub quit: Option<ChordSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub hint_mode: Option<ChordSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub copy_mode: Option<ChordSpec>,
+    /// `toggle_fullscreen = ""` gives bare F11 back to the shell (`\e[23~`).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub toggle_fullscreen: Option<ChordSpec>,
 }
 
 impl KeyBindings {

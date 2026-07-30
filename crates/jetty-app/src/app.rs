@@ -9236,6 +9236,7 @@ impl ApplicationHandler<AppEvent> for App {
                         input::KeyAction::Quit => "Quit",
                         input::KeyAction::HintMode => "HintMode",
                         input::KeyAction::CopyMode => "CopyMode",
+                        input::KeyAction::ToggleFullscreen => "ToggleFullscreen",
                         input::KeyAction::Send(_) => "Send",
                         input::KeyAction::None => "None",
                     };
@@ -9375,6 +9376,22 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     input::KeyAction::CopyMode => {
                         self.enter_copy_mode();
+                    }
+                    // F11 (macOS also Cmd+Ctrl+F) — toggle OS fullscreen on THIS
+                    // (the main) window. Transient: nothing is persisted, so the
+                    // hot key path stays free of disk I/O.
+                    //
+                    // DECISION (amendment I-G): F11 is deliberately NOT special-
+                    // cased in the modal short-circuits above. Whichever overlay
+                    // owns the keyboard — palette, search, hint mode, copy-mode,
+                    // the close/quit confirmations, inline rename, and the
+                    // Settings window (which handles only Escape) — swallows F11
+                    // exactly like every other binding. The
+                    // single-overlay-owns-keys discipline is load-bearing; carving
+                    // out one action would fork it for no real gain (close the
+                    // overlay with Esc, then press F11).
+                    input::KeyAction::ToggleFullscreen => {
+                        self.set_main_fullscreen(!self.main_fullscreen);
                     }
                     input::KeyAction::Send(bytes) => {
                         // Escape closes an open context/tab menu before forwarding to PTY.
