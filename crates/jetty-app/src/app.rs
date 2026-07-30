@@ -544,6 +544,24 @@ pub struct App {
     pending_center_frames: u8,
     /// The position to re-assert while pending_center_frames > 0.
     pending_center_pos: Option<winit::dpi::PhysicalPosition<i32>>,
+    /// Whether the MAIN window is currently in OS fullscreen. A MIRROR of the
+    /// window's real state, kept so the render path never calls the syscall-backed
+    /// `Window::fullscreen()` per frame (it feeds `effective_corner_radius_px` and
+    /// the dock/center re-assertion guards).
+    ///
+    /// SESSION-ONLY — never persisted, never read by `apply_reloaded_config`.
+    /// `window_mode == Fullscreen` is the persisted INTENT; this is the live
+    /// SHAPE, which an ad-hoc `ToggleFullscreen` (F11) can also set in Center /
+    /// Dropdown mode.
+    ///
+    /// INVARIANT (rule F0): `!main_fullscreen` whenever `!visible`. The OS
+    /// fullscreen state is never held while the window is hidden — both hide
+    /// paths leave fullscreen BEFORE `set_visible(false)` and the summon path
+    /// re-enters it AFTER `set_visible(true)`. That is what makes the enter a
+    /// genuine `None → Some` transition winit's X11 backend cannot dedupe away,
+    /// keeps `set_simple_fullscreen` off an unmapped (screen-less) macOS window,
+    /// and stops an ad-hoc F11 leaking across a hide/summon round-trip.
+    main_fullscreen: bool,
     /// Hide the window on focus loss (Yakuake auto-hide). Default ON.
     focus_autohide: bool,
     /// Scrollback history limit in lines (config `scrollback_lines`, clamped
@@ -1230,6 +1248,9 @@ impl App {
             pending_dock_frames: 0,
             pending_center_frames: 0,
             pending_center_pos: None,
+            // Session-only; the first open / first summon establishes it from
+            // `window_mode` (rule F0: never fullscreen while hidden).
+            main_fullscreen: false,
             focus_autohide: true,
             scrollback_lines: 10_000,
             launch_at_login: false,
@@ -1841,8 +1862,13 @@ impl App {
 
     /// Re-dock the main window to the top strip when it is a visible Dropdown — used
     /// after a live dropdown width/height change so it re-docks immediately.
+    ///
+    /// Inert while the window is fullscreen (Dropdown + an ad-hoc F11): docking a
+    /// fullscreen window would yank it into a squared-off top strip that cannot
+    /// then be moved, resized or un-maximised, with Settings still reading
+    /// "Dropdown" — hence the shared `dock_reassert_ok` predicate.
     fn redock_if_dropdown(&mut self) {
-        if self.visible && self.window_mode == WindowMode::Dropdown {
+        if self.visible && dock_reassert_ok(self.window_mode, self.main_fullscreen) {
             if let Some(w) = &self.window {
                 dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
                 self.pending_dock_frames = 5;
@@ -6146,16 +6172,19 @@ impl App {
                 self.auto_summon_on_finish = !self.auto_summon_on_finish;
             }
             input::MouseAction::StartDropdownDrag => {
-                // No-op in Center mode (the slider is grayed/disabled there).
-                if self.window_mode == WindowMode::Dropdown {
+                // No-op in Center/Fullscreen mode (the slider is grayed/disabled
+                // there) and while fullscreen — the latch is what enables the
+                // release-time re-dock, which must not fire on a fullscreen window.
+                if dock_reassert_ok(self.window_mode, self.main_fullscreen) {
                     self.dragging_dropdown = true;
                     self.dropdown_height_pct =
                         self.dropdown_pct_from_cursor(cx, &geom.dropdown_track);
                 }
             }
             input::MouseAction::StartDropdownWidthDrag => {
-                // No-op in Center mode (the slider is grayed/disabled there).
-                if self.window_mode == WindowMode::Dropdown {
+                // No-op in Center/Fullscreen mode (the slider is grayed/disabled
+                // there) and while fullscreen — see StartDropdownDrag above.
+                if dock_reassert_ok(self.window_mode, self.main_fullscreen) {
                     self.dragging_dropdown_width = true;
                     self.dropdown_width_pct =
                         self.dropdown_width_pct_from_cursor(cx, &geom.dropdown_width_track);
@@ -6377,9 +6406,11 @@ impl App {
                 // the main window is visible and in Dropdown mode, re-dock the top
                 // strip to the new size immediately (re-asserted post-map via
                 // pending_dock_frames) instead of waiting for the next F9.
+                // Inert while fullscreen (Dropdown + an ad-hoc F11) — see
+                // `dock_reassert_ok`.
                 if (self.dragging_dropdown || self.dragging_dropdown_width)
                     && self.visible
-                    && self.window_mode == WindowMode::Dropdown
+                    && dock_reassert_ok(self.window_mode, self.main_fullscreen)
                 {
                     if let Some(w) = &self.window {
                         dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
@@ -9252,7 +9283,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // ignores a set_outer_position issued before the window is realized
                 // (it would land centered), so re-apply the top-strip geometry on
                 // the first few post-map redraws. Counts down → idle CPU back to 0.
-                if self.pending_dock_frames > 0 && self.window_mode == WindowMode::Dropdown {
+                if self.pending_dock_frames > 0
+                    && dock_reassert_ok(self.window_mode, self.main_fullscreen)
+                {
                     self.pending_dock_frames -= 1;
                     if let Some(win) = &self.window {
                         dock_window_top(win, self.dropdown_width_pct, self.dropdown_height_pct);
@@ -9261,11 +9294,16 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                 } else if self.pending_dock_frames > 0 {
-                    // Mode switched away from Dropdown mid-countdown — stop docking.
+                    // Mode switched away from Dropdown, or we went fullscreen, mid-
+                    // countdown — stop docking. Zeroing here (rather than leaving the
+                    // counter set) is what keeps the ~0%-idle invariant: `main_pending`
+                    // selects Poll while either counter is non-zero.
                     self.pending_dock_frames = 0;
                 }
                 // Center-mode position re-assertion (see pending_center_frames).
-                if self.pending_center_frames > 0 && self.window_mode == WindowMode::Center {
+                if self.pending_center_frames > 0
+                    && center_reassert_ok(self.window_mode, self.main_fullscreen)
+                {
                     self.pending_center_frames -= 1;
                     if let (Some(win), Some(pos)) = (&self.window, self.pending_center_pos) {
                         win.set_outer_position(pos);
@@ -9479,7 +9517,12 @@ impl ApplicationHandler<AppEvent> for App {
                 // The radius is logical px; scale to physical so it matches the
                 // physical-pixel surface (HiDPI-correct rounding).
                 let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
-                let corner_radius_px = self.corner_radius * scale;
+                // Fullscreen ⇒ 0 (flat): a rounded fullscreen window would show the
+                // desktop through four notches at the screen edges. All four radii 0
+                // makes `CornerMask::apply` early-return, so the final mask pass is
+                // SKIPPED entirely, and the CRT shader treats 0 as square.
+                let corner_radius_px =
+                    effective_corner_radius_px(self.corner_radius, scale, self.main_fullscreen);
                 // In Dropdown mode the window is flush to the monitor top, so the
                 // TOP corners must stay square (only the bottom corners round).
                 // Derive "top-flush" from the window's outer position vs the
@@ -9489,7 +9532,16 @@ impl ApplicationHandler<AppEvent> for App {
                 // non-animating frames; during a dropdown slide the window is
                 // stationary, so reuse the cache and skip the per-frame
                 // outer_position()/current_monitor() round-trips.
-                if self.slide_anim.is_none() {
+                //
+                // Short-circuited while fullscreen: the flag only steers the Dropdown
+                // top-strip's square top corners, and while fullscreen every radius is
+                // already 0 — so the answer is moot. This matters for the
+                // Dropdown + ad-hoc-F11 state, where the `== Dropdown` test below is
+                // still true and would otherwise keep asking the WM about a top edge
+                // that is the monitor's.
+                if self.main_fullscreen {
+                    self.cached_top_flush = false;
+                } else if self.slide_anim.is_none() {
                     self.cached_top_flush = self.window_mode == WindowMode::Dropdown
                         && self
                             .window
@@ -10797,6 +10849,47 @@ fn translate_bar_rects(bar: &mut jetty_render::TabBar, dy: f32) {
     bar.close_rect.y += dy;
 }
 
+/// The corner radius (PHYSICAL px) a window should actually render with.
+///
+/// Fullscreen ⇒ `0.0`: a fullscreen window with rounded corners shows the desktop
+/// through four notches at the screen edges. `CornerMask::apply` early-returns
+/// when every radius is 0 (`mask.rs`) and the CRT shader treats 0 as square
+/// (`crt.rs`), so `0.0` both LOOKS right and SKIPS the whole final mask pass —
+/// fullscreen costs one render pass LESS per frame than windowed.
+///
+/// The `corner_radius` FIELD is never mutated: the Look-tab slider, `persist()`
+/// and the config round-trip must keep the user's value, so leaving fullscreen
+/// restores the rounding with nothing to restore. Suppression is render-time only.
+fn effective_corner_radius_px(radius_logical: f32, scale: f32, fullscreen: bool) -> f32 {
+    if fullscreen {
+        0.0
+    } else {
+        radius_logical * scale
+    }
+}
+
+/// Whether the Dropdown dock geometry may be (re-)asserted right now.
+///
+/// Fullscreen suppresses it: `pending_dock_frames` re-issues `dock_window_top` on
+/// the next few redraws and would yank a fullscreen window into the top strip
+/// mid-transition. This matters most in the explicitly-supported
+/// **Dropdown + ad-hoc F11** state, where `window_mode == Dropdown` is still
+/// true — so every DIRECT `dock_window_top` caller (the post-map re-assertion,
+/// `redock_if_dropdown`, the dropdown-slider release re-dock and the slider
+/// drag-start latches that enable it) goes through this one predicate.
+fn dock_reassert_ok(mode: WindowMode, fullscreen: bool) -> bool {
+    mode == WindowMode::Dropdown && !fullscreen
+}
+
+/// Whether the Center-mode post-map position re-assertion may fire this frame.
+///
+/// Deliberately `!= Dropdown`, not `== Center`: Fullscreen mode uses it too, so
+/// that an ad-hoc F11 EXIT while `window_mode == Fullscreen` can re-assert the
+/// restored `last_pos`. Fullscreen itself suppresses it.
+fn center_reassert_ok(mode: WindowMode, fullscreen: bool) -> bool {
+    mode != WindowMode::Dropdown && !fullscreen
+}
+
 /// Whether `pos` (a window outer top-left, physical px) lies within some
 /// currently-connected monitor. Used to reject a saved Center-mode position that
 /// now falls on a since-disconnected monitor (F32). The containment test itself
@@ -11421,6 +11514,64 @@ mod paint_choke_tests {
             2,
             "raw request_redraw count changed in detached.rs — run scripts/check-paint-choke.sh"
         );
+    }
+}
+
+#[cfg(test)]
+mod fullscreen_helper_tests {
+    //! The three pure fullscreen predicates. All private to `app.rs`, so the
+    //! tests live here.
+    use super::{center_reassert_ok, dock_reassert_ok, effective_corner_radius_px, WindowMode};
+
+    #[test]
+    fn corner_radius_flat_while_fullscreen() {
+        // Windowed: logical radius × scale (HiDPI-correct).
+        assert_eq!(effective_corner_radius_px(10.0, 2.0, false), 20.0);
+        assert_eq!(effective_corner_radius_px(10.0, 1.0, false), 10.0);
+        // Fullscreen: FLAT, whatever the configured radius or scale.
+        assert_eq!(effective_corner_radius_px(10.0, 2.0, true), 0.0);
+        assert_eq!(effective_corner_radius_px(24.0, 3.0, true), 0.0);
+        // A configured 0 stays 0 either way (already flat).
+        assert_eq!(effective_corner_radius_px(0.0, 1.0, false), 0.0);
+        assert_eq!(effective_corner_radius_px(0.0, 1.0, true), 0.0);
+        // Fullscreen radii are all-flat, so `CornerMask::apply` skips the pass.
+        assert!(jetty_render::all_radii_flat(
+            effective_corner_radius_px(24.0, 2.0, true),
+            effective_corner_radius_px(24.0, 2.0, true),
+            effective_corner_radius_px(24.0, 2.0, true),
+            effective_corner_radius_px(24.0, 2.0, true),
+        ));
+    }
+
+    #[test]
+    fn reassert_guards_suppressed_while_fullscreen() {
+        use WindowMode::{Center, Dropdown, Fullscreen};
+        // Dock re-assertion: Dropdown only, and never while fullscreen. The
+        // fullscreen case is the explicitly-supported "Dropdown + ad-hoc F11".
+        assert!(dock_reassert_ok(Dropdown, false));
+        assert!(!dock_reassert_ok(Dropdown, true));
+        assert!(!dock_reassert_ok(Center, false));
+        assert!(!dock_reassert_ok(Center, true));
+        assert!(!dock_reassert_ok(Fullscreen, false));
+        assert!(!dock_reassert_ok(Fullscreen, true));
+        // Center re-assertion: every NON-Dropdown mode (so an ad-hoc F11 EXIT in
+        // Fullscreen mode can restore `last_pos`), and never while fullscreen.
+        assert!(center_reassert_ok(Center, false));
+        assert!(!center_reassert_ok(Center, true));
+        assert!(center_reassert_ok(Fullscreen, false));
+        assert!(!center_reassert_ok(Fullscreen, true));
+        assert!(!center_reassert_ok(Dropdown, false));
+        assert!(!center_reassert_ok(Dropdown, true));
+        // The two are mutually exclusive in every state — no mode/flag combination
+        // can arm both geometry re-assertions at once.
+        for m in WindowMode::ORDER {
+            for fs in [false, true] {
+                assert!(
+                    !(dock_reassert_ok(m, fs) && center_reassert_ok(m, fs)),
+                    "both re-assertions enabled for {m:?} fullscreen={fs}"
+                );
+            }
+        }
     }
 }
 

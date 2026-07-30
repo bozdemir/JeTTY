@@ -168,7 +168,12 @@ impl CornerMask {
         r_bl: f32,
         r_br: f32,
     ) {
-        if r_tl <= 0.0 && r_tr <= 0.0 && r_bl <= 0.0 && r_br <= 0.0 {
+        // All-flat corners ⇒ the pass would be a no-op multiply by 1.0: skip it
+        // entirely (one fewer render pass + uniform write per frame). This is what
+        // makes the app's fullscreen corner suppression — which feeds radius 0.0 —
+        // strictly CHEAPER per frame than windowed rounding, and it is pinned by
+        // `all_radii_flat`'s unit test.
+        if all_radii_flat(r_tl, r_tr, r_bl, r_br) {
             return;
         }
         // Clamp each radius so it never exceeds half the smaller dimension.
@@ -256,6 +261,16 @@ pub fn rounded_rect_coverage_per(
     1.0 - s
 }
 
+/// Whether all four corner radii are flat (≤ 0), i.e. the rounding pass would be
+/// a no-op. `CornerMask::apply` early-returns on this, which is the load-bearing
+/// property behind "fullscreen skips the corner-mask pass entirely": the app feeds
+/// radius `0.0` while fullscreen instead of adding a shader/uniform branch.
+///
+/// Extracted as a pure fn so the early-return can be unit-tested without a GPU.
+pub fn all_radii_flat(r_tl: f32, r_tr: f32, r_bl: f32, r_br: f32) -> bool {
+    r_tl <= 0.0 && r_tr <= 0.0 && r_bl <= 0.0 && r_br <= 0.0
+}
+
 /// Uniform-radius shim over [`rounded_rect_coverage_per`] (all four corners
 /// equal). Kept so existing callers (jetty-shot CPU compositing) are unchanged.
 pub fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32 {
@@ -264,7 +279,23 @@ pub fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32
 
 #[cfg(test)]
 mod tests {
-    use super::{rounded_rect_coverage, rounded_rect_coverage_per};
+    use super::{all_radii_flat, rounded_rect_coverage, rounded_rect_coverage_per};
+
+    #[test]
+    fn corner_mask_zero_radius_is_a_no_op() {
+        // The early-return `CornerMask::apply` takes: all-zero radii skip the pass.
+        // This is the whole reason the app can suppress rounding while fullscreen by
+        // feeding 0.0 — and get a CHEAPER frame than windowed — with no shader,
+        // uniform or pipeline change.
+        assert!(all_radii_flat(0.0, 0.0, 0.0, 0.0));
+        // Negative is treated as flat too (defensive, matches `<= 0.0`).
+        assert!(all_radii_flat(-1.0, 0.0, -0.5, 0.0));
+        // ANY non-zero radius must still run the pass — including the Dropdown
+        // bottom-only case, whose top radii are zero.
+        assert!(!all_radii_flat(0.0, 0.0, 16.0, 16.0));
+        assert!(!all_radii_flat(16.0, 16.0, 16.0, 16.0));
+        assert!(!all_radii_flat(0.0, 0.0, 0.0, 0.001));
+    }
 
     #[test]
     fn top_flush_keeps_top_corners_square() {
