@@ -3350,6 +3350,12 @@ impl App {
         }
         // The corner radius changed ⇒ repaint. No persist(): transient state.
         self.request_main_paint();
+        // …and so did the Settings panel's CORNER RADIUS dim state. The panel is
+        // rebuilt from scratch on every settings RedrawRequested, so this only has
+        // to REQUEST the repaint — without it a live panel shows a stale dim until
+        // some unrelated event happens to repaint it. (`set_window_mode` already
+        // does this on both of its legs.)
+        self.request_settings_paint();
     }
 
     /// Close the Settings window because the MAIN window is about to become
@@ -5020,7 +5026,7 @@ impl App {
             self.dropdown_height_pct,
             self.dropdown_width_pct,
             self.window_mode == WindowMode::Dropdown,
-            self.main_fullscreen,
+            corner_radius_band_dimmed(self.main_fullscreen, self.window_mode),
             self.focus_autohide,
             self.launch_at_login,
             self.ui_font_logical, &self.ui_font_families, &self.ui_font_family,
@@ -5054,8 +5060,9 @@ impl App {
         let dropdown_width_pct = self.dropdown_width_pct;
         let is_dropdown = self.window_mode == WindowMode::Dropdown;
         // Dims the CORNER RADIUS band while fullscreen (the radius is suppressed at
-        // display time there, so the slider has no visible effect).
-        let fullscreen = self.main_fullscreen;
+        // display time there, so the slider has no visible effect). Must stay
+        // identical to the hit-test view's input in `build_settings_panel`.
+        let fullscreen = corner_radius_band_dimmed(self.main_fullscreen, self.window_mode);
         let focus_autohide = self.focus_autohide;
         let launch_at_login = self.launch_at_login;
         let tab_bar_name = if self.tab_bar_bottom { "Bottom" } else { "Top" };
@@ -11502,6 +11509,21 @@ fn effective_corner_radius_px(radius_logical: f32, scale: f32, fullscreen: bool)
     }
 }
 
+/// Whether the Settings panel draws the CORNER RADIUS band dimmed — the same
+/// "this control has no effect right now" idiom the panel already uses for
+/// DROPDOWN HEIGHT/WIDTH outside Dropdown mode.
+///
+/// `main_fullscreen` alone was unobservable: opening Settings exits fullscreen,
+/// so the flag was ALWAYS false while the panel was on screen. Adding the
+/// persisted MODE is what makes the feedback real — switching WINDOW MODE to
+/// Fullscreen dims the band immediately, which is precisely the user who needs
+/// telling (their corner radius is suppressed at display time on every summon).
+/// Both the render view and the hit-test view are fed from here so they can
+/// never diverge.
+fn corner_radius_band_dimmed(main_fullscreen: bool, mode: WindowMode) -> bool {
+    main_fullscreen || mode == WindowMode::Fullscreen
+}
+
 /// Whether the Dropdown dock geometry may be (re-)asserted right now.
 ///
 /// Fullscreen suppresses it: `pending_dock_frames` re-issues `dock_window_top` on
@@ -12352,6 +12374,33 @@ mod fullscreen_helper_tests {
                     c == 0 || center_reassert_ok(mode, false),
                     "dead center arming for {mode:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn corner_radius_band_dims_for_the_mode_not_just_the_live_shape() {
+        use super::corner_radius_band_dimmed;
+        use WindowMode::{Center, Dropdown, Fullscreen};
+        // The state the user actually reaches: opening Settings EXITS fullscreen,
+        // so `main_fullscreen` is false while the panel is on screen. Feeding the
+        // panel that flag alone made the dim unobservable in the real app.
+        assert!(corner_radius_band_dimmed(false, Fullscreen));
+        // Switching WINDOW MODE to Fullscreen in Settings dims immediately.
+        assert!(!corner_radius_band_dimmed(false, Center));
+        assert!(!corner_radius_band_dimmed(false, Dropdown));
+        // The ad-hoc F11 case (Center/Dropdown + fullscreen shape) still dims.
+        assert!(corner_radius_band_dimmed(true, Center));
+        assert!(corner_radius_band_dimmed(true, Dropdown));
+        assert!(corner_radius_band_dimmed(true, Fullscreen));
+        // The dim must be true exactly when the radius is actually suppressed for
+        // the shape the panel is describing — i.e. it never lies in the direction
+        // that matters (a live fullscreen window with an un-dimmed band).
+        for mode in WindowMode::ORDER {
+            for fs in [false, true] {
+                if effective_corner_radius_px(10.0, 1.0, fs) == 0.0 && fs {
+                    assert!(corner_radius_band_dimmed(fs, mode));
+                }
             }
         }
     }
