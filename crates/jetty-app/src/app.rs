@@ -2340,6 +2340,10 @@ impl App {
         // The reattached tab becomes the active one below: close the search
         // bar and clear the outgoing active tab's state first (F2/F7/F15).
         self.search_close();
+        // Leave OS fullscreen while the window still exists: dropping a
+        // fullscreen window leaks macOS's app-scoped presentation options (an
+        // auto-hidden Dock + menu bar for the rest of the session).
+        self.exit_detached_fullscreen_bare(pos);
         let dw = self.detached.remove(pos);
         // Drop focus bookkeeping that pointed at the now-destroyed detached window
         // so the main window's auto-hide guard doesn't keep suppressing on a stale
@@ -3217,6 +3221,8 @@ impl App {
             if self.window_mode != WindowMode::Dropdown {
                 self.last_pos = win.outer_position().ok().or(self.last_pos);
             }
+            // Only ONE JeTTY window may be fullscreen at a time.
+            self.enforce_single_fullscreen(None);
             // Nothing may re-assert a docked/centred rect over a fullscreen window,
             // and the top-strip slide must not run on a monitor-tall window (it
             // would show a monitor-tall band of desktop for 150 ms).
@@ -3319,10 +3325,16 @@ impl App {
     /// model. The real hazard is DROPPING one while fullscreen — see
     /// `exit_detached_fullscreen_bare`.
     fn set_detached_fullscreen(&mut self, pos: usize, on: bool) {
-        let Some(dw) = self.detached.get_mut(pos) else { return };
-        if dw.fullscreen == on {
-            return;
+        match self.detached.get(pos) {
+            Some(dw) if dw.fullscreen != on => {}
+            // Missing window, or already in the requested state.
+            _ => return,
         }
+        if on {
+            // Only ONE JeTTY window may be fullscreen at a time.
+            self.enforce_single_fullscreen(Some(pos));
+        }
+        let Some(dw) = self.detached.get_mut(pos) else { return };
         dw.fullscreen = on;
         jetty_platform::set_window_fullscreen(&dw.window, on);
         // The corner radius changed ⇒ repaint. No persist(): transient state.
@@ -3336,6 +3348,55 @@ impl App {
             None => return,
         };
         self.set_detached_fullscreen(pos, on);
+    }
+
+    /// Leave OS fullscreen on ONE detached window while it still EXISTS, with no
+    /// repaint (the window is about to be destroyed). The detached analogue of
+    /// `exit_main_fullscreen_bare`.
+    ///
+    /// MUST run before any `DetachedWindow` is dropped — reattach, the ✕ /
+    /// CloseRequested path, a shell that exited inside it, and app exit. On macOS
+    /// `set_simple_fullscreen(true)` saves and overwrites APP-scoped
+    /// `NSApplication.presentationOptions` (auto-hide Dock | auto-hide menu bar)
+    /// and ONLY the matching `set_simple_fullscreen(false)` restores them, so a
+    /// dropped fullscreen window leaves the user's Dock and menu bar auto-hidden
+    /// for the rest of the session, in every other app. A no-op everywhere else
+    /// and whenever the window is not fullscreen.
+    fn exit_detached_fullscreen_bare(&mut self, pos: usize) {
+        let Some(dw) = self.detached.get_mut(pos) else { return };
+        if !dw.fullscreen {
+            return;
+        }
+        dw.fullscreen = false;
+        jetty_platform::set_window_fullscreen(&dw.window, false);
+    }
+
+    /// SINGLE-FULLSCREEN-WINDOW RULE: at most ONE JeTTY window is ever in OS
+    /// fullscreen. Every ENTER path calls this first.
+    ///
+    /// Why it is worth the two lines: on macOS `set_simple_fullscreen(true)`
+    /// SAVES the app-scoped `NSApplication.presentationOptions` before
+    /// overwriting them, so a second window entering while the first is already
+    /// fullscreen saves the ALREADY-MODIFIED options — and the eventual restore
+    /// then re-applies an auto-hidden Dock + menu bar permanently. It also pairs
+    /// with the sibling-window fix: two stacked windows in the WM's above-normal
+    /// EWMH layer are a focus/visibility trap (focused but invisible).
+    ///
+    /// `keep` names the detached window that is about to enter; `None` means the
+    /// MAIN window is. The main window leaves through the full
+    /// `set_main_fullscreen(false)` so it lands back in its persisted mode's
+    /// geometry rather than sitting monitor-sized and windowed.
+    fn enforce_single_fullscreen(&mut self, keep: Option<usize>) {
+        if keep.is_some() && self.main_fullscreen {
+            self.set_main_fullscreen(false);
+        }
+        for i in 0..self.detached.len() {
+            if keep == Some(i) {
+                continue;
+            }
+            // `false` never recurses back into this helper.
+            self.set_detached_fullscreen(i, false);
+        }
     }
 
     /// Select a new window mode: persist it, and apply it live. Switching to
@@ -4532,6 +4593,13 @@ impl App {
         } else {
             self.exit_main_fullscreen_bare()
         };
+        // A summon into Fullscreen mode enters fullscreen INLINE below (rule F0
+        // wants `set_visible(true)` first), bypassing `set_main_fullscreen` — so
+        // the single-fullscreen-window rule is applied here instead, ahead of the
+        // `&self.window` borrow that follows.
+        if self.visible && mode == WindowMode::Fullscreen {
+            self.enforce_single_fullscreen(None);
+        }
         if let Some(win) = &self.window {
             if self.visible {
                 match mode {
@@ -6957,6 +7025,11 @@ impl ApplicationHandler<AppEvent> for App {
     /// A no-op on every other platform and whenever nothing is fullscreen.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.exit_main_fullscreen_bare();
+        // Detached windows are dropped with `App` too, and each one carries the
+        // same app-scoped macOS presentation-options hazard.
+        for i in 0..self.detached.len() {
+            self.exit_detached_fullscreen_bare(i);
+        }
     }
 
     /// Drive ControlFlow. macOS does NOT deliver a `RedrawRequested` for a
@@ -7640,6 +7713,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // harmlessly by `PtySession::Drop`.
                 for i in exited_detached.into_iter().rev() {
                     if i < self.detached.len() {
+                        // Same reason as `reattach_tab`: never DROP a fullscreen
+                        // window (macOS presentation-options leak).
+                        self.exit_detached_fullscreen_bare(i);
                         let dw = self.detached.remove(i);
                         // The dying window usually holds focus (the user typed
                         // `exit` in it); once the entry is gone its Focused(false)
