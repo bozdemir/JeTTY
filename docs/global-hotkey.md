@@ -9,9 +9,17 @@ On X11, Jetty automatically registers a system-wide F9 key grab at startup
 using the `global-hotkey` crate. No configuration is needed.
 
 F9 is a toggle: press it to hide the window, press it again to summon it. On
-summon the window is re-centred on the current monitor (or re-docked to the top
-in Dropdown mode), takes keyboard focus, and replays the reveal effect.
-(Jetty launches visible, so the first F9 press after startup hides it.)
+summon the window is placed according to `window_mode` — re-centred on the
+current monitor (Center), re-docked to the top strip (Dropdown), or expanded to
+cover the whole monitor (Fullscreen) — then takes keyboard focus and replays the
+reveal effect. (Jetty launches visible, so the first F9 press after startup
+hides it.)
+
+In Fullscreen mode the OS fullscreen state is dropped on every hide and
+re-applied on every summon: it is never held while the window is hidden. That is
+what keeps the summon reliable (a fullscreen request that matches the state the
+window already claims is silently dropped by the X11 backend) and what stops a
+hidden window from keeping the desktop's panels out of the way.
 
 ## Wayland
 

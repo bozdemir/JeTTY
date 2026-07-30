@@ -169,9 +169,11 @@ impl CornerMask {
         r_br: f32,
     ) {
         // All-flat corners ⇒ the pass would be a no-op multiply by 1.0: skip it
-        // entirely (one fewer render pass + uniform write per frame). This is what
-        // makes the app's fullscreen corner suppression — which feeds radius 0.0 —
-        // strictly CHEAPER per frame than windowed rounding, and it is pinned by
+        // entirely (one fewer render pass + uniform write per frame). The app's
+        // fullscreen corner suppression feeds radius 0.0 and so lands here — but
+        // that saves exactly THIS PASS, not the frame: every other pass still
+        // scales with surface AREA, and a fullscreen surface is several times the
+        // default window (see the CHANGELOG's honest cost note). Pinned by
         // `all_radii_flat`'s unit test.
         if all_radii_flat(r_tl, r_tr, r_bl, r_br) {
             return;

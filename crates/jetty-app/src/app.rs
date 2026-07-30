@@ -561,6 +561,20 @@ pub struct App {
     /// genuine `None → Some` transition winit's X11 backend cannot dedupe away,
     /// keeps `set_simple_fullscreen` off an unmapped (screen-less) macOS window,
     /// and stops an ad-hoc F11 leaking across a hide/summon round-trip.
+    ///
+    /// KNOWN LIMITATION — a WM-initiated fullscreen change DESYNCS this mirror.
+    /// There is no winit event for "the WM took the window in or out of
+    /// fullscreen" (and `Window::fullscreen()` returns our own cached intent, not
+    /// the WM state — which is why the `window_is_fullscreen` detector was
+    /// deleted: it could not detect). So if the user fullscreens JeTTY with a WM
+    /// keybinding or the window menu, the mirror is stale: corners stay rounded on
+    /// a fullscreen window, the ▢ button and the resize edges behave for the wrong
+    /// shape, and — the one that matters — `exit_main_fullscreen_bare` returns
+    /// early on the next hide, so the OS fullscreen state survives the hidden
+    /// period and the next summon's enter can be deduped away by the X11 backend.
+    /// It self-heals: one F11 (or ▢) re-syncs the mirror, two put the window back.
+    /// Inherent to a mirror; the alternative (polling the WM state per frame) is a
+    /// syscall on the hot path, which this field exists to avoid.
     main_fullscreen: bool,
     /// Hide the window on focus loss (Yakuake auto-hide). Default ON.
     focus_autohide: bool,
@@ -4824,6 +4838,18 @@ impl App {
                         // returns when the requested state equals the cached one, so
                         // holding the state across a hide would silently lose the WM
                         // state and make the summon a no-op.
+                        //
+                        // HONESTLY, on X11 this enter is still DEFERRED: `set_visible`
+                        // leaves winit's visibility at `YesWait` until a
+                        // `VisibilityNotify` arrives, so `set_fullscreen_inner` stores
+                        // the request in `desired_fullscreen` and replays it post-map.
+                        // The window therefore maps at its WINDOWED geometry and
+                        // expands a moment later — a brief windowed→fullscreen flash
+                        // on every summon. Harmless (the deferral returns before the
+                        // cached state is assigned, so the replay is still a genuine
+                        // `None → Some`, and `main_fullscreen` is already true so the
+                        // corners are flat for those frames), but the blueprint's
+                        // "nothing is deferred here" claim was simply wrong.
                         win.set_visible(true);
                         // Same capture as `set_main_fullscreen(true)` — this inline
                         // enter used to bypass it, which left an F11 escape (and a
@@ -11531,8 +11557,12 @@ fn translate_bar_rects(bar: &mut jetty_render::TabBar, dy: f32) {
 /// Fullscreen ⇒ `0.0`: a fullscreen window with rounded corners shows the desktop
 /// through four notches at the screen edges. `CornerMask::apply` early-returns
 /// when every radius is 0 (`mask.rs`) and the CRT shader treats 0 as square
-/// (`crt.rs`), so `0.0` both LOOKS right and SKIPS the whole final mask pass —
-/// fullscreen costs one render pass LESS per frame than windowed.
+/// (`crt.rs`), so `0.0` both LOOKS right and SKIPS the final mask pass.
+///
+/// That skipped pass is NOT a net saving: fullscreen is the most expensive mode.
+/// Frame cost scales with surface AREA — the default window is 1000×640, and a
+/// fullscreen surface on a 4K monitor is ~13× the pixels for the quad, text,
+/// image and CRT passes alike. One pass saved, not a rescue (amendment I-B).
 ///
 /// The `corner_radius` FIELD is never mutated: the Look-tab slider, `persist()`
 /// and the config round-trip must keep the user's value, so leaving fullscreen

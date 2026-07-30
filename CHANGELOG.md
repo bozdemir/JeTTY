@@ -48,9 +48,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orthogonal: `F11` on a maximized window does not un-maximize it, so
   maximize → `F11` → ▢ hands back a maximized window.
 - Opening **Settings** or **detaching a tab** while fullscreen leaves fullscreen
-  first. A fullscreen window sits in the window manager's above-normal layer, so
-  a sibling window would otherwise be focused but invisible behind it — and
-  Settings is the only UI for leaving the mode.
+  first — and, symmetrically, going fullscreen while **Settings is open closes
+  Settings**. A fullscreen window sits in the window manager's above-normal
+  layer, so a sibling window would otherwise be focused but invisible behind it —
+  and Settings is the only UI for leaving the mode. Nothing is lost: every panel
+  value is already saved, so `Ctrl+Shift+O` brings it straight back (leaving
+  fullscreen as it opens).
+- **On macOS only**, at most one JeTTY window is fullscreen at a time: entering
+  fullscreen anywhere leaves it everywhere else. This is not a style choice —
+  macOS's simple-fullscreen saves and overwrites *application-wide* presentation
+  options, so two windows nesting can leave your Dock and menu bar auto-hidden in
+  every app. On X11/Wayland/Windows there is no such side effect, so a fullscreen
+  main window on one monitor and a fullscreen detached window on another are
+  perfectly allowed.
+- Known limitation: if your **window manager** fullscreens or un-fullscreens
+  JeTTY on its own (a WM shortcut or the window menu), JeTTY is not told —
+  there is no such event — so its idea of the window's shape can go stale
+  (rounded corners on a fullscreen window, ▢ and the resize edges behaving for
+  the wrong shape). Pressing `F11` re-syncs it.
 
 ### Performance
 Be clear about this: **Fullscreen is the most EXPENSIVE window mode**, because
