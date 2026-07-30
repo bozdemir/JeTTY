@@ -3303,6 +3303,41 @@ impl App {
         true
     }
 
+    /// Enter / leave OS fullscreen on ONE detached window — the per-window
+    /// analogue of `set_main_fullscreen`, and the chokepoint F11 uses inside a
+    /// detached window.
+    ///
+    /// NO geometry restore: a detached window persists no position and has no
+    /// `window_mode`, so the WM restores its pre-fullscreen frame on exit (and on
+    /// macOS `set_simple_fullscreen(false)` restores the saved rect itself).
+    /// NO `reflow()` / `gpu.resize()` either — the WM's own `Resized` event arms
+    /// `dw.reflow_pending_at` and the existing 250 ms debounce fires exactly one
+    /// reflow, exactly as for a border drag.
+    ///
+    /// Rule F0 ("never fullscreen an unmapped window") is satisfied by
+    /// construction here: a detached window is never hidden, it has no summon
+    /// model. The real hazard is DROPPING one while fullscreen — see
+    /// `exit_detached_fullscreen_bare`.
+    fn set_detached_fullscreen(&mut self, pos: usize, on: bool) {
+        let Some(dw) = self.detached.get_mut(pos) else { return };
+        if dw.fullscreen == on {
+            return;
+        }
+        dw.fullscreen = on;
+        jetty_platform::set_window_fullscreen(&dw.window, on);
+        // The corner radius changed ⇒ repaint. No persist(): transient state.
+        dw.request_paint();
+    }
+
+    /// F11 inside a detached window toggles THAT window (never the main one).
+    fn toggle_fullscreen_detached(&mut self, pos: usize) {
+        let on = match self.detached.get(pos) {
+            Some(dw) => !dw.fullscreen,
+            None => return,
+        };
+        self.set_detached_fullscreen(pos, on);
+    }
+
     /// Select a new window mode: persist it, and apply it live. Switching to
     /// Center clears any in-progress slide; switching to Dropdown clears last_pos
     /// so the next summon re-docks from a clean top-flush geometry; switching to
@@ -5139,6 +5174,15 @@ impl App {
                     input::KeyAction::DetachTab => {
                         self.reattach_tab(pos, event_loop);
                     }
+                    // F11 (macOS also Cmd+Ctrl+F) toggles fullscreen on THIS
+                    // window — the first main-window action that is genuinely
+                    // per-window in a detached window (SearchToggle / HintMode /
+                    // CopyMode above are main-window-only, swallowed no-ops). Same
+                    // shape as the DetachTab arm above: the `dw` borrow is dead in
+                    // this arm, so calling back into `self` is fine.
+                    input::KeyAction::ToggleFullscreen => {
+                        self.toggle_fullscreen_detached(pos);
+                    }
                     // Scrollback paging on THIS window's own terminal (plain
                     // PageUp/Down on the primary screen, Shift+PageUp/Down
                     // always; the alt screen arrives here as Send instead).
@@ -5328,7 +5372,15 @@ impl App {
                 // resize arrow mid-drag.
                 if !dw.selecting {
                     // --- Resize-edge cursor feedback (borderless window) ---
-                    let zone = resize_zone_at(cx, cy, w, h);
+                    // Inert while THIS window is fullscreen (amendment I-D — the
+                    // hover site the blueprint missed): the press site below is
+                    // gated too, so a ⤡/↔ cursor over a fullscreen edge would
+                    // advertise an affordance that does nothing.
+                    let zone = if dw.fullscreen {
+                        ResizeZone::None
+                    } else {
+                        resize_zone_at(cx, cy, w, h)
+                    };
                     if zone != dw.resize_zone {
                         dw.resize_zone = zone;
                         // Link-aware, like main: the Pointer survives leaving a
@@ -5399,6 +5451,9 @@ impl App {
                     Reattach,
                     Copy,
                     Paste,
+                    /// Leave fullscreen on THIS window (double-click on its bar
+                    /// while fullscreen). Deferred out of the `dw` borrow.
+                    ExitFullscreen,
                 }
                 // &self method — must be read before the dw (self.detached) borrow.
                 let status_h = self.status_h();
@@ -5423,7 +5478,13 @@ impl App {
                         }
                     } else {
                         // --- Resize edges: corners > edges, before the bar. ---
-                        let zone = resize_zone_at(cx, cy, w, h);
+                        // Inert while fullscreen: `drag_resize_window` on a
+                        // fullscreen X11 window leaves it in a broken half-state.
+                        let zone = if dw.fullscreen {
+                            ResizeZone::None
+                        } else {
+                            resize_zone_at(cx, cy, w, h)
+                        };
                         if let Some(dir) = zone.direction() {
                             let _ = dw.window.drag_resize_window(dir);
                             return;
@@ -5446,8 +5507,25 @@ impl App {
                                 );
                                 dw.last_bar_click = Some((now, cx, cy));
                                 if is_double {
-                                    dw.window.set_maximized(!dw.window.is_maximized());
                                     dw.last_bar_click = None;
+                                    if dw.fullscreen {
+                                        // Double-click while fullscreen means
+                                        // "give me my window back": leave
+                                        // FULLSCREEN ONLY, never `set_maximized`
+                                        // (a no-op or a stuck half-state on a
+                                        // fullscreen X11 window). A window that was
+                                        // maximized before F11 comes back
+                                        // maximized; a second double-click
+                                        // normalises it (amendment I-F).
+                                        Act::ExitFullscreen
+                                    } else {
+                                        dw.window.set_maximized(!dw.window.is_maximized());
+                                        Act::None
+                                    }
+                                } else if dw.fullscreen {
+                                    // Moving a fullscreen window is inert (dragging
+                                    // one on X11 leaves a broken half-state).
+                                    Act::None
                                 } else if let Ok(op) = dw.window.outer_position() {
                                     // Manual drag: record the press offset; the
                                     // CursorMoved arm moves the window and the
@@ -5458,13 +5536,14 @@ impl App {
                                     dw.bar_drag = Some(dw.cursor);
                                     dw.bar_drag_start =
                                         Some((op.x as f64 + dw.cursor.0, op.y as f64 + dw.cursor.1));
+                                    Act::None
                                 } else {
                                     // Wayland: no readable outer position — fall
                                     // back to the compositor drag. Drop-to-reattach
                                     // is silently unavailable on this path.
                                     let _ = dw.window.drag_window();
+                                    Act::None
                                 }
-                                return;
                             }
                         } else {
                             // --- Scrollbar thumb drag / track jump ---
@@ -5578,6 +5657,7 @@ impl App {
                             }
                         }
                     }
+                    Act::ExitFullscreen => self.set_detached_fullscreen(pos, false),
                     Act::None => {}
                 }
             }
@@ -6021,8 +6101,14 @@ impl App {
                 .collect()
         };
         // Corner radius in physical px (HiDPI-correct, same scaling as main).
+        // Suppressed to 0 while THIS window is fullscreen — a fullscreen window
+        // with rounded corners shows the desktop through four notches at the
+        // screen edges — which also SKIPS the corner-mask pass entirely
+        // (`CornerMask::apply` early-returns on all-zero radii) and collapses the
+        // CRT shader's corner coverage to 1.0. The `corner_radius` FIELD is never
+        // mutated: suppression is display-time only.
         let scale = dw.window.scale_factor() as f32;
-        let corner_radius_px = corner_radius * scale;
+        let corner_radius_px = effective_corner_radius_px(corner_radius, scale, dw.fullscreen);
         // CRT routing: when enabled, the whole scene renders into this window's
         // offscreen texture and the CRT pass samples it onto the surface — the
         // exact main-window flow (no Tier-B summons here, so no bypass case).

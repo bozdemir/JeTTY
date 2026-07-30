@@ -201,6 +201,20 @@ pub(crate) struct DetachedWindow {
     /// Caret flash burst clock for keystrokes typed in THIS window (mirrors
     /// `App::caret_anim` for the main window). `None` = no burst live.
     pub caret_anim: Option<std::time::Instant>,
+    /// Whether THIS detached window is in OS fullscreen (F11 pressed in it).
+    /// Session-only and PER WINDOW — detached windows persist no geometry at all,
+    /// have no `window_mode`, and are never hidden, so this is purely a live
+    /// shape mirror (the render path must never call the syscall-backed
+    /// `Window::fullscreen()`). Mirrors `App::main_fullscreen`; feeds this
+    /// window's corner-radius suppression (`effective_corner_radius_px`) and its
+    /// maximize / drag / resize-edge inertness.
+    ///
+    /// MUST be false before the struct is dropped — on macOS
+    /// `set_simple_fullscreen(true)` overwrites app-scoped
+    /// `NSApplication.presentationOptions` that only its own `false` call
+    /// restores, so dropping a fullscreen window leaks an auto-hidden Dock and
+    /// menu bar for the rest of the session. See `App::exit_detached_fullscreen_bare`.
+    pub fullscreen: bool,
     /// Whether THIS detached window holds OS focus (from its Focused events).
     /// Drives the unfocused-hollow cursor, per-window like the main one.
     pub focused: bool,
@@ -403,6 +417,7 @@ impl DetachedWindow {
             // A freshly-detached window is created focused (the WM focuses it on
             // map); its Focused events keep this current thereafter.
             focused: true,
+            fullscreen: false,
             reflow_pending_at: None,
             // build_window above already titled the OS window from tab.title.
             applied_os_title: tab.title.clone(),
