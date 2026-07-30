@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+**Fullscreen.** A third window mode and a per-window `F11` toggle.
+
+### Added
+- **`window_mode = "fullscreen"`** — a third value for the Settings ▸ Window
+  ▸ WINDOW MODE cycler, alongside Center and Dropdown. It is a *summon policy*:
+  every `F9` summon covers the whole monitor the window is on (borderless — the
+  display mode is never changed, and `Fullscreen::Exclusive` is deliberately
+  never used). Rounded corners are squared off while fullscreen, because a
+  radius would show the desktop through four notches at the screen edges. The
+  CORNER RADIUS slider dims while fullscreen to say so; your configured radius is
+  kept untouched and comes back on exit.
+- **`F11` — toggle fullscreen on the focused window** (main *or* a detached one).
+  Transient and per-window: it never rewrites `window_mode` and never touches
+  `config.toml`, so there is no disk write on the key path. The persisted mode
+  wins on the next summon, which makes an ad-hoc `F11` self-healing. On macOS a
+  companion **`Cmd+Ctrl+F`** is seeded as well, because bare `F11` there is
+  Mission Control's "Show Desktop" — and on Apple keyboards without *Use F1,
+  F2… as standard function keys* the physical F11 is Volume Down, so the app
+  never sees the key at all.
+- **"Toggle fullscreen"** in the command palette (`Ctrl+Shift+P`) and a row in
+  the Keyboard Shortcuts overlay, which lists every bound chord.
+
+### Changed
+- **Bare `F11` no longer reaches the shell.** This is the one behaviour change in
+  the release: `F11` used to send the escape sequence `\e[23~`, and the keymap
+  now claims it. Two escape hatches, both pinned by tests:
+  ```toml
+  [keys]
+  toggle_fullscreen = ""     # give bare F11 back to the shell (sends \e[23~ again)
+  ```
+  and — because the default chord is exact, not modifier-insensitive —
+  **`Shift`/`Ctrl`/`Alt`+`F11` still reach the PTY** as the xterm modified form
+  `\e[23;{m}~`, whatever you do.
+- While a window is fullscreen, its ▢ button and a double-click on its top bar
+  **exit fullscreen** instead of toggling maximize, and dragging / resizing it is
+  inert (including the resize cursor over its edges). Maximize and fullscreen stay
+  orthogonal: `F11` on a maximized window does not un-maximize it, so
+  maximize → `F11` → ▢ hands back a maximized window.
+- Opening **Settings** or **detaching a tab** while fullscreen leaves fullscreen
+  first. A fullscreen window sits in the window manager's above-normal layer, so
+  a sibling window would otherwise be focused but invisible behind it — and
+  Settings is the only UI for leaving the mode.
+
+### Performance
+Be clear about this: **Fullscreen is the most EXPENSIVE window mode**, because
+GPU cost scales with surface AREA. The default window is 1000×640; fullscreen on
+a 4K display is roughly **13× the pixels**, and every pass scales with it — the
+background quad, the text pass, the inline-image layer, and the CRT and summon
+reveal effects worst of all. The published [performance budget](docs/perf-budget.md)
+numbers are measured at 1920×1200; expect frame times to rise roughly in
+proportion to your monitor's pixel count. The only real saving in the other
+direction is the skipped corner-mask pass (all-zero radii early-return), which is
+one pass, not a rescue. If you run the CRT effect on a 4K panel, Fullscreen is
+where you will feel it.
+
+Nothing new runs per frame and nothing new runs while idle: the idle path is
+untouched (~0 % CPU), every state change is event-driven, and a fullscreen
+transition rides the existing 250 ms resize debounce so it still costs exactly
+one reflow.
+
+---
+
 ## [0.23.1] — 2026-07-17
 
 **UI-font polish.** Four fixes so the chrome looks right under any UI font — size

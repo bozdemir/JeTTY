@@ -39,9 +39,10 @@
 ## ✨ Features
 
 - 🚀 **Blazing fast** — GPU-rendered with [`wgpu`](https://github.com/gfx-rs/wgpu); ~5.5 ms full-screen frames (144 Hz-ready), **~0 % CPU when idle** (damage-driven redraw), 150+ MB/s VT throughput. See the [performance budget](docs/perf-budget.md).
-- 🎯 **Global summon hotkey** — press **F9** anywhere to bring JeTTY up. Two modes (switchable in settings):
+- 🎯 **Global summon hotkey** — press **F9** anywhere to bring JeTTY up. Three modes (switchable in settings):
   - **Center** — drops into the middle of your screen.
   - **Dropdown** — slides down from the top edge, full screen width, Yakuake/Guake style, with adjustable width & height.
+  - **Fullscreen** — covers the whole monitor it is on (borderless, no display-mode change), with the rounded corners squared off so no desktop shows through at the screen edges. `F11` also toggles fullscreen on any window at any time, without changing the mode.
 - ✨ **Summon effects** — five self-written GPU reveal shaders, selectable in settings: **Phosphor Ignition** (default — CRT power-on), **Bayer Crystallize**, **Liquid Drop**, **Focus Pull**, or **None**.
 - 📺 **Visual effects** — an optional **CRT** mode (curvature, scanlines, shadow-mask, bloom, chromatic aberration, vignette + animated roll/flicker/jitter) and a **caret flash/glow**, all under a dedicated **Effects** settings tab. Off by default, so the default look and ~0% idle CPU are untouched.
 - 🗂️ **Tabs** — `Ctrl+Shift+T` new (**opens in the current tab's directory**), `Ctrl+Shift+W` close (with confirm), `Ctrl+Tab` / `Ctrl+1‒9` switch, double-click to rename, right-click for a **Detach / Rename / Close** menu. Tabs **auto-title from the shell** (OSC 0/2 — a manual rename always wins), and inactive tabs show an **activity / bell dot**.
@@ -54,7 +55,7 @@
 - ♻️ **Config hot-reload** — edit `~/.config/jetty/config.toml` (or a theme file) and JeTTY **applies it live**, no restart — never clobbering your file.
 - ⌘ **Command palette** — `Ctrl+Shift+P` (⌘⇧P on macOS) opens a fuzzy, keyboard-first launcher: type to filter every action (new tab, switch theme, toggle effects, jump to prompt, settings…), `Enter` runs it. The fast way to do anything.
 - 🖼️ **Inline images (Sixel + Kitty)** — programs that emit **Sixel** (`img2sixel`, `chafa -f sixel`, matplotlib's sixel backend, `lsix`) or speak the **Kitty graphics protocol** (`chafa -f kitty`, `timg -p kitty`, `kitten icat --transfer-mode=stream`) render a **real bitmap right in the grid**, GPU-textured, at native size, scrolling with your scrollback. Image previews and plots without leaving the terminal.
-- ⌨️ **Remappable keybindings** — a `[keys]` table in your config remaps any shortcut (copy, tabs, search, palette, font…) to your muscle memory; unset keys keep the sensible defaults, and it hot-reloads live. Terminal control bytes (Ctrl+C…) are protected.
+- ⌨️ **Remappable keybindings** — a `[keys]` table in your config remaps any shortcut (copy, tabs, search, palette, font…) to your muscle memory; unset keys keep the sensible defaults, and it hot-reloads live. Terminal control bytes (Ctrl+C…) are protected. Setting an action to `""` unbinds it and hands the key back to the shell — e.g. `[keys]` `toggle_fullscreen = ""` gives bare `F11` back to your TUI (it then sends `\e[23~` again); `Shift`/`Ctrl`/`Alt`+`F11` reach the shell either way.
 - 🔤 **Hint mode & copy-mode** — `Ctrl+Shift+H` labels every URL / path / git-hash / IP on screen so you can **copy it with a keystroke** (Alt to open a URL); `Ctrl+Shift+Space` enters a **vi-style keyboard copy-mode** (hjkl / word motions, `v`/`V` to select, `y` to yank) — select and copy without ever touching the mouse.
 - 🪟➡️ **Detachable tabs** — `Ctrl+Shift+D`, the tab's right-click menu, or simply **dragging a tab off the bar** pops it into its own window (with its own title bar and status strip); reattach with `Ctrl+Shift+D`, the window's right-click menu, closing it, or **dropping it back onto the main tab bar**. Detached windows have **full mouse parity**: selection, wheel, scrollbar, middle-click paste.
 - 🎨 **22 built-in themes** — Catppuccin (Mocha/Macchiato), Tokyo Night, Gruvbox, Dracula, Onyx, Nord, Solarized (dark/light), One Dark, Monokai (+Pro), Everforest, Rosé Pine, Kanagawa, Material, Ayu (dark/mirage), Tomorrow Night, Oceanic Next, GitHub Dark, Palenight — exact community palettes, picked from a scrollable dropdown with live color previews. Every UI surface re-skins with the active theme.
@@ -157,6 +158,8 @@ cargo build --release && ./target/release/jetty
 | `Ctrl+Shift+W` | Close tab (with confirm) |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Ctrl+Shift+D` | Detach tab into its own window / reattach |
+| `F11` | Toggle fullscreen (whole monitor) for the focused window |
+| `Cmd+Ctrl+F` (macOS) | Same — macOS also seeds this, because bare `F11` there is Mission Control's "Show Desktop" (and Volume Down on Apple keyboards without *Use F1, F2… as standard function keys*) |
 | Drag tab off the bar | Detach (drop the window on the bar to reattach) |
 | Right-click tab | Detach / Rename / Close menu |
 | `Ctrl+1`‒`9` | Jump to tab |
