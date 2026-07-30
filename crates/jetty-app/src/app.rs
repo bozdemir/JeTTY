@@ -10760,29 +10760,29 @@ fn translate_bar_rects(bar: &mut jetty_render::TabBar, dy: f32) {
     bar.close_rect.y += dy;
 }
 
-/// Centre `win` on its current monitor (or the first available monitor if the
-/// current one cannot be determined). No-ops gracefully if no monitor info is
-/// available.
 /// Whether `pos` (a window outer top-left, physical px) lies within some
 /// currently-connected monitor. Used to reject a saved Center-mode position that
-/// now falls on a since-disconnected monitor (F32).
+/// now falls on a since-disconnected monitor (F32). The containment test itself
+/// lives in `jetty_platform::pos_in_monitor_rect`, shared with
+/// `monitor_for_window` so "which screen" is decided in exactly one place.
 fn pos_on_some_monitor(win: &Arc<Window>, pos: winit::dpi::PhysicalPosition<i32>) -> bool {
     win.available_monitors().any(|m| {
         let p = m.position();
         let s = m.size();
-        pos.x >= p.x
-            && pos.x < p.x + s.width as i32
-            && pos.y >= p.y
-            && pos.y < p.y + s.height as i32
+        jetty_platform::pos_in_monitor_rect((pos.x, pos.y), (p.x, p.y), (s.width, s.height))
     })
 }
 
+/// Centre `win` on the monitor it belongs to. No-ops gracefully if no monitor
+/// info is available.
+///
+/// Uses the SHARED `jetty_platform::monitor_for_window` chain, so — unlike
+/// before — a HIDDEN Center-mode window on a secondary monitor re-centres on
+/// THAT monitor instead of the primary (it used to fall straight through to the
+/// primary because a hidden window reports no `current_monitor`; the Dropdown
+/// path already had this fallback and Center did not).
 fn center_window(win: &Arc<Window>) {
-    let mon = win
-        .current_monitor()
-        .or_else(|| win.available_monitors().next());
-
-    if let Some(mon) = mon {
+    if let Some(mon) = jetty_platform::monitor_for_window(win) {
         let mon_pos = mon.position(); // physical px; nonzero on secondary monitors
         let mon_size = mon.size();
         let win_size = win.outer_size();
@@ -10801,30 +10801,13 @@ fn center_window(win: &Arc<Window>) {
 /// set ONCE per summon (the slide-in is render-side, not a per-frame reposition).
 /// On Wayland set_outer_position/request_inner_size are no-ops — accepted
 /// degradation, same as the F9 hotkey.
+///
+/// The monitor is resolved by the SHARED `jetty_platform::monitor_for_window`
+/// chain (current monitor → the monitor containing the last outer position → the
+/// first available), which is where this function's own hidden-window fallback
+/// was factored out to.
 fn dock_window_top(win: &Arc<Window>, width_pct: f32, height_pct: f32) {
-    let mon = win
-        .current_monitor()
-        // A HIDDEN window (the dropdown between summons) reports no
-        // current_monitor, so this used to fall straight through to the PRIMARY
-        // monitor — re-summoning the dropdown on the wrong screen for multi-monitor
-        // users. Prefer the monitor that contains the window's last outer position
-        // so it re-appears on the SAME monitor. (If the position is unavailable —
-        // e.g. never shown, or Wayland — we fall back to the primary as before, so
-        // there is no regression.)
-        .or_else(|| {
-            win.outer_position().ok().and_then(|a| {
-                win.available_monitors().find(|m| {
-                    let p = m.position();
-                    let s = m.size();
-                    a.x >= p.x
-                        && a.x < p.x + s.width as i32
-                        && a.y >= p.y
-                        && a.y < p.y + s.height as i32
-                })
-            })
-        })
-        .or_else(|| win.available_monitors().next());
-    if let Some(mon) = mon {
+    if let Some(mon) = jetty_platform::monitor_for_window(win) {
         let mon_pos = mon.position();
         let mon_size = mon.size();
         let mon_w = mon_size.width as f32;
