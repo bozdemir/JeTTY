@@ -211,20 +211,33 @@ fn format_scrollback(n: usize) -> String {
 
 /// How F9 summons the window. Mirrors `SummonEffect`'s ORDER/cycle/from_config
 /// pattern. `Center` re-summons centered (or at the last position); `Dropdown`
-/// is a Yakuake-style top-anchored full-width strip that slides down.
+/// is a Yakuake-style top-anchored full-width strip that slides down;
+/// `Fullscreen` covers the whole monitor.
+///
+/// This is a summon-geometry POLICY (persisted as `window_mode`), NOT the live
+/// shape: the transient per-window F11 toggle lives in `App::main_fullscreen` /
+/// `DetachedWindow::fullscreen` and never writes this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowMode {
     Center,
     Dropdown,
+    /// Summon covering the WHOLE monitor the window is on (borderless
+    /// fullscreen). Rounded corners are suppressed while fullscreen (a radius
+    /// would show the desktop through four notches at the screen edges), and
+    /// neither the dock/center re-assertion counters nor the dropdown slide are
+    /// ever armed in this mode.
+    Fullscreen,
 }
 
 impl WindowMode {
-    const ORDER: [WindowMode; 2] = [WindowMode::Center, WindowMode::Dropdown];
+    const ORDER: [WindowMode; 3] =
+        [WindowMode::Center, WindowMode::Dropdown, WindowMode::Fullscreen];
 
     fn display_name(self) -> &'static str {
         match self {
             WindowMode::Center => "Center",
             WindowMode::Dropdown => "Dropdown",
+            WindowMode::Fullscreen => "Fullscreen",
         }
     }
 
@@ -235,9 +248,13 @@ impl WindowMode {
         Self::ORDER[j]
     }
 
+    /// Case-SENSITIVE, unknown ⇒ `Center` — unchanged, which is also what gives
+    /// forward compatibility for free: an OLDER JeTTY reading
+    /// `window_mode = "fullscreen"` falls into `_ => Center` and starts fine.
     fn from_config(s: &str) -> WindowMode {
         match s {
             "dropdown" => WindowMode::Dropdown,
+            "fullscreen" => WindowMode::Fullscreen,
             _ => WindowMode::Center,
         }
     }
@@ -246,6 +263,7 @@ impl WindowMode {
         match self {
             WindowMode::Center => "center",
             WindowMode::Dropdown => "dropdown",
+            WindowMode::Fullscreen => "fullscreen",
         }
     }
 }
@@ -3142,6 +3160,13 @@ impl App {
                     self.slide_anim = Some(std::time::Instant::now());
                 }
             }
+            WindowMode::Fullscreen => {
+                // Geometry is wired in the `set_main_fullscreen` commit; until then
+                // behave exactly like Center so no intermediate commit can leave a
+                // selectable mode broken.
+                self.slide_anim = None;
+                self.pending_dock_frames = 0;
+            }
         }
         self.persist();
         self.request_main_paint();
@@ -4294,6 +4319,15 @@ impl App {
                         self.pending_dock_frames = 5;
                         // Arm the render-side slide-down.
                         self.slide_anim = Some(std::time::Instant::now());
+                    }
+                    WindowMode::Fullscreen => {
+                        // Fullscreen geometry is wired in the `set_main_fullscreen`
+                        // commit; until then summon exactly like Center so no
+                        // intermediate commit can leave a selectable mode broken.
+                        win.set_visible(true);
+                        center_window(win);
+                        self.pending_center_pos = None;
+                        self.pending_center_frames = 0;
                     }
                 }
                 win.focus_window();
@@ -6876,7 +6910,10 @@ impl ApplicationHandler<AppEvent> for App {
         // First open: place the window per the configured mode. Center mode
         // centers; Dropdown mode docks as a top strip and slides in.
         match self.window_mode {
-            WindowMode::Center => center_window(&window),
+            // Fullscreen is wired in the `set_main_fullscreen` commit; until then it
+            // opens centered like Center so no intermediate commit can leave a
+            // selectable mode broken.
+            WindowMode::Center | WindowMode::Fullscreen => center_window(&window),
             WindowMode::Dropdown => {
                 dock_window_top(&window, self.dropdown_width_pct, self.dropdown_height_pct);
                 // KWin ignores the pre-map dock above (window not realized yet) →
@@ -11384,5 +11421,69 @@ mod paint_choke_tests {
             2,
             "raw request_redraw count changed in detached.rs — run scripts/check-paint-choke.sh"
         );
+    }
+}
+
+#[cfg(test)]
+mod window_mode_tests {
+    //! `WindowMode` is a private-ish app type whose `display_name` /
+    //! `from_config` / `to_config` / `cycle` / `ORDER` are private, so these
+    //! tests live in `app.rs` itself (a `tests/` integration test could not see
+    //! them).
+    use super::WindowMode;
+
+    #[test]
+    fn window_mode_config_round_trip() {
+        for m in [WindowMode::Center, WindowMode::Dropdown, WindowMode::Fullscreen] {
+            assert_eq!(
+                WindowMode::from_config(m.to_config()),
+                m,
+                "round-trip failed for {m:?}"
+            );
+        }
+        assert_eq!(WindowMode::from_config("fullscreen"), WindowMode::Fullscreen);
+        assert_eq!(WindowMode::Fullscreen.to_config(), "fullscreen");
+        assert_eq!(WindowMode::Fullscreen.display_name(), "Fullscreen");
+        // Case-SENSITIVE and unknown-tolerant, exactly as before (which is what
+        // makes an OLDER JeTTY reading "fullscreen" fall back to Center).
+        assert_eq!(WindowMode::from_config("Fullscreen"), WindowMode::Center);
+        assert_eq!(WindowMode::from_config("FULLSCREEN"), WindowMode::Center);
+        assert_eq!(WindowMode::from_config("garbage"), WindowMode::Center);
+        assert_eq!(WindowMode::from_config(""), WindowMode::Center);
+    }
+
+    #[test]
+    fn window_mode_cycle_order_over_three() {
+        assert_eq!(WindowMode::ORDER.len(), 3);
+        // Every variant appears exactly once in ORDER.
+        for m in [WindowMode::Center, WindowMode::Dropdown, WindowMode::Fullscreen] {
+            assert_eq!(
+                WindowMode::ORDER.iter().filter(|&&x| x == m).count(),
+                1,
+                "{m:?} must appear exactly once in ORDER"
+            );
+        }
+        // Forward: Center → Dropdown → Fullscreen → Center.
+        assert_eq!(WindowMode::Center.cycle(true), WindowMode::Dropdown);
+        assert_eq!(WindowMode::Dropdown.cycle(true), WindowMode::Fullscreen);
+        assert_eq!(WindowMode::Fullscreen.cycle(true), WindowMode::Center);
+        // Backward is the exact inverse.
+        for m in WindowMode::ORDER {
+            assert_eq!(m.cycle(true).cycle(false), m);
+            assert_eq!(m.cycle(false).cycle(true), m);
+            // Three forward steps are the identity.
+            assert_eq!(m.cycle(true).cycle(true).cycle(true), m);
+        }
+    }
+
+    #[test]
+    fn window_mode_display_names_are_distinct_and_cycler_sized() {
+        let names: Vec<&str> = WindowMode::ORDER.iter().map(|m| m.display_name()).collect();
+        assert_eq!(names, vec!["Center", "Dropdown", "Fullscreen"]);
+        // The Settings cycler ellipsizes past ~11 chars at the default UI font
+        // (panel.rs `cycle_max_chars`); keep every label inside that budget.
+        for n in names {
+            assert!(n.chars().count() <= 11, "cycler label too long: {n:?}");
+        }
     }
 }
