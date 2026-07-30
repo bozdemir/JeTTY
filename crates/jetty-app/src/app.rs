@@ -3284,7 +3284,9 @@ impl App {
             // WINDOW MODE ▸ Fullscreen, the primary discovery gesture, buries the
             // panel behind the terminal.
             self.close_settings_for_fullscreen();
-            // Only ONE JeTTY window may be fullscreen at a time.
+            // macOS only: at most one JeTTY window may be fullscreen at a time
+            // (an app-scoped presentation-options wart — see the helper). A no-op
+            // on every other platform, deliberately.
             self.enforce_single_fullscreen(None);
             // Nothing may re-assert a docked/centred rect over a fullscreen window,
             // and the top-strip slide must not run on a monitor-tall window (it
@@ -3438,7 +3440,9 @@ impl App {
             _ => return,
         }
         if on {
-            // Only ONE JeTTY window may be fullscreen at a time.
+            // macOS only (see `enforce_single_fullscreen`): a no-op elsewhere, so
+            // F11 in a detached window no longer yanks the main window out of
+            // fullscreen — and out of its fullscreen geometry — on X11.
             self.enforce_single_fullscreen(Some(pos));
         }
         let Some(dw) = self.detached.get_mut(pos) else { return };
