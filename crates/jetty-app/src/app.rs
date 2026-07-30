@@ -2122,6 +2122,14 @@ impl App {
         if !crate::detached::can_detach(self.tabs.len()) {
             return; // keep at least one tab in the main window
         }
+        // Same reason as `toggle_settings_window`: a new window created over a
+        // fullscreen terminal is focused but invisible behind it (a fullscreen
+        // window lives in the WM's above-normal layer, and demotion on focus loss is
+        // WM-specific — not something we may special-case). Leave fullscreen first.
+        // This covers the tear-out gesture too, which routes through here.
+        if self.main_fullscreen {
+            self.set_main_fullscreen(false);
+        }
         // Original active index, kept so the detach can be fully unwound if the
         // detached window's GPU/window init fails (see the Err arm below).
         let prev_active = self.active;
@@ -3157,14 +3165,174 @@ impl App {
         ((cx - track.x) / track.w).clamp(0.0, 1.0)
     }
 
+    /// Enter / leave OS fullscreen on the MAIN window — the single chokepoint.
+    ///
+    /// TRANSIENT: nothing is persisted here. `window_mode == Fullscreen` is the
+    /// persisted intent; this is the live shape, which an ad-hoc
+    /// `ToggleFullscreen` (F11) can also set in Center / Dropdown mode. Leaving
+    /// lands the window back in the geometry the PERSISTED `window_mode` asks
+    /// for, so an ad-hoc exit is indistinguishable from never having gone
+    /// fullscreen.
+    ///
+    /// HARD RULES enforced here:
+    /// * Rule F0 — never ENTER fullscreen on a hidden window (X11 resolves
+    ///   `Borderless(None)` from the window frame; macOS's simple fullscreen
+    ///   `expect`s a screen, which an ordered-out window does not have). Both hide
+    ///   paths leave fullscreen before unmapping, so `main_fullscreen` is `false`
+    ///   whenever `!visible` and the enter is always a genuine `None → Some`
+    ///   transition that winit's X11 dedupe cannot swallow.
+    /// * Never arm `pending_dock_frames` / `pending_center_frames` (nor issue any
+    ///   geometry call) while `!visible`: those counters only decrement inside
+    ///   `RedrawRequested`, which a hidden window never receives on macOS, so
+    ///   arming them while hidden pins `ControlFlow::Poll` and burns a core
+    ///   invisibly (the F18 bug class) — and on X11 it would fire five docks
+    ///   → five `Resized` → a SIGWINCH storm to every hidden tab.
+    /// * Never call `reflow()` or `gpu.resize()` from here: the WM's own `Resized`
+    ///   event drives the existing 250 ms debounce, which also collapses macOS's
+    ///   multi-event transition into exactly ONE reflow. Reflowing here as well
+    ///   would be the double-reflow pattern that scatters p10k's prompt.
+    fn set_main_fullscreen(&mut self, on: bool) {
+        if self.main_fullscreen == on {
+            return;
+        }
+        let Some(win) = self.window.clone() else {
+            // Pre-`resumed`: no window yet. Do NOT latch the flag — it mirrors a
+            // MAPPED window, and `resumed` establishes it from `window_mode`.
+            return;
+        };
+        if on {
+            // Rule F0: entering requires a mapped window. When hidden, the next
+            // summon applies the persisted mode instead.
+            if !self.visible {
+                return;
+            }
+            // Remember the spot BEFORE the frame becomes the monitor.
+            // `!= Dropdown` (not `== Center`): `set_window_mode` assigns the NEW
+            // mode before calling us, and F11 while already in Fullscreen mode must
+            // capture too — an `== Center` test is unreachable in exactly the cases
+            // that need it, and would lose the user's placement on
+            // Center → Fullscreen → Center. `.or(self.last_pos)` keeps an existing
+            // saved spot when the read fails (Wayland). Consistent with the
+            // loosened `center_reassert_ok` predicate.
+            if self.window_mode != WindowMode::Dropdown {
+                self.last_pos = win.outer_position().ok().or(self.last_pos);
+            }
+            // Nothing may re-assert a docked/centred rect over a fullscreen window,
+            // and the top-strip slide must not run on a monitor-tall window (it
+            // would show a monitor-tall band of desktop for 150 ms).
+            self.pending_dock_frames = 0;
+            self.pending_center_frames = 0;
+            self.pending_center_pos = None;
+            self.slide_anim = None;
+            self.main_fullscreen = true;
+            jetty_platform::set_window_fullscreen(&win, true);
+        } else {
+            self.main_fullscreen = false;
+            // Safe unconditionally: only the ENTER path needs a mapped window.
+            jetty_platform::set_window_fullscreen(&win, false);
+            // One decision, taken by a PURE function so the "never arm a counter
+            // while hidden" invariant is unit-testable (see
+            // `fullscreen_exit_frames`). `restorable` folds the F32 stale-monitor
+            // gate: a saved position on a since-disconnected monitor is not
+            // restorable, so we centre on a live monitor instead of mapping
+            // off-screen.
+            let maximized = win.is_maximized();
+            let restorable = self
+                .last_pos
+                .map(|p| pos_on_some_monitor(&win, p))
+                .unwrap_or(false);
+            let (dock_frames, center_frames) =
+                fullscreen_exit_frames(self.visible, maximized, self.window_mode, restorable);
+            self.pending_dock_frames = dock_frames;
+            self.pending_center_frames = center_frames;
+            self.pending_center_pos = None;
+            // Geometry is only ever issued on a VISIBLE, non-maximized window:
+            // hidden ⇒ the next summon places it (and an OS geometry call while
+            // hidden is forbidden); maximized ⇒ the WM restores the maximized frame
+            // itself, and an explicit position on a maximized X11 window is ignored
+            // or half-applied.
+            if self.visible && !maximized {
+                match self.window_mode {
+                    // Fullscreen mode + an ad-hoc F11 exit is a temporary escape that
+                    // restores like Center; the next summon re-establishes
+                    // fullscreen, so the escape is self-healing and needs no
+                    // "escaped" flag.
+                    WindowMode::Center | WindowMode::Fullscreen => {
+                        match self.last_pos.filter(|_| restorable) {
+                            Some(p) => {
+                                win.set_outer_position(p);
+                                self.pending_center_pos = Some(p);
+                            }
+                            None => {
+                                center_window(&win);
+                                self.last_pos = None;
+                            }
+                        }
+                    }
+                    WindowMode::Dropdown => {
+                        dock_window_top(&win, self.dropdown_width_pct, self.dropdown_height_pct);
+                        // No slide here: this is a restore, not a summon.
+                    }
+                }
+            }
+        }
+        // The corner radius changed ⇒ repaint. No persist(): transient state.
+        self.request_main_paint();
+    }
+
+    /// Rule F0: leave OS fullscreen while the window is still MAPPED, with NO
+    /// geometry restore and no repaint. Returns whether we were fullscreen.
+    ///
+    /// Used by both hide paths — `set_visibility(false)` and
+    /// `autohide_main_window` — immediately BEFORE `set_visible(false)`, and
+    /// before the window is dropped (app exit). Keeping the OS state out of the
+    /// hidden period is what makes the next summon's enter a genuine
+    /// `None → Some` transition, keeps macOS's simple fullscreen off a screen-less
+    /// window, and stops an ad-hoc F11 leaking across a hide/summon round-trip.
+    /// On macOS it is also what restores the app-scoped `presentationOptions`
+    /// (auto-hidden Dock + menu bar) — those are only ever restored by the
+    /// matching `set_simple_fullscreen(false)`.
+    fn exit_main_fullscreen_bare(&mut self) -> bool {
+        if !self.main_fullscreen {
+            return false;
+        }
+        self.main_fullscreen = false;
+        if let Some(win) = &self.window {
+            jetty_platform::set_window_fullscreen(win, false);
+        }
+        true
+    }
+
     /// Select a new window mode: persist it, and apply it live. Switching to
     /// Center clears any in-progress slide; switching to Dropdown clears last_pos
-    /// so the next summon re-docks from a clean top-flush geometry.
+    /// so the next summon re-docks from a clean top-flush geometry; switching to
+    /// Fullscreen covers the monitor immediately when visible.
     fn set_window_mode(&mut self, mode: WindowMode) {
         if self.window_mode == mode {
             return;
         }
+        let was_fullscreen = self.main_fullscreen;
+        // Assign FIRST: `set_main_fullscreen` reads `window_mode` to decide both
+        // the `last_pos` capture and where an exit lands.
         self.window_mode = mode;
+        if mode != WindowMode::Fullscreen && was_fullscreen {
+            // Leaving fullscreen (whether it came from the mode or from an ad-hoc
+            // F11): exit the OS state AND apply the NEW mode's geometry —
+            // `set_main_fullscreen(false)` does both.
+            self.set_main_fullscreen(false);
+            if mode == WindowMode::Dropdown {
+                // Match today's Dropdown mode-switch exactly, so the slide-in does
+                // not depend on whether F11 happened to be pressed earlier.
+                self.last_pos = None;
+                if self.visible {
+                    self.slide_anim = Some(std::time::Instant::now());
+                }
+            }
+            self.persist();
+            self.request_main_paint();
+            self.request_settings_paint();
+            return;
+        }
         match mode {
             WindowMode::Center => {
                 self.slide_anim = None;
@@ -3187,11 +3355,19 @@ impl App {
                 }
             }
             WindowMode::Fullscreen => {
-                // Geometry is wired in the `set_main_fullscreen` commit; until then
-                // behave exactly like Center so no intermediate commit can leave a
-                // selectable mode broken.
+                // No slide (a monitor-tall band of desktop for 150 ms) and no
+                // dock/center re-assertion can be allowed to fight the fullscreen
+                // frame.
                 self.slide_anim = None;
                 self.pending_dock_frames = 0;
+                self.pending_center_frames = 0;
+                self.pending_center_pos = None;
+                // Apply LIVE when visible so the Settings cycler feels instant;
+                // when hidden the next summon applies it (and no OS/geometry call
+                // may be issued while hidden anyway).
+                if self.visible {
+                    self.set_main_fullscreen(true);
+                }
             }
         }
         self.persist();
@@ -4249,8 +4425,16 @@ impl App {
         if !self.visible {
             return;
         }
+        // Rule F0: drop the OS fullscreen state while the window is still MAPPED,
+        // BEFORE `set_visible(false)` below.
+        let was_fullscreen = self.exit_main_fullscreen_bare();
         if let Some(win) = &self.window {
-            if self.window_mode == WindowMode::Center {
+            // Never overwrite `last_pos` when we were fullscreen: `outer_position()`
+            // on a fullscreen (or just-exited) window reports the monitor origin,
+            // which would poison the user's remembered spot to the screen corner —
+            // and `set_main_fullscreen(true)` already saved the real pre-fullscreen
+            // position on the way in.
+            if self.window_mode == WindowMode::Center && !was_fullscreen {
                 self.last_pos = win.outer_position().ok();
             }
             self.slide_anim = None;
@@ -4305,6 +4489,14 @@ impl App {
         // An explicit visibility change supersedes any scheduled auto-hide.
         self.pending_autohide_at = None;
         let mode = self.window_mode;
+        // Rule F0: on the HIDE leg, drop the OS fullscreen state while the window is
+        // still MAPPED (before `set_visible(false)` below). Computed here, ahead of
+        // the `&self.window` borrow, because it needs `&mut self`.
+        let was_fullscreen = if self.visible {
+            false
+        } else {
+            self.exit_main_fullscreen_bare()
+        };
         if let Some(win) = &self.window {
             if self.visible {
                 match mode {
@@ -4347,13 +4539,25 @@ impl App {
                         self.slide_anim = Some(std::time::Instant::now());
                     }
                     WindowMode::Fullscreen => {
-                        // Fullscreen geometry is wired in the `set_main_fullscreen`
-                        // commit; until then summon exactly like Center so no
-                        // intermediate commit can leave a selectable mode broken.
+                        // Show FIRST so the window is mapped: X11 resolves
+                        // `Borderless(None)` from the window frame and macOS's
+                        // simple fullscreen `expect`s a screen, neither of which an
+                        // unmapped window has (rule F0). Because the hide leg exited
+                        // fullscreen, this is always a genuine `None → Some`
+                        // transition — winit's X11 `set_fullscreen_inner` early-
+                        // returns when the requested state equals the cached one, so
+                        // holding the state across a hide would silently lose the WM
+                        // state and make the summon a no-op.
                         win.set_visible(true);
-                        center_window(win);
+                        self.main_fullscreen = true;
+                        jetty_platform::set_window_fullscreen(win, true);
+                        // NO Center/Dropdown geometry, NO dock/center counters, NO
+                        // slide: the summon reveal effect (`summon_pending` below) is
+                        // this mode's appearance animation, and it is
+                        // resolution-independent.
                         self.pending_center_pos = None;
                         self.pending_center_frames = 0;
+                        self.pending_dock_frames = 0;
                     }
                 }
                 win.focus_window();
@@ -4368,7 +4572,10 @@ impl App {
             } else {
                 // Remember the current spot before hiding so the next Center
                 // summon restores it. Dropdown re-docks, so last_pos is unused.
-                if mode == WindowMode::Center {
+                // Skipped when we just left fullscreen: `outer_position()` reports
+                // the monitor origin there, and the real pre-fullscreen spot was
+                // already saved on the way IN (see `set_main_fullscreen`).
+                if mode == WindowMode::Center && !was_fullscreen {
                     self.last_pos = win.outer_position().ok();
                 }
                 self.slide_anim = None;
@@ -4407,6 +4614,16 @@ impl App {
             // it responsive/consistent).
             self.request_main_paint();
             return;
+        }
+
+        // A fullscreen window sits in the WM's above-normal layer (EWMH), and
+        // whether a WM demotes it on focus loss is WM-specific — which we may not
+        // special-case. So a Settings window opened over a fullscreen terminal would
+        // be focused but INVISIBLE behind it, and Settings is the only UI for leaving
+        // Fullscreen mode. Give the window back first (coherent with "▢ while
+        // fullscreen = give me my window back").
+        if self.main_fullscreen {
+            self.set_main_fullscreen(false);
         }
 
         let window = match jetty_platform::build_fixed_window(
@@ -6633,6 +6850,24 @@ impl App {
 }
 
 impl ApplicationHandler<AppEvent> for App {
+    /// The event loop is about to return: leave OS fullscreen on every JeTTY
+    /// window while they still exist.
+    ///
+    /// This is the ONE chokepoint for app exit — there are five `event_loop.exit()`
+    /// sites (last tab closed, last shell exited, the quit confirmation's ✕ and its
+    /// Enter, a fatal PTY spawn failure) and winit calls `exiting` after all of
+    /// them, with `App` (and therefore every window) still alive.
+    ///
+    /// Why it matters: macOS `set_simple_fullscreen(true)` SAVES and overwrites the
+    /// app-scoped `NSApplication.presentationOptions` (auto-hide Dock + menu bar)
+    /// and only the matching `set_simple_fullscreen(false)` restores them. Dropping
+    /// a fullscreen window without exiting first therefore leaves the user's Dock
+    /// and menu bar auto-hidden for the rest of their session, in every other app.
+    /// A no-op on every other platform and whenever nothing is fullscreen.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.exit_main_fullscreen_bare();
+    }
+
     /// Drive ControlFlow. macOS does NOT deliver a `RedrawRequested` for a
     /// `request_redraw()` issued under `ControlFlow::Wait` until an input event
     /// arrives — so self-driving animations stall and freshly-shown windows stay
@@ -6941,10 +7176,15 @@ impl ApplicationHandler<AppEvent> for App {
         // First open: place the window per the configured mode. Center mode
         // centers; Dropdown mode docks as a top strip and slides in.
         match self.window_mode {
-            // Fullscreen is wired in the `set_main_fullscreen` commit; until then it
-            // opens centered like Center so no intermediate commit can leave a
-            // selectable mode broken.
-            WindowMode::Center | WindowMode::Fullscreen => center_window(&window),
+            WindowMode::Center => center_window(&window),
+            WindowMode::Fullscreen => {
+                // `build_window` already created AND ordered/mapped the window
+                // (winit's default attributes are visible+active), so the "entering
+                // fullscreen needs a mapped window" precondition holds here.
+                // No dock/center counters, no slide (see `set_main_fullscreen`).
+                self.main_fullscreen = true;
+                jetty_platform::set_window_fullscreen(&window, true);
+            }
             WindowMode::Dropdown => {
                 dock_window_top(&window, self.dropdown_width_pct, self.dropdown_height_pct);
                 // KWin ignores the pre-map dock above (window not realized yet) →
@@ -10881,6 +11121,44 @@ fn dock_reassert_ok(mode: WindowMode, fullscreen: bool) -> bool {
     mode == WindowMode::Dropdown && !fullscreen
 }
 
+/// The post-map re-assertion counters a fullscreen EXIT may arm:
+/// `(pending_dock_frames, pending_center_frames)`.
+///
+/// THE INVARIANT: `(0, 0)` whenever `!visible`. Those counters only decrement
+/// inside `RedrawRequested`, which a hidden (ordered-out) window never receives on
+/// macOS, while `main_pending` in `about_to_wait` selects `ControlFlow::Poll` for
+/// as long as either is non-zero — so arming one while hidden pegs a core
+/// invisibly (the F18 bug class). On X11 it would additionally fire five
+/// `dock_window_top` calls → five `Resized` events → a SIGWINCH storm to every
+/// hidden tab, the p10k-prompt-scatter trigger v0.23.1 fixed.
+///
+/// Also `(0, 0)` when the window is MAXIMIZED (nothing is restored, so nothing
+/// needs re-asserting), and `(0, 5)` for Center/Fullscreen only when there is a
+/// restorable saved position — a `center_window` fallback needs no re-assertion
+/// because it is recomputed from live monitor geometry.
+///
+/// Pure, so the invariant is a unit test rather than a code-reading exercise.
+fn fullscreen_exit_frames(
+    visible: bool,
+    maximized: bool,
+    mode: WindowMode,
+    restorable_pos: bool,
+) -> (u8, u8) {
+    if !visible || maximized {
+        return (0, 0);
+    }
+    match mode {
+        WindowMode::Dropdown => (5, 0),
+        WindowMode::Center | WindowMode::Fullscreen => {
+            if restorable_pos {
+                (0, 5)
+            } else {
+                (0, 0)
+            }
+        }
+    }
+}
+
 /// Whether the Center-mode post-map position re-assertion may fire this frame.
 ///
 /// Deliberately `!= Dropdown`, not `== Center`: Fullscreen mode uses it too, so
@@ -11521,7 +11799,61 @@ mod paint_choke_tests {
 mod fullscreen_helper_tests {
     //! The three pure fullscreen predicates. All private to `app.rs`, so the
     //! tests live here.
-    use super::{center_reassert_ok, dock_reassert_ok, effective_corner_radius_px, WindowMode};
+    use super::{
+        center_reassert_ok, dock_reassert_ok, effective_corner_radius_px,
+        fullscreen_exit_frames, WindowMode,
+    };
+
+    #[test]
+    fn fullscreen_exit_never_arms_a_counter_while_hidden() {
+        // THE ~0%-idle invariant. Reachable via the Settings WINDOW MODE cycler or a
+        // `window_mode` hot-reload while the main window is auto-hidden: a counter
+        // armed while hidden pins ControlFlow::Poll (it can only decrement inside
+        // RedrawRequested, which a hidden macOS window never receives) and on X11
+        // also fires a dock/SIGWINCH storm at every hidden tab.
+        for mode in WindowMode::ORDER {
+            for maximized in [false, true] {
+                for restorable in [false, true] {
+                    assert_eq!(
+                        fullscreen_exit_frames(false, maximized, mode, restorable),
+                        (0, 0),
+                        "armed a counter while HIDDEN: {mode:?} max={maximized} pos={restorable}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fullscreen_exit_frames_match_the_reassertion_predicates() {
+        use WindowMode::{Center, Dropdown, Fullscreen};
+        // Visible, not maximized: Dropdown re-docks, Center/Fullscreen re-assert a
+        // restorable saved position, and a centred fallback needs no re-assertion.
+        assert_eq!(fullscreen_exit_frames(true, false, Dropdown, false), (5, 0));
+        assert_eq!(fullscreen_exit_frames(true, false, Dropdown, true), (5, 0));
+        assert_eq!(fullscreen_exit_frames(true, false, Center, true), (0, 5));
+        assert_eq!(fullscreen_exit_frames(true, false, Center, false), (0, 0));
+        assert_eq!(fullscreen_exit_frames(true, false, Fullscreen, true), (0, 5));
+        assert_eq!(fullscreen_exit_frames(true, false, Fullscreen, false), (0, 0));
+        // Maximized: no geometry restore at all, so no re-assertion either — the WM
+        // restores the maximized frame itself.
+        for mode in WindowMode::ORDER {
+            assert_eq!(fullscreen_exit_frames(true, true, mode, true), (0, 0));
+        }
+        // Whatever is armed must be something the RedrawRequested guard will
+        // actually let run (with fullscreen now false) — otherwise the counter would
+        // be zeroed unused, i.e. dead arming.
+        for mode in WindowMode::ORDER {
+            for restorable in [false, true] {
+                let (d, c) = fullscreen_exit_frames(true, false, mode, restorable);
+                assert!(d == 0 || dock_reassert_ok(mode, false), "dead dock arming for {mode:?}");
+                assert!(
+                    c == 0 || center_reassert_ok(mode, false),
+                    "dead center arming for {mode:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn corner_radius_flat_while_fullscreen() {
