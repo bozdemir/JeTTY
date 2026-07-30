@@ -3458,31 +3458,61 @@ impl App {
         jetty_platform::set_window_fullscreen(&dw.window, false);
     }
 
-    /// SINGLE-FULLSCREEN-WINDOW RULE: at most ONE JeTTY window is ever in OS
-    /// fullscreen. Every ENTER path calls this first.
+    /// SINGLE-FULLSCREEN-WINDOW RULE — **macOS only**: at most one JeTTY window
+    /// may be in OS fullscreen at a time, so every ENTER path first leaves
+    /// fullscreen on all the others. A no-op on every other platform.
     ///
-    /// Why it is worth the two lines: on macOS `set_simple_fullscreen(true)`
-    /// SAVES the app-scoped `NSApplication.presentationOptions` before
-    /// overwriting them, so a second window entering while the first is already
-    /// fullscreen saves the ALREADY-MODIFIED options — and the eventual restore
-    /// then re-applies an auto-hidden Dock + menu bar permanently. It also pairs
-    /// with the sibling-window fix: two stacked windows in the WM's above-normal
-    /// EWMH layer are a focus/visibility trap (focused but invisible).
+    /// WHY IT EXISTS, and why it is macOS-only: `set_simple_fullscreen(true)`
+    /// SAVES the APP-scoped `NSApplication.presentationOptions` into the entering
+    /// window before overwriting them (auto-hide Dock | auto-hide menu bar), and
+    /// only the matching `set_simple_fullscreen(false)` restores them. Two windows
+    /// therefore NEST: the second saves the already-modified options, and an
+    /// out-of-order exit re-applies an auto-hidden Dock and menu bar permanently,
+    /// in every other app, for the rest of the session. That is a genuine
+    /// app-scoped API wart with no cross-platform equivalent: X11/Wayland/Windows
+    /// all go through `set_fullscreen(Some(Borderless(None)))`, which has no
+    /// app-scoped side effect whatsoever.
+    ///
+    /// WHY NOT EVERYWHERE. The other argument for the rule — "two stacked windows
+    /// in the WM's above-normal EWMH layer are a focus/visibility trap" — only
+    /// holds when they are on the SAME monitor, and the case the rule forbids
+    /// (main fullscreen on monitor 1, a detached window fullscreen on monitor 2)
+    /// is exactly the one where no stacking trap exists. Off macOS the rule cost
+    /// a real capability AND unrequested motion: F11 in a detached window routed
+    /// the main window out through the full `set_main_fullscreen(false)`, which
+    /// restores geometry and arms 5 re-assertion frames — a visible jump of a
+    /// window the user never touched, to serve an Objective-C ivar that does not
+    /// exist on that machine. So the "exit the others" STEP is scoped; the single
+    /// named chokepoint stays (all three enter paths still call it, so the
+    /// invariant remains greppable).
+    ///
+    /// NOT scoped, on purpose: the DROP-time exits
+    /// (`exit_detached_fullscreen_bare` / `exit_main_fullscreen_bare` before every
+    /// reattach, close, shell-exit and `exiting()`). They cost nothing off macOS,
+    /// they are the actual presentation-options leak fix, and keeping them
+    /// unconditional keeps ONE code path for everyone.
     ///
     /// `keep` names the detached window that is about to enter; `None` means the
     /// MAIN window is. The main window leaves through the full
     /// `set_main_fullscreen(false)` so it lands back in its persisted mode's
     /// geometry rather than sitting monitor-sized and windowed.
     fn enforce_single_fullscreen(&mut self, keep: Option<usize>) {
-        if keep.is_some() && self.main_fullscreen {
-            self.set_main_fullscreen(false);
-        }
-        for i in 0..self.detached.len() {
-            if keep == Some(i) {
-                continue;
+        #[cfg(target_os = "macos")]
+        {
+            if keep.is_some() && self.main_fullscreen {
+                self.set_main_fullscreen(false);
             }
-            // `false` never recurses back into this helper.
-            self.set_detached_fullscreen(i, false);
+            for i in 0..self.detached.len() {
+                if keep == Some(i) {
+                    continue;
+                }
+                // `false` never recurses back into this helper.
+                self.set_detached_fullscreen(i, false);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = keep;
         }
     }
 
@@ -4699,6 +4729,11 @@ impl App {
             // `set_visible(true)` first) — and both need `&mut self`, so they must
             // run ahead of the `&self.window` borrow that follows.
             self.close_settings_for_fullscreen();
+            // Off macOS this is now a NO-OP, which is the point: a plain F9 must
+            // never drag a detached window on another monitor out of fullscreen.
+            // On macOS it stays load-bearing — a summon that entered fullscreen
+            // alongside an already-fullscreen detached window would NEST the
+            // app-scoped `presentationOptions` (see `enforce_single_fullscreen`).
             self.enforce_single_fullscreen(None);
         }
         if let Some(win) = &self.window {
