@@ -45,8 +45,14 @@ pub struct Config {
     /// "focus" (the last two are Tier-B effects that sample the rendered frame).
     #[serde(default = "default_summon_effect")]
     pub summon_effect: String,
-    /// Window summon mode: "center" (re-summon centered/last-pos) or "dropdown"
-    /// (Yakuake-style top-anchored full-width strip that slides down).
+    /// Window summon mode: "center" (re-summon centered/last-pos), "dropdown"
+    /// (Yakuake-style top-anchored full-width strip that slides down), or
+    /// "fullscreen" (cover the whole monitor the window is on; rounded corners
+    /// are suppressed while fullscreen). Unknown values fall back to "center".
+    ///
+    /// This is the SUMMON POLICY, re-applied on every F9. The transient
+    /// per-window fullscreen toggle (`toggle_fullscreen`, default F11) never
+    /// writes this key.
     #[serde(default = "default_window_mode")]
     pub window_mode: String,
     /// Dropdown height as a fraction of the monitor height (0.25..=1.0).
@@ -76,7 +82,7 @@ pub struct Config {
     #[serde(default = "default_shell")]
     pub shell: String,
     /// Tab-bar position: "top" (default) or "bottom". Orthogonal to
-    /// `window_mode` — usable in both Center and Dropdown modes.
+    /// `window_mode` — usable in Center, Dropdown and Fullscreen modes alike.
     #[serde(default = "default_tab_bar_position")]
     pub tab_bar_position: String,
     /// Scrollback history limit in lines (default 10_000). Clamped on load to
@@ -714,6 +720,28 @@ mod tests {
         // defaults ("" = platform sans, 16pt), so an upgrade is visually a no-op.
         assert_eq!(c.ui_font_family, "");
         assert_eq!(c.ui_font_size, 16.0);
+    }
+
+    #[test]
+    fn window_mode_fullscreen_round_trips() {
+        // The new third value loads verbatim...
+        let toml = "window_mode = \"fullscreen\"\n";
+        let c: Config = toml::from_str(toml).expect("deserialize");
+        assert_eq!(c.window_mode, "fullscreen");
+        // ...survives a serialize/deserialize round-trip as the PARSED value
+        // (asserting the parsed value, not byte-identical TOML, so key order or
+        // formatting changes in the toml crate can never make this brittle)...
+        let s = toml::to_string_pretty(&c).expect("serialize");
+        let back: Config = toml::from_str(&s).expect("re-deserialize");
+        assert_eq!(back.window_mode, "fullscreen");
+        assert_eq!(c, back);
+        // ...and `sanitize_floats` (the single sanitize entry point) leaves it
+        // alone — `window_mode` is a String, so there is nothing to clamp.
+        let mut m = c.clone();
+        m.sanitize_floats();
+        assert_eq!(m.window_mode, "fullscreen");
+        // The DEFAULT is still "center" — adding a value must not change it.
+        assert_eq!(Config::default().window_mode, "center");
     }
 
     #[test]
