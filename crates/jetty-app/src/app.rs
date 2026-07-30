@@ -3263,6 +3263,13 @@ impl App {
                 &mut self.last_pos,
                 &mut self.last_windowed_size,
             );
+            // The other half of the sibling-window rule (see
+            // `close_settings_for_fullscreen`): `toggle_settings_window` leaves
+            // fullscreen before OPENING Settings, so becoming fullscreen while
+            // Settings is already open must close it — otherwise clicking
+            // WINDOW MODE ▸ Fullscreen, the primary discovery gesture, buries the
+            // panel behind the terminal.
+            self.close_settings_for_fullscreen();
             // Only ONE JeTTY window may be fullscreen at a time.
             self.enforce_single_fullscreen(None);
             // Nothing may re-assert a docked/centred rect over a fullscreen window,
@@ -3343,6 +3350,27 @@ impl App {
         }
         // The corner radius changed ⇒ repaint. No persist(): transient state.
         self.request_main_paint();
+    }
+
+    /// Close the Settings window because the MAIN window is about to become
+    /// fullscreen. The symmetric half of `toggle_settings_window`'s
+    /// "exit fullscreen before opening Settings".
+    ///
+    /// A fullscreen window sits in the WM's above-normal EWMH layer, and whether a
+    /// WM demotes it on focus loss is WM-specific — which we may not special-case.
+    /// So a Settings window that is still open when the terminal goes fullscreen
+    /// is focused but INVISIBLE behind it, and Settings is the only UI for leaving
+    /// the mode. That is reachable from the PRIMARY discovery gesture (clicking
+    /// WINDOW MODE ▸ Fullscreen inside Settings), from an F9 summon in Fullscreen
+    /// mode with Settings open, and from a `window_mode` hot-reload.
+    ///
+    /// Closing is lossless: every panel value is already persisted, and the panel
+    /// is rebuilt from scratch on the next open. `Ctrl+Shift+O` then re-opens it
+    /// and takes the exit-fullscreen leg, so the two rules compose.
+    fn close_settings_for_fullscreen(&mut self) {
+        if self.settings_window.is_some() {
+            self.close_settings_window();
+        }
     }
 
     /// Rule F0: leave OS fullscreen while the window is still MAPPED, with NO
@@ -4666,6 +4694,11 @@ impl App {
         // the single-fullscreen-window rule is applied here instead, ahead of the
         // `&self.window` borrow that follows.
         if self.visible && mode == WindowMode::Fullscreen {
+            // Same two sibling-window rules as `set_main_fullscreen(true)`, applied
+            // here because the summon enters fullscreen INLINE below (rule F0 wants
+            // `set_visible(true)` first) — and both need `&mut self`, so they must
+            // run ahead of the `&self.window` borrow that follows.
+            self.close_settings_for_fullscreen();
             self.enforce_single_fullscreen(None);
         }
         if let Some(win) = &self.window {
