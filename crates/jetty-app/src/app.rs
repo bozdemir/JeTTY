@@ -687,6 +687,21 @@ pub struct App {
     /// immediately; `about_to_wait` fires ONE reflow once the user stops, so N
     /// presses coalesce into a single PTY SIGWINCH (avoids stacked p10k prompts).
     reflow_pending_at: Option<std::time::Instant>,
+    /// Set when a HIDE dropped a still-pending `reflow_pending_at` deadline, so
+    /// the next summon re-arms it once (see the hide legs).
+    ///
+    /// Rule F0 exits OS fullscreen while the window is still MAPPED, so a hide
+    /// from Fullscreen mode shrinks the frame monitor→windowed and the resulting
+    /// `Resized` arms the 250 ms debounce. `reflow_due` is not gated on
+    /// `self.visible`, so without this the reflow fired 250 ms LATER, while
+    /// hidden, SIGWINCHing every tab to a grid the user never sees — then again
+    /// on the next summon: two reflows per F9 cycle, feeding the p10k
+    /// prompt-scatter bug v0.23.1 fixed. Clearing the deadline alone would be
+    /// wrong for the other case (resize the window, hit F9 within 250 ms) because
+    /// `gpu.resize` already ran at the `Resized` event, leaving grid ≠ surface —
+    /// hence this flag: exactly ONE debounced reflow per VISIBLE transition, at
+    /// the final geometry, and never one while hidden.
+    reflow_deferred_by_hide: bool,
     /// When the last app-initiated `reflow()` resized the tabs' PTYs. Drains
     /// within [`REFLOW_ACTIVITY_GRACE`] of it skip the inactive-tab
     /// None→Output activity upgrade: the resize SIGWINCHed every background
@@ -1299,6 +1314,7 @@ impl App {
             opacity,
             font_logical: FONT_LOGICAL_DEFAULT,
             reflow_pending_at: None,
+            reflow_deferred_by_hide: false,
             reflow_resized_at: None,
             font_family,
             font_families: Vec::new(),
@@ -4596,6 +4612,15 @@ impl App {
         self.caret_anim = None;
         self.pending_dock_frames = 0;
         self.pending_center_frames = 0;
+        // …and the debounced grid+PTY reflow. Rule F0's exit-fullscreen-while-
+        // still-mapped shrinks the frame just above, so a `Resized` may have armed
+        // the 250 ms deadline; `reflow_due` is not gated on `self.visible`, so it
+        // would SIGWINCH every tab to a grid the user never sees. The next summon
+        // re-arms it once, at the final geometry.
+        let (pending, deferred) =
+            reflow_terms_on_hide(self.reflow_pending_at, self.reflow_deferred_by_hide);
+        self.reflow_pending_at = pending;
+        self.reflow_deferred_by_hide = deferred;
     }
 
     /// Toggle window visibility (F9 / Yakuake-style summon).
@@ -4717,6 +4742,19 @@ impl App {
                         self.pending_dock_frames = 0;
                     }
                 }
+                // Pay back a reflow the hide leg dropped (see
+                // `reflow_deferred_by_hide`) at THIS geometry. When the summon's own
+                // geometry change produces a `Resized`, that overwrites this
+                // deadline with its own — so a summon always costs exactly one
+                // debounced reflow, never two and never zero.
+                let (pending, deferred) = reflow_terms_on_summon(
+                    self.reflow_pending_at,
+                    self.reflow_deferred_by_hide,
+                    std::time::Instant::now()
+                        + std::time::Duration::from_millis(REFLOW_DEBOUNCE_MS),
+                );
+                self.reflow_pending_at = pending;
+                self.reflow_deferred_by_hide = deferred;
                 win.focus_window();
                 // Crystallize/reveal on every summon (F9 show), mirroring first open.
                 // Start the clock on the FIRST real frame (summon_pending), not here:
@@ -4756,6 +4794,13 @@ impl App {
                 self.caret_anim = None;
                 self.pending_dock_frames = 0;
                 self.pending_center_frames = 0;
+                // …and the debounced reflow (see `reflow_deferred_by_hide`): rule
+                // F0 leaves fullscreen while still mapped just above, so the
+                // deadline may be live — and it would fire 250 ms later, hidden.
+                let (pending, deferred) =
+                    reflow_terms_on_hide(self.reflow_pending_at, self.reflow_deferred_by_hide);
+                self.reflow_pending_at = pending;
+                self.reflow_deferred_by_hide = deferred;
             }
         }
     }
@@ -11423,6 +11468,42 @@ fn dock_reassert_ok(mode: WindowMode, fullscreen: bool) -> bool {
 /// considered.)
 ///
 /// Pure, so the invariant is a unit test rather than a code-reading exercise.
+/// The debounce window shared by every `reflow_pending_at` arming site: one
+/// grid+PTY reflow (and so one SIGWINCH) once the user stops resizing.
+const REFLOW_DEBOUNCE_MS: u64 = 250;
+
+/// The `(reflow_pending_at, reflow_deferred_by_hide)` pair a HIDE must leave
+/// behind: NEVER a live deadline (a reflow that fires while hidden SIGWINCHes
+/// every shell to a grid the user cannot see), but remember that one was owed.
+///
+/// Pure so "the hide legs clear the deadline" is a unit test. Both hide paths —
+/// `set_visibility(false)` and `autohide_main_window` — go through it, alongside
+/// the other deferred terms they already zero.
+fn reflow_terms_on_hide(
+    pending: Option<std::time::Instant>,
+    deferred: bool,
+) -> (Option<std::time::Instant>, bool) {
+    (None, deferred || pending.is_some())
+}
+
+/// The same pair after a SUMMON: re-arm the owed reflow ONCE, at the deadline
+/// the summon's own geometry change would use, and clear the debt.
+///
+/// A later `Resized` from the summon's own geometry (the Fullscreen enter, the
+/// Dropdown dock) simply overwrites the deadline with its own, so a summon still
+/// costs exactly ONE debounced reflow — never two, never zero.
+fn reflow_terms_on_summon(
+    pending: Option<std::time::Instant>,
+    deferred: bool,
+    deadline: std::time::Instant,
+) -> (Option<std::time::Instant>, bool) {
+    if deferred {
+        (Some(deadline), false)
+    } else {
+        (pending, false)
+    }
+}
+
 fn fullscreen_exit_frames(
     visible: bool,
     maximized: bool,
@@ -12205,6 +12286,46 @@ mod fullscreen_helper_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_hide_never_leaves_a_reflow_armed_and_a_summon_pays_it_back_once() {
+        use super::{reflow_terms_on_hide, reflow_terms_on_summon};
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let armed = now + Duration::from_millis(250);
+        let next = now + Duration::from_millis(900);
+
+        // THE INVARIANT: a hide NEVER leaves a live deadline behind, whatever the
+        // state — a reflow that fires while hidden SIGWINCHes every shell to a grid
+        // the user never sees (and on the next summon it all resizes back: two
+        // reflows per F9 cycle, the p10k-scatter trigger).
+        for pending in [None, Some(armed)] {
+            for deferred in [false, true] {
+                assert_eq!(reflow_terms_on_hide(pending, deferred).0, None);
+            }
+        }
+        // A pending reflow becomes a DEBT rather than being silently dropped:
+        // `gpu.resize` already ran at the `Resized`, so grid ≠ surface until one
+        // reflow runs.
+        assert_eq!(reflow_terms_on_hide(Some(armed), false), (None, true));
+        assert_eq!(reflow_terms_on_hide(Some(armed), true), (None, true));
+        // Nothing pending ⇒ no debt invented (a plain Center hide must not cost a
+        // reflow on the next summon).
+        assert_eq!(reflow_terms_on_hide(None, false), (None, false));
+        // A debt survives a hide that had nothing pending of its own.
+        assert_eq!(reflow_terms_on_hide(None, true), (None, true));
+
+        // The summon pays the debt EXACTLY once, at the new geometry's deadline…
+        assert_eq!(reflow_terms_on_summon(None, true, next), (Some(next), false));
+        // …and a second summon does not fire another one.
+        assert_eq!(reflow_terms_on_summon(None, false, next), (None, false));
+        // A hide→summon round-trip is idempotent on the debt flag.
+        let (p, d) = reflow_terms_on_hide(Some(armed), false);
+        let (p, d) = reflow_terms_on_summon(p, d, next);
+        assert_eq!((p, d), (Some(next), false));
+        let (p2, d2) = reflow_terms_on_summon(p, d, next);
+        assert_eq!((p2, d2), (Some(next), false), "no extra reflow armed");
     }
 
     #[test]
