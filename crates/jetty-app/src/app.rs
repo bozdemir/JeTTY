@@ -3429,6 +3429,15 @@ impl App {
         }
         let Some(dw) = self.detached.get_mut(pos) else { return };
         dw.fullscreen = on;
+        // Drop any in-flight manual top-bar drag. The PRESS site is gated on
+        // `!dw.fullscreen`, but a latch taken BEFORE F11 was never cleared, so
+        // every subsequent `CursorMoved` kept issuing `set_outer_position` on a
+        // fullscreen window (the "broken half-state on X11" the sibling comments
+        // warn about) and the release still ran the drop-to-reattach test against
+        // the fullscreen origin. The main window has no equivalent latch — its move
+        // gesture is the OS-driven `drag_window()`, which the WM ends itself.
+        dw.bar_drag = None;
+        dw.bar_drag_start = None;
         jetty_platform::set_window_fullscreen(&dw.window, on);
         // The corner radius changed ⇒ repaint. No persist(): transient state.
         dw.request_paint();
@@ -5566,11 +5575,16 @@ impl App {
                 // errs — but then bar_drag is never set (see the press handler),
                 // so this arm is unreachable there.
                 if let Some((ox, oy)) = dw.bar_drag {
-                    if let Ok(outer) = dw.window.outer_position() {
-                        let nx = outer.x + (position.x - ox).round() as i32;
-                        let ny = outer.y + (position.y - oy).round() as i32;
-                        dw.window
-                            .set_outer_position(winit::dpi::PhysicalPosition::new(nx, ny));
+                    // Belt-and-braces: `set_detached_fullscreen` clears the latch on
+                    // every transition, so a live drag is always a WINDOWED one —
+                    // moving a fullscreen window leaves a broken half-state on X11.
+                    if !dw.fullscreen {
+                        if let Ok(outer) = dw.window.outer_position() {
+                            let nx = outer.x + (position.x - ox).round() as i32;
+                            let ny = outer.y + (position.y - oy).round() as i32;
+                            dw.window
+                                .set_outer_position(winit::dpi::PhysicalPosition::new(nx, ny));
+                        }
                     }
                     return;
                 }
