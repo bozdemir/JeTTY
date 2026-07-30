@@ -966,6 +966,19 @@ pub struct App {
     /// the spot the user left it instead of always re-centering. `None` until the
     /// first hide; the first open is centered.
     last_pos: Option<winit::dpi::PhysicalPosition<i32>>,
+    /// The window's OUTER SIZE captured immediately BEFORE it entered OS
+    /// fullscreen, so the fullscreen EXIT can centre it without asking the OS how
+    /// big it is.
+    ///
+    /// Why it exists: on X11 `Window::outer_size()` is a live `XGetGeometry`
+    /// round-trip, and the un-fullscreen request we issue one statement earlier is
+    /// an ASYNC `_NET_WM_STATE` ClientMessage — so a post-exit read still reports
+    /// the MONITOR size, the centring subtraction saturates to 0 and the "centre"
+    /// resolves to the monitor ORIGIN (the window lands flush in the top-left).
+    /// Captured on EVERY enter path (`set_main_fullscreen`, the summon arm and
+    /// `resumed`) by `capture_pre_fullscreen`. `None` only before the first enter,
+    /// where the live size is not stale and is the right answer anyway.
+    last_windowed_size: Option<winit::dpi::PhysicalSize<u32>>,
     /// All open detached terminal windows (one `Tab` each). Created by
     /// `detach_tab`; dropped (closing the OS window and reaping the PTY)
     /// when `reattach_tab` or the window's CloseRequested removes the entry.
@@ -1384,6 +1397,7 @@ impl App {
             confirm_close: None,
             confirm_quit: false,
             last_pos: None,
+            last_windowed_size: None,
             detached: Vec::new(),
             tab_drag: None,
             tab_menu: None,
@@ -3224,17 +3238,15 @@ impl App {
             if !self.visible {
                 return;
             }
-            // Remember the spot BEFORE the frame becomes the monitor.
-            // `!= Dropdown` (not `== Center`): `set_window_mode` assigns the NEW
-            // mode before calling us, and F11 while already in Fullscreen mode must
-            // capture too — an `== Center` test is unreachable in exactly the cases
-            // that need it, and would lose the user's placement on
-            // Center → Fullscreen → Center. `.or(self.last_pos)` keeps an existing
-            // saved spot when the read fails (Wayland). Consistent with the
-            // loosened `center_reassert_ok` predicate.
-            if self.window_mode != WindowMode::Dropdown {
-                self.last_pos = win.outer_position().ok().or(self.last_pos);
-            }
+            // Remember the spot AND the size BEFORE the frame becomes the monitor:
+            // after the async un-fullscreen request, `outer_size()` still reports
+            // the monitor on X11, and centring from that lands in the corner.
+            capture_pre_fullscreen(
+                &win,
+                self.window_mode,
+                &mut self.last_pos,
+                &mut self.last_windowed_size,
+            );
             // Only ONE JeTTY window may be fullscreen at a time.
             self.enforce_single_fullscreen(None);
             // Nothing may re-assert a docked/centred rect over a fullscreen window,
@@ -3284,7 +3296,24 @@ impl App {
                                 self.pending_center_pos = Some(p);
                             }
                             None => {
-                                center_window(&win);
+                                // Centre from the size captured on the way IN, never
+                                // from the live `outer_size()`: the un-fullscreen
+                                // request above is an async ClientMessage on X11, so
+                                // a live read still reports the MONITOR and the
+                                // centring would resolve to the monitor origin.
+                                // Re-assert the COMPUTED target for the next few
+                                // post-map frames, exactly like the `Some(p)` sibling
+                                // — the WM processes our restore and our position
+                                // request in its own order, and whichever lands first
+                                // the re-assertion settles it.
+                                let target = center_window_sized(&win, self.last_windowed_size);
+                                self.pending_center_pos = target;
+                                if target.is_none() {
+                                    // No monitor info ⇒ nothing was issued ⇒ nothing
+                                    // to re-assert (never leave a counter armed with
+                                    // no work: it would be 5 frames of Poll).
+                                    self.pending_center_frames = 0;
+                                }
                                 self.last_pos = None;
                             }
                         }
@@ -4666,6 +4695,17 @@ impl App {
                         // holding the state across a hide would silently lose the WM
                         // state and make the summon a no-op.
                         win.set_visible(true);
+                        // Same capture as `set_main_fullscreen(true)` — this inline
+                        // enter used to bypass it, which left an F11 escape (and a
+                        // Settings switch back to Center) with no position AND no
+                        // size to restore, so the exit centred from the stale
+                        // monitor-sized `outer_size()` and landed in the corner.
+                        capture_pre_fullscreen(
+                            win,
+                            mode,
+                            &mut self.last_pos,
+                            &mut self.last_windowed_size,
+                        );
                         self.main_fullscreen = true;
                         jetty_platform::set_window_fullscreen(win, true);
                         // NO Center/Dropdown geometry, NO dock/center counters, NO
@@ -7360,6 +7400,16 @@ impl ApplicationHandler<AppEvent> for App {
                 // (winit's default attributes are visible+active), so the "entering
                 // fullscreen needs a mapped window" precondition holds here.
                 // No dock/center counters, no slide (see `set_main_fullscreen`).
+                // Capture the windowed geometry first (this inline enter used to
+                // bypass it): an F11 escape right after startup must have a size to
+                // centre from, or it centres from the monitor-sized live read and
+                // lands in the corner.
+                capture_pre_fullscreen(
+                    &window,
+                    WindowMode::Fullscreen,
+                    &mut self.last_pos,
+                    &mut self.last_windowed_size,
+                );
                 self.main_fullscreen = true;
                 jetty_platform::set_window_fullscreen(&window, true);
             }
@@ -11364,29 +11414,27 @@ fn dock_reassert_ok(mode: WindowMode, fullscreen: bool) -> bool {
 /// hidden tab, the p10k-prompt-scatter trigger v0.23.1 fixed.
 ///
 /// Also `(0, 0)` when the window is MAXIMIZED (nothing is restored, so nothing
-/// needs re-asserting), and `(0, 5)` for Center/Fullscreen only when there is a
-/// restorable saved position — a `center_window` fallback needs no re-assertion
-/// because it is recomputed from live monitor geometry.
+/// needs re-asserting). Otherwise Center/Fullscreen always get `(0, 5)`: BOTH
+/// arms of the restore issue an explicit position — the saved `last_pos` when
+/// there is a restorable one, the COMPUTED centre otherwise — and both race the
+/// WM's own restore of the pre-fullscreen frame, so both need re-asserting.
+/// (`restorable_pos` no longer changes the answer; it is kept as a parameter
+/// because it names the distinction the caller acts on and documents that it was
+/// considered.)
 ///
 /// Pure, so the invariant is a unit test rather than a code-reading exercise.
 fn fullscreen_exit_frames(
     visible: bool,
     maximized: bool,
     mode: WindowMode,
-    restorable_pos: bool,
+    _restorable_pos: bool,
 ) -> (u8, u8) {
     if !visible || maximized {
         return (0, 0);
     }
     match mode {
         WindowMode::Dropdown => (5, 0),
-        WindowMode::Center | WindowMode::Fullscreen => {
-            if restorable_pos {
-                (0, 5)
-            } else {
-                (0, 0)
-            }
-        }
+        WindowMode::Center | WindowMode::Fullscreen => (0, 5),
     }
 }
 
@@ -11412,26 +11460,96 @@ fn pos_on_some_monitor(win: &Arc<Window>, pos: winit::dpi::PhysicalPosition<i32>
     })
 }
 
-/// Centre `win` on the monitor it belongs to. No-ops gracefully if no monitor
-/// info is available.
+/// Remember where and how big the main window is, immediately BEFORE it enters
+/// OS fullscreen — the one thing the exit path cannot ask the OS for afterwards.
 ///
-/// Uses the SHARED `jetty_platform::monitor_for_window` chain, so — unlike
-/// before — a HIDDEN Center-mode window on a secondary monitor re-centres on
-/// THAT monitor instead of the primary (it used to fall straight through to the
-/// primary because a hidden window reports no `current_monitor`; the Dropdown
-/// path already had this fallback and Center did not).
-fn center_window(win: &Arc<Window>) {
-    if let Some(mon) = jetty_platform::monitor_for_window(win) {
-        let mon_pos = mon.position(); // physical px; nonzero on secondary monitors
-        let mon_size = mon.size();
-        let win_size = win.outer_size();
-        // Center WITHIN the current monitor: add the monitor's origin so a
-        // multi-monitor setup centers on the right screen (the old code dropped
-        // position() and always centered relative to (0,0) — a real bug).
-        let x = mon_pos.x + (mon_size.width.saturating_sub(win_size.width) / 2) as i32;
-        let y = mon_pos.y + (mon_size.height.saturating_sub(win_size.height) / 2) as i32;
-        win.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+/// A free function taking the two fields by `&mut` (rather than an `&mut self`
+/// method) so it can be called from inside the `if let Some(win) = &self.window`
+/// borrow on the summon path, and from `resumed` where `self.window` is not set
+/// yet. Called from EVERY enter path — `set_main_fullscreen(true)`, the
+/// `set_visibility` summon arm and `resumed` — because the two inline sites used
+/// to bypass the capture entirely, which is what left the exit with nothing to
+/// restore.
+///
+/// The position is captured only when the mode is NOT Dropdown (amendment
+/// BLOCKING 7: Dropdown re-docks from monitor geometry and never restores a
+/// saved spot, and `set_window_mode` assigns the NEW mode before we run, so
+/// `!= Dropdown` — not `== Center` — is the reachable predicate). The SIZE is
+/// captured in every mode: the exit's centring maths needs it whatever the mode,
+/// and a Dropdown exit simply re-docks and ignores it.
+fn capture_pre_fullscreen(
+    win: &Arc<Window>,
+    mode: WindowMode,
+    last_pos: &mut Option<winit::dpi::PhysicalPosition<i32>>,
+    last_windowed_size: &mut Option<winit::dpi::PhysicalSize<u32>>,
+) {
+    if mode != WindowMode::Dropdown {
+        // `.or(*last_pos)` keeps an existing saved spot when the read fails
+        // (Wayland). Consistent with the loosened `center_reassert_ok`.
+        *last_pos = win.outer_position().ok().or(*last_pos);
     }
+    // Read BEFORE the fullscreen request: afterwards this is the monitor size.
+    *last_windowed_size = Some(win.outer_size());
+}
+
+/// The top-left a window of `win_size` needs to sit centred inside the monitor
+/// rect `(mon_pos, mon_size)`. All physical px.
+///
+/// Pure so the centring arithmetic — the half that the fullscreen EXIT gets
+/// wrong when it is fed a stale (monitor-sized) window size — is a unit test
+/// rather than a GUI session. `saturating_sub` keeps a window LARGER than the
+/// monitor pinned to the monitor origin instead of wrapping to a huge negative.
+fn centered_pos(mon_pos: (i32, i32), mon_size: (u32, u32), win_size: (u32, u32)) -> (i32, i32) {
+    (
+        mon_pos.0 + (mon_size.0.saturating_sub(win_size.0) / 2) as i32,
+        mon_pos.1 + (mon_size.1.saturating_sub(win_size.1) / 2) as i32,
+    )
+}
+
+/// Centre `win` on the monitor it belongs to, using `size` (physical px) as the
+/// window's size when given. Returns the position actually requested, or `None`
+/// when no monitor info is available (then nothing is issued).
+///
+/// `size` exists for the fullscreen EXIT: `win.outer_size()` is a live
+/// `XGetGeometry` on X11, and the un-fullscreen request issued one statement
+/// earlier is an ASYNC `_NET_WM_STATE` ClientMessage the WM has not processed
+/// yet — so the live read still reports the MONITOR size and the centring
+/// resolves to the monitor origin. Passing the size captured on the way IN
+/// (`last_windowed_size`) makes the maths independent of that race.
+///
+/// The monitor is resolved through the SHARED `jetty_platform::monitor_for_window`
+/// chain (current monitor → the monitor containing the last outer position → the
+/// first available), which is where `dock_window_top`'s fallback was factored out
+/// to. NOTE: on X11 `current_monitor()` already returns the last known monitor
+/// unconditionally, so the fallback legs only ever fire on macOS/Wayland — the
+/// refactor is about having ONE monitor-choosing chain, not about a hidden-window
+/// bug that X11 could exhibit.
+fn center_window_sized(
+    win: &Arc<Window>,
+    size: Option<winit::dpi::PhysicalSize<u32>>,
+) -> Option<winit::dpi::PhysicalPosition<i32>> {
+    let mon = jetty_platform::monitor_for_window(win)?;
+    let mon_pos = mon.position(); // physical px; nonzero on secondary monitors
+    let mon_size = mon.size();
+    let win_size = size.unwrap_or_else(|| win.outer_size());
+    // Center WITHIN the current monitor: add the monitor's origin so a
+    // multi-monitor setup centers on the right screen (the old code dropped
+    // position() and always centered relative to (0,0) — a real bug).
+    let (x, y) = centered_pos(
+        (mon_pos.x, mon_pos.y),
+        (mon_size.width, mon_size.height),
+        (win_size.width, win_size.height),
+    );
+    let pos = winit::dpi::PhysicalPosition::new(x, y);
+    win.set_outer_position(pos);
+    Some(pos)
+}
+
+/// Centre `win` on its monitor using its CURRENT size. The plain-windowed entry
+/// point (first open, Center-mode summon); the fullscreen exit uses
+/// `center_window_sized` with the size captured before the enter.
+fn center_window(win: &Arc<Window>) {
+    let _ = center_window_sized(win, None);
 }
 
 /// Dock the window as a Yakuake-style top strip on the current monitor: full
@@ -12031,7 +12149,7 @@ mod fullscreen_helper_tests {
     //! The three pure fullscreen predicates. All private to `app.rs`, so the
     //! tests live here.
     use super::{
-        center_reassert_ok, dock_reassert_ok, effective_corner_radius_px,
+        center_reassert_ok, centered_pos, dock_reassert_ok, effective_corner_radius_px,
         fullscreen_exit_frames, WindowMode,
     };
 
@@ -12058,14 +12176,17 @@ mod fullscreen_helper_tests {
     #[test]
     fn fullscreen_exit_frames_match_the_reassertion_predicates() {
         use WindowMode::{Center, Dropdown, Fullscreen};
-        // Visible, not maximized: Dropdown re-docks, Center/Fullscreen re-assert a
-        // restorable saved position, and a centred fallback needs no re-assertion.
+        // Visible, not maximized: Dropdown re-docks; Center/Fullscreen re-assert
+        // the position they issued — the saved `last_pos` when restorable, the
+        // COMPUTED centre otherwise. BOTH race the WM's own frame restore, so a
+        // centred fallback needs the re-assertion just as much (leaving it at
+        // (0,0) is what dumped the window in the monitor's top-left corner).
         assert_eq!(fullscreen_exit_frames(true, false, Dropdown, false), (5, 0));
         assert_eq!(fullscreen_exit_frames(true, false, Dropdown, true), (5, 0));
         assert_eq!(fullscreen_exit_frames(true, false, Center, true), (0, 5));
-        assert_eq!(fullscreen_exit_frames(true, false, Center, false), (0, 0));
+        assert_eq!(fullscreen_exit_frames(true, false, Center, false), (0, 5));
         assert_eq!(fullscreen_exit_frames(true, false, Fullscreen, true), (0, 5));
-        assert_eq!(fullscreen_exit_frames(true, false, Fullscreen, false), (0, 0));
+        assert_eq!(fullscreen_exit_frames(true, false, Fullscreen, false), (0, 5));
         // Maximized: no geometry restore at all, so no re-assertion either — the WM
         // restores the maximized frame itself.
         for mode in WindowMode::ORDER {
@@ -12084,6 +12205,36 @@ mod fullscreen_helper_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn centering_a_monitor_sized_window_is_the_corner_bug() {
+        // The windowed case: a 1000x640 window on a 1920x1200 monitor at the
+        // origin, and on a secondary monitor at x=1920 (the monitor origin must be
+        // added, or a multi-monitor setup centres on the wrong screen).
+        assert_eq!(centered_pos((0, 0), (1920, 1200), (1000, 640)), (460, 280));
+        assert_eq!(
+            centered_pos((1920, 0), (1920, 1200), (1000, 640)),
+            (2380, 280)
+        );
+        // THE REGRESSION (B1): feeding the maths the size a STILL-FULLSCREEN
+        // window reports (== the monitor) collapses the centre onto the monitor
+        // ORIGIN — the window lands flush in the top-left corner. This is why the
+        // exit path must pass `last_windowed_size`, not `win.outer_size()`.
+        assert_eq!(centered_pos((0, 0), (1920, 1200), (1920, 1200)), (0, 0));
+        assert_eq!(
+            centered_pos((1920, 0), (1920, 1200), (1920, 1200)),
+            (1920, 0)
+        );
+        // …and with the captured windowed size the SAME exit lands centred.
+        assert_ne!(
+            centered_pos((0, 0), (1920, 1200), (1000, 640)),
+            centered_pos((0, 0), (1920, 1200), (1920, 1200)),
+        );
+        // A window LARGER than the monitor pins to the origin (saturating), never
+        // wraps to a huge negative that would map it off-screen.
+        assert_eq!(centered_pos((0, 0), (1280, 800), (1920, 1200)), (0, 0));
+        assert_eq!(centered_pos((-1920, -100), (1920, 1200), (1000, 640)), (-1460, 180));
     }
 
     #[test]
