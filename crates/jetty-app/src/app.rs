@@ -3191,6 +3191,12 @@ impl App {
     ///   arming them while hidden pins `ControlFlow::Poll` and burns a core
     ///   invisibly (the F18 bug class) — and on X11 it would fire five docks
     ///   → five `Resized` → a SIGWINCH storm to every hidden tab.
+    /// * MAXIMIZE and FULLSCREEN stay orthogonal booleans (amendment I-F). F11
+    ///   while maximized enters fullscreen and does NOT un-maximize; the exit then
+    ///   SKIPS the explicit geometry restore while `is_maximized()`, because a
+    ///   position set on a maximized X11 window is ignored or half-applied — the WM
+    ///   restores the maximized frame itself. So maximize → F11 → ▢ hands back a
+    ///   maximized window, and a second ▢ normalises it.
     /// * Never call `reflow()` or `gpu.resize()` from here: the WM's own `Resized`
     ///   event drives the existing 250 ms debounce, which also collapses macOS's
     ///   multi-event transition into exactly ONE reflow. Reflowing here as well
@@ -8000,7 +8006,17 @@ impl ApplicationHandler<AppEvent> for App {
                 {
                     if let Some(gpu) = &self.gpu {
                         let (w, h) = (gpu.config.width, gpu.config.height);
-                        let zone = resize_zone_at(position.x as f32, position.y as f32, w, h);
+                        // Inert while fullscreen: the press site below is gated
+                        // too, so a ⤡/↔ cursor over a fullscreen edge would
+                        // advertise an affordance that does nothing (the main-window
+                        // twin of the detached hover site, amendment I-D). Resolving
+                        // to `None` also RESETS a cursor left over from before the
+                        // transition.
+                        let zone = if self.main_fullscreen {
+                            ResizeZone::None
+                        } else {
+                            resize_zone_at(position.x as f32, position.y as f32, w, h)
+                        };
                         if zone != self.resize_cursor {
                             self.resize_cursor = zone;
                             if let Some(win) = &self.window {
@@ -8375,7 +8391,13 @@ impl ApplicationHandler<AppEvent> for App {
                 // modal context menu. Corners > edges; a press in a resize zone
                 // starts an OS-driven resize and consumes the click so it never
                 // begins a selection, tab-bar drag, or window move. ---
-                let zone = resize_zone_at(cx, cy, w, h);
+                // Inert while fullscreen: `drag_resize_window` on a fullscreen X11
+                // window leaves it in a broken half-state.
+                let zone = if self.main_fullscreen {
+                    ResizeZone::None
+                } else {
+                    resize_zone_at(cx, cy, w, h)
+                };
                 if let Some(dir) = zone.direction() {
                     if let Some(win) = &self.window {
                         let _ = win.drag_resize_window(dir);
@@ -8447,7 +8469,17 @@ impl ApplicationHandler<AppEvent> for App {
                         return;
                     }
                     if input::point_in(&bar.max_rect, cx, cy) {
-                        if let Some(win) = &self.window {
+                        // ▢ while FULLSCREEN unambiguously means "give me my window
+                        // back": leave fullscreen ONLY — never `set_maximized`, which
+                        // on a fullscreen X11 window is a no-op or a stuck half-state.
+                        // Maximize and fullscreen stay orthogonal booleans, so
+                        // maximize → F11 → ▢ hands back a MAXIMIZED window (the exit
+                        // skips the geometry restore while `is_maximized()`, because a
+                        // position set on a maximized X11 window is ignored or
+                        // half-applied); a second ▢ then normalises it (amendment I-F).
+                        if self.main_fullscreen {
+                            self.set_main_fullscreen(false);
+                        } else if let Some(win) = &self.window {
                             win.set_maximized(!win.is_maximized());
                         }
                         return;
@@ -8523,12 +8555,19 @@ impl ApplicationHandler<AppEvent> for App {
                     // (double-click) or start an OS window move (single press).
                     self.commit_rename();
                     if is_double {
-                        if let Some(win) = &self.window {
+                        self.last_strip_click = None;
+                        // Same rule as the ▢ button above (amendment I-F).
+                        if self.main_fullscreen {
+                            self.set_main_fullscreen(false);
+                        } else if let Some(win) = &self.window {
                             win.set_maximized(!win.is_maximized());
                         }
-                        self.last_strip_click = None;
-                    } else if let Some(win) = &self.window {
-                        let _ = win.drag_window();
+                    } else if !self.main_fullscreen {
+                        // Dragging a fullscreen window leaves it in a broken
+                        // half-state on X11 — the move gesture is inert.
+                        if let Some(win) = &self.window {
+                            let _ = win.drag_window();
+                        }
                     }
                     return;
                 }
