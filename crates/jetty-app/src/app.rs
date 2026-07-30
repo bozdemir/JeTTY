@@ -3548,13 +3548,35 @@ impl App {
             // F11): exit the OS state AND apply the NEW mode's geometry —
             // `set_main_fullscreen(false)` does both.
             self.set_main_fullscreen(false);
-            if mode == WindowMode::Dropdown {
-                // Match today's Dropdown mode-switch exactly, so the slide-in does
-                // not depend on whether F11 happened to be pressed earlier.
-                self.last_pos = None;
-                if self.visible {
-                    self.slide_anim = Some(std::time::Instant::now());
+            match mode {
+                WindowMode::Center => {
+                    // The same housekeeping the `match mode` block below does for
+                    // Center, stated EXPLICITLY rather than relying on
+                    // `set_main_fullscreen`'s clears happening to cover it: this
+                    // early return skips that block, and one future arming site in
+                    // the fullscreen state would otherwise leave a stuck
+                    // `slide_anim` — a `main_pending` term, i.e. permanent Poll.
+                    self.slide_anim = None;
+                    self.pending_dock_frames = 0;
                 }
+                WindowMode::Dropdown => {
+                    // Match today's Dropdown mode-switch exactly, so the slide-in
+                    // does not depend on whether F11 happened to be pressed earlier.
+                    self.last_pos = None;
+                    // …but only when the exit actually DOCKED the window.
+                    // `set_main_fullscreen(false)` skips the dock while maximized
+                    // (amendment I-F: a position on a maximized X11 window is
+                    // ignored or half-applied) and `fullscreen_exit_frames` returns
+                    // (0, 0) there — so maximize → F11 → Dropdown leaves an
+                    // undocked, still-maximized window, and sliding it would animate
+                    // a top strip that was never there.
+                    let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
+                    if self.visible && !maximized {
+                        self.slide_anim = Some(std::time::Instant::now());
+                    }
+                }
+                // Unreachable: this branch only runs when `mode != Fullscreen`.
+                WindowMode::Fullscreen => {}
             }
             self.persist();
             self.request_main_paint();
