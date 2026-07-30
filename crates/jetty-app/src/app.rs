@@ -4749,7 +4749,9 @@ impl App {
             &format_scrollback(self.scrollback_lines),
             self.dropdown_height_pct,
             self.dropdown_width_pct,
-            self.window_mode == WindowMode::Dropdown, self.focus_autohide,
+            self.window_mode == WindowMode::Dropdown,
+            self.main_fullscreen,
+            self.focus_autohide,
             self.launch_at_login,
             self.ui_font_logical, &self.ui_font_families, &self.ui_font_family,
             self.ui_font_scroll_offset,
@@ -4781,6 +4783,9 @@ impl App {
         let dropdown_height_pct = self.dropdown_height_pct;
         let dropdown_width_pct = self.dropdown_width_pct;
         let is_dropdown = self.window_mode == WindowMode::Dropdown;
+        // Dims the CORNER RADIUS band while fullscreen (the radius is suppressed at
+        // display time there, so the slider has no visible effect).
+        let fullscreen = self.main_fullscreen;
         let focus_autohide = self.focus_autohide;
         let launch_at_login = self.launch_at_login;
         let tab_bar_name = if self.tab_bar_bottom { "Bottom" } else { "Top" };
@@ -4844,7 +4849,7 @@ impl App {
         let pv = jetty_render::build_panel(
             width, height, opacity, theme_idx, font_logical,
             &families, &family, font_scroll_offset, corner_radius, summon_name,
-            window_mode_name, tab_bar_name, &scrollback_name, dropdown_height_pct, dropdown_width_pct, is_dropdown, focus_autohide,
+            window_mode_name, tab_bar_name, &scrollback_name, dropdown_height_pct, dropdown_width_pct, is_dropdown, fullscreen, focus_autohide,
             launch_at_login,
             ui_font_logical, &ui_families, &ui_family, ui_font_scroll_offset,
             0.0, 0.0, &theme, char_w,

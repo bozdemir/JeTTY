@@ -497,6 +497,14 @@ pub fn build_panel(
     dropdown_height_pct: f32,
     dropdown_width_pct: f32,
     is_dropdown: bool,
+    // `fullscreen`: whether the MAIN window is currently in OS fullscreen (the
+    //   persisted Fullscreen mode, or an ad-hoc F11). Dims the CORNER RADIUS band
+    //   exactly like `is_dropdown` dims DROPDOWN HEIGHT/WIDTH: the radius is
+    //   suppressed at display time while fullscreen (a rounded fullscreen window
+    //   would show the desktop through four notches), so the slider has no visible
+    //   effect. The stored value is deliberately NOT mutated, so the slider still
+    //   moves and the number still reads — it is dimmed, not disabled-looking-broken.
+    fullscreen: bool,
     focus_autohide: bool,
     // `launch_at_login`: drives the "Launch at login" toggle switch (accent when
     //   ON). The app derives this from the XDG autostart file's existence.
@@ -1343,13 +1351,22 @@ pub fn build_panel(
         }
     }
 
-    // Opacity + corner-radius sliders: dim track, accent fill, knob.
+    // Opacity + corner-radius sliders: dim track, accent fill, knob. The
+    // corner-radius trio is grayed to ~0.4 alpha while the window is FULLSCREEN —
+    // the radius is suppressed at display time there, so the control is a visual
+    // no-op (same idiom as the dropdown sliders in Center/Fullscreen mode).
+    let dim_if_fullscreen = |mut r: Rect| -> Rect {
+        if fullscreen {
+            r.color[3] = (r.color[3] as f32 * 0.4).round() as u8;
+        }
+        r
+    };
     quads.push(opacity_track_q);
     quads.push(opacity_fill);
     quads.push(slider_handle);
-    quads.push(radius_track_q);
-    quads.push(radius_fill);
-    quads.push(radius_handle);
+    quads.push(dim_if_fullscreen(radius_track_q));
+    quads.push(dim_if_fullscreen(radius_fill));
+    quads.push(dim_if_fullscreen(radius_handle));
 
     // --- Labels ---
     // `labels` = chrome: title, tab strip, and non-Effects tab widget labels.
@@ -1387,11 +1404,15 @@ pub fn build_panel(
     labels.push(("Opacity".to_string(), px + PAD, t_opacity, text_header));
     labels.push((pct_str.clone(), right_x(&pct_str), t_opacity, text_main));
 
-    // CORNER RADIUS header — CAPS with right-aligned "Npx" value.
+    // CORNER RADIUS header — CAPS with right-aligned "Npx" value. Dimmed to the
+    // hint color while fullscreen (the radius is suppressed at display time there),
+    // mirroring the DROPDOWN HEIGHT/WIDTH bands' `is_dropdown` dimming below.
     let radius_px = corner_radius.round() as i32;
     let radius_str = format!("{}px", radius_px);
-    labels.push(("Corner radius".to_string(), px + PAD, t_radius, text_header));
-    labels.push((radius_str.clone(), right_x(&radius_str), t_radius, text_main));
+    let cr_text = if fullscreen { text_hint } else { text_header };
+    let cr_val_text = if fullscreen { text_hint } else { text_main };
+    labels.push(("Corner radius".to_string(), px + PAD, t_radius, cr_text));
+    labels.push((radius_str.clone(), right_x(&radius_str), t_radius, cr_val_text));
 
     // Helper: center a (possibly truncated) cycler value between its chevrons.
     let cycle_gap_left = cyc_x + CYC_SEG;
@@ -1917,6 +1938,7 @@ mod tests {
             0.5,             // dropdown_height_pct
             0.7,             // dropdown_width_pct
             true,            // is_dropdown
+            false,           // fullscreen
             false,           // focus_autohide
             false,           // launch_at_login
             18.0,            // ui_font_size (true, not capped)
@@ -1952,7 +1974,8 @@ mod tests {
             vec!["System Sans (default)".to_string(), "Inter".to_string()];
         build_panel(
             screen_w, screen_h, 0.97, 0, 15.0, &families, "JetBrains Mono", 0, 8.0,
-            "Phosphor", "Dropdown", "Top", "10k", 0.5, 0.7, true, false, false, 18.0,
+            // …, is_dropdown, FULLSCREEN, focus_autohide, launch_at_login, …
+            "Phosphor", "Dropdown", "Top", "10k", 0.5, 0.7, true, false, false, false, 18.0,
             &ui_families, "", 0, 0.0, 0.0, &theme, char_w, "zsh",
             &NotifyParams::default(), active_tab,
             &EffectsParams::default(), 0.0, false, 0,

@@ -1876,7 +1876,8 @@ mod tests {
         ];
         jetty_render::build_panel(
             1920, 1280, 0.97, 0, 15.0, &mono, "JetBrains Mono", 0,
-            8.0, "Phosphor", "Center", "Top", "10k", 0.5, 1.0, false, true,
+            // …, is_dropdown, FULLSCREEN, focus_autohide, launch_at_login, …
+            8.0, "Phosphor", "Center", "Top", "10k", 0.5, 1.0, false, false, true,
             false, // launch_at_login
             18.0, &ui, "", 0,
             0.0, 0.0, &theme, 9.8, // char_w scale-1 fallback

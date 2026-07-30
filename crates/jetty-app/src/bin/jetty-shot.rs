@@ -706,6 +706,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::env::var("JETTY_SHOT_PANEL_DH").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.50),
                 std::env::var("JETTY_SHOT_PANEL_DW").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0),
                 std::env::var("JETTY_SHOT_PANEL_WINMODE").map(|m| m == "Dropdown").unwrap_or(false),
+                // JETTY_SHOT_PANEL_FULLSCREEN=1 — render the panel as if the main
+                // window were currently in OS fullscreen, which DIMS the CORNER
+                // RADIUS band (the radius is suppressed at display time there).
+                // Defaults to the Fullscreen window mode's own answer so
+                // `JETTY_SHOT_PANEL_WINMODE=Fullscreen` alone already shows the
+                // dimmed state, and can be forced independently to capture the
+                // "Center/Dropdown + ad-hoc F11" case.
+                env_flag("JETTY_SHOT_PANEL_FULLSCREEN")
+                    || std::env::var("JETTY_SHOT_PANEL_WINMODE")
+                        .map(|m| m == "Fullscreen")
+                        .unwrap_or(false),
                 std::env::var("JETTY_SHOT_PANEL_AUTOHIDE").map(|s| s != "0").unwrap_or(true),
                 std::env::var("JETTY_SHOT_PANEL_LAUNCH").map(|s| s != "0").unwrap_or(false),
                 ui_font_size,
