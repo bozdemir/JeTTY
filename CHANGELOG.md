@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased] — targeted v0.25.0
+
+**Run selection in a new tab.** The browser gesture, transplanted: in a browser
+you click a link and it opens in a new tab; in JeTTY you select a command and
+run it in a new tab, opened in the selection's own directory.
+
+### Added
+- **Run selection in a new tab** — five triggers, one behaviour:
+  - the right-click menu's new **Run in New Tab** row (dimmed without a
+    selection, as is **Copy** now — the honest UI for the same property),
+  - **`Ctrl+Shift+Enter`** (remappable: `[keys] run_selection`; `""` unbinds),
+  - the command palette ("Run selection in new tab"),
+  - copy-mode's **`r`** — yank's sibling: select with `v`/`V`, run with `r`,
+  - a **detached window** (menu row or the same chord): the tab opens in the
+    main window at the *detached* tab's directory **without summoning or
+    focusing it** — a true background tab; if the main window is hidden it
+    stays hidden, and **Run & Notify** pings when the command finishes. That
+    composition is the point: fire a long command into a background tab from a
+    selection, keep working, get the notification.
+- **Safety (paste-protection-grade)** — the selection is sanitized before it
+  can touch a PTY: every control byte and escape sequence is stripped (`\n` and
+  `\t` survive; the bracketed-paste end marker cannot), then:
+
+  | Selection | What happens |
+  |---|---|
+  | single line | runs (bracketed paste, one accept-line after the close marker) |
+  | multi-line | **typed, not run** — lands staged at the new prompt awaiting *your* Enter (the shell's own multiline-paste protection) |
+  | > 16 KiB | truncated and staged, never auto-run |
+  | multi-line, shell without bracketed paste | refused with a status pill — the tab still opens at the right cwd |
+
+  A selection ending in `\`, an unclosed quote, or a heredoc fragment parks at
+  the shell's continuation prompt (nothing executes) — review it there; JeTTY
+  deliberately does not parse shell syntax.
+- **Injection timing** — with OSC 133 shell integration the command is injected
+  only once the new shell shows its **first prompt with bracketed paste on**
+  (p10k instant-prompt safe); without integration, single lines fall back to a
+  1.5 s timeout (tabs become spaces on that raw path, so readline completion
+  can never rewrite the line). Typing, pasting, or an IME commit into the new
+  tab **cancels** the staged injection — you claimed the prompt. A stale
+  injection never fires: 10 s TTL.
+- **Config** — `run_selection = false` disables every trigger (hot-reloadable).
+- Help overlay rows for the new chord and copy-mode `r`; `jetty-shot` hooks for
+  the 6-item menu (enabled + dimmed), the detached 4-item menu, and the rest.
+
+### Changed
+- **`Ctrl+Shift+Enter` no longer reaches the shell** (it used to collapse to
+  `\r`, the same byte plain Enter sends, so no TUI loses a distinct sequence).
+  `[keys] run_selection = ""` gives it back.
+- The right-click menu grew from five items to six (`Copy · Paste · Run in New
+  Tab · Select All · Clear · Close Tab`); the detached window's from three to
+  four (`… · Run in New Tab`). Rows that need a selection dim without one.
+
+---
+
 ## [0.24.0] — 2026-07-17
 
 **Fullscreen.** A third window mode and a per-window `F11` toggle.
