@@ -495,6 +495,11 @@ pub struct Terminal {
     /// Per-tab semantic prompt marks (OSC 133 A/B/C/D), append order == ascending
     /// `abs_top`-relative line, pruned to the live scrollback window on each bind.
     marks: VecDeque<CmdBlock>,
+    /// Lifetime count of DISTINCT OSC 133 `A` prompt marks this terminal has
+    /// seen (post-dedup; never decremented, survives mark pruning). The
+    /// run-selection-in-new-tab readiness signal: `> 0` means the shell emits
+    /// prompt marks. One u64, incremented only inside the existing `A` arm.
+    prompts_seen: u64,
     /// Latched TRUE the first time this tab produces command output (an OSC-133
     /// `C`). Gates the resize "clean-prompt" clear (p10k-scatter fix): once real
     /// output exists it must never be wiped, so the clear can only ever fire on a
@@ -673,6 +678,7 @@ impl Terminal {
             saturated: false,
             scan: Scan::Ground,
             marks: VecDeque::new(),
+            prompts_seen: 0,
             saw_command_output: false,
             completed: Vec::new(),
             sixel_buf: Vec::new(),
@@ -1293,6 +1299,12 @@ impl Terminal {
                         return;
                     }
                 }
+                // Run-selection readiness signal: count each DISTINCT prompt
+                // (after the dedup above, so a p10k double-emission counts
+                // once). One u64 add on the already-off-hot-path OSC-133
+                // scanner — same budget class as the `started_at` stamp in the
+                // `C` arm. Never per byte.
+                self.prompts_seen += 1;
                 // A new prompt closes any previous still-open block (a command
                 // that never emitted D, e.g. ^C at the prompt) as unknown.
                 if let Some(last) = self.marks.back_mut() {
@@ -2731,6 +2743,13 @@ impl Terminal {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// Lifetime count of distinct OSC 133 `A` prompt marks (post-dedup). The
+    /// run-selection readiness signal: a fresh tab starts at 0; the first
+    /// prompt makes it 1. Never reset (mark pruning does not affect it).
+    pub fn prompt_count(&self) -> u64 {
+        self.prompts_seen
+    }
+
     /// Select all text — the entire scrollback history plus the visible screen.
     ///
     /// Creates a Simple selection from the oldest history line (top-left) to the
@@ -3910,6 +3929,34 @@ mod tests {
         // The 133 is dropped (not printed); the text after it renders normally.
         assert!(t.snapshot().row_text(0).starts_with("hello"),
             "the 133 must be consumed, leaving 'hello' at col 0");
+    }
+
+    #[test]
+    fn prompt_count_increments_on_a_marks() {
+        let mut t = Terminal::new(20, 5);
+        assert_eq!(t.prompt_count(), 0, "fresh terminal has seen no prompts");
+        t.feed(b"\x1b]133;A\x07");
+        assert_eq!(t.prompt_count(), 1);
+    }
+
+    #[test]
+    fn prompt_count_dedups_same_line_double_emission() {
+        // p10k's own integration + ours both emit A for the same prompt line —
+        // the dedup in bind_mark must keep the count at 1.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]133;A\x07\x1b]133;A\x07");
+        assert_eq!(t.prompt_count(), 1, "same-line duplicate A counts once");
+        assert_eq!(t.marks.len(), 1);
+    }
+
+    #[test]
+    fn prompt_count_a_c_d_a_counts_two() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]133;A\x07");
+        t.feed(b"\x1b]133;C\x07out\r\n");
+        t.feed(b"\x1b]133;D;0\x07");
+        t.feed(b"\x1b]133;A\x07");
+        assert_eq!(t.prompt_count(), 2, "a finished block's next prompt counts");
     }
 
     #[test]
