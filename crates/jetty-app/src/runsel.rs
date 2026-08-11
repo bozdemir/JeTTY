@@ -151,6 +151,22 @@ impl PendingInject {
     }
 }
 
+/// User-facing feedback produced by servicing a pending inject, surfaced as a
+/// themed status pill in `window` (`None`/stale id = the main window).
+pub struct Notice {
+    pub msg: &'static str,
+    pub window: Option<winit::window::WindowId>,
+}
+
+/// Pill text when a multiline pending expired without bracketed paste — the
+/// tab is open at the right cwd; only the injection was withheld.
+pub const MSG_REFUSED: &str =
+    "Multi-line run needs bracketed paste — tab opened, paste manually";
+
+/// Pill text when a Type-mode pending landed staged (multiline or truncated):
+/// nothing ran; the user's Enter is the confirmation.
+pub const MSG_STAGED: &str = "Selection staged — review, then press Enter to run";
+
 /// `poll_pending`'s verdict for one pending at one instant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {

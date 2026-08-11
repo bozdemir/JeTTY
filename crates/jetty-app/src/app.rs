@@ -367,6 +367,25 @@ pub(crate) struct Tab {
     /// Unseen output/bell that arrived while this tab was INACTIVE, shown as a
     /// themed dot on its tab label; cleared when it renders as the active tab.
     pub(crate) activity: jetty_render::TabActivity,
+    /// Run-selection-in-new-tab: a command staged for injection once this
+    /// tab's shell is ready (first OSC 133 A + bracketed paste; see
+    /// `runsel::poll_pending`). `None` for every tab that never uses the
+    /// feature — the drain hook's only cost then is one `is_some()` branch.
+    /// ANY user-originated PTY write to this tab cancels it
+    /// (`runsel::cancel_on_user_write` in every input funnel). The field
+    /// rides a `detach_tab` move into a `DetachedWindow` — the detached
+    /// funnels cancel it the same way, and the detached drain services it.
+    pub(crate) pending_inject: Option<crate::runsel::PendingInject>,
+}
+
+/// Which surface a run-selection trigger fired from: the main window's active
+/// tab, or a detached window's (single) tab. The destination is ALWAYS a new
+/// main-window tab; the source decides whose selection/cwd are used and where
+/// feedback pills go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SelSource {
+    Main,
+    Detached(usize),
 }
 
 /// Resolve a pending shell title update against the tab's rename state and
@@ -830,6 +849,21 @@ pub struct App {
     /// Throttle: the toast won't re-arm until `now` passes this instant.
     /// Deliberately GLOBAL across windows (one hint per 25s app-wide).
     shift_hint_cooldown: Option<std::time::Instant>,
+    /// Run-selection status pill: `(message, until, window)` — drawn only in
+    /// window `window` while `now < until` (same window-tagged discipline as
+    /// `shift_hint_until`). Carries refusal ("needs bracketed paste") and
+    /// staged ("press Enter to run") feedback. `None` when idle — the render
+    /// path's only cost then is one `Option` check per frame already happening.
+    status_pill: Option<(String, std::time::Instant, winit::window::WindowId)>,
+    /// True while ANY tab (main or detached) may hold a `pending_inject`.
+    /// The `about_to_wait` gate: when false (the always case), run-selection
+    /// adds ONE bool check per loop iteration and nothing else. Set on arm;
+    /// recomputed (self-healing after fires/cancels) by the deadline service.
+    runsel_active: bool,
+    /// Config `run_selection` (default true): the whole feature's opt-out.
+    /// Checked once at trigger time — every surface funnels through
+    /// `run_selection_in_new_tab`. Hot-reloadable.
+    run_selection_enabled: bool,
     /// Whether the user is currently dragging the scrollbar thumb.
     dragging_scrollbar: bool,
     /// Y offset from thumb top where the user grabbed, in px.
@@ -1368,6 +1402,9 @@ impl App {
             scroll_accum: input::ScrollAccumulator::new(),
             shift_hint_until: None,
             shift_hint_cooldown: None,
+            status_pill: None,
+            runsel_active: false,
+            run_selection_enabled: true,
             dragging_scrollbar: false,
             drag_grab_dy: 0.0,
             settings_window: None,
@@ -1490,6 +1527,7 @@ impl App {
         app.notify_only_on_failure = cfg.notify_only_on_failure;
         app.auto_summon_on_finish = cfg.auto_summon_on_finish;
         app.osc52_allow_paste = cfg.osc52_allow_paste;
+        app.run_selection_enabled = cfg.run_selection;
         app.hot_reload = cfg.hot_reload;
         // Compile the keybindings (defaults + user `[keys]` overrides). Any invalid
         // chord / conflict / rejected bind is logged; the rest still apply.
@@ -1638,6 +1676,7 @@ impl App {
             notify_only_on_failure: self.notify_only_on_failure,
             auto_summon_on_finish: self.auto_summon_on_finish,
             osc52_allow_paste: self.osc52_allow_paste,
+            run_selection: self.run_selection_enabled,
             hot_reload: self.hot_reload,
             // Preserve the user's `[keys]` overrides verbatim (never editable via the
             // Settings UI — a settings-driven persist must not erase them).
@@ -1879,6 +1918,9 @@ impl App {
                 dw.tab.terminal.set_osc52_allow_paste(cfg.osc52_allow_paste);
             }
         }
+        // Run-selection opt-out — live (checked once per trigger, so a bare
+        // assign is the whole apply).
+        self.run_selection_enabled = cfg.run_selection;
         // Hot-reload toggle: turning it OFF live drops the watcher (stops watching).
         // Turning it ON when it was off is restart-only (no watcher exists to detect
         // the change) — documented.
@@ -2038,14 +2080,19 @@ impl App {
     /// can't be read.
     fn new_tab(&mut self) {
         let cwd = self.tabs.get(self.active).and_then(|t| t.pty.cwd());
-        self.new_tab_with_cwd(cwd);
+        let _ = self.new_tab_with_cwd(cwd);
     }
 
     /// Spawn a new tab sized to the current grid, themed like the others, make it
     /// active, and redraw. The new PTY shares the same wake proxy so one
     /// `AppEvent::Wake` drains every tab. `cwd` is the directory the new shell
     /// starts in (`None` = today's spawn-dir/home behavior).
-    fn new_tab_with_cwd(&mut self, cwd: Option<std::path::PathBuf>) {
+    ///
+    /// Returns the new tab's index, or `None` when the PTY spawn failed (no tab
+    /// was created and `self.active` is unchanged). Run-selection MUST arm its
+    /// pending inject only through the returned index — arming "the active tab"
+    /// on a spawn failure would stage the command into the SOURCE shell.
+    fn new_tab_with_cwd(&mut self, cwd: Option<std::path::PathBuf>) -> Option<usize> {
         let (cols, rows) = self.grid_dims();
         let proxy_wake = self.proxy.clone();
         let shell = self.opt_shell();
@@ -2065,7 +2112,7 @@ impl App {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("jetty: failed to spawn tab PTY: {e}");
-                return;
+                return None;
             }
         };
         let writer = pty.writer();
@@ -2097,9 +2144,11 @@ impl App {
             title,
             manually_renamed: false,
             activity: jetty_render::TabActivity::None,
+            pending_inject: None,
         });
         self.active = self.tabs.len() - 1;
         self.request_main_paint();
+        Some(self.active)
     }
 
     /// Close tab `i` (its PtySession Drop kills the child). Fix up `active`. If
@@ -4013,6 +4062,9 @@ impl App {
         if text.is_empty() {
             return;
         }
+        // A user paste claims the prompt — cancel any staged run-selection
+        // inject for this tab (same rule as write_key_to_pty).
+        crate::runsel::cancel_on_user_write(&mut tab.pending_inject);
         let bracketed = tab.terminal.bracketed_paste();
         let w = &mut tab.writer;
         if bracketed {
@@ -4048,6 +4100,108 @@ impl App {
             }
         }
         std::borrow::Cow::Owned(out)
+    }
+
+    /// Run the current selection in a NEW tab — the browser's "open link in a
+    /// new tab" gesture, transplanted (v0.25). One method behind EVERY trigger:
+    /// context menu, Ctrl+Shift+Enter, palette, copy-mode `r`, and the
+    /// detached-window menu/chord.
+    ///
+    /// Pipeline: `selection_text()` → `runsel::sanitize` → `runsel::classify`
+    /// → clear the SOURCE selection → `new_tab_with_cwd(source cwd)` → arm the
+    /// NEW tab's `pending_inject` (fired by the drain hook once the shell is
+    /// ready — see `runsel::poll_pending`). Ordering is load-bearing:
+    /// * the source selection is cleared BEFORE the tab switch, or the clear
+    ///   would hit the new tab and leave a stale highlight on the source;
+    /// * the pending is armed only through `new_tab_with_cwd`'s returned index
+    ///   — on spawn failure nothing is armed (never the source shell).
+    ///
+    /// From a detached source the tab opens in the MAIN window (the only tabbed
+    /// window) at the DETACHED tab's cwd, without summoning or focusing it —
+    /// the browser's "opened in a background tab"; Run & Notify pings on
+    /// completion.
+    fn run_selection_in_new_tab(&mut self, source: SelSource) {
+        if !self.run_selection_enabled {
+            return; // config opt-out: `run_selection = false`
+        }
+        // 1. Capture everything from the SOURCE tab.
+        let (text, cwd, wait_for_mark, notify_window) = match source {
+            SelSource::Main => {
+                if self.tabs.is_empty() {
+                    return;
+                }
+                let t = &self.tabs[self.active];
+                (
+                    t.terminal.selection_text(),
+                    t.pty.cwd(),
+                    t.terminal.prompt_count() > 0,
+                    self.window.as_ref().map(|w| w.id()),
+                )
+            }
+            SelSource::Detached(i) => {
+                let Some(dw) = self.detached.get(i) else { return };
+                (
+                    dw.tab.terminal.selection_text(),
+                    dw.tab.pty.cwd(),
+                    dw.tab.terminal.prompt_count() > 0,
+                    Some(dw.window.id()),
+                )
+            }
+        };
+        let Some(raw) = text else { return };
+        let (text, run) = match crate::runsel::classify(crate::runsel::sanitize(&raw)) {
+            crate::runsel::Plan::Empty => return,
+            crate::runsel::Plan::Run(t) => (t, true),
+            crate::runsel::Plan::Type(t) => (t, false),
+        };
+        // 2. Clear the SOURCE selection now — `new_tab_with_cwd` switches
+        //    `self.active`, and neither switch_tab nor select_tab clears an
+        //    outgoing terminal's Selection (same highlight-lingering property
+        //    menu-Copy handles by clearing).
+        match source {
+            SelSource::Main => {
+                self.tabs[self.active].terminal.selection_clear();
+                self.request_main_paint();
+            }
+            SelSource::Detached(i) => {
+                if let Some(dw) = self.detached.get_mut(i) {
+                    dw.tab.terminal.selection_clear();
+                    dw.request_paint();
+                }
+            }
+        }
+        // 3. Create the destination tab and arm ITS pending (and only its).
+        let Some(idx) = self.new_tab_with_cwd(cwd) else { return };
+        self.tabs[idx].pending_inject = Some(crate::runsel::PendingInject {
+            text,
+            run,
+            created: std::time::Instant::now(),
+            wait_for_mark,
+            notify_window,
+        });
+        // Wake the `about_to_wait` deadline fold (one bool; false when unused).
+        self.runsel_active = true;
+    }
+
+    /// Surface a run-selection feedback pill in the window that hosted the
+    /// trigger (falls back to the main window when the source window is gone).
+    /// Reuses the shift-hint pill surface: themed, bottom-centered, ~4 s.
+    fn show_status_pill(&mut self, n: crate::runsel::Notice) {
+        let target = n
+            .window
+            .filter(|id| {
+                self.window.as_ref().is_some_and(|w| w.id() == *id)
+                    || self.detached.iter().any(|d| d.window.id() == *id)
+            })
+            .or_else(|| self.window.as_ref().map(|w| w.id()));
+        let Some(id) = target else { return };
+        self.status_pill =
+            Some((n.msg.to_string(), std::time::Instant::now() + std::time::Duration::from_millis(4000), id));
+        if self.window.as_ref().is_some_and(|w| w.id() == id) {
+            self.request_main_paint();
+        } else if let Some(dw) = self.detached.iter().find(|d| d.window.id() == id) {
+            dw.request_paint();
+        }
     }
 
     /// Encode a mouse event and write it to the PTY. Used only when the running
@@ -4101,9 +4255,16 @@ impl App {
         let suppress_output = self
             .reflow_resized_at
             .is_some_and(|t| t.elapsed() < REFLOW_ACTIVITY_GRACE);
+        // Run-selection feedback pills produced by this drain pass (refusal /
+        // staged). Collected locally (the loop holds `self.tabs` mutably) and
+        // surfaced after it; empty on every normal pass.
+        let mut runsel_notices: Vec<crate::runsel::Notice> = Vec::new();
         for (i, tab) in self.tabs.iter_mut().enumerate() {
-            let (had, title_changed) = Self::drain_one_tab(tab, &mut vt_read);
+            let (had, title_changed, notice) = Self::drain_one_tab(tab, &mut vt_read);
             chrome_changed |= title_changed;
+            if let Some(n) = notice {
+                runsel_notices.push(n);
+            }
             // Consume the bell flag for EVERY tab (active included) so it never
             // goes stale; only INACTIVE tabs surface it as an indicator. Bell is
             // sticky (never downgraded by later output); Output only lights a
@@ -4124,6 +4285,9 @@ impl App {
             }
         }
         self.vt_bytes += vt_read;
+        for n in runsel_notices {
+            self.show_status_pill(n);
+        }
         (active_had_data, chrome_changed, exited)
     }
 
@@ -4141,7 +4305,14 @@ impl App {
     ///
     /// Shared by `drain_pty` (per `self.tabs` entry) and the `AppEvent::Wake`
     /// handler's detached-window loop, so both paths drain identically.
-    fn drain_one_tab(tab: &mut Tab, vt_read: &mut u64) -> (bool, bool) {
+    ///
+    /// The third element is a run-selection feedback [`runsel::Notice`]
+    /// (refusal/staged pill) — `None` on every normal pass; the caller
+    /// surfaces it via `show_status_pill` (a pill needs `&mut self`).
+    fn drain_one_tab(
+        tab: &mut Tab,
+        vt_read: &mut u64,
+    ) -> (bool, bool, Option<crate::runsel::Notice>) {
         let mut had = false;
         // Feed at most PTY_DRAIN_BUDGET bytes this pass so a flood can't starve
         // the event loop (see the const's doc). Any remaining chunks are drained
@@ -4204,7 +4375,100 @@ impl App {
                 had = true;
             }
         }
-        (had, title_changed)
+        // Run-selection pending inject: poll readiness against the bytes just
+        // fed (prompt mark + bracketed paste) and fire/drop. The ONLY new
+        // branch on the drain path — `pending_inject` is `None` forever for
+        // tabs that never use the feature, so this is one false `is_some()`
+        // per drain, same pattern as the take_* hooks above.
+        let mut notice = None;
+        if tab.pending_inject.is_some() {
+            let (wrote, n) = Self::service_pending_inject(tab);
+            had |= wrote;
+            notice = n;
+        }
+        (had, title_changed, notice)
+    }
+
+    /// Poll + service one tab's pending inject (the drain-hook body and the
+    /// `about_to_wait` deadline service share this). Static — it touches only
+    /// the `Tab`; the caller surfaces the returned [`runsel::Notice`] (a pill
+    /// needs `&mut self`). Returns `(wrote, notice)`.
+    ///
+    /// The pending is TAKEN before the write, so the injection can never trip
+    /// its own user-write cancel; and both fire paths go through
+    /// `runsel::fire_pending`, whose byte format is pinned by unit tests.
+    fn service_pending_inject(tab: &mut Tab) -> (bool, Option<crate::runsel::Notice>) {
+        use crate::runsel::{self, Verdict};
+        let Some(p) = tab.pending_inject.as_ref() else {
+            return (false, None);
+        };
+        let verdict = runsel::poll_pending(
+            p,
+            std::time::Instant::now(),
+            tab.terminal.prompt_count(),
+            tab.terminal.bracketed_paste(),
+        );
+        if verdict == Verdict::Wait {
+            return (false, None);
+        }
+        let p = tab.pending_inject.take().expect("checked Some above");
+        match verdict {
+            Verdict::Fire | Verdict::FireUnbracketed => {
+                let wrote = runsel::fire_pending(
+                    &mut tab.writer,
+                    &p.text,
+                    p.run,
+                    verdict == Verdict::Fire,
+                )
+                .unwrap_or(false);
+                // Type mode landed staged (multiline / truncated): say so — the
+                // user's Enter is the run confirmation.
+                let notice = (wrote && !p.run).then_some(runsel::Notice {
+                    msg: runsel::MSG_STAGED,
+                    window: p.notify_window,
+                });
+                (wrote, notice)
+            }
+            Verdict::Drop => (false, None),
+            Verdict::Refuse => (
+                false,
+                Some(runsel::Notice { msg: runsel::MSG_REFUSED, window: p.notify_window }),
+            ),
+            Verdict::Wait => unreachable!("early-returned above"),
+        }
+    }
+
+    /// `about_to_wait`'s half of the pending-inject machinery: service every
+    /// pending whose deadline elapsed (a silent shell produces no drain, so
+    /// the timeout-fire / TTL-drop need this wake), and recompute
+    /// `runsel_active` from what actually remains — self-healing after
+    /// user-write cancels, which happen in static funnels that can't touch
+    /// App state. Runs ONLY while `runsel_active`; O(tabs) then, zero otherwise.
+    fn service_runsel_deadlines(&mut self) {
+        let now = std::time::Instant::now();
+        let mut notices: Vec<crate::runsel::Notice> = Vec::new();
+        let mut any_left = false;
+        for tab in self
+            .tabs
+            .iter_mut()
+            .chain(self.detached.iter_mut().map(|d| &mut d.tab))
+        {
+            if let Some(p) = &tab.pending_inject {
+                if p.deadline() <= now {
+                    let (_wrote, notice) = Self::service_pending_inject(tab);
+                    if let Some(n) = notice {
+                        notices.push(n);
+                    }
+                    // A timeout-fire's echo arrives via the PTY (Wake → drain →
+                    // repaint), so no explicit redraw is needed for `_wrote`.
+                }
+            }
+            any_left |= tab.pending_inject.is_some();
+        }
+        self.runsel_active = any_left;
+        for n in notices {
+            self.show_status_pill(n);
+        }
     }
 
     /// Poll every tab (main + detached) for OSC 133 command completions surfaced
@@ -5386,7 +5650,7 @@ impl App {
                         // Inherit THIS detached tab's cwd; the new tab still
                         // opens in the main window as today.
                         let cwd = self.detached.get(pos).and_then(|dw| dw.tab.pty.cwd());
-                        self.new_tab_with_cwd(cwd);
+                        let _ = self.new_tab_with_cwd(cwd);
                         return;
                     }
                     input::KeyAction::NextTab => {
@@ -6293,6 +6557,8 @@ impl App {
                     let app_cursor = dw.tab.terminal.app_cursor_keys();
                     let seq = input::arrow_scroll_bytes(lines > 0, app_cursor);
                     let steps = (lines.unsigned_abs() as usize).clamp(1, 12);
+                    // User-originated PTY bytes — same cancel rule as main.
+                    crate::runsel::cancel_on_user_write(&mut dw.tab.pending_inject);
                     for _ in 0..steps {
                         let _ = dw.tab.writer.write_all(&seq);
                     }
@@ -6335,8 +6601,6 @@ impl App {
     /// post-pass (which owns the rounded corners while active, exactly like the
     /// main window). Summon/Tier-B reveals stay main-window-only.
     fn render_detached_window(&mut self, pos: usize) {
-        let Some(dw) = self.detached.get_mut(pos) else { return };
-
         // Drain this tab's PTY output into its terminal before snapshotting.
         // Detached tabs are no longer in `self.tabs`, so the main `drain_pty`
         // loop never sees them — without this the detached grid would stay
@@ -6344,10 +6608,20 @@ impl App {
         // the shared, byte-budgeted `drain_one_tab` (same flood protection as
         // the main window); any capped remainder is drained by the Wakes the
         // reader queued, which re-request this window's redraw.
-        let mut vt_read: u64 = 0;
-        Self::drain_one_tab(&mut dw.tab, &mut vt_read);
-        // OSC titles: keep the OS window title in sync (no-op unless changed).
-        dw.sync_os_title();
+        // A run-selection notice needs `&mut self` (pill state), so the drain
+        // runs in its own scope before the long `dw` borrow below.
+        let notice = {
+            let Some(dw) = self.detached.get_mut(pos) else { return };
+            let mut vt_read: u64 = 0;
+            let (_, _, notice) = Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+            // OSC titles: keep the OS window title in sync (no-op unless changed).
+            dw.sync_os_title();
+            notice
+        };
+        if let Some(n) = notice {
+            self.show_status_pill(n);
+        }
+        let Some(dw) = self.detached.get_mut(pos) else { return };
 
         // Snapshot + theme + chrome inputs are read before the mutable
         // gpu/text/quad borrow below (same pattern as the main RedrawRequested).
@@ -6374,6 +6648,9 @@ impl App {
         // THIS window's id after the dw borrow below, so only that window
         // draws the pill (F4).
         let shift_hint_until = self.shift_hint_until;
+        // Run-selection status pill — captured (Clone) before the dw borrow;
+        // drawn only when tagged with THIS window's id (same rule as the hint).
+        let status_pill = self.status_pill.clone();
         // Effects inputs, captured before the mutable dw borrow below — the
         // SAME settings the main window renders with (visual parity).
         let corner_radius = self.corner_radius;
@@ -6384,6 +6661,9 @@ impl App {
         let Some(dw) = self.detached.get_mut(pos) else { return };
         let shift_hint_show =
             shift_hint_live_in(shift_hint_until, dw.window.id(), std::time::Instant::now());
+        let status_pill_msg: Option<String> = status_pill.and_then(|(m, until, wid)| {
+            (wid == dw.window.id() && std::time::Instant::now() < until).then_some(m)
+        });
         // Caret flash progress on THIS window's burst clock: t∈[0,1], expired at
         // 1.0 — mirrors the main window's caret_t handling (app.rs ~5214).
         let caret_t = dw.caret_anim.map(|s| {
@@ -6553,6 +6833,27 @@ impl App {
                 &[(hint.to_string(), pill_x + pad, ty, [20, 20, 20])],
             );
         }
+        // Pass 5b': run-selection status pill — the main window's Pass 4c'
+        // twin, stacked above the shift hint on the rare frame both are live.
+        if let Some(msg) = &status_pill_msg {
+            let tw = chrome_text.measure_overlay_width(msg);
+            let pad = 14.0;
+            let pill_w = tw + pad * 2.0;
+            let pill_h = 26.0;
+            let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
+            let stack = if shift_hint_show { pill_h + 8.0 } else { 0.0 };
+            let pill_y = (height as f32 - status_h - 14.0 - pill_h - stack).max(0.0);
+            let c = theme.cursor;
+            let pill = jetty_render::Rect::rounded(
+                pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
+            );
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill]);
+            let ty = pill_y + (pill_h - 16.0) / 2.0;
+            let _ = chrome_text.render_overlays(
+                &gpu.device, &gpu.queue, scene_view, width, height,
+                &[(msg.clone(), pill_x + pad, ty, [20, 20, 20])],
+            );
+        }
         // Pass 6: the Reattach/Copy/Paste context menu on top of everything.
         if let Some((mx, my)) = menu_open {
             let items: Vec<(&str, &str)> = crate::detached::DETACHED_MENU_ITEMS
@@ -6633,7 +6934,12 @@ impl App {
         // clear. Also gated on the window not being occluded/minimized so a
         // hidden detached window returns to true idle instead of self-driving
         // forever (F8).
-        if !dw.occluded && (dw.caret_anim.is_some() || crt_anim_live || shift_hint_show) {
+        if !dw.occluded
+            && (dw.caret_anim.is_some()
+                || crt_anim_live
+                || shift_hint_show
+                || status_pill_msg.is_some())
+        {
             dw.window.request_redraw();
         }
     }
@@ -7360,6 +7666,14 @@ impl ApplicationHandler<AppEvent> for App {
             self.pending_reload_at = None;
             self.reload_config_and_themes();
         }
+        // Run-selection pending-inject deadlines (elapsed ones service HERE,
+        // future ones fold into WaitUntil below — the same two-halves pattern
+        // as autohide/reload above). A silent destination shell produces no
+        // drain, so the timeout/TTL need this wake to fire/drop on time.
+        // Gated on ONE bool that is false forever when the feature is unused.
+        if self.runsel_active {
+            self.service_runsel_deadlines();
+        }
         // Trailing scrollback-search refresh (F10): a streaming burst that
         // ended inside the throttle window marked the matches dirty but never
         // got a re-collect (no later drain carries data), leaving highlights,
@@ -7482,6 +7796,18 @@ impl ApplicationHandler<AppEvent> for App {
         // strictly in the future or None (F1).
         if let Some(d) = self.sync_wake_at() {
             merge_wake(&mut wake_at, d);
+        }
+        // Run-selection pending-inject deadlines: the MIN over all live
+        // pendings (per-tab deadlines — two concurrent pendings each get their
+        // wake). Elapsed ones were serviced above, so these are strictly in
+        // the future. Iterates tabs ONLY while `runsel_active` (one bool,
+        // false when the feature is unused — the zero-cost invariant).
+        if self.runsel_active {
+            for tab in self.tabs.iter().chain(self.detached.iter().map(|d| &d.tab)) {
+                if let Some(p) = &tab.pending_inject {
+                    merge_wake(&mut wake_at, p.deadline());
+                }
+            }
         }
         // Skipped (throttled) open-search refresh: wake once at the throttle
         // deadline so the trailing re-collect above runs (F10). An elapsed
@@ -7796,6 +8122,7 @@ impl ApplicationHandler<AppEvent> for App {
             default_title: "Tab 1".to_string(),
             manually_renamed: false,
             activity: jetty_render::TabActivity::None,
+            pending_inject: None,
         });
         self.active = 0;
 
@@ -7918,8 +8245,15 @@ impl ApplicationHandler<AppEvent> for App {
                 // (same damage-driven discipline as the active-tab check above).
                 let mut vt_read: u64 = 0;
                 let mut exited_detached: Vec<usize> = Vec::new();
+                // Run-selection pills from detached-tab drains (a pending rides
+                // a detach move); collected locally, surfaced after the loop.
+                let mut runsel_notices: Vec<crate::runsel::Notice> = Vec::new();
                 for (i, dw) in self.detached.iter_mut().enumerate() {
-                    let (had, title_changed) = Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+                    let (had, title_changed, notice) =
+                        Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+                    if let Some(n) = notice {
+                        runsel_notices.push(n);
+                    }
                     // Consume the bell so a reattach never shows a phantom Bell
                     // dot. Detached windows draw no indicator by design: the tab
                     // IS the visible, active tab of its own window.
@@ -7957,6 +8291,9 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
                 self.vt_bytes += vt_read;
+                for n in runsel_notices {
+                    self.show_status_pill(n);
+                }
                 // Remove in descending index order so earlier indices stay valid,
                 // mirroring `close_exited_tabs`. Dropping the `DetachedWindow`
                 // closes its OS window; its already-exited child is reaped
@@ -8572,6 +8909,11 @@ impl ApplicationHandler<AppEvent> for App {
                                 // Clear — emulates Ctrl+L (form-feed 0x0C) sent to the active PTY.
                                 // This is the same byte the Ctrl+L keybinding produces via
                                 // ctrl_byte('L') in input.rs; reuse the same writer path.
+                                // A user-originated PTY byte — cancels a staged
+                                // run-selection inject (same rule as write_key_to_pty).
+                                crate::runsel::cancel_on_user_write(
+                                    &mut self.tabs[self.active].pending_inject,
+                                );
                                 self.active_tab_mut().terminal.scroll_to_bottom();
                                 let w = &mut self.tabs[self.active].writer;
                                 let _ = w.write_all(&[0x0C]);
@@ -9288,6 +9630,12 @@ impl ApplicationHandler<AppEvent> for App {
                         let app_cursor = self.active_tab().terminal.app_cursor_keys();
                         let seq = input::arrow_scroll_bytes(lines > 0, app_cursor);
                         let steps = (lines.unsigned_abs() as usize).clamp(1, 12);
+                        // User-originated PTY bytes — cancel a staged
+                        // run-selection inject (alt screen structurally can't
+                        // be a fresh prompt, but the rule is uniform).
+                        crate::runsel::cancel_on_user_write(
+                            &mut self.tabs[self.active].pending_inject,
+                        );
                         let w = &mut self.tabs[self.active].writer;
                         for _ in 0..steps {
                             let _ = w.write_all(&seq);
@@ -10207,6 +10555,14 @@ impl ApplicationHandler<AppEvent> for App {
                 let shift_hint_show = self.window.as_ref().is_some_and(|w| {
                     shift_hint_live_in(self.shift_hint_until, w.id(), std::time::Instant::now())
                 });
+                // Run-selection status pill (refusal / staged feedback) — same
+                // window-tagged liveness rule as the shift hint above.
+                let status_pill_msg: Option<String> = self.window.as_ref().and_then(|w| {
+                    self.status_pill.as_ref().and_then(|(m, until, wid)| {
+                        (*wid == w.id() && std::time::Instant::now() < *until)
+                            .then(|| m.clone())
+                    })
+                });
                 // Backend name for the welcome overlay (captured before the mutable
                 // gpu borrow; falls back to "?" when gpu is not yet available).
                 let gpu_backend_name: String = self
@@ -10561,6 +10917,35 @@ impl ApplicationHandler<AppEvent> for App {
                         let _ = chrome_text.render_overlays(
                             &gpu.device, &gpu.queue, scene_view, width, height,
                             &[(hint.to_string(), pill_x + pad, ty, [20, 20, 20])],
+                        );
+                    }
+                    // Pass 4c': run-selection status pill (refusal / staged) —
+                    // the same pill surface as the shift hint, stacked one row
+                    // above it on the rare frame both are live.
+                    if let Some(msg) = &status_pill_msg {
+                        let tw = chrome_text.measure_overlay_width(msg);
+                        let pad = 14.0;
+                        let pill_w = tw + pad * 2.0;
+                        let pill_h = 26.0;
+                        let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
+                        let stack = if shift_hint_show { pill_h + 8.0 } else { 0.0 };
+                        let pill_y = (height as f32
+                            - status_h
+                            - if tab_bar_bottom { TABBAR_H } else { 0.0 }
+                            - 14.0
+                            - pill_h
+                            - stack)
+                            .max(0.0)
+                            + slide_y_offset;
+                        let c = theme.cursor;
+                        let pill = jetty_render::Rect::rounded(
+                            pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
+                        );
+                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill]);
+                        let ty = pill_y + (pill_h - 16.0) / 2.0;
+                        let _ = chrome_text.render_overlays(
+                            &gpu.device, &gpu.queue, scene_view, width, height,
+                            &[(msg.clone(), pill_x + pad, ty, [20, 20, 20])],
                         );
                     }
                     // Pass 4d: the scrollback-search bar (Ctrl+Shift+F) — a
@@ -10946,6 +11331,15 @@ impl ApplicationHandler<AppEvent> for App {
                             std::time::Instant::now(),
                         )
                     });
+                    // Run-selection status pill: keep repainting while ITS
+                    // window is this one and it is live, so it fades out on
+                    // expiry instead of freezing on screen (same rule as the
+                    // shift hint). One Option check; None when unused.
+                    let pill_live = self.window.as_ref().is_some_and(|w| {
+                        self.status_pill.as_ref().is_some_and(|(_, until, wid)| {
+                            *wid == w.id() && std::time::Instant::now() < *until
+                        })
+                    });
                     // CRT animation self-drive: keep painting ONLY while CRT is on
                     // AND at least one of roll/flicker/jitter is toggled on. Static
                     // CRT (enabled, all three off) does NOT match here, so it stays
@@ -10959,6 +11353,7 @@ impl ApplicationHandler<AppEvent> for App {
                     if self.summon_anim.is_some()
                         || self.slide_anim.is_some()
                         || hint_live
+                        || pill_live
                         || crt_anim_live
                         || self.caret_anim.is_some()
                     {
@@ -11257,6 +11652,13 @@ fn render_grid_scene(
 /// main-only), the perf keystroke stamp, welcome-splash dismissal, and every
 /// modal/menu short-circuit stay in the per-window callers.
 fn write_key_to_pty(tab: &mut Tab, bytes: &[u8]) {
+    // The user has claimed this prompt: a staged run-selection inject must
+    // never splice into their half-typed line. This ONE line covers every
+    // funnel that routes here — main + detached keystrokes AND both windows'
+    // IME commits. (Mouse REPORTS deliberately don't cancel: they only flow
+    // when an app enabled mouse mode, which no shell has at a fresh prompt,
+    // and they are app input, not command-line editing.)
+    crate::runsel::cancel_on_user_write(&mut tab.pending_inject);
     // Any real keystroke jumps the view back to the live bottom so typing while
     // scrolled up into scrollback is visible (F30). Order is irrelevant vs the
     // PTY write (viewport offset and the PTY writer are independent).

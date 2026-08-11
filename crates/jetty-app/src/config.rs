@@ -136,6 +136,13 @@ pub struct Config {
     /// strictly opt-in. Applies to newly-spawned tabs.
     #[serde(default = "default_osc52_allow_paste")]
     pub osc52_allow_paste: bool,
+    /// Run-selection-in-a-new-tab (the "open link in a new tab" gesture for
+    /// commands): select text → run it in a new tab. Default ON. `false`
+    /// disables EVERY trigger (context-menu row, Ctrl+Shift+Enter, palette,
+    /// copy-mode `r`, detached menu) — the opt-out for users who don't want a
+    /// feature that writes to a PTY. Hot-reloadable.
+    #[serde(default = "default_run_selection")]
+    pub run_selection: bool,
     /// Watch `~/.config/jetty/` and hot-reload config + themes live (no restart).
     /// Default `true`. The watcher is OS-event-driven (inotify/FSEvents), so it adds
     /// zero idle CPU; set `false` to disable it entirely (a pure escape hatch — no
@@ -223,6 +230,9 @@ impl KeyBindings {
 
 fn default_osc52_allow_paste() -> bool {
     false
+}
+fn default_run_selection() -> bool {
+    true
 }
 fn default_hot_reload() -> bool {
     true
@@ -437,6 +447,7 @@ impl Default for Config {
             notify_only_on_failure: default_notify_only_on_failure(),
             auto_summon_on_finish: default_auto_summon_on_finish(),
             osc52_allow_paste: default_osc52_allow_paste(),
+            run_selection: default_run_selection(),
             hot_reload: default_hot_reload(),
             keys: KeyBindings::default(),
         }
@@ -774,6 +785,7 @@ mod tests {
             notify_only_on_failure: true,
             auto_summon_on_finish: true,
             osc52_allow_paste: true,
+            run_selection: false,
             hot_reload: false,
             keys: KeyBindings::default(),
         };
@@ -813,6 +825,7 @@ mod tests {
             notify_only_on_failure: false,
             auto_summon_on_finish: false,
             osc52_allow_paste: false,
+            run_selection: true,
             hot_reload: true,
             keys: KeyBindings::default(),
         };
