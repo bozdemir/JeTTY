@@ -53,6 +53,15 @@ pub enum KeyAction {
     /// Enter keyboard copy-mode (Ctrl+Shift+Space): a modal vi-cursor over the
     /// viewport + scrollback for keyboard-only text selection and yank.
     CopyMode,
+    /// Run the current selection in a NEW tab (Ctrl+Shift+Enter) — the
+    /// browser's "open link in a new tab" gesture for commands. No-op without
+    /// a selection. The chord is Ctrl+Shift-only; plain/Shift/Ctrl Enter all
+    /// still reach the PTY as `\r` (input.rs implements no kitty keyboard
+    /// protocol, so no TUI loses a distinct encoding today — if one is ever
+    /// added, this chord will shadow its Ctrl+Shift+Enter sequence; the
+    /// opt-out is `[keys] run_selection = ""`). NumpadEnter deliberately
+    /// unmatched.
+    RunSelection,
     /// Toggle OS fullscreen on the window that has focus (F11; macOS also
     /// Cmd+Ctrl+F). Transient per-window view state — it never writes
     /// `window_mode`, so it costs no disk I/O on the key path.

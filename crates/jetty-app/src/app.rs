@@ -5714,6 +5714,14 @@ impl App {
                     input::KeyAction::HintMode | input::KeyAction::CopyMode => {
                         return;
                     }
+                    // Run-selection from a DETACHED window: this window's own
+                    // selection + cwd; the new tab opens in the MAIN window
+                    // (not summoned, focus stays here — the browser's "opened
+                    // in a background tab").
+                    input::KeyAction::RunSelection => {
+                        self.run_selection_in_new_tab(SelSource::Detached(pos));
+                        return;
+                    }
                     // The palette is main-window only; keep Ctrl+Shift+P's pre-0.18
                     // behavior in a detached window (open Settings) so the chord
                     // isn't silently dropped here. A bare macOS Cmd+P, however, was a
@@ -10029,6 +10037,7 @@ impl ApplicationHandler<AppEvent> for App {
                         input::KeyAction::Quit => "Quit",
                         input::KeyAction::HintMode => "HintMode",
                         input::KeyAction::CopyMode => "CopyMode",
+                        input::KeyAction::RunSelection => "RunSelection",
                         input::KeyAction::ToggleFullscreen => "ToggleFullscreen",
                         input::KeyAction::Send(_) => "Send",
                         input::KeyAction::None => "None",
@@ -10169,6 +10178,12 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     input::KeyAction::CopyMode => {
                         self.enter_copy_mode();
+                    }
+                    // Ctrl+Shift+Enter — run the current selection in a new tab
+                    // (no-op without a selection; every trigger funnels through
+                    // the same method).
+                    input::KeyAction::RunSelection => {
+                        self.run_selection_in_new_tab(SelSource::Main);
                     }
                     // F11 (macOS also Cmd+Ctrl+F) — toggle OS fullscreen on THIS
                     // (the main) window. Transient: nothing is persisted, so the

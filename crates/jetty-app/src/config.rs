@@ -216,6 +216,10 @@ pub struct KeyBindings {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub quit: Option<ChordSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub hint_mode: Option<ChordSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub copy_mode: Option<ChordSpec>,
+    /// `run_selection = ""` unbinds the chord (the menu/palette/copy-mode
+    /// triggers remain; the whole feature's off-switch is the top-level
+    /// `run_selection = false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub run_selection: Option<ChordSpec>,
     /// `toggle_fullscreen = ""` gives bare F11 back to the shell (`\e[23~`).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub toggle_fullscreen: Option<ChordSpec>,
 }

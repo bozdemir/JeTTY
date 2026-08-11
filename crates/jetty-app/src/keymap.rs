@@ -180,12 +180,13 @@ pub enum BindableAction {
     Quit,
     HintMode,
     CopyMode,
+    RunSelection,
     /// Declared LAST so it can never win a slot from an existing action.
     ToggleFullscreen,
 }
 
 impl BindableAction {
-    pub const ALL: [BindableAction; 31] = [
+    pub const ALL: [BindableAction; 32] = [
         BindableAction::ToggleSettings,
         BindableAction::OpenPalette,
         BindableAction::NewTab,
@@ -216,6 +217,7 @@ impl BindableAction {
         BindableAction::Quit,
         BindableAction::HintMode,
         BindableAction::CopyMode,
+        BindableAction::RunSelection,
         BindableAction::ToggleFullscreen,
     ];
 
@@ -253,6 +255,7 @@ impl BindableAction {
             Quit => "quit",
             HintMode => "hint_mode",
             CopyMode => "copy_mode",
+            RunSelection => "run_selection",
             ToggleFullscreen => "toggle_fullscreen",
         }
     }
@@ -291,6 +294,7 @@ impl BindableAction {
             Quit => KeyAction::Quit,
             HintMode => KeyAction::HintMode,
             CopyMode => KeyAction::CopyMode,
+            RunSelection => KeyAction::RunSelection,
             ToggleFullscreen => KeyAction::ToggleFullscreen,
         }
     }
@@ -329,6 +333,7 @@ impl BindableAction {
             Quit => &b.quit,
             HintMode => &b.hint_mode,
             CopyMode => &b.copy_mode,
+            RunSelection => &b.run_selection,
             ToggleFullscreen => &b.toggle_fullscreen,
         }
     }
@@ -428,6 +433,16 @@ impl BindableAction {
             // in the default set (H and Space are unbound Ctrl+Shift slots).
             HintMode => vec![ctrl_shift(KeyMatch::Phys(KeyCode::KeyH))],
             CopyMode => vec![ctrl_shift(KeyMatch::Phys(KeyCode::Space))],
+            // Run-selection-in-a-new-tab: Ctrl+Shift+Enter — the browser/IDE
+            // "run it" chord. Verified free across the whole default set (no
+            // other default binds Enter under any modifiers). Standard
+            // alt-loose Ctrl+Shift form, so plain Enter, Shift+Enter and
+            // Ctrl+Enter still reach the PTY (all collapse to \r today — no
+            // kitty keyboard protocol is implemented). Like SearchToggle/
+            // DetachTab/HintMode/CopyMode there is NO macOS Cmd companion:
+            // the Ctrl+Shift chord works there as-is, and Cmd+Enter is
+            // iTerm2's fullscreen muscle memory — deliberately not taken.
+            RunSelection => vec![ctrl_shift(KeyMatch::Phys(KeyCode::Enter))],
             // Bare F11 — the universal fullscreen chord, and the ONLY default
             // chord that binds an F-key. Legal bare because
             // `chord_reject_reason` permits F-keys without a modifier
@@ -1350,6 +1365,98 @@ mod tests {
         );
     }
 
+    // ── run selection (Ctrl+Shift+Enter) ──────────────────────────────────────
+
+    #[test]
+    fn run_selection_default_chord_resolves() {
+        use winit::keyboard::NamedKey;
+        let km = KeyMap::defaults();
+        let cs = Mods::new(true, true, false, false);
+        assert_eq!(
+            km.lookup(cs, PhysicalKey::Code(KeyCode::Enter), &Key::Named(NamedKey::Enter)),
+            Some(KeyAction::RunSelection)
+        );
+        // Alt-insensitive like the other Ctrl+Shift defaults.
+        let csa = Mods::new(true, true, true, false);
+        assert_eq!(
+            km.lookup(csa, PhysicalKey::Code(KeyCode::Enter), &Key::Named(NamedKey::Enter)),
+            Some(KeyAction::RunSelection)
+        );
+        // Plain / Shift / Ctrl Enter stay UNMAPPED → reach the PTY as \r.
+        for m in [
+            Mods::default(),
+            Mods::new(false, true, false, false),
+            Mods::new(true, false, false, false),
+        ] {
+            assert_eq!(
+                km.lookup(m, PhysicalKey::Code(KeyCode::Enter), &Key::Named(NamedKey::Enter)),
+                None,
+                "{m:?}+Enter must pass through to the PTY"
+            );
+        }
+    }
+
+    #[test]
+    fn run_selection_chord_passes_guard_and_collides_with_nothing() {
+        // The default chord parses, passes chord_reject_reason, and the FULL
+        // default map still compiles without a single conflict warning.
+        let c = parse_chord("Ctrl+Shift+Enter").unwrap();
+        assert!(chord_reject_reason(&c).is_none());
+        assert!(!c.mods.ctrl_only());
+        assert!(
+            KeyMap::defaults().warnings().is_empty(),
+            "default keymap must stay conflict-free: {:?}",
+            KeyMap::defaults().warnings()
+        );
+        // No OTHER default action binds Enter under ANY modifier set.
+        for a in BindableAction::ALL {
+            if a == BindableAction::RunSelection {
+                continue;
+            }
+            for ch in a.default_chords() {
+                assert_ne!(
+                    ch.key,
+                    KeyMatch::Phys(KeyCode::Enter),
+                    "{} also binds Enter",
+                    a.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_selection_remap_and_unbind() {
+        use winit::keyboard::NamedKey;
+        // Remap: the new chord fires and the default is freed.
+        let km = km_with(|b| b.run_selection = Some(ChordSpec::One("Ctrl+Shift+R".to_string())));
+        let cs = Mods::new(true, true, false, false);
+        assert_eq!(
+            km.lookup(cs, PhysicalKey::Code(KeyCode::KeyR), &ch("R")),
+            Some(KeyAction::RunSelection)
+        );
+        assert_eq!(
+            km.lookup(cs, PhysicalKey::Code(KeyCode::Enter), &Key::Named(NamedKey::Enter)),
+            None
+        );
+        // `""` unbinds entirely.
+        let km = km_with(|b| b.run_selection = Some(ChordSpec::One(String::new())));
+        assert_eq!(
+            km.lookup(cs, PhysicalKey::Code(KeyCode::Enter), &Key::Named(NamedKey::Enter)),
+            None
+        );
+        assert!(km.pretty_chords(BindableAction::RunSelection).is_empty());
+    }
+
+    #[test]
+    fn run_selection_ordering_in_all() {
+        // Declared after CopyMode, and ToggleFullscreen stays LAST (its doc
+        // comment demands it never wins a slot from an existing action).
+        let all = BindableAction::ALL;
+        assert_eq!(all[all.len() - 1], BindableAction::ToggleFullscreen);
+        assert_eq!(all[all.len() - 2], BindableAction::RunSelection);
+        assert_eq!(all[all.len() - 3], BindableAction::CopyMode);
+    }
+
     // ── fullscreen (F11) ──────────────────────────────────────────────────────
 
     #[test]
@@ -1418,15 +1525,17 @@ mod tests {
     fn toggle_fullscreen_is_remappable_and_unbindable() {
         use winit::keyboard::NamedKey;
         // Remap: the new chord fires and bare F11 is freed (→ PTY passthrough).
+        // (Ctrl+Shift+U — Enter is no longer free: Ctrl+Shift+Enter became
+        // RunSelection's default in v0.25.)
         let km = km_with(|b| {
-            b.toggle_fullscreen = Some(ChordSpec::One("Ctrl+Shift+Return".to_string()))
+            b.toggle_fullscreen = Some(ChordSpec::One("Ctrl+Shift+U".to_string()))
         });
         assert!(km.warnings().is_empty(), "{:?}", km.warnings());
         assert_eq!(
             km.lookup(
                 Mods::new(true, true, false, false),
-                PhysicalKey::Code(KeyCode::Enter),
-                &Key::Named(NamedKey::Enter)
+                PhysicalKey::Code(KeyCode::KeyU),
+                &ch("U")
             ),
             Some(KeyAction::ToggleFullscreen)
         );
@@ -1454,7 +1563,7 @@ mod tests {
 
     #[test]
     fn bindable_action_all_is_exhaustive() {
-        assert_eq!(BindableAction::ALL.len(), 31);
+        assert_eq!(BindableAction::ALL.len(), 32);
         for a in BindableAction::ALL {
             assert_eq!(
                 BindableAction::ALL.iter().filter(|x| **x == a).count(),
