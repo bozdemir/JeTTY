@@ -120,7 +120,9 @@ pub fn tab_menu_items(can_detach: bool) -> Vec<&'static str> {
 }
 
 /// Items of a DETACHED window's context menu (right-click anywhere).
-pub const DETACHED_MENU_ITEMS: [&str; 3] = ["Reattach", "Copy", "Paste"];
+/// "Run in New Tab" runs THIS window's selection in a new MAIN-window tab at
+/// this tab's cwd (the main window is the only tabbed one; it is not summoned).
+pub const DETACHED_MENU_ITEMS: [&str; 4] = ["Reattach", "Copy", "Paste", "Run in New Tab"];
 
 /// Per-corner radii (tl, tr, bl, br) for a detached window's corner mask.
 /// A detached window is a free-floating window — it is never docked top-flush
@@ -137,6 +139,7 @@ pub fn menu_hint(label: &str) -> &'static str {
         "Detach" | "Reattach" => "⇧⌃D",
         "Copy" => "⇧⌃C",
         "Paste" => "⇧⌃V",
+        "Run in New Tab" => "⇧⌃⏎",
         "Close Tab" => "⇧⌃W",
         _ => "",
     }
@@ -251,6 +254,9 @@ pub(crate) struct DetachedWindow {
     pub menu_open: Option<(f32, f32)>,
     /// Cached hit-test rects for the open context menu (built once on open).
     pub menu_rects: Vec<jetty_render::Rect>,
+    /// Disabled menu indices, computed once at open (Copy=1 and Run in New
+    /// Tab=3 dim without a selection — same rule as the main menu's cache).
+    pub menu_disabled: Vec<usize>,
     /// Menu item currently under the cursor (hover highlight).
     pub menu_hover: Option<usize>,
     /// Whether the cursor is over the close ✕ (drives the red hover highlight).
@@ -428,6 +434,7 @@ impl DetachedWindow {
             resize_zone: crate::app::ResizeZone::None,
             menu_open: None,
             menu_rects: Vec::new(),
+            menu_disabled: Vec::new(),
             menu_hover: None,
             close_hover: false,
             last_bar_click: None,
@@ -618,8 +625,10 @@ mod tests {
     }
 
     #[test]
-    fn detached_menu_is_reattach_copy_paste() {
-        assert_eq!(DETACHED_MENU_ITEMS, ["Reattach", "Copy", "Paste"]);
+    fn detached_menu_is_reattach_copy_paste_run() {
+        // Pinned order — app.rs's detached click dispatch matches on these
+        // hard indices (0 Reattach, 1 Copy, 2 Paste, 3 Run in New Tab).
+        assert_eq!(DETACHED_MENU_ITEMS, ["Reattach", "Copy", "Paste", "Run in New Tab"]);
     }
 
     #[test]
@@ -628,6 +637,7 @@ mod tests {
         assert_eq!(menu_hint("Reattach"), "⇧⌃D");
         assert_eq!(menu_hint("Copy"), "⇧⌃C");
         assert_eq!(menu_hint("Paste"), "⇧⌃V");
+        assert_eq!(menu_hint("Run in New Tab"), "⇧⌃⏎");
         assert_eq!(menu_hint("Close Tab"), "⇧⌃W");
         assert_eq!(menu_hint("Rename"), "");
     }

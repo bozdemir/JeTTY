@@ -912,6 +912,11 @@ pub struct App {
     /// hover/click hit-testing so high-frequency CursorMoved doesn't rebuild the
     /// whole menu every move.
     menu_item_rects: Vec<jetty_render::Rect>,
+    /// Disabled context-menu indices, computed ONCE at menu open (needs-a-
+    /// selection rows: Copy=0 and Run in New Tab=2; Run also when the feature
+    /// is config-disabled) and cached beside `menu_item_rects` so hover/click
+    /// and the per-frame rebuild never re-query the terminal.
+    menu_disabled: Vec<usize>,
     /// Index of the menu item currently under the cursor (for hover highlight).
     menu_hover: Option<usize>,
     /// Inline tab rename: `Some(tab_index)` while the user is editing a tab title.
@@ -1422,6 +1427,7 @@ impl App {
             debug,
             context_menu: None,
             menu_item_rects: Vec::new(),
+            menu_disabled: Vec::new(),
             menu_hover: None,
             renaming: None,
             rename_buf: String::new(),
@@ -2501,6 +2507,7 @@ impl App {
         self.context_menu = None;
         self.menu_hover = None;
         self.menu_item_rects.clear();
+        self.menu_disabled.clear();
         self.tab_menu = None;
         self.tab_menu_hover = None;
         self.tab_menu_rects.clear();
@@ -5811,6 +5818,7 @@ impl App {
                             dw.menu_open = None;
                             dw.menu_hover = None;
                             dw.menu_rects.clear();
+                            dw.menu_disabled.clear();
                             dw.request_paint();
                             return;
                         }
@@ -5863,6 +5871,7 @@ impl App {
                 dw.menu_open = None;
                 dw.menu_hover = None;
                 dw.menu_rects.clear();
+                dw.menu_disabled.clear();
                 // DEBOUNCE the grid+PTY reflow (mirrors the main window's
                 // Resized arm): a borderless-edge drag fires many Resized
                 // events, and reflowing + a SIGWINCH on each bombards p10k with
@@ -5917,10 +5926,15 @@ impl App {
                 let cy = position.y as f32;
                 if dw.menu_open.is_some() {
                     // Menu hover tracking from the cached rects (menu is modal;
-                    // no resize/close hover underneath it).
-                    let new_hover = dw.menu_rects.iter().position(|r| {
-                        cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
-                    });
+                    // no resize/close hover underneath it). Disabled (grayed)
+                    // rows are inert: no hover state.
+                    let new_hover = dw
+                        .menu_rects
+                        .iter()
+                        .position(|r| {
+                            cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
+                        })
+                        .filter(|i| !dw.menu_disabled.contains(i));
                     if new_hover != dw.menu_hover {
                         dw.menu_hover = new_hover;
                         dw.request_paint();
@@ -6031,6 +6045,8 @@ impl App {
                     Reattach,
                     Copy,
                     Paste,
+                    /// Run this window's selection in a new MAIN-window tab.
+                    RunSelection,
                     /// Leave fullscreen on THIS window (double-click on its bar
                     /// while fullscreen). Deferred out of the `dw` borrow.
                     ExitFullscreen,
@@ -6044,16 +6060,24 @@ impl App {
                     if dw.menu_open.take().is_some() {
                         // --- Context menu hit-test (consume the click entirely) ---
                         dw.menu_hover = None;
-                        let hit = dw.menu_rects.iter().position(|r| {
-                            cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
-                        });
+                        let hit = dw
+                            .menu_rects
+                            .iter()
+                            .position(|r| {
+                                cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
+                            })
+                            // Disabled rows no-op (the menu still closes).
+                            .filter(|i| !dw.menu_disabled.contains(i));
                         dw.menu_rects.clear();
+                        dw.menu_disabled.clear();
                         dw.request_paint();
-                        // Index → DETACHED_MENU_ITEMS order (Reattach/Copy/Paste).
+                        // Index → DETACHED_MENU_ITEMS order
+                        // (Reattach/Copy/Paste/Run in New Tab).
                         match hit {
                             Some(0) => Act::Reattach,
                             Some(1) => Act::Copy,
                             Some(2) => Act::Paste,
+                            Some(3) => Act::RunSelection,
                             _ => Act::None,
                         }
                     } else {
@@ -6237,6 +6261,7 @@ impl App {
                             }
                         }
                     }
+                    Act::RunSelection => self.run_selection_in_new_tab(SelSource::Detached(pos)),
                     Act::ExitFullscreen => self.set_detached_fullscreen(pos, false),
                     Act::None => {}
                 }
@@ -6373,12 +6398,28 @@ impl App {
                 button: MouseButton::Right,
                 ..
             } => {
-                // Right-click anywhere → Reattach / Copy / Paste context menu.
+                // Right-click anywhere → Reattach / Copy / Paste / Run in New
+                // Tab context menu.
                 let theme = self.current_theme();
+                let run_enabled = self.run_selection_enabled;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 let (cx, cy) = (dw.cursor.0 as f32, dw.cursor.1 as f32);
                 dw.menu_open = Some((cx, cy));
                 dw.menu_hover = None;
+                // Disabled rows, computed once at open — the same needs-a-
+                // selection class as the main menu: Copy (1) and Run in New
+                // Tab (3) dim without a selection; Run also dims when the
+                // feature is config-disabled.
+                let has_sel = dw
+                    .tab
+                    .terminal
+                    .selection_text()
+                    .is_some_and(|t| !t.is_empty());
+                dw.menu_disabled = match (has_sel, run_enabled) {
+                    (false, _) => vec![1, 3],
+                    (true, false) => vec![3],
+                    (true, true) => Vec::new(),
+                };
                 // Cache the item hit-test rects once (anchor + size fixed for the
                 // menu's lifetime), same pattern as the main context menu.
                 let items: Vec<(&str, &str)> = crate::detached::DETACHED_MENU_ITEMS
@@ -6395,6 +6436,7 @@ impl App {
                     dw.chrome_text.cell_size().0,
                     &items,
                     &[],
+                    &dw.menu_disabled,
                 );
                 dw.menu_rects = menu.item_rects;
                 dw.request_paint();
@@ -6638,6 +6680,7 @@ impl App {
         let close_hover = dw.close_hover;
         let menu_open = dw.menu_open;
         let menu_hover = dw.menu_hover;
+        let menu_disabled = dw.menu_disabled.clone();
         // Ctrl+hover link underline spans, snapshotted before the wide
         // gpu/text/quad borrows below (same pattern as the main window).
         let link_spans: Option<Vec<(usize, usize, usize)>> =
@@ -6870,6 +6913,7 @@ impl App {
                 .collect();
             let menu = jetty_render::build_menu(
                 mx, my, width, height, menu_hover, &theme, chrome_char_w, &items, &[],
+                &menu_disabled,
             );
             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &menu.quads);
             if !menu.labels.is_empty() {
@@ -8701,9 +8745,14 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.context_menu.is_some() {
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
-                    let new_hover = self.menu_item_rects.iter().position(|r| {
-                        cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
-                    });
+                    let new_hover = self
+                        .menu_item_rects
+                        .iter()
+                        .position(|r| {
+                            cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
+                        })
+                        // Disabled (grayed) rows are inert: no hover state.
+                        .filter(|i| !self.menu_disabled.contains(i));
                     if new_hover != self.menu_hover {
                         self.menu_hover = new_hover;
                         self.request_main_paint();
@@ -8887,6 +8936,9 @@ impl ApplicationHandler<AppEvent> for App {
                     let hit = self.menu_item_rects.iter().position(|r| {
                         cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
                     });
+                    // A click on a DISABLED (grayed) row is a no-op that still
+                    // closes the menu — the "click anywhere closes" contract.
+                    let hit = hit.filter(|i| !self.menu_disabled.contains(i));
                     if let Some(idx) = hit {
                         match idx {
                             0 => {
@@ -8910,10 +8962,15 @@ impl ApplicationHandler<AppEvent> for App {
                                 }
                             }
                             2 => {
+                                // Run in New Tab — the browser gesture: the
+                                // selection runs in a fresh tab at this tab's cwd.
+                                self.run_selection_in_new_tab(SelSource::Main);
+                            }
+                            3 => {
                                 // Select All
                                 self.active_tab_mut().terminal.select_all();
                             }
-                            3 => {
+                            4 => {
                                 // Clear — emulates Ctrl+L (form-feed 0x0C) sent to the active PTY.
                                 // This is the same byte the Ctrl+L keybinding produces via
                                 // ctrl_byte('L') in input.rs; reuse the same writer path.
@@ -8927,7 +8984,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 let _ = w.write_all(&[0x0C]);
                                 let _ = w.flush();
                             }
-                            4 => {
+                            5 => {
                                 // Close Tab — mirrors the Ctrl+Shift+W handler: set confirm_close
                                 // to open the confirmation popup (or close directly if no child).
                                 // This reuses the exact same flow as KeyAction::CloseTab.
@@ -9388,7 +9445,7 @@ impl ApplicationHandler<AppEvent> for App {
                             .map(|&l| (l, crate::detached::menu_hint(l)))
                             .collect();
                         let menu = jetty_render::build_menu(
-                            cx, cy, w, h, None, &theme, self.chrome_char_w(), &items, &[],
+                            cx, cy, w, h, None, &theme, self.chrome_char_w(), &items, &[], &[],
                         );
                         self.tab_menu_rects = menu.item_rects;
                         self.request_main_paint();
@@ -9406,12 +9463,28 @@ impl ApplicationHandler<AppEvent> for App {
                 self.tab_menu_labels.clear();
                 self.context_menu = Some((cx, cy));
                 self.menu_hover = None;
+                // Disabled rows, computed once at open: "Copy" (0) and "Run in
+                // New Tab" (2) share the needs-a-selection property (Copy
+                // silently no-ops without one today — dimming is the honest UI
+                // for the same property); Run additionally dims when the
+                // feature is config-disabled.
+                let has_sel = self
+                    .active_tab()
+                    .terminal
+                    .selection_text()
+                    .is_some_and(|t| !t.is_empty());
+                self.menu_disabled = match (has_sel, self.run_selection_enabled) {
+                    (false, _) => vec![0, 2],
+                    (true, false) => vec![2],
+                    (true, true) => Vec::new(),
+                };
                 // Cache the item hit-test rects once (anchor + size fixed for the
                 // menu's lifetime) so CursorMoved hover doesn't rebuild the menu.
                 if let Some(gpu) = &self.gpu {
                     let theme = self.current_theme();
                     let menu = jetty_render::build_context_menu(
-                        cx, cy, gpu.config.width, gpu.config.height, None, &theme, self.chrome_char_w(),
+                        cx, cy, gpu.config.width, gpu.config.height, None, &theme,
+                        self.chrome_char_w(), &self.menu_disabled,
                     );
                     self.menu_item_rects = menu.item_rects;
                 }
@@ -10483,6 +10556,8 @@ impl ApplicationHandler<AppEvent> for App {
                 self.perf_label = perf_string.clone();
                 let context_menu = self.context_menu;
                 let menu_hover = self.menu_hover;
+                // Disabled rows computed at menu open (cheap clone of ≤2 idx).
+                let menu_disabled = self.menu_disabled.clone();
                 let tab_menu = self.tab_menu;
                 let tab_menu_hover = self.tab_menu_hover;
                 let tab_menu_labels = self.tab_menu_labels.clone();
@@ -11077,7 +11152,10 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     // Draw the right-click context menu on top of everything.
                     if let Some((mx, my)) = context_menu {
-                        let menu = jetty_render::build_context_menu(mx, my, width, height, menu_hover, &theme, chrome_char_w);
+                        let menu = jetty_render::build_context_menu(
+                            mx, my, width, height, menu_hover, &theme, chrome_char_w,
+                            &menu_disabled,
+                        );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &menu.quads);
                         if !menu.labels.is_empty() {
                             let _ = chrome_text.render_overlays(
@@ -11098,7 +11176,7 @@ impl ApplicationHandler<AppEvent> for App {
                             .map(|&l| (l, crate::detached::menu_hint(l)))
                             .collect();
                         let menu = jetty_render::build_menu(
-                            mx, my, width, height, tab_menu_hover, &theme, chrome_char_w, &items, &[],
+                            mx, my, width, height, tab_menu_hover, &theme, chrome_char_w, &items, &[], &[],
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &menu.quads);
                         if !menu.labels.is_empty() {

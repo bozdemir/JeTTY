@@ -866,8 +866,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // JETTY_SHOT_MENU — render the right-click context menu for visual checks.
+        // JETTY_SHOT_MENU_DISABLED=1 renders the no-selection state: Copy (0)
+        // and Run in New Tab (2) dimmed with the hover on an ENABLED row —
+        // verifies the grayed-row rendering and the ⇧⌃⏎ hint glyph.
         if env_flag("JETTY_SHOT_MENU") {
-            let menu = jetty_render::build_context_menu(620.0, 120.0, width, height, Some(1), terminal.theme(), chrome_char_w);
+            let disabled: &[usize] =
+                if env_flag("JETTY_SHOT_MENU_DISABLED") { &[0, 2] } else { &[] };
+            let menu = jetty_render::build_context_menu(
+                620.0, 120.0, width, height, Some(1), terminal.theme(), chrome_char_w, disabled,
+            );
+            rects.extend(menu.quads);
+            panel_labels.extend(menu.labels);
+        }
+
+        // JETTY_SHOT_DMENU — render the DETACHED window's 4-item context menu
+        // (Reattach / Copy / Paste / Run in New Tab) through the same generic
+        // builder the app uses. JETTY_SHOT_DMENU_DISABLED=1 dims Copy (1) +
+        // Run in New Tab (3) — the no-selection state.
+        if env_flag("JETTY_SHOT_DMENU") {
+            let items: Vec<(&str, &str)> = jetty_app::detached_menu_items();
+            let disabled: &[usize] =
+                if env_flag("JETTY_SHOT_DMENU_DISABLED") { &[1, 3] } else { &[] };
+            let menu = jetty_render::build_menu(
+                620.0, 120.0, width, height, Some(0), terminal.theme(), chrome_char_w,
+                &items, &[], disabled,
+            );
             rects.extend(menu.quads);
             panel_labels.extend(menu.labels);
         }

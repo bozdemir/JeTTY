@@ -25,6 +25,16 @@ pub mod perf;
 use app::AppEvent;
 use winit::event_loop::{ControlFlow, EventLoop};
 
+/// The detached window's context-menu `(label, hint)` rows — public so the
+/// `jetty-shot` self-test (JETTY_SHOT_DMENU) renders EXACTLY the menu the app
+/// builds, driving the same `DETACHED_MENU_ITEMS`/`menu_hint` pair.
+pub fn detached_menu_items() -> Vec<(&'static str, &'static str)> {
+    detached::DETACHED_MENU_ITEMS
+        .iter()
+        .map(|&l| (l, detached::menu_hint(l)))
+        .collect()
+}
+
 /// Unix-socket path used for single-instance IPC. Any running primary Jetty
 /// instance listens here; secondary invocations (including `jetty --toggle`)
 /// connect and send a summon message, then exit immediately.
