@@ -2722,7 +2722,11 @@ impl App {
                 // and-exits, `r` runs-in-a-new-tab-and-exits. Requires an
                 // ACTIVE v/V selection; without one the key is swallowed
                 // (copy-mode owns the keyboard) — never guess "current line".
-                if self.copy_mode.is_some_and(|cm| cm.selecting) {
+                // Gated on the config opt-out too (sweep M3): with
+                // `run_selection = false` the key must be a PURE no-op —
+                // swallowed like any unbound copy-mode key, keeping the
+                // selection and the mode — not a clear-and-exit surprise.
+                if self.run_selection_enabled && self.copy_mode.is_some_and(|cm| cm.selecting) {
                     // run_selection_in_new_tab captures + clears the SOURCE
                     // selection BEFORE switching to the new tab; the extra
                     // clear covers the empty-selection no-op path so the exit
@@ -4200,6 +4204,7 @@ impl App {
             }
         }
         // 3. Create the destination tab and arm ITS pending (and only its).
+        let prev_active = self.active;
         let Some(idx) = self.new_tab_with_cwd(cwd) else { return };
         self.tabs[idx].pending_inject = Some(crate::runsel::PendingInject {
             text,
@@ -4208,6 +4213,15 @@ impl App {
             wait_for_mark,
             notify_window,
         });
+        // A detached-source run is the browser's BACKGROUND tab (sweep M2):
+        // `new_tab_with_cwd` switched `self.active` to the new tab, which would
+        // visibly flip a shown main window's grid under the user — restore the
+        // tab they were on. Main-window triggers DO switch (the user fired the
+        // gesture there, and a staged multiline needs their review + Enter).
+        if matches!(source, SelSource::Detached(_)) {
+            self.active = prev_active;
+            self.request_main_paint();
+        }
         // Wake the `about_to_wait` deadline fold (one bool; false when unused).
         self.runsel_active = true;
     }
@@ -4458,7 +4472,12 @@ impl App {
                 });
                 (wrote, notice)
             }
-            Verdict::Drop => (false, None),
+            Verdict::Drop => (
+                // Tell the user (safety MINOR-2): the tab is open but nothing
+                // ran — without the pill an empty tab is a silent mystery.
+                false,
+                Some(runsel::Notice { msg: runsel::MSG_DROPPED, window: p.notify_window }),
+            ),
             Verdict::Refuse => (
                 false,
                 Some(runsel::Notice { msg: runsel::MSG_REFUSED, window: p.notify_window }),

@@ -42,11 +42,13 @@ run it in a new tab, opened in the selection's own directory.
   deliberately does not parse shell syntax.
 - **Injection timing** — with OSC 133 shell integration the command is injected
   only once the new shell shows its **first prompt with bracketed paste on**
-  (p10k instant-prompt safe); without integration, single lines fall back to a
-  1.5 s timeout (tabs become spaces on that raw path, so readline completion
-  can never rewrite the line). Typing, pasting, or an IME commit into the new
-  tab **cancels** the staged injection — you claimed the prompt. A stale
-  injection never fires: 10 s TTL.
+  (p10k instant-prompt safe); without integration it falls back to a 1.5 s
+  timeout — **bracketed whenever the shell has bracketed paste on by then**
+  (multi-line stages there too), otherwise raw and single-line-run only (tabs
+  become spaces on that raw path, so readline completion can never rewrite the
+  line). Typing, pasting, or an IME commit into the new tab **cancels** the
+  staged injection — you claimed the prompt. A stale injection never fires:
+  10 s TTL, with a status pill either way so an empty tab is never a mystery.
 - **Config** — `run_selection = false` disables every trigger (hot-reloadable).
 - Help overlay rows for the new chord and copy-mode `r`; `jetty-shot` hooks for
   the 6-item menu (enabled + dimmed), the detached 4-item menu, and the rest.

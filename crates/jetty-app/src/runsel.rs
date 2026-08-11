@@ -50,6 +50,12 @@ pub struct Sanitized {
 /// 1. `\r\n` and lone `\r` normalize to `\n`.
 /// 2. Every `char::is_control()` except `\n` and `\t` is removed — that kills
 ///    ESC (so `ESC[201~` cannot survive), all C0, DEL, and the C1 range.
+///    Unicode FORMAT codepoints (category Cf: ZWSP/ZWJ, bidi controls, U+FEFF,
+///    soft hyphen) deliberately PASS: `is_control()` is Cc-only. They cannot
+///    break the bracketed framing (only real ESC could) and carry no execution
+///    semantics of their own — the exact exposure the ordinary paste path has
+///    always had, kept identical on purpose rather than inventing a stricter
+///    filter that would corrupt legitimate RTL/emoji-joined selections.
 /// 3. The WHOLE text is trimmed (removes the trailing newline a full-line
 ///    selection always carries, so `cmd\n` classifies as a single line).
 /// 4. Capped at [`MAX_BYTES`] on a char boundary; sets `truncated`.
@@ -167,6 +173,11 @@ pub const MSG_REFUSED: &str =
 /// nothing ran; the user's Enter is the confirmation.
 pub const MSG_STAGED: &str = "Selection staged — review, then press Enter to run";
 
+/// Pill text when a single-line pending hit its TTL — the tab is open at the
+/// right cwd, but nothing ran and nothing will (a late fire is forbidden).
+/// Without this the user sees an open tab and no clue why it is empty.
+pub const MSG_DROPPED: &str = "Run selection timed out — nothing was run";
+
 /// `poll_pending`'s verdict for one pending at one instant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -209,12 +220,18 @@ pub fn poll_pending(
     if prompt_count > 0 && bracketed_on {
         return Verdict::Fire;
     }
-    if !p.wait_for_mark
-        && !p.multiline()
-        && p.run
-        && now.duration_since(p.created) >= INJECT_TIMEOUT
-    {
-        return Verdict::FireUnbracketed;
+    if !p.wait_for_mark && now.duration_since(p.created) >= INJECT_TIMEOUT {
+        // Integration-less fallback, OPPORTUNISTICALLY bracketed: marks will
+        // never come, but zsh/bash/fish still enable `?2004h` at their prompt —
+        // when it is on by the timeout, a bracketed fire is strictly safer than
+        // raw AND lets a multiline stage here instead of refusing at TTL. The
+        // raw path stays single-line-run only (`\t` → space at write time).
+        if bracketed_on {
+            return Verdict::Fire;
+        }
+        if !p.multiline() && p.run {
+            return Verdict::FireUnbracketed;
+        }
     }
     Verdict::Wait
 }
@@ -458,6 +475,27 @@ mod tests {
         // Multiline never takes the unbracketed path, integration or not.
         let m = pending("a\nb", false, t0, false);
         assert_eq!(poll_pending(&m, t0 + INJECT_TIMEOUT, 0, false), Verdict::Wait);
+    }
+
+    #[test]
+    fn poll_timeout_fires_bracketed_opportunistically_without_integration() {
+        // No integration marks will ever come, but the shell DID enable ?2004h
+        // by the timeout: fire BRACKETED — strictly safer than raw, and it
+        // lets a multiline STAGE here instead of refusing 10s later at TTL.
+        let t0 = Instant::now();
+        let p = pending("echo hi", true, t0, false);
+        assert_eq!(poll_pending(&p, t0 + INJECT_TIMEOUT, 0, true), Verdict::Fire);
+        let m = pending("a\nb", false, t0, false);
+        assert_eq!(poll_pending(&m, t0 + INJECT_TIMEOUT, 0, true), Verdict::Fire);
+        // Before the timeout it still waits (no premature fire on 2004h alone —
+        // the mark path handles integrated shells).
+        assert_eq!(
+            poll_pending(&m, t0 + INJECT_TIMEOUT - Duration::from_millis(1), 0, true),
+            Verdict::Wait
+        );
+        // Integration expected: the timeout path never fires, bracketed or not.
+        let p = pending("echo hi", true, t0, true);
+        assert_eq!(poll_pending(&p, t0 + INJECT_TIMEOUT, 0, true), Verdict::Wait);
     }
 
     #[test]
