@@ -25,6 +25,7 @@ pub const HELP_ROWS: &[&str] = &[
     "",
     "## Clipboard & selection",
     "Ctrl+Shift+C / Ctrl+Shift+V — Copy / paste",
+    "Ctrl+Shift+Enter — Run selection in a new tab   (multi-line lands staged)",
     "Left-drag — Select text (auto-copies)",
     "Shift+drag — Select over mouse apps (vim / htop / Claude Code)",
     "Right-click — Context menu",
@@ -37,7 +38,7 @@ pub const HELP_ROWS: &[&str] = &[
     "",
     "## Keyboard modes & links",
     "Ctrl+Shift+H — Hint mode: copy a URL / path   (Alt = open, Esc cancel)",
-    "Ctrl+Shift+Space — Copy-mode: keyboard select   (hjkl, v/V, y = yank)",
+    "Ctrl+Shift+Space — Copy-mode: keyboard select   (hjkl, v/V, y = yank, r = run)",
     "Ctrl+click — Open URL   (Ctrl+hover underlines)",
     "",
     "## Other",
@@ -386,10 +387,11 @@ mod tests {
         // behaviour for an extreme (<~381px) window and not exercised here.
         let ink_floor = 16.0_f32; // ROW_H_MIN == font_size at scale 1 (vscale==1)
         // The readable lower bound rises with the ENTRY count: the sectioned
-        // overlay now has ~36 entries (headers + items + blank spacers), so the
-        // floored metrics (2·8 + 22 + 36·16 ≈ 614px) need ~620px before the
-        // last-resort pitch tightening kicks in. 640 is the smallest clear of that.
-        for h in [640u32, 760, 900, 1100] {
+        // overlay now has ~37 entries (headers + items + blank spacers — the
+        // run-selection row of v0.25 added one), so the floored metrics
+        // (2·8 + 22 + 37·16 ≈ 630px) need ~660px before the last-resort pitch
+        // tightening kicks in. 660 is the smallest clear of that.
+        for h in [660u32, 760, 900, 1100] {
             let overlay = build_help_overlay(700, h, &theme(), TEST_CHAR_W, &default_help_rows());
             // labels[0] is the title; labels[1..] are the row labels. An item emits
             // a key AND a description label at the SAME y (side-by-side columns),

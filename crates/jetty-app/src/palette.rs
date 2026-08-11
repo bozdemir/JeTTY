@@ -38,6 +38,7 @@ pub enum PaletteCmd {
     Search,
     HintMode,
     CopyMode,
+    RunSelection,
     PrevPrompt,
     NextPrompt,
     Copy,
@@ -77,7 +78,7 @@ pub fn build_registry(
     tabs: &[String],
     detached: &[String],
 ) -> Vec<PaletteEntry> {
-    let statics: [(&str, &str, PaletteCmd); 31] = [
+    let statics: [(&str, &str, PaletteCmd); 32] = [
         ("New tab", "create open window shell", PaletteCmd::NewTab),
         ("Close tab", "kill remove", PaletteCmd::CloseTab),
         ("Next tab", "cycle switch forward", PaletteCmd::NextTab),
@@ -104,6 +105,11 @@ pub fn build_registry(
         ("Jump to next prompt", "osc133 shell down", PaletteCmd::NextPrompt),
         ("Copy selection", "clipboard yank", PaletteCmd::Copy),
         ("Paste", "clipboard insert", PaletteCmd::Paste),
+        (
+            "Run selection in new tab",
+            "execute run selected command tab shell browser",
+            PaletteCmd::RunSelection,
+        ),
         ("Toggle launch at login", "autostart startup boot", PaletteCmd::ToggleLaunchAtLogin),
         ("Reset keybindings to defaults", "shortcut hotkey rebind reset keys", PaletteCmd::ResetKeybindings),
         ("Toggle fullscreen", "full screen maximize f11 whole monitor", PaletteCmd::ToggleFullscreen),
@@ -236,6 +242,16 @@ mod tests {
         let hits = filter(&r, "past");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].indices, vec![0, 1, 2, 3], "title match highlights its chars");
+    }
+
+    #[test]
+    fn registry_contains_run_selection_and_ranks_it() {
+        let r = reg();
+        assert!(r.iter().any(|e| e.cmd == PaletteCmd::RunSelection));
+        // The browser-gesture entry must be the top hit for its own words.
+        let hits = filter(&r, "run sel");
+        assert_eq!(hits[0].cmd, PaletteCmd::RunSelection, "top hit for 'run sel'");
+        assert_eq!(hits[0].title, "Run selection in new tab");
     }
 
     #[test]

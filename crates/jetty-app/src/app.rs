@@ -1602,6 +1602,10 @@ impl App {
             String::new(),
             "## Clipboard & selection".to_string(),
             format!("{} / {} — Copy / paste", first(A::Copy), first(A::Paste)),
+            format!(
+                "{} — Run selection in a new tab   (multi-line lands staged)",
+                all(A::RunSelection)
+            ),
             "Left-drag — Select text (auto-copies)".to_string(),
             "Shift+drag — Select over mouse apps (vim / htop / Claude Code)".to_string(),
             "Right-click — Context menu".to_string(),
@@ -1625,7 +1629,7 @@ impl App {
                 first(A::HintMode)
             ),
             format!(
-                "{} — Copy-mode: keyboard select   (hjkl, v/V, y = yank)",
+                "{} — Copy-mode: keyboard select   (hjkl, v/V, y = yank, r = run)",
                 first(A::CopyMode)
             ),
             "Ctrl+click — Open URL   (Ctrl+hover underlines)".to_string(),
@@ -2713,6 +2717,22 @@ impl App {
                 self.copy_mode_yank();
                 return;
             }
+            Key::Character(s) if s.as_str() == "r" => {
+                // Run the selection in a new tab — `y`'s sibling: `y` copies-
+                // and-exits, `r` runs-in-a-new-tab-and-exits. Requires an
+                // ACTIVE v/V selection; without one the key is swallowed
+                // (copy-mode owns the keyboard) — never guess "current line".
+                if self.copy_mode.is_some_and(|cm| cm.selecting) {
+                    // run_selection_in_new_tab captures + clears the SOURCE
+                    // selection BEFORE switching to the new tab; the extra
+                    // clear covers the empty-selection no-op path so the exit
+                    // mirrors the `y` arm exactly (clear + exit).
+                    self.run_selection_in_new_tab(SelSource::Main);
+                    self.active_tab_mut().terminal.selection_clear();
+                    self.exit_copy_mode();
+                }
+                return;
+            }
             Key::Character(s) if s.as_str() == "v" || s.as_str() == "V" => {
                 let line = s.as_str() == "V";
                 // Content-pinned anchor: capture the BUFFER line under the cursor
@@ -3048,6 +3068,8 @@ impl App {
             // close_palette), so overlay_owns_keys() is false and the mode enters.
             C::HintMode => self.enter_hint_mode(),
             C::CopyMode => self.enter_copy_mode(),
+            // Clean no-op without a selection (the method aborts on Empty).
+            C::RunSelection => self.run_selection_in_new_tab(SelSource::Main),
             C::PrevPrompt => {
                 if self.active_tab_mut().terminal.jump_prompt(false) {
                     self.request_main_paint();
@@ -13066,6 +13088,39 @@ mod fullscreen_helper_tests {
         let idx = rows.iter().position(|r| r == live).unwrap();
         let header = rows[..idx].iter().rfind(|r| r.starts_with("## ")).unwrap();
         assert_eq!(header, "## Tabs & windows");
+    }
+
+    #[test]
+    fn help_rows_include_run_selection_and_mirror_matches() {
+        // Live row: default chord + the staged-multiline note, in the
+        // clipboard section; static HELP_ROWS mirror carries the same row
+        // verbatim (the default chord pretty-prints as Ctrl+Shift+Enter).
+        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), "F9");
+        let live = rows
+            .iter()
+            .find(|r| r.contains("Run selection in a new tab"))
+            .expect("no run-selection help row");
+        assert!(live.contains("Ctrl+Shift+Enter"), "{live:?}");
+        assert!(live.contains(" — "), "sectioned 'KEY — desc' shape: {live:?}");
+        assert!(
+            jetty_render::HELP_ROWS.iter().any(|r| *r == live.as_str()),
+            "static HELP_ROWS mirror out of sync with the live row: {live:?}"
+        );
+        let idx = rows.iter().position(|r| r == live).unwrap();
+        let header = rows[..idx].iter().rfind(|r| r.starts_with("## ")).unwrap();
+        assert_eq!(header, "## Clipboard & selection");
+        // Copy-mode's row documents `r` in BOTH sources.
+        let cm = rows
+            .iter()
+            .find(|r| r.contains("Copy-mode"))
+            .expect("no copy-mode help row");
+        assert!(cm.contains("r = run"), "{cm:?}");
+        assert!(
+            jetty_render::HELP_ROWS
+                .iter()
+                .any(|r| r.contains("Copy-mode") && r.contains("r = run")),
+            "static copy-mode row is missing 'r = run'"
+        );
     }
 
     #[test]
