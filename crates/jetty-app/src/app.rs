@@ -4182,7 +4182,7 @@ impl App {
             }
         };
         let Some(raw) = text else { return };
-        let (text, run) = match crate::runsel::classify(crate::runsel::sanitize(&raw)) {
+        let (text, run) = match crate::runsel::classify(crate::runsel::prepare(&raw)) {
             crate::runsel::Plan::Empty => return,
             crate::runsel::Plan::Run(t) => (t, true),
             crate::runsel::Plan::Type(t) => (t, false),
@@ -9519,6 +9519,22 @@ impl ApplicationHandler<AppEvent> for App {
                     (true, false) => vec![2],
                     (true, true) => Vec::new(),
                 };
+                // THE teachable moment for mouse-grabbing apps (Claude Code,
+                // vim, htop): the user right-clicked wanting Copy / Run in New
+                // Tab, but their drag was forwarded to the app, so there is no
+                // selection and both rows sit dimmed with no explanation.
+                // Surface the Shift+drag hint alongside the menu — deliberately
+                // BYPASSING the 25s drag-cooldown: an explicit right-click on
+                // dimmed rows is a direct question, not a nag.
+                if !has_sel && self.active_tab().terminal.mouse_mode() {
+                    if let Some(w) = &self.window {
+                        let now = std::time::Instant::now();
+                        self.shift_hint_until =
+                            Some((now + std::time::Duration::from_millis(3500), w.id()));
+                        self.shift_hint_cooldown =
+                            Some(now + std::time::Duration::from_secs(25));
+                    }
+                }
                 // Cache the item hit-test rects once (anchor + size fixed for the
                 // menu's lifetime) so CursorMoved hover doesn't rebuild the menu.
                 if let Some(gpu) = &self.gpu {

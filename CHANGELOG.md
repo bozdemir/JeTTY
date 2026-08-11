@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.25.1] — 2026-08-11
+
+**Run-selection, now usable where you actually live: inside Claude Code.** The
+v0.25.0 gesture assumed a plain-shell screen; selecting from a mouse-grabbing
+TUI (Claude Code, vim, htop) hit two walls in a row — this release removes both.
+
+### Fixed
+- **You couldn't select at all** — a mouse-grabbing app swallows the left-drag,
+  so no JeTTY selection existed and the menu's Copy / Run in New Tab sat dimmed
+  with no explanation. The escape has always been **Shift+drag**; now JeTTY
+  teaches it at the exact moment of failure: right-clicking over a
+  mouse-grabbing app with no selection shows the *"Hold Shift while dragging to
+  select text"* pill alongside the menu.
+- **What you selected carried the frame** — Claude-Code-style bordered output
+  drags its `│` edges (and doc-style `$ ` / `❯ ` prompt markers) into the
+  selection, so the "command" arrived as garbage. `strip_decorations` now
+  cleans, byte-exact-tested and strictly conservative — each rule fires only
+  when UNIFORM across every line of the selection, so a mixed selection is left
+  untouched:
+  - a shared leading/trailing box-drawing border (`│ cargo build │` →
+    `cargo build`, multi-line frames too),
+  - a shared `$ ` / `❯ ` prompt marker (`$ cmd1` ⏎ `$ cmd2` → `cmd1` ⏎ `cmd2`;
+    `echo $PATH` is untouched).
+  Stripping runs after sanitization and only ever shrinks the text.
+
+---
+
 ## [0.25.0] — 2026-08-11
 
 **Run selection in a new tab.** The browser gesture, transplanted: in a browser

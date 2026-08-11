@@ -116,6 +116,85 @@ pub fn classify(s: Sanitized) -> Plan {
     }
 }
 
+/// Vertical box-drawing characters that TUI frames (Claude Code's bordered
+/// blocks, `boxes`, `gum`…) put at the left/right edge of every framed row. A
+/// selection that spans such rows drags the border in — and a command that
+/// starts with `│` is never what the user meant to run.
+const FRAME_CHARS: [char; 9] = ['│', '┃', '║', '┆', '┇', '┊', '┋', '╎', '╏'];
+
+/// Strip UNIFORM, UNAMBIGUOUS decorations a real-terminal selection drags in,
+/// so "select the command out of Claude Code's framed output and run it" works
+/// without hand-editing. Every rule fires only when it holds on EVERY non-empty
+/// line — a mixed selection is left byte-for-byte alone:
+///
+/// 1. A shared LEADING frame border (`│` etc. + optional one space) on every
+///    line is stripped (Claude Code / boxed-TUI left edge).
+/// 2. A shared TRAILING frame border (optional spaces + `│` etc.) is stripped
+///    (the right edge of a full-width frame selection).
+/// 3. A shared doc-style PROMPT marker `"$ "` or `"❯ "` on every line is
+///    stripped ONCE (the way docs and shell transcripts prefix commands —
+///    `echo $PATH` is untouched: `$` there is not followed by a space-prefixed
+///    token start on every line).
+///
+/// Runs AFTER [`sanitize`] (on clean, trimmed text — stripping only shrinks, so
+/// the cap holds) and re-trims. Pure; byte-exact tests below.
+pub fn strip_decorations(text: &str) -> String {
+    let non_empty = |l: &&str| !l.trim().is_empty();
+    let mut out: Vec<String> = text.lines().map(str::to_string).collect();
+
+    // 1. Uniform leading frame char (+ at most one following space).
+    if let Some(first) = out.iter().find(|l| non_empty(&l.as_str())) {
+        if let Some(f) = first.chars().next().filter(|c| FRAME_CHARS.contains(c)) {
+            if out.iter().filter(|l| non_empty(&l.as_str())).all(|l| l.starts_with(f)) {
+                for l in &mut out {
+                    if let Some(rest) = l.strip_prefix(f) {
+                        *l = rest.strip_prefix(' ').unwrap_or(rest).to_string();
+                    }
+                }
+            }
+        }
+    }
+    // 2. Uniform trailing frame char (spaces before it allowed).
+    if let Some(first) = out.iter().find(|l| non_empty(&l.as_str())) {
+        if let Some(f) = first.trim_end().chars().last().filter(|c| FRAME_CHARS.contains(c)) {
+            if out
+                .iter()
+                .filter(|l| non_empty(&l.as_str()))
+                .all(|l| l.trim_end().ends_with(f))
+            {
+                for l in &mut out {
+                    let t = l.trim_end();
+                    if let Some(rest) = t.strip_suffix(f) {
+                        *l = rest.trim_end().to_string();
+                    }
+                }
+            }
+        }
+    }
+    // 3. Uniform doc-style prompt marker on every line.
+    for marker in ["$ ", "❯ "] {
+        if out.iter().filter(|l| non_empty(&l.as_str())).all(|l| l.trim_start().starts_with(marker))
+            && out.iter().any(|l| non_empty(&l.as_str()))
+        {
+            for l in &mut out {
+                let lead: String = l.chars().take_while(|c| c.is_whitespace()).collect();
+                if let Some(rest) = l.trim_start().strip_prefix(marker) {
+                    *l = format!("{lead}{rest}");
+                }
+            }
+        }
+    }
+    out.join("\n").trim().to_string()
+}
+
+/// [`sanitize`] + [`strip_decorations`] — the full selection→command pipeline
+/// the app runs before [`classify`]. Kept as one seam so every trigger path
+/// (menu, chord, palette, copy-mode, detached) prepares text identically.
+pub fn prepare(raw: &str) -> Sanitized {
+    let s = sanitize(raw);
+    Sanitized { text: strip_decorations(&s.text), truncated: s.truncated }
+}
+
 /// A command staged for injection into a freshly-spawned tab, waiting for the
 /// destination shell to become ready. Lives in `Tab.pending_inject`
 /// (`Option`, `None` for every tab that never uses the feature — the zero-cost
@@ -329,6 +408,55 @@ mod tests {
     use super::*;
 
     // ── sanitize ─────────────────────────────────────────────────────────────
+
+    // ── strip_decorations (the select-from-framed-TUI-output path) ────────────
+
+    #[test]
+    fn strip_frame_left_border_single_and_multi() {
+        assert_eq!(strip_decorations("│ cargo build"), "cargo build");
+        assert_eq!(strip_decorations("│ line1\n│ line2"), "line1\nline2");
+        // No space after the border is fine too.
+        assert_eq!(strip_decorations("│cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn strip_frame_right_border_full_width_selection() {
+        assert_eq!(strip_decorations("│ cargo build        │"), "cargo build");
+        assert_eq!(strip_decorations("│ a   │\n│ b │"), "a\nb");
+    }
+
+    #[test]
+    fn strip_frame_only_when_uniform() {
+        // Mixed starts: left alone byte-for-byte (minus the outer trim, a no-op here).
+        assert_eq!(strip_decorations("│ a\nb"), "│ a\nb");
+        // Border NOT at line start: untouched.
+        assert_eq!(strip_decorations("echo │ x"), "echo │ x");
+    }
+
+    #[test]
+    fn strip_doc_prompt_markers() {
+        assert_eq!(strip_decorations("$ cargo build"), "cargo build");
+        assert_eq!(strip_decorations("❯ ls -la"), "ls -la");
+        // Uniform across a transcript block.
+        assert_eq!(strip_decorations("$ cmd1\n$ cmd2"), "cmd1\ncmd2");
+        // `$` not followed by space = real shell text, untouched.
+        assert_eq!(strip_decorations("echo $PATH"), "echo $PATH");
+        // Mixed prompt/non-prompt lines: untouched.
+        assert_eq!(strip_decorations("$ a\nplain"), "$ a\nplain");
+    }
+
+    #[test]
+    fn strip_frame_then_prompt_composes() {
+        // Claude-Code-style framed transcript: border first, then the prompt.
+        assert_eq!(strip_decorations("│ $ cargo build │"), "cargo build");
+    }
+
+    #[test]
+    fn prepare_pipeline_still_single_line_run() {
+        // The full seam: sanitize (controls/trim) + decorations → classify Run.
+        let p = classify(prepare("  │ $ cargo \x1b[31mbuild\x1b[0m │  \n"));
+        assert_eq!(p, Plan::Run("cargo [31mbuild[0m".into()));
+    }
 
     #[test]
     fn sanitize_strips_esc_c0_c1_del_keeps_nl_tab() {
