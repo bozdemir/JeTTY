@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.25.2] — 2026-10-02
+
+**Prebuilt packages run on older distros again.** No code changes — this is a
+build fix.
+
+### Fixed
+- **The AppImage, `.deb` and tarball refused to start on anything older than
+  Ubuntu 24.04** (`GLIBC_2.39 not found`). Releases were built on
+  `ubuntu-latest` (24.04, glibc 2.39), and Rust std weak-links
+  `pidfd_spawnp` / `pidfd_getpid` with a `GLIBC_2.39` version tag that the
+  loader enforces even though the symbols are optional; the `.deb` also
+  declared `libc6 (>= 2.39)`. The AppImage catalog's test (Ubuntu 22.04) caught
+  it. Releases are now built on Ubuntu 22.04, so all three run on glibc
+  **2.35+** (Ubuntu 22.04, Debian 12, Fedora 36 and newer).
+
+### Changed
+- The release workflow fails before publishing if the binary needs a glibc
+  newer than 2.35, and a manual run is now a dry run (builds and uploads the
+  files as a workflow artifact, publishes nothing).
+
+---
+
 ## [0.25.1] — 2026-08-11
 
 **Run-selection, now usable where you actually live: inside Claude Code.** The
