@@ -3,6 +3,8 @@ name: release
 # Build prebuilt artifacts and publish a GitHub Release whenever a version tag
 # is pushed, e.g.:
 #   git tag v0.1.0 && git push origin v0.1.0
+# A manual run (workflow_dispatch) is a dry run: it builds everything and
+# uploads the files as a workflow artifact, but publishes no release.
 on:
   push:
     tags: ["v*"]
@@ -13,7 +15,11 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # Pinned to the oldest supported Ubuntu LTS, NOT ubuntu-latest: the binary
+    # links against the build host's glibc, so a 24.04 build (glibc 2.39) refuses
+    # to start on 22.04 ("GLIBC_2.39 not found") — which is exactly how the
+    # AppImage catalog's test (run on 22.04) rejected v0.25.1.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -22,6 +28,10 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          # The auto key doesn't include the runner image; never restore objects
+          # built against another glibc.
+          key: ubuntu-22.04
 
       - name: System build deps
         run: |
@@ -33,6 +43,20 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --bin jetty
+
+      - name: glibc floor check
+        # Fail before anything ships if the binary needs a glibc newer than
+        # 22.04's 2.35. Rust std weak-links newer symbols (pidfd_spawnp,
+        # pidfd_getpid @ GLIBC_2.39) when the build host has them, and the
+        # loader rejects the version tag even though the symbols are optional.
+        run: |
+          floor=GLIBC_2.35
+          max=$(objdump -T target/release/jetty | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "highest glibc version required: $max (floor $floor)"
+          if [ "$(printf '%s\n' "$max" "$floor" | sort -V | tail -1)" != "$floor" ]; then
+            echo "::error::jetty requires $max, newer than $floor"
+            exit 1
+          fi
 
       - name: Tarball
         run: |
@@ -72,7 +96,19 @@ jobs:
       - name: Checksums
         run: sha256sum *.tar.gz *.deb *.AppImage > SHA256SUMS.txt
 
+      - name: Upload artifacts (dry run)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetty-dry-run
+          path: |
+            *.tar.gz
+            *.deb
+            *.AppImage
+            SHA256SUMS.txt
+
       - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           draft: false
