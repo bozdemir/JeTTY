@@ -18,13 +18,16 @@
 //! scrollbar track and chrome overlays anchor to — stays the un-padded area
 //! between the bars.
 //!
-//! The per-cell quad builders (`cell_bg_rects`, `cursor_rects_split`,
-//! `text_decoration_rects`, `link_underline_rects`, `search_hit_rects`,
-//! `copy_cursor_rects`, the hint-chip and IME-preedit overlays) take the
+//! The per-cell quad builders (`cell_bg_rects`, `text_decoration_rects`,
+//! `link_underline_rects`, `search_hit_rects`, `copy_cursor_rects`,
+//! `cursor_guide_rect`, the hint-chip and IME-preedit overlays) take the
 //! origin's `top` (plus any slide) as their `y_offset` and lay x out from the
 //! grid's LEFT EDGE (`col·cell_w`). The caller moves what they return onto the
 //! origin with [`shift_x`] / [`shift_labels_x`] right where it builds them, so
-//! every list that reaches a draw call is in window coordinates.
+//! every list that reaches a draw call is in window coordinates. The shell
+//! cursor (`cursor_draw`) and the cursor trail (`cursor_trail_rect`) take the
+//! origin's `left` as an explicit `x_offset` instead and return window
+//! coordinates directly.
 //! `TextLayer::prepare_grid` takes the whole origin, and its
 //! `decoration_rects()` come back already placed.
 //!

@@ -1,6 +1,7 @@
 mod chrome;
 mod colors;
 mod cursor;
+mod cursor_trail;
 mod gpu;
 mod text;
 mod builtin;
@@ -41,8 +42,12 @@ pub use colors::{
     caret_flash_target, contrast_ratio, cursor_text_color, is_light_bg, relative_luminance, selection_bg,
     selection_paint, SelectionPaint, CARET_FLASH_MIN_CONTRAST, SELECTION_MIN_CONTRAST,
 };
+pub use cursor_trail::{
+    rect_corners, simulate_trail, CursorTrailLayer, TrailFrame, TrailModel, TrailParams, TrailPos, TrailUniform,
+    TRAIL_DWELL,
+};
 pub use cursor::{
-    caret_flash_color, cursor_colors, cursor_draw, cursor_guide_rect, CursorColor, CursorColors, CursorDraw, CursorStyle,
+    caret_flash_color, cursor_colors, cursor_draw, cursor_guide_rect, cursor_trail_rect, CursorColor, CursorColors, CursorDraw, CursorStyle,
     UnderlineCursor, UnfocusedCursor, CURSOR_THICKNESS_DEFAULT, CURSOR_THICKNESS_MAX, CURSOR_THICKNESS_MIN,
 };
 pub use quad::{QuadLayer, Rect, cell_bg_rects, default_bg_clear, scrollbar_rect, scrollbar_rect_geom, scrollbar_offset_from_cursor, text_decoration_rects, link_underline_rects, failed_marker_rects, grid_decoration_key, SCROLLBAR_W};

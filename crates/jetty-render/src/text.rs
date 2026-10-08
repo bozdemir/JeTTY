@@ -92,7 +92,7 @@ struct OverdrawGlyph {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GridPaint<'a> {
     /// `(row, col, color)` of the glyph under a SOLID block cursor. The block is a
-    /// quad painted UNDER the text (see `quad::cursor_rects_split`), so the glyph
+    /// quad painted UNDER the text (see `cursor::cursor_draw`), so the glyph
     /// stays visible on top of it in this contrast color.
     pub cursor_glyph: Option<(usize, usize, [u8; 3])>,
     /// Selected-glyph coloring (see [`SelectionPaint`]); `None` = unchanged colors.
@@ -867,7 +867,7 @@ impl TextLayer {
         let metrics = layer_metrics(rounded_font_px(font_size), LINE_HEIGHT_DEFAULT);
         let line_height = metrics.line_height;
 
-        // The cursor is drawn as a QuadLayer rect (see `quad::cursor_rects_split`),
+        // The cursor is drawn as a QuadLayer rect (see `cursor::cursor_draw`),
         // not a text-atlas block glyph, so there is no cursor buffer to build here.
         // Grid rows get their own buffers lazily (see `new_row_buffer`).
 

@@ -269,6 +269,44 @@ pub fn cursor_draw(
     out
 }
 
+/// The cursor's resting rect `[x, y, w, h]` in window coordinates — the shape
+/// the cursor trail chases (block and hollow: the cell(s); beam: its bar; any
+/// underline: the strokes' extent). `None` when [`cursor_draw`] draws nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn cursor_trail_rect(
+    snap: &GridSnapshot,
+    cell_w: f32,
+    cell_h: f32,
+    x_offset: f32,
+    y_offset: f32,
+    focused: bool,
+    style: &CursorStyle,
+) -> Option<[f32; 4]> {
+    use unicode_width::UnicodeWidthChar;
+    let cell = cursor_cell(snap).filter(|_| snap.cursor_visible)?;
+    let shape = match (focused, style.unfocused, snap.cursor_shape) {
+        (false, UnfocusedCursor::None, _) => return None,
+        (_, _, s) => s,
+    };
+    let wide = snap.cursor_col + 1 < snap.cols && cell.c.width() == Some(2);
+    let span_w = if wide { cell_w * 2.0 } else { cell_w };
+    let x = x_offset + snap.cursor_col as f32 * cell_w;
+    let y = y_offset + snap.cursor_row as f32 * cell_h;
+    let stroke = style.thickness.clamp(CURSOR_THICKNESS_MIN, CURSOR_THICKNESS_MAX);
+    Some(match shape {
+        CursorShapeSnap::Block | CursorShapeSnap::HollowBlock => [x, y, span_w, cell_h],
+        CursorShapeSnap::Beam => [x, y, (cell_w * stroke).max(1.0), cell_h],
+        CursorShapeSnap::Underline => {
+            let h = match style.underline {
+                UnderlineCursor::Single => (cell_h * stroke).max(1.0),
+                UnderlineCursor::Double => 3.0 * (cell_h * stroke * 0.75).round().max(1.0),
+                UnderlineCursor::Thick => (cell_h * stroke * THICK_UNDERLINE_STROKES).min(cell_h * 0.5).max(2.0),
+            };
+            [x, y + cell_h - h, span_w, h]
+        }
+    })
+}
+
 /// The faint band across the cursor's row (`[cursor] guide`): the page color
 /// [`CURSOR_GUIDE_MIX`] of the way to the foreground, across the whole grid
 /// row, opaque like every cell background. Painted FIRST in the background
@@ -522,6 +560,27 @@ mod tests {
         // Concealed text (fg == bg) never makes the cursor invisible.
         g.cells[0].fg = g.cells[0].bg;
         assert_eq!(cursor_colors(&g, &t, CursorColor::Cell), themed);
+    }
+
+    #[test]
+    fn trail_rect_follows_the_drawn_shape() {
+        let mut g = grid(5, 3);
+        g.cursor_row = 1;
+        g.cursor_col = 2;
+        let style = CursorStyle::default();
+        let r = |g: &GridSnapshot, s: &CursorStyle| cursor_trail_rect(g, 10.0, 20.0, 4.0, 30.0, true, s);
+        assert_eq!(r(&g, &style), Some([24.0, 50.0, 10.0, 20.0]), "block: the cell, at the origin");
+        g.cursor_shape = CursorShapeSnap::Beam;
+        let beam = r(&g, &style).unwrap();
+        assert!((beam[2] - 1.2).abs() < 1e-5 && beam[3] == 20.0);
+        g.cursor_shape = CursorShapeSnap::Underline;
+        let ul = r(&g, &style).unwrap();
+        assert!((ul[1] + ul[3] - 70.0).abs() < 1e-4, "sits on the cell bottom");
+        // Hidden / unfocused-none → nothing to chase.
+        let none = CursorStyle { unfocused: UnfocusedCursor::None, ..Default::default() };
+        assert!(cursor_trail_rect(&g, 10.0, 20.0, 0.0, 0.0, false, &none).is_none());
+        g.cursor_visible = false;
+        assert!(r(&g, &style).is_none());
     }
 
     #[test]

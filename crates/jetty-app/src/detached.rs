@@ -432,6 +432,12 @@ pub(crate) struct DetachedWindow {
     /// This window's caret glow pass (`App::caret_fx`'s twin on this window's
     /// device): `None` until the glow is enabled and this window paints.
     pub caret_fx: Option<jetty_render::CaretFx>,
+    /// This window's cursor trail (`App::trail` and friends, per window).
+    pub trail: jetty_render::TrailModel,
+    pub trail_layer: Option<jetty_render::CursorTrailLayer>,
+    pub trail_wake: Option<std::time::Instant>,
+    /// When this window's tab last drained a flood (see `App::flood_at`).
+    pub flood_at: Option<std::time::Instant>,
     /// The hovered 0-based grid cell the cache above was computed for.
     /// Mirrors `App::link_hover_cell`.
     pub link_hover_cell: Option<(usize, usize)>,
@@ -596,6 +602,10 @@ impl DetachedWindow {
             link_hover: None,
             link_hover_cell: None,
             caret_fx: None,
+            trail: jetty_render::TrailModel::default(),
+            trail_layer: None,
+            trail_wake: None,
+            flood_at: None,
         })
     }
 
@@ -642,8 +652,9 @@ impl DetachedWindow {
         self.offscreen = None;
         // Rebuilt on the next frame that draws a backdrop, on the new device.
         self.backdrop = None;
-        // Rebuilt on the new device by the next glow frame.
+        // Rebuilt on the new device by the next glow / trail frame.
         self.caret_fx = None;
+        self.trail_layer = None;
         self.acquire_retry = None;
         self.gpu = gpu;
         true

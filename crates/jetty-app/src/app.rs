@@ -1440,6 +1440,16 @@ pub struct App {
     visual_bell: crate::motion::VisualBell,
     /// `command_pulse` (off / failures / all).
     command_pulse: crate::motion::CommandPulse,
+    /// The main window's cursor trail (`[cursor] trail`): the state machine,
+    /// its GPU pass (built by the first frame with the trail enabled) and the
+    /// ONE timed wake it may owe (the dwell before a jump starts trailing).
+    trail: jetty_render::TrailModel,
+    trail_layer: Option<jetty_render::CursorTrailLayer>,
+    trail_wake: Option<std::time::Instant>,
+    /// When the main window's tabs last drained a flood (≥ `FLOOD_PACE_BYTES`
+    /// in one Wake): a cursor jump right after is output, not the user — no
+    /// trail for it.
+    flood_at: Option<std::time::Instant>,
 
 
 }
@@ -1966,6 +1976,10 @@ impl App {
             reduce_motion: crate::motion::ReduceMotion::Off,
             visual_bell: crate::motion::VisualBell::Off,
             command_pulse: crate::motion::CommandPulse::Off,
+            trail: jetty_render::TrailModel::default(),
+            trail_layer: None,
+            trail_wake: None,
+            flood_at: None,
         };
         // Persisted user settings override the env-derived defaults (but env
         // vars still seed the initial values above, so an explicit JETTY_* can
@@ -3039,6 +3053,12 @@ impl App {
         }
         self.cursor_cfg = cfg;
         self.cursor_spec = spec;
+        self.trail.reset();
+        self.trail_wake = None;
+        for dw in &mut self.detached {
+            dw.trail.reset();
+            dw.trail_wake = None;
+        }
         self.mark_dirty_all();
         self.persist();
     }
@@ -3077,6 +3097,12 @@ impl App {
     fn motion_changed(&mut self) {
         if self.motion_reduced() {
             self.slide_anim = None;
+            self.trail.reset();
+            self.trail_wake = None;
+            for dw in &mut self.detached {
+                dw.trail.reset();
+                dw.trail_wake = None;
+            }
         }
         self.mark_dirty_all();
     }
@@ -5704,6 +5730,8 @@ impl App {
         // outgoing tab's regex/matches) before the index moves (F2/F7/F15).
         self.search_close(Surface::Main);
         self.active = idx;
+        self.trail.reset();
+        self.trail_wake = None;
         self.entered_new_active_tab();
     }
 
@@ -7716,6 +7744,8 @@ impl App {
         // hidden (F18). Re-armed naturally on the next keystroke/summon.
         self.caret_anim = None;
         self.glitch.cancel();
+        self.trail.reset();
+        self.trail_wake = None;
         self.pending_dock_frames = 0;
         self.pending_center_frames = 0;
         // Paints owed to a now-invisible window: drop them (the next summon
@@ -7986,6 +8016,8 @@ impl App {
                 // they don't pin Poll and spin 100% CPU while hidden (F18).
                 self.caret_anim = None;
                 self.glitch.cancel();
+                self.trail.reset();
+                self.trail_wake = None;
                 self.pending_dock_frames = 0;
                 self.pending_center_frames = 0;
                 // Paints owed to a now-invisible window (idle HUD, keystroke
@@ -10040,6 +10072,30 @@ impl App {
         let focused = dw.focused;
         let cursor_style = self.cursor_spec.style;
         let cursor_guide = self.cursor_spec.guide.shows(dw.tab.terminal.alt_screen());
+        // This window's cursor trail (the main window's rules, its own state).
+        if self.cursor_cfg.trail && dw.trail_layer.is_none() {
+            dw.trail_layer = Some(jetty_render::CursorTrailLayer::new(&dw.gpu.device, dw.gpu.format));
+        }
+        let trail_blocked = copy_mode_ui.is_some()
+            || preedit_ui.is_some()
+            || self.reduce_motion.active(self.system_reduced_motion)
+            || dw.flood_at.is_some_and(|t| t.elapsed() < TRAIL_FLOOD_QUIET);
+        let trail_uniform = trail_step(
+            &mut dw.trail,
+            &mut dw.trail_wake,
+            &self.cursor_cfg,
+            &cursor_style,
+            TrailInput {
+                snap: &snap,
+                theme: &theme,
+                cell: dw.text.cell_size(),
+                origin,
+                focused,
+                surface_key: dw.tab.id.0,
+                surface: (dw.gpu.config.width, dw.gpu.config.height),
+                blocked: trail_blocked,
+            },
+        );
         // OSC 133 failed-command marker rows for THIS window's tab (captured
         // before the mutable dw borrows below; parity with the main window).
         let failed_rows = dw.tab.terminal.failed_prompt_rows();
@@ -10097,6 +10153,7 @@ impl App {
                 .prepare(&g.device, light);
         }
         let caret_fx = dw.caret_fx.as_ref();
+        let trail_layer = dw.trail_layer.as_ref();
         let gpu = &mut dw.gpu;
         let text = &mut dw.text;
         let chrome_text = &mut dw.chrome_text;
@@ -10163,6 +10220,7 @@ impl App {
             caret_flash_color: fx.caret_flash_color,
             cursor_style,
             cursor_guide,
+            trail: trail_uniform,
             copy_mode_active: copy_mode_ui.is_some(),
             copy_mode_ui,
         };
@@ -10172,6 +10230,7 @@ impl App {
             quad,
             image_layer,
             backdrop,
+            trail_layer,
             scene_view,
             width,
             height,
@@ -10897,10 +10956,25 @@ impl ApplicationHandler<AppEvent> for App {
         if self.glitch.expire(now) {
             main_settled = true;
         }
+        // The cursor trail's dwell ended: one paint decides whether it starts.
+        if self.trail_wake.is_some_and(|d| now >= d) {
+            self.trail_wake = None;
+            main_settled = true;
+        }
+        // A live trail ends by the wall clock too (frames may stop arriving).
+        if self.trail.anim().is_some_and(|a| {
+            let p = jetty_render::TrailParams::new(self.cursor_cfg.trail_ms, self.cursor_cfg.trail_threshold);
+            anim_expired(a.started, p.max_secs(), now)
+        }) {
+            self.trail.reset();
+            main_settled = true;
+        }
         if main_settled && main_visible {
             self.request_main_paint();
             painted = true;
         }
+        let trail_max_secs =
+            jetty_render::TrailParams::new(self.cursor_cfg.trail_ms, self.cursor_cfg.trail_threshold).max_secs();
         for dw in &mut self.detached {
             let mut settled = false;
             if dw.caret_anim.is_some_and(|s| anim_expired(s, caret_secs, now)) {
@@ -10912,6 +10986,14 @@ impl ApplicationHandler<AppEvent> for App {
                 settled = true;
             }
             if dw.glitch.expire(now) {
+                settled = true;
+            }
+            if dw.trail_wake.is_some_and(|d| now >= d) {
+                dw.trail_wake = None;
+                settled = true;
+            }
+            if dw.trail.anim().is_some_and(|a| anim_expired(a.started, trail_max_secs, now)) {
+                dw.trail.reset();
                 settled = true;
             }
             if settled && !dw.occluded {
@@ -11045,6 +11127,7 @@ impl ApplicationHandler<AppEvent> for App {
             && (self.summon_anim.is_some()
                 || self.slide_anim.is_some()
                 || self.summon_pending
+                || self.trail.animating()
                 || caret_drives_frames(self.caret_anim, self.key_paint_due)))
             || (self.visible && (self.pending_dock_frames > 0 || self.pending_center_frames > 0));
         if main_pending {
@@ -11056,7 +11139,9 @@ impl ApplicationHandler<AppEvent> for App {
         // caret-flash burst — only for windows that are not occluded/minimized
         // and whose swapchain is healthy.
         let detached_animates = |d: &crate::detached::DetachedWindow| {
-            !d.occluded && d.acquire_retry.is_none() && caret_drives_frames(d.caret_anim, d.key_paint_due)
+            !d.occluded
+                && d.acquire_retry.is_none()
+                && (d.trail.animating() || caret_drives_frames(d.caret_anim, d.key_paint_due))
         };
         let detached_pending = self.detached.iter().any(detached_animates);
         if detached_pending {
@@ -11247,6 +11332,10 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some(d) = self.key_paint_due {
             merge_wake(&mut wake_at, d);
         }
+        // The cursor trail's dwell (a due one was serviced above → future).
+        if let Some(d) = self.trail_wake {
+            merge_wake(&mut wake_at, d);
+        }
         // Failed-acquire retries (dropped above for windows not effectively
         // visible / closed, so these only ever wake for a window that can present).
         if let Some(r) = self.acquire_retry {
@@ -11257,6 +11346,9 @@ impl ApplicationHandler<AppEvent> for App {
         }
         for dw in &self.detached {
             if let Some(d) = dw.key_paint_due {
+                merge_wake(&mut wake_at, d);
+            }
+            if let Some(d) = dw.trail_wake {
                 merge_wake(&mut wake_at, d);
             }
             if let Some(r) = dw.acquire_retry {
@@ -11669,6 +11761,9 @@ impl ApplicationHandler<AppEvent> for App {
                 let vt_before = self.vt_bytes;
                 let (had_data, chrome_changed, exited) = self.drain_pty();
                 let main_flood = self.vt_bytes - vt_before >= FLOOD_PACE_BYTES;
+                if main_flood {
+                    self.flood_at = Some(std::time::Instant::now());
+                }
                 // Input-latency echo signal (JETTY_PERF_LOG only): the Wake drain is
                 // usually where the shell's keystroke echo is consumed (before the
                 // redraw re-drains empty), so mark it here too. Gated on `perf.on`;
@@ -11745,6 +11840,9 @@ impl ApplicationHandler<AppEvent> for App {
                         dw.ov.note_output();
                     }
                     let flood = vt_read - read_before >= FLOOD_PACE_BYTES;
+                    if flood {
+                        dw.flood_at = Some(std::time::Instant::now());
+                    }
                     if let Some(n) = notice {
                         runsel_notices.push(n);
                     }
@@ -13928,6 +14026,43 @@ impl ApplicationHandler<AppEvent> for App {
                 // The `[cursor]` look + the row guide for the active tab.
                 let cursor_style = self.cursor_spec.style;
                 let cursor_guide = self.cursor_spec.guide.shows(self.active_tab().terminal.alt_screen());
+                // Cursor trail: this frame's smear (if any) — never during
+                // copy-mode, an IME composition, the dropdown slide, a flood
+                // or reduced motion. Its pass is built by the first frame with
+                // the trail on (not on the first jump).
+                if self.cursor_cfg.trail && self.trail_layer.is_none() {
+                    if let Some(g) = &self.gpu {
+                        self.trail_layer = Some(jetty_render::CursorTrailLayer::new(&g.device, g.format));
+                    }
+                }
+                let trail_blocked = copy_mode_active
+                    || preedit_ui.is_some()
+                    || self.slide_anim.is_some()
+                    || self.motion_reduced()
+                    || self.flood_at.is_some_and(|t| t.elapsed() < TRAIL_FLOOD_QUIET);
+                let trail_uniform = match (
+                    self.text.as_ref().map(|t| t.cell_size()),
+                    self.gpu.as_ref().map(|g| (g.config.width, g.config.height)),
+                ) {
+                    (Some(cell), Some(surface)) => trail_step(
+                        &mut self.trail,
+                        &mut self.trail_wake,
+                        &self.cursor_cfg,
+                        &cursor_style,
+                        TrailInput {
+                            snap: &snap,
+                            theme: &theme,
+                            cell,
+                            origin,
+                            focused: main_focused,
+                            surface_key: self.tabs[self.active].id.0,
+                            surface,
+                            blocked: trail_blocked,
+                        },
+                    ),
+                    _ => None,
+                };
+                let trail_layer = self.trail_layer.as_ref();
                 let (Some(gpu), Some(text), Some(chrome_text), Some(quad), Some(image_layer)) = (
                     &mut self.gpu,
                     &mut self.text,
@@ -14066,6 +14201,7 @@ impl ApplicationHandler<AppEvent> for App {
                         caret_flash_color,
                         cursor_style,
                         cursor_guide,
+                        trail: trail_uniform,
                         copy_mode_active,
                         copy_mode_ui,
                     };
@@ -14075,6 +14211,7 @@ impl ApplicationHandler<AppEvent> for App {
                         quad,
                         image_layer,
                         backdrop,
+                        trail_layer,
                         scene_view,
                         width,
                         height,
@@ -14716,6 +14853,9 @@ struct GridScene<'a> {
     /// Paint the `[cursor] guide` band on the cursor row (already resolved
     /// against the guide mode and the terminal's alternate screen).
     cursor_guide: bool,
+    /// This frame's cursor trail (`None` = no smear), drawn by the caller's
+    /// `CursorTrailLayer` between the cell backgrounds and the glyphs.
+    trail: Option<jetty_render::TrailUniform>,
     /// Copy-mode is main-only. Detached passes `false` → the shell cursor is
     /// never suppressed here.
     copy_mode_active: bool,
@@ -14755,6 +14895,7 @@ fn render_grid_scene(
     quad: &mut QuadLayer,
     image_layer: &mut jetty_render::ImageLayer,
     backdrop: Option<&jetty_render::Backdrop>,
+    trail_layer: Option<&jetty_render::CursorTrailLayer>,
     scene_view: &wgpu::TextureView,
     width: u32,
     height: u32,
@@ -14834,6 +14975,14 @@ fn render_grid_scene(
     // separate pass + submit cost tens of µs of CPU on every frame). Both uploads
     // land at that submit, ahead of the draws.
     let bg_count = quad.upload(device, queue, width, height, &bg_rects);
+    // The cursor trail's uniform rides the same submit (zero cost without one).
+    let trail = match (trail_layer, s.trail.as_ref()) {
+        (Some(layer), Some(u)) => {
+            layer.upload(queue, u);
+            Some(layer)
+        }
+        _ => None,
+    };
     let text_ready = text.prepare_grid(device, queue, width, height, s.snap, origin, &paint).is_ok();
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("grid") });
     {
@@ -14859,6 +15008,11 @@ fn render_grid_scene(
             bd.draw(&mut pass);
         }
         quad.draw_uploaded(&mut pass, bg_count);
+        // The trail smear: over the cell backgrounds (and the block cursor,
+        // which its fragment skips), under the glyphs.
+        if let Some(layer) = trail {
+            layer.draw(&mut pass);
+        }
         if text_ready {
             text.draw_grid(&mut pass);
         }
@@ -14939,6 +15093,84 @@ fn render_grid_scene(
         rects.extend(copy);
     }
     quad.render(device, queue, scene_view, width, height, &rects);
+}
+
+/// A cursor jump within this long after a flood drain is output, not the
+/// user: it never trails (the cursor simply settles where the output left it).
+const TRAIL_FLOOD_QUIET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// One window's inputs to [`trail_step`].
+struct TrailInput<'a> {
+    snap: &'a jetty_core::GridSnapshot,
+    theme: &'a jetty_core::Theme,
+    /// Cell size (physical px).
+    cell: (f32, f32),
+    /// The UN-slid grid origin.
+    origin: jetty_render::GridOrigin,
+    focused: bool,
+    /// Identifies what the grid shows (the tab's stable id): a switch is a
+    /// new trail context.
+    surface_key: u64,
+    /// The render target's size (for the uniform).
+    surface: (u32, u32),
+    /// A frame the trail must not run in (copy-mode, IME, slide, flood,
+    /// reduced motion): drops any live trail.
+    blocked: bool,
+}
+
+/// Advance one window's cursor trail for a frame and return the smear to draw.
+/// Sets `wake` to the one timed wake the trail owes (the dwell before a jump
+/// starts trailing), else clears it. With `[cursor] trail` off this forgets
+/// everything and costs one bool check.
+fn trail_step(
+    model: &mut jetty_render::TrailModel,
+    wake: &mut Option<std::time::Instant>,
+    cfg: &crate::config::CursorConfig,
+    style: &jetty_render::CursorStyle,
+    i: TrailInput,
+) -> Option<jetty_render::TrailUniform> {
+    if !cfg.trail {
+        if model.animating() || wake.is_some() {
+            model.reset();
+            *wake = None;
+        }
+        return None;
+    }
+    let (cell_w, cell_h) = i.cell;
+    let pos = if i.blocked {
+        None
+    } else {
+        jetty_render::cursor_trail_rect(i.snap, cell_w, cell_h, i.origin.left, i.origin.top, i.focused, style).map(
+            |rect| jetty_render::TrailPos {
+                key: [
+                    i.surface_key,
+                    ((i.snap.cols as u64) << 32) | i.snap.rows as u64,
+                    i.snap.scroll_offset as u64,
+                    ((cell_w.to_bits() as u64) << 32 | cell_h.to_bits() as u64)
+                        ^ ((i.origin.left.to_bits() as u64) << 17)
+                        ^ (i.origin.top.to_bits() as u64),
+                ],
+                cell: (i.snap.cursor_row, i.snap.cursor_col),
+                rect,
+            },
+        )
+    };
+    let params = jetty_render::TrailParams::new(cfg.trail_ms, cfg.trail_threshold);
+    match model.frame(pos, std::time::Instant::now(), &params) {
+        jetty_render::TrailFrame::Idle => {
+            *wake = None;
+            None
+        }
+        jetty_render::TrailFrame::WakeAt(t) => {
+            *wake = Some(t);
+            None
+        }
+        jetty_render::TrailFrame::Draw { corners, skip } => {
+            *wake = None;
+            let color = jetty_render::cursor_colors(i.snap, i.theme, style.color).block;
+            Some(jetty_render::TrailUniform::new(i.surface.0, i.surface.1, corners, skip, color))
+        }
+    }
 }
 
 /// `r` while its tab is still among `live`, else `None` — the stale-reference

@@ -185,6 +185,11 @@
 ///                    parsed by the app's own parser: the shape becomes the
 ///                    terminal's default (DECSCUSR in JETTY_SHOT_INPUT still
 ///                    wins), the rest is the render look + the row guide.
+///   JETTY_SHOT_TRAIL="row,col,ms" — the cursor trail `ms` milliseconds after
+///                    the cursor jumped from cell (row,col) to where the input
+///                    left it (trail_ms 200, threshold 2 unless
+///                    JETTY_SHOT_TRAIL_MS / _THRESHOLD say otherwise) — the
+///                    app's model and its 6-vertex pass inside the grid pass.
 ///   JETTY_SHOT_GLOW_T=t — the caret glow/ripple pass at progress t around the
 ///                    cursor (additive on a dark theme, multiply on a light
 ///                    one; same color source as JETTY_SHOT_CARET_COLOR).
@@ -1095,6 +1100,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // harness CPU-composites over its own checkerboard, independent of any surface.
     let bg_count = quad.upload(&device, &queue, width, height, &bg_rects);
     text.prepare_grid(&device, &queue, width, height, &snap, shot_origin, &paint)?;
+    // JETTY_SHOT_TRAIL="row,col,ms" — the cursor trail (see the header): the
+    // app's model simulated from the jump, drawn by the app's pass between the
+    // cell backgrounds and the glyphs.
+    let shot_trail = std::env::var("JETTY_SHOT_TRAIL").ok().and_then(|spec| {
+        let v: Vec<f32> = spec.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        let (row, col, ms) = (*v.first()? as usize, *v.get(1)? as usize, *v.get(2)?);
+        let getu = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+        let params = jetty_render::TrailParams::new(
+            getu("JETTY_SHOT_TRAIL_MS", 200),
+            getu("JETTY_SHOT_TRAIL_THRESHOLD", 2),
+        );
+        let to_rect =
+            jetty_render::cursor_trail_rect(&snap, cell_w, cell_h, shot_origin.left, shot_origin.top, cursor_focused, &shot_cursor_style)?;
+        let key = [0, 0, 0, 0];
+        let from_rect = [shot_origin.col_x(col, cell_w), shot_origin.row_y(row, cell_h), to_rect[2], to_rect[3]];
+        let from = jetty_render::TrailPos { key, cell: (row, col), rect: from_rect };
+        let to = jetty_render::TrailPos { key, cell: (snap.cursor_row, snap.cursor_col), rect: to_rect };
+        let corners = jetty_render::simulate_trail(from, to, std::time::Duration::from_secs_f32(ms / 1000.0), &params);
+        eprintln!("jetty-shot: JETTY_SHOT_TRAIL {spec:?} -> corners {corners:?}");
+        let color = jetty_render::cursor_colors(&snap, terminal.theme(), shot_cursor_style.color).block;
+        corners.map(|c| {
+            let layer = jetty_render::CursorTrailLayer::new(&device, format);
+            layer.upload(&queue, &jetty_render::TrailUniform::new(width, height, c, to_rect, color));
+            layer
+        })
+    });
     {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot-grid") });
         {
@@ -1118,6 +1149,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bd.draw(&mut pass);
             }
             quad.draw_uploaded(&mut pass, bg_count);
+            if let Some(layer) = &shot_trail {
+                layer.draw(&mut pass);
+            }
             text.draw_grid(&mut pass);
         }
         queue.submit(Some(encoder.finish()));
