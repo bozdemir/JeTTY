@@ -25,14 +25,22 @@ pub mod perf;
 use app::AppEvent;
 use winit::event_loop::{ControlFlow, EventLoop};
 
-/// The detached window's context-menu `(label, hint)` rows — public so the
-/// `jetty-shot` self-test (JETTY_SHOT_DMENU) renders EXACTLY the menu the app
-/// builds, driving the same `DETACHED_MENU_ITEMS`/`menu_hint` pair.
-pub fn detached_menu_items() -> Vec<(&'static str, &'static str)> {
+/// The detached window's context-menu `(label, hint)` rows under the DEFAULT
+/// keymap — public so the `jetty-shot` self-test (JETTY_SHOT_DMENU) renders
+/// EXACTLY the menu the app builds, driving the same
+/// `DETACHED_MENU_ITEMS`/`menu_hint` pair.
+pub fn detached_menu_items() -> Vec<(&'static str, String)> {
+    let km = keymap::KeyMap::defaults();
     detached::DETACHED_MENU_ITEMS
         .iter()
-        .map(|&l| (l, detached::menu_hint(l)))
+        .map(|&l| (l, detached::menu_hint(&km, l)))
         .collect()
+}
+
+/// The main context menu's six shortcut hints under the DEFAULT keymap (for
+/// `jetty-shot`; the app derives them from its live keymap the same way).
+pub fn default_context_menu_hints() -> Vec<String> {
+    detached::context_menu_hints(&keymap::KeyMap::defaults()).to_vec()
 }
 
 /// Unix-socket path used for single-instance IPC. Any running primary Jetty

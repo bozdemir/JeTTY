@@ -316,11 +316,12 @@ const UI_FONT_LOGICAL_DEFAULT: f32 = 16.0;
 const FALLBACK_COLS: usize = 80;
 const FALLBACK_ROWS: usize = 24;
 
-/// Height of the tab bar (re-exported from the renderer so app.rs has one name).
-const TABBAR_H: f32 = jetty_render::TABBAR_H;
-/// Height of the bottom status bar (the live perf HUD lives here, OFF the tab
-/// row). Reserved from the grid only when `show_perf_hud` is on — see `status_h`.
-const STATUS_H: f32 = 22.0;
+// The tab bar / detached title bar, the bottom status strip (the live perf HUD)
+// and the toast pills are sized by each window's `jetty_render::ChromeMetrics`
+// (DPI × UI font size) — never a fixed px constant, which the glyphs overflowed
+// at large UI fonts / on HiDPI. See `App::chrome_metrics`, `App::bar_h`,
+// `App::status_h` and `DetachedWindow::chrome_metrics`.
+
 /// Width reserved on the right of the grid for the scrollbar (a gutter), so the
 /// terminal never renders content underneath the scrollbar (which would cover the
 /// last column / p10k's right-aligned prompt at some window widths). Scrollbar
@@ -1171,22 +1172,25 @@ impl ResizeZone {
 }
 
 /// Compute the resize zone for a cursor at `(cx, cy)` (physical px) in a window
-/// of physical size `w`×`h`. Edges are within `EDGE` px of a side; corners
-/// within `CORNER` px of a corner. Corners take priority over edges. Returns
-/// `ResizeZone::None` when the cursor is in the interior.
-pub(crate) fn resize_zone_at(cx: f32, cy: f32, w: u32, h: u32) -> ResizeZone {
-    const EDGE: f32 = 6.0;
-    const CORNER: f32 = 12.0;
+/// of physical size `w`×`h` at DPI scale `dpi`. Edges are within `EDGE` logical
+/// px of a side; corners within `CORNER` logical px of a corner (scaled to
+/// physical by `dpi`, so the grab band is the same physical-inch target on a 2×
+/// display). Corners take priority over edges. Returns `ResizeZone::None` when
+/// the cursor is in the interior.
+pub(crate) fn resize_zone_at(cx: f32, cy: f32, w: u32, h: u32, dpi: f32) -> ResizeZone {
+    let dpi = if dpi.is_finite() && dpi > 0.0 { dpi } else { 1.0 };
+    let edge = 6.0 * dpi;
+    let corner = 12.0 * dpi;
     let w = w as f32;
     let h = h as f32;
     // Out-of-bounds → no resize.
     if cx < 0.0 || cy < 0.0 || cx > w || cy > h {
         return ResizeZone::None;
     }
-    let near_left = cx <= CORNER;
-    let near_right = cx >= w - CORNER;
-    let near_top = cy <= CORNER;
-    let near_bottom = cy >= h - CORNER;
+    let near_left = cx <= corner;
+    let near_right = cx >= w - corner;
+    let near_top = cy <= corner;
+    let near_bottom = cy >= h - corner;
     // Corners first (within CORNER of two adjacent sides).
     if near_top && near_left {
         return ResizeZone::NorthWest;
@@ -1201,16 +1205,16 @@ pub(crate) fn resize_zone_at(cx: f32, cy: f32, w: u32, h: u32) -> ResizeZone {
         return ResizeZone::SouthEast;
     }
     // Edges (within EDGE of one side).
-    if cx <= EDGE {
+    if cx <= edge {
         return ResizeZone::West;
     }
-    if cx >= w - EDGE {
+    if cx >= w - edge {
         return ResizeZone::East;
     }
-    if cy <= EDGE {
+    if cy <= edge {
         return ResizeZone::North;
     }
-    if cy >= h - EDGE {
+    if cy >= h - edge {
         return ResizeZone::South;
     }
     ResizeZone::None
@@ -2014,31 +2018,70 @@ impl App {
             return (FALLBACK_COLS, FALLBACK_ROWS);
         }
         let cols = ((gpu.config.width as f32 - SCROLLBAR_GUTTER) / cw).floor().max(2.0) as usize;
-        let rows = ((gpu.config.height as f32 - TABBAR_H - status_h) / ch).floor().max(1.0) as usize;
+        let rows = ((gpu.config.height as f32 - self.bar_h() - status_h) / ch).floor().max(1.0) as usize;
         (cols, rows)
     }
 
-    /// Pixel Y origin of the terminal grid. The bar always costs `TABBAR_H` of
-    /// grid HEIGHT regardless of side, but the grid's pixel ORIGIN is 0 when the
-    /// bar is at the bottom (grid fills from the top) and `TABBAR_H` when it's at
-    /// the top (grid starts below the bar).
+    /// Chrome metrics of the MAIN window: its DPI × the UI font size. Every
+    /// main-window chrome builder AND hit-test derives its geometry from this, so
+    /// the bar / strip / menus / pills grow with the text they hold and clicks
+    /// land where the chrome is drawn.
+    fn chrome_metrics(&self) -> jetty_render::ChromeMetrics {
+        let dpi = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
+        jetty_render::ChromeMetrics::new(dpi, self.ui_font_logical)
+    }
+
+    /// Chrome metrics of the SETTINGS window: its own DPI × the CAPPED panel
+    /// text size (the panel body font is clamped to `[PANEL_TEXT_MIN,
+    /// PANEL_TEXT_MAX]`, so the panel stays bounded for huge UI fonts). This is
+    /// the panel's layout scale (`build_panel`'s `cm`).
+    fn settings_metrics(&self) -> jetty_render::ChromeMetrics {
+        let dpi = self
+            .settings_window
+            .as_ref()
+            .or(self.window.as_ref())
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0);
+        let capped = self.ui_font_logical.clamp(PANEL_TEXT_MIN, PANEL_TEXT_MAX);
+        jetty_render::ChromeMetrics::new(dpi, capped)
+    }
+
+    /// Height of the main window's tab bar (physical px).
+    fn bar_h(&self) -> f32 {
+        self.chrome_metrics().bar_h()
+    }
+
+    /// Pixel Y origin of the terminal grid. The bar always costs `bar_h` of grid
+    /// HEIGHT regardless of side, but the grid's pixel ORIGIN is 0 when the bar is
+    /// at the bottom (grid fills from the top) and `bar_h` when it's at the top
+    /// (grid starts below the bar).
     fn grid_top_offset(&self) -> f32 {
-        if self.tab_bar_bottom { 0.0 } else { TABBAR_H }
+        if self.tab_bar_bottom { 0.0 } else { self.bar_h() }
     }
 
     /// Pixel height reserved at the BOTTOM of the window for the status bar (the
-    /// perf HUD). `STATUS_H` when the HUD is enabled, else 0 (no bar, grid uses the
-    /// full height). The grid and the bottom-mode tab bar both sit above it.
+    /// perf HUD): the metrics' strip height when the HUD is enabled, else 0 (no
+    /// bar, grid uses the full height). The grid and the bottom-mode tab bar both
+    /// sit above it.
     fn status_h(&self) -> f32 {
-        if self.show_perf_hud { STATUS_H } else { 0.0 }
+        if self.show_perf_hud { self.chrome_metrics().status_h() } else { 0.0 }
+    }
+
+    /// The bottom status strip's height in a DETACHED window (its own DPI).
+    fn detached_status_h(&self, dw: &crate::detached::DetachedWindow) -> f32 {
+        if self.show_perf_hud {
+            dw.chrome_metrics(self.ui_font_logical).status_h()
+        } else {
+            0.0
+        }
     }
 
     /// Pixel Y of the tab bar's top edge for a surface of physical `height`.
-    /// 0 when the bar is at the top; `height - TABBAR_H - status_h` at the bottom
+    /// 0 when the bar is at the top; `height - bar_h - status_h` at the bottom
     /// (the status bar always sits below the bottom-mode tab bar).
     fn tabbar_y(&self, height: f32) -> f32 {
         if self.tab_bar_bottom {
-            (height - TABBAR_H - self.status_h()).max(0.0)
+            (height - self.bar_h() - self.status_h()).max(0.0)
         } else {
             0.0
         }
@@ -2414,8 +2457,8 @@ impl App {
             cw,
             ch,
             SCROLLBAR_GUTTER,
-            TABBAR_H,
-            self.status_h(),
+            dw.chrome_metrics(self.ui_font_logical).bar_h(),
+            self.detached_status_h(&dw),
         );
         dw.tab.terminal.resize(cols, rows);
         dw.tab.terminal.set_cell_px(cw, ch);
@@ -3759,38 +3802,14 @@ impl App {
         self.request_settings_paint();
     }
 
-    /// Returns the measured physical-pixel advance of one chrome-font character
-    /// from the fixed-size chrome `TextLayer`. Falls back to `9.6` when the chrome
-    /// layer has not yet been initialised (i.e. before the first GPU frame).
-    ///
-    /// This is the scale-aware value that must be threaded into every chrome overlay
-    /// builder (`build_tab_bar_ex`, `build_panel`, `build_help_overlay`, etc.) so
-    /// that right-alignment and width reservations are correct on HiDPI displays.
-    #[inline]
-    fn chrome_char_w(&self) -> f32 {
-        self.chrome_text.as_ref().map(|ct| ct.cell_size().0).unwrap_or(9.6)
-    }
-
-    /// Measured advance of the SETTINGS panel's text layer (the CAPPED UI size),
-    /// used by `build_panel` so the panel's right-aligned values and family-row
-    /// truncation match the layer that actually draws those labels. Falls back to
-    /// the main chrome advance, then 9.6, before the settings layer exists.
-    #[inline]
-    fn settings_char_w(&self) -> f32 {
-        self.settings_text
-            .as_ref()
-            .map(|st| st.cell_size().0)
-            .unwrap_or_else(|| self.chrome_char_w())
-    }
-
     /// Logical size the Settings window needs so the panel — which scales its
-    /// fixed `PANEL_W`×`PANEL_H` layout by `dpi = settings_char_w /
-    /// CHAR_W_FALLBACK` — is never clipped. A larger UI font size OR a wider UI
-    /// family grows the panel, so the window must grow with it (the panel body
-    /// font is capped to `[PANEL_TEXT_MIN, PANEL_TEXT_MAX]`, so this is bounded to
-    /// ~1.3×). Clamped to the monitor so even a huge UI font can't push the
-    /// window off-screen. This is what makes "the bottom rows can never be
-    /// clipped" (see `SETTINGS_WIN_*`) hold for ANY UI font, not just the default.
+    /// fixed `PANEL_W`×`PANEL_H` layout by the settings chrome unit (DPI × the
+    /// CAPPED panel text size / 16) — is never clipped. A larger UI font size
+    /// grows the panel, so the window must grow with it (the panel body font is
+    /// capped to `[PANEL_TEXT_MIN, PANEL_TEXT_MAX]`, so this is bounded to
+    /// ~1.06×). The UI font FAMILY no longer changes the panel's size (it used
+    /// to, via the font's 'M' advance — a proportional family inflated it
+    /// ~1.5×). Clamped to the monitor so the window always stays on-screen.
     fn desired_settings_logical_size(&self) -> (u32, u32) {
         let scale = self
             .settings_window
@@ -3799,16 +3818,8 @@ impl App {
             .map(|w| w.scale_factor() as f32)
             .unwrap_or(1.0)
             .max(0.5);
-        // Before the settings text layer exists (first open), estimate the CAPPED
-        // body advance from the main chrome advance (chrome runs at the UNCAPPED
-        // UI size, so scale it down by capped/true).
-        let char_w = if self.settings_text.is_some() {
-            self.settings_char_w()
-        } else {
-            let capped = self.ui_font_logical.clamp(PANEL_TEXT_MIN, PANEL_TEXT_MAX);
-            self.chrome_char_w() * (capped / self.ui_font_logical.max(1.0))
-        };
-        let f = (char_w / (jetty_render::CHAR_W_FALLBACK * scale)).max(1.0);
+        // Physical panel = PANEL_W × u; logical = that / the window's DPI.
+        let f = (self.settings_metrics().u / scale).max(1.0);
         let mut w = (jetty_render::PANEL_W * f).ceil() as u32 + 4;
         let mut h = (jetty_render::PANEL_H * f).ceil() as u32 + 4;
         // Never exceed the monitor (leave a margin) so the window stays on-screen.
@@ -3993,12 +4004,13 @@ impl App {
 
     /// Recompute (or clear) the Ctrl+hover link state of detached window
     /// `pos` — the detached mirror of [`App::update_link_hover`], using that
-    /// window's own cursor/geometry (grid origin `TABBAR_H`, its own modal =
+    /// window's own cursor/geometry (grid origin = its top bar, its own modal =
     /// the context menu).
     fn update_detached_link_hover(&mut self, pos: usize, force: bool) {
         let held = link_modifier_held(&self.modifiers);
-        let status_h = self.status_h();
+        let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
         let Some(dw) = self.detached.get_mut(pos) else { return };
+        let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
         let (cw, ch) = dw.text.cell_size();
         let cy = dw.cursor.1 as f32;
         let h = dw.gpu.config.height as f32;
@@ -4009,7 +4021,7 @@ impl App {
             && dw.menu_open.is_none()
             && cw > 0.0
             && ch > 0.0
-            && cy >= TABBAR_H
+            && cy >= bar_h
             && cy < h - status_h;
         if !gated {
             dw.link_hover_cell = None;
@@ -4019,7 +4031,7 @@ impl App {
             }
             return;
         }
-        let gy = (cy - TABBAR_H).max(0.0);
+        let gy = (cy - bar_h).max(0.0);
         let (line, col, _) = input::cell_at_0_side(
             dw.cursor.0 as f32,
             gy,
@@ -4799,6 +4811,7 @@ impl App {
     /// features share one code path.
     fn reflow(&mut self) {
         let status_h = self.status_h();
+        let bar_h = self.bar_h();
         let (Some(gpu), Some(text)) = (&self.gpu, &self.text) else { return };
         let (cw, ch) = text.cell_size();
         if cw <= 0.0 || ch <= 0.0 {
@@ -4808,7 +4821,7 @@ impl App {
         let h = gpu.config.height;
         let cols = ((w as f32 - SCROLLBAR_GUTTER) / cw).floor().max(2.0) as usize;
         // The grid occupies the area below the tab bar and above the status bar.
-        let rows = ((h as f32 - TABBAR_H - status_h) / ch).floor().max(1.0) as usize;
+        let rows = ((h as f32 - bar_h - status_h) / ch).floor().max(1.0) as usize;
         // Reflow every tab so background sessions stay in sync with the window.
         for tab in &mut self.tabs {
             tab.terminal.resize(cols, rows);
@@ -4917,9 +4930,11 @@ impl App {
     /// `new_with_family`, which would rescan fontconfig ~20ms). The settings panel
     /// body text is CAPPED to [13, 17] so the absolute-px panel layout never
     /// overflows, while the rest of the chrome (and the live "Aa" specimen) tracks
-    /// the true size. Crucially does NOT reflow the grid/PTY: chrome size has no
-    /// effect on cols/rows, so there is no p10k-scatter risk and no debounce — the
-    /// idle 0-CPU path is untouched.
+    /// the true size. The tab bar and status strip are sized by the UI font
+    /// (`ChromeMetrics`), so a size change also changes how many grid ROWS fit:
+    /// every window's grid/PTY reflow is armed on the same debounced
+    /// `reflow_pending_at` path as a window resize (one coalesced SIGWINCH for a
+    /// burst of steps — the p10k-scatter guard).
     fn set_ui_font_size(&mut self, new_logical: f32) {
         self.ui_font_logical = new_logical.clamp(UI_FONT_MIN, UI_FONT_MAX);
         let scale = self
@@ -4945,14 +4960,18 @@ impl App {
             sp.set_font_size(self.ui_font_logical * settings_scale);
         }
         // Detached windows: resize THEIR chrome font (title/status/menu) at each
-        // window's own scale. No grid reflow — chrome size is orthogonal to
-        // cols/rows (F7/F20).
+        // window's own scale, and re-grid them: their title bar / status strip
+        // follow the UI font too (debounced like a border drag).
         let ui_logical = self.ui_font_logical;
+        let reflow_at = std::time::Instant::now() + std::time::Duration::from_millis(120);
         for dw in &mut self.detached {
             let dscale = dw.window.scale_factor() as f32;
             dw.chrome_text.set_font_size(ui_logical * dscale);
+            dw.reflow_pending_at = Some(reflow_at);
             dw.request_paint();
         }
+        // The main window's bar/strip heights changed → its row count did too.
+        self.reflow_pending_at = Some(reflow_at);
         self.persist();
         self.request_main_paint();
         // A different UI size grows/shrinks the panel — re-fit the window so the
@@ -5370,8 +5389,14 @@ impl App {
 
     /// Build the panel view for the settings window in its own coordinate space
     /// (the panel is centred to fill the fixed-size window; no drag offset).
-    fn settings_panel_view(&self, w: u32, h: u32) -> jetty_render::PanelView {
+    /// `&mut self` only to MEASURE labels with the settings text layer (the same
+    /// cached measurement `render_settings_window` uses, so hit-rects match the
+    /// drawn panel exactly).
+    fn settings_panel_view(&mut self, w: u32, h: u32) -> jetty_render::PanelView {
         let theme = self.current_theme();
+        let shell_display = self.shell_display();
+        let cm = self.settings_metrics();
+        let mut fallback = mono_fallback(cm);
         let fx = jetty_render::EffectsParams {
             crt_enabled: self.fx.crt_enabled,
             crt_curvature: self.fx.crt_curvature,
@@ -5404,8 +5429,10 @@ impl App {
             self.launch_at_login,
             self.ui_font_logical, &self.ui_font_families, &self.ui_font_family,
             self.ui_font_scroll_offset,
-            0.0, 0.0, &theme, self.settings_char_w(),
-            &self.shell_display(),
+            0.0, 0.0, &theme,
+            measure_or(self.settings_text.as_mut(), &mut fallback),
+            cm,
+            &shell_display,
             &jetty_render::NotifyParams {
                 enabled: self.notify_on_finish,
                 only_on_failure: self.notify_only_on_failure,
@@ -5451,9 +5478,9 @@ impl App {
         let shell_display = self.shell_display();
         let settings_tab = self.settings_tab;
         let theme = self.current_theme();
-        // Panel labels use the SETTINGS (capped) layer advance so right-align /
-        // truncation match the layer that draws them.
-        let char_w = self.settings_char_w();
+        // The panel's layout scale: the settings window's DPI × the CAPPED panel
+        // text size. Labels are measured with the settings layer that draws them.
+        let cm = self.settings_metrics();
         // Specimen color: the theme's blue accent, so the preview pops against the
         // panel surface (same accent the panel chrome uses for handles/selection).
         let accent = theme.palette[4];
@@ -5502,7 +5529,7 @@ impl App {
             window_mode_name, tab_bar_name, &scrollback_name, dropdown_height_pct, dropdown_width_pct, is_dropdown, fullscreen, focus_autohide,
             launch_at_login,
             ui_font_logical, &ui_families, &ui_family, ui_font_scroll_offset,
-            0.0, 0.0, &theme, char_w,
+            0.0, 0.0, &theme, &mut *text, cm,
             &shell_display,
             &notify_params,
             settings_tab,
@@ -5936,9 +5963,12 @@ impl App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                // &self method — must be read before the dw (self.detached) borrow.
-                let status_h = self.status_h();
+                // App-wide inputs, read before the dw (self.detached) borrow.
+                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
                 let Some(dw) = self.detached.get_mut(pos) else { return };
+                // This window's chrome geometry (its own DPI × the UI font).
+                let cm = dw.chrome_metrics(ui_font);
+                let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
                 let prev = dw.cursor;
                 dw.cursor = (position.x, position.y);
                 // --- Manual top-bar drag (move the window ourselves) ---
@@ -5989,7 +6019,7 @@ impl App {
                     let rows = dw.tab.terminal.rows();
                     let max = dw.tab.terminal.scroll_max();
                     if let Some(o) = jetty_render::scrollbar_offset_from_cursor(
-                        cy, dw.drag_grab_dy, rows, max, h, TABBAR_H, status_h,
+                        cy, dw.drag_grab_dy, rows, max, h, bar_h, status_h,
                     ) {
                         dw.tab.terminal.scroll_to_offset(o);
                     }
@@ -6014,7 +6044,7 @@ impl App {
                     let zone = if dw.fullscreen {
                         ResizeZone::None
                     } else {
-                        resize_zone_at(cx, cy, w, h)
+                        resize_zone_at(cx, cy, w, h, cm.dpi)
                     };
                     if zone != dw.resize_zone {
                         dw.resize_zone = zone;
@@ -6029,7 +6059,7 @@ impl App {
                         );
                     }
                     // --- Close ✕ hover highlight ---
-                    let hover = input::point_in(&jetty_render::detached_close_rect(w), cx, cy);
+                    let hover = input::point_in(&jetty_render::detached_close_rect(w, cm), cx, cy);
                     if hover != dw.close_hover {
                         dw.close_hover = hover;
                         dw.request_paint();
@@ -6041,7 +6071,7 @@ impl App {
                 let (cw, ch) = dw.text.cell_size();
                 if cw > 0.0 && ch > 0.0 {
                     if dw.selecting {
-                        let gy = (cy - TABBAR_H).max(0.0);
+                        let gy = (cy - bar_h).max(0.0);
                         let (line, col, left_half) = input::cell_at_0_side(
                             cx, gy, cw, ch,
                             dw.tab.terminal.cols(), dw.tab.terminal.rows(),
@@ -6056,9 +6086,9 @@ impl App {
                             let cols_n = dw.tab.terminal.cols();
                             let rows_n = dw.tab.terminal.rows();
                             let new_cell = input::cell_at_clamped(
-                                cx, (cy - TABBAR_H).max(0.0), cw, ch, cols_n, rows_n);
+                                cx, (cy - bar_h).max(0.0), cw, ch, cols_n, rows_n);
                             let prev_cell = input::cell_at_clamped(
-                                prev.0 as f32, (prev.1 as f32 - TABBAR_H).max(0.0), cw, ch, cols_n, rows_n);
+                                prev.0 as f32, (prev.1 as f32 - bar_h).max(0.0), cw, ch, cols_n, rows_n);
                             if new_cell != prev_cell {
                                 let base = if left_held { 0u8 } else { 3u8 };
                                 let sgr = dw.tab.terminal.mouse_sgr();
@@ -6092,10 +6122,12 @@ impl App {
                     /// while fullscreen). Deferred out of the `dw` borrow.
                     ExitFullscreen,
                 }
-                // &self method — must be read before the dw (self.detached) borrow.
-                let status_h = self.status_h();
+                // App-wide inputs, read before the dw (self.detached) borrow.
+                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
                 let act = {
                     let Some(dw) = self.detached.get_mut(pos) else { return };
+                    let cm = dw.chrome_metrics(ui_font);
+                    let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
                     let (cx, cy) = (dw.cursor.0 as f32, dw.cursor.1 as f32);
                     let (w, h) = (dw.gpu.config.width, dw.gpu.config.height);
                     if dw.menu_open.take().is_some() {
@@ -6128,15 +6160,15 @@ impl App {
                         let zone = if dw.fullscreen {
                             ResizeZone::None
                         } else {
-                            resize_zone_at(cx, cy, w, h)
+                            resize_zone_at(cx, cy, w, h, cm.dpi)
                         };
                         if let Some(dir) = zone.direction() {
                             let _ = dw.window.drag_resize_window(dir);
                             return;
                         }
                         // --- Top bar: close ✕ → reattach; empty bar → move. ---
-                        if cy < TABBAR_H {
-                            if input::point_in(&jetty_render::detached_close_rect(w), cx, cy) {
+                        if cy < bar_h {
+                            if input::point_in(&jetty_render::detached_close_rect(w, cm), cx, cy) {
                                 Act::Reattach
                             } else {
                                 // Double-click on the bar toggles maximize (same
@@ -6199,7 +6231,7 @@ impl App {
                             let max = dw.tab.terminal.scroll_max();
                             // Color is irrelevant for hit-test geometry.
                             let sb = jetty_render::scrollbar_rect_geom(
-                                rows, off, max, w, h, TABBAR_H, status_h, [0, 0, 0, 0],
+                                rows, off, max, w, h, bar_h, status_h, [0, 0, 0, 0],
                             );
                             match input::decide_mouse_press(None, sb.as_ref(), cx, cy) {
                                 input::MouseAction::StartScrollbarDrag { grab_dy } => {
@@ -6214,7 +6246,7 @@ impl App {
                                     dw.drag_grab_dy =
                                         sb.as_ref().map(|r| r.h / 2.0).unwrap_or(0.0);
                                     if let Some(o) = jetty_render::scrollbar_offset_from_cursor(
-                                        cy, dw.drag_grab_dy, rows, max, h, TABBAR_H, status_h,
+                                        cy, dw.drag_grab_dy, rows, max, h, bar_h, status_h,
                                     ) {
                                         dw.tab.terminal.scroll_to_offset(o);
                                     }
@@ -6232,7 +6264,7 @@ impl App {
                             if cw > 0.0 && ch > 0.0 {
                                 let mouse_mode = dw.tab.terminal.mouse_mode();
                                 let shift = self.modifiers.shift_key();
-                                let gy = (cy - TABBAR_H).max(0.0);
+                                let gy = (cy - bar_h).max(0.0);
                                 // Ctrl+click on a link opens it and consumes the
                                 // click (same precedence as the main window:
                                 // Shift still forces selection). Same grid-band
@@ -6316,8 +6348,10 @@ impl App {
                 // or forward the mouse release report — mutually exclusive with a
                 // top-bar drag, so handle it first and return. Mirrors the main
                 // window's release logic.
+                let ui_font = self.ui_font_logical;
                 {
                     let Some(dw) = self.detached.get_mut(pos) else { return };
+                    let bar_h = dw.chrome_metrics(ui_font).bar_h();
                     // A release ending a scrollbar drag is a host-widget
                     // interaction: it must never end a selection, emit a mouse
                     // report, or count as a bar-drag drop (mirrors main's
@@ -6339,7 +6373,7 @@ impl App {
                     if let Some((px, py)) = dw.mouse_grab_press.take() {
                         let (cw, ch) = dw.text.cell_size();
                         if cw > 0.0 && ch > 0.0 {
-                            let gy = (dw.cursor.1 as f32 - TABBAR_H).max(0.0);
+                            let gy = (dw.cursor.1 as f32 - bar_h).max(0.0);
                             let (col, row) = input::cell_at_clamped(
                                 dw.cursor.0 as f32, gy, cw, ch,
                                 dw.tab.terminal.cols(), dw.tab.terminal.rows());
@@ -6413,9 +6447,15 @@ impl App {
                             .get(pos)
                             .map(|d| d.window.scale_factor())
                             .unwrap_or(1.0);
+                        // The main window's chrome bands, in ITS physical px.
+                        let (main_bar_h, main_status_h) = (self.bar_h() as f64, self.status_h() as f64);
                         if let (Some(win), Some(gpu)) = (&self.window, &self.gpu) {
                             if let Ok(mp) = win.outer_position() {
                                 let main_scale = win.scale_factor();
+                                // EVERY input in logical points — including the
+                                // bar/strip heights, which used to be passed in
+                                // physical px (a too-high, half-overlapping band
+                                // on a 2× display).
                                 if crate::detached::main_tabbar_contains(
                                     gx / dw_scale,
                                     gy / dw_scale,
@@ -6423,8 +6463,8 @@ impl App {
                                     mp.y as f64 / main_scale,
                                     gpu.config.width as f64 / main_scale,
                                     gpu.config.height as f64 / main_scale,
-                                    TABBAR_H as f64,
-                                    self.status_h() as f64,
+                                    main_bar_h / main_scale,
+                                    main_status_h / main_scale,
                                     self.tab_bar_bottom,
                                 ) {
                                     self.reattach_tab(pos, event_loop);
@@ -6443,7 +6483,9 @@ impl App {
                 // Tab context menu.
                 let theme = self.current_theme();
                 let run_enabled = self.run_selection_enabled;
+                let ui_font = self.ui_font_logical;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
+                let cm = dw.chrome_metrics(ui_font);
                 let (cx, cy) = (dw.cursor.0 as f32, dw.cursor.1 as f32);
                 dw.menu_open = Some((cx, cy));
                 dw.menu_hover = None;
@@ -6462,10 +6504,17 @@ impl App {
                     (true, true) => Vec::new(),
                 };
                 // Cache the item hit-test rects once (anchor + size fixed for the
-                // menu's lifetime), same pattern as the main context menu.
+                // menu's lifetime), same pattern as the main context menu. Hints
+                // come from the live keymap; widths from this window's chrome
+                // layer (the same measurement the render pass uses).
+                let hints: Vec<String> = crate::detached::DETACHED_MENU_ITEMS
+                    .iter()
+                    .map(|&l| crate::detached::menu_hint(&self.keymap, l))
+                    .collect();
                 let items: Vec<(&str, &str)> = crate::detached::DETACHED_MENU_ITEMS
                     .iter()
-                    .map(|&l| (l, crate::detached::menu_hint(l)))
+                    .zip(&hints)
+                    .map(|(&l, h)| (l, h.as_str()))
                     .collect();
                 let menu = jetty_render::build_menu(
                     cx,
@@ -6474,7 +6523,8 @@ impl App {
                     dw.gpu.config.height,
                     None,
                     &theme,
-                    dw.chrome_text.cell_size().0,
+                    &mut dw.chrome_text,
+                    cm,
                     &items,
                     &[],
                     &dw.menu_disabled,
@@ -6495,14 +6545,15 @@ impl App {
                 //    held, the button belongs to the app — do NOT inject a paste.
                 // Pastes the CLIPBOARD selection (same source as main).
                 let shift = self.modifiers.shift_key();
-                let status_h = self.status_h();
+                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 if dw.menu_open.is_some() {
                     return;
                 }
+                let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
                 let cy = dw.cursor.1 as f32;
                 let h = dw.gpu.config.height as f32;
-                if cy < TABBAR_H || cy >= h - status_h {
+                if cy < bar_h || cy >= h - status_h {
                     return;
                 }
                 if dw.tab.terminal.mouse_mode() && !shift {
@@ -6588,7 +6639,7 @@ impl App {
                 // (mouse-mode app, not over the scrollbar) or scroll THIS
                 // window's own scrollback.
                 let delta_lines = wheel_delta_to_lines(delta);
-                let status_h = self.status_h();
+                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 // Use THIS window's own accumulator so a leftover fraction never
                 // bleeds across windows (F26) — the shared self.scroll_accum did.
@@ -6596,6 +6647,7 @@ impl App {
                 if lines == 0 {
                     return;
                 }
+                let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
                 let (w, h) = (dw.gpu.config.width, dw.gpu.config.height);
                 // Wheeling over the scrollbar always scrolls the host scrollback
                 // even in mouse-mode apps (mirrors the main window).
@@ -6603,7 +6655,7 @@ impl App {
                     let rows = dw.tab.terminal.rows();
                     let off = dw.tab.terminal.scroll_offset();
                     let max = dw.tab.terminal.scroll_max();
-                    jetty_render::scrollbar_rect_geom(rows, off, max, w, h, TABBAR_H, status_h, [0, 0, 0, 0])
+                    jetty_render::scrollbar_rect_geom(rows, off, max, w, h, bar_h, status_h, [0, 0, 0, 0])
                         .map(|r| {
                             let cx = dw.cursor.0 as f32;
                             cx >= r.x && cx <= r.x + r.w
@@ -6619,7 +6671,7 @@ impl App {
                     };
                     let notches = ((lines.abs() + 2) / 3).clamp(1, 8);
                     if cw > 0.0 && ch > 0.0 {
-                        let gy = (dw.cursor.1 as f32 - TABBAR_H).max(0.0);
+                        let gy = (dw.cursor.1 as f32 - bar_h).max(0.0);
                         // 1-based cell coords: the encoders are 1-based, so the
                         // old 0-based col/row named the cell one row up / one col
                         // left of the pointer (F12). cell_at_clamped adds the +1,
@@ -6682,7 +6734,7 @@ impl App {
     }
 
     /// Render a detached window: its single tab's grid plus the window chrome —
-    /// a top bar (title pill + close ✕, TABBAR_H tall), the bottom status strip
+    /// a top bar (title pill + close ✕, its metrics' bar height), the bottom status strip
     /// (perf HUD) when `show_perf_hud`, and the Reattach/Copy/Paste context menu
     /// when open. Mirrors the main window's terminal draw passes from the
     /// `RedrawRequested` arm of `window_event` using the detached window's OWN
@@ -6731,7 +6783,16 @@ impl App {
                 None
             };
         let theme = self.current_theme();
-        let status_h = self.status_h();
+        let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+        // Menu hints from the LIVE keymap (only built while the menu is open).
+        let menu_hints: Vec<String> = if menu_open.is_some() {
+            crate::detached::DETACHED_MENU_ITEMS
+                .iter()
+                .map(|&l| crate::detached::menu_hint(&self.keymap, l))
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Same global HUD string the main status bar shows (built on the main
         // window's frames). Reading the cache never wakes anything.
         let perf_label = self.perf_label.clone();
@@ -6751,6 +6812,9 @@ impl App {
         let crt_anim_live = fx.crt_anim_live();
 
         let Some(dw) = self.detached.get_mut(pos) else { return };
+        // This window's chrome geometry (its own DPI × the UI font).
+        let cm = dw.chrome_metrics(ui_font);
+        let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
         let shift_hint_show =
             shift_hint_live_in(shift_hint_until, dw.window.id(), std::time::Instant::now());
         let status_pill_msg: Option<String> = status_pill.and_then(|(m, until, wid)| {
@@ -6817,8 +6881,7 @@ impl App {
         let scene_view: &wgpu::TextureView = if crt_active { &offscreen.1 } else { &view };
 
         // The grid sits below the top bar (and above the status strip).
-        let grid_top = TABBAR_H;
-        let chrome_char_w = chrome_text.cell_size().0;
+        let grid_top = bar_h;
         let grid_bottom_px = (height as f32 - status_h).max(0.0);
 
         // Passes 1–4 via the shared render core (v0.23 Task 8). The detached
@@ -6858,7 +6921,9 @@ impl App {
             &scene,
             // Pass 3: the top bar (title pill + close ✕) over the grid.
             |quad, device, queue, view, w, h| {
-                let bar = jetty_render::build_detached_bar(w, &title, &theme, close_hover, chrome_char_w);
+                let bar = jetty_render::build_detached_bar(
+                    w, &title, &theme, close_hover, &mut *chrome_text, cm,
+                );
                 quad.render(device, queue, view, w, h, &bar.quads);
                 if !bar.labels.is_empty() {
                     let _ = chrome_text.render_overlays(device, queue, view, w, h, &bar.labels);
@@ -6893,9 +6958,9 @@ impl App {
                 // Measure the ACTUAL proportional width (chars×cell_w mis-aligns a
                 // non-monospace UI font), same fix as the main perf HUD.
                 let perf_w = chrome_text.measure_overlay_width(perf);
-                let px = (width as f32 - perf_w - 12.0).max(8.0);
+                let px = (width as f32 - perf_w - cm.px(12.0)).max(cm.px(8.0));
                 let dim = nl(0.5);
-                let py = sy + (status_h - 16.0) / 2.0;
+                let py = sy + (status_h - cm.text_h()) / 2.0;
                 let _ = chrome_text.render_overlays(
                     &gpu.device, &gpu.queue, scene_view, width, height,
                     &[(perf.to_string(), px, py, [dim[0], dim[1], dim[2]])],
@@ -6909,17 +6974,17 @@ impl App {
         if shift_hint_show {
             let hint = "Hold Shift while dragging to select text";
             let tw = chrome_text.measure_overlay_width(hint);
-            let pad = 14.0;
+            let pad = cm.px(14.0);
             let pill_w = tw + pad * 2.0;
-            let pill_h = 26.0;
+            let pill_h = cm.pill_h();
             let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
-            let pill_y = (height as f32 - status_h - 14.0 - pill_h).max(0.0);
+            let pill_y = (height as f32 - status_h - cm.px(14.0) - pill_h).max(0.0);
             let c = theme.cursor;
             let pill = jetty_render::Rect::rounded(
                 pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
             );
             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill]);
-            let ty = pill_y + (pill_h - 16.0) / 2.0;
+            let ty = pill_y + (pill_h - cm.text_h()) / 2.0;
             let _ = chrome_text.render_overlays(
                 &gpu.device, &gpu.queue, scene_view, width, height,
                 &[(hint.to_string(), pill_x + pad, ty, [20, 20, 20])],
@@ -6929,18 +6994,18 @@ impl App {
         // twin, stacked above the shift hint on the rare frame both are live.
         if let Some(msg) = &status_pill_msg {
             let tw = chrome_text.measure_overlay_width(msg);
-            let pad = 14.0;
+            let pad = cm.px(14.0);
             let pill_w = tw + pad * 2.0;
-            let pill_h = 26.0;
+            let pill_h = cm.pill_h();
             let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
-            let stack = if shift_hint_show { pill_h + 8.0 } else { 0.0 };
-            let pill_y = (height as f32 - status_h - 14.0 - pill_h - stack).max(0.0);
+            let stack = if shift_hint_show { pill_h + cm.px(8.0) } else { 0.0 };
+            let pill_y = (height as f32 - status_h - cm.px(14.0) - pill_h - stack).max(0.0);
             let c = theme.cursor;
             let pill = jetty_render::Rect::rounded(
                 pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
             );
             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill]);
-            let ty = pill_y + (pill_h - 16.0) / 2.0;
+            let ty = pill_y + (pill_h - cm.text_h()) / 2.0;
             let _ = chrome_text.render_overlays(
                 &gpu.device, &gpu.queue, scene_view, width, height,
                 &[(msg.clone(), pill_x + pad, ty, [20, 20, 20])],
@@ -6950,10 +7015,11 @@ impl App {
         if let Some((mx, my)) = menu_open {
             let items: Vec<(&str, &str)> = crate::detached::DETACHED_MENU_ITEMS
                 .iter()
-                .map(|&l| (l, crate::detached::menu_hint(l)))
+                .zip(&menu_hints)
+                .map(|(&l, h)| (l, h.as_str()))
                 .collect();
             let menu = jetty_render::build_menu(
-                mx, my, width, height, menu_hover, &theme, chrome_char_w, &items, &[],
+                mx, my, width, height, menu_hover, &theme, &mut *chrome_text, cm, &items, &[],
                 &menu_disabled,
             );
             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &menu.quads);
@@ -7460,12 +7526,13 @@ impl App {
                         MouseScrollDelta::PixelDelta(p) => -(p.y as f32),
                     };
                     // `effects_scroll` accumulates in PHYSICAL px, but build_panel
-                    // divides it by `dpi = settings_char_w / CHAR_W_FALLBACK` to
+                    // divides it by its layout scale (the settings chrome unit) to
                     // lay bands out in LOGICAL space. So the clamp bound (a LOGICAL
-                    // content/viewport delta) must be scaled by the SAME dpi, or on
-                    // HiDPI the bottom bands (caret RGB sliders) stayed unreachable
-                    // and on sub-1× the scroll overshot into blank space (F10).
-                    let dpi = (self.settings_char_w() / jetty_render::CHAR_W_FALLBACK).max(0.1);
+                    // content/viewport delta) must be scaled by the SAME factor, or
+                    // on HiDPI the bottom bands (caret RGB sliders) stayed
+                    // unreachable and on sub-1× the scroll overshot into blank
+                    // space (F10).
+                    let dpi = self.settings_metrics().u.max(0.1);
                     let max_scroll = (jetty_render::EFFECTS_CONTENT_H
                         - jetty_render::EFFECTS_VISIBLE_H).max(0.0)
                         * dpi;
@@ -7707,7 +7774,7 @@ impl ApplicationHandler<AppEvent> for App {
         // only resizes the surface and arms `reflow_pending_at`, exactly like
         // the main window's — one SIGWINCH per drag, no p10k prompt scatter).
         {
-            let status_h = self.status_h();
+            let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
             let now = std::time::Instant::now();
             // Indexed loop (not iter_mut) so the reflowed window's cached
             // Ctrl+hover can be revalidated via &mut self below (F6).
@@ -7716,13 +7783,14 @@ impl ApplicationHandler<AppEvent> for App {
                 if dw.reflow_pending_at.is_some_and(|d| now >= d) {
                     dw.reflow_pending_at = None;
                     let (cw, ch) = dw.text.cell_size();
+                    let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
                     let (cols, rows) = crate::detached::grid_dims(
                         dw.gpu.config.width as f32,
                         dw.gpu.config.height as f32,
                         cw,
                         ch,
                         SCROLLBAR_GUTTER,
-                        TABBAR_H,
+                        bar_h,
                         status_h,
                     );
                     dw.tab.terminal.resize(cols, rows);
@@ -8055,7 +8123,10 @@ impl ApplicationHandler<AppEvent> for App {
             let (cw, ch) = text.cell_size();
             // Derive the grid from the physical pixel size and the physical cell size.
             let cols = ((size.width as f32 - SCROLLBAR_GUTTER) / cw).floor().max(2.0) as usize;
-            let rows = ((size.height as f32 - TABBAR_H - self.status_h()) / ch).floor().max(1.0) as usize;
+            // Chrome bands at THIS window's scale (self.window isn't stored yet).
+            let cm = jetty_render::ChromeMetrics::new(scale, self.ui_font_logical);
+            let status_h = if self.show_perf_hud { cm.status_h() } else { 0.0 };
+            let rows = ((size.height as f32 - cm.bar_h() - status_h) / ch).floor().max(1.0) as usize;
             let quad = QuadLayer::new(&g.device, g.format);
             (Some(text), Some(quad), cols, rows)
         } else {
@@ -8689,7 +8760,7 @@ impl ApplicationHandler<AppEvent> for App {
                         let zone = if self.main_fullscreen {
                             ResizeZone::None
                         } else {
-                            resize_zone_at(position.x as f32, position.y as f32, w, h)
+                            resize_zone_at(position.x as f32, position.y as f32, w, h, self.chrome_metrics().dpi)
                         };
                         if zone != self.resize_cursor {
                             self.resize_cursor = zone;
@@ -8712,8 +8783,9 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(gpu) = &self.gpu {
                     let w = gpu.config.width;
                     let bar_y = self.tabbar_y(gpu.config.height as f32);
-                    let before = ctrl_hover_at(prev.0 as f32, prev.1 as f32, w, bar_y);
-                    let after = ctrl_hover_at(position.x as f32, position.y as f32, w, bar_y);
+                    let cm = self.chrome_metrics();
+                    let before = ctrl_hover_at(prev.0 as f32, prev.1 as f32, w, bar_y, cm);
+                    let after = ctrl_hover_at(position.x as f32, position.y as f32, w, bar_y, cm);
                     if before != after {
                         self.request_main_paint();
                     }
@@ -8742,7 +8814,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let now_tearing = crate::detached::tearing(
                         position.y as f32,
                         bar_y,
-                        TABBAR_H,
+                        self.bar_h(),
                         crate::detached::TEAR_THRESHOLD_PX,
                     ) && crate::detached::can_detach(self.tabs.len());
                     if let Some(drag) = self.tab_drag.as_mut() {
@@ -8848,7 +8920,8 @@ impl ApplicationHandler<AppEvent> for App {
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
                     let theme = self.current_theme();
-                    let cw = self.chrome_char_w();
+                    let cm = self.chrome_metrics();
+                    let mut fallback = mono_fallback(cm);
                     let first = self.palette_scroll;
                     let sel = self.palette_selected;
                     let total = self.palette_filtered.len();
@@ -8869,7 +8942,8 @@ impl ApplicationHandler<AppEvent> for App {
                         })
                         .collect();
                     let pal = jetty_render::build_command_palette(
-                        w, h, &theme, cw, &self.palette_query, &prows, total, first,
+                        w, h, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
+                        &self.palette_query, &prows, total, first,
                     );
                     let mut hit: Option<usize> = None;
                     for (vi, r) in pal.row_hits.iter().enumerate() {
@@ -8896,8 +8970,12 @@ impl ApplicationHandler<AppEvent> for App {
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
                     let theme = self.current_theme();
-                    let popup =
-                        jetty_render::build_confirm(w, h, "Quit JeTTY? — all tabs will close", &theme, self.chrome_char_w());
+                    let cm = self.chrome_metrics();
+                    let mut fallback = mono_fallback(cm);
+                    let popup = jetty_render::build_confirm(
+                        w, h, "Quit JeTTY? — all tabs will close", &theme,
+                        measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
+                    );
                     if input::point_in(&popup.close_rect, cx, cy) {
                         event_loop.exit();
                         return;
@@ -8918,7 +8996,11 @@ impl ApplicationHandler<AppEvent> for App {
                     let cy = self.cursor.1 as f32;
                     let title = self.tabs.get(i).map(|t| t.title.clone()).unwrap_or_default();
                     let theme = self.current_theme();
-                    let popup = jetty_render::build_confirm_close(w, h, &title, &theme, self.chrome_char_w());
+                    let cm = self.chrome_metrics();
+                    let mut fallback = mono_fallback(cm);
+                    let popup = jetty_render::build_confirm_close(
+                        w, h, &title, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
+                    );
                     if input::point_in(&popup.close_rect, cx, cy) {
                         self.confirm_close = None;
                         self.close_tab(i, event_loop);
@@ -9048,7 +9130,12 @@ impl ApplicationHandler<AppEvent> for App {
                 // it never reaches the tab bar, a resize edge, or the terminal. ---
                 if self.help_open {
                     let theme = self.current_theme();
-                    let help = jetty_render::build_help_overlay(w, h, &theme, self.chrome_char_w(), &self.help_rows);
+                    let cm = self.chrome_metrics();
+                    let mut fallback = mono_fallback(cm);
+                    let help = jetty_render::build_help_overlay(
+                        w, h, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
+                        &self.help_rows,
+                    );
                     if !input::point_in(&help.panel, cx, cy) {
                         self.help_open = false;
                     }
@@ -9067,8 +9154,12 @@ impl ApplicationHandler<AppEvent> for App {
                         let (cur, total) = t.search_counter();
                         (t.search_query().to_string(), cur, total)
                     };
+                    let grid_top = self.grid_top_offset();
+                    let cm = self.chrome_metrics();
+                    let mut fallback = mono_fallback(cm);
                     let bar = jetty_render::build_search_bar(
-                        w, self.grid_top_offset(), &theme, self.chrome_char_w(), &q, cur, total,
+                        w, grid_top, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
+                        &q, cur, total,
                     );
                     if input::point_in(&bar.close_rect, cx, cy) {
                         self.search_close();
@@ -9088,7 +9179,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let zone = if self.main_fullscreen {
                     ResizeZone::None
                 } else {
-                    resize_zone_at(cx, cy, w, h)
+                    resize_zone_at(cx, cy, w, h, self.chrome_metrics().dpi)
                 };
                 if let Some(dir) = zone.direction() {
                     if let Some(win) = &self.window {
@@ -9101,7 +9192,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // Window controls, tab switching/close/new, inline-rename, window
                 // drag, and double-click-maximize — all BEFORE terminal selection.
                 let bar_y = self.tabbar_y(h as f32);
-                if cy >= bar_y && cy < bar_y + TABBAR_H {
+                if cy >= bar_y && cy < bar_y + self.bar_h() {
                     // Detect a double-click on the strip (within ~400ms and ~5px).
                     let now = std::time::Instant::now();
                     let is_double = matches!(
@@ -9127,11 +9218,14 @@ impl ApplicationHandler<AppEvent> for App {
                     // self.perf_label here reserved ~250px of phantom width and
                     // shrank the hit tab_w below the drawn tab_w, so clicks near a
                     // tab's right edge / on ✕ / on + landed on the wrong tab (F19).
+                    let cm = self.chrome_metrics();
+                    let mut fallback = mono_fallback(cm);
                     let mut bar = jetty_render::build_tab_bar_ex(
-                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, None, self.chrome_char_w(),
+                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, None,
+                        measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
                         &[], // activity never affects geometry; keeps hit rects == drawn rects
                     );
-                    // build_tab_bar_ex lays the bar out at y 0..TABBAR_H; shift its
+                    // build_tab_bar_ex lays the bar out at y 0..bar_h; shift its
                     // hit-test rects down to the bar's actual position (bottom mode).
                     if bar_y != 0.0 {
                         translate_bar_rects(&mut bar, bar_y);
@@ -9441,7 +9535,7 @@ impl ApplicationHandler<AppEvent> for App {
                 } else {
                     0.0
                 };
-                if cy >= bar_y && cy < bar_y + TABBAR_H {
+                if cy >= bar_y && cy < bar_y + self.bar_h() {
                     let Some(gpu) = &self.gpu else { return };
                     let (w, h) = (gpu.config.width, gpu.config.height);
                     let theme = self.current_theme();
@@ -9453,11 +9547,14 @@ impl ApplicationHandler<AppEvent> for App {
                         .enumerate()
                         .map(|(i, t)| (t.title.clone(), i == self.active))
                         .collect();
+                    let cm = self.chrome_metrics();
+                    let mut fallback = mono_fallback(cm);
                     let rename_ref = self.renaming.map(|i| (i, self.rename_buf.as_str()));
                     // perf=None to match the DRAWN bar (HUD lives in the status
                     // strip); passing perf_label mis-sized the hit-rects (F19).
                     let mut bar = jetty_render::build_tab_bar_ex(
-                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, None, self.chrome_char_w(),
+                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, None,
+                        measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
                         &[], // activity never affects geometry; keeps hit rects == drawn rects
                     );
                     if bar_y != 0.0 {
@@ -9480,13 +9577,22 @@ impl ApplicationHandler<AppEvent> for App {
                             crate::detached::can_detach(self.tabs.len()),
                         );
                         // Cache the item hit-test rects once, same as context_menu.
+                        // Hints from the live keymap (same strings the draw uses).
+                        let hints: Vec<String> = self
+                            .tab_menu_labels
+                            .iter()
+                            .map(|&l| crate::detached::menu_hint(&self.keymap, l))
+                            .collect();
                         let items: Vec<(&str, &str)> = self
                             .tab_menu_labels
                             .iter()
-                            .map(|&l| (l, crate::detached::menu_hint(l)))
+                            .zip(&hints)
+                            .map(|(&l, h)| (l, h.as_str()))
                             .collect();
                         let menu = jetty_render::build_menu(
-                            cx, cy, w, h, None, &theme, self.chrome_char_w(), &items, &[], &[],
+                            cx, cy, w, h, None, &theme,
+                            measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
+                            &items, &[], &[],
                         );
                         self.tab_menu_rects = menu.item_rects;
                         self.request_main_paint();
@@ -9538,10 +9644,16 @@ impl ApplicationHandler<AppEvent> for App {
                 // Cache the item hit-test rects once (anchor + size fixed for the
                 // menu's lifetime) so CursorMoved hover doesn't rebuild the menu.
                 if let Some(gpu) = &self.gpu {
+                    let (w, h) = (gpu.config.width, gpu.config.height);
                     let theme = self.current_theme();
+                    let cm = self.chrome_metrics();
+                    let mut fallback = mono_fallback(cm);
+                    let hints = crate::detached::context_menu_hints(&self.keymap);
+                    let hint_refs: Vec<&str> = hints.iter().map(String::as_str).collect();
                     let menu = jetty_render::build_context_menu(
-                        cx, cy, gpu.config.width, gpu.config.height, None, &theme,
-                        self.chrome_char_w(), &self.menu_disabled,
+                        cx, cy, w, h, None, &theme,
+                        measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
+                        &hint_refs, &self.menu_disabled,
                     );
                     self.menu_item_rects = menu.item_rects;
                 }
@@ -10813,6 +10925,30 @@ impl ApplicationHandler<AppEvent> for App {
                 // Status-bar height (perf HUD) reserved at the window bottom,
                 // captured before the mutable gpu/text borrow below.
                 let status_h = self.status_h();
+                // The main window's chrome geometry (DPI × UI font) — every chrome
+                // builder below and the hit-tests in the input arms use the SAME
+                // metrics, so clicks land where the chrome is drawn.
+                let cm = self.chrome_metrics();
+                let bar_h = cm.bar_h();
+                // Metrics of the TERMINAL font, for overlays anchored to grid
+                // cells (hint chips): their labels render in the grid font so
+                // they always fit their one-row chip, whatever the UI font size.
+                let grid_cm = jetty_render::ChromeMetrics::new(scale, self.font_logical);
+                // Menu shortcut hints from the LIVE keymap (built only while a
+                // menu is open).
+                let context_hints: Vec<String> = if context_menu.is_some() {
+                    crate::detached::context_menu_hints(&self.keymap).to_vec()
+                } else {
+                    Vec::new()
+                };
+                let tab_menu_hints: Vec<String> = if tab_menu.is_some() {
+                    tab_menu_labels
+                        .iter()
+                        .map(|&l| crate::detached::menu_hint(&self.keymap, l))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let cursor = self.cursor;
                 // Ctrl+hover link underline spans, snapshotted before the
                 // gpu/text/quad borrows (drawn only while the modifier is held).
@@ -10868,20 +11004,19 @@ impl ApplicationHandler<AppEvent> for App {
                         -(height as f32) * (1.0 - eased)
                     })
                     .unwrap_or(0.0);
-                // Tab-bar geometry: the bar's pixel Y (0 at top, height-TABBAR_H at
-                // bottom) and the grid's pixel ORIGIN (TABBAR_H at top, 0 at bottom).
-                // Bottom-mode tab bar sits ABOVE the status bar (height - TABBAR_H
+                // Tab-bar geometry: the bar's pixel Y (0 at top, height-bar_h at
+                // bottom) and the grid's pixel ORIGIN (bar_h at top, 0 at bottom).
+                // Bottom-mode tab bar sits ABOVE the status bar (height - bar_h
                 // - status_h); the status bar (perf HUD) takes the very bottom.
-                let bar_y = if tab_bar_bottom { (height as f32 - TABBAR_H - status_h).max(0.0) } else { 0.0 };
-                let grid_top = if tab_bar_bottom { 0.0 } else { TABBAR_H };
+                let bar_y = if tab_bar_bottom { (height as f32 - bar_h - status_h).max(0.0) } else { 0.0 };
+                let grid_top = if tab_bar_bottom { 0.0 } else { bar_h };
                 // Compute window-control hover from the last cursor position.
-                let ctrl_hover = ctrl_hover_at(cursor.0 as f32, cursor.1 as f32, width, bar_y);
+                let ctrl_hover = ctrl_hover_at(cursor.0 as f32, cursor.1 as f32, width, bar_y, cm);
                 let rename_ref = rename_state.as_ref().map(|(i, b)| (*i, b.as_str()));
-                let chrome_char_w = chrome_text.cell_size().0;
                 // The perf HUD now lives in the bottom STATUS BAR (off the tab row),
                 // so the tab bar is built WITHOUT it (None).
                 let mut bar = jetty_render::build_tab_bar_ex(
-                    width, &tabs_meta, &theme, rename_ref, ctrl_hover, None, chrome_char_w,
+                    width, &tabs_meta, &theme, rename_ref, ctrl_hover, None, &mut *chrome_text, cm,
                     &tab_activity,
                 );
                 // Translate the bar quads + labels to its actual y (bottom mode)
@@ -10942,7 +11077,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // it again internally).
                     let (cell_w, cell_h) = text.cell_size();
                     let grid_bottom_px = if tab_bar_bottom {
-                        (height as f32 - TABBAR_H - status_h).max(0.0)
+                        (height as f32 - bar_h - status_h).max(0.0)
                     } else {
                         (height as f32 - status_h).max(0.0)
                     };
@@ -10986,9 +11121,9 @@ impl ApplicationHandler<AppEvent> for App {
                         |quad, device, queue, view, w, h| {
                             quad.render(device, queue, view, w, h, &bar.quads);
                             if !bar.labels.is_empty() {
-                                // Chrome: fixed-size layer so the bar text never
-                                // scales with the terminal font (never overflows
-                                // the 36px bar).
+                                // Chrome: the UI-font layer, so the bar text never
+                                // scales with the TERMINAL font; the bar itself is
+                                // sized by the same ChromeMetrics as this text.
                                 let _ = chrome_text.render_overlays(device, queue, view, w, h, &bar.labels);
                             }
                             if !bar.title_labels.is_empty() {
@@ -11027,9 +11162,9 @@ impl ApplicationHandler<AppEvent> for App {
                             // the ACTUAL proportional width (chars×cell_w is wrong
                             // for a non-monospace UI font — it left-floated the HUD).
                             let perf_w = chrome_text.measure_overlay_width(perf);
-                            let px = (width as f32 - perf_w - 12.0).max(8.0);
+                            let px = (width as f32 - perf_w - cm.px(12.0)).max(cm.px(8.0));
                             let dim = nl(0.5);
-                            let py = sy + (status_h - 16.0) / 2.0;
+                            let py = sy + (status_h - cm.text_h()) / 2.0;
                             let _ = chrome_text.render_overlays(
                                 &gpu.device, &gpu.queue, scene_view, width, height,
                                 &[(perf.to_string(), px, py, [dim[0], dim[1], dim[2]])],
@@ -11042,16 +11177,16 @@ impl ApplicationHandler<AppEvent> for App {
                     if shift_hint_show {
                         let hint = "Hold Shift while dragging to select text";
                         let tw = chrome_text.measure_overlay_width(hint);
-                        let pad = 14.0;
+                        let pad = cm.px(14.0);
                         let pill_w = tw + pad * 2.0;
-                        let pill_h = 26.0;
+                        let pill_h = cm.pill_h();
                         let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
                         // Sit the pill above the bottom-mode tab bar too, not just
                         // the status strip, or it draws over the tab titles.
                         let pill_y = (height as f32
                             - status_h
-                            - if tab_bar_bottom { TABBAR_H } else { 0.0 }
-                            - 14.0
+                            - if tab_bar_bottom { bar_h } else { 0.0 }
+                            - cm.px(14.0)
                             - pill_h)
                             .max(0.0)
                             + slide_y_offset;
@@ -11060,7 +11195,7 @@ impl ApplicationHandler<AppEvent> for App {
                             pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill]);
-                        let ty = pill_y + (pill_h - 16.0) / 2.0;
+                        let ty = pill_y + (pill_h - cm.text_h()) / 2.0;
                         let _ = chrome_text.render_overlays(
                             &gpu.device, &gpu.queue, scene_view, width, height,
                             &[(hint.to_string(), pill_x + pad, ty, [20, 20, 20])],
@@ -11071,15 +11206,15 @@ impl ApplicationHandler<AppEvent> for App {
                     // above it on the rare frame both are live.
                     if let Some(msg) = &status_pill_msg {
                         let tw = chrome_text.measure_overlay_width(msg);
-                        let pad = 14.0;
+                        let pad = cm.px(14.0);
                         let pill_w = tw + pad * 2.0;
-                        let pill_h = 26.0;
+                        let pill_h = cm.pill_h();
                         let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
-                        let stack = if shift_hint_show { pill_h + 8.0 } else { 0.0 };
+                        let stack = if shift_hint_show { pill_h + cm.px(8.0) } else { 0.0 };
                         let pill_y = (height as f32
                             - status_h
-                            - if tab_bar_bottom { TABBAR_H } else { 0.0 }
-                            - 14.0
+                            - if tab_bar_bottom { bar_h } else { 0.0 }
+                            - cm.px(14.0)
                             - pill_h
                             - stack)
                             .max(0.0)
@@ -11089,7 +11224,7 @@ impl ApplicationHandler<AppEvent> for App {
                             pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill]);
-                        let ty = pill_y + (pill_h - 16.0) / 2.0;
+                        let ty = pill_y + (pill_h - cm.text_h()) / 2.0;
                         let _ = chrome_text.render_overlays(
                             &gpu.device, &gpu.queue, scene_view, width, height,
                             &[(msg.clone(), pill_x + pad, ty, [20, 20, 20])],
@@ -11102,7 +11237,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // visual priority over it.
                     if let Some((q, cur, total)) = &search_ui {
                         let sb = jetty_render::build_search_bar(
-                            width, grid_top + slide_y_offset, &theme, chrome_char_w, q, *cur, *total,
+                            width, grid_top + slide_y_offset, &theme, &mut *chrome_text, cm, q, *cur, *total,
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &sb.quads);
                         if !sb.labels.is_empty() {
@@ -11111,8 +11246,11 @@ impl ApplicationHandler<AppEvent> for App {
                             );
                         }
                     }
-                    // Pass 4e: hint-mode label chips — themed/HiDPI, mirroring the
-                    // search bar's draw (quads then chrome text). Only while active.
+                    // Pass 4e: hint-mode label chips — themed/HiDPI, quads then
+                    // text. Only while active. The chips are one grid ROW tall, so
+                    // their labels render (and are measured) in the TERMINAL font
+                    // via the grid layer — like the welcome splash — not the UI
+                    // font, which at a large UI size overflowed the chip.
                     if let Some((labeled, typed)) = &hint_ui {
                         let refs: Vec<(&str, usize, usize)> =
                             labeled.iter().map(|(l, r, c)| (l.as_str(), *r, *c)).collect();
@@ -11122,13 +11260,14 @@ impl ApplicationHandler<AppEvent> for App {
                             cell_h,
                             grid_top + slide_y_offset,
                             &theme,
-                            chrome_char_w,
+                            &mut *text,
+                            grid_cm,
                             typed,
                             width,
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
                         if !ov.labels.is_empty() {
-                            let _ = chrome_text.render_overlays(
+                            let _ = text.render_overlays(
                                 &gpu.device, &gpu.queue, scene_view, width, height, &ov.labels,
                             );
                         }
@@ -11140,7 +11279,8 @@ impl ApplicationHandler<AppEvent> for App {
                             width,
                             grid_top + slide_y_offset,
                             &theme,
-                            chrome_char_w,
+                            &mut *chrome_text,
+                            cm,
                             line_mode,
                             selecting,
                         );
@@ -11185,7 +11325,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // that straddles the edge. The status strip is always
                         // reserved; the tab bar only in bottom mode.
                         let grid_bottom = if tab_bar_bottom {
-                            (height as f32 - TABBAR_H - status_h).max(0.0)
+                            (height as f32 - bar_h - status_h).max(0.0)
                         } else {
                             (height as f32 - status_h).max(0.0)
                         };
@@ -11209,9 +11349,10 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     // Draw the right-click context menu on top of everything.
                     if let Some((mx, my)) = context_menu {
+                        let hint_refs: Vec<&str> = context_hints.iter().map(String::as_str).collect();
                         let menu = jetty_render::build_context_menu(
-                            mx, my, width, height, menu_hover, &theme, chrome_char_w,
-                            &menu_disabled,
+                            mx, my, width, height, menu_hover, &theme, &mut *chrome_text, cm,
+                            &hint_refs, &menu_disabled,
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &menu.quads);
                         if !menu.labels.is_empty() {
@@ -11230,10 +11371,12 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some((mx, my, _)) = tab_menu {
                         let items: Vec<(&str, &str)> = tab_menu_labels
                             .iter()
-                            .map(|&l| (l, crate::detached::menu_hint(l)))
+                            .zip(&tab_menu_hints)
+                            .map(|(&l, h)| (l, h.as_str()))
                             .collect();
                         let menu = jetty_render::build_menu(
-                            mx, my, width, height, tab_menu_hover, &theme, chrome_char_w, &items, &[], &[],
+                            mx, my, width, height, tab_menu_hover, &theme, &mut *chrome_text, cm,
+                            &items, &[], &[],
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &menu.quads);
                         if !menu.labels.is_empty() {
@@ -11250,7 +11393,9 @@ impl ApplicationHandler<AppEvent> for App {
                     // Draw the Help overlay (Keyboard Shortcuts) on top of all
                     // else — a dim layer, a bordered panel, and the binding rows.
                     if help_open && palette_ui.is_none() {
-                        let help = jetty_render::build_help_overlay(width, height, &theme, chrome_char_w, &help_rows);
+                        let help = jetty_render::build_help_overlay(
+                            width, height, &theme, &mut *chrome_text, cm, &help_rows,
+                        );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &help.quads);
                         if !help.labels.is_empty() {
                             let _ = chrome_text.render_overlays(
@@ -11267,7 +11412,8 @@ impl ApplicationHandler<AppEvent> for App {
                     // (above the help overlay): dim + bordered panel + buttons.
                     if confirm_quit {
                         let popup = jetty_render::build_confirm(
-                            width, height, "Quit JeTTY? — all tabs will close", &theme, chrome_char_w,
+                            width, height, "Quit JeTTY? — all tabs will close", &theme,
+                            &mut *chrome_text, cm,
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &popup.quads);
                         if !popup.labels.is_empty() {
@@ -11276,7 +11422,9 @@ impl ApplicationHandler<AppEvent> for App {
                             );
                         }
                     } else if let Some(title) = &confirm_close {
-                        let popup = jetty_render::build_confirm_close(width, height, title, &theme, chrome_char_w);
+                        let popup = jetty_render::build_confirm_close(
+                            width, height, title, &theme, &mut *chrome_text, cm,
+                        );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &popup.quads);
                         if !popup.labels.is_empty() {
                             let _ = chrome_text.render_overlays(
@@ -11303,7 +11451,7 @@ impl ApplicationHandler<AppEvent> for App {
                             })
                             .collect();
                         let pal = jetty_render::build_command_palette(
-                            width, height, &theme, chrome_char_w, q, &prows, *total, *first,
+                            width, height, &theme, &mut *chrome_text, cm, q, &prows, *total, *first,
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pal.quads);
                         if !pal.labels.is_empty() {
@@ -12058,16 +12206,41 @@ fn scrollbar_thumb_for(theme: &jetty_core::Theme) -> [u8; 4] {
     [mix(0), mix(1), mix(2), 210]
 }
 
-fn ctrl_hover_at(cx: f32, cy: f32, width: u32, bar_y: f32) -> jetty_render::CtrlHover {
+/// The text measurer for chrome built OUTSIDE a frame (hit-testing): the
+/// window's chrome text layer when it exists, else a monospace estimate at the
+/// metrics' scale (only before the GPU stack is up, when nothing is drawn).
+fn measure_or<'a>(
+    layer: Option<&'a mut TextLayer>,
+    fallback: &'a mut jetty_render::MonoMeasure,
+) -> &'a mut dyn jetty_render::ChromeMeasure {
+    match layer {
+        Some(t) => t,
+        None => fallback,
+    }
+}
+
+/// Monospace fallback measurer at metrics `cm` (the default chrome font's
+/// 9.6px design advance, scaled).
+fn mono_fallback(cm: jetty_render::ChromeMetrics) -> jetty_render::MonoMeasure {
+    jetty_render::MonoMeasure(9.6 * cm.u)
+}
+
+fn ctrl_hover_at(
+    cx: f32,
+    cy: f32,
+    width: u32,
+    bar_y: f32,
+    cm: jetty_render::ChromeMetrics,
+) -> jetty_render::CtrlHover {
     use jetty_render::CtrlHover;
-    if cy < bar_y || cy >= bar_y + TABBAR_H {
+    if cy < bar_y || cy >= bar_y + cm.bar_h() {
         return CtrlHover::None;
     }
-    // The controls are inset from the surface's right edge by STRIP_PAD; mirror
-    // that here or every hover zone is shifted STRIP_PAD px right of the buttons.
-    let sw = width as f32 - jetty_render::STRIP_PAD;
-    let ctrl_w = jetty_render::CONTROLS_W / 5.0;
-    let help_x = sw - jetty_render::CONTROLS_W; // sw - 5*ctrl_w
+    // The controls are inset from the surface's right edge by the strip pad;
+    // mirror that here or every hover zone is shifted right of the buttons.
+    let sw = width as f32 - cm.strip_pad();
+    let ctrl_w = cm.ctrl_w();
+    let help_x = sw - cm.controls_w(); // sw - 5*ctrl_w
     let settings_x = sw - ctrl_w * 4.0;
     let min_x = sw - ctrl_w * 3.0;
     let max_x = sw - ctrl_w * 2.0;
@@ -12418,47 +12591,59 @@ mod resize_zone_tests {
 
     #[test]
     fn interior_is_none() {
-        assert_eq!(resize_zone_at(500.0, 320.0, W, H), ResizeZone::None);
+        assert_eq!(resize_zone_at(500.0, 320.0, W, H, 1.0), ResizeZone::None);
     }
 
     #[test]
     fn edges_map_to_sides() {
         // West/East within 6px of a vertical side (mid-height).
-        assert_eq!(resize_zone_at(2.0, 320.0, W, H), ResizeZone::West);
-        assert_eq!(resize_zone_at(998.0, 320.0, W, H), ResizeZone::East);
+        assert_eq!(resize_zone_at(2.0, 320.0, W, H, 1.0), ResizeZone::West);
+        assert_eq!(resize_zone_at(998.0, 320.0, W, H, 1.0), ResizeZone::East);
         // North/South within 6px of a horizontal side (mid-width).
-        assert_eq!(resize_zone_at(500.0, 2.0, W, H), ResizeZone::North);
-        assert_eq!(resize_zone_at(500.0, 638.0, W, H), ResizeZone::South);
+        assert_eq!(resize_zone_at(500.0, 2.0, W, H, 1.0), ResizeZone::North);
+        assert_eq!(resize_zone_at(500.0, 638.0, W, H, 1.0), ResizeZone::South);
     }
 
     #[test]
     fn corners_take_priority_over_edges() {
         // Within 12px of two adjacent sides → the diagonal corner zone.
-        assert_eq!(resize_zone_at(3.0, 3.0, W, H), ResizeZone::NorthWest);
-        assert_eq!(resize_zone_at(997.0, 3.0, W, H), ResizeZone::NorthEast);
-        assert_eq!(resize_zone_at(3.0, 637.0, W, H), ResizeZone::SouthWest);
-        assert_eq!(resize_zone_at(997.0, 637.0, W, H), ResizeZone::SouthEast);
+        assert_eq!(resize_zone_at(3.0, 3.0, W, H, 1.0), ResizeZone::NorthWest);
+        assert_eq!(resize_zone_at(997.0, 3.0, W, H, 1.0), ResizeZone::NorthEast);
+        assert_eq!(resize_zone_at(3.0, 637.0, W, H, 1.0), ResizeZone::SouthWest);
+        assert_eq!(resize_zone_at(997.0, 637.0, W, H, 1.0), ResizeZone::SouthEast);
     }
 
     #[test]
     fn just_inside_edge_band_is_interior() {
         // 7px from the left edge (> EDGE=6, < CORNER=12 only matters near a corner):
         // at mid-height this is interior, not a resize zone.
-        assert_eq!(resize_zone_at(7.0, 320.0, W, H), ResizeZone::None);
+        assert_eq!(resize_zone_at(7.0, 320.0, W, H, 1.0), ResizeZone::None);
     }
 
     #[test]
     fn top_outer_strip_is_resize_inner_is_not() {
-        // The top 6px is North (resize); below that (still inside TABBAR_H) is the
+        // The top 6px is North (resize); below that (still inside the bar) is the
         // tab bar, so resize_zone_at returns None there.
-        assert_eq!(resize_zone_at(500.0, 3.0, W, H), ResizeZone::North);
-        assert_eq!(resize_zone_at(500.0, 20.0, W, H), ResizeZone::None);
+        assert_eq!(resize_zone_at(500.0, 3.0, W, H, 1.0), ResizeZone::North);
+        assert_eq!(resize_zone_at(500.0, 20.0, W, H, 1.0), ResizeZone::None);
     }
 
     #[test]
     fn out_of_bounds_is_none() {
-        assert_eq!(resize_zone_at(-5.0, 320.0, W, H), ResizeZone::None);
-        assert_eq!(resize_zone_at(500.0, 700.0, W, H), ResizeZone::None);
+        assert_eq!(resize_zone_at(-5.0, 320.0, W, H, 1.0), ResizeZone::None);
+        assert_eq!(resize_zone_at(500.0, 700.0, W, H, 1.0), ResizeZone::None);
+    }
+
+    #[test]
+    fn grab_bands_scale_with_dpi() {
+        // On a 2× display the edge/corner bands are 12/24 physical px — the same
+        // physical-inch target as 6/12 at 1×, not a hair-thin band.
+        let (w, h) = (2000u32, 1280u32);
+        assert_eq!(resize_zone_at(10.0, 640.0, w, h, 2.0), ResizeZone::West);
+        assert_eq!(resize_zone_at(10.0, 640.0, w, h, 1.0), ResizeZone::None);
+        assert_eq!(resize_zone_at(20.0, 20.0, w, h, 2.0), ResizeZone::NorthWest);
+        // A bogus scale factor falls back to 1×.
+        assert_eq!(resize_zone_at(10.0, 640.0, w, h, 0.0), ResizeZone::None);
     }
 
     #[test]

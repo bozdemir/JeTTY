@@ -132,17 +132,41 @@ pub fn corner_radii(radius_px: f32) -> (f32, f32, f32, f32) {
     (radius_px, radius_px, radius_px, radius_px)
 }
 
-/// Right-aligned keyboard-shortcut hint for a menu label (same symbols as
-/// `menu::MENU_HINTS`; blank when the action has no binding).
-pub fn menu_hint(label: &str) -> &'static str {
-    match label {
-        "Detach" | "Reattach" => "⇧⌃D",
-        "Copy" => "⇧⌃C",
-        "Paste" => "⇧⌃V",
-        "Run in New Tab" => "⇧⌃⏎",
-        "Close Tab" => "⇧⌃W",
-        _ => "",
-    }
+/// The remappable action a tab / detached-window menu label triggers (`None`
+/// for labels with no keyboard binding, e.g. "Rename").
+pub fn menu_action(label: &str) -> Option<crate::keymap::BindableAction> {
+    use crate::keymap::BindableAction as A;
+    Some(match label {
+        "Detach" | "Reattach" => A::DetachTab,
+        "Copy" => A::Copy,
+        "Paste" => A::Paste,
+        "Run in New Tab" => A::RunSelection,
+        "Close Tab" => A::CloseTab,
+        _ => return None,
+    })
+}
+
+/// The six shortcut hints of the main right-click menu (`jetty_render::
+/// MENU_ITEMS` order: Copy, Paste, Run in New Tab, Select All, Clear, Close
+/// Tab) from the LIVE keymap. "Clear" is the raw Ctrl+L byte, not a remappable
+/// action, so its hint is fixed.
+pub fn context_menu_hints(km: &crate::keymap::KeyMap) -> [String; 6] {
+    use crate::keymap::BindableAction as A;
+    [
+        km.menu_hint(A::Copy),
+        km.menu_hint(A::Paste),
+        km.menu_hint(A::RunSelection),
+        km.menu_hint(A::SelectAll),
+        "⌃L".to_string(),
+        km.menu_hint(A::CloseTab),
+    ]
+}
+
+/// Right-aligned keyboard-shortcut hint for a menu label, from the LIVE keymap
+/// (a `[keys]` remap — or macOS's ⌘ chords — shows in the menu); blank when
+/// the action has no binding.
+pub fn menu_hint(km: &crate::keymap::KeyMap, label: &str) -> String {
+    menu_action(label).map(|a| km.menu_hint(a)).unwrap_or_default()
 }
 
 /// True if `last_focused` is one of the live detached-window ids, i.e. focus
@@ -481,6 +505,20 @@ impl DetachedWindow {
     pub(crate) fn request_paint(&self) {
         self.window.request_redraw();
     }
+
+    /// This window's chrome metrics: its OWN DPI (it may sit on a different
+    /// monitor than the main window) × the app-wide UI font size. Drives the
+    /// title-bar / status-strip / menu geometry and every hit-test against it.
+    pub(crate) fn chrome_metrics(&self, ui_font_logical: f32) -> jetty_render::ChromeMetrics {
+        jetty_render::ChromeMetrics::new(self.window.scale_factor() as f32, ui_font_logical)
+    }
+
+    /// `(top bar height, bottom status-strip height)` of this window's chrome
+    /// in physical px — the strip is 0 when the perf HUD is off.
+    pub(crate) fn chrome_bands(&self, ui_font_logical: f32, show_perf_hud: bool) -> (f32, f32) {
+        let cm = self.chrome_metrics(ui_font_logical);
+        (cm.bar_h(), if show_perf_hud { cm.status_h() } else { 0.0 })
+    }
 }
 
 #[cfg(test)]
@@ -633,13 +671,19 @@ mod tests {
 
     #[test]
     fn menu_hints_match_key_bindings() {
-        assert_eq!(menu_hint("Detach"), "⇧⌃D");
-        assert_eq!(menu_hint("Reattach"), "⇧⌃D");
-        assert_eq!(menu_hint("Copy"), "⇧⌃C");
-        assert_eq!(menu_hint("Paste"), "⇧⌃V");
-        assert_eq!(menu_hint("Run in New Tab"), "⇧⌃⏎");
-        assert_eq!(menu_hint("Close Tab"), "⇧⌃W");
-        assert_eq!(menu_hint("Rename"), "");
+        // Hints come from the live keymap; on Linux the defaults reproduce the
+        // menus' historical glyphs exactly (macOS shows its ⌘ chords instead).
+        let km = crate::keymap::KeyMap::defaults();
+        if !cfg!(target_os = "macos") {
+            assert_eq!(menu_hint(&km, "Detach"), "⇧⌃D");
+            assert_eq!(menu_hint(&km, "Reattach"), "⇧⌃D");
+            assert_eq!(menu_hint(&km, "Copy"), "⇧⌃C");
+            assert_eq!(menu_hint(&km, "Paste"), "⇧⌃V");
+            assert_eq!(menu_hint(&km, "Run in New Tab"), "⇧⌃⏎");
+            assert_eq!(menu_hint(&km, "Close Tab"), "⇧⌃W");
+        }
+        assert_eq!(menu_hint(&km, "Rename"), "");
+        assert!(menu_action("Rename").is_none());
     }
 
     #[test]

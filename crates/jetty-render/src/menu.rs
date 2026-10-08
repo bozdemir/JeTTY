@@ -1,3 +1,4 @@
+use crate::chrome::{ChromeMeasure, ChromeMetrics};
 use crate::Rect;
 
 /// The six clickable items in the right-click context menu, in display order.
@@ -10,14 +11,14 @@ use crate::Rect;
 pub const MENU_ITEMS: [&str; 6] =
     ["Copy", "Paste", "Run in New Tab", "Select All", "Clear", "Close Tab"];
 
-/// Right-aligned keyboard-shortcut hints shown beside each item.
+/// The DEFAULT (Linux) keyboard-shortcut hints for [`MENU_ITEMS`], used by
+/// tests and fixed-size harnesses. The app passes hints derived from the LIVE
+/// keymap instead (a `[keys]` remap, or macOS's ⌘ chords, must show in the
+/// menu) — "Clear" is the only fixed one (it is the raw Ctrl+L byte, not a
+/// remappable action). Blank for items that have no shortcut. The symbols
+/// (⇧ ⌃) render through MesloLGS NF (the chrome Nerd Font).
 ///
-/// Blank for items that have no shortcut.  The symbols (⇧ ⌃) render
-/// correctly through MesloLGS NF (the chrome Nerd Font).  If glyph
-/// fallback is ever needed, replace with "Ctrl+Shift+C" style strings to
-/// match the help.rs overlay.
-///
-/// Verified against input.rs bindings:
+/// Default bindings:
 ///   ⇧⌃C = Ctrl+Shift+C     → KeyAction::Copy
 ///   ⇧⌃V = Ctrl+Shift+V     → KeyAction::Paste
 ///   ⇧⌃⏎ = Ctrl+Shift+Enter → KeyAction::RunSelection
@@ -25,13 +26,12 @@ pub const MENU_ITEMS: [&str; 6] =
 ///   ⇧⌃W = Ctrl+Shift+W     → KeyAction::CloseTab
 pub const MENU_HINTS: [&str; 6] = ["⇧⌃C", "⇧⌃V", "⇧⌃⏎", "", "⌃L", "⇧⌃W"];
 
-// --- Layout constants ---
+// --- Layout constants (DESIGN px: 16pt UI font, 1× — scaled by the chrome unit) ---
 //
-// Fixed minimum card width (the historical value that fits the standard menu at
-// the scale-1 chrome advance). `build_menu` uses this only as a FLOOR: the real
-// width is measured from the items with the passed `char_w` so that on HiDPI /
-// large UI fonts (where `char_w` grows) the card widens to keep the shortcut hint
-// from overlapping the label.
+// Minimum card width (the historical value that fits the standard menu at the
+// baseline). `build_menu` uses this only as a FLOOR: the real width is measured
+// from the items, so with a wide UI font / long labels the card widens to keep
+// the shortcut hint from overlapping the label.
 const MENU_W: f32 = 210.0;
 /// Inner left/right padding of the menu card (px, logical).
 const MENU_HPAD: f32 = 10.0;
@@ -84,9 +84,9 @@ fn row_y_in(i: usize, sep_before: &[usize]) -> f32 {
 /// caller's no-op. Indices NEVER shift (the array is static), so cached
 /// hit-rects stay valid.
 ///
-/// `char_w` is the measured physical-pixel advance of one chrome-font character
-/// (from `TextLayer::cell_size().0`). Pass `9.8` when a real measurement is not
-/// available (scale-1 fallback used by tests).
+/// `hints` are the shortcut hints for the six items in `MENU_ITEMS` order (the
+/// app derives them from the live keymap; [`MENU_HINTS`] is the default set);
+/// a missing entry reads as blank. `m` / `cm`: see [`build_menu`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_context_menu(
     x: f32,
@@ -95,15 +95,17 @@ pub fn build_context_menu(
     win_h: u32,
     hovered: Option<usize>,
     theme: &jetty_core::Theme,
-    char_w: f32,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
+    hints: &[&str],
     disabled: &[usize],
 ) -> ContextMenu {
     let items: Vec<(&str, &str)> = MENU_ITEMS
         .iter()
-        .copied()
-        .zip(MENU_HINTS.iter().copied())
+        .enumerate()
+        .map(|(i, &label)| (label, hints.get(i).copied().unwrap_or("")))
         .collect();
-    build_menu(x, y, win_w, win_h, hovered, theme, char_w, &items, &[4], disabled)
+    build_menu(x, y, win_w, win_h, hovered, theme, m, cm, &items, &[4], disabled)
 }
 
 /// Build a context menu from an arbitrary `(label, hint)` item list anchored at
@@ -118,10 +120,11 @@ pub fn build_context_menu(
 /// `disabled` lists item indices drawn dim with the hover highlight
 /// suppressed (grayed rows); pass `&[]` for none.
 ///
-/// `char_w` is the measured chrome-font advance (see `build_context_menu`).
-/// The shortcut-hint glyphs (⇧ ⌃) are wider than ASCII; the hint width is
-/// computed as `char_w * 1.25` to account for this — at scale 1 this gives
-/// ≈ 12.25 px/glyph, matching the previous hardcoded 12.0 estimate.
+/// `m` measures the labels/hints exactly as the chrome text pass renders them
+/// (so the card fits a proportional UI font and the hints right-align flush);
+/// `cm` scales rows, paddings and radii with the DPI × UI-font chrome unit, so
+/// a large UI font gets taller rows instead of glyphs overflowing a fixed 28px
+/// row.
 #[allow(clippy::too_many_arguments)]
 pub fn build_menu(
     x: f32,
@@ -130,7 +133,8 @@ pub fn build_menu(
     win_h: u32,
     hovered: Option<usize>,
     theme: &jetty_core::Theme,
-    char_w: f32,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
     items: &[(&str, &str)],
     sep_before: &[usize],
     disabled: &[usize],
@@ -139,25 +143,25 @@ pub fn build_menu(
     let sh = win_h as f32;
     let n_items = items.len();
     let n_seps = sep_before.iter().filter(|&&s| s > 0 && s < n_items).count();
-    let menu_h = ROW_H * n_items as f32 + SEP_GAP * n_seps as f32;
+    let row_h = cm.px(ROW_H);
+    let sep_gap = cm.px(SEP_GAP);
+    let hpad = cm.px(MENU_HPAD);
+    let border = cm.px(BORDER);
+    let menu_h = row_h * n_items as f32 + sep_gap * n_seps as f32;
 
-    // Card width measured from the widest row so the hint never overlaps the label
-    // on HiDPI / large UI fonts (`char_w` scales with those). Each row needs
-    // left-pad + label + [gap + hint] + right-pad; hint glyphs (⇧ ⌃) render ~1.25×
-    // an ASCII cell, matching the hint layout below. Floored at MENU_W so the
-    // standard menu at the scale-1 advance is unchanged.
-    let menu_w = items
+    // Card width measured from the widest row so the hint never overlaps the
+    // label. Each row needs left-pad + label + [gap + hint] + right-pad. Floored
+    // at MENU_W so the standard menu at the baseline keeps its classic width.
+    let measured: Vec<(f32, f32)> =
+        items.iter().map(|(label, hint)| (m.text_w(label), m.text_w(hint))).collect();
+    let menu_w = measured
         .iter()
-        .map(|(label, hint)| {
-            let label_w = label.chars().count() as f32 * char_w;
-            let hint_extra = if hint.is_empty() {
-                0.0
-            } else {
-                MENU_LABEL_HINT_GAP + hint.chars().count() as f32 * (char_w * 1.25)
-            };
-            2.0 * MENU_HPAD + label_w + hint_extra
+        .zip(items)
+        .map(|(&(label_w, hint_w), (_, hint))| {
+            let hint_extra = if hint.is_empty() { 0.0 } else { cm.px(MENU_LABEL_HINT_GAP) + hint_w };
+            2.0 * hpad + label_w + hint_extra
         })
-        .fold(MENU_W, f32::max);
+        .fold(cm.px(MENU_W), f32::max);
 
     // --- Theme-derived menu colors (mirrors panel.rs::build_panel) ---
     let tbg = theme.bg;
@@ -186,14 +190,16 @@ pub fn build_menu(
     };
 
     // Clamp so the full menu (plus border) stays on-screen.
-    let total_w = menu_w + BORDER * 2.0;
-    let total_h = menu_h + BORDER * 2.0;
+    let total_w = menu_w + border * 2.0;
+    let total_h = menu_h + border * 2.0;
     let mx = x.min(sw - total_w).max(0.0);
     let my = y.min(sh - total_h).max(0.0);
 
     // Content area (inside the border).
-    let cx = mx + BORDER;
-    let cy = my + BORDER;
+    let cx = mx + border;
+    let cy = my + border;
+    // Row-top Y for item `i` in content space (separator gaps included).
+    let row_y = |i: usize| row_y_in(i, sep_before) * cm.u;
 
     // Build item rects (also serve as hit-test rects).
     // Each rect sits at its visual row position; separator gaps are dead
@@ -202,9 +208,9 @@ pub fn build_menu(
     for i in 0..n_items {
         item_rects.push(Rect {
             x: cx,
-            y: cy + row_y_in(i, sep_before),
+            y: cy + row_y(i),
             w: menu_w,
-            h: ROW_H,
+            h: row_h,
             color: row_bg,
             ..Default::default()
         });
@@ -214,10 +220,10 @@ pub fn build_menu(
 
     // Outer border quad (a 2px halo around the content), rounded to bg+2 so the
     // halo width is uniform — matches panel/help/confirm.
-    quads.push(Rect::rounded(mx, my, total_w, total_h, border_col, 8.0));
+    quads.push(Rect::rounded(mx, my, total_w, total_h, border_col, cm.px(8.0)));
 
     // Background panel (rounded; hover rows stay sharp inside).
-    quads.push(Rect::rounded(cx, cy, menu_w, menu_h, menu_bg, 6.0));
+    quads.push(Rect::rounded(cx, cy, menu_w, menu_h, menu_bg, cm.px(6.0)));
 
     // Hover highlight quad (drawn on top of background, under labels). The top
     // and bottom rows get the bg's corner radius so the highlight doesn't square
@@ -225,12 +231,12 @@ pub fn build_menu(
     // never highlight (grayed rows are inert).
     if let Some(idx) = hovered {
         if idx < n_items && !disabled.contains(&idx) {
-            let radius = if idx == 0 || idx == n_items - 1 { 6.0 } else { 0.0 };
+            let radius = if idx == 0 || idx == n_items - 1 { cm.px(6.0) } else { 0.0 };
             quads.push(Rect {
                 x: cx,
-                y: cy + row_y_in(idx, sep_before),
+                y: cy + row_y(idx),
                 w: menu_w,
-                h: ROW_H,
+                h: row_h,
                 color: hover_col,
                 radius,
             });
@@ -240,11 +246,11 @@ pub fn build_menu(
     // Separator lines: a thin (1px) dim quad in the middle of each SEP_GAP,
     // inset by 10px on each side so it doesn't butt against the rounded corners.
     for &s in sep_before.iter().filter(|&&s| s > 0 && s < n_items) {
-        let sep_y = cy + row_y_in(s, sep_before) - SEP_GAP + (SEP_GAP - 1.0) * 0.5;
+        let sep_y = cy + row_y(s) - sep_gap + (sep_gap - 1.0) * 0.5;
         quads.push(Rect {
-            x: cx + 10.0,
+            x: cx + hpad,
             y: sep_y,
-            w: menu_w - 20.0,
+            w: menu_w - 2.0 * hpad,
             h: 1.0,
             color: sep_col,
             radius: 0.0,
@@ -255,17 +261,14 @@ pub fn build_menu(
     // Disabled rows draw the LABEL in the dim hint color too (grayed).
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
     for (i, &(name, hint)) in items.iter().enumerate() {
-        let label_y = cy + row_y_in(i, sep_before) + 7.0; // 7px from row top — matches original
+        let label_y = cy + row_y(i) + cm.px(7.0); // 7 design px from the row top
         let label_col = if disabled.contains(&i) { hint_col } else { text_col };
-        labels.push((name.to_string(), cx + 10.0, label_y, label_col));
+        labels.push((name.to_string(), cx + hpad, label_y, label_col));
 
         if !hint.is_empty() {
-            // Right-align the shortcut hint. Unicode glyph hints (⇧ ⌃) render
-            // wider than plain ASCII; use char_w * 1.25 so the reservation
-            // scales correctly on HiDPI (at scale 1, 9.8 * 1.25 ≈ 12.25 px —
-            // the same as the former hardcoded 12.0 estimate).
-            let hint_w = hint.chars().count() as f32 * (char_w * 1.25);
-            let hint_x = cx + menu_w - 10.0 - hint_w;
+            // Right-align the shortcut hint flush with the right padding, by its
+            // MEASURED width (the ⇧ ⌃ ⌘ glyphs are not one ASCII cell each).
+            let hint_x = cx + menu_w - hpad - measured[i].1;
             labels.push((hint.to_string(), hint_x, label_y, hint_col));
         }
     }
@@ -280,6 +283,7 @@ pub fn build_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::MonoMeasure;
 
     /// Use a real theme preset so the struct fields never need manual updating.
     fn theme() -> jetty_core::Theme {
@@ -288,10 +292,15 @@ mod tests {
 
     /// Scale-1 char advance used in tests (matches the historical 9.8 estimate).
     const TEST_CHAR_W: f32 = 9.8;
+    const CM: ChromeMetrics = ChromeMetrics::DEFAULT;
+
+    fn mono() -> MonoMeasure {
+        MonoMeasure(TEST_CHAR_W)
+    }
 
     #[test]
     fn exactly_six_item_rects() {
-        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), TEST_CHAR_W, &[]);
+        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
         assert_eq!(
             menu.item_rects.len(),
             6,
@@ -304,7 +313,7 @@ mod tests {
         // The separator is drawn as a quad in `quads`, NOT as an item_rect.
         // Verify that six item_rects exist and the gap between rect[3]
         // (Select All) and rect[4] (Clear) is positive (SEP_GAP wide).
-        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), TEST_CHAR_W, &[]);
+        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
         assert_eq!(menu.item_rects.len(), 6);
         let bottom_of_3 = menu.item_rects[3].y + menu.item_rects[3].h;
         let top_of_4 = menu.item_rects[4].y;
@@ -321,7 +330,10 @@ mod tests {
         // plus its hint would collide); the card must widen so the right-aligned
         // hint stays clear of the label.
         let big = 2.0 * TEST_CHAR_W;
-        let menu = build_context_menu(100.0, 100.0, 3000, 2000, None, &theme(), big, &[]);
+        let menu = build_context_menu(
+            100.0, 100.0, 3000, 2000, None, &theme(), &mut MonoMeasure(big),
+            ChromeMetrics::new(2.0, 16.0), &MENU_HINTS, &[],
+        );
         let label = menu.labels.iter().find(|l| l.0 == "Close Tab").expect("label");
         let hint = menu.labels.iter().find(|l| l.0 == "⇧⌃W").expect("hint");
         let label_right = label.1 + "Close Tab".chars().count() as f32 * big;
@@ -335,7 +347,7 @@ mod tests {
 
     #[test]
     fn hints_present_in_labels() {
-        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), TEST_CHAR_W, &[]);
+        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
         let texts: Vec<&str> = menu.labels.iter().map(|(t, ..)| t.as_str()).collect();
         // Each non-empty hint must appear as a label.
         for hint in MENU_HINTS.iter() {
@@ -351,7 +363,7 @@ mod tests {
 
     #[test]
     fn all_items_present_in_labels() {
-        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), TEST_CHAR_W, &[]);
+        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
         let texts: Vec<&str> = menu.labels.iter().map(|(t, ..)| t.as_str()).collect();
         for item in MENU_ITEMS.iter() {
             assert!(texts.contains(item), "item {:?} missing from labels", item);
@@ -365,7 +377,7 @@ mod tests {
         // the real card is wider than the MENU_W floor, so asserting against
         // the floor would silently stop describing the right edge).
         let (win_w, win_h) = (800u32, 600u32);
-        let menu = build_context_menu(790.0, 590.0, win_w, win_h, None, &theme(), TEST_CHAR_W, &[]);
+        let menu = build_context_menu(790.0, 590.0, win_w, win_h, None, &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
         // The outer border rect is the first quad; its size IS total_w/total_h.
         let outer = &menu.quads[0];
         assert!(
@@ -407,7 +419,7 @@ mod tests {
         // The separator gap between item[3] (Select All) and item[4] (Clear) must
         // be a dead zone — a click coordinate inside it should not fall within any
         // item_rect.
-        let menu = build_context_menu(50.0, 50.0, 1280, 800, None, &theme(), TEST_CHAR_W, &[]);
+        let menu = build_context_menu(50.0, 50.0, 1280, 800, None, &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
         assert_eq!(menu.item_rects.len(), 6);
 
         // The dead zone is the pixel band between bottom of rect[3] and top of rect[4].
@@ -430,7 +442,7 @@ mod tests {
         // The generic builder (used by the tab / detached context menus) emits
         // exactly one hit-rect per item, adjacent when no separator is passed.
         let items = [("Detach", "⇧⌃D"), ("Rename", ""), ("Close Tab", "⇧⌃W")];
-        let menu = build_menu(50.0, 50.0, 1280, 800, None, &theme(), TEST_CHAR_W, &items, &[], &[]);
+        let menu = build_menu(50.0, 50.0, 1280, 800, None, &theme(), &mut mono(), CM, &items, &[], &[]);
         assert_eq!(menu.item_rects.len(), 3);
         for pair in menu.item_rects.windows(2) {
             assert_eq!(
@@ -451,7 +463,7 @@ mod tests {
         let items = [("Reattach", "⇧⌃D"), ("Copy", "⇧⌃C"), ("Paste", "⇧⌃V")];
         for hovered in 0..items.len() {
             let menu = build_menu(
-                790.0, 590.0, 800, 600, Some(hovered), &theme(), TEST_CHAR_W, &items, &[], &[],
+                790.0, 590.0, 800, 600, Some(hovered), &theme(), &mut mono(), CM, &items, &[], &[],
             );
             // Quad order without separators: [0] border, [1] bg, [2] hover.
             let hover_quad = &menu.quads[2];
@@ -467,13 +479,13 @@ mod tests {
     fn legacy_menu_matches_generic_with_separator_at_4() {
         // build_context_menu is now a wrapper over build_menu; pin that the
         // separator layout (gap before item 4, "Clear") is preserved exactly.
-        let legacy = build_context_menu(100.0, 100.0, 1280, 800, Some(5), &theme(), TEST_CHAR_W, &[]);
+        let legacy = build_context_menu(100.0, 100.0, 1280, 800, Some(5), &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
         let items: Vec<(&str, &str)> = MENU_ITEMS
             .iter()
             .copied()
             .zip(MENU_HINTS.iter().copied())
             .collect();
-        let generic = build_menu(100.0, 100.0, 1280, 800, Some(5), &theme(), TEST_CHAR_W, &items, &[4], &[]);
+        let generic = build_menu(100.0, 100.0, 1280, 800, Some(5), &theme(), &mut mono(), CM, &items, &[4], &[]);
         assert_eq!(legacy.item_rects.len(), generic.item_rects.len());
         for (a, b) in legacy.item_rects.iter().zip(&generic.item_rects) {
             assert_eq!(a.y, b.y);
@@ -486,7 +498,7 @@ mod tests {
         // For each of the 6 items, the hover quad y must match the item rect y.
         // Quad order: [0] border, [1] bg, [2] hover, [3] separator.
         for hovered in 0..6 {
-            let menu = build_context_menu(50.0, 50.0, 1280, 800, Some(hovered), &theme(), TEST_CHAR_W, &[]);
+            let menu = build_context_menu(50.0, 50.0, 1280, 800, Some(hovered), &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
             let hover_quad = &menu.quads[2];
             let item = &menu.item_rects[hovered];
             assert_eq!(
@@ -505,7 +517,7 @@ mod tests {
         // index quads by position stay honest).
         let dis = [0usize, 2];
         let menu =
-            build_context_menu(50.0, 50.0, 1280, 800, Some(2), &theme(), TEST_CHAR_W, &dis);
+            build_context_menu(50.0, 50.0, 1280, 800, Some(2), &theme(), &mut mono(), CM, &MENU_HINTS, &dis);
         assert_eq!(
             menu.quads.len(),
             3,
@@ -513,7 +525,7 @@ mod tests {
         );
         // Compare label colors: disabled labels match the hint color of an
         // enabled row's hint (the dim lerp), enabled labels do not.
-        let enabled = build_context_menu(50.0, 50.0, 1280, 800, None, &theme(), TEST_CHAR_W, &[]);
+        let enabled = build_context_menu(50.0, 50.0, 1280, 800, None, &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
         let color_of = |m: &ContextMenu, text: &str| {
             m.labels.iter().find(|l| l.0 == text).map(|l| l.3).unwrap()
         };
@@ -523,8 +535,53 @@ mod tests {
         assert_ne!(color_of(&menu, "Paste"), dim_hint, "enabled Paste label stays bright");
         // An ENABLED row still highlights with the same disabled set present.
         let menu2 =
-            build_context_menu(50.0, 50.0, 1280, 800, Some(1), &theme(), TEST_CHAR_W, &dis);
+            build_context_menu(50.0, 50.0, 1280, 800, Some(1), &theme(), &mut mono(), CM, &MENU_HINTS, &dis);
         assert_eq!(menu2.quads.len(), 4, "enabled hover keeps its quad");
         assert_eq!(menu2.quads[2].y, menu2.item_rects[1].y);
+    }
+
+    #[test]
+    fn rows_scale_with_the_chrome_unit() {
+        // A 28pt UI font (u = 1.75) gets 49px rows, and every label's line box
+        // (ceil(font_px * 1.3)) stays inside its row instead of spilling into
+        // the next one (the fixed 28px rows did at >= ~21pt).
+        let cm = ChromeMetrics::new(1.0, 28.0);
+        let menu = build_context_menu(
+            10.0, 10.0, 2000, 2000, None, &theme(), &mut MonoMeasure(9.6 * cm.u), cm, &MENU_HINTS, &[],
+        );
+        let line_h = (16.0 * cm.u * 1.3).ceil();
+        for (i, r) in menu.item_rects.iter().enumerate() {
+            assert!((r.h - ROW_H * cm.u).abs() < 0.01, "row {i} not scaled");
+            let label = menu.labels.iter().find(|l| l.0 == MENU_ITEMS[i]).unwrap();
+            assert!(label.2 >= r.y && label.2 + line_h <= r.y + r.h + 0.5, "row {i} label spills");
+        }
+    }
+
+    #[test]
+    fn hints_right_align_flush_by_measured_width() {
+        // The hint's measured right edge sits exactly on the right padding — no
+        // more `chars * char_w * 1.25` guess leaving a ragged gap.
+        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
+        let card = menu.item_rects[0];
+        for hint in MENU_HINTS.iter().filter(|h| !h.is_empty()) {
+            let l = menu.labels.iter().find(|l| l.0 == *hint).unwrap();
+            let right = l.1 + mono().text_w(hint);
+            assert!((right - (card.x + card.w - MENU_HPAD)).abs() < 0.01, "{hint} not flush: {right}");
+        }
+    }
+
+    #[test]
+    fn caller_hints_replace_the_defaults() {
+        // The app feeds hints from the LIVE keymap (remaps, macOS ⌘ chords).
+        let hints = ["⌘C", "⌘V", "", "⌘A", "⌃L", "⌘W"];
+        let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), &mut mono(), CM, &hints, &[]);
+        let texts: Vec<&str> = menu.labels.iter().map(|l| l.0.as_str()).collect();
+        for h in hints.iter().filter(|h| !h.is_empty()) {
+            assert!(texts.contains(h), "{h} missing");
+        }
+        assert!(!texts.contains(&"⇧⌃C"), "default hint must not leak through");
+        // A short hint list reads as blank for the missing items.
+        let short = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), &mut mono(), CM, &["⇧⌃C"], &[]);
+        assert_eq!(short.labels.len(), 7, "6 labels + the one hint");
     }
 }

@@ -1,3 +1,4 @@
+use crate::chrome::{fit_head, ChromeMeasure, ChromeMetrics};
 use crate::Rect;
 
 /// Visual-effects parameters forwarded from `App.fx` (the `EffectsConfig`
@@ -374,16 +375,10 @@ const TAB_NAMES: [&str; 5] = ["Look", "Fonts", "Window", "Shell", "Effects"];
 /// unconditionally safe, and the GPU clips the offscreen quads/labels away.
 const OFF: f32 = 1.0e6;
 
-/// Fallback chrome-font character advance (px), used when a measured advance is
-/// not available. Passed in via the `char_w` parameter of `build_panel` on
-/// HiDPI-aware paths; matches the constant used in help.rs/tabbar.rs.
-/// Referenced by tests in this module; the `#[cfg(test)]` gating causes the
-/// compiler to warn about dead code in non-test builds, hence the allow.
-#[allow(dead_code)]
-/// Reference chrome cell advance (scale-1). `build_panel` lays out in LOGICAL
-/// space as if `char_w == CHAR_W_FALLBACK` and scales by `dpi = char_w /
-/// CHAR_W_FALLBACK`. Exposed so callers (e.g. the Effects-tab scroll clamp in
-/// app.rs) can express bounds in the SAME dpi units the panel consumes (F10).
+/// Reference chrome advance at the design size (16pt, 1×) — the monospace
+/// estimate the panel's label budgets were authored against, and the advance
+/// the unit tests measure with. The live panel MEASURES its labels (see
+/// `build_panel`'s `m`) and scales by the chrome unit, never by this.
 pub const CHAR_W_FALLBACK: f32 = 9.8;
 
 /// Settings-panel dimensions in logical px. The separate Settings OS window is
@@ -473,9 +468,9 @@ pub const EFFECTS_VISIBLE_H: f32 = PANEL_H - CONTENT_TOP_OFFSET - FOOTER_H;
 /// `active_tab` (0..=4) selects which group of bands is laid out; every other
 /// tab's widgets are positioned offscreen so hit-tests can never match them.
 ///
-/// `char_w` is the measured physical-pixel advance of one chrome-font character
-/// (from `TextLayer::cell_size().0`). Pass `CHAR_W_FALLBACK` (9.8) when a real
-/// measurement is not available (scale-1 fallback used by tests).
+/// `m` measures labels exactly as the settings text layer draws them, and `cm`
+/// is the settings window's chrome metrics (its DPI × the capped panel text
+/// size) — the panel's layout scale. See the HiDPI note in the body.
 #[allow(clippy::too_many_arguments)]
 pub fn build_panel(
     screen_w: u32,
@@ -524,7 +519,8 @@ pub fn build_panel(
     dx: f32,
     dy: f32,
     theme: &jetty_core::Theme,
-    char_w: f32,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
     // `shell_display`: the basename of the selected shell (e.g. "zsh"), or
     //   "System default" when the `shell` config key is empty. Drives the SHELL
     //   cycler band's centered name, mirroring `window_mode_name`.
@@ -558,24 +554,24 @@ pub fn build_panel(
 
     // ── HiDPI layout scale ────────────────────────────────────────────────────
     // The panel's window is created at a LOGICAL size (SETTINGS_WIN_* = PANEL_W/H
-    // + border) but `build_panel` receives the PHYSICAL surface size and a
-    // PHYSICAL, DPI-scaled chrome advance (`char_w`). Laying the fixed-px
-    // constants out directly against the physical surface leaves every control the
-    // designed logical size while the glyphs are `char_w` (≈scale×) wide, so text
-    // overflows its control on HiDPI. Instead we lay the whole panel out in a
-    // LOGICAL space — as if `char_w == CHAR_W_FALLBACK` — and scale the finished
-    // geometry by `dpi` on the way out, so controls/rows/text stay proportional at
-    // any DPI. `dpi` is recovered from the measured advance (the only scale signal
-    // available without a signature change); at scale 1 the tests pass
-    // `CHAR_W_FALLBACK`, so `dpi == 1.0` and every output below is byte-identical.
-    // NOTE: `char_w` is the CAPPED settings advance (jetty-app caps the panel body
-    // font to [13,17] pt), so for very large UI fonts the panel scales with the
-    // capped text, not the raw font — it stays bounded rather than filling more of
-    // its window. The settings window itself is sized in jetty-app (not editable
-    // here); this fix corrects the intra-panel proportions, which is the visible
-    // breakage. Physical inputs (drag, scroll) are converted to logical here.
-    let dpi = (char_w / CHAR_W_FALLBACK).max(0.1);
-    let char_w = CHAR_W_FALLBACK;
+    // + border) but `build_panel` receives the PHYSICAL surface size and draws
+    // PHYSICAL, DPI-scaled glyphs. Laying the fixed-px constants out directly
+    // against the physical surface would leave every control the designed logical
+    // size while the text is ≈scale× larger, so text would overflow its control
+    // on HiDPI. Instead we lay the whole panel out in a LOGICAL space and scale the
+    // finished geometry by `dpi` on the way out, so controls/rows/text stay
+    // proportional at any DPI. `dpi` is the chrome unit (window DPI × the CAPPED
+    // panel text size / 16 — jetty-app caps the panel body font to [13,17] pt, so
+    // for very large UI fonts the panel scales with the capped text and stays
+    // bounded). It used to be recovered from the font's measured 'M' advance,
+    // which inflated the whole panel ~1.5× for a proportional UI font; now the
+    // FONT only decides text widths (measured with `m`, converted to logical px by
+    // `tw`), never the layout scale. At 1×/16pt `dpi == 1.0` and the scale-out
+    // pass below is skipped. Physical inputs (drag, scroll) are converted to
+    // logical here.
+    let dpi = cm.u.max(0.1);
+    // Rendered width of a label in the panel's LOGICAL space.
+    let tw = |m: &mut dyn ChromeMeasure, s: &str| -> f32 { m.text_w(s) / dpi };
     let dx = dx / dpi;
     let dy = dy / dpi;
     let effects_scroll = effects_scroll / dpi;
@@ -778,14 +774,14 @@ pub fn build_panel(
     // Leading-aligned cells sized to their label (text + adaptive side padding),
     // sitting on a full-width hairline at py+76; the active tab carries a 2-px
     // accent underline exactly as wide as its label (+8) that meets the hairline.
-    let tab_names_chars: [f32; 5] = {
+    let tab_names_w: [f32; 5] = {
         let mut a = [0.0; 5];
         for (i, n) in TAB_NAMES.iter().enumerate() {
-            a[i] = n.chars().count() as f32;
+            a[i] = tw(m, n);
         }
         a
     };
-    let tabs_text_w: f32 = tab_names_chars.iter().map(|c| c * char_w).sum();
+    let tabs_text_w: f32 = tab_names_w.iter().sum();
     // Adaptive per-side cell padding: use the slack left of CW, capped to 14 px
     // so the strip stays leading-aligned (never stretches to fill).
     let tab_pad = ((CW - tabs_text_w) / 10.0).clamp(4.0, 14.0);
@@ -794,7 +790,7 @@ pub fn build_panel(
     {
         let mut cx = px + PAD - tab_pad; // first label still starts at px+PAD
         for (i, r) in tab_rects.iter_mut().enumerate() {
-            let cell_w = tab_names_chars[i] * char_w + 2.0 * tab_pad;
+            let cell_w = tab_names_w[i] + 2.0 * tab_pad;
             *r = Rect {
                 x: cx,
                 y: py + 44.0,
@@ -807,15 +803,11 @@ pub fn build_panel(
         }
     }
 
-    // Helper: right-align a text value against the content right edge.
-    let right_x = |text: &str| -> f32 {
-        let w = text.chars().count() as f32 * char_w;
-        px + PANEL_W - PAD - w
-    };
-    // Helper: center `text` inside [left, left+width].
-    let center_x = |text: &str, left: f32, width: f32| -> f32 {
-        left + (width - text.chars().count() as f32 * char_w) * 0.5
-    };
+    // Helper: right-align a value of measured width `w` against the content right
+    // edge.
+    let right_x = |w: f32| -> f32 { px + PANEL_W - PAD - w };
+    // Helper: center a label of measured width `w` inside [left, left+width].
+    let center_x = |w: f32, left: f32, width: f32| -> f32 { left + (width - w) * 0.5 };
 
     // ── Shared control constructors ──────────────────────────────────────────
     // Full-width slider: CAPS header + right value on line 1, a 4-px track with
@@ -1042,12 +1034,13 @@ pub fn build_panel(
     let (notify_failure_toggle, notify_failure_knob) = switch_at(t_notify_fail, notify.only_on_failure);
     let (notify_dur_body, notify_dur_prev, notify_dur_next) = cycler_at(t_notify_dur);
     let (auto_summon_toggle, auto_summon_knob) = switch_at(t_auto_summon, notify.auto_summon);
-    // Section-header hairline rule to the right of "Run & Notify" (7 chars wide
-    // header → account for its glyphs). Drawn only on the Shell tab (t is OFF else).
+    // Section-header hairline rule to the right of the measured "Run & Notify"
+    // header. Drawn only on the Shell tab (t is OFF else).
+    let notify_rule_x = px + PAD + tw(m, "Run & Notify") + 12.0;
     let notify_rule = Rect {
-        x: px + PAD + 12.0 * char_w + 12.0,
+        x: notify_rule_x,
         y: t_notify_hdr + 8.0,
-        w: ((px + PANEL_W - PAD) - (px + PAD + 12.0 * char_w + 12.0)).max(0.0),
+        w: ((px + PANEL_W - PAD) - notify_rule_x).max(0.0),
         h: 1.0,
         color: hairline,
         ..Default::default()
@@ -1091,17 +1084,23 @@ pub fn build_panel(
         mini_slider_at(rgb_b_x, t_fx_tint, effects.crt_scanline_tint[2]);
 
     // CRT animation toggle chips (band 9): Roll / Flicker / Jitter, right-aligned.
-    const CHIP_W: f32 = 72.0;
+    // One shared width that fits the widest MEASURED label with 10px a side
+    // (floored at the classic 72px), so "Flicker" never touches its chip edges.
+    const CHIP_W_MIN: f32 = 72.0;
     const CHIP_H: f32 = 24.0;
-    let chip_x2 = px + PANEL_W - PAD - CHIP_W;
-    let chip_x1 = chip_x2 - CHIP_W - 8.0;
-    let chip_x0 = chip_x1 - CHIP_W - 8.0;
+    let chip_w = ["Roll", "Flicker", "Jitter"]
+        .iter()
+        .map(|t| tw(m, t) + 20.0)
+        .fold(CHIP_W_MIN, f32::max);
+    let chip_x2 = px + PANEL_W - PAD - chip_w;
+    let chip_x1 = chip_x2 - chip_w - 8.0;
+    let chip_x0 = chip_x1 - chip_w - 8.0;
     let roll_col    = if effects.crt_animate_roll { accent_col } else { ctl_fill };
     let flicker_col = if effects.crt_flicker      { accent_col } else { ctl_fill };
     let jitter_col  = if effects.crt_jitter       { accent_col } else { ctl_fill };
-    let crt_roll_toggle    = Rect::rounded(chip_x0, t_fx_anim + 2.0, CHIP_W, CHIP_H, roll_col,    CHIP_H / 2.0);
-    let crt_flicker_toggle = Rect::rounded(chip_x1, t_fx_anim + 2.0, CHIP_W, CHIP_H, flicker_col, CHIP_H / 2.0);
-    let crt_jitter_toggle  = Rect::rounded(chip_x2, t_fx_anim + 2.0, CHIP_W, CHIP_H, jitter_col,  CHIP_H / 2.0);
+    let crt_roll_toggle    = Rect::rounded(chip_x0, t_fx_anim + 2.0, chip_w, CHIP_H, roll_col,    CHIP_H / 2.0);
+    let crt_flicker_toggle = Rect::rounded(chip_x1, t_fx_anim + 2.0, chip_w, CHIP_H, flicker_col, CHIP_H / 2.0);
+    let crt_jitter_toggle  = Rect::rounded(chip_x2, t_fx_anim + 2.0, chip_w, CHIP_H, jitter_col,  CHIP_H / 2.0);
 
     // Caret switches (bands 11, 12): caret_flash_enabled, caret_glow_enabled.
     let (caret_flash_toggle, caret_flash_knob) = switch_at(t_fx_flash, effects.caret_flash_enabled);
@@ -1146,8 +1145,7 @@ pub fn build_panel(
     });
     {
         let cell = &tab_rects[active_tab];
-        let text_w = tab_names_chars[active_tab] * char_w;
-        let bar_w = text_w + 8.0;
+        let bar_w = tab_names_w[active_tab] + 8.0;
         quads.push(Rect::rounded(
             cell.x + (cell.w - bar_w) * 0.5,
             py + 74.0,
@@ -1224,19 +1222,19 @@ pub fn build_panel(
     // are at their scrolled positions. The caller renders them with a hardware
     // scissor rect (`effects_viewport`) so overflow is GPU-clipped.
     if active_tab == 4 {
-        // Section hairlines beside the "CRT" / "Caret" headers.
-        let section_rule = |t: f32, chars: f32| -> Rect {
+        // Section hairlines beside the measured "CRT" / "Caret" headers.
+        let section_rule = |t: f32, header_w: f32| -> Rect {
             Rect {
-                x: track_x + chars * char_w + 12.0,
+                x: track_x + header_w + 12.0,
                 y: t + 8.0,
-                w: (px + PANEL_W - PAD) - (track_x + chars * char_w + 12.0),
+                w: (px + PANEL_W - PAD) - (track_x + header_w + 12.0),
                 h: 1.0,
                 color: hairline,
                 ..Default::default()
             }
         };
-        effects_quads.push(section_rule(t_fx_crt_hdr, 3.0));
-        effects_quads.push(section_rule(t_fx_caret_hdr, 5.0));
+        effects_quads.push(section_rule(t_fx_crt_hdr, tw(m, "CRT")));
+        effects_quads.push(section_rule(t_fx_caret_hdr, tw(m, "Caret")));
 
         effects_quads.push(crt_enabled_toggle);
         effects_quads.push(crt_en_knob);
@@ -1381,8 +1379,7 @@ pub fn build_panel(
     // the "active" signal), inactive tabs muted.
     for (i, name) in TAB_NAMES.iter().enumerate() {
         let cell = &tab_rects[i];
-        let text_w = tab_names_chars[i] * char_w;
-        let label_x = cell.x + (cell.w - text_w) * 0.5;
+        let label_x = cell.x + (cell.w - tab_names_w[i]) * 0.5;
         let col = if i == active_tab { text_main } else { text_header };
         labels.push((name.to_string(), label_x, tab_strip_y, col));
     }
@@ -1395,14 +1392,16 @@ pub fn build_panel(
         text_hint,
     ));
 
-    // Segment-glyph helpers (chevrons/steppers centered in their segments).
-    let seg_glyph_x = |seg_x: f32, seg_w: f32| seg_x + (seg_w - char_w) * 0.5;
+    // Segment-glyph helper: a chevron/stepper glyph centered in its segment.
+    let seg_glyph_x = |m: &mut dyn ChromeMeasure, glyph: &str, seg_x: f32, seg_w: f32| {
+        seg_x + (seg_w - tw(m, glyph)) * 0.5
+    };
 
     // OPACITY header — CAPS with right-aligned "97%" value.
     let pct = (opacity * 100.0).round() as i32;
     let pct_str = format!("{}%", pct);
     labels.push(("Opacity".to_string(), px + PAD, t_opacity, text_header));
-    labels.push((pct_str.clone(), right_x(&pct_str), t_opacity, text_main));
+    labels.push((pct_str.clone(), right_x(tw(m, &pct_str)), t_opacity, text_main));
 
     // CORNER RADIUS header — CAPS with right-aligned "Npx" value. Dimmed to the
     // hint color while fullscreen (the radius is suppressed at display time there),
@@ -1412,48 +1411,39 @@ pub fn build_panel(
     let cr_text = if fullscreen { text_hint } else { text_header };
     let cr_val_text = if fullscreen { text_hint } else { text_main };
     labels.push(("Corner radius".to_string(), px + PAD, t_radius, cr_text));
-    labels.push((radius_str.clone(), right_x(&radius_str), t_radius, cr_val_text));
+    labels.push((radius_str.clone(), right_x(tw(m, &radius_str)), t_radius, cr_val_text));
 
     // Helper: center a (possibly truncated) cycler value between its chevrons.
+    // The value is fitted to the gap by its MEASURED width (physical budget).
     let cycle_gap_left = cyc_x + CYC_SEG;
     let cycle_gap_w = CYC_W - 2.0 * CYC_SEG;
-    let cycle_max_chars = if char_w > 0.0 {
-        ((cycle_gap_w / char_w).floor() as usize).max(3)
-    } else {
-        11
-    };
-    let center_cycle = |name: &str| -> (String, f32) {
-        let shown: String = if name.chars().count() > cycle_max_chars {
-            let mut s: String = name.chars().take(cycle_max_chars - 1).collect();
-            s.push('…');
-            s
-        } else {
-            name.to_string()
-        };
-        let x = center_x(&shown, cycle_gap_left, cycle_gap_w)
+    let center_cycle = |m: &mut dyn ChromeMeasure, name: &str| -> (String, f32) {
+        let shown = fit_head(m, name, cycle_gap_w * dpi, false);
+        let x = center_x(tw(m, &shown), cycle_gap_left, cycle_gap_w)
             .clamp(cycle_gap_left, (cycle_gap_left + cycle_gap_w).max(cycle_gap_left));
         (shown, x)
     };
     // Emit one cycler's labels: chevrons + centered value on the control row.
-    let push_cycler_labels = |labels: &mut Vec<(String, f32, f32, [u8; 3])>,
-                                  t: f32,
-                                  value: &str| {
-        let (shown, name_x) = center_cycle(value);
+    let push_cycler_labels = |m: &mut dyn ChromeMeasure,
+                              labels: &mut Vec<(String, f32, f32, [u8; 3])>,
+                              t: f32,
+                              value: &str| {
+        let (shown, name_x) = center_cycle(m, value);
         labels.push((shown, name_x, t + 6.0, text_main));
-        labels.push(("<".to_string(), seg_glyph_x(cycle_prev_x, CYC_SEG), t + 6.0, text_btn));
-        labels.push((">".to_string(), seg_glyph_x(cycle_next_x, CYC_SEG), t + 6.0, text_btn));
+        labels.push(("<".to_string(), seg_glyph_x(m, "<", cycle_prev_x, CYC_SEG), t + 6.0, text_btn));
+        labels.push((">".to_string(), seg_glyph_x(m, ">", cycle_next_x, CYC_SEG), t + 6.0, text_btn));
     };
 
     // SUMMON EFFECT / WINDOW MODE / TAB BAR bands (Window) — CAPS headers with
     // the segmented cycler on the same row.
     labels.push(("Summon effect".to_string(), px + PAD, t_summon + 6.0, text_header));
-    push_cycler_labels(&mut labels, t_summon, summon_effect_name);
+    push_cycler_labels(m, &mut labels, t_summon, summon_effect_name);
     labels.push(("Window mode".to_string(), px + PAD, t_winmode + 6.0, text_header));
-    push_cycler_labels(&mut labels, t_winmode, window_mode_name);
+    push_cycler_labels(m, &mut labels, t_winmode, window_mode_name);
     labels.push(("Tab bar".to_string(), px + PAD, t_tabbar + 6.0, text_header));
-    push_cycler_labels(&mut labels, t_tabbar, tab_bar_name);
+    push_cycler_labels(m, &mut labels, t_tabbar, tab_bar_name);
     labels.push(("Scrollback lines".to_string(), px + PAD, t_scrollback + 6.0, text_header));
-    push_cycler_labels(&mut labels, t_scrollback, scrollback_name);
+    push_cycler_labels(m, &mut labels, t_scrollback, scrollback_name);
 
     // DROPDOWN HEIGHT band (Window) — CAPS header + right-aligned value.
     let dh_text = if is_dropdown { text_header } else { text_hint };
@@ -1461,37 +1451,38 @@ pub fn build_panel(
     let dh_pct = (dropdown_height_pct * 100.0).round() as i32;
     let dh_str = format!("{}%", dh_pct);
     labels.push(("Dropdown height".to_string(), px + PAD, t_droph, dh_text));
-    labels.push((dh_str.clone(), right_x(&dh_str), t_droph, dh_val_text));
+    labels.push((dh_str.clone(), right_x(tw(m, &dh_str)), t_droph, dh_val_text));
 
     // DROPDOWN WIDTH band (Window) — CAPS header + right-aligned value.
     let dw_pct = (dropdown_width_pct * 100.0).round() as i32;
     let dw_str = format!("{}%", dw_pct);
     labels.push(("Dropdown width".to_string(), px + PAD, t_dropw, dh_text));
-    labels.push((dw_str.clone(), right_x(&dw_str), t_dropw, dh_val_text));
+    labels.push((dw_str.clone(), right_x(tw(m, &dw_str)), t_dropw, dh_val_text));
 
     // AUTO-HIDE band (Window) — CAPS header; the switch itself is stateful.
     labels.push(("Auto-hide on focus loss".to_string(), px + PAD, t_autohide + 6.0, text_header));
 
     // Emit one stepper's labels: − / value / + / Reset.
-    let push_stepper_labels = |labels: &mut Vec<(String, f32, f32, [u8; 3])>,
-                                   t: f32,
-                                   value: &str| {
+    let push_stepper_labels = |m: &mut dyn ChromeMeasure,
+                               labels: &mut Vec<(String, f32, f32, [u8; 3])>,
+                               t: f32,
+                               value: &str| {
         labels.push((
             value.to_string(),
-            center_x(value, step_x + STEP_SEG, STEP_W - 2.0 * STEP_SEG),
+            center_x(tw(m, value), step_x + STEP_SEG, STEP_W - 2.0 * STEP_SEG),
             t + 6.0,
             text_main,
         ));
-        labels.push(("-".to_string(), seg_glyph_x(step_x, STEP_SEG), t + 6.0, text_btn));
+        labels.push(("-".to_string(), seg_glyph_x(m, "-", step_x, STEP_SEG), t + 6.0, text_btn));
         labels.push((
             "+".to_string(),
-            seg_glyph_x(step_x + STEP_W - STEP_SEG, STEP_SEG),
+            seg_glyph_x(m, "+", step_x + STEP_W - STEP_SEG, STEP_SEG),
             t + 6.0,
             text_btn,
         ));
         labels.push((
             "Reset".to_string(),
-            center_x("Reset", reset_x, RESET_W),
+            center_x(tw(m, "Reset"), reset_x, RESET_W),
             t + 6.0,
             text_btn,
         ));
@@ -1500,27 +1491,31 @@ pub fn build_panel(
     // FONT SIZE band (Fonts) — CAPS header + stepper with the "Npt" value inside.
     let fs_str = format!("{}pt", font_size.round() as i32);
     labels.push(("Font size".to_string(), px + PAD, t_fontsize + 6.0, text_header));
-    push_stepper_labels(&mut labels, t_fontsize, &fs_str);
+    push_stepper_labels(m, &mut labels, t_fontsize, &fs_str);
 
     // List-section header helper: CAPS header + n/total counter + ▲▼ arrows.
-    let push_list_header = |labels: &mut Vec<(String, f32, f32, [u8; 3])>,
-                                t: f32,
-                                title: &str,
-                                shown_to: usize,
-                                total: usize,
-                                overflows: bool| {
+    let push_list_header = |m: &mut dyn ChromeMeasure,
+                            labels: &mut Vec<(String, f32, f32, [u8; 3])>,
+                            t: f32,
+                            title: &str,
+                            shown_to: usize,
+                            total: usize,
+                            overflows: bool| {
         labels.push((title.to_string(), px + PAD, t, text_header));
         labels.push(("^".to_string(), arrow_up_x + 6.0, t + 2.0, text_btn));
         labels.push(("v".to_string(), arrow_dn_x + 6.0, t + 2.0, text_btn));
         if overflows {
             let hint = format!("{}/{}", shown_to, total);
-            let hint_w = hint.chars().count() as f32 * char_w;
+            let hint_w = tw(m, &hint);
             labels.push((hint, arrow_up_x - 10.0 - hint_w, t, text_hint));
         }
     };
+    // Family names are fitted to their row by MEASURED width (12px insets).
+    let family_name_w = (row_w - 24.0) * dpi;
 
     // FONT list (Fonts).
     push_list_header(
+        m,
         &mut labels,
         t_fontlist,
         "Font",
@@ -1533,13 +1528,7 @@ pub fn build_panel(
         if let Some(name) = families.get(family_idx) {
             let is_selected = name.as_str() == selected_family;
             let text_color: [u8; 3] = if is_selected { text_main } else { text_dim };
-            // Char-boundary-safe truncation (multibyte-safe).
-            let display = if name.chars().count() > 34 {
-                let truncated: String = name.chars().take(32).collect();
-                format!("{}…", truncated)
-            } else {
-                name.clone()
-            };
+            let display = fit_head(m, name, family_name_w, false);
             labels.push((display, row.x + 12.0, row.y + 4.0, text_color));
         }
     }
@@ -1547,9 +1536,10 @@ pub fn build_panel(
     // ── UI FONT section labels (Fonts) ──
     let ui_fs_str = format!("{}pt", ui_font_size.round() as i32);
     labels.push(("UI font size".to_string(), px + PAD, t_uifontsize + 6.0, text_header));
-    push_stepper_labels(&mut labels, t_uifontsize, &ui_fs_str);
+    push_stepper_labels(m, &mut labels, t_uifontsize, &ui_fs_str);
 
     push_list_header(
+        m,
         &mut labels,
         t_uifontlist,
         "UI font",
@@ -1567,34 +1557,24 @@ pub fn build_panel(
         };
         let is_selected = row_value == selected_ui_family;
         let text_color: [u8; 3] = if is_selected { text_main } else { text_dim };
-        let display = if name.chars().count() > 34 {
-            let truncated: String = name.chars().take(32).collect();
-            format!("{}…", truncated)
-        } else {
-            name.to_string()
-        };
+        let display = fit_head(m, name, family_name_w, false);
         labels.push((display, row.x + 12.0, row.y + 4.0, text_color));
     }
 
     // THEME band (Look) — CAPS header (+ scroll arrows/counter when open+overflow).
     labels.push(("Theme".to_string(), px + PAD, t_theme, text_header));
 
-    // Truncate a display name to fit the combo/row width (leaving room for swatches).
-    let fit_theme_name = |name: &str| -> String {
-        const MAX_CHARS: usize = 22;
-        if name.chars().count() > MAX_CHARS {
-            let s: String = name.chars().take(MAX_CHARS - 1).collect();
-            format!("{}…", s)
-        } else {
-            name.to_string()
-        }
-    };
+    // Fit a theme display name between its 12px left inset and the swatch strip
+    // (8px gap), by MEASURED width. Combo: the strip sits left of the caret;
+    // open-menu rows: the strip sits at the row's right edge.
+    let combo_name_w = ((combo_w - 20.0 - 10.0 - THEME_STRIP_W) - 12.0 - 8.0) * dpi;
+    let row_name_w = ((row_w - 10.0 - THEME_STRIP_W) - 12.0 - 8.0) * dpi;
 
     // Combo header label: active theme name (left) + ▼ / ▲ caret (right).
     {
         let active = jetty_core::theme_at(active_theme_idx);
         labels.push((
-            fit_theme_name(&active.display_name),
+            fit_head(m, &active.display_name, combo_name_w, false),
             theme_combo.x + 12.0,
             theme_combo.y + 7.0,
             text_main,
@@ -1614,20 +1594,20 @@ pub fn build_panel(
             let preset_idx = theme_offset + i;
             let name = jetty_core::theme_at(preset_idx).display_name;
             let col = if preset_idx == theme_idx { text_main } else { text_dim };
-            labels.push((fit_theme_name(&name), row.x + 12.0, row.y + 6.0, col));
+            labels.push((fit_head(m, &name, row_name_w, false), row.x + 12.0, row.y + 6.0, col));
         }
         if theme_has_scroll {
             labels.push(("^".to_string(), theme_scroll_up.x + 6.0, theme_scroll_up.y + 3.0, text_btn));
             labels.push(("v".to_string(), theme_scroll_down.x + 6.0, theme_scroll_down.y + 3.0, text_btn));
             let hint = format!("{}/{}", theme_offset + theme_visible, num_presets);
-            let hint_w = hint.chars().count() as f32 * char_w;
+            let hint_w = tw(m, &hint);
             labels.push((hint, arrow_up_x - 10.0 - hint_w, t_theme, text_hint));
         }
     }
 
     // SHELL band (Shell) — CAPS header + segmented cycler + helper line.
     labels.push(("Shell".to_string(), px + PAD, t_shell + 6.0, text_header));
-    push_cycler_labels(&mut labels, t_shell, shell_display);
+    push_cycler_labels(m, &mut labels, t_shell, shell_display);
     labels.push(("Applies to new tabs".to_string(), px + PAD, t_shell + 34.0, text_hint));
 
     // LAUNCH AT LOGIN band (Shell) — CAPS header + switch + helper line.
@@ -1659,7 +1639,7 @@ pub fn build_panel(
     } else {
         format!("{}s", notify.min_seconds)
     };
-    push_cycler_labels(&mut labels, t_notify_dur, &dur_name);
+    push_cycler_labels(m, &mut labels, t_notify_dur, &dur_name);
     labels.push(("Auto-summon when hidden".to_string(), px + PAD, t_auto_summon + 6.0, text_header));
 
     // ── Effects-tab labels (into effects_labels; empty when tab ≠ 4) ────────
@@ -1682,7 +1662,7 @@ pub fn build_panel(
                 effects_labels.push(($label.to_string(), px + PAD, $band_y, text_header));
                 let pct = ($val * 100.0).round() as i32;
                 let pct_str = format!("{}%", pct);
-                effects_labels.push((pct_str.clone(), right_x(&pct_str), $band_y, text_main));
+                effects_labels.push((pct_str.clone(), right_x(tw(m, &pct_str)), $band_y, text_main));
             };
         }
         fx_slider_label!("Curvature", t_fx_curv,     effects.crt_curvature);
@@ -1708,7 +1688,7 @@ pub fn build_panel(
             let col = if on { on_accent } else { text_btn };
             effects_labels.push((
                 txt.to_string(),
-                center_x(txt, chip.x, chip.w),
+                center_x(tw(m, txt), chip.x, chip.w),
                 chip.y + 4.0,
                 col,
             ));
@@ -1722,7 +1702,7 @@ pub fn build_panel(
         effects_labels.push(("Flash (ms)".to_string(), px + PAD, t_fx_dur, text_header));
         {
             let ms_str = format!("{}ms", effects.caret_flash_ms.round() as i32);
-            effects_labels.push((ms_str.clone(), right_x(&ms_str), t_fx_dur, text_main));
+            effects_labels.push((ms_str.clone(), right_x(tw(m, &ms_str)), t_fx_dur, text_main));
         }
 
         // CARET flash-color RGB triple (band 14): section header + R/G/B sub-labels.
@@ -1889,6 +1869,7 @@ pub fn build_panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::MonoMeasure;
 
     /// Build a panel view with representative inputs for the given active tab.
     fn panel_tab(screen_w: u32, screen_h: u32, active_tab: usize) -> PanelView {
@@ -1947,7 +1928,8 @@ mod tests {
             0,               // ui_font_scroll_offset
             0.0, 0.0,        // dx, dy
             &theme,
-            CHAR_W_FALLBACK, // char_w (scale-1 default for tests)
+            &mut MonoMeasure(CHAR_W_FALLBACK), // scale-1 monospace measurer
+            ChromeMetrics::DEFAULT,
             "zsh",           // shell_display
             &NotifyParams::default(), // Run & Notify (defaults: on, 10s, all, no summon)
             active_tab,
@@ -1963,11 +1945,11 @@ mod tests {
         panel_tab(screen_w, screen_h, 0)
     }
 
-    /// Build a panel with an explicit chrome advance (drives the HiDPI layout
-    /// scale) so the DPI path can be exercised. `char_w == CHAR_W_FALLBACK` is
-    /// scale 1; `2×CHAR_W_FALLBACK` on a 2× surface must reproduce the scale-1
-    /// layout scaled by exactly 2.
-    fn panel_scaled(screen_w: u32, screen_h: u32, char_w: f32, active_tab: usize) -> PanelView {
+    /// Build a panel at an explicit chrome scale so the DPI path can be
+    /// exercised. `scale == 1.0` is the design baseline; a 2× scale (with a 2×
+    /// glyph advance) on a 2× surface must reproduce the scale-1 layout scaled
+    /// by exactly 2.
+    fn panel_scaled(screen_w: u32, screen_h: u32, scale: f32, active_tab: usize) -> PanelView {
         let theme = jetty_core::Theme::by_name("catppuccin_mocha");
         let families: Vec<String> = vec!["JetBrains Mono".to_string(), "Fira Code".to_string()];
         let ui_families: Vec<String> =
@@ -1976,7 +1958,8 @@ mod tests {
             screen_w, screen_h, 0.97, 0, 15.0, &families, "JetBrains Mono", 0, 8.0,
             // …, is_dropdown, FULLSCREEN, focus_autohide, launch_at_login, …
             "Phosphor", "Dropdown", "Top", "10k", 0.5, 0.7, true, false, false, false, 18.0,
-            &ui_families, "", 0, 0.0, 0.0, &theme, char_w, "zsh",
+            &ui_families, "", 0, 0.0, 0.0, &theme,
+            &mut MonoMeasure(CHAR_W_FALLBACK * scale), ChromeMetrics::new(scale, 16.0), "zsh",
             &NotifyParams::default(), active_tab,
             &EffectsParams::default(), 0.0, false, 0,
         )
@@ -2011,8 +1994,8 @@ mod tests {
         // exactly twice the scale-1 layout — proving every quad/label/hit-rect is
         // scaled (a missed field would break proportionality on HiDPI only).
         for tab in 0..5 {
-            let one = panel_scaled(1200, 900, CHAR_W_FALLBACK, tab);
-            let two = panel_scaled(2400, 1800, 2.0 * CHAR_W_FALLBACK, tab);
+            let one = panel_scaled(1200, 900, 1.0, tab);
+            let two = panel_scaled(2400, 1800, 2.0, tab);
             assert_eq!(one.quads.len(), two.quads.len());
             for (a, b) in one.quads.iter().zip(&two.quads) {
                 assert!((b.x - 2.0 * a.x).abs() < 1e-2, "quad x not 2× at tab {tab}");
@@ -2060,7 +2043,7 @@ mod tests {
         // forcing a small tile): the scissor rect must stay within the surface or
         // be skipped, never exceeding it (which would panic wgpu validation).
         for (w, h) in [(600u32, 400u32), (300, 200), (420, 120), (1000, 700)] {
-            let pv = panel_scaled(w, h, CHAR_W_FALLBACK, 4);
+            let pv = panel_scaled(w, h, 1.0, 4);
             if let Some([vx, vy, vw, vh]) = pv.effects_viewport {
                 assert!(vx + vw <= w, "scissor right {} > surface {w}", vx + vw);
                 assert!(vy + vh <= h, "scissor bottom {} > surface {h}", vy + vh);

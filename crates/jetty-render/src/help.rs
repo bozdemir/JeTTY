@@ -1,3 +1,4 @@
+use crate::chrome::{fit_head, ChromeMeasure, ChromeMetrics};
 use crate::Rect;
 
 /// The keyboard-shortcut rows shown in the Help overlay — ONE binding per line
@@ -78,14 +79,15 @@ enum HelpEntry {
 /// `win_w`×`win_h` (physical pixels). The panel is sized to fit the rows and
 /// clamped on-screen. A click outside `panel` (or Esc / the "?" button) closes it.
 ///
-/// `char_w` is the measured physical-pixel advance of one chrome-font character
-/// (from `TextLayer::cell_size().0`). Pass `9.8` when a real measurement is not
-/// available (scale-1 fallback used by tests).
+/// `m` measures every key/description/header exactly as the chrome layer draws
+/// it (so the description column aligns and the panel fits for any UI font);
+/// `cm` scales the vertical rhythm and paddings with DPI × UI font.
 pub fn build_help_overlay(
     win_w: u32,
     win_h: u32,
     theme: &jetty_core::Theme,
-    char_w: f32,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
     rows: &[String],
 ) -> HelpOverlay {
     let sw = win_w as f32;
@@ -116,9 +118,6 @@ pub fn build_help_overlay(
     let key_col = tfg;
     let desc_col = lerp(0.60);
 
-    // The caller supplies the measured chrome-font advance via `char_w`.
-    // On scale-1 displays this is ~9.8px (the historical hardcoded estimate);
-    // on HiDPI it scales proportionally so the panel is always wide enough.
     // Ideal vertical metrics. When the window is too SHORT to fit every row, the
     // padding / title / row heights are scaled DOWN proportionally (to a readable
     // floor) so the overlay always fits and no row clips off-screen.
@@ -155,51 +154,35 @@ pub fn build_help_overlay(
             }
         })
         .collect();
-    // Column metrics (in characters): the key column is as wide as the widest
-    // key so every description lines up in a second column; headers/title only
-    // constrain the overall width.
-    let key_chars = entries
-        .iter()
-        .filter_map(|e| match e {
-            HelpEntry::Item(k, _) => Some(k.chars().count()),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0) as f32;
-    let desc_chars = entries
-        .iter()
-        .filter_map(|e| match e {
-            HelpEntry::Item(_, d) => Some(d.chars().count()),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0) as f32;
-    let header_chars = entries
-        .iter()
-        .filter_map(|e| match e {
-            HelpEntry::Header(h) => Some(h.chars().count()),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0) as f32;
-    // Gap between the key and description columns.
-    let col_gap = 2.5 * char_w;
-    let key_col_w = key_chars * char_w;
-    let desc_x_off = key_col_w + col_gap;
-    let two_col_chars = key_chars + 2.5 + desc_chars;
-    let content_w = two_col_chars
-        .max(header_chars)
-        .max("Keyboard Shortcuts".chars().count() as f32)
-        * char_w;
+    // Column metrics (MEASURED as drawn): the key column is as wide as the
+    // widest key so every description lines up in a second column;
+    // headers/title only constrain the overall width.
+    let mut key_w = 0.0f32;
+    let mut desc_w = 0.0f32;
+    let mut header_w = 0.0f32;
+    for e in &entries {
+        match e {
+            HelpEntry::Item(k, d) => {
+                key_w = key_w.max(m.text_w(k));
+                desc_w = desc_w.max(m.text_w(d));
+            }
+            HelpEntry::Header(h) => header_w = header_w.max(m.text_w(h)),
+            HelpEntry::Spacer => {}
+        }
+    }
+    // Gap between the key and description columns (2.5 chrome chars).
+    let col_gap = cm.px(2.5 * 9.6);
+    let desc_x_off = key_w + col_gap;
+    let content_w = (desc_x_off + desc_w)
+        .max(header_w)
+        .max(m.text_w("Keyboard Shortcuts"));
 
-    // The vertical / padding metrics are FIXED logical px, but the chrome line box
-    // is `ceil(font_size * 1.3)` with `font_size = ui_font_logical * scale`, so it
-    // grows with DPI just like `char_w` does. Scale every vertical metric (ideals
-    // AND floors) by the same factor the text uses — `char_w` relative to the
-    // ~9.8px scale-1 advance — so rows never overlap their neighbour on a 2×
-    // display. At scale 1 (`char_w ≈ 9.8`) `vscale == 1` and the layout is
-    // unchanged.
-    let vscale = (char_w / 9.8).max(0.1);
+    // The vertical / padding metrics are design px, but the chrome line box is
+    // `ceil(font_size * 1.3)` with `font_size = ui_font_logical * scale`, so it
+    // grows with DPI and the UI font. Scale every vertical metric (ideals AND
+    // floors) by the same chrome unit the text uses so rows never overlap their
+    // neighbour on a 2× display or at a large UI font. At 1×/16pt `vscale == 1`.
+    let vscale = cm.u;
     let pad_ideal = PAD_IDEAL * vscale;
     let title_h_ideal = TITLE_H_IDEAL * vscale;
     let row_h_ideal = ROW_H_IDEAL * vscale;
@@ -237,12 +220,19 @@ pub fn build_help_overlay(
 
     // Ideal width fits the content with full padding; clamp to the window with a
     // margin. If the window is narrower, reduce padding (down to MIN_PAD) so the
-    // text still sits inside the border instead of overflowing. The HARD floor is
-    // content + 2*MIN_PAD: text-inside-the-border wins over staying on-screen, so
-    // for an absurdly narrow window the panel keeps its text (and is simply
-    // clamped to x>=0), never clipping a row.
+    // text still sits inside the border instead of overflowing. If even that
+    // can't fit (a large UI font, a narrow window), the long DESCRIPTIONS (and
+    // headers/title) are ellipsized to the room left inside the window — the key
+    // column is never cut, it is the information. Only when not even the keys
+    // fit is the panel allowed past the window (clamped to x>=0): text inside
+    // the border wins over staying on-screen, so no row is ever clipped.
     const MARGIN: f32 = 16.0;
     let max_panel_w = (sw - MARGIN * 2.0).max(0.0);
+    let fit_w = max_panel_w - min_pad * 2.0;
+    let desc_room = fit_w - desc_x_off;
+    // Squeeze only while a description keeps room for a few characters.
+    let squeeze = content_w > fit_w && desc_room >= 4.0 * col_gap / 2.5;
+    let content_w = if squeeze { fit_w } else { content_w };
     let min_panel_w = content_w + min_pad * 2.0;
     let ideal_w = content_w + pad_ideal * 2.0;
     // Prefer ideal, clamp down toward the window, but never below the hard floor.
@@ -270,9 +260,14 @@ pub fn build_help_overlay(
 
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
 
+    // Squeezed layout: ellipsize to the room inside the window (see above).
+    let fit = |m: &mut dyn ChromeMeasure, s: &str, room: f32| -> String {
+        if squeeze { fit_head(m, s, room, false) } else { s.to_string() }
+    };
+
     // Title.
     labels.push((
-        "Keyboard Shortcuts".to_string(),
+        fit(m, "Keyboard Shortcuts", content_w),
         px + pad_x,
         py + pad_top,
         title_col,
@@ -287,7 +282,7 @@ pub fn build_help_overlay(
         match e {
             HelpEntry::Spacer => {}
             HelpEntry::Header(h) => {
-                labels.push((h.clone(), px + pad_x, y, header_col));
+                labels.push((fit(m, h, content_w), px + pad_x, y, header_col));
                 // A thin, subtle accent rule under each header crisply separates
                 // the sections (drawn on the panel, beneath the row text).
                 let rule_y = (y + row_h * 0.9).round();
@@ -303,7 +298,7 @@ pub fn build_help_overlay(
             HelpEntry::Item(key, desc) => {
                 labels.push((key.clone(), px + pad_x, y, key_col));
                 if !desc.is_empty() {
-                    labels.push((desc.clone(), px + pad_x + desc_x_off, y, desc_col));
+                    labels.push((fit(m, desc, desc_room), px + pad_x + desc_x_off, y, desc_col));
                 }
             }
         }
@@ -315,6 +310,7 @@ pub fn build_help_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::MonoMeasure;
 
     fn theme() -> jetty_core::Theme {
         jetty_core::Theme::by_name("catppuccin_mocha")
@@ -323,9 +319,15 @@ mod tests {
     /// Scale-1 char advance used in tests (matches the historical fallback constant).
     const TEST_CHAR_W: f32 = 9.8;
 
+    const CM: ChromeMetrics = ChromeMetrics::DEFAULT;
+
+    fn mono() -> MonoMeasure {
+        MonoMeasure(TEST_CHAR_W)
+    }
+
     #[test]
     fn panel_is_centered_and_on_screen() {
-        let h = build_help_overlay(1000, 700, &theme(), TEST_CHAR_W, &default_help_rows());
+        let h = build_help_overlay(1000, 700, &theme(), &mut mono(), CM, &default_help_rows());
         assert!(h.panel.x >= 0.0 && h.panel.y >= 0.0);
         assert!(h.panel.x + h.panel.w <= 1000.0 + 0.5);
         assert!(h.panel.y + h.panel.h <= 700.0 + 0.5);
@@ -340,10 +342,10 @@ mod tests {
     fn every_row_text_fits_inside_panel() {
         // Across a range of widths (including very narrow), no row's estimated
         // rendered text right edge may exceed the panel's right border.
-        // The estimate uses the same char_w passed to the builder so the panel
-        // is always sized to contain the text.
+        // The estimate uses the same advance the test measurer uses, so the
+        // panel is always sized to contain the text.
         for w in [320u32, 500, 700, 1000, 1600] {
-            let h = build_help_overlay(w, 700, &theme(), TEST_CHAR_W, &default_help_rows());
+            let h = build_help_overlay(w, 700, &theme(), &mut mono(), CM, &default_help_rows());
             let panel_right = h.panel.x + h.panel.w;
             for (text, x, _y, _c) in &h.labels {
                 let est_right = x + text.chars().count() as f32 * TEST_CHAR_W;
@@ -360,7 +362,7 @@ mod tests {
         // At short window heights the overlay must still fit every row on-screen
         // (the lower rows must not clip off the bottom of the window).
         for h in [360u32, 420, 480, 640] {
-            let overlay = build_help_overlay(700, h, &theme(), TEST_CHAR_W, &default_help_rows());
+            let overlay = build_help_overlay(700, h, &theme(), &mut mono(), CM, &default_help_rows());
             // The panel itself fits the window.
             assert!(
                 overlay.panel.y >= 0.0 && overlay.panel.y + overlay.panel.h <= h as f32 + 0.5,
@@ -392,7 +394,7 @@ mod tests {
         // (2·8 + 22 + 37·16 ≈ 630px) need ~660px before the last-resort pitch
         // tightening kicks in. 660 is the smallest clear of that.
         for h in [660u32, 760, 900, 1100] {
-            let overlay = build_help_overlay(700, h, &theme(), TEST_CHAR_W, &default_help_rows());
+            let overlay = build_help_overlay(700, h, &theme(), &mut mono(), CM, &default_help_rows());
             // labels[0] is the title; labels[1..] are the row labels. An item emits
             // a key AND a description label at the SAME y (side-by-side columns),
             // so collapse consecutive equal-y labels to get the distinct row pitch.
@@ -418,10 +420,34 @@ mod tests {
 
     #[test]
     fn lists_core_bindings() {
-        let h = build_help_overlay(1000, 700, &theme(), TEST_CHAR_W, &default_help_rows());
+        let h = build_help_overlay(1000, 700, &theme(), &mut mono(), CM, &default_help_rows());
         let joined: String = h.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("F9"));
         assert!(joined.contains("Ctrl+Shift+P"));
         assert!(joined.contains("Ctrl+D"));
+    }
+
+    #[test]
+    fn large_ui_font_ellipsizes_descriptions_into_the_window() {
+        // A 28pt UI font in a 1000px window: the content is wider than the
+        // window, so descriptions are ellipsized to fit — the panel and every
+        // label stay inside the window instead of running off its right edge.
+        let cm = ChromeMetrics::new(1.0, 28.0);
+        let mut m = MonoMeasure(9.6 * cm.u);
+        let h = build_help_overlay(1000, 900, &theme(), &mut m, cm, &default_help_rows());
+        assert!(h.panel.x >= 0.0 && h.panel.x + h.panel.w <= 1000.0 + 0.5, "panel past the window");
+        for (text, x, _y, _c) in &h.labels {
+            let right = x + m.text_w(text);
+            assert!(right <= h.panel.x + h.panel.w + 0.5, "{text:?} overflows: {right}");
+        }
+        assert!(h.labels.iter().any(|l| l.0.ends_with('…')), "long descriptions are ellipsized");
+        // Keys are never cut.
+        assert!(h.labels.iter().any(|l| l.0 == "Ctrl+Tab / Ctrl+Shift+Tab"));
+    }
+
+    #[test]
+    fn wide_window_keeps_full_descriptions() {
+        let h = build_help_overlay(1600, 1200, &theme(), &mut mono(), CM, &default_help_rows());
+        assert!(h.labels.iter().all(|l| !l.0.ends_with('…')), "nothing to squeeze at 1600px");
     }
 }

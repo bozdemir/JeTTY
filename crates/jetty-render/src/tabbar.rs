@@ -1,69 +1,38 @@
+use crate::chrome::{fit_head, fit_tail, ChromeMeasure, ChromeMetrics, MonoMeasure};
 use crate::Rect;
 use jetty_core::Theme;
-use unicode_width::UnicodeWidthChar;
 
-/// Display cells a char occupies in the bar (wide CJK/emoji = 2). Titles are
-/// shell-controlled (OSC 0/2) and chrome shaping falls back across fonts, so
-/// truncation must count cells, not chars — a char count lets wide glyphs
-/// overflow the tab pill.
-fn cell_width(c: char) -> usize {
-    c.width().unwrap_or(0)
-}
+// Every distance below is a DESIGN px — authored for the default 16pt UI font on
+// a 1× display — and is multiplied by the window's chrome unit
+// (`ChromeMetrics::u` = DPI × UI font / 16) when the bar is built. So the strip,
+// its pills and its hit-boxes grow with the text they hold: at a 28pt UI font or
+// on a 2× display the bar is no longer a fixed 36px strip the glyphs spill out
+// of. At 1× with the default font every value is used verbatim.
 
-/// Total display cells of `s`.
-fn display_cells(s: &str) -> usize {
-    s.chars().map(cell_width).sum()
-}
-
-/// Longest prefix of `s` that fits in `max` display cells.
-fn take_cells(s: &str, max: usize) -> String {
-    let mut used = 0;
-    let mut out = String::new();
-    for c in s.chars() {
-        let w = cell_width(c);
-        if used + w > max {
-            break;
-        }
-        used += w;
-        out.push(c);
-    }
-    out
-}
-
-/// Longest suffix of `s` that fits in `max` display cells (rename keeps the tail
-/// so the caret stays visible).
-fn tail_cells(s: &str, max: usize) -> String {
-    let mut used = 0;
-    let mut start = s.len();
-    for (i, c) in s.char_indices().rev() {
-        let w = cell_width(c);
-        if used + w > max {
-            break;
-        }
-        used += w;
-        start = i;
-    }
-    s[start..].to_string()
-}
-
-/// Height of the tab bar in physical pixels. The terminal grid is offset down by
-/// this amount; pixel↔cell math for the main grid subtracts it.
+/// Design height of the tab bar. The live height is [`ChromeMetrics::bar_h`]
+/// (this × the chrome unit, rounded); the terminal grid starts right below it.
 pub const TABBAR_H: f32 = 36.0;
 
-/// Width of a single tab in physical pixels.
+/// Width of a single tab.
 const TAB_W: f32 = 140.0;
 /// Width of the "+" new-tab button.
 const PLUS_W: f32 = 32.0;
 /// Size of the "×" close hit box at the right of each tab.
 const CLOSE_W: f32 = 18.0;
 /// Width of each window-control button (minimize/maximize/close) on the right.
-const CTRL_W: f32 = 28.0;
-/// Total width reserved on the right of the strip for the controls. Left→right:
+/// Live: [`ChromeMetrics::ctrl_w`].
+pub(crate) const CTRL_W_BASE: f32 = 28.0;
+/// Design width reserved on the right of the strip for the controls. Left→right:
 /// Help "?", Settings "⚙", minimize "─", maximize "▢", close "✕" — five cells.
-pub const CONTROLS_W: f32 = CTRL_W * 5.0;
+/// Live: [`ChromeMetrics::controls_w`].
+pub const CONTROLS_W: f32 = CTRL_W_BASE * 5.0;
 /// Inset of the whole tab strip from the window's left/right edges, so tabs and
 /// the window controls don't sit flush against the rounded window corners.
+/// A window-SHAPE distance: live value [`ChromeMetrics::strip_pad`] (DPI-scaled
+/// like the corner radius, not UI-font-scaled).
 pub const STRIP_PAD: f32 = 8.0;
+/// Top inset of every one-line label inside the bar (the glyph box's top).
+const LABEL_Y: f32 = 9.0;
 
 /// Unseen activity on a tab, shown as a small themed dot on INACTIVE tabs.
 /// `Output` = PTY output arrived while the tab was inactive (accent dot);
@@ -116,32 +85,34 @@ pub struct TabBar {
     pub close_rect: Rect,
 }
 
-/// Build the tab bar across the top of the window.
-///
-/// `tabs` is `(title, is_active)` per tab in order; `theme` supplies colors so
-/// the bar matches the active terminal theme. The active tab is highlighted with
-/// the theme accent (palette blue); inactive tabs are dimmer.
-///
-/// `renaming` is `Some((idx, buf))` when tab `idx` is being renamed inline; that
-/// tab shows `buf` plus a trailing caret and a highlighted background instead of
-/// its stored title. `ctrl_hover` selects which window-control button is drawn
-/// highlighted (close hover reads red).
+/// Build the tab bar across the top of the window at the design baseline (1×,
+/// 16pt UI font, monospace advance). Tests and fixed-size harnesses only — the
+/// app calls [`build_tab_bar_ex`] with its real metrics and text measurer.
 pub fn build_tab_bar(width: u32, tabs: &[(String, bool)], theme: &Theme) -> TabBar {
-    build_tab_bar_ex(width, tabs, theme, None, CtrlHover::None, None, CHROME_CHAR_W, &[])
+    build_tab_bar_ex(
+        width,
+        tabs,
+        theme,
+        None,
+        CtrlHover::None,
+        None,
+        &mut MonoMeasure(CHROME_CHAR_W),
+        ChromeMetrics::DEFAULT,
+        &[],
+    )
 }
 
-/// Fallback chrome-font advance per character (physical px), used when the
-/// caller does not have a measured advance available (e.g. `build_tab_bar` thin
-/// wrapper and legacy call sites). The real measured value is threaded in via the
-/// `char_w` parameter of `build_tab_bar_ex` on HiDPI-aware paths.
+/// Advance of the default monospace chrome font at the design size (MesloLGS NF
+/// at 16px). Only used by the [`build_tab_bar`] baseline wrapper.
 const CHROME_CHAR_W: f32 = 9.6;
-/// Gap (px) between the perf HUD's left edge and the nearest tab/+button, so the
-/// reserved area never visually touches the tabs.
+/// Gap (design px) between the perf HUD's left edge and the nearest tab/+button,
+/// so the reserved area never visually touches the tabs.
 const PERF_GAP: f32 = 16.0;
-/// Comfortable PER-TAB width (px) the perf HUD must NOT push tabs below. The HUD
-/// is the lowest-priority strip element: if reserving its width would shrink each
-/// tab beneath this (≈6 title chars), the HUD is HIDDEN and the tabs get the full
-/// area instead (so several tabs in a narrowish window never squash to "T…×").
+/// Comfortable PER-TAB width (design px) the perf HUD must NOT push tabs below.
+/// The HUD is the lowest-priority strip element: if reserving its width would
+/// shrink each tab beneath this (≈6 title chars), the HUD is HIDDEN and the tabs
+/// get the full area instead (so several tabs in a narrowish window never squash
+/// to "T…×").
 const PERF_MIN_TAB_W: f32 = 110.0;
 
 /// Extended tab-bar builder with inline-rename, window-control hover state, and
@@ -153,10 +124,11 @@ const PERF_MIN_TAB_W: f32 = 110.0;
 /// HUD without squeezing the tabs below a sane minimum, the HUD is HIDDEN and the
 /// tab layout is identical to the no-HUD case. `None` shows no HUD.
 ///
-/// `char_w` is the measured physical-pixel advance of one chrome-font character
-/// (from `TextLayer::cell_size().0`). Pass `CHROME_CHAR_W` (9.6) when a real
-/// measurement is not available (scale-1 fallback used by tests and the thin
-/// `build_tab_bar` wrapper).
+/// `m` measures labels exactly as the chrome text pass renders them (titles in
+/// the title family), so title truncation, the rename caret and the HUD
+/// reservation are right for any UI font. `cm` sizes the whole strip. The hit
+/// geometry (tab/close/plus/control rects) depends only on `width`, the tab
+/// count and `cm` — never on text — so a hit-test rebuild may pass any measurer.
 ///
 /// `activity` is index-aligned with `tabs` (missing indices read as `None`);
 /// inactive tabs with activity get a small themed dot in the title gutter and
@@ -170,11 +142,17 @@ pub fn build_tab_bar_ex(
     renaming: Option<(usize, &str)>,
     ctrl_hover: CtrlHover,
     perf: Option<&str>,
-    char_w: f32,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
     activity: &[TabActivity],
 ) -> TabBar {
     let sw = width as f32;
-    let h = TABBAR_H;
+    let h = cm.bar_h();
+    let label_y = cm.px(LABEL_Y);
+    let tab_w_max = cm.px(TAB_W);
+    let plus_w = cm.px(PLUS_W);
+    let close_w = cm.px(CLOSE_W);
+    let ctrl_w = cm.ctrl_w();
 
     // Theme-derived colors.
     let bg = [theme.bg[0], theme.bg[1], theme.bg[2], 255];
@@ -227,12 +205,12 @@ pub fn build_tab_bar_ex(
     quads.push(Rect { x: 0.0, y: 0.0, w: sw, h, color: bg, ..Default::default() });
 
     // Tabs are laid out from `left` (inset from the window edge) and must never
-    // overlap the window controls parked at the right (also inset by STRIP_PAD).
-    // `tab_area_x` is the absolute x where the controls begin — the right
+    // overlap the window controls parked at the right (also inset by the strip
+    // pad). `tab_area_x` is the absolute x where the controls begin — the right
     // boundary for the tabs and the "+" button.
-    let left = STRIP_PAD;
+    let left = cm.strip_pad();
     // The controls region begins here; tabs+HUD must stay left of it.
-    let controls_left = (sw - STRIP_PAD - CONTROLS_W).max(left);
+    let controls_left = (sw - left - cm.controls_w()).max(left);
 
     // --- Perf HUD reservation (LOWEST priority — yields space to the tabs) ---
     // The HUD sits between the tabs and the window controls, right-aligned with a
@@ -241,33 +219,32 @@ pub fn build_tab_bar_ex(
     // Otherwise (several tabs in a narrowish window) the HUD is HIDDEN so the tabs
     // aren't squashed to their unreadable ~64px floor just to fit a stats readout —
     // the tab layout then matches the no-HUD case exactly.
+    let perf_gap = cm.px(PERF_GAP);
     let n_tabs = tabs.len().max(1) as f32;
-    let perf_w = perf
-        .map(|s| s.chars().count() as f32 * char_w)
-        .unwrap_or(0.0);
+    let perf_w = perf.map(|s| m.text_w(s)).unwrap_or(0.0);
     // Width carved out of the tab area when the HUD is shown: the label plus the
     // gap to the tabs and a small gap to the controls.
-    let perf_reserve = if perf_w > 0.0 { perf_w + PERF_GAP * 1.5 } else { 0.0 };
+    let perf_reserve = if perf_w > 0.0 { perf_w + perf_gap * 1.5 } else { 0.0 };
     // Per-tab width the tabs WOULD get if we reserved for the HUD (capped at the
     // ideal TAB_W — extra room beyond that doesn't make a tab more comfortable).
-    let tab_w_if_hud = ((controls_left - perf_reserve - left - PLUS_W).max(0.0) / n_tabs).min(TAB_W);
-    let perf_shown = perf_w > 0.0 && tab_w_if_hud >= PERF_MIN_TAB_W;
+    let tab_w_if_hud = ((controls_left - perf_reserve - left - plus_w).max(0.0) / n_tabs).min(tab_w_max);
+    let perf_shown = perf_w > 0.0 && tab_w_if_hud >= cm.px(PERF_MIN_TAB_W);
     // Right boundary for the tabs / "+" / overflow hint. Shrinks by the HUD
     // reservation only when the HUD is actually shown.
     let tab_area_x = if perf_shown { controls_left - perf_reserve } else { controls_left };
     // The "+" button sits after the last tab and must stay left of the controls,
     // so the tabs themselves get the area from `left` to `tab_area_x - PLUS_W`.
-    let tabs_avail_w = (tab_area_x - left - PLUS_W).max(0.0);
+    let tabs_avail_w = (tab_area_x - left - plus_w).max(0.0);
 
     // --- Dynamic tab width: shrink tabs to fit the available area so they never
     // overflow under the window controls. With many tabs we shrink down to a
     // readable minimum (TAB_W_MIN); if even that can't fit all of them, we cap the
     // number of tabs drawn (the rest are unreachable here but stay index-aligned
     // via the switch_tab keyboard path). ---
-    const TAB_W_MIN: f32 = 64.0;
+    let tab_w_min = cm.px(64.0);
     // Ideal width per tab, clamped to [MIN, default]. Use the full default when
     // there's room; shrink toward MIN as tabs are added.
-    let tab_w = (tabs_avail_w / n_tabs).clamp(TAB_W_MIN, TAB_W).min(TAB_W);
+    let tab_w = (tabs_avail_w / n_tabs).clamp(tab_w_min, tab_w_max).min(tab_w_max);
     // How many tabs actually fit at `tab_w` (at least 1 so the active tab shows).
     let max_visible = if tab_w > 0.0 {
         ((tabs_avail_w / tab_w).floor() as usize).max(1)
@@ -294,14 +271,15 @@ pub fn build_tab_bar_ex(
     // pill (no border, no leading marker); inactive tabs draw nothing — just their
     // dim title — so the strip reads as light, modern text-tabs rather than a row
     // of bordered boxes.
-    const TAB_RADIUS: f32 = 8.0;
-    const TAB_INSET: f32 = 4.0; // horizontal gap between adjacent tabs
-    const TAB_VPAD: f32 = 6.0; // top/bottom margin so the pill doesn't touch edges
-    const TITLE_PAD: f32 = 13.0; // left inset of the title inside a tab
+    let tab_radius = cm.px(8.0);
+    let tab_inset = cm.px(4.0); // horizontal gap between adjacent tabs
+    let tab_vpad = cm.px(6.0); // top/bottom margin so the pill doesn't touch edges
+    let title_pad = cm.px(13.0); // left inset of the title inside a tab
 
-    // Characters that fit, from the measured chrome advance. Reserve the close "×"
-    // box + left title pad + a little right breathing room.
-    let max_chars = (((tab_w - CLOSE_W - TITLE_PAD - 8.0) / char_w).floor() as usize).max(2);
+    // Title room inside a tab: everything but the close "×" box, the left title
+    // pad and a little right breathing room. Titles are MEASURED in the title
+    // family (a char count × a monospace advance mis-sized a proportional title).
+    let title_max_w = (tab_w - close_w - title_pad - cm.px(8.0)).max(0.0);
 
     // Hit-rects are index-aligned to ABSOLUTE tab indices; off-window tabs get an
     // offscreen sentinel (0-width, far left) so a click can never match them.
@@ -316,33 +294,30 @@ pub fn build_tab_bar_ex(
 
         // Active/renaming tab → a soft filled pill. Inactive → nothing drawn.
         if is_on {
-            let body_x = x + TAB_INSET;
-            let body_w = tab_w - TAB_INSET * 2.0;
-            quads.push(Rect::rounded(body_x, TAB_VPAD, body_w, h - TAB_VPAD * 2.0, tab_active_fill, TAB_RADIUS));
+            let body_x = x + tab_inset;
+            let body_w = tab_w - tab_inset * 2.0;
+            quads.push(Rect::rounded(body_x, tab_vpad, body_w, h - tab_vpad * 2.0, tab_active_fill, tab_radius));
         }
 
         let label_color = if is_on { fg } else { tab_text_inactive };
-        let title_x = x + TITLE_PAD;
+        let title_x = x + title_pad;
         if being_renamed {
             // Live edit buffer + trailing caret, front-truncated so the caret stays.
             let buf = match renaming { Some((_, b)) => b, None => "" };
-            let mut shown = tail_cells(buf, max_chars - 1);
-            shown.push('|'); // ASCII caret: every UI font has it (U+258F was tofu on fonts without Block Elements)
-            title_labels.push((shown, title_x, 9.0, label_color));
+            // ASCII caret: every UI font has it (U+258F was tofu on fonts without
+            // Block Elements).
+            let caret_w = m.title_w("|");
+            let mut shown = fit_tail(m, buf, (title_max_w - caret_w).max(0.0), true);
+            shown.push('|');
+            title_labels.push((shown, title_x, label_y, label_color));
         } else {
-            let shown: String = if display_cells(title) > max_chars {
-                let mut s = take_cells(title, max_chars - 1);
-                s.push('…');
-                s
-            } else {
-                title.clone()
-            };
-            title_labels.push((shown, title_x, 9.0, label_color));
+            let shown = fit_head(m, title, title_max_w, true);
+            title_labels.push((shown, title_x, label_y, label_color));
 
             // Close "×": recessive on inactive tabs, a touch brighter on the active.
-            let close_x = x + tab_w - CLOSE_W - 4.0;
+            let close_x = x + tab_w - close_w - cm.px(4.0);
             let x_col = if is_on { close_active } else { close_dim };
-            labels.push(("×".to_string(), close_x + 4.0, 9.0, x_col));
+            labels.push(("×".to_string(), close_x + cm.px(4.0), label_y, x_col));
         }
 
         // Activity/bell dot on INACTIVE tabs, in the TITLE_PAD gutter left of
@@ -351,34 +326,34 @@ pub fn build_tab_bar_ex(
         // theme red = bell.
         let act = activity.get(i).copied().unwrap_or(TabActivity::None);
         if !is_on && act != TabActivity::None {
-            const DOT_D: f32 = 6.0;
+            let dot_d = cm.px(6.0);
             let dc = match act {
                 TabActivity::Bell => theme.palette[1],
                 _ => accent,
             };
             quads.push(Rect::rounded(
-                x + 4.0,
-                (h - DOT_D) / 2.0,
-                DOT_D,
-                DOT_D,
+                x + cm.px(4.0),
+                (h - dot_d) / 2.0,
+                dot_d,
+                dot_d,
                 [dc[0], dc[1], dc[2], 255],
-                DOT_D / 2.0,
+                dot_d / 2.0,
             ));
         }
 
         // Close hit-box (kept while renaming so indices stay aligned). Color is
         // unused for hit-testing.
-        let close_x = x + tab_w - CLOSE_W - 4.0;
-        close_rects[i] = Rect { x: close_x, y: 0.0, w: CLOSE_W, h, color: [0, 0, 0, 0], ..Default::default() };
+        let close_x = x + tab_w - close_w - cm.px(4.0);
+        close_rects[i] = Rect { x: close_x, y: 0.0, w: close_w, h, color: [0, 0, 0, 0], ..Default::default() };
 
         tab_rects[i] = Rect { x, y: 0.0, w: tab_w, h, color: [0, 0, 0, 0], ..Default::default() };
         x += tab_w;
     }
 
     // "+" new-tab button — minimal: just a dim glyph, no box.
-    let plus_rect = Rect { x, y: 0.0, w: PLUS_W, h, color: [0, 0, 0, 0], ..Default::default() };
-    if x + PLUS_W <= tab_area_x {
-        labels.push(("+".to_string(), x + 11.0, 8.0, plus_col));
+    let plus_rect = Rect { x, y: 0.0, w: plus_w, h, color: [0, 0, 0, 0], ..Default::default() };
+    if x + plus_w <= tab_area_x {
+        labels.push(("+".to_string(), x + cm.px(11.0), cm.px(8.0), plus_col));
     }
 
     // A small "+N" hint when some tabs couldn't be drawn (too many to fit even at
@@ -386,8 +361,9 @@ pub fn build_tab_bar_ex(
     // Guard: only draw when the hint fits left of the controls region — at very
     // narrow widths (<~400px) the hint would otherwise overrun the window controls.
     if overflow > 0 {
-        let hint_x = (tab_area_x - 34.0).max(x + PLUS_W + 4.0);
-        let hint_w = format!("+{overflow}").chars().count() as f32 * char_w;
+        let hint = format!("+{overflow}");
+        let hint_x = (tab_area_x - cm.px(34.0)).max(x + plus_w + cm.px(4.0));
+        let hint_w = m.text_w(&hint);
         if hint_x + hint_w <= controls_left {
             // Tint the hint with the strongest activity among the HIDDEN tabs
             // (Bell > Output) so activity on a scrolled-out tab is never
@@ -405,7 +381,7 @@ pub fn build_tab_bar_ex(
                 TabActivity::Output => accent,
                 TabActivity::None => dim_fg,
             };
-            labels.push((format!("+{overflow}"), hint_x, 9.0, hint_col));
+            labels.push((hint, hint_x, label_y, hint_col));
         }
     }
 
@@ -422,9 +398,8 @@ pub fn build_tab_bar_ex(
                 (bg[2] as f32 + (fg[2] as f32 - bg[2] as f32) * 0.45) as u8,
             ];
             // Right-align: right edge sits PERF_GAP left of the controls region.
-            let hud_w = s.chars().count() as f32 * char_w;
-            let hud_x = (controls_left - PERF_GAP - hud_w).max(left);
-            labels.push((s.to_string(), hud_x, 9.0, hud_color));
+            let hud_x = (controls_left - perf_gap - perf_w).max(left);
+            labels.push((s.to_string(), hud_x, label_y, hud_color));
         }
     }
 
@@ -436,43 +411,43 @@ pub fn build_tab_bar_ex(
     let close_hover_bg = [red[0], red[1], red[2], 255];
     let ctrl_y = 0.0;
 
-    let help_x = sw - STRIP_PAD - CONTROLS_W; // = tab_area_x
-    let settings_x = sw - STRIP_PAD - CTRL_W * 4.0;
-    let min_x = sw - STRIP_PAD - CTRL_W * 3.0;
-    let max_x = sw - STRIP_PAD - CTRL_W * 2.0;
-    let close_x = sw - STRIP_PAD - CTRL_W;
+    let help_x = sw - left - cm.controls_w(); // = tab_area_x
+    let settings_x = sw - left - ctrl_w * 4.0;
+    let min_x = sw - left - ctrl_w * 3.0;
+    let max_x = sw - left - ctrl_w * 2.0;
+    let close_x = sw - left - ctrl_w;
 
-    let help_rect = Rect { x: help_x, y: ctrl_y, w: CTRL_W, h, color: bg, ..Default::default() };
-    let settings_rect = Rect { x: settings_x, y: ctrl_y, w: CTRL_W, h, color: bg, ..Default::default() };
-    let min_rect = Rect { x: min_x, y: ctrl_y, w: CTRL_W, h, color: bg, ..Default::default() };
-    let max_rect = Rect { x: max_x, y: ctrl_y, w: CTRL_W, h, color: bg, ..Default::default() };
-    let close_rect = Rect { x: close_x, y: ctrl_y, w: CTRL_W, h, color: bg, ..Default::default() };
+    let help_rect = Rect { x: help_x, y: ctrl_y, w: ctrl_w, h, color: bg, ..Default::default() };
+    let settings_rect = Rect { x: settings_x, y: ctrl_y, w: ctrl_w, h, color: bg, ..Default::default() };
+    let min_rect = Rect { x: min_x, y: ctrl_y, w: ctrl_w, h, color: bg, ..Default::default() };
+    let max_rect = Rect { x: max_x, y: ctrl_y, w: ctrl_w, h, color: bg, ..Default::default() };
+    let close_rect = Rect { x: close_x, y: ctrl_y, w: ctrl_w, h, color: bg, ..Default::default() };
 
     // Hover highlight quads.
     if ctrl_hover == CtrlHover::Help {
-        quads.push(Rect { x: help_x, y: 0.0, w: CTRL_W, h, color: hover_bg, ..Default::default() });
+        quads.push(Rect { x: help_x, y: 0.0, w: ctrl_w, h, color: hover_bg, ..Default::default() });
     }
     if ctrl_hover == CtrlHover::Settings {
-        quads.push(Rect { x: settings_x, y: 0.0, w: CTRL_W, h, color: hover_bg, ..Default::default() });
+        quads.push(Rect { x: settings_x, y: 0.0, w: ctrl_w, h, color: hover_bg, ..Default::default() });
     }
     if ctrl_hover == CtrlHover::Min {
-        quads.push(Rect { x: min_x, y: 0.0, w: CTRL_W, h, color: hover_bg, ..Default::default() });
+        quads.push(Rect { x: min_x, y: 0.0, w: ctrl_w, h, color: hover_bg, ..Default::default() });
     }
     if ctrl_hover == CtrlHover::Max {
-        quads.push(Rect { x: max_x, y: 0.0, w: CTRL_W, h, color: hover_bg, ..Default::default() });
+        quads.push(Rect { x: max_x, y: 0.0, w: ctrl_w, h, color: hover_bg, ..Default::default() });
     }
     if ctrl_hover == CtrlHover::Close {
-        quads.push(Rect { x: close_x, y: 0.0, w: CTRL_W, h, color: close_hover_bg, ..Default::default() });
+        quads.push(Rect { x: close_x, y: 0.0, w: ctrl_w, h, color: close_hover_bg, ..Default::default() });
     }
 
     // Glyphs centred-ish in each control cell. "⚙" may be missing in some
     // monospace fonts; "≡" is a safe, widely-available fallback for settings.
-    labels.push(("?".to_string(), help_x + 9.0, 9.0, fg));
-    labels.push(("⚙".to_string(), settings_x + 8.0, 9.0, fg));
-    labels.push(("─".to_string(), min_x + 8.0, 9.0, fg));
-    labels.push(("▢".to_string(), max_x + 8.0, 9.0, fg));
+    labels.push(("?".to_string(), help_x + cm.px(9.0), label_y, fg));
+    labels.push(("⚙".to_string(), settings_x + cm.px(8.0), label_y, fg));
+    labels.push(("─".to_string(), min_x + cm.px(8.0), label_y, fg));
+    labels.push(("▢".to_string(), max_x + cm.px(8.0), label_y, fg));
     let close_fg = if ctrl_hover == CtrlHover::Close { [0xFF, 0xFF, 0xFF] } else { fg };
-    labels.push(("✕".to_string(), close_x + 8.0, 9.0, close_fg));
+    labels.push(("✕".to_string(), close_x + cm.px(8.0), label_y, close_fg));
 
     TabBar {
         quads, labels, title_labels, tab_rects, close_rects, plus_rect,
@@ -497,16 +472,16 @@ pub struct DetachedBar {
     pub close_rect: Rect,
 }
 
-/// Hit-test rect for a detached window's close "✕": the rightmost CTRL_W cell
-/// of the TABBAR_H strip, inset by STRIP_PAD — the same cell the main window's
-/// close control occupies. Exposed separately so the app's hover tracking can
+/// Hit-test rect for a detached window's close "✕": the rightmost control cell
+/// of the bar, inset by the strip pad — the same cell the main window's close
+/// control occupies. Exposed separately so the app's hover tracking can
 /// hit-test without building the whole bar.
-pub fn detached_close_rect(width: u32) -> Rect {
+pub fn detached_close_rect(width: u32, cm: ChromeMetrics) -> Rect {
     Rect {
-        x: width as f32 - STRIP_PAD - CTRL_W,
+        x: width as f32 - cm.strip_pad() - cm.ctrl_w(),
         y: 0.0,
-        w: CTRL_W,
-        h: TABBAR_H,
+        w: cm.ctrl_w(),
+        h: cm.bar_h(),
         color: [0, 0, 0, 0],
         ..Default::default()
     }
@@ -514,17 +489,18 @@ pub fn detached_close_rect(width: u32) -> Rect {
 
 /// Build the top bar of a DETACHED window: bar background, the tab title as an
 /// active pill (it is always the "active tab" of its window), and the close
-/// "✕" at the right (red highlight when `close_hover`). `char_w` is the
-/// measured chrome-font advance, as in `build_tab_bar_ex`.
+/// "✕" at the right (red highlight when `close_hover`). `m` / `cm` as in
+/// [`build_tab_bar_ex`].
 pub fn build_detached_bar(
     width: u32,
     title: &str,
     theme: &Theme,
     close_hover: bool,
-    char_w: f32,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
 ) -> DetachedBar {
     let sw = width as f32;
-    let h = TABBAR_H;
+    let h = cm.bar_h();
 
     // Same theme-derived surface language as build_tab_bar_ex.
     let bg = [theme.bg[0], theme.bg[1], theme.bg[2], 255];
@@ -549,51 +525,44 @@ pub fn build_detached_bar(
     // Bar background spanning the full width.
     quads.push(Rect { x: 0.0, y: 0.0, w: sw, h, color: bg, ..Default::default() });
 
-    // Title pill on the left — same geometry constants as a main-window tab,
-    // clamped so it never runs under the close control.
-    const TAB_RADIUS: f32 = 8.0;
-    const TAB_INSET: f32 = 4.0;
-    const TAB_VPAD: f32 = 6.0;
-    const TITLE_PAD: f32 = 13.0;
-    let left = STRIP_PAD;
-    let controls_left = (sw - STRIP_PAD - CTRL_W).max(left);
-    let tab_w = TAB_W.min((controls_left - left).max(0.0));
-    if tab_w > TAB_INSET * 2.0 {
+    // Title pill on the left — same geometry as a main-window tab, clamped so it
+    // never runs under the close control.
+    let tab_radius = cm.px(8.0);
+    let tab_inset = cm.px(4.0);
+    let tab_vpad = cm.px(6.0);
+    let title_pad = cm.px(13.0);
+    let left = cm.strip_pad();
+    let controls_left = (sw - left - cm.ctrl_w()).max(left);
+    let tab_w = cm.px(TAB_W).min((controls_left - left).max(0.0));
+    if tab_w > tab_inset * 2.0 {
         quads.push(Rect::rounded(
-            left + TAB_INSET,
-            TAB_VPAD,
-            tab_w - TAB_INSET * 2.0,
-            h - TAB_VPAD * 2.0,
+            left + tab_inset,
+            tab_vpad,
+            tab_w - tab_inset * 2.0,
+            h - tab_vpad * 2.0,
             pill_fill,
-            TAB_RADIUS,
+            tab_radius,
         ));
-        let max_chars = (((tab_w - TITLE_PAD - 8.0) / char_w).floor() as usize).max(2);
-        let shown: String = if display_cells(title) > max_chars {
-            let mut s = take_cells(title, max_chars.saturating_sub(1));
-            s.push('…');
-            s
-        } else {
-            title.to_string()
-        };
-        title_labels.push((shown, left + TITLE_PAD, 9.0, fg));
+        let shown = fit_head(m, title, (tab_w - title_pad - cm.px(8.0)).max(0.0), true);
+        title_labels.push((shown, left + title_pad, cm.px(LABEL_Y), fg));
     }
 
     // Close "✕" at the right — red hover background, white glyph on hover
     // (identical treatment to the main window's close control).
-    let close_rect = detached_close_rect(width);
+    let close_rect = detached_close_rect(width, cm);
     if close_hover {
         let red = theme.palette[1];
         quads.push(Rect {
             x: close_rect.x,
             y: 0.0,
-            w: CTRL_W,
+            w: close_rect.w,
             h,
             color: [red[0], red[1], red[2], 255],
             ..Default::default()
         });
     }
     let close_fg = if close_hover { [0xFF, 0xFF, 0xFF] } else { fg };
-    labels.push(("✕".to_string(), close_rect.x + 8.0, 9.0, close_fg));
+    labels.push(("✕".to_string(), close_rect.x + cm.px(8.0), cm.px(LABEL_Y), close_fg));
 
     DetachedBar { quads, labels, title_labels, close_rect }
 }
@@ -606,20 +575,30 @@ mod tests {
         Theme::by_name("catppuccin_mocha")
     }
 
+    /// Baseline measurer + metrics (1×, 16pt, monospace advance).
+    fn mono() -> MonoMeasure {
+        MonoMeasure(CHROME_CHAR_W)
+    }
+    const CM: ChromeMetrics = ChromeMetrics::DEFAULT;
+
     #[test]
-    fn cell_truncation_counts_display_width_not_chars() {
-        // 5 CJK chars = 10 display cells; a char count would keep all 5 in an
-        // 8-cell budget and overflow the pill.
-        assert_eq!(display_cells("你好世界啊"), 10);
-        assert_eq!(take_cells("你好世界啊", 8), "你好世界");
-        // Odd budget: a wide char that would straddle the limit is dropped.
-        assert_eq!(take_cells("你好世界啊", 7), "你好世");
-        assert_eq!(take_cells("abc", 8), "abc");
-        // Rename keeps the tail so the caret stays visible.
-        assert_eq!(tail_cells("burak@omen:~/Bozkurt", 5), "zkurt");
-        assert_eq!(tail_cells("ab你好", 5), "b你好");
-        // Zero-width chars occupy no budget.
-        assert_eq!(display_cells("a\u{200b}b"), 2);
+    fn long_titles_truncate_by_measured_width() {
+        // Titles are fitted to the tab by their MEASURED width (wide CJK chars
+        // count double), never past the close box — and short titles are kept.
+        let tabs = [
+            ("你好世界你好世界你好世界".to_string(), true),
+            ("Tab 2".to_string(), false),
+        ];
+        let bar = build_tab_bar_ex(1000, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &[]);
+        let cjk = &bar.title_labels[0];
+        assert!(cjk.0.ends_with('…'), "long title must be ellipsized: {:?}", cjk.0);
+        let right = cjk.1 + mono().title_w(&cjk.0);
+        assert!(
+            right <= bar.close_rects[0].x + 0.5,
+            "title runs under its close box: right={right} close_x={}",
+            bar.close_rects[0].x
+        );
+        assert_eq!(bar.title_labels[1].0, "Tab 2", "short titles are untouched");
     }
 
     #[test]
@@ -634,6 +613,7 @@ mod tests {
         assert!((bar.close_rect.x + bar.close_rect.w - (1000.0 - STRIP_PAD)).abs() < 0.01);
         // Each control is one cell wide (CONTROLS_W spans five cells).
         assert!((bar.close_rect.w - CONTROLS_W / 5.0).abs() < 0.01);
+        assert_eq!(bar.close_rect.h, TABBAR_H);
     }
 
     #[test]
@@ -709,7 +689,7 @@ mod tests {
     #[test]
     fn rename_shows_caret() {
         let tabs = [("Old".to_string(), true)];
-        let bar = build_tab_bar_ex(800, &tabs, &theme(), Some((0, "New")), CtrlHover::None, None, CHROME_CHAR_W, &[]);
+        let bar = build_tab_bar_ex(800, &tabs, &theme(), Some((0, "New")), CtrlHover::None, None, &mut mono(), CM, &[]);
         // Renaming shows the edit buffer + caret in the sans TITLE labels.
         let buf = bar.title_labels.iter().find(|l| l.0.contains('|'));
         assert!(buf.is_some(), "no caret label found");
@@ -726,8 +706,8 @@ mod tests {
             ("Tab 1".to_string(), true),
             ("Tab 2".to_string(), false),
         ];
-        let with = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, Some(PERF), CHROME_CHAR_W, &[]);
-        let without = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[]);
+        let with = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, Some(PERF), &mut mono(), CM, &[]);
+        let without = build_tab_bar_ex(1400, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &[]);
 
         // The HUD label is present.
         let hud = with.labels.iter().find(|l| l.0 == PERF).expect("HUD label missing");
@@ -761,8 +741,8 @@ mod tests {
             ("Tab 2".to_string(), false),
             ("Tab 3".to_string(), false),
         ];
-        let with = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, Some(PERF), CHROME_CHAR_W, &[]);
-        let without = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[]);
+        let with = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, Some(PERF), &mut mono(), CM, &[]);
+        let without = build_tab_bar_ex(560, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &[]);
 
         // No HUD label emitted.
         assert!(with.labels.iter().all(|l| l.0 != PERF), "HUD should be hidden");
@@ -785,8 +765,8 @@ mod tests {
         // squashed to its ~64px minimum just to fit the stats readout.
         let tabs: Vec<(String, bool)> =
             (0..4).map(|i| (format!("Tab {i}"), i == 0)).collect();
-        let with = build_tab_bar_ex(900, &tabs, &theme(), None, CtrlHover::None, Some(PERF), CHROME_CHAR_W, &[]);
-        let without = build_tab_bar_ex(900, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[]);
+        let with = build_tab_bar_ex(900, &tabs, &theme(), None, CtrlHover::None, Some(PERF), &mut mono(), CM, &[]);
+        let without = build_tab_bar_ex(900, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &[]);
 
         // HUD hidden, layout identical to no-HUD.
         assert!(with.labels.iter().all(|l| l.0 != PERF), "HUD should yield to the tabs");
@@ -824,13 +804,13 @@ mod tests {
 
     #[test]
     fn detached_bar_close_parked_at_right() {
-        let bar = build_detached_bar(1000, "Tab 2", &theme(), false, CHROME_CHAR_W);
+        let bar = build_detached_bar(1000, "Tab 2", &theme(), false, &mut mono(), CM);
         // The ✕ occupies the rightmost control cell, inset by STRIP_PAD.
         assert!((bar.close_rect.x + bar.close_rect.w - (1000.0 - STRIP_PAD)).abs() < 0.01);
-        assert!((bar.close_rect.w - CTRL_W).abs() < 0.01);
+        assert!((bar.close_rect.w - CTRL_W_BASE).abs() < 0.01);
         assert_eq!(bar.close_rect.h, TABBAR_H);
         // It matches the standalone hit-test helper the app uses for hover.
-        let cr = detached_close_rect(1000);
+        let cr = detached_close_rect(1000, CM);
         assert_eq!(cr.x, bar.close_rect.x);
         // The ✕ glyph is emitted.
         assert!(bar.labels.iter().any(|l| l.0 == "✕"));
@@ -838,7 +818,7 @@ mod tests {
 
     #[test]
     fn detached_bar_shows_title_pill() {
-        let bar = build_detached_bar(1000, "Build logs", &theme(), false, CHROME_CHAR_W);
+        let bar = build_detached_bar(1000, "Build logs", &theme(), false, &mut mono(), CM);
         // Title present in the sans title labels.
         assert!(bar.title_labels.iter().any(|l| l.0 == "Build logs"));
         // Bar bg + pill are both emitted (≥ 2 quads).
@@ -847,7 +827,7 @@ mod tests {
 
     #[test]
     fn detached_bar_close_hover_paints_theme_red() {
-        let hot = build_detached_bar(1000, "Tab 2", &theme(), true, CHROME_CHAR_W);
+        let hot = build_detached_bar(1000, "Tab 2", &theme(), true, &mut mono(), CM);
         let red = theme().palette[1];
         assert!(hot.quads.iter().any(|q| q.color == [red[0], red[1], red[2], 255]));
         // Glyph flips to white on hover.
@@ -857,7 +837,7 @@ mod tests {
     #[test]
     fn detached_bar_long_title_truncates_with_ellipsis() {
         let long = "a very long detached tab title that cannot fit";
-        let bar = build_detached_bar(1000, long, &theme(), false, CHROME_CHAR_W);
+        let bar = build_detached_bar(1000, long, &theme(), false, &mut mono(), CM);
         let label = &bar.title_labels[0].0;
         assert!(label.ends_with('…'), "expected truncation, got {label:?}");
     }
@@ -865,7 +845,7 @@ mod tests {
     #[test]
     fn close_hover_changes_glyph_color() {
         let tabs = [("Tab 1".to_string(), true)];
-        let hot = build_tab_bar_ex(800, &tabs, &theme(), None, CtrlHover::Close, None, CHROME_CHAR_W, &[]);
+        let hot = build_tab_bar_ex(800, &tabs, &theme(), None, CtrlHover::Close, None, &mut mono(), CM, &[]);
         // A theme-red hover quad is appended when the close control is hovered.
         let red = theme().palette[1];
         let red_bg = [red[0], red[1], red[2], 255];
@@ -891,7 +871,7 @@ mod tests {
             ("Tab 3".to_string(), false),
         ];
         let bar = build_tab_bar_ex(
-            1000, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W,
+            1000, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM,
             &[TabActivity::None, TabActivity::Output, TabActivity::Bell],
         );
         let accent = theme().palette[4];
@@ -904,7 +884,7 @@ mod tests {
             "bell dot must use the theme red");
         // Baseline: no activity → no dots.
         let base = build_tab_bar_ex(
-            1000, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[],
+            1000, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &[],
         );
         assert!(dot_quads(&base).is_empty());
     }
@@ -917,7 +897,7 @@ mod tests {
             ("Tab 3".to_string(), false),
         ];
         let bar = build_tab_bar_ex(
-            1000, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W,
+            1000, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM,
             &[TabActivity::Bell, TabActivity::None, TabActivity::None],
         );
         assert!(dot_quads(&bar).is_empty(), "the active tab never shows a dot");
@@ -931,11 +911,11 @@ mod tests {
             ("Tab 3".to_string(), false),
         ];
         let with = build_tab_bar_ex(
-            1000, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W,
+            1000, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM,
             &[TabActivity::None, TabActivity::Output, TabActivity::Bell],
         );
         let without = build_tab_bar_ex(
-            1000, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[],
+            1000, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &[],
         );
         // Labels + hit geometry are bit-identical; only the quads differ.
         assert_eq!(with.title_labels, without.title_labels);
@@ -959,7 +939,7 @@ mod tests {
         let mut activity = vec![TabActivity::None; 20];
         activity[19] = TabActivity::Bell;
         let bar = build_tab_bar_ex(
-            800, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &activity,
+            800, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &activity,
         );
         let hint = |b: &TabBar| {
             b.labels
@@ -976,7 +956,7 @@ mod tests {
         assert_eq!(tinted.3, red, "hidden Bell must tint the +N hint red");
         // All-None keeps the dim blend.
         let base = build_tab_bar_ex(
-            800, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[],
+            800, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &[],
         );
         let plain = hint(&base).expect("overflow hint missing");
         assert_ne!(plain.3, red);
@@ -991,9 +971,81 @@ mod tests {
         ];
         let wrapper = build_tab_bar(1000, &tabs, &theme());
         let ex = build_tab_bar_ex(
-            1000, &tabs, &theme(), None, CtrlHover::None, None, CHROME_CHAR_W, &[],
+            1000, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &[],
         );
         assert_eq!(wrapper.quads.len(), ex.quads.len());
         assert!(dot_quads(&wrapper).is_empty());
+    }
+
+    #[test]
+    fn bar_geometry_scales_with_chrome_metrics() {
+        // A 2× display must yield EXACTLY twice the 1× hit geometry (on a 2×
+        // wide surface), so hover/click targets track the drawn chrome.
+        let tabs = [
+            ("Tab 1".to_string(), true),
+            ("Tab 2".to_string(), false),
+            ("Tab 3".to_string(), false),
+        ];
+        let one = build_tab_bar_ex(1000, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &[]);
+        let hi = ChromeMetrics::new(2.0, 16.0);
+        let two = build_tab_bar_ex(
+            2000, &tabs, &theme(), None, CtrlHover::None, None, &mut MonoMeasure(2.0 * CHROME_CHAR_W), hi, &[],
+        );
+        let pairs = one
+            .tab_rects
+            .iter()
+            .zip(&two.tab_rects)
+            .chain(one.close_rects.iter().zip(&two.close_rects))
+            .chain([
+                (&one.plus_rect, &two.plus_rect),
+                (&one.help_rect, &two.help_rect),
+                (&one.settings_rect, &two.settings_rect),
+                (&one.close_rect, &two.close_rect),
+            ]);
+        for (a, b) in pairs {
+            for (va, vb) in [(a.x, b.x), (a.y, b.y), (a.w, b.w), (a.h, b.h)] {
+                assert!((vb - 2.0 * va).abs() < 0.01, "not 2×: {va} vs {vb}");
+            }
+        }
+        for (a, b) in one.title_labels.iter().zip(&two.title_labels) {
+            assert_eq!(a.0, b.0);
+            assert!((b.1 - 2.0 * a.1).abs() < 0.01 && (b.2 - 2.0 * a.2).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn labels_stay_inside_the_bar_at_large_ui_fonts() {
+        // The bug class: a 28pt UI font (or a 2× display) drew 28–37px glyphs
+        // into a fixed 36px bar, spilling into the grid's first row. The bar now
+        // grows with the chrome unit, so every label's line box fits inside it.
+        let tabs = [("Tab 1".to_string(), true), ("Tab 2".to_string(), false)];
+        for (dpi, font) in [(1.0, 16.0), (1.0, 24.0), (1.0, 28.0), (2.0, 16.0), (2.0, 28.0), (1.25, 18.0)] {
+            let cm = ChromeMetrics::new(dpi, font);
+            let bar = build_tab_bar_ex(
+                3000, &tabs, &theme(), None, CtrlHover::None, None, &mut MonoMeasure(9.6 * cm.u), cm, &[],
+            );
+            // The chrome text line box is ceil(font_px * 1.3) tall.
+            let line_h = (16.0 * cm.u * 1.3).ceil();
+            for l in bar.labels.iter().chain(&bar.title_labels) {
+                assert!(
+                    l.2 + line_h <= cm.bar_h() + 1.0,
+                    "label {:?} overflows the bar at {dpi}×/{font}pt: bottom {} > bar {}",
+                    l.0,
+                    l.2 + line_h,
+                    cm.bar_h()
+                );
+            }
+            assert_eq!(bar.close_rect.h, cm.bar_h());
+        }
+    }
+
+    #[test]
+    fn detached_close_rect_tracks_metrics() {
+        let hi = ChromeMetrics::new(2.0, 16.0);
+        let r = detached_close_rect(2000, hi);
+        assert!((r.x + r.w - (2000.0 - 2.0 * STRIP_PAD)).abs() < 0.01);
+        assert_eq!(r.h, 72.0);
+        let bar = build_detached_bar(2000, "Tab", &theme(), false, &mut MonoMeasure(19.2), hi);
+        assert_eq!(bar.close_rect.x, r.x);
     }
 }
