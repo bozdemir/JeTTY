@@ -24,6 +24,9 @@ const COMPACT_TAB_W: f32 = 104.0;
 const COMPACT_TAB_W_MIN: f32 = 48.0;
 /// Width of the "+" new-tab button.
 const PLUS_W: f32 = 32.0;
+/// Room (design px) kept after the "+" for the "+N" overflow hint while tabs
+/// overflow — the hint's 34 px slot plus a 4 px gap.
+const OVERFLOW_HINT_W: f32 = 38.0;
 /// Size of the "×" close hit box at the right of each tab.
 const CLOSE_W: f32 = 18.0;
 /// Width of each window-control button (minimize/maximize/close) on the right.
@@ -377,7 +380,7 @@ impl StyleMetrics {
                 inset: 3.0,
                 vpad: 8.0,
                 radius: 6.0,
-                title_pad: 10.0,
+                title_pad: 12.0,
             },
             TabStyle::Slant | TabStyle::Powerline => StyleMetrics {
                 tab_w: TAB_W,
@@ -497,6 +500,25 @@ fn activity_color(ui: &UiPalette, act: TabActivity) -> Option<[u8; 3]> {
         TabActivity::Bell => Some(ui.warn),
         TabActivity::Done => Some(ui.success),
         TabActivity::Failed => Some(ui.danger),
+    }
+}
+
+/// Push an activity badge of diameter `d` at `(x, y)` in color `c`, over a
+/// surface of color `under`. The kinds differ in SHAPE as well as color, so
+/// they stay apart on themes whose yellow and green are close (solarized) and
+/// for red/green color blindness: output and done are dots, a bell is a ring,
+/// a failure a (rounded) square.
+fn push_badge(quads: &mut Vec<Rect>, act: TabActivity, x: f32, y: f32, d: f32, c: [u8; 3], under: [u8; 3]) {
+    let rgba = |c: [u8; 3]| [c[0], c[1], c[2], 255];
+    match act {
+        TabActivity::Failed => quads.push(Rect::rounded(x, y, d, d, rgba(c), d * 0.2)),
+        TabActivity::Bell => {
+            quads.push(Rect::rounded(x, y, d, d, rgba(c), d / 2.0));
+            let hole = d * 0.45;
+            let inset = (d - hole) / 2.0;
+            quads.push(Rect::rounded(x + inset, y + inset, hole, hole, rgba(under), hole / 2.0));
+        }
+        _ => quads.push(Rect::rounded(x, y, d, d, rgba(c), d / 2.0)),
     }
 }
 
@@ -626,15 +648,13 @@ fn push_tab_progress(
     bottom: bool,
 ) {
     let (x0, x1, y, th) = progress_slot(style, sm, cm, cell, h, title_x, close_x - cm.px(2.0), bottom);
-    let pc = progress_color(ui, p);
+    // The underline style's track is its own underline, dimmed, so the bright
+    // part reads as the underline filling up.
     let track = match (style, colors.mark) {
-        (TabStyle::Underline, Some(mk)) => mix(ui.bg, mk, 0.40),
+        (TabStyle::Underline, Some(mk)) => mix(ui.bg, mk, 0.35),
         _ => mix(ui.bg, ui.text, 0.16),
     };
-    // An accent underline under an accent fill would hide the fill: use the
-    // text color for the filled part then.
-    let fill = if style == TabStyle::Underline && colors.mark == Some(pc) { ui.text } else { pc };
-    push_progress_bar(quads, p, x0, x1, y, th, Some(track), fill, cm.px(6.0));
+    push_progress_bar(quads, p, x0, x1, y, th, Some(track), progress_color(ui, p), cm.px(6.0));
 }
 
 /// Push the seam hairline of the ACTIVE tab's progress: 1 logical px at the
@@ -847,11 +867,14 @@ pub fn build_tab_bar_styled(
     // there's room; shrink toward MIN as tabs are added.
     let tab_w = (tabs_avail_w / n_tabs).clamp(tab_w_min, tab_w_max).min(tab_w_max);
     // How many tabs actually fit at `tab_w` (at least 1 so the active tab shows).
-    let max_visible = if tab_w > 0.0 {
-        ((tabs_avail_w / tab_w).floor() as usize).max(1)
-    } else {
-        1
-    };
+    // When they don't all fit, room is kept for the "+N" hint after the "+":
+    // it carries the hidden tabs' badges (a failure must never be invisible),
+    // and a strip filled to the edge used to leave it no room at all.
+    let fit = |w: f32| if tab_w > 0.0 { ((w / tab_w).floor() as usize).max(1) } else { 1 };
+    let mut max_visible = fit(tabs_avail_w);
+    if tabs.len() > max_visible {
+        max_visible = fit((tabs_avail_w - cm.px(OVERFLOW_HINT_W)).max(0.0));
+    }
     let drawn = tabs.len().min(max_visible);
     let overflow = tabs.len().saturating_sub(drawn);
 
@@ -932,8 +955,11 @@ pub fn build_tab_bar_styled(
         // so the layout is bit-identical with or without activity.
         if !is_on {
             if let Some(dc) = activity_color(&ui, d.activity) {
+                // 3 design px clear of the title (x+4..x+10 before a 13 px pad).
                 let dot_d = cm.px(6.0);
-                quads.push(Rect::rounded(x + cm.px(4.0) + lead, (h - dot_d) / 2.0, dot_d, dot_d, rgba(dc), dot_d / 2.0));
+                let dot_x = x + cm.px(sm.title_pad - 9.0) + lead;
+                let under = colors.fill.unwrap_or(ui.bg);
+                push_badge(&mut quads, d.activity, dot_x, (h - dot_d) / 2.0, dot_d, dc, under);
             }
         }
 
@@ -2017,6 +2043,28 @@ mod tests {
         assert_eq!(tab_color_name(5), Some("Magenta"));
         let junk = [TabDeco { color: Some(42), ..Default::default() }];
         assert_eq!(styled(1000, &tabs, &junk, &TabBarOpts::default()).quads.len(), plain.quads.len());
+    }
+
+    #[test]
+    fn an_overflowing_strip_always_has_room_for_its_hint() {
+        // Whatever the style and width, a strip that cannot show every tab keeps
+        // room for the "+N" hint after the "+" — it carries the hidden tabs'
+        // badges, so a hidden failure is never invisible.
+        let tabs: Vec<(String, bool)> = (0..60).map(|i| (format!("Tab {i}"), i == 0)).collect();
+        let mut deco = vec![TabDeco::default(); 60];
+        deco[59].activity = TabActivity::Failed;
+        let red = UiPalette::from_theme(&theme()).danger;
+        for style in TabStyle::ALL {
+            for w in (440..1700).step_by(9) {
+                let bar = styled(w, &tabs, &deco, &opts(style));
+                assert!(bar.tab_rects.iter().filter(|r| r.x >= 0.0).count() < tabs.len(), "60 tabs overflow");
+                let hint = bar.labels.iter().find(|l| l.0.starts_with('+') && l.0.len() > 1);
+                let hint = hint.unwrap_or_else(|| panic!("{style:?} at {w}px: no overflow hint"));
+                assert_eq!(hint.3, red, "{style:?} at {w}px: the hidden failure tints it");
+                let right = hint.1 + mono().text_w(&hint.0);
+                assert!(right <= w as f32 - STRIP_PAD - CONTROLS_W + 0.5, "{style:?} at {w}px: hint under the controls");
+            }
+        }
     }
 
     #[test]
