@@ -77,6 +77,9 @@ pub(crate) struct BackdropState {
     gen: u64,
     /// The animation clock.
     clock: Instant,
+    /// Motion is reduced (`reduce_motion`): an animated look holds still — see
+    /// [`Self::set_calm`].
+    calm: bool,
 }
 
 impl BackdropState {
@@ -88,6 +91,7 @@ impl BackdropState {
             shown: None,
             gen: 0,
             clock: Instant::now(),
+            calm: false,
         }
     }
 
@@ -96,9 +100,31 @@ impl BackdropState {
         if cfg == self.cfg {
             return false;
         }
-        self.settings = cfg.settings();
+        self.settings = Self::effective(&cfg, self.calm);
         self.cfg = cfg;
         true
+    }
+
+    /// Hold an animated look still while motion is reduced (`reduce_motion`):
+    /// it draws the static frame `animate = false` draws, and asks for no
+    /// paced wakes. Returns whether the look changed (a repaint is owed).
+    pub fn set_calm(&mut self, calm: bool) -> bool {
+        if calm == self.calm {
+            return false;
+        }
+        self.calm = calm;
+        self.settings = Self::effective(&self.cfg, calm);
+        self.cfg.settings().animates()
+    }
+
+    /// The settings the renderer reads: `cfg`'s, with the animation off when
+    /// `calm`.
+    fn effective(cfg: &BackdropConfig, calm: bool) -> BackdropSettings {
+        let mut s = cfg.settings();
+        if calm {
+            s.animate = false;
+        }
+        s
     }
 
     /// Whether the backdrop wants paced animation frames on an adapter: the
@@ -428,6 +454,25 @@ mod tests {
         assert_eq!(background_images(&dir), vec!["a.png", "b.JPG", "c.jpeg"]);
         assert!(background_images(&dir.join("missing")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reduced_motion_holds_an_animated_backdrop_still() {
+        let moving = BackdropConfig { mode: "pattern".into(), pattern: "aurora".into(), animate: true, ..BackdropConfig::default() };
+        let mut s = BackdropState::new(moving.clone());
+        assert!(s.animates_on(false));
+        assert!(s.set_calm(true), "the look changes: a repaint is owed");
+        assert!(!s.animates_on(false) && !s.settings.animate, "the static frame, no paced wakes");
+        assert_eq!(s.cfg, moving, "the config (what Settings shows and saves) is untouched");
+        // A new table while calm stays calm; leaving reduced motion moves again.
+        assert!(s.set_config(BackdropConfig { pattern: "stars".into(), ..moving.clone() }));
+        assert!(!s.animates_on(false));
+        assert!(!s.set_calm(true), "no change");
+        assert!(s.set_calm(false));
+        assert!(s.animates_on(false));
+        // A still look has nothing to calm: no repaint.
+        let mut still = BackdropState::new(BackdropConfig { animate: false, ..moving });
+        assert!(!still.set_calm(true));
     }
 
     #[test]

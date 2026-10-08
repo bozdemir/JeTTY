@@ -1068,7 +1068,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The `[cursor] guide` band first (cells, selection and block cover it).
     let mut bg_rects: Vec<jetty_render::Rect> = Vec::new();
     if copymode_cursor.is_none() && shot_cursor.guide.shows(terminal.alt_screen()) {
-        bg_rects.extend(jetty_render::cursor_guide_rect(&snap, terminal.theme(), cell_w, cell_h, 0.0, shot_origin.top));
+        bg_rects.extend(jetty_render::cursor_guide_rect(
+            &snap,
+            terminal.theme(),
+            cell_w,
+            cell_h,
+            0.0,
+            shot_origin.top,
+            backdrop.is_some(),
+        ));
     }
     bg_rects.extend(jetty_render::cell_bg_rects(&snap, cell_w, cell_h, shot_origin.top, selection.bg));
     // The current match's glyph recolor (Pass 2), like the app's render core.

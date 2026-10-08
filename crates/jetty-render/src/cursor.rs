@@ -12,7 +12,7 @@
 //! text. The glyph color never animates — only the block's own color and scale
 //! ride the caret flash — so the per-row shaping cache is untouched.
 
-use crate::colors::{caret_flash_target, contrast_ratio, cursor_text_color};
+use crate::colors::{caret_flash_target, contrast_ratio, cursor_text_color, relative_luminance};
 use crate::quad::{Rect, UnderlineGeom};
 use jetty_core::{CursorShapeSnap, GridSnapshot, Theme};
 
@@ -344,6 +344,11 @@ pub fn cursor_trail_rect(
 /// pass, so cells with a background of their own (and the selection) cover it
 /// and the glyphs draw over it. `None` while the cursor is hidden or scrolled
 /// off the grid.
+///
+/// `over_backdrop`: a `[backdrop]` is drawn under the grid, so the band is a
+/// translucent foreground tint instead — never a solid stripe across the
+/// image — whose alpha lands it on the opaque band's luminance over the page
+/// color (the quads blend in linear light; see [`guide_tint_alpha`]).
 pub fn cursor_guide_rect(
     snap: &GridSnapshot,
     theme: &Theme,
@@ -351,21 +356,44 @@ pub fn cursor_guide_rect(
     cell_h: f32,
     x_offset: f32,
     y_offset: f32,
+    over_backdrop: bool,
 ) -> Option<Rect> {
     if !snap.cursor_visible || snap.cursor_row >= snap.rows {
         return None;
     }
-    let bg = snap.bg_rgba;
-    let mix = |i: usize| {
-        (bg[i] as f32 + (theme.fg[i] as f32 - bg[i] as f32) * CURSOR_GUIDE_MIX).round().clamp(0.0, 255.0) as u8
+    let bg = [snap.bg_rgba[0], snap.bg_rgba[1], snap.bg_rgba[2]];
+    let fg = theme.fg;
+    let color = if over_backdrop {
+        [fg[0], fg[1], fg[2], (guide_tint_alpha(bg, fg) * 255.0).round().max(1.0) as u8]
+    } else {
+        let band = guide_band(bg, fg);
+        [band[0], band[1], band[2], 255]
     };
     Some(Rect::new(
         x_offset,
         y_offset + snap.cursor_row as f32 * cell_h,
         snap.cols as f32 * cell_w,
         cell_h,
-        [mix(0), mix(1), mix(2), 255],
+        color,
     ))
+}
+
+/// The opaque guide band: `bg` [`CURSOR_GUIDE_MIX`] of the way to `fg`, in sRGB.
+fn guide_band(bg: [u8; 3], fg: [u8; 3]) -> [u8; 3] {
+    let mix = |i: usize| (bg[i] as f32 + (fg[i] as f32 - bg[i] as f32) * CURSOR_GUIDE_MIX).round().clamp(0.0, 255.0) as u8;
+    [mix(0), mix(1), mix(2)]
+}
+
+/// The alpha of an `fg` tint that, blended over `bg` in linear light, has the
+/// luminance of the opaque [`guide_band`] — the same faint band on the page
+/// color, a tint over a backdrop. Falls back to [`CURSOR_GUIDE_MIX`] when `fg`
+/// and `bg` are (nearly) equally bright.
+pub fn guide_tint_alpha(bg: [u8; 3], fg: [u8; 3]) -> f32 {
+    let (yb, yf) = (relative_luminance(bg), relative_luminance(fg));
+    if (yf - yb).abs() < 1e-3 {
+        return CURSOR_GUIDE_MIX;
+    }
+    ((relative_luminance(guide_band(bg, fg)) - yb) / (yf - yb)).clamp(0.0, 0.5)
 }
 
 #[cfg(test)]
@@ -579,7 +607,7 @@ mod tests {
         g.cursor_visible = true;
         g.cursor_row = 3;
         assert!(all(&draw(&g, true, None, &CursorStyle::default())).is_empty());
-        assert!(cursor_guide_rect(&g, &theme(), 10.0, 20.0, 0.0, 0.0).is_none());
+        assert!(cursor_guide_rect(&g, &theme(), 10.0, 20.0, 0.0, 0.0, false).is_none());
     }
 
     #[test]
@@ -656,7 +684,7 @@ mod tests {
     fn guide_spans_the_cursor_row() {
         let mut g = grid(7, 4);
         g.cursor_row = 2;
-        let r = cursor_guide_rect(&g, &theme(), 10.0, 20.0, 4.0, 30.0).unwrap();
+        let r = cursor_guide_rect(&g, &theme(), 10.0, 20.0, 4.0, 30.0, false).unwrap();
         assert_eq!((r.x, r.y, r.w, r.h), (4.0, 70.0, 70.0, 20.0));
         // 7% of the way from the page (the snapshot's bg, OSC 11 included)
         // toward the theme fg, opaque.
@@ -668,17 +696,48 @@ mod tests {
         assert_eq!(r.color[3], 255);
     }
 
+    #[test]
+    fn over_a_backdrop_the_guide_is_a_tint_matching_the_band() {
+        // On every built-in theme: the same rect, but the fg at an alpha that,
+        // blended in linear light over the page, lands on the opaque band's
+        // luminance — so the backdrop shows through and the page looks the same.
+        let lin = |c: u8| {
+            let c = c as f32 / 255.0;
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        for i in 0..jetty_core::theme::PRESETS.len() {
+            let t = jetty_core::theme::theme_at(i);
+            let mut g = grid(4, 2);
+            g.bg_rgba = t.bg;
+            let opaque = cursor_guide_rect(&g, &t, 10.0, 20.0, 0.0, 0.0, false).unwrap();
+            let tint = cursor_guide_rect(&g, &t, 10.0, 20.0, 0.0, 0.0, true).unwrap();
+            assert_eq!((tint.x, tint.y, tint.w, tint.h), (opaque.x, opaque.y, opaque.w, opaque.h));
+            assert_eq!(&tint.color[..3], &t.fg[..], "{}", t.name);
+            assert!(tint.color[3] < 128, "{}: a faint tint, alpha {}", t.name, tint.color[3]);
+            let a = tint.color[3] as f32 / 255.0;
+            let blended: [f32; 3] =
+                std::array::from_fn(|k| lin(t.bg[k]) * (1.0 - a) + lin(t.fg[k]) * a);
+            let band = lum(std::array::from_fn(|k| lin(opaque.color[k])));
+            let page = lum(std::array::from_fn(|k| lin(t.bg[k])));
+            // Within one alpha step of the band, and visibly off the page.
+            let step = (lum(std::array::from_fn(|k| lin(t.fg[k]))) - page).abs() / 255.0;
+            assert!((lum(blended) - band).abs() <= step + 1e-4, "{}: {} vs {}", t.name, lum(blended), band);
+        }
+    }
+
     /// The caret flash keeps the cursor visible on EVERY built-in theme, for the
     /// default white flash, a black one and a mid-tone accent:
     /// * at the peak the block contrasts ≥ 3:1 with the page;
     /// * the target is never a worse pick than the configured color, black or
     ///   white (scored by the smaller of its page / glyph contrasts);
     /// * where the theme draws the classic inverted cell (glyph = page color —
-    ///   21 of the 22 built-ins) the glyph on the block never drops below its
+    ///   nearly every built-in) the glyph on the block never drops below its
     ///   resting contrast or 3:1, whichever is lower, at any point of the burst.
-    ///   (palenight's cursor is too close to its page for that, so its glyph is
-    ///   the light fg; no flash target can then contrast with both — it keeps
-    ///   white, as before the fix, and the cursor itself stays plainly visible.)
+    ///   (A theme whose cursor is too close to its page — palenight — draws the
+    ///   glyph in the light fg instead; no flash target can then contrast with
+    ///   both — it keeps white, as before the fix, and the cursor itself stays
+    ///   plainly visible.)
     #[test]
     fn caret_flash_stays_readable_on_every_builtin_theme() {
         let score = |c: [u8; 3], bg: [u8; 3], glyph: [u8; 3]| {

@@ -2137,6 +2137,7 @@ impl App {
         app.ensure_appearance_watcher();
         app.visual_bell = crate::motion::VisualBell::parse(&cfg.visual_bell);
         app.command_pulse = crate::motion::CommandPulse::parse(&cfg.command_pulse);
+        app.backdrop.set_calm(app.motion_reduced());
         // Run & Notify: mirror the persisted keys (min-seconds re-clamped for
         // belt-and-suspenders; Config::load's sanitize already applied the range).
         app.notify_on_finish = cfg.notify_on_command_finish;
@@ -3220,6 +3221,8 @@ impl App {
     /// Reduce-motion flipped: stop what it forbids at once and repaint.
     fn motion_changed(&mut self) {
         self.ensure_summon_fx();
+        // An animated backdrop holds still (its static frame, no paced wakes).
+        self.backdrop.set_calm(self.motion_reduced());
         if self.motion_reduced() {
             self.slide_anim = None;
             self.trail.reset();
@@ -11487,7 +11490,8 @@ impl ApplicationHandler<AppEvent> for App {
         // (`anim_step` → Idle). The backdrop never animates on a CPU adapter.
         let cpu_adapter = self.gpu.as_ref().is_some_and(|g| g.is_cpu_adapter());
         let anim_interval = crate::effects::anim_interval(cpu_adapter);
-        // (`reduce_motion` stops the continuous CRT animations.)
+        // (`reduce_motion` stops the continuous CRT animations and holds an
+        // animated backdrop still — `BackdropState::set_calm`.)
         let crt_live = self.crt_anim_live() || self.backdrop.animates_on(cpu_adapter);
         let animate_unfocused = self.fx.animate_unfocused;
         let settings_focused = self
@@ -15406,7 +15410,11 @@ fn render_grid_scene(
     // and the block cover it (copy-mode hides the shell cursor, and its row).
     let mut bg_rects: Vec<jetty_render::Rect> = Vec::new();
     if s.cursor_guide && !s.copy_mode_active {
-        bg_rects.extend(jetty_render::cursor_guide_rect(s.snap, s.theme, cell_w, cell_h, 0.0, grid_origin_y));
+        // Over a backdrop the band is a tint (never a stripe across the image).
+        let over_backdrop = backdrop.is_some();
+        bg_rects.extend(jetty_render::cursor_guide_rect(
+            s.snap, s.theme, cell_w, cell_h, 0.0, grid_origin_y, over_backdrop,
+        ));
     }
     bg_rects.extend(jetty_render::cell_bg_rects(s.snap, cell_w, cell_h, grid_origin_y, selection.bg));
     if !s.search_hits.is_empty() {
