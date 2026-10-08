@@ -25,6 +25,12 @@ pub struct Theme {
     pub bg: [u8; 4],           // background RGBA (alpha < 255 => transparent)
     pub fg: [u8; 3],           // default foreground
     pub cursor: [u8; 3],       // cursor block color
+    /// Color of the glyph under a solid block cursor. `None` = the theme bg (the
+    /// classic inverted cell), falling back to fg if bg is too close to `cursor`.
+    pub cursor_text: Option<[u8; 3]>,
+    /// Color of every selected glyph. `None` = keep each glyph's own color unless
+    /// it would be unreadable on the selection highlight.
+    pub selection_fg: Option<[u8; 3]>,
     pub palette: [[u8; 3]; 16], // standard ANSI 0..=15
 }
 
@@ -176,6 +182,8 @@ pub fn catppuccin_mocha() -> Theme {
         bg: [30, 30, 46, 255],   // base   #1e1e2e
         fg: [205, 214, 244],     // text   #cdd6f4
         cursor: [245, 224, 220], // rosewater #f5e0dc
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [69, 71, 90],    // 0  surface1 #45475a
             [243, 139, 168], // 1  red      #f38ba8
@@ -205,6 +213,8 @@ pub fn tokyo_night() -> Theme {
         bg: [26, 27, 38, 255],   // #1a1b26
         fg: [192, 202, 245],     // #c0caf5
         cursor: [192, 202, 245], // #c0caf5
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [21, 22, 30],    // 0  #15161e
             [247, 118, 142], // 1  #f7768e
@@ -234,6 +244,8 @@ pub fn gruvbox_dark() -> Theme {
         bg: [40, 40, 40, 255],
         fg: [235, 219, 178],
         cursor: [251, 241, 199],
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [40, 40, 40],    // 0  black (dark0)
             [204, 36, 29],   // 1  red
@@ -263,6 +275,8 @@ pub fn dracula() -> Theme {
         bg: [40, 42, 54, 255],   // #282a36
         fg: [248, 248, 242],     // #f8f8f2
         cursor: [248, 248, 242], // #f8f8f2
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [33, 34, 44],    // 0  #21222c
             [255, 85, 85],   // 1  #ff5555
@@ -293,6 +307,8 @@ pub fn onyx() -> Theme {
         bg: [22, 22, 26, 255],   // #16161a
         fg: [200, 200, 205],     // #c8c8cd
         cursor: [97, 175, 239],  // #61afef
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [58, 60, 66],    // 0  #3a3c42
             [224, 108, 117], // 1  red     #e06c75
@@ -323,6 +339,8 @@ pub fn nord() -> Theme {
         bg: [46, 52, 64, 255],   // #2e3440
         fg: [216, 222, 233],     // #d8dee9
         cursor: [236, 239, 244], // #eceff4
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [59, 66, 82], // 0  black      #3b4252
             [191, 97, 106], // 1  red        #bf616a
@@ -352,6 +370,8 @@ pub fn solarized_dark() -> Theme {
         bg: [0, 43, 54, 255],   // #002b36
         fg: [131, 148, 150],     // #839496
         cursor: [131, 148, 150], // #839496
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [7, 54, 66], // 0  black      #073642
             [220, 50, 47], // 1  red        #dc322f
@@ -381,6 +401,8 @@ pub fn solarized_light() -> Theme {
         bg: [253, 246, 227, 255],   // #fdf6e3
         fg: [101, 123, 131],     // #657b83
         cursor: [101, 123, 131], // #657b83
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [7, 54, 66], // 0  black      #073642
             [220, 50, 47], // 1  red        #dc322f
@@ -410,6 +432,8 @@ pub fn one_dark() -> Theme {
         bg: [33, 37, 43, 255],   // #21252b
         fg: [171, 178, 191],     // #abb2bf
         cursor: [171, 178, 191], // #abb2bf
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [33, 37, 43], // 0  black      #21252b
             [224, 108, 117], // 1  red        #e06c75
@@ -439,6 +463,8 @@ pub fn monokai() -> Theme {
         bg: [39, 40, 34, 255],   // #272822
         fg: [253, 255, 241],     // #fdfff1
         cursor: [192, 193, 181], // #c0c1b5
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [39, 40, 34], // 0  black      #272822
             [249, 38, 114], // 1  red        #f92672
@@ -468,6 +494,8 @@ pub fn monokai_pro() -> Theme {
         bg: [45, 42, 46, 255],   // #2d2a2e
         fg: [252, 252, 250],     // #fcfcfa
         cursor: [193, 192, 192], // #c1c0c0
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [45, 42, 46], // 0  black      #2d2a2e
             [255, 97, 136], // 1  red        #ff6188
@@ -497,6 +525,8 @@ pub fn everforest_dark() -> Theme {
         bg: [45, 53, 59, 255],   // #2d353b
         fg: [211, 198, 170],     // #d3c6aa
         cursor: [230, 152, 117], // #e69875
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [122, 132, 120], // 0  black      #7a8478
             [230, 126, 128], // 1  red        #e67e80
@@ -526,6 +556,8 @@ pub fn rose_pine() -> Theme {
         bg: [25, 23, 36, 255],   // #191724
         fg: [224, 222, 244],     // #e0def4
         cursor: [224, 222, 244], // #e0def4
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [38, 35, 58], // 0  black      #26233a
             [235, 111, 146], // 1  red        #eb6f92
@@ -555,6 +587,8 @@ pub fn kanagawa() -> Theme {
         bg: [31, 31, 40, 255],   // #1f1f28
         fg: [220, 215, 186],     // #dcd7ba
         cursor: [220, 215, 186], // #dcd7ba
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [22, 22, 29], // 0  black      #16161d
             [195, 64, 67], // 1  red        #c34043
@@ -584,6 +618,8 @@ pub fn material_dark() -> Theme {
         bg: [35, 35, 34, 255],   // #232322
         fg: [229, 229, 229],     // #e5e5e5
         cursor: [22, 175, 202], // #16afca
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [33, 33, 33], // 0  black      #212121
             [183, 20, 31], // 1  red        #b7141f
@@ -613,6 +649,8 @@ pub fn ayu_dark() -> Theme {
         bg: [11, 14, 20, 255],   // #0b0e14
         fg: [191, 189, 182],     // #bfbdb6
         cursor: [230, 180, 80], // #e6b450
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [17, 21, 28], // 0  black      #11151c
             [234, 108, 115], // 1  red        #ea6c73
@@ -642,6 +680,8 @@ pub fn ayu_mirage() -> Theme {
         bg: [31, 36, 48, 255],   // #1f2430
         fg: [204, 202, 194],     // #cccac2
         cursor: [255, 204, 102], // #ffcc66
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [23, 27, 36], // 0  black      #171b24
             [237, 130, 116], // 1  red        #ed8274
@@ -671,6 +711,8 @@ pub fn tomorrow_night() -> Theme {
         bg: [29, 31, 33, 255],   // #1d1f21
         fg: [197, 200, 198],     // #c5c8c6
         cursor: [197, 200, 198], // #c5c8c6
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [0, 0, 0], // 0  black      #000000
             [204, 102, 102], // 1  red        #cc6666
@@ -700,6 +742,8 @@ pub fn oceanic_next() -> Theme {
         bg: [22, 44, 53, 255],   // #162c35
         fg: [192, 197, 206],     // #c0c5ce
         cursor: [192, 197, 206], // #c0c5ce
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [22, 44, 53], // 0  black      #162c35
             [236, 95, 103], // 1  red        #ec5f67
@@ -729,6 +773,8 @@ pub fn github_dark() -> Theme {
         bg: [13, 17, 23, 255],   // #0d1117
         fg: [201, 209, 217],     // #c9d1d9
         cursor: [88, 166, 255], // #58a6ff
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [72, 79, 88], // 0  black      #484f58
             [255, 123, 114], // 1  red        #ff7b72
@@ -758,6 +804,8 @@ pub fn palenight() -> Theme {
         bg: [41, 45, 62, 255],   // #292d3e
         fg: [191, 199, 213],     // #bfc7d5
         cursor: [126, 87, 194], // #7e57c2
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [103, 110, 149], // 0  black      #676e95
             [255, 85, 114], // 1  red        #ff5572
@@ -787,6 +835,8 @@ pub fn catppuccin_macchiato() -> Theme {
         bg: [36, 39, 58, 255],   // #24273a
         fg: [202, 211, 245],     // #cad3f5
         cursor: [244, 219, 214], // #f4dbd6
+        cursor_text: None,
+        selection_fg: None,
         palette: [
             [73, 77, 100], // 0  black      #494d64
             [237, 135, 150], // 1  red        #ed8796

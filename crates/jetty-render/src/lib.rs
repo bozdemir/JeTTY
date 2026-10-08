@@ -1,3 +1,4 @@
+mod colors;
 mod gpu;
 mod text;
 mod quad;
@@ -18,9 +19,13 @@ mod caret_fx;
 mod search_bar;
 mod hints;
 mod palette;
-pub use gpu::GpuContext;
-pub use text::TextLayer;
-pub use quad::{QuadLayer, Rect, cell_bg_rects, default_bg_clear, scrollbar_rect, scrollbar_rect_geom, scrollbar_offset_from_cursor, text_decoration_rects, link_underline_rects, failed_marker_rects, grid_decoration_key, cursor_rects, SCROLLBAR_W};
+pub use gpu::{AcquireError, GpuContext, GpuShared};
+pub use text::{GridPaint, TextLayer};
+pub use colors::{
+    contrast_ratio, cursor_text_color, relative_luminance, selection_bg, selection_paint, SelectionPaint,
+    SELECTION_MIN_CONTRAST,
+};
+pub use quad::{QuadLayer, Rect, cell_bg_rects, default_bg_clear, scrollbar_rect, scrollbar_rect_geom, scrollbar_offset_from_cursor, text_decoration_rects, link_underline_rects, failed_marker_rects, grid_decoration_key, cursor_rects, cursor_rects_split, SCROLLBAR_W};
 pub use panel::{build_panel, EffectsParams, NotifyParams, PanelView, PanelGeom, PANEL_W, PANEL_H,
                 EFFECTS_CONTENT_H, EFFECTS_VISIBLE_H, CHAR_W_FALLBACK};
 pub use mask::{CornerMask, all_radii_flat, rounded_rect_coverage, rounded_rect_coverage_per};

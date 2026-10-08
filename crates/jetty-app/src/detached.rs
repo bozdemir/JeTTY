@@ -184,9 +184,11 @@ pub(crate) struct DetachedWindow {
     /// Surface-sized offscreen render target (same descriptor as
     /// `App::make_offscreen`). When CRT is enabled the whole detached scene is
     /// rendered into it and the CRT post-pass samples it onto the surface —
-    /// the same routing as the main window. Lazily re-allocated on size change
-    /// by `App::render_detached_window` (mirrors the main stale check).
-    pub offscreen: (wgpu::Texture, wgpu::TextureView),
+    /// the same routing as the main window. Allocated LAZILY by
+    /// `App::render_detached_window` on the first CRT frame and re-allocated on
+    /// size change (mirrors the main window); `None` while CRT has never been on,
+    /// so a plain detached window holds no full-surface texture.
+    pub offscreen: Option<(wgpu::Texture, wgpu::TextureView)>,
     /// Per-window rounded-corner mask pass (same radius as the main window's;
     /// all four corners round — see `corner_radii`). Per-window instance because
     /// `CornerMask` caches its uniform/bind group; sharing across surfaces of
@@ -303,8 +305,13 @@ pub(crate) struct DetachedWindow {
 impl DetachedWindow {
     /// Construct a detached window sized `w_logical × h_logical` (logical /
     /// device-independent pixels) that owns `tab`. Mirrors the construction in
-    /// `App::toggle_settings_window` and `App::resumed` — same `GpuContext::new`,
-    /// same `TextLayer`/`QuadLayer` descriptors, same offscreen-texture descriptor.
+    /// `App::toggle_settings_window` and `App::resumed` — same `TextLayer` /
+    /// `QuadLayer` descriptors — but on the main window's GPU: `gpu_shared` (the
+    /// main `GpuContext::shared()`) means only a new surface is created, and
+    /// `font_source` (the main grid `TextLayer`) lends its loaded font database,
+    /// so a detach no longer blocks the UI thread on a new device plus two
+    /// fontconfig scans. Either may be `None` (main GPU unavailable) → the window
+    /// acquires its own, as before.
     ///
     /// `font_logical` and `ui_font_logical` are the caller's current logical font
     /// sizes (same values stored in `App::font_logical` and `App::ui_font_logical`).
@@ -332,6 +339,8 @@ impl DetachedWindow {
         ui_font_logical: f32,
         font_family: &str,
         ui_font_family: &str,
+        gpu_shared: Option<&Arc<jetty_render::GpuShared>>,
+        font_source: Option<&TextLayer>,
     ) -> Result<Self, Tab> {
         // Title the OS window from the tab (mirrors how the tab bar displays it).
         let window = match jetty_platform::build_window(
@@ -353,10 +362,10 @@ impl DetachedWindow {
         // HiDPI: same scale-factor handling as the main window in `resumed`.
         let scale = window.scale_factor() as f32;
 
-        // GPU context — identical call to App::resumed (`app.rs` ~2722) and
-        // `toggle_settings_window` (`app.rs` ~1800). Failure hands the tab back
-        // (the main + settings windows handle the same None gracefully).
-        let gpu = match GpuContext::new(window.clone(), size.width, size.height) {
+        // GPU context — a surface on the shared main device (same call as
+        // `toggle_settings_window`), else a device of its own. Failure hands the tab
+        // back (the main + settings windows handle the same None gracefully).
+        let gpu = match GpuContext::new_sharing(gpu_shared, window.clone(), size.width, size.height) {
             Some(g) => g,
             None => {
                 eprintln!("jetty: detached window GPU init failed — no suitable adapter");
@@ -364,16 +373,19 @@ impl DetachedWindow {
             }
         };
 
-        // Terminal content layer — mirrors `TextLayer::new_with_family` used in
-        // `App::resumed` (`app.rs` ~2728): terminal font at logical × scale_factor.
-        let text = TextLayer::new_with_family(
-            &gpu.device, &gpu.queue, gpu.format, font_logical * scale, font_family,
+        // Both layers build from the main layer's already-loaded font database
+        // (a copy of the face index, not a fresh fontconfig scan).
+        let fonts = || font_source.map_or_else(TextLayer::build_font_system, |t| t.clone_font_system());
+        // Terminal content layer — mirrors the grid TextLayer built in
+        // `App::resumed`: terminal font at logical × scale_factor.
+        let text = TextLayer::new_with_family_and_fonts(
+            &gpu.device, &gpu.queue, gpu.format, font_logical * scale, font_family, fonts(),
         );
-        // Chrome layer — mirrors the chrome TextLayer built in `App::resumed`
-        // (`app.rs` ~2801): UI font at ui_font_logical × scale_factor, with the
-        // chrome family applied via `set_ui_family` (no fontconfig rescan).
-        let mut chrome_text = TextLayer::new_with_family(
-            &gpu.device, &gpu.queue, gpu.format, ui_font_logical * scale, font_family,
+        // Chrome layer — mirrors the chrome TextLayer built in `App::resumed`:
+        // UI font at ui_font_logical × scale_factor, with the chrome family
+        // applied via `set_ui_family` (no fontconfig rescan).
+        let mut chrome_text = TextLayer::new_with_family_and_fonts(
+            &gpu.device, &gpu.queue, gpu.format, ui_font_logical * scale, font_family, fonts(),
         );
         chrome_text.set_ui_family(if ui_font_family.is_empty() {
             None
@@ -382,27 +394,6 @@ impl DetachedWindow {
         });
         // Quad layer — same call as both sites in `app.rs` (~1823, ~2735).
         let quad = QuadLayer::new(&gpu.device, gpu.format);
-
-        // Offscreen texture — verbatim copy of `App::make_offscreen` (~939).
-        let offscreen = {
-            let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("detached-offscreen"),
-                size: wgpu::Extent3d {
-                    width: gpu.config.width.max(1),
-                    height: gpu.config.height.max(1),
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: gpu.format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-            (tex, view)
-        };
 
         // Rounded-corner mask + CRT post-pass — same unconditional construction
         // as the main window's in `App::resumed` (app.rs ~3523/~3537), but as
@@ -421,7 +412,8 @@ impl DetachedWindow {
             text,
             chrome_text,
             quad,
-            offscreen,
+            // Allocated on the first CRT frame (see the field doc).
+            offscreen: None,
             corner_mask,
             crt,
             image_layer,

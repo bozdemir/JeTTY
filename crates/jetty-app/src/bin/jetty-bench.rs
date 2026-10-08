@@ -182,11 +182,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     text.render_to(&device, &queue, &view, width, height, &snap, true, 0.0)?;
     device.poll(wgpu::PollType::wait_indefinitely())?;
 
-    // Split each frame into CPU-prep (build spans + shape + glyphon prepare +
-    // queue.submit, all inside render_to) vs GPU-execute (the device.poll wait for
-    // the GPU to finish). This shows where the budget actually goes — JeTTY's grid
-    // render is CPU-prep-dominated (text shaping + atlas prep), so the GPU portion
-    // is small and a faster GPU barely moves the total.
+    // Split each frame into CPU-prep (build spans + glyphon prepare + queue.submit,
+    // all inside render_to) vs GPU-execute (the device.poll wait for the GPU to
+    // finish). NOTE: this re-renders the SAME snapshot every frame, so after the
+    // warm-up no row is ever re-shaped — it measures the unchanged-grid path (what
+    // a caret-flash / CRT-only frame costs), NOT a frame with new output. The
+    // `frames` section below measures frames whose content actually changes.
     let n_frames = 200;
     let mut cpu_accum = 0.0f64;
     let t4 = Instant::now();
@@ -206,10 +207,206 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("text_init     {text_init_ms:6.1} ms    (font system + atlas)");
     println!("throughput    {mbps:6.0} MB/s   (fed {mb:.0} MB colored VT in {feed_s:.2}s)");
     println!("snapshot      {snap_ms:8.3} ms/frame  ({:.0}k cells)", (cols * rows) as f64 / 1000.0);
-    println!("render        {frame_ms:8.3} ms/frame  ({:.0} fps cap)", 1000.0 / frame_ms);
-    println!("  ├─ cpu prep {cpu_ms:8.3} ms/frame  (build spans + shape + atlas prepare + submit)");
+    println!("render        {frame_ms:8.3} ms/frame  ({:.0} fps cap; SAME snapshot every frame → no re-shape)", 1000.0 / frame_ms);
+    println!("  ├─ cpu prep {cpu_ms:8.3} ms/frame  (build spans + atlas prepare + submit; shaping skipped — unchanged grid)");
     println!("  └─ gpu exec {gpu_ms:8.3} ms/frame  (device.poll wait for GPU completion)");
     print_pipeline_1byte_cpu(&mut term);
+    print_font_db_costs(&text);
+    bench_frames(&device, &queue, format, font_size)?;
+    Ok(())
+}
+
+/// Font-database cost on the main thread: a fresh fontconfig scan (what every extra
+/// `TextLayer` — chrome, Settings, each detached window — used to pay) vs. building
+/// from the already-loaded database (`TextLayer::clone_font_system`).
+fn print_font_db_costs(text: &TextLayer) {
+    let median3 = |f: &dyn Fn()| {
+        let mut v: Vec<f32> = (0..3)
+            .map(|_| {
+                let t = Instant::now();
+                f();
+                t.elapsed().as_secs_f32() * 1000.0
+            })
+            .collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[1]
+    };
+    let scan = median3(&|| drop(TextLayer::build_font_system()));
+    let clone = median3(&|| drop(text.clone_font_system()));
+    println!("font_db_scan  {scan:6.1} ms    (median of 3; fresh fontconfig scan)");
+    println!("font_db_clone {clone:6.2} ms    (median of 3; reuse the loaded database)");
+}
+
+/// One content line for the frame benchmarks, numbered so every row is distinct
+/// (identical rows would let a content-keyed cache cheat).
+fn numbered_line(k: usize) -> Vec<u8> {
+    let mut v = format!("\x1b[2m{k:06}\x1b[0m ").into_bytes();
+    v.extend_from_slice(VT_LINE);
+    v
+}
+
+/// Per-frame cost of frames whose CONTENT changes, at two fixed grid sizes:
+///   static — same snapshot again (caret-flash / CRT-only frame)
+///   typing — one printable char echoed at the prompt per frame
+///   scroll — one new line per frame (the whole screen moves up one row)
+/// Each frame = snapshot + render_to (CPU) and then the GPU wait (total).
+fn bench_frames(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    font_size: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("frames        (per frame: snapshot + render_to CPU | incl. GPU wait; mean, p99 CPU; n=300)");
+    for &(cols, rows) in &[(120usize, 40usize), (240, 70)] {
+        let mut text = TextLayer::new_with_family(device, queue, format, font_size, "MesloLGS NF");
+        let (cw, ch) = text.cell_size();
+        let width = (cols as f32 * cw).ceil() as u32 + 1;
+        let height = (rows as f32 * ch).ceil() as u32 + 1;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bench-frames-tex"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut term = jetty_core::Terminal::new(cols, rows);
+        for k in 0..rows * 2 {
+            term.feed(&numbered_line(k));
+        }
+        let snap = term.snapshot();
+        text.render_to(device, queue, &view, width, height, &snap, true, 0.0)?;
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+
+        let mut run = |label: &str,
+                       step: &mut dyn FnMut(&mut jetty_core::Terminal, usize)|
+         -> Result<(), Box<dyn std::error::Error>> {
+            let n = 300usize;
+            let mut cpu = Vec::with_capacity(n);
+            let mut total = 0.0f64;
+            for k in 0..n {
+                step(&mut term, k);
+                let t = Instant::now();
+                let snap = term.snapshot();
+                text.render_to(device, queue, &view, width, height, &snap, true, 0.0)?;
+                cpu.push(t.elapsed().as_secs_f32() * 1000.0);
+                device.poll(wgpu::PollType::wait_indefinitely())?;
+                total += t.elapsed().as_secs_f64() * 1000.0;
+            }
+            let mean = cpu.iter().sum::<f32>() / n as f32;
+            cpu.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            println!(
+                "  {cols:3}x{rows:<3} {label:<7} cpu {mean:7.3} ms | total {:7.3} ms | p99 cpu {:7.3} ms",
+                total / n as f64,
+                percentile(&cpu, 99.0)
+            );
+            Ok(())
+        };
+        run("static", &mut |_t, _k| {})?;
+        run("typing", &mut |t, k| {
+            // Wrap like a long command line would, but stay on the prompt row most
+            // of the time: a CR+LF every 100 chars starts a fresh prompt line.
+            if k % 100 == 99 {
+                t.feed(b"\r\n$ ");
+            } else {
+                t.feed(&[b"abcdefghijklmnopqrstuvwxyz"[k % 26]]);
+            }
+        })?;
+        let mut line = 1_000_000usize;
+        run("scroll", &mut |t, _k| {
+            line += 1;
+            t.feed(&numbered_line(line));
+        })?;
+    }
+    bench_scene_passes(device, queue, format, font_size)
+}
+
+/// The app's whole grid scene per frame — cell-background quads + glyphs, typing —
+/// recorded as two render passes + two submits (the pre-batching render core) vs.
+/// ONE pass + ONE submit (what `render_grid_scene` does now). Interleaved frame by
+/// frame so machine load hits both variants alike.
+fn bench_scene_passes(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    font_size: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (cols, rows) = (240usize, 70usize);
+    let mut text = TextLayer::new_with_family(device, queue, format, font_size, "MesloLGS NF");
+    let mut quad = jetty_render::QuadLayer::new(device, format);
+    let (cw, ch) = text.cell_size();
+    let width = (cols as f32 * cw).ceil() as u32 + 1;
+    let height = (rows as f32 * ch).ceil() as u32 + 1;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("bench-scene-tex"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut term = jetty_core::Terminal::new(cols, rows);
+    for k in 0..rows * 2 {
+        term.feed(&numbered_line(k));
+    }
+    let (mut two, mut one) = (Vec::new(), Vec::new());
+    for k in 0..600usize {
+        if k % 100 == 99 {
+            term.feed(b"\r\n$ ");
+        } else {
+            term.feed(&[b"abcdefghijklmnopqrstuvwxyz"[k % 26]]);
+        }
+        let t = Instant::now();
+        let snap = term.snapshot();
+        let bg = jetty_render::cell_bg_rects(&snap, cw, ch, 0.0, [60, 80, 120]);
+        let clear = jetty_render::default_bg_clear(&snap, true);
+        if k % 2 == 0 {
+            quad.render_clear(device, queue, &view, width, height, &bg, clear);
+            text.render_to(device, queue, &view, width, height, &snap, false, 0.0)?;
+            two.push(t.elapsed().as_secs_f32() * 1000.0);
+        } else {
+            let n = quad.upload(device, queue, width, height, &bg);
+            let ready = text
+                .prepare_grid(device, queue, width, height, &snap, 0.0, &jetty_render::GridPaint::default())
+                .is_ok();
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                quad.draw_uploaded(&mut pass, n);
+                if ready {
+                    text.draw_grid(&mut pass);
+                }
+            }
+            queue.submit(Some(encoder.finish()));
+            text.end_grid_frame();
+            one.push(t.elapsed().as_secs_f32() * 1000.0);
+        }
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+    }
+    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+    println!(
+        "scene         {cols}x{rows} typing, bg quads + glyphs: 2 passes/submits cpu {:.3} ms | 1 pass/submit cpu {:.3} ms",
+        mean(&two),
+        mean(&one)
+    );
     Ok(())
 }
 
