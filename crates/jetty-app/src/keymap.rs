@@ -1,14 +1,18 @@
 //! Configurable keybindings: a chord grammar (parse + serialize), a compiled
-//! [`KeyMap`] (two small hashmaps — logical + physical), and
-//! [`KeyMap::lookup`], which `decide_key` calls once at the top to resolve the
-//! discrete app-command chords.
+//! [`KeyMap`] (small hashmaps — logical, physical, physical-fallback), and
+//! [`KeyMap::lookup`], which `decide_key_event` calls once at the top to resolve
+//! the discrete app-command chords.
 //!
-//! PRIME DIRECTIVE: a user with no `[keys]` config gets byte-for-byte today's
-//! behavior. The default keymap reproduces every hardcoded chord `decide_key`
-//! (and the old macOS `Cmd` block) used, INCLUDING today's exact modifier
-//! semantics — the Ctrl+Shift / tab-nav / font chords never tested Alt, so their
-//! defaults are Alt-INSENSITIVE; the macOS `Cmd` chords never tested Shift, so
-//! their defaults are Shift-INSENSITIVE. User-supplied chords use exact matching.
+//! Letter and symbol chords follow the key LABEL: they match the produced
+//! (case-folded) character, so Ctrl+Shift+C copies on Dvorak / AZERTY /
+//! Turkish-F exactly where the control-byte path already sends Ctrl+C = 0x03.
+//! Their US physical position is only a fallback for keys that produce no ASCII
+//! character (Cyrillic / Greek layouts, Turkish `ı`, dead / unidentified keys).
+//! Named keys and the digit row (Ctrl+1…9 tab jumps) match by position.
+//!
+//! The Ctrl+Shift / tab-nav chords never tested Alt, so their defaults are
+//! Alt-INSENSITIVE; the macOS `Cmd` chords never tested Shift, so their
+//! defaults are Shift-INSENSITIVE. User-supplied chords use exact matching.
 
 use std::collections::HashMap;
 
@@ -44,12 +48,12 @@ impl Mods {
 /// How a chord's key segment resolves against a key event.
 #[derive(Clone, Debug, PartialEq)]
 enum KeyMatch {
-    /// Match `event.physical_key` (layout-invariant position). Used for letters,
-    /// digits 1-9, and named keys.
+    /// Match `event.physical_key` (layout-invariant position). Used for named
+    /// keys and digits 1-9.
     Phys(KeyCode),
-    /// Match the produced logical character(s) (layout-following), with a
-    /// US-position physical fallback. Used for font/opacity symbols, `0`, and
-    /// `Super`-letters (macOS label convention).
+    /// Match the produced logical character(s) (layout-following). The US
+    /// physical position is consulted only when the event's logical key is not
+    /// an ASCII character. Used for letters, symbols and `0`.
     Logical {
         chars: Vec<SmolStr>,
         phys_fallback: Option<KeyCode>,
@@ -136,7 +140,12 @@ impl Chord {
             KeyMatch::Phys(code) => s.push_str(&keycode_pretty(*code)),
             KeyMatch::Logical { chars, .. } => {
                 if let Some(c) = chars.first() {
-                    s.push_str(c);
+                    // Letters are stored case-folded; show them as engraved.
+                    if c.len() == 1 && c.as_bytes()[0].is_ascii_alphabetic() {
+                        s.push_str(&c.to_ascii_uppercase());
+                    } else {
+                        s.push_str(c);
+                    }
                 }
             }
         }
@@ -181,12 +190,16 @@ pub enum BindableAction {
     HintMode,
     CopyMode,
     RunSelection,
-    /// Declared LAST so it can never win a slot from an existing action.
+    /// Declared after every older action so it can never win a slot from one.
     ToggleFullscreen,
+    /// Host scrollback paging (v0.26: Shift+PageUp/PageDown; plain Page keys
+    /// now reach the program). Appended LAST, like every new action.
+    ScrollPageUp,
+    ScrollPageDown,
 }
 
 impl BindableAction {
-    pub const ALL: [BindableAction; 32] = [
+    pub const ALL: [BindableAction; 34] = [
         BindableAction::ToggleSettings,
         BindableAction::OpenPalette,
         BindableAction::NewTab,
@@ -219,6 +232,8 @@ impl BindableAction {
         BindableAction::CopyMode,
         BindableAction::RunSelection,
         BindableAction::ToggleFullscreen,
+        BindableAction::ScrollPageUp,
+        BindableAction::ScrollPageDown,
     ];
 
     /// Stable name for warnings / debugging.
@@ -257,6 +272,8 @@ impl BindableAction {
             CopyMode => "copy_mode",
             RunSelection => "run_selection",
             ToggleFullscreen => "toggle_fullscreen",
+            ScrollPageUp => "scroll_page_up",
+            ScrollPageDown => "scroll_page_down",
         }
     }
 
@@ -296,6 +313,8 @@ impl BindableAction {
             CopyMode => KeyAction::CopyMode,
             RunSelection => KeyAction::RunSelection,
             ToggleFullscreen => KeyAction::ToggleFullscreen,
+            ScrollPageUp => KeyAction::ScrollPageUp,
+            ScrollPageDown => KeyAction::ScrollPageDown,
         }
     }
 
@@ -335,6 +354,8 @@ impl BindableAction {
             CopyMode => &b.copy_mode,
             RunSelection => &b.run_selection,
             ToggleFullscreen => &b.toggle_fullscreen,
+            ScrollPageUp => &b.scroll_page_up,
+            ScrollPageDown => &b.scroll_page_down,
         }
     }
 
@@ -348,30 +369,30 @@ impl BindableAction {
                 let mut v = vec![
                     // Ctrl+, (logical + physical fallback) and Ctrl+Shift+O.
                     ctrl(sym(",", KeyCode::Comma)),
-                    ctrl_shift(KeyMatch::Phys(KeyCode::KeyO)),
+                    ctrl_shift(letter('o')),
                 ];
                 push_cmd(&mut v, cmd_symbol(logical_only(",")));
                 v
             }
             OpenPalette => {
-                let mut v = vec![ctrl_shift(KeyMatch::Phys(KeyCode::KeyP))];
+                let mut v = vec![ctrl_shift(letter('p'))];
                 push_cmd(&mut v, cmd_letter("p"));
                 v
             }
             NewTab => {
-                let mut v = vec![ctrl_shift(KeyMatch::Phys(KeyCode::KeyT))];
+                let mut v = vec![ctrl_shift(letter('t'))];
                 push_cmd(&mut v, cmd_letter("t"));
                 v
             }
             CloseTab => {
-                let mut v = vec![ctrl_shift(KeyMatch::Phys(KeyCode::KeyW))];
+                let mut v = vec![ctrl_shift(letter('w'))];
                 push_cmd(&mut v, cmd_letter("w"));
                 v
             }
-            DetachTab => vec![ctrl_shift(KeyMatch::Phys(KeyCode::KeyD))],
-            SearchToggle => vec![ctrl_shift(KeyMatch::Phys(KeyCode::KeyF))],
-            PrevPrompt => vec![ctrl_shift(KeyMatch::Phys(KeyCode::KeyZ))],
-            NextPrompt => vec![ctrl_shift(KeyMatch::Phys(KeyCode::KeyX))],
+            DetachTab => vec![ctrl_shift(letter('d'))],
+            SearchToggle => vec![ctrl_shift(letter('f'))],
+            PrevPrompt => vec![ctrl_shift(letter('z'))],
+            NextPrompt => vec![ctrl_shift(letter('x'))],
             PrevTab => vec![ctrl_shift(KeyMatch::Phys(KeyCode::Tab))],
             NextTab => vec![ctrl(KeyMatch::Phys(KeyCode::Tab))],
             SelectTab1 => vec![ctrl(KeyMatch::Phys(KeyCode::Digit1))],
@@ -384,28 +405,39 @@ impl BindableAction {
             SelectTab8 => vec![ctrl(KeyMatch::Phys(KeyCode::Digit8))],
             SelectTab9 => vec![ctrl(KeyMatch::Phys(KeyCode::Digit9))],
             Copy => {
-                let mut v = vec![ctrl_shift(KeyMatch::Phys(KeyCode::KeyC))];
+                let mut v = vec![ctrl_shift(letter('c'))];
                 push_cmd(&mut v, cmd_letter("c"));
                 v
             }
             Paste => {
                 let mut v = vec![
-                    ctrl_shift(KeyMatch::Phys(KeyCode::KeyV)),
+                    ctrl_shift(letter('v')),
                     // Shift+Insert is EXACT (today: shift && !ctrl && !alt).
                     Chord::exact(Mods::new(false, true, false, false), KeyMatch::Phys(KeyCode::Insert)),
                 ];
                 push_cmd(&mut v, cmd_letter("v"));
                 v
             }
-            OpacityUp => vec![ctrl_shift(font_up_keymatch())],
-            OpacityDown => vec![ctrl_shift(opacity_down_keymatch())],
+            // Transparency lives on Ctrl+Alt+'±' (v0.26; was Ctrl+Shift): that
+            // freed Ctrl+Shift+'+' for font zoom — on Turkish-Q / Swiss /
+            // Hungarian layouts '+' only exists WITH Shift — and gave Ctrl+_
+            // (readline / emacs undo, 0x1f) back to the shell. AltGr is not Alt
+            // (XKB reports it as ISO_Level3), so no AltGr character is shadowed.
+            OpacityUp => vec![shift_loose(Mods::new(true, false, true, false), font_up_keymatch())],
+            OpacityDown => {
+                vec![shift_loose(Mods::new(true, false, true, false), opacity_down_keymatch())]
+            }
+            // Ctrl + whatever key types '+' or '=' zooms in, Shift or not.
+            // Alt-SENSITIVE: Ctrl+Alt+'±' is transparency.
             FontUp => {
-                let mut v = vec![ctrl(font_up_keymatch())];
+                let mut v = vec![shift_loose(Mods::new(true, false, false, false), font_up_keymatch())];
                 push_cmd(&mut v, cmd_symbol(font_up_keymatch()));
                 v
             }
+            // Exact Ctrl+'-': Ctrl+Shift+'-' types '_' and must reach the shell
+            // as 0x1f; Ctrl+Alt+'-' is transparency.
             FontDown => {
-                let mut v = vec![ctrl(font_down_keymatch())];
+                let mut v = vec![Chord::exact(Mods::new(true, false, false, false), font_down_keymatch())];
                 push_cmd(&mut v, cmd_symbol(font_down_keymatch()));
                 v
             }
@@ -431,7 +463,7 @@ impl BindableAction {
             // like SearchToggle/DetachTab, have NO macOS Cmd variant — the
             // Ctrl+Shift chord works on every platform. Both were verified free
             // in the default set (H and Space are unbound Ctrl+Shift slots).
-            HintMode => vec![ctrl_shift(KeyMatch::Phys(KeyCode::KeyH))],
+            HintMode => vec![ctrl_shift(letter('h'))],
             CopyMode => vec![ctrl_shift(KeyMatch::Phys(KeyCode::Space))],
             // Run-selection-in-a-new-tab: Ctrl+Shift+Enter — the browser/IDE
             // "run it" chord. Verified free across the whole default set (no
@@ -466,6 +498,17 @@ impl BindableAction {
                 push_cmd(&mut v, cmd_ctrl_letter("f"));
                 v
             }
+            // Shift+PageUp/Down: every terminal's host-scrollback chord. Plain
+            // PageUp/Down reach the program (fzf's inline Ctrl+R / Ctrl+T, zsh
+            // history paging, inline prompt_toolkit apps). Old behaviour:
+            // `[keys] scroll_page_up = ["Shift+PageUp", "PageUp"]` (+ down);
+            // the bare keys then still go to programs on the alternate screen.
+            ScrollPageUp => {
+                vec![Chord::exact(Mods::new(false, true, false, false), KeyMatch::Phys(KeyCode::PageUp))]
+            }
+            ScrollPageDown => {
+                vec![Chord::exact(Mods::new(false, true, false, false), KeyMatch::Phys(KeyCode::PageDown))]
+            }
         }
     }
 }
@@ -480,6 +523,22 @@ fn ctrl(k: KeyMatch) -> Chord {
 /// Ctrl+Shift, Alt-don't-care.
 fn ctrl_shift(k: KeyMatch) -> Chord {
     Chord::alt_loose(Mods::new(true, true, false, false), k)
+}
+
+/// `mods` with Shift-don't-care (Alt still exact): for symbols that need Shift
+/// on some layouts and not on others ('+' is Shift+4 on Turkish-Q).
+fn shift_loose(mods: Mods, k: KeyMatch) -> Chord {
+    Chord { mods, key: k, alt_insensitive: false, shift_insensitive: true }
+}
+
+/// A letter chord: matches the key LABELED `ch` (any case) on any layout; the
+/// US position is only a fallback for non-Latin layouts (see [`KeyMap::lookup`]).
+fn letter(ch: char) -> KeyMatch {
+    let lc = ch.to_ascii_lowercase();
+    KeyMatch::Logical {
+        chars: vec![SmolStr::new(lc.to_string())],
+        phys_fallback: Some(letter_keycode(lc)),
+    }
 }
 
 /// A logical symbol keymatch with a US physical fallback.
@@ -561,8 +620,15 @@ fn push_cmd(_v: &mut [Chord], _chord: Chord) {}
 
 /// A compiled, ready-to-query keymap.
 pub struct KeyMap {
+    /// Position chords (named keys, digits 1-9): always consulted.
     physical: HashMap<(Mods, KeyCode), KeyAction>,
+    /// Label chords (letters, symbols, `0`), keyed by the case-folded character.
     logical: HashMap<(Mods, SmolStr), KeyAction>,
+    /// The US positions of the label chords, consulted ONLY when the event's
+    /// logical key is not an ASCII character (non-Latin layouts, Turkish `ı`,
+    /// dead / unidentified keys) — never on a layout that types another ASCII
+    /// character there (Dvorak's KeyC is 'J', and Ctrl+Shift+J is not Copy).
+    phys_fallback: HashMap<(Mods, KeyCode), KeyAction>,
     /// The compiled chords per action (unexpanded), for help/display.
     by_action: Vec<(BindableAction, Vec<Chord>)>,
     /// Human-readable compile warnings (conflicts / rejected binds / invalid
@@ -573,7 +639,9 @@ pub struct KeyMap {
 impl PartialEq for KeyMap {
     fn eq(&self, other: &Self) -> bool {
         // Compare only the resolved maps — by_action/warnings are derived from them.
-        self.physical == other.physical && self.logical == other.logical
+        self.physical == other.physical
+            && self.logical == other.logical
+            && self.phys_fallback == other.phys_fallback
     }
 }
 
@@ -591,6 +659,7 @@ impl KeyMap {
         let mut km = KeyMap {
             physical: HashMap::new(),
             logical: HashMap::new(),
+            phys_fallback: HashMap::new(),
             by_action: Vec::new(),
             warnings: Vec::new(),
         };
@@ -632,8 +701,9 @@ impl KeyMap {
     }
 
     /// Resolve a key event to an app action, or `None` when unmapped (the caller
-    /// falls through to raw PTY encoding). LOGICAL is checked before PHYSICAL,
-    /// mirroring `decide_key`'s font-before-letter precedence.
+    /// falls through to raw PTY encoding): the produced character (label) first,
+    /// then the position chords, then — only for a key that produced no ASCII
+    /// character — the label chords' US positions.
     pub fn lookup(&self, m: Mods, physical: PhysicalKey, logical: &Key) -> Option<KeyAction> {
         if let Key::Character(s) = logical {
             let key = smol_lower(s);
@@ -644,6 +714,12 @@ impl KeyMap {
         if let PhysicalKey::Code(code) = physical {
             if let Some(a) = self.physical.get(&(m, code)) {
                 return Some(a.clone());
+            }
+            let ascii_char = matches!(logical, Key::Character(s) if s.is_ascii());
+            if !ascii_char {
+                if let Some(a) = self.phys_fallback.get(&(m, code)) {
+                    return Some(a.clone());
+                }
             }
         }
         None
@@ -667,7 +743,9 @@ impl KeyMap {
     // ── internals ────────────────────────────────────────────────────────────
 
     fn contains_action(&self, ka: &KeyAction) -> bool {
-        self.physical.values().any(|v| v == ka) || self.logical.values().any(|v| v == ka)
+        self.physical.values().any(|v| v == ka)
+            || self.logical.values().any(|v| v == ka)
+            || self.phys_fallback.values().any(|v| v == ka)
     }
 
     /// Insert a chord's slots into the maps, expanding the Alt/Shift-insensitive
@@ -698,11 +776,28 @@ impl KeyMap {
                         self.put_logical(action, m, smol_lower(cc), &ka, force);
                     }
                     if let Some(fb) = phys_fallback {
-                        self.put_phys(action, m, *fb, &ka, force);
+                        self.put_phys_fallback(action, m, *fb, &ka, force);
                     }
                 }
             }
         }
+    }
+
+    fn put_phys_fallback(&mut self, action: BindableAction, m: Mods, code: KeyCode, ka: &KeyAction, force: bool) {
+        if let Some(existing) = self.phys_fallback.get(&(m, code)) {
+            if existing == ka {
+                return;
+            }
+            if !force {
+                self.warnings.push(format!(
+                    "keybinding conflict on {}: {} is ignored (already bound)",
+                    pretty_slot_phys(m, code),
+                    action.name(),
+                ));
+                return;
+            }
+        }
+        self.phys_fallback.insert((m, code), ka.clone());
     }
 
     fn put_phys(&mut self, action: BindableAction, m: Mods, code: KeyCode, ka: &KeyAction, force: bool) {
@@ -796,14 +891,14 @@ impl KeyMap {
     }
 }
 
-/// Lowercase a logical character key for case-folded matching.
+/// Lowercase a logical character key for case-folded matching. Runs on every
+/// keystroke, so the common already-lowercase / non-letter case returns the
+/// (inline, heap-free) SmolStr without building a String.
 fn smol_lower(s: &SmolStr) -> SmolStr {
-    let lowered = s.to_lowercase();
-    if lowered == s.as_str() {
-        s.clone()
-    } else {
-        SmolStr::new(lowered)
+    if s.chars().all(|c| !c.is_alphabetic() || c.is_lowercase()) {
+        return s.clone();
     }
+    SmolStr::new(s.to_lowercase())
 }
 
 /// Would this user chord shadow a needed terminal control byte or lock out
@@ -811,12 +906,20 @@ fn smol_lower(s: &SmolStr) -> SmolStr {
 fn chord_reject_reason(ch: &Chord) -> Option<String> {
     // A no-modifier bind shadows whatever the key normally sends — printable
     // chars, but ALSO Enter/Tab/Space/Backspace/Escape and the arrow/nav keys a
-    // TUI needs. Only F-keys are safe to bind bare; everything else would lock
-    // that key out of the shell.
+    // TUI needs. Only F-keys and PageUp/PageDown (the pre-v0.26 scroll keys —
+    // `scroll_page_up = ["Shift+PageUp", "PageUp"]`; programs on the alternate
+    // screen still get them) may be bound bare; anything else would lock that
+    // key out of the shell.
     if ch.mods.is_empty() {
-        let ok_bare = matches!(&ch.key, KeyMatch::Phys(code) if is_fkey(*code));
+        let ok_bare = matches!(
+            &ch.key,
+            KeyMatch::Phys(code) if is_fkey(*code) || matches!(code, KeyCode::PageUp | KeyCode::PageDown)
+        );
         if !ok_bare {
-            return Some("bindings need a modifier (only F-keys may be bound bare)".to_string());
+            return Some(
+                "bindings need a modifier (only F-keys and PageUp/PageDown may be bound bare)"
+                    .to_string(),
+            );
         }
     }
     // Ctrl-only chord on a C0 control-byte producer → would kill SIGINT/EOF/ESC/…
@@ -886,7 +989,7 @@ fn parse_chord(s: &str) -> Result<Chord, String> {
         }
     }
 
-    let key = parse_key(&key_tok, mods)?;
+    let key = parse_key(&key_tok)?;
     Ok(Chord::exact(mods, key))
 }
 
@@ -916,24 +1019,16 @@ fn split_chord(s: &str) -> Option<(Vec<&str>, String)> {
     Some((parts, key))
 }
 
-fn parse_key(tok: &str, mods: Mods) -> Result<KeyMatch, String> {
+fn parse_key(tok: &str) -> Result<KeyMatch, String> {
     let t = tok.trim();
     if t.is_empty() {
         return Err("missing key".to_string());
     }
 
-    // Single ASCII letter.
+    // Single ASCII letter: matched by LABEL (the produced character), with the
+    // US position as the non-Latin-layout fallback — like the defaults.
     if t.len() == 1 && t.chars().next().unwrap().is_ascii_alphabetic() {
-        let ch = t.chars().next().unwrap().to_ascii_lowercase();
-        let code = letter_keycode(ch);
-        // Super-letter resolves by logical char (macOS label convention).
-        if mods.super_ {
-            return Ok(KeyMatch::Logical {
-                chars: vec![SmolStr::new(ch.to_string())],
-                phys_fallback: Some(code),
-            });
-        }
-        return Ok(KeyMatch::Phys(code));
+        return Ok(letter(t.chars().next().unwrap()));
     }
 
     // Single ASCII digit.
@@ -1449,12 +1544,15 @@ mod tests {
 
     #[test]
     fn run_selection_ordering_in_all() {
-        // Declared after CopyMode, and ToggleFullscreen stays LAST (its doc
-        // comment demands it never wins a slot from an existing action).
+        // New actions are APPENDED so they never win a slot from an older one:
+        // … CopyMode, RunSelection, ToggleFullscreen, then the v0.26 scroll
+        // actions.
         let all = BindableAction::ALL;
-        assert_eq!(all[all.len() - 1], BindableAction::ToggleFullscreen);
-        assert_eq!(all[all.len() - 2], BindableAction::RunSelection);
-        assert_eq!(all[all.len() - 3], BindableAction::CopyMode);
+        assert_eq!(all[all.len() - 1], BindableAction::ScrollPageDown);
+        assert_eq!(all[all.len() - 2], BindableAction::ScrollPageUp);
+        assert_eq!(all[all.len() - 3], BindableAction::ToggleFullscreen);
+        assert_eq!(all[all.len() - 4], BindableAction::RunSelection);
+        assert_eq!(all[all.len() - 5], BindableAction::CopyMode);
     }
 
     // ── fullscreen (F11) ──────────────────────────────────────────────────────
@@ -1563,7 +1661,7 @@ mod tests {
 
     #[test]
     fn bindable_action_all_is_exhaustive() {
-        assert_eq!(BindableAction::ALL.len(), 32);
+        assert_eq!(BindableAction::ALL.len(), 34);
         for a in BindableAction::ALL {
             assert_eq!(
                 BindableAction::ALL.iter().filter(|x| **x == a).count(),
@@ -1582,9 +1680,10 @@ mod tests {
                 "Ctrl+Shift+N".to_string(),
             ]));
         });
-        for code in [KeyCode::KeyG, KeyCode::KeyN] {
+        // (Letters match the produced character, so each event carries its own.)
+        for (code, label) in [(KeyCode::KeyG, "G"), (KeyCode::KeyN, "N")] {
             assert_eq!(
-                km.lookup(Mods::new(true, true, false, false), PhysicalKey::Code(code), &ch("x")),
+                km.lookup(Mods::new(true, true, false, false), PhysicalKey::Code(code), &ch(label)),
                 Some(KeyAction::NewTab)
             );
         }
@@ -1604,6 +1703,45 @@ mod tests {
             &ch("+"),
         );
         assert_eq!(a, Some(KeyAction::FontUp));
+    }
+
+    #[test]
+    fn letter_chords_match_labels_and_pretty_print_uppercase() {
+        let km = KeyMap::defaults();
+        let cs = Mods::new(true, true, false, false);
+        // Label match wherever the key sits…
+        assert_eq!(km.lookup(cs, PhysicalKey::Code(KeyCode::KeyI), &ch("C")), Some(KeyAction::Copy));
+        // …an ASCII label elsewhere never falls back to the US position…
+        assert_eq!(km.lookup(cs, PhysicalKey::Code(KeyCode::KeyC), &ch("J")), None);
+        // …while a non-ASCII one does (Cyrillic С at KeyC).
+        assert_eq!(km.lookup(cs, PhysicalKey::Code(KeyCode::KeyC), &ch("С")), Some(KeyAction::Copy));
+        // Named keys and the digit row stay positional.
+        assert_eq!(
+            km.lookup(Mods::new(true, false, false, false), PhysicalKey::Code(KeyCode::Digit2), &ch("é")),
+            Some(KeyAction::SelectTab(1)),
+            "AZERTY Ctrl+[2/é] still jumps to tab 2"
+        );
+        // Help shows letters as engraved.
+        assert_eq!(km.pretty_chords(BindableAction::NewTab), vec!["Ctrl+Shift+T".to_string()]);
+        // A user letter chord is a label chord too.
+        let c = parse_chord("Ctrl+Shift+n").unwrap();
+        assert_eq!(c.canonical(), "Ctrl+Shift+N");
+        assert_eq!(c.key, letter('N'));
+    }
+
+    #[test]
+    fn page_keys_may_be_bound_bare_but_letters_may_not() {
+        assert!(chord_reject_reason(&parse_chord("PageUp").unwrap()).is_none());
+        assert!(chord_reject_reason(&parse_chord("PageDown").unwrap()).is_none());
+        assert!(chord_reject_reason(&parse_chord("Home").unwrap()).is_some());
+        assert!(chord_reject_reason(&parse_chord("T").unwrap()).is_some());
+        // Default scroll chords: Shift+PageUp / Shift+PageDown, conflict-free.
+        let km = KeyMap::defaults();
+        let sh = Mods::new(false, true, false, false);
+        let pgup = Key::Named(winit::keyboard::NamedKey::PageUp);
+        assert_eq!(km.lookup(sh, PhysicalKey::Code(KeyCode::PageUp), &pgup), Some(KeyAction::ScrollPageUp));
+        assert_eq!(km.lookup(Mods::default(), PhysicalKey::Code(KeyCode::PageUp), &pgup), None);
+        assert!(km.warnings().is_empty(), "{:?}", km.warnings());
     }
 
     #[test]

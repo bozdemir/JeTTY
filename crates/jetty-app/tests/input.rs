@@ -169,40 +169,48 @@ fn ctrl_shift_t_opens_new_tab() {
 }
 
 #[test]
-fn ctrl_shift_equal_increases_opacity() {
+fn ctrl_alt_plus_increases_opacity() {
+    // v0.26: transparency is Ctrl+Alt+'±' (Ctrl+Shift+'+' is font zoom now).
     let action = dk(
         true,
-        true,
         false,
+        true,
         phys(KeyCode::Equal),
-        &Key::Character("+".into()),
+        &Key::Character("=".into()),
         false,
         false,
         false,
     );
     assert_eq!(action, KeyAction::OpacityUp);
+    let shifted = dk(true, true, true, phys(KeyCode::Equal), &Key::Character("+".into()), false, false, false);
+    assert_eq!(shifted, KeyAction::OpacityUp);
+    let zoom = dk(true, true, false, phys(KeyCode::Equal), &Key::Character("+".into()), false, false, false);
+    assert_eq!(zoom, KeyAction::FontUp);
 }
 
 #[test]
-fn ctrl_shift_minus_decreases_opacity() {
+fn ctrl_alt_minus_decreases_opacity() {
     let action = dk(
         true,
-        true,
         false,
+        true,
         phys(KeyCode::Minus),
-        &Key::Character("_".into()),
+        &Key::Character("-".into()),
         false,
         false,
         false,
     );
     assert_eq!(action, KeyAction::OpacityDown);
+    // Ctrl+Shift+Minus types '_' → 0x1f (readline undo) again.
+    let undo = dk(true, true, false, phys(KeyCode::Minus), &Key::Character("_".into()), false, false, false);
+    assert_eq!(undo, KeyAction::Send(vec![0x1f]));
 }
 
 #[test]
-fn page_up_scrolls_up() {
+fn shift_page_up_scrolls_up() {
     let action = dk(
         false,
-        false,
+        true,
         false,
         phys(KeyCode::PageUp),
         &Key::Named(NamedKey::PageUp),
@@ -211,13 +219,16 @@ fn page_up_scrolls_up() {
         false,
     );
     assert_eq!(action, KeyAction::ScrollPageUp);
+    // v0.26: plain PageUp reaches the program (fzf, zsh history paging).
+    let plain = dk(false, false, false, phys(KeyCode::PageUp), &Key::Named(NamedKey::PageUp), false, false, false);
+    assert_eq!(plain, KeyAction::Send(b"\x1b[5~".to_vec()));
 }
 
 #[test]
-fn page_down_scrolls_down() {
+fn shift_page_down_scrolls_down() {
     let action = dk(
         false,
-        false,
+        true,
         false,
         phys(KeyCode::PageDown),
         &Key::Named(NamedKey::PageDown),
@@ -226,6 +237,8 @@ fn page_down_scrolls_down() {
         false,
     );
     assert_eq!(action, KeyAction::ScrollPageDown);
+    let plain = dk(false, false, false, phys(KeyCode::PageDown), &Key::Named(NamedKey::PageDown), false, false, false);
+    assert_eq!(plain, KeyAction::Send(b"\x1b[6~".to_vec()));
 }
 
 #[test]
