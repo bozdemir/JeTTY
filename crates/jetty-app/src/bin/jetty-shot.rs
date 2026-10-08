@@ -176,6 +176,12 @@
 ///                    scrollback position; _SLIDE=px offsets it like the dropdown
 ///                    slide. The image is decoded synchronously (the app uses a
 ///                    worker thread) and scaled to cover the shot.
+///   JETTY_SHOT_CARET_T=t — a caret-flash frame at progress t (0..1; the peak
+///                    is t≈0.29) with JETTY_SHOT_CARET_COLOR="r,g,b" (0..1,
+///                    default white), through the app's contrast-safe path.
+///   JETTY_SHOT_GLOW_T=t — the caret glow/ripple pass at progress t around the
+///                    cursor (additive on a dark theme, multiply on a light
+///                    one; same color source as JETTY_SHOT_CARET_COLOR).
 ///
 /// If the terminal bg alpha < 255, the rendered image is composited over a
 /// checkerboard (alternating 16px squares of [40,40,40] and [90,90,90]) so
@@ -999,17 +1005,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // snapshot (DECSCUSR in the input, e.g. `\e[5 q` for a beam). Copy-mode
     // suppresses the shell cursor (only the keyboard cursor shows).
     let cursor_focused = !env_flag("JETTY_SHOT_CURSOR_UNFOCUSED");
+    // JETTY_SHOT_CARET_T=t (0..1) — a caret-flash frame at progress t with the
+    // configured flash color (JETTY_SHOT_CARET_COLOR="r,g,b" in 0..1, default
+    // white), through the same contrast-safe path as the app.
+    let shot_caret_flash: Option<(f32, [f32; 3])> =
+        std::env::var("JETTY_SHOT_CARET_T").ok().and_then(|s| s.parse::<f32>().ok()).map(|t| {
+            let color = std::env::var("JETTY_SHOT_CARET_COLOR")
+                .ok()
+                .and_then(|s| {
+                    let v: Vec<f32> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                    (v.len() == 3).then(|| [v[0], v[1], v[2]])
+                })
+                .unwrap_or([1.0; 3]);
+            (t.clamp(0.0, 1.0), color)
+        });
+    let shot_cursor_style = jetty_render::CursorStyle::default();
+    let cursor = if copymode_cursor.is_none() {
+        jetty_render::cursor_draw(
+            &snap,
+            terminal.theme(),
+            cell_w,
+            cell_h,
+            shot_origin.left,
+            shot_origin.top,
+            cursor_focused,
+            shot_caret_flash,
+            &shot_cursor_style,
+        )
+    } else {
+        jetty_render::CursorDraw::default()
+    };
     // Grid-space builders (x from the grid's left edge), each moved onto the
     // origin right where it is built — the app's `render_grid_scene` order.
-    let (mut cursor_under, mut cursor_over) = if copymode_cursor.is_none() {
-        jetty_render::cursor_rects_split(&snap, cell_w, cell_h, shot_origin.top, cursor_focused, None, [0.0, 0.0, 0.0])
-    } else {
-        (None, Vec::new())
-    };
-    if let Some(block) = cursor_under.as_mut() {
-        block.x += shot_origin.left;
-    }
-    jetty_render::shift_x(&mut cursor_over, shot_origin.left);
     let mut bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, shot_origin.top, selection.bg);
     // The current match's glyph recolor (Pass 2), like the app's render core.
     let mut search_recolor: Vec<(usize, usize, usize, [u8; 3])> = Vec::new();
@@ -1027,7 +1054,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         search_recolor = jetty_render::search_recolor_spans(&hits, terminal.theme());
     }
     jetty_render::shift_x(&mut bg_rects, shot_origin.left);
-    bg_rects.extend(cursor_under);
+    bg_rects.extend(cursor.under);
 
     // --- Pass 2: the grid text on top of the painted background ---
     // The cells carrying combining marks / VS16 / ZWJ, as the app hands them to
@@ -1044,9 +1071,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }))
         .collect();
     let paint = jetty_render::GridPaint {
-        cursor_glyph: cursor_under.map(|_| {
-            (snap.cursor_row, snap.cursor_col, jetty_render::cursor_text_color(terminal.theme(), snap.cursor_rgb))
-        }),
+        cursor_glyph: cursor.glyph,
         selection: Some(selection),
         graphemes: &graphemes,
         recolor: &search_recolor,
@@ -1169,7 +1194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // The thin cursor shapes over the glyphs + decorations (the solid block
         // was painted under the text in Pass 1).
-        rects.extend(cursor_over);
+        rects.extend(cursor.over);
 
         // Baseline + color of the live "Aa" UI-font specimen, set when the panel
         // is built.
@@ -1758,6 +1783,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             eprintln!("jetty-shot: window border {mode:?} focused={focused}: no ring");
         }
+    }
+
+    // --- Caret glow/ripple (JETTY_SHOT_GLOW_T) ---
+    // The REAL pass (the app's variant choice, color and scissor) around the
+    // shell cursor, after the overlays — where the app runs it, before the mask.
+    if let Some(t) = std::env::var("JETTY_SHOT_GLOW_T").ok().and_then(|s| s.parse::<f32>().ok()) {
+        let flash = shot_caret_flash.map(|(_, c)| c).unwrap_or([1.0; 3]);
+        let bg = terminal.theme().bg;
+        let (light, color, intensity) = jetty_render::caret_glow_look(flash, [bg[0], bg[1], bg[2]]);
+        eprintln!("jetty-shot: caret glow (GPU pass, t={t}, light={light}, color={color:?})");
+        let mut cfx = jetty_render::CaretFx::new(&device, format);
+        cfx.prepare(&device, light);
+        cfx.apply(
+            &device,
+            &queue,
+            &view,
+            &jetty_render::CaretFxUniform {
+                resolution: [width as f32, height as f32],
+                cursor_px: [
+                    shot_origin.col_x(snap.cursor_col, cell_w) + cell_w * 0.5,
+                    shot_origin.row_y(snap.cursor_row, cell_h) + cell_h * 0.5,
+                ],
+                cell: [cell_w, cell_h],
+                t: t.clamp(0.0, 1.0),
+                intensity,
+                color: [color[0], color[1], color[2], 0.0],
+            },
+            light,
+        );
     }
 
     // --- Bayer Crystallize summon reveal (JETTY_SHOT_SUMMON_T) ---

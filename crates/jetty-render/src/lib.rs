@@ -1,5 +1,6 @@
 mod chrome;
 mod colors;
+mod cursor;
 mod gpu;
 mod text;
 mod builtin;
@@ -37,10 +38,14 @@ pub use chrome::{
 pub use gpu::{AcquireError, GpuContext, GpuShared};
 pub use text::{GridPaint, TextLayer};
 pub use colors::{
-    contrast_ratio, cursor_text_color, relative_luminance, selection_bg, selection_paint, SelectionPaint,
-    SELECTION_MIN_CONTRAST,
+    caret_flash_target, contrast_ratio, cursor_text_color, is_light_bg, relative_luminance, selection_bg,
+    selection_paint, SelectionPaint, CARET_FLASH_MIN_CONTRAST, SELECTION_MIN_CONTRAST,
 };
-pub use quad::{QuadLayer, Rect, cell_bg_rects, default_bg_clear, scrollbar_rect, scrollbar_rect_geom, scrollbar_offset_from_cursor, text_decoration_rects, link_underline_rects, failed_marker_rects, grid_decoration_key, cursor_rects, cursor_rects_split, SCROLLBAR_W};
+pub use cursor::{
+    caret_flash_color, cursor_colors, cursor_draw, cursor_guide_rect, CursorColor, CursorColors, CursorDraw, CursorStyle,
+    UnderlineCursor, UnfocusedCursor, CURSOR_THICKNESS_DEFAULT, CURSOR_THICKNESS_MAX, CURSOR_THICKNESS_MIN,
+};
+pub use quad::{QuadLayer, Rect, cell_bg_rects, default_bg_clear, scrollbar_rect, scrollbar_rect_geom, scrollbar_offset_from_cursor, text_decoration_rects, link_underline_rects, failed_marker_rects, grid_decoration_key, SCROLLBAR_W};
 pub use quad::{link_underline_rects_at, text_decoration_rects_at, Deco, UnderlineGeom};
 pub use panel::{
     build_panel, gallery_order, is_user_theme, theme_is_light, track_knob, CtlId, CtlPart, CtlRow, CtlShow, Label,
@@ -58,7 +63,7 @@ pub use crt::{
     CRT_FLAG_FLICKER, CRT_FLAG_JITTER, CRT_FLAG_ROLL,
 };
 pub use image_layer::{ImageDraw, ImageLayer};
-pub use caret_fx::{CaretFx, CaretFxUniform};
+pub use caret_fx::{caret_glow_look, caret_glow_scissor, CaretFx, CaretFxUniform};
 pub use menu::{build_context_menu, build_menu, ContextMenu, MENU_HINTS, MENU_ITEMS};
 pub use help::{build_help_overlay, default_help_rows, HelpOverlay, HELP_ROWS};
 pub use confirm::{build_confirm, build_confirm_close, ConfirmPopup};

@@ -429,6 +429,9 @@ pub(crate) struct DetachedWindow {
     /// The link under the pointer while the link modifier is held in THIS
     /// window (underlined; opened on click). Mirrors `App::link_hover`.
     pub link_hover: Option<jetty_core::LinkHit>,
+    /// This window's caret glow pass (`App::caret_fx`'s twin on this window's
+    /// device): `None` until the glow is enabled and this window paints.
+    pub caret_fx: Option<jetty_render::CaretFx>,
     /// The hovered 0-based grid cell the cache above was computed for.
     /// Mirrors `App::link_hover_cell`.
     pub link_hover_cell: Option<(usize, usize)>,
@@ -592,6 +595,7 @@ impl DetachedWindow {
             scrollbar_hover: false,
             link_hover: None,
             link_hover_cell: None,
+            caret_fx: None,
         })
     }
 
@@ -638,6 +642,8 @@ impl DetachedWindow {
         self.offscreen = None;
         // Rebuilt on the next frame that draws a backdrop, on the new device.
         self.backdrop = None;
+        // Rebuilt on the new device by the next glow frame.
+        self.caret_fx = None;
         self.acquire_retry = None;
         self.gpu = gpu;
         true

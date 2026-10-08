@@ -61,6 +61,45 @@ pub fn cursor_text_color(theme: &jetty_core::Theme, cursor_rgb: [u8; 3]) -> [u8;
     }
 }
 
+/// The contrast the caret flash keeps at its peak — against the cell it sits on
+/// (so the cursor never melts into the page) and against the glyph drawn on a
+/// solid block (so the character under it stays readable). WCAG's 3:1 for UI
+/// components.
+pub const CARET_FLASH_MIN_CONTRAST: f32 = 3.0;
+
+/// The color the caret flash animates toward. The configured `flash` color (0..1
+/// RGB) when it keeps [`CARET_FLASH_MIN_CONTRAST`] against both `cell_bg` and
+/// `glyph` (the character drawn on a solid block; pass `cell_bg` for the thin
+/// shapes, which cover no glyph); otherwise black or white — whichever keeps the
+/// larger of those two contrasts — unless the configured color still does better.
+///
+/// A white flash on a dark theme is therefore exactly what was configured, while
+/// on a light theme it turns into a black one: flashing to white there drew a
+/// near-white block on a near-white page with the glyph in the page color
+/// (1.08:1 on solarized_light), so the cursor vanished for most of the burst.
+pub fn caret_flash_target(flash: [f32; 3], cell_bg: [u8; 3], glyph: [u8; 3]) -> [f32; 3] {
+    let to_u8 = |c: [f32; 3]| c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+    let score = |c: [u8; 3]| contrast_ratio(c, cell_bg).min(contrast_ratio(c, glyph));
+    let configured = score(to_u8(flash));
+    if configured >= CARET_FLASH_MIN_CONTRAST {
+        return flash;
+    }
+    let (white, black) = (score([255; 3]), score([0; 3]));
+    let (best, best_score) = if black > white { ([0.0; 3], black) } else { ([1.0; 3], white) };
+    if configured >= best_score {
+        flash
+    } else {
+        best
+    }
+}
+
+/// Whether `bg` reads as a LIGHT background: black text contrasts more with it
+/// than white text does (relative luminance above ~0.18). Effects that brighten
+/// (an additive glow) are invisible there and must darken instead.
+pub fn is_light_bg(bg: [u8; 3]) -> bool {
+    contrast_ratio(bg, [0, 0, 0]) > contrast_ratio(bg, [255, 255, 255])
+}
+
 /// Whichever of `a` / `b` contrasts more with `against` (ties → `a`).
 fn more_contrasting(against: [u8; 3], a: [u8; 3], b: [u8; 3]) -> [u8; 3] {
     if contrast_ratio(b, against) > contrast_ratio(a, against) {

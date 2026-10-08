@@ -689,9 +689,11 @@ pub struct App {
     /// compositing apply). Detached windows hold their own on their own device.
     /// Built in `resumed`; `None` until then. Zero cost when no image is visible.
     image_layer: Option<jetty_render::ImageLayer>,
-    /// Optional GPU caret glow/ripple pass (Task 12). Additive halo + expanding
-    /// ring around the cursor cell on each keystroke burst. Built in `resumed`
-    /// with the surface format; dispatched only when `fx.caret_glow_enabled` AND
+    /// Optional GPU caret glow/ripple pass (Task 12). A halo + expanding ring
+    /// around the cursor cell on each keystroke burst (additive on dark themes,
+    /// a multiply tint on light ones). `None` until the glow is first enabled —
+    /// built (just the variant the theme needs) by the first main frame after
+    /// that, never in `resumed`; dispatched only when `fx.caret_glow_enabled` AND
     /// `caret_anim.is_some()` AND the cursor is visible — zero cost otherwise.
     caret_fx: Option<jetty_render::CaretFx>,
     /// Surface-sized offscreen color texture used while a Tier-B effect is
@@ -8118,7 +8120,8 @@ impl App {
         self.crt = None;
         self.crt_key = None;
         self.image_layer = Some(jetty_render::ImageLayer::new(device, format));
-        self.caret_fx = Some(jetty_render::CaretFx::new(device, format));
+        // Rebuilt on the new device by the next frame that wants it.
+        self.caret_fx = None;
         // Lazily re-allocated on the next frame that needs it, on the new device.
         self.offscreen = None;
         // The backdrop layer and its image texture lived on the lost device: the
@@ -8889,11 +8892,12 @@ impl App {
                         // deadline as the main window's Send arm).
                         let now = std::time::Instant::now();
                         dw.key_paint_due = Some(now + KEY_ECHO_GRACE);
-                        // Caret flash on printable keystrokes — same trigger as
-                        // the main window, on THIS window's own burst clock. Glow
-                        // is main-window-only (its CaretFx pass isn't replicated
-                        // per-window), so gate on the flash toggle alone.
-                        if self.fx.caret_flash_enabled && is_printable_keystroke(&bytes) {
+                        // Caret flash / glow on printable keystrokes — same
+                        // trigger as the main window, on THIS window's own burst
+                        // clock (each consumer gates on its own toggle).
+                        if (self.fx.caret_flash_enabled || self.fx.caret_glow_enabled)
+                            && is_printable_keystroke(&bytes)
+                        {
                             dw.caret_anim = Some(now);
                         }
                     }
@@ -8947,7 +8951,7 @@ impl App {
                     if self.overlay_ime_commit(Surface::Detached(pos), &text) {
                         return;
                     }
-                    let caret_flash_enabled = self.fx.caret_flash_enabled;
+                    let caret_burst = self.fx.caret_flash_enabled || self.fx.caret_glow_enabled;
                     let Some(dw) = self.detached.get_mut(pos) else { return };
                     // Snap to the live bottom (F30) then write to the PTY — the
                     // shared input core, same as the Send arm (v0.23 Task 9).
@@ -8955,7 +8959,7 @@ impl App {
                     // The echo paints (fallback deadline), as in the Send arm.
                     let now = std::time::Instant::now();
                     dw.key_paint_due = Some(now + KEY_ECHO_GRACE);
-                    if caret_flash_enabled && is_printable_keystroke(text.as_bytes()) {
+                    if caret_burst && is_printable_keystroke(text.as_bytes()) {
                         dw.caret_anim = Some(now);
                     }
                 }
@@ -9975,6 +9979,19 @@ impl App {
         {
             dw.offscreen = Some(Self::make_offscreen(&dw.gpu));
         }
+        // This window's caret glow (the main window's pass, on its own device):
+        // built + the theme's variant compiled on the first frame after the
+        // glow is enabled.
+        let glow_look = fx.caret_glow_enabled.then(|| {
+            jetty_render::caret_glow_look(fx.caret_flash_color, [theme.bg[0], theme.bg[1], theme.bg[2]])
+        });
+        if let Some((light, _, _)) = glow_look {
+            let g = &dw.gpu;
+            dw.caret_fx
+                .get_or_insert_with(|| jetty_render::CaretFx::new(&g.device, g.format))
+                .prepare(&g.device, light);
+        }
+        let caret_fx = dw.caret_fx.as_ref();
         let gpu = &mut dw.gpu;
         let text = &mut dw.text;
         let chrome_text = &mut dw.chrome_text;
@@ -10039,6 +10056,7 @@ impl App {
             focused,
             caret_t_for_flash,
             caret_flash_color: fx.caret_flash_color,
+            cursor_style: jetty_render::CursorStyle::default(),
             copy_mode_active: copy_mode_ui.is_some(),
             copy_mode_ui,
         };
@@ -10211,6 +10229,32 @@ impl App {
                 jetty_render::ring_width_px(scale),
                 [c[0], c[1], c[2], 255],
             );
+        }
+        // Caret glow/ripple — the main window's pass (see there), BEFORE the
+        // corner mask so the mask clips it to the window shape.
+        if let (Some((glow_light, glow_color, glow_intensity)), Some(cfx), Some(t_val)) =
+            (glow_look, caret_fx, caret_t)
+        {
+            if snap.cursor_visible && snap.cursor_col < snap.cols && snap.cursor_row < snap.rows && t_val < 1.0 {
+                let (cell_w, cell_h) = text.cell_size();
+                cfx.apply(
+                    &gpu.device,
+                    &gpu.queue,
+                    scene_view,
+                    &jetty_render::CaretFxUniform {
+                        resolution: [width as f32, height as f32],
+                        cursor_px: [
+                            origin.col_x(snap.cursor_col, cell_w) + cell_w * 0.5,
+                            origin.row_y(snap.cursor_row, cell_h) + cell_h * 0.5,
+                        ],
+                        cell: [cell_w, cell_h],
+                        t: t_val,
+                        intensity: glow_intensity,
+                        color: [glow_color[0], glow_color[1], glow_color[2], 0.0],
+                    },
+                    glow_light,
+                );
+            }
         }
         // Final pass: round the window corners — the SAME mask pass the main
         // window runs, at the SAME configured radius. A detached window is a
@@ -11339,10 +11383,8 @@ impl ApplicationHandler<AppEvent> for App {
             // Inline-image (sixel) layer on the main device. Same surface format
             // as the scene target; zero cost until an image is visible.
             self.image_layer = Some(jetty_render::ImageLayer::new(&g.device, g.format));
-            // Caret glow/ripple (Task 12). Built unconditionally so the toggle
-            // can be flipped at runtime without a restart; dispatched only when
-            // `fx.caret_glow_enabled` is true (zero cost when off).
-            self.caret_fx = Some(jetty_render::CaretFx::new(&g.device, g.format));
+            // The caret glow (Task 12) is NOT built here: the first frame with
+            // the glow enabled builds just the variant it needs (zero cost off).
             self.summon_pending = true;
             self.summon_settle_until =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
@@ -13662,6 +13704,18 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
                 let focus_ring = self.focus_ring.as_ref();
+                // Caret glow look for this theme (blend variant, contrast-safe
+                // color, strength) — and its pipeline, compiled on the first
+                // frame after the glow is enabled (not on the first keystroke).
+                let glow_look = self.fx.caret_glow_enabled.then(|| {
+                    let bg = theme.bg;
+                    jetty_render::caret_glow_look(self.fx.caret_flash_color, [bg[0], bg[1], bg[2]])
+                });
+                if let (Some((light, _, _)), Some(g)) = (glow_look, self.gpu.as_ref()) {
+                    self.caret_fx
+                        .get_or_insert_with(|| jetty_render::CaretFx::new(&g.device, g.format))
+                        .prepare(&g.device, light);
+                }
                 let corner_mask = self.corner_mask.as_ref();
                 let bayer_reveal = self.bayer_reveal.as_ref();
                 let phosphor = self.phosphor.as_ref();
@@ -13899,6 +13953,7 @@ impl ApplicationHandler<AppEvent> for App {
                         focused: main_focused,
                         caret_t_for_flash,
                         caret_flash_color,
+                        cursor_style: jetty_render::CursorStyle::default(),
                         copy_mode_active,
                         copy_mode_ui,
                     };
@@ -14274,7 +14329,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // No new redraw scheduling — the caret_anim guard in the
                     // self-drive block below keeps frames coming while the burst
                     // is live.
-                    if self.fx.caret_glow_enabled {
+                    if let Some((glow_light, glow_color, glow_intensity)) = glow_look {
                         if let (Some(cfx), Some(t_val)) = (caret_fx, caret_t) {
                             if snap.cursor_visible
                                 && snap.cursor_col < snap.cols
@@ -14297,16 +14352,10 @@ impl ApplicationHandler<AppEvent> for App {
                                         cursor_px: [cursor_px_x, cursor_px_y],
                                         cell: [cell_w, cell_h],
                                         t: t_val,
-                                        // Tasteful default intensity; bright enough to
-                                        // be visible, subtle enough not to dominate.
-                                        intensity: 0.5,
-                                        color: [
-                                            caret_flash_color[0],
-                                            caret_flash_color[1],
-                                            caret_flash_color[2],
-                                            0.0, // pad
-                                        ],
+                                        intensity: glow_intensity,
+                                        color: [glow_color[0], glow_color[1], glow_color[2], 0.0],
                                     },
+                                    glow_light,
                                 );
                             }
                         }
@@ -14550,6 +14599,8 @@ struct GridScene<'a> {
     focused: bool,
     caret_t_for_flash: Option<f32>,
     caret_flash_color: [f32; 3],
+    /// The `[cursor]` look (shape variants, stroke, unfocused look, color).
+    cursor_style: jetty_render::CursorStyle,
     /// Copy-mode is main-only. Detached passes `false` → the shell cursor is
     /// never suppressed here.
     copy_mode_active: bool,
@@ -14614,17 +14665,22 @@ fn render_grid_scene(
     // beam / underline / unfocused hollow draw over the text (Pass 4). In
     // copy-mode (main only) the shell cursor is SUPPRESSED so only the copy-mode
     // keyboard cursor shows; detached always passes `copy_mode_active = false`.
-    let (mut cursor_under, mut cursor_over) = if s.copy_mode_active {
-        (None, Vec::new())
+    let cursor = if s.copy_mode_active {
+        jetty_render::CursorDraw::default()
     } else {
-        jetty_render::cursor_rects_split(
-            s.snap, cell_w, cell_h, grid_origin_y, s.focused, s.caret_t_for_flash, s.caret_flash_color,
+        // Already in window coordinates (the origin's left goes in directly).
+        jetty_render::cursor_draw(
+            s.snap,
+            s.theme,
+            cell_w,
+            cell_h,
+            origin.left,
+            grid_origin_y,
+            s.focused,
+            s.caret_t_for_flash.map(|t| (t, s.caret_flash_color)),
+            &s.cursor_style,
         )
     };
-    if let Some(block) = cursor_under.as_mut() {
-        block.x += origin.left;
-    }
-    jetty_render::shift_x(&mut cursor_over, origin.left);
 
     // Pass 1: clear to the (premultiplied, opacity-correct) theme bg and paint
     // the per-cell background quads under the text. Search-hit tint rects are
@@ -14638,7 +14694,7 @@ fn render_grid_scene(
         ));
     }
     jetty_render::shift_x(&mut bg_rects, origin.left);
-    bg_rects.extend(cursor_under);
+    bg_rects.extend(cursor.under);
 
     // Pass 2: glyphs over the painted background, offset down by the grid origin.
     // Cells carrying combining marks / VS16 / ZWJ (sparse; empty = no allocation).
@@ -14648,9 +14704,7 @@ fn render_grid_scene(
     // (empty — no allocation — unless a search is open with a current match).
     let recolor = jetty_render::search_recolor_spans(s.search_hits, s.theme);
     let paint = jetty_render::GridPaint {
-        cursor_glyph: cursor_under.map(|_| {
-            (s.snap.cursor_row, s.snap.cursor_col, jetty_render::cursor_text_color(s.theme, s.snap.cursor_rgb))
-        }),
+        cursor_glyph: cursor.glyph,
         selection: Some(selection),
         graphemes: &graphemes,
         recolor: &recolor,
@@ -14757,7 +14811,7 @@ fn render_grid_scene(
     }
     // The thin cursor shapes (beam / underline / unfocused hollow) last, over the
     // glyphs + decorations; the solid block was painted under the text (Pass 1).
-    rects.extend(cursor_over);
+    rects.extend(cursor.over);
     if let Some((cr, cc, _sel, _lm)) = s.copy_mode_ui {
         let mut copy = jetty_render::copy_cursor_rects(cr, cc, cell_w, cell_h, grid_origin_y, s.theme.cursor);
         jetty_render::shift_x(&mut copy, origin.left);

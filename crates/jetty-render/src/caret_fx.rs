@@ -1,15 +1,26 @@
-//! Caret glow/ripple GPU pass — an OPTIONAL additive fullscreen pass that
+//! Caret glow/ripple GPU pass — an OPTIONAL fullscreen-triangle pass that
 //! draws a soft radial halo plus an expanding ring around the cursor cell on
-//! each keystroke burst.
+//! each keystroke burst, in the main window AND detached windows.
 //!
-//! The pass is dispatched ONLY when `caret_glow_enabled` is true AND
-//! `caret_anim.is_some()`; otherwise it is a true zero-cost no-op.
+//! The pass is dispatched ONLY when `caret_glow_enabled` is true AND a caret
+//! burst is live; otherwise it is a true zero-cost no-op, and no pipeline exists
+//! until the glow is first turned on (`CaretFx::prepare` builds just the
+//! variant the theme needs).
 //!
-//! Additive blending (src=One / dst=One): the pass only ever BRIGHTENS pixels.
-//! Alpha output is 0 so the destination alpha is untouched. NOTE: on a
-//! PreMultiplied surface the compositor still displays nonzero RGB at alpha=0
-//! (`src.rgb + dst*(1-src.a)`), so this pass must run BEFORE the corner mask —
-//! the mask's coverage multiply then clips the glow at the rounded corners.
+//! Two blend variants, picked by the theme background ([`caret_glow_look`]):
+//! * DARK themes — additive (src=One / dst=One): the pass only ever BRIGHTENS.
+//!   Alpha output is 0 so the destination alpha is untouched. NOTE: on a
+//!   PreMultiplied surface the compositor still displays nonzero RGB at
+//!   alpha=0, so this pass must run BEFORE the corner mask — the mask's coverage
+//!   multiply then clips the glow at the rounded corners.
+//! * LIGHT themes — a multiply tint (src=Zero / dst=Src): an additive glow is
+//!   invisible on a near-white page, so the halo DARKENS toward the
+//!   contrast-safe flash color instead (black for the default white flash).
+//!   Multiplying color by ≤ 1 keeps premultiplication valid; alpha is untouched.
+//!
+//! The halo/ring is negligible beyond ~3.7 cells, so the fullscreen triangle is
+//! scissored to ±4.5 cells around the cursor ([`caret_glow_scissor`]) — ~95% less
+//! fragment work at a typical window size, identical pixels.
 //!
 //! Self-contained: our own wgpu/WGSL, no offscreen texture, no scene sampling.
 //! Model: phosphor.rs (`fs_glow` additive pass).
@@ -49,14 +60,11 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return o;
 }
 
-@fragment
-fn fs(in: VsOut) -> @location(0) vec4<f32> {
+// The halo + ring intensity (0..1) at this fragment.
+fn glow_at(frag: vec2<f32>) -> f32 {
     let t = clamp(p.t, 0.0, 1.0);
-    // Fragment pixel position: y=0 at top-left, matching cursor_px coordinate space.
-    // (@builtin(position) in a WebGPU fragment shader is in window/viewport space
-    // with y=0 at the TOP of the viewport — same convention as cursor_px.)
-    let frag = in.pos.xy;
-    // Distance from fragment to the cursor cell centre (pixels).
+    // Distance from fragment to the cursor cell centre (pixels). Fragment
+    // position: y=0 at the top-left of the viewport, the cursor_px convention.
     let d = length(frag - p.cursor_px);
     // Characteristic cell radius used to scale falloff distances.
     let cell_r = max(p.cell.x, p.cell.y);
@@ -64,23 +72,32 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // sigma = 1.5 * cell_r  => at d = 2*cell_r: exp(-4/2.25) ≈ 0.17 (still warm),
     //                          at d = 3*cell_r: exp(-4)      ≈ 0.02 (near zero).
     // Temporal envelope (1-t): halo is bright at burst start, gone at t=1 so
-    // when caret_anim expires the last frame renders zero contribution cleanly.
+    // when the burst expires the last frame renders zero contribution cleanly.
     let sigma = 1.5 * cell_r;
     let halo = (1.0 - t) * exp(-d * d / (sigma * sigma));
-    // --- Ring: expanding ripple, fades as (1-t). ---
-    // Radius grows linearly from 0 at t=0 to 2.5*cell_r at t=1, so the ring
-    // just reaches ~2.5 cells away as it fades out — visible but tasteful.
+    // --- Ring: expanding ripple, fades as (1-t). Radius grows linearly from 0
+    // at t=0 to 2.5*cell_r at t=1; Gaussian width 0.4 cells. ---
     let ring_radius = 2.5 * cell_r * t;
-    // Gaussian ring width: half-power at ±0.4 cells from the ring edge.
     let ring_w = 0.4 * cell_r;
     let delta = d - ring_radius;
     let ring = (1.0 - t) * exp(-(delta * delta) / (ring_w * ring_w));
-    // Combined additive contribution, clamped so intensity spikes don't oversaturate.
-    let glow = clamp(halo + ring, 0.0, 1.0);
-    // Alpha = 0: additive RGB only. The destination alpha is untouched, so the
-    // window's premultiplied transparency (and rounded-corner mask) is preserved:
-    // a corner pixel with alpha=0 remains alpha=0 after this additive pass.
-    return vec4<f32>(p.color.rgb * p.intensity * glow, 0.0);
+    // Clamped so intensity spikes don't oversaturate.
+    return clamp(halo + ring, 0.0, 1.0);
+}
+
+// DARK themes (additive blend): RGB only, alpha = 0 so the destination alpha
+// (the window's premultiplied transparency / rounded corners) is untouched.
+@fragment
+fn fs_add(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(p.color.rgb * p.intensity * glow_at(in.pos.xy), 0.0);
+}
+
+// LIGHT themes (multiply blend, dst *= src): darken toward the glow color —
+// 1 where there is no glow, `color` at full strength. Alpha 1 keeps dst alpha.
+@fragment
+fn fs_mul(in: VsOut) -> @location(0) vec4<f32> {
+    let k = p.intensity * glow_at(in.pos.xy);
+    return vec4<f32>(vec3<f32>(1.0, 1.0, 1.0) - k * (vec3<f32>(1.0, 1.0, 1.0) - p.color.rgb), 1.0);
 }
 "#;
 
@@ -120,18 +137,61 @@ pub struct CaretFxUniform {
     pub color: [f32; 4],
 }
 
-/// Caret glow/ripple GPU post-pass. Draws a soft additive halo + expanding
-/// ring around the cursor cell on each keystroke burst. Build once at startup;
-/// dispatch on each frame where glow is enabled and `caret_anim.is_some()`.
+/// Glow strength on a dark page (additive): bright enough to be visible,
+/// subtle enough not to dominate (the pre-light-theme constant).
+pub const CARET_GLOW_INTENSITY_DARK: f32 = 0.5;
+/// Glow strength on a light page (multiply): darkening reads stronger than
+/// brightening, so the halo is gentler there.
+pub const CARET_GLOW_INTENSITY_LIGHT: f32 = 0.35;
+/// The glow never reaches past this many cells (cell = the larger cell side)
+/// from the cursor centre: the halo is exp(-9) ~ 1e-4 there and the ring's
+/// outer edge sits at 2.5 + 3 x 0.4 = 3.7 cells.
+pub const CARET_GLOW_REACH_CELLS: f32 = 4.5;
+
+/// How the glow looks on a page of color `theme_bg` for the configured caret
+/// `flash` color: `(light, color, intensity)`. `light` picks the multiply-tint
+/// variant; `color` is the contrast-safe flash target against the page (white
+/// stays white on a dark theme; it becomes black on a light one, where a white
+/// glow is invisible).
+pub fn caret_glow_look(flash: [f32; 3], theme_bg: [u8; 3]) -> (bool, [f32; 3], f32) {
+    let light = crate::colors::is_light_bg(theme_bg);
+    let color = crate::colors::caret_flash_target(flash, theme_bg, theme_bg);
+    let intensity = if light { CARET_GLOW_INTENSITY_LIGHT } else { CARET_GLOW_INTENSITY_DARK };
+    (light, color, intensity)
+}
+
+/// The scissor rect `[x, y, w, h]` (physical px) holding every pixel the glow
+/// can touch: +/-[`CARET_GLOW_REACH_CELLS`] around `cursor_px`, clamped to the
+/// `width`x`height` target. `None` when it falls entirely outside.
+pub fn caret_glow_scissor(cursor_px: [f32; 2], cell: [f32; 2], width: u32, height: u32) -> Option<[u32; 4]> {
+    let reach = CARET_GLOW_REACH_CELLS * cell[0].max(cell[1]).max(1.0);
+    let clamp_x = |v: f32| v.clamp(0.0, width as f32);
+    let clamp_y = |v: f32| v.clamp(0.0, height as f32);
+    let (x0, x1) = (clamp_x((cursor_px[0] - reach).floor()), clamp_x((cursor_px[0] + reach).ceil()));
+    let (y0, y1) = (clamp_y((cursor_px[1] - reach).floor()), clamp_y((cursor_px[1] + reach).ceil()));
+    let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+    (w > 0 && h > 0).then_some([x0 as u32, y0 as u32, w, h])
+}
+
+/// Caret glow/ripple GPU pass. Draws a soft halo + expanding ring around the
+/// cursor cell on each keystroke burst -- additive on dark themes, a multiply
+/// tint on light ones. Built (by the window that needs it) when the glow is
+/// first enabled; each blend variant is compiled on first [`CaretFx::prepare`].
 pub struct CaretFx {
-    pipeline: wgpu::RenderPipeline,
+    shader: wgpu::ShaderModule,
+    pipeline_layout: wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    /// Additive (dark theme) and multiply (light theme) pipelines, compiled on
+    /// demand.
+    add: Option<wgpu::RenderPipeline>,
+    mul: Option<wgpu::RenderPipeline>,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
 
 impl CaretFx {
-    /// Build the pipeline. Called once in `resumed()` alongside the other
-    /// fullscreen-pass constructors. `format` must match the render target.
+    /// Create the shader + buffers; no pipeline is compiled until
+    /// [`CaretFx::prepare`]. `format` must match the render target.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("caret-fx-shader"),
@@ -174,30 +234,54 @@ impl CaretFx {
             ..Default::default()
         });
 
-        // Additive blend: src=One, dst=One. Only ever brightens the destination;
-        // never darkens or re-opaques pixels (alpha channel output is 0 so the
-        // destination alpha is not changed either).
-        let additive = wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::One,
-            operation: wgpu::BlendOperation::Add,
-        };
+        Self { shader, pipeline_layout, format, add: None, mul: None, uniform_buf, bind_group }
+    }
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("caret-fx-pipeline"),
-            layout: Some(&pipeline_layout),
+    /// Compile the variant for a `light` (multiply) or dark (additive) page if
+    /// it does not exist yet. Cheap (one `Option` check) once built; call it
+    /// outside the frame's borrows, before [`CaretFx::apply`].
+    pub fn prepare(&mut self, device: &wgpu::Device, light: bool) {
+        let slot = if light { &mut self.mul } else { &mut self.add };
+        if slot.is_some() {
+            return;
+        }
+        let (entry, blend) = if light {
+            // dst.rgb *= src.rgb; dst.a unchanged.
+            let mul = wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::Src,
+                operation: wgpu::BlendOperation::Add,
+            };
+            let keep = wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            };
+            ("fs_mul", wgpu::BlendState { color: mul, alpha: keep })
+        } else {
+            // Additive: only ever brightens; alpha output 0 leaves dst alpha.
+            let add = wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            };
+            ("fs_add", wgpu::BlendState { color: add, alpha: add })
+        };
+        *slot = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(if light { "caret-fx-mul" } else { "caret-fx-add" }),
+            layout: Some(&self.pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &self.shader,
                 entry_point: Some("vs"),
                 buffers: &[],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
+                module: &self.shader,
+                entry_point: Some(entry),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState { color: additive, alpha: additive }),
+                    format: self.format,
+                    blend: Some(blend),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -207,26 +291,27 @@ impl CaretFx {
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
-        });
-
-        Self { pipeline, uniform_buf, bind_group }
+        }));
     }
 
-    /// Draw the caret glow/ripple additively onto `dst`.
+    /// Draw the caret glow/ripple onto `dst` (additive on a dark page, a
+    /// multiply tint on a `light` one -- [`CaretFx::prepare`] that variant
+    /// first; an unprepared variant draws nothing), scissored to the reach of
+    /// the effect around `u.cursor_px`.
     ///
-    /// Uses `LoadOp::Load` (composites with the existing frame content) and
-    /// additive blending. Call only when the glow effect is enabled AND
-    /// `caret_anim.is_some()` AND the cursor is visible.
+    /// Uses `LoadOp::Load` (composites with the existing frame content). Call
+    /// only when the glow effect is enabled AND a burst is live AND the cursor
+    /// is visible.
     ///
     /// Compositing targets (caller must pick the right `dst`; dispatch BEFORE
     /// the corner mask so the mask's coverage multiply clips the glow at the
-    /// rounded corners — an additive pass after the mask would put nonzero RGB
+    /// rounded corners -- an additive pass after the mask would put nonzero RGB
     /// into alpha=0 corner pixels, which PreMultiplied compositors display):
-    /// - CRT ON:    `scene_view` (the offscreen) — the CRT pass then processes
+    /// - CRT ON:    `scene_view` (the offscreen) -- the CRT pass then processes
     ///   and rounds corners. Glow gets full CRT treatment.
-    /// - CRT OFF:   `scene_view` (== surface view) — the corner mask runs
+    /// - CRT OFF:   `scene_view` (== surface view) -- the corner mask runs
     ///   after this pass and clips the glow to the window shape.
-    /// - Tier-B:    `scene_view` (== offscreen) — the Tier-B effect resamples
+    /// - Tier-B:    `scene_view` (== offscreen) -- the Tier-B effect resamples
     ///   it; glow is displaced/blurred like the rest of the scene.
     pub fn apply(
         &self,
@@ -234,7 +319,15 @@ impl CaretFx {
         queue: &wgpu::Queue,
         dst: &wgpu::TextureView,
         u: &CaretFxUniform,
+        light: bool,
     ) {
+        let Some(pipeline) = (if light { self.mul.as_ref() } else { self.add.as_ref() }) else {
+            return;
+        };
+        let (w, h) = (u.resolution[0].max(0.0) as u32, u.resolution[1].max(0.0) as u32);
+        let Some([sx, sy, sw, sh]) = caret_glow_scissor(u.cursor_px, u.cell, w, h) else {
+            return;
+        };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(u));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -257,8 +350,9 @@ impl CaretFx {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_scissor_rect(sx, sy, sw, sh);
             pass.draw(0..3, 0..1);
         }
         queue.submit(Some(encoder.finish()));
@@ -282,6 +376,51 @@ mod tests {
         validator
             .validate(&module)
             .expect("CARET_FX_SHADER must pass naga validation");
+    }
+
+    #[test]
+    fn caret_fx_has_both_blend_variants() {
+        assert!(CARET_FX_SHADER.contains("fn fs_add("));
+        assert!(CARET_FX_SHADER.contains("fn fs_mul("));
+    }
+
+    #[test]
+    fn glow_scissor_covers_the_reach_and_clamps_to_the_target() {
+        // Mid-screen: a (2 x 4.5 cells of the larger side) square around the cursor.
+        let r = caret_glow_scissor([500.0, 300.0], [10.0, 20.0], 1000, 640).unwrap();
+        assert_eq!(r, [410, 210, 180, 180]);
+        // ~5% of a 1000x640 frame -- the fragment work the clip saves.
+        assert!((r[2] * r[3]) as f32 / (1000.0 * 640.0) < 0.06);
+        // At the top-left corner it clamps to the target.
+        let c = caret_glow_scissor([5.0, 10.0], [10.0, 20.0], 1000, 640).unwrap();
+        assert_eq!((c[0], c[1]), (0, 0));
+        assert!(c[2] <= 1000 && c[3] <= 640);
+        // Entirely off-target -> nothing to draw.
+        assert!(caret_glow_scissor([5000.0, 10.0], [10.0, 20.0], 1000, 640).is_none());
+    }
+
+    #[test]
+    fn the_scissor_drops_nothing_visible() {
+        // Mirror the shader: at the scissor edge (4.5 cells) the halo is below
+        // half an 8-bit step at full intensity, and the ring has ended.
+        let halo_at_edge = (-(4.5f32 / 1.5).powi(2)).exp();
+        assert!(halo_at_edge * 255.0 < 0.5, "halo {halo_at_edge}");
+        let ring_edge = 2.5 + 3.0 * 0.4;
+        assert!(ring_edge < CARET_GLOW_REACH_CELLS);
+    }
+
+    #[test]
+    fn glow_look_follows_the_page() {
+        // Dark page: additive, the configured white, full strength (as before).
+        let (light, color, k) = caret_glow_look([1.0; 3], [11, 14, 20]);
+        assert!(!light);
+        assert_eq!(color, [1.0; 3]);
+        assert_eq!(k, CARET_GLOW_INTENSITY_DARK);
+        // Light page (solarized_light): multiply toward black, gentler.
+        let (light, color, k) = caret_glow_look([1.0; 3], [253, 246, 227]);
+        assert!(light);
+        assert_eq!(color, [0.0; 3]);
+        assert_eq!(k, CARET_GLOW_INTENSITY_LIGHT);
     }
 
     /// The Rust `CaretFxUniform` layout must match the WGSL `struct C`
