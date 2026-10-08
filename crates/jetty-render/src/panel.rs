@@ -788,22 +788,27 @@ impl Lay<'_> {
     fn cycler(&mut self, y: f32, row: &CtlRow, value: &str) {
         let c = self.c;
         let st = row.state;
-        let x = self.right() - CYC_W;
+        // CYC_W wide, grown to fit a long value (a theme name) as far as the
+        // label beside it leaves room — short values keep the common width.
+        let label_w = self.tw(&row.label);
+        let want = self.tw(value) + 2.0 * CYC_SEG + 16.0;
+        let cyc_w = want.min(self.cw - label_w - 12.0).max(CYC_W);
+        let x = self.right() - cyc_w;
         self.row_label(row, y + LABEL_DY, x);
-        self.quad(faded(Rect::rounded(x, y, CYC_W, CTL_H, c.ctl, R_CTL), st));
+        self.quad(faded(Rect::rounded(x, y, cyc_w, CTL_H, c.ctl, R_CTL), st));
         self.seg_line(x + CYC_SEG, y, st);
-        self.seg_line(x + CYC_W - CYC_SEG, y, st);
+        self.seg_line(x + cyc_w - CYC_SEG, y, st);
         let gap_x = x + CYC_SEG;
-        let gap_w = CYC_W - 2.0 * CYC_SEG;
+        let gap_w = cyc_w - 2.0 * CYC_SEG;
         let shown = self.fit(value, gap_w - 8.0);
         let sx = gap_x + ((gap_w - self.tw(&shown)) * 0.5).max(0.0);
         self.label(shown, sx, y + LABEL_DY, c.value(st));
         let gc = c.label(st);
         self.seg_glyph("<", x, CYC_SEG, y + LABEL_DY, gc);
-        self.seg_glyph(">", x + CYC_W - CYC_SEG, CYC_SEG, y + LABEL_DY, gc);
+        self.seg_glyph(">", x + cyc_w - CYC_SEG, CYC_SEG, y + LABEL_DY, gc);
         if self.live(row) {
             self.hit(area(x, y, CYC_SEG, CTL_H), PanelHit::Ctl { id: row.id, part: CtlPart::Prev });
-            self.hit(area(x + CYC_W - CYC_SEG, y, CYC_SEG, CTL_H), PanelHit::Ctl { id: row.id, part: CtlPart::Next });
+            self.hit(area(x + cyc_w - CYC_SEG, y, CYC_SEG, CTL_H), PanelHit::Ctl { id: row.id, part: CtlPart::Next });
         }
     }
 

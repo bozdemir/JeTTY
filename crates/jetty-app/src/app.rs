@@ -8240,10 +8240,18 @@ impl App {
             return false;
         }
         let summon_before = self.summon_effect;
+        // `apply_reloaded_config` only records the theme slots; which theme to
+        // SHOW is resolved by its caller (as `reload_config_and_themes` does).
+        let slots_changed = cfg.theme != before.theme
+            || cfg.light_theme != before.light_theme
+            || cfg.follow_system_theme != before.follow_system_theme;
         let was_reloading = std::mem::replace(&mut self.reloading, true);
         let mut warnings = Vec::new();
         self.apply_reloaded_config(cfg, &mut warnings);
         self.reloading = was_reloading;
+        if slots_changed {
+            self.reresolve_theme(true);
+        }
         if self.summon_effect != summon_before {
             // A new summon effect previews once on the main window.
             self.summon_pending = true;

@@ -622,12 +622,18 @@ fn dropdown_size_sliders_are_inert_outside_dropdown_mode() {
 
 #[test]
 fn click_gallery_card_and_filter_chip() {
-    let geom = make_panel_geom();
+    // The gallery closes the Look tab: scroll its section to the top.
+    let top = make_panel_geom().anchor("look.theme").expect("the Theme section").0;
+    let geom = make_panel_geom_tab_scroll(0, top);
     let card = geom
         .hits
         .iter()
         .find_map(|(r, h)| match h {
-            jetty_render::PanelHit::GalleryCard(i) if r.y + r.h < geom.content_bottom => Some((*r, *i)),
+            jetty_render::PanelHit::GalleryCard(i)
+                if r.y >= geom.content_top && r.y + r.h < geom.content_bottom =>
+            {
+                Some((*r, *i))
+            }
             _ => None,
         })
         .expect("a fully visible theme card");

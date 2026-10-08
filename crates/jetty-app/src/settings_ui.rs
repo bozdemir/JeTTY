@@ -127,9 +127,10 @@ pub enum ListSrc {
 
 /// A control's kind, with its range / options.
 pub enum Kind {
-    /// `min..=max` along the track. `live`: applied on every drag move (else
-    /// once, on release — for settings that re-dock a window).
-    Slider { min: f32, max: f32, fmt: fn(f32) -> String, live: bool },
+    /// `min..=max` along the track, snapped to multiples of `step` above `min`
+    /// (0 = continuous). `live`: applied on every drag move (else once, on
+    /// release — for settings that re-dock a window).
+    Slider { min: f32, max: f32, step: f32, fmt: fn(f32) -> String, live: bool },
     Toggle,
     /// `< value >` over `(config value, label)` options. A value that is not
     /// an option (hand-edited) shows verbatim; cycling from it starts over.
@@ -222,19 +223,19 @@ pub static SECTIONS: &[Section] = &[
     Section { id: "look.window", tab: LOOK, title: "Opacity & corners", ..Section::DEFAULT },
     // Hook: the background layer (mode, strength, image, dim, blur, pattern).
     Section { id: "look.backdrop", tab: LOOK, title: "Backdrop", ..Section::DEFAULT },
-    // Hook: tab style, window border.
+    // Tab look, close buttons, titles, progress, the window border.
     Section { id: "look.chrome", tab: LOOK, title: "Tabs & border", ..Section::DEFAULT },
-    // Hook: follow the system light/dark setting, the light theme, minimum contrast.
-    Section { id: "look.appearance", tab: LOOK, title: "Light & dark", ..Section::DEFAULT },
+    // Following the system light/dark setting, the light theme, minimum contrast.
+    Section { id: "look.appearance", tab: LOOK, title: "Appearance", ..Section::DEFAULT },
     // The gallery is long (every theme): last, so nothing hides below it.
     Section { id: "look.theme", tab: LOOK, title: "Theme", ..Section::DEFAULT },
     Section { id: "fonts.terminal", tab: FONTS, title: "Terminal font", ..Section::DEFAULT },
     Section { id: "fonts.ui", tab: FONTS, title: "Interface font", ..Section::DEFAULT },
-    // Hook: line height, built-in glyphs, bold is bright, color emoji.
+    // Line height (hook: built-in glyphs, bold is bright, color emoji).
     Section { id: "fonts.render", tab: FONTS, title: "Rendering", ..Section::DEFAULT },
     Section { id: "window.summon", tab: WINDOW, title: "Summon", ..Section::DEFAULT },
     Section { id: "window.dropdown", tab: WINDOW, title: "Dropdown", ..Section::DEFAULT },
-    // Also the hook for padding and the scrollbar.
+    // Tab bar position, scrollbar, grid padding, scrollback.
     Section { id: "window.layout", tab: WINDOW, title: "Layout", ..Section::DEFAULT },
     // Hook: reduce motion.
     Section { id: "window.motion", tab: WINDOW, title: "Motion", ..Section::DEFAULT },
@@ -301,6 +302,14 @@ pub fn fmt_pt(v: f32) -> String {
 pub fn fmt_ms(v: f32) -> String {
     format!("{}ms", v.round() as i32)
 }
+/// A multiplier: "1.30×".
+pub fn fmt_mult(v: f32) -> String {
+    format!("{v:.2}×")
+}
+/// A contrast ratio: "4.5:1", or "Off" at 1:1 (the no-op ratio).
+pub fn fmt_contrast(v: f32) -> String {
+    if v <= 1.0 + 1e-3 { "Off".to_string() } else { format!("{v:.1}:1") }
+}
 /// Whole thousands render as "Nk" (the cycler steps); anything else — a
 /// hand-edited value — verbatim.
 pub fn fmt_scrollback(n: u64) -> String {
@@ -312,7 +321,7 @@ pub fn fmt_secs(n: u64) -> String {
 }
 
 /// A 0..=1 slider shown as a percentage (most effect strengths).
-pub const PCT: Kind = Kind::Slider { min: 0.0, max: 1.0, fmt: fmt_pct, live: true };
+pub const PCT: Kind = Kind::Slider { min: 0.0, max: 1.0, step: 0.0, fmt: fmt_pct, live: true };
 
 /// Scrollback-cycler steps. 100_000 is alacritty's own UI max (and the config
 /// clamp ceiling): at ≤24 B/cell a fully-filled 100k×120-col history is
@@ -354,6 +363,22 @@ fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
     v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
 }
 
+/// The light themes of the registry (built-in and user), `(name, display)`.
+fn light_theme_choices() -> Vec<(String, String)> {
+    jetty_render::gallery_order(jetty_render::ThemeFilter::Light)
+        .into_iter()
+        .map(|i| {
+            let t = jetty_core::theme_at(i);
+            (t.name.to_string(), t.display_name.to_string())
+        })
+        .collect()
+}
+
+/// The light theme only shows while following the system (still settable).
+fn light_theme_state(c: &Config, _: &Ctx) -> RowState {
+    if c.follow_system_theme { RowState::Normal } else { RowState::Dimmed }
+}
+
 /// The dropdown sliders do nothing outside Dropdown mode or while the main
 /// window is fullscreen (docking a fullscreen window would yank it into a
 /// squared-off strip) — so they are inert there, like `dock_reassert_ok`.
@@ -382,7 +407,7 @@ pub static DESCS: &[Desc] = &[
         id: "opacity",
         section: "look.window",
         label: "Opacity",
-        kind: Kind::Slider { min: 0.1, max: 1.0, fmt: fmt_pct, live: true },
+        kind: Kind::Slider { min: 0.1, max: 1.0, step: 0.0, fmt: fmt_pct, live: true },
         get: get_f!(opacity),
         set: set_f!(opacity),
         ..Desc::DEFAULT
@@ -391,10 +416,117 @@ pub static DESCS: &[Desc] = &[
         id: "corner_radius",
         section: "look.window",
         label: "Corner radius",
-        kind: Kind::Slider { min: 0.0, max: 24.0, fmt: fmt_px, live: true },
+        kind: Kind::Slider { min: 0.0, max: 24.0, step: 0.0, fmt: fmt_px, live: true },
         get: get_f!(corner_radius),
         set: set_f!(corner_radius),
         state: Some(radius_state),
+        ..Desc::DEFAULT
+    },
+    // ── Look › Tabs & border ──────────────────────────────────────────────────
+    Desc {
+        id: "tab_style",
+        section: "look.chrome",
+        label: "Tab style",
+        kind: Kind::Choice {
+            options: |_| {
+                jetty_render::TabStyle::ALL
+                    .iter()
+                    .map(|s| (s.to_config().to_string(), s.display_name().to_string()))
+                    .collect()
+            },
+        },
+        get: get_s!(tab_style),
+        set: set_s!(tab_style),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "tab_close_button",
+        section: "look.chrome",
+        label: "Close buttons",
+        kind: Kind::Choice {
+            options: |_| {
+                jetty_render::CloseButton::ALL
+                    .iter()
+                    .map(|m| (m.to_config().to_string(), m.display_name().to_string()))
+                    .collect()
+            },
+        },
+        get: get_s!(tab_close_button),
+        set: set_s!(tab_close_button),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "tab_title",
+        section: "look.chrome",
+        label: "Tab titles",
+        kind: Kind::Choice { options: |_| pairs(&[("osc", "Program"), ("auto", "Smart")]) },
+        get: get_s!(tab_title),
+        set: set_s!(tab_title),
+        hint: Some("Smart: the command, else the folder"),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "progress_bar",
+        section: "look.chrome",
+        label: "Progress in tabs",
+        kind: Kind::Toggle,
+        get: get_b!(progress_bar),
+        set: set_b!(progress_bar),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "tab_bar_opacity",
+        section: "look.chrome",
+        label: "Translucent tab bar",
+        kind: Kind::Toggle,
+        get: get_b!(tab_bar_opacity),
+        set: set_b!(tab_bar_opacity),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "window_border",
+        section: "look.chrome",
+        label: "Window border",
+        kind: Kind::Choice {
+            options: |_| {
+                crate::tabmeta::WindowBorder::ALL
+                    .iter()
+                    .map(|b| (b.to_config().to_string(), b.display_name().to_string()))
+                    .collect()
+            },
+        },
+        get: get_s!(window_border),
+        set: set_s!(window_border),
+        ..Desc::DEFAULT
+    },
+    // ── Look › Appearance ─────────────────────────────────────────────────────
+    Desc {
+        id: "follow_system_theme",
+        section: "look.appearance",
+        label: "Follow system light/dark",
+        kind: Kind::Toggle,
+        get: get_b!(follow_system_theme),
+        set: set_b!(follow_system_theme),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "light_theme",
+        section: "look.appearance",
+        label: "Light theme",
+        kind: Kind::Choice { options: |_| light_theme_choices() },
+        get: get_s!(light_theme),
+        set: set_s!(light_theme),
+        hint: Some("Shown while the system is light"),
+        state: Some(light_theme_state),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "minimum_contrast",
+        section: "look.appearance",
+        label: "Minimum contrast",
+        kind: Kind::Slider { min: 1.0, max: 7.0, step: 0.1, fmt: fmt_contrast, live: true },
+        get: get_f!(minimum_contrast),
+        set: set_f!(minimum_contrast),
         ..Desc::DEFAULT
     },
     Desc {
@@ -457,6 +589,23 @@ pub static DESCS: &[Desc] = &[
         set: set_s!(ui_font_family),
         ..Desc::DEFAULT
     },
+    // ── Fonts › Rendering ─────────────────────────────────────────────────────
+    Desc {
+        id: "line_height",
+        tab: FONTS,
+        section: "fonts.render",
+        label: "Line height",
+        kind: Kind::Slider {
+            min: jetty_render::LINE_HEIGHT_MIN,
+            max: jetty_render::LINE_HEIGHT_MAX,
+            step: 0.05,
+            fmt: fmt_mult,
+            live: true,
+        },
+        get: get_f!(line_height),
+        set: set_f!(line_height),
+        ..Desc::DEFAULT
+    },
     // ── Window ────────────────────────────────────────────────────────────────
     Desc {
         id: "summon_effect",
@@ -493,7 +642,7 @@ pub static DESCS: &[Desc] = &[
         tab: WINDOW,
         section: "window.dropdown",
         label: "Dropdown height",
-        kind: Kind::Slider { min: 0.25, max: 1.0, fmt: fmt_pct, live: false },
+        kind: Kind::Slider { min: 0.25, max: 1.0, step: 0.0, fmt: fmt_pct, live: false },
         get: get_f!(dropdown_height_pct),
         set: set_f!(dropdown_height_pct),
         state: Some(dropdown_state),
@@ -504,7 +653,7 @@ pub static DESCS: &[Desc] = &[
         tab: WINDOW,
         section: "window.dropdown",
         label: "Dropdown width",
-        kind: Kind::Slider { min: 0.2, max: 1.0, fmt: fmt_pct, live: false },
+        kind: Kind::Slider { min: 0.2, max: 1.0, step: 0.0, fmt: fmt_pct, live: false },
         get: get_f!(dropdown_width_pct),
         set: set_f!(dropdown_width_pct),
         state: Some(dropdown_state),
@@ -518,6 +667,40 @@ pub static DESCS: &[Desc] = &[
         kind: Kind::Choice { options: |_| pairs(&[("top", "Top"), ("bottom", "Bottom")]) },
         get: get_s!(tab_bar_position),
         set: set_s!(tab_bar_position),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "scrollbar",
+        tab: WINDOW,
+        section: "window.layout",
+        label: "Scrollbar",
+        kind: Kind::Choice { options: |_| pairs(&[("always", "Always"), ("auto", "Auto"), ("never", "Never")]) },
+        get: |c| Val::S(c.scrollbar.as_str().to_string()),
+        set: |c, v| {
+            if let Val::S(x) = v {
+                c.scrollbar = crate::config::ScrollbarMode::parse(&x);
+            }
+        },
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "padding_x",
+        tab: WINDOW,
+        section: "window.layout",
+        label: "Side padding",
+        kind: Kind::Slider { min: 0.0, max: jetty_render::PADDING_MAX, step: 1.0, fmt: fmt_px, live: true },
+        get: get_f!(padding_x),
+        set: set_f!(padding_x),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "padding_y",
+        tab: WINDOW,
+        section: "window.layout",
+        label: "Top & bottom padding",
+        kind: Kind::Slider { min: 0.0, max: jetty_render::PADDING_MAX, step: 1.0, fmt: fmt_px, live: true },
+        get: get_f!(padding_y),
+        set: set_f!(padding_y),
         ..Desc::DEFAULT
     },
     Desc {
@@ -728,7 +911,7 @@ pub static DESCS: &[Desc] = &[
         tab: EFFECTS,
         section: "fx.caret",
         label: "Flash duration",
-        kind: Kind::Slider { min: 60.0, max: 400.0, fmt: fmt_ms, live: true },
+        kind: Kind::Slider { min: 60.0, max: 400.0, step: 0.0, fmt: fmt_ms, live: true },
         get: get_f!(effects.caret_flash_ms),
         set: set_f!(effects.caret_flash_ms),
         ..Desc::DEFAULT
@@ -959,7 +1142,11 @@ pub fn press(d: &Desc, part: CtlPart, cfg: &Config, ctx: &Ctx) -> Press {
 pub fn drag_value(d: &Desc, part: CtlPart, frac: f32, cur: &Val) -> Option<Val> {
     let frac = if frac.is_finite() { frac.clamp(0.0, 1.0) } else { 0.0 };
     match (&d.kind, part) {
-        (Kind::Slider { min, max, .. }, CtlPart::Track) => Some(Val::F(min + frac * (max - min))),
+        (Kind::Slider { min, max, step, .. }, CtlPart::Track) => {
+            let v = min + frac * (max - min);
+            let v = if *step > 0.0 { min + ((v - min) / step).round() * step } else { v };
+            Some(Val::F(v.clamp(*min, *max)))
+        }
         (Kind::Rgb, CtlPart::Channel(i)) if i < 3 => {
             let mut c = cur.rgb();
             c[i as usize] = frac;
@@ -984,13 +1171,11 @@ pub fn live(d: &Desc) -> bool {
 
 /// One palette deep link into Settings.
 pub struct DeepLink {
-    /// "Settings › Effects › Bloom".
+    /// "Settings › Effects › Bloom" — found by the control's name (the
+    /// palette ranks a title match above a keyword-only one).
     pub title: String,
     /// The control it opens.
     pub id: CtlId,
-    /// Extra fuzzy keywords: the control's own label, so typing it ranks the
-    /// link first (an exact-prefix keyword match beats a mid-title one).
-    pub keywords: &'static str,
 }
 
 /// Palette deep links, one per setting.
@@ -998,11 +1183,7 @@ pub fn deep_links() -> Vec<DeepLink> {
     DESCS
         .iter()
         .filter(|d| d.is_setting())
-        .map(|d| DeepLink {
-            title: format!("Settings › {} › {}", TAB_NAMES[d.tab], d.label),
-            id: d.id,
-            keywords: d.label,
-        })
+        .map(|d| DeepLink { title: format!("Settings › {} › {}", TAB_NAMES[d.tab], d.label), id: d.id })
         .collect()
 }
 
@@ -1424,12 +1605,14 @@ mod tests {
                 scroll = (scroll + v.geom.viewport_h()).min(max);
             }
             for it in &items {
-                let want = match it {
-                    PanelItem::Section { title, .. } => title.clone(),
-                    PanelItem::Row(r) => r.label.clone(),
+                let want: Vec<String> = match it {
+                    PanelItem::Section { title, hint, .. } => std::iter::once(title.clone()).chain(hint.clone()).collect(),
+                    PanelItem::Row(r) => std::iter::once(r.label.clone()).chain(r.hint.clone()).collect(),
                     _ => continue,
                 };
-                assert!(drawn.contains(&want), "tab {tab}: {want:?} is truncated or missing");
+                for w in want {
+                    assert!(drawn.contains(&w), "tab {tab}: {w:?} is truncated or missing");
+                }
             }
         }
     }
@@ -1444,7 +1627,7 @@ mod tests {
         titles.dedup();
         assert_eq!(titles.len(), n, "duplicate deep-link title");
         assert!(links.iter().any(|l| l.title == "Settings › Effects › Bloom" && l.id == "effects.crt_bloom"));
-        assert!(links.iter().all(|l| find(l.id).is_some_and(|d| d.label == l.keywords)));
+        assert!(links.iter().all(|l| find(l.id).is_some_and(|d| l.title.ends_with(d.label))));
     }
 
     #[test]

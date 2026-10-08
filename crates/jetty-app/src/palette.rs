@@ -260,7 +260,7 @@ pub fn build_registry(
     // Deep links into Settings, one per control ("Settings › Effects › Bloom"),
     // straight from the control table — a new setting gets one by itself.
     for link in crate::settings_ui::deep_links() {
-        v.push(PaletteEntry { title: link.title, keywords: link.keywords, cmd: PaletteCmd::SettingsAt(link.id) });
+        v.push(PaletteEntry { title: link.title, keywords: "preferences option", cmd: PaletteCmd::SettingsAt(link.id) });
     }
     for (id, title) in tabs {
         v.push(PaletteEntry {
@@ -294,21 +294,27 @@ pub fn filter(registry: &[PaletteEntry], query: &str) -> Vec<PaletteHit> {
             .map(|e| PaletteHit { title: e.title.clone(), indices: Vec::new(), cmd: e.cmd.clone() })
             .collect();
     }
-    let mut scored: Vec<(i32, usize, PaletteHit)> = Vec::new();
+    let mut scored: Vec<(i32, bool, usize, PaletteHit)> = Vec::new();
     for (i, e) in registry.iter().enumerate() {
         let title_m = fuzzy_match(query, &e.title);
         let kw_m = fuzzy_match(query, e.keywords);
-        let best = match (title_m.as_ref().map(|m| m.score), kw_m.map(|m| m.score)) {
+        let (t, k) = (title_m.as_ref().map(|m| m.score), kw_m.map(|m| m.score));
+        let best = match (t, k) {
             (None, None) => continue,
             (a, b) => a.unwrap_or(i32::MIN).max(b.unwrap_or(i32::MIN)),
         };
+        // Whether the TITLE carries the best score (keywords are secondary).
+        let by_title = t == Some(best);
         // Highlight indices come ONLY from the title match.
         let indices = title_m.map(|m| m.indices).unwrap_or_default();
-        scored.push((best, i, PaletteHit { title: e.title.clone(), indices, cmd: e.cmd.clone() }));
+        scored.push((best, by_title, i, PaletteHit { title: e.title.clone(), indices, cmd: e.cmd.clone() }));
     }
-    // Score desc, then registry order (stable tiebreak on the original index).
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, _, hit)| hit).collect()
+    // Score desc; on a tie a title match beats a keyword-only one ("bloom"
+    // finds "Settings › Effects › Bloom" before an action that merely lists the
+    // word); then registry order — actions before the Settings deep links, so a
+    // command you can run beats a link to its control (stable on the index).
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
+    scored.into_iter().map(|(_, _, _, hit)| hit).collect()
 }
 
 #[cfg(test)]
@@ -499,15 +505,20 @@ mod tests {
     }
 
     #[test]
-    fn settings_deep_links_rank_first_for_their_control_name() {
+    fn settings_deep_links_beat_keyword_matches_but_not_actions() {
         // Typing a control's name finds its "Settings › Tab › Control" link
-        // first — even where an action's keywords mention the same word
-        // ("Toggle caret glow" carries "bloom").
+        // first — even where an action's KEYWORDS mention the word ("Toggle
+        // caret glow" carries "bloom")…
         let r = reg();
-        for (q, id) in [("bloom", "effects.crt_bloom"), ("vignette", "effects.crt_vignette"), ("scrollback", "scrollback_lines")] {
+        for (q, id) in [("bloom", "effects.crt_bloom"), ("vignette", "effects.crt_vignette"), ("line height", "line_height")] {
             let hits = filter(&r, q);
             assert_eq!(hits[0].cmd, PaletteCmd::SettingsAt(id), "top hit for {q:?}");
         }
+        // …but an action whose TITLE names it runs it directly: it ranks first,
+        // its Settings link right behind.
+        let hits = filter(&r, "follow system");
+        assert_eq!(hits[0].cmd, PaletteCmd::ToggleFollowSystemTheme);
+        assert_eq!(hits[1].cmd, PaletteCmd::SettingsAt("follow_system_theme"));
         assert!(r.iter().any(|e| e.title == "Settings › Effects › Bloom"));
     }
 
