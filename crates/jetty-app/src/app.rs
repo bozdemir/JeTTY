@@ -1036,6 +1036,9 @@ pub struct App {
     /// macOS Option-as-Meta sides (mirrors `Config.macos_option_as_alt`; live on
     /// reload, written back by `persist`). Feeds `input::KeyOptions::native`.
     macos_option_as_alt: input::OptionAsAlt,
+    /// Where a finished mouse selection is copied (mirrors
+    /// `Config.copy_on_select`; live on reload, written back by `persist`).
+    copy_on_select: clipboard::CopyOnSelect,
     /// Compiled keybindings (built from `keys` on load / reload). The input path
     /// does ONE cheap hashmap lookup against this per keypress — never per frame.
     keymap: crate::keymap::KeyMap,
@@ -1735,6 +1738,7 @@ impl App {
             osc52_allow_paste: false,
             hot_reload: true,
             macos_option_as_alt: input::OptionAsAlt::default(),
+            copy_on_select: clipboard::CopyOnSelect::default(),
             // Placeholder default keymap; rebuilt from cfg.keys below in `new`.
             keymap: crate::keymap::KeyMap::defaults(),
             keys: crate::config::KeyBindings::default(),
@@ -1891,6 +1895,7 @@ impl App {
         app.run_selection_enabled = cfg.run_selection;
         app.hot_reload = cfg.hot_reload;
         app.macos_option_as_alt = cfg.macos_option_as_alt;
+        app.copy_on_select = cfg.copy_on_select;
         // Compile the keybindings (defaults + user `[keys]` overrides). Any invalid
         // chord / conflict / rejected bind is logged; the rest still apply.
         app.keys = cfg.keys;
@@ -2045,6 +2050,7 @@ impl App {
             run_selection: self.run_selection_enabled,
             hot_reload: self.hot_reload,
             macos_option_as_alt: self.macos_option_as_alt,
+            copy_on_select: self.copy_on_select,
             // Preserve the user's `[keys]` overrides verbatim (never editable via the
             // Settings UI — a settings-driven persist must not erase them).
             keys: self.keys.clone(),
@@ -2298,6 +2304,7 @@ impl App {
         }
         self.macos_option_as_alt = cfg.macos_option_as_alt;
         self.apply_option_as_alt_everywhere();
+        self.copy_on_select = cfg.copy_on_select;
         // Mirror the RESTART-ONLY-EFFECT keys too, so a later panel-driven persist()
         // round-trips the user's external edit instead of clobbering it with the
         // stale startup value. Their live EFFECTS stay restart-only (summon_hotkey is
@@ -7095,7 +7102,7 @@ impl App {
                         crate::gridmouse::release(g, MouseButton::Left)
                     }) {
                         crate::gridmouse::Release::Copy(text) => {
-                            clipboard::set_primary(&text);
+                            clipboard::copy_on_select(&text, self.copy_on_select);
                             dw.request_paint();
                             return;
                         }
@@ -10600,7 +10607,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // select: teach Shift+drag (throttled).
                 match self.with_main_grid(|g| crate::gridmouse::release(g, MouseButton::Left)) {
                     Some(crate::gridmouse::Release::Copy(text)) => {
-                        clipboard::set_primary(&text);
+                        clipboard::copy_on_select(&text, self.copy_on_select);
                         self.request_main_paint();
                     }
                     Some(crate::gridmouse::Release::Cleared) => self.request_main_paint(),
@@ -14347,6 +14354,7 @@ mod hot_reload_tests {
             "osc52_allow_paste",
             "hot_reload",
             "macos_option_as_alt",
+            "copy_on_select",
             // shell (new tabs pick up the edited shell) and show_welcome apply live;
             // both are also mirrored in apply_reloaded_config so a later persist()
             // round-trips an external edit instead of clobbering it.
