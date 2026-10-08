@@ -28,6 +28,25 @@ pub struct Config {
     /// Theme preset name (must match a `jetty_core::theme::PRESETS` entry).
     #[serde(default = "default_theme")]
     pub theme: String,
+    // ── System appearance & theme UX (visuals v2) ────────────────────────────
+    /// Follow the desktop's light/dark preference — the freedesktop settings
+    /// portal on Linux/BSD (any desktop that runs one), the system appearance on
+    /// macOS: `light_theme` while it prefers light (or states no preference),
+    /// `theme` while it prefers dark. Default OFF. Without a portal (a bare
+    /// window manager) `theme` stays. Hot-reloadable.
+    #[serde(default)]
+    pub follow_system_theme: bool,
+    /// The theme shown while `follow_system_theme` is on and the system is
+    /// light; `theme` is the dark (and default) one. While the light one is on
+    /// screen, a theme picked in the palette or Settings is saved here.
+    #[serde(default = "default_light_theme")]
+    pub light_theme: String,
+    /// Minimum WCAG contrast between every glyph and its cell background,
+    /// 1.0..=21.0. `1.0` (default) = off; `4.5` = WCAG AA, `3.0` = large text.
+    /// Text below it is pushed toward white or black, keeping its hue —
+    /// concealed text and powerline / block / sextant glyphs never change.
+    #[serde(default = "default_minimum_contrast")]
+    pub minimum_contrast: f32,
     /// Background opacity in 0.0..=1.0.
     #[serde(default = "default_opacity")]
     pub opacity: f32,
@@ -312,6 +331,10 @@ pub struct KeyBindings {
     /// `scroll_page_up = ["Shift+PageUp", "PageUp"]` (+ the `_down` twin).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub scroll_page_up: Option<ChordSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub scroll_page_down: Option<ChordSpec>,
+    /// Step to the next / previous theme. No default chord (palette:
+    /// "Next theme" / "Previous theme"); e.g. `next_theme = "Ctrl+Alt+T"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub next_theme: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub prev_theme: Option<ChordSpec>,
 }
 
 impl KeyBindings {
@@ -350,6 +373,14 @@ fn default_auto_summon_on_finish() -> bool {
 
 fn default_theme() -> String {
     "catppuccin_mocha".to_string()
+}
+
+fn default_light_theme() -> String {
+    "catppuccin_latte".to_string()
+}
+
+fn default_minimum_contrast() -> f32 {
+    1.0
 }
 
 fn default_opacity() -> f32 {
@@ -635,6 +666,9 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             theme: default_theme(),
+            follow_system_theme: false,
+            light_theme: default_light_theme(),
+            minimum_contrast: default_minimum_contrast(),
             opacity: default_opacity(),
             font_size: default_font_size(),
             font_family: default_font_family(),
@@ -929,6 +963,8 @@ impl Config {
     /// and `save()` persisted it right back. Finite values pass through
     /// untouched; the normal range clamps in `App::new` still apply after.
     fn sanitize_floats(&mut self) {
+        // NaN / ±inf → off; otherwise clamped to 1..=21.
+        self.minimum_contrast = jetty_core::contrast::clamp_ratio(self.minimum_contrast);
         self.opacity = finite_or(self.opacity, 1.0);
         self.font_size = finite_or(self.font_size, 16.0);
         self.ui_font_size = finite_or(self.ui_font_size, default_ui_font_size());
@@ -1907,6 +1943,9 @@ mod tests {
     fn round_trip_through_toml() {
         let c = Config {
             theme: "dracula".to_string(),
+            follow_system_theme: true,
+            light_theme: "solarized_light".to_string(),
+            minimum_contrast: 4.5,
             opacity: 0.85,
             font_size: 18.0,
             font_family: "Fira Code".to_string(),
@@ -1960,6 +1999,9 @@ mod tests {
         let path = dir.join("config.toml");
         let c = Config {
             theme: "tokyo_night".to_string(),
+            follow_system_theme: false,
+            light_theme: "catppuccin_latte".to_string(),
+            minimum_contrast: 1.0,
             opacity: 0.5,
             font_size: 14.0,
             font_family: "MesloLGS NF".to_string(),
@@ -2221,6 +2263,33 @@ corner_radius = 8.0
         assert_eq!(cfg.opacity, 0.42);
         assert_eq!(cfg.font_size, 13.0);
         assert_eq!(cfg.corner_radius, 3.0);
+    }
+
+    #[test]
+    fn appearance_keys_default_parse_and_sanitize() {
+        let d = Config::default();
+        assert!(!d.follow_system_theme, "following the system is opt-in");
+        assert_eq!(d.light_theme, "catppuccin_latte");
+        assert_eq!(d.minimum_contrast, 1.0, "minimum contrast is off by default");
+        let (cfg, warnings) = Config::parse_with_base(
+            "follow_system_theme = true\nlight_theme = \"solarized_light\"\nminimum_contrast = 3\n",
+            &d,
+            "using the default",
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(cfg.follow_system_theme);
+        assert_eq!(cfg.light_theme, "solarized_light");
+        assert_eq!(cfg.minimum_contrast, 3.0, "an integer ratio is accepted");
+        for (text, want) in [("minimum_contrast = nan", 1.0), ("minimum_contrast = 0.2", 1.0), ("minimum_contrast = 40.0", 21.0)] {
+            let (cfg, _) = Config::parse_with_base(text, &d, "using the default").unwrap();
+            assert_eq!(cfg.minimum_contrast, want, "{text}");
+        }
+        // A wrong type keeps the base value, with a warning (per-key loading).
+        let (cfg, warnings) =
+            Config::parse_with_base("follow_system_theme = \"yes\"\n", &d, "using the default").unwrap();
+        assert!(!cfg.follow_system_theme);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]

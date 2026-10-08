@@ -179,6 +179,8 @@ cargo build --release && ./target/release/jetty
 | `Ctrl+Alt+=` · `Ctrl+Alt+-` | Window opacity up / down | `opacity_up` · `opacity_down` |
 | `F11` | Fullscreen (whole monitor) for the focused window | `toggle_fullscreen` |
 | — (command palette; Cmd+Q on macOS) | Quit (with confirm) | `quit` |
+| — (command palette: "Next theme") | Next theme | `next_theme` |
+| — (command palette: "Previous theme") | Previous theme | `prev_theme` |
 <!-- keybindings:end -->
 
 Mouse: **left-drag** selects (double-click a word, triple-click a line); **Shift+drag** selects even over programs that track the mouse (vim, htop, tmux, Claude Code) — those programs get the clicks otherwise, right and middle buttons included, and **Shift+right-click** opens JeTTY's menu there; **right-click** opens the Copy / Paste / Run in New Tab / Select All / Clear / Close Tab menu; **middle-click** pastes the primary selection; **Ctrl+click** opens a link. Tabs: drag one off the bar to detach it (drop it back on the bar to reattach), right-click a tab for Detach / Rename / Close, double-click to rename. `Ctrl+D` exits the shell.

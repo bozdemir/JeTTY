@@ -1,5 +1,5 @@
 use std::io::Write;
-use crate::overlays::{HintDrawData, HintState, Overlays, PaletteDrawData, Surface};
+use crate::overlays::{HintDrawData, HintState, Overlays, PaletteDrawData, Surface, ThemePreview};
 use std::sync::Arc;
 use jetty_core::{PtySession, Terminal};
 use jetty_render::{GpuContext, QuadLayer, TextLayer};
@@ -25,6 +25,10 @@ pub enum AppEvent {
     /// A user-facing configuration problem found off the UI thread (a refused
     /// save, an unusable summon hotkey) — shown as a status pill + logged.
     ConfigNotice(String),
+    /// The system appearance (light/dark preference, reduced motion, accent)
+    /// was read or changed — from the settings-portal watcher thread
+    /// (`appearance.rs`), which blocks on the bus in between.
+    Appearance(crate::appearance::Appearance),
 }
 
 /// Window-summon reveal effect, selectable in Settings and persisted in config.
@@ -1114,6 +1118,32 @@ pub struct App {
     /// is shown but this name is what gets saved and re-resolved on every reload,
     /// so fixing the file brings it back — the fallback never replaces the choice.
     theme_name: String,
+    // ── System appearance & theme UX (visuals v2) ─────────────────────────────
+    /// Show `light_theme_name` while the system prefers light (mirrors
+    /// `Config.follow_system_theme`; live on reload).
+    follow_system_theme: bool,
+    /// The light-slot theme the user CHOSE (config `light_theme`) — kept, saved
+    /// and re-resolved exactly like `theme_name`.
+    light_theme_name: String,
+    /// The system appearance as last reported (settings portal / winit); each
+    /// field stays `None` until something reports it. Event-driven: never polled.
+    system_appearance: crate::appearance::Appearance,
+    /// The desktop asked apps to minimize animation (`org.freedesktop.appearance
+    /// reduced-motion`). `false` until reported. What `reduce_motion = "system"`
+    /// reads (slice F).
+    system_reduced_motion: bool,
+    /// The desktop's accent color (`accent-color`), when it reports one.
+    /// Stored for chrome that wants to follow it; no consumer yet.
+    system_accent: Option<[u8; 3]>,
+    /// The portal watcher's first reading, for the first tab's `COLORFGBG`
+    /// (decided on the PTY worker before the event loop delivers it).
+    appearance_first: crate::appearance::FirstReading,
+    /// The appearance watcher thread runs (started on first need; it then
+    /// blocks on the bus for the process lifetime — zero idle CPU).
+    appearance_watching: bool,
+    /// `minimum_contrast` (mirrors the config, clamped 1..=21; 1 = off): pushed
+    /// into every terminal, live on reload.
+    minimum_contrast: f32,
     /// Config / theme / keybinding problems found while starting up, printed in
     /// the first tab once it exists (a desktop launch has no visible stderr).
     startup_warnings: Vec<String>,
@@ -1823,6 +1853,14 @@ impl App {
             persister: std::cell::RefCell::new(persister),
             // Set from the config below.
             theme_name: String::new(),
+            follow_system_theme: false,
+            light_theme_name: String::new(),
+            system_appearance: crate::appearance::Appearance::default(),
+            system_reduced_motion: false,
+            system_accent: None,
+            appearance_first: crate::appearance::FirstReading::default(),
+            appearance_watching: false,
+            minimum_contrast: 1.0,
             startup_warnings: Vec::new(),
             themes_fp,
             shown_warnings: theme_warnings,
@@ -1950,6 +1988,13 @@ impl App {
                 startup_warnings.push(w);
             }
         }
+        // System appearance: the light slot applies once the system's scheme is
+        // known (the watcher's first reading; macOS: `resumed`). Started here, as
+        // early as possible, so that reading usually beats the first frame.
+        app.follow_system_theme = cfg.follow_system_theme;
+        app.light_theme_name = cfg.light_theme.clone();
+        app.minimum_contrast = cfg.minimum_contrast;
+        app.ensure_appearance_watcher();
         // Clamp opacity to a VISIBLE floor: a persisted 0.0 would load a fully
         // transparent (invisible) window, which looks like a launch failure.
         app.opacity = cfg.opacity.clamp(0.1, 1.0);
@@ -2170,6 +2215,9 @@ impl App {
             // The theme the user CHOSE — not the fallback shown while it is missing
             // (a broken user theme file must never be replaced by the fallback).
             theme: self.theme_name.clone(),
+            follow_system_theme: self.follow_system_theme,
+            light_theme: self.light_theme_name.clone(),
+            minimum_contrast: self.minimum_contrast,
             opacity: self.opacity,
             font_size: self.font_logical,
             // The CHOSEN families, never a fallback shown for a missing one.
@@ -2223,31 +2271,178 @@ impl App {
     }
 
     /// Select theme `i` as the user's choice (palette / Settings pick): show it and
-    /// make it the remembered `theme_name`.
+    /// make it the remembered choice of the slot in effect — `light_theme_name`
+    /// while following a light system appearance, else `theme_name` (so a pick
+    /// always changes what is on screen, and survives the next system flip).
     fn pick_theme(&mut self, i: usize) {
         self.theme_idx = i;
-        self.theme_name = jetty_core::theme_at(i).name.to_string();
+        let name = jetty_core::theme_at(i).name.to_string();
+        if self.light_slot_active() {
+            self.light_theme_name = name;
+        } else {
+            self.theme_name = name;
+        }
         self.apply_theme();
     }
 
-    /// Point `theme_idx` at the chosen `theme_name`. When it is missing (a user
-    /// theme file deleted or broken mid-edit) keep showing the current theme if it
-    /// still exists, else the first built-in — and say so. Never touches
-    /// `theme_name`, so the choice survives until the file is fixed.
+    /// Whether the light slot (`light_theme_name`) decides the theme now:
+    /// following the system, which prefers light (or states no preference).
+    fn light_slot_active(&self) -> bool {
+        crate::appearance::light_slot(
+            self.follow_system_theme,
+            self.system_appearance.color_scheme,
+            &self.light_theme_name,
+        )
+    }
+
+    /// Point `theme_idx` at the chosen theme of the slot in effect (`theme_name`,
+    /// or `light_theme_name` while following a light system). When it is missing
+    /// (a user theme file deleted or broken mid-edit) the light slot falls back to
+    /// `theme_name`; otherwise keep showing the current theme if it still exists,
+    /// else the first built-in — and say so. Never touches the chosen names, so a
+    /// choice survives until the file is fixed.
     fn resolve_chosen_theme(&mut self, warnings: &mut Vec<String>) {
-        match jetty_core::theme_index(&self.theme_name) {
+        let light = self.light_slot_active();
+        let want = if light { &self.light_theme_name } else { &self.theme_name };
+        match jetty_core::theme_index(want) {
             Some(i) => self.theme_idx = i,
             None => {
                 let shown = self.active_theme.name.to_string();
-                self.theme_idx = jetty_core::theme_index(&shown)
+                self.theme_idx = light
+                    .then(|| jetty_core::theme_index(&self.theme_name))
+                    .flatten()
+                    .or_else(|| jetty_core::theme_index(&shown))
                     .unwrap_or(0)
                     .min(jetty_core::theme_count().saturating_sub(1));
-                warnings.push(theme_missing_warning(
-                    &self.theme_name,
-                    &jetty_core::theme_at(self.theme_idx).display_name,
-                ));
+                let shown = jetty_core::theme_at(self.theme_idx).display_name;
+                warnings.push(if light {
+                    format!(
+                        "light_theme {want:?} not found (missing or invalid theme file?) — showing \
+                         {shown:?} while the system is light"
+                    )
+                } else {
+                    theme_missing_warning(want, &shown)
+                });
             }
         }
+    }
+
+    /// Re-resolve the theme to show (the slot in effect may have changed: the
+    /// system flipped light/dark, `follow_system_theme` / `light_theme` changed,
+    /// a palette preview ended) and repaint when it differs. A missing theme is
+    /// reported when `report` (not for the end of a preview: it was reported when
+    /// it became the choice).
+    fn reresolve_theme(&mut self, report: bool) {
+        let mut warnings = Vec::new();
+        let before = self.theme_idx;
+        self.resolve_chosen_theme(&mut warnings);
+        if self.theme_idx != before || self.active_theme.name != jetty_core::theme_at(self.theme_idx).name {
+            self.apply_theme();
+        }
+        if report {
+            self.show_config_warnings(&warnings);
+        }
+    }
+
+    /// Start the system-appearance watcher once something needs it
+    /// (`follow_system_theme`; `reduce_motion = "system"` too). It then lives for
+    /// the process, blocked on the session bus between changes (zero idle CPU).
+    /// macOS needs none: winit reports the system theme there.
+    fn ensure_appearance_watcher(&mut self) {
+        if self.appearance_watching || !self.appearance_wanted() {
+            return;
+        }
+        let proxy = self.proxy.clone();
+        self.appearance_watching =
+            crate::appearance::spawn_watcher(self.appearance_first.clone(), move |a| {
+                let _ = proxy.send_event(AppEvent::Appearance(a));
+            });
+    }
+
+    /// Whether anything follows the system appearance.
+    fn appearance_wanted(&self) -> bool {
+        self.follow_system_theme
+    }
+
+    /// A system appearance report (settings portal, or winit's system theme):
+    /// remember it, and follow it where asked. Idempotent — the same report twice
+    /// changes nothing.
+    fn apply_appearance(&mut self, a: crate::appearance::Appearance) {
+        let scheme_before = self.system_appearance.color_scheme;
+        self.system_appearance.merge(a);
+        if let Some(rm) = a.reduced_motion {
+            self.system_reduced_motion = rm;
+        }
+        if let Some(accent) = a.accent {
+            self.system_accent = accent;
+        }
+        if self.system_appearance.color_scheme != scheme_before && self.follow_system_theme {
+            self.reresolve_theme(true);
+        }
+    }
+
+    /// A window reported the system theme changed (`WindowEvent::ThemeChanged`:
+    /// macOS / Windows). Every window reports it; the first one wins, the rest
+    /// change nothing.
+    fn system_theme_changed(&mut self, t: winit::window::Theme) {
+        self.apply_appearance(crate::appearance::Appearance {
+            color_scheme: Some(crate::appearance::ColorScheme::from_winit(t)),
+            ..Default::default()
+        });
+    }
+
+    /// Apply the portal watcher's first reading if it is already in (never
+    /// waits; the event that carries it too then changes nothing).
+    fn take_first_appearance(&mut self) {
+        if self.appearance_watching {
+            if let Some(a) = self.appearance_first.wait(std::time::Duration::ZERO) {
+                self.apply_appearance(a);
+            }
+        }
+    }
+
+    /// Turn following the system light/dark preference on or off (palette;
+    /// Settings): starts the watcher on first use, shows the slot now in effect
+    /// and saves.
+    fn set_follow_system_theme(&mut self, on: bool) {
+        if self.follow_system_theme == on {
+            return;
+        }
+        self.follow_system_theme = on;
+        self.ensure_appearance_watcher();
+        self.reresolve_theme(true);
+        self.persist();
+        self.request_settings_paint();
+    }
+
+    /// Set `minimum_contrast` (clamped 1..=21; 1 = off) in every terminal —
+    /// main-window tabs and detached windows — repaint them, and save.
+    fn set_minimum_contrast(&mut self, ratio: f32) {
+        self.minimum_contrast = jetty_core::contrast::clamp_ratio(ratio);
+        for tab in &mut self.tabs {
+            tab.terminal.set_minimum_contrast(self.minimum_contrast);
+        }
+        for dw in &mut self.detached {
+            dw.tab.terminal.set_minimum_contrast(self.minimum_contrast);
+        }
+        self.mark_dirty_all();
+        self.persist();
+    }
+
+    /// The first shell's environment (see [`FirstShellEnv`]).
+    fn first_shell_env(&self) -> FirstShellEnv {
+        let now = colorfgbg_env(&self.active_theme);
+        let pending = (self.follow_system_theme
+            && self.appearance_watching
+            && self.system_appearance.color_scheme.is_none())
+        .then(|| {
+            // A missing light theme shows the dark slot (resolve_chosen_theme).
+            let light = jetty_core::theme_index(&self.light_theme_name)
+                .map(|i| colorfgbg_env(&jetty_core::theme_at(i)))
+                .unwrap_or_else(|| now.clone());
+            (self.appearance_first.clone(), light, self.light_theme_name.clone())
+        });
+        FirstShellEnv { now, pending }
     }
 
     /// Show configuration problems the user must see: a status pill on the main
@@ -2417,11 +2612,16 @@ impl App {
         // never panics on a stale/out-of-range index).
         self.active_theme = jetty_core::theme_at(self.theme_idx);
         let t = self.current_theme();
+        // A program that enabled the DEC 2031 reports gets `CSI ? 997 ; 1|2 n`
+        // for a palette change (queued by `set_theme`): written right away, not
+        // on the tab's next output.
         for tab in &mut self.tabs {
             tab.terminal.set_theme(t.clone());
+            write_replies(tab);
         }
         for dw in &mut self.detached {
             dw.tab.terminal.set_theme(t.clone());
+            write_replies(&mut dw.tab);
         }
         // Theme AND opacity (also applied through here) are shared visuals:
         // repaint every surface — main, detached and the Settings panel, whose
@@ -2555,6 +2755,18 @@ impl App {
         // rebuilt registry right after (a missing theme falls back visibly).
         if cfg.theme != self.theme_name {
             self.theme_name = cfg.theme.clone();
+        }
+        // Following the system / the light slot: the same resolve picks the slot.
+        if cfg.light_theme != self.light_theme_name {
+            self.light_theme_name = cfg.light_theme.clone();
+        }
+        if cfg.follow_system_theme != self.follow_system_theme {
+            // A watcher started now reports its first reading by event.
+            self.follow_system_theme = cfg.follow_system_theme;
+            self.ensure_appearance_watcher();
+        }
+        if (cfg.minimum_contrast - self.minimum_contrast).abs() > eps {
+            self.set_minimum_contrast(cfg.minimum_contrast);
         }
         // Opacity — skip while the user is dragging the opacity slider (H4).
         if !self.dragging_slider {
@@ -3218,7 +3430,9 @@ impl App {
             })
             .unwrap_or((0, 0));
         let spawn_cwd = cwd.clone();
-        let pty = match PtySession::spawn(cols as u16, rows as u16, px_w, px_h, shell, cwd, move || {
+        // COLORFGBG: the dark/light hint of the theme on screen.
+        let env = colorfgbg_env(&self.active_theme);
+        let pty = match PtySession::spawn_with_env(cols as u16, rows as u16, px_w, px_h, shell, cwd, env, move || {
             let _ = proxy_wake.send_event(AppEvent::Wake);
         }) {
             Ok(p) => p,
@@ -3236,6 +3450,7 @@ impl App {
         let writer = pty.writer();
         let mut terminal = Terminal::new(cols, rows);
         terminal.set_theme(self.current_theme());
+        terminal.set_minimum_contrast(self.minimum_contrast);
         // Seed the sixel cell-px metric from the live grid font so an image fed
         // before the first reflow reserves the right number of rows.
         if let Some((cw, ch)) = self.text.as_ref().map(|t| t.cell_size()) {
@@ -4278,17 +4493,81 @@ impl App {
     /// Close window `s`'s palette and free its transient state, so nothing is
     /// allocated while it is closed.
     fn close_palette(&mut self, s: Surface) {
+        // A live theme preview that was not kept (Enter on its row clears it
+        // first) ends here: the chosen theme comes back.
+        self.end_palette_preview(s, false);
         if self.ov_of_mut(s).is_some_and(|o| o.close_palette()) {
             self.paint_surface(s);
         }
     }
 
     /// Move window `s`'s palette selection by `delta` rows (clamped), keeping it
-    /// inside the `MAX_PALETTE_ROWS` scroll window.
+    /// inside the `MAX_PALETTE_ROWS` scroll window. Navigating onto `Theme: …`
+    /// rows previews them live.
     fn palette_move(&mut self, s: Surface, delta: isize) {
         if let Some(ov) = self.ov_of_mut(s) {
             ov.palette_move(delta);
         }
+        self.palette_preview_step(s, true);
+    }
+
+    /// Follow window `s`'s palette selection with the live theme preview
+    /// (`navigated`: arrows / Page keys / wheel, else a refilter by typing).
+    fn palette_preview_step(&mut self, s: Surface, navigated: bool) {
+        let Some(step) = self.ov_of_mut(s).map(|o| o.theme_preview_step(navigated)) else { return };
+        match step {
+            ThemePreview::Keep => {}
+            ThemePreview::Show(i) => self.preview_theme(i),
+            ThemePreview::Restore => self.reresolve_theme(false),
+        }
+    }
+
+    /// End window `s`'s theme preview as its palette closes. `kept`: the command
+    /// run on close picks the previewed theme (which saves it).
+    fn end_palette_preview(&mut self, s: Surface, kept: bool) {
+        if self.ov_of_mut(s).is_some_and(|o| o.end_theme_preview(kept)) {
+            self.reresolve_theme(false);
+        }
+    }
+
+    /// Show theme `i` WITHOUT choosing it (palette preview): `theme_idx` only —
+    /// the chosen names stay, nothing is saved. Every window repaints with it.
+    fn preview_theme(&mut self, i: usize) {
+        if i < jetty_core::theme_count() && i != self.theme_idx {
+            self.theme_idx = i;
+            self.apply_theme();
+        }
+    }
+
+    /// Step the theme by `step` in registry order (wrapping) from the one on
+    /// screen, pick and save it, and name it in a pill (a key binding gives no
+    /// other feedback of which theme came up).
+    fn cycle_theme(&mut self, step: isize) {
+        let n = jetty_core::theme_count();
+        if n == 0 {
+            return;
+        }
+        let i = (self.theme_idx as isize + step).rem_euclid(n as isize) as usize;
+        self.pick_cycled_theme(i);
+    }
+
+    /// Pick a random theme other than the one on screen (see [`cycle_theme`]).
+    fn random_theme(&mut self) {
+        use std::hash::{BuildHasher, Hasher};
+        // RandomState is randomly keyed per instance: no RNG crate needed.
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        let i = random_other(jetty_core::theme_count(), self.theme_idx, h.finish());
+        self.pick_cycled_theme(i);
+    }
+
+    fn pick_cycled_theme(&mut self, i: usize) {
+        self.pick_theme(i);
+        self.persist();
+        self.redraw_main_and_detached();
+        self.request_settings_paint();
+        let name = self.active_theme.display_name.to_string();
+        self.show_notice_pill(format!("Theme: {name}"), 1500);
     }
 
     /// Keys owned by window `s`'s MODAL overlays, in priority order
@@ -4327,6 +4606,10 @@ impl App {
                 Key::Named(NamedKey::Escape) => self.close_palette(s),
                 Key::Named(NamedKey::Enter) => {
                     let cmd = self.ov_of(s).and_then(|o| o.palette_pick());
+                    // Enter on a `Theme: …` row keeps the preview (the pick below
+                    // saves it); on any other row the chosen theme comes back.
+                    let keep = matches!(cmd, Some(crate::palette::PaletteCmd::SetTheme(_)));
+                    self.end_palette_preview(s, keep);
                     self.close_palette(s);
                     if let Some(c) = cmd {
                         self.run_palette_cmd(c, s, event_loop);
@@ -4346,6 +4629,7 @@ impl App {
                         ov.palette_query.pop();
                         ov.refilter_palette();
                     }
+                    self.palette_preview_step(s, false);
                 }
                 _ => {
                     if ctrl || sup {
@@ -4485,6 +4769,7 @@ impl App {
         }
         if changed {
             ov.refilter_palette();
+            self.palette_preview_step(s, false);
         }
     }
 
@@ -4562,6 +4847,10 @@ impl App {
         let hit = pal.row_hits.iter().position(|r| input::point_in(r, cx, cy)).map(|vi| first + vi);
         if let Some(gi) = hit {
             let cmd = self.ov_of(s).and_then(|o| o.palette_filtered.get(gi)).map(|h| h.cmd.clone());
+            // Like Enter: clicking a `Theme: …` row keeps a live preview (the
+            // pick then shows and saves the clicked theme).
+            let keep = matches!(cmd, Some(crate::palette::PaletteCmd::SetTheme(_)));
+            self.end_palette_preview(s, keep);
             self.close_palette(s);
             if let Some(c) = cmd {
                 self.run_palette_cmd(c, s, event_loop);
@@ -5108,6 +5397,31 @@ impl App {
                 if let Some(id) = id {
                     self.set_tab_color(id, color);
                 }
+            }
+            C::NextTheme => self.cycle_theme(1),
+            C::PrevTheme => self.cycle_theme(-1),
+            C::RandomTheme => self.random_theme(),
+            C::ToggleFollowSystemTheme => {
+                self.set_follow_system_theme(!self.follow_system_theme);
+                let msg = if !self.follow_system_theme {
+                    "Following the system light/dark theme: off".to_string()
+                } else if self.system_appearance.color_scheme.is_none() {
+                    // No portal answered (yet): `theme` stays until one reports.
+                    "Following the system light/dark theme: on (no system preference reported yet)".to_string()
+                } else {
+                    format!("Following the system light/dark theme: on — {}", self.active_theme.display_name)
+                };
+                self.show_notice_pill(msg, 2500);
+            }
+            C::CycleMinimumContrast => {
+                let next = next_minimum_contrast(self.minimum_contrast);
+                self.set_minimum_contrast(next);
+                let msg = if next <= 1.0 {
+                    "Minimum contrast: off".to_string()
+                } else {
+                    format!("Minimum contrast: {next}:1")
+                };
+                self.show_notice_pill(msg, 1500);
             }
             // Index-bearing dynamic actions: `.get()`-guard against a stale index.
             C::SetTheme(i) => {
@@ -8013,6 +8327,7 @@ impl App {
             WindowEvent::CloseRequested if pos < self.detached.len() => {
                 self.reattach_tab(pos, event_loop);
             }
+            WindowEvent::ThemeChanged(t) => self.system_theme_changed(t),
             WindowEvent::KeyboardInput { event, is_synthetic, .. } if event.state.is_pressed() => {
                 // Ignore X11's synthetic focus-gain key presses (keys physically
                 // held while this window takes focus) — same guard as the main
@@ -8144,6 +8459,11 @@ impl App {
                     // Quit only arises from macOS Cmd+Q, which was a swallowed no-op
                     // in a detached window today — keep it a no-op (amendment 6).
                     input::KeyAction::Quit => {
+                        return;
+                    }
+                    // The theme is app-wide: every window takes it.
+                    input::KeyAction::NextTheme | input::KeyAction::PrevTheme => {
+                        self.cycle_theme(if action == input::KeyAction::NextTheme { 1 } else { -1 });
                         return;
                     }
                     _ => {}
@@ -9884,6 +10204,7 @@ impl App {
                 self.close_settings_window();
                 self.request_main_paint();
             }
+            WindowEvent::ThemeChanged(t) => self.system_theme_changed(t),
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.settings_gpu {
                     gpu.resize(size.width, size.height);
@@ -10736,14 +11057,35 @@ impl ApplicationHandler<AppEvent> for App {
         // thread (they are !Send). The PTY is spawned at a provisional grid and
         // resized to the real cols/rows once the cell size is known.
         let font_handle = std::thread::spawn(TextLayer::build_font_system);
+        // System appearance known synchronously: winit's system theme (macOS,
+        // Windows; `None` on X11/Wayland), or the portal's first reading if it is
+        // already in. Decided before the window exists, so the first frame and the
+        // first shell's COLORFGBG agree with it.
+        if let Some(t) = event_loop.system_theme() {
+            self.apply_appearance(crate::appearance::Appearance {
+                color_scheme: Some(crate::appearance::ColorScheme::from_winit(t)),
+                ..Default::default()
+            });
+        }
+        self.take_first_appearance();
         let proxy_wake = self.proxy.clone();
         let shell = self.opt_shell();
+        let first_shell_env = self.first_shell_env();
         let pty_handle = std::thread::spawn(move || {
             // Provisional grid at startup: the real text-area pixel size is set by
             // the immediate resize once the cell metrics are known (see below).
-            PtySession::spawn(FALLBACK_COLS as u16, FALLBACK_ROWS as u16, 0, 0, shell, None, move || {
-                let _ = proxy_wake.send_event(AppEvent::Wake);
-            })
+            PtySession::spawn_with_env(
+                FALLBACK_COLS as u16,
+                FALLBACK_ROWS as u16,
+                0,
+                0,
+                shell,
+                None,
+                first_shell_env.resolve(),
+                move || {
+                    let _ = proxy_wake.send_event(AppEvent::Wake);
+                },
+            )
         });
 
         // Startup: a failure to create the main window is genuinely fatal (there
@@ -10961,8 +11303,14 @@ impl ApplicationHandler<AppEvent> for App {
         // agree with the actual window layout. The on_data callback wakes the
         // winit event loop the instant bytes arrive (within ~1ms) — critical for
         // p10k's cursor-position / capability queries which have tight timeouts.
+        //
+        // The system appearance's first reading (Linux portal) has usually come
+        // in while the GPU initialized: follow it before the first frame. A slower
+        // portal delivers it as an event instead (one theme flip, then steady).
+        self.take_first_appearance();
         let mut terminal = Terminal::new(cols, rows);
         terminal.set_theme(self.current_theme());
+        terminal.set_minimum_contrast(self.minimum_contrast);
         // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
         // Applied at spawn so new tabs pick up the current setting.
         terminal.set_osc52_allow_paste(self.osc52_allow_paste);
@@ -11234,6 +11582,7 @@ impl ApplicationHandler<AppEvent> for App {
                     Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
             }
             AppEvent::ConfigNotice(msg) => self.show_config_warnings(&[msg]),
+            AppEvent::Appearance(a) => self.apply_appearance(a),
         }
     }
 
@@ -11266,6 +11615,9 @@ impl ApplicationHandler<AppEvent> for App {
                 self.confirm_quit = true;
                 self.request_main_paint();
             }
+            // The system appearance flipped light/dark (macOS / Windows; winit
+            // never reports it on X11/Wayland — the settings portal does there).
+            WindowEvent::ThemeChanged(t) => self.system_theme_changed(t),
             WindowEvent::Occluded(occluded) => {
                 // The compositor tells us the main window is fully hidden behind
                 // others (or minimized on platforms that report it here). Track it
@@ -12608,6 +12960,8 @@ impl ApplicationHandler<AppEvent> for App {
                         input::KeyAction::CopyMode => "CopyMode",
                         input::KeyAction::RunSelection => "RunSelection",
                         input::KeyAction::ToggleFullscreen => "ToggleFullscreen",
+                        input::KeyAction::NextTheme => "NextTheme",
+                        input::KeyAction::PrevTheme => "PrevTheme",
                         input::KeyAction::Send(_) => "Send",
                         input::KeyAction::None => "None",
                     };
@@ -12759,6 +13113,9 @@ impl ApplicationHandler<AppEvent> for App {
                     input::KeyAction::ToggleFullscreen => {
                         self.set_main_fullscreen(!self.main_fullscreen);
                     }
+                    // `[keys] next_theme` / `prev_theme` (no default chord).
+                    input::KeyAction::NextTheme => self.cycle_theme(1),
+                    input::KeyAction::PrevTheme => self.cycle_theme(-1),
                     input::KeyAction::Send(bytes) => {
                         // Escape closes an open context/tab menu before forwarding to PTY.
                         // Decided on the KEY, not the encoded bytes: under the kitty
@@ -14519,6 +14876,74 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
 
 /// The warning for a chosen theme that isn't in the registry (`shown` is the
 /// display name of the fallback on screen).
+/// The `minimum_contrast` steps the palette cycles through: off, 3:1 (WCAG
+/// large text), 4.5:1 (AA), 7:1 (AAA). A hand-set value goes to the next step
+/// above it.
+fn next_minimum_contrast(current: f32) -> f32 {
+    const STEPS: [f32; 3] = [3.0, 4.5, 7.0];
+    STEPS.into_iter().find(|&s| s > current + 1e-3).unwrap_or(1.0)
+}
+
+/// A uniformly chosen index in `0..n` other than `avoid` (when there is
+/// another), from the random word `r`.
+fn random_other(n: usize, avoid: usize, r: u64) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let k = (r % (n as u64 - 1)) as usize;
+    if k >= avoid { k + 1 } else { k }
+}
+
+/// Write `tab`'s pending query replies (a DEC 2031 color-scheme report queued by
+/// `set_theme`) to its PTY now. Nothing pending = one channel poll.
+fn write_replies(tab: &mut Tab) {
+    let replies = tab.terminal.drain_pty_writes();
+    if !replies.is_empty() {
+        let _ = tab.writer.write_all(&replies);
+        let _ = tab.writer.flush();
+    }
+}
+
+/// `COLORFGBG` for a shell started under `theme` (see
+/// [`jetty_core::contrast::colorfgbg`]).
+fn colorfgbg_env(theme: &jetty_core::Theme) -> Vec<(String, String)> {
+    let bg = [theme.bg[0], theme.bg[1], theme.bg[2]];
+    vec![("COLORFGBG".to_string(), jetty_core::contrast::colorfgbg(bg).to_string())]
+}
+
+/// The first shell's environment, decided on the PTY worker thread: its
+/// `COLORFGBG` must describe the theme it will be SHOWN with — which, while
+/// following the system on Linux, depends on the portal's first reading. The
+/// worker waits for that (bounded); the main thread never does.
+struct FirstShellEnv {
+    /// For the theme on screen now.
+    now: Vec<(String, String)>,
+    /// While the reading is outstanding: its handle, the light slot's env and
+    /// the light theme's name.
+    pending: Option<(crate::appearance::FirstReading, Vec<(String, String)>, String)>,
+}
+
+impl FirstShellEnv {
+    /// The longest the worker waits for the first reading. A running portal
+    /// answers in a few ms; one being D-Bus-activated can take longer — the
+    /// first shell then keeps the dark hint and the theme flips by event.
+    const WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+    fn resolve(self) -> Vec<(String, String)> {
+        match self.pending {
+            Some((first, light_env, light_name)) => {
+                let scheme = first.wait(Self::WAIT).and_then(|a| a.color_scheme);
+                if crate::appearance::light_slot(true, scheme, &light_name) {
+                    light_env
+                } else {
+                    self.now
+                }
+            }
+            None => self.now,
+        }
+    }
+}
+
 fn theme_missing_warning(name: &str, shown: &str) -> String {
     format!(
         "theme {name:?} not found (missing or invalid theme file?) — showing \
@@ -15550,6 +15975,63 @@ mod stable_tab_id_tests {
         let confirm = Some(TabId(2));
         assert_eq!(still_open(confirm, &[TabId(1), TabId(3)]), None);
         assert_eq!(still_open(None, &[TabId(1)]), None);
+    }
+}
+
+#[cfg(test)]
+mod theme_ux_tests {
+    use super::{colorfgbg_env, next_minimum_contrast, random_other, FirstShellEnv};
+    use crate::appearance::{Appearance, ColorScheme, FirstReading};
+
+    #[test]
+    fn random_theme_is_never_the_current_one_and_reaches_every_other() {
+        let n = 7;
+        let mut seen = [false; 7];
+        for r in 0..200u64 {
+            let i = random_other(n, 3, r.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            assert!(i < n && i != 3, "{i}");
+            seen[i] = true;
+        }
+        assert_eq!(seen, [true, true, true, false, true, true, true]);
+        assert_eq!(random_other(1, 0, 42), 0, "a single theme stays");
+        assert!(random_other(5, 99, 3) < 5, "a stale current index is harmless");
+    }
+
+    #[test]
+    fn minimum_contrast_cycles_off_3_45_7() {
+        assert_eq!(next_minimum_contrast(1.0), 3.0);
+        assert_eq!(next_minimum_contrast(3.0), 4.5);
+        assert_eq!(next_minimum_contrast(4.5), 7.0);
+        assert_eq!(next_minimum_contrast(7.0), 1.0);
+        assert_eq!(next_minimum_contrast(5.2), 7.0, "a hand-set value steps up");
+        assert_eq!(next_minimum_contrast(12.0), 1.0);
+    }
+
+    #[test]
+    fn first_shell_colorfgbg_follows_the_first_reading() {
+        let dark = jetty_core::theme_at(jetty_core::theme_index("catppuccin_mocha").unwrap());
+        let light = jetty_core::theme_at(jetty_core::theme_index("solarized_light").unwrap());
+        let (d, l) = (colorfgbg_env(&dark), colorfgbg_env(&light));
+        assert_eq!(d[0].1, "15;0");
+        assert_eq!(l[0].1, "0;15");
+        let with = |reading: Option<ColorScheme>| {
+            let first = FirstReading::default();
+            if let Some(s) = reading {
+                first.set(Appearance { color_scheme: Some(s), ..Default::default() });
+            }
+            FirstShellEnv {
+                now: d.clone(),
+                pending: Some((first, l.clone(), "solarized_light".to_string())),
+            }
+            .resolve()
+        };
+        assert_eq!(with(Some(ColorScheme::Light)), l);
+        assert_eq!(with(Some(ColorScheme::NoPreference)), l);
+        assert_eq!(with(Some(ColorScheme::Dark)), d);
+        // No reading within the bound (no portal / slow): the theme on screen.
+        assert_eq!(with(None), d);
+        // Nothing pending (not following, or already known): as is.
+        assert_eq!(FirstShellEnv { now: l.clone(), pending: None }.resolve(), l);
     }
 }
 

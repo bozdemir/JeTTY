@@ -21,6 +21,7 @@
 ///                    `\e[5 q` beam) to screenshot each shape.
 ///   JETTY_THEME      — theme name (picked up automatically via Terminal::new)
 ///   JETTY_OPACITY    — opacity 0.0..1.0 (picked up automatically via Terminal::new)
+///   JETTY_SHOT_MIN_CONTRAST — `minimum_contrast` ratio (1 = off .. 21).
 ///   JETTY_SHOT_UI_FONT_SIZE — UI (chrome) font size in logical pt (10..28,
 ///                    default 16). Drives ALL chrome (tab bar/status/menu/panel/
 ///                    help/confirm/welcome) and the panel's live "Aa" specimen.
@@ -343,6 +344,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Push the real cell metrics so a fed sixel (JETTY_SHOT_SIXEL) reserves the
     // correct row footprint — the shot's analogue of App::reflow's set_cell_px.
     terminal.set_cell_px(cell_w, cell_h);
+    // JETTY_SHOT_MIN_CONTRAST=<ratio> — the `minimum_contrast` config key.
+    if let Some(r) = std::env::var("JETTY_SHOT_MIN_CONTRAST").ok().and_then(|v| v.parse::<f32>().ok()) {
+        terminal.set_minimum_contrast(r);
+        eprintln!("jetty-shot: minimum_contrast {:.2}", terminal.minimum_contrast());
+    }
 
     if env_flag("JETTY_SHOT_PTY") {
         // Drive a REAL shell offscreen so we can see the live startup prompt

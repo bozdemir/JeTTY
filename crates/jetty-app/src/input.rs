@@ -69,6 +69,10 @@ pub enum KeyAction {
     /// Cmd+Ctrl+F). Transient per-window view state — it never writes
     /// `window_mode`, so it costs no disk I/O on the key path.
     ToggleFullscreen,
+    /// Step to the next / previous theme (no default chord; `[keys]
+    /// next_theme` / `prev_theme`).
+    NextTheme,
+    PrevTheme,
     /// Raw bytes to write to the PTY.
     Send(Vec<u8>),
     None,

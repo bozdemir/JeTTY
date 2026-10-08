@@ -1209,6 +1209,7 @@ dependencies = [
  "toml_edit",
  "wgpu",
  "winit",
+ "zbus",
 ]
 
 [[package]]

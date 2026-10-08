@@ -51,6 +51,15 @@ pub enum PaletteCmd {
     ToggleFullscreen,
     Hide,
     Quit,
+    /// Step to the next / previous theme in the registry order (wrapping), or
+    /// a random other one — picked and saved like a `SetTheme`.
+    NextTheme,
+    PrevTheme,
+    RandomTheme,
+    /// Toggle `follow_system_theme`.
+    ToggleFollowSystemTheme,
+    /// Step `minimum_contrast` through off → 3 → 4.5 → 7 → off.
+    CycleMinimumContrast,
     SetTheme(usize),
     SelectTab(u64),
     Reattach(u64),
@@ -200,6 +209,26 @@ pub fn build_registry(
         v.push(PaletteEntry { title: title.to_string(), keywords, cmd });
     }
     v.extend(chrome_entries());
+    // Theme navigation and the appearance switches, ahead of the per-theme
+    // rows (arrowing over those previews them live; Esc reverts, Enter keeps).
+    let theme_ux: [(&str, &str, PaletteCmd); 5] = [
+        ("Next theme", "theme cycle colour color scheme forward", PaletteCmd::NextTheme),
+        ("Previous theme", "theme cycle colour color scheme back", PaletteCmd::PrevTheme),
+        ("Random theme", "theme shuffle surprise colour color scheme", PaletteCmd::RandomTheme),
+        (
+            "Toggle follow system light/dark theme",
+            "appearance dark mode light mode night day system auto theme",
+            PaletteCmd::ToggleFollowSystemTheme,
+        ),
+        (
+            "Cycle minimum contrast (off / 3 / 4.5 / 7)",
+            "contrast readability accessibility wcag legible text color",
+            PaletteCmd::CycleMinimumContrast,
+        ),
+    ];
+    for (title, keywords, cmd) in theme_ux {
+        v.push(PaletteEntry { title: title.to_string(), keywords, cmd });
+    }
     for (i, (_name, display)) in themes.iter().enumerate() {
         v.push(PaletteEntry {
             title: format!("Theme: {display}"),
@@ -386,6 +415,29 @@ mod tests {
         let n = titles.len();
         titles.dedup();
         assert_eq!(titles.len(), n, "duplicate palette titles");
+    }
+
+    #[test]
+    fn theme_navigation_and_appearance_commands_are_found_by_their_words() {
+        let r = reg();
+        for (q, cmd) in [
+            ("next theme", PaletteCmd::NextTheme),
+            ("previous theme", PaletteCmd::PrevTheme),
+            ("random theme", PaletteCmd::RandomTheme),
+            ("follow system", PaletteCmd::ToggleFollowSystemTheme),
+            ("dark mode", PaletteCmd::ToggleFollowSystemTheme),
+            ("minimum contrast", PaletteCmd::CycleMinimumContrast),
+            ("readability", PaletteCmd::CycleMinimumContrast),
+        ] {
+            let hits = filter(&r, q);
+            assert_eq!(hits.first().map(|h| &h.cmd), Some(&cmd), "top hit for {q:?}");
+        }
+        // They sit before the per-theme rows (an arrow-down from them enters
+        // the previewed list), each listed once.
+        let pos = |c: &PaletteCmd| r.iter().position(|e| &e.cmd == c).unwrap();
+        let first_theme_row = r.iter().position(|e| matches!(e.cmd, PaletteCmd::SetTheme(_))).unwrap();
+        assert!(pos(&PaletteCmd::NextTheme) < first_theme_row);
+        assert_eq!(r.iter().filter(|e| e.cmd == PaletteCmd::RandomTheme).count(), 1);
     }
 
     #[test]

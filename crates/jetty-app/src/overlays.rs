@@ -29,6 +29,18 @@ pub(crate) type PaletteDrawData = (String, Vec<(String, Vec<usize>, bool)>, usiz
 /// visible `(label, vp_row, col_start)` chips + the typed prefix.
 pub(crate) type HintDrawData = (Vec<(String, usize, usize)>, String);
 
+/// What the theme on screen does after the palette selection changed (see
+/// [`Overlays::theme_preview_step`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThemePreview {
+    /// Leave it.
+    Keep,
+    /// Show theme `i` — `theme_idx` only: nothing is chosen or saved.
+    Show(usize),
+    /// Show the chosen theme again (the preview ended without a pick).
+    Restore,
+}
+
 /// Hint-mode capture state: the scanned tokens, their parallel labels, and the
 /// typed label prefix.
 pub(crate) struct HintState {
@@ -76,6 +88,10 @@ pub(crate) struct Overlays {
     /// recomputed on each keystroke. Enter runs the stored command, never a
     /// stale index.
     pub palette_filtered: Vec<crate::palette::PaletteHit>,
+    /// A live theme preview is on screen: the selection was navigated onto a
+    /// `Theme: …` row (see [`Overlays::theme_preview_step`]). Ends by Enter on a
+    /// theme row (kept) or any other close (the chosen theme comes back).
+    pub theme_preview: bool,
     /// Active hint-mode state (primary screen only). `Some` while the labelled
     /// URL/path/hash/IPv4 chips are shown; the tokens are scanned ONCE on enter.
     pub hint_mode: Option<HintState>,
@@ -133,6 +149,38 @@ impl Overlays {
     /// The highlighted palette command, if any.
     pub fn palette_pick(&self) -> Option<crate::palette::PaletteCmd> {
         self.palette_filtered.get(self.palette_selected).map(|h| h.cmd.clone())
+    }
+
+    /// The palette selection just changed — by NAVIGATION (`navigated`: arrows,
+    /// Page keys, the wheel) or by a refilter (typing). What the theme on screen
+    /// does: a preview starts only by navigating onto a `Theme: …` row (typing a
+    /// query never flashes themes by); once live it follows the selection, and a
+    /// selection off the theme rows ends it, showing the chosen theme again.
+    pub fn theme_preview_step(&mut self, navigated: bool) -> ThemePreview {
+        let selected = match self.palette_filtered.get(self.palette_selected).map(|h| &h.cmd) {
+            Some(crate::palette::PaletteCmd::SetTheme(i)) => Some(*i),
+            _ => None,
+        };
+        match (self.theme_preview, selected) {
+            (false, Some(i)) if navigated => {
+                self.theme_preview = true;
+                ThemePreview::Show(i)
+            }
+            (false, _) => ThemePreview::Keep,
+            (true, Some(i)) => ThemePreview::Show(i),
+            (true, None) => {
+                self.theme_preview = false;
+                ThemePreview::Restore
+            }
+        }
+    }
+
+    /// The palette is closing. `kept`: the command run on close (Enter / a
+    /// click) picks the previewed theme row, which keeps it. Returns whether the
+    /// chosen theme must be shown again (a preview ended without a pick: Esc, a
+    /// click outside, another command).
+    pub fn end_theme_preview(&mut self, kept: bool) -> bool {
+        std::mem::take(&mut self.theme_preview) && !kept
     }
 
     /// Output was drained into this window's (active) tab: an open search's
@@ -237,6 +285,73 @@ mod tests {
         assert_eq!(ov.palette_scroll, 40 - win);
         ov.palette_move(-1000);
         assert_eq!((ov.palette_selected, ov.palette_scroll), (0, 0));
+    }
+
+    /// A palette listing `New tab`, `Theme: A`, `Theme: B`, `Quit` (in that
+    /// order), opened with the selection on the first row.
+    fn theme_rows_palette() -> Overlays {
+        use crate::palette::{PaletteCmd as C, PaletteEntry};
+        let reg = vec![
+            PaletteEntry { title: "New tab".into(), keywords: "", cmd: C::NewTab },
+            PaletteEntry { title: "Theme: A".into(), keywords: "", cmd: C::SetTheme(4) },
+            PaletteEntry { title: "Theme: B".into(), keywords: "", cmd: C::SetTheme(9) },
+            PaletteEntry { title: "Quit".into(), keywords: "", cmd: C::Quit },
+        ];
+        Overlays {
+            palette_open: true,
+            palette_filtered: crate::palette::filter(&reg, ""),
+            palette_registry: reg,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn arrowing_over_theme_rows_previews_them_and_leaving_restores() {
+        let mut ov = theme_rows_palette();
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Keep, "on `New tab`: nothing");
+        ov.palette_move(1);
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show(4));
+        assert!(ov.theme_preview);
+        ov.palette_move(1);
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show(9));
+        ov.palette_move(1);
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Restore, "off the theme rows");
+        assert!(!ov.theme_preview);
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Keep);
+    }
+
+    #[test]
+    fn typing_never_starts_a_preview_but_a_live_one_follows_the_selection() {
+        let mut ov = theme_rows_palette();
+        // A refilter that lands on a theme row (typing "theme") shows nothing.
+        ov.palette_selected = 1;
+        assert_eq!(ov.theme_preview_step(false), ThemePreview::Keep);
+        // Once arrowed into, a later refilter keeps the preview in step.
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show(4));
+        ov.palette_selected = 2;
+        assert_eq!(ov.theme_preview_step(false), ThemePreview::Show(9));
+        ov.palette_selected = 0;
+        assert_eq!(ov.theme_preview_step(false), ThemePreview::Restore);
+    }
+
+    #[test]
+    fn esc_reverts_and_enter_on_the_theme_keeps_it() {
+        let mut ov = theme_rows_palette();
+        ov.palette_move(2);
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show(9));
+        assert!(ov.end_theme_preview(false), "Esc / click outside / other command: restore");
+        assert!(!ov.theme_preview);
+        assert!(!ov.end_theme_preview(false), "nothing to restore twice");
+
+        let mut ov = theme_rows_palette();
+        ov.palette_move(1);
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show(4));
+        assert!(!ov.end_theme_preview(true), "Enter on the theme row keeps it");
+        assert!(!ov.theme_preview);
+
+        // No preview at all: closing restores nothing.
+        let mut ov = theme_rows_palette();
+        assert!(!ov.end_theme_preview(false));
     }
 
     #[test]

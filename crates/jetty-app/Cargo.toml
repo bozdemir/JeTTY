@@ -46,6 +46,12 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 #   is the winit request_user_attention dock bounce (no dep required); see notify.rs.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 notify-rust = { version = "4", default-features = false, features = ["z"] }
+# System appearance (follow_system_theme, reduced motion): the freedesktop
+# settings portal (org.freedesktop.portal.Settings) — a cross-desktop standard,
+# NOT a DE-specific API. Already in the tree via notify-rust (same version and
+# async-io executor); `blocking-api` adds only its blocking wrappers (no new
+# crate). One watcher thread blocks on the bus: zero idle CPU. See appearance.rs.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 
 [dev-dependencies]
 # Tests drive the shell-integration snippets in a REAL shell on a PTY (bash -u).

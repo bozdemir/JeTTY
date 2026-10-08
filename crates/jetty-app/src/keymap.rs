@@ -223,10 +223,15 @@ pub enum BindableAction {
     /// now reach the program). Appended LAST, like every new action.
     ScrollPageUp,
     ScrollPageDown,
+    /// Step to the next / previous theme (picked and saved, named in a pill).
+    /// NO default chord — bind one in `[keys]` (`next_theme = "Ctrl+Alt+T"`);
+    /// the command palette has "Next theme" / "Previous theme" either way.
+    NextTheme,
+    PrevTheme,
 }
 
 impl BindableAction {
-    pub const ALL: [BindableAction; 34] = [
+    pub const ALL: [BindableAction; 36] = [
         BindableAction::ToggleSettings,
         BindableAction::OpenPalette,
         BindableAction::NewTab,
@@ -261,6 +266,8 @@ impl BindableAction {
         BindableAction::ToggleFullscreen,
         BindableAction::ScrollPageUp,
         BindableAction::ScrollPageDown,
+        BindableAction::NextTheme,
+        BindableAction::PrevTheme,
     ];
 
     /// Stable name for warnings / debugging.
@@ -301,6 +308,8 @@ impl BindableAction {
             ToggleFullscreen => "toggle_fullscreen",
             ScrollPageUp => "scroll_page_up",
             ScrollPageDown => "scroll_page_down",
+            NextTheme => "next_theme",
+            PrevTheme => "prev_theme",
         }
     }
 
@@ -342,6 +351,8 @@ impl BindableAction {
             ToggleFullscreen => KeyAction::ToggleFullscreen,
             ScrollPageUp => KeyAction::ScrollPageUp,
             ScrollPageDown => KeyAction::ScrollPageDown,
+            NextTheme => KeyAction::NextTheme,
+            PrevTheme => KeyAction::PrevTheme,
         }
     }
 
@@ -383,6 +394,8 @@ impl BindableAction {
             ToggleFullscreen => &b.toggle_fullscreen,
             ScrollPageUp => &b.scroll_page_up,
             ScrollPageDown => &b.scroll_page_down,
+            NextTheme => &b.next_theme,
+            PrevTheme => &b.prev_theme,
         }
     }
 
@@ -536,6 +549,9 @@ impl BindableAction {
             ScrollPageDown => {
                 vec![Chord::exact(Mods::new(false, true, false, false), KeyMatch::Phys(KeyCode::PageDown))]
             }
+            // No default chord (no new default chords this release): theme
+            // cycling is a palette command and a `[keys]` opt-in.
+            NextTheme | PrevTheme => Vec::new(),
         }
     }
 }
@@ -1633,11 +1649,34 @@ mod tests {
         // … CopyMode, RunSelection, ToggleFullscreen, then the v0.26 scroll
         // actions.
         let all = BindableAction::ALL;
-        assert_eq!(all[all.len() - 1], BindableAction::ScrollPageDown);
-        assert_eq!(all[all.len() - 2], BindableAction::ScrollPageUp);
-        assert_eq!(all[all.len() - 3], BindableAction::ToggleFullscreen);
-        assert_eq!(all[all.len() - 4], BindableAction::RunSelection);
-        assert_eq!(all[all.len() - 5], BindableAction::CopyMode);
+        assert_eq!(all[all.len() - 1], BindableAction::PrevTheme);
+        assert_eq!(all[all.len() - 2], BindableAction::NextTheme);
+        assert_eq!(all[all.len() - 3], BindableAction::ScrollPageDown);
+        assert_eq!(all[all.len() - 4], BindableAction::ScrollPageUp);
+        assert_eq!(all[all.len() - 5], BindableAction::ToggleFullscreen);
+        assert_eq!(all[all.len() - 6], BindableAction::RunSelection);
+        assert_eq!(all[all.len() - 7], BindableAction::CopyMode);
+    }
+
+    #[test]
+    fn theme_cycling_has_no_default_chord_and_binds_from_keys() {
+        let km = KeyMap::defaults();
+        assert!(km.pretty_chords(BindableAction::NextTheme).is_empty());
+        assert!(km.pretty_chords(BindableAction::PrevTheme).is_empty());
+        let km = km_with(|b| {
+            b.next_theme = Some(ChordSpec::One("Ctrl+Alt+T".into()));
+            b.prev_theme = Some(ChordSpec::One("Ctrl+Alt+R".into()));
+        });
+        assert!(km.warnings().is_empty(), "{:?}", km.warnings());
+        let mods = Mods::new(true, false, true, false);
+        assert_eq!(
+            km.lookup(mods, PhysicalKey::Code(KeyCode::KeyT), &Key::Character("t".into())),
+            Some(KeyAction::NextTheme)
+        );
+        assert_eq!(
+            km.lookup(mods, PhysicalKey::Code(KeyCode::KeyR), &Key::Character("r".into())),
+            Some(KeyAction::PrevTheme)
+        );
     }
 
     // ── fullscreen (F11) ──────────────────────────────────────────────────────
@@ -1746,7 +1785,7 @@ mod tests {
 
     #[test]
     fn bindable_action_all_is_exhaustive() {
-        assert_eq!(BindableAction::ALL.len(), 34);
+        assert_eq!(BindableAction::ALL.len(), 36);
         for a in BindableAction::ALL {
             assert_eq!(
                 BindableAction::ALL.iter().filter(|x| **x == a).count(),

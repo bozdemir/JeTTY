@@ -1,4 +1,7 @@
 mod app;
+/// System light/dark preference, reduced motion and accent (freedesktop
+/// settings portal on Linux/BSD; winit's system theme elsewhere).
+mod appearance;
 mod config;
 mod copymode;
 mod detached;
