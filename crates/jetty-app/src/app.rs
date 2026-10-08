@@ -6973,77 +6973,42 @@ impl App {
         // theme-derived strip as the main window; it may show the same global
         // HUD string (built by the main window's frames).
         if status_h > 0.0 {
-            let sy = height as f32 - status_h;
-            let tb = theme.bg;
-            let tf = theme.fg;
-            let nl = |t: f32| -> [u8; 4] {
-                [
-                    (tb[0] as f32 + (tf[0] as f32 - tb[0] as f32) * t) as u8,
-                    (tb[1] as f32 + (tf[1] as f32 - tb[1] as f32) * t) as u8,
-                    (tb[2] as f32 + (tf[2] as f32 - tb[2] as f32) * t) as u8,
-                    255,
-                ]
-            };
-            let strip = jetty_render::Rect {
-                x: 0.0, y: sy, w: width as f32, h: status_h,
-                color: nl(0.05), ..Default::default()
-            };
-            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[strip]);
-            if let Some(perf) = perf_label.as_deref() {
-                // Measure the ACTUAL proportional width (chars×cell_w mis-aligns a
-                // non-monospace UI font), same fix as the main perf HUD.
-                let perf_w = chrome_text.measure_overlay_width(perf);
-                let px = (width as f32 - perf_w - cm.px(12.0)).max(cm.px(8.0));
-                let dim = nl(0.5);
-                let py = sy + (status_h - cm.text_h()) / 2.0;
+            let strip = jetty_render::build_status_strip(
+                width, height as f32 - status_h, status_h, perf_label.as_deref(), &theme,
+                &mut *chrome_text, cm,
+            );
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[strip.quad]);
+            if let Some(label) = strip.label {
                 let _ = chrome_text.render_overlays(
-                    &gpu.device, &gpu.queue, scene_view, width, height,
-                    &[(perf.to_string(), px, py, [dim[0], dim[1], dim[2]])],
+                    &gpu.device, &gpu.queue, scene_view, width, height, &[label],
                 );
             }
         }
         // Pass 5b: Shift+drag hint toast — the main window's Pass 4c pill,
-        // byte-for-byte, positioned above the status strip (the detached bar is
-        // always on top, so no bottom-bar / slide offset terms apply). Drawn
-        // only on frames where the 3.5s flag is live — no steady-state cost.
+        // positioned above the status strip (the detached bar is always on top,
+        // so no bottom-bar / slide offset terms apply). Drawn only on frames
+        // where the 3.5s flag is live — no steady-state cost.
+        let pill_bottom = height as f32 - status_h - cm.px(14.0);
         if shift_hint_show {
-            let hint = "Hold Shift while dragging to select text";
-            let tw = chrome_text.measure_overlay_width(hint);
-            let pad = cm.px(14.0);
-            let pill_w = tw + pad * 2.0;
-            let pill_h = cm.pill_h();
-            let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
-            let pill_y = (height as f32 - status_h - cm.px(14.0) - pill_h).max(0.0);
-            let c = theme.cursor;
-            let pill = jetty_render::Rect::rounded(
-                pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
+            let pill = jetty_render::build_toast_pill(
+                width, pill_bottom, 0.0, "Hold Shift while dragging to select text", &theme,
+                &mut *chrome_text, cm,
             );
-            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill]);
-            let ty = pill_y + (pill_h - cm.text_h()) / 2.0;
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill.quad]);
             let _ = chrome_text.render_overlays(
-                &gpu.device, &gpu.queue, scene_view, width, height,
-                &[(hint.to_string(), pill_x + pad, ty, [20, 20, 20])],
+                &gpu.device, &gpu.queue, scene_view, width, height, &[pill.label],
             );
         }
         // Pass 5b': run-selection status pill — the main window's Pass 4c'
         // twin, stacked above the shift hint on the rare frame both are live.
         if let Some(msg) = &status_pill_msg {
-            let tw = chrome_text.measure_overlay_width(msg);
-            let pad = cm.px(14.0);
-            let pill_w = tw + pad * 2.0;
-            let pill_h = cm.pill_h();
-            let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
-            let stack = if shift_hint_show { pill_h + cm.px(8.0) } else { 0.0 };
-            let pill_y = (height as f32 - status_h - cm.px(14.0) - pill_h - stack).max(0.0);
-            let c = theme.cursor;
-            let pill = jetty_render::Rect::rounded(
-                pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
+            let stack = if shift_hint_show { cm.pill_h() + cm.px(8.0) } else { 0.0 };
+            let pill = jetty_render::build_toast_pill(
+                width, pill_bottom - stack, 0.0, msg, &theme, &mut *chrome_text, cm,
             );
-            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill]);
-            let ty = pill_y + (pill_h - cm.text_h()) / 2.0;
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill.quad]);
             let _ = chrome_text.render_overlays(
-                &gpu.device, &gpu.queue, scene_view, width, height,
-                &[(msg.clone(), pill_x + pad, ty, [20, 20, 20])],
+                &gpu.device, &gpu.queue, scene_view, width, height, &[pill.label],
             );
         }
         // Pass 6: the Reattach/Copy/Paste context menu on top of everything.
@@ -11220,93 +11185,51 @@ impl ApplicationHandler<AppEvent> for App {
                     if status_h > 0.0 {
                         if let Some(perf) = perf_string.as_deref() {
                             let sy = (height as f32 - status_h) + slide_y_offset;
-                            // Theme-derived: a faint lifted strip + dim text (same
-                            // bg→fg surface language as the rest of the chrome).
-                            let tb = theme.bg;
-                            let tf = theme.fg;
-                            let nl = |t: f32| -> [u8; 4] {
-                                [
-                                    (tb[0] as f32 + (tf[0] as f32 - tb[0] as f32) * t) as u8,
-                                    (tb[1] as f32 + (tf[1] as f32 - tb[1] as f32) * t) as u8,
-                                    (tb[2] as f32 + (tf[2] as f32 - tb[2] as f32) * t) as u8,
-                                    255,
-                                ]
-                            };
-                            let strip = jetty_render::Rect {
-                                x: 0.0, y: sy, w: width as f32, h: status_h,
-                                color: nl(0.05), ..Default::default()
-                            };
-                            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[strip]);
-                            // Right-align the perf text within the strip. Measure
-                            // the ACTUAL proportional width (chars×cell_w is wrong
-                            // for a non-monospace UI font — it left-floated the HUD).
-                            let perf_w = chrome_text.measure_overlay_width(perf);
-                            let px = (width as f32 - perf_w - cm.px(12.0)).max(cm.px(8.0));
-                            let dim = nl(0.5);
-                            let py = sy + (status_h - cm.text_h()) / 2.0;
-                            let _ = chrome_text.render_overlays(
-                                &gpu.device, &gpu.queue, scene_view, width, height,
-                                &[(perf.to_string(), px, py, [dim[0], dim[1], dim[2]])],
+                            // Right-aligned, measured, ellipsized to the window
+                            // (shared with detached windows and jetty-shot).
+                            let strip = jetty_render::build_status_strip(
+                                width, sy, status_h, Some(perf), &theme, &mut *chrome_text, cm,
                             );
+                            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[strip.quad]);
+                            if let Some(label) = strip.label {
+                                let _ = chrome_text.render_overlays(
+                                    &gpu.device, &gpu.queue, scene_view, width, height, &[label],
+                                );
+                            }
                         }
                     }
                     // Pass 4c: Shift+drag hint toast — a brief, centered pill shown
                     // when the user drags (no Shift) inside a mouse-reporting app, so
                     // they discover the Shift+drag-to-select gesture. Throttled.
+                    // Pills sit above the bottom-mode tab bar too, not just the
+                    // status strip, or they draw over the tab titles.
+                    let pill_bottom = height as f32
+                        - status_h
+                        - if tab_bar_bottom { bar_h } else { 0.0 }
+                        - cm.px(14.0);
                     if shift_hint_show {
-                        let hint = "Hold Shift while dragging to select text";
-                        let tw = chrome_text.measure_overlay_width(hint);
-                        let pad = cm.px(14.0);
-                        let pill_w = tw + pad * 2.0;
-                        let pill_h = cm.pill_h();
-                        let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
-                        // Sit the pill above the bottom-mode tab bar too, not just
-                        // the status strip, or it draws over the tab titles.
-                        let pill_y = (height as f32
-                            - status_h
-                            - if tab_bar_bottom { bar_h } else { 0.0 }
-                            - cm.px(14.0)
-                            - pill_h)
-                            .max(0.0)
-                            + slide_y_offset;
-                        let c = theme.cursor;
-                        let pill = jetty_render::Rect::rounded(
-                            pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
+                        let pill = jetty_render::build_toast_pill(
+                            width, pill_bottom, slide_y_offset,
+                            "Hold Shift while dragging to select text",
+                            &theme, &mut *chrome_text, cm,
                         );
-                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill]);
-                        let ty = pill_y + (pill_h - cm.text_h()) / 2.0;
+                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill.quad]);
                         let _ = chrome_text.render_overlays(
-                            &gpu.device, &gpu.queue, scene_view, width, height,
-                            &[(hint.to_string(), pill_x + pad, ty, [20, 20, 20])],
+                            &gpu.device, &gpu.queue, scene_view, width, height, &[pill.label],
                         );
                     }
                     // Pass 4c': run-selection status pill (refusal / staged) —
                     // the same pill surface as the shift hint, stacked one row
                     // above it on the rare frame both are live.
                     if let Some(msg) = &status_pill_msg {
-                        let tw = chrome_text.measure_overlay_width(msg);
-                        let pad = cm.px(14.0);
-                        let pill_w = tw + pad * 2.0;
-                        let pill_h = cm.pill_h();
-                        let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
-                        let stack = if shift_hint_show { pill_h + cm.px(8.0) } else { 0.0 };
-                        let pill_y = (height as f32
-                            - status_h
-                            - if tab_bar_bottom { bar_h } else { 0.0 }
-                            - cm.px(14.0)
-                            - pill_h
-                            - stack)
-                            .max(0.0)
-                            + slide_y_offset;
-                        let c = theme.cursor;
-                        let pill = jetty_render::Rect::rounded(
-                            pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
+                        let stack = if shift_hint_show { cm.pill_h() + cm.px(8.0) } else { 0.0 };
+                        let pill = jetty_render::build_toast_pill(
+                            width, pill_bottom - stack, slide_y_offset, msg,
+                            &theme, &mut *chrome_text, cm,
                         );
-                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill]);
-                        let ty = pill_y + (pill_h - cm.text_h()) / 2.0;
+                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill.quad]);
                         let _ = chrome_text.render_overlays(
-                            &gpu.device, &gpu.queue, scene_view, width, height,
-                            &[(msg.clone(), pill_x + pad, ty, [20, 20, 20])],
+                            &gpu.device, &gpu.queue, scene_view, width, height, &[pill.label],
                         );
                     }
                     // Pass 4d: the scrollback-search bar (Ctrl+Shift+F) — a

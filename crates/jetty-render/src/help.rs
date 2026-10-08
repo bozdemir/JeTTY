@@ -61,7 +61,8 @@ pub struct HelpOverlay {
     /// rules, and the scroll thumb when the rows overflow.
     pub quads: Vec<Rect>,
     /// Text labels: (text, x, y, rgb) — title, then per row a section header, a
-    /// key + a description label, or nothing (a blank spacer).
+    /// key + a description label, or nothing (a blank spacer). A narrow window
+    /// stacks each description on its own row under its key.
     pub labels: Vec<(String, f32, f32, [u8; 3])>,
     /// The panel rect (for hit-testing "click outside closes").
     pub panel: Rect,
@@ -80,6 +81,17 @@ pub struct HelpOverlay {
 enum HelpEntry {
     Header(String),
     Item(String, String),
+    Spacer,
+}
+
+/// One drawn help row: an entry as is, or — in the STACKED layout of a narrow
+/// window — an item split into its key row and an indented description row.
+#[derive(Clone, Copy)]
+enum HelpLine<'a> {
+    Header(&'a str),
+    Item(&'a str, &'a str),
+    Key(&'a str),
+    Desc(&'a str),
     Spacer,
 }
 
@@ -182,11 +194,11 @@ pub fn build_help_overlay(
         }
     }
     // Gap between the key and description columns (2.5 chrome chars).
-    let col_gap = cm.px(2.5 * CHROME_ADVANCE);
+    let char_w = cm.px(CHROME_ADVANCE);
+    let col_gap = 2.5 * char_w;
     let desc_x_off = key_w + col_gap;
-    let content_w = (desc_x_off + desc_w)
-        .max(header_w)
-        .max(m.text_w("Keyboard Shortcuts"));
+    let title_w = m.text_w("Keyboard Shortcuts");
+    let two_col_w = (desc_x_off + desc_w).max(header_w).max(title_w);
 
     // The vertical / padding metrics are design px, but the chrome line box is
     // `ceil(font_size * 1.3)` with `font_size = ui_font_logical * scale`, so it
@@ -203,7 +215,45 @@ pub fn build_help_overlay(
     let row_h_min = ROW_H_MIN * vscale;
     let min_pad = MIN_PAD * vscale;
 
-    let row_count = entries.len() as f32;
+    // Width: the ideal fits the content with full padding, clamped to the window
+    // with a margin; a narrower window first gives up padding (down to MIN_PAD).
+    // If the two columns still don't fit (a large UI font, a narrow window), the
+    // long DESCRIPTIONS (and headers/title) are ellipsized to the room left —
+    // while a description keeps room for a dozen characters. Narrower than that
+    // the layout STACKS: each description gets its own indented row under its
+    // key, and anything still too wide is ellipsized, so no text ever runs past
+    // the panel or the window.
+    const MARGIN: f32 = 16.0;
+    let max_panel_w = (sw - MARGIN * 2.0).max(0.0);
+    let fit_w = max_panel_w - min_pad * 2.0;
+    let desc_room = fit_w - desc_x_off;
+    let stacked = two_col_w > fit_w && desc_room < 12.0 * char_w;
+    let squeeze = two_col_w > fit_w && !stacked;
+    let indent = 2.0 * char_w;
+    let content_w = if stacked {
+        key_w.max(indent + desc_w).max(header_w).max(title_w).min(fit_w).max(0.0)
+    } else if squeeze {
+        fit_w
+    } else {
+        two_col_w
+    };
+    // The drawn rows: one per entry, or key + description rows when stacked.
+    let mut lines: Vec<HelpLine> = Vec::with_capacity(entries.len() * if stacked { 2 } else { 1 });
+    for e in &entries {
+        match e {
+            HelpEntry::Item(k, d) if stacked => {
+                lines.push(HelpLine::Key(k));
+                if !d.is_empty() {
+                    lines.push(HelpLine::Desc(d));
+                }
+            }
+            HelpEntry::Item(k, d) => lines.push(HelpLine::Item(k, d)),
+            HelpEntry::Header(h) => lines.push(HelpLine::Header(h)),
+            HelpEntry::Spacer => lines.push(HelpLine::Spacer),
+        }
+    }
+
+    let row_count = lines.len() as f32;
     // Ideal content height; if it exceeds the window, scale the vertical metrics
     // down by a single factor (clamped so each metric keeps its readable floor).
     let ideal_h = pad_ideal + title_h_ideal + row_count * row_h_ideal + pad_ideal;
@@ -230,7 +280,7 @@ pub fn build_help_overlay(
             row_h = fitted.clamp(1.0, row_h);
         }
     }
-    let n_rows = entries.len();
+    let n_rows = lines.len();
     let rows_room = avail_h - 2.0 * pad_v - title_h;
     // Whole rows that fit (the epsilon absorbs the rounding of a pitch that was
     // just fitted exactly above).
@@ -247,21 +297,6 @@ pub fn build_help_overlay(
     // `PAD` is the vertical text padding (top inset for the title).
     let pad_top = pad_v;
 
-    // Ideal width fits the content with full padding; clamp to the window with a
-    // margin. If the window is narrower, reduce padding (down to MIN_PAD) so the
-    // text still sits inside the border instead of overflowing. If even that
-    // can't fit (a large UI font, a narrow window), the long DESCRIPTIONS (and
-    // headers/title) are ellipsized to the room left inside the window — the key
-    // column is never cut, it is the information. Only when not even the keys
-    // fit is the panel allowed past the window (clamped to x>=0): text inside
-    // the border wins over staying on-screen, so no row is ever clipped.
-    const MARGIN: f32 = 16.0;
-    let max_panel_w = (sw - MARGIN * 2.0).max(0.0);
-    let fit_w = max_panel_w - min_pad * 2.0;
-    let desc_room = fit_w - desc_x_off;
-    // Squeeze only while a description keeps room for a few characters.
-    let squeeze = content_w > fit_w && desc_room >= 4.0 * col_gap / 2.5;
-    let content_w = if squeeze { fit_w } else { content_w };
     let min_panel_w = content_w + min_pad * 2.0;
     let ideal_w = content_w + pad_ideal * 2.0;
     // Prefer ideal, clamp down toward the window, but never below the hard floor.
@@ -289,9 +324,9 @@ pub fn build_help_overlay(
 
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
 
-    // Squeezed layout: ellipsize to the room inside the window (see above).
+    // Squeezed / stacked layouts: ellipsize to the room inside the window.
     let fit = |m: &mut dyn ChromeMeasure, s: &str, room: f32| -> String {
-        if squeeze { fit_head(m, s, room, false) } else { s.to_string() }
+        if squeeze || stacked { fit_head(m, s, room, false) } else { s.to_string() }
     };
 
     // Title.
@@ -304,13 +339,14 @@ pub fn build_help_overlay(
 
     // Rows: section headers (accent), aligned key (bright) + description (muted)
     // columns, and blank spacers between sections. The description column starts
-    // at a fixed offset so keys and descriptions each line up vertically.
+    // at a fixed offset so keys and descriptions each line up vertically (or, when
+    // stacked, each description sits indented under its key).
     let rows_top = py + pad_top + title_h;
-    for (i, e) in entries.iter().enumerate().skip(first).take(visible) {
+    for (i, line) in lines.iter().enumerate().skip(first).take(visible) {
         let y = rows_top + (i - first) as f32 * row_h;
-        match e {
-            HelpEntry::Spacer => {}
-            HelpEntry::Header(h) => {
+        match *line {
+            HelpLine::Spacer => {}
+            HelpLine::Header(h) => {
                 labels.push((fit(m, h, content_w), px + pad_x, y, header_col));
                 // A thin, subtle accent rule under each header crisply separates
                 // the sections (drawn on the panel, beneath the row text).
@@ -324,12 +360,19 @@ pub fn build_help_overlay(
                     ..Default::default()
                 });
             }
-            HelpEntry::Item(key, desc) => {
-                labels.push((key.clone(), px + pad_x, y, key_col));
+            HelpLine::Item(key, desc) => {
+                labels.push((key.to_string(), px + pad_x, y, key_col));
                 if !desc.is_empty() {
                     labels.push((fit(m, desc, desc_room), px + pad_x + desc_x_off, y, desc_col));
                 }
             }
+            HelpLine::Key(key) => labels.push((fit(m, key, content_w), px + pad_x, y, key_col)),
+            HelpLine::Desc(desc) => labels.push((
+                fit(m, desc, (content_w - indent).max(0.0)),
+                px + pad_x + indent,
+                y,
+                desc_col,
+            )),
         }
     }
 
@@ -496,6 +539,33 @@ mod tests {
         // The default font in a 640px window still fits without scrolling.
         let fits = build_help_overlay(1000, 640, &theme(), &mut MonoMeasure(CHROME_ADVANCE), CM, &rows, 3);
         assert_eq!((fits.max_scroll, fits.first_row), (0, 0));
+    }
+
+    #[test]
+    fn narrow_windows_stack_descriptions_under_their_keys() {
+        // Too narrow for the two columns (a 28pt UI font in a 420px window, or
+        // 320px at the default): every description gets its own indented row
+        // under its key, and NO label runs past the panel or the window — the
+        // key column used to push the panel off-window here.
+        let rows = default_help_rows();
+        for (cm, w) in [(ChromeMetrics::new(1.0, 28.0), 420u32), (CM, 320)] {
+            let mut m = MonoMeasure(CHROME_ADVANCE * cm.u);
+            let h = build_help_overlay(w, 2400, &theme(), &mut m, cm, &rows, 0);
+            assert!(h.panel.x >= 0.0 && h.panel.x + h.panel.w <= w as f32 + 0.5, "panel past {w}px");
+            for (text, x, _y, _c) in &h.labels {
+                let right = x + m.text_w(text);
+                assert!(right <= h.panel.x + h.panel.w + 0.5, "{text:?} overflows at {w}px: {right}");
+            }
+            let key = h.labels.iter().find(|l| l.0 == "Ctrl+Shift+T").expect("key row");
+            let desc = h.labels.iter().find(|l| l.0 == "New tab").expect("description row");
+            assert!(desc.2 > key.2, "description stacked below its key");
+            assert!(desc.1 > key.1, "description indented");
+        }
+        // Wide enough for two columns: unchanged side-by-side rows.
+        let h = build_help_overlay(1000, 900, &theme(), &mut MonoMeasure(CHROME_ADVANCE), CM, &rows, 0);
+        let key = h.labels.iter().find(|l| l.0 == "Ctrl+Shift+T").unwrap();
+        let desc = h.labels.iter().find(|l| l.0 == "New tab").unwrap();
+        assert_eq!(desc.2, key.2, "side by side");
     }
 
     #[test]

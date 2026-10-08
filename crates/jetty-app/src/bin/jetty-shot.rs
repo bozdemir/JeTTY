@@ -1085,26 +1085,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Bottom STATUS BAR (perf HUD, off the tab row) — mirrors the live app.
             if let Some(perf) = perf_owned.as_deref() {
-                let status_h = shot_status_h;
-                let sy = (height as f32 - status_h).max(0.0);
-                let tb = terminal.theme().bg;
-                let tf = terminal.theme().fg;
-                let nl = |t: f32| -> [u8; 4] {
-                    [
-                        (tb[0] as f32 + (tf[0] as f32 - tb[0] as f32) * t) as u8,
-                        (tb[1] as f32 + (tf[1] as f32 - tb[1] as f32) * t) as u8,
-                        (tb[2] as f32 + (tf[2] as f32 - tb[2] as f32) * t) as u8,
-                        255,
-                    ]
-                };
-                rects.push(jetty_render::Rect {
-                    x: 0.0, y: sy, w: width as f32, h: status_h, color: nl(0.05), ..Default::default()
-                });
-                // Measure the ACTUAL proportional width (matches the app fix).
-                let perf_w = chrome_text.measure_overlay_width(perf);
-                let px = (width as f32 - perf_w - cm.px(12.0)).max(cm.px(8.0));
-                let dim = nl(0.5);
-                chrome_labels.push((perf.to_string(), px, sy + (status_h - cm.text_h()) / 2.0, [dim[0], dim[1], dim[2]]));
+                let strip = jetty_render::build_status_strip(
+                    width, (height as f32 - shot_status_h).max(0.0), shot_status_h, Some(perf),
+                    terminal.theme(), &mut chrome_text, cm,
+                );
+                rects.push(strip.quad);
+                chrome_labels.extend(strip.label);
             }
             eprintln!(
                 "jetty-shot: JETTY_SHOT_TABBAR rendered 3 sample tabs ({})",
@@ -1134,27 +1120,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // values — no fabricated fallback (a headless shot cannot honestly
             // measure fps/CPU/throughput). The strip itself always renders.
             let perf = std::env::var("JETTY_SHOT_PERF").ok().filter(|v| !v.is_empty());
-            let sy = (height as f32 - shot_status_h).max(0.0);
-            let tb = terminal.theme().bg;
-            let tf = terminal.theme().fg;
-            let nl = |t: f32| -> [u8; 4] {
-                [
-                    (tb[0] as f32 + (tf[0] as f32 - tb[0] as f32) * t) as u8,
-                    (tb[1] as f32 + (tf[1] as f32 - tb[1] as f32) * t) as u8,
-                    (tb[2] as f32 + (tf[2] as f32 - tb[2] as f32) * t) as u8,
-                    255,
-                ]
-            };
-            rects.push(jetty_render::Rect {
-                x: 0.0, y: sy, w: width as f32, h: shot_status_h, color: nl(0.05), ..Default::default()
-            });
-            if let Some(perf) = perf {
-                // Measure the ACTUAL proportional width (matches the app fix).
-                let perf_w = chrome_text.measure_overlay_width(&perf);
-                let px = (width as f32 - perf_w - cm.px(12.0)).max(cm.px(8.0));
-                let dim = nl(0.5);
-                chrome_labels.push((perf, px, sy + (shot_status_h - cm.text_h()) / 2.0, [dim[0], dim[1], dim[2]]));
-            }
+            let strip = jetty_render::build_status_strip(
+                width, (height as f32 - shot_status_h).max(0.0), shot_status_h, perf.as_deref(),
+                terminal.theme(), &mut chrome_text, cm,
+            );
+            rects.push(strip.quad);
+            chrome_labels.extend(strip.label);
 
             eprintln!("jetty-shot: JETTY_SHOT_DETACHED rendered detached-window chrome (title={title:?}, hover={close_hover})");
         }
@@ -1206,18 +1177,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // as the main window: centred, above the status strip and a bottom bar.
         if let Ok(msg) = std::env::var("JETTY_SHOT_PILL") {
             if !msg.is_empty() {
-                let tw = chrome_text.measure_overlay_width(&msg);
-                let pad = cm.px(14.0);
-                let pill_w = tw + pad * 2.0;
-                let pill_h = cm.pill_h();
-                let pill_x = ((width as f32 - pill_w) / 2.0).max(0.0);
-                let pill_y =
-                    (height as f32 - shot_status_h - shot_bottom_bar_h - cm.px(14.0) - pill_h).max(0.0);
-                let c = terminal.theme().cursor;
-                rects.push(jetty_render::Rect::rounded(
-                    pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0,
-                ));
-                chrome_labels.push((msg, pill_x + pad, pill_y + (pill_h - cm.text_h()) / 2.0, [20, 20, 20]));
+                let pill = jetty_render::build_toast_pill(
+                    width,
+                    height as f32 - shot_status_h - shot_bottom_bar_h - cm.px(14.0),
+                    0.0,
+                    &msg,
+                    terminal.theme(),
+                    &mut chrome_text,
+                    cm,
+                );
+                rects.push(pill.quad);
+                chrome_labels.push(pill.label);
             }
         }
 

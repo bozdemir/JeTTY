@@ -1085,16 +1085,8 @@ impl TextLayer {
     /// Render NON-TITLE chrome labels (menu, status/perf bar, panel, help,
     /// confirm, welcome, window controls). With a `Named` UI family they render in
     /// it; at the `Sans` default they render in the mono Nerd Font (preserving its
-    /// symbol glyphs ⇧ ⌃ ⚡ ⚙ ✕ …), exactly as before this feature.
-    /// Measure the ACTUAL rendered width (physical px) of a chrome overlay string
-    /// under the current UI family + size, using the SAME Advanced shaping as
-    /// [`Self::render_overlays`]. Chrome overlays are PROPORTIONAL (no grid snap),
-    /// so `chars().count() * cell_size().0` mis-measures a non-monospace UI font —
-    /// use this to right-align the perf HUD / shift-hint pill correctly.
-    pub fn measure_overlay_width(&mut self, text: &str) -> f32 {
-        crate::chrome::ChromeMeasure::text_w(self, text)
-    }
-
+    /// symbol glyphs ⇧ ⌃ ⚡ ⚙ ✕ …), exactly as before this feature. Chrome text
+    /// is measured through `ChromeMeasure` (the same shaping as this pass).
     pub fn render_overlays(
         &mut self,
         device: &wgpu::Device,
