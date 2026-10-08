@@ -42,8 +42,29 @@ die() { echo "nested-live: $*" >&2; exit 1; }
 
 py() { python3 -I - "$@"; }
 
+# A private session bus with NO service activation, used by jetty and the WM:
+# nothing on it can D-Bus-activate a real desktop service (a portal backend, a
+# secret daemon …) that would outlive the bus.
+write_bus_conf() {
+    cat >"$SB/bus.conf" <<'EOF'
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+EOF
+}
+
 launch_jetty() {
     [ -x "$BIN" ] || die "no binary at $BIN (cargo build --release --bin jetty)"
+    [ -f "$SB/bus.conf" ] || write_bus_conf
     ln -sfn "$BIN" "$SB/bin/jetty"
     (cd "$SB" && setsid -f env -u JETTY -u JETTY_BIN -u TERM_PROGRAM -u TERM_PROGRAM_VERSION \
         -u WAYLAND_DISPLAY -u SESSION_MANAGER DISPLAY="$D" \
@@ -53,7 +74,7 @@ launch_jetty() {
         DISABLE_AUTO_UPDATE=true \
         VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
         VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
-        dbus-run-session -- "$SB/bin/jetty" >>"$SB/jetty.log" 2>&1)
+        dbus-run-session --config-file="$SB/bus.conf" -- "$SB/bin/jetty" >>"$SB/jetty.log" 2>&1)
     for _ in $(seq 50); do
         pid=$(for p in $(pgrep -x jetty); do
             tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | grep -qx "JETTY_CONFIG_DIR=$SB/config/jetty" && echo "$p"
@@ -87,28 +108,14 @@ start)
     for _ in $(seq 50); do [ -S "/tmp/.X11-unix/X$N" ] && break; sleep 0.1; done
     DISPLAY="$D" setxkbmap -layout "${2:-us}"
     wm="${NESTED_WM:-$(command -v kwin_x11 >/dev/null && echo kwin || echo none)}"
+    write_bus_conf
     if [ "$wm" = kwin ]; then
-        cat >"$SB/wm/bus.conf" <<'EOF'
-<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
- "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-<busconfig>
-  <!-- private bus with no service activation: nothing else gets started -->
-  <type>session</type>
-  <listen>unix:tmpdir=/tmp</listen>
-  <auth>EXTERNAL</auth>
-  <policy context="default">
-    <allow send_destination="*" eavesdrop="true"/>
-    <allow eavesdrop="true"/>
-    <allow own="*"/>
-  </policy>
-</busconfig>
-EOF
         (cd "$SB/wm" && setsid -f env -u SESSION_MANAGER -u KDE_FULL_SESSION -u KDE_SESSION_UID \
             -u KDE_SESSION_VERSION -u KDE_APPLICATIONS_AS_SCOPE -u QT_IM_MODULE -u XMODIFIERS \
             -u WAYLAND_DISPLAY DISPLAY="$D" XDG_CONFIG_HOME="$SB/wm/config" XDG_CACHE_HOME="$SB/wm/cache" \
             XDG_DATA_HOME="$SB/wm/data" XDG_STATE_HOME="$SB/wm/state" XDG_RUNTIME_DIR="$SB/wm/run" \
             KWIN_COMPOSE=N QT_QPA_PLATFORM=xcb \
-            dbus-run-session --config-file="$SB/wm/bus.conf" -- kwin_x11 >"$SB/wm.log" 2>&1)
+            dbus-run-session --config-file="$SB/bus.conf" -- kwin_x11 >"$SB/wm.log" 2>&1)
         for _ in $(seq 50); do
             p=$(for q in $(pgrep -x kwin_x11); do
                 tr '\0' '\n' <"/proc/$q/environ" 2>/dev/null | grep -qx "DISPLAY=$D" && echo "$q"
