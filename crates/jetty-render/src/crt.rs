@@ -14,9 +14,11 @@
 //! combination the user never selects is never compiled. With no curvature,
 //! jitter or glitch the scene is read with ONE `textureLoad` per pixel (the
 //! sample position is the pixel itself). Bloom runs at quarter resolution — a
-//! bright-pass downsample (4×4 texels → 1) plus a separable 9-tap blur into two
-//! small `Rgba16Float` textures owned by this pass — and the composite reads it
-//! with one bilinear tap (the old in-shader bloom read 13 full-res taps).
+//! bright-pass downsample (4×4 texels → 1, four bilinear taps) into small
+//! `Rgba16Float` textures owned by this pass, blurred (separable 9-tap Gaussian,
+//! twice) only when `crt_bloom_radius` > 0 — and the composite adds it with one
+//! bilinear tap plus the pixel's own bright-pass (the old in-shader bloom read
+//! 13 full-res taps).
 //!
 //! **Bloom keys on the light ABOVE the background** (the theme background, or
 //! the phosphor's unlit "paper" color): a light theme's bright background no
@@ -69,12 +71,13 @@ pub const CRT_FLAG_ROLL: u32 = 1 << 0; // bit0: rolling scanline crawl
 pub const CRT_FLAG_FLICKER: u32 = 1 << 1; // bit1: global brightness flicker
 pub const CRT_FLAG_JITTER: u32 = 1 << 2; // bit2: sub-pixel horizontal jitter
 
-/// Bloom blur step range (quarter-resolution texels between Gaussian taps) that
-/// `crt_bloom_radius` 0..1 maps onto. At the minimum the glow is the 4×4
-/// downsample plus the bilinear upsample (≈ the old 13-tap glow's footprint);
-/// at the maximum a soft halo of ~25 px.
-pub const BLOOM_STEP_MIN: f32 = 0.35;
-pub const BLOOM_STEP_MAX: f32 = 3.0;
+/// Bloom blur step (quarter-resolution texels between Gaussian taps) at
+/// `crt_bloom_radius` = 1; the step scales linearly with the radius. Radius 0
+/// (the default — the pre-v2 tight glow) runs NO blur pass: the halo is the 4×4
+/// bright-pass downsample plus the bilinear upsample. Above 0 the separable
+/// 9-tap Gaussian runs twice (H, V, H, V), so the glow widens continuously
+/// (σ ≈ 4.9·radius quarter-res texels ≈ 20 px at 1) without tap ghosting.
+pub const BLOOM_STEP_MAX: f32 = 2.0;
 
 /// The rate (frames per second) the animated seeds (`crt_grain_animate`, the
 /// glitch tear pattern) advance at: the time is quantized to this clock, so a
@@ -145,6 +148,27 @@ fn axis_t(c: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>) -> f32 {
     return (lightness(c) - a) / step;
 }
 
+// Bloom bright-pass of one scene color (premultiplied as stored): the light
+// ABOVE the display background — the theme background, or with a phosphor the
+// unlit paper (after the same remap the composite applies) — thresholded on its
+// brightest channel. A light theme's background is not "above" itself, so it
+// never blooms into a wash-out; on a dark theme this is the classic threshold.
+// A wider bloom (radius > 0; x.fg.w = 2·radius) also lowers the threshold, so
+// a soft neon halo catches bright text, not only solid bright areas.
+fn bright(c: vec4<f32>) -> vec3<f32> {
+    let a = alpha_div(c.a);
+    var s = c.rgb / a;
+    var base = x.bg.rgb;
+    if (FEAT_PHOS) {
+        s = phosphor_map(s);
+        base = x.paper.rgb;
+    }
+    let ex = max(s - base, vec3(0.0, 0.0, 0.0));
+    let l = max(ex.r, max(ex.g, ex.b));
+    let r = clamp(x.fg.w * 0.5, 0.0, 1.0);
+    return ex * (smoothstep(0.55 - 0.33 * r, 0.9 - 0.32 * r, l) * a);
+}
+
 // The scene (straight color) as a monochrome display: the theme background maps
 // to the unlit paper, the theme foreground to the lit phosphor (brighter text a
 // little beyond), interpolated in perceptual space; `hue` keeps that much of the
@@ -201,9 +225,11 @@ const FLICKER_FREQ: f32 = 50.0;  // brightness wobble angular freq (rad/s, ~8 Hz
 const FLICKER_AMP: f32 = 0.04;   // brightness dip amplitude (4%), sub-strobe
 const JITTER_AMP: f32 = 0.5;     // horizontal sync jitter peak (sub-pixel px)
 
-// Quarter-res bloom composite gain (the blurred bright-pass carries the same
-// energy the old 13-tap kernel added, spread a little wider).
-const BLOOM_GAIN: f32 = 1.1;
+// Bloom gains, calibrated against the pre-v2 13-tap kernel (jetty-shot pixel
+// diffs: 52.7 dB on the owner's look, ~39 dB at the default bloom .4): the
+// pixel's own bright-pass (that kernel's on-stroke taps) + the quarter-res halo.
+const BLOOM_LOCAL: f32 = 0.4;
+const BLOOM_SPREAD: f32 = 0.7;
 // Grain amplitude in perceptual (sqrt) units at crt_grain = 1.
 const GRAIN_AMP: f32 = 0.22;
 // Event glitch: color split (px at full intensity) and the tear's max shift
@@ -346,9 +372,11 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         col = col * (vec3(1.0, 1.0, 1.0) - depth * (vec3(1.0, 1.0, 1.0) - triad));
     }
 
-    // --- 5) Bloom: the quarter-res blurred bright-pass, one bilinear tap. ---
+    // --- 5) Bloom: the pixel's own bright-pass (local glow, free: the scene is
+    // already sampled) + the quarter-res blurred bright-pass (one bilinear tap). ---
     if (FEAT_BLOOM) {
-        col = col + textureSampleLevel(bloom_tex, src_samp, suv, 0.0).rgb * (p.bloom * BLOOM_GAIN);
+        let halo = textureSampleLevel(bloom_tex, src_samp, suv, 0.0).rgb;
+        col = col + (bright(cg) * BLOOM_LOCAL + halo * BLOOM_SPREAD) * p.bloom;
     }
 
     // --- 5b) Film grain: monochrome noise per (DPI-scaled) cell, added in
@@ -425,37 +453,20 @@ const BLOOM_WGSL: &str = r#"
 
 override BLUR_VERTICAL: bool = false;
 
-// The light of one scene texel ABOVE the display background: the theme
-// background (or, with a phosphor, the unlit paper — after the same remap the
-// composite applies), thresholded on its brightest channel. A light theme's
-// background is not "above" itself, so it never blooms into a wash-out.
-fn bright(c: vec4<f32>) -> vec3<f32> {
-    let a = alpha_div(c.a);
-    var s = c.rgb / a;
-    var base = x.bg.rgb;
-    if (FEAT_PHOS) {
-        s = phosphor_map(s);
-        base = x.paper.rgb;
-    }
-    let ex = max(s - base, vec3(0.0, 0.0, 0.0));
-    let l = max(ex.r, max(ex.g, ex.b));
-    return ex * (smoothstep(0.55, 0.9, l) * a);
-}
-
 @fragment
 fn fs_down(in: VsOut) -> @location(0) vec4<f32> {
-    // The 4×4 full-res block under this quarter-res texel (uv-mapped, so a size
-    // that is not a multiple of 4 stays aligned with the composite's uv).
-    let dims = vec2<i32>(textureDimensions(src_tex));
-    let o = vec2<i32>(round(in.uv * vec2<f32>(dims) - 2.0));
-    var acc = vec3(0.0, 0.0, 0.0);
-    for (var j = 0; j < 4; j = j + 1) {
-        for (var i = 0; i < 4; i = i + 1) {
-            let q = clamp(o + vec2<i32>(i, j), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
-            acc = acc + bright(textureLoad(src_tex, q, 0));
-        }
-    }
-    return vec4(acc * 0.0625, 1.0);
+    // The 4×4 full-res block under this quarter-res texel, read as its four 2×2
+    // quads (one bilinear tap each, at the quad's shared corner) and thresholded
+    // per quad: like the pre-v2 13-tap kernel, which thresholded bilinear taps,
+    // a thin bright stroke brightens itself (the composite's local term) but
+    // only a solid bright area spreads a halo.
+    let ts = 1.0 / vec2<f32>(textureDimensions(src_tex));
+    let c = in.uv;
+    var acc = bright(textureSampleLevel(src_tex, src_samp, c + vec2(-ts.x, -ts.y), 0.0));
+    acc = acc + bright(textureSampleLevel(src_tex, src_samp, c + vec2(ts.x, -ts.y), 0.0));
+    acc = acc + bright(textureSampleLevel(src_tex, src_samp, c + vec2(-ts.x, ts.y), 0.0));
+    acc = acc + bright(textureSampleLevel(src_tex, src_samp, c + vec2(ts.x, ts.y), 0.0));
+    return vec4(acc * 0.25, 1.0);
 }
 
 @fragment
@@ -759,10 +770,11 @@ pub fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
 }
 
-/// The bloom blur step (quarter-res texels) for `crt_bloom_radius` 0..1.
+/// The bloom blur step (quarter-res texels) for `crt_bloom_radius` 0..1; 0 = no
+/// blur pass at all.
 pub fn bloom_blur_step(radius: f32) -> f32 {
     let r = if radius.is_finite() { radius.clamp(0.0, 1.0) } else { 0.0 };
-    BLOOM_STEP_MIN + (BLOOM_STEP_MAX - BLOOM_STEP_MIN) * r
+    BLOOM_STEP_MAX * r
 }
 
 /// The animated-seed counter at `time` (seconds): advances [`ANIM_SEED_FPS`]
@@ -1213,8 +1225,13 @@ impl Crt {
             g.blur.as_ref(),
         ) {
             pass(&mut encoder, "crt-bloom-down", &t.a, down, down_bind);
-            pass(&mut encoder, "crt-bloom-blur-h", &t.b, blur_h, &t.bind_h);
-            pass(&mut encoder, "crt-bloom-blur-v", &t.a, blur_v, &t.bind_v);
+            // A wider glow (radius > 0): the separable Gaussian twice.
+            if params.ext.fg[3] > 0.01 {
+                for _ in 0..2 {
+                    pass(&mut encoder, "crt-bloom-blur-h", &t.b, blur_h, &t.bind_h);
+                    pass(&mut encoder, "crt-bloom-blur-v", &t.a, blur_v, &t.bind_v);
+                }
+            }
         }
         pass(&mut encoder, "crt-pass", dst, main_pipe, &binds.main);
         queue.submit(Some(encoder.finish()));
@@ -1478,13 +1495,16 @@ mod tests {
         assert_ne!(t0, t2, "the next step");
     }
 
+    /// Radius 0 = no blur pass (the pre-v2 tight glow); the step grows linearly.
     #[test]
     fn bloom_step_maps_the_radius() {
-        assert_eq!(bloom_blur_step(0.0), BLOOM_STEP_MIN);
+        assert_eq!(bloom_blur_step(0.0), 0.0);
         assert_eq!(bloom_blur_step(1.0), BLOOM_STEP_MAX);
-        assert_eq!(bloom_blur_step(-3.0), BLOOM_STEP_MIN);
-        assert_eq!(bloom_blur_step(f32::NAN), BLOOM_STEP_MIN);
-        assert!(bloom_blur_step(0.5) > BLOOM_STEP_MIN && bloom_blur_step(0.5) < BLOOM_STEP_MAX);
+        assert_eq!(bloom_blur_step(-3.0), 0.0);
+        assert_eq!(bloom_blur_step(f32::NAN), 0.0);
+        assert_eq!(bloom_blur_step(0.5), BLOOM_STEP_MAX * 0.5);
+        let s = CrtSettings { bloom: 0.4, bloom_radius: 0.3, ..CrtSettings::PASSTHROUGH };
+        assert_eq!(CrtParams::build(&s, &frame()).ext.fg[3], bloom_blur_step(0.3));
     }
 
     /// Smoke-test `Crt` on a real device: prepare a few variants (incl. bloom)
