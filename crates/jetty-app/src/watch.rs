@@ -1,120 +1,274 @@
 //! Config + themes hot-reload file watcher.
 //!
 //! One `notify` `RecommendedWatcher` (INotifyWatcher on Linux, FsEventWatcher on
-//! macOS) watches the JeTTY config directory. It is OS-event-driven — the backing
-//! thread blocks in the kernel and only wakes on a real filesystem change, so it
-//! adds ZERO idle CPU (no polling). On a relevant change it forwards a single
-//! `AppEvent::ConfigChanged` through the winit `EventLoopProxy`; the app debounces
-//! and applies the reload from `about_to_wait`.
+//! macOS) watches a handful of directories NON-recursively. It is OS-event-driven —
+//! the backing thread blocks in the kernel and only wakes on a real filesystem
+//! change, so it adds ZERO idle CPU (no polling). On a relevant change it calls the
+//! `on_change` callback (the app forwards a single `AppEvent::ConfigChanged`; it
+//! debounces and applies the reload from `about_to_wait`).
+//!
+//! What is watched (recomputed by [`ConfigWatcher::rearm`] after every reload):
+//! * the config dir's PARENT (`~/.config`) — so the config dir being created,
+//!   deleted-and-recreated or re-linked (stow / home-manager) is noticed;
+//! * the config dir itself (`config.toml`) and its `themes/` subdir (a symlinked
+//!   dir is followed);
+//! * when `config.toml` is a symlink to a file elsewhere (a dotfiles repo), the
+//!   real file's directory — matched by the real file's exact path, so its own
+//!   name (`jetty.toml`) works and the repo's other files are ignored.
 //!
 //! Naming gotcha: jetty-app already has a local `mod notify` (desktop toasts), so
 //! the file-watcher crate is referenced as `::notify` throughout.
 
-use winit::event_loop::EventLoopProxy;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use crate::app::AppEvent;
+use ::notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-/// Does this changed path warrant a reload? Matches ONLY the real `config.toml` and
-/// `themes/*.toml`, and EXCLUDES `write_atomic`'s PID-suffixed temp file
-/// (`.config.toml.tmp.<pid>`, which contains `.tmp.`) and the startup-only
-/// `config.toml.bad` — both of which would otherwise fire spurious CREATE/REMOVE
-/// events (amendment H4).
-fn is_watched_path(p: &std::path::Path) -> bool {
-    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    // Exclude the atomic-write temp file and the preserved-bad file.
-    if name.contains(".tmp.") || name.ends_with(".bad") {
-        return false;
-    }
-    if name == "config.toml" {
-        return true;
-    }
-    // A theme file: `*.toml` directly inside a `themes` directory.
-    p.extension().and_then(|x| x.to_str()) == Some("toml")
-        && p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()) == Some("themes")
+/// The paths that matter right now. Recomputed on every `rearm`, read by the
+/// event callback.
+#[derive(Debug, Clone, PartialEq)]
+struct Targets {
+    /// The config dir as configured (`~/.config/jetty`, not canonicalized).
+    config_dir: PathBuf,
+    /// `<config_dir>/themes`.
+    themes_dir: PathBuf,
+    /// The real file `config.toml` points at, when it is a symlink.
+    real_config: Option<PathBuf>,
 }
 
-/// Spawn the config/themes watcher. Returns the `RecommendedWatcher`, which the
-/// caller MUST keep alive for the process lifetime (dropping it stops watching);
-/// `None` if the watcher could not be created or the config dir could not be watched.
-///
-/// Watches the CANONICAL config directory (following a symlinked `config.toml`, the
-/// common dotfiles/stow/chezmoi setup — amendment H3) recursively, plus a distinct
-/// canonical `themes/` directory when it resolves outside the config dir.
-pub fn spawn_config_watcher(
-    proxy: EventLoopProxy<AppEvent>,
-) -> Option<::notify::RecommendedWatcher> {
-    use ::notify::{Config as NotifyConfig, EventKind, RecursiveMode, Watcher};
-
-    // Canonical parent of config.toml (resolves a symlinked config file to its real
-    // dir); fall back to the plain ~/.config/jetty when the file doesn't exist yet.
-    let cfg_path = crate::config::Config::config_path();
-    let cfg_dir = std::fs::canonicalize(&cfg_path)
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(crate::config::Config::dir);
-
-    // Canonical themes dir (may be symlinked to a different real location).
-    let themes_raw = crate::config::Config::dir().join("themes");
-    let themes_dir = std::fs::canonicalize(&themes_raw).ok();
-
-    let mut watcher = ::notify::RecommendedWatcher::new(
-        move |res: ::notify::Result<::notify::Event>| {
-            let Ok(ev) = res else { return };
-            // Content/rename/create/remove only — ignore Access (open/close/read).
-            if !matches!(
-                ev.kind,
-                EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-            ) {
-                return;
-            }
-            if ev.paths.iter().any(|p| is_watched_path(p)) {
-                // Coalesced app-side (debounced in about_to_wait); a send error just
-                // means the loop is gone (shutting down).
-                let _ = proxy.send_event(AppEvent::ConfigChanged);
-            }
-        },
-        NotifyConfig::default(),
-    )
-    .ok()?;
-
-    // Watch the DIRECTORY (not the file): write_atomic swaps the inode via rename,
-    // which would drop a file-level watch. Recursive so a `themes/` created later is
-    // covered too.
-    watcher.watch(&cfg_dir, RecursiveMode::Recursive).ok()?;
-
-    // If themes/ resolves OUTSIDE the config dir (symlinked away), watch it too.
-    // Errors (e.g. it doesn't exist yet) are non-fatal — the config watch still works.
-    if let Some(td) = themes_dir {
-        if td != cfg_dir.join("themes") {
-            let _ = watcher.watch(&td, RecursiveMode::Recursive);
+impl Targets {
+    fn compute(config_dir: &Path) -> Targets {
+        let plain = config_dir.join("config.toml");
+        let real_config = match std::fs::symlink_metadata(&plain) {
+            Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(&plain).ok(),
+            _ => None,
+        };
+        Targets {
+            config_dir: config_dir.to_path_buf(),
+            themes_dir: config_dir.join("themes"),
+            real_config,
         }
     }
 
-    Some(watcher)
+    /// The directories to watch (each non-recursively), existing ones only.
+    fn watch_paths(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        let mut add = |p: &Path| {
+            if p.is_dir() && !out.iter().any(|q| q == p) {
+                out.push(p.to_path_buf());
+            }
+        };
+        if let Some(parent) = self.config_dir.parent() {
+            add(parent);
+        }
+        add(&self.config_dir);
+        add(&self.themes_dir);
+        if let Some(dir) = self.real_config.as_deref().and_then(Path::parent) {
+            add(dir);
+        }
+        out
+    }
+
+    /// Does a change to `p` warrant a reload? The real `config.toml` (or the file
+    /// it links to), `themes/*.toml`, and the config / themes dirs themselves
+    /// (created, removed, renamed). Never JeTTY's own atomic-save temp file
+    /// (`.config.toml.tmp.<pid>`), its backups (`config.toml.bad-*`, `.bak-*`) or
+    /// anything else in the watched dirs.
+    fn is_relevant(&self, p: &Path) -> bool {
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        if name.contains(".tmp.") {
+            return false;
+        }
+        if p == self.config_dir || p == self.themes_dir || p == self.config_dir.join("config.toml") {
+            return true;
+        }
+        if self.real_config.as_deref() == Some(p) {
+            return true;
+        }
+        p.parent() == Some(self.themes_dir.as_path())
+            && p.extension().and_then(|x| x.to_str()) == Some("toml")
+    }
+}
+
+/// A live config/themes watcher. Keep it alive for as long as watching should
+/// continue (dropping it stops watching); call [`ConfigWatcher::rearm`] after each
+/// reload.
+pub struct ConfigWatcher {
+    watcher: RecommendedWatcher,
+    targets: Arc<Mutex<Targets>>,
+    config_dir: PathBuf,
+    watched: Vec<PathBuf>,
+}
+
+impl ConfigWatcher {
+    /// Watch `config_dir` (see the module docs); `on_change` runs on the watcher's
+    /// thread for every relevant change. `None` if the OS watcher can't be created.
+    pub fn spawn(config_dir: PathBuf, on_change: impl Fn() + Send + 'static) -> Option<ConfigWatcher> {
+        let targets = Arc::new(Mutex::new(Targets::compute(&config_dir)));
+        let seen = Arc::clone(&targets);
+        let watcher = RecommendedWatcher::new(
+            move |res: ::notify::Result<::notify::Event>| {
+                let Ok(ev) = res else { return };
+                // Content/rename/create/remove only — ignore Access (open/close/read).
+                if !matches!(
+                    ev.kind,
+                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                ) {
+                    return;
+                }
+                let relevant = {
+                    let t = seen.lock().unwrap_or_else(|p| p.into_inner());
+                    ev.paths.iter().any(|p| t.is_relevant(p))
+                };
+                if relevant {
+                    on_change();
+                }
+            },
+            NotifyConfig::default(),
+        )
+        .ok()?;
+        let mut w = ConfigWatcher { watcher, targets, config_dir, watched: Vec::new() };
+        w.rearm();
+        Some(w)
+    }
+
+    /// Recompute what to watch and (re)attach: picks up a config dir that was
+    /// created or recreated, a `config.toml` symlink that was retargeted and a
+    /// `themes/` dir created later. A watch on a deleted dir dies silently in the
+    /// kernel, so every desired path is re-added (cheap: a few directories).
+    pub fn rearm(&mut self) {
+        let t = Targets::compute(&self.config_dir);
+        let desired = t.watch_paths();
+        *self.targets.lock().unwrap_or_else(|p| p.into_inner()) = t;
+        for p in self.watched.drain(..) {
+            let _ = self.watcher.unwatch(&p);
+        }
+        for p in desired {
+            if self.watcher.watch(&p, RecursiveMode::NonRecursive).is_ok() {
+                self.watched.push(p);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-    #[test]
-    fn matches_config_and_theme_files() {
-        assert!(is_watched_path(Path::new("/home/u/.config/jetty/config.toml")));
-        assert!(is_watched_path(Path::new("/home/u/.config/jetty/themes/mine.toml")));
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("jetty-watch-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn targets(dir: &str) -> Targets {
+        Targets::compute(Path::new(dir))
     }
 
     #[test]
-    fn ignores_temp_and_bad_and_unrelated() {
+    fn matches_config_and_theme_files() {
+        let t = targets("/home/u/.config/jetty");
+        assert!(t.is_relevant(Path::new("/home/u/.config/jetty/config.toml")));
+        assert!(t.is_relevant(Path::new("/home/u/.config/jetty/themes/mine.toml")));
+        // The dirs themselves appearing/disappearing.
+        assert!(t.is_relevant(Path::new("/home/u/.config/jetty")));
+        assert!(t.is_relevant(Path::new("/home/u/.config/jetty/themes")));
+    }
+
+    #[test]
+    fn ignores_temp_backups_and_unrelated() {
+        let t = targets("/home/u/.config/jetty");
         // write_atomic's PID temp file.
-        assert!(!is_watched_path(Path::new("/home/u/.config/jetty/.config.toml.tmp.1234")));
-        // preserved-bad file (startup-only).
-        assert!(!is_watched_path(Path::new("/home/u/.config/jetty/config.toml.bad")));
-        // a stray toml NOT under themes/.
-        assert!(!is_watched_path(Path::new("/home/u/.config/jetty/other.toml")));
-        // unrelated file.
-        assert!(!is_watched_path(Path::new("/home/u/.config/jetty/notes.txt")));
+        assert!(!t.is_relevant(Path::new("/home/u/.config/jetty/.config.toml.tmp.1234")));
+        // preserved copies.
+        assert!(!t.is_relevant(Path::new("/home/u/.config/jetty/config.toml.bad-1700000000")));
+        assert!(!t.is_relevant(Path::new("/home/u/.config/jetty/config.toml.bak-1700000000")));
+        // a stray toml NOT under themes/, other apps' configs next door.
+        assert!(!t.is_relevant(Path::new("/home/u/.config/jetty/other.toml")));
+        assert!(!t.is_relevant(Path::new("/home/u/.config/kwinrc")));
+        assert!(!t.is_relevant(Path::new("/home/u/.config/foo/config.toml")));
+        assert!(!t.is_relevant(Path::new("/home/u/.config/jetty/notes.txt")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_watches_and_matches_the_real_file_only() {
+        use std::os::unix::fs::symlink;
+        let base = tmp("link");
+        let dotfiles = base.join("dotfiles");
+        let cfg_dir = base.join("config").join("jetty");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(dotfiles.join("jetty.toml"), "theme = \"nord\"\n").unwrap();
+        symlink(dotfiles.join("jetty.toml"), cfg_dir.join("config.toml")).unwrap();
+        let t = Targets::compute(&cfg_dir);
+        let real_dir = std::fs::canonicalize(&dotfiles).unwrap();
+        assert!(t.watch_paths().contains(&real_dir), "{:?}", t.watch_paths());
+        assert!(t.is_relevant(&real_dir.join("jetty.toml")));
+        // The dotfiles repo's OTHER files never trigger a reload.
+        assert!(!t.is_relevant(&real_dir.join("config.toml")));
+        assert!(!t.is_relevant(&real_dir.join("nvim.toml")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn missing_config_dir_still_watches_its_parent() {
+        let base = tmp("missing");
+        let t = Targets::compute(&base.join("jetty"));
+        assert_eq!(t.watch_paths(), vec![base.clone()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Waits for at least one change notification (draining any burst).
+    fn changed(rx: &mpsc::Receiver<()>) -> bool {
+        let got = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        while rx.recv_timeout(Duration::from_millis(150)).is_ok() {}
+        got
+    }
+
+    /// End-to-end with the real OS watcher: an edit, a themes/ dir created after
+    /// startup, and the whole config dir deleted and recreated all keep working.
+    #[test]
+    fn live_watch_survives_new_themes_dir_and_recreated_config_dir() {
+        let base = tmp("live");
+        let cfg_dir = base.join("jetty");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("config.toml"), "theme = \"nord\"\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let mut w = ConfigWatcher::spawn(cfg_dir.clone(), move || {
+            let _ = tx.lock().unwrap().send(());
+        })
+        .expect("watcher");
+        std::fs::write(cfg_dir.join("config.toml"), "theme = \"dracula\"\n").unwrap();
+        assert!(changed(&rx), "edit of config.toml");
+
+        // themes/ created later: the creation itself is a change; after the reload's
+        // rearm, a theme file inside it is watched too.
+        std::fs::create_dir_all(cfg_dir.join("themes")).unwrap();
+        assert!(changed(&rx), "themes/ created");
+        w.rearm();
+        std::fs::write(cfg_dir.join("themes").join("mine.toml"), "x = 1\n").unwrap();
+        assert!(changed(&rx), "theme file in a late themes/");
+
+        // The config dir deleted and recreated (seen through the parent watch).
+        std::fs::remove_dir_all(&cfg_dir).unwrap();
+        assert!(changed(&rx), "config dir removed");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        assert!(changed(&rx), "config dir recreated");
+        w.rearm();
+        std::fs::write(cfg_dir.join("config.toml"), "theme = \"nord\"\n").unwrap();
+        assert!(changed(&rx), "edit after the dir was recreated");
+
+        // Unrelated churn next door does not wake the app.
+        std::fs::write(base.join("kwinrc"), "x").unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(600)).is_err(), "unrelated file");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

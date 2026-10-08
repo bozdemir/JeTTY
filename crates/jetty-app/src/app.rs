@@ -10,7 +10,7 @@ use winit::window::{Window, WindowId};
 use crate::{clipboard, input};
 
 /// Events sent through the winit user-event channel.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum AppEvent {
     /// PTY data is ready — drain and redraw.
     Wake,
@@ -21,6 +21,9 @@ pub enum AppEvent {
     /// A watched config/theme file changed (from the `notify` watcher). Debounced
     /// and applied from `about_to_wait`; carries no payload (the reload re-reads).
     ConfigChanged,
+    /// A user-facing configuration problem found off the UI thread (a refused
+    /// save, an unusable summon hotkey) — shown as a status pill + logged.
+    ConfigNotice(String),
 }
 
 /// Window-summon reveal effect, selectable in Settings and persisted in config.
@@ -489,9 +492,13 @@ pub struct App {
     /// `visible && !main_occluded` so a hidden/minimized window returns to true
     /// idle instead of burning CPU rendering invisible frames (F8/F16/F17/F18).
     main_occluded: bool,
-    /// Whether the F9 global-hotkey worker has been launched. The manager itself
-    /// is kept alive inside that worker thread (it never returns), so we only need
-    /// a launched-once sentinel here rather than holding the manager on the App.
+    /// The global summon-hotkey manager. On macOS it must be created AND kept on
+    /// the main thread (an upstream `global-hotkey` requirement), so it lives here.
+    /// Elsewhere an off-thread worker creates it (registering blocks on X11
+    /// round-trips) and keeps it alive itself, so this is a launched-once sentinel.
+    #[cfg(target_os = "macos")]
+    hotkey_manager: Option<global_hotkey::GlobalHotKeyManager>,
+    #[cfg(not(target_os = "macos"))]
     hotkey_manager: Option<()>,
     gpu: Option<GpuContext>,
     text: Option<TextLayer>,
@@ -601,8 +608,9 @@ pub struct App {
     /// 100..=100_000, default 10_000). Applied live to every tab (main +
     /// detached) when changed via the Settings cycler.
     scrollback_lines: usize,
-    /// Launch JeTTY at login via the XDG autostart `.desktop` file. The file's
-    /// existence is the source of truth; this mirrors it for the Settings pill.
+    /// Launch JeTTY at login (config `launch_at_login` — the source of truth: the
+    /// XDG autostart entry / macOS LaunchAgent is (re)written or removed to match
+    /// at startup, on a hot-reload, and when toggled in Settings or the palette).
     launch_at_login: bool,
     /// Global summon hotkey string (e.g. "F9", "F12", "Ctrl+Shift+F12"). Parsed
     /// by `global_hotkey`'s own `HotKey::from_str`. Default "F9".
@@ -788,20 +796,36 @@ pub struct App {
     /// Cached help-overlay rows, regenerated from `keymap` on load/reload so the
     /// Help panel reflects remaps. Cloned only when the overlay is actually drawn.
     help_rows: Vec<String>,
-    /// The `notify` file-watcher handle. MUST be kept alive for the process lifetime
-    /// (dropping it stops watching). `None` when hot-reload is off. Named with a
-    /// leading `_` intent, but read on a live turn-off to drop it.
-    config_watcher: Option<::notify::RecommendedWatcher>,
+    /// The config/themes file watcher. MUST be kept alive for the process lifetime
+    /// (dropping it stops watching). `None` when hot-reload is off; dropped on a live
+    /// turn-off. Re-armed after every reload so a recreated dir, a retargeted
+    /// symlink or a later `themes/` keep being watched.
+    config_watcher: Option<crate::watch::ConfigWatcher>,
     /// Set true ONLY for the duration of `reload_config_and_themes`. While set,
     /// `persist()` is a NO-OP — so a reload applying live keys through the normal
     /// setters can never write config.toml, making the watcher loop-free BY
     /// CONSTRUCTION (amendment H2), independent of the hash guard.
     reloading: bool,
-    /// Hash of the exact string content of the last config.toml WE wrote (via
-    /// `persist`). A reload whose on-disk content hashes to this value is our own
-    /// write echoing back through the watcher → skipped (the secondary loop guard
-    /// after `reloading`). `Cell` so `persist(&self)` can record it.
-    last_written_config_hash: std::cell::Cell<Option<u64>>,
+    /// Saves settings changes to config.toml: debounced, in place (only changed
+    /// keys; comments and unknown keys survive) and off the UI thread. It also
+    /// owns the self-write hash guard: a reload whose on-disk content is our own
+    /// write echoing back through the watcher is skipped (the secondary loop guard
+    /// after `reloading`). `RefCell` so `persist(&self)` can record a change.
+    persister: std::cell::RefCell<crate::config::Persister>,
+    /// The theme the user CHOSE (config `theme`), kept separate from the theme on
+    /// screen: if it is missing or broken (a user theme file mid-edit), a fallback
+    /// is shown but this name is what gets saved and re-resolved on every reload,
+    /// so fixing the file brings it back — the fallback never replaces the choice.
+    theme_name: String,
+    /// Config / theme / keybinding problems found while starting up, printed in
+    /// the first tab once it exists (a desktop launch has no visible stderr).
+    startup_warnings: Vec<String>,
+    /// "Reset keybindings" asks for confirmation: the first run arms it until this
+    /// instant; running it again before then resets (after writing a backup).
+    reset_keys_armed_until: Option<std::time::Instant>,
+    /// Start hidden (`jetty --background`, used by the login autostart entry): the
+    /// window is created unmapped and the first summon shows it.
+    start_hidden: bool,
     /// When `Some`, a debounced config/theme reload is due at this instant. Set by a
     /// `ConfigChanged` event (coalescing an editor's write/rename/chmod burst); the
     /// reload runs once from `about_to_wait` when the deadline passes, then clears.
@@ -1274,7 +1298,21 @@ impl App {
         // Seed the theme registry (built-ins + user themes) BEFORE any theme
         // resolution below (amendment T4): otherwise a `JETTY_THEME`/config value
         // naming a USER theme would resolve to idx 0 and the custom default be lost.
-        crate::themes::rebuild_registry();
+        // Problems (a skipped theme file) are shown in the first tab.
+        let mut startup_warnings = crate::themes::rebuild_registry();
+        // The persisted settings (per-key: one bad value never resets the rest).
+        let loaded = crate::config::Config::load();
+        // Saves are written by a background thread; it reports a refused save (the
+        // file is not valid TOML) back through the event loop as a status pill.
+        let notice_proxy = proxy.clone();
+        let persister = crate::config::Persister::new(
+            crate::config::Config::config_path(),
+            loaded.cfg.clone(),
+            loaded.hash,
+            Box::new(move |msg| {
+                let _ = notice_proxy.send_event(AppEvent::ConfigNotice(msg));
+            }),
+        );
 
         // Resolve initial theme index from JETTY_THEME env var (consults the
         // registry, so a user theme name resolves too).
@@ -1390,7 +1428,12 @@ impl App {
             help_rows: Vec::new(),
             config_watcher: None,
             reloading: false,
-            last_written_config_hash: std::cell::Cell::new(None),
+            persister: std::cell::RefCell::new(persister),
+            // Set from the config below.
+            theme_name: String::new(),
+            startup_warnings: Vec::new(),
+            reset_keys_armed_until: None,
+            start_hidden: false,
             pending_reload_at: None,
             // Run & Notify: overridden by config below; safe defaults here.
             notify_on_finish: true,
@@ -1492,9 +1535,18 @@ impl App {
         // window comes up already themed/sized as the user left it. The font
         // size/family are consumed later by `resumed` when it builds the
         // TextLayer; theme+opacity are pushed into the terminals by apply_theme.
-        let cfg = crate::config::Config::load();
-        if let Some(i) = jetty_core::theme_index(&cfg.theme) {
-            app.theme_idx = i;
+        let crate::config::Loaded { cfg, warnings, .. } = loaded;
+        startup_warnings.extend(warnings);
+        // The CHOSEN theme is remembered by name even when it can't be shown (a
+        // missing/broken user theme file): the fallback on screen is never saved
+        // over it, and a reload that fixes the file brings it back.
+        app.theme_name = cfg.theme.clone();
+        match jetty_core::theme_index(&cfg.theme) {
+            Some(i) => app.theme_idx = i,
+            None => startup_warnings.push(theme_missing_warning(
+                &cfg.theme,
+                &jetty_core::theme_at(app.theme_idx).display_name,
+            )),
         }
         // Clamp opacity to a VISIBLE floor: a persisted 0.0 would load a fully
         // transparent (invisible) window, which looks like a launch failure.
@@ -1516,10 +1568,13 @@ impl App {
         // Re-clamp for belt-and-suspenders (mirrors the opacity/font clamps
         // above); Config::load's sanitize pass already applied this range.
         app.scrollback_lines = cfg.scrollback_lines.clamp(100, 100_000);
-        // The autostart FILE's existence is the source of truth (so the toggle
-        // reflects reality even if the file was changed externally), not the
-        // stored config bool.
-        app.launch_at_login = autostart_file_exists();
+        // The config key is the source of truth: (re)write or remove the login
+        // autostart entry to match — this also refreshes a stale Exec path (an
+        // AppImage moved, a reinstall) on every start.
+        app.launch_at_login = cfg.launch_at_login;
+        if let Err(e) = set_launch_at_login(app.launch_at_login) {
+            startup_warnings.push(e);
+        }
         app.summon_hotkey = cfg.summon_hotkey;
         app.shell = cfg.shell;
         app.welcome_open = cfg.show_welcome;
@@ -1539,16 +1594,24 @@ impl App {
         // chord / conflict / rejected bind is logged; the rest still apply.
         app.keys = cfg.keys;
         app.keymap = crate::keymap::KeyMap::compile(&app.keys);
-        for w in app.keymap.warnings() {
+        startup_warnings.extend(app.keymap.warnings().iter().map(|w| format!("[keys] {w}")));
+        app.help_rows = App::compute_help_rows(&app.keymap, &app.summon_hotkey);
+        for w in &startup_warnings {
             eprintln!("jetty: {w}");
         }
-        app.help_rows = App::compute_help_rows(&app.keymap, &app.summon_hotkey);
+        app.startup_warnings = startup_warnings;
 
         // Apply the initial theme+opacity so Terminal::new env defaults are
         // overridden by our managed state (avoids double-reads from env). Also
         // populates the `active_theme` cache from the config-resolved theme_idx.
         app.apply_theme();
         app
+    }
+
+    /// Start hidden (`jetty --background`): the window is created unmapped and the
+    /// first summon shows it. Call before the event loop runs.
+    pub fn set_start_hidden(&mut self, hidden: bool) {
+        self.start_hidden = hidden;
     }
 
     /// Build the Help overlay rows from the CURRENT keymap (so a remap is
@@ -1641,9 +1704,10 @@ impl App {
         ]
     }
 
-    /// Write the current user-tweakable settings to the on-disk config file.
-    /// Called whenever a setting changes (theme, opacity, font size/family,
-    /// corner radius). Best-effort and cheap; errors are swallowed by `save`.
+    /// Record the current user-tweakable settings for saving. Called whenever a
+    /// setting changes. Cheap and non-blocking: only the keys that differ from the
+    /// file's last-synced state are queued, and they are written ~400 ms after the
+    /// last change, in place and off the UI thread (see `config::Persister`).
     fn persist(&self) {
         // Never write config.toml while applying a reload: that would re-trigger the
         // watcher (a burst of atomic writes) and risk a loop. Combined with the
@@ -1651,11 +1715,16 @@ impl App {
         if self.reloading {
             return;
         }
-        let cfg = crate::config::Config {
-            // The current theme's stable name (registry-resolved; a user theme keeps
-            // its own name). `active_theme` is kept in lockstep with `theme_idx` by
-            // `apply_theme`, so this is the selected theme without a registry lock.
-            theme: self.active_theme.name.to_string(),
+        let cfg = self.settings_snapshot();
+        self.persister.borrow_mut().record(&cfg, std::time::Instant::now());
+    }
+
+    /// The current settings as a `Config` (what `persist` saves).
+    fn settings_snapshot(&self) -> crate::config::Config {
+        crate::config::Config {
+            // The theme the user CHOSE — not the fallback shown while it is missing
+            // (a broken user theme file must never be replaced by the fallback).
+            theme: self.theme_name.clone(),
             opacity: self.opacity,
             font_size: self.font_logical,
             font_family: self.font_family.clone(),
@@ -1691,15 +1760,117 @@ impl App {
             // Preserve the user's `[keys]` overrides verbatim (never editable via the
             // Settings UI — a settings-driven persist must not erase them).
             keys: self.keys.clone(),
-        };
-        // Record the hash of the EXACT string we're about to write so the watcher's
-        // echo of our own save is recognized and skipped on reload (secondary loop
-        // guard). `save()` re-serializes the same deterministic string, so this hash
-        // matches the on-disk bytes the reload will read.
-        if let Ok(s) = toml::to_string_pretty(&cfg) {
-            self.last_written_config_hash.set(Some(hash_config_str(&s)));
         }
-        cfg.save();
+    }
+
+    /// Select theme `i` as the user's choice (palette / Settings pick): show it and
+    /// make it the remembered `theme_name`.
+    fn pick_theme(&mut self, i: usize) {
+        self.theme_idx = i;
+        self.theme_name = jetty_core::theme_at(i).name.to_string();
+        self.apply_theme();
+    }
+
+    /// Point `theme_idx` at the chosen `theme_name`. When it is missing (a user
+    /// theme file deleted or broken mid-edit) keep showing the current theme if it
+    /// still exists, else the first built-in — and say so. Never touches
+    /// `theme_name`, so the choice survives until the file is fixed.
+    fn resolve_chosen_theme(&mut self, warnings: &mut Vec<String>) {
+        match jetty_core::theme_index(&self.theme_name) {
+            Some(i) => self.theme_idx = i,
+            None => {
+                let shown = self.active_theme.name.to_string();
+                self.theme_idx = jetty_core::theme_index(&shown)
+                    .unwrap_or(0)
+                    .min(jetty_core::theme_count().saturating_sub(1));
+                warnings.push(theme_missing_warning(
+                    &self.theme_name,
+                    &jetty_core::theme_at(self.theme_idx).display_name,
+                ));
+            }
+        }
+    }
+
+    /// Show configuration problems the user must see: a status pill on the main
+    /// window (long enough to read; several are summarized as "<first> (+N more)")
+    /// plus every one on stderr.
+    fn show_config_warnings(&mut self, warnings: &[String]) {
+        let Some(first) = warnings.first() else { return };
+        for w in warnings {
+            eprintln!("jetty: {w}");
+        }
+        let mut msg = format!("Config: {}", sanitize_notice(first));
+        if msg.chars().count() > 96 {
+            msg = msg.chars().take(93).collect::<String>() + "…";
+        }
+        if warnings.len() > 1 {
+            msg.push_str(&format!(" (+{} more)", warnings.len() - 1));
+        }
+        self.show_notice_pill(msg, 8000);
+    }
+
+    /// Show `msg` in the main window's status pill for `ms` milliseconds.
+    fn show_notice_pill(&mut self, msg: String, ms: u64) {
+        let Some(id) = self.window.as_ref().map(|w| w.id()) else { return };
+        self.status_pill =
+            Some((msg, std::time::Instant::now() + std::time::Duration::from_millis(ms), id));
+        self.request_main_paint();
+    }
+
+    /// Register the global summon hotkey (`summon_hotkey`) and forward its presses
+    /// to the event loop as `ToggleVisibility`. An invalid hotkey string falls back
+    /// to F9 and a registration failure is reported in-app — except where it is the
+    /// expected state (a Wayland session, which binds `jetty --toggle` instead).
+    fn start_summon_hotkey(&mut self) {
+        use std::str::FromStr;
+        let proxy = self.proxy.clone();
+        let spec = self.summon_hotkey.clone();
+        // global_hotkey's own parser ("F9", "F12", "Ctrl+Shift+F12").
+        let hotkey = match global_hotkey::hotkey::HotKey::from_str(&spec) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = proxy.send_event(AppEvent::ConfigNotice(format!(
+                    "summon_hotkey {spec:?} is invalid ({e}) — using F9"
+                )));
+                global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::F9)
+            }
+        };
+        // macOS: upstream requires the manager to be created — and kept — on the
+        // MAIN thread (here, in `resumed`); registering there is a cheap Carbon
+        // call. A background-thread manager (the old code) was documented as
+        // fragile and could silently never deliver F9.
+        #[cfg(target_os = "macos")]
+        {
+            let registered = global_hotkey::GlobalHotKeyManager::new()
+                .and_then(|m| m.register(hotkey).map(|()| m));
+            match registered {
+                Ok(manager) => {
+                    self.hotkey_manager = Some(manager);
+                    std::thread::spawn(move || forward_hotkey_presses(&proxy));
+                }
+                Err(e) => report_hotkey_failure(&proxy, &spec, &e.to_string()),
+            }
+        }
+        // Linux/BSD: off the main thread — GlobalHotKeyManager::register() blocks on
+        // a worker that opens a 2nd X11 connection + xkb round-trips ending in a
+        // 50 ms sleep, which used to delay the first redraw. The press events go
+        // through the async proxy either way, so moving it changes only WHERE it
+        // blocks. The manager is kept alive inside the forwarding loop.
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.hotkey_manager = Some(());
+            std::thread::spawn(move || {
+                let manager = match global_hotkey::GlobalHotKeyManager::new() {
+                    Ok(m) => m,
+                    Err(e) => return report_hotkey_failure(&proxy, &spec, &e.to_string()),
+                };
+                if let Err(e) = manager.register(hotkey) {
+                    return report_hotkey_failure(&proxy, &spec, &e.to_string());
+                }
+                forward_hotkey_presses(&proxy);
+                drop(manager);
+            });
+        }
     }
 
     /// Select a new window-summon reveal effect: persist it, fire a one-shot
@@ -1768,42 +1939,69 @@ impl App {
     /// Apply a debounced config + themes hot-reload. Runs on the UI thread from
     /// `about_to_wait`. Non-destructive and loop-free by construction:
     ///
+    /// * A save still pending or being written goes first: the reload is postponed
+    ///   until it lands, or reading the file would revert that change in memory.
     /// * THEMES are ALWAYS rebuilt + reapplied (amendment T3): editing the active
     ///   theme file leaves config.toml untouched, so the config hash-skip must not
-    ///   gate the repaint. `theme_idx` is re-resolved by NAME and re-clamped against
-    ///   the rebuilt registry (amendment T2), then `apply_theme` repaints all tabs +
-    ///   detached with the (possibly changed) palette.
-    /// * CONFIG is parsed NON-DESTRUCTIVELY (amendment H1): a parse error keeps the
-    ///   in-memory state and waits for the next event — never `.bad`, never defaults.
-    ///   A file whose content hashes to our own last write is skipped (self-write
-    ///   echo). `self.reloading` disables `persist()` for the whole apply, so no live
-    ///   key can write config.toml back (amendment H2 — loop-free by construction).
+    ///   gate the repaint. The CHOSEN theme (`theme_name`) is re-resolved against
+    ///   the rebuilt registry (amendment T2) — so a theme file fixed after a broken
+    ///   save comes back — then `apply_theme` repaints all tabs + detached.
+    /// * CONFIG is parsed key by key: an invalid value keeps the live setting, a
+    ///   syntax error keeps everything — never `.bad`, never defaults — and each
+    ///   problem is shown in a status pill. A file whose content hashes to our own
+    ///   last write is skipped (self-write echo). `self.reloading` disables
+    ///   `persist()` for the whole apply, so no live key can write config.toml back
+    ///   (amendment H2 — loop-free by construction).
     fn reload_config_and_themes(&mut self) {
+        if self.persister.borrow().busy() {
+            self.persister.borrow_mut().flush();
+            self.pending_reload_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(60));
+            return;
+        }
         self.reloading = true;
+        let mut warnings = Vec::new();
 
-        // (A) Themes — always. Rebuild the registry from disk, then re-resolve the
-        // active theme BY NAME against it (indices may have shifted) and repaint.
-        crate::themes::rebuild_registry();
-        let cur_name = self.active_theme.name.to_string();
-        self.theme_idx = jetty_core::theme_index(&cur_name)
-            .unwrap_or(0)
-            .min(jetty_core::theme_count().saturating_sub(1));
-        self.apply_theme(); // refreshes active_theme (new palette) + fans out to all surfaces
+        // (A) Themes — always. Rebuild the registry from disk.
+        warnings.extend(crate::themes::rebuild_registry());
 
-        // (B) Config — non-destructive, hash-guarded.
+        // (B) Config — per-key, hash-guarded.
         if let Ok(s) = std::fs::read_to_string(crate::config::Config::config_path()) {
-            let h = hash_config_str(&s);
+            let h = crate::config::hash_str(&s);
             // Skip our own write echoing back through the watcher.
-            if self.last_written_config_hash.get() != Some(h) {
-                if let Some(cfg) = crate::config::Config::parse_reload(&s) {
-                    self.apply_reloaded_config(cfg);
+            if !self.persister.borrow().is_self_write(h) {
+                let live = self.settings_snapshot();
+                match crate::config::Config::parse_with_base(&s, &live, "keeping the current value") {
+                    Ok((cfg, problems)) => {
+                        warnings.extend(problems);
+                        self.apply_reloaded_config(cfg.clone(), &mut warnings);
+                        // Records the observed hash too, so an identical later
+                        // hand-save no-ops.
+                        self.persister.borrow_mut().note_reloaded(cfg, h);
+                    }
+                    Err(syntax) => {
+                        warnings.push(format!(
+                            "config.toml is not valid TOML ({syntax}) — keeping the current settings"
+                        ));
+                        self.persister.borrow_mut().note_seen(h);
+                    }
                 }
-                // Record the observed hash so an identical later hand-save no-ops too.
-                self.last_written_config_hash.set(Some(h));
             }
         }
 
+        // (C) The chosen theme against the rebuilt registry (indices may have
+        // shifted), then repaint every surface with the (possibly changed) palette.
+        self.resolve_chosen_theme(&mut warnings);
+        self.apply_theme();
+
+        // (D) Keep watching a recreated config dir, a retargeted config symlink or a
+        // newly created themes/ dir.
+        if let Some(w) = self.config_watcher.as_mut() {
+            w.rearm();
+        }
+
         self.reloading = false;
+        self.show_config_warnings(&warnings);
         // Repaint chrome (theme/settings) once the reload settled.
         self.request_main_paint();
         self.request_settings_paint();
@@ -1812,19 +2010,20 @@ impl App {
     /// Apply an externally-edited `Config` LIVE, diffing against current in-memory
     /// state and touching only changed keys. Runs with `self.reloading == true`, so
     /// every setter it calls is non-persisting (they early-return in `persist`).
+    /// Problems found while applying (rejected keybindings, an unwritable autostart
+    /// entry) are appended to `warnings`.
     ///
     /// Keys mid-DRAG in the Settings panel are skipped (amendment H4): the in-flight
-    /// interactive value wins over a concurrent external edit. `summon_hotkey` and
-    /// `launch_at_login` are RESTART/external-only and deliberately NOT applied here.
-    fn apply_reloaded_config(&mut self, cfg: crate::config::Config) {
+    /// interactive value wins over a concurrent external edit. `summon_hotkey` is
+    /// RESTART-only (the global grab is registered once) and deliberately NOT
+    /// applied here (only mirrored).
+    fn apply_reloaded_config(&mut self, cfg: crate::config::Config, warnings: &mut Vec<String>) {
         let eps = f32::EPSILON;
 
-        // Theme (by name → registry index; never direct-index).
-        if let Some(idx) = jetty_core::theme_index(&cfg.theme) {
-            if idx != self.theme_idx {
-                self.theme_idx = idx;
-                self.apply_theme();
-            }
+        // Theme: remember the chosen name; the caller resolves it against the
+        // rebuilt registry right after (a missing theme falls back visibly).
+        if cfg.theme != self.theme_name {
+            self.theme_name = cfg.theme.clone();
         }
         // Opacity — skip while the user is dragging the opacity slider (H4).
         if !self.dragging_slider {
@@ -1938,12 +2137,19 @@ impl App {
         if !self.hot_reload {
             self.config_watcher = None;
         }
-        // Mirror the RESTART-ONLY-EFFECT keys too, so a later panel-driven persist()
+        // Launch at login — live: the config key is the source of truth, so the
+        // autostart entry is written/removed to match.
+        if cfg.launch_at_login != self.launch_at_login {
+            self.launch_at_login = cfg.launch_at_login;
+            if let Err(e) = set_launch_at_login(self.launch_at_login) {
+                warnings.push(e);
+            }
+        }
+        // Mirror the RESTART-ONLY-EFFECT key too, so a later panel-driven persist()
         // round-trips the user's external edit instead of clobbering it with the
-        // stale startup value. Their live EFFECTS stay restart-only (summon_hotkey is
-        // re-read at startup; launch_at_login's source of truth is the autostart file,
-        // so it is deliberately NOT mirrored here) — but the on-disk value must
-        // survive an external edit + a subsequent unrelated Settings change.
+        // stale startup value. Its live EFFECT stays restart-only (the summon grab
+        // is registered once at startup) — but the on-disk value must survive an
+        // external edit + a subsequent unrelated Settings change.
         self.summon_hotkey = cfg.summon_hotkey.clone();
         self.cfg_show_welcome = cfg.show_welcome;
         // shell: mirror so new tabs spawned after the reload use the edited shell.
@@ -1953,9 +2159,7 @@ impl App {
         // skips the rebuild). No redraw needed; the next keypress uses the new map.
         if cfg.keys != self.keys {
             let new_km = crate::keymap::KeyMap::compile(&cfg.keys);
-            for w in new_km.warnings() {
-                eprintln!("jetty: {w}");
-            }
+            warnings.extend(new_km.warnings().iter().map(|w| format!("[keys] {w}")));
             self.keys = cfg.keys.clone();
             self.keymap = new_km;
             self.help_rows = App::compute_help_rows(&self.keymap, &self.summon_hotkey);
@@ -3105,16 +3309,50 @@ impl App {
             }
             C::ToggleLaunchAtLogin => {
                 self.launch_at_login = !self.launch_at_login;
-                set_launch_at_login(self.launch_at_login);
+                if let Err(e) = set_launch_at_login(self.launch_at_login) {
+                    self.show_config_warnings(&[e]);
+                }
                 self.persist();
             }
             C::ResetKeybindings => {
+                // Destructive (every hand-written binding goes), so it asks first:
+                // the first run arms a confirmation, a second run within 6 s
+                // resets — after copying config.toml aside.
+                let now = std::time::Instant::now();
+                if self.reset_keys_armed_until.is_none_or(|t| now >= t) {
+                    self.reset_keys_armed_until = Some(now + std::time::Duration::from_secs(6));
+                    self.show_notice_pill(
+                        "Run \u{201c}Reset keybindings\u{201d} again within 6 s to confirm (a backup is saved first)"
+                            .to_string(),
+                        6000,
+                    );
+                    return;
+                }
+                self.reset_keys_armed_until = None;
+                let backed_up = self.persister.borrow_mut().backup();
+                let backup = match backed_up {
+                    Ok(path) => path,
+                    Err(e) => {
+                        // No backup → no reset: the user's bindings stay intact.
+                        self.show_config_warnings(&[format!(
+                            "keybindings NOT reset — could not back up config.toml: {e}"
+                        )]);
+                        return;
+                    }
+                };
                 // Clear every user `[keys]` override → back to the built-in defaults.
                 self.keys = crate::config::KeyBindings::default();
                 self.keymap = crate::keymap::KeyMap::compile(&self.keys);
                 self.help_rows = App::compute_help_rows(&self.keymap, &self.summon_hotkey);
                 self.persist();
-                self.request_main_paint();
+                let msg = match backup {
+                    Some(p) => format!(
+                        "Keybindings reset to defaults — backup: {}",
+                        p.file_name().and_then(|n| n.to_str()).unwrap_or("config.toml.bak")
+                    ),
+                    None => "Keybindings reset to defaults".to_string(),
+                };
+                self.show_notice_pill(msg, 6000);
             }
             // Main-window only, like Hide: the palette itself is main-window only.
             C::ToggleFullscreen => self.set_main_fullscreen(!self.main_fullscreen),
@@ -3126,8 +3364,7 @@ impl App {
             // Index-bearing dynamic actions: `.get()`-guard against a stale index.
             C::SetTheme(i) => {
                 if i < jetty_core::theme_count() {
-                    self.theme_idx = i;
-                    self.apply_theme();
+                    self.pick_theme(i);
                     self.persist();
                     self.redraw_main_and_detached();
                 }
@@ -5026,6 +5263,8 @@ impl App {
             win.set_visible(false);
         }
         self.visible = false;
+        // Save a still-debounced settings change now (non-blocking).
+        self.persister.borrow_mut().flush();
         // The matching button-release never arrives once hidden — clear the
         // terminal drag state so it doesn't resume stuck on the next summon.
         self.selecting = false;
@@ -5229,6 +5468,8 @@ impl App {
                 self.summon_anim = None;
                 self.summon_pending = false;
                 win.set_visible(false);
+                // Save a still-debounced settings change now (non-blocking).
+                self.persister.borrow_mut().flush();
                 // The matching button-release never arrives once hidden — clear
                 // the terminal drag state so it doesn't resume stuck on the next
                 // summon (mirrors autohide_main_window; the F9/IPC hide path
@@ -7069,8 +7310,7 @@ impl App {
             }
             input::MouseAction::SetTheme(i) => {
                 if i < jetty_core::theme_count() {
-                    self.theme_idx = i;
-                    self.apply_theme();
+                    self.pick_theme(i);
                 }
                 self.theme_dropdown_open = false;
             }
@@ -7294,9 +7534,11 @@ impl App {
             }
             input::MouseAction::ToggleLaunchAtLogin => {
                 self.launch_at_login = !self.launch_at_login;
-                // Write/remove the XDG autostart .desktop file to match. The file's
-                // existence is the source of truth; persist() (below) mirrors it.
-                set_launch_at_login(self.launch_at_login);
+                // Write/remove the login autostart entry to match; persist() (below)
+                // saves the config key, which is the source of truth.
+                if let Err(e) = set_launch_at_login(self.launch_at_login) {
+                    self.show_config_warnings(&[e]);
+                }
             }
             // The OS title bar moves the window now; in-panel drag/consume are no-ops.
             input::MouseAction::StartDialogDrag
@@ -7663,6 +7905,8 @@ impl ApplicationHandler<AppEvent> for App {
     /// and menu bar auto-hidden for the rest of their session, in every other app.
     /// A no-op on every other platform and whenever nothing is fullscreen.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Write a still-debounced settings change before the process goes away.
+        self.persister.borrow_mut().flush_and_wait(std::time::Duration::from_millis(1500));
         self.exit_main_fullscreen_bare();
         // Detached windows are dropped with `App` too, and each one carries the
         // same app-scoped macOS presentation-options hazard.
@@ -7758,6 +8002,17 @@ impl ApplicationHandler<AppEvent> for App {
         {
             self.pending_reload_at = None;
             self.reload_config_and_themes();
+        }
+        // Debounced settings save: the burst of changes settled — hand them to the
+        // background writer (non-blocking). The deadline is folded into WaitUntil
+        // below, so this costs one wake per burst.
+        if self
+            .persister
+            .borrow()
+            .due_at()
+            .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            self.persister.borrow_mut().flush();
         }
         // Run-selection pending-inject deadlines (elapsed ones service HERE,
         // future ones fold into WaitUntil below — the same two-halves pattern
@@ -7883,6 +8138,10 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some(d) = self.pending_reload_at {
             merge_wake(&mut wake_at, d);
         }
+        // The debounced settings-save deadline (an elapsed one was flushed above).
+        if let Some(d) = self.persister.borrow().due_at() {
+            merge_wake(&mut wake_at, d);
+        }
         // Pending synchronized-update (CSI ?2026) flush deadline: wake exactly
         // once at the soonest so a stuck BSU is force-flushed on time. Any
         // already-elapsed deadline was flushed at the top of this fn, so this is
@@ -7988,8 +8247,17 @@ impl ApplicationHandler<AppEvent> for App {
         // Startup: a failure to create the main window is genuinely fatal (there
         // is nothing to fall back to), so surface it as a clean panic here — the
         // runtime detach/settings call sites handle their `Err` gracefully.
-        let window = jetty_platform::build_window(event_loop, "JeTTY", (1000, 640))
-            .expect("create_window failed");
+        // `jetty --background` (the login autostart entry) creates the window
+        // UNMAPPED — no flash at login. The first summon then places, maps and
+        // reveals it per `window_mode` through the normal show path, exactly like
+        // any later summon (rule F0: never fullscreen while hidden).
+        let window = jetty_platform::build_window_with_visibility(
+            event_loop,
+            "JeTTY",
+            (1000, 640),
+            !self.start_hidden,
+        )
+        .expect("create_window failed");
         // Allow IME on the terminal window (winit disables it by default):
         // without this, CJK/complex input methods can never commit text and
         // dead-key composition is degraded. Commits arrive as
@@ -7997,8 +8265,13 @@ impl ApplicationHandler<AppEvent> for App {
         // text; preedit rendering is intentionally not implemented.
         window.set_ime_allowed(true);
         // First open: place the window per the configured mode. Center mode
-        // centers; Dropdown mode docks as a top strip and slides in.
+        // centers; Dropdown mode docks as a top strip and slides in. A hidden
+        // start (`--background`) skips this — its first summon does it.
+        if self.start_hidden {
+            self.visible = false;
+        }
         match self.window_mode {
+            _ if self.start_hidden => {}
             WindowMode::Center => center_window(&window),
             WindowMode::Fullscreen => {
                 // `build_window` already created AND ordered/mapped the window
@@ -8206,6 +8479,12 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some(notice) = pty.startup_notice() {
             terminal.feed(format!("\x1b[33m{notice}\x1b[0m\r\n").as_bytes());
         }
+        // Config / theme / keybinding problems found at startup, printed where the
+        // user will see them (a desktop launch has no visible stderr). Sanitized:
+        // the text quotes the user's file, which must never inject escapes here.
+        for w in std::mem::take(&mut self.startup_warnings) {
+            terminal.feed(format!("\x1b[33mjetty: {}\x1b[0m\r\n", sanitize_notice(&w)).as_bytes());
+        }
         let writer = pty.writer();
         self.tabs.push(Tab {
             terminal,
@@ -8219,51 +8498,10 @@ impl ApplicationHandler<AppEvent> for App {
         });
         self.active = 0;
 
-        // Register the F9 global hotkey (Yakuake-style toggle). This only works
-        // on X11; on Wayland registration will fail and we log a warning without
-        // crashing. The manager must be kept alive (stored in self.hotkey_manager)
-        // or the hotkey is automatically unregistered when it drops.
-        // Off the main thread: GlobalHotKeyManager::register() blocks on a worker
-        // that opens a 2nd X11 connection + xkb round-trips at the tail of a loop
-        // ending in a 50ms sleep — that wait used to sit at the END of resumed(),
-        // directly delaying the first redraw. The F9 event was already delivered
-        // through the async proxy (never read synchronously), so moving register()
-        // off-thread changes only WHERE it blocks, not the event semantics. The
-        // manager is kept alive inside the forwarding loop (which never returns).
+        // Register the global summon hotkey (Yakuake-style toggle). The manager
+        // must stay alive or the hotkey unregisters when it drops.
         if self.hotkey_manager.is_none() {
-            self.hotkey_manager = Some(());
-            let proxy_hotkey = self.proxy.clone();
-            let summon_hotkey = self.summon_hotkey.clone();
-            std::thread::spawn(move || {
-                use std::str::FromStr;
-                let manager = match global_hotkey::GlobalHotKeyManager::new() {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("global hotkey {summon_hotkey} unavailable (Wayland? already grabbed?) — {e}");
-                        return;
-                    }
-                };
-                // Parse the configured string with global_hotkey's own parser
-                // (handles "F9", "F12", and even "Ctrl+Shift+F12"); fall back to F9.
-                let hotkey = global_hotkey::hotkey::HotKey::from_str(&summon_hotkey)
-                    .unwrap_or_else(|e| {
-                        eprintln!("invalid summon_hotkey {summon_hotkey:?} ({e}); falling back to F9");
-                        global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::F9)
-                    });
-                if let Err(e) = manager.register(hotkey) {
-                    eprintln!("global hotkey {summon_hotkey} unavailable (Wayland? already grabbed?) — {e}");
-                    return;
-                }
-                // Forward summon-key-pressed events to the winit loop. Keeps `manager`
-                // alive for the program lifetime (this loop never returns).
-                let rx = global_hotkey::GlobalHotKeyEvent::receiver();
-                while let Ok(ev) = rx.recv() {
-                    if ev.state == global_hotkey::HotKeyState::Pressed {
-                        let _ = proxy_hotkey.send_event(AppEvent::ToggleVisibility);
-                    }
-                }
-                drop(manager);
-            });
+            self.start_summon_hotkey();
         }
 
         // Slow safety heartbeat — 100ms is enough for any future time-based UI
@@ -8275,7 +8513,13 @@ impl ApplicationHandler<AppEvent> for App {
         // thread blocks in the kernel and adds ZERO idle CPU. The returned handle is
         // stored so it lives for the process lifetime (dropping it stops watching).
         if self.hot_reload && self.config_watcher.is_none() {
-            self.config_watcher = crate::watch::spawn_config_watcher(self.proxy.clone());
+            let proxy = self.proxy.clone();
+            self.config_watcher =
+                crate::watch::ConfigWatcher::spawn(crate::config::Config::dir(), move || {
+                    // Coalesced app-side (debounced in about_to_wait); a send error
+                    // just means the loop is gone (shutting down).
+                    let _ = proxy.send_event(AppEvent::ConfigChanged);
+                });
         }
 
         self.request_main_paint();
@@ -8432,6 +8676,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.pending_reload_at =
                     Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
             }
+            AppEvent::ConfigNotice(msg) => self.show_config_warnings(&[msg]),
         }
     }
 
@@ -11847,14 +12092,50 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
     b
 }
 
-/// Hash a config-file string to a `u64` (self-write guard for hot-reload). Content-
-/// based and dependency-free; only equality matters, so the exact algorithm is
-/// irrelevant as long as it is deterministic within a process run.
-fn hash_config_str(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
+/// The warning for a chosen theme that isn't in the registry (`shown` is the
+/// display name of the fallback on screen).
+fn theme_missing_warning(name: &str, shown: &str) -> String {
+    format!(
+        "theme {name:?} not found (missing or invalid theme file?) — showing \
+         {shown:?} until it loads"
+    )
+}
+
+/// Make user-derived notice text safe to print into a terminal or a pill: every
+/// control character (ESC, CR, C1, …) becomes a visible `�`, so a value quoted
+/// from config.toml can never inject an escape sequence.
+fn sanitize_notice(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '\u{FFFD}' } else { c }).collect()
+}
+
+/// Forward global summon-hotkey presses to the event loop (blocks for the
+/// process lifetime on the hotkey receiver).
+fn forward_hotkey_presses(proxy: &EventLoopProxy<AppEvent>) {
+    let rx = global_hotkey::GlobalHotKeyEvent::receiver();
+    while let Ok(ev) = rx.recv() {
+        if ev.state == global_hotkey::HotKeyState::Pressed && proxy.send_event(AppEvent::ToggleVisibility).is_err() {
+            break;
+        }
+    }
+}
+
+/// Report that the global summon hotkey could not be registered. Logged always;
+/// shown in-app unless this is a Wayland session, where apps can't grab keys by
+/// design and `jetty --toggle` bound in the compositor is the documented path.
+fn report_hotkey_failure(proxy: &EventLoopProxy<AppEvent>, spec: &str, err: &str) {
+    eprintln!("jetty: global hotkey {spec} unavailable — {err}");
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland");
+    if cfg!(target_os = "macos") || !wayland {
+        let hint = if cfg!(target_os = "macos") {
+            "grant JeTTY Accessibility permission, or bind `jetty --toggle` to a shortcut"
+        } else {
+            "another app may hold it — set another `summon_hotkey`, or bind `jetty --toggle`"
+        };
+        let _ = proxy.send_event(AppEvent::ConfigNotice(format!(
+            "summon hotkey {spec} unavailable ({err}) — {hint}"
+        )));
+    }
 }
 
 fn spawn_waker(proxy: EventLoopProxy<AppEvent>) {
@@ -11885,66 +12166,150 @@ fn selection_bg_for(theme: &jetty_core::Theme) -> [u8; 3] {
     ]
 }
 
-/// Path to the XDG autostart entry: `$XDG_CONFIG_HOME/autostart/jetty.desktop`,
-/// falling back to `~/.config/autostart/jetty.desktop`. This is the freedesktop
-/// standard honored by KDE/GNOME/any DE — no desktop-environment-specific code.
+/// The launchd label of the macOS login item (also its plist file name).
+const LAUNCH_AGENT_LABEL: &str = "io.github.bozdemir.jetty";
+
+/// Where the login-autostart entry lives. Linux/BSD: the freedesktop XDG autostart
+/// file `$XDG_CONFIG_HOME/autostart/jetty.desktop` (falling back to
+/// `~/.config/autostart/`), honored by KDE/GNOME/any DE — no desktop-environment-
+/// specific code. macOS (which ignores XDG autostart): a launchd LaunchAgent,
+/// `~/Library/LaunchAgents/io.github.bozdemir.jetty.plist`.
 fn autostart_path() -> std::path::PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .unwrap_or_else(|| std::path::PathBuf::from(".config"));
-    base.join("autostart").join("jetty.desktop")
+    #[cfg(target_os = "macos")]
+    {
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{LAUNCH_AGENT_LABEL}.plist"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+            .unwrap_or_else(|| std::path::PathBuf::from(".config"));
+        base.join("autostart").join("jetty.desktop")
+    }
 }
 
-/// True when the autostart `.desktop` file exists — the source of truth for the
-/// "Launch at login" toggle state at startup.
-fn autostart_file_exists() -> bool {
-    autostart_path().exists()
+/// The program the autostart entry launches: the AppImage FILE when running from
+/// one (`$APPIMAGE` — `current_exe()` is then a temporary `/tmp/.mount_*` path that
+/// is gone by the next login), else this executable, else `jetty` from PATH.
+fn autostart_program(appimage: Option<String>, exe: Option<String>) -> String {
+    appimage
+        .filter(|p| !p.is_empty())
+        .or(exe)
+        .unwrap_or_else(|| "jetty".to_string())
 }
 
-/// Write (enabled) or remove (disabled) the XDG autostart `.desktop` file.
-/// Best-effort: logs a one-line error and never panics.
-fn set_launch_at_login(enabled: bool) {
-    let path = autostart_path();
-    if enabled {
-        if let Some(dir) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                eprintln!("launch-at-login: could not create {}: {e}", dir.display());
-                return;
+/// The freedesktop autostart entry. Starts with `--background`: at login JeTTY
+/// comes up hidden, holding the summon hotkey, instead of popping a window.
+/// `Exec=` is quoted per the Desktop Entry spec (see `desktop_exec_arg`).
+fn autostart_desktop_entry(program: &str) -> String {
+    let exec = desktop_exec_arg(program);
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=JeTTY\n\
+         GenericName=Terminal Emulator\n\
+         Comment=Blazing-fast GPU terminal with a center-summon hotkey (starts hidden at login; holds the summon hotkey)\n\
+         Exec={exec} --background\n\
+         Icon=jetty\n\
+         Terminal=false\n\
+         Categories=System;TerminalEmulator;Utility;\n\
+         StartupWMClass=jetty\n\
+         X-GNOME-Autostart-enabled=true\n\
+         X-JeTTY-Generated=true\n"
+    )
+}
+
+/// Was this autostart file written by JeTTY (now or by an older version)? Only
+/// those are rewritten or removed: an entry the user made themselves at the same
+/// path (e.g. a desktop's own "add to autostart") is never touched.
+fn is_jetty_autostart_entry(content: &str) -> bool {
+    content.contains("X-JeTTY-Generated=true")
+        // Pre-v0.26 JeTTY entries carried this comment and no marker.
+        || content.contains("(autostart: holds the F9 grab)")
+        || content.contains(&format!("<string>{LAUNCH_AGENT_LABEL}</string>"))
+}
+
+/// The macOS LaunchAgent: run `program --background` once at login.
+fn launch_agent_plist(program: &str) -> String {
+    let xml = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \t<key>Label</key>\n\
+         \t<string>{LAUNCH_AGENT_LABEL}</string>\n\
+         \t<key>ProgramArguments</key>\n\
+         \t<array>\n\
+         \t\t<string>{}</string>\n\
+         \t\t<string>--background</string>\n\
+         \t</array>\n\
+         \t<key>RunAtLoad</key>\n\
+         \t<true/>\n\
+         \t<key>ProcessType</key>\n\
+         \t<string>Interactive</string>\n\
+         </dict>\n\
+         </plist>\n",
+        xml(program)
+    )
+}
+
+/// Make the login-autostart entry match `enabled` (the config key — the source
+/// of truth): write it, refreshing a stale program path, or remove it. Never
+/// panics; a failure is returned for display.
+fn set_launch_at_login(enabled: bool) -> Result<(), String> {
+    let contents = enabled.then(|| {
+        let program = autostart_program(
+            std::env::var("APPIMAGE").ok(),
+            std::env::current_exe().ok().and_then(|p| p.to_str().map(str::to_string)),
+        );
+        if cfg!(target_os = "macos") {
+            launch_agent_plist(&program)
+        } else {
+            autostart_desktop_entry(&program)
+        }
+    });
+    sync_autostart_file(&autostart_path(), contents.as_deref())
+}
+
+/// Write `contents` to `path` (only when it differs — no churn on every start) or,
+/// for `None`, remove it (a missing file is already the goal). A file at `path`
+/// that JeTTY did not write is left alone either way.
+fn sync_autostart_file(path: &std::path::Path, contents: Option<&str>) -> Result<(), String> {
+    let current = std::fs::read_to_string(path).ok();
+    if current.as_deref().is_some_and(|c| !is_jetty_autostart_entry(c)) {
+        return Ok(());
+    }
+    match contents {
+        Some(c) => {
+            if current.as_deref() == Some(c) {
+                return Ok(());
             }
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    format!("launch at login: could not create {}: {e}", dir.display())
+                })?;
+            }
+            std::fs::write(path, c)
+                .map_err(|e| format!("launch at login: could not write {}: {e}", path.display()))
         }
-        // Use the absolute path of the current executable so the entry works
-        // regardless of install location; fall back to the bare "jetty" name.
-        // Quoted/escaped per the Desktop Entry spec: a path with a space would
-        // otherwise be parsed as program + argument (autostart silently dead),
-        // and a literal '%' would be consumed as a field code.
-        let exec = desktop_exec_arg(
-            &std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(str::to_string))
-                .unwrap_or_else(|| "jetty".to_string()),
-        );
-        let contents = format!(
-            "[Desktop Entry]\n\
-             Type=Application\n\
-             Name=JeTTY\n\
-             GenericName=Terminal Emulator\n\
-             Comment=Blazing-fast GPU terminal with a center-summon hotkey (autostart: holds the F9 grab)\n\
-             Exec={exec}\n\
-             Icon=jetty\n\
-             Terminal=false\n\
-             Categories=System;TerminalEmulator;Utility;\n\
-             StartupWMClass=jetty\n\
-             X-GNOME-Autostart-enabled=true\n"
-        );
-        if let Err(e) = std::fs::write(&path, contents) {
-            eprintln!("launch-at-login: could not write {}: {e}", path.display());
-        }
-    } else if let Err(e) = std::fs::remove_file(&path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("launch-at-login: could not remove {}: {e}", path.display());
-        }
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("launch at login: could not remove {}: {e}", path.display())),
+        },
     }
 }
 
@@ -12556,6 +12921,75 @@ mod desktop_exec_arg_tests {
 }
 
 #[cfg(test)]
+mod autostart_tests {
+    use super::{autostart_desktop_entry, autostart_program, launch_agent_plist, sync_autostart_file};
+
+    #[test]
+    fn appimage_file_wins_over_its_temporary_mount() {
+        // Inside an AppImage, current_exe() is /tmp/.mount_XXXX/usr/bin/jetty —
+        // gone by the next login. $APPIMAGE is the real file.
+        assert_eq!(
+            autostart_program(
+                Some("/home/u/Apps/JeTTY.AppImage".to_string()),
+                Some("/tmp/.mount_abc/usr/bin/jetty".to_string())
+            ),
+            "/home/u/Apps/JeTTY.AppImage"
+        );
+        assert_eq!(autostart_program(None, Some("/usr/bin/jetty".to_string())), "/usr/bin/jetty");
+        assert_eq!(autostart_program(Some(String::new()), Some("/usr/bin/jetty".to_string())), "/usr/bin/jetty");
+        assert_eq!(autostart_program(None, None), "jetty");
+    }
+
+    #[test]
+    fn desktop_entry_starts_hidden_and_quotes_the_path() {
+        let e = autostart_desktop_entry("/home/u/My Apps/jetty");
+        assert!(e.contains("Exec=\"/home/u/My Apps/jetty\" --background\n"), "{e}");
+        assert!(e.starts_with("[Desktop Entry]\n"));
+    }
+
+    #[test]
+    fn launch_agent_runs_at_load_hidden_and_escapes_xml() {
+        let p = launch_agent_plist("/Users/u/A&B <x>/jetty");
+        assert!(p.contains("<string>/Users/u/A&amp;B &lt;x&gt;/jetty</string>"), "{p}");
+        assert!(p.contains("<string>--background</string>"));
+        assert!(p.contains("<key>RunAtLoad</key>\n\t<true/>"));
+        assert!(p.contains("<string>io.github.bozdemir.jetty</string>"));
+    }
+
+    #[test]
+    fn sync_writes_refreshes_and_removes_only_its_own_entry() {
+        let dir = std::env::temp_dir().join(format!("jetty-autostart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("autostart").join("jetty.desktop");
+        let v1 = autostart_desktop_entry("/usr/bin/jetty");
+        let v2 = autostart_desktop_entry("/opt/jetty/jetty");
+        sync_autostart_file(&path, Some(&v1)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), v1);
+        // A stale entry (old program path) is refreshed.
+        sync_autostart_file(&path, Some(&v2)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), v2);
+        sync_autostart_file(&path, None).unwrap();
+        assert!(!path.exists());
+        // Removing what isn't there is fine.
+        sync_autostart_file(&path, None).unwrap();
+        // A pre-v0.26 JeTTY entry (no marker) is still recognized as ours.
+        let legacy = "[Desktop Entry]\nComment=Blazing-fast GPU terminal with a center-summon hotkey (autostart: holds the F9 grab)\nExec=/usr/bin/jetty\n";
+        std::fs::write(&path, legacy).unwrap();
+        sync_autostart_file(&path, Some(&v1)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), v1, "legacy entry upgraded");
+        // An entry the USER made (e.g. their desktop's "add to autostart") is never
+        // rewritten or deleted.
+        let users = "[Desktop Entry]\nName=JeTTY\nExec=jetty --show\n";
+        std::fs::write(&path, users).unwrap();
+        sync_autostart_file(&path, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), users);
+        sync_autostart_file(&path, Some(&v1)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), users);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod printable_keystroke_tests {
     use super::is_printable_keystroke;
 
@@ -12799,7 +13233,8 @@ mod shift_hint_tests {
 
 #[cfg(test)]
 mod hot_reload_tests {
-    use super::{floor_char_boundary, hash_config_str};
+    use super::{floor_char_boundary, sanitize_notice, theme_missing_warning};
+    use crate::config::hash_str as hash_config_str;
 
     /// The self-write guard: a reload is IGNORED iff the on-disk content hashes to
     /// the value we last wrote (our own save echoing back through the watcher).
@@ -12823,6 +13258,16 @@ mod hot_reload_tests {
     }
 
     #[test]
+    fn notices_cannot_inject_escapes() {
+        // Config warnings quote the user's file and are printed INTO the first tab;
+        // an ESC/CR/BEL/C1 in a value must arrive as a visible placeholder.
+        let s = sanitize_notice("`theme = \"x\u{1b}]52;c;AAA\u{7}\r\n\u{9b}31m\"` is invalid");
+        assert!(!s.chars().any(|c| c.is_control()), "{s:?}");
+        assert!(s.contains("]52;c;AAA"), "printable text is kept: {s:?}");
+        assert!(theme_missing_warning("mine", "Catppuccin Mocha").contains("\"mine\""));
+    }
+
+    #[test]
     fn osc52_reply_cap_never_splits_a_char() {
         // The paste-reply cap must land on a char boundary so String::truncate can't
         // panic on a multibyte char straddling the cap.
@@ -12837,21 +13282,22 @@ mod hot_reload_tests {
         assert_eq!(floor_char_boundary(s, s.len() + 10), s.len());
     }
 
-    /// Which config keys apply LIVE on hot-reload vs require a RESTART/external action.
-    /// Mirrors `apply_reloaded_config` (live keys are applied there; `summon_hotkey`
-    /// and `launch_at_login` are deliberately skipped). Test-only classifier so the
-    /// documented contract is locked in.
+    /// Which config keys apply LIVE on hot-reload vs require a RESTART. Mirrors
+    /// `apply_reloaded_config` (live keys are applied there; only `summon_hotkey`
+    /// is skipped — the global grab is registered once). Test-only classifier so
+    /// the documented contract is locked in.
     fn is_restart_only(key: &str) -> bool {
-        matches!(key, "summon_hotkey" | "launch_at_login")
+        matches!(key, "summon_hotkey")
     }
 
     #[test]
     fn live_vs_restart_key_classification() {
-        // Restart/external-only keys.
+        // Restart-only key.
         assert!(is_restart_only("summon_hotkey"));
-        assert!(is_restart_only("launch_at_login"));
-        // Everything else applies live on reload.
+        // Everything else applies live on reload — including launch_at_login, whose
+        // config key is the source of truth for the autostart entry.
         for k in [
+            "launch_at_login",
             "theme",
             "opacity",
             "font_size",

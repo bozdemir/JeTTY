@@ -7,9 +7,9 @@
 //! parsed data + the registry.
 //!
 //! Never panics: a malformed file (bad TOML, bad hex, wrong palette length, missing
-//! a required field) is skipped-and-logged; the other themes still load. `read_dir`
-//! order is unspecified, so files are SORTED before loading, making "duplicate user
-//! name → last wins" deterministic.
+//! a required field) is skipped and reported (the app shows the warning); the other
+//! themes still load. `read_dir` order is unspecified, so files are SORTED before
+//! loading, making "duplicate user name → last wins" deterministic.
 //!
 //! ## Schema (`~/.config/jetty/themes/<id>.toml`)
 //! ```toml
@@ -83,6 +83,14 @@ impl AnsiTable {
 /// Parse a hex color (`#rrggbb`, `#rgb`, `rrggbb`, or `rgb`) to `[r, g, b]`.
 fn parse_hex(s: &str) -> Result<[u8; 3], String> {
     let h = s.trim().trim_start_matches('#');
+    // Validate BEFORE slicing: the length match below counts BYTES, so a non-ASCII
+    // value with a matching byte length (`"#aç"`, `"#1é1e2"`) would byte-slice
+    // through a UTF-8 char and panic — crashing the whole terminal on startup or
+    // on a theme hot-reload. `from_str_radix` would also accept a leading `+`
+    // (`"#+f+f+f"`). Requiring ASCII hex digits rules out both.
+    if !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("bad hex color {s:?} (want #rrggbb or #rgb)"));
+    }
     let byte = |two: &str| u8::from_str_radix(two, 16).map_err(|_| format!("bad hex color {s:?}"));
     match h.len() {
         6 => Ok([byte(&h[0..2])?, byte(&h[2..4])?, byte(&h[4..6])?]),
@@ -162,18 +170,23 @@ fn theme_from_toml(t: ThemeToml, stem: &str) -> Result<jetty_core::Theme, String
     })
 }
 
-/// Read `~/.config/jetty/themes/*.toml` into a `Vec<Theme>`. Never panics: a
-/// malformed file is skipped-and-logged; a missing directory yields `[]`. Files are
-/// sorted by path so duplicate names resolve deterministically (last wins).
-pub fn load_user_themes() -> Vec<jetty_core::Theme> {
-    let dir = crate::config::Config::dir().join("themes");
-    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
+/// Read `<dir>/*.toml` (the user themes dir) into a `Vec<Theme>`, plus a warning
+/// per problem. Never panics: a malformed file is skipped (and reported); a missing
+/// directory yields `[]`. Files are sorted by path so duplicate names resolve
+/// deterministically (last wins).
+pub fn load_user_themes_from(dir: &std::path::Path) -> (Vec<jetty_core::Theme>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("toml"))
+            // `.tmp.` = an editor's / our own atomic-save temp file mid-write.
+            .filter(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("toml")
+                    && !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(".tmp."))
+            })
             .collect(),
-        Err(_) => return Vec::new(), // no themes dir → no user themes
+        Err(_) => return (Vec::new(), warnings), // no themes dir → no user themes
     };
     files.sort(); // deterministic load order (read_dir order is unspecified)
 
@@ -184,36 +197,42 @@ pub fn load_user_themes() -> Vec<jetty_core::Theme> {
             .and_then(|s| s.to_str())
             .unwrap_or("theme")
             .to_string();
+        let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("jetty: skipping theme {}: {e}", path.display());
+                warnings.push(format!("theme file themes/{file} skipped: {e}"));
                 continue;
             }
         };
         let parsed: ThemeToml = match toml::from_str(&content) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("jetty: skipping theme {}: {e}", path.display());
+                warnings.push(format!("theme file themes/{file} skipped: {}", e.message().trim()));
                 continue;
             }
         };
         match theme_from_toml(parsed, &stem) {
             Ok(theme) => {
-                // Duplicate user name → last wins (drop the earlier one), logged.
+                // Duplicate user name → last wins (drop the earlier one), reported.
                 if let Some(pos) = out.iter().position(|t| t.name == theme.name) {
-                    eprintln!(
-                        "jetty: duplicate user theme name {:?} (later file wins)",
+                    warnings.push(format!(
+                        "two theme files are named {:?} — themes/{file} wins",
                         theme.name
-                    );
+                    ));
                     out.remove(pos);
                 }
                 out.push(theme);
             }
-            Err(e) => eprintln!("jetty: skipping theme {}: {e}", path.display()),
+            Err(e) => warnings.push(format!("theme file themes/{file} skipped: {e}")),
         }
     }
-    out
+    (out, warnings)
+}
+
+/// The user themes from `~/.config/jetty/themes/` (see [`load_user_themes_from`]).
+pub fn load_user_themes() -> (Vec<jetty_core::Theme>, Vec<String>) {
+    load_user_themes_from(&crate::config::Config::dir().join("themes"))
 }
 
 /// Merge the built-ins (PRESETS order) with `user` themes: a user theme whose `name`
@@ -231,9 +250,12 @@ fn merge_into_builtins(user: Vec<jetty_core::Theme>) -> Vec<jetty_core::Theme> {
 }
 
 /// Rebuild the runtime theme registry from the built-ins + the current user themes
-/// on disk. Called once at startup and on every hot-reload of `themes/`.
-pub fn rebuild_registry() {
-    jetty_core::set_registry(merge_into_builtins(load_user_themes()));
+/// on disk. Called once at startup and on every hot-reload of `themes/`. Returns a
+/// warning per skipped / shadowed theme file, for the app to show (also logged).
+pub fn rebuild_registry() -> Vec<String> {
+    let (user, warnings) = load_user_themes();
+    jetty_core::set_registry(merge_into_builtins(user));
+    warnings
 }
 
 #[cfg(test)]
@@ -254,6 +276,24 @@ mod tests {
         assert_eq!(parse_hex("#abc").unwrap(), [170, 187, 204]);
         assert!(parse_hex("#12").is_err());
         assert!(parse_hex("#gggggg").is_err());
+    }
+
+    #[test]
+    fn non_ascii_or_signed_hex_is_an_error_not_a_panic() {
+        // Byte lengths 3 and 6 with a multi-byte char used to slice through it
+        // and panic ("byte index 2 is not a char boundary") — on startup or a
+        // theme hot-reload that killed the terminal with every shell.
+        for bad in ["#aç", "#ç1", "#1é1e2", "#€", "ğğğ", "#+f+f+f", "+ff", "#-1-1-1"] {
+            assert!(parse_hex(bad).is_err(), "{bad:?} must be rejected, not panic");
+        }
+        // A whole theme file with such a value is skipped, never panics.
+        let toml = r##"
+background = "#1é1e2"
+foreground = "#eeeeee"
+cursor = "#ffffff"
+palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606","#070707","#080808","#090909","#0a0a0a","#0b0b0b","#0c0c0c","#0d0d0d","#0e0e0e","#0f0f0f"]
+"##;
+        assert!(parse(toml, "x").is_err());
     }
 
     #[test]
@@ -389,6 +429,30 @@ cursor = "#ffffff"
 palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606","#070707","#080808","#090909","#0a0a0a","#0b0b0b","#0c0c0c","#0d0d0d","#0e0e0e","#0f0f0f"]
 "##;
         assert!(parse(toml, "x").is_err());
+    }
+
+    #[test]
+    fn theme_dir_problems_are_reported_and_good_files_still_load() {
+        let dir = std::env::temp_dir().join(format!("jetty-themes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let palette = r##"palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606","#070707","#080808","#090909","#0a0a0a","#0b0b0b","#0c0c0c","#0d0d0d","#0e0e0e","#0f0f0f"]"##;
+        let good = format!("background = \"#101010\"\nforeground = \"#eeeeee\"\ncursor = \"#ffffff\"\n{palette}\n");
+        std::fs::write(dir.join("a_good.toml"), &good).unwrap();
+        std::fs::write(dir.join("b_badhex.toml"), good.replace("#101010", "#aç")).unwrap();
+        std::fs::write(dir.join("c_notoml.toml"), "background = = 1\n").unwrap();
+        // An in-flight atomic-save temp file is not a theme.
+        std::fs::write(dir.join(".a_good.toml.tmp.42.toml"), "garbage").unwrap();
+        let (themes, warnings) = load_user_themes_from(&dir);
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].name.as_ref(), "a_good");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("b_badhex.toml"), "{warnings:?}");
+        assert!(warnings[1].contains("c_notoml.toml"), "{warnings:?}");
+        // A missing dir is simply no user themes.
+        let (none, w) = load_user_themes_from(&dir.join("nope"));
+        assert!(none.is_empty() && w.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

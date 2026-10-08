@@ -35,7 +35,20 @@ pub fn build_window(
     title: &str,
     size: (u32, u32),
 ) -> Result<Arc<Window>, OsError> {
+    build_window_with_visibility(event_loop, title, size, true)
+}
+
+/// [`build_window`], optionally created UNMAPPED (`visible == false`): a hidden
+/// start (`jetty --background`) must not flash a window at login; the first
+/// summon maps it.
+pub fn build_window_with_visibility(
+    event_loop: &ActiveEventLoop,
+    title: &str,
+    size: (u32, u32),
+    visible: bool,
+) -> Result<Arc<Window>, OsError> {
     let attrs = Window::default_attributes()
+        .with_visible(visible)
         .with_title(title)
         .with_window_icon(app_icon())
         .with_inner_size(LogicalSize::new(size.0, size.1))

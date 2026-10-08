@@ -10,11 +10,14 @@ jetty-platform = { path = "../jetty-platform" }
 winit = "0.30"
 pollster = "0.4"
 wgpu = "29.0"
-png = "0.17"
+png = "0.18.1"
 arboard = "3.6.1"
 global-hotkey = "0.8.0"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
+# In-place config.toml edits (only changed keys; comments/formatting/unknown keys
+# survive). Already in the lockfile — no new download.
+toml_edit = "0.25"
 dirs = "6.0.0"
 # Cross-platform, OS-event-driven filesystem watcher for config + theme hot-reload
 # (inotify on Linux, FSEvents on macOS, kqueue on BSD). DE-INDEPENDENT — no
