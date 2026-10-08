@@ -68,7 +68,9 @@ fi
 /// tells the resize clean-prompt wipe that real output exists. Registers via
 /// bash-preexec's `precmd_functions` when present, else PREPENDS to a scalar or
 /// array `PROMPT_COMMAND` so `$?` on the first line is the user command's true
-/// exit status.
+/// exit status. The A mark carries `redraw=0` (kitty's extension): readline
+/// repaints only the LAST line of a multi-line `PS1` after a resize, so JeTTY
+/// must not wipe the prompt then.
 pub const BASH: &str = r#"# JeTTY bash shell integration — OSC 133 semantic prompts.
 # Opt in from ~/.bashrc with (guarded; silent in other terminals):
 #   [[ -n "$JETTY" ]] && source <("${JETTY_BIN:-jetty}" --print-shell-integration bash 2>/dev/null)
@@ -81,7 +83,8 @@ if [[ $- == *i* && -n "$JETTY" && -z "${_jetty_bash_loaded:-}" ]]; then
     local ret=$?                                    # user command's exit (first line)
     if [[ -n "${_jetty_started:-}" ]]; then printf '\033]133;D;%s\007' "$ret"; fi
     _jetty_started=1
-    printf '\033]133;A\007'
+    # redraw=0: after a resize readline repaints only the last line of the prompt.
+    printf '\033]133;A;redraw=0\007'
   }
   if [[ -n "${__bp_imported:-}" || -n "${bash_preexec_imported:-}" ]]; then
     # bash-preexec present: register through its array (it preserves $?).
@@ -169,6 +172,8 @@ mod tests {
         // against sourcing twice.
         assert!(BASH.contains(r"PS0+=$'\033]133;C\007'"), "C mark via PS0 append");
         assert!(BASH.contains(r#"[[ "$PS0" == *$'\033]133;C'* ]] ||"#), "idempotent");
+        // readline repaints only a multi-line prompt's last line after a resize.
+        assert!(BASH.contains(r"133;A;redraw=0"), "the A mark tells JeTTY not to wipe");
     }
 
     #[test]

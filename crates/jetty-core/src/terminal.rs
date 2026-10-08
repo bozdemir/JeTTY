@@ -542,8 +542,8 @@ impl Dimensions for Size {
 const MAX_MARKS: usize = 4096;
 
 /// [`Terminal::at_clean_prompt`] bounds: the cursor may sit at most this many rows
-/// below the open prompt mark (a multi-line prompt plus wrapped typed input),
-/// and at most this many (blank) lines may lie above it.
+/// below the open prompt's input line (typed input soft-wrapping that far), and
+/// at most this many (blank) lines may lie above the prompt.
 const CLEAN_PROMPT_MAX_ROWS: i64 = 8;
 const CLEAN_PROMPT_MAX_ABOVE: i64 = 256;
 
@@ -570,6 +570,22 @@ fn count_line_feeds(s: &[u8]) -> usize {
 
 /// The exact OSC 133 introducer the scanner matches after `ESC ]`.
 const OSC133_PREFIX: &[u8] = b"133;";
+
+/// The `redraw=0` parameter of an OSC 133 `A` (kitty's extension): the shell
+/// does NOT repaint its whole prompt after a resize — readline repaints only the
+/// LAST line of a multi-line PS1 — so the resize wipe must not erase the rest.
+const REDRAW_OFF: &[u8] = b"redraw=0";
+
+/// [`Scan::Payload`] `kv`: the current parameter can no longer be `redraw=0`.
+const KV_MISMATCH: u8 = u8::MAX;
+
+/// Advance the `redraw=0` match of the current OSC 133 parameter by one byte.
+fn redraw_step(kv: u8, b: u8) -> u8 {
+    match REDRAW_OFF.get(usize::from(kv)) {
+        Some(&want) if want == b => kv + 1,
+        _ => KV_MISMATCH,
+    }
+}
 
 /// Cap on the sixel carry buffer (`sixel_buf`). A never-terminated or hostile
 /// sixel cannot grow memory without bound: past this the scanner latches
@@ -662,7 +678,9 @@ enum Scan {
     /// Matched `133;`; collecting the letter (A/B/C/D) and the first `;code`.
     /// `code_done` is set by a SECOND `;` so `aid=<n>` params never corrupt the
     /// exit code (only the first param after the letter is the exit status).
-    Payload { letter: u8, code: Option<u32>, in_code: bool, code_done: bool },
+    /// `kv` matches the current parameter against [`REDRAW_OFF`];
+    /// `no_redraw` latches once one matched (an `A;redraw=0`).
+    Payload { letter: u8, code: Option<u32>, in_code: bool, code_done: bool, kv: u8, no_redraw: bool },
     /// Inside some OTHER OSC (title/hyperlink/color); skip to its terminator.
     Skip,
     /// An OSC overran [`OSC_MAX_BYTES`]: vte was handed CAN to end it, and every
@@ -713,6 +731,9 @@ struct CmdBlock {
     exit: Option<i32>,
     /// Set once a D arrives (or a later A closes an abandoned command, e.g. ^C).
     finished: bool,
+    /// The shell repaints this whole prompt after a resize (false for an
+    /// `A;redraw=0`, e.g. bash: readline repaints only a prompt's last line).
+    redraws: bool,
 }
 
 /// The shell command between its prompt mark (`A`) and its completion (`D`) —
@@ -1648,6 +1669,8 @@ impl Terminal {
                                     code: None,
                                     in_code: false,
                                     code_done: false,
+                                    kv: KV_MISMATCH,
+                                    no_redraw: false,
                                 }
                             } else {
                                 Scan::Prefix { n: n2 }
@@ -1668,7 +1691,7 @@ impl Terminal {
                 {
                     start = self.abort_osc(bytes, start, i);
                 }
-                Scan::Payload { letter, code, in_code, code_done } => match b {
+                Scan::Payload { letter, code, in_code, code_done, kv, no_redraw } => match b {
                     // BEL / CAN / SUB / ESC(=ST) all end the OSC (vte parity).
                     0x07 | 0x18 | 0x1a | 0x1b => {
                         let is_esc = b == 0x1b;
@@ -1677,7 +1700,8 @@ impl Terminal {
                         // read the cursor NOW (OSC 133 never moves it, so the line
                         // is identical whether read in this feed or a later split).
                         self.advance_slice(&bytes[start..k]);
-                        self.bind_mark(letter, code.map(|c| c as i32));
+                        let redraws = !(no_redraw || usize::from(kv) == REDRAW_OFF.len());
+                        self.bind_mark(letter, code.map(|c| c as i32), redraws);
                         // ESC leaves alacritty in Escape state and may begin a new
                         // sequence (the trailing `\` of an ST is consumed there).
                         self.scan = if is_esc { Scan::Esc } else { Scan::Ground };
@@ -1692,6 +1716,8 @@ impl Terminal {
                             code,
                             in_code: true,
                             code_done: in_code || code_done,
+                            kv: 0,
+                            no_redraw: no_redraw || usize::from(kv) == REDRAW_OFF.len(),
                         };
                         self.osc_len += 1;
                         i += 1;
@@ -1708,7 +1734,8 @@ impl Terminal {
                             .saturating_mul(10)
                             .saturating_add((b - b'0') as u32)
                             .min(EXIT_CODE_MAX);
-                        self.scan = Scan::Payload { letter, code: Some(next), in_code, code_done };
+                        let kv = redraw_step(kv, b);
+                        self.scan = Scan::Payload { letter, code: Some(next), in_code, code_done, kv, no_redraw };
                         self.osc_len += 1;
                         i += 1;
                     }
@@ -1717,12 +1744,13 @@ impl Terminal {
                         // non-digit inside the code field (e.g. `k=v`) makes the
                         // exit code unknown (None), closed so trailing digits do
                         // not resurrect it.
+                        let kv = if in_code { redraw_step(kv, b) } else { kv };
                         self.scan = if letter == 0 && !in_code {
-                            Scan::Payload { letter: b, code, in_code, code_done }
+                            Scan::Payload { letter: b, code, in_code, code_done, kv, no_redraw }
                         } else if in_code && !code_done {
-                            Scan::Payload { letter, code: None, in_code, code_done: true }
+                            Scan::Payload { letter, code: None, in_code, code_done: true, kv, no_redraw }
                         } else {
-                            Scan::Payload { letter, code, in_code, code_done }
+                            Scan::Payload { letter, code, in_code, code_done, kv, no_redraw }
                         };
                         self.osc_len += 1;
                         i += 1;
@@ -2474,10 +2502,17 @@ impl Terminal {
     /// * no command has run in this tab yet (`saw_command_output`, latched by a
     ///   `C`, or by a `D` from integrations that never send `C`);
     /// * the newest prompt block is open and has not started a command;
+    /// * the shell repaints that whole prompt after a resize (no `A;redraw=0`:
+    ///   bash's readline repaints only the last line of a multi-line PS1, so the
+    ///   wipe would erase the rest for good);
     /// * nothing but blank lines exists ABOVE that prompt's line — output printed
     ///   before the first prompt (login banner, motd, fastfetch) must survive;
-    /// * the cursor is still within [`CLEAN_PROMPT_MAX_ROWS`] of the prompt line
-    ///   (a `C`-less shell running its very first command has moved it further);
+    /// * the cursor is still on the prompt's INPUT line — its `B` mark when the
+    ///   integration sends one, else the `A` line — or on rows soft-wrapped from
+    ///   it (typed input longer than a row), within [`CLEAN_PROMPT_MAX_ROWS`].
+    ///   Below a hard line break sits either a multi-line prompt drawn after an
+    ///   `A` without a `B`, or the first command's output from a shell that sends
+    ///   no `C`; the two look alike, and the output must survive;
     /// * the shell is not mid-write: no escape sequence cut by a read boundary,
     ///   no synchronized update still buffered in vte (its output isn't settled,
     ///   so a wipe now could erase or reorder part of it).
@@ -2495,14 +2530,20 @@ impl Terminal {
         let Some(m) = self.marks.back() else {
             return false;
         };
-        if m.finished || m.output.is_some() {
+        if m.finished || m.output.is_some() || !m.redraws {
             return false;
         }
         let grid = self.term.grid();
-        // Grid line of the prompt mark (negative = in scrollback).
+        // Grid lines of the prompt mark and of where input starts (negative = in
+        // scrollback).
         let prompt_line = m.prompt - self.abs_top;
+        let input_line = m.input.map_or(prompt_line, |b| (b - self.abs_top).max(prompt_line));
         let cursor_line = grid.cursor.point.line.0 as i64;
-        if cursor_line - prompt_line > CLEAN_PROMPT_MAX_ROWS {
+        if cursor_line < input_line || cursor_line - input_line > CLEAN_PROMPT_MAX_ROWS {
+            return false;
+        }
+        let last_col = Column(self.cols - 1);
+        if (input_line..cursor_line).any(|l| !grid[Line(l as i32)][last_col].flags.contains(Flags::WRAPLINE)) {
             return false;
         }
         let top = grid.topmost_line().0 as i64;
@@ -2520,7 +2561,7 @@ impl Terminal {
     /// has been advanced. No-op on the alt screen (OSC 133 inside a TUI is
     /// meaningless). Coalesces a duplicate A on the same line so p10k + our own
     /// snippet both emitting A cannot create two blocks.
-    fn bind_mark(&mut self, letter: u8, exit: Option<i32>) {
+    fn bind_mark(&mut self, letter: u8, exit: Option<i32>, redraws: bool) {
         if self.term.mode().contains(TermMode::ALT_SCREEN) {
             return;
         }
@@ -2564,6 +2605,7 @@ impl Terminal {
                     output: None,
                     exit: None,
                     finished: false,
+                    redraws,
                 });
                 let history = self.term.grid().history_size();
                 self.prune_marks(history);
@@ -4268,7 +4310,8 @@ mod tests {
             state ^= state << 17;
             state % m
         };
-        let block = |prompt: i64| CmdBlock { prompt, input: None, output: None, exit: None, finished: true };
+        let block =
+            |prompt: i64| CmdBlock { prompt, input: None, output: None, exit: None, finished: true, redraws: true };
         let mut fast_path_hits = 0;
         for _ in 0..300 {
             let mut t = Terminal::new(80, 24);
@@ -5814,6 +5857,88 @@ mod tests {
         let snap = t.snapshot();
         let found = (0..snap.rows).any(|r| snap.row_text(r).contains("LOGLINE 11"));
         assert!(found, "output of a running first command survives a resize");
+    }
+
+    /// Whether any row of `t`'s screen contains `needle`.
+    fn screen_has(t: &Terminal, needle: &str) -> bool {
+        let snap = t.snapshot();
+        (0..snap.rows).any(|r| snap.row_text(r).contains(needle))
+    }
+
+    #[test]
+    fn resize_wipe_spares_a_short_first_command_without_c() {
+        // A shell that sends no C, running its very first command: three output
+        // lines keep the cursor well within the old 8-row allowance, but a hard
+        // line break separates them from the prompt — never a clean prompt.
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]133;A\x07$ cat notes\r\n");
+        t.feed(b"NOTE_ONE\r\nNOTE_TWO\r\n");
+        t.resize(40, 12);
+        assert!(screen_has(&t, "NOTE_ONE") && screen_has(&t, "NOTE_TWO"), "the output survives");
+    }
+
+    #[test]
+    fn resize_wipe_spares_a_prompt_that_will_not_redraw() {
+        // bash: readline repaints only the LAST line of a multi-line PS1 after
+        // SIGWINCH, and the snippet says so with `A;redraw=0`; wiping would lose
+        // the info line for good.
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]133;A;redraw=0\x07[INFO_LINE]\r\n$ ");
+        t.resize(40, 12);
+        assert!(screen_has(&t, "INFO_LINE"), "the first prompt line survives");
+        // Even a single-line prompt: the shell said it will not repaint it.
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]133;A;aid=7;redraw=0\x07BASH_PROMPT$ ");
+        t.resize(40, 12);
+        assert!(screen_has(&t, "BASH_PROMPT"));
+    }
+
+    #[test]
+    fn redraw_param_is_read_from_any_a_parameter() {
+        let parse = |payload: &[u8]| {
+            let mut t = Terminal::new(20, 5);
+            t.feed(payload);
+            t.marks.back().map(|m| m.redraws)
+        };
+        assert_eq!(parse(b"\x1b]133;A\x07"), Some(true));
+        assert_eq!(parse(b"\x1b]133;A;redraw=0\x07"), Some(false));
+        assert_eq!(parse(b"\x1b]133;A;cl=m;redraw=0;aid=3\x1b\\"), Some(false));
+        assert_eq!(parse(b"\x1b]133;A;redraw=1\x07"), Some(true));
+        assert_eq!(parse(b"\x1b]133;A;redraw=00\x07"), Some(true));
+        assert_eq!(parse(b"\x1b]133;A;xredraw=0\x07"), Some(true));
+        // Split across feeds at every byte.
+        let mut t = Terminal::new(20, 5);
+        for b in b"\x1b]133;A;redraw=0\x07" {
+            t.feed(&[*b]);
+        }
+        assert_eq!(t.marks.back().map(|m| m.redraws), Some(false));
+    }
+
+    #[test]
+    fn resize_wipe_still_fires_with_wrapped_typed_input() {
+        // Typed input longer than a row soft-wraps: still the input line.
+        let mut t = Terminal::new(20, 10);
+        t.feed(b"\x1b]133;A\x07\xe2\x9d\xaf ");
+        t.feed("x".repeat(30).as_bytes()); // wraps onto a second row
+        assert_eq!(t.snapshot().cursor_row, 1, "premise: the input wrapped");
+        t.resize(12, 8);
+        assert!(!screen_has(&t, "\u{276f}"), "the clean prompt was wiped (the shell repaints it)");
+    }
+
+    #[test]
+    fn resize_wipe_uses_the_b_mark_for_a_multi_line_prompt() {
+        // p10k / starship with B: the prompt's first line is above the input
+        // line, joined by a HARD break — B says where input starts, so this is
+        // still a clean prompt and its stray fragments are wiped.
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]133;A\x07~/src/jetty  main\r\n\x1b]133;B\x07\xe2\x9d\xaf ");
+        t.resize(40, 12);
+        assert!(!screen_has(&t, "~/src/jetty"), "wiped: the shell repaints both lines");
+        // Without B the same two lines are not provably a prompt: kept.
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]133;A\x07~/src/jetty  main\r\n\xe2\x9d\xaf ");
+        t.resize(40, 12);
+        assert!(screen_has(&t, "~/src/jetty"), "no B: never wiped");
     }
 
     #[test]
