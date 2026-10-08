@@ -92,30 +92,52 @@ pub fn pos_in_monitor_rect(pos: (i32, i32), mon_pos: (i32, i32), mon_size: (u32,
 /// The monitor a window should be placed on.
 ///
 /// Resolution order:
-/// 1. `current_monitor()` — the platform's own answer, when it has one.
+/// 1. `current_monitor()` — the platform's own answer, when it has one AND it is
+///    still connected (see below).
 /// 2. the monitor CONTAINING the window's last outer position. A HIDDEN window
-///    (the dropdown between summons) reports no `current_monitor` on X11, so
-///    without this fallback it would be treated as being on the PRIMARY monitor
-///    and re-appear on the wrong screen for multi-monitor users.
+///    (the dropdown between summons) reports no `current_monitor` on some
+///    platforms, so without this fallback it would be treated as being on the
+///    PRIMARY monitor and re-appear on the wrong screen for multi-monitor users.
 /// 3. the first available monitor (also the Wayland path, where `outer_position`
 ///    is `Err` — accepted degradation, same as the F9 hotkey).
+///
+/// `current_monitor()` is NOT trusted blindly: on X11 it returns a CACHED handle
+/// (winit's `last_monitor`, refreshed only by the WM's ConfigureNotify), so for a
+/// window hidden while its monitor was unplugged it still names the vanished
+/// output — and centering/docking against that rect maps the window off-screen.
+/// It is therefore matched against the LIVE `available_monitors()` list and the
+/// live handle (fresh geometry) is used; an unmatched one falls through to 2/3.
 ///
 /// Shared by `center_window`, `dock_window_top` and the fullscreen path so all
 /// three agree on "which screen". Lives in `jetty-platform` (not `jetty-app`)
 /// because the crate dependency only points one way: `jetty-app` →
 /// `jetty-platform`, never the reverse.
 pub fn monitor_for_window(win: &Window) -> Option<MonitorHandle> {
-    win.current_monitor()
-        .or_else(|| {
-            win.outer_position().ok().and_then(|a| {
-                win.available_monitors().find(|m| {
-                    let p = m.position();
-                    let s = m.size();
-                    pos_in_monitor_rect((a.x, a.y), (p.x, p.y), (s.width, s.height))
-                })
-            })
+    let available: Vec<MonitorHandle> = win.available_monitors().collect();
+    let last_pos = win.outer_position().ok().map(|a| (a.x, a.y));
+    pick_monitor(win.current_monitor(), &available, |m| {
+        last_pos.is_some_and(|a| {
+            let p = m.position();
+            let s = m.size();
+            pos_in_monitor_rect(a, (p.x, p.y), (s.width, s.height))
         })
-        .or_else(|| win.available_monitors().next())
+    })
+}
+
+/// Pure resolution core of [`monitor_for_window`], generic over the monitor
+/// type so it is unit-testable without a display. `current` is honored only if
+/// it is still among `available` (and the LIVE entry is returned, so a monitor
+/// re-plugged with a new geometry is placed against its current rect); else the
+/// first available monitor `contains_last_pos` accepts; else the first one.
+pub fn pick_monitor<M: PartialEq + Clone>(
+    current: Option<M>,
+    available: &[M],
+    contains_last_pos: impl Fn(&M) -> bool,
+) -> Option<M> {
+    current
+        .and_then(|c| available.iter().find(|m| **m == c).cloned())
+        .or_else(|| available.iter().find(|m| contains_last_pos(m)).cloned())
+        .or_else(|| available.first().cloned())
 }
 
 /// Put `win` into (or out of) whole-monitor fullscreen, cross-platform, through
@@ -207,7 +229,68 @@ pub fn set_window_fullscreen(win: &Window, on: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::pos_in_monitor_rect;
+    use super::{pick_monitor, pos_in_monitor_rect};
+
+    /// Synthetic monitor for `pick_monitor`: equality by `id` (like winit's X11
+    /// CRTC-id equality), geometry carried so the LIVE entry can be told apart
+    /// from a stale cached one.
+    #[derive(Clone, Debug)]
+    struct Mon {
+        id: u32,
+        pos: (i32, i32),
+        size: (u32, u32),
+    }
+    impl PartialEq for Mon {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+    fn mon(id: u32, x: i32, w: u32) -> Mon {
+        Mon { id, pos: (x, 0), size: (w, 1080) }
+    }
+    fn contains(last: (i32, i32)) -> impl Fn(&Mon) -> bool {
+        move |m: &Mon| pos_in_monitor_rect(last, m.pos, m.size)
+    }
+
+    #[test]
+    fn pick_monitor_honors_a_still_connected_current_monitor() {
+        let avail = [mon(1, 0, 1920), mon(2, 1920, 2560)];
+        let got = pick_monitor(Some(mon(2, 1920, 2560)), &avail, contains((10, 10)));
+        assert_eq!(got.map(|m| m.id), Some(2));
+    }
+
+    #[test]
+    fn pick_monitor_rejects_an_unplugged_cached_current_monitor() {
+        // X11's current_monitor() still names output 2 after it was unplugged
+        // while hidden; only output 1 is live. The window's last position sits
+        // on the vanished monitor, so the fallback is the first live one.
+        let avail = [mon(1, 0, 1920)];
+        let got = pick_monitor(Some(mon(2, 1920, 2560)), &avail, contains((2000, 10)));
+        assert_eq!(got.map(|m| m.id), Some(1), "must never place on a vanished monitor");
+    }
+
+    #[test]
+    fn pick_monitor_returns_the_live_geometry_for_a_replugged_monitor() {
+        // Same output id, new geometry (re-plugged at another resolution): the
+        // LIVE handle's rect is used, never the stale cached one.
+        let avail = [mon(1, 0, 1920), mon(2, 1920, 3840)];
+        let got = pick_monitor(Some(mon(2, 1920, 2560)), &avail, contains((0, 0))).unwrap();
+        assert_eq!((got.id, got.size.0), (2, 3840));
+    }
+
+    #[test]
+    fn pick_monitor_falls_back_to_the_monitor_containing_the_last_position() {
+        let avail = [mon(1, 0, 1920), mon(2, 1920, 2560)];
+        let got = pick_monitor(None, &avail, contains((2500, 100)));
+        assert_eq!(got.map(|m| m.id), Some(2));
+    }
+
+    #[test]
+    fn pick_monitor_falls_back_to_the_first_monitor_and_handles_none() {
+        let avail = [mon(1, 0, 1920), mon(2, 1920, 2560)];
+        assert_eq!(pick_monitor(None, &avail, |_: &Mon| false).map(|m| m.id), Some(1));
+        assert!(pick_monitor(Some(mon(9, 0, 1)), &[], |_: &Mon| true).is_none());
+    }
 
     #[test]
     fn pos_in_monitor_rect_contains_interior_and_origin() {
