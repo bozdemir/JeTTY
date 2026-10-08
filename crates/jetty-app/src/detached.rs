@@ -204,6 +204,12 @@ pub(crate) struct DetachedWindow {
     /// Caret flash burst clock for keystrokes typed in THIS window (mirrors
     /// `App::caret_anim` for the main window). `None` = no burst live.
     pub caret_anim: Option<std::time::Instant>,
+    /// Fallback paint deadline for THIS window's latest PTY-bound keystroke
+    /// (mirrors `App::key_paint_due`): the echo paints, not the key.
+    pub key_paint_due: Option<std::time::Instant>,
+    /// Backoff after this window's `acquire_frame()` failed (mirrors
+    /// `App::acquire_retry`); `None` while frames present normally.
+    pub acquire_retry: Option<crate::app::AcquireRetry>,
     /// Whether THIS detached window is in OS fullscreen (F11 pressed in it).
     /// Session-only and PER WINDOW — detached windows persist no geometry at all,
     /// have no `window_mode`, and are never hidden, so this is purely a live
@@ -420,6 +426,8 @@ impl DetachedWindow {
             crt,
             image_layer,
             caret_anim: None,
+            key_paint_due: None,
+            acquire_retry: None,
             // A freshly-detached window is created focused (the WM focuses it on
             // map); its Focused events keep this current thereafter.
             focused: true,

@@ -24,19 +24,18 @@
 #   app.rs
 #     1. fn request_main_paint     — the main choke DEFINITION
 #     2. fn request_settings_paint — the settings choke DEFINITION
-#     3. fn about_to_wait          — ALL animation/lifecycle self-drive sites
+#     3. fn about_to_wait          — ALL animation/lifecycle drive sites
 #          (main_pending / detached_pending / settings_pending Poll re-requests,
 #           reflow/deadline services). Must stay raw: the macOS Poll/Wait seam.
-#     4. main render-tail self-drive — the block guarded by
-#          `summon_anim || slide_anim || hint_live || crt_anim_live || caret_anim`
+#          It is the ONLY place that decides another frame: the main and
+#          detached render tails no longer self-drive (pills repaint once at
+#          expiry via WaitUntil), so there is no render-tail whitelist entry.
 #     5. dock re-assert  — guarded by `pending_dock_frames > 0`
 #     6. center re-assert — guarded by `pending_center_frames > 0`
 #     7. settings-window-open first-frame nudge — a bare local `window` binding
 #        (in `open_settings`, right before `self.settings_window = Some(window)`)
 #   detached.rs
 #     8. fn request_paint          — the detached choke DEFINITION
-#     9. detached render-tail self-drive — guarded by
-#          `!occluded && (caret_anim || crt_anim_live || shift_hint_show)`
 #    10. DetachedWindow::new first-frame nudge — a bare local `window` binding
 #
 # Exit 0 = clean. Exit 1 = a raw producer redraw leaked in (prints the sites).
@@ -84,16 +83,6 @@ def allowed_app(i):
     # whitelist 5/6: dock / center re-assert
     if "pending_dock_frames > 0" in prev or "pending_center_frames > 0" in prev:
         return True
-    # whitelist 4: main render-tail self-drive
-    if prev == "if let Some(w) = &self.window {":
-        pred = "\n".join(lines[max(0,i-12):i])
-        if ("self.summon_anim.is_some()" in pred and
-            "self.caret_anim.is_some()" in pred and "crt_anim_live" in pred):
-            return True
-    # whitelist 9: detached render-tail self-drive (render_detached_window lives
-    # in app.rs); guarded by `!occluded && (caret_anim || crt_anim_live || shift_hint_show)`
-    if "shift_hint_show" in prev:
-        return True
     return False
 
 for i,l in enumerate(lines):
@@ -115,9 +104,6 @@ def allowed_det(i):
         return True
     # whitelist 10: bare local `window` nudge in the constructor
     if re.match(r"^window\.request_redraw\(\);$", s):
-        return True
-    # whitelist 9: detached render-tail self-drive
-    if "shift_hint_show" in prev:
         return True
     return False
 
