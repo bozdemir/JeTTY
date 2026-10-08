@@ -1,4 +1,5 @@
 use std::io::Write;
+use crate::overlays::{HintDrawData, HintState, Overlays, PaletteDrawData, Surface};
 use std::sync::Arc;
 use jetty_core::{PtySession, Terminal};
 use jetty_render::{GpuContext, QuadLayer, TextLayer};
@@ -157,10 +158,11 @@ fn cycle_notify_min(cur: u64, forward: bool) -> u64 {
 const NOTIFY_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Anti-spam key for command-finish notifications: identifies which surface last
-/// fired. Main tabs key on their index; detached windows on their stable id.
+/// fired. Main tabs key on their stable [`TabId`]; detached windows on their
+/// window id.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum NotifyKey {
-    MainTab(usize),
+    MainTab(TabId),
     Detached(WindowId),
 }
 
@@ -338,11 +340,6 @@ const SCROLLBAR_GUTTER: f32 = jetty_render::SCROLLBAR_W + 4.0;
 /// PTY read queue (the reader blocks and the child with it), not by this.
 const PTY_DRAIN_BUDGET: usize = 2 * 1024 * 1024;
 
-/// Minimum interval between open-search match re-collects while output
-/// streams (each re-collect scans the whole scrollback). Shared by the
-/// render-path throttle, the `about_to_wait` trailing one-shot that services
-/// a refresh the throttle skipped (F10), and its WaitUntil deadline.
-const SEARCH_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Wrap period (seconds) for the CRT animation phase before it is narrowed to
 /// f32. The three sub-effects all use INTEGER angular frequencies (roll 6,
@@ -352,9 +349,18 @@ const SEARCH_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// `elapsed().as_secs_f32()` degrades into visible stutter after ~1.5 days).
 const CRT_PHASE_WRAP: f64 = std::f64::consts::TAU;
 
+/// A tab's STABLE identity for its whole life (main window ↔ detached window
+/// included). Long-lived references — the rename box, the close confirmation,
+/// the tab menu, a tab drag, palette entries, notification keys — hold this,
+/// never a `Vec` index, so closing or moving another tab can't retarget them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TabId(pub(crate) u64);
+
 /// A single terminal session: its grid model, PTY, writer, and tab title. One
 /// `Tab` per visible tab. Per-tab scroll/selection live inside `terminal`.
 pub(crate) struct Tab {
+    /// Stable identity (see [`TabId`]).
+    pub(crate) id: TabId,
     pub(crate) terminal: Terminal,
     pub(crate) pty: PtySession,
     pub(crate) writer: Box<dyn Write + Send>,
@@ -1036,6 +1042,9 @@ pub struct App {
     /// macOS Option-as-Meta sides (mirrors `Config.macos_option_as_alt`; live on
     /// reload, written back by `persist`). Feeds `input::KeyOptions::native`.
     macos_option_as_alt: input::OptionAsAlt,
+    /// Where a finished mouse selection is copied (mirrors
+    /// `Config.copy_on_select`; live on reload, written back by `persist`).
+    copy_on_select: clipboard::CopyOnSelect,
     /// Compiled keybindings (built from `keys` on load / reload). The input path
     /// does ONE cheap hashmap lookup against this per keypress — never per frame.
     keymap: crate::keymap::KeyMap,
@@ -1190,8 +1199,10 @@ pub struct App {
     menu_disabled: Vec<usize>,
     /// Index of the menu item currently under the cursor (for hover highlight).
     menu_hover: Option<usize>,
-    /// Inline tab rename: `Some(tab_index)` while the user is editing a tab title.
-    renaming: Option<usize>,
+    /// Next [`TabId`] to hand out (monotonic; ids are never reused).
+    next_tab_id: u64,
+    /// Inline tab rename: `Some(tab)` while the user is editing a tab title.
+    renaming: Option<TabId>,
     /// The edit buffer for the in-progress rename (committed/discarded on Enter/Esc).
     rename_buf: String,
     /// Time + physical-pixel position of the last left press on the top strip,
@@ -1269,32 +1280,16 @@ pub struct App {
     frame_log: bool,
     frames_presented: u64,
 
-    /// Whether the in-window "Keyboard Shortcuts" help overlay is open. Drawn on
-    /// top of everything in the main window; dismissed by Esc, the "?" button,
-    /// or a click outside the panel.
-    help_open: bool,
-    /// First help row shown when the rows overflow the window (large UI font /
-    /// short window); scrolled by the wheel, arrows, PgUp/PgDn, Home/End.
-    help_scroll: usize,
-    /// Whether the scrollback-search bar (Ctrl+Shift+F) is open on the ACTIVE
-    /// tab of the main window (detached windows are out of scope). While open,
-    /// keys edit the query; Esc / ✕ / Ctrl+Shift+F close it and clear matches.
-    search_open: bool,
-    /// Last streaming refresh of the open search's matches (throttled to
-    /// [`SEARCH_REFRESH_INTERVAL`] on the PTY-drain path so heavy output
-    /// never re-scans history every frame). `None` until the first refresh.
-    search_refresh_at: Option<std::time::Instant>,
-    /// True while the open search's stored matches may be stale: set when a
-    /// drain consumed output but the throttle skipped the re-collect, cleared
-    /// by every refresh. While set, `about_to_wait` schedules ONE wake at the
-    /// throttle deadline so a burst that ENDS inside the window still gets a
-    /// trailing refresh (F10) — the flag never exists while idle, so this
-    /// adds zero idle work.
-    search_dirty: bool,
-    /// When `Some(i)`, a "Close this tab?" confirmation popup is open for tab `i`.
-    /// The × click / Ctrl+Shift+W / Ctrl+D set this instead of closing immediately;
-    /// Enter (or the Close button) confirms, Esc (or Cancel / click-outside) clears.
-    confirm_close: Option<usize>,
+    /// The main window's overlays (search bar, help, command palette, hint
+    /// mode, copy-mode). Every detached window owns its own `Overlays`
+    /// (`DetachedWindow::ov`); operations name their window with a
+    /// [`Surface`].
+    ov: Overlays,
+    /// When `Some(tab)`, a "Close this tab?" confirmation popup is open for that
+    /// tab. The × click / Ctrl+Shift+W / Ctrl+D set this instead of closing
+    /// immediately; Enter (or the Close button) confirms, Esc (or Cancel /
+    /// click-outside) clears. A tab that vanished meanwhile just drops it.
+    confirm_close: Option<TabId>,
     /// Set when the user tries to close the whole app (window × button or the OS
     /// CloseRequested). Shows a "Quit JeTTY?" popup instead of exiting; Enter
     /// confirms, Esc / Cancel / click-outside dismisses.
@@ -1326,10 +1321,10 @@ pub struct App {
     /// while tearing detaches that tab at the drop position. Cleared on release
     /// and on focus loss (same discipline as `selecting`/`dragging_scrollbar`).
     tab_drag: Option<TabDrag>,
-    /// When `Some((x, y, tab_idx))`, the TAB context menu (Detach / Rename /
-    /// Close Tab) is open at this physical-pixel anchor for tab `tab_idx`.
+    /// When `Some((x, y, tab))`, the TAB context menu (Detach / Rename /
+    /// Close Tab) is open at this physical-pixel anchor for that tab.
     /// Mutually exclusive with `context_menu` (the terminal Copy/Paste menu).
-    tab_menu: Option<(f32, f32, usize)>,
+    tab_menu: Option<(f32, f32, TabId)>,
     /// Item labels of the open tab menu, snapshotted when it opened (the
     /// "Detach" row is present only when detaching was allowed at open time).
     tab_menu_labels: Vec<&'static str>,
@@ -1338,58 +1333,17 @@ pub struct App {
     /// Tab-menu item currently under the cursor (hover highlight).
     tab_menu_hover: Option<usize>,
 
-    // --- Command palette (Ctrl+Shift+P / macOS Cmd+Shift+P) ---
-    /// Whether the fuzzy command palette overlay is open on the MAIN window.
-    /// While open it captures ALL keyboard + mouse input (single-overlay-owns-
-    /// keys). Zero cost when closed: the registry/filtered vecs are empty and the
-    /// overlay is neither built nor drawn (one bool test on the hot path).
-    palette_open: bool,
-    /// The typed query. Refiltered only on a keystroke — never per frame.
-    palette_query: String,
-    /// Index of the highlighted row within `palette_filtered`.
-    palette_selected: usize,
-    /// First visible row (scroll offset) into `palette_filtered`.
-    palette_scroll: usize,
-    /// The action registry, rebuilt FRESH on open (never per frame / in
-    /// apply_theme, which auto-repeats on opacity) and dropped on close.
-    palette_registry: Vec<crate::palette::PaletteEntry>,
-    /// The current fuzzy hits (resolved PaletteCmd + title + matched indices),
-    /// recomputed on each keystroke. Enter runs the stored cmd, never a stale idx.
-    palette_filtered: Vec<crate::palette::PaletteHit>,
 
-    // --- Hint mode (Ctrl+Shift+H) + keyboard copy-mode (Ctrl+Shift+Space) ---
-    /// Active hint-mode state (main window + primary screen only). `Some` while
-    /// the labelled URL/path/hash/IPv4 chips are shown; the tokens are scanned
-    /// ONCE on enter (never per frame). Zero cost when closed (one `Option`
-    /// test on the hot path).
-    hint_mode: Option<HintState>,
-    /// Active copy-mode state: a keyboard vi-cursor over the viewport +
-    /// scrollback. `Some` while active; the shell cursor is suppressed and the
-    /// alacritty `Selection` drives the highlight. Zero cost when closed.
-    copy_mode: Option<crate::copymode::CopyMode>,
 }
 
-/// Hint-mode capture state: the scanned tokens, their parallel labels, and the
-/// prefix typed so far (for partial narrowing).
-struct HintState {
-    tokens: Vec<jetty_core::HintToken>,
-    labels: Vec<String>,
-    typed: String,
-}
 
-/// Owned command-palette draw data, captured before the render borrow:
-/// `(query, visible rows as (title, matched-char indices, selected), total, first_visible)`.
-type PaletteDrawData = (String, Vec<(String, Vec<usize>, bool)>, usize, usize);
-/// Hint-mode overlay draw data captured before the mutable render borrow:
-/// the visible `(label, vp_row, col_start)` chips + the typed prefix.
-type HintDrawData = (Vec<(String, usize, usize)>, String);
 
-/// A left-button drag that began on tab `idx` in the main tab bar. `tearing`
+/// A left-button drag that began on tab `tab` in the main tab bar. `tearing`
 /// flips true once the cursor moves > `TEAR_THRESHOLD_PX` vertically out of the
 /// strip (and back false if it returns), so a plain click still selects.
 #[derive(Debug, Clone, Copy)]
 struct TabDrag {
-    idx: usize,
+    tab: TabId,
     tearing: bool,
 }
 
@@ -1735,6 +1689,7 @@ impl App {
             osc52_allow_paste: false,
             hot_reload: true,
             macos_option_as_alt: input::OptionAsAlt::default(),
+            copy_on_select: clipboard::CopyOnSelect::default(),
             // Placeholder default keymap; rebuilt from cfg.keys below in `new`.
             keymap: crate::keymap::KeyMap::defaults(),
             keys: crate::config::KeyBindings::default(),
@@ -1784,6 +1739,7 @@ impl App {
             menu_item_rects: Vec::new(),
             menu_disabled: Vec::new(),
             menu_hover: None,
+            next_tab_id: 1,
             renaming: None,
             rename_buf: String::new(),
             last_strip_click: None,
@@ -1817,11 +1773,7 @@ impl App {
             perf: crate::perf::Perf::from_env(),
             frame_log: std::env::var_os("JETTY_FRAME_LOG").is_some(),
             frames_presented: 0,
-            help_open: false,
-            help_scroll: 0,
-            search_open: false,
-            search_refresh_at: None,
-            search_dirty: false,
+            ov: Overlays::default(),
             confirm_close: None,
             confirm_quit: false,
             last_pos: None,
@@ -1832,14 +1784,6 @@ impl App {
             tab_menu_labels: Vec::new(),
             tab_menu_rects: Vec::new(),
             tab_menu_hover: None,
-            palette_open: false,
-            palette_query: String::new(),
-            palette_selected: 0,
-            palette_scroll: 0,
-            palette_registry: Vec::new(),
-            palette_filtered: Vec::new(),
-            hint_mode: None,
-            copy_mode: None,
         };
         // Persisted user settings override the env-derived defaults (but env
         // vars still seed the initial values above, so an explicit JETTY_* can
@@ -1891,6 +1835,7 @@ impl App {
         app.run_selection_enabled = cfg.run_selection;
         app.hot_reload = cfg.hot_reload;
         app.macos_option_as_alt = cfg.macos_option_as_alt;
+        app.copy_on_select = cfg.copy_on_select;
         // Compile the keybindings (defaults + user `[keys]` overrides). Any invalid
         // chord / conflict / rejected bind is logged; the rest still apply.
         app.keys = cfg.keys;
@@ -2045,6 +1990,7 @@ impl App {
             run_selection: self.run_selection_enabled,
             hot_reload: self.hot_reload,
             macos_option_as_alt: self.macos_option_as_alt,
+            copy_on_select: self.copy_on_select,
             // Preserve the user's `[keys]` overrides verbatim (never editable via the
             // Settings UI — a settings-driven persist must not erase them).
             keys: self.keys.clone(),
@@ -2072,6 +2018,29 @@ impl App {
         self.summon_pending = true;
         self.request_main_paint();
         self.request_settings_paint();
+    }
+
+    /// The in-progress rename as the tab bar's `(tab index, buffer)`, if the
+    /// renamed tab is (still) in the main window.
+    fn rename_ref(&self) -> Option<(usize, &str)> {
+        self.renaming.and_then(|id| self.tab_index(id)).map(|i| (i, self.rename_buf.as_str()))
+    }
+
+    /// Hand out the next stable [`TabId`].
+    fn alloc_tab_id(&mut self) -> TabId {
+        let id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        id
+    }
+
+    /// The main-window index of tab `id`, if it is (still) there.
+    fn tab_index(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
+    /// The `self.detached` index of the window holding tab `id`, if any.
+    fn detached_index(&self, id: TabId) -> Option<usize> {
+        self.detached.iter().position(|d| d.tab.id == id)
     }
 
     /// The active tab. Panics if `tabs` is empty, which only happens before
@@ -2298,6 +2267,7 @@ impl App {
         }
         self.macos_option_as_alt = cfg.macos_option_as_alt;
         self.apply_option_as_alt_everywhere();
+        self.copy_on_select = cfg.copy_on_select;
         // Mirror the RESTART-ONLY-EFFECT keys too, so a later panel-driven persist()
         // round-trips the user's external edit instead of clobbering it with the
         // stale startup value. Their live EFFECTS stay restart-only (summon_hotkey is
@@ -2407,28 +2377,145 @@ impl App {
         self.chrome_metrics().bar_h()
     }
 
-    /// The help overlay's scroll range in the main window right now —
-    /// `(max_scroll, page_rows)` — or `None` when every row fits (nothing to
-    /// scroll; the wheel and keys then behave as if the help were not open).
-    fn help_scroll_range(&mut self) -> Option<(usize, usize)> {
-        let (w, h) = self.gpu.as_ref().map(|g| (g.config.width, g.config.height))?;
+    /// Lay out window `s`'s help overlay at first row `scroll` — the SAME call
+    /// its draw pass makes, so hit-tests and scroll ranges match what's drawn.
+    fn layout_help(&mut self, s: Surface, scroll: usize) -> Option<jetty_render::HelpOverlay> {
+        let (w, h, cm, _) = self.surface_layout(s)?;
         let theme = self.current_theme();
-        let cm = self.chrome_metrics();
         let mut fallback = mono_fallback(cm);
-        let help = jetty_render::build_help_overlay(
-            w, h, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
-            &self.help_rows, 0,
-        );
+        Some(match s {
+            Surface::Main => jetty_render::build_help_overlay(
+                w, h, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
+                &self.help_rows, scroll,
+            ),
+            Surface::Detached(p) => {
+                let d = self.detached.get_mut(p)?;
+                jetty_render::build_help_overlay(w, h, &theme, &mut d.chrome_text, cm, &self.help_rows, scroll)
+            }
+        })
+    }
+
+    /// Lay out window `s`'s open search bar (same call as its draw pass).
+    fn layout_search_bar(&mut self, s: Surface) -> Option<jetty_render::SearchBar> {
+        let (w, _, cm, grid_top) = self.surface_layout(s)?;
+        let theme = self.current_theme();
+        let (q, cur, total) = {
+            let t = self.term_of(s)?;
+            let (cur, total) = t.search_counter();
+            (t.search_query().to_string(), cur, total)
+        };
+        let mut fallback = mono_fallback(cm);
+        let m = measure_or(self.surface_chrome_text(s), &mut fallback);
+        Some(jetty_render::build_search_bar(w, grid_top, &theme, m, cm, &q, cur, total))
+    }
+
+    /// Lay out window `s`'s open command palette (same call as its draw pass).
+    fn layout_palette(&mut self, s: Surface) -> Option<jetty_render::CommandPalette> {
+        let (w, h, cm, _) = self.surface_layout(s)?;
+        let theme = self.current_theme();
+        let (q, vis, total, first) = self.ov_of(s)?.palette_draw()?;
+        let prows: Vec<jetty_render::PaletteRow> = vis
+            .iter()
+            .map(|(t, idx, sel)| jetty_render::PaletteRow { title: t, match_indices: idx, selected: *sel })
+            .collect();
+        let mut fallback = mono_fallback(cm);
+        let m = measure_or(self.surface_chrome_text(s), &mut fallback);
+        Some(jetty_render::build_command_palette(w, h, &theme, m, cm, &q, &prows, total, first))
+    }
+
+    /// Window `s`'s help-overlay scroll range right now — `(max_scroll,
+    /// page_rows)` — or `None` when every row fits (nothing to scroll; the wheel
+    /// and keys then behave as if the help were not open).
+    fn help_scroll_range(&mut self, s: Surface) -> Option<(usize, usize)> {
+        let help = self.layout_help(s, 0)?;
         (help.max_scroll > 0).then_some((help.max_scroll, help.page_rows))
     }
 
-    /// Move the help overlay to first row `to`, clamped to `[0, max]`.
-    fn set_help_scroll(&mut self, to: isize, max: usize) {
+    /// Move window `s`'s help overlay to first row `to`, clamped to `[0, max]`.
+    fn set_help_scroll(&mut self, s: Surface, to: isize, max: usize) {
         let to = to.clamp(0, max as isize) as usize;
-        if to != self.help_scroll {
-            self.help_scroll = to;
-            self.request_main_paint();
+        let Some(ov) = self.ov_of_mut(s) else { return };
+        if to != ov.help_scroll {
+            ov.help_scroll = to;
+            self.paint_surface(s);
         }
+    }
+
+    /// Toggle window `s`'s keyboard-shortcuts help (the "?" button). Opening it
+    /// closes that window's context menu so the two are mutually exclusive.
+    fn toggle_help(&mut self, s: Surface) {
+        let Some(ov) = self.ov_of_mut(s) else { return };
+        ov.help_open = !ov.help_open;
+        if ov.help_open {
+            ov.help_scroll = 0;
+            self.dismiss_help_peers(s);
+        }
+        self.paint_surface(s);
+    }
+
+    /// Close the context menus that the help overlay replaces in window `s`
+    /// (main: the terminal context menu; detached: its menu).
+    fn dismiss_help_peers(&mut self, s: Surface) {
+        match s {
+            Surface::Main => {
+                self.context_menu = None;
+                self.menu_hover = None;
+            }
+            Surface::Detached(_) => self.dismiss_surface_menus(s),
+        }
+    }
+
+    /// Whole wheel lines for window `s`, through ITS fractional accumulator at
+    /// its cell height (slow touchpad scrolling arrives as sub-line deltas).
+    fn surface_wheel_lines(&mut self, s: Surface, delta: MouseScrollDelta) -> i32 {
+        match s {
+            Surface::Main => {
+                let cell_h = self.text.as_ref().map_or(0.0, |t| t.cell_size().1);
+                self.scroll_accum.add(input::wheel_lines(delta, cell_h))
+            }
+            Surface::Detached(p) => match self.detached.get_mut(p) {
+                Some(d) => {
+                    let cell_h = d.text.cell_size().1;
+                    d.scroll_accum.add(input::wheel_lines(delta, cell_h))
+                }
+                None => 0,
+            },
+        }
+    }
+
+    /// The overlays of window `s` that own the mouse wheel. Hint mode and
+    /// copy-mode swallow it (scrolling would slide the labelled tokens out from
+    /// under their chips, or desync the copy-mode cursor/selection from the
+    /// content — k/j/Ctrl+u/d move within the mode); the help scrolls its rows
+    /// while they overflow the window; the palette scrolls its list. Returns
+    /// whether the wheel was consumed (never reaching the terminal).
+    fn overlay_wheel(&mut self, s: Surface, delta: MouseScrollDelta) -> bool {
+        let Some(ov) = self.ov_of(s) else { return false };
+        if ov.hint_mode.is_some() || ov.copy_mode.is_some() {
+            return true;
+        }
+        if ov.help_open {
+            if let Some((max, _)) = self.help_scroll_range(s) {
+                let lines = self.surface_wheel_lines(s, delta);
+                let cur = self.ov_of(s).map_or(0, |o| o.help_scroll);
+                self.set_help_scroll(s, cur.min(max) as isize - lines as isize, max);
+                return true;
+            }
+        }
+        if self.ov_of(s).is_some_and(|o| o.palette_open) {
+            let step = match delta {
+                MouseScrollDelta::LineDelta(_, y) => -(y.round() as isize),
+                MouseScrollDelta::PixelDelta(p) => {
+                    if p.y > 0.0 { -1 } else if p.y < 0.0 { 1 } else { 0 }
+                }
+            };
+            if step != 0 {
+                self.palette_move(s, step);
+                self.paint_surface(s);
+            }
+            return true;
+        }
+        false
     }
 
     /// Pixel Y origin of the terminal grid. The bar always costs `bar_h` of grid
@@ -2590,7 +2677,9 @@ impl App {
             terminal.feed_notice(notice);
         }
         let title = format!("Tab {}", self.tabs.len() + 1);
+        let id = self.alloc_tab_id();
         self.tabs.push(Tab {
+            id,
             terminal,
             pty,
             writer,
@@ -2619,7 +2708,7 @@ impl App {
         if active_removed {
             // The searched (active) tab is going away; the bar must not stay
             // open silently retargeting whichever tab becomes active (F2/F7).
-            self.search_close();
+            self.search_close(Surface::Main);
         }
         self.tabs.remove(i);
         if self.tabs.is_empty() {
@@ -2636,16 +2725,13 @@ impl App {
         } else if self.active > i {
             self.active -= 1;
         }
-        // Keep index-bearing UI state aligned with the removed tab so the wrong
-        // tab is never renamed/confirmed, and any in-progress selection is reset.
-        Self::adjust_index_after_remove(&mut self.renaming, i);
-        Self::adjust_index_after_remove(&mut self.confirm_close, i);
-        if self.renaming.is_none() {
-            self.rename_buf.clear();
-        }
+        // A rename box / close confirmation for the removed tab goes with it
+        // (they hold stable ids, so every other tab's stay put); any in-progress
+        // selection is reset.
+        self.drop_stale_tab_refs();
         self.selecting = false;
-        // The tab menu / a held tab drag hold raw indices; the layout just
-        // changed under them, so drop both (transient state, cheap to reopen).
+        // The tab menu / a held tab drag are anchored on the old layout; it
+        // just changed under them, so drop both (transient, cheap to reopen).
         self.tab_menu = None;
         self.tab_menu_hover = None;
         self.tab_menu_rects.clear();
@@ -2706,11 +2792,7 @@ impl App {
         } else if self.active > idx {
             self.active -= 1;
         }
-        Self::adjust_index_after_remove(&mut self.renaming, idx);
-        Self::adjust_index_after_remove(&mut self.confirm_close, idx);
-        if self.renaming.is_none() {
-            self.rename_buf.clear();
-        }
+        self.drop_stale_tab_refs();
         // The tab menu / a held tab drag hold raw indices; the layout just
         // changed under them, so drop both — same invariant as `close_tab` /
         // `close_exited_tabs` (a stale index would rename/close/tear the
@@ -2726,13 +2808,14 @@ impl App {
         // text the user never selected. Same fix-up close_tab does (F27).
         self.selecting = false;
 
-        // Search state travels inside the Terminal, but detached windows
-        // never render it: if the searched (active) tab is leaving, close the
-        // bar and drop its matches so no invisible state rides along. The bar
-        // stays open (showing the next tab's usually-empty query) only when a
-        // NON-active tab is detached via its context menu.
-        if self.search_open && idx == prev_active {
-            self.search_open = false;
+        // Search state travels inside the Terminal, and the main window's bar
+        // targets its ACTIVE tab: if the searched tab is leaving, close the bar
+        // and drop its matches so no invisible state rides along (the new
+        // window starts with its own closed bar). The bar stays open (showing
+        // the next tab's usually-empty query) only when a NON-active tab is
+        // detached via its context menu.
+        if self.ov.search_open && idx == prev_active {
+            self.ov.search_open = false;
             tab.terminal.search_clear();
         }
         // Apply the current theme to the detached tab before it leaves.
@@ -2911,6 +2994,14 @@ impl App {
         if pos >= self.detached.len() {
             return;
         }
+        // This window's overlays go away with it: close its search (dropping
+        // the tab's compiled regex + matches, which the main window's closed bar
+        // would otherwise carry into every reflow) and its copy-mode selection.
+        let s = Surface::Detached(pos);
+        self.search_close(s);
+        if self.ov_of(s).is_some_and(|o| o.copy_mode.is_some()) {
+            self.cancel_copy_mode(s);
+        }
         // Leave OS fullscreen while the window still exists: dropping a
         // fullscreen window leaks macOS's app-scoped presentation options (an
         // auto-hidden Dock + menu bar for the rest of the session).
@@ -2985,98 +3076,287 @@ impl App {
         self.tab_menu_labels.clear();
     }
 
-    /// Adjust an `Option<usize>` index after the tab at `removed` is removed:
-    /// clear it if it pointed AT the removed tab; decrement it if it pointed to a
-    /// later tab (so it keeps referring to the same logical tab).
-    fn adjust_index_after_remove(idx: &mut Option<usize>, removed: usize) {
-        match *idx {
-            Some(j) if j == removed => *idx = None,
-            Some(j) if j > removed => *idx = Some(j - 1),
-            _ => {}
+    /// Drop the long-lived tab references (rename box, close confirmation)
+    /// whose tab left the main window (closed, exited, detached). They hold
+    /// stable ids, so a reference to any OTHER tab stays valid untouched — no
+    /// index shuffling that could retarget it.
+    fn drop_stale_tab_refs(&mut self) {
+        let live: Vec<TabId> = self.tabs.iter().map(|t| t.id).collect();
+        self.renaming = still_open(self.renaming, &live);
+        self.confirm_close = still_open(self.confirm_close, &live);
+        if self.renaming.is_none() {
+            self.rename_buf.clear();
+        }
+        // Ids are never reused, so a gone tab's notification throttle is dead
+        // weight — drop it.
+        self.notify_last_at
+            .retain(|k, _| !matches!(k, NotifyKey::MainTab(id) if !live.contains(id)));
+    }
+
+    // ── Per-window overlay plumbing ──────────────────────────────────────────
+    //
+    // Every overlay (search bar, help, command palette, hint mode, copy-mode)
+    // lives in its window's `Overlays` and acts on that window's terminal: the
+    // main window's ACTIVE tab, or a detached window's own tab. The helpers below
+    // resolve a `Surface` to those, so the main and detached windows run the SAME
+    // overlay code.
+
+    /// The overlays of window `s` (`None` for a detached index that's gone).
+    fn ov_of(&self, s: Surface) -> Option<&Overlays> {
+        match s {
+            Surface::Main => Some(&self.ov),
+            Surface::Detached(p) => self.detached.get(p).map(|d| &d.ov),
         }
     }
 
-    /// Close the scrollback-search bar and clear the ACTIVE tab's search
+    fn ov_of_mut(&mut self, s: Surface) -> Option<&mut Overlays> {
+        match s {
+            Surface::Main => Some(&mut self.ov),
+            Surface::Detached(p) => self.detached.get_mut(p).map(|d| &mut d.ov),
+        }
+    }
+
+    /// The terminal window `s`'s overlays act on.
+    fn term_of(&self, s: Surface) -> Option<&Terminal> {
+        match s {
+            Surface::Main => self.tabs.get(self.active).map(|t| &t.terminal),
+            Surface::Detached(p) => self.detached.get(p).map(|d| &d.tab.terminal),
+        }
+    }
+
+    fn term_of_mut(&mut self, s: Surface) -> Option<&mut Terminal> {
+        match s {
+            Surface::Main => self.tabs.get_mut(self.active).map(|t| &mut t.terminal),
+            Surface::Detached(p) => self.detached.get_mut(p).map(|d| &mut d.tab.terminal),
+        }
+    }
+
+    /// Window `s`'s overlays and terminal together (disjoint borrows).
+    fn ov_term_mut(&mut self, s: Surface) -> Option<(&mut Overlays, &mut Terminal)> {
+        match s {
+            Surface::Main => {
+                let tab = self.tabs.get_mut(self.active)?;
+                Some((&mut self.ov, &mut tab.terminal))
+            }
+            Surface::Detached(p) => self.detached.get_mut(p).map(|d| (&mut d.ov, &mut d.tab.terminal)),
+        }
+    }
+
+    /// Repaint window `s`.
+    fn paint_surface(&self, s: Surface) {
+        match s {
+            Surface::Main => self.request_main_paint(),
+            Surface::Detached(p) => {
+                if let Some(d) = self.detached.get(p) {
+                    d.request_paint();
+                }
+            }
+        }
+    }
+
+    /// Close window `s`'s context menu(s) (an overlay taking over the window).
+    fn dismiss_surface_menus(&mut self, s: Surface) {
+        match s {
+            Surface::Main => self.dismiss_menus(),
+            Surface::Detached(p) => {
+                if let Some(d) = self.detached.get_mut(p) {
+                    d.menu_open = None;
+                    d.menu_hover = None;
+                    d.menu_rects.clear();
+                    d.menu_disabled.clear();
+                }
+            }
+        }
+    }
+
+    /// The run-selection source for window `s`.
+    fn sel_source(s: Surface) -> SelSource {
+        match s {
+            Surface::Main => SelSource::Main,
+            Surface::Detached(p) => SelSource::Detached(p),
+        }
+    }
+
+    /// Window `s`'s layout for overlay builders and hit-tests: `(width, height,
+    /// chrome metrics, grid top)`. `None` before its GPU stack exists.
+    fn surface_layout(&self, s: Surface) -> Option<(u32, u32, jetty_render::ChromeMetrics, f32)> {
+        match s {
+            Surface::Main => {
+                let g = self.gpu.as_ref()?;
+                Some((g.config.width, g.config.height, self.chrome_metrics(), self.grid_top_offset()))
+            }
+            Surface::Detached(p) => {
+                let d = self.detached.get(p)?;
+                let cm = d.chrome_metrics(self.ui_font_logical);
+                let (bar_h, _) = d.chrome_bands(self.ui_font_logical, self.show_perf_hud);
+                Some((d.gpu.config.width, d.gpu.config.height, cm, bar_h))
+            }
+        }
+    }
+
+    /// Window `s`'s chrome text layer (the measurer its overlays are laid out
+    /// with), if built.
+    fn surface_chrome_text(&mut self, s: Surface) -> Option<&mut TextLayer> {
+        match s {
+            Surface::Main => self.chrome_text.as_mut(),
+            Surface::Detached(p) => self.detached.get_mut(p).map(|d| &mut d.chrome_text),
+        }
+    }
+
+    /// Close window `s`'s scrollback-search bar and clear its terminal's search
     /// state (query, compiled regex, matches). The single close path for
-    /// Esc / ✕ / Ctrl+Shift+F — and for every active-tab change while the
-    /// bar is open (tab switch/select/reattach/close): the bar targets the
-    /// active tab, so leaving a searched tab in the background would strand
-    /// a compiled regex + match list on it, and `Terminal::resize` would
-    /// re-scan that tab's ENTIRE scrollback on every reflow forever
-    /// (F2/F7/F15 — an invisible, permanent resize-path slowdown).
-    fn search_close(&mut self) {
-        if !self.search_open {
+    /// Esc / ✕ / the search chord — and, in the main window, for every
+    /// active-tab change while the bar is open: the bar targets the active tab,
+    /// so leaving a searched tab in the background would strand a compiled regex
+    /// and match list on it, and `Terminal::resize` would re-scan that tab's
+    /// ENTIRE scrollback on every reflow forever (F2/F7/F15).
+    fn search_close(&mut self, s: Surface) {
+        let Some(ov) = self.ov_of_mut(s) else { return };
+        if !ov.search_open {
             return;
         }
-        self.search_open = false;
-        self.search_dirty = false;
+        ov.search_open = false;
+        ov.search_dirty = false;
         // Tolerate an empty tabs vec (reattach-from-close_exited_tabs path).
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.terminal.search_clear();
+        if let Some(term) = self.term_of_mut(s) {
+            term.search_clear();
         }
-        self.request_main_paint();
+        self.paint_surface(s);
+    }
+
+    /// Open window `s`'s search bar (the search chord / palette). Every close
+    /// path clears, so the bar normally opens empty; should query state somehow
+    /// survive on this terminal, re-collect so stale points (the scrollback
+    /// rotated while closed) never render. No-op re-collect without a query.
+    fn search_open(&mut self, s: Surface) {
+        let Some(ov) = self.ov_of_mut(s) else { return };
+        if !ov.search_open {
+            ov.search_open = true;
+            if let Some(term) = self.term_of_mut(s) {
+                term.search_refresh();
+            }
+        }
+        self.paint_surface(s);
+    }
+
+    /// The search chord: close window `s`'s bar if open, else open it.
+    fn search_toggle(&mut self, s: Surface) {
+        if self.ov_of(s).is_some_and(|o| o.search_open) {
+            self.search_close(s);
+        } else {
+            self.search_open(s);
+        }
+    }
+
+    /// Window `s`'s search-bar draw data `(query, current, total)` and the
+    /// viewport match hits to tint — `None` / empty while its bar is closed
+    /// (one bool test on the hot path, zero allocation).
+    fn search_draw(&self, s: Surface) -> (Option<(String, usize, usize)>, Vec<jetty_core::SearchHit>) {
+        if !self.ov_of(s).is_some_and(|o| o.search_open) {
+            return (None, Vec::new());
+        }
+        let Some(t) = self.term_of(s) else { return (None, Vec::new()) };
+        let (cur, total) = t.search_counter();
+        (Some((t.search_query().to_string(), cur, total)), t.search_viewport_hits())
+    }
+
+    /// Re-collect window `s`'s open search now when a throttled refresh is due
+    /// (output rotated its scrollback). Returns whether it re-collected.
+    fn refresh_search_if_due(&mut self, s: Surface, now: std::time::Instant) -> bool {
+        let Some((ov, term)) = self.ov_term_mut(s) else { return false };
+        if !ov.search_refresh_due(now) {
+            return false;
+        }
+        term.search_refresh();
+        ov.search_refreshed(now);
+        true
+    }
+
+    /// Type `text` into window `s`'s open search query (printable chars only).
+    fn search_extend_query(&mut self, s: Surface, text: &str) {
+        if let Some(term) = self.term_of_mut(s) {
+            let mut q = term.search_query().to_string();
+            q.extend(text.chars().filter(|c| !c.is_control()));
+            term.search_set_query(&q);
+        }
     }
 
     // ── Hint mode (Ctrl+Shift+H) + keyboard copy-mode (Ctrl+Shift+Space) ──────
 
-    /// True while another overlay owns the keyboard, so the hint/copy-mode chords
-    /// cannot start a mode (single-owner rule). Palette/search/rename/confirm
-    /// capture the chord BEFORE `decide_key` runs; welcome + help only capture
-    /// Esc, so they are checked explicitly here (amendment 6 — "cannot enter
-    /// while another owns keys", INCLUDING welcome, for parity).
-    fn overlay_owns_keys(&self) -> bool {
-        self.confirm_quit
-            || self.confirm_close.is_some()
-            || self.renaming.is_some()
-            || self.palette_open
-            || self.welcome_open
-            || self.help_open
-            || self.search_open
+    /// True while another overlay owns window `s`'s keyboard, so the hint /
+    /// copy-mode chords cannot start a mode (single-owner rule). In the main
+    /// window the app-level modals (confirm/quit popups, inline rename, the
+    /// welcome splash) count too: palette/search/rename/confirm capture the chord
+    /// BEFORE `decide_key` runs; welcome + help only capture Esc, so they are
+    /// checked explicitly here (amendment 6 — "cannot enter while another owns
+    /// keys", INCLUDING welcome, for parity).
+    fn overlay_owns_keys(&self, s: Surface) -> bool {
+        let window_overlay = self.ov_of(s).is_some_and(|o| o.owns_keys());
+        match s {
+            Surface::Main => {
+                self.confirm_quit
+                    || self.confirm_close.is_some()
+                    || self.renaming.is_some()
+                    || self.welcome_open
+                    || window_overlay
+            }
+            Surface::Detached(_) => window_overlay,
+        }
     }
 
-    /// Enter hint mode: scan the visible URL/path/hash/IPv4 tokens ONCE and show
-    /// their labels. No-op on the alt screen, while another overlay owns keys, or
-    /// when the scan finds ZERO tokens (n=0 auto-exit — never trap the user in an
-    /// empty mode requiring Esc).
-    fn enter_hint_mode(&mut self) {
-        if self.overlay_owns_keys() || self.copy_mode.is_some() {
+    /// Enter hint mode in window `s`: scan the visible URL/path/hash/IPv4 tokens
+    /// ONCE and show their labels. No-op on the alt screen, while another
+    /// overlay owns keys, or when the scan finds ZERO tokens (n=0 auto-exit —
+    /// never trap the user in an empty mode requiring Esc).
+    fn enter_hint_mode(&mut self, s: Surface) {
+        if self.overlay_owns_keys(s) || self.ov_of(s).is_none_or(|o| o.copy_mode.is_some()) {
             return;
         }
-        if self.active_tab().terminal.alt_screen() {
+        let Some(term) = self.term_of(s) else { return };
+        if term.alt_screen() {
             return;
         }
-        let tokens = self.active_tab().terminal.hint_tokens();
+        let tokens = term.hint_tokens();
         if tokens.is_empty() {
             return;
         }
         let labels = jetty_core::hints::assign_labels(tokens.len());
-        self.hint_mode = Some(HintState { tokens, labels, typed: String::new() });
-        self.request_main_paint();
+        if let Some(ov) = self.ov_of_mut(s) {
+            ov.hint_mode = Some(HintState { tokens, labels, typed: String::new() });
+        }
+        self.paint_surface(s);
     }
 
-    /// Cancel hint mode (Esc / after firing).
-    fn exit_hint_mode(&mut self) {
-        self.hint_mode = None;
-        self.request_main_paint();
+    /// Cancel window `s`'s hint mode (Esc / after firing).
+    fn exit_hint_mode(&mut self, s: Surface) {
+        if let Some(ov) = self.ov_of_mut(s) {
+            ov.hint_mode = None;
+        }
+        self.paint_surface(s);
     }
 
-    /// Handle one key while hint mode owns the keyboard. Letters narrow the typed
-    /// prefix (matched against the BASE ASCII letter, independent of Alt/compose —
-    /// BLOCKING 5); an exact label match COPIES the token (default) or, for a URL
-    /// with Alt held at completion, OPENS it. Esc cancels; Backspace pops; every
-    /// other key is swallowed.
-    fn hint_mode_key(&mut self, physical: winit::keyboard::PhysicalKey, logical: &winit::keyboard::Key) {
+    /// Handle one key while hint mode owns window `s`'s keyboard. Letters narrow
+    /// the typed prefix (matched against the BASE ASCII letter, independent of
+    /// Alt/compose — BLOCKING 5); an exact label match COPIES the token (default)
+    /// or, for a URL with Alt held at completion, OPENS it. Esc cancels;
+    /// Backspace pops; every other key is swallowed.
+    fn hint_mode_key(
+        &mut self,
+        s: Surface,
+        physical: winit::keyboard::PhysicalKey,
+        logical: &winit::keyboard::Key,
+    ) {
         use winit::keyboard::{Key, NamedKey};
         match logical {
             Key::Named(NamedKey::Escape) => {
-                self.exit_hint_mode();
+                self.exit_hint_mode(s);
                 return;
             }
             Key::Named(NamedKey::Backspace) => {
-                if let Some(hs) = self.hint_mode.as_mut() {
+                if let Some(hs) = self.ov_of_mut(s).and_then(|o| o.hint_mode.as_mut()) {
                     hs.typed.pop();
                 }
-                self.request_main_paint();
+                self.paint_surface(s);
                 return;
             }
             _ => {}
@@ -3090,7 +3370,7 @@ impl App {
             Ignore,
         }
         let outcome = {
-            let Some(hs) = self.hint_mode.as_ref() else { return };
+            let Some(hs) = self.ov_of(s).and_then(|o| o.hint_mode.as_ref()) else { return };
             let mut typed = hs.typed.clone();
             typed.push(ch);
             if let Some(idx) = hs.labels.iter().position(|l| *l == typed) {
@@ -3111,29 +3391,31 @@ impl App {
                 } else {
                     crate::clipboard::set(&tok.text);
                 }
-                self.exit_hint_mode();
+                self.exit_hint_mode(s);
             }
             Outcome::Narrow(t) => {
-                if let Some(hs) = self.hint_mode.as_mut() {
+                if let Some(hs) = self.ov_of_mut(s).and_then(|o| o.hint_mode.as_mut()) {
                     hs.typed = t;
                 }
-                self.request_main_paint();
+                self.paint_surface(s);
             }
             Outcome::Ignore => {}
         }
     }
 
-    /// Enter copy-mode: a keyboard vi-cursor over the viewport + scrollback.
-    /// No-op on the alt screen or while another overlay owns keys. Clears any
-    /// leftover mouse selection on enter so the old highlight never lingers.
-    fn enter_copy_mode(&mut self) {
-        if self.overlay_owns_keys() || self.hint_mode.is_some() {
+    /// Enter copy-mode in window `s`: a keyboard vi-cursor over the viewport +
+    /// scrollback. No-op on the alt screen or while another overlay owns keys.
+    /// Clears any leftover mouse selection on enter so the old highlight never
+    /// lingers.
+    fn enter_copy_mode(&mut self, s: Surface) {
+        if self.overlay_owns_keys(s) || self.ov_of(s).is_none_or(|o| o.hint_mode.is_some()) {
             return;
         }
-        if self.active_tab().terminal.alt_screen() {
+        let Some(term) = self.term_of_mut(s) else { return };
+        if term.alt_screen() {
             return;
         }
-        let snap = self.active_tab().terminal.snapshot();
+        let snap = term.snapshot();
         let (row, col) = if snap.cursor_visible {
             (
                 snap.cursor_row.min(snap.rows.saturating_sub(1)),
@@ -3142,19 +3424,38 @@ impl App {
         } else {
             (snap.rows.saturating_sub(1), 0)
         };
-        self.active_tab_mut().terminal.selection_clear();
-        self.copy_mode = Some(crate::copymode::CopyMode::new(row, col));
-        self.request_main_paint();
+        term.selection_clear();
+        if let Some(ov) = self.ov_of_mut(s) {
+            ov.copy_mode = Some(crate::copymode::CopyMode::new(row, col));
+        }
+        self.paint_surface(s);
     }
 
-    /// Exit copy-mode (Esc / after yank).
-    fn exit_copy_mode(&mut self) {
-        self.copy_mode = None;
-        self.request_main_paint();
+    /// Exit window `s`'s copy-mode (Esc / after yank).
+    fn exit_copy_mode(&mut self, s: Surface) {
+        if let Some(ov) = self.ov_of_mut(s) {
+            ov.copy_mode = None;
+        }
+        self.paint_surface(s);
     }
 
-    /// Handle one key while copy-mode owns the keyboard.
-    fn copy_mode_key(&mut self, physical: winit::keyboard::PhysicalKey, logical: &winit::keyboard::Key, ctrl: bool) {
+    /// Clear window `s`'s selection and leave copy-mode (Esc, the copy-mode
+    /// chord, and every "done" path).
+    fn cancel_copy_mode(&mut self, s: Surface) {
+        if let Some(term) = self.term_of_mut(s) {
+            term.selection_clear();
+        }
+        self.exit_copy_mode(s);
+    }
+
+    /// Handle one key while copy-mode owns window `s`'s keyboard.
+    fn copy_mode_key(
+        &mut self,
+        s: Surface,
+        physical: winit::keyboard::PhysicalKey,
+        logical: &winit::keyboard::Key,
+        ctrl: bool,
+    ) {
         use crate::copymode::Motion;
         use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
         // Ctrl combos: half-page scroll (keyed on physical position, robust vs
@@ -3162,8 +3463,8 @@ impl App {
         if ctrl {
             if let PhysicalKey::Code(code) = physical {
                 match code {
-                    KeyCode::KeyU => self.copy_mode_motion(Motion::HalfPageUp),
-                    KeyCode::KeyD => self.copy_mode_motion(Motion::HalfPageDown),
+                    KeyCode::KeyU => self.copy_mode_motion(s, Motion::HalfPageUp),
+                    KeyCode::KeyD => self.copy_mode_motion(s, Motion::HalfPageDown),
                     _ => {}
                 }
             }
@@ -3172,19 +3473,18 @@ impl App {
         // Non-motion commands.
         match logical {
             Key::Named(NamedKey::Escape) => {
-                self.active_tab_mut().terminal.selection_clear();
-                self.exit_copy_mode();
+                self.cancel_copy_mode(s);
                 return;
             }
             Key::Named(NamedKey::Enter) => {
-                self.copy_mode_yank();
+                self.copy_mode_yank(s);
                 return;
             }
-            Key::Character(s) if s.as_str() == "y" => {
-                self.copy_mode_yank();
+            Key::Character(c) if c.as_str() == "y" => {
+                self.copy_mode_yank(s);
                 return;
             }
-            Key::Character(s) if s.as_str() == "r" => {
+            Key::Character(c) if c.as_str() == "r" => {
                 // Run the selection in a new tab — `y`'s sibling: `y` copies-
                 // and-exits, `r` runs-in-a-new-tab-and-exits. Requires an
                 // ACTIVE v/V selection; without one the key is swallowed
@@ -3193,43 +3493,43 @@ impl App {
                 // `run_selection = false` the key must be a PURE no-op —
                 // swallowed like any unbound copy-mode key, keeping the
                 // selection and the mode — not a clear-and-exit surprise.
-                if self.run_selection_enabled && self.copy_mode.is_some_and(|cm| cm.selecting) {
+                let selecting = self.ov_of(s).and_then(|o| o.copy_mode).is_some_and(|cm| cm.selecting);
+                if self.run_selection_enabled && selecting {
                     // run_selection_in_new_tab captures + clears the SOURCE
                     // selection BEFORE switching to the new tab; the extra
                     // clear covers the empty-selection no-op path so the exit
                     // mirrors the `y` arm exactly (clear + exit).
-                    self.run_selection_in_new_tab(SelSource::Main);
-                    self.active_tab_mut().terminal.selection_clear();
-                    self.exit_copy_mode();
+                    self.run_selection_in_new_tab(Self::sel_source(s));
+                    self.cancel_copy_mode(s);
                 }
                 return;
             }
-            Key::Character(s) if s.as_str() == "v" || s.as_str() == "V" => {
-                let line = s.as_str() == "V";
+            Key::Character(c) if c.as_str() == "v" || c.as_str() == "V" => {
+                let line = c.as_str() == "V";
                 // Content-pinned anchor: capture the BUFFER line under the cursor
                 // NOW, so scrolling while selecting extends into scrollback rather
                 // than sliding the whole selection with the viewport.
-                let cur_row = self.copy_mode.map(|cm| cm.row);
-                let anchor_line =
-                    cur_row.map(|row| self.active_tab().terminal.viewport_line_to_buffer(row));
-                let now_selecting = if let (Some(cm), Some(anchor_line)) =
-                    (self.copy_mode.as_mut(), anchor_line)
-                {
-                    if cm.selecting && cm.line_mode == line {
-                        cm.selecting = false;
-                        false
-                    } else {
-                        cm.begin_select(line, anchor_line);
-                        true
+                let Some((ov, term)) = self.ov_term_mut(s) else { return };
+                let now_selecting = match ov.copy_mode.as_mut() {
+                    Some(cm) => {
+                        let anchor_line = term.viewport_line_to_buffer(cm.row);
+                        if cm.selecting && cm.line_mode == line {
+                            cm.selecting = false;
+                            false
+                        } else {
+                            cm.begin_select(line, anchor_line);
+                            true
+                        }
                     }
-                } else {
-                    false
+                    None => false,
                 };
                 if now_selecting {
-                    self.copy_mode_refresh_selection();
+                    self.copy_mode_refresh_selection(s);
                 } else {
-                    self.active_tab_mut().terminal.selection_clear();
-                    self.request_main_paint();
+                    if let Some(term) = self.term_of_mut(s) {
+                        term.selection_clear();
+                    }
+                    self.paint_surface(s);
                 }
                 return;
             }
@@ -3240,7 +3540,7 @@ impl App {
             Key::Named(NamedKey::ArrowRight) => Some(Motion::Right),
             Key::Named(NamedKey::ArrowUp) => Some(Motion::Up),
             Key::Named(NamedKey::ArrowDown) => Some(Motion::Down),
-            Key::Character(s) if s.chars().count() == 1 => match s.chars().next().unwrap() {
+            Key::Character(c) if c.chars().count() == 1 => match c.chars().next().unwrap() {
                 'h' => Some(Motion::Left),
                 'l' => Some(Motion::Right),
                 'k' => Some(Motion::Up),
@@ -3257,50 +3557,49 @@ impl App {
             _ => None,
         };
         if let Some(m) = motion {
-            self.copy_mode_motion(m);
+            self.copy_mode_motion(s, m);
         }
         // else: swallow the key (copy-mode owns the keyboard).
     }
 
-    /// Apply a copy-mode motion: move the cursor, honour the scroll request, and
-    /// re-drive the selection from the (possibly scrolled) viewport coords.
-    fn copy_mode_motion(&mut self, motion: crate::copymode::Motion) {
+    /// Apply a copy-mode motion in window `s`: move the cursor, honour the
+    /// scroll request, and re-drive the selection from the (possibly scrolled)
+    /// viewport coords.
+    fn copy_mode_motion(&mut self, s: Surface, motion: crate::copymode::Motion) {
         use crate::copymode::ScrollReq;
-        let Some(cm) = self.copy_mode else { return };
-        let (rows, cols) = {
-            let t = &self.active_tab().terminal;
-            (t.rows(), t.cols())
-        };
-        let viewport = self.active_tab().terminal.viewport_rows_chars();
+        let Some((ov, term)) = self.ov_term_mut(s) else { return };
+        let Some(cm) = ov.copy_mode else { return };
+        let (rows, cols) = (term.rows(), term.cols());
+        let viewport = term.viewport_rows_chars();
         let out = crate::copymode::apply_motion(&cm, motion, rows, cols, &viewport);
         match out.scroll {
             ScrollReq::None => {}
-            ScrollReq::Lines(n) => self.active_tab_mut().terminal.scroll_lines(n),
+            ScrollReq::Lines(n) => term.scroll_lines(n),
             ScrollReq::Top => {
-                let max = self.active_tab().terminal.scroll_max();
-                self.active_tab_mut().terminal.scroll_to_offset(max);
+                let max = term.scroll_max();
+                term.scroll_to_offset(max);
             }
-            ScrollReq::Bottom => self.active_tab_mut().terminal.scroll_to_bottom(),
+            ScrollReq::Bottom => term.scroll_to_bottom(),
         }
-        if let Some(cm) = self.copy_mode.as_mut() {
+        if let Some(cm) = ov.copy_mode.as_mut() {
             cm.row = out.row.min(rows.saturating_sub(1));
             cm.col = out.col.min(cols.saturating_sub(1));
         }
-        self.copy_mode_refresh_selection();
-        self.request_main_paint();
+        self.copy_mode_refresh_selection(s);
+        self.paint_surface(s);
     }
 
-    /// Rebuild the alacritty selection from the copy-mode anchor + cursor with
-    /// the DERIVED sub-cell sides (BLOCKING 2) — reading-order start=Left,
-    /// end=Right — so the highlight/yank is inclusive on both ends regardless of
+    /// Rebuild window `s`'s selection from the copy-mode anchor + cursor with the
+    /// DERIVED sub-cell sides (BLOCKING 2) — reading-order start=Left, end=Right
+    /// — so the highlight/yank is inclusive on both ends regardless of
     /// direction. No-op when not selecting (never clobbers a cleared selection).
-    fn copy_mode_refresh_selection(&mut self) {
-        let Some(cm) = self.copy_mode else { return };
+    fn copy_mode_refresh_selection(&mut self, s: Surface) {
+        let Some((ov, term)) = self.ov_term_mut(s) else { return };
+        let Some(cm) = ov.copy_mode else { return };
         if !cm.selecting {
             return;
         }
         let anchor = (cm.anchor_line, cm.anchor_col);
-        let term = &mut self.active_tab_mut().terminal;
         // The cursor's CURRENT absolute buffer line (viewport row → buffer at the
         // present scroll offset); the anchor is already absolute + fixed, so a
         // scroll extends the selection through scrollback instead of sliding it.
@@ -3321,77 +3620,372 @@ impl App {
         }
     }
 
-    /// Yank the current selection to the clipboard and exit copy-mode.
-    fn copy_mode_yank(&mut self) {
-        let text = self
-            .active_tab()
-            .terminal
-            .selection_text()
-            .filter(|t| !t.is_empty());
-        if let Some(t) = text {
+    /// Yank window `s`'s selection to the clipboard and exit copy-mode.
+    fn copy_mode_yank(&mut self, s: Surface) {
+        if let Some(t) = self.term_of(s).and_then(|t| t.selection_text()).filter(|t| !t.is_empty()) {
             crate::clipboard::set(&t);
         }
-        self.active_tab_mut().terminal.selection_clear();
-        self.exit_copy_mode();
+        self.cancel_copy_mode(s);
     }
 
     // ── Command palette ──────────────────────────────────────────────────────
 
-    /// (Re)build the palette registry FRESH and open the overlay. Building on
-    /// open (~50 short entries) — not incrementally and NOT in `apply_theme`
-    /// (which auto-repeats on opacity) — keeps the dynamic theme/tab/detach
-    /// entries current at zero per-frame cost. Dismisses every peer overlay so
-    /// exactly one overlay owns keys + draws on top.
-    fn open_palette(&mut self) {
-        self.dismiss_menus();
-        self.help_open = false;
-        self.welcome_open = false;
+    /// (Re)build the palette registry FRESH and open the overlay in window `s`.
+    /// Building on open (~50 short entries) — not incrementally and NOT in
+    /// `apply_theme` (which auto-repeats on opacity) — keeps the dynamic
+    /// theme/tab/detach entries current at zero per-frame cost. Dismisses every
+    /// peer overlay of that window so exactly one overlay owns keys + draws on
+    /// top.
+    fn open_palette(&mut self, s: Surface) {
+        self.dismiss_surface_menus(s);
+        if s == Surface::Main {
+            self.welcome_open = false;
+        }
         let themes = jetty_core::theme_list();
-        let tabs: Vec<String> = self.tabs.iter().map(|t| t.title.clone()).collect();
-        let detached: Vec<String> = self.detached.iter().map(|d| d.tab.title.clone()).collect();
-        self.palette_registry = crate::palette::build_registry(&themes, &tabs, &detached);
-        self.palette_query.clear();
-        self.palette_open = true;
-        self.refilter_palette();
-        self.request_main_paint();
+        let tabs: Vec<(u64, String)> = self.tabs.iter().map(|t| (t.id.0, t.title.clone())).collect();
+        let detached: Vec<(u64, String)> =
+            self.detached.iter().map(|d| (d.tab.id.0, d.tab.title.clone())).collect();
+        let registry = crate::palette::build_registry(&themes, &tabs, &detached);
+        let Some(ov) = self.ov_of_mut(s) else { return };
+        ov.help_open = false;
+        ov.palette_registry = registry;
+        ov.palette_query.clear();
+        ov.palette_open = true;
+        ov.refilter_palette();
+        self.paint_surface(s);
     }
 
-    /// Recompute the fuzzy hit list from the current query. Called ONLY on open +
-    /// each keystroke — never per frame. Resets the selection/scroll to the top.
-    fn refilter_palette(&mut self) {
-        self.palette_filtered = crate::palette::filter(&self.palette_registry, &self.palette_query);
-        self.palette_selected = 0;
-        self.palette_scroll = 0;
+    /// Close window `s`'s palette and free its transient state, so nothing is
+    /// allocated while it is closed.
+    fn close_palette(&mut self, s: Surface) {
+        if self.ov_of_mut(s).is_some_and(|o| o.close_palette()) {
+            self.paint_surface(s);
+        }
     }
 
-    /// Close the palette and free its transient state, so nothing is allocated
-    /// while it is closed.
-    fn close_palette(&mut self) {
-        if !self.palette_open {
-            return;
+    /// Move window `s`'s palette selection by `delta` rows (clamped), keeping it
+    /// inside the `MAX_PALETTE_ROWS` scroll window.
+    fn palette_move(&mut self, s: Surface, delta: isize) {
+        if let Some(ov) = self.ov_of_mut(s) {
+            ov.palette_move(delta);
         }
-        self.palette_open = false;
-        self.palette_query.clear();
-        self.palette_filtered = Vec::new();
-        self.palette_registry = Vec::new();
-        self.request_main_paint();
     }
 
-    /// Move the palette selection by `delta` rows (clamped), keeping it inside the
-    /// `MAX_PALETTE_ROWS` scroll window.
-    fn palette_move(&mut self, delta: isize) {
-        let n = self.palette_filtered.len();
-        if n == 0 {
-            return;
+    /// Keys owned by window `s`'s MODAL overlays, in priority order
+    /// (single-overlay-owns-keys): the command palette captures ALL keys while
+    /// open — type → query, Up/Down → select, PageUp/Down → page, Enter → run +
+    /// close, Esc → close, Backspace → edit, its own chord → toggle closed, every
+    /// other Ctrl/Cmd chord swallowed so nothing leaks; then hint mode (letters
+    /// narrow the label prefix, Esc cancels, Backspace pops, its chord toggles
+    /// closed, everything else swallowed); then copy-mode. Chords are routed
+    /// through the keymap so a remapped binding toggles closed consistently
+    /// (amendment 4). Returns whether the key was consumed.
+    fn overlay_key_modal(
+        &mut self,
+        s: Surface,
+        event: &winit::event::KeyEvent,
+        event_loop: &ActiveEventLoop,
+    ) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        let Some(ov) = self.ov_of(s) else { return false };
+        let (palette, hint, copy) = (ov.palette_open, ov.hint_mode.is_some(), ov.copy_mode.is_some());
+        if !(palette || hint || copy) {
+            return false;
         }
-        let next = (self.palette_selected as isize + delta).clamp(0, n as isize - 1) as usize;
-        self.palette_selected = next;
-        let win = jetty_render::MAX_PALETTE_ROWS;
-        if next < self.palette_scroll {
-            self.palette_scroll = next;
-        } else if next >= self.palette_scroll + win {
-            self.palette_scroll = next + 1 - win;
+        let ctrl = self.modifiers.control_key();
+        let shift = self.modifiers.shift_key();
+        let alt = self.modifiers.alt_key();
+        let sup = self.modifiers.super_key();
+        let mods = crate::keymap::Mods::new(ctrl, shift, alt, sup);
+        let chord = self.keymap.lookup(mods, event.physical_key, &event.logical_key);
+        if palette {
+            if chord == Some(input::KeyAction::OpenPalette) {
+                self.close_palette(s);
+                return true;
+            }
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => self.close_palette(s),
+                Key::Named(NamedKey::Enter) => {
+                    let cmd = self.ov_of(s).and_then(|o| o.palette_pick());
+                    self.close_palette(s);
+                    if let Some(c) = cmd {
+                        self.run_palette_cmd(c, s, event_loop);
+                    }
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowDown) => self.palette_move(s, 1),
+                Key::Named(NamedKey::ArrowUp) => self.palette_move(s, -1),
+                Key::Named(NamedKey::PageDown) => {
+                    self.palette_move(s, jetty_render::MAX_PALETTE_ROWS as isize)
+                }
+                Key::Named(NamedKey::PageUp) => {
+                    self.palette_move(s, -(jetty_render::MAX_PALETTE_ROWS as isize))
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(ov) = self.ov_of_mut(s) {
+                        ov.palette_query.pop();
+                        ov.refilter_palette();
+                    }
+                }
+                _ => {
+                    if ctrl || sup {
+                        // Swallow other chords while the palette owns keys.
+                    } else if let Some(t) = &event.text {
+                        self.palette_type(s, t);
+                    }
+                }
+            }
+            self.paint_surface(s);
+            return true;
         }
+        if hint {
+            if chord == Some(input::KeyAction::HintMode) {
+                self.exit_hint_mode(s);
+                return true;
+            }
+            self.hint_mode_key(s, event.physical_key, &event.logical_key);
+            return true;
+        }
+        if chord == Some(input::KeyAction::CopyMode) {
+            self.cancel_copy_mode(s);
+            return true;
+        }
+        self.copy_mode_key(s, event.physical_key, &event.logical_key, ctrl);
+        true
+    }
+
+    /// Keys owned by window `s`'s BAR overlays. The help captures Escape —
+    /// fully consumed: it must NOT also close a tab or reach the shell — and,
+    /// only while its rows overflow the window, the scroll keys (otherwise they
+    /// reach the shell as before). The scrollback-search bar (after the help
+    /// Esc, so help keeps Esc priority) captures every key while open: printable
+    /// keys edit the query incrementally; Enter/F3 step older, Shift+Enter /
+    /// Shift+F3 newer; Backspace pops; Esc / its chord close and CLEAR (no query
+    /// retention); the Paste chord pastes into the query; every other Ctrl/Cmd
+    /// chord is swallowed (alacritty-style). Returns whether the key was
+    /// consumed.
+    fn overlay_key_bars(&mut self, s: Surface, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        let Some(ov) = self.ov_of(s) else { return false };
+        let (help, search) = (ov.help_open, ov.search_open);
+        if help && matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+            if let Some(ov) = self.ov_of_mut(s) {
+                ov.help_open = false;
+            }
+            self.dismiss_help_peers(s);
+            self.paint_surface(s);
+            return true;
+        }
+        if help {
+            if let Key::Named(
+                k @ (NamedKey::ArrowUp
+                | NamedKey::ArrowDown
+                | NamedKey::PageUp
+                | NamedKey::PageDown
+                | NamedKey::Home
+                | NamedKey::End),
+            ) = &event.logical_key
+            {
+                if let Some((max, page)) = self.help_scroll_range(s) {
+                    let cur = self.ov_of(s).map_or(0, |o| o.help_scroll).min(max) as isize;
+                    let page = page.max(1) as isize;
+                    let to = match k {
+                        NamedKey::ArrowUp => cur - 1,
+                        NamedKey::ArrowDown => cur + 1,
+                        NamedKey::PageUp => cur - page,
+                        NamedKey::PageDown => cur + page,
+                        NamedKey::Home => 0,
+                        _ => max as isize,
+                    };
+                    self.set_help_scroll(s, to, max);
+                    return true;
+                }
+            }
+        }
+        if !search {
+            return false;
+        }
+        let ctrl = self.modifiers.control_key();
+        let shift = self.modifiers.shift_key();
+        let alt = self.modifiers.alt_key();
+        let sup = self.modifiers.super_key();
+        let mods = crate::keymap::Mods::new(ctrl, shift, alt, sup);
+        let chord_action = self.keymap.lookup(mods, event.physical_key, &event.logical_key);
+        if chord_action == Some(input::KeyAction::SearchToggle) {
+            self.search_close(s);
+            return true;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.search_close(s),
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::F3) => {
+                // Matches stale after a throttled streaming burst? Re-collect
+                // FIRST so navigation steps real points instead of scrolling to
+                // rotated rows (F10). Enter/F3 = older; +Shift = newer.
+                if let Some((ov, term)) = self.ov_term_mut(s) {
+                    if ov.search_dirty {
+                        term.search_refresh();
+                        ov.search_refreshed(std::time::Instant::now());
+                    }
+                    term.search_nav(!shift);
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(term) = self.term_of_mut(s) {
+                    let mut q = term.search_query().to_string();
+                    q.pop();
+                    term.search_set_query(&q);
+                }
+            }
+            _ => {
+                if chord_action == Some(input::KeyAction::Paste) {
+                    if let Some(text) = clipboard::get() {
+                        self.search_extend_query(s, &text);
+                    }
+                } else if ctrl || sup {
+                    // Swallow other Ctrl/Cmd chords while the bar is open.
+                } else if let Some(t) = &event.text {
+                    self.search_extend_query(s, t);
+                }
+            }
+        }
+        self.paint_surface(s);
+        true
+    }
+
+    /// Type `text` into window `s`'s palette query (printable chars only),
+    /// refiltering when it changed.
+    fn palette_type(&mut self, s: Surface, text: &str) {
+        let Some(ov) = self.ov_of_mut(s) else { return };
+        let mut changed = false;
+        for ch in text.chars() {
+            if !ch.is_control() {
+                ov.palette_query.push(ch);
+                changed = true;
+            }
+        }
+        if changed {
+            ov.refilter_palette();
+        }
+    }
+
+    /// An IME commit while one of window `s`'s overlays owns its keyboard: hint
+    /// mode / copy-mode DROP it (a CJK IME routes even Latin letters through
+    /// commits, which must neither leak to the shell behind the overlay nor
+    /// silently fail the mode's own keys — BLOCKING 1); the palette and the
+    /// search bar take it into their query (CJK queries). Returns whether the
+    /// commit was consumed.
+    fn overlay_ime_commit(&mut self, s: Surface, text: &str) -> bool {
+        let Some(ov) = self.ov_of(s) else { return false };
+        if ov.hint_mode.is_some() || ov.copy_mode.is_some() {
+            return true;
+        }
+        if ov.palette_open {
+            self.palette_type(s, text);
+            self.paint_surface(s);
+            return true;
+        }
+        if ov.search_open {
+            self.search_extend_query(s, text);
+            self.paint_surface(s);
+            return true;
+        }
+        false
+    }
+
+    /// Hint mode and copy-mode are primary-screen only: when a program switched
+    /// window `s`'s terminal to the alt screen mid-mode (a full-screen TUI
+    /// launched), drop them cleanly rather than draw stale chips / a cursor over
+    /// the TUI. Cheap: one test while no mode is active.
+    fn exit_modes_on_alt_screen(&mut self, s: Surface) {
+        let Some((ov, term)) = self.ov_term_mut(s) else { return };
+        if (ov.hint_mode.is_some() || ov.copy_mode.is_some()) && term.alt_screen() {
+            if ov.copy_mode.is_some() {
+                term.selection_clear();
+            }
+            ov.hint_mode = None;
+            ov.copy_mode = None;
+        }
+    }
+
+    /// A left press on window `s` while hint mode / copy-mode is active: hint
+    /// mode is keyboard-only, so the click is swallowed (returns true);
+    /// copy-mode exits and lets the click fall through to the normal mouse path
+    /// (predictable, simple).
+    fn modes_click(&mut self, s: Surface) -> bool {
+        let Some(ov) = self.ov_of(s) else { return false };
+        if ov.hint_mode.is_some() {
+            return true;
+        }
+        if ov.copy_mode.is_some() {
+            if let Some(term) = self.term_of_mut(s) {
+                term.selection_clear();
+            }
+            if let Some(ov) = self.ov_of_mut(s) {
+                ov.copy_mode = None;
+            }
+            self.paint_surface(s);
+        }
+        false
+    }
+
+    /// A left press while window `s`'s command palette is open. The palette
+    /// captures the mouse: every press is consumed so none falls through to
+    /// terminal selection, the scrollbar, or a button that could open another
+    /// overlay over it. A click on a visible row runs it; a click outside the
+    /// panel closes it; inside (non-row) is a no-op. Returns whether it was open.
+    fn palette_click(&mut self, s: Surface, cx: f32, cy: f32, event_loop: &ActiveEventLoop) -> bool {
+        if !self.ov_of(s).is_some_and(|o| o.palette_open) {
+            return false;
+        }
+        let Some(pal) = self.layout_palette(s) else { return true };
+        let first = self.ov_of(s).map_or(0, |o| o.palette_scroll);
+        let hit = pal.row_hits.iter().position(|r| input::point_in(r, cx, cy)).map(|vi| first + vi);
+        if let Some(gi) = hit {
+            let cmd = self.ov_of(s).and_then(|o| o.palette_filtered.get(gi)).map(|h| h.cmd.clone());
+            self.close_palette(s);
+            if let Some(c) = cmd {
+                self.run_palette_cmd(c, s, event_loop);
+            }
+        } else if !input::point_in(&pal.panel, cx, cy) {
+            self.close_palette(s);
+        }
+        true
+    }
+
+    /// A left press while window `s`'s help is open. Modal: a click outside its
+    /// panel closes it, a click inside is swallowed — either way the click is
+    /// consumed so it never reaches the tab bar, a resize edge, or the terminal.
+    fn help_click(&mut self, s: Surface, cx: f32, cy: f32) -> bool {
+        let Some(ov) = self.ov_of(s) else { return false };
+        if !ov.help_open {
+            return false;
+        }
+        let scroll = ov.help_scroll;
+        if let Some(help) = self.layout_help(s, scroll) {
+            if !input::point_in(&help.panel, cx, cy) {
+                if let Some(ov) = self.ov_of_mut(s) {
+                    ov.help_open = false;
+                }
+            }
+        }
+        self.paint_surface(s);
+        true
+    }
+
+    /// A left press while window `s`'s search bar is open — NON-modal for the
+    /// mouse: ✕ closes + clears, a click inside the panel is swallowed, clicks
+    /// OUTSIDE fall through so terminal selection keeps working. Laid out with
+    /// the SAME call as the draw pass for hit parity. Returns whether consumed.
+    fn search_bar_click(&mut self, s: Surface, cx: f32, cy: f32) -> bool {
+        if !self.ov_of(s).is_some_and(|o| o.search_open) {
+            return false;
+        }
+        let Some(bar) = self.layout_search_bar(s) else { return false };
+        if input::point_in(&bar.close_rect, cx, cy) {
+            self.search_close(s);
+            return true;
+        }
+        input::point_in(&bar.panel, cx, cy)
     }
 
     /// Toggle the perf HUD. Extracted so every caller shares the reflow: the HUD
@@ -3495,20 +4089,51 @@ impl App {
     }
 
     /// Run a resolved palette command by invoking the EXISTING app action for it.
-    /// The palette is already closed by the caller. Index-bearing variants are
-    /// `.get()`-guarded (bounds-checked) so a tab/theme that vanished between open
-    /// and Enter is a clean no-op — belt-and-suspenders on top of build-on-open.
-    fn run_palette_cmd(&mut self, cmd: crate::palette::PaletteCmd, event_loop: &ActiveEventLoop) {
+    /// The palette is already closed by the caller. `s` is the window the palette
+    /// was opened in: per-window commands (search, hint/copy mode, run
+    /// selection, prompt jumps, copy/paste, fullscreen) act on THAT window — and
+    /// from a detached window, close/detach tab mean "reattach" exactly like
+    /// their chords there; app-wide commands stay app-wide, and the ones that
+    /// change the main window (tab nav, new tab, welcome, quit) bring it up so
+    /// the user sees the result. Index-bearing variants are `.get()`-guarded
+    /// (bounds-checked) so a tab/theme that vanished between open and Enter is a
+    /// clean no-op — belt-and-suspenders on top of build-on-open.
+    fn run_palette_cmd(&mut self, cmd: crate::palette::PaletteCmd, s: Surface, event_loop: &ActiveEventLoop) {
         use crate::palette::PaletteCmd as C;
-        match cmd {
-            C::NewTab => self.new_tab(),
-            C::CloseTab => {
-                self.confirm_close = Some(self.active);
-                self.request_main_paint();
+        // From a detached window, commands that act on the MAIN window raise it.
+        let reveal_main = |app: &mut Self, event_loop: &ActiveEventLoop| {
+            if s != Surface::Main {
+                app.set_visibility(true, event_loop);
             }
-            C::NextTab => self.switch_tab(true),
-            C::PrevTab => self.switch_tab(false),
-            C::DetachTab => self.detach_tab(self.active, event_loop, None),
+        };
+        match cmd {
+            C::NewTab => match s {
+                Surface::Main => self.new_tab(),
+                Surface::Detached(p) => {
+                    // Inherit THIS detached tab's cwd; the tab opens in the main window.
+                    let cwd = self.detached.get(p).and_then(|dw| dw.tab.pty.cwd());
+                    if self.new_tab_with_cwd(cwd).is_some() {
+                        reveal_main(self, event_loop);
+                    }
+                }
+            },
+            C::CloseTab => match s {
+                Surface::Main => {
+                    self.confirm_close = self.tabs.get(self.active).map(|t| t.id);
+                    self.request_main_paint();
+                }
+                Surface::Detached(p) => self.reattach_tab(p, event_loop),
+            },
+            C::NextTab | C::PrevTab => {
+                if !self.tabs.is_empty() {
+                    self.switch_tab(matches!(cmd, C::NextTab));
+                    reveal_main(self, event_loop);
+                }
+            }
+            C::DetachTab => match s {
+                Surface::Main => self.detach_tab(self.active, event_loop, None),
+                Surface::Detached(p) => self.reattach_tab(p, event_loop),
+            },
             C::OpenSettings => {
                 // Open (never toggle-closed): don't dismiss an already-open panel.
                 if self.settings_window.is_none() {
@@ -3564,47 +4189,45 @@ impl App {
             C::ShowWelcome => {
                 self.welcome_open = true;
                 self.request_main_paint();
+                reveal_main(self, event_loop);
             }
-            C::Search => {
-                if !self.search_open {
-                    self.search_open = true;
-                    self.active_tab_mut().terminal.search_refresh();
-                }
-                self.request_main_paint();
-            }
+            C::Search => self.search_open(s),
             // The palette has already closed (run_palette_cmd runs after
             // close_palette), so overlay_owns_keys() is false and the mode enters.
-            C::HintMode => self.enter_hint_mode(),
-            C::CopyMode => self.enter_copy_mode(),
+            C::HintMode => self.enter_hint_mode(s),
+            C::CopyMode => self.enter_copy_mode(s),
             // Clean no-op without a selection (the method aborts on Empty).
-            C::RunSelection => self.run_selection_in_new_tab(SelSource::Main),
-            C::PrevPrompt => {
-                if self.active_tab_mut().terminal.jump_prompt(false) {
-                    self.request_main_paint();
-                    self.update_link_hover(true);
-                }
-            }
-            C::NextPrompt => {
-                if self.active_tab_mut().terminal.jump_prompt(true) {
-                    self.request_main_paint();
-                    self.update_link_hover(true);
+            C::RunSelection => self.run_selection_in_new_tab(Self::sel_source(s)),
+            C::PrevPrompt | C::NextPrompt => {
+                let forward = matches!(cmd, C::NextPrompt);
+                if self.term_of_mut(s).is_some_and(|t| t.jump_prompt(forward)) {
+                    self.paint_surface(s);
+                    match s {
+                        Surface::Main => self.update_link_hover(true),
+                        Surface::Detached(p) => self.update_detached_link_hover(p, true),
+                    }
                 }
             }
             C::Copy => {
-                let copied = self
-                    .active_tab()
-                    .terminal
-                    .selection_text()
-                    .filter(|t| !t.is_empty());
+                let copied = self.term_of(s).and_then(|t| t.selection_text()).filter(|t| !t.is_empty());
                 if let Some(text) = copied {
                     clipboard::set(&text);
-                    self.active_tab_mut().terminal.selection_clear();
-                    self.request_main_paint();
+                    if let Some(term) = self.term_of_mut(s) {
+                        term.selection_clear();
+                    }
+                    self.paint_surface(s);
                 }
             }
             C::Paste => {
                 if let Some(text) = clipboard::get() {
-                    self.paste_text(&text);
+                    match s {
+                        Surface::Main => self.paste_text(&text),
+                        Surface::Detached(p) => {
+                            if let Some(dw) = self.detached.get_mut(p) {
+                                Self::paste_to_tab(&mut dw.tab, &text);
+                            }
+                        }
+                    }
                 }
             }
             C::ToggleLaunchAtLogin => {
@@ -3620,12 +4243,16 @@ impl App {
                 self.persist();
                 self.request_main_paint();
             }
-            // Main-window only, like Hide: the palette itself is main-window only.
-            C::ToggleFullscreen => self.set_main_fullscreen(!self.main_fullscreen),
+            // Fullscreen toggles the window the palette was opened in.
+            C::ToggleFullscreen => match s {
+                Surface::Main => self.set_main_fullscreen(!self.main_fullscreen),
+                Surface::Detached(p) => self.toggle_fullscreen_detached(p),
+            },
             C::Hide => self.set_visibility(false, event_loop),
             C::Quit => {
                 self.confirm_quit = true;
                 self.request_main_paint();
+                reveal_main(self, event_loop);
             }
             // Index-bearing dynamic actions: `.get()`-guard against a stale index.
             C::SetTheme(i) => {
@@ -3636,14 +4263,17 @@ impl App {
                     self.redraw_main_and_detached();
                 }
             }
-            C::SelectTab(i) => {
-                if i < self.tabs.len() {
+            // Id-bearing dynamic actions: a tab that closed (or moved) between
+            // open and Enter resolves to nothing — never to its neighbour.
+            C::SelectTab(id) => {
+                if let Some(i) = self.tab_index(TabId(id)) {
                     self.select_tab(i);
+                    reveal_main(self, event_loop);
                 }
             }
-            C::Reattach(i) => {
-                if i < self.detached.len() {
-                    self.reattach_tab(i, event_loop);
+            C::Reattach(id) => {
+                if let Some(p) = self.detached_index(TabId(id)) {
+                    self.reattach_tab(p, event_loop);
                 }
             }
         }
@@ -3681,7 +4311,7 @@ impl App {
         }
         // The search bar targets the ACTIVE tab: close it (clearing the
         // outgoing tab's regex/matches) before the index moves (F2/F7/F15).
-        self.search_close();
+        self.search_close(Surface::Main);
         self.active = idx;
         self.entered_new_active_tab();
     }
@@ -3695,8 +4325,8 @@ impl App {
     /// ModifiersChanged) and the hovered CELL is unchanged, so without the forced
     /// recompute tab 1's underline ghosts over tab 2's text (F12).
     fn entered_new_active_tab(&mut self) {
-        self.hint_mode = None;
-        self.copy_mode = None;
+        self.ov.hint_mode = None;
+        self.ov.copy_mode = None;
         // A selection drag, scrollbar drag, or button the outgoing tab's program
         // saw pressed can't be released into the new tab.
         self.reset_main_pointer();
@@ -3752,14 +4382,14 @@ impl App {
     /// title and clear the rename state. No-op when not renaming. An empty buffer
     /// is ignored (keep the previous title) so a tab never ends up nameless.
     fn commit_rename(&mut self) {
-        if let Some(i) = self.renaming.take() {
-            let trimmed = self.rename_buf.trim();
-            if i < self.tabs.len() && !trimmed.is_empty() {
-                self.tabs[i].title = trimmed.to_string();
+        if let Some(id) = self.renaming.take() {
+            let trimmed = self.rename_buf.trim().to_string();
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id).filter(|_| !trimmed.is_empty()) {
+                tab.title = trimmed;
                 // Manual rename permanently wins over shell OSC 0/2 titles for
                 // this tab. An empty rename (no-op above) deliberately does NOT
                 // set the flag, so auto-titles stay live.
-                self.tabs[i].manually_renamed = true;
+                tab.manually_renamed = true;
             }
             self.rename_buf.clear();
             self.request_main_paint();
@@ -4464,7 +5094,7 @@ impl App {
         // Same modal predicate as the resize-cursor block in CursorMoved.
         let modal_open = self.confirm_quit
             || self.confirm_close.is_some()
-            || self.help_open
+            || self.ov.help_open
             || self.context_menu.is_some()
             || self.tab_menu.is_some();
         let gated = link_modifier_held(&self.modifiers)
@@ -5168,7 +5798,9 @@ impl App {
         c: jetty_core::CommandCompletion,
         watching: bool,
     ) -> Option<bool> {
-        let key = NotifyKey::MainTab(tab);
+        // Throttled per TAB (its stable id), not per position: closing an
+        // earlier tab must not hand this tab's throttle to its neighbour.
+        let key = self.tabs.get(tab).map(|t| NotifyKey::MainTab(t.id))?;
         let since_last = self.notify_last_at.get(&key).map(|t| t.elapsed());
         if !crate::notify::should_notify(
             watching,
@@ -5320,7 +5952,7 @@ impl App {
         if active_removed {
             // The searched (active) tab's shell exited: close the bar before
             // the removals below retarget it (same invariant as close_tab).
-            self.search_close();
+            self.search_close(Surface::Main);
         }
         exited.sort_unstable();
         exited.dedup();
@@ -5335,9 +5967,8 @@ impl App {
             } else if self.active > i {
                 self.active -= 1;
             }
-            Self::adjust_index_after_remove(&mut self.renaming, i);
-            Self::adjust_index_after_remove(&mut self.confirm_close, i);
         }
+        self.drop_stale_tab_refs();
         if self.tabs.is_empty() {
             // Exit only when NO tabs exist anywhere: while detached windows
             // hold live shells, adopt the first detached tab into the main
@@ -6437,15 +7068,19 @@ impl App {
                 if is_synthetic {
                     return;
                 }
+                // --- THIS window's overlays own the keyboard first, in the main
+                // window's order: command palette, hint mode, copy-mode, then the
+                // help (Esc + scroll keys) and the scrollback-search bar ---
+                let s = Surface::Detached(pos);
+                if self.overlay_key_modal(s, &event, event_loop) || self.overlay_key_bars(s, &event) {
+                    return;
+                }
                 // The SAME key decision as the main window (`decide_window_key`),
                 // against THIS window's own terminal. macOS Cmd chords are folded
                 // into the keymap and dispatched below through the same action
                 // path as the main window; the keymap lookup keeps the "swallow
-                // unmapped Cmd" safety net. Cmd+Q / Cmd+P stay detached no-ops
+                // unmapped Cmd" safety net. Cmd+Q stays a detached no-op
                 // (guarded below).
-                let ctrl = self.modifiers.control_key();
-                let alt = self.modifiers.alt_key();
-                let sup = self.modifiers.super_key();
                 let action = {
                     let Some(dw) = self.detached.get(pos) else { return };
                     decide_window_key(
@@ -6527,18 +7162,23 @@ impl App {
                         for dw in &self.detached { dw.request_paint(); }
                         return;
                     }
-                    // Scrollback search, hint mode and keyboard copy-mode exist
-                    // only in the main window for now: a detached window never
-                    // sends their chords to the PTY nor opens them on the
-                    // unfocused main window — and says so in a pill instead of
-                    // swallowing the key silently.
-                    input::KeyAction::SearchToggle
-                    | input::KeyAction::HintMode
-                    | input::KeyAction::CopyMode => {
-                        if let Some(msg) = crate::detached::main_only_notice(&action) {
-                            let window = self.detached.get(pos).map(|d| d.window.id());
-                            self.show_status_pill(crate::runsel::Notice { msg, window });
-                        }
+                    // Scrollback search, hint mode, keyboard copy-mode and the
+                    // command palette open in THIS window, on its own terminal —
+                    // exactly like the main window's.
+                    input::KeyAction::SearchToggle => {
+                        self.search_toggle(s);
+                        return;
+                    }
+                    input::KeyAction::HintMode => {
+                        self.enter_hint_mode(s);
+                        return;
+                    }
+                    input::KeyAction::CopyMode => {
+                        self.enter_copy_mode(s);
+                        return;
+                    }
+                    input::KeyAction::OpenPalette => {
+                        self.open_palette(s);
                         return;
                     }
                     // Run-selection from a DETACHED window: this window's own
@@ -6547,17 +7187,6 @@ impl App {
                     // in a background tab").
                     input::KeyAction::RunSelection => {
                         self.run_selection_in_new_tab(SelSource::Detached(pos));
-                        return;
-                    }
-                    // The palette is main-window only; keep Ctrl+Shift+P's pre-0.18
-                    // behavior in a detached window (open Settings) so the chord
-                    // isn't silently dropped here. A bare macOS Cmd+P, however, was a
-                    // swallowed no-op in today's detached Cmd block (no p/q arm) — keep
-                    // it a no-op so the fold is byte-identical (amendment 6).
-                    input::KeyAction::OpenPalette => {
-                        if !(sup && !ctrl && !alt) {
-                            self.toggle_settings_window(event_loop);
-                        }
                         return;
                     }
                     // Quit only arises from macOS Cmd+Q, which was a swallowed no-op
@@ -6577,11 +7206,9 @@ impl App {
                         self.reattach_tab(pos, event_loop);
                     }
                     // F11 (macOS also Cmd+Ctrl+F) toggles fullscreen on THIS
-                    // window — the first main-window action that is genuinely
-                    // per-window in a detached window (SearchToggle / HintMode /
-                    // CopyMode above are main-window-only, swallowed no-ops). Same
-                    // shape as the DetachTab arm above: the `dw` borrow is dead in
-                    // this arm, so calling back into `self` is fine.
+                    // window. Same shape as the DetachTab arm above: the `dw`
+                    // borrow is dead in this arm, so calling back into `self` is
+                    // fine.
                     input::KeyAction::ToggleFullscreen => {
                         self.toggle_fullscreen_detached(pos);
                     }
@@ -6659,9 +7286,8 @@ impl App {
                             dw.caret_anim = Some(now);
                         }
                     }
-                    // Every other action (new/close/nav tab, font, opacity,
-                    // panel, scroll, ...) is a main-window-only feature for
-                    // this MVP — ignored in a detached window.
+                    // Everything else was handled above (app-wide actions
+                    // return early) or has no meaning in a detached window.
                     _ => {}
                 }
                 if viewport_moved {
@@ -6704,6 +7330,12 @@ impl App {
                     }
                 }
                 if !text.is_empty() {
+                    // This window's overlays take the commit first (palette /
+                    // search queries; hint/copy-mode drop it) — the main
+                    // window's modal priority.
+                    if self.overlay_ime_commit(Surface::Detached(pos), &text) {
+                        return;
+                    }
                     let caret_flash_enabled = self.fx.caret_flash_enabled;
                     let Some(dw) = self.detached.get_mut(pos) else { return };
                     // Snap to the live bottom (F30) then write to the PTY — the
@@ -6881,6 +7513,24 @@ impl App {
                     /// Leave fullscreen on THIS window (double-click on its bar
                     /// while fullscreen). Deferred out of the `dw` borrow.
                     ExitFullscreen,
+                    /// The bar's help "?" — this window's shortcuts help.
+                    ToggleHelp,
+                }
+                // --- THIS window's overlays first, in the main window's order:
+                // hint mode / copy-mode, the command palette (captures the mouse
+                // while open), then — unless a context menu takes the click —
+                // the help (modal) and the search bar (✕ / panel) ---
+                let s = Surface::Detached(pos);
+                let Some((cx, cy)) = self.detached.get(pos).map(|d| (d.cursor.0 as f32, d.cursor.1 as f32))
+                else {
+                    return;
+                };
+                if self.modes_click(s) || self.palette_click(s, cx, cy, event_loop) {
+                    return;
+                }
+                let menu_open = self.detached.get(pos).is_some_and(|d| d.menu_open.is_some());
+                if !menu_open && (self.help_click(s, cx, cy) || self.search_bar_click(s, cx, cy)) {
+                    return;
                 }
                 // App-wide inputs, read before the dw (self.detached) borrow.
                 let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
@@ -6930,6 +7580,8 @@ impl App {
                         if cy < bar_h {
                             if input::point_in(&jetty_render::detached_close_rect(w, cm), cx, cy) {
                                 Act::Reattach
+                            } else if input::point_in(&jetty_render::detached_help_rect(w, cm), cx, cy) {
+                                Act::ToggleHelp
                             } else {
                                 // Double-click on the bar toggles maximize (same
                                 // ~400ms/5px window as the main strip).
@@ -7061,6 +7713,7 @@ impl App {
                     }
                     Act::RunSelection => self.run_selection_in_new_tab(SelSource::Detached(pos)),
                     Act::ExitFullscreen => self.set_detached_fullscreen(pos, false),
+                    Act::ToggleHelp => self.toggle_help(s),
                     Act::None => {}
                 }
             }
@@ -7095,7 +7748,7 @@ impl App {
                         crate::gridmouse::release(g, MouseButton::Left)
                     }) {
                         crate::gridmouse::Release::Copy(text) => {
-                            clipboard::set_primary(&text);
+                            clipboard::copy_on_select(&text, self.copy_on_select);
                             dw.request_paint();
                             return;
                         }
@@ -7193,6 +7846,15 @@ impl App {
                 // menu — except on the grid of a program that tracks the mouse,
                 // which gets the click (Shift, or a JeTTY selection, keeps the
                 // menu): the shared gridmouse routing, as in the main window.
+                // Same modal gates as the main window: no menu over this
+                // window's help or palette, none in hint mode (keyboard-only —
+                // a menu opened there could never be clicked).
+                if self
+                    .ov_of(Surface::Detached(pos))
+                    .is_none_or(|o| o.help_open || o.palette_open || o.hint_mode.is_some())
+                {
+                    return;
+                }
                 let theme = self.current_theme();
                 let run_enabled = self.run_selection_enabled;
                 let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
@@ -7271,10 +7933,16 @@ impl App {
             } => {
                 // Middle click, mirroring the main window's arm with this
                 // window's equivalent gates:
-                //  - the context menu (this window's only modal) open → swallow;
+                //  - its context menu, help or palette open, or hint mode → swallow;
                 //  - only over the terminal grid, never the chrome strips;
                 //  - a program that tracks the mouse (no Shift) gets the click.
                 // Otherwise it pastes the PRIMARY selection (same as main).
+                if self
+                    .ov_of(Surface::Detached(pos))
+                    .is_none_or(|o| o.help_open || o.palette_open || o.hint_mode.is_some())
+                {
+                    return;
+                }
                 let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
@@ -7397,7 +8065,11 @@ impl App {
                 // for an alt-screen pager, else this window's own scrollback;
                 // Shift or the scrollbar keep it on the scrollback). THIS window's
                 // own line accumulator, so a leftover fraction never bleeds across
-                // windows (F26).
+                // windows (F26). This window's overlays own the wheel first
+                // (hint/copy-mode swallow it, the help and palette scroll).
+                if self.overlay_wheel(Surface::Detached(pos), delta) {
+                    return;
+                }
                 let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
@@ -7478,7 +8150,10 @@ impl App {
             // is no longer owed (mirrors the main window's RedrawRequested).
             dw.key_paint_due = None;
             let mut vt_read: u64 = 0;
-            let (_, _, notice) = Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+            let (had, _, notice) = Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+            if had {
+                dw.ov.note_output();
+            }
             // OSC titles: keep the OS window title in sync (no-op unless changed).
             dw.sync_os_title();
             notice
@@ -7486,6 +8161,23 @@ impl App {
         if let Some(n) = notice {
             self.show_status_pill(n);
         }
+        // This window's open search: throttled streaming re-collect (the main
+        // window's render-path twin), and drop hint/copy-mode if a program
+        // switched to the alt screen mid-mode.
+        self.refresh_search_if_due(Surface::Detached(pos), std::time::Instant::now());
+        self.exit_modes_on_alt_screen(Surface::Detached(pos));
+        // THIS window's overlays, captured (owned) before the wide borrows — the
+        // main window's capture, from this window's own state.
+        let s = Surface::Detached(pos);
+        let (search_ui, search_hits) = self.search_draw(s);
+        let Some(ov) = self.ov_of(s) else { return };
+        let (palette_ui, hint_ui, copy_mode_ui) = (ov.palette_draw(), ov.hint_draw(), ov.copy_draw());
+        let (help_open, help_scroll) = (ov.help_open, ov.help_scroll);
+        // The IME preedit isn't drawn while one of the window's overlays owns
+        // its keyboard (mirrors the main window).
+        let overlay_owns_keys = ov.owns_keys() || hint_ui.is_some() || copy_mode_ui.is_some();
+        let help_rows: Vec<String> = if help_open { self.help_rows.clone() } else { Vec::new() };
+        let font_logical = self.font_logical;
         let Some(dw) = self.detached.get_mut(pos) else { return };
 
         // Snapshot + theme + chrome inputs are read before the mutable
@@ -7505,7 +8197,7 @@ impl App {
                 winit::dpi::PhysicalSize::new(ime_area.2, ime_area.3),
             );
         }
-        let preedit_ui = dw.ime_preedit.clone();
+        let preedit_ui = if overlay_owns_keys { None } else { dw.ime_preedit.clone() };
         let close_hover = dw.close_hover;
         let menu_open = dw.menu_open;
         let menu_hover = dw.menu_hover;
@@ -7631,12 +8323,10 @@ impl App {
 
         // Passes 1–4 via the shared render core (v0.23 Task 8). The detached
         // title bar (Pass 3) is the mid-scene chrome, injected between the glyph
-        // and scrollbar/cursor passes exactly as before. `slide_y = 0.0`,
-        // `copy_mode = None/false`, and `search_hits = &[]`, so a detached
-        // window gains NO dropdown slide, NO copy-mode cursor, and no search
-        // tint (BLOCKING 5) — its render is byte-identical to the pre-refactor
-        // body. The main-only caret GLOW / summon reveals live only in the main
-        // caller's tail and never reach here.
+        // and scrollbar/cursor passes. `slide_y = 0.0`: a detached window has no
+        // dropdown slide; its own search tint and copy-mode cursor come from
+        // THIS window's overlays. The main-only caret GLOW / summon reveals live
+        // only in the main caller's tail and never reach here.
         let scene = GridScene {
             snap: &snap,
             theme: &theme,
@@ -7645,15 +8335,15 @@ impl App {
             grid_bottom: grid_bottom_px,
             status_h,
             scale,
-            search_hits: &[],
+            search_hits: &search_hits,
             failed_rows: &failed_rows,
             link_spans: link_spans.as_ref(),
             images: &images,
             focused,
             caret_t_for_flash,
             caret_flash_color: fx.caret_flash_color,
-            copy_mode_active: false,
-            copy_mode_ui: None,
+            copy_mode_active: copy_mode_ui.is_some(),
+            copy_mode_ui,
         };
         render_grid_scene(
             gpu,
@@ -7721,6 +8411,28 @@ impl App {
                 &gpu.device, &gpu.queue, scene_view, width, height, &[pill.label],
             );
         }
+        // Pass 5c-: this window's search bar and hint chips (the main window's
+        // Passes 4d / 4e). Hint labels render in the TERMINAL font via the
+        // grid layer, so they always fit their one-row chip.
+        if let Some((q, cur, total)) = &search_ui {
+            let sb = jetty_render::build_search_bar(width, grid_top, &theme, &mut *chrome_text, cm, q, *cur, *total);
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &sb.quads);
+            if !sb.labels.is_empty() {
+                let _ = chrome_text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &sb.labels);
+            }
+        }
+        if let Some((labeled, typed)) = &hint_ui {
+            let refs: Vec<(&str, usize, usize)> = labeled.iter().map(|(l, r, c)| (l.as_str(), *r, *c)).collect();
+            let (cell_w, cell_h) = text.cell_size();
+            let grid_cm = jetty_render::ChromeMetrics::new(scale, font_logical);
+            let ov = jetty_render::build_hint_overlay(
+                &refs, cell_w, cell_h, grid_top, &theme, &mut *text, grid_cm, typed, width,
+            );
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
+            if !ov.labels.is_empty() {
+                let _ = text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &ov.labels);
+            }
+        }
         // Pass 5c: IME preedit at this window's cursor (the main window's
         // Pass 4e' twin): terminal font via the grid layer, underlined.
         if let Some(p) = &preedit_ui {
@@ -7730,6 +8442,14 @@ impl App {
             ) {
                 quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
                 let _ = text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &ov.labels);
+            }
+        }
+        // Pass 5d: this window's copy-mode "COPY" pill (main window's Pass 4f).
+        if let Some((_, _, selecting, line_mode)) = copy_mode_ui {
+            let pill = jetty_render::build_copy_pill(width, grid_top, &theme, &mut *chrome_text, cm, line_mode, selecting);
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pill.quads);
+            if !pill.labels.is_empty() {
+                let _ = chrome_text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &pill.labels);
             }
         }
         // Pass 6: the Reattach/Copy/Paste context menu on top of everything.
@@ -7748,6 +8468,30 @@ impl App {
                 let _ = chrome_text.render_overlays(
                     &gpu.device, &gpu.queue, scene_view, width, height, &menu.labels,
                 );
+            }
+        }
+        // Pass 7: this window's keyboard-shortcuts help, then the command
+        // palette LAST (above everything) — the main window's order.
+        if help_open && palette_ui.is_none() {
+            let help = jetty_render::build_help_overlay(
+                width, height, &theme, &mut *chrome_text, cm, &help_rows, help_scroll,
+            );
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &help.quads);
+            if !help.labels.is_empty() {
+                let _ = chrome_text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &help.labels);
+            }
+        }
+        if let Some((q, prows_data, total, first)) = &palette_ui {
+            let prows: Vec<jetty_render::PaletteRow> = prows_data
+                .iter()
+                .map(|(t, idx, sel)| jetty_render::PaletteRow { title: t, match_indices: idx, selected: *sel })
+                .collect();
+            let pal = jetty_render::build_command_palette(
+                width, height, &theme, &mut *chrome_text, cm, q, &prows, *total, *first,
+            );
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pal.quads);
+            if !pal.labels.is_empty() {
+                let _ = chrome_text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &pal.labels);
             }
         }
         // Final pass: round the window corners — the SAME mask pass the main
@@ -8553,19 +9297,18 @@ impl ApplicationHandler<AppEvent> for App {
         // refresh exactly once at the throttle deadline (scheduled via the
         // WaitUntil merge below); the flag only exists while the bar is open
         // AND output was drained, so idle stays at zero work.
-        if self.search_open
-            && self.search_dirty
-            && self
-                .search_refresh_at
-                .is_none_or(|t| t.elapsed() >= SEARCH_REFRESH_INTERVAL)
-            && !self.tabs.is_empty()
-        {
-            self.search_dirty = false;
-            self.active_tab_mut().terminal.search_refresh();
-            self.search_refresh_at = Some(std::time::Instant::now());
-            if self.visible && !self.main_occluded {
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+        let search_now = std::time::Instant::now();
+        if self.refresh_search_if_due(Surface::Main, search_now) && self.visible && !self.main_occluded {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+                painted = true;
+            }
+        }
+        // Same trailing refresh for every detached window's own search bar.
+        for p in 0..self.detached.len() {
+            if self.refresh_search_if_due(Surface::Detached(p), search_now) {
+                if let Some(dw) = self.detached.get(p).filter(|dw| !dw.occluded) {
+                    dw.request_paint();
                     painted = true;
                 }
             }
@@ -8827,10 +9570,11 @@ impl ApplicationHandler<AppEvent> for App {
         // Skipped (throttled) open-search refresh: wake once at the throttle
         // deadline so the trailing re-collect above runs (F10). An elapsed
         // deadline was serviced above, so this is strictly in the future.
-        if self.search_open && self.search_dirty {
-            if let Some(t) = self.search_refresh_at {
-                merge_wake(&mut wake_at, t + SEARCH_REFRESH_INTERVAL);
-            }
+        let search_wakes = std::iter::once(self.ov.search_wake())
+            .chain(self.detached.iter().map(|d| d.ov.search_wake()))
+            .flatten();
+        for t in search_wakes {
+            merge_wake(&mut wake_at, t);
         }
         // Idle-HUD one-shot (effectively visible windows only — see above).
         if let IdleHud::WakeAt(d) = perf_idle {
@@ -9178,7 +9922,9 @@ impl ApplicationHandler<AppEvent> for App {
             terminal.feed_notice(notice);
         }
         let writer = pty.writer();
+        let id = self.alloc_tab_id();
         self.tabs.push(Tab {
+            id,
             terminal,
             pty,
             writer,
@@ -9279,8 +10025,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // re-collect. Marked HERE too — not just in the render-path
                 // drain — because this drain may consume the whole burst,
                 // leaving the following RedrawRequested drain empty (F10).
-                if had_data && self.search_open {
-                    self.search_dirty = true;
+                if had_data {
+                    self.ov.note_output();
                 }
                 // Damage-driven: only request a redraw when the active tab's PTY
                 // produced data (or query replies were sent). Background tabs still
@@ -9329,6 +10075,11 @@ impl ApplicationHandler<AppEvent> for App {
                     let read_before = vt_read;
                     let (had, title_changed, notice) =
                         Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+                    // Output rotated the scrollback under this window's open
+                    // search: its matches are stale until the next re-collect.
+                    if had {
+                        dw.ov.note_output();
+                    }
                     let flood = vt_read - read_before >= FLOOD_PACE_BYTES;
                     if let Some(n) = notice {
                         runsel_notices.push(n);
@@ -9661,7 +10412,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // consumed by the modal, so a resize-edge cursor under it is wrong.
                 let modal_open = self.confirm_quit
                     || self.confirm_close.is_some()
-                    || self.help_open
+                    || self.ov.help_open
                     || self.context_menu.is_some()
                     || self.tab_menu.is_some();
                 if !self.dragging_scrollbar
@@ -9822,71 +10573,13 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
 
-                // --- Hint mode / copy-mode ---
-                // Hint mode is keyboard-only: swallow the click. Copy-mode exits
-                // on a left press and lets the click fall through to the normal
-                // mouse-selection path (predictable, simple).
-                if self.hint_mode.is_some() {
+                // --- Hint mode / copy-mode, then the command palette (which
+                // captures the mouse while open) — shared with the detached
+                // windows ---
+                if self.modes_click(Surface::Main) {
                     return;
                 }
-                if self.copy_mode.is_some() {
-                    self.active_tab_mut().terminal.selection_clear();
-                    self.copy_mode = None;
-                    self.request_main_paint();
-                    // fall through to normal press handling
-                }
-
-                // --- Command palette captures the mouse while open ---
-                // Swallow every click so none falls through to terminal selection,
-                // the scrollbar, or the ? / window-control buttons (which is exactly
-                // what would let another overlay open over the palette). A click on
-                // a visible row runs it; a click outside the panel closes it.
-                if self.palette_open {
-                    let cx = self.cursor.0 as f32;
-                    let cy = self.cursor.1 as f32;
-                    let theme = self.current_theme();
-                    let cm = self.chrome_metrics();
-                    let mut fallback = mono_fallback(cm);
-                    let first = self.palette_scroll;
-                    let sel = self.palette_selected;
-                    let total = self.palette_filtered.len();
-                    let vis: Vec<(String, Vec<usize>, bool)> = self
-                        .palette_filtered
-                        .iter()
-                        .enumerate()
-                        .skip(first)
-                        .take(jetty_render::MAX_PALETTE_ROWS)
-                        .map(|(i, hh)| (hh.title.clone(), hh.indices.clone(), i == sel))
-                        .collect();
-                    let prows: Vec<jetty_render::PaletteRow> = vis
-                        .iter()
-                        .map(|(t, idx, s)| jetty_render::PaletteRow {
-                            title: t,
-                            match_indices: idx,
-                            selected: *s,
-                        })
-                        .collect();
-                    let pal = jetty_render::build_command_palette(
-                        w, h, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
-                        &self.palette_query, &prows, total, first,
-                    );
-                    let mut hit: Option<usize> = None;
-                    for (vi, r) in pal.row_hits.iter().enumerate() {
-                        if input::point_in(r, cx, cy) {
-                            hit = Some(first + vi);
-                            break;
-                        }
-                    }
-                    if let Some(gi) = hit {
-                        let cmd = self.palette_filtered.get(gi).map(|hh| hh.cmd.clone());
-                        self.close_palette();
-                        if let Some(c) = cmd {
-                            self.run_palette_cmd(c, event_loop);
-                        }
-                    } else if !input::point_in(&pal.panel, cx, cy) {
-                        // Click on the dim backdrop closes; inside (non-row) is a no-op.
-                        self.close_palette();
-                    }
+                if self.palette_click(Surface::Main, self.cursor.0 as f32, self.cursor.1 as f32, event_loop) {
                     return;
                 }
 
@@ -9916,10 +10609,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // --- Close-tab confirmation popup is modal ---
                 // Clicking Close confirms; Cancel or anywhere outside the panel
                 // cancels. Either way the click is fully consumed.
-                if let Some(i) = self.confirm_close {
+                if let Some(id) = self.confirm_close {
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
-                    let title = self.tabs.get(i).map(|t| t.title.clone()).unwrap_or_default();
+                    let target = self.tab_index(id);
+                    let title = target.map(|i| self.tabs[i].title.clone()).unwrap_or_default();
                     let theme = self.current_theme();
                     let cm = self.chrome_metrics();
                     let mut fallback = mono_fallback(cm);
@@ -9928,7 +10622,9 @@ impl ApplicationHandler<AppEvent> for App {
                     );
                     if input::point_in(&popup.close_rect, cx, cy) {
                         self.confirm_close = None;
-                        self.close_tab(i, event_loop);
+                        if let Some(i) = target {
+                            self.close_tab(i, event_loop);
+                        }
                     } else if input::point_in(&popup.cancel_rect, cx, cy)
                         || !input::point_in(&popup.panel, cx, cy)
                     {
@@ -9940,7 +10636,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 // --- Tab context menu hit-test (consume the click entirely) ---
-                if let Some((_, _, tab_idx)) = self.tab_menu.take() {
+                if let Some((_, _, tab_id)) = self.tab_menu.take() {
                     self.tab_menu_hover = None;
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
@@ -9952,7 +10648,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let label = hit.and_then(|i| self.tab_menu_labels.get(i).copied());
                     self.tab_menu_labels.clear();
                     self.tab_menu_rects.clear();
-                    if tab_idx < self.tabs.len() {
+                    if let Some(tab_idx) = self.tab_index(tab_id) {
                         match label {
                             Some("Detach") => {
                                 // Same flow as Ctrl+Shift+D, for THAT tab.
@@ -9960,12 +10656,12 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                             Some("Rename") => {
                                 // Same inline-rename flow as double-click.
-                                self.renaming = Some(tab_idx);
+                                self.renaming = Some(tab_id);
                                 self.rename_buf = self.tabs[tab_idx].title.clone();
                             }
                             Some("Close Tab") => {
                                 // Same confirm-close flow as the × / Ctrl+Shift+W.
-                                self.confirm_close = Some(tab_idx);
+                                self.confirm_close = Some(tab_id);
                             }
                             _ => {}
                         }
@@ -10036,7 +10732,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 // Close Tab — mirrors the Ctrl+Shift+W handler: set confirm_close
                                 // to open the confirmation popup (or close directly if no child).
                                 // This reuses the exact same flow as KeyAction::CloseTab.
-                                self.confirm_close = Some(self.active);
+                                self.confirm_close = self.tabs.get(self.active).map(|t| t.id);
                             }
                             _ => {}
                         }
@@ -10050,49 +10746,10 @@ impl ApplicationHandler<AppEvent> for App {
                 let cx = self.cursor.0 as f32;
                 let cy = self.cursor.1 as f32;
 
-                // --- Help overlay is modal: a click outside its panel closes it;
-                // a click inside is swallowed. Either way the click is consumed so
-                // it never reaches the tab bar, a resize edge, or the terminal. ---
-                if self.help_open {
-                    let theme = self.current_theme();
-                    let cm = self.chrome_metrics();
-                    let mut fallback = mono_fallback(cm);
-                    let help = jetty_render::build_help_overlay(
-                        w, h, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
-                        &self.help_rows, self.help_scroll,
-                    );
-                    if !input::point_in(&help.panel, cx, cy) {
-                        self.help_open = false;
-                    }
-                    self.request_main_paint();
+                // --- Help (modal) and the search bar (✕ / panel) — shared with
+                // the detached windows ---
+                if self.help_click(Surface::Main, cx, cy) || self.search_bar_click(Surface::Main, cx, cy) {
                     return;
-                }
-
-                // --- Search bar (NON-modal for the mouse): ✕ closes+clears, a
-                // click inside the panel is swallowed, clicks OUTSIDE fall
-                // through so terminal selection keeps working. Built with the
-                // SAME args as the draw call for hit parity. ---
-                if self.search_open {
-                    let theme = self.current_theme();
-                    let (q, cur, total) = {
-                        let t = &self.active_tab().terminal;
-                        let (cur, total) = t.search_counter();
-                        (t.search_query().to_string(), cur, total)
-                    };
-                    let grid_top = self.grid_top_offset();
-                    let cm = self.chrome_metrics();
-                    let mut fallback = mono_fallback(cm);
-                    let bar = jetty_render::build_search_bar(
-                        w, grid_top, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
-                        &q, cur, total,
-                    );
-                    if input::point_in(&bar.close_rect, cx, cy) {
-                        self.search_close();
-                        return;
-                    }
-                    if input::point_in(&bar.panel, cx, cy) {
-                        return;
-                    }
                 }
 
                 // --- Resize edges (borderless window): highest priority after the
@@ -10136,7 +10793,11 @@ impl ApplicationHandler<AppEvent> for App {
                         .enumerate()
                         .map(|(i, t)| (t.title.clone(), i == self.active))
                         .collect();
-                    let rename_ref = self.renaming.map(|i| (i, self.rename_buf.as_str()));
+                    // Field-level borrows (the builder below also borrows the chrome text).
+                    let rename_ref = self
+                        .renaming
+                        .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+                        .map(|i| (i, self.rename_buf.as_str()));
                     // Build with perf=None to MATCH the drawn bar (the perf HUD
                     // moved to the bottom status strip, so the drawn tab bar
                     // reserves no HUD width — see the RedrawRequested build). Passing
@@ -10160,13 +10821,7 @@ impl ApplicationHandler<AppEvent> for App {
                     if input::point_in(&bar.help_rect, cx, cy) {
                         // Toggle the in-window Help overlay. Opening it closes the
                         // context menu so the two overlays are mutually exclusive.
-                        self.help_open = !self.help_open;
-                        if self.help_open {
-                            self.help_scroll = 0;
-                            self.context_menu = None;
-                            self.menu_hover = None;
-                        }
-                        self.request_main_paint();
+                        self.toggle_help(Surface::Main);
                         return;
                     }
                     if input::point_in(&bar.settings_rect, cx, cy) {
@@ -10209,7 +10864,7 @@ impl ApplicationHandler<AppEvent> for App {
 
                     // A click anywhere on the strip commits an in-progress rename
                     // unless it lands on the tab being renamed (handled below).
-                    let renaming_idx = self.renaming;
+                    let renaming_id = self.renaming;
 
                     // Close buttons take priority over the tab body they sit on.
                     if let Some(i) = bar
@@ -10219,7 +10874,7 @@ impl ApplicationHandler<AppEvent> for App {
                     {
                         self.commit_rename();
                         // Ask before closing instead of closing immediately.
-                        self.confirm_close = Some(i);
+                        self.confirm_close = self.tabs.get(i).map(|t| t.id);
                         self.request_main_paint();
                         return;
                     }
@@ -10237,8 +10892,9 @@ impl ApplicationHandler<AppEvent> for App {
                         // double-click on the tab ALREADY being renamed must not
                         // reset the in-progress edit buffer (it would discard the
                         // user's typing); leave the rename untouched.
-                        if is_double && self.renaming != Some(i) {
-                            self.renaming = Some(i);
+                        let tab_id = self.tabs[i].id;
+                        if is_double && self.renaming != Some(tab_id) {
+                            self.renaming = Some(tab_id);
                             self.rename_buf = self.tabs[i].title.clone();
                             self.last_strip_click = None;
                             self.request_main_paint();
@@ -10251,7 +10907,7 @@ impl ApplicationHandler<AppEvent> for App {
                             return;
                         }
                         // Single click on a different tab commits any rename.
-                        if renaming_idx != Some(i) {
+                        if renaming_id != Some(tab_id) {
                             self.commit_rename();
                         }
                         // Select immediately (a plain click), and ARM the
@@ -10259,7 +10915,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // more than TEAR_THRESHOLD_PX before release, the drag
                         // becomes a tear-out and the release detaches this tab.
                         self.select_tab(i);
-                        self.tab_drag = Some(TabDrag { idx: i, tearing: false });
+                        self.tab_drag = Some(TabDrag { tab: tab_id, tearing: false });
                         return;
                     }
 
@@ -10408,9 +11064,9 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.slide_anim.is_some()
                     || self.confirm_quit
                     || self.confirm_close.is_some()
-                    || self.help_open
-                    || self.palette_open
-                    || self.hint_mode.is_some()
+                    || self.ov.help_open
+                    || self.ov.palette_open
+                    || self.ov.hint_mode.is_some()
                     || self.tabs.is_empty()
                 {
                     return;
@@ -10443,7 +11099,11 @@ impl ApplicationHandler<AppEvent> for App {
                         .collect();
                     let cm = self.chrome_metrics();
                     let mut fallback = mono_fallback(cm);
-                    let rename_ref = self.renaming.map(|i| (i, self.rename_buf.as_str()));
+                    // Field-level borrows (the builder below also borrows the chrome text).
+                    let rename_ref = self
+                        .renaming
+                        .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+                        .map(|i| (i, self.rename_buf.as_str()));
                     // perf=None to match the DRAWN bar (HUD lives in the status
                     // strip); passing perf_label mis-sized the hit-rects (F19).
                     let mut bar = jetty_render::build_tab_bar_ex(
@@ -10462,10 +11122,10 @@ impl ApplicationHandler<AppEvent> for App {
                         // Close the other overlays so the menu can't be orphaned
                         // under them (mutually exclusive with the terminal menu).
                         self.commit_rename();
-                        self.help_open = false;
+                        self.ov.help_open = false;
                         self.context_menu = None;
                         self.menu_hover = None;
-                        self.tab_menu = Some((cx, cy, i));
+                        self.tab_menu = Some((cx, cy, self.tabs[i].id));
                         self.tab_menu_hover = None;
                         self.tab_menu_labels = crate::detached::tab_menu_items(
                             crate::detached::can_detach(self.tabs.len()),
@@ -10511,7 +11171,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // menu can't be orphaned under it. The tab menu is mutually
                 // exclusive with the terminal menu.
                 self.commit_rename();
-                self.help_open = false;
+                self.ov.help_open = false;
                 self.tab_menu = None;
                 self.tab_menu_hover = None;
                 self.tab_menu_rects.clear();
@@ -10581,7 +11241,12 @@ impl ApplicationHandler<AppEvent> for App {
                             .as_ref()
                             .and_then(|w| w.outer_position().ok())
                             .map(|p| (p.x as f64 + self.cursor.0, p.y as f64 + self.cursor.1));
-                        self.detach_tab(drag.idx, event_loop, drop_global);
+                        // The dragged tab by identity: a tab that closed
+                        // mid-drag (shell exit) detaches nothing — never its
+                        // neighbour.
+                        if let Some(idx) = self.tab_index(drag.tab) {
+                            self.detach_tab(idx, event_loop, drop_global);
+                        }
                         return;
                     }
                 }
@@ -10600,7 +11265,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // select: teach Shift+drag (throttled).
                 match self.with_main_grid(|g| crate::gridmouse::release(g, MouseButton::Left)) {
                     Some(crate::gridmouse::Release::Copy(text)) => {
-                        clipboard::set_primary(&text);
+                        clipboard::copy_on_select(&text, self.copy_on_select);
                         self.request_main_paint();
                     }
                     Some(crate::gridmouse::Release::Cleared) => self.request_main_paint(),
@@ -10630,9 +11295,9 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.slide_anim.is_some()
                     || self.confirm_quit
                     || self.confirm_close.is_some()
-                    || self.help_open
-                    || self.palette_open
-                    || self.hint_mode.is_some()
+                    || self.ov.help_open
+                    || self.ov.palette_open
+                    || self.ov.hint_mode.is_some()
                     || self.context_menu.is_some()
                     || self.tab_menu.is_some()
                     || self.tabs.is_empty()
@@ -10669,9 +11334,9 @@ impl ApplicationHandler<AppEvent> for App {
                     && self.main_grid_geom().contains_y(self.cursor.1 as f32)
                     && !(self.confirm_quit
                         || self.confirm_close.is_some()
-                        || self.help_open
-                        || self.palette_open
-                        || self.hint_mode.is_some()
+                        || self.ov.help_open
+                        || self.ov.palette_open
+                        || self.ov.hint_mode.is_some()
                         || self.context_menu.is_some()
                         || self.tab_menu.is_some())
                 {
@@ -10699,33 +11364,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // does not slide the labelled tokens out from under their chips
                 // (hint) or desync the keyboard cursor/selection from the content
                 // (copy — use k/j/Ctrl+u/d to move within the mode instead).
-                if self.hint_mode.is_some() || self.copy_mode.is_some() {
-                    return;
-                }
-                // The help overlay owns the wheel while its rows overflow the
-                // window (large UI font / short window): scroll the rows, never
-                // the terminal underneath.
-                if self.help_open {
-                    if let Some((max, _)) = self.help_scroll_range() {
-                        let cell_h = self.text.as_ref().map_or(0.0, |t| t.cell_size().1);
-                        let lines = self.scroll_accum.add(input::wheel_lines(delta, cell_h));
-                        self.set_help_scroll(self.help_scroll.min(max) as isize - lines as isize, max);
-                        return;
-                    }
-                }
-                // The palette owns the wheel while open: scroll its list, never
-                // the terminal underneath (swallow so nothing falls through).
-                if self.palette_open {
-                    let step = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => -(y.round() as isize),
-                        MouseScrollDelta::PixelDelta(p) => {
-                            if p.y > 0.0 { -1 } else if p.y < 0.0 { 1 } else { 0 }
-                        }
-                    };
-                    if step != 0 {
-                        self.palette_move(step);
-                        self.request_main_paint();
-                    }
+                // The help overlay (while its rows overflow) and the palette
+                // own the wheel too (shared with the detached windows).
+                if self.overlay_wheel(Surface::Main, delta) {
                     return;
                 }
                 // The shared grid wheel (detached windows run the same). Deltas
@@ -10808,12 +11449,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // While the popup is open it is modal: Enter confirms the close,
                 // Esc cancels. Both are fully consumed so they never reach the
                 // shell, close the help, or fall through to other handlers.
-                if let Some(i) = self.confirm_close {
+                if let Some(id) = self.confirm_close {
                     use winit::keyboard::{Key, NamedKey};
                     match &event.logical_key {
                         Key::Named(NamedKey::Enter) => {
                             self.confirm_close = None;
-                            self.close_tab(i, event_loop);
+                            if let Some(i) = self.tab_index(id) {
+                                self.close_tab(i, event_loop);
+                            }
                             return;
                         }
                         Key::Named(NamedKey::Escape) => {
@@ -10831,7 +11474,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // While renaming, keys edit the title buffer and never reach the
                 // PTY: printable chars append, Backspace pops, Enter commits,
                 // Escape cancels. Return early so nothing leaks to the shell.
-                if let Some(i) = self.renaming {
+                if self.renaming.is_some() {
                     use winit::keyboard::{Key, NamedKey};
                     match &event.logical_key {
                         Key::Named(NamedKey::Enter) => {
@@ -10861,113 +11504,12 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                         }
                     }
-                    // Defensive: keep `i` referenced so the renaming index is valid.
-                    let _ = i;
                     return;
                 }
-                // --- Command palette captures ALL keys while open ---
-                // Sits above welcome/help/search: once open the palette owns the
-                // keyboard (single-overlay-owns-keys). Type → query, Up/Down →
-                // select, PageUp/Down → page, Enter → run + close, Esc → close,
-                // Backspace → edit, Ctrl+Shift+P / Cmd+Shift+P → toggle closed.
-                // Every other Ctrl/Cmd chord is swallowed so nothing leaks.
-                if self.palette_open {
-                    use winit::keyboard::{Key, NamedKey};
-                    let ctrl = self.modifiers.control_key();
-                    let shift = self.modifiers.shift_key();
-                    let alt = self.modifiers.alt_key();
-                    let sup = self.modifiers.super_key();
-                    // Toggle closed on the SAME chord that opens the palette — routed
-                    // through the keymap so a remapped `open_palette` toggles closed
-                    // consistently (amendment 4).
-                    let mods = crate::keymap::Mods::new(ctrl, shift, alt, sup);
-                    let is_palette_chord = self
-                        .keymap
-                        .lookup(mods, event.physical_key, &event.logical_key)
-                        == Some(input::KeyAction::OpenPalette);
-                    if is_palette_chord {
-                        self.close_palette();
-                        return;
-                    }
-                    match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => self.close_palette(),
-                        Key::Named(NamedKey::Enter) => {
-                            let cmd = self
-                                .palette_filtered
-                                .get(self.palette_selected)
-                                .map(|h| h.cmd.clone());
-                            self.close_palette();
-                            if let Some(c) = cmd {
-                                self.run_palette_cmd(c, event_loop);
-                            }
-                            return;
-                        }
-                        Key::Named(NamedKey::ArrowDown) => self.palette_move(1),
-                        Key::Named(NamedKey::ArrowUp) => self.palette_move(-1),
-                        Key::Named(NamedKey::PageDown) => {
-                            self.palette_move(jetty_render::MAX_PALETTE_ROWS as isize)
-                        }
-                        Key::Named(NamedKey::PageUp) => {
-                            self.palette_move(-(jetty_render::MAX_PALETTE_ROWS as isize))
-                        }
-                        Key::Named(NamedKey::Backspace) => {
-                            self.palette_query.pop();
-                            self.refilter_palette();
-                        }
-                        _ => {
-                            if ctrl || sup {
-                                // Swallow other chords while the palette owns keys.
-                            } else if let Some(t) = &event.text {
-                                let mut changed = false;
-                                for ch in t.chars() {
-                                    if !ch.is_control() {
-                                        self.palette_query.push(ch);
-                                        changed = true;
-                                    }
-                                }
-                                if changed {
-                                    self.refilter_palette();
-                                }
-                            }
-                        }
-                    }
-                    self.request_main_paint();
-                    return;
-                }
-                // --- Hint mode captures ALL keys while active ---
-                // Sits below the palette (single-overlay-owns-keys): letters
-                // narrow the label prefix, Esc cancels, Backspace pops, the same
-                // chord toggles closed, everything else is swallowed.
-                if self.hint_mode.is_some() {
-                    let ctrl = self.modifiers.control_key();
-                    let shift = self.modifiers.shift_key();
-                    let alt = self.modifiers.alt_key();
-                    let sup = self.modifiers.super_key();
-                    let mods = crate::keymap::Mods::new(ctrl, shift, alt, sup);
-                    if self.keymap.lookup(mods, event.physical_key, &event.logical_key)
-                        == Some(input::KeyAction::HintMode)
-                    {
-                        self.exit_hint_mode();
-                        return;
-                    }
-                    self.hint_mode_key(event.physical_key, &event.logical_key);
-                    return;
-                }
-                // --- Copy-mode captures ALL keys while active ---
-                if self.copy_mode.is_some() {
-                    let ctrl = self.modifiers.control_key();
-                    let shift = self.modifiers.shift_key();
-                    let alt = self.modifiers.alt_key();
-                    let sup = self.modifiers.super_key();
-                    let mods = crate::keymap::Mods::new(ctrl, shift, alt, sup);
-                    if self.keymap.lookup(mods, event.physical_key, &event.logical_key)
-                        == Some(input::KeyAction::CopyMode)
-                    {
-                        self.active_tab_mut().terminal.selection_clear();
-                        self.exit_copy_mode();
-                        return;
-                    }
-                    self.copy_mode_key(event.physical_key, &event.logical_key, ctrl);
+                // --- The window's modal overlays own the keyboard: command
+                // palette, then hint mode, then copy-mode (shared with the
+                // detached windows) ---
+                if self.overlay_key_modal(Surface::Main, &event, event_loop) {
                     return;
                 }
                 // --- Welcome splash captures Escape (dismiss only, non-modal) ---
@@ -10983,117 +11525,9 @@ impl ApplicationHandler<AppEvent> for App {
                     self.welcome_open = false;
                     // Don't return — let Esc continue through to the PTY path.
                 }
-                // --- Help overlay captures Escape ---
-                // When the help overlay is open, Escape closes it and is fully
-                // consumed: it must NOT also close a tab or reach the shell.
-                if self.help_open
-                    && matches!(
-                        event.logical_key,
-                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
-                    )
-                {
-                    self.help_open = false;
-                    self.context_menu = None;
-                    self.menu_hover = None;
-                    self.request_main_paint();
-                    return;
-                }
-                // --- Help overlay scroll keys --- only while its rows overflow
-                // the window; otherwise these keys reach the shell as before.
-                if self.help_open {
-                    use winit::keyboard::{Key, NamedKey};
-                    if let Key::Named(
-                        k @ (NamedKey::ArrowUp
-                        | NamedKey::ArrowDown
-                        | NamedKey::PageUp
-                        | NamedKey::PageDown
-                        | NamedKey::Home
-                        | NamedKey::End),
-                    ) = &event.logical_key
-                    {
-                        if let Some((max, page)) = self.help_scroll_range() {
-                            let cur = self.help_scroll.min(max) as isize;
-                            let page = page.max(1) as isize;
-                            let to = match k {
-                                NamedKey::ArrowUp => cur - 1,
-                                NamedKey::ArrowDown => cur + 1,
-                                NamedKey::PageUp => cur - page,
-                                NamedKey::PageDown => cur + page,
-                                NamedKey::Home => 0,
-                                _ => max as isize,
-                            };
-                            self.set_help_scroll(to, max);
-                            return;
-                        }
-                    }
-                }
-                // --- Scrollback-search bar captures all keys while open ---
-                // (after the help-Esc block, so help keeps Esc priority).
-                // Printable keys edit the query incrementally; Enter/F3 step
-                // older, Shift+Enter/Shift+F3 newer; Backspace pops; Esc /
-                // Ctrl+Shift+F close and CLEAR (no query retention). Every
-                // other Ctrl/Cmd chord is swallowed (alacritty-style) so
-                // nothing leaks to the shell while the bar owns the keyboard.
-                if self.search_open {
-                    use winit::keyboard::{Key, NamedKey};
-                    let ctrl = self.modifiers.control_key();
-                    let shift = self.modifiers.shift_key();
-                    let alt = self.modifiers.alt_key();
-                    let sup = self.modifiers.super_key();
-                    // Close on the SAME chord that toggles search — routed through the
-                    // keymap so a remapped `search_toggle` closes consistently (amend. 4).
-                    let mods = crate::keymap::Mods::new(ctrl, shift, alt, sup);
-                    let chord_action = self
-                        .keymap
-                        .lookup(mods, event.physical_key, &event.logical_key);
-                    if chord_action == Some(input::KeyAction::SearchToggle) {
-                        self.search_close();
-                        return;
-                    }
-                    match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => {
-                            self.search_close();
-                        }
-                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::F3) => {
-                            // Matches stale after a throttled streaming burst?
-                            // Re-collect FIRST so navigation steps real Points
-                            // instead of scrolling to rotated rows (F10).
-                            if self.search_dirty {
-                                self.search_dirty = false;
-                                self.active_tab_mut().terminal.search_refresh();
-                                self.search_refresh_at = Some(std::time::Instant::now());
-                            }
-                            // Enter/F3 = older (up through history); +Shift = newer.
-                            self.active_tab_mut().terminal.search_nav(!shift);
-                        }
-                        Key::Named(NamedKey::Backspace) => {
-                            let mut q = self.active_tab().terminal.search_query().to_string();
-                            q.pop();
-                            self.active_tab_mut().terminal.search_set_query(&q);
-                        }
-                        _ => {
-                            // Paste-into-query on the SAME chord the keymap maps to
-                            // Paste (Ctrl+Shift+V / Shift+Insert / macOS Cmd+V, or a
-                            // remap), so a remapped paste works in the search bar too.
-                            let is_paste = chord_action == Some(input::KeyAction::Paste);
-                            if is_paste {
-                                if let Some(text) = clipboard::get() {
-                                    let mut q =
-                                        self.active_tab().terminal.search_query().to_string();
-                                    q.extend(text.chars().filter(|c| !c.is_control()));
-                                    self.active_tab_mut().terminal.search_set_query(&q);
-                                }
-                            } else if ctrl || sup {
-                                // Swallow other Ctrl/Cmd chords while the bar is open.
-                            } else if let Some(t) = &event.text {
-                                let mut q =
-                                    self.active_tab().terminal.search_query().to_string();
-                                q.extend(t.chars().filter(|c| !c.is_control()));
-                                self.active_tab_mut().terminal.search_set_query(&q);
-                            }
-                        }
-                    }
-                    self.request_main_paint();
+                // --- Help (Esc + its scroll keys) and the scrollback-search bar
+                // (every key while open), shared with the detached windows ---
+                if self.overlay_key_bars(Surface::Main, &event) {
                     return;
                 }
                 let ctrl = self.modifiers.control_key();
@@ -11166,28 +11600,17 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     input::KeyAction::CloseTab => {
                         // Ask before closing instead of closing immediately.
-                        self.confirm_close = Some(self.active);
+                        self.confirm_close = self.tabs.get(self.active).map(|t| t.id);
                         self.request_main_paint();
                     }
                     input::KeyAction::DetachTab => {
                         self.detach_tab(self.active, event_loop, None);
                     }
                     input::KeyAction::OpenPalette => {
-                        self.open_palette();
+                        self.open_palette(Surface::Main);
                     }
                     input::KeyAction::SearchToggle => {
-                        if self.search_open {
-                            self.search_close();
-                        } else {
-                            self.search_open = true;
-                            // Every close path clears, so the bar normally
-                            // opens empty; should query state somehow survive
-                            // on this tab, re-collect so stale Points (the
-                            // scrollback rotated while closed) never render.
-                            // No-op when no query is set.
-                            self.active_tab_mut().terminal.search_refresh();
-                            self.request_main_paint();
-                        }
+                        self.search_toggle(Surface::Main);
                     }
                     input::KeyAction::NextTab => {
                         self.switch_tab(true);
@@ -11277,10 +11700,10 @@ impl ApplicationHandler<AppEvent> for App {
                     // the enter methods double-check + no-op on the alt screen /
                     // (hint) an empty token scan.
                     input::KeyAction::HintMode => {
-                        self.enter_hint_mode();
+                        self.enter_hint_mode(Surface::Main);
                     }
                     input::KeyAction::CopyMode => {
-                        self.enter_copy_mode();
+                        self.enter_copy_mode(Surface::Main);
                     }
                     // Ctrl+Shift+Enter — run the current selection in a new tab
                     // (no-op without a selection; every trigger funnels through
@@ -11409,7 +11832,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // than KeyboardInput) cannot leak typed text to the shell behind
                 // the overlay, nor have the mode's own keys silently fail
                 // (BLOCKING 1). Mirrors the palette/search short-circuits below.
-                if self.hint_mode.is_some() || self.copy_mode.is_some() {
+                if self.ov.hint_mode.is_some() || self.ov.copy_mode.is_some() {
                     return;
                 }
                 // Inline tab rename captures the commit into the title buffer
@@ -11423,30 +11846,12 @@ impl ApplicationHandler<AppEvent> for App {
                     self.request_main_paint();
                     return;
                 }
-                // The command palette captures IME commits into its query
-                // (mirrors the KeyboardInput palette arm; keeps the same modal
-                // priority so composed text never leaks behind the overlay).
-                if self.palette_open {
-                    let mut changed = false;
-                    for ch in text.chars() {
-                        if !ch.is_control() {
-                            self.palette_query.push(ch);
-                            changed = true;
-                        }
-                    }
-                    if changed {
-                        self.refilter_palette();
-                    }
-                    self.request_main_paint();
-                    return;
-                }
-                // The scrollback-search bar captures IME commits so CJK users
-                // can type queries (mirrors the KeyboardInput search arm).
-                if self.search_open {
-                    let mut q = self.active_tab().terminal.search_query().to_string();
-                    q.extend(text.chars().filter(|c| !c.is_control()));
-                    self.active_tab_mut().terminal.search_set_query(&q);
-                    self.request_main_paint();
+                // The command palette, then the scrollback-search bar, capture
+                // IME commits into their query (mirrors the KeyboardInput arms;
+                // same modal priority so composed text never leaks behind an
+                // overlay — CJK users can type queries). Shared with the
+                // detached windows.
+                if self.overlay_ime_commit(Surface::Main, &text) {
                     return;
                 }
                 if self.welcome_open {
@@ -11480,20 +11885,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // pump frames (`caret_drives_frames`).
                 self.key_paint_due = None;
                 // Auto-exit hint/copy-mode if a program switched to the alt screen
-                // while a mode was active (a full-screen TUI launched mid-mode):
-                // both modes are primary-screen only, so drop them cleanly rather
-                // than draw stale chips / a cursor over the TUI. Cheap: one bool
-                // test, only when a mode is active.
-                if (self.hint_mode.is_some() || self.copy_mode.is_some())
-                    && !self.tabs.is_empty()
-                    && self.active_tab().terminal.alt_screen()
-                {
-                    if self.copy_mode.is_some() {
-                        self.active_tab_mut().terminal.selection_clear();
-                    }
-                    self.hint_mode = None;
-                    self.copy_mode = None;
-                }
+                // while a mode was active (shared with the detached windows).
+                self.exit_modes_on_alt_screen(Surface::Main);
                 // Re-assert the Dropdown dock AFTER the window is mapped: X11/KWin
                 // ignores a set_outer_position issued before the window is realized
                 // (it would land centered), so re-apply the top-strip geometry on
@@ -11566,19 +11959,10 @@ impl ApplicationHandler<AppEvent> for App {
                 // about_to_wait then wakes once at the deadline for a trailing
                 // refresh, so a burst that ends inside the window can't leave
                 // the highlights/counter stale forever (F10).
-                if had && self.search_open {
-                    self.search_dirty = true;
+                if had {
+                    self.ov.note_output();
                 }
-                if self.search_dirty
-                    && self.search_open
-                    && self
-                        .search_refresh_at
-                        .is_none_or(|t| t.elapsed() >= SEARCH_REFRESH_INTERVAL)
-                {
-                    self.active_tab_mut().terminal.search_refresh();
-                    self.search_refresh_at = Some(std::time::Instant::now());
-                    self.search_dirty = false;
-                }
+                self.refresh_search_if_due(Surface::Main, std::time::Instant::now());
                 // SINGLE clearing point for the activity indicator: the active
                 // tab is on screen this frame, so its pending dot is consumed.
                 // Covers every switch path (click, Ctrl+Tab, Ctrl+1..9, close
@@ -11615,10 +11999,10 @@ impl ApplicationHandler<AppEvent> for App {
                 let preedit_ui: Option<String> = if self.confirm_quit
                     || self.confirm_close.is_some()
                     || self.renaming.is_some()
-                    || self.palette_open
-                    || self.search_open
-                    || self.hint_mode.is_some()
-                    || self.copy_mode.is_some()
+                    || self.ov.palette_open
+                    || self.ov.search_open
+                    || self.ov.hint_mode.is_some()
+                    || self.ov.copy_mode.is_some()
                 {
                     None
                 } else {
@@ -11662,8 +12046,8 @@ impl ApplicationHandler<AppEvent> for App {
                 let tab_menu = self.tab_menu;
                 let tab_menu_hover = self.tab_menu_hover;
                 let tab_menu_labels = self.tab_menu_labels.clone();
-                let help_open = self.help_open;
-                let help_scroll = self.help_scroll;
+                let help_open = self.ov.help_open;
+                let help_scroll = self.ov.help_scroll;
                 // Clone the (cached, keymap-derived) help rows only when the overlay
                 // is actually open — keeps the hot render path allocation-free.
                 let help_rows: Vec<String> =
@@ -11671,18 +12055,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // Search bar draw data + visible match highlights, captured
                 // before the mutable gpu/text borrow. Both empty/None while
                 // the bar is closed (one bool branch on the hot path).
-                let search_ui: Option<(String, usize, usize)> = if self.search_open {
-                    let t = &self.active_tab().terminal;
-                    let (cur, total) = t.search_counter();
-                    Some((t.search_query().to_string(), cur, total))
-                } else {
-                    None
-                };
-                let search_hits = if self.search_open {
-                    self.active_tab().terminal.search_viewport_hits()
-                } else {
-                    Vec::new()
-                };
+                let (search_ui, search_hits) = self.search_draw(Surface::Main);
                 // OSC 133 failed-command marker rows (captured before the mutable
                 // gpu render borrow, like search_hits). Empty in the common case.
                 let failed_rows = self.active_tab().terminal.failed_prompt_rows();
@@ -11700,46 +12073,16 @@ impl ApplicationHandler<AppEvent> for App {
                 // Command-palette draw data, captured (owned) before the mutable
                 // gpu/text borrow so the draw pass borrows nothing off self. None
                 // while closed — one bool test on the hot path, zero allocation.
-                let palette_ui: Option<PaletteDrawData> =
-                    if self.palette_open {
-                        let first = self.palette_scroll;
-                        let sel = self.palette_selected;
-                        let total = self.palette_filtered.len();
-                        let rows: Vec<(String, Vec<usize>, bool)> = self
-                            .palette_filtered
-                            .iter()
-                            .enumerate()
-                            .skip(first)
-                            .take(jetty_render::MAX_PALETTE_ROWS)
-                            .map(|(i, h)| (h.title.clone(), h.indices.clone(), i == sel))
-                            .collect();
-                        Some((self.palette_query.clone(), rows, total, first))
-                    } else {
-                        None
-                    };
+                let palette_ui: Option<PaletteDrawData> = self.ov.palette_draw();
                 let welcome_open = self.welcome_open;
                 // Hint-mode chips: (label, first-span row, first-span col) for
                 // each token whose label still matches the typed prefix, captured
                 // OWNED before the mutable gpu/text borrow. None while inactive
                 // (one Option test on the hot path, zero allocation).
-                let hint_ui: Option<HintDrawData> =
-                    self.hint_mode.as_ref().map(|hs| {
-                        let typed = hs.typed.clone();
-                        let labeled: Vec<(String, usize, usize)> = hs
-                            .labels
-                            .iter()
-                            .zip(hs.tokens.iter())
-                            .filter(|(lab, _)| typed.is_empty() || lab.starts_with(&typed))
-                            .filter_map(|(lab, tok)| {
-                                tok.spans.first().map(|(r, c, _)| (lab.clone(), *r, *c))
-                            })
-                            .collect();
-                        (labeled, typed)
-                    });
+                let hint_ui: Option<HintDrawData> = self.ov.hint_draw();
                 // Copy-mode cursor + pill: (row, col, selecting, line_mode). None
                 // while inactive; `copy_mode_active` suppresses the shell cursor.
-                let copy_mode_ui: Option<(usize, usize, bool, bool)> =
-                    self.copy_mode.as_ref().map(|c| (c.row, c.col, c.selecting, c.line_mode));
+                let copy_mode_ui: Option<(usize, usize, bool, bool)> = self.ov.copy_draw();
                 let copy_mode_active = copy_mode_ui.is_some();
                 // Pill only when the hint is live AND belongs to THIS (the
                 // main) window — a detached-window drag must not light it
@@ -11765,9 +12108,10 @@ impl ApplicationHandler<AppEvent> for App {
                 let confirm_quit = self.confirm_quit;
                 let confirm_close: Option<String> = self
                     .confirm_close
-                    .and_then(|i| self.tabs.get(i).map(|t| t.title.clone()));
+                    .and_then(|id| self.tab_index(id))
+                    .map(|i| self.tabs[i].title.clone());
                 let rename_state: Option<(usize, String)> =
-                    self.renaming.map(|i| (i, self.rename_buf.clone()));
+                    self.rename_ref().map(|(i, buf)| (i, buf.to_string()));
                 // Corner-mask inputs captured before the mutable render borrows.
                 // The radius is logical px; scale to physical so it matches the
                 // physical-pixel surface (HiDPI-correct rounding).
@@ -12872,6 +13216,12 @@ fn render_grid_scene(
     quad.render(device, queue, scene_view, width, height, &rects);
 }
 
+/// `r` while its tab is still among `live`, else `None` — the stale-reference
+/// rule for every id-holding piece of UI state.
+fn still_open(r: Option<TabId>, live: &[TabId]) -> Option<TabId> {
+    r.filter(|id| live.contains(id))
+}
+
 /// Shared input core (v0.23 Task 9 / amendment I5): a keystroke (or IME commit)
 /// that was NOT consumed by any chrome/overlay → snap the viewport to the live
 /// bottom and write the decoded bytes to this tab's PTY. Deliberately SMALL —
@@ -13752,35 +14102,24 @@ mod resize_zone_tests {
 }
 
 #[cfg(test)]
-mod index_adjust_tests {
-    use super::App;
+mod stable_tab_id_tests {
+    use super::{still_open, TabId};
 
     #[test]
-    fn clears_when_pointing_at_removed() {
-        let mut idx = Some(2);
-        App::adjust_index_after_remove(&mut idx, 2);
-        assert_eq!(idx, None);
+    fn closing_another_tab_never_retargets_a_reference() {
+        // Tabs A(1) B(2) C(3); the rename box is on C. Closing A shifts every
+        // index down by one — an index-held reference would now name D-or-none;
+        // the id still names C.
+        let renaming = Some(TabId(3));
+        let after_closing_a = [TabId(2), TabId(3)];
+        assert_eq!(still_open(renaming, &after_closing_a), Some(TabId(3)));
     }
 
     #[test]
-    fn decrements_when_pointing_after_removed() {
-        let mut idx = Some(3);
-        App::adjust_index_after_remove(&mut idx, 1);
-        assert_eq!(idx, Some(2));
-    }
-
-    #[test]
-    fn unchanged_when_pointing_before_removed() {
-        let mut idx = Some(1);
-        App::adjust_index_after_remove(&mut idx, 3);
-        assert_eq!(idx, Some(1));
-    }
-
-    #[test]
-    fn none_stays_none() {
-        let mut idx: Option<usize> = None;
-        App::adjust_index_after_remove(&mut idx, 0);
-        assert_eq!(idx, None);
+    fn closing_the_referenced_tab_drops_the_reference() {
+        let confirm = Some(TabId(2));
+        assert_eq!(still_open(confirm, &[TabId(1), TabId(3)]), None);
+        assert_eq!(still_open(None, &[TabId(1)]), None);
     }
 }
 
@@ -14347,6 +14686,7 @@ mod hot_reload_tests {
             "osc52_allow_paste",
             "hot_reload",
             "macos_option_as_alt",
+            "copy_on_select",
             // shell (new tabs pick up the edited shell) and show_welcome apply live;
             // both are also mirrored in apply_reloaded_config so a later persist()
             // round-trips an external edit instead of clobbering it.

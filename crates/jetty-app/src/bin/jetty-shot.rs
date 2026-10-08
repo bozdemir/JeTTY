@@ -1042,7 +1042,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A representative registry: the SHARED builder over the live theme
             // list plus two sample tabs, filtered exactly like the app.
             let themes = jetty_core::theme_list();
-            let tabs = vec!["Tab 1".to_string(), "Tab 2".to_string()];
+            let tabs = vec![(1, "Tab 1".to_string()), (2, "Tab 2".to_string())];
             let registry = jetty_app::palette::build_registry(&themes, &tabs, &[]);
             let hits = jetty_app::palette::filter(&registry, &query);
             let total = hits.len();
@@ -1174,7 +1174,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let bar = jetty_render::build_detached_bar(
                 width, &title, terminal.theme(), close_hover, &mut chrome_text, cm,
             );
-            rects.extend(bar.quads);
+            // The app draws the bar mid-scene, UNDER this window's overlays (its
+            // help / palette dim layers cover it): put its quads first.
+            rects.splice(0..0, bar.quads);
             chrome_labels.extend(bar.labels);
             panel_title_labels.extend(bar.title_labels);
 

@@ -470,6 +470,21 @@ pub struct DetachedBar {
     pub title_labels: Vec<(String, f32, f32, [u8; 3])>,
     /// Hit-test rect for the close "✕" (triggers the close→reattach path).
     pub close_rect: Rect,
+    /// Hit-test rect for the help "?" (the window's keyboard-shortcuts help).
+    pub help_rect: Rect,
+}
+
+/// Hit-test rect of a DETACHED window's help "?" control: one control cell left
+/// of the close "✕" — the main bar's control geometry.
+pub fn detached_help_rect(width: u32, cm: ChromeMetrics) -> Rect {
+    Rect {
+        x: width as f32 - cm.strip_pad() - cm.ctrl_w() * 2.0,
+        y: 0.0,
+        w: cm.ctrl_w(),
+        h: cm.bar_h(),
+        color: [0, 0, 0, 0],
+        ..Default::default()
+    }
 }
 
 /// Hit-test rect for a detached window's close "✕": the rightmost control cell
@@ -526,13 +541,13 @@ pub fn build_detached_bar(
     quads.push(Rect { x: 0.0, y: 0.0, w: sw, h, color: bg, ..Default::default() });
 
     // Title pill on the left — same geometry as a main-window tab, clamped so it
-    // never runs under the close control.
+    // never runs under the help / close controls.
     let tab_radius = cm.px(8.0);
     let tab_inset = cm.px(4.0);
     let tab_vpad = cm.px(6.0);
     let title_pad = cm.px(13.0);
     let left = cm.strip_pad();
-    let controls_left = (sw - left - cm.ctrl_w()).max(left);
+    let controls_left = (sw - left - cm.ctrl_w() * 2.0).max(left);
     let tab_w = cm.px(TAB_W).min((controls_left - left).max(0.0));
     if tab_w > tab_inset * 2.0 {
         quads.push(Rect::rounded(
@@ -563,8 +578,11 @@ pub fn build_detached_bar(
     }
     let close_fg = if close_hover { [0xFF, 0xFF, 0xFF] } else { fg };
     labels.push(("✕".to_string(), close_rect.x + cm.px(8.0), cm.px(LABEL_Y), close_fg));
+    // Help "?" left of it (same glyph offset as the main bar's help control).
+    let help_rect = detached_help_rect(width, cm);
+    labels.push(("?".to_string(), help_rect.x + cm.px(9.0), cm.px(LABEL_Y), fg));
 
-    DetachedBar { quads, labels, title_labels, close_rect }
+    DetachedBar { quads, labels, title_labels, close_rect, help_rect }
 }
 
 #[cfg(test)]
@@ -1083,5 +1101,20 @@ mod tests {
         assert_eq!(r.h, 72.0);
         let bar = build_detached_bar(2000, "Tab", &theme(), false, &mut MonoMeasure(19.2), hi);
         assert_eq!(bar.close_rect.x, r.x);
+        // The help "?" sits one control cell left of the ✕, at the same scale.
+        let help = detached_help_rect(2000, hi);
+        assert_eq!(bar.help_rect.x, help.x);
+        assert!((help.x + help.w - r.x).abs() < 0.01, "help abuts the close control");
+        assert!(bar.labels.iter().any(|(t, x, _, _)| t == "?" && *x >= help.x && *x < r.x));
+    }
+
+    #[test]
+    fn detached_title_pill_never_runs_under_the_controls() {
+        let cm = ChromeMetrics::new(1.0, 16.0);
+        // Narrow window: the pill is clamped to end before the help control.
+        let bar = build_detached_bar(260, "a very long tab title indeed", &theme(), false, &mut MonoMeasure(9.6), cm);
+        let help = detached_help_rect(260, cm);
+        let pill = &bar.quads[1];
+        assert!(pill.x + pill.w <= help.x + 0.01, "pill ends at {} past help x {}", pill.x + pill.w, help.x);
     }
 }

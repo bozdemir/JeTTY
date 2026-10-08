@@ -156,6 +156,12 @@ pub struct Config {
     /// Ignored on other platforms. Unknown values read as `"none"`.
     #[serde(default)]
     pub macos_option_as_alt: crate::input::OptionAsAlt,
+    /// Where a finished mouse selection is copied: `"primary"` (default — the
+    /// X11/Wayland select-to-copy convention; a middle click pastes it and the
+    /// clipboard is left alone), `"clipboard"`, `"both"` or `"off"`. macOS and
+    /// Windows have no primary selection: there `"primary"` means the clipboard.
+    #[serde(default)]
+    pub copy_on_select: crate::clipboard::CopyOnSelect,
     /// User keybinding overrides (`[keys]` table). Every action defaults to its
     /// built-in chord when omitted; `""`/`[]` explicitly UNBINDS an action (the
     /// chord reverts to its raw terminal meaning). Backward compatible: an old
@@ -465,6 +471,7 @@ impl Default for Config {
             run_selection: default_run_selection(),
             hot_reload: default_hot_reload(),
             macos_option_as_alt: crate::input::OptionAsAlt::default(),
+            copy_on_select: crate::clipboard::CopyOnSelect::default(),
             keys: KeyBindings::default(),
         }
     }
@@ -804,6 +811,7 @@ mod tests {
             run_selection: false,
             hot_reload: false,
             macos_option_as_alt: crate::input::OptionAsAlt::Left,
+            copy_on_select: crate::clipboard::CopyOnSelect::Both,
             keys: KeyBindings::default(),
         };
         let s = toml::to_string_pretty(&c).expect("serialize");
@@ -845,6 +853,7 @@ mod tests {
             run_selection: true,
             hot_reload: true,
             macos_option_as_alt: crate::input::OptionAsAlt::None,
+            copy_on_select: crate::clipboard::CopyOnSelect::Primary,
             keys: KeyBindings::default(),
         };
         std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();

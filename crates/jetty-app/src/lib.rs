@@ -4,6 +4,7 @@ mod copymode;
 mod detached;
 mod gridmouse;
 mod notify;
+mod overlays;
 mod runsel;
 /// Command-palette action registry + fuzzy filter. Public so the `jetty-shot`
 /// self-test binary can drive the SAME registry/filter path the app uses.
