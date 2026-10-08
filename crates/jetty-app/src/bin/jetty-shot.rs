@@ -232,13 +232,13 @@ fn shot_effects() -> Option<(jetty_app::effects::EffectsConfig, f32)> {
         "JETTY_SHOT_CRT_PHOSPHOR_HUE" => crt_phosphor_hue,
         "JETTY_SHOT_CRT_GRAIN" => crt_grain,
     );
-    if let Some(m) = std::env::var("JETTY_SHOT_CRT_PHOSPHOR").ok() {
+    if let Ok(m) = std::env::var("JETTY_SHOT_CRT_PHOSPHOR") {
         match PhosphorMode::from_name(&m) {
             Some(m) => fx.crt_phosphor = m,
             None => eprintln!("jetty-shot: unknown JETTY_SHOT_CRT_PHOSPHOR {m:?} (ignored)"),
         }
     }
-    if let Some(hex) = std::env::var("JETTY_SHOT_CRT_PHOSPHOR_COLOR").ok() {
+    if let Ok(hex) = std::env::var("JETTY_SHOT_CRT_PHOSPHOR_COLOR") {
         let h = hex.trim().trim_start_matches('#');
         match u32::from_str_radix(h, 16) {
             Ok(c) if h.len() == 6 => {

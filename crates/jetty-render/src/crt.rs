@@ -1009,8 +1009,9 @@ impl Crt {
         main && bloom
     }
 
+    /// One fullscreen-triangle pipeline of a CRT module: `vs` + fragment
+    /// `entry` with these override `constants`, REPLACE blend into `format`.
     fn pipeline(
-        &self,
         device: &wgpu::Device,
         label: &str,
         layout: &wgpu::PipelineLayout,
@@ -1065,7 +1066,7 @@ impl Crt {
                     ..Default::default()
                 })
             });
-            let pipe = self.pipeline(device, "crt-pipeline", layout, module, "fs", self.format, &key.constants());
+            let pipe = Self::pipeline(device, "crt-pipeline", layout, module, "fs", self.format, &key.constants());
             g.pipelines.push((key, pipe));
         }
         if !key.contains(CrtKey::BLOOM) {
@@ -1089,14 +1090,14 @@ impl Crt {
             if g.down[phos as usize].is_none() {
                 let c = [("FEAT_PHOS", if phos { 1.0 } else { 0.0 })];
                 g.down[phos as usize] =
-                    Some(self.pipeline(device, "crt-bloom-down", layout, module, "fs_down", BLOOM_FORMAT, &c));
+                    Some(Self::pipeline(device, "crt-bloom-down", layout, module, "fs_down", BLOOM_FORMAT, &c));
             }
             if g.blur.is_none() {
-                let h = self.pipeline(
+                let h = Self::pipeline(
                     device, "crt-bloom-blur-h", layout, module, "fs_blur", BLOOM_FORMAT,
                     &[("BLUR_VERTICAL", 0.0)],
                 );
-                let v = self.pipeline(
+                let v = Self::pipeline(
                     device, "crt-bloom-blur-v", layout, module, "fs_blur", BLOOM_FORMAT,
                     &[("BLUR_VERTICAL", 1.0)],
                 );
