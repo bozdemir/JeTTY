@@ -271,8 +271,8 @@ pub fn run() {
                      Settings: Ctrl+, or Ctrl+Shift+O · Command palette: Ctrl+Shift+P\n\
                      Config: {config} (another dir: set JETTY_CONFIG_DIR)\n\
                      Shell integration (prompt marks, Ctrl+Shift+Z/X jump, Run & Notify). Add to your rc file:\n\
-                     \x20 zsh:  [[ -n \"$JETTY\" ]] && source <(\"${{JETTY_BIN:-jetty}}\" --print-shell-integration zsh)\n\
-                     \x20 bash: [[ -n \"$JETTY\" ]] && source <(\"${{JETTY_BIN:-jetty}}\" --print-shell-integration bash)\n\
+                     \x20 zsh:  [[ -n \"${{JETTY-}}\" ]] && source <(\"${{JETTY_BIN:-jetty}}\" --print-shell-integration zsh)\n\
+                     \x20 bash: [[ -n \"${{JETTY-}}\" ]] && source <(\"${{JETTY_BIN:-jetty}}\" --print-shell-integration bash)\n\
                      \x20 fish: set -q JETTY; and \"$JETTY_BIN\" --print-shell-integration fish | source",
                     config = config::Config::config_path().display(),
                 );

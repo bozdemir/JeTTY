@@ -28,14 +28,14 @@ pub const ZSH: &str = r#"# JeTTY zsh shell integration — OSC 133 semantic prom
 # (prompt marks + failed-command markers + Ctrl+Shift+Z/X prompt jump)
 #
 # Opt in from ~/.zshrc with (guarded; silent in other terminals):
-#   [[ -n "$JETTY" ]] && source <("${JETTY_BIN:-jetty}" --print-shell-integration zsh 2>/dev/null)
+#   [[ -n "${JETTY-}" ]] && source <("${JETTY_BIN:-jetty}" --print-shell-integration zsh 2>/dev/null)
 #
 # powerlevel10k users: the most robust, instant-prompt-safe path is to let p10k
 # emit the marks itself — add  POWERLEVEL9K_TERM_SHELL_INTEGRATION=true  to your
 # ~/.p10k.zsh. When p10k is detected below, JeTTY installs NOTHING (a naive
 # precmd $? capture is unreliable under p10k's hook order, and competing hooks
 # can perturb instant prompt). On plain zsh the hooks below are correct.
-if [[ -o interactive && -n "$JETTY" ]]; then
+if [[ -o interactive && -n "${JETTY-}" ]]; then
   if (( ${+functions[p10k]} )) || [[ -n "${POWERLEVEL9K_MODE:-}${POWERLEVEL9K_TERM_SHELL_INTEGRATION:-}" ]]; then
     # powerlevel10k detected: see the note above — set
     # POWERLEVEL9K_TERM_SHELL_INTEGRATION=true in ~/.p10k.zsh for correct marks.
@@ -70,14 +70,15 @@ fi
 /// array `PROMPT_COMMAND` so `$?` on the first line is the user command's true
 /// exit status. The A mark carries `redraw=0` (kitty's extension): readline
 /// repaints only the LAST line of a multi-line `PS1` after a resize, so JeTTY
-/// must not wipe the prompt then.
+/// must not wipe the prompt then. Safe under `set -u` (every variable read has a
+/// default).
 pub const BASH: &str = r#"# JeTTY bash shell integration — OSC 133 semantic prompts.
 # Opt in from ~/.bashrc with (guarded; silent in other terminals):
-#   [[ -n "$JETTY" ]] && source <("${JETTY_BIN:-jetty}" --print-shell-integration bash 2>/dev/null)
+#   [[ -n "${JETTY-}" ]] && source <("${JETTY_BIN:-jetty}" --print-shell-integration bash 2>/dev/null)
 #
 # A (prompt) and D (exit) come from PROMPT_COMMAND, C (command start) from PS0
 # (bash >= 4.4); no DEBUG trap is installed — fully non-destructive.
-if [[ $- == *i* && -n "$JETTY" && -z "${_jetty_bash_loaded:-}" ]]; then
+if [[ $- == *i* && -n "${JETTY-}" && -z "${_jetty_bash_loaded:-}" ]]; then
   _jetty_bash_loaded=1   # sourcing twice must not register the hook twice
   _jetty_precmd() {
     local ret=$?                                    # user command's exit (first line)
@@ -97,7 +98,7 @@ if [[ $- == *i* && -n "$JETTY" && -z "${_jetty_bash_loaded:-}" ]]; then
     PROMPT_COMMAND="_jetty_precmd${PROMPT_COMMAND:+$'\n'$PROMPT_COMMAND}"
   fi
   # Command start: PS0 is printed after a command line is read, before it runs.
-  [[ "$PS0" == *$'\033]133;C'* ]] || PS0+=$'\033]133;C\007'
+  [[ "${PS0-}" == *$'\033]133;C'* ]] || PS0+=$'\033]133;C\007'
 fi
 "#;
 
@@ -171,9 +172,98 @@ mod tests {
         // C comes from PS0, APPENDED (an existing PS0 keeps working) and guarded
         // against sourcing twice.
         assert!(BASH.contains(r"PS0+=$'\033]133;C\007'"), "C mark via PS0 append");
-        assert!(BASH.contains(r#"[[ "$PS0" == *$'\033]133;C'* ]] ||"#), "idempotent");
+        assert!(BASH.contains(r#"[[ "${PS0-}" == *$'\033]133;C'* ]] ||"#), "idempotent");
         // readline repaints only a multi-line prompt's last line after a resize.
         assert!(BASH.contains(r"133;A;redraw=0"), "the A mark tells JeTTY not to wipe");
+    }
+
+    /// The bash snippet run for real: an interactive `bash -u` (nounset — some
+    /// users enable it in their rc) on a PTY, sourcing the snippet, then a
+    /// passing and a failing command. No rc files, no history file, a scratch
+    /// HOME. Skipped when there is no bash.
+    #[cfg(unix)]
+    #[test]
+    fn bash_snippet_runs_clean_under_set_u_in_a_real_pty() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        let Some(bash) = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash", "/opt/homebrew/bin/bash"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).is_file())
+        else {
+            eprintln!("no bash — skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("jetty-bash-u-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let snippet = dir.join("snippet.bash");
+        std::fs::write(&snippet, BASH).unwrap();
+
+        let pair = native_pty_system()
+            .openpty(PtySize { rows: 24, cols: 120, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new(bash);
+        cmd.args(["--norc", "--noprofile", "-u", "-i"]);
+        cmd.env_clear();
+        cmd.env("HOME", &dir);
+        cmd.env("HISTFILE", "/dev/null");
+        cmd.env("PATH", "/usr/bin:/bin");
+        cmd.env("TERM", "dumb");
+        cmd.env("JETTY", "test");
+        cmd.env("PS1", "$ ");
+        cmd.cwd(&dir);
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn bash");
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut writer = pair.master.take_writer().unwrap();
+        let script = format!(
+            "source '{}'\nprintf 'BASHV=%s%02d\\n' \"${{BASH_VERSINFO[0]}}\" \"${{BASH_VERSINFO[1]}}\"\ntrue\nfalse\nexit\n",
+            snippet.display()
+        );
+        writer.write_all(script.as_bytes()).unwrap();
+        writer.flush().unwrap();
+
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(chunk) => out.extend_from_slice(&chunk),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if child.try_wait().ok().flatten().is_some() {
+                        while let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                            out.extend_from_slice(&chunk);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8_lossy(&out);
+        assert!(!text.contains("unbound variable"), "set -u broke the snippet:\n{text}");
+        assert!(text.contains("\x1b]133;A;redraw=0\x07"), "A mark missing:\n{text}");
+        assert!(text.contains("\x1b]133;D;0\x07"), "`true` exit mark missing:\n{text}");
+        assert!(text.contains("\x1b]133;D;1\x07"), "`false` exit mark missing:\n{text}");
+        // PS0 (the C mark) exists from bash 4.4 on (macOS ships 3.2).
+        let version: u32 = text
+            .split("BASHV=")
+            .skip(1) // the echoed command lines carry the format, not digits
+            .find_map(|v| v.get(..3)?.parse().ok())
+            .expect("bash version printed");
+        if version >= 404 {
+            assert!(text.contains("\x1b]133;C\x07"), "command-start mark missing:\n{text}");
+        }
     }
 
     #[test]

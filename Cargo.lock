@@ -1202,6 +1202,7 @@ dependencies = [
  "notify-rust",
  "png",
  "pollster",
+ "portable-pty",
  "serde",
  "sysinfo",
  "toml",
