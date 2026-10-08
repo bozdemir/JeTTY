@@ -457,26 +457,36 @@ fn run_cpu_only() -> Result<(), Box<dyn std::error::Error>> {
     // With `minimum_contrast` on: an interleaved in-process A/B (same grid, same
     // noise), so its cost is measurable on a busy machine.
     if let Some(r) = min_contrast {
+        // Mean over all batches, and the fastest batch (robust to preemption
+        // on a loaded machine).
         let (mut off_s, mut on_s) = (0.0f64, 0.0f64);
-        for _ in 0..100 {
+        let (mut off_min, mut on_min) = (f64::MAX, f64::MAX);
+        for _ in 0..200 {
             term.set_minimum_contrast(1.0);
             let t = Instant::now();
             for _ in 0..10 {
                 std::hint::black_box(term.snapshot());
             }
-            off_s += t.elapsed().as_secs_f64();
+            let d = t.elapsed().as_secs_f64();
+            off_s += d;
+            off_min = off_min.min(d);
             term.set_minimum_contrast(r);
             let t = Instant::now();
             for _ in 0..10 {
                 std::hint::black_box(term.snapshot());
             }
-            on_s += t.elapsed().as_secs_f64();
+            let d = t.elapsed().as_secs_f64();
+            on_s += d;
+            on_min = on_min.min(d);
         }
         println!(
-            "min_contrast  off {:.4} / on {:.4} ms/frame  ({:+.1}% interleaved A/B, n=1000 each)",
-            off_s,
-            on_s,
-            (on_s / off_s - 1.0) * 100.0
+            "min_contrast  mean off {:.4} / on {:.4} ms ({:+.1}%), best batch off {:.4} / on {:.4} ms ({:+.1}%)  (interleaved A/B, 2000 snapshots each)",
+            off_s / 2.0,
+            on_s / 2.0,
+            (on_s / off_s - 1.0) * 100.0,
+            off_min * 100.0,
+            on_min * 100.0,
+            (on_min / off_min - 1.0) * 100.0
         );
     }
     print_pipeline_1byte_cpu(&mut term);
