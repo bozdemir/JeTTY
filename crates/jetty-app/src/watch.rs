@@ -9,7 +9,10 @@
 //!
 //! What is watched (recomputed by [`ConfigWatcher::rearm`] after every reload):
 //! * the config dir's PARENT (`~/.config`) — so the config dir being created,
-//!   deleted-and-recreated or re-linked (stow / home-manager) is noticed;
+//!   deleted-and-recreated or re-linked (stow / home-manager) is noticed. Not on
+//!   macOS while the config dir exists: FSEvents watches recursively whatever is
+//!   asked, and that parent is `~/Library/Application Support`, where every app
+//!   writes all the time — each write would wake the watcher;
 //! * the config dir itself (`config.toml`) and its `themes/` subdir (a symlinked
 //!   dir is followed);
 //! * when `config.toml` is a symlink to a file elsewhere (a dotfiles repo), the
@@ -23,6 +26,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ::notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+
+/// Whether the OS watcher backend watches directories RECURSIVELY regardless of
+/// the mode asked for (macOS FSEvents) — then a busy parent dir is not watched.
+const RECURSIVE_BACKEND: bool = cfg!(target_os = "macos");
 
 /// The paths that matter right now. Recomputed on every `rearm`, read by the
 /// event callback.
@@ -52,6 +59,14 @@ impl Targets {
 
     /// The directories to watch (each non-recursively), existing ones only.
     fn watch_paths(&self) -> Vec<PathBuf> {
+        self.watch_paths_for(RECURSIVE_BACKEND)
+    }
+
+    /// [`Targets::watch_paths`] for a backend that is (`recursive`) or is not
+    /// recursive whatever is asked: a recursive one watches the config dir's
+    /// parent only while the config dir is missing (to see it appear) — once it
+    /// exists, the dir's own watch reports its removal.
+    fn watch_paths_for(&self, recursive: bool) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
         let mut add = |p: &Path| {
             if p.is_dir() && !out.iter().any(|q| q == p) {
@@ -59,7 +74,9 @@ impl Targets {
             }
         };
         if let Some(parent) = self.config_dir.parent() {
-            add(parent);
+            if !recursive || !self.config_dir.is_dir() {
+                add(parent);
+            }
         }
         add(&self.config_dir);
         add(&self.themes_dir);
@@ -221,6 +238,26 @@ mod tests {
         let base = tmp("missing");
         let t = Targets::compute(&base.join("jetty"));
         assert_eq!(t.watch_paths(), vec![base.clone()]);
+        assert_eq!(t.watch_paths_for(true), vec![base.clone()], "recursive backend too");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_recursive_backend_skips_the_busy_parent_once_the_dir_exists() {
+        // macOS FSEvents is recursive whatever is asked: watching the parent
+        // (`~/Library/Application Support`) woke the watcher on every write of
+        // every app. Only the config dir itself (and themes/) is watched then.
+        let base = tmp("recursive");
+        let cfg_dir = base.join("jetty");
+        std::fs::create_dir_all(cfg_dir.join("themes")).unwrap();
+        let t = Targets::compute(&cfg_dir);
+        assert_eq!(t.watch_paths_for(true), vec![cfg_dir.clone(), cfg_dir.join("themes")]);
+        // inotify (non-recursive) keeps the cheap parent watch: it also sees the
+        // config dir re-linked (stow), which its own watch cannot.
+        assert_eq!(
+            t.watch_paths_for(false),
+            vec![base.clone(), cfg_dir.clone(), cfg_dir.join("themes")]
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
