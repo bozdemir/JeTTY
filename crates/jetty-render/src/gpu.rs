@@ -340,13 +340,6 @@ impl GpuContext {
         self.last_acquire_error
     }
 
-    /// The adapter's device type — `Cpu` for a software rasterizer (lavapipe),
-    /// where opt-in animations stay off. Copies the adapter info: query it once
-    /// (e.g. when a feature is first built), not per frame.
-    pub fn device_type(&self) -> wgpu::DeviceType {
-        self.shared.adapter.get_info().device_type
-    }
-
     pub fn resize(&mut self, w: u32, h: u32) {
         if w > 0 && h > 0 {
             self.config.width = w.min(self.max_dim);

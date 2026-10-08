@@ -1,7 +1,8 @@
 //! App-side backdrop state (visuals v2, slice E): the `[backdrop]` mirror and
 //! its parsed settings, the image decode worker's bookkeeping plus the ONE
 //! texture every window on the main device shares, and the opt-in animation's
-//! 30 fps pacing. The GPU layer is `jetty_render::Backdrop`: one per window,
+//! clock (its frames are paced by `effects::anim_step`, like every effect
+//! animation). The GPU layer is `jetty_render::Backdrop`: one per window,
 //! `None` while the mode is "none" (nothing built), created lazily on the first
 //! frame that needs it ([`prepare`]).
 //!
@@ -12,15 +13,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use jetty_render::backdrop_image::DecodedImage;
 use jetty_render::{Backdrop, BackdropFrame, BackdropMode, BackdropSettings, GpuImage};
 
 use crate::config::BackdropConfig;
-
-/// Frame interval of an animated backdrop: ≤ 30 fps, as timed wakes (never Poll).
-pub(crate) const ANIM_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Fallback monitor size for the decode downscale when no monitor is known.
 pub(crate) const FALLBACK_MONITOR: (u32, u32) = (3840, 2160);
@@ -79,10 +77,6 @@ pub(crate) struct BackdropState {
     gen: u64,
     /// The animation clock.
     clock: Instant,
-    /// The next animation wake while the backdrop animates; `None` otherwise.
-    pub tick_at: Option<Instant>,
-    /// The main adapter is a CPU rasterizer (lavapipe): never animate there.
-    pub cpu_adapter: bool,
 }
 
 impl BackdropState {
@@ -94,8 +88,6 @@ impl BackdropState {
             shown: None,
             gen: 0,
             clock: Instant::now(),
-            tick_at: None,
-            cpu_adapter: false,
         }
     }
 
@@ -109,10 +101,11 @@ impl BackdropState {
         true
     }
 
-    /// Whether frames must be paced for the animation right now (the look
-    /// moves, and the adapter is a real GPU).
-    pub fn animates(&self) -> bool {
-        self.settings.animates() && !self.cpu_adapter
+    /// Whether the backdrop wants paced animation frames on an adapter: the
+    /// look moves (`animate` on a gradient / pattern), and never on a CPU
+    /// adapter (lavapipe) — there every frame costs real CPU.
+    pub fn animates_on(&self, cpu_adapter: bool) -> bool {
+        self.settings.animates() && !cpu_adapter
     }
 
     /// The animation phase (seconds). Wrapped daily so the f32 never loses the
@@ -309,7 +302,7 @@ mod tests {
     fn off_by_default_and_no_image_wanted() {
         let s = BackdropState::new(BackdropConfig::default());
         assert!(s.settings.is_off());
-        assert!(!s.animates());
+        assert!(!s.animates_on(false));
         assert_eq!(s.wanted_image(Path::new("/c"), (100, 100)), None);
     }
 
@@ -410,16 +403,17 @@ mod tests {
 
     #[test]
     fn animation_needs_a_real_gpu_and_a_moving_look() {
-        let mut s = BackdropState::new(BackdropConfig {
+        let s = BackdropState::new(BackdropConfig {
             mode: "pattern".into(),
             animate: true,
             ..BackdropConfig::default()
         });
-        assert!(s.animates());
-        s.cpu_adapter = true;
-        assert!(!s.animates(), "never on a CPU adapter");
+        assert!(s.animates_on(false));
+        assert!(!s.animates_on(true), "never on a CPU adapter");
         let img = BackdropState::new(BackdropConfig { animate: true, ..image_cfg("a.png", 0.0) });
-        assert!(!img.animates(), "images do not animate");
+        assert!(!img.animates_on(false), "images do not animate");
+        let still = BackdropState::new(BackdropConfig { mode: "theme".into(), ..BackdropConfig::default() });
+        assert!(!still.animates_on(false), "animate is opt-in");
     }
 
     #[test]

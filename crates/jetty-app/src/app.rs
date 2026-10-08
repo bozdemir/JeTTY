@@ -9948,10 +9948,6 @@ impl App {
         {
             dw.offscreen = Some(Self::make_offscreen(&dw.gpu));
         }
-        // The backdrop's CPU-adapter check, once, when this window first draws it.
-        if dw.backdrop.is_none() && !self.backdrop.settings.is_off() {
-            self.backdrop.cpu_adapter |= dw.gpu.device_type() == wgpu::DeviceType::Cpu;
-        }
         let gpu = &mut dw.gpu;
         let text = &mut dw.text;
         let chrome_text = &mut dw.chrome_text;
@@ -10887,15 +10883,15 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
         // Paced effect animation — CRT roll/flicker/jitter, animated grain, an
-        // event-glitch burst: at most 30 fps (15 on a CPU adapter) by ONE timed
-        // wake per frame, never Poll at the display rate. A continuous animation
-        // pauses while its window (or the Settings window previewing it) is
-        // unfocused, unless `animate_unfocused`; a bounded glitch burst always
-        // plays out. Same gates per window as above (`anim_step` → Idle).
-        let anim_interval = crate::effects::anim_interval(
-            self.gpu.as_ref().is_some_and(|g| g.is_cpu_adapter()),
-        );
-        let crt_live = self.fx.crt_anim_live();
+        // animated backdrop, an event-glitch burst: at most 30 fps (15 on a CPU
+        // adapter) by ONE timed wake per frame, never Poll at the display rate. A
+        // continuous animation pauses while its window (or the Settings window
+        // previewing it) is unfocused, unless `animate_unfocused`; a bounded
+        // glitch burst always plays out. Same gates per window as above
+        // (`anim_step` → Idle). The backdrop never animates on a CPU adapter.
+        let cpu_adapter = self.gpu.as_ref().is_some_and(|g| g.is_cpu_adapter());
+        let anim_interval = crate::effects::anim_interval(cpu_adapter);
+        let crt_live = self.fx.crt_anim_live() || self.backdrop.animates_on(cpu_adapter);
         let animate_unfocused = self.fx.animate_unfocused;
         let settings_focused = self
             .settings_window
@@ -10940,27 +10936,6 @@ impl ApplicationHandler<AppEvent> for App {
                 dw.anim_requested_at = Some(now);
                 painted = true;
             }
-        }
-        // Opt-in backdrop animation (`[backdrop] animate`): ≤ 30 fps as ONE
-        // timed wake per frame — never Poll — and only while a window showing it
-        // can present (the visibility gates above). Off — the default, a look
-        // that does not move (images), or a CPU adapter — costs one bool here.
-        if self.backdrop.animates() {
-            let det_can = |d: &crate::detached::DetachedWindow| !d.occluded && d.acquire_retry.is_none();
-            if !main_can_animate && !self.detached.iter().any(det_can) {
-                self.backdrop.tick_at = None;
-            } else if self.backdrop.tick_at.is_none_or(|t| now >= t) {
-                if main_can_animate {
-                    self.request_main_paint();
-                }
-                for dw in self.detached.iter().filter(|d| det_can(d)) {
-                    dw.request_paint();
-                }
-                painted = true;
-                self.backdrop.tick_at = Some(now + crate::backdrop::ANIM_INTERVAL);
-            }
-        } else {
-            self.backdrop.tick_at = None;
         }
         let settings_pending = self.settings_window.is_some()
             && self
@@ -11077,11 +11052,6 @@ impl ApplicationHandler<AppEvent> for App {
         // A failed GPU rebuild retries once its backoff elapses (a due one ran
         // at the top of this iteration, so this is strictly in the future).
         if let Some(t) = self.gpu_rebuild_retry_at.filter(|&t| t > now) {
-            merge_wake(&mut wake_at, t);
-        }
-        // The animated backdrop's next frame (set above only while it animates
-        // in a window that can present).
-        if let Some(t) = self.backdrop.tick_at {
             merge_wake(&mut wake_at, t);
         }
         // Pill expiries: one wake each to repaint the pill away.
@@ -13873,9 +13843,6 @@ impl ApplicationHandler<AppEvent> for App {
                     // The backdrop (visuals v2): `None` for mode "none" — no layer
                     // exists and the frame is exactly the clear. Built on the first
                     // frame that draws it; the dropdown slide and parallax move it.
-                    if self.backdrop_gpu.is_none() && !self.backdrop.settings.is_off() {
-                        self.backdrop.cpu_adapter = gpu.device_type() == wgpu::DeviceType::Cpu;
-                    }
                     let backdrop = crate::backdrop::prepare(
                         &mut self.backdrop_gpu,
                         &self.backdrop,
