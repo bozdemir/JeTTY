@@ -50,6 +50,14 @@ enum IsolatedSeq {
     AltToggle,
 }
 
+/// Index of the first OSC terminator in `s` — BEL, CAN, SUB or ESC (vte 0.15's
+/// `advance_osc_string` set) — via SIMD scans.
+fn osc_terminator(s: &[u8]) -> Option<usize> {
+    let a = memchr::memchr3(0x07, 0x18, 0x1b, s);
+    let b = memchr::memchr(0x1a, &s[..a.unwrap_or(s.len())]);
+    b.or(a)
+}
+
 /// Classify a completed CSI (`ESC [` + `params` + `fin`) the scanner isolates.
 fn isolated_csi(params: &[u8], fin: u8) -> Option<IsolatedSeq> {
     match (params, fin) {
@@ -366,6 +374,16 @@ const MAX_IMAGE_ROWS: usize = 1024;
 /// keeps scanning to resync, then DROPS (correct-or-absent).
 const APC_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// Cap on ONE OSC's payload. vte (built with `std`) buffers an OSC in an
+/// unbounded `Vec` until its terminator, so `printf '\e]0;'; base64 /dev/urandom`
+/// would grow memory without bound. No OSC JeTTY honors needs more: OSC 52's
+/// commit cap is [`OSC52_MAX_BYTES`] decoded (~137 KiB of base64), titles are
+/// sanitized to 256 chars, hyperlink URIs are short. Past the cap the scanner
+/// ends the OSC for vte (CAN — dispatching the truncated head, which every
+/// handler above caps or rejects) and DISCARDS the rest up to its terminator,
+/// so none of it leaks onto the grid as text.
+const OSC_MAX_BYTES: u32 = 1024 * 1024;
+
 /// The RAW (post-base64, post-inflate) decode budget for a Kitty image, shared by
 /// the cross-chunk accumulator and the zlib inflate limit. Reconciles the
 /// transport ceiling with the decoder ceiling (amendment BLOCKING 2): a full HiDPI
@@ -426,6 +444,9 @@ enum Scan {
     Payload { letter: u8, code: Option<u32>, in_code: bool, code_done: bool },
     /// Inside some OTHER OSC (title/hyperlink/color); skip to its terminator.
     Skip,
+    /// An OSC overran [`OSC_MAX_BYTES`]: vte was handed CAN to end it, and every
+    /// byte up to the OSC's own terminator is DROPPED (never reaches alacritty).
+    OscDiscard,
     /// Inside `ESC P`, collecting the `P1;P2;P3` params up to the final byte
     /// (`0x40..=0x7E`). `field` tracks which param digit run we're in; `p2` (the
     /// background-select param) is stashed for the decoder. `inter` latches an
@@ -694,6 +715,9 @@ pub struct Terminal {
     kitty_images: VecDeque<(u32, Arc<crate::sixel::InlineImage>)>,
     /// Running sum of `rgba.len()` across `kitty_images` (the registry byte budget).
     kitty_stored_bytes: u64,
+    /// Payload bytes of the OSC being scanned (bounded by [`OSC_MAX_BYTES`]).
+    /// Persists across `feed` calls like `scan`.
+    osc_len: u32,
 }
 
 /// Maximum scrollback-search query length in chars (bounds per-keystroke DFA
@@ -833,6 +857,7 @@ impl Terminal {
             chunk_count: 0,
             kitty_images: VecDeque::new(),
             kitty_stored_bytes: 0,
+            osc_len: 0,
         }
     }
 
@@ -1049,7 +1074,11 @@ impl Terminal {
                     // sits at `i - 1` (or ended the previous feed when `i == 0`).
                     let esc_at = i.saturating_sub(1);
                     self.scan = match b {
-                        0x5d => Scan::Prefix { n: 0 }, // ']' opens an OSC
+                        0x5d => {
+                            // ']' opens an OSC.
+                            self.osc_len = 0;
+                            Scan::Prefix { n: 0 }
+                        }
                         0x50 => Scan::DcsParams { p2: 0, field: 0, inter: false }, // 'P' opens a DCS
                         0x5f => Scan::ApcIntro,        // '_' opens an APC (Kitty graphics)
                         // '[' opens a CSI. Only while anchors exist is it checked for
@@ -1135,6 +1164,13 @@ impl Terminal {
                     }
                     i += 1;
                 }
+                // An OSC 133 payload overrunning the OSC cap: end it for vte and
+                // discard the rest (never binds a mark).
+                Scan::Payload { .. }
+                    if self.osc_len >= OSC_MAX_BYTES && !matches!(b, 0x07 | 0x18 | 0x1a | 0x1b) =>
+                {
+                    start = self.abort_osc(bytes, start, i);
+                }
                 Scan::Payload { letter, code, in_code, code_done } => match b {
                     // BEL / CAN / SUB / ESC(=ST) all end the OSC (vte parity).
                     0x07 | 0x18 | 0x1a | 0x1b => {
@@ -1160,6 +1196,7 @@ impl Terminal {
                             in_code: true,
                             code_done: in_code || code_done,
                         };
+                        self.osc_len += 1;
                         i += 1;
                     }
                     b'0'..=b'9' if in_code && !code_done => {
@@ -1175,6 +1212,7 @@ impl Terminal {
                             .saturating_add((b - b'0') as u32)
                             .min(EXIT_CODE_MAX);
                         self.scan = Scan::Payload { letter, code: Some(next), in_code, code_done };
+                        self.osc_len += 1;
                         i += 1;
                     }
                     _ => {
@@ -1189,17 +1227,51 @@ impl Terminal {
                         } else {
                             Scan::Payload { letter, code, in_code, code_done }
                         };
+                        self.osc_len += 1;
                         i += 1;
                     }
                 },
+                // Some other OSC: jump straight to its terminator (one SIMD scan,
+                // not a step per byte), counting the payload toward the cap.
                 Scan::Skip => {
-                    self.scan = match b {
-                        0x1b => Scan::Esc,             // ST: ends this OSC, new escape
-                        0x07 | 0x18 | 0x1a => Scan::Ground,
-                        _ => Scan::Skip,
-                    };
-                    i += 1;
+                    let term = osc_terminator(&bytes[i..]);
+                    let run = term.unwrap_or(bytes.len() - i);
+                    let room = (OSC_MAX_BYTES - self.osc_len) as usize;
+                    if run > room {
+                        // Hand vte exactly up to the cap, end the OSC, drop the rest.
+                        start = self.abort_osc(bytes, start, i + room);
+                        i += room;
+                    } else {
+                        self.osc_len += run as u32;
+                        i += run;
+                        if term.is_some() {
+                            // ESC (= ST) also begins a new escape; BEL/CAN/SUB end it.
+                            self.scan = if bytes[i] == 0x1b { Scan::Esc } else { Scan::Ground };
+                            i += 1;
+                        }
+                    }
                 }
+                // Past an OSC overrun: drop everything up to the OSC's terminator.
+                Scan::OscDiscard => match osc_terminator(&bytes[i..]) {
+                    None => {
+                        i = bytes.len();
+                        start = i;
+                    }
+                    Some(off) => {
+                        let j = i + off;
+                        if bytes[j] == 0x1b {
+                            // Forward the ESC: vte (back in Ground after our CAN)
+                            // parses what follows — ST's `\`, or a new escape.
+                            start = j;
+                            self.scan = Scan::Esc;
+                        } else {
+                            // BEL/CAN/SUB: the OSC already ended for vte; drop it too.
+                            start = j + 1;
+                            self.scan = Scan::Ground;
+                        }
+                        i = j + 1;
+                    }
+                },
                 // Inside `ESC P`, collecting P1;P2;P3 up to the final byte. Mirrors
                 // vte's DcsEntry/DcsParam/DcsIntermediate tables: digits fold into
                 // the current param, `;`/`:` advance/subdivide it, `0x20..=0x2F` is
@@ -1438,6 +1510,19 @@ impl Terminal {
     /// below the user cap (so room for it can always be made under the cap).
     fn piece_budget(&self) -> usize {
         SLICE_MAX_LINES.min(self.scrollback_limit / 2).max(1)
+    }
+
+    /// An OSC overran [`OSC_MAX_BYTES`] at `bytes[cut]`: hand alacritty the bytes
+    /// up to the cap, end the OSC with CAN (vte dispatches the truncated head —
+    /// every handler caps or rejects it — and CAN itself is a no-op), and switch
+    /// to discarding up to the OSC's terminator. Returns the new `start`.
+    #[cold]
+    #[inline(never)]
+    fn abort_osc(&mut self, bytes: &[u8], start: usize, cut: usize) -> usize {
+        self.advance_slice(&bytes[start..cut]);
+        self.advance_slice(b"\x18");
+        self.scan = Scan::OscDiscard;
+        cut
     }
 
     /// Advance `bytes[start..k]` with the isolated sequence `bytes[seq_start..k]`
@@ -5754,6 +5839,64 @@ mod tests {
         buf.extend_from_slice(&red_rgba_2x2(""));
         t.feed(&buf);
         assert_eq!(t.placements.len(), 2, "both a sixel and a Kitty image placed");
+    }
+
+    // ── OSC size cap ──────────────────────────────────────────────────────────
+
+    /// Resident set size of this process in bytes (Linux; 0 elsewhere).
+    fn rss_bytes() -> u64 {
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()))
+            .map_or(0, |pages| pages * 4096)
+    }
+
+    #[test]
+    fn unterminated_osc_flood_is_bounded_and_leaks_no_text() {
+        // `printf '\e]0;'; base64 /dev/urandom` used to grow vte's OSC buffer
+        // without bound. 300 MiB streamed in PTY-sized chunks must stay bounded,
+        // print none of it, and the terminal must recover at the terminator.
+        let mut t = Terminal::new(40, 5);
+        t.feed(b"\x1b]0;");
+        let chunk = vec![b'A'; 64 * 1024];
+        let before = rss_bytes();
+        for _ in 0..(300 * 16) {
+            t.feed(&chunk);
+        }
+        let grown = rss_bytes().saturating_sub(before);
+        assert!(grown < 64 * 1024 * 1024, "RSS grew by {grown} bytes");
+        assert_eq!(t.scan, Scan::OscDiscard, "the overrun is being discarded");
+        t.feed(b"\x07ok");
+        let snap = t.snapshot();
+        assert!(snap.row_text(0).starts_with("ok"), "recovers: {:?}", snap.row_text(0));
+        assert!((0..snap.rows).all(|r| !snap.row_text(r).contains('A')), "no payload leaked");
+    }
+
+    #[test]
+    fn osc_overrun_split_across_feeds_resyncs_on_st() {
+        let mut t = Terminal::new(40, 5);
+        let mut payload = b"\x1b]2;".to_vec();
+        payload.extend(std::iter::repeat_n(b'z', OSC_MAX_BYTES as usize + 10));
+        let (a, b) = payload.split_at(payload.len() / 2);
+        t.feed(a);
+        t.feed(b);
+        t.feed(b"zzz\x1b\\after"); // terminated by a 7-bit ST
+        assert_eq!(t.snapshot().row_text(0).trim_end(), "after");
+        // A normal OSC right after still works.
+        t.feed(b"\x1b]0;fine\x07");
+        assert_eq!(t.take_title_update(), Some(Some("fine".to_string())));
+    }
+
+    #[test]
+    fn overrunning_osc133_binds_no_mark() {
+        let mut t = Terminal::new(40, 5);
+        let mut bytes = b"\x1b]133;A".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', OSC_MAX_BYTES as usize + 5));
+        bytes.push(0x07);
+        t.feed(&bytes);
+        assert!(t.marks.is_empty(), "a garbage-sized 133 never binds");
+        assert_eq!(t.prompt_count(), 0);
+        assert!(t.snapshot().row_text(0).trim().is_empty(), "nothing printed");
     }
 
     // ── mode getters for the input layer (kitty keyboard / focus / mouse) ────
