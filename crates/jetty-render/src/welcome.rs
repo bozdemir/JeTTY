@@ -140,6 +140,7 @@ pub fn build_welcome_overlay(
             h: SWATCH_H,
             color: [color[0], color[1], color[2], 220],
             radius: 3.0,
+            shear: 0.0,
         });
     }
 

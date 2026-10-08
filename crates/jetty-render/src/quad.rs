@@ -1,7 +1,10 @@
-// Per-instance data: rect (xywh), color (rgba), and rounded-rect params
-// (half-size xy, corner radius, _pad). The fragment computes an antialiased
+// Per-instance data: rect (xywh), color (rgba), and shape params (shear,
+// unused, corner radius, _pad). The fragment computes an antialiased
 // rounded-rect SDF coverage; radius == 0 yields full coverage everywhere, so
-// every existing (sharp) quad is byte-identical to before.
+// every existing (sharp) quad is byte-identical to before. `shear` slants the
+// quad into a parallelogram (x shifts by shear × the distance above the rect's
+// vertical centre): the SDF runs in the unsheared frame, so the corners stay
+// rounded and the slanted edges antialiased. 0 = an upright rect.
 const QUAD_SHADER: &str = r#"
 struct Screen { size: vec2<f32>, _pad: vec2<f32> };
 @group(0) @binding(0) var<uniform> screen: Screen;
@@ -17,11 +20,12 @@ fn vs(
     @builtin(vertex_index) vi: u32,
     @location(0) rect: vec4<f32>,
     @location(1) color: vec4<f32>,
-    @location(2) round: vec4<f32>,   // half.xy, radius, _pad
+    @location(2) round: vec4<f32>,   // shear, _unused, radius, _pad
 ) -> VsOut {
     var corners = array<vec2<f32>, 6>(vec2(0.,0.), vec2(1.,0.), vec2(0.,1.), vec2(0.,1.), vec2(1.,0.), vec2(1.,1.));
     let c = corners[vi];
-    let px = rect.xy + c * rect.zw;
+    var px = rect.xy + c * rect.zw;
+    px.x += round.x * (0.5 - c.y) * rect.w;
     let ndc = vec2(px.x / screen.size.x * 2.0 - 1.0, 1.0 - px.y / screen.size.y * 2.0);
     var o: VsOut;
     o.pos = vec4(ndc, 0.0, 1.0);
@@ -61,23 +65,36 @@ pub struct Rect {
     /// existing quads render unchanged. A positive value rounds the corners via
     /// an antialiased rounded-rect SDF in the shader.
     pub radius: f32,
+    /// Horizontal slant: x shifts by `shear × (h/2 − y_local)` px, so a positive
+    /// value leans the top edge right (`/`). `0.0` (the default) = upright. The
+    /// tab bar's slant / powerline styles use it; give a sheared quad a small
+    /// `radius` so its slanted edges are antialiased (radius 0 skips the SDF).
+    pub shear: f32,
 }
 
 impl Default for Rect {
     fn default() -> Self {
-        Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0, color: [0, 0, 0, 0], radius: 0.0 }
+        Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0, color: [0, 0, 0, 0], radius: 0.0, shear: 0.0 }
     }
 }
 
 impl Rect {
     /// A sharp (radius 0) rect — convenience matching the old field-only literal.
     pub fn new(x: f32, y: f32, w: f32, h: f32, color: [u8; 4]) -> Self {
-        Rect { x, y, w, h, color, radius: 0.0 }
+        Rect { x, y, w, h, color, radius: 0.0, shear: 0.0 }
     }
 
     /// A rounded rect with the given corner `radius` in pixels.
     pub fn rounded(x: f32, y: f32, w: f32, h: f32, color: [u8; 4], radius: f32) -> Self {
-        Rect { x, y, w, h, color, radius }
+        Rect { x, y, w, h, color, radius, shear: 0.0 }
+    }
+
+    /// The x extent `[left, right]` this quad COVERS once sheared (equal to
+    /// `[x, x + w]` when upright): the slant moves the top and bottom edges by
+    /// `±shear·h/2`.
+    pub fn sheared_x_span(&self) -> (f32, f32) {
+        let lean = (self.shear * self.h * 0.5).abs();
+        (self.x - lean, self.x + self.w + lean)
     }
 }
 
@@ -213,9 +230,10 @@ impl QuadLayer {
             self.instance_scratch.push(r.color[1] as f32 / 255.0);
             self.instance_scratch.push(r.color[2] as f32 / 255.0);
             self.instance_scratch.push(r.color[3] as f32 / 255.0);
-            // Round params: half-size xy (unused by the shader; derived from
-            // rect there too), corner radius, _pad.
-            self.instance_scratch.push(r.w * 0.5);
+            // Shape params: shear, the old half-height slot (unused by the
+            // shader, which derives the half-size from rect), corner radius,
+            // _pad.
+            self.instance_scratch.push(r.shear);
             self.instance_scratch.push(r.h * 0.5);
             self.instance_scratch.push(r.radius);
             self.instance_scratch.push(0.0);
@@ -1005,6 +1023,30 @@ pub fn scrollbar_rect(
 mod tests {
     use super::*;
     use jetty_core::{attr, CellSnapshot, CursorShapeSnap, GridSnapshot};
+
+    /// The quad WGSL (now with the shear term) parses and passes naga's
+    /// validator — the always-run gate for a shader with no GPU in CI.
+    #[test]
+    fn quad_shader_passes_naga_validation() {
+        let module = naga::front::wgsl::parse_str(QUAD_SHADER).expect("QUAD_SHADER must parse");
+        let mut validator =
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all());
+        validator.validate(&module).expect("QUAD_SHADER must pass naga validation");
+    }
+
+    #[test]
+    fn shear_defaults_to_upright_and_widens_the_covered_span() {
+        // Every existing constructor stays upright (byte-identical instances).
+        assert_eq!(Rect::default().shear, 0.0);
+        assert_eq!(Rect::new(1.0, 2.0, 3.0, 4.0, [0; 4]).shear, 0.0);
+        assert_eq!(Rect::rounded(1.0, 2.0, 3.0, 4.0, [0; 4], 2.0).shear, 0.0);
+        let upright = Rect::new(10.0, 0.0, 50.0, 20.0, [0; 4]);
+        assert_eq!(upright.sheared_x_span(), (10.0, 60.0));
+        // shear 0.5 over a 20px-tall quad leans each edge 5px either way.
+        let slanted = Rect { shear: 0.5, ..upright };
+        assert_eq!(slanted.sheared_x_span(), (5.0, 65.0));
+        assert_eq!(Rect { shear: -0.5, ..upright }.sheared_x_span(), (5.0, 65.0));
+    }
 
     /// A blank grid with default cells for the decoration/cursor geometry tests.
     fn grid(cols: usize, rows: usize) -> GridSnapshot {

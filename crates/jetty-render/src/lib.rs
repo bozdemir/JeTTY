@@ -50,8 +50,10 @@ pub use menu::{build_context_menu, build_menu, ContextMenu, MENU_HINTS, MENU_ITE
 pub use help::{build_help_overlay, default_help_rows, HelpOverlay, HELP_ROWS};
 pub use confirm::{build_confirm, build_confirm_close, ConfirmPopup};
 pub use tabbar::{
-    build_detached_bar, build_tab_bar, build_tab_bar_ex, detached_close_rect, detached_help_rect, CtrlHover,
-    DetachedBar, TabActivity, TabBar, CONTROLS_W, STRIP_PAD, TABBAR_H,
+    build_detached_bar, build_detached_bar_styled, build_tab_bar, build_tab_bar_ex, build_tab_bar_styled,
+    detached_close_rect, detached_help_rect, tab_color_name, tab_color_rgb, valid_tab_color, CloseButton,
+    CtrlHover, DetachedBar, TabActivity, TabBar, TabBarOpts, TabDeco, TabStyle, CONTROLS_W, STRIP_PAD,
+    TABBAR_H, TAB_COLORS,
 };
 pub use welcome::{build_welcome_overlay, WelcomeOverlay};
 pub use search_bar::{

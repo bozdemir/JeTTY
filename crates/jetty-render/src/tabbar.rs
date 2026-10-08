@@ -1,6 +1,7 @@
 use crate::chrome::{fit_head, fit_tail, ChromeMeasure, ChromeMetrics, MonoMeasure};
+use crate::ui_palette::{mix, UiPalette};
 use crate::Rect;
-use jetty_core::Theme;
+use jetty_core::{Progress, ProgressState, Theme};
 
 // Every distance below is a DESIGN px — authored for the default 16pt UI font on
 // a 1× display — and is multiplied by the window's chrome unit
@@ -13,8 +14,14 @@ use jetty_core::Theme;
 /// (this × the chrome unit, rounded); the terminal grid starts right below it.
 pub const TABBAR_H: f32 = 36.0;
 
-/// Width of a single tab.
+/// Width of a single tab (the most a tab grows to).
 const TAB_W: f32 = 140.0;
+/// The narrowest a tab shrinks to before the strip overflows into "+N".
+const TAB_W_MIN: f32 = 64.0;
+/// [`TabStyle::Compact`]'s tab width range: denser tabs, so more fit before the
+/// strip overflows. Every other style keeps [`TAB_W`] / [`TAB_W_MIN`].
+const COMPACT_TAB_W: f32 = 104.0;
+const COMPACT_TAB_W_MIN: f32 = 48.0;
 /// Width of the "+" new-tab button.
 const PLUS_W: f32 = 32.0;
 /// Size of the "×" close hit box at the right of each tab.
@@ -34,16 +41,225 @@ pub const STRIP_PAD: f32 = 8.0;
 /// Top inset of every one-line label inside the bar (the glyph box's top).
 const LABEL_Y: f32 = 9.0;
 
-/// Unseen activity on a tab, shown as a small themed dot on INACTIVE tabs.
-/// `Output` = PTY output arrived while the tab was inactive (accent dot);
-/// `Bell` = BEL (^G) rang while inactive (theme-red dot, never downgraded by
-/// later output). Sticky until the tab is viewed.
+/// Unseen activity on a tab, shown as a small themed dot (a "badge") on
+/// INACTIVE tabs and tinting the "+N" overflow hint. Sticky until the tab is
+/// viewed; a stronger kind replaces a weaker one, never the reverse — see
+/// [`TabActivity::rank`] (Failed > Bell > Done > Output).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TabActivity {
     #[default]
     None,
+    /// PTY output arrived while the tab was inactive (accent dot).
     Output,
+    /// BEL (^G) rang while inactive (amber dot — red means failure).
     Bell,
+    /// A command finished successfully while inactive (OSC 133 D; green dot).
+    Done,
+    /// A command FAILED while inactive (OSC 133 D with a nonzero exit; red dot).
+    Failed,
+}
+
+impl TabActivity {
+    /// Precedence: Failed > Bell > Done > Output > None. A failure is what the
+    /// user most needs to see; a bell asked for attention; a finished command
+    /// says more than "something printed".
+    pub fn rank(self) -> u8 {
+        match self {
+            TabActivity::None => 0,
+            TabActivity::Output => 1,
+            TabActivity::Done => 2,
+            TabActivity::Bell => 3,
+            TabActivity::Failed => 4,
+        }
+    }
+
+    /// The stronger of `self` and `other` by [`Self::rank`] (`self` on a tie).
+    pub fn max(self, other: TabActivity) -> TabActivity {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// How the tabs are drawn (config `tab_style`). Only [`TabStyle::Compact`]
+/// changes the tab geometry (narrower tabs); the others share today's widths,
+/// so every hit rect is identical across them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabStyle {
+    /// A soft rounded pill behind the active tab; inactive tabs are text (today).
+    #[default]
+    Pill,
+    /// No fills: an accent bar under the active tab's title.
+    Underline,
+    /// Every tab a slanted parallelogram (`/ title /`).
+    Slant,
+    /// Breadcrumb chevrons (powerline segments), the active one in the accent.
+    Powerline,
+    /// The pill look on narrower, denser tabs.
+    Compact,
+}
+
+impl TabStyle {
+    /// Cycle / Settings order.
+    pub const ALL: [TabStyle; 5] =
+        [TabStyle::Pill, TabStyle::Underline, TabStyle::Slant, TabStyle::Powerline, TabStyle::Compact];
+
+    /// Config string → style; unknown values read as [`TabStyle::Pill`].
+    pub fn from_config(s: &str) -> TabStyle {
+        match s {
+            "underline" => TabStyle::Underline,
+            "slant" => TabStyle::Slant,
+            "powerline" => TabStyle::Powerline,
+            "compact" => TabStyle::Compact,
+            _ => TabStyle::Pill,
+        }
+    }
+
+    pub fn to_config(self) -> &'static str {
+        match self {
+            TabStyle::Pill => "pill",
+            TabStyle::Underline => "underline",
+            TabStyle::Slant => "slant",
+            TabStyle::Powerline => "powerline",
+            TabStyle::Compact => "compact",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            TabStyle::Pill => "Pill",
+            TabStyle::Underline => "Underline",
+            TabStyle::Slant => "Slant",
+            TabStyle::Powerline => "Powerline",
+            TabStyle::Compact => "Compact",
+        }
+    }
+
+    /// The next / previous style in [`Self::ALL`] order (wraps).
+    pub fn cycle(self, forward: bool) -> TabStyle {
+        let i = Self::ALL.iter().position(|&s| s == self).unwrap_or(0);
+        let n = Self::ALL.len();
+        Self::ALL[if forward { (i + 1) % n } else { (i + n - 1) % n }]
+    }
+}
+
+/// Which tabs show their "×" close button (config `tab_close_button`). A hidden
+/// "×" is not clickable either: its hit rect is parked offscreen, so a click
+/// there selects the tab. The pointer's own tab always shows it in `Hover` and
+/// `Active` mode, so the button is there whenever it can be clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseButton {
+    /// Every tab (today).
+    #[default]
+    Always,
+    /// Only the tab under the pointer.
+    Hover,
+    /// The active tab, and the tab under the pointer.
+    Active,
+}
+
+impl CloseButton {
+    pub const ALL: [CloseButton; 3] = [CloseButton::Always, CloseButton::Hover, CloseButton::Active];
+
+    /// Config string → mode; unknown values read as [`CloseButton::Always`].
+    pub fn from_config(s: &str) -> CloseButton {
+        match s {
+            "hover" => CloseButton::Hover,
+            "active" => CloseButton::Active,
+            _ => CloseButton::Always,
+        }
+    }
+
+    pub fn to_config(self) -> &'static str {
+        match self {
+            CloseButton::Always => "always",
+            CloseButton::Hover => "hover",
+            CloseButton::Active => "active",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            CloseButton::Always => "Always",
+            CloseButton::Hover => "On hover",
+            CloseButton::Active => "Active tab",
+        }
+    }
+
+    /// Whether a tab shows its "×".
+    pub fn shows(self, active: bool, hovered: bool) -> bool {
+        match self {
+            CloseButton::Always => true,
+            CloseButton::Hover => hovered,
+            CloseButton::Active => active || hovered,
+        }
+    }
+}
+
+/// Per-tab colors offered by the tab menu and the palette: ANSI palette indices
+/// 1–6, so a tab's color follows the theme (stored as the index, never RGB).
+pub const TAB_COLORS: [(u8, &str); 6] =
+    [(1, "Red"), (2, "Green"), (3, "Yellow"), (4, "Blue"), (5, "Magenta"), (6, "Cyan")];
+
+/// A valid per-tab color index (1..=6) — what a config or a stale id may hold.
+pub fn valid_tab_color(idx: u8) -> Option<u8> {
+    (1..=6).contains(&idx).then_some(idx)
+}
+
+/// The display name of a per-tab color index ("Red" … "Cyan").
+pub fn tab_color_name(idx: u8) -> Option<&'static str> {
+    TAB_COLORS.iter().find(|(i, _)| *i == idx).map(|(_, n)| *n)
+}
+
+/// The live RGB of per-tab color `idx` in `theme` (`None` for a bad index).
+pub fn tab_color_rgb(theme: &Theme, idx: u8) -> Option<[u8; 3]> {
+    valid_tab_color(idx).map(|i| theme.palette[usize::from(i)])
+}
+
+/// Everything about ONE tab the bar draws beyond its title. None of it affects
+/// the tab GEOMETRY (hit rects), so hit-test rebuilds can pass defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TabDeco {
+    /// Unseen activity badge (drawn on inactive tabs only).
+    pub activity: TabActivity,
+    /// OSC 9;4 progress the tab's program reports.
+    pub progress: Option<Progress>,
+    /// Per-tab color: an ANSI palette index 1..=6 ([`TAB_COLORS`]).
+    pub color: Option<u8>,
+}
+
+/// Bar-wide drawing options (the chrome config keys + pointer state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabBarOpts {
+    pub style: TabStyle,
+    pub close_button: CloseButton,
+    /// The tab under the pointer: its hover lift, and its "×" in the
+    /// `Hover` / `Active` close-button modes.
+    pub hover: Option<usize>,
+    /// The bar strip is painted opaque in the theme bg (today). `false`
+    /// (`tab_bar_opacity = true`) leaves it unpainted, so the window's opacity —
+    /// and anything drawn under the bar — shows through like the grid.
+    pub opaque: bool,
+    /// Draw OSC 9;4 progress (`progress_bar`).
+    pub progress: bool,
+    /// The bar sits at the window BOTTOM: marks that face the grid (the
+    /// underline, the progress hairline) move to the bar's top edge.
+    pub bottom: bool,
+}
+
+impl Default for TabBarOpts {
+    fn default() -> Self {
+        TabBarOpts {
+            style: TabStyle::Pill,
+            close_button: CloseButton::Always,
+            hover: None,
+            opaque: true,
+            progress: true,
+            bottom: false,
+        }
+    }
 }
 
 /// Which window-control button (if any) is hovered, for the highlight.
@@ -69,7 +285,8 @@ pub struct TabBar {
     pub title_labels: Vec<(String, f32, f32, [u8; 3])>,
     /// One hit-test rect per tab (full tab area, for switching).
     pub tab_rects: Vec<Rect>,
-    /// One hit-test rect per tab for its "×" close affordance.
+    /// One hit-test rect per tab for its "×" close affordance (parked offscreen
+    /// while the "×" is hidden — see [`CloseButton`]).
     pub close_rects: Vec<Rect>,
     /// Hit-test rect for the "+" new-tab button.
     pub plus_rect: Rect,
@@ -87,7 +304,7 @@ pub struct TabBar {
 
 /// Build the tab bar across the top of the window at the design baseline (1×,
 /// 16pt UI font, monospace advance). Tests and fixed-size harnesses only — the
-/// app calls [`build_tab_bar_ex`] with its real metrics and text measurer.
+/// app calls [`build_tab_bar_styled`] with its real metrics and text measurer.
 pub fn build_tab_bar(width: u32, tabs: &[(String, bool)], theme: &Theme) -> TabBar {
     build_tab_bar_ex(
         width,
@@ -115,25 +332,9 @@ const PERF_GAP: f32 = 16.0;
 /// to "T…×").
 const PERF_MIN_TAB_W: f32 = 110.0;
 
-/// Extended tab-bar builder with inline-rename, window-control hover state, and
-/// an optional right-aligned performance HUD label.
-///
-/// `perf` is `Some(string)` to show the live perf HUD (`⚡ … ms · … fps · …`)
-/// right-aligned just left of the window controls. Its width is RESERVED out of
-/// the tab area so tabs never overlap it; if the window is too narrow to fit the
-/// HUD without squeezing the tabs below a sane minimum, the HUD is HIDDEN and the
-/// tab layout is identical to the no-HUD case. `None` shows no HUD.
-///
-/// `m` measures labels exactly as the chrome text pass renders them (titles in
-/// the title family), so title truncation, the rename caret and the HUD
-/// reservation are right for any UI font. `cm` sizes the whole strip. The hit
-/// geometry (tab/close/plus/control rects) depends only on `width`, the tab
-/// count and `cm` — never on text — so a hit-test rebuild may pass any measurer.
-///
-/// `activity` is index-aligned with `tabs` (missing indices read as `None`);
-/// inactive tabs with activity get a small themed dot in the title gutter and
-/// a hidden (overflowed) tab's activity tints the "+N" hint. Activity NEVER
-/// affects geometry, so hit-test rebuilds can pass `&[]`.
+/// [`build_tab_bar_styled`] with the default look ([`TabBarOpts::default`]) and
+/// only activity badges — the pre-style API, kept for callers and tests that
+/// need nothing else. `activity` is index-aligned with `tabs`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_tab_bar_ex(
     width: u32,
@@ -146,53 +347,450 @@ pub fn build_tab_bar_ex(
     cm: ChromeMetrics,
     activity: &[TabActivity],
 ) -> TabBar {
+    let deco: Vec<TabDeco> =
+        activity.iter().map(|&activity| TabDeco { activity, ..TabDeco::default() }).collect();
+    build_tab_bar_styled(width, tabs, theme, renaming, ctrl_hover, perf, m, cm, &deco, &TabBarOpts::default())
+}
+
+/// Shape metrics of one style (design px, scaled by the chrome unit on use).
+#[derive(Clone, Copy)]
+struct StyleMetrics {
+    /// Most / least a tab is wide.
+    tab_w: f32,
+    tab_w_min: f32,
+    /// Horizontal gap kept free on each side of a tab's body.
+    inset: f32,
+    /// Top/bottom margin of the body inside the bar.
+    vpad: f32,
+    /// Corner radius of the body.
+    radius: f32,
+    /// Left inset of the title inside the tab cell.
+    title_pad: f32,
+}
+
+impl StyleMetrics {
+    fn of(style: TabStyle) -> StyleMetrics {
+        match style {
+            TabStyle::Compact => StyleMetrics {
+                tab_w: COMPACT_TAB_W,
+                tab_w_min: COMPACT_TAB_W_MIN,
+                inset: 3.0,
+                vpad: 8.0,
+                radius: 6.0,
+                title_pad: 10.0,
+            },
+            TabStyle::Slant | TabStyle::Powerline => StyleMetrics {
+                tab_w: TAB_W,
+                tab_w_min: TAB_W_MIN,
+                inset: 2.0,
+                vpad: 5.0,
+                radius: 3.0,
+                title_pad: 13.0,
+            },
+            TabStyle::Pill | TabStyle::Underline => StyleMetrics {
+                tab_w: TAB_W,
+                tab_w_min: TAB_W_MIN,
+                inset: 4.0,
+                vpad: 6.0,
+                radius: 8.0,
+                title_pad: 13.0,
+            },
+        }
+    }
+}
+
+/// Horizontal lean (design px) of a [`TabStyle::Slant`] tab across its body.
+const SLANT_LEAN: f32 = 10.0;
+/// Depth of a [`TabStyle::Powerline`] chevron as a fraction of the body height.
+const POWERLINE_DEPTH: f32 = 0.40;
+/// Gap (design px) between two powerline segments (the separator).
+const POWERLINE_GAP: f32 = 2.0;
+
+/// The resolved colors of one tab.
+struct TabColors {
+    /// Body fill, `None` = no body (text-only tab).
+    fill: Option<[u8; 3]>,
+    title: [u8; 3],
+    close: [u8; 3],
+    /// The underline style's bar (and any style's identity mark), if drawn.
+    mark: Option<[u8; 3]>,
+}
+
+/// Colors of a tab in `style`: `on` = active (or being renamed), `hovered` =
+/// under the pointer, `color` = its per-tab color (RGB, already resolved).
+fn tab_colors(ui: &UiPalette, style: TabStyle, on: bool, hovered: bool, color: Option<[u8; 3]>) -> TabColors {
+    let bg = ui.bg;
+    let tint = |t: f32| color.map(|c| mix(bg, c, t));
+    match style {
+        TabStyle::Pill | TabStyle::Compact => {
+            let fill = if on {
+                Some(tint(0.30).unwrap_or_else(|| ui.shade(0.12)))
+            } else if hovered {
+                Some(tint(0.20).unwrap_or_else(|| ui.shade(0.06)))
+            } else {
+                tint(0.13)
+            };
+            TabColors {
+                fill,
+                title: if on { ui.text } else if hovered { ui.text_dim } else { ui.text_hint },
+                close: if on { ui.text_dim } else { ui.text_hint },
+                mark: None,
+            }
+        }
+        TabStyle::Underline => {
+            let mark = if on {
+                Some(color.map(|c| ui.readable(c, UiPalette::ACCENT_FLOOR)).unwrap_or(ui.accent))
+            } else if hovered {
+                Some(tint(0.70).unwrap_or_else(|| ui.shade(0.30)))
+            } else {
+                tint(0.55)
+            };
+            TabColors {
+                fill: None,
+                title: if on { ui.text } else if hovered { ui.text_dim } else { ui.text_hint },
+                close: if on { ui.text_dim } else { ui.text_hint },
+                mark,
+            }
+        }
+        TabStyle::Slant => {
+            let fill = if on {
+                tint(0.32).unwrap_or_else(|| ui.shade(0.15))
+            } else if hovered {
+                tint(0.22).unwrap_or_else(|| ui.shade(0.09))
+            } else {
+                tint(0.15).unwrap_or_else(|| ui.shade(0.05))
+            };
+            TabColors {
+                fill: Some(fill),
+                title: if on { ui.text } else if hovered { ui.text_dim } else { ui.text_hint },
+                close: if on { ui.text_dim } else { ui.text_hint },
+                mark: None,
+            }
+        }
+        TabStyle::Powerline => {
+            if on {
+                let fill = color.unwrap_or(ui.accent);
+                let on_fill = ui.on_fill(fill);
+                TabColors { fill: Some(fill), title: on_fill, close: mix(fill, on_fill, 0.75), mark: None }
+            } else {
+                let fill = if hovered {
+                    tint(0.30).unwrap_or_else(|| ui.shade(0.14))
+                } else {
+                    tint(0.22).unwrap_or_else(|| ui.shade(0.08))
+                };
+                TabColors {
+                    fill: Some(fill),
+                    title: if hovered { ui.text } else { ui.text_dim },
+                    close: ui.text_hint,
+                    mark: None,
+                }
+            }
+        }
+    }
+}
+
+/// The badge color of an activity kind (`None` draws no badge).
+fn activity_color(ui: &UiPalette, act: TabActivity) -> Option<[u8; 3]> {
+    match act {
+        TabActivity::None => None,
+        TabActivity::Output => Some(ui.accent),
+        TabActivity::Bell => Some(ui.warn),
+        TabActivity::Done => Some(ui.success),
+        TabActivity::Failed => Some(ui.danger),
+    }
+}
+
+/// The color of a progress report's bar.
+fn progress_color(ui: &UiPalette, p: &Progress) -> [u8; 3] {
+    match p.state {
+        ProgressState::Normal | ProgressState::Indeterminate => ui.accent,
+        ProgressState::Error => ui.danger,
+        ProgressState::Paused => ui.warn,
+    }
+}
+
+/// The filled fraction of a progress report: `None` = indeterminate (drawn as
+/// a static dashed stripe — no animation, so it costs nothing at idle). An
+/// error with no value fills the whole bar.
+fn progress_fraction(p: &Progress) -> Option<f32> {
+    match (p.state, p.value) {
+        (ProgressState::Indeterminate, _) => None,
+        (ProgressState::Error, None) => Some(1.0),
+        (_, v) => Some(f32::from(v.unwrap_or(0)) / 100.0),
+    }
+}
+
+/// Push a `thick`-px progress bar spanning `[x0, x1]` at `y`: a faint track
+/// in `track`, then the filled part (or, when indeterminate, a static dashed
+/// stripe with `dash`-px dashes) in `fill`.
+#[allow(clippy::too_many_arguments)]
+fn push_progress_bar(
+    quads: &mut Vec<Rect>,
+    p: &Progress,
+    x0: f32,
+    x1: f32,
+    y: f32,
+    thick: f32,
+    track: Option<[u8; 3]>,
+    fill: [u8; 3],
+    dash: f32,
+) {
+    let w = (x1 - x0).max(0.0);
+    if w <= 0.0 || thick <= 0.0 {
+        return;
+    }
+    let rgba = |c: [u8; 3]| [c[0], c[1], c[2], 255];
+    let r = thick * 0.5;
+    if let Some(t) = track {
+        quads.push(Rect::rounded(x0, y, w, thick, rgba(t), r));
+    }
+    match progress_fraction(p) {
+        Some(f) => {
+            let fw = (w * f.clamp(0.0, 1.0)).round();
+            if fw > 0.0 {
+                quads.push(Rect::rounded(x0, y, fw, thick, rgba(fill), r));
+            }
+        }
+        None => {
+            // Static stripe: dash, gap, dash … (gap = dash / 2), clipped to w.
+            let step = dash * 1.5;
+            let mut x = x0;
+            while x < x1 {
+                let dw = dash.min(x1 - x);
+                quads.push(Rect::rounded(x, y, dw, thick, rgba(fill), r));
+                x += step;
+            }
+        }
+    }
+}
+
+/// The resolved geometry of one tab cell in the strip.
+struct TabCell {
+    /// Left edge of the cell (`tab_rects[i].x`) and its width.
+    x: f32,
+    w: f32,
+}
+
+/// The underline style's bar for `cell`: `(x, w, y, thickness)`. It faces the
+/// grid: near the bar's bottom edge, or its top edge for a bottom bar.
+fn underline_geom(sm: StyleMetrics, cm: ChromeMetrics, cell: &TabCell, h: f32, bottom: bool) -> (f32, f32, f32, f32) {
+    let th = cm.px(2.0).round().max(1.0);
+    let inset = cm.px(sm.inset);
+    let y = if bottom { cm.px(4.0).round() } else { (h - cm.px(4.0)).round() - th };
+    let x = cell.x + inset + cm.px(6.0);
+    let w = (cell.w - inset * 2.0 - cm.px(12.0)).max(0.0);
+    (x, w, y, th)
+}
+
+/// Where a tab's 2px OSC 9;4 bar goes: `(x0, x1, y, thickness)`. Under the
+/// title in the gap between the tab body and the bar edge (clear of glyph
+/// descenders); the underline style puts it IN the underline's slot (the
+/// underline becomes the progress track).
+#[allow(clippy::too_many_arguments)]
+fn progress_slot(
+    style: TabStyle,
+    sm: StyleMetrics,
+    cm: ChromeMetrics,
+    cell: &TabCell,
+    h: f32,
+    title_x: f32,
+    right: f32,
+    bottom: bool,
+) -> (f32, f32, f32, f32) {
+    if style == TabStyle::Underline {
+        let (x, w, y, th) = underline_geom(sm, cm, cell, h, bottom);
+        return (x, x + w, y, th);
+    }
+    let th = cm.px(2.0).round().max(1.0);
+    let vpad = cm.px(sm.vpad);
+    let y = (h - vpad + (vpad - th) * 0.5).round();
+    (title_x, right.max(title_x), y, th)
+}
+
+/// Push a tab's in-tab progress bar (track + fill) into its slot. The slot lies
+/// on the bar background (below the tab body), so the progress color reads in
+/// every style; the underline style's track is its own dimmed underline.
+#[allow(clippy::too_many_arguments)]
+fn push_tab_progress(
+    quads: &mut Vec<Rect>,
+    ui: &UiPalette,
+    p: &Progress,
+    style: TabStyle,
+    sm: StyleMetrics,
+    cm: ChromeMetrics,
+    cell: &TabCell,
+    h: f32,
+    colors: &TabColors,
+    title_x: f32,
+    close_x: f32,
+    bottom: bool,
+) {
+    let (x0, x1, y, th) = progress_slot(style, sm, cm, cell, h, title_x, close_x - cm.px(2.0), bottom);
+    let pc = progress_color(ui, p);
+    let track = match (style, colors.mark) {
+        (TabStyle::Underline, Some(mk)) => mix(ui.bg, mk, 0.40),
+        _ => mix(ui.bg, ui.text, 0.16),
+    };
+    // An accent underline under an accent fill would hide the fill: use the
+    // text color for the filled part then.
+    let fill = if style == TabStyle::Underline && colors.mark == Some(pc) { ui.text } else { pc };
+    push_progress_bar(quads, p, x0, x1, y, th, Some(track), fill, cm.px(6.0));
+}
+
+/// Push the seam hairline of the ACTIVE tab's progress: 1 logical px at the
+/// bar/grid seam, across the full window width `sw`.
+fn push_seam_progress(quads: &mut Vec<Rect>, ui: &UiPalette, p: &Progress, cm: ChromeMetrics, sw: f32, h: f32, bottom: bool) {
+    let hair = cm.dpx(1.0).round().max(1.0);
+    let hy = if bottom { 0.0 } else { h - hair };
+    push_progress_bar(quads, p, 0.0, sw, hy, hair, None, progress_color(ui, p), cm.px(16.0));
+}
+
+/// Paint one tab's body (fill / underline / slant / chevron) and return the x
+/// offset its content (badge + title) starts at relative to the plain layout
+/// (the slant/powerline shapes push the content right of their lean).
+#[allow(clippy::too_many_arguments)]
+fn paint_tab_body(
+    quads: &mut Vec<Rect>,
+    style: TabStyle,
+    sm: StyleMetrics,
+    cm: ChromeMetrics,
+    cell: &TabCell,
+    h: f32,
+    colors: &TabColors,
+    first: bool,
+    bottom: bool,
+) -> f32 {
+    let rgba = |c: [u8; 3]| [c[0], c[1], c[2], 255];
+    let inset = cm.px(sm.inset);
+    let vpad = cm.px(sm.vpad);
+    let body_h = (h - vpad * 2.0).max(1.0);
+    match style {
+        TabStyle::Pill | TabStyle::Compact => {
+            if let Some(f) = colors.fill {
+                quads.push(Rect::rounded(
+                    cell.x + inset,
+                    vpad,
+                    cell.w - inset * 2.0,
+                    body_h,
+                    rgba(f),
+                    cm.px(sm.radius),
+                ));
+            }
+            0.0
+        }
+        TabStyle::Underline => {
+            if let Some(mk) = colors.mark {
+                let (x0, w, y, th) = underline_geom(sm, cm, cell, h, bottom);
+                quads.push(Rect::rounded(x0, y, w, th, rgba(mk), th * 0.5));
+            }
+            0.0
+        }
+        TabStyle::Slant => {
+            let lean = cm.px(SLANT_LEAN);
+            if let Some(f) = colors.fill {
+                quads.push(Rect {
+                    x: cell.x + inset + lean * 0.5,
+                    y: vpad,
+                    w: (cell.w - inset * 2.0 - lean).max(1.0),
+                    h: body_h,
+                    color: rgba(f),
+                    radius: cm.px(sm.radius),
+                    shear: lean / body_h,
+                });
+            }
+            lean * 0.5
+        }
+        TabStyle::Powerline => {
+            // Two half-height quads sheared in opposite directions make one
+            // chevron: the left edge is notched (`>`), the right edge is the
+            // arrow tip, `depth` px deep at mid-height. Neighbours nest with a
+            // constant `gap`. The halves overlap by 1px so no seam shows at mid.
+            let depth = (body_h * POWERLINE_DEPTH).round();
+            let gap = cm.px(POWERLINE_GAP);
+            let left = cell.x + gap * 0.5;
+            let w = (cell.w - gap).max(1.0);
+            if let Some(f) = colors.fill {
+                let half = body_h * 0.5;
+                let ov = 0.5;
+                let shear = depth / half;
+                // Top half: its bottom edge (mid) sits `depth` right of its top.
+                quads.push(Rect {
+                    x: left + depth * 0.5,
+                    y: vpad,
+                    w,
+                    h: half + ov,
+                    color: rgba(f),
+                    radius: 0.75,
+                    shear: -shear,
+                });
+                // Bottom half: its top edge (mid) sits `depth` right of its bottom.
+                quads.push(Rect {
+                    x: left + depth * 0.5,
+                    y: vpad + half - ov,
+                    w,
+                    h: half + ov,
+                    color: rgba(f),
+                    radius: 0.75,
+                    shear,
+                });
+                // The first segment starts flat (classic powerline) instead of
+                // notched: fill the notch.
+                if first {
+                    quads.push(Rect::rounded(left, vpad, depth + 1.0, body_h, rgba(f), cm.px(sm.radius)));
+                }
+            }
+            depth
+        }
+    }
+}
+
+/// Build the tab bar: `tabs` are (title, active) pairs; `deco` is index-aligned
+/// per-tab decoration (badges, progress, color — missing indices read as
+/// default); `opts` the style and pointer state.
+///
+/// `perf` is `Some(string)` to show the live perf HUD (`⚡ … ms · … fps · …`)
+/// right-aligned just left of the window controls. Its width is RESERVED out of
+/// the tab area so tabs never overlap it; if the window is too narrow to fit the
+/// HUD without squeezing the tabs below a sane minimum, the HUD is HIDDEN and the
+/// tab layout is identical to the no-HUD case. `None` shows no HUD.
+///
+/// `m` measures labels exactly as the chrome text pass renders them (titles in
+/// the title family), so title truncation, the rename caret and the HUD
+/// reservation are right for any UI font. `cm` sizes the whole strip. The hit
+/// geometry (tab/close/plus/control rects) depends only on `width`, the tab
+/// count, `cm`, the style (only [`TabStyle::Compact`] differs) and — for the
+/// close rects — which "×" are shown ([`CloseButton`] + `opts.hover`); never on
+/// text or `deco`, so a hit-test rebuild may pass any measurer and no deco.
+///
+/// Inactive tabs with activity get a small themed badge in the title gutter
+/// and a hidden (overflowed) tab's strongest activity tints the "+N" hint.
+#[allow(clippy::too_many_arguments)]
+pub fn build_tab_bar_styled(
+    width: u32,
+    tabs: &[(String, bool)],
+    theme: &Theme,
+    renaming: Option<(usize, &str)>,
+    ctrl_hover: CtrlHover,
+    perf: Option<&str>,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
+    deco: &[TabDeco],
+    opts: &TabBarOpts,
+) -> TabBar {
     let sw = width as f32;
     let h = cm.bar_h();
     let label_y = cm.px(LABEL_Y);
-    let tab_w_max = cm.px(TAB_W);
+    let sm = StyleMetrics::of(opts.style);
+    let tab_w_max = cm.px(sm.tab_w);
     let plus_w = cm.px(PLUS_W);
     let close_w = cm.px(CLOSE_W);
     let ctrl_w = cm.ctrl_w();
 
-    // Theme-derived colors.
-    let bg = [theme.bg[0], theme.bg[1], theme.bg[2], 255];
-    let accent = theme.palette[4]; // blue
-    // Tab fills are SUBTLE accent tints of the bar bg (not a full bright slab):
-    // the active tab is a soft tinted panel topped with a bright accent indicator
-    // bar (drawn in the loop); inactive tabs barely lift off the bar so they recede.
-    let tint = |t: f32| -> [u8; 4] {
-        [
-            (bg[0] as f32 + (accent[0] as f32 - bg[0] as f32) * t) as u8,
-            (bg[1] as f32 + (accent[1] as f32 - bg[1] as f32) * t) as u8,
-            (bg[2] as f32 + (accent[2] as f32 - bg[2] as f32) * t) as u8,
-            255,
-        ]
-    };
-    let active_bg = tint(0.22); // still used for the window-control hover highlight
-    let fg = theme.fg;
-    let dim_fg = [
-        (fg[0] as u16 * 2 / 3) as u8,
-        (fg[1] as u16 * 2 / 3) as u8,
-        (fg[2] as u16 * 2 / 3) as u8,
-    ];
-    // --- Elegant frameless tab palette ---
-    // The active tab is a soft, theme-derived NEUTRAL pill (a bg→fg blend, the
-    // same surface language as the settings panel) — no per-tab border, no marker.
-    // Inactive tabs are text only (transparent). This keeps the strip consistent
-    // with the rest of the UI instead of reading as bordered widgets.
-    let nl = |t: f32| -> [u8; 3] {
-        [
-            (bg[0] as f32 + (fg[0] as f32 - bg[0] as f32) * t) as u8,
-            (bg[1] as f32 + (fg[1] as f32 - bg[1] as f32) * t) as u8,
-            (bg[2] as f32 + (fg[2] as f32 - bg[2] as f32) * t) as u8,
-        ]
-    };
-    let n = |t: f32| -> [u8; 4] { let c = nl(t); [c[0], c[1], c[2], 255] };
-    let tab_active_fill = n(0.12); // soft lifted pill for the active/renaming tab
-    let tab_text_inactive = nl(0.46); // muted title on inactive tabs
-    let close_dim = nl(0.36); // recessive close × on inactive tabs
-    let close_active = nl(0.62); // close × on the active tab (a touch brighter)
-    let plus_col = nl(0.50); // "+" new-tab glyph
+    // Every color comes from the theme's chrome palette (contrast floors
+    // enforced, so light themes read as well as dark ones).
+    let ui = UiPalette::cached(theme);
+    let rgba = |c: [u8; 3]| [c[0], c[1], c[2], 255];
+    let bg = rgba(ui.bg);
 
     let mut quads: Vec<Rect> = Vec::new();
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
@@ -201,8 +799,11 @@ pub fn build_tab_bar_ex(
     let mut tab_rects: Vec<Rect>;
     let mut close_rects: Vec<Rect>;
 
-    // Bar background spanning the full width.
-    quads.push(Rect { x: 0.0, y: 0.0, w: sw, h, color: bg, ..Default::default() });
+    // Bar background spanning the full width — unless the bar follows the
+    // window opacity, where the frame's (translucent) clear already is it.
+    if opts.opaque {
+        quads.push(Rect { x: 0.0, y: 0.0, w: sw, h, color: bg, ..Default::default() });
+    }
 
     // Tabs are laid out from `left` (inset from the window edge) and must never
     // overlap the window controls parked at the right (also inset by the strip
@@ -228,7 +829,7 @@ pub fn build_tab_bar_ex(
     // Per-tab width the tabs WOULD get if we reserved for the HUD (capped at the
     // ideal TAB_W — extra room beyond that doesn't make a tab more comfortable).
     let tab_w_if_hud = ((controls_left - perf_reserve - left - plus_w).max(0.0) / n_tabs).min(tab_w_max);
-    let perf_shown = perf_w > 0.0 && tab_w_if_hud >= cm.px(PERF_MIN_TAB_W);
+    let perf_shown = perf_w > 0.0 && tab_w_if_hud >= cm.px(PERF_MIN_TAB_W).min(tab_w_max);
     // Right boundary for the tabs / "+" / overflow hint. Shrinks by the HUD
     // reservation only when the HUD is actually shown.
     let tab_area_x = if perf_shown { controls_left - perf_reserve } else { controls_left };
@@ -238,10 +839,10 @@ pub fn build_tab_bar_ex(
 
     // --- Dynamic tab width: shrink tabs to fit the available area so they never
     // overflow under the window controls. With many tabs we shrink down to a
-    // readable minimum (TAB_W_MIN); if even that can't fit all of them, we cap the
-    // number of tabs drawn (the rest are unreachable here but stay index-aligned
-    // via the switch_tab keyboard path). ---
-    let tab_w_min = cm.px(64.0);
+    // readable minimum; if even that can't fit all of them, we cap the number of
+    // tabs drawn (the rest are unreachable here but stay index-aligned via the
+    // switch_tab keyboard path). ---
+    let tab_w_min = cm.px(sm.tab_w_min);
     // Ideal width per tab, clamped to [MIN, default]. Use the full default when
     // there's room; shrink toward MIN as tabs are added.
     let tab_w = (tabs_avail_w / n_tabs).clamp(tab_w_min, tab_w_max).min(tab_w_max);
@@ -267,19 +868,19 @@ pub fn build_tab_bar_ex(
         0
     };
 
-    // Frameless pill geometry. The active/renaming tab is a single soft rounded
-    // pill (no border, no leading marker); inactive tabs draw nothing — just their
-    // dim title — so the strip reads as light, modern text-tabs rather than a row
-    // of bordered boxes.
-    let tab_radius = cm.px(8.0);
-    let tab_inset = cm.px(4.0); // horizontal gap between adjacent tabs
-    let tab_vpad = cm.px(6.0); // top/bottom margin so the pill doesn't touch edges
-    let title_pad = cm.px(13.0); // left inset of the title inside a tab
+    let title_pad = cm.px(sm.title_pad); // left inset of the title inside a tab
 
     // Title room inside a tab: everything but the close "×" box, the left title
     // pad and a little right breathing room. Titles are MEASURED in the title
     // family (a char count × a monospace advance mis-sized a proportional title).
-    let title_max_w = (tab_w - close_w - title_pad - cm.px(8.0)).max(0.0);
+    // The slant/powerline shapes push the content right by their lean, so the
+    // room shrinks by the same amount.
+    let content_lead = match opts.style {
+        TabStyle::Slant => cm.px(SLANT_LEAN) * 0.5,
+        TabStyle::Powerline => (((h - cm.px(sm.vpad) * 2.0).max(1.0)) * POWERLINE_DEPTH).round(),
+        _ => 0.0,
+    };
+    let title_max_w = (tab_w - close_w - title_pad - content_lead - cm.px(8.0)).max(0.0);
 
     // Hit-rects are index-aligned to ABSOLUTE tab indices; off-window tabs get an
     // offscreen sentinel (0-width, far left) so a click can never match them.
@@ -287,20 +888,21 @@ pub fn build_tab_bar_ex(
     tab_rects = vec![offscreen; tabs.len()];
     close_rects = vec![offscreen; tabs.len()];
 
+    let deco_of = |i: usize| deco.get(i).copied().unwrap_or_default();
     let mut x = left;
     for (i, (title, active)) in tabs.iter().enumerate().skip(start).take(drawn) {
         let being_renamed = matches!(renaming, Some((ri, _)) if ri == i);
         let is_on = *active || being_renamed;
+        let hovered = opts.hover == Some(i);
+        let d = deco_of(i);
+        let color = d.color.and_then(|c| tab_color_rgb(theme, c));
+        let colors = tab_colors(&ui, opts.style, is_on, hovered, color);
+        let cell = TabCell { x, w: tab_w };
 
-        // Active/renaming tab → a soft filled pill. Inactive → nothing drawn.
-        if is_on {
-            let body_x = x + tab_inset;
-            let body_w = tab_w - tab_inset * 2.0;
-            quads.push(Rect::rounded(body_x, tab_vpad, body_w, h - tab_vpad * 2.0, tab_active_fill, tab_radius));
-        }
+        let lead = paint_tab_body(&mut quads, opts.style, sm, cm, &cell, h, &colors, i == start, opts.bottom);
 
-        let label_color = if is_on { fg } else { tab_text_inactive };
-        let title_x = x + title_pad;
+        let title_x = x + title_pad + lead;
+        let close_x = x + tab_w - close_w - cm.px(4.0);
         if being_renamed {
             // Live edit buffer + trailing caret, front-truncated so the caret stays.
             let buf = match renaming { Some((_, b)) => b, None => "" };
@@ -309,51 +911,52 @@ pub fn build_tab_bar_ex(
             let caret_w = m.title_w("|");
             let mut shown = fit_tail(m, buf, (title_max_w - caret_w).max(0.0), true);
             shown.push('|');
-            title_labels.push((shown, title_x, label_y, label_color));
+            title_labels.push((shown, title_x, label_y, colors.title));
         } else {
             let shown = fit_head(m, title, title_max_w, true);
-            title_labels.push((shown, title_x, label_y, label_color));
-
-            // Close "×": recessive on inactive tabs, a touch brighter on the active.
-            let close_x = x + tab_w - close_w - cm.px(4.0);
-            let x_col = if is_on { close_active } else { close_dim };
-            labels.push(("×".to_string(), close_x + cm.px(4.0), label_y, x_col));
+            title_labels.push((shown, title_x, label_y, colors.title));
         }
 
-        // Activity/bell dot on INACTIVE tabs, in the TITLE_PAD gutter left of
-        // the title (dot spans x+4..x+10, title starts at x+13) so the layout
-        // is bit-identical with or without activity. Accent = unseen output,
-        // theme red = bell.
-        let act = activity.get(i).copied().unwrap_or(TabActivity::None);
-        if !is_on && act != TabActivity::None {
-            let dot_d = cm.px(6.0);
-            let dc = match act {
-                TabActivity::Bell => theme.palette[1],
-                _ => accent,
-            };
-            quads.push(Rect::rounded(
-                x + cm.px(4.0),
-                (h - dot_d) / 2.0,
-                dot_d,
-                dot_d,
-                [dc[0], dc[1], dc[2], 255],
-                dot_d / 2.0,
-            ));
+        // Close "×" (recessive on inactive tabs) — only where the mode shows it;
+        // a hidden one is not clickable (its rect stays offscreen). Kept while
+        // renaming so indices stay aligned, but never drawn over the edit box.
+        if opts.close_button.shows(is_on, hovered) {
+            if !being_renamed {
+                labels.push(("×".to_string(), close_x + cm.px(4.0), label_y, colors.close));
+            }
+            close_rects[i] = Rect { x: close_x, y: 0.0, w: close_w, h, color: [0, 0, 0, 0], ..Default::default() };
         }
 
-        // Close hit-box (kept while renaming so indices stay aligned). Color is
-        // unused for hit-testing.
-        let close_x = x + tab_w - close_w - cm.px(4.0);
-        close_rects[i] = Rect { x: close_x, y: 0.0, w: close_w, h, color: [0, 0, 0, 0], ..Default::default() };
+        // Activity badge on INACTIVE tabs, in the title gutter left of the title
+        // (dot spans x+4..x+10 + the shape's lead, title starts at x+13 + lead)
+        // so the layout is bit-identical with or without activity.
+        if !is_on {
+            if let Some(dc) = activity_color(&ui, d.activity) {
+                let dot_d = cm.px(6.0);
+                quads.push(Rect::rounded(x + cm.px(4.0) + lead, (h - dot_d) / 2.0, dot_d, dot_d, rgba(dc), dot_d / 2.0));
+            }
+        }
+
+        // OSC 9;4 progress: a 2px bar under the title (see `progress_slot`), and
+        // for the active tab a hairline at the bar/grid seam across the whole
+        // window — the grid's own edge, where the eye already is.
+        if let (true, Some(p)) = (opts.progress, d.progress.as_ref()) {
+            push_tab_progress(&mut quads, &ui, p, opts.style, sm, cm, &cell, h, &colors, title_x, close_x, opts.bottom);
+            if is_on {
+                push_seam_progress(&mut quads, &ui, p, cm, sw, h, opts.bottom);
+            }
+        }
 
         tab_rects[i] = Rect { x, y: 0.0, w: tab_w, h, color: [0, 0, 0, 0], ..Default::default() };
         x += tab_w;
     }
 
-    // "+" new-tab button — minimal: just a dim glyph, no box.
+    // "+" new-tab button — minimal: just a dim glyph, no box. (A powerline
+    // strip's last arrow reaches into its cell: the glyph steps right of it.)
     let plus_rect = Rect { x, y: 0.0, w: plus_w, h, color: [0, 0, 0, 0], ..Default::default() };
     if x + plus_w <= tab_area_x {
-        labels.push(("+".to_string(), x + cm.px(11.0), cm.px(8.0), plus_col));
+        let plus_lead = if opts.style == TabStyle::Powerline { content_lead * 0.5 } else { 0.0 };
+        labels.push(("+".to_string(), x + cm.px(11.0) + plus_lead, cm.px(8.0), ui.text_hint));
     }
 
     // A small "+N" hint when some tabs couldn't be drawn (too many to fit even at
@@ -366,49 +969,35 @@ pub fn build_tab_bar_ex(
         let hint_w = m.text_w(&hint);
         if hint_x + hint_w <= controls_left {
             // Tint the hint with the strongest activity among the HIDDEN tabs
-            // (Bell > Output) so activity on a scrolled-out tab is never
-            // silently invisible.
+            // (Failed > Bell > Done > Output) so activity on a scrolled-out tab
+            // is never silently invisible.
             let hidden_act = (0..start)
                 .chain(start + drawn..tabs.len())
-                .map(|i| activity.get(i).copied().unwrap_or(TabActivity::None))
-                .fold(TabActivity::None, |acc, a| match (acc, a) {
-                    (TabActivity::Bell, _) | (_, TabActivity::Bell) => TabActivity::Bell,
-                    (TabActivity::Output, _) | (_, TabActivity::Output) => TabActivity::Output,
-                    _ => TabActivity::None,
-                });
-            let hint_col = match hidden_act {
-                TabActivity::Bell => theme.palette[1],
-                TabActivity::Output => accent,
-                TabActivity::None => dim_fg,
-            };
+                .map(|i| deco_of(i).activity)
+                .fold(TabActivity::None, TabActivity::max);
+            let hint_col = activity_color(&ui, hidden_act).unwrap_or(ui.text_hint);
             labels.push((hint, hint_x, label_y, hint_col));
         }
     }
 
     // --- Perf HUD label (right-aligned, just left of the window controls) ---
-    // Drawn dim (a bg→fg blend, theme-derived — never a hardcoded gray) so it
-    // reads as a muted status line, matching the chrome. Only emitted when the
-    // HUD fits without squeezing the tabs (perf_shown).
+    // A muted status line (the palette's hint text, readable on any theme). Only
+    // emitted when the HUD fits without squeezing the tabs (perf_shown).
     if perf_shown {
         if let Some(s) = perf {
-            // Dim blend: ~45% of the way from bg toward fg.
-            let hud_color = [
-                (bg[0] as f32 + (fg[0] as f32 - bg[0] as f32) * 0.45) as u8,
-                (bg[1] as f32 + (fg[1] as f32 - bg[1] as f32) * 0.45) as u8,
-                (bg[2] as f32 + (fg[2] as f32 - bg[2] as f32) * 0.45) as u8,
-            ];
             // Right-align: right edge sits PERF_GAP left of the controls region.
             let hud_x = (controls_left - perf_gap - perf_w).max(left);
-            labels.push((s.to_string(), hud_x, label_y, hud_color));
+            labels.push((s.to_string(), hud_x, label_y, ui.text_hint));
         }
     }
 
     // --- Right-side controls (left→right): Help "?", Settings "⚙",
     // minimize "─", maximize "▢", close "✕" (rightmost). ---
-    let hover_bg = active_bg;
-    // A red-ish background for the close button when hovered (theme's red).
-    let red = theme.palette[1];
-    let close_hover_bg = [red[0], red[1], red[2], 255];
+    // Hover: a soft accent tint of the bar; the close control turns the theme's
+    // danger red with a glyph picked to read on it (white on red failed 3:1 on
+    // several themes).
+    let hover_bg = rgba(mix(ui.bg, ui.accent, 0.22));
+    let close_hover_bg = rgba(ui.danger);
     let ctrl_y = 0.0;
 
     let help_x = sw - left - cm.controls_w(); // = tab_area_x
@@ -442,11 +1031,12 @@ pub fn build_tab_bar_ex(
 
     // Glyphs centred-ish in each control cell. "⚙" may be missing in some
     // monospace fonts; "≡" is a safe, widely-available fallback for settings.
+    let fg = ui.text;
     labels.push(("?".to_string(), help_x + cm.px(9.0), label_y, fg));
     labels.push(("⚙".to_string(), settings_x + cm.px(8.0), label_y, fg));
     labels.push(("─".to_string(), min_x + cm.px(8.0), label_y, fg));
     labels.push(("▢".to_string(), max_x + cm.px(8.0), label_y, fg));
-    let close_fg = if ctrl_hover == CtrlHover::Close { [0xFF, 0xFF, 0xFF] } else { fg };
+    let close_fg = if ctrl_hover == CtrlHover::Close { ui.on_danger } else { fg };
     labels.push(("✕".to_string(), close_x + cm.px(8.0), label_y, close_fg));
 
     TabBar {
@@ -502,10 +1092,8 @@ pub fn detached_close_rect(width: u32, cm: ChromeMetrics) -> Rect {
     }
 }
 
-/// Build the top bar of a DETACHED window: bar background, the tab title as an
-/// active pill (it is always the "active tab" of its window), and the close
-/// "✕" at the right (red highlight when `close_hover`). `m` / `cm` as in
-/// [`build_tab_bar_ex`].
+/// Build the top bar of a DETACHED window in the default look (see
+/// [`build_detached_bar_styled`]).
 pub fn build_detached_bar(
     width: u32,
     title: &str,
@@ -514,73 +1102,71 @@ pub fn build_detached_bar(
     m: &mut dyn ChromeMeasure,
     cm: ChromeMetrics,
 ) -> DetachedBar {
+    build_detached_bar_styled(width, title, theme, close_hover, m, cm, &TabDeco::default(), &TabBarOpts::default())
+}
+
+/// Build the top bar of a DETACHED window: bar background, the tab title as the
+/// window's (always active) tab in `opts.style` with its color and progress,
+/// and the close "✕" at the right (danger highlight when `close_hover`). `m` /
+/// `cm` as in [`build_tab_bar_styled`]. The detached bar is always at the top.
+#[allow(clippy::too_many_arguments)]
+pub fn build_detached_bar_styled(
+    width: u32,
+    title: &str,
+    theme: &Theme,
+    close_hover: bool,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
+    deco: &TabDeco,
+    opts: &TabBarOpts,
+) -> DetachedBar {
     let sw = width as f32;
     let h = cm.bar_h();
-
-    // Same theme-derived surface language as build_tab_bar_ex.
-    let bg = [theme.bg[0], theme.bg[1], theme.bg[2], 255];
-    let fg = theme.fg;
-    let nl = |t: f32| -> [u8; 3] {
-        [
-            (bg[0] as f32 + (fg[0] as f32 - bg[0] as f32) * t) as u8,
-            (bg[1] as f32 + (fg[1] as f32 - bg[1] as f32) * t) as u8,
-            (bg[2] as f32 + (fg[2] as f32 - bg[2] as f32) * t) as u8,
-        ]
-    };
-    let n = |t: f32| -> [u8; 4] {
-        let c = nl(t);
-        [c[0], c[1], c[2], 255]
-    };
-    let pill_fill = n(0.12); // same soft lifted pill as the active main tab
+    let ui = UiPalette::cached(theme);
+    let rgba = |c: [u8; 3]| [c[0], c[1], c[2], 255];
 
     let mut quads: Vec<Rect> = Vec::new();
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
     let mut title_labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
 
-    // Bar background spanning the full width.
-    quads.push(Rect { x: 0.0, y: 0.0, w: sw, h, color: bg, ..Default::default() });
-
-    // Title pill on the left — same geometry as a main-window tab, clamped so it
-    // never runs under the help / close controls.
-    let tab_radius = cm.px(8.0);
-    let tab_inset = cm.px(4.0);
-    let tab_vpad = cm.px(6.0);
-    let title_pad = cm.px(13.0);
-    let left = cm.strip_pad();
-    let controls_left = (sw - left - cm.ctrl_w() * 2.0).max(left);
-    let tab_w = cm.px(TAB_W).min((controls_left - left).max(0.0));
-    if tab_w > tab_inset * 2.0 {
-        quads.push(Rect::rounded(
-            left + tab_inset,
-            tab_vpad,
-            tab_w - tab_inset * 2.0,
-            h - tab_vpad * 2.0,
-            pill_fill,
-            tab_radius,
-        ));
-        let shown = fit_head(m, title, (tab_w - title_pad - cm.px(8.0)).max(0.0), true);
-        title_labels.push((shown, left + title_pad, cm.px(LABEL_Y), fg));
+    // Bar background spanning the full width (see `TabBarOpts::opaque`).
+    if opts.opaque {
+        quads.push(Rect { x: 0.0, y: 0.0, w: sw, h, color: rgba(ui.bg), ..Default::default() });
     }
 
-    // Close "✕" at the right — red hover background, white glyph on hover
+    // The title tab on the left — same geometry as a main-window tab, clamped so
+    // it never runs under the help / close controls.
+    let sm = StyleMetrics::of(opts.style);
+    let left = cm.strip_pad();
+    let controls_left = (sw - left - cm.ctrl_w() * 2.0).max(left);
+    let tab_w = cm.px(sm.tab_w).min((controls_left - left).max(0.0));
+    if tab_w > cm.px(sm.inset) * 2.0 {
+        let color = deco.color.and_then(|c| tab_color_rgb(theme, c));
+        let colors = tab_colors(&ui, opts.style, true, false, color);
+        let cell = TabCell { x: left, w: tab_w };
+        let lead = paint_tab_body(&mut quads, opts.style, sm, cm, &cell, h, &colors, true, false);
+        let title_x = left + cm.px(sm.title_pad) + lead;
+        let shown = fit_head(m, title, (tab_w - cm.px(sm.title_pad) - lead - cm.px(8.0)).max(0.0), true);
+        title_labels.push((shown, title_x, cm.px(LABEL_Y), colors.title));
+        if let (true, Some(p)) = (opts.progress, deco.progress.as_ref()) {
+            // The detached tab has no "×": its bar runs to the tab's right pad.
+            let right_edge = left + tab_w - cm.px(8.0) + cm.px(2.0);
+            push_tab_progress(&mut quads, &ui, p, opts.style, sm, cm, &cell, h, &colors, title_x, right_edge, false);
+            push_seam_progress(&mut quads, &ui, p, cm, sw, h, false);
+        }
+    }
+
+    // Close "✕" at the right — danger hover background with a readable glyph
     // (identical treatment to the main window's close control).
     let close_rect = detached_close_rect(width, cm);
     if close_hover {
-        let red = theme.palette[1];
-        quads.push(Rect {
-            x: close_rect.x,
-            y: 0.0,
-            w: close_rect.w,
-            h,
-            color: [red[0], red[1], red[2], 255],
-            ..Default::default()
-        });
+        quads.push(Rect { x: close_rect.x, y: 0.0, w: close_rect.w, h, color: rgba(ui.danger), ..Default::default() });
     }
-    let close_fg = if close_hover { [0xFF, 0xFF, 0xFF] } else { fg };
+    let close_fg = if close_hover { ui.on_danger } else { ui.text };
     labels.push(("✕".to_string(), close_rect.x + cm.px(8.0), cm.px(LABEL_Y), close_fg));
     // Help "?" left of it (same glyph offset as the main bar's help control).
     let help_rect = detached_help_rect(width, cm);
-    labels.push(("?".to_string(), help_rect.x + cm.px(9.0), cm.px(LABEL_Y), fg));
+    labels.push(("?".to_string(), help_rect.x + cm.px(9.0), cm.px(LABEL_Y), ui.text));
 
     DetachedBar { quads, labels, title_labels, close_rect, help_rect }
 }
@@ -846,10 +1432,11 @@ mod tests {
     #[test]
     fn detached_bar_close_hover_paints_theme_red() {
         let hot = build_detached_bar(1000, "Tab 2", &theme(), true, &mut mono(), CM);
-        let red = theme().palette[1];
+        let ui = UiPalette::from_theme(&theme());
+        let red = ui.danger;
         assert!(hot.quads.iter().any(|q| q.color == [red[0], red[1], red[2], 255]));
-        // Glyph flips to white on hover.
-        assert!(hot.labels.iter().any(|l| l.0 == "✕" && l.3 == [0xFF, 0xFF, 0xFF]));
+        // The glyph switches to the palette's readable-on-danger color.
+        assert!(hot.labels.iter().any(|l| l.0 == "✕" && l.3 == ui.on_danger));
     }
 
     #[test]
@@ -892,14 +1479,14 @@ mod tests {
             1000, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM,
             &[TabActivity::None, TabActivity::Output, TabActivity::Bell],
         );
-        let accent = theme().palette[4];
-        let red = theme().palette[1];
+        let ui = UiPalette::from_theme(&theme());
+        let (accent, amber) = (ui.accent, ui.warn);
         let dots = dot_quads(&bar);
         assert_eq!(dots.len(), 2, "one dot per inactive tab with activity");
         assert!(dots.iter().any(|q| q.color == [accent[0], accent[1], accent[2], 255]),
             "output dot must use the theme accent");
-        assert!(dots.iter().any(|q| q.color == [red[0], red[1], red[2], 255]),
-            "bell dot must use the theme red");
+        assert!(dots.iter().any(|q| q.color == [amber[0], amber[1], amber[2], 255]),
+            "bell dot must be amber (red means a failed command)");
         // Baseline: no activity → no dots.
         let base = build_tab_bar_ex(
             1000, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &[],
@@ -951,7 +1538,7 @@ mod tests {
     #[test]
     fn overflow_hint_tinted_when_hidden_tab_has_activity() {
         // 20 tabs at 800px overflow; tab 19 is scrolled out (window sticks to
-        // the active head) and its Bell must tint the "+N" hint theme-red.
+        // the active head) and its Bell must tint the "+N" hint amber.
         let tabs: Vec<(String, bool)> =
             (0..20).map(|i| (format!("Tab {i}"), i == 0)).collect();
         let mut activity = vec![TabActivity::None; 20];
@@ -969,16 +1556,21 @@ mod tests {
                 })
                 .cloned()
         };
-        let red = theme().palette[1];
+        let ui = UiPalette::from_theme(&theme());
         let tinted = hint(&bar).expect("overflow hint missing");
-        assert_eq!(tinted.3, red, "hidden Bell must tint the +N hint red");
-        // All-None keeps the dim blend.
+        assert_eq!(tinted.3, ui.warn, "hidden Bell must tint the +N hint amber");
+        // All-None keeps the dim hint color.
         let base = build_tab_bar_ex(
             800, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &[],
         );
         let plain = hint(&base).expect("overflow hint missing");
-        assert_ne!(plain.3, red);
+        assert_eq!(plain.3, ui.text_hint);
         assert_eq!(tinted.1, plain.1, "tint must not move the hint");
+        // A hidden FAILED command outranks the bell: the hint turns red.
+        activity[15] = TabActivity::Failed; // hidden (9 tabs fit at 800px)
+        activity[17] = TabActivity::Done;
+        let failed = build_tab_bar_ex(800, &tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, &activity);
+        assert_eq!(hint(&failed).expect("overflow hint missing").3, ui.danger);
     }
 
     #[test]
@@ -1116,5 +1708,414 @@ mod tests {
         let help = detached_help_rect(260, cm);
         let pill = &bar.quads[1];
         assert!(pill.x + pill.w <= help.x + 0.01, "pill ends at {} past help x {}", pill.x + pill.w, help.x);
+    }
+
+    // ── styles, close modes, hover, badges, progress, per-tab colors ─────────
+
+    fn three_tabs() -> Vec<(String, bool)> {
+        vec![("Tab 1".to_string(), true), ("Tab 2".to_string(), false), ("Tab 3".to_string(), false)]
+    }
+
+    fn styled(width: u32, tabs: &[(String, bool)], deco: &[TabDeco], opts: &TabBarOpts) -> TabBar {
+        build_tab_bar_styled(width, tabs, &theme(), None, CtrlHover::None, None, &mut mono(), CM, deco, opts)
+    }
+
+    fn opts(style: TabStyle) -> TabBarOpts {
+        TabBarOpts { style, ..TabBarOpts::default() }
+    }
+
+    fn same_rect(a: &Rect, b: &Rect) -> bool {
+        (a.x - b.x).abs() < 0.001 && (a.y - b.y).abs() < 0.001 && (a.w - b.w).abs() < 0.001 && (a.h - b.h).abs() < 0.001
+    }
+
+    fn rgba(c: [u8; 3]) -> [u8; 4] {
+        [c[0], c[1], c[2], 255]
+    }
+
+    #[test]
+    fn activity_precedence_is_failed_bell_done_output() {
+        use TabActivity::*;
+        let order = [None, Output, Done, Bell, Failed];
+        for (i, &a) in order.iter().enumerate() {
+            for (j, &b) in order.iter().enumerate() {
+                let want = if j > i { b } else { a };
+                assert_eq!(a.max(b), want, "{a:?} vs {b:?}");
+            }
+        }
+        // Folding a set keeps the strongest whatever the order.
+        assert_eq!([Output, Failed, Done, Bell].into_iter().fold(None, TabActivity::max), Failed);
+        assert_eq!([Done, Output].into_iter().fold(None, TabActivity::max), Done);
+    }
+
+    #[test]
+    fn done_and_failed_badges_use_success_and_danger() {
+        let ui = UiPalette::from_theme(&theme());
+        let tabs = three_tabs();
+        let deco = [
+            TabDeco::default(),
+            TabDeco { activity: TabActivity::Done, ..Default::default() },
+            TabDeco { activity: TabActivity::Failed, ..Default::default() },
+        ];
+        let bar = styled(1000, &tabs, &deco, &TabBarOpts::default());
+        let dots = dot_quads(&bar);
+        assert_eq!(dots.len(), 2);
+        let has = |c: [u8; 3]| dots.iter().any(|q| q.color == rgba(c));
+        assert!(has(ui.success), "done = green");
+        assert!(has(ui.danger), "failed = red");
+    }
+
+    #[test]
+    fn non_compact_styles_share_todays_hit_geometry() {
+        // Only the look changes: every hit rect equals the default (pill) layout,
+        // for 3 tabs and for an overflowing strip, top and bottom.
+        for n in [3usize, 20] {
+            let tabs: Vec<(String, bool)> = (0..n).map(|i| (format!("Tab {i}"), i == 1)).collect();
+            let base = styled(1000, &tabs, &[], &TabBarOpts::default());
+            for style in [TabStyle::Underline, TabStyle::Slant, TabStyle::Powerline] {
+                for bottom in [false, true] {
+                    let bar = styled(1000, &tabs, &[], &TabBarOpts { style, bottom, ..TabBarOpts::default() });
+                    for (a, b) in bar.tab_rects.iter().zip(&base.tab_rects) {
+                        assert!(same_rect(a, b), "{style:?}: tab rect moved");
+                    }
+                    for (a, b) in bar.close_rects.iter().zip(&base.close_rects) {
+                        assert!(same_rect(a, b), "{style:?}: close rect moved");
+                    }
+                    for (a, b) in [
+                        (&bar.plus_rect, &base.plus_rect),
+                        (&bar.help_rect, &base.help_rect),
+                        (&bar.settings_rect, &base.settings_rect),
+                        (&bar.min_rect, &base.min_rect),
+                        (&bar.max_rect, &base.max_rect),
+                        (&bar.close_rect, &base.close_rect),
+                    ] {
+                        assert!(same_rect(a, b), "{style:?}: control rect moved");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_tabs_are_narrower_and_fit_more() {
+        let tabs = three_tabs();
+        let pill = styled(1000, &tabs, &[], &TabBarOpts::default());
+        let compact = styled(1000, &tabs, &[], &opts(TabStyle::Compact));
+        assert!((pill.tab_rects[0].w - TAB_W).abs() < 0.01);
+        assert!((compact.tab_rects[0].w - COMPACT_TAB_W).abs() < 0.01);
+        // Each close box still sits inside its (narrower) tab.
+        for (t, c) in compact.tab_rects.iter().zip(&compact.close_rects) {
+            assert!(c.x >= t.x && c.x + c.w <= t.x + t.w + 0.01);
+        }
+        // More tabs fit before the strip overflows.
+        let many: Vec<(String, bool)> = (0..20).map(|i| (format!("Tab {i}"), i == 0)).collect();
+        let fit = |b: &TabBar| b.tab_rects.iter().filter(|r| r.x >= 0.0).count();
+        let p = styled(800, &many, &[], &TabBarOpts::default());
+        let c = styled(800, &many, &[], &opts(TabStyle::Compact));
+        assert!(fit(&c) > fit(&p), "compact fits {} vs pill {}", fit(&c), fit(&p));
+        // The bar height is the same (the grid never reflows on a style change).
+        assert_eq!(c.close_rect.h, p.close_rect.h);
+    }
+
+    #[test]
+    fn close_button_modes_show_and_hit_only_visible_crosses() {
+        let tabs = three_tabs(); // tab 0 active
+        let xs = |b: &TabBar| b.labels.iter().filter(|l| l.0 == "×").count();
+        let live = |b: &TabBar| b.close_rects.iter().map(|r| r.x >= 0.0).collect::<Vec<_>>();
+        let always = styled(1000, &tabs, &[], &TabBarOpts::default());
+        assert_eq!((xs(&always), live(&always)), (3, vec![true, true, true]));
+        // Hover: nothing without a pointer, only the hovered tab with one.
+        let mut o = TabBarOpts { close_button: CloseButton::Hover, ..TabBarOpts::default() };
+        let none = styled(1000, &tabs, &[], &o);
+        assert_eq!((xs(&none), live(&none)), (0, vec![false, false, false]));
+        o.hover = Some(2);
+        let hov = styled(1000, &tabs, &[], &o);
+        assert_eq!((xs(&hov), live(&hov)), (1, vec![false, false, true]));
+        // Active: the active tab, plus the hovered one.
+        o.close_button = CloseButton::Active;
+        o.hover = None;
+        let act = styled(1000, &tabs, &[], &o);
+        assert_eq!((xs(&act), live(&act)), (1, vec![true, false, false]));
+        o.hover = Some(1);
+        let act_hov = styled(1000, &tabs, &[], &o);
+        assert_eq!((xs(&act_hov), live(&act_hov)), (2, vec![true, true, false]));
+        // A visible cross keeps today's exact rect.
+        assert!(same_rect(&act_hov.close_rects[1], &always.close_rects[1]));
+        // Config strings round-trip; unknown → Always.
+        for m in CloseButton::ALL {
+            assert_eq!(CloseButton::from_config(m.to_config()), m);
+        }
+        assert_eq!(CloseButton::from_config("bogus"), CloseButton::Always);
+    }
+
+    #[test]
+    fn hovering_an_inactive_tab_lifts_it() {
+        let tabs = three_tabs();
+        let ui = UiPalette::from_theme(&theme());
+        let lift = rgba(ui.shade(0.06));
+        let has_lift = |b: &TabBar| b.quads.iter().any(|q| q.color == lift);
+        assert!(!has_lift(&styled(1000, &tabs, &[], &TabBarOpts::default())));
+        let hovered = styled(1000, &tabs, &[], &TabBarOpts { hover: Some(2), ..TabBarOpts::default() });
+        assert!(has_lift(&hovered), "a soft pill lifts the hovered inactive tab");
+        // Its title brightens from the hint to the dim text color.
+        assert_eq!(hovered.title_labels[2].3, ui.text_dim);
+        assert_eq!(hovered.title_labels[1].3, ui.text_hint);
+        // Hovering the ACTIVE tab changes nothing.
+        let on_active = styled(1000, &tabs, &[], &TabBarOpts { hover: Some(0), ..TabBarOpts::default() });
+        assert!(!has_lift(&on_active));
+    }
+
+    #[test]
+    fn slant_and_powerline_are_sheared_quads_never_glyphs() {
+        let tabs = three_tabs();
+        let slant = styled(1000, &tabs, &[], &opts(TabStyle::Slant));
+        let sheared: Vec<&Rect> = slant.quads.iter().filter(|q| q.shear != 0.0).collect();
+        assert_eq!(sheared.len(), 3, "one parallelogram per tab");
+        assert!(sheared.iter().all(|q| q.shear > 0.0 && q.radius > 0.0), "leaning `/`, antialiased");
+        // Each parallelogram stays inside its tab cell.
+        for (q, t) in sheared.iter().zip(&slant.tab_rects) {
+            let (l, r) = q.sheared_x_span();
+            assert!(l >= t.x - 0.01 && r <= t.x + t.w + 0.01, "slant spills out of its tab: {l}..{r}");
+        }
+        let pl = styled(1000, &tabs, &[], &opts(TabStyle::Powerline));
+        let ups = pl.quads.iter().filter(|q| q.shear < 0.0).count();
+        let downs = pl.quads.iter().filter(|q| q.shear > 0.0).count();
+        assert_eq!((ups, downs), (3, 3), "each chevron = two opposite half-height shears");
+        // No style draws its shapes with font glyphs (the Nerd Font is not bundled).
+        for style in TabStyle::ALL {
+            let b = styled(1000, &tabs, &[], &opts(style));
+            for l in b.labels.iter().chain(&b.title_labels) {
+                assert!(!l.0.chars().any(|c| ('\u{e000}'..='\u{f8ff}').contains(&c)), "{style:?} drew a PUA glyph");
+            }
+        }
+        for s in TabStyle::ALL {
+            assert_eq!(TabStyle::from_config(s.to_config()), s);
+            assert_eq!(s.cycle(true).cycle(false), s);
+        }
+        assert_eq!(TabStyle::from_config("nope"), TabStyle::Pill);
+    }
+
+    #[test]
+    fn underline_style_marks_the_active_tab_at_the_seam() {
+        let tabs = three_tabs();
+        let ui = UiPalette::from_theme(&theme());
+        let marks = |b: &TabBar| -> Vec<Rect> { b.quads.iter().filter(|q| q.color == rgba(ui.accent)).copied().collect() };
+        let top = styled(1000, &tabs, &[], &opts(TabStyle::Underline));
+        let m = marks(&top);
+        assert_eq!(m.len(), 1, "one accent underline");
+        assert!(m[0].x >= top.tab_rects[0].x && m[0].x + m[0].w <= top.tab_rects[0].x + top.tab_rects[0].w);
+        assert!(m[0].y > TABBAR_H / 2.0, "near the grid seam (bottom edge) of a top bar");
+        let bottom = styled(1000, &tabs, &[], &TabBarOpts { style: TabStyle::Underline, bottom: true, ..TabBarOpts::default() });
+        assert!(marks(&bottom)[0].y < TABBAR_H / 2.0, "a bottom bar's seam is its top edge");
+        // No filled tab body anywhere in this style (only the bar background).
+        assert_eq!(top.quads.iter().filter(|q| q.h > 10.0 && q.w < 200.0).count(), 0);
+    }
+
+    fn prog(state: ProgressState, value: Option<u8>) -> Option<Progress> {
+        Some(Progress { state, value })
+    }
+
+    #[test]
+    fn progress_draws_an_in_tab_bar_and_a_seam_hairline_for_the_active_tab() {
+        let tabs = three_tabs();
+        let ui = UiPalette::from_theme(&theme());
+        let deco = [
+            TabDeco { progress: prog(ProgressState::Normal, Some(50)), ..Default::default() },
+            TabDeco { progress: prog(ProgressState::Error, Some(30)), ..Default::default() },
+            TabDeco::default(),
+        ];
+        let bar = styled(1000, &tabs, &deco, &TabBarOpts::default());
+        let accent: Vec<&Rect> = bar.quads.iter().filter(|q| q.color == rgba(ui.accent)).collect();
+        // The active tab: a half-filled in-tab bar + a half-width seam hairline.
+        let hair = accent.iter().find(|q| q.h <= 1.0).expect("seam hairline");
+        assert!(hair.x.abs() < 0.01 && (hair.w - 500.0).abs() < 1.0, "50% of the window width: {}", hair.w);
+        assert!((hair.y + hair.h - TABBAR_H).abs() < 0.01, "at the bar/grid seam");
+        let in_tab = accent.iter().find(|q| q.h > 1.0).expect("in-tab bar");
+        assert!(in_tab.x >= bar.tab_rects[0].x && in_tab.x + in_tab.w <= bar.tab_rects[0].x + bar.tab_rects[0].w);
+        // Its fill is half of its track.
+        let track = bar
+            .quads
+            .iter()
+            .find(|q| (q.y - in_tab.y).abs() < 0.01 && q.x == in_tab.x && q.w > in_tab.w)
+            .expect("track");
+        assert!((in_tab.w - (track.w * 0.5).round()).abs() <= 1.0);
+        // The inactive tab's error bar is red and it gets NO hairline.
+        let red: Vec<&Rect> = bar.quads.iter().filter(|q| q.color == rgba(ui.danger)).collect();
+        assert_eq!(red.len(), 1);
+        assert!(red[0].x >= bar.tab_rects[1].x && red[0].h > 1.0);
+        // progress_bar = false draws nothing.
+        let off = styled(1000, &tabs, &deco, &TabBarOpts { progress: false, ..TabBarOpts::default() });
+        let plain = styled(1000, &tabs, &[], &TabBarOpts::default());
+        assert_eq!(off.quads.len(), plain.quads.len());
+        // A bottom bar's hairline is its top edge.
+        let bottom = styled(1000, &tabs, &deco, &TabBarOpts { bottom: true, ..TabBarOpts::default() });
+        assert!(bottom.quads.iter().any(|q| q.color == rgba(ui.accent) && q.h <= 1.0 && q.y == 0.0));
+        // Progress never moves a hit rect or a label.
+        assert_eq!(bar.title_labels, plain.title_labels);
+        for (a, b) in bar.tab_rects.iter().zip(&plain.tab_rects) {
+            assert!(same_rect(a, b));
+        }
+    }
+
+    #[test]
+    fn indeterminate_progress_is_a_static_stripe() {
+        let tabs = vec![("Tab 1".to_string(), true)];
+        let ui = UiPalette::from_theme(&theme());
+        let deco = [TabDeco { progress: prog(ProgressState::Indeterminate, None), ..Default::default() }];
+        let bar = styled(1000, &tabs, &deco, &TabBarOpts::default());
+        let dashes: Vec<&Rect> = bar.quads.iter().filter(|q| q.color == rgba(ui.accent)).collect();
+        // Several dashes in the tab plus many along the seam; same input → same
+        // quads (nothing time-based, so idle frames are identical).
+        assert!(dashes.iter().filter(|q| q.h > 1.0).count() >= 4);
+        assert!(dashes.iter().filter(|q| q.h <= 1.0).count() >= 20);
+        let again = styled(1000, &tabs, &deco, &TabBarOpts::default());
+        assert_eq!(bar.quads.len(), again.quads.len());
+        // Paused is amber; an error with no value fills the whole bar.
+        let p = [TabDeco { progress: prog(ProgressState::Paused, Some(10)), ..Default::default() }];
+        assert!(styled(1000, &tabs, &p, &TabBarOpts::default()).quads.iter().any(|q| q.color == rgba(ui.warn)));
+        let e = [TabDeco { progress: prog(ProgressState::Error, None), ..Default::default() }];
+        let eb = styled(1000, &tabs, &e, &TabBarOpts::default());
+        let hair = eb.quads.iter().find(|q| q.color == rgba(ui.danger) && q.h <= 1.0).unwrap();
+        assert!((hair.w - 1000.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn per_tab_colors_tint_the_tab_in_every_style() {
+        let tabs = three_tabs();
+        let t = theme();
+        let red = t.palette[1];
+        let deco = [
+            TabDeco { color: Some(1), ..Default::default() },
+            TabDeco { color: Some(6), ..Default::default() },
+            TabDeco::default(),
+        ];
+        // Pill: the active pill is tinted toward its color, and the inactive
+        // colored tab gets a tinted body the uncolored layout lacks.
+        let dist = |c: [u8; 4], to: [u8; 3]| {
+            let d = |a: u8, b: u8| (a as i32 - b as i32).abs();
+            d(c[0], to[0]) + d(c[1], to[1]) + d(c[2], to[2])
+        };
+        let bar = styled(1000, &tabs, &deco, &TabBarOpts::default());
+        let plain = styled(1000, &tabs, &[], &TabBarOpts::default());
+        let pill = bar.quads.iter().find(|q| q.radius > 0.0 && q.w > 100.0).unwrap();
+        let plain_pill = plain.quads.iter().find(|q| q.radius > 0.0 && q.w > 100.0).unwrap();
+        assert!(dist(pill.color, red) < dist(plain_pill.color, red), "the active pill takes the tab's red");
+        assert!(bar.quads.len() > plain.quads.len(), "the inactive colored tab gets a tinted body");
+        // Underline: the active underline IS the tab's color (kept readable).
+        let ul = styled(1000, &tabs, &deco, &opts(TabStyle::Underline));
+        let ui = UiPalette::from_theme(&t);
+        let want = ui.readable(red, UiPalette::ACCENT_FLOOR);
+        assert!(ul.quads.iter().any(|q| q.color == rgba(want)));
+        // Powerline: the active segment is filled with the color, its title
+        // readable on it.
+        let pl = styled(1000, &tabs, &deco, &opts(TabStyle::Powerline));
+        assert!(pl.quads.iter().any(|q| q.color == rgba(red) && q.shear != 0.0));
+        assert_eq!(pl.title_labels[0].3, ui.on_fill(red));
+        // Colors resolve from the live theme; bad indices are ignored.
+        assert_eq!(tab_color_rgb(&t, 3), Some(t.palette[3]));
+        assert_eq!(tab_color_rgb(&t, 0), None);
+        assert_eq!(tab_color_rgb(&t, 7), None);
+        assert_eq!(tab_color_name(5), Some("Magenta"));
+        let junk = [TabDeco { color: Some(42), ..Default::default() }];
+        assert_eq!(styled(1000, &tabs, &junk, &TabBarOpts::default()).quads.len(), plain.quads.len());
+    }
+
+    #[test]
+    fn translucent_bar_skips_its_background() {
+        let tabs = three_tabs();
+        let opaque = styled(1000, &tabs, &[], &TabBarOpts::default());
+        let clear = styled(1000, &tabs, &[], &TabBarOpts { opaque: false, ..TabBarOpts::default() });
+        let full = |b: &TabBar| b.quads.iter().filter(|q| q.w >= 1000.0 && q.h >= TABBAR_H).count();
+        assert_eq!((full(&opaque), full(&clear)), (1, 0));
+        assert_eq!(opaque.quads.len(), clear.quads.len() + 1);
+        let d = build_detached_bar_styled(
+            1000,
+            "T",
+            &theme(),
+            false,
+            &mut mono(),
+            CM,
+            &TabDeco::default(),
+            &TabBarOpts { opaque: false, ..TabBarOpts::default() },
+        );
+        assert!(d.quads.iter().all(|q| q.w < 1000.0));
+    }
+
+    #[test]
+    fn chrome_text_is_readable_on_every_builtin_theme() {
+        // The contrast fixes: the close "✕" on its red hover (white measured
+        // 2.3–2.9:1 on 8 themes) and the muted inactive titles / "+" / "+N" (a
+        // fixed fg×2/3 or bg→fg blend fell to 1.5–1.8:1 on light themes).
+        let tabs: Vec<(String, bool)> = (0..20).map(|i| (format!("Tab {i}"), i == 0)).collect();
+        for t in jetty_core::theme::builtins() {
+            let ui = UiPalette::from_theme(&t);
+            let bar = build_tab_bar_styled(
+                800,
+                &tabs,
+                &t,
+                None,
+                CtrlHover::Close,
+                None,
+                &mut mono(),
+                CM,
+                &[],
+                &TabBarOpts::default(),
+            );
+            let x = bar.labels.iter().find(|l| l.0 == "✕").unwrap();
+            let c = crate::contrast_ratio(x.3, ui.danger);
+            assert!(c >= 4.5, "{}: ✕ on red {c:.2}", t.name);
+            let d = build_detached_bar(800, "T", &t, true, &mut mono(), CM);
+            let dx = d.labels.iter().find(|l| l.0 == "✕").unwrap();
+            assert!(crate::contrast_ratio(dx.3, ui.danger) >= 4.5, "{}: detached ✕", t.name);
+            for l in bar.title_labels.iter().chain(bar.labels.iter().filter(|l| l.0 != "✕")) {
+                let c = crate::contrast_ratio(l.3, ui.bg);
+                assert!(c >= 2.95, "{}: {:?} only {c:.2}:1 on the bar", t.name, l.0);
+            }
+        }
+    }
+
+    #[test]
+    fn every_style_keeps_marks_and_labels_inside_the_bar() {
+        let tabs = three_tabs();
+        let deco = [
+            TabDeco { progress: prog(ProgressState::Normal, Some(40)), color: Some(2), ..Default::default() },
+            TabDeco {
+                activity: TabActivity::Failed,
+                progress: prog(ProgressState::Indeterminate, None),
+                ..Default::default()
+            },
+            TabDeco::default(),
+        ];
+        for style in TabStyle::ALL {
+            for (dpi, font) in [(1.0, 16.0), (1.0, 28.0), (2.0, 16.0), (2.0, 17.0), (1.25, 22.0)] {
+                for bottom in [false, true] {
+                    let cm = ChromeMetrics::new(dpi, font);
+                    let o = TabBarOpts { style, bottom, hover: Some(1), ..TabBarOpts::default() };
+                    let bar = build_tab_bar_styled(
+                        2400,
+                        &tabs,
+                        &theme(),
+                        None,
+                        CtrlHover::None,
+                        None,
+                        &mut MonoMeasure(9.6 * cm.u),
+                        cm,
+                        &deco,
+                        &o,
+                    );
+                    let line_h = (16.0 * cm.u * 1.3).ceil();
+                    for l in bar.labels.iter().chain(&bar.title_labels) {
+                        assert!(l.2 + line_h <= cm.bar_h() + 1.0, "{style:?} {dpi}×/{font}pt: {:?} overflows", l.0);
+                    }
+                    for q in &bar.quads {
+                        assert!(
+                            q.y >= -0.01 && q.y + q.h <= cm.bar_h() + 0.01,
+                            "{style:?} {dpi}×/{font}pt: quad leaves the bar: y={} h={}",
+                            q.y,
+                            q.h
+                        );
+                    }
+                }
+            }
+        }
     }
 }

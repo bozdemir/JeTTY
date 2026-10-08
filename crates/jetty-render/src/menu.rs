@@ -230,6 +230,7 @@ pub fn build_menu(
                 h: row_h,
                 color: hover_col,
                 radius,
+                shear: 0.0,
             });
         }
     }
@@ -245,6 +246,7 @@ pub fn build_menu(
             h: 1.0,
             color: sep_col,
             radius: 0.0,
+            shear: 0.0,
         });
     }
 
