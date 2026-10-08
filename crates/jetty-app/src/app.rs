@@ -744,6 +744,13 @@ pub struct App {
     /// normal (Tier-A / no-summon / CRT-off) hot path renders straight to the
     /// surface as before.
     offscreen: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// The CRT pass's output while a Tier-B summon plays with CRT on: the
+    /// effect samples THIS (scene → CRT → effect), so the CRT look never drops
+    /// out for the reveal and snaps back after it. `None` until the first such
+    /// summon (CRT off or a Tier-A / no reveal never allocates it); then kept
+    /// like `offscreen` (re-made at a new size) — the effect's cached bind
+    /// group would hold it alive anyway.
+    summon_offscreen: Option<(wgpu::Texture, wgpu::TextureView)>,
     /// The currently selected window-summon reveal effect.
     summon_effect: SummonEffect,
     /// How F9 summons the window (Center vs Yakuake-style Dropdown).
@@ -1803,6 +1810,7 @@ impl App {
             glitch: crate::effects::Glitch::default(),
             anim_requested_at: None,
             caret_fx: None,
+            summon_offscreen: None,
             image_layer: None,
             offscreen: None,
             summon_effect: SummonEffect::Bayer,
@@ -8513,6 +8521,7 @@ impl App {
         // layer is rebuilt on the next frame, the image decoded again.
         self.backdrop_gpu = None;
         self.backdrop.on_device_rebuilt();
+        self.summon_offscreen = None;
         self.text = Some(text);
         self.apply_glyph_options();
         self.chrome_text = Some(chrome);
@@ -14215,6 +14224,21 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                 }
+                // The post pass under a Tier-B summon: a second target for its
+                // output (CRT / glitch), which the effect then samples — made by
+                // the first such summon (and at a new size), never otherwise.
+                if post.is_some() && summon_effect.is_tier_b() && self.summon_anim.is_some() {
+                    if let Some(g) = &self.gpu {
+                        let (gw, gh) = (g.config.width, g.config.height);
+                        if self
+                            .summon_offscreen
+                            .as_ref()
+                            .is_none_or(|(t, _)| t.width() != gw || t.height() != gh)
+                        {
+                            self.summon_offscreen = Some(Self::make_offscreen(g));
+                        }
+                    }
+                }
                 // Window border / focus ring (`window_border`): its color for this
                 // frame (None = no ring), and the pass, built the first time a
                 // ring is drawn (zero cost while the key is "none").
@@ -14263,6 +14287,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // but a pass without its object must never skip the corner mask.)
                 let crt_enabled = post.is_some() && crt.is_some();
                 let crt_time = self.crt_clock.elapsed().as_secs_f64();
+                let summon_offscreen = self.summon_offscreen.as_ref();
                 // Summon progress: t in [0,1) drives a reveal pass this frame
                 // (`about_to_wait` pumps the next one); t>=1 ends the animation so
                 // we return to damage-driven idle (0 CPU). None = not animating.
@@ -14489,6 +14514,10 @@ impl ApplicationHandler<AppEvent> for App {
                     // (see the dispatch guard before `present()`). Requires the
                     // offscreen to actually exist (alloc'd above when crt_enabled).
                     let crt_active = crt_enabled && !tier_b_active && offscreen.is_some();
+                    // …except that a Tier-B summon no longer drops the post pass
+                    // (the CRT look): it renders the scene into the summon
+                    // target and the effect samples THAT (below).
+                    let crt_under = tier_b_active && crt_enabled && summon_offscreen.is_some() && crt.is_some();
                     // Either consumer routes the scene into the offscreen; otherwise
                     // it renders straight to the surface view (byte-identical to the
                     // pre-CRT hot path).
@@ -14990,7 +15019,9 @@ impl ApplicationHandler<AppEvent> for App {
                     // rounded corners via its own alpha compositing, so SKIP the
                     // mask here to avoid double-rounding. During a Tier-B summon
                     // CRT is bypassed (crt_active is false), so the mask still runs
-                    // exactly as today and the summon path is unchanged.
+                    // exactly as today and the summon path is unchanged — unless
+                    // the pass runs UNDER the summon (`crt_under`), when it keeps
+                    // owning the corners.
                     // Window border / focus ring: on the window's own shape (the
                     // mask's radii), BEFORE the mask so its outer edge is feathered
                     // like the content's; under CRT it lands in the offscreen and
@@ -15013,7 +15044,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // background and rounded bottom corners — instead of a
                     // full-height strip whose content alone moves.
                     let r_top = if top_flush { 0.0 } else { corner_radius_px };
-                    if let (Some(mask), false) = (corner_mask, crt_active) {
+                    if let (Some(mask), false) = (corner_mask, crt_active || crt_under) {
                         // Bottom corners always round to corner_radius_px; the top
                         // corners are zeroed when the window is top-flush (Dropdown).
                         mask.apply_slid(
@@ -15046,6 +15077,49 @@ impl ApplicationHandler<AppEvent> for App {
                     // (instead of CRT clobbering a surface-only reveal). Tier-A
                     // effects use LoadOp::Load + blend and sample no texture, so
                     // there is no src==dst hazard against the CRT read.
+                    // The post pass's parameters, built once for whichever path
+                    // runs it this frame (under a Tier-B summon, or onto the
+                    // surface below). The pass owns the rounded corners (the
+                    // corner mask is skipped while it runs), fed the same
+                    // per-position radii the mask would use: the TOP corners stay
+                    // square when the window is top-flush (Dropdown), so the pass
+                    // never opens a transparent notch at the monitor's top edge.
+                    let crt_params = post.as_ref().filter(|_| crt_active || crt_under).map(|settings| {
+                        jetty_render::CrtParams::build(
+                            settings,
+                            &jetty_render::CrtFrame {
+                                width,
+                                height,
+                                corner_radius: corner_radius_px,
+                                corner_radius_top: r_top,
+                                time: crt_time,
+                                bg: [theme.bg[0], theme.bg[1], theme.bg[2]],
+                                fg: theme.fg,
+                                premultiplied: gpu.premultiply_clear,
+                                srgb: gpu.format.is_srgb(),
+                                dpi_scale: scale,
+                                glitch: glitch_level,
+                            },
+                        )
+                    });
+                    // What a Tier-B effect samples: the scene — or, with CRT on,
+                    // the CRT pass's output of it (with the moving edge of a
+                    // Dropdown slide cut there, as the post-CRT mask would).
+                    let tier_b_src: &wgpu::TextureView = match (crt_params.as_ref(), crt, summon_offscreen) {
+                        (Some(params), Some(crt), Some((_, crt_view))) if crt_under => {
+                            crt.apply(&gpu.device, &gpu.queue, crt_view, scene_view, params);
+                            if slide_y_offset != 0.0 {
+                                if let Some(mask) = corner_mask {
+                                    mask.apply_slid(
+                                        &gpu.device, &gpu.queue, crt_view, width, height, r_top, r_top,
+                                        corner_radius_px, corner_radius_px, slide_y_offset,
+                                    );
+                                }
+                            }
+                            crt_view
+                        }
+                        _ => scene_view,
+                    };
                     if let Some(t) = summon_t {
                         if t < 1.0 {
                             match summon_effect {
@@ -15070,7 +15144,7 @@ impl ApplicationHandler<AppEvent> for App {
                                     // offscreen frame here; sample it → surface.
                                     if let (Some(lq), true) = (liquid, tier_b_active) {
                                         lq.apply(
-                                            &gpu.device, &gpu.queue, &view, scene_view,
+                                            &gpu.device, &gpu.queue, &view, tier_b_src,
                                             width, height, t,
                                         );
                                     }
@@ -15078,7 +15152,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 SummonEffect::Focus => {
                                     if let (Some(fc), true) = (focus, tier_b_active) {
                                         fc.apply(
-                                            &gpu.device, &gpu.queue, &view, scene_view,
+                                            &gpu.device, &gpu.queue, &view, tier_b_src,
                                             width, height, t,
                                         );
                                     }
@@ -15088,7 +15162,7 @@ impl ApplicationHandler<AppEvent> for App {
                                         (transform, summon_effect.transform_kind(), tier_b_active)
                                     {
                                         tf.apply(
-                                            &gpu.device, &gpu.queue, &view, scene_view,
+                                            &gpu.device, &gpu.queue, &view, tier_b_src,
                                             width, height, kind, t,
                                         );
                                     }
@@ -15108,39 +15182,21 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                     // Post pass: when it is active (CRT on, or a glitch burst over
-                    // a CRT-off frame — AND not bypassed by an active Tier-B summon,
-                    // which owns the offscreen this frame) run the CRT pipeline
-                    // sampling the offscreen onto the surface `view`. `crt` exists
+                    // a CRT-off frame — AND not running under an active Tier-B
+                    // summon, which owns the offscreen this frame and samples the
+                    // pass's output itself, above) run the CRT pipeline sampling
+                    // the offscreen onto the surface `view`. `crt` exists
                     // whenever a post pass is wanted (`sync_main_post` above) and
                     // the offscreen was alloc'd above, but guard defensively.
                     // src=offscreen, dst=surface — never src==dst; the offscreen was
                     // cleared+painted this frame, so it is never sampled
                     // uninitialized. This does NOT request a redraw: a static look
-                    // keeps 0-CPU idle. The pass owns the rounded corners (the
-                    // corner mask is skipped while it runs), fed the same
-                    // per-position radii the mask would use: the TOP corners stay
-                    // square when the window is top-flush (Dropdown), so the pass
-                    // never opens a transparent notch at the monitor's top edge.
-                    if let (true, Some(settings), Some(crt), Some((_, off_view))) =
-                        (crt_active, post.as_ref(), crt, offscreen)
+                    // keeps 0-CPU idle. (The pass owns the rounded corners:
+                    // `crt_params`.)
+                    if let (true, Some(params), Some(crt), Some((_, off_view))) =
+                        (crt_active, crt_params.as_ref(), crt, offscreen)
                     {
-                        let params = jetty_render::CrtParams::build(
-                            settings,
-                            &jetty_render::CrtFrame {
-                                width,
-                                height,
-                                corner_radius: corner_radius_px,
-                                corner_radius_top: if top_flush { 0.0 } else { corner_radius_px },
-                                time: crt_time,
-                                bg: [theme.bg[0], theme.bg[1], theme.bg[2]],
-                                fg: theme.fg,
-                                premultiplied: gpu.premultiply_clear,
-                                srgb: gpu.format.is_srgb(),
-                                dpi_scale: scale,
-                                glitch: glitch_level,
-                            },
-                        );
-                        crt.apply(&gpu.device, &gpu.queue, &view, off_view, &params);
+                        crt.apply(&gpu.device, &gpu.queue, &view, off_view, params);
                         // The CRT pass rounds the UN-slid window; mid-slide the
                         // strip's real (moving) edge is cut by the corner mask
                         // over the CRT output — only for the ~150 ms slide.

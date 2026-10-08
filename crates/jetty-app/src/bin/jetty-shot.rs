@@ -1950,58 +1950,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         phosphor.apply(&device, &queue, &view, width, height, radius, t, accent);
     }
 
-    // --- Tier-B summon effects (LiquidDrop / FocusPull) ---
-    // These SAMPLE the rendered scene (the `texture` above, now also
-    // TEXTURE_BINDING-capable) and write the displaced/blurred result into a
-    // SECOND output texture (a texture can't be sampled and rendered to in the
-    // same pass). When one runs, we read back from `tex_b` instead of `texture`.
-    // This runs the REAL GPU pass so the harness validates the actual pipeline +
-    // texture/sampler binding headlessly, mirroring the SUMMON/PHOSPHOR hooks.
-    let liquid_t = std::env::var("JETTY_SHOT_LIQUID_T").ok().and_then(|s| s.parse::<f32>().ok());
-    let focus_t = std::env::var("JETTY_SHOT_FOCUS_T").ok().and_then(|s| s.parse::<f32>().ok());
-    let transform_t = std::env::var("JETTY_SHOT_TRANSFORM_T").ok().and_then(|s| s.parse::<f32>().ok());
-    let tier_b_tex = if liquid_t.is_some() || focus_t.is_some() || transform_t.is_some() {
-        let tex_b = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("jetty-shot-tex-b"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            // TEXTURE_BINDING so a following CRT pass can SAMPLE this Tier-B
-            // output (JETTY_SHOT_LIQUID_T/_FOCUS_T + JETTY_SHOT_CRT combined).
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view_b = tex_b.create_view(&wgpu::TextureViewDescriptor::default());
-        if let Some(t) = liquid_t {
-            eprintln!("jetty-shot: applying LiquidDrop reveal (GPU pass, t={t}, samples frame)");
-            let liquid = jetty_render::LiquidDrop::new(&device, format);
-            liquid.apply(&device, &queue, &view_b, &view, width, height, t);
-        } else if let Some(t) = focus_t {
-            eprintln!("jetty-shot: applying FocusPull reveal (GPU pass, t={t}, samples frame)");
-            let focus = jetty_render::FocusPull::new(&device, format);
-            focus.apply(&device, &queue, &view_b, &view, width, height, t);
-        } else if let Some(t) = transform_t {
-            let kind = match std::env::var("JETTY_SHOT_TRANSFORM").unwrap_or_default().as_str() {
-                "glide" => jetty_render::TransformKind::Glide,
-                "fade" => jetty_render::TransformKind::Fade,
-                _ => jetty_render::TransformKind::Pop,
-            };
-            eprintln!(
-                "jetty-shot: applying {kind:?} transform (GPU pass, t={t}, params {:?})",
-                jetty_render::transform_params(kind, t)
-            );
-            let tf = jetty_render::SummonTransform::new(&device, format);
-            tf.apply(&device, &queue, &view_b, &view, width, height, kind, t);
-        }
-        Some(tex_b)
-    } else {
-        None
-    };
-
     // Rounded-corner radius (JETTY_CORNER_RADIUS) — parsed here because BOTH the
     // CRT pass below (which owns the corners while active, like the live app)
     // and the CPU mask after readback consume it.
@@ -2015,7 +1963,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run the REAL CRT GPU pass onto a SECOND texture, sampling the rendered
     // scene — mirroring the Tier-B sample-then-readback pattern — through the
     // app's own settings path (`effects::frame_settings` → `CrtParams::build`),
-    // so the harness captures exactly what the app draws.
+    // so the harness captures exactly what the app draws. Like the live app, it
+    // runs BEFORE a Tier-B summon effect, which then samples the CRT output (the
+    // CRT look stays on through the reveal).
     let shot_post = shot_effects()
         .and_then(|(fx, glitch)| jetty_app::effects::frame_settings(&fx, glitch > 0.0).map(|s| (s, glitch)));
     let crt_tex = if let Some((settings, glitch)) = shot_post {
@@ -2027,15 +1977,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            // TEXTURE_BINDING so a following Tier-B summon effect can sample it.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let ct_view = ct.create_view(&wgpu::TextureViewDescriptor::default());
-        // Sample the current scene: the Tier-B output if one ran, else the frame.
-        let src_view = match &tier_b_tex {
-            Some(t) => t.create_view(&wgpu::TextureViewDescriptor::default()),
-            None => texture.create_view(&wgpu::TextureViewDescriptor::default()),
-        };
         // The CRT pass OWNS the rounded corners while active (the live app
         // skips the corner mask then and feeds the radius to the uniform):
         // default to JETTY_CORNER_RADIUS so the interplay matches the app;
@@ -2066,7 +2014,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         crt.prepare(&device, params.key);
         device.poll(wgpu::PollType::wait_indefinitely())?;
         eprintln!("jetty-shot: CRT pipeline build {:.1} ms", t_build.elapsed().as_secs_f64() * 1000.0);
-        crt.apply(&device, &queue, &ct_view, &src_view, &params);
+        crt.apply(&device, &queue, &ct_view, &view, &params);
         // JETTY_SHOT_CRT_BENCH=<n>: n more passes in one go (the first above
         // warmed the targets/bind groups), GPU-synchronized.
         if let Some(n) = std::env::var("JETTY_SHOT_CRT_BENCH").ok().and_then(|s| s.parse::<u32>().ok()) {
@@ -2074,7 +2022,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let n = n.max(1);
             let t = std::time::Instant::now();
             for _ in 0..n {
-                crt.apply(&device, &queue, &ct_view, &src_view, &params);
+                crt.apply(&device, &queue, &ct_view, &view, &params);
             }
             device.poll(wgpu::PollType::wait_indefinitely())?;
             eprintln!(
@@ -2084,6 +2032,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Some(ct)
+    } else {
+        None
+    };
+
+    // --- Tier-B summon effects (Liquid / Focus / Pop / Glide / Fade) ---
+    // These SAMPLE the rendered scene — or, with JETTY_SHOT_CRT, the CRT output
+    // of it (the app's order) — and write the result into another texture (a
+    // texture can't be sampled and rendered to in the same pass), which is then
+    // read back. The REAL GPU passes, so the harness validates the pipelines and
+    // texture/sampler bindings headlessly.
+    let liquid_t = std::env::var("JETTY_SHOT_LIQUID_T").ok().and_then(|s| s.parse::<f32>().ok());
+    let focus_t = std::env::var("JETTY_SHOT_FOCUS_T").ok().and_then(|s| s.parse::<f32>().ok());
+    let transform_t = std::env::var("JETTY_SHOT_TRANSFORM_T").ok().and_then(|s| s.parse::<f32>().ok());
+    let tier_b_tex = if liquid_t.is_some() || focus_t.is_some() || transform_t.is_some() {
+        let tex_b = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("jetty-shot-tex-b"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view_b = tex_b.create_view(&wgpu::TextureViewDescriptor::default());
+        let crt_view = crt_tex.as_ref().map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
+        let src = crt_view.as_ref().unwrap_or(&view);
+        if let Some(t) = liquid_t {
+            eprintln!("jetty-shot: applying LiquidDrop reveal (GPU pass, t={t}, samples frame)");
+            let liquid = jetty_render::LiquidDrop::new(&device, format);
+            liquid.apply(&device, &queue, &view_b, src, width, height, t);
+        } else if let Some(t) = focus_t {
+            eprintln!("jetty-shot: applying FocusPull reveal (GPU pass, t={t}, samples frame)");
+            let focus = jetty_render::FocusPull::new(&device, format);
+            focus.apply(&device, &queue, &view_b, src, width, height, t);
+        } else if let Some(t) = transform_t {
+            let kind = match std::env::var("JETTY_SHOT_TRANSFORM").unwrap_or_default().as_str() {
+                "glide" => jetty_render::TransformKind::Glide,
+                "fade" => jetty_render::TransformKind::Fade,
+                _ => jetty_render::TransformKind::Pop,
+            };
+            eprintln!(
+                "jetty-shot: applying {kind:?} transform (GPU pass, t={t}, params {:?})",
+                jetty_render::transform_params(kind, t)
+            );
+            let tf = jetty_render::SummonTransform::new(&device, format);
+            tf.apply(&device, &queue, &view_b, src, width, height, kind, t);
+        }
+        Some(tex_b)
     } else {
         None
     };
@@ -2104,10 +2101,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
-    // Read back the Tier-B effect output when one ran (it sampled `texture` and
-    // wrote the displaced/blurred result into its own texture); otherwise the
-    // scene texture itself.
-    let readback_tex = crt_tex.as_ref().or(tier_b_tex.as_ref()).unwrap_or(&texture);
+    // Read back the last pass that ran: the Tier-B effect (it sampled the
+    // scene or the CRT output), else the CRT output, else the scene itself.
+    let readback_tex = tier_b_tex.as_ref().or(crt_tex.as_ref()).unwrap_or(&texture);
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: readback_tex,
