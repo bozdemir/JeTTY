@@ -504,25 +504,53 @@ enum ToggleAction {
 /// raise whose focus never arrived hides instead of raising again.
 const RAISE_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// How long after losing focus the main window still counts as FOCUSED for a
+/// toggle. On X11 the summon hotkey is a passive key grab (global-hotkey's
+/// `XGrabKey` on the root): pressing it makes the server send the focused
+/// window a FocusOut (mode NotifyGrab) — winit reports it as `Focused(false)`,
+/// it does not filter by mode — and the matching FocusIn only on key RELEASE,
+/// while the hotkey's own event reaches the loop 20–50 ms AFTER the FocusOut
+/// (global-hotkey polls the X connection every 50 ms). Measured in Xvfb with
+/// XTEST: `Focused(false)` → +20.7 ms hotkey → +30.4 ms `Focused(true)` for a
+/// 30 ms tap; `Focused(false)` → +29 ms hotkey → +400 ms `Focused(true)` for a
+/// 400 ms hold. Without this grace every F9 on a focused window looked
+/// "unfocused" and RAISED it instead of hiding it. 300 ms covers a busy loop.
+const FOCUS_CHURN_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Pure toggle decision. Hiding is right only when the user is LOOKING at the
-/// terminal (shown, focused, not occluded). A window that is shown but behind
-/// other windows or unfocused (`focus_autohide = false` leaves it up after the
-/// user clicks elsewhere) is RAISED instead — the old `!visible` toggle hid it,
-/// so getting it back took a second press. If the compositor refuses the raise
-/// (focus never arrives, e.g. Wayland without an activation token), the next
-/// press within [`RAISE_RETRY_WINDOW`] hides, so the key can never get stuck
-/// re-raising a window it cannot focus.
+/// terminal (shown, focused, not occluded); "focused" includes a focus loss
+/// within [`FOCUS_CHURN_GRACE`] — the hotkey's own grab churn. A window that is
+/// shown but behind other windows or genuinely unfocused (`focus_autohide =
+/// false` leaves it up after the user clicks elsewhere) is RAISED instead — the
+/// old `!visible` toggle hid it, so getting it back took a second press. If the
+/// compositor refuses the raise (focus never arrives, e.g. Wayland without an
+/// activation token), the next press within [`RAISE_RETRY_WINDOW`] hides, so
+/// the key can never get stuck re-raising a window it cannot focus.
+///
+/// A hidden window whose focus-loss AUTO-hide fired within the churn grace
+/// stays hidden (`Hide` on a hidden window is a no-op): that FocusOut was this
+/// very press's grab, and the auto-hide merely beat a slow hotkey event to it —
+/// the user asked to hide, so re-showing it would flash the window back up.
 fn toggle_action(
     visible: bool,
     focused: bool,
     occluded: bool,
+    focus_lost_at: Option<std::time::Instant>,
+    autohidden_at: Option<std::time::Instant>,
     last_raise: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> ToggleAction {
+    let within_churn = |t: Option<std::time::Instant>| {
+        t.is_some_and(|t| now.saturating_duration_since(t) < FOCUS_CHURN_GRACE)
+    };
     if !visible {
-        return ToggleAction::Show;
+        return if within_churn(autohidden_at) {
+            ToggleAction::Hide
+        } else {
+            ToggleAction::Show
+        };
     }
-    if focused && !occluded {
+    if (focused || within_churn(focus_lost_at)) && !occluded {
         return ToggleAction::Hide;
     }
     match last_raise {
@@ -783,6 +811,15 @@ pub struct App {
     /// window. Cleared when focus arrives; a toggle within `RAISE_RETRY_WINDOW`
     /// of a raise that never got focus hides instead (see `toggle_action`).
     raise_attempt_at: Option<std::time::Instant>,
+    /// When the main window last LOST focus (`Focused(false)`); `None` while it
+    /// holds focus. A toggle within `FOCUS_CHURN_GRACE` of it still counts as
+    /// focused — on X11 the summon hotkey's own key grab produces exactly such a
+    /// FocusOut just before the hotkey event arrives (see `toggle_action`).
+    focus_lost_at: Option<std::time::Instant>,
+    /// When the focus-loss AUTO-hide last hid the main window; cleared on show.
+    /// A toggle within `FOCUS_CHURN_GRACE` of it keeps the window hidden (the
+    /// auto-hide beat a slow hotkey event to the same press).
+    autohidden_at: Option<std::time::Instant>,
     /// Set when the Settings window gains focus; consumed by the main window's
     /// Focused(false) to suppress auto-hide even when X11 delivers the main
     /// Focused(false) BEFORE the settings Focused(true) (the last_focused_window
@@ -848,6 +885,10 @@ pub struct App {
     /// dropped (the window shows blank until clicked). Repaint for a short window
     /// instead, until one frame actually presents. None = idle.
     settings_paint_until: Option<std::time::Instant>,
+    /// Backoff after the Settings window's `acquire_frame()` failed (same
+    /// `AcquireRetry` schedule as the main/detached windows); `None` while its
+    /// frames present normally or while it is closed.
+    settings_acquire_retry: Option<AcquireRetry>,
     /// Window corner radius in logical px, clamped [0, 24]. 0 = square corners.
     corner_radius: f32,
     /// All open terminal sessions, one per tab. Always non-empty once `resumed`
@@ -1505,6 +1546,8 @@ impl App {
             last_focused_window: None,
             main_focused: false,
             raise_attempt_at: None,
+            focus_lost_at: None,
+            autohidden_at: None,
             switching_to_settings: false,
             switching_to_detached: false,
             pending_autohide_at: None,
@@ -1519,6 +1562,7 @@ impl App {
             summon_pending: false,
             summon_settle_until: None,
             settings_paint_until: None,
+            settings_acquire_retry: None,
             corner_radius,
             tabs: Vec::new(),
             active: 0,
@@ -5217,6 +5261,10 @@ impl App {
             win.set_visible(false);
         }
         self.visible = false;
+        // Stamp the auto-hide: if this FocusOut was the summon hotkey's own key
+        // grab and the hotkey event is merely late, that toggle must not re-show
+        // the window (see `toggle_action`).
+        self.autohidden_at = Some(std::time::Instant::now());
         // The matching button-release never arrives once hidden — clear the
         // terminal drag state so it doesn't resume stuck on the next summon.
         self.selecting = false;
@@ -5258,9 +5306,10 @@ impl App {
 
     /// Toggle window visibility (F9 / Yakuake-style summon / `jetty --toggle`).
     ///
-    /// Hidden → summon. Shown AND in front of the user (focused, not occluded)
-    /// → hide. Shown but NOT in front (behind other windows, or unfocused after
-    /// the user clicked elsewhere with `focus_autohide = false`) → raise + focus
+    /// Hidden → summon. Shown AND in front of the user (focused — counting the
+    /// hotkey grab's own momentary FocusOut as focused — and not occluded) →
+    /// hide. Shown but NOT in front (behind other windows, or unfocused after the
+    /// user clicked elsewhere with `focus_autohide = false`) → raise + focus
     /// instead of hiding it; if the compositor refuses that raise, the next press
     /// hides (see `toggle_action`). The PTY keeps running while the window is
     /// hidden — nothing is killed or suspended.
@@ -5270,6 +5319,8 @@ impl App {
             self.visible,
             self.main_focused,
             self.main_occluded,
+            self.focus_lost_at,
+            self.autohidden_at,
             self.raise_attempt_at,
             now,
         ) {
@@ -5443,9 +5494,11 @@ impl App {
                 self.summon_settle_until =
                     Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
                 // The summon may have placed the window anywhere: re-derive the
-                // Dropdown top-flush once, and a fresh show is not a "raise".
+                // Dropdown top-flush once; a fresh show is not a "raise", and any
+                // earlier auto-hide no longer matters.
                 self.top_flush_dirty = true;
                 self.raise_attempt_at = None;
+                self.autohidden_at = None;
                 self.request_main_paint();
             } else {
                 // Remember the current spot before hiding so the next Center
@@ -5830,11 +5883,19 @@ impl App {
                 &[("Aa".to_string(), sx, sy, specimen_rgb)],
             );
             frame.present();
+            // The swapchain is healthy again: drop any retry schedule.
+            self.settings_acquire_retry = None;
             // Missed-paint proof counter (JETTY_FRAME_LOG only).
             if self.frame_log {
                 self.frames_presented += 1;
                 eprintln!("JETTY_FRAME {} settings", self.frames_presented);
             }
+        } else {
+            // Acquire failed: this frame's change was not shown. Same bounded
+            // retry schedule as the main/detached windows (`about_to_wait`
+            // issues + advances it) — the panel must not stay stale.
+            self.settings_acquire_retry
+                .get_or_insert_with(|| next_acquire_retry(None, std::time::Instant::now()));
         }
     }
 
@@ -8139,6 +8200,15 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
         }
+        if let Some(r) = self.settings_acquire_retry {
+            if self.settings_window.is_none() {
+                self.settings_acquire_retry = None;
+            } else if now >= r.due {
+                self.settings_acquire_retry = Some(next_acquire_retry(Some(r), now));
+                self.request_settings_paint();
+                painted = true;
+            }
+        }
         // Idle-HUD one-shot: flip the HUD from its last live value to an honest
         // "idle" reading once the app settles — only for an effectively visible
         // window (see `perf_idle_decision`: requesting it while hidden spun a core
@@ -8279,8 +8349,11 @@ impl ApplicationHandler<AppEvent> for App {
             merge_wake(&mut wake_at, d);
         }
         // Failed-acquire retries (dropped above for windows not effectively
-        // visible, so these only ever wake for a window that can present).
+        // visible / closed, so these only ever wake for a window that can present).
         if let Some(r) = self.acquire_retry {
+            merge_wake(&mut wake_at, r.due);
+        }
+        if let Some(r) = self.settings_acquire_retry {
             merge_wake(&mut wake_at, r.due);
         }
         for dw in &self.detached {
@@ -8919,8 +8992,12 @@ impl ApplicationHandler<AppEvent> for App {
                 // The main terminal window gained focus.
                 self.last_focused_window = Some(id);
                 self.main_focused = true;
+                self.focus_lost_at = None;
                 // A toggle-raise succeeded (or focus came back by itself): the
-                // next toggle should hide, not count as a refused raise.
+                // next toggle should hide, not count as a refused raise. This is
+                // also the FocusIn that ends the summon hotkey's key grab (on
+                // release); clearing here is harmless — the window IS focused,
+                // so the next toggle hides either way.
                 self.raise_attempt_at = None;
                 // Focus implies the window is on-screen again: clear any stale
                 // occluded/minimized flag in case the WM skipped Occluded(false)
@@ -8947,6 +9024,10 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::Focused(false) => {
                 self.main_focused = false;
+                // Stamped for the toggle's churn grace: on X11 pressing the
+                // summon hotkey itself sends this FocusOut (its key grab) just
+                // before the hotkey event — see `FOCUS_CHURN_GRACE`.
+                self.focus_lost_at = Some(std::time::Instant::now());
                 // A held tab drag can never see its release once focus is gone —
                 // clear it (and its grabbing cursor) so it doesn't resume stuck.
                 if self.tab_drag.take().is_some() {
@@ -13149,8 +13230,8 @@ mod scheduler_tests {
     //! the loop at 0-CPU idle (or makes it wake) is a pure function tested here.
     use super::{
         anim_expired, caret_drives_frames, main_tab_watched, next_acquire_retry,
-        perf_idle_decision, toggle_action, IdleHud, ToggleAction, KEY_ECHO_GRACE,
-        RAISE_RETRY_WINDOW,
+        perf_idle_decision, toggle_action, IdleHud, ToggleAction, FOCUS_CHURN_GRACE,
+        KEY_ECHO_GRACE, RAISE_RETRY_WINDOW,
     };
     use std::time::{Duration, Instant};
 
@@ -13189,34 +13270,113 @@ mod scheduler_tests {
     }
 
     // ── F9 / launcher toggle ─────────────────────────────────────────────────
+    // Argument order: visible, focused, occluded, focus_lost_at, autohidden_at,
+    // last_raise, now.
 
     #[test]
     fn toggle_shows_a_hidden_window_and_hides_a_watched_one() {
         let now = Instant::now();
-        assert_eq!(toggle_action(false, false, false, None, now), ToggleAction::Show);
-        assert_eq!(toggle_action(false, true, true, Some(now), now), ToggleAction::Show);
-        assert_eq!(toggle_action(true, true, false, None, now), ToggleAction::Hide);
+        assert_eq!(toggle_action(false, false, false, None, None, None, now), ToggleAction::Show);
+        assert_eq!(
+            toggle_action(false, true, true, Some(now), None, Some(now), now),
+            ToggleAction::Show,
+            "a hidden window shows unless an auto-hide just raced this press"
+        );
+        assert_eq!(toggle_action(true, true, false, None, None, None, now), ToggleAction::Hide);
     }
 
     #[test]
     fn toggle_raises_a_visible_window_that_is_not_in_front() {
         let now = Instant::now();
-        // Unfocused (clicked elsewhere, focus_autohide = false): raise, not hide.
-        assert_eq!(toggle_action(true, false, false, None, now), ToggleAction::Raise);
-        // Covered by other windows / minimized: raise, even if it kept focus.
-        assert_eq!(toggle_action(true, true, true, None, now), ToggleAction::Raise);
+        let long_ago = Some(now - Duration::from_secs(2));
+        // Genuinely unfocused for 2 s (clicked elsewhere, focus_autohide = false):
+        // raise, not hide.
+        assert_eq!(
+            toggle_action(true, false, false, long_ago, None, None, now),
+            ToggleAction::Raise
+        );
+        // Covered by other windows / minimized: raise, even if it kept focus…
+        assert_eq!(toggle_action(true, true, true, None, None, None, now), ToggleAction::Raise);
+        // …and even inside the churn grace (occlusion is not grab churn).
+        let churn = Some(now - Duration::from_millis(30));
+        assert_eq!(toggle_action(true, false, true, churn, None, None, now), ToggleAction::Raise);
+    }
+
+    /// The X11 grab-churn sequences measured in Xvfb (global-hotkey F9 via
+    /// XTEST): the hotkey's own key grab FocusOuts the focused window just
+    /// before the hotkey event reaches the loop; FocusIn only comes on release.
+    #[test]
+    fn toggle_hides_a_focused_window_through_its_own_hotkey_grab_churn() {
+        let t_focus_out = Instant::now();
+        // 30 ms tap: Focused(false) → hotkey +20.7 ms (FocusIn at +30 ms, after).
+        let at = t_focus_out + Duration::from_millis(21);
+        assert_eq!(
+            toggle_action(true, false, false, Some(t_focus_out), None, None, at),
+            ToggleAction::Hide,
+            "FocusOut→toggle within 50 ms is the grab, not a real focus loss"
+        );
+        // 400 ms hold: Focused(false) → hotkey +29 ms (FocusIn only at +400 ms).
+        let at = t_focus_out + Duration::from_millis(29);
+        assert_eq!(
+            toggle_action(true, false, false, Some(t_focus_out), None, None, at),
+            ToggleAction::Hide
+        );
+        // A very short tap whose FocusIn beat the hotkey event: plainly focused.
+        assert_eq!(
+            toggle_action(true, true, false, None, None, None, at),
+            ToggleAction::Hide
+        );
+        // A loaded loop delivering the hotkey late is still covered…
+        let at = t_focus_out + FOCUS_CHURN_GRACE - Duration::from_millis(1);
+        assert_eq!(
+            toggle_action(true, false, false, Some(t_focus_out), None, None, at),
+            ToggleAction::Hide
+        );
+        // …while a focus loss older than the grace is a genuine one → raise.
+        let at = t_focus_out + FOCUS_CHURN_GRACE;
+        assert_eq!(
+            toggle_action(true, false, false, Some(t_focus_out), None, None, at),
+            ToggleAction::Raise
+        );
+    }
+
+    #[test]
+    fn toggle_keeps_hidden_when_the_autohide_raced_the_same_press() {
+        // focus_autohide = true: the grab's FocusOut schedules the 100 ms
+        // auto-hide; if the hotkey event is later than that, the auto-hide hides
+        // first and the late toggle must NOT re-show the window.
+        let t_autohide = Instant::now();
+        let at = t_autohide + Duration::from_millis(40);
+        assert_eq!(
+            toggle_action(false, false, false, None, Some(t_autohide), None, at),
+            ToggleAction::Hide,
+            "Hide on a hidden window is a no-op: it stays hidden"
+        );
+        // A press well after an auto-hide is a real summon.
+        let at = t_autohide + Duration::from_secs(2);
+        assert_eq!(
+            toggle_action(false, false, false, None, Some(t_autohide), None, at),
+            ToggleAction::Show
+        );
     }
 
     #[test]
     fn toggle_hides_after_a_raise_the_compositor_refused() {
         let t0 = Instant::now();
+        let unfocused = Some(t0 - Duration::from_secs(5));
         // The raise never produced focus (e.g. Wayland): a press within the
         // window hides instead of raising forever…
         let soon = t0 + RAISE_RETRY_WINDOW - Duration::from_millis(1);
-        assert_eq!(toggle_action(true, false, false, Some(t0), soon), ToggleAction::Hide);
+        assert_eq!(
+            toggle_action(true, false, false, unfocused, None, Some(t0), soon),
+            ToggleAction::Hide
+        );
         // …but a much later press is a fresh intent → raise again.
         let later = t0 + RAISE_RETRY_WINDOW;
-        assert_eq!(toggle_action(true, false, false, Some(t0), later), ToggleAction::Raise);
+        assert_eq!(
+            toggle_action(true, false, false, unfocused, None, Some(t0), later),
+            ToggleAction::Raise
+        );
     }
 
     // ── failed-acquire retry backoff ─────────────────────────────────────────
