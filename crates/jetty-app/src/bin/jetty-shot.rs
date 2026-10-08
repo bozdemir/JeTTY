@@ -1203,10 +1203,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // terminal font in the app, so the block-art logo aligns regardless
             // of the UI font. Mirror that here for a faithful screenshot.
             let (wcw, wch) = text.cell_size();
+            // Below the prompt, as in the app (the cursor row + 1).
+            let prompt_rows = snap.cursor_row.min(snap.rows.saturating_sub(1)) + 1;
             let splash = jetty_render::build_welcome_overlay(
                 width,
                 height,
-                cm.bar_h(),
+                shot_grid_top + prompt_rows as f32 * wch,
                 env!("CARGO_PKG_VERSION"),
                 "Vulkan",
                 terminal.theme(),

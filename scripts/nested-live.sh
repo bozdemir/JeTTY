@@ -25,14 +25,16 @@
 #
 # Env: DISPLAY_NUM, NESTED_WM=kwin|none (default: kwin when installed),
 #      NESTED_CONFIG=<config.toml to copy> (default: ~/.config/jetty/config.toml if
-#      present — copied, never written), JETTY_BIN=<binary> (default target/release/jetty).
+#      present — copied, never written), NESTED_BIN=<binary> (default target/release/jetty).
 
 set -u
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 N="${DISPLAY_NUM:-187}"
 SB="$ROOT/target/nested-live-$N"
-BIN="${JETTY_BIN:-$ROOT/target/release/jetty}"
+# NOT $JETTY_BIN: inside JeTTY that names the INSTALLED binary (JeTTY sets it
+# for its shells), which would silently test the wrong build.
+BIN="${NESTED_BIN:-$ROOT/target/release/jetty}"
 D=":$N"
 
 die() { echo "nested-live: $*" >&2; exit 1; }
@@ -48,6 +50,7 @@ launch_jetty() {
         XDG_CONFIG_HOME="$SB/config" XDG_CACHE_HOME="$SB/cache" XDG_DATA_HOME="$SB/data" \
         XDG_STATE_HOME="$SB/state" XDG_RUNTIME_DIR="$SB/run" JETTY_CONFIG_DIR="$SB/config/jetty" \
         PATH="$SB/bin:$PATH" HISTFILE="$SB/zsh_history" GITSTATUS_CACHE_DIR="$HOME/.cache/gitstatus" \
+        DISABLE_AUTO_UPDATE=true \
         VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
         VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
         dbus-run-session -- "$SB/bin/jetty" >>"$SB/jetty.log" 2>&1)
@@ -60,7 +63,8 @@ launch_jetty() {
     done
     [ -n "${pid:-}" ] || die "jetty did not start — see $SB/jetty.log"
     echo "$pid" >"$SB/jetty.pid"
-    echo "jetty pid $pid (log $SB/jetty.log)"
+    sleep 0.5
+    echo "jetty pid $pid: $(readlink "/proc/$pid/exe") — $(grep '^jetty [0-9]' "$SB/jetty.log" | tail -1) (log $SB/jetty.log)"
 }
 
 stop_pid() { # only a pid we recorded, and only if it is still the process we started

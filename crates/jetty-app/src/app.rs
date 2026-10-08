@@ -13021,10 +13021,15 @@ impl ApplicationHandler<AppEvent> for App {
                         // block-art logo needs fixed advances + row pitch to stay
                         // aligned, and a proportional UI font garbled it.
                         let (welcome_cw, welcome_ch) = text.cell_size();
+                        // Start BELOW the shell's prompt, not at a fixed inset: the
+                        // splash is an overlay, and at the top it covered a two-line
+                        // prompt's input line (powerlevel10k) — the line the user
+                        // types on. It follows the cursor until the first key.
+                        let prompt_rows = snap.cursor_row.min(snap.rows.saturating_sub(1)) + 1;
                         let mut splash = jetty_render::build_welcome_overlay(
                             width,
                             height,
-                            grid_top + slide_y_offset,
+                            grid_top + slide_y_offset + prompt_rows as f32 * welcome_ch,
                             env!("CARGO_PKG_VERSION"),
                             &gpu_backend_name,
                             &theme,
