@@ -173,6 +173,13 @@ pub struct Config {
     /// Windows have no primary selection: there `"primary"` means the clipboard.
     #[serde(default)]
     pub copy_on_select: crate::clipboard::CopyOnSelect,
+    /// The kitty keyboard protocol: a program that asks for it (`CSI > u`) gets
+    /// unambiguous key reports (Ctrl+I ≠ Tab, key releases, …). Default `true`;
+    /// `false` turns it off in every tab, so programs see a terminal without it
+    /// and use legacy keys. Hot-reloadable (a change resets the flags programs
+    /// pushed).
+    #[serde(default = "default_kitty_keyboard")]
+    pub kitty_keyboard: bool,
     /// User keybinding overrides (`[keys]` table). Every action defaults to its
     /// built-in chord when omitted; `""`/`[]` explicitly UNBINDS an action (the
     /// chord reverts to its raw terminal meaning). Backward compatible: an old
@@ -267,6 +274,9 @@ fn default_run_selection() -> bool {
     true
 }
 fn default_hot_reload() -> bool {
+    true
+}
+fn default_kitty_keyboard() -> bool {
     true
 }
 
@@ -483,6 +493,7 @@ impl Default for Config {
             hot_reload: default_hot_reload(),
             macos_option_as_alt: crate::input::OptionAsAlt::default(),
             copy_on_select: crate::clipboard::CopyOnSelect::default(),
+            kitty_keyboard: default_kitty_keyboard(),
             keys: KeyBindings::default(),
         }
     }
@@ -1366,6 +1377,9 @@ mod tests {
         assert!(c.show_perf_hud);
         assert!(!c.osc52_allow_paste, "osc52 paste is off by default (secure)");
         assert!(c.hot_reload, "hot reload is on by default");
+        assert!(c.kitty_keyboard, "the kitty keyboard protocol is on by default");
+        let off: Config = toml::from_str("kitty_keyboard = false").unwrap();
+        assert!(!off.kitty_keyboard);
     }
 
     #[test]
@@ -1456,6 +1470,7 @@ mod tests {
             hot_reload: false,
             macos_option_as_alt: crate::input::OptionAsAlt::Left,
             copy_on_select: crate::clipboard::CopyOnSelect::Both,
+            kitty_keyboard: false,
             keys: KeyBindings::default(),
         };
         let s = toml::to_string_pretty(&c).expect("serialize");
@@ -1498,6 +1513,7 @@ mod tests {
             hot_reload: true,
             macos_option_as_alt: crate::input::OptionAsAlt::None,
             copy_on_select: crate::clipboard::CopyOnSelect::Primary,
+            kitty_keyboard: true,
             keys: KeyBindings::default(),
         };
         std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();

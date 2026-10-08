@@ -236,6 +236,31 @@ enum CsiPeek {
 /// Parameter bytes [`Scan::Csi`] collects when a CSI is cut by a feed boundary.
 const CSI_PARAMS_MAX: usize = 5;
 
+/// Bytes vte executes (C0 controls but CAN / SUB / ESC) or ignores (DEL, 0x80..)
+/// inside a CSI WITHOUT leaving it — so `ESC [ <LF> > 1 u` is still a push.
+fn csi_transparent(b: u8) -> bool {
+    matches!(b, 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff)
+}
+
+/// Most kitty keyboard flag-stack entries JeTTY lets a screen hold. A push past
+/// it is dropped before it reaches alacritty: alacritty 0.26 caps its stack at
+/// 4096 by evicting from the TITLE stack — a panic (the whole terminal gone)
+/// when that is empty, so `printf '\e[>1u%.0s' {1..4097}` crashed JeTTY. Real
+/// programs push one or two levels; the margin to 4096 absorbs any mirror drift.
+const KBD_STACK_MAX: u16 = 128;
+
+/// The PRIMARY-screen kitty keyboard state a command started from (see
+/// [`Terminal::restore_kbd`]): the lowest stack depth seen since — what was on
+/// the stack below it belongs to the shell — and whether the active flags were
+/// replaced in place (`CSI = … u`, no push). `provisional` = opened at a prompt
+/// (`A`) because the shell may never send a command-start `C`.
+#[derive(Clone, Copy, Debug)]
+struct KbdWindow {
+    floor: u16,
+    set: bool,
+    provisional: bool,
+}
+
 /// Peek at `rest` (the bytes right after `ESC [`) for an [`IsolatedSeq`]. An SGR
 /// costs its first parameter's digits and one compare of the byte after them
 /// (`;` or `m`); a letter-led CSI other than `J`/`S`/`M` costs one compare.
@@ -663,6 +688,14 @@ enum Scan {
     /// An APC that is NOT `_G…` (some other APC use): skip to the terminator,
     /// accumulate nothing, emit nothing.
     ApcOther,
+    /// Inside `ESC [ >`, `ESC [ <` or `ESC [ =` — a kitty keyboard-protocol
+    /// candidate (`CSI > Ps u` push, `CSI < Ps u` pop, `CSI = Ps ; Pm u` set),
+    /// read so JeTTY can mirror each screen's flag-stack DEPTH (`kbd_depth`;
+    /// alacritty keeps the stacks private). `n` = the first parameter
+    /// (saturating, like vte), `seps` = parameter separators so far, `odd` =
+    /// something vte would not dispatch as a plain push/pop/set (an
+    /// intermediate, a second marker, too many parameters).
+    KbdCsi { marker: u8, n: u16, seps: u8, odd: bool },
 }
 
 /// One shell command's OSC 133 semantic marks. `prompt`/`input`/`output` are
@@ -958,6 +991,15 @@ pub struct Terminal {
     /// The OSC payload cap in force: [`OSC_MAX_BYTES`], lowered only by tests so
     /// the vte differential fuzz reaches it cheaply.
     osc_cap: u32,
+    /// JeTTY's mirror of alacritty's kitty keyboard flag stacks — their DEPTHS
+    /// only — `[primary, alternate]` (alacritty swaps the two stacks with the
+    /// screens). Fed by the scanner (`Scan::KbdCsi`); zeroed whenever alacritty
+    /// clears the stacks (RIS, a protocol toggle). It keeps a push flood below
+    /// alacritty's panicking limit ([`KBD_STACK_MAX`]) and lets a prompt undo
+    /// what a dead program left pushed ([`Terminal::restore_kbd`]).
+    kbd_depth: [u16; 2],
+    /// The keyboard state the running command started from; `None` outside one.
+    kbd_window: Option<KbdWindow>,
     /// Test-only: every byte handed to vte, in order (the differential fuzz
     /// replays it through a model of vte's state machine).
     #[cfg(test)]
@@ -1108,6 +1150,8 @@ impl Terminal {
             mouse_x10: false,
             mouse_urxvt: false,
             osc_cap: OSC_MAX_BYTES,
+            kbd_depth: [0, 0],
+            kbd_window: None,
             #[cfg(test)]
             vte_log: None,
         }
@@ -1213,6 +1257,38 @@ impl Terminal {
         }
         self.kitty_keyboard = enabled;
         self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, self.kitty_keyboard));
+        self.kbd_cleared();
+    }
+
+    /// Drop every keyboard / mouse mode a program may have left behind — the
+    /// kitty keyboard flag stacks of BOTH screens, mouse reporting and its
+    /// encodings, focus reporting and bracketed paste — without touching the
+    /// screen, the scrollback or the cursor. The way out when a program died
+    /// with them on (Ctrl+C sent as `\e[99;5u`, clicks typed as escape codes),
+    /// e.g. a TUI killed on the alternate screen, where no prompt mark can
+    /// restore anything.
+    pub fn reset_input_modes(&mut self) {
+        use alacritty_terminal::vte::ansi::{Handler, NamedPrivateMode, PrivateMode};
+        if self.kitty_keyboard {
+            // A protocol toggle is alacritty's only way to clear BOTH screens'
+            // stacks (`set_options`; the re-emitted title is a no-op app-side).
+            self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, false));
+            self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, true));
+        }
+        self.kbd_cleared();
+        for mode in [
+            NamedPrivateMode::ReportMouseClicks,
+            NamedPrivateMode::ReportCellMouseMotion,
+            NamedPrivateMode::ReportAllMouseMotion,
+            NamedPrivateMode::Utf8Mouse,
+            NamedPrivateMode::SgrMouse,
+            NamedPrivateMode::ReportFocusInOut,
+            NamedPrivateMode::BracketedPaste,
+        ] {
+            self.term.unset_private_mode(PrivateMode::Named(mode));
+        }
+        self.mouse_x10 = false;
+        self.mouse_urxvt = false;
     }
 
     /// The kitty keyboard protocol flags the running app has currently pushed,
@@ -1382,10 +1458,17 @@ impl Terminal {
                         }
                         0x50 => Scan::DcsParams { p2: 0, field: 0, inter: false }, // 'P' opens a DCS
                         0x5f => Scan::ApcIntro,        // '_' opens an APC (Kitty graphics)
-                        // '[' opens a CSI. Only while anchors exist is it checked for
-                        // the few history-rewriting sequences ([`IsolatedSeq`]), by
-                        // peeking ahead in this buffer — an SGR costs a byte compare,
-                        // no extra scanner steps.
+                        // '[' opens a CSI. A kitty keyboard push/pop/set is always
+                        // followed (the flag-stack mirror, `kbd_depth`).
+                        0x5b if matches!(bytes.get(i + 1), Some(b'<' | b'=' | b'>')) => {
+                            self.scan = Scan::KbdCsi { marker: bytes[i + 1], n: 0, seps: 0, odd: false };
+                            i += 2;
+                            continue;
+                        }
+                        // Only while anchors exist is it checked for the few
+                        // history-rewriting sequences ([`IsolatedSeq`]), by peeking
+                        // ahead in this buffer — an SGR costs a byte compare or
+                        // two, no extra scanner steps.
                         0x5b if self.has_anchors() => match peek_isolated_csi(&bytes[i + 1..]) {
                             CsiPeek::Isolate(len, kind) => {
                                 let k = i + 1 + len;
@@ -1406,26 +1489,32 @@ impl Terminal {
                                 i += 2;
                                 continue;
                             }
+                            // A control vte executes inside the CSI: read on.
+                            CsiPeek::Other if bytes.get(i + 1).is_some_and(|&c| csi_transparent(c)) => {
+                                seq_start = i;
+                                Scan::Csi { params: [0; CSI_PARAMS_MAX], len: 0 }
+                            }
                             CsiPeek::Other => Scan::Ground,
                         },
                         // Without anchors only private-mode CSIs are followed (a
                         // one-byte peek; an SGR still costs no extra step). At the
-                        // end of the feed, finish the CSI byte-wise.
+                        // end of the feed — or past a control vte executes inside
+                        // the CSI — finish it byte-wise.
                         0x5b => match bytes.get(i + 1) {
                             Some(b'?') => {
                                 self.scan = Scan::Decset { cur: 0, hit: 0 };
                                 i += 2;
                                 continue;
                             }
-                            Some(_) => Scan::Ground,
-                            None => {
+                            Some(&c) if !csi_transparent(c) => Scan::Ground,
+                            _ => {
                                 seq_start = i;
                                 Scan::Csi { params: [0; CSI_PARAMS_MAX], len: 0 }
                             }
                         },
                         // `ESC c` (RIS) resets the screen AND scrollback — and
-                        // every terminal mode, including the two mouse modes
-                        // tracked here.
+                        // every terminal mode, including the two mouse modes and
+                        // the keyboard flag stacks mirrored here.
                         b'c' => {
                             let k = i + 1;
                             if self.has_anchors() {
@@ -1433,6 +1522,7 @@ impl Terminal {
                             }
                             self.mouse_x10 = false;
                             self.mouse_urxvt = false;
+                            self.kbd_cleared();
                             Scan::Ground
                         }
                         // ESC ESC restarts; C0 controls (vte executes them), DEL and
@@ -1461,9 +1551,13 @@ impl Terminal {
                             self.scan = Scan::Decset { cur: 0, hit };
                         }
                         b'0'..=b'9' if private => self.scan = Scan::Decset { cur: u16::MAX, hit: 0 },
+                        // A kitty keyboard push/pop/set (its marker comes first).
+                        b'<' | b'=' | b'>' if len == 0 => {
+                            self.scan = Scan::KbdCsi { marker: b, n: 0, seps: 0, odd: false };
+                        }
                         // vte executes C0 controls and ignores DEL / high bytes
-                        // inside a CSI; a private sequence keeps being read.
-                        0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff if private => {}
+                        // inside a CSI without leaving it: keep reading.
+                        _ if csi_transparent(b) => {}
                         // Final byte: advance an isolated sequence in a sub-slice of
                         // its own (only while anchors exist — otherwise splitting
                         // buys nothing).
@@ -1484,6 +1578,35 @@ impl Terminal {
                         // Anything else (`;`, intermediates, C0): not a sequence we
                         // isolate — stop tracking it.
                         _ => self.scan = Scan::Ground,
+                    }
+                    i += 1;
+                }
+                Scan::KbdCsi { marker, n, seps, odd } => {
+                    match b {
+                        b'0'..=b'9' if seps == 0 => {
+                            let n = n.saturating_mul(10).saturating_add(u16::from(b - b'0'));
+                            self.scan = Scan::KbdCsi { marker, n, seps, odd };
+                        }
+                        b'0'..=b'9' => {}
+                        // A parameter / sub-parameter separator (vte dispatches
+                        // nothing past 32 of them; stay well clear of the edge).
+                        b';' | b':' => {
+                            let seps = seps.saturating_add(1);
+                            self.scan = Scan::KbdCsi { marker, n, seps, odd: odd || seps >= 30 };
+                        }
+                        b'u' => {
+                            start = self.kitty_kbd_csi(bytes, start, i, marker, n, odd);
+                            self.scan = Scan::Ground;
+                        }
+                        // Any other final byte (`CSI > 4 ; 2 m`, `CSI > c`, …).
+                        0x40..=0x7e => self.scan = Scan::Ground,
+                        // ESC restarts, CAN/SUB abort (vte's "anywhere" rules).
+                        0x1b => self.scan = Scan::Esc,
+                        0x18 | 0x1a => self.scan = Scan::Ground,
+                        _ if csi_transparent(b) => {}
+                        // An intermediate or a second private marker: vte does not
+                        // dispatch it as a push/pop/set (read on to the final byte).
+                        _ => self.scan = Scan::KbdCsi { marker, n, seps, odd: true },
                     }
                     i += 1;
                 }
@@ -1933,6 +2056,85 @@ impl Terminal {
         k
     }
 
+    /// A complete kitty keyboard CSI whose final `u` is `bytes[i]` (`marker` `>`
+    /// push, `<` pop, `=` set; `n` its first parameter; `odd` = vte would not
+    /// dispatch it as one). Catches alacritty up to the `u` — so the screen it
+    /// acts on is known, and a synchronized update applied first, as for a mark
+    /// — then mirrors it in `kbd_depth` and returns the new `start`. A push that
+    /// would exceed [`KBD_STACK_MAX`] is DROPPED: vte gets CAN instead of the `u`.
+    /// Errs safe where it must guess: an odd push still counts, an odd pop does
+    /// not, so the mirror never under-counts what alacritty holds.
+    #[cold]
+    #[inline(never)]
+    fn kitty_kbd_csi(&mut self, bytes: &[u8], start: usize, i: usize, marker: u8, n: u16, odd: bool) -> usize {
+        self.advance_slice(&bytes[start..i]);
+        if !self.kitty_keyboard {
+            return i; // alacritty ignores the protocol: nothing to mirror
+        }
+        if self.sync_deadline().is_some() {
+            self.flush_sync();
+        }
+        let screen = usize::from(self.term.mode().contains(TermMode::ALT_SCREEN));
+        let primary = screen == 0;
+        let depth = self.kbd_depth[screen];
+        match marker {
+            b'>' if depth >= KBD_STACK_MAX => {
+                self.advance_slice(b"\x18");
+                return i + 1;
+            }
+            b'>' => self.kbd_depth[screen] = depth + 1,
+            b'<' if !odd => {
+                // vte: a missing or zero count pops one.
+                let depth = depth.saturating_sub(n.max(1));
+                self.kbd_depth[screen] = depth;
+                if let Some(w) = self.kbd_window.as_mut().filter(|_| primary) {
+                    w.floor = w.floor.min(depth);
+                }
+            }
+            b'=' => {
+                if let Some(w) = self.kbd_window.as_mut().filter(|_| primary) {
+                    w.set = true;
+                }
+            }
+            _ => {}
+        }
+        i
+    }
+
+    /// alacritty just cleared BOTH kitty keyboard stacks (RIS, a protocol toggle).
+    fn kbd_cleared(&mut self) {
+        self.kbd_depth = [0, 0];
+        if let Some(w) = self.kbd_window.as_mut() {
+            w.floor = 0;
+        }
+    }
+
+    /// A prompt arrived: whatever ran since the save point is over. Undo what it
+    /// left on the PRIMARY kitty keyboard stack — entries it pushed and never
+    /// popped (a SIGKILLed or crashed program, a dropped ssh) and, unless the
+    /// window is a `provisional` prompt-to-prompt one, flags it set in place — so
+    /// the shell gets legacy keys again (Ctrl+C as `^C`, not `\e[99;5u`; with
+    /// "report all keys" even `reset` could not be typed). What the shell had on
+    /// the stack before the command stays. A no-op while nothing changed.
+    fn restore_kbd(&mut self, end_of_command: bool) {
+        let Some(w) = self.kbd_window.take() else { return };
+        let depth = self.kbd_depth[0];
+        let extra = depth.saturating_sub(w.floor);
+        let reload = w.set && (end_of_command || !w.provisional);
+        if self.kitty_keyboard && (extra > 0 || reload) {
+            use alacritty_terminal::vte::ansi::Handler;
+            // Pops `extra` entries and reloads the active flags from the new
+            // stack top — with 0 it only drops flags a `CSI = u` set in place.
+            self.term.pop_keyboard_modes(extra);
+            self.kbd_depth[0] = depth - extra;
+        }
+    }
+
+    /// Start a keyboard save point at the current primary stack depth.
+    fn open_kbd_window(&mut self, provisional: bool) {
+        self.kbd_window = Some(KbdWindow { floor: self.kbd_depth[0], set: false, provisional });
+    }
+
     /// Whether any row-anchored state exists — the only time the scanner pays to
     /// isolate history-rewriting sequences (see [`IsolatedSeq`]).
     #[inline(always)]
@@ -2352,6 +2554,10 @@ impl Terminal {
                     last.finished = true;
                 }
                 self.cur_cmd = Some(OpenCmd { prompt: abs, started_at: None });
+                // Keyboard: what ran since the last save point is over; save
+                // again here in case this shell never sends a `C`.
+                self.restore_kbd(false);
+                self.open_kbd_window(true);
                 self.push_mark(CmdBlock {
                     prompt: abs,
                     input: None,
@@ -2381,6 +2587,8 @@ impl Terminal {
                 }
                 // A command ran: the resize clean-prompt wipe must never fire again.
                 self.saw_command_output = true;
+                // Keyboard: the command starts from the shell's current flags.
+                self.open_kbd_window(false);
             }
             b'D' => {
                 // Failed-command marker: bind to the most-recent still-open block
@@ -2407,6 +2615,8 @@ impl Terminal {
                 // Also covers integrations that never send C (old bash): once a
                 // command has completed, the clean-prompt wipe is off for good.
                 self.saw_command_output = true;
+                // Keyboard: drop what the finished command left behind.
+                self.restore_kbd(true);
             }
             _ => {} // unknown 133 sub-command: ignore
         }
@@ -7004,6 +7214,165 @@ mod tests {
         t.set_scrollback_lines(500);
         t.feed(b"\x1b[?u");
         assert!(!t.drain_pty_writes().is_empty(), "still enabled after a Config rebuild");
+    }
+
+    /// A terminal with the kitty keyboard protocol on (as every app tab is).
+    fn kitty_term() -> Terminal {
+        let mut t = Terminal::new(40, 10);
+        t.set_kitty_keyboard(true);
+        t
+    }
+
+    #[test]
+    fn flags_a_killed_program_pushed_are_dropped_at_the_next_prompt() {
+        // A main-screen program pushes "report all keys" and dies (SIGKILL, a
+        // crash, a dropped ssh) without popping. The shell's next prompt must not
+        // inherit it: Ctrl+C would reach the shell as `\e[99;5u`.
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07$ tui\r\n\x1b]133;C\x07");
+        t.feed(b"\x1b[>15u");
+        assert_eq!(t.kitty_keyboard_flags(), 15, "premise: the program's flags are live");
+        t.feed(b"\x1b]133;D;137\x07\x1b]133;A\x07$ ");
+        assert_eq!(t.kitty_keyboard_flags(), 0, "the prompt gets legacy keys back");
+        t.feed(b"\x1b[?u");
+        assert_eq!(t.drain_pty_writes(), b"\x1b[?0u", "the stack itself is empty again");
+    }
+
+    #[test]
+    fn flags_the_shell_had_before_the_command_are_kept() {
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b[>1u$ tui\r\n\x1b]133;C\x07"); // the shell's own entry
+        t.feed(b"\x1b[>8u\x1b[>31u"); // the program's two, never popped
+        t.feed(b"\x1b]133;D;1\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 1, "only the program's entries are dropped");
+        t.feed(b"\x1b[<u");
+        assert_eq!(t.kitty_keyboard_flags(), 0, "the shell's entry is still the bottom one");
+    }
+
+    #[test]
+    fn a_program_that_cleans_up_is_left_alone() {
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b]133;C\x07\x1b[>15u\x1b[<u\x1b]133;D;0\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        assert_eq!(t.kbd_depth, [0, 0]);
+    }
+
+    #[test]
+    fn flags_set_in_place_by_a_killed_program_are_dropped() {
+        // `CSI = flags u` replaces the active flags without a push.
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b]133;C\x07\x1b[=8u");
+        assert_eq!(t.kitty_keyboard_flags(), 8);
+        t.feed(b"\x1b]133;D;137\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn a_shell_popping_its_own_entry_after_c_is_not_undone() {
+        // A line editor that pushes while reading (reedline) and pops just after
+        // the shell emitted C: the floor follows the pop, so only the program's
+        // push is undone — the shell's popped entry is never resurrected.
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b[>1u$ cmd\r\n\x1b]133;C\x07\x1b[<u");
+        t.feed(b"\x1b[>8u"); // the program, killed
+        t.feed(b"\x1b]133;D;137\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        assert_eq!(t.kbd_depth[0], 0);
+    }
+
+    #[test]
+    fn a_shell_without_c_marks_still_gets_its_keys_back() {
+        // A/D-only integrations (bash < 4.4): the save point is the prompt itself.
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07$ tui\r\n\x1b[>31u");
+        t.feed(b"\x1b]133;D;137\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        // And a new prompt without any D (Ctrl+C at the prompt) undoes a push too.
+        t.feed(b"\x1b]133;A\x07\x1b[>8u^C\r\n\x1b]133;A\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn a_prompt_repaint_keeps_flags_the_shell_set_while_reading() {
+        // fish sets its flags in place (`CSI = 5 u`) while reading a line; a
+        // Ctrl+C repaint emits a fresh A with no command in between — those
+        // flags are the shell's, not a dead program's.
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b[=5u");
+        t.feed(b"^C\r\n\x1b]133;A\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 5);
+    }
+
+    #[test]
+    fn the_alternate_screen_stack_is_not_touched_by_prompts() {
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b]133;C\x07\x1b[?1049h\x1b[>15u");
+        assert_eq!(t.kbd_depth, [0, 1]);
+        t.feed(b"\x1b[?1049l");
+        assert_eq!(t.kitty_keyboard_flags(), 0, "the primary stack was never pushed");
+        t.feed(b"\x1b]133;D;0\x07");
+        assert_eq!(t.kbd_depth, [0, 1], "a prompt only restores the primary stack");
+    }
+
+    #[test]
+    fn a_push_flood_cannot_crash_the_terminal() {
+        // alacritty 0.26 caps its stack at 4096 by evicting from the TITLE stack,
+        // which panics when that is empty: `printf '\e[>1u%.0s' {1..4097}` used
+        // to kill the whole terminal. Controls vte executes inside the CSI are
+        // seen through, so they cannot hide a push from the mirror.
+        for unit in [&b"\x1b[>1u"[..], b"\x1b[\x00>1u", b"\x1b[\x07>\x7f1\x0au", b"\x1b[>;1u"] {
+            let mut t = kitty_term();
+            let flood = unit.repeat(5000);
+            t.feed(&flood);
+            assert!(t.kbd_depth[0] <= KBD_STACK_MAX, "{unit:?}: depth {}", t.kbd_depth[0]);
+        }
+        // Split across feeds at every byte.
+        let mut t = kitty_term();
+        for _ in 0..4200 {
+            for b in b"\x1b[>1u" {
+                t.feed(&[*b]);
+            }
+        }
+        assert_eq!(t.kbd_depth[0], KBD_STACK_MAX);
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+    }
+
+    #[test]
+    fn the_depth_mirror_follows_pops_resets_and_toggles() {
+        let mut t = kitty_term();
+        t.feed(b"\x1b[>1u\x1b[>2u\x1b[>4u");
+        assert_eq!(t.kbd_depth[0], 3);
+        t.feed(b"\x1b[<2u");
+        assert_eq!((t.kbd_depth[0], t.kitty_keyboard_flags()), (1, 1));
+        t.feed(b"\x1b[<0u"); // vte: a zero count pops one
+        assert_eq!(t.kbd_depth[0], 0);
+        t.feed(b"\x1b[>1u\x1bc"); // RIS clears both stacks
+        assert_eq!((t.kbd_depth, t.kitty_keyboard_flags()), ([0, 0], 0));
+        t.feed(b"\x1b[>1u");
+        t.set_kitty_keyboard(false);
+        assert_eq!((t.kbd_depth, t.kitty_keyboard_flags()), ([0, 0], 0));
+        t.feed(b"\x1b[>1u");
+        assert_eq!(t.kbd_depth, [0, 0], "ignored while the protocol is off");
+    }
+
+    #[test]
+    fn reset_input_modes_clears_modes_but_keeps_the_screen() {
+        let mut t = kitty_term();
+        t.feed(b"keep me\r\n");
+        t.feed(b"\x1b[>15u\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[?9h\x1b[?1015h");
+        t.feed(b"\x1b[?1049h\x1b[>8u\x1b[?1003h"); // a TUI that then died on the alt screen
+        assert!(t.mouse_mode() && t.kitty_keyboard_flags() == 8);
+        t.reset_input_modes();
+        assert_eq!(t.kitty_keyboard_flags(), 0, "alt-screen flags gone");
+        assert!(!t.mouse_mode() && !t.mouse_drag() && !t.mouse_motion());
+        assert!(!t.sgr_mouse() && !t.focus_reporting() && !t.bracketed_paste());
+        assert!(!t.mouse_x10() && !t.mouse_urxvt());
+        assert!(t.alt_screen(), "the screen itself is left alone");
+        t.feed(b"\x1b[?1049l");
+        assert_eq!(t.kitty_keyboard_flags(), 0, "the primary stack was cleared too");
+        assert_eq!(t.snapshot().row_text(0).trim_end(), "keep me");
+        t.feed(b"\x1b[?u");
+        assert_eq!(t.drain_pty_writes(), b"\x1b[?0u", "the protocol is still on");
     }
 
     #[test]

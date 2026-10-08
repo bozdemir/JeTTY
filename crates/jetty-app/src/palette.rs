@@ -47,6 +47,7 @@ pub enum PaletteCmd {
     Paste,
     ToggleLaunchAtLogin,
     ResetKeybindings,
+    ResetInputModes,
     ToggleFullscreen,
     Hide,
     Quit,
@@ -81,7 +82,7 @@ pub fn build_registry(
     tabs: &[(u64, String)],
     detached: &[(u64, String)],
 ) -> Vec<PaletteEntry> {
-    let statics: [(&str, &str, PaletteCmd); 32] = [
+    let statics: [(&str, &str, PaletteCmd); 33] = [
         ("New tab", "create open window shell", PaletteCmd::NewTab),
         ("Close tab", "kill remove", PaletteCmd::CloseTab),
         ("Next tab", "cycle switch forward", PaletteCmd::NextTab),
@@ -115,6 +116,11 @@ pub fn build_registry(
         ),
         ("Toggle launch at login", "autostart startup boot", PaletteCmd::ToggleLaunchAtLogin),
         ("Reset keybindings to defaults", "shortcut hotkey rebind reset keys", PaletteCmd::ResetKeybindings),
+        (
+            "Reset keyboard & mouse modes",
+            "stuck keys kitty protocol mouse reporting focus bracketed paste crashed program fix tab",
+            PaletteCmd::ResetInputModes,
+        ),
         ("Toggle fullscreen", "full screen maximize f11 whole monitor", PaletteCmd::ToggleFullscreen),
         ("Hide window", "summon dismiss minimize", PaletteCmd::Hide),
         ("Quit JeTTY", "exit close all", PaletteCmd::Quit),
@@ -268,6 +274,17 @@ mod tests {
         let hits = filter(&r, "new");
         assert!(!hits.is_empty());
         assert_eq!(hits[0].title, "New tab", "prefix match ranks first");
+    }
+
+    #[test]
+    fn registry_contains_reset_input_modes_and_ranks_it() {
+        // The way out of a crashed program's keyboard/mouse modes is found by the
+        // words a user would type in that situation.
+        let r = reg();
+        for q in ["reset keyboard", "mouse modes", "stuck keys"] {
+            let hits = filter(&r, q);
+            assert_eq!(hits[0].cmd, PaletteCmd::ResetInputModes, "top hit for {q:?}");
+        }
     }
 
     #[test]

@@ -1053,6 +1053,9 @@ pub struct App {
     /// Where a finished mouse selection is copied (mirrors
     /// `Config.copy_on_select`; live on reload, written back by `persist`).
     copy_on_select: clipboard::CopyOnSelect,
+    /// The kitty keyboard protocol in every tab (mirrors `Config.kitty_keyboard`;
+    /// applied at spawn and live to every tab on reload).
+    kitty_keyboard: bool,
     /// Compiled keybindings (built from `keys` on load / reload). The input path
     /// does ONE cheap hashmap lookup against this per keypress — never per frame.
     keymap: crate::keymap::KeyMap,
@@ -1728,6 +1731,7 @@ impl App {
             hot_reload: true,
             macos_option_as_alt: input::OptionAsAlt::default(),
             copy_on_select: clipboard::CopyOnSelect::default(),
+            kitty_keyboard: true,
             // Placeholder default keymap; rebuilt from cfg.keys below in `new`.
             keymap: crate::keymap::KeyMap::defaults(),
             keys: crate::config::KeyBindings::default(),
@@ -1891,6 +1895,7 @@ impl App {
         app.hot_reload = cfg.hot_reload;
         app.macos_option_as_alt = cfg.macos_option_as_alt;
         app.copy_on_select = cfg.copy_on_select;
+        app.kitty_keyboard = cfg.kitty_keyboard;
         // Compile the keybindings (defaults + user `[keys]` overrides). Any invalid
         // chord / conflict / rejected bind is logged; the rest still apply.
         app.keys = cfg.keys;
@@ -2060,6 +2065,7 @@ impl App {
             hot_reload: self.hot_reload,
             macos_option_as_alt: self.macos_option_as_alt,
             copy_on_select: self.copy_on_select,
+            kitty_keyboard: self.kitty_keyboard,
             // Preserve the user's `[keys]` overrides verbatim (never editable via the
             // Settings UI — a settings-driven persist must not erase them).
             keys: self.keys.clone(),
@@ -2467,6 +2473,17 @@ impl App {
         self.macos_option_as_alt = cfg.macos_option_as_alt;
         self.apply_option_as_alt_everywhere();
         self.copy_on_select = cfg.copy_on_select;
+        // Kitty keyboard protocol — live in every tab (a change resets the flag
+        // stacks programs pushed, as alacritty does on any toggle).
+        if cfg.kitty_keyboard != self.kitty_keyboard {
+            self.kitty_keyboard = cfg.kitty_keyboard;
+            for tab in &mut self.tabs {
+                tab.terminal.set_kitty_keyboard(cfg.kitty_keyboard);
+            }
+            for dw in &mut self.detached {
+                dw.tab.terminal.set_kitty_keyboard(cfg.kitty_keyboard);
+            }
+        }
         // Launch at login — live: the config key is the source of truth, so the
         // autostart entry is written/removed to match.
         if cfg.launch_at_login != self.launch_at_login {
@@ -2866,10 +2883,11 @@ impl App {
         // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
         // Applied at spawn so new tabs pick up the current setting.
         terminal.set_osc52_allow_paste(self.osc52_allow_paste);
-        // Kitty keyboard protocol: answer `CSI ? u` and track the app's
-        // `CSI > u` flag stack — the key path encodes per those flags
-        // (`decide_window_key`), so a program that opts in gets kitty keys.
-        terminal.set_kitty_keyboard(true);
+        // Kitty keyboard protocol (config `kitty_keyboard`, default on): answer
+        // `CSI ? u` and track the app's `CSI > u` flag stack — the key path
+        // encodes per those flags (`decide_window_key`), so a program that opts
+        // in gets kitty keys.
+        terminal.set_kitty_keyboard(self.kitty_keyboard);
         // Apply the configured scrollback cap (guard skips the no-op
         // set_options round-trip on the 10k default path).
         if self.scrollback_lines != 10_000 {
@@ -4480,6 +4498,22 @@ impl App {
                     None => "Keybindings reset to defaults".to_string(),
                 };
                 self.show_notice_pill(msg, 6000);
+            }
+            // A crashed program's keyboard / mouse modes, dropped for the tab the
+            // palette was opened over — the screen and scrollback stay.
+            C::ResetInputModes => {
+                if let Some(term) = self.term_of_mut(s) {
+                    term.reset_input_modes();
+                }
+                let window = match s {
+                    Surface::Main => self.window.as_ref().map(|w| w.id()),
+                    Surface::Detached(p) => self.detached.get(p).map(|d| d.window.id()),
+                };
+                self.show_status_pill(crate::runsel::Notice {
+                    msg: "Keyboard & mouse modes reset for this tab",
+                    window,
+                });
+                self.paint_surface(s);
             }
             // Fullscreen toggles the window the palette was opened in.
             C::ToggleFullscreen => match s {
@@ -10159,10 +10193,11 @@ impl ApplicationHandler<AppEvent> for App {
         // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
         // Applied at spawn so new tabs pick up the current setting.
         terminal.set_osc52_allow_paste(self.osc52_allow_paste);
-        // Kitty keyboard protocol: answer `CSI ? u` and track the app's
-        // `CSI > u` flag stack — the key path encodes per those flags
-        // (`decide_window_key`), so a program that opts in gets kitty keys.
-        terminal.set_kitty_keyboard(true);
+        // Kitty keyboard protocol (config `kitty_keyboard`, default on): answer
+        // `CSI ? u` and track the app's `CSI > u` flag stack — the key path
+        // encodes per those flags (`decide_window_key`), so a program that opts
+        // in gets kitty keys.
+        terminal.set_kitty_keyboard(self.kitty_keyboard);
         // Apply the configured scrollback cap (guard skips the no-op
         // set_options round-trip on the 10k default path).
         if self.scrollback_lines != 10_000 {
@@ -15260,6 +15295,7 @@ mod hot_reload_tests {
             "hot_reload",
             "macos_option_as_alt",
             "copy_on_select",
+            "kitty_keyboard",
             // shell (new tabs pick up the edited shell) and show_welcome apply live;
             // both are also mirrored in apply_reloaded_config so a later persist()
             // round-trips an external edit instead of clobbering it.
