@@ -96,7 +96,11 @@ struct PreparedGrid {
     cols: usize,
     keys: Vec<u64>,
     fallback: Vec<(f32, f32, char, [u8; 3])>,
-    graphemes: Vec<(f32, f32, Box<str>, [u8; 3])>,
+    /// `(x, y, index into clusters, fg)` per cluster-drawn cell.
+    graphemes: Vec<(f32, f32, u32, [u8; 3])>,
+    /// The distinct (clamped) clusters those cells draw — bounded by
+    /// `GRAPHEME_GLYPH_CAP` × `MAX_CLUSTER_BYTES`.
+    clusters: Vec<Box<str>>,
 }
 
 /// The default terminal font. Matches the user's Konsole profile: MesloLGS NF
@@ -162,18 +166,67 @@ enum CellRoute {
 const FALLBACK_GLYPH_CAP: usize = 4096;
 
 /// Upper bound on cached shaped grapheme-cluster buffers (same role as
-/// `FALLBACK_GLYPH_CAP` for the per-char overdraw cache).
+/// `FALLBACK_GLYPH_CAP` for the per-char overdraw cache). Also the per-frame cap
+/// on DISTINCT clusters drawn, so the cache never has to hold more than this.
 const GRAPHEME_GLYPH_CAP: usize = 1024;
 
+/// The longest grapheme cluster drawn for one cell: its base char plus this many
+/// zero-width chars (combining marks, VS16, ZWJ parts). Real text needs a handful
+/// (Vietnamese 2, Tibetan stacks ~4–6); the VT engine stores ANY number on a cell
+/// (alacritty's `push_zerowidth` is unbounded), so a "Zalgo" flood can stack
+/// thousands — the excess is simply not drawn.
+const MAX_CLUSTER_MARKS: usize = 32;
+/// Byte cap on one drawn cluster (cut on a char boundary), whichever cap hits first.
+const MAX_CLUSTER_BYTES: usize = 256;
+/// Per-frame budget of cluster chars drawn across ALL cells. Bounds the glyphs a
+/// frame's grapheme overrides add to glyphon's prepare (and the shaping a frame
+/// of all-new clusters can cost). Cells past it — or past `GRAPHEME_GLYPH_CAP`
+/// distinct clusters — draw just their base char. Generous for real text: a
+/// screen full of NFD / Thai / Devanagari clusters stays well inside it.
+const GRAPHEME_FRAME_CHARS: usize = 32 * 1024;
+
+/// `s` cut to what is drawn for one cell (see `MAX_CLUSTER_MARKS` /
+/// `MAX_CLUSTER_BYTES`): a prefix on a char boundary, plus its char count. Scans
+/// at most the kept prefix — O(cap), however long `s` is.
+fn clamp_cluster(s: &str) -> (&str, usize) {
+    let mut end = 0;
+    let mut chars = 0;
+    for (i, c) in s.char_indices() {
+        let next = i + c.len_utf8();
+        if chars > MAX_CLUSTER_MARKS || next > MAX_CLUSTER_BYTES {
+            break;
+        }
+        end = next;
+        chars += 1;
+    }
+    (&s[..end], chars)
+}
+
+/// Approximate bytes one cached grid row costs per cell: the packed key word plus
+/// cosmic-text's per-char text, attribute, shape and layout-glyph records
+/// (pinned against the real struct sizes by a test).
+const ROW_BYTES_PER_CELL: usize = 256;
+/// Byte budget for cached grid rows BEYOND the ones on screen. The visible rows
+/// must be shaped whatever they cost (O(rows × cols), the grid itself); the
+/// off-screen extras that make scrolling back a cache hit get at most this much.
+const ROW_CACHE_EXTRA_BYTES: usize = 16 * 1024 * 1024;
+
+/// Row-cache entry cap for a `rows × cols` grid: every visible row, plus up to
+/// one more screen (+16) of off-screen rows within `ROW_CACHE_EXTRA_BYTES`.
+fn row_cache_cap(rows: usize, cols: usize) -> usize {
+    let per_row = cols.max(1) * ROW_BYTES_PER_CELL;
+    rows + (rows + 16).min(ROW_CACHE_EXTRA_BYTES / per_row)
+}
+
 /// Evict oldest entries from a FIFO-ordered cache down to `cap`, never removing
-/// a key present in `visible` (keys drawn this frame). A visible key scanned
-/// during eviction is rotated to the back (treated as most-recent) instead of
-/// dropped. Pure + generic so it is unit-testable independent of cosmic-text
-/// `Buffer`. (F25)
+/// a key for which `visible` is true (keys drawn this frame). A visible key
+/// scanned during eviction is rotated to the back (treated as most-recent)
+/// instead of dropped. Pure + generic so it is unit-testable independent of
+/// cosmic-text `Buffer`. (F25)
 fn evict_fifo_cache<K: std::hash::Hash + Eq, V>(
     map: &mut std::collections::HashMap<K, V>,
     order: &mut std::collections::VecDeque<K>,
-    visible: &std::collections::HashSet<K>,
+    visible: impl Fn(&K) -> bool,
     cap: usize,
 ) {
     let mut scanned = 0usize;
@@ -181,12 +234,230 @@ fn evict_fifo_cache<K: std::hash::Hash + Eq, V>(
     while map.len() > cap && scanned < cap_scan {
         let Some(old) = order.pop_front() else { break };
         scanned += 1;
-        if visible.contains(&old) {
+        if visible(&old) {
             order.push_back(old);
         } else {
             map.remove(&old);
         }
     }
+}
+
+/// Shaped grapheme-cluster buffers, keyed by the (clamped) cluster. Bounded in
+/// entries (`GRAPHEME_GLYPH_CAP`, FIFO, never evicting a cluster drawn this
+/// frame — and a frame draws at most that many distinct clusters) and per entry
+/// (a key is at most `MAX_CLUSTER_BYTES`, its buffer at most
+/// `MAX_CLUSTER_MARKS + 1` chars), so its memory is bounded no matter what a
+/// program prints. Generic over the cached value only so the bounds are testable
+/// without a font; the renderer caches shaped `Buffer`s.
+struct ClusterGlyphCache<V = Buffer> {
+    map: std::collections::HashMap<Box<str>, V>,
+    order: std::collections::VecDeque<Box<str>>,
+}
+
+impl<V> Default for ClusterGlyphCache<V> {
+    fn default() -> Self {
+        Self { map: std::collections::HashMap::new(), order: std::collections::VecDeque::new() }
+    }
+}
+
+impl<V> ClusterGlyphCache<V> {
+    /// Build (`make`) every cluster of this frame not cached yet, then evict down
+    /// to the cap, keeping this frame's clusters.
+    fn ensure_with(&mut self, clusters: &[&str], mut make: impl FnMut(&str) -> V) {
+        for &cluster in clusters {
+            debug_assert!(cluster.len() <= MAX_CLUSTER_BYTES, "clusters are clamped before caching");
+            if !self.map.contains_key(cluster) {
+                let v = make(cluster);
+                self.map.insert(Box::from(cluster), v);
+                self.order.push_back(Box::from(cluster));
+            }
+        }
+        if self.map.len() > GRAPHEME_GLYPH_CAP {
+            let drawn: rustc_hash::FxHashSet<&str> = clusters.iter().copied().collect();
+            evict_fifo_cache(&mut self.map, &mut self.order, |k| drawn.contains(&**k), GRAPHEME_GLYPH_CAP);
+        }
+    }
+
+    /// Bytes held by the keys (each stored twice: map + FIFO order).
+    #[cfg(test)]
+    fn key_bytes(&self) -> usize {
+        self.map.keys().map(|k| k.len()).sum::<usize>() + self.order.iter().map(|k| k.len()).sum::<usize>()
+    }
+
+    fn get(&self, cluster: &str) -> Option<&V> {
+        self.map.get(cluster)
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
+impl ClusterGlyphCache<Buffer> {
+    /// Shape every cluster of this frame not cached yet (`Shaping::Advanced`, so
+    /// font fallback supplies marks/emoji the primary font lacks).
+    fn ensure(&mut self, font_system: &mut FontSystem, metrics: Metrics, family: &str, clusters: &[&str]) {
+        let attrs = Attrs::new().family(Family::Name(family));
+        self.ensure_with(clusters, |cluster| {
+            let mut buf = Buffer::new(font_system, metrics);
+            buf.set_size(font_system, None, None);
+            buf.set_text(font_system, cluster, &attrs, Shaping::Advanced, None);
+            buf
+        });
+    }
+}
+
+/// Scratch vectors for [`pack_grid`], reused frame to frame so the frame path
+/// does not reallocate.
+#[derive(Default)]
+struct PackScratch {
+    keys: Vec<u64>,
+    row_hashes: Vec<u64>,
+    fallback: Vec<(f32, f32, char, [u8; 3])>,
+    graphemes: Vec<(f32, f32, u32, [u8; 3])>,
+    order: Vec<usize>,
+}
+
+/// One frame's grid, packed for shaping, comparison and drawing.
+struct PackedGrid<'a> {
+    /// `rows * cols` packed cells (see `pack_cell`) — independent of any cluster:
+    /// a cluster-drawn cell packs as a blank, so a row costs O(cols) whatever a
+    /// program stacked on its cells.
+    keys: Vec<u64>,
+    /// Per-row content hash; 0 = all-blank row (nothing to shape or draw).
+    row_hashes: Vec<u64>,
+    /// `(x, y, char, fg)` per overdraw cell (glyph missing from the primary font,
+    /// or double-width).
+    fallback: Vec<(f32, f32, char, [u8; 3])>,
+    /// `(x, y, index into clusters, fg)` per cell drawn from its grapheme cluster.
+    graphemes: Vec<(f32, f32, u32, [u8; 3])>,
+    /// The DISTINCT clusters drawn this frame, each clamped by `clamp_cluster`; at
+    /// most `GRAPHEME_GLYPH_CAP` of them, `GRAPHEME_FRAME_CHARS` chars across all
+    /// cells.
+    clusters: Vec<&'a str>,
+    /// Underline/strike content fingerprint (see `quad::fold_decoration`).
+    deco: u64,
+    order: Vec<usize>,
+}
+
+impl PackedGrid<'_> {
+    fn into_scratch(self) -> PackScratch {
+        PackScratch {
+            keys: self.keys,
+            row_hashes: self.row_hashes,
+            fallback: self.fallback,
+            graphemes: self.graphemes,
+            order: self.order,
+        }
+    }
+}
+
+/// Pack every cell of `snapshot` (pure: no GPU, no font system — `route` answers
+/// whether a char must be overdrawn). Applies the paint inputs (selection colors,
+/// the block-cursor glyph color) and the grapheme overrides under their budgets:
+/// a cluster is clamped to `MAX_CLUSTER_MARKS` / `MAX_CLUSTER_BYTES`, and a frame
+/// draws at most `GRAPHEME_GLYPH_CAP` distinct clusters and `GRAPHEME_FRAME_CHARS`
+/// cluster chars — a cell past either budget draws just its base char. However
+/// large a program makes a cell's cluster, the work here is O(cells × cap).
+fn pack_grid<'a>(
+    snapshot: &GridSnapshot,
+    paint: &GridPaint<'a>,
+    cell_w: f32,
+    cell_h: f32,
+    route: &mut dyn FnMut(char) -> CellRoute,
+    scratch: PackScratch,
+) -> PackedGrid<'a> {
+    let (rows, cols) = (snapshot.rows, snapshot.cols);
+    let PackScratch { mut keys, mut row_hashes, mut fallback, mut graphemes, mut order } = scratch;
+    keys.clear();
+    keys.reserve(rows * cols);
+    row_hashes.clear();
+    fallback.clear();
+    graphemes.clear();
+    // Grapheme overrides in row-major order, walked with a cursor alongside the
+    // cell loop (empty — the common case — means no sort and one compare/cell).
+    order.clear();
+    if !paint.graphemes.is_empty() {
+        order.extend(0..paint.graphemes.len());
+        order.sort_unstable_by_key(|&i| (paint.graphemes[i].0, paint.graphemes[i].1));
+    }
+    let g_pos = |i: usize| (paint.graphemes[i].0, paint.graphemes[i].1);
+    let mut g_next = 0usize;
+    let mut clusters: Vec<&'a str> = Vec::new();
+    let mut cluster_index: FxHashMap<&'a str, u32> = FxHashMap::default();
+    let mut cluster_chars = 0usize;
+    let mut sel_memo: Option<([u8; 3], [u8; 3])> = None;
+    // Fingerprint for the underline/strike quads (folded in the SAME per-cell
+    // loop, so no extra pass): an underline-only change rebuilds decorations
+    // without forcing a re-shape.
+    let mut deco_hasher = FxHasher::default();
+
+    for row in 0..rows {
+        let mut h = FxHasher::default();
+        let mut inked = false;
+        for col in 0..cols {
+            let cell = snapshot.cell(row, col);
+            crate::quad::fold_decoration(&mut deco_hasher, cell);
+            let mut fg = cell.fg;
+            if cell.selected {
+                if let Some(sel) = &paint.selection {
+                    fg = selected_glyph_fg(cell, sel, &mut sel_memo);
+                }
+            }
+            if let Some((cr, cc, cursor_fg)) = paint.cursor_glyph {
+                if cr == row && cc == col {
+                    fg = cursor_fg;
+                }
+            }
+            // alacritty stores a literal '\t' in the cell at a tab stop (so
+            // copies preserve tabs); control chars have no glyph, so render
+            // them as blanks instead of routing them to the overdraw (tofu).
+            let mut ch = if cell.c.is_control() { ' ' } else { cell.c };
+            while g_next < order.len() && g_pos(order[g_next]) < (row, col) {
+                g_next += 1;
+            }
+            let mut drawn_as_cluster = false;
+            if g_next < order.len() && g_pos(order[g_next]) == (row, col) {
+                let (cluster, n) = clamp_cluster(paint.graphemes[order[g_next]].2);
+                let ci = if n == 0 || cluster_chars + n > GRAPHEME_FRAME_CHARS {
+                    None
+                } else if let Some(&ci) = cluster_index.get(cluster) {
+                    Some(ci)
+                } else if clusters.len() < GRAPHEME_GLYPH_CAP {
+                    let ci = clusters.len() as u32;
+                    clusters.push(cluster);
+                    cluster_index.insert(cluster, ci);
+                    Some(ci)
+                } else {
+                    None
+                };
+                if let Some(ci) = ci {
+                    cluster_chars += n;
+                    graphemes.push((col as f32 * cell_w, row as f32 * cell_h, ci, fg));
+                    ch = ' ';
+                    drawn_as_cluster = true;
+                }
+            }
+            if !drawn_as_cluster && !ch.is_ascii() && route(ch) == CellRoute::Overdraw {
+                // A glyph the primary font lacks (tofu under Shaping::Basic, no
+                // fallback) or draws double-width (a CJK glyph advances ~2 cells
+                // and would shift the rest of the row): blank it here so the row
+                // stays on the grid, overdraw the real glyph on top, aligned.
+                // ASCII (incl. blank) cells skip the (cached) probe entirely — the
+                // primary font always lays them out inline.
+                fallback.push((col as f32 * cell_w, row as f32 * cell_h, ch, fg));
+                ch = ' ';
+            }
+            inked |= ch != ' ';
+            let k = pack_cell(ch, fg, cell.shape_bits());
+            h.write_u64(k);
+            keys.push(k);
+        }
+        // 0 marks an all-blank row: no glyphs to shape or draw.
+        row_hashes.push(if inked { h.finish() | 1 } else { 0 });
+    }
+    PackedGrid { keys, row_hashes, fallback, graphemes, clusters, deco: deco_hasher.finish(), order }
 }
 
 pub struct TextLayer {
@@ -208,17 +479,13 @@ pub struct TextLayer {
     /// prepare on this layer).
     prepared: Option<PreparedGrid>,
     /// Per-frame scratch, reused so the frame path does not reallocate.
-    row_keys_scratch: Vec<u64>,
-    row_hash_scratch: Vec<u64>,
+    pack_scratch: PackScratch,
     row_slots_scratch: Vec<u32>,
     row_miss_scratch: Vec<usize>,
     row_index_scratch: FxHashMap<u64, u32>,
-    grapheme_cells_scratch: Vec<(f32, f32, usize, [u8; 3])>,
-    grapheme_sort_scratch: Vec<usize>,
-    /// Shaped grapheme-cluster buffers for `GridPaint::graphemes`, keyed by the
-    /// cluster (FIFO-bounded like `fallback_glyphs`).
-    grapheme_glyphs: std::collections::HashMap<Box<str>, Buffer>,
-    grapheme_order: std::collections::VecDeque<Box<str>>,
+    /// Shaped grapheme-cluster buffers for `GridPaint::graphemes` (bounded — see
+    /// `ClusterGlyphCache`).
+    clusters: ClusterGlyphCache,
     metrics: Metrics,
     cell_w: f32,
     cell_h: f32,
@@ -261,9 +528,6 @@ pub struct TextLayer {
     /// through a large CJK/emoji corpus can't accumulate shaped buffers without
     /// bound (F25). Chars visible in the current frame are never evicted.
     fallback_order: std::collections::VecDeque<char>,
-    /// Per-frame scratch: `(pixel_x, pixel_y, char, rgb)` for each cell drawn via the
-    /// overdraw path (missing glyph or double-width) and overdrawn from `fallback_glyphs`.
-    fallback_cells_scratch: Vec<(f32, f32, char, [u8; 3])>,
     /// Monotonic counter bumped whenever a change invalidates shaped grid content
     /// (font family, font size, resize): it drops the row cache and forces the next
     /// frame to re-prepare even when the grid text/colors are unchanged.
@@ -368,15 +632,11 @@ impl TextLayer {
             row_cache_gen: 0,
             frame_no: 0,
             prepared: None,
-            row_keys_scratch: Vec::new(),
-            row_hash_scratch: Vec::new(),
+            pack_scratch: PackScratch::default(),
             row_slots_scratch: Vec::new(),
             row_miss_scratch: Vec::new(),
             row_index_scratch: FxHashMap::default(),
-            grapheme_cells_scratch: Vec::new(),
-            grapheme_sort_scratch: Vec::new(),
-            grapheme_glyphs: std::collections::HashMap::new(),
-            grapheme_order: std::collections::VecDeque::new(),
+            clusters: ClusterGlyphCache::default(),
             metrics,
             cell_w,
             cell_h,
@@ -392,7 +652,6 @@ impl TextLayer {
             coverage_buffer,
             fallback_glyphs: std::collections::HashMap::new(),
             fallback_order: std::collections::VecDeque::new(),
-            fallback_cells_scratch: Vec::new(),
             shape_gen: 0,
             deco_rects: Vec::new(),
             deco_cache_key: None,
@@ -487,8 +746,7 @@ impl TextLayer {
         self.glyph_route.clear();
         self.fallback_glyphs.clear();
         self.fallback_order.clear();
-        self.grapheme_glyphs.clear();
-        self.grapheme_order.clear();
+        self.clusters.clear();
         // The shape-gen bump also drops every cached grid row: they are rebuilt with
         // the new family and its cell width as their monospace snap, so a
         // bold/italic run in the new family stays column-aligned.
@@ -564,8 +822,7 @@ impl TextLayer {
         // layer the grid rows are never built — chrome renders via overlay_buffers.
         self.fallback_glyphs.clear();
         self.fallback_order.clear();
-        self.grapheme_glyphs.clear();
-        self.grapheme_order.clear();
+        self.clusters.clear();
         self.shape_gen = self.shape_gen.wrapping_add(1);
     }
 
@@ -769,93 +1026,18 @@ impl TextLayer {
         let cell_h = self.cell_h;
         let (rows, cols) = (snapshot.rows, snapshot.cols);
 
-        // ---- 1. Pack every cell; fold decorations; collect overdraw cells. -------
-        let mut keys = std::mem::take(&mut self.row_keys_scratch);
-        keys.clear();
-        keys.reserve(rows * cols);
-        let mut row_hashes = std::mem::take(&mut self.row_hash_scratch);
-        row_hashes.clear();
-        // Cells whose glyph the primary font lacks or draws double-width: blanked in
-        // their row, overdrawn from their own buffer at the exact cell origin.
-        let mut fallback_cells = std::mem::take(&mut self.fallback_cells_scratch);
-        fallback_cells.clear();
-        // Cells drawn from a grapheme cluster: `(x, y, index into paint.graphemes, rgb)`.
-        let mut grapheme_cells = std::mem::take(&mut self.grapheme_cells_scratch);
-        grapheme_cells.clear();
-        // Grapheme overrides in row-major order, walked with a cursor alongside the
-        // cell loop (empty — the common case — means no sort and one compare/cell).
-        let mut g_order = std::mem::take(&mut self.grapheme_sort_scratch);
-        g_order.clear();
-        if !paint.graphemes.is_empty() {
-            g_order.extend(0..paint.graphemes.len());
-            g_order.sort_unstable_by_key(|&i| (paint.graphemes[i].0, paint.graphemes[i].1));
-        }
-        let g_pos = |i: usize| (paint.graphemes[i].0, paint.graphemes[i].1);
-        let mut g_next = 0usize;
-        let mut sel_memo: Option<([u8; 3], [u8; 3])> = None;
-        // Fingerprint for the underline/strike quads (folded in the SAME per-cell
-        // loop, so no extra pass): an underline-only change rebuilds decorations
-        // without forcing a re-shape.
-        let mut deco_hasher = FxHasher::default();
-
-        for row in 0..rows {
-            let mut h = FxHasher::default();
-            let mut inked = false;
-            for col in 0..cols {
-                let cell = snapshot.cell(row, col);
-                crate::quad::fold_decoration(&mut deco_hasher, cell);
-                let mut fg = cell.fg;
-                if cell.selected {
-                    if let Some(sel) = &paint.selection {
-                        fg = selected_glyph_fg(cell, sel, &mut sel_memo);
-                    }
-                }
-                if let Some((cr, cc, cursor_fg)) = paint.cursor_glyph {
-                    if cr == row && cc == col {
-                        fg = cursor_fg;
-                    }
-                }
-                // alacritty stores a literal '\t' in the cell at a tab stop (so
-                // copies preserve tabs); control chars have no glyph, so render
-                // them as blanks instead of routing them to the overdraw (tofu).
-                let mut ch = if cell.c.is_control() { ' ' } else { cell.c };
-                while g_next < g_order.len() && g_pos(g_order[g_next]) < (row, col) {
-                    g_next += 1;
-                }
-                if g_next < g_order.len() && g_pos(g_order[g_next]) == (row, col) {
-                    grapheme_cells.push((col as f32 * cell_w, row as f32 * cell_h, g_order[g_next], fg));
-                    ch = ' ';
-                } else if ch != ' ' && self.route(ch) == CellRoute::Overdraw {
-                    // A glyph the primary font lacks (tofu under Shaping::Basic, no
-                    // fallback) or draws double-width (a CJK glyph advances ~2 cells
-                    // and would shift the rest of the row): blank it here so the row
-                    // stays on the grid, overdraw the real glyph on top, aligned.
-                    // ASCII and blank cells skip the (cached) probe entirely.
-                    fallback_cells.push((col as f32 * cell_w, row as f32 * cell_h, ch, fg));
-                    ch = ' ';
-                }
-                inked |= ch != ' ';
-                let k = pack_cell(ch, fg, cell.shape_bits());
-                h.write_u64(k);
-                keys.push(k);
-            }
-            // 0 marks an all-blank row: no glyphs to shape or draw.
-            row_hashes.push(if inked { h.finish() | 1 } else { 0 });
-        }
+        // ---- 1. Pack every cell (pure; see `pack_grid`): keys, row hashes, the
+        // overdraw cells and the budgeted grapheme clusters, plus the decoration
+        // fingerprint.
+        let scratch = std::mem::take(&mut self.pack_scratch);
+        let packed = pack_grid(snapshot, paint, cell_w, cell_h, &mut |c| self.route(c), scratch);
 
         // ---- 2. Underline/strike quads: rebuilt only when their content, the cell
         // metrics or the grid offset changed. Grid dims are part of the key:
         // fold_decoration folds cells positionally by LINEAR index, so a
         // cell-count-preserving reflow (e.g. 80x24 -> 60x32) can fold identically
         // yet needs different rects.
-        let deco_key = (
-            deco_hasher.finish(),
-            cell_w.to_bits(),
-            cell_h.to_bits(),
-            top_offset.to_bits(),
-            cols as u32,
-            rows as u32,
-        );
+        let deco_key = (packed.deco, cell_w.to_bits(), cell_h.to_bits(), top_offset.to_bits(), cols as u32, rows as u32);
         if self.deco_cache_key != Some(deco_key) {
             self.deco_rects.clear();
             crate::quad::text_decoration_rects(snapshot, cell_w, cell_h, top_offset, &mut self.deco_rects);
@@ -873,25 +1055,25 @@ impl TextLayer {
                 && p.top_bits == top_offset.to_bits()
                 && p.rows == rows
                 && p.cols == cols
-                && p.keys == keys
-                && p.fallback == fallback_cells
-                && p.graphemes.len() == grapheme_cells.len()
-                && p.graphemes.iter().zip(&grapheme_cells).all(|(a, b)| {
-                    a.0 == b.0 && a.1 == b.1 && a.3 == b.3 && *a.2 == *paint.graphemes[b.2].2
-                })
+                && p.keys == packed.keys
+                && p.fallback == packed.fallback
+                && p.graphemes == packed.graphemes
+                && p.clusters.len() == packed.clusters.len()
+                && p.clusters.iter().zip(&packed.clusters).all(|(a, b)| **a == **b)
         });
 
         let mut result = Ok(());
+        let mut packed = packed;
         if !unchanged {
             // Whatever happens below, the renderer no longer holds a known grid.
             let mut p = self.prepared.take().unwrap_or_default();
-            let slots = self.shape_rows(rows, cols, &keys, &row_hashes);
-            self.ensure_overdraw_buffers(&fallback_cells, &grapheme_cells, paint);
+            let slots = self.shape_rows(rows, cols, &packed.keys, &packed.row_hashes);
+            self.ensure_overdraw_buffers(&packed.fallback, &packed.clusters);
 
             let win_bounds = TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 };
             let default_color = Color::rgb(220, 220, 220);
             let mut areas: Vec<TextArea> =
-                Vec::with_capacity(rows + fallback_cells.len() + grapheme_cells.len());
+                Vec::with_capacity(rows + packed.fallback.len() + packed.graphemes.len());
             for (r, &slot) in slots.iter().enumerate() {
                 if slot != NO_ROW {
                     areas.push(TextArea {
@@ -905,9 +1087,10 @@ impl TextLayer {
                     });
                 }
             }
-            // Overdraws: drawn ON TOP of their blanked cells, at the exact cell
-            // origin, in this same prepare() — so they never shift a neighbor.
-            for (x, y, c, rgb) in fallback_cells.iter() {
+            // Overdraws and clusters: drawn ON TOP of their blanked cells, at the
+            // exact cell origin, in this same prepare() — so they never shift a
+            // neighbor.
+            for (x, y, c, rgb) in packed.fallback.iter() {
                 if let Some(buffer) = self.fallback_glyphs.get(c) {
                     areas.push(TextArea {
                         buffer,
@@ -920,8 +1103,8 @@ impl TextLayer {
                     });
                 }
             }
-            for (x, y, gi, rgb) in grapheme_cells.iter() {
-                if let Some(buffer) = self.grapheme_glyphs.get(paint.graphemes[*gi].2) {
+            for (x, y, ci, rgb) in packed.graphemes.iter() {
+                if let Some(buffer) = self.clusters.get(packed.clusters[*ci as usize]) {
                     areas.push(TextArea {
                         buffer,
                         left: *x,
@@ -963,32 +1146,29 @@ impl TextLayer {
             self.row_slots_scratch = slots;
             if prepared.is_ok() {
                 // Remember exactly what the vertex buffer now holds. The key vectors
-                // are swapped, not copied: `keys` takes the previous allocation back
-                // as next frame's scratch.
+                // are swapped, not copied: `packed.keys` takes the previous
+                // allocation back as next frame's scratch. Cluster strings are
+                // copied: at most GRAPHEME_GLYPH_CAP × MAX_CLUSTER_BYTES.
                 p.shape_gen = self.shape_gen;
                 p.width = width;
                 p.height = height;
                 p.top_bits = top_offset.to_bits();
                 p.rows = rows;
                 p.cols = cols;
-                std::mem::swap(&mut p.keys, &mut keys);
+                std::mem::swap(&mut p.keys, &mut packed.keys);
                 p.fallback.clear();
-                p.fallback.extend_from_slice(&fallback_cells);
+                p.fallback.extend_from_slice(&packed.fallback);
                 p.graphemes.clear();
-                p.graphemes.extend(
-                    grapheme_cells.iter().map(|&(x, y, gi, rgb)| (x, y, Box::from(paint.graphemes[gi].2), rgb)),
-                );
+                p.graphemes.extend_from_slice(&packed.graphemes);
+                p.clusters.clear();
+                p.clusters.extend(packed.clusters.iter().map(|&c| Box::from(c)));
                 self.prepared = Some(p);
             }
             result = prepared;
         }
 
         // Return the scratch buffers for reuse next frame.
-        self.row_keys_scratch = keys;
-        self.row_hash_scratch = row_hashes;
-        self.fallback_cells_scratch = fallback_cells;
-        self.grapheme_cells_scratch = grapheme_cells;
-        self.grapheme_sort_scratch = g_order;
+        self.pack_scratch = packed.into_scratch();
         result
     }
 
@@ -1002,8 +1182,9 @@ impl TextLayer {
         }
         self.frame_no = self.frame_no.wrapping_add(1);
         let frame = self.frame_no;
-        // ~2 screens of rows: scrolling back over what was just on screen hits.
-        let cap = rows * 2 + 16;
+        // Every visible row plus up to one more screen of off-screen rows (within a
+        // byte budget), so scrolling back over what was just on screen hits.
+        let cap = row_cache_cap(rows, cols);
         if self.row_cache.len() > cap {
             self.row_cache.sort_unstable_by_key(|r| std::cmp::Reverse(r.last_used));
             self.row_cache.truncate(cap);
@@ -1135,57 +1316,42 @@ impl TextLayer {
         self.cell_ranges_scratch = runs;
     }
 
-    /// Shape each DISTINCT overdraw char / grapheme cluster once into a cached
-    /// buffer with `Shaping::Advanced`, so cosmic-text either falls back to a font
-    /// that HAS the glyph or uses the primary font's own double-width glyph (and
-    /// composes combining marks / emoji sequences). Cached across frames (cleared on
-    /// family/size change), so a char repeated across the grid — e.g. full-screen
-    /// CJK — shapes only once. Usually both lists are empty and this does nothing.
-    fn ensure_overdraw_buffers(
-        &mut self,
-        fallback_cells: &[(f32, f32, char, [u8; 3])],
-        grapheme_cells: &[(f32, f32, usize, [u8; 3])],
-        paint: &GridPaint,
-    ) {
-        if fallback_cells.is_empty() && grapheme_cells.is_empty() {
-            return;
-        }
-        let fam = Arc::clone(&self.font_family);
-        let metrics = self.metrics;
-        let attrs = Attrs::new().family(Family::Name(&fam));
-        for (_x, _y, c, _rgb) in fallback_cells {
-            if !self.fallback_glyphs.contains_key(c) {
-                let mut buf = Buffer::new(&mut self.font_system, metrics);
-                buf.set_size(&mut self.font_system, None, None);
-                let mut tmp = [0u8; 4];
-                buf.set_text(&mut self.font_system, c.encode_utf8(&mut tmp), &attrs, Shaping::Advanced, None);
-                self.fallback_glyphs.insert(*c, buf);
-                self.fallback_order.push_back(*c);
+    /// Shape each DISTINCT overdraw char once into a cached buffer with
+    /// `Shaping::Advanced`, so cosmic-text either falls back to a font that HAS the
+    /// glyph or uses the primary font's own double-width glyph — and likewise each
+    /// distinct grapheme cluster of this frame (`ClusterGlyphCache`, which also
+    /// composes combining marks / emoji sequences). Cached across frames (cleared
+    /// on family/size change), so a char repeated across the grid — e.g.
+    /// full-screen CJK — shapes only once. Usually both lists are empty and this
+    /// does nothing.
+    fn ensure_overdraw_buffers(&mut self, fallback_cells: &[(f32, f32, char, [u8; 3])], clusters: &[&str]) {
+        if !fallback_cells.is_empty() {
+            let fam = Arc::clone(&self.font_family);
+            let metrics = self.metrics;
+            let attrs = Attrs::new().family(Family::Name(&fam));
+            for (_x, _y, c, _rgb) in fallback_cells {
+                if !self.fallback_glyphs.contains_key(c) {
+                    let mut buf = Buffer::new(&mut self.font_system, metrics);
+                    buf.set_size(&mut self.font_system, None, None);
+                    let mut tmp = [0u8; 4];
+                    buf.set_text(&mut self.font_system, c.encode_utf8(&mut tmp), &attrs, Shaping::Advanced, None);
+                    self.fallback_glyphs.insert(*c, buf);
+                    self.fallback_order.push_back(*c);
+                }
+            }
+            // Evict the oldest cached buffers once the cache exceeds its cap, so a
+            // session scrolling through a large CJK/emoji corpus can't accumulate
+            // shaped buffers unbounded (F25). Never evict one drawn THIS frame. The
+            // cap sits well above any single frame's distinct count, so this only
+            // trims long-past entries and runs only when over cap.
+            if self.fallback_glyphs.len() > FALLBACK_GLYPH_CAP {
+                let drawn: rustc_hash::FxHashSet<char> = fallback_cells.iter().map(|(_, _, c, _)| *c).collect();
+                evict_fifo_cache(&mut self.fallback_glyphs, &mut self.fallback_order, |c| drawn.contains(c), FALLBACK_GLYPH_CAP);
             }
         }
-        for &(_x, _y, gi, _rgb) in grapheme_cells {
-            let cluster = paint.graphemes[gi].2;
-            if !self.grapheme_glyphs.contains_key(cluster) {
-                let mut buf = Buffer::new(&mut self.font_system, metrics);
-                buf.set_size(&mut self.font_system, None, None);
-                buf.set_text(&mut self.font_system, cluster, &attrs, Shaping::Advanced, None);
-                self.grapheme_glyphs.insert(Box::from(cluster), buf);
-                self.grapheme_order.push_back(Box::from(cluster));
-            }
-        }
-        // Evict the oldest cached buffers once a cache exceeds its cap, so a session
-        // scrolling through a large CJK/emoji corpus can't accumulate shaped buffers
-        // unbounded (F25). Never evict one drawn THIS frame. The caps sit well above
-        // any single frame's distinct count, so this only trims long-past entries
-        // and runs only when over cap.
-        if self.fallback_glyphs.len() > FALLBACK_GLYPH_CAP {
-            let visible: std::collections::HashSet<char> = fallback_cells.iter().map(|(_, _, c, _)| *c).collect();
-            evict_fifo_cache(&mut self.fallback_glyphs, &mut self.fallback_order, &visible, FALLBACK_GLYPH_CAP);
-        }
-        if self.grapheme_glyphs.len() > GRAPHEME_GLYPH_CAP {
-            let visible: std::collections::HashSet<Box<str>> =
-                grapheme_cells.iter().map(|&(_, _, gi, _)| Box::from(paint.graphemes[gi].2)).collect();
-            evict_fifo_cache(&mut self.grapheme_glyphs, &mut self.grapheme_order, &visible, GRAPHEME_GLYPH_CAP);
+        if !clusters.is_empty() {
+            let fam = Arc::clone(&self.font_family);
+            self.clusters.ensure(&mut self.font_system, self.metrics, &fam, clusters);
         }
     }
 
@@ -1440,6 +1606,153 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet, VecDeque};
 
+    /// A `cols × rows` grid of plain 'a'..'z' cells (no GPU, no fonts).
+    fn plain_grid(cols: usize, rows: usize) -> GridSnapshot {
+        let mut cells = vec![jetty_core::CellSnapshot::default(); cols * rows];
+        for (i, c) in cells.iter_mut().enumerate() {
+            c.c = (b'a' + (i % 26) as u8) as char;
+        }
+        GridSnapshot {
+            cols,
+            rows,
+            cells,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            bg_rgba: [0, 0, 0, 255],
+            cursor_rgb: [255, 255, 255],
+            scroll_offset: 0,
+            scroll_max: 0,
+            cursor_shape: Default::default(),
+        }
+    }
+
+    /// `base` + `marks` combining marks, made distinct per `id` by its first marks.
+    fn zalgo(base: char, id: usize, marks: usize) -> String {
+        let mut s = String::with_capacity(1 + marks * 2);
+        s.push(base);
+        // U+0300..U+036F: the combining diacritical marks block (112 marks).
+        s.push(char::from_u32(0x300 + (id % 112) as u32).unwrap());
+        s.push(char::from_u32(0x300 + (id / 112 % 112) as u32).unwrap());
+        for k in 0..marks.saturating_sub(2) {
+            s.push(char::from_u32(0x300 + (k % 112) as u32).unwrap());
+        }
+        s
+    }
+
+    #[test]
+    fn clamp_cluster_caps_marks_and_bytes_and_keeps_real_clusters() {
+        // Real clusters pass through untouched.
+        for real in ["e\u{301}", "c\u{327}", "\u{2764}\u{fe0f}", "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", "a"] {
+            assert_eq!(clamp_cluster(real), (real, real.chars().count()));
+        }
+        assert_eq!(clamp_cluster(""), ("", 0));
+        // Floods of 1/2/3/4-byte zero-width chars: a prefix with the base char and at
+        // most MAX_CLUSTER_MARKS marks, within MAX_CLUSTER_BYTES.
+        for mark in ['\u{200b}', '\u{301}', '\u{20d0}', '\u{e0100}'] {
+            let flood: String = std::iter::once('x').chain(std::iter::repeat_n(mark, 50_000)).collect();
+            let (kept, n) = clamp_cluster(&flood);
+            assert!(flood.starts_with(kept) && kept.starts_with('x'));
+            assert_eq!(n, kept.chars().count());
+            assert!(n <= 1 + MAX_CLUSTER_MARKS, "{n} chars kept");
+            assert!(kept.len() <= MAX_CLUSTER_BYTES, "{} bytes kept", kept.len());
+        }
+    }
+
+    #[test]
+    fn zalgo_flood_packs_in_bounded_work_and_memory() {
+        // A hostile frame: EVERY cell of a 240×70 grid carries a cluster of thousands
+        // of combining marks (the VT engine stores any number per cell). Packing
+        // must stay O(cells × cap): the clusters are clamped, at most
+        // GRAPHEME_GLYPH_CAP distinct ones and GRAPHEME_FRAME_CHARS chars are drawn,
+        // and a row's packed size never depends on what was stacked on its cells.
+        let (cols, rows) = (240, 70);
+        let snap = plain_grid(cols, rows);
+        let distinct: Vec<String> = (0..2048).map(|id| zalgo('e', id, 2_000)).collect();
+        // One 8 MB cluster shared by a whole row: if anything were O(cluster length)
+        // per cell, this alone would scan ~2 GB and the test would crawl.
+        let huge = zalgo('h', 0, 4_000_000);
+        let overrides: Vec<(usize, usize, &str)> = (0..rows * cols)
+            .map(|i| {
+                let (r, c) = (i / cols, i % cols);
+                let s: &str = if r == 5 { &huge } else { &distinct[i % distinct.len()] };
+                (r, c, s)
+            })
+            .collect();
+        let paint = GridPaint { graphemes: &overrides, ..Default::default() };
+        let t = std::time::Instant::now();
+        let packed = pack_grid(&snap, &paint, 10.0, 20.0, &mut |_| CellRoute::Inline, PackScratch::default());
+        let elapsed = t.elapsed();
+
+        assert!(packed.clusters.len() <= GRAPHEME_GLYPH_CAP, "{} distinct clusters", packed.clusters.len());
+        for c in &packed.clusters {
+            assert!(c.len() <= MAX_CLUSTER_BYTES && c.chars().count() <= 1 + MAX_CLUSTER_MARKS);
+        }
+        let drawn_chars: usize = packed
+            .graphemes
+            .iter()
+            .map(|&(_, _, ci, _)| packed.clusters[ci as usize].chars().count())
+            .sum();
+        assert!(drawn_chars <= GRAPHEME_FRAME_CHARS, "{drawn_chars} cluster chars drawn");
+        assert!(!packed.graphemes.is_empty(), "clusters within budget are still drawn");
+        // Row memory: one word per cell, whatever the clusters weigh.
+        assert_eq!(packed.keys.len(), rows * cols);
+        // Cluster-drawn cells pack as blanks; cells past the budget keep their base
+        // char (graceful: the text stays readable, only the marks are dropped).
+        let drawn: HashSet<(u32, u32)> =
+            packed.graphemes.iter().map(|&(x, y, _, _)| ((x / 10.0) as u32, (y / 20.0) as u32)).collect();
+        for (i, &k) in packed.keys.iter().enumerate() {
+            let (ch, _, _) = unpack_cell(k);
+            let at = ((i % cols) as u32, (i / cols) as u32);
+            if drawn.contains(&at) {
+                assert_eq!(ch, ' ');
+            } else {
+                assert_eq!(ch, snap.cells[i].c, "a cell past the budget draws its base char");
+            }
+        }
+        assert!(elapsed < std::time::Duration::from_secs(2), "packing a Zalgo flood took {elapsed:?}");
+    }
+
+    #[test]
+    fn cluster_glyph_cache_stays_bounded_under_a_zalgo_stream() {
+        // Frame after frame of brand-new hostile clusters (as `pack_grid` hands them
+        // over: clamped, ≤ GRAPHEME_GLYPH_CAP per frame). The cache must stay within
+        // its entry cap and its key bytes within cap × MAX_CLUSTER_BYTES (×2: the
+        // map and the FIFO each hold the key) — and still serve every cluster drawn
+        // in the current frame. Hermetic (no GPU, no font): the cached value records
+        // the char count that would be shaped, which the clamp bounds per entry.
+        let mut cache: ClusterGlyphCache<usize> = ClusterGlyphCache::default();
+        for frame in 0..6 {
+            let raw: Vec<String> =
+                (0..GRAPHEME_GLYPH_CAP).map(|i| zalgo('z', frame * GRAPHEME_GLYPH_CAP + i, 5_000)).collect();
+            let clusters: Vec<&str> = raw.iter().map(|s| clamp_cluster(s).0).collect();
+            cache.ensure_with(&clusters, |c| c.chars().count());
+            assert!(cache.map.values().all(|&n| n <= 1 + MAX_CLUSTER_MARKS), "each entry shapes ≤ the cap");
+            assert!(cache.map.len() <= GRAPHEME_GLYPH_CAP, "frame {frame}: {} entries", cache.map.len());
+            assert_eq!(cache.map.len(), cache.order.len(), "map and FIFO stay in sync");
+            assert!(cache.key_bytes() <= 2 * GRAPHEME_GLYPH_CAP * MAX_CLUSTER_BYTES);
+            assert!(clusters.iter().all(|c| cache.get(c).is_some()), "this frame's clusters are all served");
+        }
+    }
+
+    #[test]
+    fn row_cache_is_bounded_by_bytes_beyond_the_visible_rows() {
+        // Ordinary grids keep a whole extra screen (+16 rows) for scroll-back hits.
+        assert_eq!(row_cache_cap(40, 120), 2 * 40 + 16);
+        assert_eq!(row_cache_cap(70, 240), 2 * 70 + 16);
+        // Any grid, however huge: every visible row, and the off-screen extras within
+        // the byte budget.
+        for (rows, cols) in [(1, 1), (70, 240), (400, 1000), (2000, 4000), (5, 100_000)] {
+            let cap = row_cache_cap(rows, cols);
+            assert!(cap >= rows);
+            assert!((cap - rows) * cols * ROW_BYTES_PER_CELL <= ROW_CACHE_EXTRA_BYTES, "{rows}x{cols}");
+        }
+        // The per-cell estimate covers cosmic-text's real per-glyph records (shape +
+        // layout) plus the packed key word and up to 4 UTF-8 bytes of row text.
+        let real = std::mem::size_of::<glyphon::ShapeGlyph>() + std::mem::size_of::<glyphon::LayoutGlyph>() + 8 + 4;
+        assert!(ROW_BYTES_PER_CELL >= real, "ROW_BYTES_PER_CELL {ROW_BYTES_PER_CELL} < {real}");
+    }
+
     #[test]
     fn evict_fifo_bounds_map_and_keeps_visible() {
         // Regression (F25): the fallback-glyph cache must stay bounded, evicting
@@ -1454,7 +1767,7 @@ mod tests {
         }
         // 'a' and 'b' are the oldest but 'a' is visible this frame → keep it.
         let visible: HashSet<char> = ['a', 'z'].into_iter().collect();
-        evict_fifo_cache(&mut map, &mut order, &visible, 6);
+        evict_fifo_cache(&mut map, &mut order, |k| visible.contains(k), 6);
         assert!(map.len() <= 6, "map bounded to cap; got {}", map.len());
         assert!(map.contains_key(&'a'), "visible 'a' must survive eviction");
         assert!(!map.contains_key(&'b'), "oldest non-visible 'b' evicted");
@@ -1464,8 +1777,8 @@ mod tests {
     fn evict_fifo_noop_under_cap() {
         let mut map: HashMap<char, ()> = "abc".chars().map(|c| (c, ())).collect();
         let mut order: VecDeque<char> = "abc".chars().collect();
-        let visible = HashSet::new();
-        evict_fifo_cache(&mut map, &mut order, &visible, 10);
+        let visible: HashSet<char> = HashSet::new();
+        evict_fifo_cache(&mut map, &mut order, |k| visible.contains(k), 10);
         assert_eq!(map.len(), 3, "no eviction while under cap");
     }
 
@@ -1477,7 +1790,7 @@ mod tests {
         let mut map: HashMap<char, ()> = "abcde".chars().map(|c| (c, ())).collect();
         let mut order: VecDeque<char> = "abcde".chars().collect();
         let visible: HashSet<char> = "abcde".chars().collect();
-        evict_fifo_cache(&mut map, &mut order, &visible, 2);
+        evict_fifo_cache(&mut map, &mut order, |k| visible.contains(k), 2);
         assert_eq!(map.len(), 5, "all-visible entries are retained, no hang");
         assert_eq!(order.len(), 5, "order queue preserved");
     }
