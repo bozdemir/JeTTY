@@ -138,7 +138,8 @@
 ///                    JETTY_SHOT_PANEL_COLLAPSE=<section id,...>,
 ///                    JETTY_SHOT_PANEL_FOCUS=<control id> (a deep link: its tab,
 ///                    scrolled to it, highlighted), JETTY_SHOT_PANEL_RESET=
-///                    armed|ready|disabled, JETTY_SHOT_PANEL_SESSION=1 (a gallery
+///                    armed|ready|disabled, JETTY_SHOT_PANEL_PRESET=<id> (an effects
+///                    preset on the panel config only), JETTY_SHOT_PANEL_SESSION=1 (a gallery
 ///                    browsing session's footer hint).
 ///   JETTY_SHOT_COPYMODE="row,col" — copy-mode self-test: draw the keyboard cursor
 ///                    (hollow box) + the "COPY" pill at (row,col). With
@@ -338,6 +339,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Ok(v) = std::env::var("JETTY_SHOT_UI_FONT") {
             cfg.ui_font_family = v;
+        }
+        // An effects preset applied to the PANEL's config only (it lights its
+        // chip) — unlike JETTY_SHOT_PRESET, no CRT pass runs over the shot.
+        if let Some(p) = var("JETTY_SHOT_PANEL_PRESET").and_then(|n| jetty_app::effects::find_preset(&n)) {
+            p.patch.apply_to(&mut cfg.effects);
         }
         cfg
     });

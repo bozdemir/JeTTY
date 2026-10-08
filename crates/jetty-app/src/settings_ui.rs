@@ -144,6 +144,10 @@ pub enum Kind {
     Rgb,
     /// Independent on/off chips, one bit each.
     Chips { labels: &'static [&'static str] },
+    /// Named looks applied as a whole (a wrapping chip row). `get` returns the
+    /// index of the preset the config matches (`u64::MAX` = none: "Custom");
+    /// `set` applies preset `i`.
+    Presets { names: fn() -> Vec<&'static str> },
     List { src: ListSrc, rows: usize },
     /// The theme gallery (its own clicks / keys, see `App::gallery_*`).
     Gallery,
@@ -247,14 +251,14 @@ pub static SECTIONS: &[Section] = &[
         master: Some("notify_on_command_finish"),
         hint: Some("Notify on finish while hidden"),
     },
-    // Hook: effect presets (Clean, Retro CRT, Amber, Green Phosphor, Neon, Paper, E-ink).
+    // Effect presets (Clean, Retro CRT, Amber, Green Phosphor, Neon, Paper, E-ink).
     Section { id: "fx.presets", tab: EFFECTS, title: "Presets", ..Section::DEFAULT },
     Section { id: "fx.crt", tab: EFFECTS, title: "CRT", master: Some("effects.crt_enabled"), ..Section::DEFAULT },
     Section { id: "fx.caret", tab: EFFECTS, title: "Caret", ..Section::DEFAULT },
     // Hook: cursor shape, thickness, unfocused style, color, guide, trail.
     Section { id: "fx.cursor", tab: EFFECTS, title: "Cursor", ..Section::DEFAULT },
-    // Hook: visual bell, command pulse, glitch.
-    Section { id: "fx.bell", tab: EFFECTS, title: "Bell & pulse", ..Section::DEFAULT },
+    // The glitch (hook: visual bell, command pulse).
+    Section { id: "fx.bell", tab: EFFECTS, title: "Alerts", ..Section::DEFAULT },
 ];
 
 // ── get / set helpers for `Desc` literals ─────────────────────────────────────
@@ -377,6 +381,18 @@ fn light_theme_choices() -> Vec<(String, String)> {
 /// The light theme only shows while following the system (still settable).
 fn light_theme_state(c: &Config, _: &Ctx) -> RowState {
     if c.follow_system_theme { RowState::Normal } else { RowState::Dimmed }
+}
+
+/// Phosphor rows matter only with a phosphor (the color: only for "custom").
+fn phosphor_hue_state(c: &Config, _: &Ctx) -> RowState {
+    if c.effects.crt_phosphor == crate::config::PhosphorMode::Off { RowState::Dimmed } else { RowState::Normal }
+}
+fn phosphor_color_state(c: &Config, _: &Ctx) -> RowState {
+    if c.effects.crt_phosphor == crate::config::PhosphorMode::Custom { RowState::Normal } else { RowState::Dimmed }
+}
+/// Animating the grain does nothing without grain.
+fn grain_animate_state(c: &Config, _: &Ctx) -> RowState {
+    if c.effects.crt_grain > 0.0 { RowState::Normal } else { RowState::Dimmed }
 }
 
 /// The dropdown sliders do nothing outside Dropdown mode or while the main
@@ -788,6 +804,25 @@ pub static DESCS: &[Desc] = &[
     },
     // ── Effects ───────────────────────────────────────────────────────────────
     Desc {
+        id: "effects.preset",
+        tab: EFFECTS,
+        section: "fx.presets",
+        label: "Preset",
+        kind: Kind::Presets { names: || crate::effects::effect_presets().iter().map(|p| p.name).collect() },
+        get: |c| {
+            let i = crate::effects::active_preset(&c.effects)
+                .and_then(|a| crate::effects::effect_presets().iter().position(|p| p.id == a.id));
+            Val::U(i.map_or(u64::MAX, |i| i as u64))
+        },
+        set: |c, v| {
+            if let Some(p) = usize::try_from(v.u()).ok().and_then(|i| crate::effects::effect_presets().get(i)) {
+                p.patch.apply_to(&mut c.effects);
+            }
+        },
+        reset: false,
+        ..Desc::DEFAULT
+    },
+    Desc {
         id: "effects.crt_enabled",
         tab: EFFECTS,
         section: "fx.crt",
@@ -838,6 +873,16 @@ pub static DESCS: &[Desc] = &[
         ..Desc::DEFAULT
     },
     Desc {
+        id: "effects.crt_bloom_radius",
+        tab: EFFECTS,
+        section: "fx.crt",
+        label: "Bloom radius",
+        kind: PCT,
+        get: get_f!(effects.crt_bloom_radius),
+        set: set_f!(effects.crt_bloom_radius),
+        ..Desc::DEFAULT
+    },
+    Desc {
         id: "effects.crt_chromatic",
         tab: EFFECTS,
         section: "fx.crt",
@@ -855,6 +900,81 @@ pub static DESCS: &[Desc] = &[
         kind: PCT,
         get: get_f!(effects.crt_vignette),
         set: set_f!(effects.crt_vignette),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "effects.crt_grain",
+        tab: EFFECTS,
+        section: "fx.crt",
+        label: "Grain",
+        kind: PCT,
+        get: get_f!(effects.crt_grain),
+        set: set_f!(effects.crt_grain),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "effects.crt_grain_animate",
+        tab: EFFECTS,
+        section: "fx.crt",
+        label: "Animate grain",
+        kind: Kind::Toggle,
+        get: get_b!(effects.crt_grain_animate),
+        set: set_b!(effects.crt_grain_animate),
+        state: Some(grain_animate_state),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "effects.crt_phosphor",
+        tab: EFFECTS,
+        section: "fx.crt",
+        label: "Phosphor",
+        kind: Kind::Choice {
+            options: |_| {
+                crate::config::PhosphorMode::ALL
+                    .iter()
+                    .map(|m| (m.display_name().to_ascii_lowercase(), m.display_name().to_string()))
+                    .collect()
+            },
+        },
+        get: |c| Val::S(c.effects.crt_phosphor.display_name().to_ascii_lowercase()),
+        set: |c, v| {
+            if let Val::S(x) = v {
+                c.effects.crt_phosphor = crate::config::PhosphorMode::from_name(&x).unwrap_or_default();
+            }
+        },
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "effects.crt_phosphor_color",
+        tab: EFFECTS,
+        section: "fx.crt",
+        label: "Phosphor color",
+        kind: Kind::Rgb,
+        get: get_rgb!(effects.crt_phosphor_color),
+        set: set_rgb!(effects.crt_phosphor_color),
+        hint: Some("Used by the Custom phosphor"),
+        state: Some(phosphor_color_state),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "effects.crt_phosphor_hue",
+        tab: EFFECTS,
+        section: "fx.crt",
+        label: "Keep colors",
+        kind: PCT,
+        get: get_f!(effects.crt_phosphor_hue),
+        set: set_f!(effects.crt_phosphor_hue),
+        state: Some(phosphor_hue_state),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "effects.crt_dither",
+        tab: EFFECTS,
+        section: "fx.crt",
+        label: "1-bit dither",
+        kind: Kind::Toggle,
+        get: get_b!(effects.crt_dither),
+        set: set_b!(effects.crt_dither),
         ..Desc::DEFAULT
     },
     Desc {
@@ -884,6 +1004,16 @@ pub static DESCS: &[Desc] = &[
                 c.effects.crt_jitter = b & 4 != 0;
             }
         },
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "effects.animate_unfocused",
+        tab: EFFECTS,
+        section: "fx.crt",
+        label: "Animate when unfocused",
+        kind: Kind::Toggle,
+        get: get_b!(effects.animate_unfocused),
+        set: set_b!(effects.animate_unfocused),
         ..Desc::DEFAULT
     },
     Desc {
@@ -924,6 +1054,22 @@ pub static DESCS: &[Desc] = &[
         kind: Kind::Rgb,
         get: get_rgb!(effects.caret_flash_color),
         set: set_rgb!(effects.caret_flash_color),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "effects.glitch",
+        tab: EFFECTS,
+        section: "fx.bell",
+        label: "Glitch on",
+        kind: Kind::Chips { labels: &["Failure", "Bell"] },
+        get: |c| Val::Bits(c.effects.glitch_on_error as u32 | (c.effects.glitch_on_bell as u32) << 1),
+        set: |c, v| {
+            if let Val::Bits(b) = v {
+                c.effects.glitch_on_error = b & 1 != 0;
+                c.effects.glitch_on_bell = b & 2 != 0;
+            }
+        },
+        hint: Some("Color split on a failure or the bell"),
         ..Desc::DEFAULT
     },
 ];
@@ -1036,6 +1182,14 @@ fn row_for(d: &Desc, cfg: &Config, ctx: &Ctx, master_off: bool) -> PanelItem {
         Kind::Chips { labels } => CtlShow::Chips(
             labels.iter().enumerate().map(|(i, l)| (l.to_string(), v.bits() & (1 << i) != 0)).collect(),
         ),
+        Kind::Presets { names } => {
+            let names = names();
+            let active = usize::try_from(v.u()).ok().filter(|&i| i < names.len());
+            CtlShow::ChipFlow {
+                chips: names.iter().enumerate().map(|(i, n)| (n.to_string(), Some(i) == active)).collect(),
+                status: active.map_or_else(|| "Custom".to_string(), |i| names[i].to_string()),
+            }
+        }
         Kind::List { src, rows } => {
             let (items, offset, shown) = list_src(*src, ctx);
             let offset = offset.min(items.len().saturating_sub(*rows));
@@ -1128,6 +1282,7 @@ pub fn press(d: &Desc, part: CtlPart, cfg: &Config, ctx: &Ctx) -> Press {
         (Kind::Chips { labels }, CtlPart::Chip(i)) if (i as usize) < labels.len() => {
             Press::Set(Val::Bits(v.bits() ^ (1 << i)))
         }
+        (Kind::Presets { names }, CtlPart::Chip(i)) if (i as usize) < names().len() => Press::Set(Val::U(i as u64)),
         (Kind::List { src, .. }, CtlPart::Row(i)) => {
             let (items, _, _) = list_src(*src, ctx);
             list_value(*src, items, i).map_or(Press::Nothing, |s| Press::Set(Val::S(s)))
@@ -1320,6 +1475,7 @@ mod tests {
                 Kind::Stepper { min, .. } => Val::F(*min),
                 Kind::Rgb => Val::Rgb([0.25, 0.5, 0.75]),
                 Kind::Chips { .. } => Val::Bits(v.bits() ^ 1),
+                Kind::Presets { .. } => Val::U(1),
                 Kind::List { .. } | Kind::Gallery => Val::S("Something Else".into()),
                 Kind::Specimen => unreachable!(),
             };

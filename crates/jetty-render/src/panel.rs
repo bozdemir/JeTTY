@@ -82,6 +82,9 @@ pub enum CtlShow {
     Rgb([f32; 3]),
     /// A row of independent on/off chips: `(label, on)`.
     Chips(Vec<(String, bool)>),
+    /// A wrapping row of choice chips (`(label, lit)`, e.g. effect presets)
+    /// under the label, with a status readout right of the label ("Custom").
+    ChipFlow { chips: Vec<(String, bool)>, status: String },
     /// A scrolling list: the VISIBLE items (`items[i]` is item `offset + i`),
     /// the total item count, the selected item (absolute index) and how many
     /// rows the list shows at once.
@@ -444,6 +447,9 @@ const RESET_W: f32 = 64.0;
 /// Chips.
 const CHIP_W_MIN: f32 = 72.0;
 const CHIP_H: f32 = 24.0;
+/// Chip-flow rows: the narrowest chip, and the gap between chips and lines.
+const CHIP_FLOW_MIN_W: f32 = 56.0;
+const CHIP_FLOW_GAP: f32 = 8.0;
 /// RGB rows: the gap between the three channel sliders, the room for each
 /// channel letter, and the color swatch beside the label.
 const MINI_GAP: f32 = 16.0;
@@ -704,6 +710,10 @@ impl Lay<'_> {
             CtlShow::Slider { .. } => SLIDER_PITCH,
             CtlShow::Rgb(_) => RGB_PITCH,
             CtlShow::List { rows, .. } => 24.0 + list_card_h(*rows) + 16.0,
+            CtlShow::ChipFlow { chips, .. } => {
+                let lines = self.chip_flow_lines(chips).len().max(1) as f32;
+                24.0 + lines * (CHIP_H + CHIP_FLOW_GAP) + 8.0
+            }
             _ => ROW_PITCH,
         } + if row.hint.is_some() { HINT_H } else { 0.0 };
         if self.focus == Some(row.id) {
@@ -717,6 +727,7 @@ impl Lay<'_> {
             CtlShow::Stepper(v) => self.stepper(y, row, v),
             CtlShow::Rgb(v) => self.rgb(y, row, *v),
             CtlShow::Chips(chips) => self.chips(y, row, chips),
+            CtlShow::ChipFlow { chips, status } => self.chip_flow(y, row, chips, status),
             CtlShow::List { items, offset, total, selected, rows } => {
                 self.list(y, row, items, *offset, *total, *selected, *rows)
             }
@@ -726,6 +737,10 @@ impl Lay<'_> {
                 CtlShow::Slider { .. } => y + 44.0,
                 CtlShow::Rgb(_) => y + 42.0,
                 CtlShow::List { rows, .. } => y + 24.0 + list_card_h(*rows) + 4.0,
+                CtlShow::ChipFlow { chips, .. } => {
+                    let lines = self.chip_flow_lines(chips).len().max(1) as f32;
+                    y + 24.0 + lines * (CHIP_H + CHIP_FLOW_GAP) + 2.0
+                }
                 _ => y + CTL_H + 5.0,
             };
             let s = self.fit(hint, self.cw);
@@ -891,6 +906,50 @@ impl Lay<'_> {
             self.label(shown, tx, y + 2.0 + 4.0, tc);
             if self.live(row) {
                 self.hit(r, PanelHit::Ctl { id: row.id, part: CtlPart::Chip(i as u8) });
+            }
+        }
+    }
+
+    /// The chips of a chip-flow row split into lines that fit the content
+    /// width: per line, `(chip index, x offset, width)`.
+    fn chip_flow_lines(&mut self, chips: &[(String, bool)]) -> Vec<Vec<(usize, f32, f32)>> {
+        let mut lines: Vec<Vec<(usize, f32, f32)>> = Vec::new();
+        let mut x = 0.0;
+        for (i, (t, _)) in chips.iter().enumerate() {
+            let w = (self.tw(t) + 24.0).clamp(CHIP_FLOW_MIN_W, self.cw);
+            if lines.is_empty() || (x > 0.0 && x + w > self.cw) {
+                lines.push(Vec::new());
+                x = 0.0;
+            }
+            lines.last_mut().expect("a line").push((i, x, w));
+            x += w + CHIP_FLOW_GAP;
+        }
+        lines
+    }
+
+    /// The label (and its status readout) on line 1; the choice chips flow
+    /// below, wrapping to the content width.
+    fn chip_flow(&mut self, y: f32, row: &CtlRow, chips: &[(String, bool)], status: &str) {
+        let c = self.c;
+        let st = row.state;
+        let status_w = self.tw(status);
+        self.row_label(row, y, self.right() - status_w);
+        let sc = c.label(st);
+        self.label(status.to_string(), self.right() - status_w, y, sc);
+        for (line, items) in self.chip_flow_lines(chips).into_iter().enumerate() {
+            let cy = y + 24.0 + line as f32 * (CHIP_H + CHIP_FLOW_GAP);
+            for (i, dx, w) in items {
+                let (t, on) = &chips[i];
+                let x = self.x0 + dx;
+                let r = Rect::rounded(x, cy, w, CHIP_H, if *on { c.accent } else { c.ctl }, CHIP_H / 2.0);
+                self.quad(faded(r, st));
+                let shown = self.fit(t, w - 8.0);
+                let tx = x + ((w - self.tw(&shown)) * 0.5).max(0.0);
+                let tc = if *on { c.ui.on_accent } else { c.label(st) };
+                self.label(shown, tx, cy + 4.0, tc);
+                if self.live(row) {
+                    self.hit(r, PanelHit::Ctl { id: row.id, part: CtlPart::Chip(i.min(255) as u8) });
+                }
             }
         }
     }
@@ -1298,6 +1357,18 @@ mod tests {
                 "Animate",
                 CtlShow::Chips(vec![("Roll".into(), true), ("Flicker".into(), false), ("Jitter".into(), false)]),
             ),
+            row(
+                "presets",
+                "Preset",
+                CtlShow::ChipFlow {
+                    chips: ["Clean", "Retro CRT", "Amber", "Green Phosphor", "Neon", "Paper", "E-ink"]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| (n.to_string(), i == 1))
+                        .collect(),
+                    status: "Retro CRT".into(),
+                },
+            ),
             PanelItem::Section { id: "s.two", title: "Lists".into(), master: None, collapsed: false, hint: None },
             row(
                 "list",
@@ -1451,6 +1522,8 @@ mod tests {
             ("rgb", CtlPart::Channel(0)),
             ("rgb", CtlPart::Channel(2)),
             ("chips", CtlPart::Chip(1)),
+            ("presets", CtlPart::Chip(0)),
+            ("presets", CtlPart::Chip(6)),
             ("list", CtlPart::Row(1)),
             ("list", CtlPart::ScrollUp),
             ("list", CtlPart::ScrollDown),

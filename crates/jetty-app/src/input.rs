@@ -3125,8 +3125,20 @@ mod tests {
             (4, "effects.crt_enabled", CtlPart::Switch),
             (4, "effects.crt_curvature", CtlPart::Track),
             (4, "effects.crt_animate", CtlPart::Chip(2)),
+            (4, "effects.preset", CtlPart::Chip(3)),
+            (4, "effects.crt_phosphor", CtlPart::Next),
+            (4, "effects.glitch", CtlPart::Chip(1)),
+            (0, "tab_style", CtlPart::Next),
+            (0, "follow_system_theme", CtlPart::Switch),
+            (0, "minimum_contrast", CtlPart::Track),
+            (1, "line_height", CtlPart::Track),
+            (2, "scrollbar", CtlPart::Prev),
+            (2, "padding_x", CtlPart::Track),
         ] {
-            let pv = settings_view(tab, 0.0);
+            // Scroll the control's row to the top of the viewport first (a
+            // section's master switch sits in its header: no row of its own).
+            let top = settings_view(tab, 0.0).geom.anchor(id).map_or(0.0, |a| a.0);
+            let pv = settings_view(tab, top);
             let g = &pv.geom;
             let r = g
                 .rect_of(PanelHit::Ctl { id, part })

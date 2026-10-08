@@ -799,15 +799,14 @@ fn effects_panel_geom_scrolled() -> jetty_render::PanelGeom {
     make_panel_geom_tab_scroll(4, 1.0e9)
 }
 
-/// Click control part `(id, part)` on whichever Effects view shows it fully.
+/// Click control part `(id, part)` with its row scrolled to the top of the
+/// Effects viewport (a section's master switch: the tab's top).
 fn click_fx(id: &'static str, part: jetty_render::CtlPart) -> MouseAction {
-    for g in [effects_panel_geom(), effects_panel_geom_scrolled()] {
-        let r = ctl_rect(&g, id, part);
-        if r.y >= g.content_top && r.y + r.h <= g.content_bottom {
-            return click(&g, &r);
-        }
-    }
-    panic!("{id} {part:?} is never fully in view");
+    let top = effects_panel_geom().anchor(id).map_or(0.0, |a| a.0);
+    let g = make_panel_geom_tab_scroll(4, top);
+    let r = ctl_rect(&g, id, part);
+    assert!(r.y >= g.content_top && r.y + r.h <= g.content_bottom, "{id} {part:?} not in view");
+    click(&g, &r)
 }
 
 #[test]
