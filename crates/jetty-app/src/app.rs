@@ -4098,48 +4098,19 @@ impl App {
     /// Paste `text` into `tab`'s PTY (bracketed when the app enabled it).
     /// Shared by the main window's paste paths and the detached windows'
     /// context-menu / Ctrl+Shift+V paste, so all windows paste identically.
+    /// The wire bytes — control characters stripped (no `^C` can split a paste
+    /// into typed commands, no ESC can forge the end marker), line breaks
+    /// normalized — come from the pure, unit-tested `runsel::paste_bytes`.
     fn paste_to_tab(tab: &mut Tab, text: &str) {
-        if text.is_empty() {
+        let bytes = crate::runsel::paste_bytes(text, tab.terminal.bracketed_paste());
+        if bytes.is_empty() {
             return;
         }
         // A user paste claims the prompt — cancel any staged run-selection
         // inject for this tab (same rule as write_key_to_pty).
         crate::runsel::cancel_on_user_write(&mut tab.pending_inject);
-        let bracketed = tab.terminal.bracketed_paste();
-        let w = &mut tab.writer;
-        if bracketed {
-            // Strip any embedded end-paste marker (ESC[201~) from the payload so
-            // pasted content can never terminate the bracketed-paste guard early
-            // and inject the remainder as typed commands (the classic paste
-            // injection; xterm/iTerm2/alacritty all do this).
-            let clean = Self::strip_paste_end(text.as_bytes());
-            let _ = w.write_all(b"\x1b[200~");
-            let _ = w.write_all(&clean);
-            let _ = w.write_all(b"\x1b[201~");
-        } else {
-            let _ = w.write_all(text.as_bytes());
-        }
-        let _ = w.flush();
-    }
-
-    /// Remove every embedded bracketed-paste END marker (`ESC[201~`) from
-    /// `bytes`. Borrows unchanged when the marker is absent (the common case),
-    /// so a normal paste pays no allocation. Checks the OUTPUT tail after each
-    /// byte so a marker cannot re-form across a removed one (e.g. the crafted
-    /// `ESC[2` + `ESC[201~` + `01~`).
-    fn strip_paste_end(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-        const END: &[u8] = b"\x1b[201~";
-        if bytes.len() < END.len() || !bytes.windows(END.len()).any(|w| w == END) {
-            return std::borrow::Cow::Borrowed(bytes);
-        }
-        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-        for &b in bytes {
-            out.push(b);
-            if out.ends_with(END) {
-                out.truncate(out.len() - END.len());
-            }
-        }
-        std::borrow::Cow::Owned(out)
+        let _ = tab.writer.write_all(&bytes);
+        let _ = tab.writer.flush();
     }
 
     /// Run the current selection in a NEW tab — the browser's "open link in a
@@ -12689,46 +12660,6 @@ mod url_open_tests {
         // Scheme must be a PREFIX, and multibyte text can't panic the check.
         assert!(!url_scheme_allowed("xhttps://example.com"));
         assert!(!url_scheme_allowed("héllo→"));
-    }
-}
-
-#[cfg(test)]
-mod paste_sanitize_tests {
-    use super::App;
-
-    #[test]
-    fn plain_text_borrows_unchanged() {
-        let s = "echo hello\nworld\t!";
-        let out = App::strip_paste_end(s.as_bytes());
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(&*out, s.as_bytes());
-    }
-
-    #[test]
-    fn embedded_end_marker_is_removed() {
-        // The classic injection: an ESC[201~ in the payload would otherwise
-        // terminate the bracketed-paste guard and run the rest as commands.
-        let out = App::strip_paste_end(b"a\x1b[201~rm -rf ~\n");
-        assert_eq!(&*out, b"arm -rf ~\n");
-        assert!(!contains(&out, b"\x1b[201~"));
-    }
-
-    #[test]
-    fn reformed_marker_across_removal_is_defeated() {
-        // Crafted so a naive single-pass removal would re-form ESC[201~ by
-        // concatenating the surrounding bytes.
-        let out = App::strip_paste_end(b"\x1b[2\x1b[201~01~");
-        assert!(!contains(&out, b"\x1b[201~"));
-    }
-
-    #[test]
-    fn multiple_markers_all_removed() {
-        let out = App::strip_paste_end(b"\x1b[201~x\x1b[201~y\x1b[201~");
-        assert_eq!(&*out, b"xy");
-    }
-
-    fn contains(hay: &[u8], needle: &[u8]) -> bool {
-        hay.windows(needle.len()).any(|w| w == needle)
     }
 }
 
