@@ -5527,6 +5527,10 @@ impl App {
                     self.toggle_settings_window(event_loop);
                 }
             }
+            C::ApplyLook(i) => {
+                self.apply_look(i);
+                reveal_main(self, event_loop);
+            }
             C::SettingsAt(id) => {
                 // "Settings › Effects › Bloom": open Settings at that control.
                 if self.settings_window.is_none() {
@@ -8591,6 +8595,7 @@ impl App {
             font_offset: self.font_scroll_offset,
             ui_font_offset: self.ui_font_scroll_offset,
             backdrop_images: &self.backdrop_images,
+            shown_theme: &self.active_theme.name,
             collapsed: &self.settings_collapsed,
             drag: self.ctl_drag.as_ref().and_then(|d| d.pending.as_ref().map(|v| (d.id, v))),
         }
@@ -8791,8 +8796,24 @@ impl App {
                 self.settings_drag_to(self.settings_cursor.0 as f32);
             }
             Press::Scroll(n) => self.scroll_list(d, n),
+            Press::Look(i) => self.apply_look(i),
             Press::Nothing => {}
         }
+    }
+
+    /// Apply look `settings_ui::LOOKS[i]` (a Settings chip, a palette entry):
+    /// its keys through the config path, its theme through the slot-aware pick
+    /// (the light slot while following a light system), then one save.
+    fn apply_look(&mut self, i: usize) {
+        let Some(look) = crate::settings_ui::LOOKS.get(i) else { return };
+        self.apply_settings_change(|c| crate::settings_ui::apply_look_keys(c, look));
+        if let Some(idx) = look.theme.and_then(jetty_core::theme_index) {
+            if idx != self.theme_idx || jetty_core::theme_at(idx).name != self.active_theme.name {
+                self.pick_theme(idx);
+            }
+        }
+        self.persist();
+        self.request_settings_paint();
     }
 
     /// Move the dragged Settings control to the pointer at `cx`: a live control

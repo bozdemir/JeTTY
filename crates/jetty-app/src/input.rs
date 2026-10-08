@@ -3134,6 +3134,12 @@ mod tests {
             (1, "line_height", CtlPart::Track),
             (2, "scrollbar", CtlPart::Prev),
             (2, "padding_x", CtlPart::Track),
+            (0, "look", CtlPart::Chip(2)),
+            (2, "reduce_motion", CtlPart::Next),
+            (4, "cursor.shape", CtlPart::Next),
+            (4, "cursor.trail", CtlPart::Switch),
+            (4, "visual_bell", CtlPart::Prev),
+            (4, "command_pulse", CtlPart::Next),
         ] {
             // Scroll the control's row to the top of the viewport first (a
             // section's master switch sits in its header: no row of its own).

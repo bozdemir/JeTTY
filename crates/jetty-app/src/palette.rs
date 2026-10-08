@@ -89,6 +89,9 @@ pub enum PaletteCmd {
     SetTabColor(Option<u8>),
     /// Open Settings at a control ("Settings › Effects › Bloom"), by its id.
     SettingsAt(&'static str),
+    /// Apply a look (`settings_ui::LOOKS[i]`): theme, effects, backdrop,
+    /// summon and cursor in one go.
+    ApplyLook(usize),
     /// Change the `[backdrop]` look (see [`backdrop_entries`]).
     SetBackdrop(BackdropPick),
 }
@@ -310,6 +313,14 @@ pub fn build_registry(
     ];
     for (title, keywords, cmd) in theme_ux {
         v.push(PaletteEntry { title: title.to_string(), keywords, cmd });
+    }
+    // One-click looks (theme + effects + backdrop + summon + cursor).
+    for (i, look) in crate::settings_ui::LOOKS.iter().enumerate() {
+        v.push(PaletteEntry {
+            title: format!("Look: {}", look.name),
+            keywords: "look bundle style showcase theme effects backdrop crt",
+            cmd: PaletteCmd::ApplyLook(i),
+        });
     }
     for (i, (_name, display)) in themes.iter().enumerate() {
         v.push(PaletteEntry {

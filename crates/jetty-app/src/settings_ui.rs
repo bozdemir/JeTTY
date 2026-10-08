@@ -94,6 +94,9 @@ pub struct Ctx<'a> {
     /// The image files in `<config dir>/backgrounds/` (the backdrop picker),
     /// listed when Settings opens — never per frame.
     pub backdrop_images: &'a [String],
+    /// The theme on screen (its id) — what a look's theme is compared with
+    /// (the light slot may be showing).
+    pub shown_theme: &'a str,
     /// Collapsed section ids.
     pub collapsed: &'a [&'static str],
     /// A drag that applies on release: `(control, value so far)` — shown in
@@ -114,6 +117,7 @@ impl Ctx<'_> {
             font_offset: 0,
             ui_font_offset: 0,
             backdrop_images: &[],
+            shown_theme: "",
             collapsed: &[],
             drag: None,
         }
@@ -148,6 +152,9 @@ pub enum Kind {
     Rgb,
     /// Independent on/off chips, one bit each.
     Chips { labels: &'static [&'static str] },
+    /// The [`LOOKS`] (a wrapping chip row; a click is `Press::Look`, applied by
+    /// the app — a look's theme goes through the slot-aware theme pick).
+    Looks,
     /// Named looks applied as a whole (a wrapping chip row). `get` returns the
     /// index of the preset the config matches (`u64::MAX` = none: "Custom");
     /// `set` applies preset `i`.
@@ -232,6 +239,8 @@ impl Section {
 /// Every section, in display order per tab. Sections with no control yet are
 /// hook points (hidden until a control lands in them).
 pub static SECTIONS: &[Section] = &[
+    // One-click bundles of theme, effects, backdrop, summon and cursor.
+    Section { id: "look.looks", tab: LOOK, title: "Looks", ..Section::DEFAULT },
     Section { id: "look.window", tab: LOOK, title: "Opacity & corners", ..Section::DEFAULT },
     // The background layer: a mode, then only the rows that mode uses.
     Section { id: "look.backdrop", tab: LOOK, title: "Backdrop", ..Section::DEFAULT },
@@ -262,10 +271,9 @@ pub static SECTIONS: &[Section] = &[
     // Effect presets (Clean, Retro CRT, Amber, Green Phosphor, Neon, Paper, E-ink).
     Section { id: "fx.presets", tab: EFFECTS, title: "Presets", ..Section::DEFAULT },
     Section { id: "fx.crt", tab: EFFECTS, title: "CRT", master: Some("effects.crt_enabled"), ..Section::DEFAULT },
-    Section { id: "fx.caret", tab: EFFECTS, title: "Caret", ..Section::DEFAULT },
-    // Hook: cursor shape, thickness, unfocused style, color, guide, trail.
+    // The cursor's shape, look and trail, and the caret flash / glow.
     Section { id: "fx.cursor", tab: EFFECTS, title: "Cursor", ..Section::DEFAULT },
-    // The glitch (hook: visual bell, command pulse).
+    // The glitch, the visual bell, the command pulse.
     Section { id: "fx.bell", tab: EFFECTS, title: "Alerts", ..Section::DEFAULT },
 ];
 
@@ -450,6 +458,23 @@ fn light_theme_state(c: &Config, _: &Ctx) -> RowState {
     if c.follow_system_theme { RowState::Normal } else { RowState::Dimmed }
 }
 
+/// The cursor stroke thickness does nothing for a block cursor.
+fn thickness_state(c: &Config, _: &Ctx) -> RowState {
+    if crate::motion::CursorShapePref::parse(&c.cursor.shape) == crate::motion::CursorShapePref::Block {
+        RowState::Dimmed
+    } else {
+        RowState::Normal
+    }
+}
+/// The trail's timing rows do nothing without the trail.
+fn trail_state(c: &Config, _: &Ctx) -> RowState {
+    if c.cursor.trail { RowState::Normal } else { RowState::Dimmed }
+}
+fn fmt_cells(v: f32) -> String {
+    let n = v.round() as i32;
+    if n == 1 { "1 cell".to_string() } else { format!("{n} cells") }
+}
+
 /// Phosphor rows matter only with a phosphor (the color: only for "custom").
 fn phosphor_hue_state(c: &Config, _: &Ctx) -> RowState {
     if c.effects.crt_phosphor == crate::config::PhosphorMode::Off { RowState::Dimmed } else { RowState::Normal }
@@ -486,6 +511,17 @@ fn radius_state(c: &Config, x: &Ctx) -> RowState {
 /// Every control, in display order within its section.
 pub static DESCS: &[Desc] = &[
     // ── Look ──────────────────────────────────────────────────────────────────
+    // ── Look › Looks ──────────────────────────────────────────────────────────
+    Desc {
+        id: "look",
+        section: "look.looks",
+        label: "Looks",
+        kind: Kind::Looks,
+        hint: Some("Theme, effects, backdrop and cursor"),
+        reset: false,
+        ..Desc::DEFAULT
+    },
+
     Desc {
         id: "opacity",
         section: "look.window",
@@ -933,6 +969,17 @@ pub static DESCS: &[Desc] = &[
         ..Desc::DEFAULT
     },
     Desc {
+        id: "reduce_motion",
+        tab: WINDOW,
+        section: "window.summon",
+        label: "Reduce motion",
+        kind: Kind::Choice { options: |_| pairs(&[("off", "Off"), ("on", "On"), ("system", "System")]) },
+        get: get_s!(reduce_motion),
+        set: set_s!(reduce_motion),
+        hint: Some("System follows the desktop (Linux)"),
+        ..Desc::DEFAULT
+    },
+    Desc {
         id: "window_mode",
         tab: WINDOW,
         section: "window.summon",
@@ -1315,11 +1362,116 @@ pub static DESCS: &[Desc] = &[
         set: set_b!(effects.animate_unfocused),
         ..Desc::DEFAULT
     },
+    // ── Effects › Cursor ──────────────────────────────────────────────────────
+    Desc {
+        id: "cursor.shape",
+        tab: EFFECTS,
+        section: "fx.cursor",
+        label: "Shape",
+        kind: Kind::Choice {
+            options: |_| {
+                pairs(&[
+                    ("block", "Block"),
+                    ("beam", "Beam"),
+                    ("underline", "Underline"),
+                    ("double_underline", "Double underline"),
+                    ("thick_underline", "Thick underline"),
+                ])
+            },
+        },
+        get: get_s!(cursor.shape),
+        set: set_s!(cursor.shape),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "cursor.thickness",
+        tab: EFFECTS,
+        section: "fx.cursor",
+        label: "Thickness",
+        kind: Kind::Slider { min: 0.04, max: 0.5, step: 0.01, fmt: fmt_pct, live: true },
+        get: get_f!(cursor.thickness),
+        set: set_f!(cursor.thickness),
+        state: Some(thickness_state),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "cursor.unfocused",
+        tab: EFFECTS,
+        section: "fx.cursor",
+        label: "Unfocused",
+        kind: Kind::Choice {
+            options: |_| pairs(&[("hollow", "Hollow"), ("unchanged", "Unchanged"), ("none", "Hidden")]),
+        },
+        get: get_s!(cursor.unfocused),
+        set: set_s!(cursor.unfocused),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "cursor.color",
+        tab: EFFECTS,
+        section: "fx.cursor",
+        label: "Color",
+        kind: Kind::Choice { options: |_| pairs(&[("theme", "Theme"), ("cell", "Reverse"), ("auto", "Auto")]) },
+        get: get_s!(cursor.color),
+        set: set_s!(cursor.color),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "cursor.guide",
+        tab: EFFECTS,
+        section: "fx.cursor",
+        label: "Row guide",
+        kind: Kind::Choice { options: |_| pairs(&[("off", "Off"), ("shell", "Shell"), ("always", "Always")]) },
+        get: get_s!(cursor.guide),
+        set: set_s!(cursor.guide),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "cursor.trail",
+        tab: EFFECTS,
+        section: "fx.cursor",
+        label: "Trail",
+        kind: Kind::Toggle,
+        get: get_b!(cursor.trail),
+        set: set_b!(cursor.trail),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "cursor.trail_ms",
+        tab: EFFECTS,
+        section: "fx.cursor",
+        label: "Trail duration",
+        kind: Kind::Slider { min: 60.0, max: 600.0, step: 10.0, fmt: fmt_ms, live: true },
+        get: |c| Val::F(c.cursor.trail_ms as f32),
+        set: |c, v| {
+            if let Val::F(x) = v {
+                c.cursor.trail_ms = x.round().clamp(60.0, 1000.0) as u32;
+            }
+        },
+        state: Some(trail_state),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "cursor.trail_threshold",
+        tab: EFFECTS,
+        section: "fx.cursor",
+        label: "Trail threshold",
+        kind: Kind::Slider { min: 1.0, max: 10.0, step: 1.0, fmt: fmt_cells, live: true },
+        get: |c| Val::F(c.cursor.trail_threshold as f32),
+        set: |c, v| {
+            if let Val::F(x) = v {
+                c.cursor.trail_threshold = x.round().clamp(1.0, 40.0) as u32;
+            }
+        },
+        hint: Some("A jump must cover more cells to trail"),
+        state: Some(trail_state),
+        ..Desc::DEFAULT
+    },
     Desc {
         id: "effects.caret_flash_enabled",
         tab: EFFECTS,
-        section: "fx.caret",
-        label: "Flash",
+        section: "fx.cursor",
+        label: "Caret flash",
         kind: Kind::Toggle,
         get: get_b!(effects.caret_flash_enabled),
         set: set_b!(effects.caret_flash_enabled),
@@ -1328,8 +1480,8 @@ pub static DESCS: &[Desc] = &[
     Desc {
         id: "effects.caret_glow_enabled",
         tab: EFFECTS,
-        section: "fx.caret",
-        label: "Glow",
+        section: "fx.cursor",
+        label: "Caret glow",
         kind: Kind::Toggle,
         get: get_b!(effects.caret_glow_enabled),
         set: set_b!(effects.caret_glow_enabled),
@@ -1338,7 +1490,7 @@ pub static DESCS: &[Desc] = &[
     Desc {
         id: "effects.caret_flash_ms",
         tab: EFFECTS,
-        section: "fx.caret",
+        section: "fx.cursor",
         label: "Flash duration",
         kind: Kind::Slider { min: 60.0, max: 400.0, step: 0.0, fmt: fmt_ms, live: true },
         get: get_f!(effects.caret_flash_ms),
@@ -1348,7 +1500,7 @@ pub static DESCS: &[Desc] = &[
     Desc {
         id: "effects.caret_flash_color",
         tab: EFFECTS,
-        section: "fx.caret",
+        section: "fx.cursor",
         label: "Flash color",
         kind: Kind::Rgb,
         get: get_rgb!(effects.caret_flash_color),
@@ -1371,12 +1523,156 @@ pub static DESCS: &[Desc] = &[
         hint: Some("Color split on a failure or the bell"),
         ..Desc::DEFAULT
     },
+    Desc {
+        id: "visual_bell",
+        tab: EFFECTS,
+        section: "fx.bell",
+        label: "Visual bell",
+        kind: Kind::Choice { options: |_| pairs(&[("off", "Off"), ("flash", "Flash"), ("rim", "Rim")]) },
+        get: get_s!(visual_bell),
+        set: set_s!(visual_bell),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "command_pulse",
+        tab: EFFECTS,
+        section: "fx.bell",
+        label: "Command pulse",
+        kind: Kind::Choice { options: |_| pairs(&[("off", "Off"), ("failures", "Failures"), ("all", "All")]) },
+        get: get_s!(command_pulse),
+        set: set_s!(command_pulse),
+        hint: Some("Needs shell integration (OSC 133)"),
+        ..Desc::DEFAULT
+    },
 ];
 
 /// The image files in `<config dir>/backgrounds/` (the backdrop picker's
 /// list) — for jetty-shot; the app caches its own copy.
 pub fn backdrop_images() -> Vec<String> {
     crate::backdrop::background_images(&Config::dir())
+}
+
+/// A one-click "look": a bundle of keys a click writes (no look name is
+/// stored — a look is lit while every key it sets still holds).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LookDef {
+    pub name: &'static str,
+    /// The theme id; `None` leaves the theme alone.
+    pub theme: Option<&'static str>,
+    /// An effects preset id (`effects::effect_presets`).
+    pub preset: &'static str,
+    pub backdrop: &'static str,
+    pub pattern: Option<&'static str>,
+    pub strength: Option<f32>,
+    pub summon: &'static str,
+    pub cursor_shape: Option<&'static str>,
+    pub trail: bool,
+    pub guide: Option<&'static str>,
+}
+
+impl LookDef {
+    const DEFAULT: LookDef = LookDef {
+        name: "",
+        theme: None,
+        preset: "clean",
+        backdrop: "none",
+        pattern: None,
+        strength: None,
+        summon: "phosphor",
+        cursor_shape: None,
+        trail: false,
+        guide: None,
+    };
+}
+
+/// The looks, in chip / palette order — one array to tune.
+pub static LOOKS: &[LookDef] = &[
+    LookDef {
+        name: "Amber VT",
+        theme: Some("phosphor_amber"),
+        preset: "amber",
+        summon: "phosphor",
+        cursor_shape: Some("block"),
+        ..LookDef::DEFAULT
+    },
+    LookDef {
+        name: "P1 Green",
+        theme: Some("phosphor_green"),
+        preset: "green_phosphor",
+        summon: "phosphor",
+        cursor_shape: Some("block"),
+        ..LookDef::DEFAULT
+    },
+    LookDef {
+        name: "Trinitron",
+        theme: Some("tokyo_night"),
+        preset: "retro_crt",
+        backdrop: "theme",
+        summon: "focus",
+        ..LookDef::DEFAULT
+    },
+    LookDef {
+        name: "Neon Night",
+        theme: Some("synthwave_84"),
+        preset: "neon",
+        backdrop: "pattern",
+        pattern: Some("synthwave"),
+        strength: Some(0.5),
+        summon: "pop",
+        trail: true,
+        ..LookDef::DEFAULT
+    },
+    LookDef {
+        name: "Aurora",
+        theme: Some("tokyo_night_storm"),
+        preset: "clean",
+        backdrop: "pattern",
+        pattern: Some("aurora"),
+        strength: Some(0.5),
+        summon: "glide",
+        trail: true,
+        ..LookDef::DEFAULT
+    },
+    LookDef { name: "Paper", theme: Some("flexoki_light"), preset: "paper", summon: "fade", ..LookDef::DEFAULT },
+    LookDef { name: "Clean", preset: "clean", summon: "phosphor", guide: Some("off"), ..LookDef::DEFAULT },
+];
+
+/// Write every key of `look` but the theme (the app picks that one, into the
+/// slot on screen) into `c`.
+pub fn apply_look_keys(c: &mut Config, look: &LookDef) {
+    if let Some(p) = crate::effects::find_preset(look.preset) {
+        p.patch.apply_to(&mut c.effects);
+    }
+    c.backdrop.mode = look.backdrop.to_string();
+    if let Some(p) = look.pattern {
+        c.backdrop.pattern = p.to_string();
+    }
+    if let Some(v) = look.strength {
+        c.backdrop.strength = v;
+    }
+    c.summon_effect = look.summon.to_string();
+    if let Some(sh) = look.cursor_shape {
+        c.cursor.shape = sh.to_string();
+    }
+    c.cursor.trail = look.trail;
+    if let Some(g) = look.guide {
+        c.cursor.guide = g.to_string();
+    }
+}
+
+/// Whether every key `look` sets holds in `c`, its theme compared with
+/// `shown_theme` (the theme on screen).
+pub fn look_matches(c: &Config, look: &LookDef, shown_theme: &str) -> bool {
+    let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    look.theme.is_none_or(|t| t == shown_theme)
+        && crate::effects::find_preset(look.preset).is_some_and(|p| crate::effects::matches_preset(&c.effects, p))
+        && eq(&c.backdrop.mode, look.backdrop)
+        && look.pattern.is_none_or(|p| eq(&c.backdrop.pattern, p))
+        && look.strength.is_none_or(|v| (c.backdrop.strength - v).abs() < 1e-3)
+        && eq(&c.summon_effect, look.summon)
+        && look.cursor_shape.is_none_or(|sh| eq(&c.cursor.shape, sh))
+        && c.cursor.trail == look.trail
+        && look.guide.is_none_or(|g| eq(&c.cursor.guide, g))
 }
 
 /// The control `id`.
@@ -1487,6 +1783,14 @@ fn row_for(d: &Desc, cfg: &Config, ctx: &Ctx, master_off: bool) -> PanelItem {
         Kind::Chips { labels } => CtlShow::Chips(
             labels.iter().enumerate().map(|(i, l)| (l.to_string(), v.bits() & (1 << i) != 0)).collect(),
         ),
+        Kind::Looks => {
+            let shown = if ctx.shown_theme.is_empty() { cfg.theme.as_str() } else { ctx.shown_theme };
+            let lit = LOOKS.iter().position(|l| look_matches(cfg, l, shown));
+            CtlShow::ChipFlow {
+                chips: LOOKS.iter().enumerate().map(|(i, l)| (l.name.to_string(), Some(i) == lit)).collect(),
+                status: lit.map_or_else(|| "Custom".to_string(), |i| LOOKS[i].name.to_string()),
+            }
+        }
         Kind::Presets { names } => {
             let names = names();
             let active = usize::try_from(v.u()).ok().filter(|&i| i < names.len());
@@ -1554,6 +1858,8 @@ pub enum Press {
     Drag,
     /// Scroll a list by this many rows.
     Scroll(i32),
+    /// Apply look `LOOKS[i]`.
+    Look(usize),
     /// Nothing (a part the control does not have).
     Nothing,
 }
@@ -1591,6 +1897,7 @@ pub fn press(d: &Desc, part: CtlPart, cfg: &Config, ctx: &Ctx) -> Press {
             Press::Set(Val::Bits(v.bits() ^ (1 << i)))
         }
         (Kind::Presets { names }, CtlPart::Chip(i)) if (i as usize) < names().len() => Press::Set(Val::U(i as u64)),
+        (Kind::Looks, CtlPart::Chip(i)) if (i as usize) < LOOKS.len() => Press::Look(i as usize),
         (Kind::List { src, .. }, CtlPart::Row(i)) => {
             let (items, _, _) = list_src(*src, ctx);
             list_value(*src, items, i).map_or(Press::Nothing, |s| Press::Set(Val::S(s)))
@@ -1785,6 +2092,7 @@ mod tests {
                 Kind::Rgb => Val::Rgb([64.0 / 255.0, 128.0 / 255.0, 192.0 / 255.0]),
                 Kind::Chips { .. } => Val::Bits(v.bits() ^ 1),
                 Kind::Presets { .. } => Val::U(1),
+                Kind::Looks => continue,
                 Kind::List { .. } | Kind::Gallery => Val::S("Something Else".into()),
                 Kind::Specimen => unreachable!(),
             };
@@ -2040,6 +2348,120 @@ mod tests {
         assert_eq!(hex_rgb("ff8000"), None);
         assert_eq!(hex_rgb("#ff80"), None);
         assert_eq!(hex_rgb("#gg0000"), None);
+    }
+
+    #[test]
+    fn every_look_writes_valid_keys() {
+        let opts = |id: &str| -> Vec<String> {
+            match &find(id).unwrap().kind {
+                Kind::Choice { options } => options(&Ctx::empty()).into_iter().map(|o| o.0).collect(),
+                _ => unreachable!(),
+            }
+        };
+        assert!(!LOOKS.is_empty());
+        let mut names: Vec<&str> = LOOKS.iter().map(|l| l.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), LOOKS.len(), "duplicate look name");
+        for l in LOOKS {
+            if let Some(t) = l.theme {
+                assert!(jetty_core::theme_index(t).is_some(), "{}: no theme {t}", l.name);
+            }
+            assert!(crate::effects::find_preset(l.preset).is_some(), "{}: no preset {}", l.name, l.preset);
+            assert!(opts("backdrop.mode").iter().any(|m| m == l.backdrop), "{}: backdrop {}", l.name, l.backdrop);
+            if let Some(p) = l.pattern {
+                assert!(opts("backdrop.pattern").iter().any(|m| m == p), "{}: pattern {p}", l.name);
+            }
+            assert!(l.strength.is_none_or(|v| (0.0..=1.0).contains(&v)), "{}: strength", l.name);
+            assert!(opts("summon_effect").iter().any(|m| m == l.summon), "{}: summon {}", l.name, l.summon);
+            if let Some(sh) = l.cursor_shape {
+                assert_eq!(crate::motion::CursorShapePref::parse(sh).as_str(), sh, "{}: shape", l.name);
+            }
+            if let Some(g) = l.guide {
+                assert_eq!(crate::motion::GuideMode::parse(g).as_str(), g, "{}: guide", l.name);
+            }
+        }
+    }
+
+    #[test]
+    fn applying_a_look_lights_exactly_its_chip() {
+        for (i, look) in LOOKS.iter().enumerate() {
+            let mut c = Config::default();
+            apply_look_keys(&mut c, look);
+            // The app picks the theme (the slot on screen); here: the dark one.
+            if let Some(t) = look.theme {
+                c.theme = t.to_string();
+            }
+            let lit: Vec<usize> = (0..LOOKS.len()).filter(|&j| look_matches(&c, &LOOKS[j], &c.theme)).collect();
+            assert_eq!(lit, vec![i], "{} lights {lit:?}", look.name);
+            // The Looks row shows it: one lit chip, named in the status.
+            let row = tab_items(LOOK, &c, &Ctx::empty()).into_iter().find_map(|it| match it {
+                PanelItem::Row(CtlRow { id: "look", show: CtlShow::ChipFlow { chips, status }, .. }) => Some((chips, status)),
+                _ => None,
+            });
+            let (chips, status) = row.expect("the Looks row");
+            assert_eq!(chips.iter().filter(|c| c.1).count(), 1);
+            assert!(chips[i].1, "{}'s chip lit", look.name);
+            assert_eq!(status, look.name);
+        }
+        // The defaults ARE the Clean look; one key off any look reads "Custom".
+        let custom = Config { summon_effect: "bayer".into(), ..Config::default() };
+        let row = tab_items(LOOK, &custom, &Ctx::empty()).into_iter().find_map(|it| match it {
+            PanelItem::Row(CtlRow { id: "look", show: CtlShow::ChipFlow { chips, status }, .. }) => Some((chips, status)),
+            _ => None,
+        });
+        let (chips, status) = row.unwrap();
+        assert!(chips.iter().all(|c| !c.1));
+        assert_eq!(status, "Custom");
+    }
+
+    #[test]
+    fn a_look_matches_the_theme_on_screen_and_clean_keeps_the_theme() {
+        let paper = LOOKS.iter().find(|l| l.name == "Paper").unwrap();
+        let mut c = Config { theme: "dracula".into(), follow_system_theme: true, ..Config::default() };
+        apply_look_keys(&mut c, paper);
+        // The light slot is showing Flexoki Light: Paper is lit…
+        assert!(look_matches(&c, paper, "flexoki_light"));
+        // …and not while Dracula shows.
+        assert!(!look_matches(&c, paper, "dracula"));
+        let clean = LOOKS.iter().find(|l| l.name == "Clean").unwrap();
+        assert!(clean.theme.is_none(), "Clean leaves the theme alone");
+        let mut c = Config { theme: "dracula".into(), ..Config::default() };
+        apply_look_keys(&mut c, clean);
+        assert_eq!(c.theme, "dracula");
+        assert!(look_matches(&c, clean, "dracula"));
+        assert!(!c.effects.crt_enabled);
+        assert_eq!((c.backdrop.mode.as_str(), c.cursor.trail, c.cursor.guide.as_str()), ("none", false, "off"));
+    }
+
+    #[test]
+    fn summon_cycler_lists_the_new_effects_and_cursor_rows_dim_sensibly() {
+        let summon = match &find("summon_effect").unwrap().kind {
+            Kind::Choice { options } => options(&Ctx::empty()),
+            _ => unreachable!(),
+        };
+        for (v, label) in [("pop", "Pop"), ("glide", "Glide"), ("fade", "Fade")] {
+            assert!(summon.iter().any(|o| o.0 == v && o.1 == label), "summon effect {v} missing");
+        }
+        let state = |c: &Config, id: &str| {
+            tab_items(EFFECTS, c, &Ctx::empty()).into_iter().find_map(|it| match it {
+                PanelItem::Row(r) if r.id == id => Some(r.state),
+                _ => None,
+            })
+        };
+        let c = Config::default(); // block cursor, no trail
+        assert_eq!(state(&c, "cursor.thickness"), Some(RowState::Dimmed));
+        assert_eq!(state(&c, "cursor.trail_ms"), Some(RowState::Dimmed));
+        let mut beam = Config::default();
+        beam.cursor.shape = "beam".into();
+        beam.cursor.trail = true;
+        assert_eq!(state(&beam, "cursor.thickness"), Some(RowState::Normal));
+        assert_eq!(state(&beam, "cursor.trail_threshold"), Some(RowState::Normal));
+        // The trail rows write whole numbers into the u32 keys.
+        let mut c = Config::default();
+        (find("cursor.trail_ms").unwrap().set)(&mut c, Val::F(254.6));
+        (find("cursor.trail_threshold").unwrap().set)(&mut c, Val::F(3.4));
+        assert_eq!((c.cursor.trail_ms, c.cursor.trail_threshold), (255, 3));
     }
 
     #[test]
