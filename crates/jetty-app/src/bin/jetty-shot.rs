@@ -1047,7 +1047,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or([1.0; 3]);
             (t.clamp(0.0, 1.0), color)
         });
-    let shot_cursor_style = shot_cursor.style;
+    let shot_cursor_style = shot_cursor.style.lifted(text.text_bottom_inset());
     let cursor = if copymode_cursor.is_none() {
         jetty_render::cursor_draw(
             &snap,

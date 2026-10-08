@@ -84,6 +84,11 @@ pub struct CursorStyle {
     pub unfocused: UnfocusedCursor,
     pub underline: UnderlineCursor,
     pub color: CursorColor,
+    /// Physical px the underline shapes sit above the cell bottom — the grid
+    /// layer's `TextLayer::text_bottom_inset`, so with a tall `line_height`
+    /// the underline stays under the text. Set per window each frame; 0 = the
+    /// cell bottom (the default spacing).
+    pub underline_lift: f32,
 }
 
 impl Default for CursorStyle {
@@ -93,7 +98,15 @@ impl Default for CursorStyle {
             unfocused: UnfocusedCursor::Hollow,
             underline: UnderlineCursor::Single,
             color: CursorColor::Theme,
+            underline_lift: 0.0,
         }
+    }
+}
+
+impl CursorStyle {
+    /// This look with the underline lifted `lift` px (see `underline_lift`).
+    pub fn lifted(self, lift: f32) -> Self {
+        CursorStyle { underline_lift: lift.max(0.0), ..self }
     }
 }
 
@@ -240,7 +253,7 @@ pub fn cursor_draw(
             out.over.push(Rect::new(base_x, base_y, w, cell_h, color));
         }
         CursorShapeSnap::Underline => {
-            let bottom = base_y + cell_h;
+            let bottom = base_y + cell_h - style.underline_lift.clamp(0.0, cell_h * 0.5);
             match style.underline {
                 UnderlineCursor::Single => {
                     let h = (cell_h * stroke).max(1.0);
@@ -302,7 +315,8 @@ pub fn cursor_trail_rect(
                 UnderlineCursor::Double => 3.0 * (cell_h * stroke * 0.75).round().max(1.0),
                 UnderlineCursor::Thick => (cell_h * stroke * THICK_UNDERLINE_STROKES).min(cell_h * 0.5).max(2.0),
             };
-            [x, y + cell_h - h, span_w, h]
+            let bottom = y + cell_h - style.underline_lift.clamp(0.0, cell_h * 0.5);
+            [x, bottom - h, span_w, h]
         }
     })
 }
@@ -448,6 +462,24 @@ mod tests {
         assert!((draw(&g, true, None, &silly).over[0].w - 5.0).abs() < 1e-5, "clamped to half a cell");
         let hair = CursorStyle { thickness: 0.0, ..Default::default() };
         assert!(draw(&g, true, None, &hair).over[0].w >= 1.0, "never thinner than a pixel");
+    }
+
+    #[test]
+    fn a_lifted_underline_stays_under_the_text() {
+        let mut g = grid(5, 3);
+        g.cursor_shape = CursorShapeSnap::Underline;
+        let style = CursorStyle::default().lifted(5.0);
+        let ul = draw(&g, true, None, &style).over[0];
+        assert!((ul.y + ul.h - 15.0).abs() < 1e-4, "5 px above the 20 px cell bottom");
+        let rect = cursor_trail_rect(&g, 10.0, 20.0, 0.0, 0.0, true, &style).unwrap();
+        assert!((rect[1] + rect[3] - 15.0).abs() < 1e-4, "the trail chases the lifted shape");
+        // Blocks and beams fill the cell regardless.
+        g.cursor_shape = CursorShapeSnap::Block;
+        assert_eq!(draw(&g, true, None, &style).under.unwrap().h, 20.0);
+        // Never lifted out of the lower half of the cell.
+        g.cursor_shape = CursorShapeSnap::Underline;
+        let silly = CursorStyle::default().lifted(50.0);
+        assert!(draw(&g, true, None, &silly).over[0].y >= 10.0 - 3.0);
     }
 
     #[test]

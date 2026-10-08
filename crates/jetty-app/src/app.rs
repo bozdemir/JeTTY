@@ -10330,7 +10330,7 @@ impl App {
         // Window focus drives the unfocused-hollow cursor (captured before the
         // gpu/text/quad borrows below).
         let focused = dw.focused;
-        let cursor_style = self.cursor_spec.style;
+        let cursor_style = self.cursor_spec.style.lifted(dw.text.text_bottom_inset());
         let cursor_guide = self.cursor_spec.guide.shows(dw.tab.terminal.alt_screen());
         // This window's cursor trail (the main window's rules, its own state).
         if self.cursor_cfg.trail && dw.trail_layer.is_none() {
@@ -14351,8 +14351,12 @@ impl ApplicationHandler<AppEvent> for App {
                 // Window focus drives the unfocused-hollow cursor (captured before
                 // the mutable gpu/text borrow below).
                 let main_focused = self.main_focused;
-                // The `[cursor]` look + the row guide for the active tab.
-                let cursor_style = self.cursor_spec.style;
+                // The `[cursor]` look (the underline kept under the text with a
+                // tall line height) + the row guide for the active tab.
+                let cursor_style = self
+                    .cursor_spec
+                    .style
+                    .lifted(self.text.as_ref().map_or(0.0, |t| t.text_bottom_inset()));
                 let cursor_guide = self.cursor_spec.guide.shows(self.active_tab().terminal.alt_screen());
                 // Cursor trail: this frame's smear (if any) — never during
                 // copy-mode, an IME composition, the dropdown slide, a flood

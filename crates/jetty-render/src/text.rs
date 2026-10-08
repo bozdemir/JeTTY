@@ -234,6 +234,13 @@ fn layer_metrics(px: f32, line_height: f32) -> Metrics {
     Metrics::new(px, (px * line_height).ceil())
 }
 
+/// See [`TextLayer::text_bottom_inset`]: half of what a cell of height
+/// `cell_h` adds over the default-spacing cell at `font_px`, floored.
+fn text_bottom_inset(font_px: f32, cell_h: f32) -> f32 {
+    let natural = (font_px * LINE_HEIGHT_DEFAULT).ceil();
+    ((cell_h - natural) * 0.5).floor().max(0.0)
+}
+
 /// Which family the chrome-overlay pass (`render_overlays*`) shapes its labels
 /// in. Distinct from the TERMINAL grid font (`font_family`): chrome — tab
 /// titles, the status bar, the menu, the panel, help/confirm/welcome — renders
@@ -1185,6 +1192,15 @@ impl TextLayer {
     /// The line-height multiple this layer lays rows out with.
     pub fn line_height(&self) -> f32 {
         self.line_height
+    }
+
+    /// How far above the cell bottom the TEXT's own line box ends (whole px):
+    /// half the extra height a `line_height` above the default adds (the
+    /// glyphs are centred in the taller row); 0 at the default or below.
+    /// Marks that belong under the text — the underline cursor — sit this much
+    /// higher, so they stay under the glyphs instead of drifting into the gap.
+    pub fn text_bottom_inset(&self) -> f32 {
+        text_bottom_inset(self.metrics.font_size, self.cell_h)
     }
 
     /// Drop every cached chrome measurement (family or size changed).
@@ -2668,6 +2684,15 @@ mod tests {
         assert_eq!(layer_metrics(16.0, LINE_HEIGHT_DEFAULT).line_height, 21.0);
         assert_eq!(layer_metrics(22.0, LINE_HEIGHT_DEFAULT).line_height, 29.0);
         assert_eq!(layer_metrics(20.0, LINE_HEIGHT_DEFAULT).line_height, 26.0);
+    }
+
+    #[test]
+    fn the_text_bottom_inset_tracks_the_extra_row_height() {
+        let inset = |px: f32, lh: f32| text_bottom_inset(px, layer_metrics(px, lh).line_height);
+        assert_eq!(inset(16.0, LINE_HEIGHT_DEFAULT), 0.0, "today's spacing: at the cell bottom");
+        assert_eq!(inset(16.0, 1.0), 0.0, "a shorter row never lifts");
+        assert_eq!(inset(16.0, 2.0), 5.0, "32 px row vs 21 px: half of 11, floored");
+        assert_eq!(inset(32.0, 1.5), 3.0, "48 vs 42");
     }
 
     #[test]
