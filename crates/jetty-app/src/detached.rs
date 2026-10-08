@@ -26,25 +26,23 @@ pub fn reattach_index(tabs_len_after_push: usize) -> usize {
 }
 
 /// Cols/rows for a detached terminal window with chrome: the grid fills the
-/// client area minus the scrollbar gutter (width), the top bar (`top_bar_h`,
-/// normally TABBAR_H) and the bottom status strip (`status_h`, 0 when the perf
-/// HUD is off). `width_px`/`height_px` are physical pixels; `cell_w`/`cell_h`
-/// the glyph cell size. Mirrors the main window's `grid_dims`/`reflow` math.
+/// client area minus the top bar (`bars.0`, its scaled bar height) and the
+/// bottom status strip (`bars.1`, 0 when the perf HUD is off), inside the
+/// physical inner padding `pad` (x, y) and the scrollbar `gutter` on the
+/// right (`jetty_render::grid_dims`). `width_px`/`height_px` are physical
+/// pixels; `cell` the glyph cell size. Mirrors the main window's
+/// `main_grid_dims_at`. The 80×24 fallback (app.rs FALLBACK_COLS/ROWS) before
+/// cell metrics exist.
 pub(crate) fn grid_dims(
     width_px: f32,
     height_px: f32,
-    cell_w: f32,
-    cell_h: f32,
-    scrollbar_gutter: f32,
-    top_bar_h: f32,
-    status_h: f32,
+    cell: (f32, f32),
+    gutter: f32,
+    bars: (f32, f32),
+    pad: (f32, f32),
 ) -> (usize, usize) {
-    if cell_w <= 0.0 || cell_h <= 0.0 {
-        return (80, 24); // fallback, matches app.rs FALLBACK_COLS/ROWS
-    }
-    let cols = ((width_px - scrollbar_gutter) / cell_w).floor().max(2.0) as usize;
-    let rows = ((height_px - top_bar_h - status_h) / cell_h).floor().max(1.0) as usize;
-    (cols, rows)
+    let band_h = height_px - bars.0 - bars.1;
+    jetty_render::grid_dims(width_px, band_h, cell.0, cell.1, gutter, pad.0, pad.1)
 }
 
 /// Vertical distance (px) the cursor must travel OUT of the tab-bar strip
@@ -588,6 +586,39 @@ impl DetachedWindow {
         let cm = self.chrome_metrics(ui_font_logical);
         (cm.bar_h(), if show_perf_hud { cm.status_h() } else { 0.0 })
     }
+
+    /// THIS window's physical inner padding `(x, y)` for the logical
+    /// `padding` — its own DPI, whole pixels (`jetty_render::padding_px`).
+    pub(crate) fn pad_px(&self, padding: (f32, f32)) -> (f32, f32) {
+        let s = self.window.scale_factor() as f32;
+        (jetty_render::padding_px(padding.0, s), jetty_render::padding_px(padding.1, s))
+    }
+
+    /// Where THIS window's grid cell (0, 0) sits: below its top bar, inside
+    /// the padding (see `jetty_render::grid_geom`).
+    pub(crate) fn grid_origin(&self, ui_font_logical: f32, padding: (f32, f32)) -> jetty_render::GridOrigin {
+        let (px, py) = self.pad_px(padding);
+        jetty_render::GridOrigin::new(px, self.chrome_metrics(ui_font_logical).bar_h() + py)
+    }
+
+    /// THIS window's grid cols × rows right now: its surface minus its chrome
+    /// bands, the scrollbar `gutter` and the padding ([`grid_dims`]).
+    pub(crate) fn fit_grid_dims(
+        &self,
+        ui_font_logical: f32,
+        show_perf_hud: bool,
+        gutter: f32,
+        padding: (f32, f32),
+    ) -> (usize, usize) {
+        grid_dims(
+            self.gpu.config.width as f32,
+            self.gpu.config.height as f32,
+            self.text.cell_size(),
+            gutter,
+            self.chrome_bands(ui_font_logical, show_perf_hud),
+            self.pad_px(padding),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -627,19 +658,28 @@ mod tests {
         // Chrome heights: 36px top bar + 22px status strip → rows shrink;
         // width still only loses the scrollbar gutter.
         // cols = floor((800-14)/10) = 78; rows = floor((600-36-22)/20) = 27.
-        assert_eq!(grid_dims(800.0, 600.0, 10.0, 20.0, 14.0, 36.0, 22.0), (78, 27));
+        assert_eq!(grid_dims(800.0, 600.0, (10.0, 20.0), 14.0, (36.0, 22.0), (0.0, 0.0)), (78, 27));
     }
 
     #[test]
     fn detached_grid_dims_no_status_strip_when_hud_off() {
         // status_h = 0 (perf HUD off): only the top bar is reserved.
         // rows = floor((600-36)/20) = 28.
-        assert_eq!(grid_dims(800.0, 600.0, 10.0, 20.0, 14.0, 36.0, 0.0), (78, 28));
+        assert_eq!(grid_dims(800.0, 600.0, (10.0, 20.0), 14.0, (36.0, 0.0), (0.0, 0.0)), (78, 28));
     }
 
     #[test]
     fn detached_grid_dims_zero_cell_falls_back_to_default() {
-        assert_eq!(grid_dims(800.0, 600.0, 0.0, 0.0, 14.0, 36.0, 22.0), (80, 24));
+        assert_eq!(grid_dims(800.0, 600.0, (0.0, 0.0), 14.0, (36.0, 22.0), (0.0, 0.0)), (80, 24));
+    }
+
+    #[test]
+    fn detached_grid_dims_reserve_the_padding() {
+        // 1×, padding 8 × 4: cols = floor((800 - 8 - max(8, 18)) / 10) = 77;
+        // rows = floor((600 - 36 - 22 - 2·4) / 20) = 26.
+        assert_eq!(grid_dims(800.0, 600.0, (10.0, 20.0), 18.0, (36.0, 22.0), (8.0, 4.0)), (77, 26));
+        // 2× (every length doubled): the same grid.
+        assert_eq!(grid_dims(1600.0, 1200.0, (20.0, 40.0), 36.0, (72.0, 44.0), (16.0, 8.0)), (77, 26));
     }
 
     // ── tear-out threshold ───────────────────────────────────────────────────

@@ -29,6 +29,12 @@
 ///                    Retina / 4K@200%). Fonts rasterize at size × scale and the
 ///                    chrome follows ChromeMetrics, exactly like the live app.
 ///                    Pass PHYSICAL JETTY_SHOT_WIDTH/HEIGHT (e.g. 2000×1280).
+///   JETTY_SHOT_PADDING="x,y" — the grid's inner padding in LOGICAL px (the
+///                    `padding_x`/`padding_y` config keys; default = their
+///                    defaults, "0,0" = the unpadded grid). Scaled by
+///                    JETTY_SHOT_SCALE like the app; every grid-anchored layer
+///                    (cells, glyphs, cursor, decorations, images, hint chips,
+///                    preedit, failed-command bars) moves with it.
 ///   JETTY_SHOT_TABBAR_N — number of sample tabs for JETTY_SHOT_TABBAR (default 3).
 ///   JETTY_SHOT_HELP_SCROLL — first help row for JETTY_SHOT_HELP when its rows
 ///                    overflow the window (large UI font / short window).
@@ -269,15 +275,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The bar's height when it sits at the BOTTOM (the grid ends above it).
     let shot_bottom_bar_h: f32 = if tabbar_shot && tab_bar_bottom { cm.bar_h() } else { 0.0 };
 
+    // The grid's inner padding (JETTY_SHOT_PADDING="x,y", logical px; default
+    // = the config defaults), scaled to whole physical px like the app.
+    let (pad_lx, pad_ly) = std::env::var("JETTY_SHOT_PADDING")
+        .ok()
+        .and_then(|s| {
+            let (x, y) = s.split_once(',')?;
+            Some((x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?))
+        })
+        .unwrap_or_else(jetty_app::default_grid_padding);
+    let (pad_x, pad_y) = (jetty_render::padding_px(pad_lx, dpi), jetty_render::padding_px(pad_ly, dpi));
+    // Cell (0, 0): the left padding, and the band top plus the top padding.
+    let shot_origin = jetty_render::GridOrigin::new(pad_x, shot_grid_top + pad_y);
+
     // Reserve the scrollbar gutter EXACTLY like the live windows
     // (app.rs grid_dims / detached.rs), so a screenshot builds the same column
     // count the user sees and never lays text UNDER the drawn scrollbar (F22).
     // SCROLLBAR_GUTTER = jetty_render::SCROLLBAR_W (14) + 4.
     let scrollbar_gutter = jetty_render::SCROLLBAR_W + 4.0;
-    let cols = ((width as f32 - scrollbar_gutter) / cell_w).floor().max(2.0) as usize;
-    let rows = (((height as f32 - shot_grid_top - shot_status_h - shot_bottom_bar_h) / cell_h).floor()).max(1.0) as usize;
+    let band_h = height as f32 - shot_grid_top - shot_status_h - shot_bottom_bar_h;
+    let (cols, rows) = jetty_render::grid_dims(width as f32, band_h, cell_w, cell_h, scrollbar_gutter, pad_x, pad_y);
 
-    eprintln!("jetty-shot: grid = {cols}x{rows} cells (cell {cell_w:.1}x{cell_h:.1}px)");
+    eprintln!(
+        "jetty-shot: grid = {cols}x{rows} cells (cell {cell_w:.2}x{cell_h:.1}px, origin {:.0},{:.0}, padding {pad_x}x{pad_y}px)",
+        shot_origin.left, shot_origin.top,
+    );
 
     // --- Build terminal snapshot ---
     // Terminal::new picks up JETTY_THEME and JETTY_OPACITY from the environment.
@@ -601,12 +623,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // snapshot (DECSCUSR in the input, e.g. `\e[5 q` for a beam). Copy-mode
     // suppresses the shell cursor (only the keyboard cursor shows).
     let cursor_focused = !env_flag("JETTY_SHOT_CURSOR_UNFOCUSED");
-    let (cursor_under, cursor_over) = if copymode_cursor.is_none() {
-        jetty_render::cursor_rects_split(&snap, cell_w, cell_h, shot_grid_top, cursor_focused, None, [0.0, 0.0, 0.0])
+    // Grid-space builders (x from the grid's left edge), each moved onto the
+    // origin right where it is built — the app's `render_grid_scene` order.
+    let (mut cursor_under, mut cursor_over) = if copymode_cursor.is_none() {
+        jetty_render::cursor_rects_split(&snap, cell_w, cell_h, shot_origin.top, cursor_focused, None, [0.0, 0.0, 0.0])
     } else {
         (None, Vec::new())
     };
-    let mut bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, shot_grid_top, selection.bg);
+    if let Some(block) = cursor_under.as_mut() {
+        block.x += shot_origin.left;
+    }
+    jetty_render::shift_x(&mut cursor_over, shot_origin.left);
+    let mut bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, shot_origin.top, selection.bg);
     if search_query.is_some() {
         // Same pass-1 placement as the app: match tints under the glyphs,
         // appended after the selection rects so they win where overlapping.
@@ -614,10 +642,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &terminal.search_viewport_hits(),
             cell_w,
             cell_h,
-            shot_grid_top,
+            shot_origin.top,
             terminal.theme(),
         ));
     }
+    jetty_render::shift_x(&mut bg_rects, shot_origin.left);
     bg_rects.extend(cursor_under);
 
     // --- Pass 2: the grid text on top of the painted background ---
@@ -643,7 +672,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `render_grid_scene`. The clear is the historical premultiplied value: the
     // harness CPU-composites over its own checkerboard, independent of any surface.
     let bg_count = quad.upload(&device, &queue, width, height, &bg_rects);
-    text.prepare_grid(&device, &queue, width, height, &snap, shot_grid_top, &paint)?;
+    text.prepare_grid(&device, &queue, width, height, &snap, shot_origin, &paint)?;
     {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot-grid") });
         {
@@ -687,8 +716,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 h: img.height,
                 rgba: &img.rgba,
                 dst: [
-                    vi.col as f32 * cell_w,
-                    shot_grid_top + vi.top_row * cell_h,
+                    shot_origin.col_x(vi.col as usize, cell_w),
+                    shot_origin.top + vi.top_row * cell_h,
                     vi.px_w as f32,
                     vi.px_h as f32,
                 ],
@@ -696,7 +725,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect();
         let grid_bottom_px = (height as f32 - shot_status_h - shot_bottom_bar_h).max(0.0);
-        let sc_y = shot_grid_top.clamp(0.0, height as f32) as u32;
+        let sc_y = shot_origin.top.clamp(0.0, height as f32) as u32;
         let sc_h = (grid_bottom_px.clamp(0.0, height as f32) as u32).saturating_sub(sc_y);
         image_layer.render(&device, &queue, &view, width, height, &draws, [0, sc_y, width, sc_h]);
     }
@@ -717,11 +746,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // whole pipeline (scanner → marks → visible-row mapping → render).
         let failed_rows = terminal.failed_prompt_rows();
         if !failed_rows.is_empty() {
+            let bar_w = (3.0 * dpi).round().max(2.0);
             rects.extend(jetty_render::failed_marker_rects(
                 &failed_rows,
                 cell_h,
-                shot_grid_top,
-                (3.0 * dpi).round().max(2.0),
+                shot_origin.top,
+                jetty_render::failed_marker_x(shot_origin.left, bar_w),
+                bar_w,
                 terminal.theme().failed_marker_color(),
             ));
         }
@@ -734,13 +765,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (theme bright blue), identical to the app's Pass 4.
         if let Some(hit) = &link_hit {
             let p12 = terminal.theme().palette[12];
-            rects.extend(jetty_render::link_underline_rects(
+            let mut link = jetty_render::link_underline_rects(
                 &hit.spans,
                 [p12[0], p12[1], p12[2], 255],
                 cell_w,
                 cell_h,
-                shot_grid_top,
-            ));
+                shot_origin.top,
+            );
+            jetty_render::shift_x(&mut link, shot_origin.left);
+            rects.extend(link);
         }
 
         // The thin cursor shapes over the glyphs + decorations (the solid block
@@ -935,9 +968,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Chips are one grid row tall: labels in the TERMINAL font (grid
             // layer + grid-font metrics), exactly like the app.
             let grid_cm = jetty_render::ChromeMetrics::new(dpi, font_size);
-            let ov = jetty_render::build_hint_overlay(
-                &refs, cell_w, cell_h, shot_grid_top, terminal.theme(), &mut text, grid_cm, &typed, width,
+            let mut ov = jetty_render::build_hint_overlay(
+                &refs, cell_w, cell_h, shot_origin.top, terminal.theme(), &mut text, grid_cm, &typed,
+                width.saturating_sub(shot_origin.left as u32),
             );
+            jetty_render::shift_x(&mut ov.quads, shot_origin.left);
+            jetty_render::shift_labels_x(&mut ov.labels, shot_origin.left);
             rects.extend(ov.quads);
             welcome_labels.extend(ov.labels);
             eprintln!(
@@ -950,10 +986,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // JETTY_SHOT_PREEDIT — an IME composition at the terminal cursor, via the
         // SAME builder the app uses (terminal font through the grid layer).
         if let Ok(p) = std::env::var("JETTY_SHOT_PREEDIT") {
-            if let Some(ov) = jetty_render::build_preedit_overlay(
-                &p, snap.cursor_row, snap.cursor_col, snap.cols, cell_w, cell_h, shot_grid_top,
+            if let Some(mut ov) = jetty_render::build_preedit_overlay(
+                &p, snap.cursor_row, snap.cursor_col, snap.cols, cell_w, cell_h, shot_origin.top,
                 terminal.theme(), dpi,
             ) {
+                jetty_render::shift_x(&mut ov.quads, shot_origin.left);
+                jetty_render::shift_labels_x(&mut ov.labels, shot_origin.left);
                 rects.extend(ov.quads);
                 welcome_labels.extend(ov.labels);
             }
@@ -963,9 +1001,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // "COPY" pill. The selection tint (when an anchor is set) is already drawn
         // by the cell_bg_rects path above (the selection was applied pre-snapshot).
         if let Some((cr, cc, selecting, line_mode)) = copymode_cursor {
-            rects.extend(jetty_render::copy_cursor_rects(
-                cr, cc, cell_w, cell_h, shot_grid_top, terminal.theme().cursor,
-            ));
+            let mut copy = jetty_render::copy_cursor_rects(
+                cr, cc, cell_w, cell_h, shot_origin.top, terminal.theme().cursor,
+            );
+            jetty_render::shift_x(&mut copy, shot_origin.left);
+            rects.extend(copy);
             let pill = jetty_render::build_copy_pill(
                 width, shot_grid_top, terminal.theme(), &mut chrome_text, cm, line_mode, selecting,
             );
@@ -1208,7 +1248,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let splash = jetty_render::build_welcome_overlay(
                 width,
                 height,
-                shot_grid_top + prompt_rows as f32 * wch,
+                shot_origin.top + prompt_rows as f32 * wch,
                 env!("CARGO_PKG_VERSION"),
                 "Vulkan",
                 terminal.theme(),

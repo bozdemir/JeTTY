@@ -962,6 +962,11 @@ pub struct App {
     paced_paint_at: Option<std::time::Instant>,
     /// Window corner radius in logical px, clamped [0, 24]. 0 = square corners.
     corner_radius: f32,
+    /// Inner grid padding in LOGICAL px (`padding_x` / `padding_y` config
+    /// keys, clamped [0, PADDING_MAX]); every window scales it by its own DPI
+    /// (`jetty_render::padding_px`). 0 × 0 = the unpadded pre-0.27 grid.
+    padding_x: f32,
+    padding_y: f32,
     /// All open terminal sessions, one per tab. Always non-empty once `resumed`
     /// has run; when it becomes empty the event loop exits.
     tabs: Vec<Tab>,
@@ -1509,16 +1514,20 @@ fn write_pty_bytes(writer: &mut dyn Write, bytes: &[u8]) {
 }
 
 /// Where a detached window's grid sits (below its title bar, above its status
-/// strip), for the shared grid mouse handling.
+/// strip, inside the logical `padding`), for the shared grid mouse handling.
 fn detached_grid_geom(
     dw: &crate::detached::DetachedWindow,
     ui_font: f32,
     show_hud: bool,
+    padding: (f32, f32),
 ) -> crate::gridmouse::GridGeom {
     let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
     let (cell_w, cell_h) = dw.text.cell_size();
+    let origin = dw.grid_origin(ui_font, padding);
     crate::gridmouse::GridGeom {
-        top: bar_h,
+        left: origin.left,
+        top: origin.top,
+        band_top: bar_h,
         bottom: dw.gpu.config.height as f32 - status_h,
         cell_w,
         cell_h,
@@ -1727,6 +1736,9 @@ impl App {
             frame_interval: refresh_interval(None),
             paced_paint_at: None,
             corner_radius,
+            // Replaced by the config's values in `new` below.
+            padding_x: 0.0,
+            padding_y: 0.0,
             tabs: Vec::new(),
             active: 0,
             theme_idx,
@@ -1898,6 +1910,8 @@ impl App {
         app.ui_font_family = cfg.ui_font_family;
         app.ui_font_family_chosen = app.ui_font_family.clone();
         app.corner_radius = cfg.corner_radius.clamp(0.0, 24.0);
+        app.padding_x = cfg.padding_x.clamp(0.0, jetty_render::PADDING_MAX);
+        app.padding_y = cfg.padding_y.clamp(0.0, jetty_render::PADDING_MAX);
         app.summon_effect = SummonEffect::from_config(&cfg.summon_effect);
         app.window_mode = WindowMode::from_config(&cfg.window_mode);
         app.tab_bar_bottom = cfg.tab_bar_position == "bottom";
@@ -2102,6 +2116,8 @@ impl App {
             ui_font_family: self.ui_font_family_chosen.clone(),
             ui_font_size: self.ui_font_logical,
             corner_radius: self.corner_radius,
+            padding_x: self.padding_x,
+            padding_y: self.padding_y,
             summon_effect: self.summon_effect.to_config().to_string(),
             window_mode: self.window_mode.to_config().to_string(),
             dropdown_height_pct: self.dropdown_height_pct,
@@ -2506,6 +2522,15 @@ impl App {
                 self.mark_dirty_all();
             }
         }
+        // Grid padding: moves every window's grid origin and changes how many
+        // cells fit (a debounced reflow, like a font-size change).
+        let (px, py) = (
+            cfg.padding_x.clamp(0.0, jetty_render::PADDING_MAX),
+            cfg.padding_y.clamp(0.0, jetty_render::PADDING_MAX),
+        );
+        if (px - self.padding_x).abs() > eps || (py - self.padding_y).abs() > eps {
+            self.set_grid_padding(px, py);
+        }
         // Summon effect: ASSIGN directly (NOT set_summon_effect, which fires a one-
         // shot preview animation on every reload — amendment).
         let se = SummonEffect::from_config(&cfg.summon_effect);
@@ -2675,10 +2700,10 @@ impl App {
     }
 
     /// Compute the current grid (cols, rows) from the GPU surface size and cell
-    /// metrics, accounting for the tab bar. Falls back to the constants when the
-    /// renderer is not yet available.
+    /// metrics, accounting for the tab bar, the status strip, the padding and
+    /// the scrollbar gutter. Falls back to the constants when the renderer is
+    /// not yet available.
     fn grid_dims(&self) -> (usize, usize) {
-        let status_h = self.status_h();
         let (Some(gpu), Some(text)) = (&self.gpu, &self.text) else {
             return (FALLBACK_COLS, FALLBACK_ROWS);
         };
@@ -2686,9 +2711,61 @@ impl App {
         if cw <= 0.0 || ch <= 0.0 {
             return (FALLBACK_COLS, FALLBACK_ROWS);
         }
-        let cols = ((gpu.config.width as f32 - SCROLLBAR_GUTTER) / cw).floor().max(2.0) as usize;
-        let rows = ((gpu.config.height as f32 - self.bar_h() - status_h) / ch).floor().max(1.0) as usize;
-        (cols, rows)
+        let (w, h) = (gpu.config.width as f32, gpu.config.height as f32);
+        self.main_grid_dims_at(w, h, self.chrome_metrics().dpi, cw, ch)
+    }
+
+    /// Cols × rows of the MAIN window's grid on a `w` × `h` px surface at DPI
+    /// `scale` with `cw` × `ch` cells: the band between the tab bar and the
+    /// status strip, inside the padding and the scrollbar gutter
+    /// (`jetty_render::grid_dims`). The ONE formula behind startup, `reflow`
+    /// and `grid_dims` — `scale` is explicit for startup, before `self.window`
+    /// exists.
+    fn main_grid_dims_at(&self, w: f32, h: f32, scale: f32, cw: f32, ch: f32) -> (usize, usize) {
+        let cm = jetty_render::ChromeMetrics::new(scale, self.ui_font_logical);
+        let status_h = if self.show_perf_hud { cm.status_h() } else { 0.0 };
+        let (pad_x, pad_y) = self.pad_px_at(cm.dpi);
+        jetty_render::grid_dims(w, h - cm.bar_h() - status_h, cw, ch, SCROLLBAR_GUTTER, pad_x, pad_y)
+    }
+
+    /// The logical grid padding `(x, y)` (config units).
+    fn padding(&self) -> (f32, f32) {
+        (self.padding_x, self.padding_y)
+    }
+
+    /// The grid padding in physical px at DPI `scale` (whole pixels).
+    fn pad_px_at(&self, scale: f32) -> (f32, f32) {
+        (jetty_render::padding_px(self.padding_x, scale), jetty_render::padding_px(self.padding_y, scale))
+    }
+
+    /// Where the MAIN window's grid cell (0, 0) sits, un-slid: the left padding,
+    /// and the band top (below a top tab bar) plus the top padding. Every
+    /// cell ↔ pixel mapping of the main window derives from this (see
+    /// `jetty_render::grid_geom`).
+    fn grid_origin(&self) -> jetty_render::GridOrigin {
+        let (pad_x, pad_y) = self.pad_px_at(self.chrome_metrics().dpi);
+        jetty_render::GridOrigin::new(pad_x, self.grid_top_offset() + pad_y)
+    }
+
+    /// Change the grid padding (logical px) live: every window's grid origin
+    /// moves at once and ONE debounced grid + PTY reflow per window follows
+    /// (the cell count changes; a burst of slider steps must not scatter a
+    /// p10k prompt with a SIGWINCH each — same path as a font-size change).
+    fn set_grid_padding(&mut self, x: f32, y: f32) {
+        self.padding_x = x.clamp(0.0, jetty_render::PADDING_MAX);
+        self.padding_y = y.clamp(0.0, jetty_render::PADDING_MAX);
+        let reflow_at = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        self.reflow_pending_at = Some(reflow_at);
+        for dw in &mut self.detached {
+            dw.reflow_pending_at = Some(reflow_at);
+        }
+        // The pointer's cell moved under a held link modifier.
+        self.update_link_hover(true);
+        for pos in 0..self.detached.len() {
+            self.update_detached_link_hover(pos, true);
+        }
+        self.persist();
+        self.mark_dirty_all();
     }
 
     /// Chrome metrics of the MAIN window: its DPI × the UI font size. Every
@@ -2875,15 +2952,6 @@ impl App {
     /// sit above it.
     fn status_h(&self) -> f32 {
         if self.show_perf_hud { self.chrome_metrics().status_h() } else { 0.0 }
-    }
-
-    /// The bottom status strip's height in a DETACHED window (its own DPI).
-    fn detached_status_h(&self, dw: &crate::detached::DetachedWindow) -> f32 {
-        if self.show_perf_hud {
-            dw.chrome_metrics(self.ui_font_logical).status_h()
-        } else {
-            0.0
-        }
     }
 
     /// Pixel Y of the tab bar's top edge for a surface of physical `height`.
@@ -3289,19 +3357,13 @@ impl App {
         }
 
         // Reflow the moved tab to the detached window's grid: the client area
-        // minus its own chrome (top bar + status strip when the perf HUD is on)
-        // and the scrollbar gutter. Use the detached window's OWN GPU surface
-        // size and cell size (not `self.grid_dims()` — different surface).
+        // minus its own chrome (top bar + status strip when the perf HUD is on),
+        // the padding and the scrollbar gutter. Use the detached window's OWN GPU
+        // surface size, DPI and cell size (not `self.grid_dims()` — different
+        // surface).
         let (cw, ch) = dw.text.cell_size();
-        let (cols, rows) = crate::detached::grid_dims(
-            dw.gpu.config.width as f32,
-            dw.gpu.config.height as f32,
-            cw,
-            ch,
-            SCROLLBAR_GUTTER,
-            dw.chrome_metrics(self.ui_font_logical).bar_h(),
-            self.detached_status_h(&dw),
-        );
+        let (cols, rows) =
+            dw.fit_grid_dims(self.ui_font_logical, self.show_perf_hud, SCROLLBAR_GUTTER, self.padding());
         dw.tab.terminal.resize(cols, rows);
         dw.tab.terminal.set_cell_px(cw, ch);
         dw.tab.pty.resize(
@@ -5358,7 +5420,15 @@ impl App {
         let h = self.gpu.as_ref().map_or(0.0, |g| g.config.height as f32);
         let bottom = if self.tab_bar_bottom { self.tabbar_y(h) } else { h - self.status_h() };
         let (cell_w, cell_h) = self.text.as_ref().map_or((0.0, 0.0), |t| t.cell_size());
-        crate::gridmouse::GridGeom { top: self.grid_top_offset(), bottom, cell_w, cell_h }
+        let origin = self.grid_origin();
+        crate::gridmouse::GridGeom {
+            left: origin.left,
+            top: origin.top,
+            band_top: self.grid_top_offset(),
+            bottom,
+            cell_w,
+            cell_h,
+        }
     }
 
     /// Run one shared grid-mouse step on the main window's active tab and write
@@ -5421,10 +5491,10 @@ impl App {
                 None => self.grid_mouse.reset(),
             }
         }
-        let (ui_font, show_hud, mods) = (self.ui_font_logical, self.show_perf_hud, self.modifiers);
+        let (ui_font, show_hud, mods, padding) = (self.ui_font_logical, self.show_perf_hud, self.modifiers, self.padding());
         for dw in &mut self.detached {
             if dw.grid_mouse.autoscroll_due().is_some_and(|t| now >= t) {
-                let geom = detached_grid_geom(dw, ui_font, show_hud);
+                let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                 if with_detached_grid(dw, geom, mods, |g| crate::gridmouse::autoscroll_step(g, now)) {
                     dw.request_paint();
                     painted = true;
@@ -5451,19 +5521,12 @@ impl App {
     /// hardcoding Left-at-press / Right-at-update dropped the endpoint cells on a
     /// reverse (right-to-left / bottom-to-top) drag.
     fn cursor_cell_0_side(&self) -> Option<(usize, usize, bool)> {
-        let (cell_w, cell_h) = self.text.as_ref()?.cell_size();
-        if cell_w <= 0.0 || cell_h <= 0.0 {
+        let geom = self.main_grid_geom();
+        if geom.cell_w <= 0.0 || geom.cell_h <= 0.0 {
             return None;
         }
-        let y = (self.cursor.1 as f32 - self.grid_top_offset()).max(0.0);
-        Some(input::cell_at_0_side(
-            self.cursor.0 as f32,
-            y,
-            cell_w,
-            cell_h,
-            self.active_tab().terminal.cols(),
-            self.active_tab().terminal.rows(),
-        ))
+        let term = &self.active_tab().terminal;
+        Some(geom.select_cell(self.cursor.0 as f32, self.cursor.1 as f32, term.cols(), term.rows()))
     }
 
     /// The cursor icon the main window should show for `zone`: the link
@@ -5496,20 +5559,8 @@ impl App {
         // Cursor must be over the grid band (same bounds as the Middle-click
         // paste arm): below the top chrome, above the bottom strips.
         let in_grid = gated
-            && self
-                .gpu
-                .as_ref()
-                .map(|g| {
-                    let h = g.config.height as f32;
-                    let cy = self.cursor.1 as f32;
-                    let grid_bottom = if self.tab_bar_bottom {
-                        self.tabbar_y(h)
-                    } else {
-                        h - self.status_h()
-                    };
-                    cy >= self.grid_top_offset() && cy < grid_bottom
-                })
-                .unwrap_or(false);
+            && self.gpu.is_some()
+            && self.main_grid_geom().contains_y(self.cursor.1 as f32);
         if !in_grid {
             self.link_hover_cell = None;
             if self.link_hover.take().is_some() {
@@ -5567,21 +5618,18 @@ impl App {
     /// the context menu).
     fn update_detached_link_hover(&mut self, pos: usize, force: bool) {
         let held = link_modifier_held(&self.modifiers);
-        let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+        let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
         let Some(dw) = self.detached.get_mut(pos) else { return };
-        let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
-        let (cw, ch) = dw.text.cell_size();
-        let cy = dw.cursor.1 as f32;
-        let h = dw.gpu.config.height as f32;
+        let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
+        let (cx, cy) = (dw.cursor.0 as f32, dw.cursor.1 as f32);
         let gated = held
             && !dw.selecting
             && !dw.dragging_scrollbar
             && dw.bar_drag.is_none()
             && dw.menu_open.is_none()
-            && cw > 0.0
-            && ch > 0.0
-            && cy >= bar_h
-            && cy < h - status_h;
+            && geom.cell_w > 0.0
+            && geom.cell_h > 0.0
+            && geom.contains_y(cy);
         if !gated {
             dw.link_hover_cell = None;
             if dw.link_hover.take().is_some() {
@@ -5590,15 +5638,7 @@ impl App {
             }
             return;
         }
-        let gy = (cy - bar_h).max(0.0);
-        let (line, col, _) = input::cell_at_0_side(
-            dw.cursor.0 as f32,
-            gy,
-            cw,
-            ch,
-            dw.tab.terminal.cols(),
-            dw.tab.terminal.rows(),
-        );
+        let (line, col, _) = geom.select_cell(cx, cy, dw.tab.terminal.cols(), dw.tab.terminal.rows());
         if !force && dw.link_hover_cell == Some((line, col)) {
             return;
         }
@@ -6401,18 +6441,15 @@ impl App {
     /// Called from both `WindowEvent::Resized` and `set_font_size` so both
     /// features share one code path.
     fn reflow(&mut self) {
-        let status_h = self.status_h();
-        let bar_h = self.bar_h();
         let (Some(gpu), Some(text)) = (&self.gpu, &self.text) else { return };
         let (cw, ch) = text.cell_size();
         if cw <= 0.0 || ch <= 0.0 {
             return;
         }
-        let w = gpu.config.width;
-        let h = gpu.config.height;
-        let cols = ((w as f32 - SCROLLBAR_GUTTER) / cw).floor().max(2.0) as usize;
-        // The grid occupies the area below the tab bar and above the status bar.
-        let rows = ((h as f32 - bar_h - status_h) / ch).floor().max(1.0) as usize;
+        // The grid occupies the band below the tab bar and above the status
+        // bar, inside the padding and the scrollbar gutter.
+        let (w, h) = (gpu.config.width as f32, gpu.config.height as f32);
+        let (cols, rows) = self.main_grid_dims_at(w, h, self.chrome_metrics().dpi, cw, ch);
         // Reflow every tab so background sessions stay in sync with the window.
         for tab in &mut self.tabs {
             tab.terminal.resize(cols, rows);
@@ -7805,7 +7842,7 @@ impl App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 // App-wide inputs, read before the dw (self.detached) borrow.
-                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+                let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 // This window's chrome geometry (its own DPI × the UI font).
                 let cm = dw.chrome_metrics(ui_font);
@@ -7909,7 +7946,7 @@ impl App {
                 // the main window runs it — extend a selection drag (edge
                 // auto-scroll past the top/bottom), or report the motion to a
                 // program that tracks it, once per cell. ---
-                let geom = detached_grid_geom(dw, ui_font, show_hud);
+                let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                 let now = std::time::Instant::now();
                 if with_detached_grid(dw, geom, self.modifiers, |g| crate::gridmouse::motion(g, now)).paint {
                     dw.request_paint();
@@ -7953,7 +7990,7 @@ impl App {
                     return;
                 }
                 // App-wide inputs, read before the dw (self.detached) borrow.
-                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+                let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let act = {
                     let Some(dw) = self.detached.get_mut(pos) else { return };
                     let cm = dw.chrome_metrics(ui_font);
@@ -8094,7 +8131,7 @@ impl App {
                             // on a link opens it, a program that tracks the mouse
                             // gets the press, otherwise a cell / word / line
                             // selection starts (Shift always selects).
-                            let geom = detached_grid_geom(dw, ui_font, show_hud);
+                            let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                             let link_mod = link_modifier_held(&self.modifiers);
                             let now = std::time::Instant::now();
                             match with_detached_grid(dw, geom, self.modifiers, |g| {
@@ -8146,7 +8183,7 @@ impl App {
                 // or forward the mouse release report — mutually exclusive with a
                 // top-bar drag, so handle it first and return. Mirrors the main
                 // window's release logic.
-                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+                let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 {
                     let Some(dw) = self.detached.get_mut(pos) else { return };
                     // A release ending a scrollbar drag is a host-widget
@@ -8163,7 +8200,7 @@ impl App {
                     // no-Shift DRAG over a mouse-grabbing program, the Shift+drag
                     // hint (cooldown shared across windows; drawn only in THIS
                     // window, F4).
-                    let geom = detached_grid_geom(dw, ui_font, show_hud);
+                    let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                     match with_detached_grid(dw, geom, self.modifiers, |g| {
                         crate::gridmouse::release(g, MouseButton::Left)
                     }) {
@@ -8277,10 +8314,10 @@ impl App {
                 }
                 let theme = self.current_theme();
                 let run_enabled = self.run_selection_enabled;
-                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+                let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
-                let geom = detached_grid_geom(dw, ui_font, show_hud);
+                let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                 if geom.contains_y(dw.cursor.1 as f32) {
                     let now = std::time::Instant::now();
                     if with_detached_grid(dw, geom, mods, |g| {
@@ -8365,13 +8402,13 @@ impl App {
                     return;
                 }
                 let copy_on_select = self.copy_on_select;
-                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+                let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 if dw.menu_open.is_some() {
                     return;
                 }
-                let geom = detached_grid_geom(dw, ui_font, show_hud);
+                let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                 if !geom.contains_y(dw.cursor.1 as f32) {
                     return;
                 }
@@ -8393,10 +8430,10 @@ impl App {
                 // Releases of middle/right presses that went to the program
                 // (their presses have their own arms above), and back/forward
                 // over the grid — the same shared handling as the main window.
-                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+                let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
-                let geom = detached_grid_geom(dw, ui_font, show_hud);
+                let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                 let now = std::time::Instant::now();
                 if state == ElementState::Released {
                     with_detached_grid(dw, geom, mods, |g| crate::gridmouse::release(g, button));
@@ -8495,7 +8532,7 @@ impl App {
                 if self.overlay_wheel(Surface::Detached(pos), delta) {
                     return;
                 }
-                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+                let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
@@ -8510,7 +8547,7 @@ impl App {
                         cx >= r.x && cx <= r.x + r.w
                     })
                 };
-                let geom = detached_grid_geom(dw, ui_font, show_hud);
+                let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                 let mut vertical = std::mem::take(&mut dw.scroll_accum);
                 let outcome = with_detached_grid(dw, geom, mods, |g| {
                     crate::gridmouse::wheel(g, delta, over_scrollbar, &mut vertical)
@@ -8603,7 +8640,10 @@ impl App {
         let overlay_owns_keys = ov.owns_keys() || hint_ui.is_some() || copy_mode_ui.is_some();
         let help_rows: Vec<String> = if help_open { self.help_rows.clone() } else { Vec::new() };
         let font_logical = self.font_logical;
+        let padding = self.padding();
         let Some(dw) = self.detached.get_mut(pos) else { return };
+        // Where this window's grid cell (0, 0) sits (below its bar, padded).
+        let origin = dw.grid_origin(self.ui_font_logical, padding);
 
         // Snapshot + theme + chrome inputs are read before the mutable
         // gpu/text/quad borrow below (same pattern as the main RedrawRequested).
@@ -8613,7 +8653,7 @@ impl App {
         // winit only when that cell moves) — mirrors the main window.
         let ime_area = {
             let (cw, ch) = dw.text.cell_size();
-            input::ime_cursor_area(snap.cursor_row, snap.cursor_col, cw, ch, dw.chrome_bands(self.ui_font_logical, self.show_perf_hud).0)
+            input::ime_cursor_area(snap.cursor_row, snap.cursor_col, cw, ch, origin)
         };
         if dw.ime_area != Some(ime_area) {
             dw.ime_area = Some(ime_area);
@@ -8756,6 +8796,7 @@ impl App {
             snap: &snap,
             theme: &theme,
             grid_top,
+            origin,
             slide_y: 0.0,
             grid_bottom: grid_bottom_px,
             status_h,
@@ -8850,9 +8891,13 @@ impl App {
             let refs: Vec<(&str, usize, usize)> = labeled.iter().map(|(l, r, c)| (l.as_str(), *r, *c)).collect();
             let (cell_w, cell_h) = text.cell_size();
             let grid_cm = jetty_render::ChromeMetrics::new(scale, font_logical);
-            let ov = jetty_render::build_hint_overlay(
-                &refs, cell_w, cell_h, grid_top, &theme, &mut *text, grid_cm, typed, width,
+            // Built in grid space, then moved onto the origin (as in main).
+            let mut ov = jetty_render::build_hint_overlay(
+                &refs, cell_w, cell_h, origin.top, &theme, &mut *text, grid_cm, typed,
+                width.saturating_sub(origin.left as u32),
             );
+            jetty_render::shift_x(&mut ov.quads, origin.left);
+            jetty_render::shift_labels_x(&mut ov.labels, origin.left);
             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
             if !ov.labels.is_empty() {
                 let _ = text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &ov.labels);
@@ -8862,9 +8907,11 @@ impl App {
         // Pass 4e' twin): terminal font via the grid layer, underlined.
         if let Some(p) = &preedit_ui {
             let (cell_w, cell_h) = text.cell_size();
-            if let Some(ov) = jetty_render::build_preedit_overlay(
-                p, snap.cursor_row, snap.cursor_col, snap.cols, cell_w, cell_h, grid_top, &theme, scale,
+            if let Some(mut ov) = jetty_render::build_preedit_overlay(
+                p, snap.cursor_row, snap.cursor_col, snap.cols, cell_w, cell_h, origin.top, &theme, scale,
             ) {
+                jetty_render::shift_x(&mut ov.quads, origin.left);
+                jetty_render::shift_labels_x(&mut ov.labels, origin.left);
                 quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
                 let _ = text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &ov.labels);
             }
@@ -9648,7 +9695,7 @@ impl ApplicationHandler<AppEvent> for App {
         // only resizes the surface and arms `reflow_pending_at`, exactly like
         // the main window's — one SIGWINCH per drag, no p10k prompt scatter).
         {
-            let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+            let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
             let now = std::time::Instant::now();
             // Indexed loop (not iter_mut) so the reflowed window's cached
             // Ctrl+hover can be revalidated via &mut self below (F6).
@@ -9657,16 +9704,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if dw.reflow_pending_at.is_some_and(|d| now >= d) {
                     dw.reflow_pending_at = None;
                     let (cw, ch) = dw.text.cell_size();
-                    let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
-                    let (cols, rows) = crate::detached::grid_dims(
-                        dw.gpu.config.width as f32,
-                        dw.gpu.config.height as f32,
-                        cw,
-                        ch,
-                        SCROLLBAR_GUTTER,
-                        bar_h,
-                        status_h,
-                    );
+                    let (cols, rows) = dw.fit_grid_dims(ui_font, show_hud, SCROLLBAR_GUTTER, padding);
                     dw.tab.terminal.resize(cols, rows);
                     dw.tab.terminal.set_cell_px(cw, ch);
                     dw.tab.pty.resize(
@@ -10220,12 +10258,11 @@ impl ApplicationHandler<AppEvent> for App {
                 font_system,
             );
             let (cw, ch) = text.cell_size();
-            // Derive the grid from the physical pixel size and the physical cell size.
-            let cols = ((size.width as f32 - SCROLLBAR_GUTTER) / cw).floor().max(2.0) as usize;
-            // Chrome bands at THIS window's scale (self.window isn't stored yet).
-            let cm = jetty_render::ChromeMetrics::new(scale, self.ui_font_logical);
-            let status_h = if self.show_perf_hud { cm.status_h() } else { 0.0 };
-            let rows = ((size.height as f32 - cm.bar_h() - status_h) / ch).floor().max(1.0) as usize;
+            // Derive the grid from the physical pixel size and the physical cell
+            // size, the chrome bands and padding at THIS window's scale
+            // (self.window isn't stored yet).
+            let (cols, rows) =
+                self.main_grid_dims_at(size.width as f32, size.height as f32, scale, cw, ch);
             let quad = QuadLayer::new(&g.device, g.format);
             (Some(text), Some(quad), cols, rows)
         } else {
@@ -12436,7 +12473,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // winit only when that cell moves, not every frame).
                 let ime_area = self.text.as_ref().map(|t| {
                     let (cw, ch) = t.cell_size();
-                    input::ime_cursor_area(snap.cursor_row, snap.cursor_col, cw, ch, self.grid_top_offset())
+                    input::ime_cursor_area(snap.cursor_row, snap.cursor_col, cw, ch, self.grid_origin())
                 });
                 if let Some(area) = ime_area {
                     if self.ime_area != Some(area) {
@@ -12663,6 +12700,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // metrics, so clicks land where the chrome is drawn.
                 let cm = self.chrome_metrics();
                 let bar_h = cm.bar_h();
+                // Where grid cell (0, 0) sits, un-slid (padding + bar).
+                let origin = self.grid_origin();
                 // Metrics of the TERMINAL font, for overlays anchored to grid
                 // cells (hint chips): their labels render in the grid font so
                 // they always fit their one-row chip, whatever the UI font size.
@@ -12826,6 +12865,7 @@ impl ApplicationHandler<AppEvent> for App {
                         snap: &snap,
                         theme: &theme,
                         grid_top,
+                        origin,
                         slide_y: slide_y_offset,
                         grid_bottom: grid_bottom_px,
                         status_h,
@@ -12945,17 +12985,21 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some((labeled, typed)) = &hint_ui {
                         let refs: Vec<(&str, usize, usize)> =
                             labeled.iter().map(|(l, r, c)| (l.as_str(), *r, *c)).collect();
-                        let ov = jetty_render::build_hint_overlay(
+                        // Built in grid space (the grid's width from its left
+                        // edge), then moved onto the origin.
+                        let mut ov = jetty_render::build_hint_overlay(
                             &refs,
                             cell_w,
                             cell_h,
-                            grid_top + slide_y_offset,
+                            origin.top + slide_y_offset,
                             &theme,
                             &mut *text,
                             grid_cm,
                             typed,
-                            width,
+                            width.saturating_sub(origin.left as u32),
                         );
+                        jetty_render::shift_x(&mut ov.quads, origin.left);
+                        jetty_render::shift_labels_x(&mut ov.labels, origin.left);
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
                         if !ov.labels.is_empty() {
                             let _ = text.render_overlays(
@@ -12967,17 +13011,19 @@ impl ApplicationHandler<AppEvent> for App {
                     // TERMINAL font via the grid layer (like the hint chips), on
                     // the theme bg, underlined, until it commits.
                     if let Some(p) = &preedit_ui {
-                        if let Some(ov) = jetty_render::build_preedit_overlay(
+                        if let Some(mut ov) = jetty_render::build_preedit_overlay(
                             p,
                             snap.cursor_row,
                             snap.cursor_col,
                             snap.cols,
                             cell_w,
                             cell_h,
-                            grid_top + slide_y_offset,
+                            origin.top + slide_y_offset,
                             &theme,
                             scale,
                         ) {
+                            jetty_render::shift_x(&mut ov.quads, origin.left);
+                            jetty_render::shift_labels_x(&mut ov.labels, origin.left);
                             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
                             let _ = text.render_overlays(
                                 &gpu.device, &gpu.queue, scene_view, width, height, &ov.labels,
@@ -13029,7 +13075,7 @@ impl ApplicationHandler<AppEvent> for App {
                         let mut splash = jetty_render::build_welcome_overlay(
                             width,
                             height,
-                            grid_top + slide_y_offset + prompt_rows as f32 * welcome_ch,
+                            origin.top + slide_y_offset + prompt_rows as f32 * welcome_ch,
                             env!("CARGO_PKG_VERSION"),
                             &gpu_backend_name,
                             &theme,
@@ -13210,12 +13256,11 @@ impl ApplicationHandler<AppEvent> for App {
                             {
                                 // Cursor cell centre in physical pixels. x and y both
                                 // start from (0,0) at the top-left of the viewport,
-                                // matching @builtin(position) in the WGSL fragment.
-                                // Mirrors text.rs:585-596's cursor_left/top formula.
-                                let cursor_px_x = snap.cursor_col as f32 * cell_w
-                                    + cell_w * 0.5;
-                                let cursor_px_y = snap.cursor_row as f32 * cell_h
-                                    + grid_top + slide_y_offset + cell_h * 0.5;
+                                // matching @builtin(position) in the WGSL fragment —
+                                // the cell at the (slid) grid origin.
+                                let o = origin.slid(slide_y_offset);
+                                let cursor_px_x = o.col_x(snap.cursor_col, cell_w) + cell_w * 0.5;
+                                let cursor_px_y = o.row_y(snap.cursor_row, cell_h) + cell_h * 0.5;
                                 cfx.apply(
                                     &gpu.device,
                                     &gpu.queue,
@@ -13478,9 +13523,14 @@ impl ApplicationHandler<AppEvent> for App {
 struct GridScene<'a> {
     snap: &'a jetty_core::GridSnapshot,
     theme: &'a jetty_core::Theme,
-    /// Un-slid grid top (0.0 or `TABBAR_H`). The scrollbar is computed at this
-    /// origin and then translated by `slide_y` (main dropdown slide).
+    /// Un-slid top of the grid BAND (0.0, or the bar height below a top bar).
+    /// The scrollbar is computed at this origin and then translated by
+    /// `slide_y` (main dropdown slide).
     grid_top: f32,
+    /// Un-slid position of cell (0, 0): the band top plus the top padding, and
+    /// the left padding (`jetty_render::grid_geom`). Every grid-space quad,
+    /// the glyphs and the images are placed at `origin.slid(slide_y)`.
+    origin: jetty_render::GridOrigin,
     /// Dropdown-slide pixel offset. Always `0.0` for a detached window.
     slide_y: f32,
     /// Un-slid grid bottom (image scissor). `slide_y` is added inside the core.
@@ -13542,7 +13592,12 @@ fn render_grid_scene(
     // The glyphs/backgrounds/cursor all draw at the slid origin; the scrollbar
     // is computed at the un-slid `grid_top` and then translated by `slide_y`
     // (matches both windows' pre-refactor behavior; `slide_y == 0` for detached).
-    let grid_origin_y = s.grid_top + s.slide_y;
+    // The grid-space builders below lay x out from the grid's left edge and
+    // take `grid_origin_y` as their y offset; each result is moved onto the
+    // origin (`shift_x`) right where it is built, so every list that reaches a
+    // draw call is in window coordinates.
+    let origin = s.origin.slid(s.slide_y);
+    let grid_origin_y = origin.top;
     let selection = jetty_render::selection_paint(s.theme);
     let scrollbar_thumb = scrollbar_thumb_for(s.theme);
     // The shell cursor, split by layer: the SOLID block is painted under the
@@ -13550,13 +13605,17 @@ fn render_grid_scene(
     // beam / underline / unfocused hollow draw over the text (Pass 4). In
     // copy-mode (main only) the shell cursor is SUPPRESSED so only the copy-mode
     // keyboard cursor shows; detached always passes `copy_mode_active = false`.
-    let (cursor_under, cursor_over) = if s.copy_mode_active {
+    let (mut cursor_under, mut cursor_over) = if s.copy_mode_active {
         (None, Vec::new())
     } else {
         jetty_render::cursor_rects_split(
             s.snap, cell_w, cell_h, grid_origin_y, s.focused, s.caret_t_for_flash, s.caret_flash_color,
         )
     };
+    if let Some(block) = cursor_under.as_mut() {
+        block.x += origin.left;
+    }
+    jetty_render::shift_x(&mut cursor_over, origin.left);
 
     // Pass 1: clear to the (premultiplied, opacity-correct) theme bg and paint
     // the per-cell background quads under the text. Search-hit tint rects are
@@ -13569,6 +13628,7 @@ fn render_grid_scene(
             s.search_hits, cell_w, cell_h, grid_origin_y, s.theme,
         ));
     }
+    jetty_render::shift_x(&mut bg_rects, origin.left);
     bg_rects.extend(cursor_under);
 
     // Pass 2: glyphs over the painted background, offset down by the grid origin.
@@ -13586,7 +13646,7 @@ fn render_grid_scene(
     // separate pass + submit cost tens of µs of CPU on every frame). Both uploads
     // land at that submit, ahead of the draws.
     let bg_count = quad.upload(device, queue, width, height, &bg_rects);
-    let text_ready = text.prepare_grid(device, queue, width, height, s.snap, grid_origin_y, &paint).is_ok();
+    let text_ready = text.prepare_grid(device, queue, width, height, s.snap, origin, &paint).is_ok();
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("grid") });
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -13625,7 +13685,7 @@ fn render_grid_scene(
             h: img.height,
             rgba: &img.rgba,
             dst: [
-                vi.col as f32 * cell_w,
+                origin.col_x(vi.col as usize, cell_w),
                 grid_origin_y + vi.top_row * cell_h,
                 vi.px_w as f32,
                 vi.px_h as f32,
@@ -13633,6 +13693,8 @@ fn render_grid_scene(
             opacity: 1.0,
         })
         .collect();
+    // From row 0's top (an image scrolled half off the top stays out of the
+    // top padding) to the band bottom.
     let sc_top = grid_origin_y.clamp(0.0, height as f32);
     let sc_bot = (s.grid_bottom + s.slide_y).clamp(0.0, height as f32);
     let sc_y = sc_top as u32;
@@ -13653,26 +13715,34 @@ fn render_grid_scene(
         rects.push(r);
     }
     if !s.failed_rows.is_empty() {
+        // In the left padding (x 0 at zero padding, over column 0 as before).
+        let bar_w = (3.0 * s.scale).round().max(2.0);
         rects.extend(jetty_render::failed_marker_rects(
             s.failed_rows,
             cell_h,
             grid_origin_y,
-            (3.0 * s.scale).round().max(2.0),
+            jetty_render::failed_marker_x(origin.left, bar_w),
+            bar_w,
             s.theme.failed_marker_color(),
         ));
     }
+    // Already placed at the origin by `prepare_grid`.
     rects.extend_from_slice(text.decoration_rects());
     if let Some(spans) = s.link_spans {
         let p12 = s.theme.palette[12];
-        rects.extend(jetty_render::link_underline_rects(
+        let mut link = jetty_render::link_underline_rects(
             spans, [p12[0], p12[1], p12[2], 255], cell_w, cell_h, grid_origin_y,
-        ));
+        );
+        jetty_render::shift_x(&mut link, origin.left);
+        rects.extend(link);
     }
     // The thin cursor shapes (beam / underline / unfocused hollow) last, over the
     // glyphs + decorations; the solid block was painted under the text (Pass 1).
     rects.extend(cursor_over);
     if let Some((cr, cc, _sel, _lm)) = s.copy_mode_ui {
-        rects.extend(jetty_render::copy_cursor_rects(cr, cc, cell_w, cell_h, grid_origin_y, s.theme.cursor));
+        let mut copy = jetty_render::copy_cursor_rects(cr, cc, cell_w, cell_h, grid_origin_y, s.theme.cursor);
+        jetty_render::shift_x(&mut copy, origin.left);
+        rects.extend(copy);
     }
     quad.render(device, queue, scene_view, width, height, &rects);
 }

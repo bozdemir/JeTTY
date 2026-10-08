@@ -91,6 +91,7 @@ struct PreparedGrid {
     shape_gen: u64,
     width: u32,
     height: u32,
+    left_bits: u32,
     top_bits: u32,
     rows: usize,
     cols: usize,
@@ -532,13 +533,14 @@ pub struct TextLayer {
     /// (font family, font size, resize): it drops the row cache and forces the next
     /// frame to re-prepare even when the grid text/colors are unchanged.
     shape_gen: u64,
-    /// Cached underline/strikethrough quads and the key they were built for:
-    /// `(grid_decoration_key, cell_w bits, cell_h bits, y_offset bits)`. Rebuilt
+    /// Cached underline/strikethrough quads (placed at the grid origin) and the
+    /// key they were built for: `(grid_decoration_key, cell_w bits, cell_h bits,
+    /// origin left bits, origin top bits, cols, rows)`. Rebuilt
     /// only when that changes, so a caret-flash / CRT / scrollbar-only animate
     /// frame (same grid) reuses them — decorations never rebuild per frame; only
     /// the CURSOR quads do (drawn app-side). Consumed via `decoration_rects()`.
     deco_rects: Vec<crate::quad::Rect>,
-    deco_cache_key: Option<(u64, u32, u32, u32, u32, u32)>,
+    deco_cache_key: Option<(u64, u32, u32, u32, u32, u32, u32)>,
     /// Chrome text measurement (`ChromeMeasure`): rendered width per label for
     /// non-title [0] and tab-title [1] chrome. Chrome labels are mostly static
     /// strings rebuilt every rendered frame, so a hit is one hash lookup and a
@@ -922,9 +924,11 @@ impl TextLayer {
         Some(self.cell_w)
     }
 
-    /// The cached underline/strikethrough quads for the last rendered frame, built
-    /// at the `top_offset` passed to `render_to`. The caller appends these to its
-    /// Pass-4 quad batch (they draw over the glyphs, under the cursor).
+    /// The cached underline/strikethrough quads for the last rendered frame,
+    /// already PLACED at the grid origin passed to `prepare_grid` (window
+    /// coordinates — unlike the grid-space quad builders, do not shift them).
+    /// The caller appends these to its Pass-4 quad batch (they draw over the
+    /// glyphs, under the cursor).
     pub fn decoration_rects(&self) -> &[crate::quad::Rect] {
         &self.deco_rects
     }
@@ -999,7 +1003,8 @@ impl TextLayer {
         clear: bool,
         top_offset: f32,
     ) -> Result<(), PrepareError> {
-        self.render_grid(device, queue, view, width, height, snapshot, clear, top_offset, &GridPaint::default())
+        let origin = crate::GridOrigin::new(0.0, top_offset);
+        self.render_grid(device, queue, view, width, height, snapshot, clear, origin, &GridPaint::default())
     }
 
     /// [`Self::render_to`] with the per-frame [`GridPaint`] inputs.
@@ -1022,10 +1027,10 @@ impl TextLayer {
         height: u32,
         snapshot: &GridSnapshot,
         clear: bool,
-        top_offset: f32,
+        origin: crate::GridOrigin,
         paint: &GridPaint,
     ) -> Result<(), PrepareError> {
-        self.prepare_grid(device, queue, width, height, snapshot, top_offset, paint)?;
+        self.prepare_grid(device, queue, width, height, snapshot, origin, paint)?;
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("text") });
         {
@@ -1091,6 +1096,9 @@ impl TextLayer {
     /// cells, rebuild decorations, shape new rows and glyphon-prepare — or nothing
     /// at all when the grid is unchanged. Pair with [`Self::draw_grid`] +
     /// [`Self::end_grid_frame`]; on `Err` there is nothing valid to draw.
+    ///
+    /// `origin` is where cell (0, 0) sits in the window (see `grid_geom`): the
+    /// glyphs AND the cached decoration quads are placed there.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_grid(
         &mut self,
@@ -1099,9 +1107,10 @@ impl TextLayer {
         width: u32,
         height: u32,
         snapshot: &GridSnapshot,
-        top_offset: f32,
+        origin: crate::GridOrigin,
         paint: &GridPaint,
     ) -> Result<(), PrepareError> {
+        let (left_offset, top_offset) = (origin.left, origin.top);
         let cell_w = self.cell_w;
         let cell_h = self.cell_h;
         let (rows, cols) = (snapshot.rows, snapshot.cols);
@@ -1117,10 +1126,20 @@ impl TextLayer {
         // fold_decoration folds cells positionally by LINEAR index, so a
         // cell-count-preserving reflow (e.g. 80x24 -> 60x32) can fold identically
         // yet needs different rects.
-        let deco_key = (packed.deco, cell_w.to_bits(), cell_h.to_bits(), top_offset.to_bits(), cols as u32, rows as u32);
+        let deco_key = (
+            packed.deco,
+            cell_w.to_bits(),
+            cell_h.to_bits(),
+            left_offset.to_bits(),
+            top_offset.to_bits(),
+            cols as u32,
+            rows as u32,
+        );
         if self.deco_cache_key != Some(deco_key) {
             self.deco_rects.clear();
+            // Built in grid space (x from the grid's left edge), then placed.
             crate::quad::text_decoration_rects(snapshot, cell_w, cell_h, top_offset, &mut self.deco_rects);
+            crate::grid_geom::shift_x(&mut self.deco_rects, left_offset);
             self.deco_cache_key = Some(deco_key);
         }
 
@@ -1132,6 +1151,7 @@ impl TextLayer {
             p.shape_gen == self.shape_gen
                 && p.width == width
                 && p.height == height
+                && p.left_bits == left_offset.to_bits()
                 && p.top_bits == top_offset.to_bits()
                 && p.rows == rows
                 && p.cols == cols
@@ -1158,7 +1178,7 @@ impl TextLayer {
                 if slot != NO_ROW {
                     areas.push(TextArea {
                         buffer: &self.row_cache[slot as usize].buffer,
-                        left: 0.0,
+                        left: left_offset,
                         top: top_offset + r as f32 * cell_h,
                         scale: 1.0,
                         bounds: win_bounds,
@@ -1174,7 +1194,7 @@ impl TextLayer {
                 if let Some(buffer) = self.fallback_glyphs.get(c) {
                     areas.push(TextArea {
                         buffer,
-                        left: *x,
+                        left: *x + left_offset,
                         top: *y + top_offset,
                         scale: 1.0,
                         bounds: win_bounds,
@@ -1187,7 +1207,7 @@ impl TextLayer {
                 if let Some(buffer) = self.clusters.get(packed.clusters[*ci as usize]) {
                     areas.push(TextArea {
                         buffer,
-                        left: *x,
+                        left: *x + left_offset,
                         top: *y + top_offset,
                         scale: 1.0,
                         bounds: win_bounds,
@@ -1232,6 +1252,7 @@ impl TextLayer {
                 p.shape_gen = self.shape_gen;
                 p.width = width;
                 p.height = height;
+                p.left_bits = left_offset.to_bits();
                 p.top_bits = top_offset.to_bits();
                 p.rows = rows;
                 p.cols = cols;
