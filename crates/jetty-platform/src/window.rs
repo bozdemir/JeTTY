@@ -240,6 +240,82 @@ pub fn set_window_fullscreen(win: &Window, on: bool) {
     }
 }
 
+/// Bring an already-shown window to the front and give it keyboard focus, as a
+/// DIRECT USER REQUEST: the summon hotkey, `jetty --show`, a command typed in a
+/// detached window that acts on the main one. Never for something the user did
+/// not just ask for — that would be focus stealing.
+///
+/// winit's `focus_window()` asks with the EWMH `_NET_ACTIVE_WINDOW` message,
+/// source indication 1 ("an application asks") and no timestamp. A window
+/// manager with focus-stealing prevention judges that against the window's last
+/// user interaction: KWin's default level refused it whenever another window had
+/// been used since, so F9 on a JeTTY left behind another window did nothing
+/// (seen under KWin 6.6 on a nested X server — source 1 refused, source 2
+/// raised and focused). On X11 this sends the same standard message with source
+/// indication 2, the one pagers and taskbars send for a user's click, which
+/// every EWMH window manager honors (KWin, Mutter, Xfwm4, Openbox, i3). Not a
+/// desktop-specific hack: one freedesktop message, no WM is named. Wayland,
+/// macOS and an unreachable X server keep winit's `focus_window()`.
+pub fn activate_window(win: &Window) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if x11::request_activation(win) {
+        return;
+    }
+    win.focus_window();
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+mod x11 {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use winit::window::Window;
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt as _, EventMask};
+
+    /// EWMH `_NET_ACTIVE_WINDOW` source indication for a request made on the
+    /// user's behalf (pagers, taskbars — and a global hotkey).
+    const SOURCE_USER: u32 = 2;
+
+    /// Send `_NET_ACTIVE_WINDOW` (source 2) for `win` over a short-lived
+    /// connection of its own (a raise is rare: one hotkey press). `false` when
+    /// `win` is not an X11 window (Wayland) or the server can't be reached, so
+    /// the caller falls back to winit.
+    pub(super) fn request_activation(win: &Window) -> bool {
+        let Ok(handle) = win.window_handle() else {
+            return false;
+        };
+        let xid = match handle.as_raw() {
+            RawWindowHandle::Xlib(h) => h.window as u32,
+            RawWindowHandle::Xcb(h) => h.window.get(),
+            _ => return false,
+        };
+        send(xid).is_ok()
+    }
+
+    fn send(xid: u32) -> Result<(), Box<dyn std::error::Error>> {
+        let (conn, screen) = x11rb::connect(None)?;
+        let root = conn.setup().roots.get(screen).ok_or("no X screen")?.root;
+        let atom = conn
+            .intern_atom(false, b"_NET_ACTIVE_WINDOW")?
+            .reply()?
+            .atom;
+        // [source, timestamp (CurrentTime), requestor's active window (none), 0, 0]
+        let event =
+            ClientMessageEvent::new(32, xid, atom, [SOURCE_USER, x11rb::CURRENT_TIME, 0, 0, 0]);
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )?
+        // Round-trip before the connection closes: a request merely flushed and
+        // then followed by the close was dropped unprocessed by the server (on
+        // Xvfb no message reached the WM until the request was checked or the
+        // connection lingered). `check` also surfaces an X error (BadWindow).
+        .check()?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{pick_monitor, pos_in_monitor_rect};

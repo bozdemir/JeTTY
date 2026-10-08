@@ -17,9 +17,12 @@ F9 does what you'd expect from the window's state:
 - **shown and in front** (any JeTTY window — the terminal, Settings or a
   detached tab — has focus) → hides it;
 - **shown but behind other windows** (e.g. with `focus_autohide = false`, after
-  you clicked elsewhere) → raises it instead of hiding, so one press brings it
-  back. If the compositor refuses to give it focus, the next press within
-  1.5 s hides it.
+  you clicked elsewhere) → brings it to the front instead of hiding, so one
+  press brings it back; a minimized window is restored. On X11 JeTTY asks the
+  window manager the way a taskbar click does (the standard EWMH activation
+  request with the "user action" source), so focus-stealing prevention — KWin's,
+  for one — lets it through. If the window manager still refuses (Wayland
+  without an activation token), the next press within 1.5 s hides it.
 
 On summon the window is placed according to `window_mode` — re-centred on the
 current monitor (Center), re-docked to the top strip (Dropdown), or expanded to

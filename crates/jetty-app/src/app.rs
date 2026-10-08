@@ -6736,7 +6736,13 @@ impl App {
                 // later if the WM's FocusIn didn't beat the deadline (F31).
                 self.pending_autohide_at = None;
                 if let Some(win) = &self.window {
-                    win.focus_window();
+                    // Every caller that gets here is the user asking for this
+                    // window (F9's raise, `--show`, a detached window's command on
+                    // the main one; the auto-summon only runs while hidden), so ask
+                    // the WM the way a taskbar click does — a plain
+                    // `focus_window()` was refused by KWin's focus-stealing
+                    // prevention and F9 left the window behind.
+                    jetty_platform::activate_window(win);
                     self.request_main_paint();
                 }
             }
