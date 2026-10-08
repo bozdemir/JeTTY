@@ -1138,6 +1138,12 @@ struct SyncShared {
     known: Option<u64>,
     /// Hash of JeTTY's own last write: its watcher echo is skipped on reload.
     self_written: Option<u64>,
+    /// A write merged an EXTERNAL edit the app has not applied yet. Until a reload
+    /// applies the file (`note_reloaded`), no write counts as purely our own —
+    /// or a second settings change before that reload would mark the merged file
+    /// as a self-write and the edit would never be applied (file says dracula,
+    /// app shows nord).
+    external_pending: bool,
     /// Writes handed to the writer thread and not finished yet.
     inflight: usize,
 }
@@ -1267,6 +1273,8 @@ impl Persister {
         s.known = Some(hash);
         // An identical later re-save of the same content is then a no-op too.
         s.self_written = Some(hash);
+        // Whatever external edit our writes merged is applied now.
+        s.external_pending = false;
     }
 
     /// A reload saw bytes hashing to `hash` but couldn't apply them (syntax error).
@@ -1330,12 +1338,70 @@ fn write_changes(
     full: &Config,
     shared: &Mutex<SyncShared>,
 ) -> Result<(), String> {
-    let before = match std::fs::read_to_string(path) {
-        Ok(s) => Some(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("could not read {} to save settings: {e}", path.display())),
-    };
-    let new_text = match &before {
+    write_changes_racing(path, changes, full, shared, &mut || {})
+}
+
+/// How many times a save re-merges because an editor saved `config.toml` while
+/// it was being written, before giving up (with a notice).
+const SAVE_ATTEMPTS: usize = 5;
+
+/// [`write_changes`], with `race` run between reading the file and committing
+/// the rewrite — a test hook standing in for an editor saving right then. The
+/// file is re-checked just before the rename: if it changed since it was read,
+/// the merge is redone on top of the new content, so the editor's save is never
+/// overwritten (what remains is the instant between that check and the rename).
+fn write_changes_racing(
+    path: &Path,
+    changes: &[Change],
+    full: &Config,
+    shared: &Mutex<SyncShared>,
+    race: &mut dyn FnMut(),
+) -> Result<(), String> {
+    for _ in 0..SAVE_ATTEMPTS {
+        let before = read_config_text(path)?;
+        let new_text = merged_text(before.as_deref(), changes, full)?;
+        if before.as_deref() == Some(new_text.as_str()) {
+            return Ok(()); // nothing to change on disk
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("could not create config dir {}: {e}", dir.display()))?;
+        }
+        race();
+        let committed = write_atomic_checked(path, new_text.as_bytes(), || {
+            read_config_text(path).ok().as_ref() == Some(&before)
+        })
+        .map_err(|e| format!("could not save settings to {}: {e}", path.display()))?;
+        if committed {
+            let h = hash_str(&new_text);
+            let mut s = lock(shared);
+            if s.known != before.as_deref().map(hash_str) {
+                s.external_pending = true;
+            }
+            s.self_written = if s.external_pending { None } else { Some(h) };
+            s.known = Some(h);
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "config.toml kept changing while settings were saved ({SAVE_ATTEMPTS} tries) — the \
+         change was not saved"
+    ))
+}
+
+/// The config text at `path` (`None` = no file).
+fn read_config_text(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("could not read {} to save settings: {e}", path.display())),
+    }
+}
+
+/// `before` (the file's text, `None` = no file) with `changes` applied in place
+/// — or, without a file, every setting of `full`.
+fn merged_text(before: Option<&str>, changes: &[Change], full: &Config) -> Result<String, String> {
+    Ok(match before {
         // No file yet: write every setting, so the file documents them all.
         None => toml::to_string_pretty(full).map_err(|e| format!("could not serialize settings: {e}"))?,
         Some(text) => {
@@ -1354,23 +1420,7 @@ fn write_changes(
             }
             doc.to_string()
         }
-    };
-    if before.as_deref() == Some(new_text.as_str()) {
-        return Ok(()); // nothing to change on disk
-    }
-    let h = hash_str(&new_text);
-    {
-        let mut s = lock(shared);
-        let external = s.known != before.as_deref().map(hash_str);
-        s.self_written = if external { None } else { Some(h) };
-        s.known = Some(h);
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("could not create config dir {}: {e}", dir.display()))?;
-    }
-    write_atomic(path, new_text.as_bytes())
-        .map_err(|e| format!("could not save settings to {}: {e}", path.display()))
+    })
 }
 
 /// Write `data` to `path` atomically: write + fsync a temp file in the SAME
@@ -1381,7 +1431,15 @@ fn write_changes(
 /// defaults, losing every setting. The temp name is PID-suffixed so two
 /// processes never share one temp file; rename is atomic on POSIX, so readers
 /// always see either the old or the new complete file.
-fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+///
+/// The rename happens only if `unchanged()` still holds right before it (after
+/// the slow write + fsync of the temp file): `Ok(false)` — temp removed, `path`
+/// untouched — when it does not.
+fn write_atomic_checked(
+    path: &std::path::Path,
+    data: &[u8],
+    unchanged: impl Fn() -> bool,
+) -> std::io::Result<bool> {
     use std::io::Write as _;
     // If `path` is a symlink (common dotfiles setup: ~/.config/jetty/config.toml
     // → ~/dotfiles/jetty/config.toml), resolve it and atomic-rename over the
@@ -1402,7 +1460,7 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("config.toml");
     let tmp = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
+    let result = (|| -> std::io::Result<bool> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;
         // Flush file contents to disk BEFORE the rename so a crash/power loss
@@ -1418,6 +1476,9 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
                 std::fs::Permissions::from_mode(meta.permissions().mode()),
             );
         }
+        if !unchanged() {
+            return Ok(false);
+        }
         std::fs::rename(&tmp, path)?;
         // fsync the parent directory so the rename (the directory-entry update)
         // is itself durable: without it, a power loss just after rename() can
@@ -1426,10 +1487,10 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         if let Ok(dir_file) = std::fs::File::open(dir) {
             let _ = dir_file.sync_all();
         }
-        Ok(())
+        Ok(true)
     })();
-    if result.is_err() {
-        // Best-effort cleanup of the temp file on any failure.
+    if !matches!(result, Ok(true)) {
+        // Best-effort cleanup of the temp file on a failure or a refused commit.
         let _ = std::fs::remove_file(&tmp);
     }
     result
@@ -1438,6 +1499,11 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`write_atomic_checked`] without a precondition.
+    fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+        write_atomic_checked(path, data, || true).map(|_| ())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2262,6 +2328,82 @@ caret_glow_enabled = true\n";
         assert!(out.contains("font_size = 20.0"), "{out}");
         // NOT marked as our own write, so the hot-reload applies the merged file.
         assert!(!p.is_self_write(hash_str(&out)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_save_before_the_reload_still_leaves_the_external_edit_to_apply() {
+        // The user edits config.toml (theme → dracula); before the hot-reload
+        // runs, TWO settings changes are saved. The first merges the edit and is
+        // rightly not our own — but the second used to read that merged file as
+        // "what we last saw", mark ITS write as our own, and the reload then
+        // skipped it as an echo: the file said dracula, the app showed nord.
+        let dir = tmp_dir("external-pending");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "theme = \"nord\"\nfont_size = 15.0\n").unwrap();
+        let (mut p, mut cfg, _) = persister_for(&path);
+        std::fs::write(&path, "theme = \"dracula\"\nfont_size = 15.0\n").unwrap();
+        for size in [20.0, 21.0] {
+            cfg.font_size = size;
+            p.record(&cfg, Instant::now());
+            assert!(p.flush_and_wait(Duration::from_secs(5)));
+        }
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("dracula") && out.contains("21.0"), "{out}");
+        assert!(!p.is_self_write(hash_str(&out)), "the reload must still apply the edit");
+        // Once a reload applied it, our writes are our own again.
+        let (applied, _) = Config::parse_with_base(&out, &cfg, "x").unwrap();
+        p.note_reloaded(applied.clone(), hash_str(&out));
+        let mut cfg = applied;
+        cfg.font_size = 22.0;
+        p.record(&cfg, Instant::now());
+        assert!(p.flush_and_wait(Duration::from_secs(5)));
+        assert!(p.is_self_write(hash_str(&std::fs::read_to_string(&path).unwrap())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_editor_save_between_read_and_rename_is_merged_not_overwritten() {
+        let dir = tmp_dir("race");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "theme = \"nord\"\nfont_size = 15.0\n").unwrap();
+        let loaded = Config::load_from(&path);
+        let shared = Mutex::new(SyncShared { known: loaded.hash, ..SyncShared::default() });
+        let mut cfg = loaded.cfg.clone();
+        cfg.font_size = 20.0;
+        let changes = diff_configs(&loaded.cfg, &cfg);
+        let mut raced = 0;
+        let mut editor = || {
+            // The editor saves right after JeTTY read the file (first try only).
+            if raced == 0 {
+                std::fs::write(&path, "theme = \"dracula\"\nfont_size = 15.0\nopacity = 0.8\n").unwrap();
+            }
+            raced += 1;
+        };
+        write_changes_racing(&path, &changes, &cfg, &shared, &mut editor).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("theme = \"dracula\""), "the editor's save survives: {out}");
+        assert!(out.contains("opacity = 0.8"), "{out}");
+        assert!(out.contains("font_size = 20.0"), "and the setting is saved: {out}");
+        assert_eq!(raced, 2, "merged again once");
+        assert!(lock(&shared).self_written.is_none(), "the merged edit is left to the reload");
+        // An editor that never stops saving: give up, never clobber.
+        cfg.font_size = 25.0;
+        let changes = diff_configs(&loaded.cfg, &cfg);
+        let mut flip = 0u32;
+        let mut changing = || {
+            flip += 1;
+            std::fs::write(&path, format!("theme = \"edit{flip}\"\n")).unwrap();
+        };
+        let err = write_changes_racing(&path, &changes, &cfg, &shared, &mut changing).unwrap_err();
+        assert!(err.contains("kept changing"), "{err}");
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with("theme = \"edit"), "untouched");
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftovers, 0, "no temp file left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
