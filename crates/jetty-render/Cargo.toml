@@ -16,6 +16,9 @@ rustc-hash = "2"
 # Used for chrome-text display-width estimates (CJK/fullwidth ≈ 2 cells).
 unicode-width = "0.2"
 wgpu = { version = "29.0", features = ["wgsl"] }
+# Already in the tree via swash (glyphon's rasterizer) — no new download. The
+# anti-aliased path rasterizer behind the built-in arcs / Powerline shapes.
+zeno = { version = "0.3", default-features = false, features = ["eval", "std"] }
 
 [dev-dependencies]
 naga = "29"

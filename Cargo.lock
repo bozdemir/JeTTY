@@ -1247,6 +1247,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "unicode-width",
  "wgpu",
+ "zeno",
 ]
 
 [[package]]
