@@ -1095,6 +1095,12 @@ pub struct App {
     /// Config / theme / keybinding problems found while starting up, printed in
     /// the first tab once it exists (a desktop launch has no visible stderr).
     startup_warnings: Vec<String>,
+    /// The theme files as last loaded ([`crate::themes::fingerprint`]) and the
+    /// warnings last shown for a config/theme load: a hot-reload that is only
+    /// the watcher echo of JeTTY's own settings save (config skipped, themes
+    /// unchanged) does not re-show the very same warnings after every save.
+    themes_fp: u64,
+    shown_warnings: Vec<String>,
     /// "Reset keybindings" asks for confirmation: the first run arms it until this
     /// instant; running it again before then resets (after writing a backup).
     reset_keys_armed_until: Option<std::time::Instant>,
@@ -1601,7 +1607,9 @@ impl App {
         // resolution below (amendment T4): otherwise a `JETTY_THEME`/config value
         // naming a USER theme would resolve to idx 0 and the custom default be lost.
         // Problems (a skipped theme file) are shown in the first tab.
-        let mut startup_warnings = crate::themes::rebuild_registry();
+        let theme_warnings = crate::themes::rebuild_registry();
+        let themes_fp = crate::themes::fingerprint();
+        let mut startup_warnings = theme_warnings.clone();
         // The persisted settings (per-key: one bad value never resets the rest).
         let loaded = crate::config::Config::load();
         // Saves are written by a background thread; it reports a refused save (the
@@ -1750,6 +1758,8 @@ impl App {
             // Set from the config below.
             theme_name: String::new(),
             startup_warnings: Vec::new(),
+            themes_fp,
+            shown_warnings: theme_warnings,
             reset_keys_armed_until: None,
             start_hidden: false,
             pending_reload_at: None,
@@ -1854,10 +1864,12 @@ impl App {
         app.theme_name = cfg.theme.clone();
         match jetty_core::theme_index(&cfg.theme) {
             Some(i) => app.theme_idx = i,
-            None => startup_warnings.push(theme_missing_warning(
-                &cfg.theme,
-                &jetty_core::theme_at(app.theme_idx).display_name,
-            )),
+            None => {
+                let w = theme_missing_warning(&cfg.theme, &jetty_core::theme_at(app.theme_idx).display_name);
+                // What a reload re-derives from the same files (see `shown_warnings`).
+                app.shown_warnings.push(w.clone());
+                startup_warnings.push(w);
+            }
         }
         // Clamp opacity to a VISIBLE floor: a persisted 0.0 would load a fully
         // transparent (invisible) window, which looks like a launch failure.
@@ -2321,12 +2333,16 @@ impl App {
 
         // (A) Themes — always. Rebuild the registry from disk.
         warnings.extend(crate::themes::rebuild_registry());
+        let themes_fp = crate::themes::fingerprint();
+        let themes_changed = std::mem::replace(&mut self.themes_fp, themes_fp) != themes_fp;
+        let mut config_read = false;
 
         // (B) Config — per-key, hash-guarded.
         if let Ok(s) = std::fs::read_to_string(crate::config::Config::config_path()) {
             let h = crate::config::hash_str(&s);
             // Skip our own write echoing back through the watcher.
             if !self.persister.borrow().is_self_write(h) {
+                config_read = true;
                 let live = self.settings_snapshot();
                 match crate::config::Config::parse_with_base(&s, &live, "keeping the current value") {
                     Ok((mut cfg, problems)) => {
@@ -2383,7 +2399,10 @@ impl App {
         }
 
         self.reloading = false;
-        self.show_config_warnings(&warnings);
+        if !is_reload_echo(config_read, themes_changed, &warnings, &self.shown_warnings) {
+            self.show_config_warnings(&warnings);
+        }
+        self.shown_warnings = warnings;
         // Repaint chrome (theme/settings) once the reload settled.
         self.request_main_paint();
         self.request_settings_paint();
@@ -14097,6 +14116,14 @@ fn desktop_exec_arg(path: &str) -> String {
     string_escaped.replace('%', "%%")
 }
 
+/// Whether a hot-reload's `warnings` merely repeat what the user was already
+/// shown: nothing they did changed (the config was our own save's echo, no theme
+/// file changed) and the warnings are the very same. Then they are not shown
+/// again — every settings save used to re-pop a broken theme's warning.
+fn is_reload_echo(config_read: bool, themes_changed: bool, warnings: &[String], shown: &[String]) -> bool {
+    !config_read && !themes_changed && warnings == shown
+}
+
 /// Display name for a `shell` config value: "System default" for the empty
 /// (auto-detect) selection, else the file basename of the path (e.g. "zsh").
 fn shell_display_name(shell: &str) -> String {
@@ -14813,6 +14840,22 @@ mod desktop_exec_arg_tests {
         assert_eq!(out, expected);
         // The invalid single-backslash `\$` escape must NOT appear.
         assert!(out.contains("\\\\$"), "literal $ must be doubly escaped");
+    }
+}
+
+#[cfg(test)]
+mod reload_warning_tests {
+    use super::is_reload_echo;
+
+    #[test]
+    fn a_save_echo_does_not_reshow_the_same_warnings() {
+        let w = vec!["theme file themes/x.toml skipped: bad".to_string()];
+        assert!(is_reload_echo(false, false, &w, &w), "our own save's echo: quiet");
+        assert!(!is_reload_echo(true, false, &w, &w), "the user edited config.toml: show");
+        assert!(!is_reload_echo(false, true, &w, &w), "a theme file was edited (still broken): show");
+        let other = vec!["theme file themes/y.toml skipped: bad".to_string()];
+        assert!(!is_reload_echo(false, false, &other, &w), "a new problem: show");
+        assert!(is_reload_echo(false, false, &[], &[]), "nothing to show either way");
     }
 }
 

@@ -240,6 +240,33 @@ pub fn load_user_themes_from(dir: &std::path::Path) -> (Vec<jetty_core::Theme>, 
     (out, warnings)
 }
 
+/// A fingerprint of the user theme files in `dir` (each `*.toml`'s name and
+/// content): equal fingerprints mean no theme file changed — so a reload that is
+/// only the echo of JeTTY's own config save need not re-show theme warnings.
+pub fn fingerprint_of(dir: &std::path::Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("toml"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in &files {
+        f.hash(&mut h);
+        std::fs::read(f).ok().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// [`fingerprint_of`] the user themes dir.
+pub fn fingerprint() -> u64 {
+    fingerprint_of(&crate::config::Config::dir().join("themes"))
+}
+
 /// The user themes from `~/.config/jetty/themes/` (see [`load_user_themes_from`]).
 pub fn load_user_themes() -> (Vec<jetty_core::Theme>, Vec<String>) {
     load_user_themes_from(&crate::config::Config::dir().join("themes"))
@@ -271,6 +298,21 @@ pub fn rebuild_registry() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_changes_only_with_the_theme_files() {
+        let dir = std::env::temp_dir().join(format!("jetty-theme-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.toml"), "bad").unwrap();
+        let fp = fingerprint_of(&dir);
+        assert_eq!(fingerprint_of(&dir), fp, "stable");
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        assert_eq!(fingerprint_of(&dir), fp, "non-theme files do not count");
+        std::fs::write(dir.join("a.toml"), "still bad").unwrap();
+        assert_ne!(fingerprint_of(&dir), fp, "an edit (even still broken) counts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn parse(s: &str, stem: &str) -> Result<jetty_core::Theme, String> {
         let t: ThemeToml = toml::from_str(s).map_err(|e| e.to_string())?;
