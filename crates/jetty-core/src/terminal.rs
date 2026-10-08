@@ -1,6 +1,9 @@
 use crate::hints::HintToken;
 use crate::kitty::KittyCmd;
-use crate::snapshot::{attr, CellSnapshot, CursorShapeSnap, GridSnapshot, SearchHit};
+use crate::snapshot::{
+    attr, CellGrapheme, CellSnapshot, CursorShapeSnap, GridSnapshot, SearchHit, GRAPHEME_MAX_BYTES,
+    GRAPHEME_MAX_MARKS,
+};
 use crate::theme::Theme;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -56,6 +59,101 @@ fn osc_terminator(s: &[u8]) -> Option<usize> {
     let a = memchr::memchr3(0x07, 0x18, 0x1b, s);
     let b = memchr::memchr(0x1a, &s[..a.unwrap_or(s.len())]);
     b.or(a)
+}
+
+/// Drop the placements `keep` rejects, keeping the live-bytes counter exact.
+fn retain_placements(
+    list: &mut VecDeque<ImagePlacement>,
+    bytes: &mut u64,
+    mut keep: impl FnMut(&ImagePlacement) -> bool,
+) {
+    list.retain(|p| {
+        let k = keep(p);
+        if !k {
+            *bytes = bytes.saturating_sub(p.image.rgba.len() as u64);
+        }
+        k
+    });
+}
+
+/// Record `p`, first evicting every placement it fully covers (an in-place
+/// redraw or animation frame — chafa, timg, a re-sent preview — would otherwise
+/// stack up to the cap, every layer drawn each frame) and, for Kitty, any
+/// placement with the same image id AND placement id (the spec's replace). Then
+/// enforce the count / live-bytes budget, oldest first.
+fn insert_placement(list: &mut VecDeque<ImagePlacement>, bytes: &mut u64, p: ImagePlacement) {
+    retain_placements(list, bytes, |o| {
+        !(o.covered_by(&p)
+            || (p.kitty_placement.is_some()
+                && o.kitty_id == p.kitty_id
+                && o.kitty_placement == p.kitty_placement))
+    });
+    *bytes = bytes.saturating_add(p.image.rgba.len() as u64);
+    list.push_back(p);
+    while list.len() > MAX_PLACEMENTS || *bytes > MAX_PLACEMENT_BYTES {
+        let Some(old) = list.pop_front() else { break };
+        *bytes = bytes.saturating_sub(old.image.rgba.len() as u64);
+    }
+}
+
+/// A cell flag bit alacritty does not define, set on the ALT-screen cells a
+/// sixel covers. Writing, erasing or resetting a cell rebuilds its flags (from
+/// the cursor template / defaults), so a covered cell without it was written —
+/// even with identical content: TUIs erase a sixel by printing spaces over it.
+const SIXEL_CELL: Flags = Flags::from_bits_retain(1 << 15);
+const _: () = assert!(Flags::all().bits() & SIXEL_CELL.bits() == 0, "alacritty took bit 15");
+
+/// The screen cells an ALT-screen placement covers, clipped to the screen.
+fn alt_cells(p: &ImagePlacement, rows: usize, cols: usize) -> impl Iterator<Item = (Line, Column)> {
+    let r0 = p.abs_line.clamp(0, rows as i64) as i32;
+    let r1 = (p.abs_line + p.rows as i64).clamp(0, rows as i64) as i32;
+    let c0 = (p.col as usize).min(cols);
+    let c1 = (p.col as usize + p.cols as usize).min(cols);
+    (r0..r1).flat_map(move |r| (c0..c1).map(move |c| (Line(r), Column(c))))
+}
+
+/// The composed text of a cell carrying zero-width chars: the base char, then at
+/// most [`GRAPHEME_MAX_MARKS`] marks within [`GRAPHEME_MAX_BYTES`] — so a Zalgo
+/// stack costs the snapshot (built every frame) a bounded amount.
+fn grapheme_text(base: char, marks: &[char]) -> String {
+    let mut text = String::with_capacity(base.len_utf8() + marks.len().min(GRAPHEME_MAX_MARKS) * 2);
+    text.push(base);
+    for &m in marks.iter().take(GRAPHEME_MAX_MARKS) {
+        if text.len() + m.len_utf8() > GRAPHEME_MAX_BYTES {
+            break;
+        }
+        text.push(m);
+    }
+    text
+}
+
+/// Trim the zero-width chars piled on the cells next to the cursor — the only
+/// cells `Term::input` attaches marks to (the previous cell, or the one before a
+/// wide glyph's spacer) — to [`GRAPHEME_MAX_MARKS`]. alacritty appends them
+/// unbounded (`Cell::push_zerowidth`), so a Zalgo stream on ONE cell would grow
+/// without limit; run after every sub-slice, a cell holds at most this many plus
+/// one sub-slice's worth (≤ 8 KiB of input) at any time. RESIDUAL (documented):
+/// marks spread one-per-base-char across many cells are bounded only by the
+/// input still in the scrollback (each mark is a 4-byte `char` in its cell).
+fn cap_cursor_zerowidth(term: &mut Term<EventProxy>) {
+    let point = term.grid().cursor.point;
+    let grid = term.grid_mut();
+    let last = grid.columns().saturating_sub(1);
+    for col in point.column.0.saturating_sub(2)..=point.column.0.min(last) {
+        let cell = &mut grid[point.line][Column(col)];
+        let Some(marks) = cell.zerowidth().filter(|m| m.len() > GRAPHEME_MAX_MARKS) else {
+            continue;
+        };
+        let keep = marks[..GRAPHEME_MAX_MARKS].to_vec();
+        let underline = cell.underline_color();
+        let link = cell.hyperlink();
+        cell.extra = None;
+        for m in keep {
+            cell.push_zerowidth(m);
+        }
+        cell.set_underline_color(underline);
+        cell.set_hyperlink(link);
+    }
 }
 
 /// Classify a completed CSI (`ESC [` + `params` + `fin`) the scanner isolates.
@@ -226,13 +324,11 @@ impl EventListener for EventProxy {
             Event::PtyWrite(s) => {
                 let _ = self.tx.send(s.into_bytes());
             }
-            // \e[14t (text area size in pixels) / \e[18t (size in cells).
-            // The formatter turns a WindowSize into the proper escape reply.
-            // We do not track the live font metrics here, but apps that use \e[14t
-            // to derive a cell aspect ratio (chafa/timg/notcurses/viu for image
-            // rendering) get vertically-squashed output from a 1x1 (square) cell.
-            // Report a typical ~1:2 monospace cell so the derived aspect is sane;
-            // the cell/col/line counts are what shells actually care about.
+            // \e[14t (text area size in pixels) / \e[18t (size in cells). The
+            // formatter turns a WindowSize into the proper escape reply. Cell
+            // metrics are the REAL ones the app pushed via `set_cell_px` (image
+            // tools — chafa/timg/notcurses/viu — scale to them); 8×16 is only the
+            // fallback until the first push.
             Event::TextAreaSizeRequest(fmt) => {
                 let g = self.geom.load(Ordering::Relaxed);
                 // Real cell px shared from the owning Terminal (A5); fall back to
@@ -500,14 +596,16 @@ struct OpenCmd {
     started_at: Option<std::time::Instant>,
 }
 
-/// One live inline-image placement (a decoded sixel anchored in the grid).
+/// One live inline-image placement (a decoded sixel / Kitty image in the grid).
 ///
-/// `abs_line` is the ABSOLUTE grid line of the image's top-left cell — the exact
-/// analogue of `CmdBlock::prompt` (`abs_top`-relative, survives scrolling). The
-/// decoded RGBA lives behind an `Arc` so the render layer can clone it cheaply to
-/// upload to (each window's) GPU without copying, and so a texture evicted then
-/// re-scrolled-into-view can re-upload. `cols`/`rows` are the reserved cell
-/// footprint; `px_w`/`px_h` are the native pixel size the image draws at.
+/// On the PRIMARY screen `abs_line` is the ABSOLUTE grid line of the image's
+/// top-left cell — the exact analogue of `CmdBlock::prompt` (`abs_top`-relative,
+/// survives scrolling). On the ALT screen (`Terminal::alt_placements`) it is the
+/// plain screen row: the alt screen has no scrollback. The decoded RGBA lives
+/// behind an `Arc` so the render layer can clone it cheaply to upload to (each
+/// window's) GPU without copying, and so a texture evicted then
+/// re-scrolled-into-view can re-upload. `cols`/`rows` are the cell footprint;
+/// `px_w`/`px_h` are the native pixel size the image draws at.
 #[derive(Clone, Debug)]
 struct ImagePlacement {
     id: u64,
@@ -522,10 +620,28 @@ struct ImagePlacement {
     /// created from, so `a=d,d=i,i=N` can target it (amendment A6). `None` for
     /// sixel placements and anonymous Kitty transmits.
     kitty_id: Option<u32>,
+    /// The Kitty placement id (`p=`, nonzero) — a display reusing the same image
+    /// id AND placement id REPLACES this placement (spec).
+    kitty_placement: Option<u32>,
     /// Which inline-image protocol created this placement. Lets a Kitty
     /// delete-all (`d=a`/`d=A`) clear Kitty images — INCLUDING anonymous ones,
     /// which carry no `kitty_id` — without wiping a coexisting sixel image (M2).
     is_kitty: bool,
+    /// ALT-screen sixels only: the covered cells carry [`SIXEL_CELL`]. A sixel's
+    /// pixels ARE those cells, so once a TUI writes any of them the image is gone
+    /// (checked after each sub-slice — see `check_alt_placements`).
+    marks_cells: bool,
+}
+
+impl ImagePlacement {
+    /// Whether `self`'s cell rectangle lies entirely inside `other`'s (same
+    /// screen, same anchor space).
+    fn covered_by(&self, other: &ImagePlacement) -> bool {
+        self.abs_line >= other.abs_line
+            && self.abs_line + self.rows as i64 <= other.abs_line + other.rows as i64
+            && self.col >= other.col
+            && self.col + self.cols <= other.col + other.cols
+    }
 }
 
 /// One finished shell command, surfaced from an OSC 133 `D` mark. The tab index /
@@ -679,14 +795,21 @@ pub struct Terminal {
     /// to the 8×16 the `EventProxy` reports for `\e[14t`.
     cell_px_w: f32,
     cell_px_h: f32,
-    /// Live inline-image placements (decoded sixels), append order ≈ ascending
-    /// `abs_line`. Pruned to the scrollback window (span-intersection), dropped on
-    /// saturation / reflow (correct-or-absent). Bounded by [`MAX_PLACEMENTS`] and
-    /// [`MAX_PLACEMENT_BYTES`].
+    /// Live PRIMARY-screen inline-image placements (sixel / Kitty), append order ≈
+    /// ascending `abs_line`. Pruned to the scrollback window (span-intersection),
+    /// dropped on reflow / anchor loss (correct-or-absent). Bounded by
+    /// [`MAX_PLACEMENTS`] and [`MAX_PLACEMENT_BYTES`].
     placements: VecDeque<ImagePlacement>,
     /// Running sum of `image.rgba.len()` across `placements` (the live-bytes
     /// budget), maintained incrementally so pruning never re-sums the deque.
     placement_bytes: u64,
+    /// Live ALT-screen placements (TUI image previews: yazi, ranger, image.nvim),
+    /// anchored at screen rows. Kitty ones last until deleted (`a=d`) or until the
+    /// alt grid is cleared / scrolled / reset (alacritty FULL damage); sixel ones
+    /// also vanish once a covered cell is written. All go on alt-screen enter /
+    /// exit and on resize. Bounded like `placements` (own budget).
+    alt_placements: VecDeque<ImagePlacement>,
+    alt_placement_bytes: u64,
     /// Live cell pixel size shared with the `EventProxy` (cell_w<<16 | cell_h) so
     /// the `\e[14t` reply reports real metrics (A5). Updated by `set_cell_px`.
     cell_px: Arc<AtomicU32>,
@@ -715,9 +838,16 @@ pub struct Terminal {
     kitty_images: VecDeque<(u32, Arc<crate::sixel::InlineImage>)>,
     /// Running sum of `rgba.len()` across `kitty_images` (the registry byte budget).
     kitty_stored_bytes: u64,
-    /// Payload bytes of the OSC being scanned (bounded by [`OSC_MAX_BYTES`]).
-    /// Persists across `feed` calls like `scan`.
+    /// Payload bytes of the OSC being scanned (bounded by `osc_cap`). Persists
+    /// across `feed` calls like `scan`.
     osc_len: u32,
+    /// The OSC payload cap in force: [`OSC_MAX_BYTES`], lowered only by tests so
+    /// the vte differential fuzz reaches it cheaply.
+    osc_cap: u32,
+    /// Test-only: every byte handed to vte, in order (the differential fuzz
+    /// replays it through a model of vte's state machine).
+    #[cfg(test)]
+    vte_log: Option<Vec<u8>>,
 }
 
 /// Maximum scrollback-search query length in chars (bounds per-keystroke DFA
@@ -848,6 +978,8 @@ impl Terminal {
             cell_px_h: 16.0,
             placements: VecDeque::new(),
             placement_bytes: 0,
+            alt_placements: VecDeque::new(),
+            alt_placement_bytes: 0,
             cell_px,
             reply_tx,
             apc_buf: Vec::new(),
@@ -858,6 +990,9 @@ impl Terminal {
             kitty_images: VecDeque::new(),
             kitty_stored_bytes: 0,
             osc_len: 0,
+            osc_cap: OSC_MAX_BYTES,
+            #[cfg(test)]
+            vte_log: None,
         }
     }
 
@@ -1069,10 +1204,14 @@ impl Terminal {
             match self.scan {
                 // Ground is handled by the memchr fast path above.
                 Scan::Ground => unreachable!(),
+                // Mirrors vte 0.15's Escape state exactly (`advance_esc`): C0
+                // controls other than CAN/SUB, DEL and 0x80..=0xFF are executed or
+                // ignored WITHOUT leaving Escape (so `ESC LF ]` still opens an OSC
+                // there — leaving Esc here would let an OSC run uncapped), CAN/SUB
+                // abort to Ground, ESC restarts. An isolated sequence's sub-slice
+                // starts at THIS byte: vte's Escape state carries across advance
+                // calls, and anything it executed since the ESC stays outside.
                 Scan::Esc => {
-                    // Esc is only ever entered right after consuming an ESC, so it
-                    // sits at `i - 1` (or ended the previous feed when `i == 0`).
-                    let esc_at = i.saturating_sub(1);
                     self.scan = match b {
                         0x5d => {
                             // ']' opens an OSC.
@@ -1088,28 +1227,34 @@ impl Terminal {
                         0x5b if self.has_anchors() => match peek_isolated_csi(&bytes[i + 1..]) {
                             CsiPeek::Isolate(len, kind) => {
                                 let k = i + 1 + len;
-                                start = self.isolate(bytes, start, esc_at, k, kind);
+                                start = self.isolate(bytes, start, i, k, kind);
                                 i = k;
                                 self.scan = Scan::Ground;
                                 continue;
                             }
                             // Cut off by the end of this feed: finish it byte-wise.
                             CsiPeek::Incomplete => {
-                                seq_start = esc_at;
+                                seq_start = i;
                                 Scan::Csi { params: [0; 5], len: 0 }
                             }
                             CsiPeek::Other => Scan::Ground,
                         },
-                        0x1b => Scan::Esc,             // ESC ESC: restart escape scan
                         // `ESC c` (RIS) resets the screen AND scrollback.
                         b'c' => {
                             let k = i + 1;
                             if self.has_anchors() {
-                                start = self.isolate(bytes, start, esc_at, k, IsolatedSeq::Reset);
+                                start = self.isolate(bytes, start, i, k, IsolatedSeq::Reset);
                             }
                             Scan::Ground
                         }
-                        _ => Scan::Ground,             // some other escape; resync
+                        // ESC ESC restarts; C0 controls (vte executes them), DEL and
+                        // 0x80..=0xFF (vte ignores them) all stay in Escape.
+                        0x00..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f..=0xff => Scan::Esc,
+                        // CAN / SUB abort the escape; any other byte completes an
+                        // ESC sequence, enters EscapeIntermediate (which can only
+                        // reach a string state through another ESC), or opens a
+                        // CSI / SOS / PM vte never buffers.
+                        _ => Scan::Ground,
                     };
                     i += 1;
                 }
@@ -1162,12 +1307,15 @@ impl Terminal {
                         // Some other OSC (title/hyperlink/color): skip to its end.
                         _ => self.scan = Scan::Skip,
                     }
+                    if !matches!(b, 0x07 | 0x18 | 0x1a | 0x1b) {
+                        self.osc_len += 1; // OSC payload as vte buffers it
+                    }
                     i += 1;
                 }
                 // An OSC 133 payload overrunning the OSC cap: end it for vte and
                 // discard the rest (never binds a mark).
                 Scan::Payload { .. }
-                    if self.osc_len >= OSC_MAX_BYTES && !matches!(b, 0x07 | 0x18 | 0x1a | 0x1b) =>
+                    if self.osc_len >= self.osc_cap && !matches!(b, 0x07 | 0x18 | 0x1a | 0x1b) =>
                 {
                     start = self.abort_osc(bytes, start, i);
                 }
@@ -1236,7 +1384,7 @@ impl Terminal {
                 Scan::Skip => {
                     let term = osc_terminator(&bytes[i..]);
                     let run = term.unwrap_or(bytes.len() - i);
-                    let room = (OSC_MAX_BYTES - self.osc_len) as usize;
+                    let room = self.osc_cap.saturating_sub(self.osc_len) as usize;
                     if run > room {
                         // Hand vte exactly up to the cap, end the OSC, drop the rest.
                         start = self.abort_osc(bytes, start, i + room);
@@ -1335,10 +1483,14 @@ impl Terminal {
                 // here (unlike OSC) — only CAN/SUB/ESC/8-bit-ST terminate.
                 Scan::Sixel => match b {
                     0x18 | 0x1a | 0x9c => {
-                        // CAN/SUB/8-bit-ST: flush the DCS to alacritty (it ignores
-                        // it), decode + place, return to Ground.
+                        // 8-bit ST ends the DCS; CAN / SUB CANCEL it (vte aborts the
+                        // DCS) — nothing may be drawn. Flush the DCS to alacritty
+                        // (it ignores it), then decode + place, or drop.
                         let k = i + 1;
                         self.advance_slice(&bytes[start..k]);
+                        if b != 0x9c {
+                            self.sixel_overflow = true;
+                        }
                         self.finish_sixel();
                         self.scan = Scan::Ground;
                         start = k;
@@ -1586,16 +1738,14 @@ impl Terminal {
             self.make_room(lines);
         }
         let h0 = self.term.grid().history_size();
+        #[cfg(test)]
+        if let Some(log) = self.vte_log.as_mut() {
+            log.extend_from_slice(s);
+        }
         self.parser.advance(&mut self.term, s);
         let alt_after = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h1 = self.term.grid().history_size();
-        // A full-screen TUI took over mid-transfer: abandon any partial Kitty
-        // chunk accumulation (its anchor context changed). Bounded regardless;
-        // this frees it promptly (M5).
-        if !alt_before && alt_after {
-            self.reset_kitty_chunks();
-        }
-        self.track_abs_top(alt_before, alt_after, h0, h1);
+        self.after_vte(alt_before, alt_after, h0, h1);
     }
 
     /// Fold a `history_size` delta into `abs_top`, honoring the alt screen.
@@ -1701,6 +1851,129 @@ impl Terminal {
         self.placement_bytes = 0;
     }
 
+    /// Empty the ALT-screen placement list.
+    fn clear_alt_placements(&mut self) {
+        self.alt_placements.clear();
+        self.alt_placement_bytes = 0;
+    }
+
+    /// Bookkeeping after vte consumed bytes (a sub-slice or a sync flush).
+    fn after_vte(&mut self, alt_before: bool, alt_after: bool, h0: usize, h1: usize) {
+        if alt_before != alt_after {
+            // A full-screen TUI took over (or left) mid-transfer: a partial Kitty
+            // chunk accumulation lost its context (M5), and alt-screen images
+            // belong to the screen that just went away.
+            self.reset_kitty_chunks();
+            self.clear_alt_placements();
+        }
+        self.track_abs_top(alt_before, alt_after, h0, h1);
+        if alt_after && !self.alt_placements.is_empty() {
+            self.check_alt_placements();
+        }
+        cap_cursor_zerowidth(&mut self.term);
+    }
+
+    /// Re-validate ALT-screen images after vte moved on. FULL damage (alacritty
+    /// marks it on any scroll, any ED — even one that misses the image — RIS,
+    /// insert mode, palette change) may mean the grid under them moved: drop
+    /// them all (correct-or-absent; TUIs re-send previews they still want). A
+    /// sixel additionally goes once any covered cell was written (its pixels ARE
+    /// those cells). Damage is consumed only here and reset at an alt placement
+    /// (its baseline) — JeTTY renders from snapshots, not alacritty's damage.
+    #[cold]
+    #[inline(never)]
+    fn check_alt_placements(&mut self) {
+        use alacritty_terminal::term::TermDamage;
+        let full = matches!(self.term.damage(), TermDamage::Full);
+        self.term.reset_damage();
+        if full {
+            self.clear_alt_placements();
+            return;
+        }
+        let (rows, cols) = (self.rows, self.cols);
+        let grid = self.term.grid();
+        let mut freed = 0u64;
+        self.alt_placements.retain(|p| {
+            let keep = !p.marks_cells
+                || alt_cells(p, rows, cols).all(|(l, c)| grid[l][c].flags.contains(SIXEL_CELL));
+            if !keep {
+                freed += p.image.rgba.len() as u64;
+            }
+            keep
+        });
+        self.alt_placement_bytes = self.alt_placement_bytes.saturating_sub(freed);
+    }
+
+    /// Anchor `p` at the cursor on the PRIMARY screen. With `reserve`, the cursor
+    /// then moves down `p.rows` lines to column 0 (a sixel first returns to column
+    /// 0: `sixel`), scrolling as needed — through alacritty's `Handler`, never by
+    /// injecting bytes into a parser that may sit mid-sequence (e.g. inside an APC
+    /// that 0x9C ended for the scanner but not for vte). Room for that scroll is
+    /// made first so it is counted exactly; an anchor reset on the way drops `p`.
+    fn place_primary_at_cursor(&mut self, mut p: ImagePlacement, reserve: bool, sixel: bool) {
+        use alacritty_terminal::vte::ansi::Handler;
+        self.make_room(p.rows as usize + 1);
+        let cur = self.term.grid().cursor.point;
+        p.abs_line = self.abs_top + cur.line.0 as i64;
+        // A sixel starts at column 0 (the reserve's leading CR, like most sixel
+        // terminals); a Kitty image at the cursor column, clamped to fit (A8).
+        p.col = if sixel { 0 } else { (cur.column.0 as u16).min((self.cols as u16).saturating_sub(p.cols)) };
+        if reserve {
+            let epoch = self.anchor_epoch;
+            let h0 = self.term.grid().history_size();
+            if sixel {
+                self.term.carriage_return();
+            }
+            for _ in 0..p.rows {
+                self.term.carriage_return();
+                self.term.linefeed();
+            }
+            let h1 = self.term.grid().history_size();
+            self.track_abs_top(false, false, h0, h1);
+            if self.anchor_epoch != epoch {
+                return;
+            }
+        }
+        insert_placement(&mut self.placements, &mut self.placement_bytes, p);
+        let history = self.term.grid().history_size();
+        self.prune_placements(history);
+    }
+
+    /// Anchor `p` at the cursor on the ALT screen (a TUI preview: yazi, ranger,
+    /// image.nvim). Never scrolls the TUI. A sixel moves the cursor to the line
+    /// below it (clamped to the screen) and marks its cells so it vanishes once
+    /// any is written; a Kitty image moves the cursor past its last column on its
+    /// last row (a wrap pending at the edge) unless `C=1`. The cursor is set
+    /// directly: `Handler::goto` would offset it by the scroll region (DECOM).
+    fn place_alt_at_cursor(&mut self, mut p: ImagePlacement, sixel: bool, move_cursor: bool) {
+        let (rows, cols) = (self.rows, self.cols);
+        let cur = self.term.grid().cursor.point;
+        p.abs_line = cur.line.0 as i64;
+        p.col = (cur.column.0 as u16).min((cols as u16).saturating_sub(p.cols));
+        let last_row = rows as i32 - 1;
+        let grid = self.term.grid_mut();
+        let target = if sixel {
+            p.marks_cells = true;
+            for (l, c) in alt_cells(&p, rows, cols) {
+                grid[l][c].flags.insert(SIXEL_CELL);
+            }
+            Some(((cur.line.0 + p.rows as i32).min(last_row), cur.column.0))
+        } else if move_cursor {
+            Some(((cur.line.0 + p.rows as i32 - 1).min(last_row), (p.col + p.cols) as usize))
+        } else {
+            None
+        };
+        if let Some((line, col)) = target {
+            let cursor = &mut grid.cursor;
+            cursor.point = Point::new(Line(line), Column(col.min(cols.saturating_sub(1))));
+            cursor.input_needs_wrap = col >= cols;
+        }
+        insert_placement(&mut self.alt_placements, &mut self.alt_placement_bytes, p);
+        // Damage baseline for `check_alt_placements`: whatever happened before this
+        // image was placed must not count against it.
+        self.term.reset_damage();
+    }
+
     /// Drop placements whose entire row SPAN lies outside the live window
     /// `[abs_top - history_size, abs_top + rows)`, then enforce the count / bytes
     /// caps (drop oldest). Unlike `prune_marks` (a single-line predicate) this is
@@ -1737,12 +2010,19 @@ impl Terminal {
     /// * nothing but blank lines exists ABOVE that prompt's line — output printed
     ///   before the first prompt (login banner, motd, fastfetch) must survive;
     /// * the cursor is still within [`CLEAN_PROMPT_MAX_ROWS`] of the prompt line
-    ///   (a `C`-less shell running its very first command has moved it further).
+    ///   (a `C`-less shell running its very first command has moved it further);
+    /// * the shell is not mid-write: no escape sequence cut by a read boundary,
+    ///   no synchronized update still buffered in vte (its output isn't settled,
+    ///   so a wipe now could erase or reorder part of it).
     ///
     /// False without shell integration (no marks) and on the alt screen. Only
     /// called on a real resize, so the bounded blank-line walk is off the hot path.
     fn at_clean_prompt(&self) -> bool {
-        if self.saw_command_output || self.term.mode().contains(TermMode::ALT_SCREEN) {
+        if self.saw_command_output
+            || self.scan != Scan::Ground
+            || self.sync_deadline().is_some()
+            || self.term.mode().contains(TermMode::ALT_SCREEN)
+        {
             return false;
         }
         let Some(m) = self.marks.back() else {
@@ -1882,89 +2162,52 @@ impl Terminal {
         }
     }
 
-    /// Finish a sixel DCS at its terminator: decode the accumulated bytes, reserve
-    /// its cell rows by injecting line-feeds (so alacritty scrolls + grows history
-    /// and `abs_top` tracks the image for free), and record the placement.
+    /// Finish a sixel DCS at its terminator: decode the accumulated bytes and
+    /// place the image. PRIMARY screen: reserve its cell rows (the cursor moves
+    /// down, scrolling as needed, so `abs_top` tracks the image) anchored at
+    /// column 0 like most sixel terminals. ALT screen (TUI previews): anchor at
+    /// the cursor cell without scrolling; it lives until a covered cell is
+    /// written (see `check_alt_placements`).
     ///
-    /// Correct-or-absent guards (drop, touch nothing): a buffer overflow, the alt
-    /// screen, an ACTIVE synchronized-update block (mode 2026 — the cursor is not
-    /// yet at its post-flush position, so the anchor would be wrong), a zero cell
-    /// metric, a decode failure, or an anchor reset (scroll overflow) caused by
-    /// the reserve injection itself.
+    /// Correct-or-absent guards (drop, touch nothing): a buffer overflow or a
+    /// CAN/SUB-cancelled DCS (`sixel_overflow`), a zero cell metric, a decode
+    /// failure, or an anchor reset caused by the reserve itself. A synchronized
+    /// update in flight is flushed first, so the cursor is where the app put it.
     fn finish_sixel(&mut self) {
         let buf = std::mem::take(&mut self.sixel_buf);
         let overflow = std::mem::take(&mut self.sixel_overflow);
         let p2 = self.pending_sixel_p2;
-
-        if overflow
-            || self.term.mode().contains(TermMode::ALT_SCREEN)
-            // A sixel emitted inside a DECSET-2026 sync block anchors at the wrong
-            // row (vte is buffering; the cursor hasn't advanced). Drop it (P2).
-            || self.sync_deadline().is_some()
-            || self.cell_px_w <= 0.0
-            || self.cell_px_h <= 0.0
-        {
+        if overflow || self.cell_px_w <= 0.0 || self.cell_px_h <= 0.0 {
             return;
         }
-
         let Some(img) = crate::sixel::decode_sixel(p2, &buf, crate::sixel::SIXEL_CAPS) else {
             return;
         };
-
+        if self.sync_deadline().is_some() {
+            self.flush_sync();
+        }
         // Footprint in cells (ceil), clamped to the grid width and a row cap.
         let cols = ((img.width as f32 / self.cell_px_w).ceil() as usize).clamp(1, self.cols) as u16;
-        let rows = ((img.height as f32 / self.cell_px_h).ceil() as usize)
-            .clamp(1, MAX_IMAGE_ROWS) as u16;
-
-        // The reserve below scrolls up to `rows` lines before this image is an
-        // anchor; make room so that scroll is counted exactly (see `make_room`).
-        self.make_room(rows as usize + 1);
-        // Anchor at the CURRENT cursor ROW (alacritty ignored the DCS, so it is
-        // still the image's top) — captured BEFORE injecting the reserve scroll,
-        // so it reuses the FIXED abs_top model exactly like `bind_mark`. The image
-        // starts at COLUMN 0 because the reserve injects a leading CR (below),
-        // matching most sixel terminals; so the anchor column is 0.
-        let cur = self.term.grid().cursor.point;
-        let abs_line = self.abs_top + cur.line.0 as i64;
-        let col = 0u16;
-
-        // Reserve vertical space: a CR to start the image at column 0 (matching
-        // most sixel terminals, and so a mid-line cursor doesn't overlap the
-        // image), then `rows` line-feeds through the same `advance_slice` path so
-        // alacritty scrolls, grows history, and `abs_top` tracks automatically.
-        let mut reserve = Vec::with_capacity(1 + rows as usize * 2);
-        reserve.push(b'\r');
-        for _ in 0..rows {
-            reserve.push(b'\r');
-            reserve.push(b'\n');
-        }
-        let epoch = self.anchor_epoch;
-        self.advance_slice(&reserve);
-
-        // The reserve injection dropped every anchor (a scroll overflow): the
-        // anchor computed above is no longer trustworthy — treat the image as
-        // absent (do not record).
-        if self.anchor_epoch != epoch {
-            return;
-        }
-
-        let id = crate::sixel::content_id(&img);
-        let bytes = img.rgba.len() as u64;
-        self.placements.push_back(ImagePlacement {
-            id,
-            abs_line,
-            col,
+        let rows = ((img.height as f32 / self.cell_px_h).ceil() as usize).clamp(1, MAX_IMAGE_ROWS) as u16;
+        let p = ImagePlacement {
+            id: crate::sixel::content_id(&img),
+            abs_line: 0,
+            col: 0,
             cols,
             rows,
             px_w: img.width.min(u16::MAX as u32) as u16,
             px_h: img.height.min(u16::MAX as u32) as u16,
             image: Arc::new(img),
             kitty_id: None,
+            kitty_placement: None,
             is_kitty: false,
-        });
-        self.placement_bytes = self.placement_bytes.saturating_add(bytes);
-        let history = self.term.grid().history_size();
-        self.prune_placements(history);
+            marks_cells: false,
+        };
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            self.place_alt_at_cursor(p, true, true);
+        } else {
+            self.place_primary_at_cursor(p, true, true);
+        }
     }
 
     // ─────────────────────────── Kitty graphics (APC ESC _ G) ────────────────
@@ -2000,10 +2243,11 @@ impl Terminal {
     /// then decode/place/store/delete/reply. `apc_overflow` (buffer cap OR a
     /// CAN/SUB abort) drops everything (correct-or-absent).
     ///
-    /// Chunk state machine (amendment BLOCKING 1): continuation chunks OMIT the
-    /// action key (`has_action == false`). While an accumulation is in progress,
-    /// only a `!has_action` APC appends/finalizes; ANY `has_action` APC ABORTS the
-    /// partial and is handled fresh — never spliced.
+    /// Chunk state machine: a continuation chunk carries ONLY `m=` (and maybe
+    /// `q=`) — `!has_control`. A first chunk carries the image's keys, with or
+    /// without `a=` (the spec's own chunked example omits it). While an
+    /// accumulation is in progress, only a continuation appends/finalizes; any
+    /// other APC ABORTS the partial and is handled fresh — never spliced.
     fn finish_kitty_apc(&mut self) {
         let buf = std::mem::take(&mut self.apc_buf);
         let overflow = std::mem::take(&mut self.apc_overflow);
@@ -2024,7 +2268,7 @@ impl Terminal {
         let cmd = KittyCmd::parse(control);
 
         if self.chunk_meta.is_some() {
-            if !cmd.has_action {
+            if !cmd.has_control {
                 // Continuation chunk: append this chunk's RAW payload.
                 if !self.accumulate_chunk(payload) {
                     self.reset_kitty_chunks();
@@ -2044,17 +2288,17 @@ impl Terminal {
                 }
                 return;
             }
-            // has_action while accumulating ⇒ ABORT the partial, then handle
+            // A new command while accumulating ⇒ ABORT the partial, then handle
             // `cmd` fresh below (never splice).
             self.reset_kitty_chunks();
         }
 
-        // Fresh command. A first chunk (`m=1` WITH an action) starts accumulation.
-        // An orphan continuation (`m=1`, no action, nothing in progress) is a
-        // stray fragment — ignore it (this also caps an endless-`m=1` stream that
-        // has already aborted its accumulation).
+        // Fresh command. A first chunk (`m=1` with the image's keys) starts an
+        // accumulation. An orphan continuation (`m=1`, only `m`/`q`, nothing in
+        // progress) is a stray fragment — ignore it (this also caps an
+        // endless-`m=1` stream that has already aborted its accumulation).
         if cmd.more == 1 {
-            if !cmd.has_action {
+            if !cmd.has_control {
                 return;
             }
             self.reset_kitty_chunks();
@@ -2076,6 +2320,12 @@ impl Terminal {
     /// Dispatch a finalized Kitty command with its RAW (base64-decoded) payload.
     /// `raw` is meaningful only for transmit/query; delete/put ignore it.
     fn handle_kitty_command(&mut self, cmd: KittyCmd, raw: Vec<u8>) {
+        if cmd.virtual_placement && matches!(cmd.action, b'T' | b'p') {
+            // Unicode-placeholder (virtual) placements are not rendered: refuse,
+            // so the client falls back instead of printing placeholder cells.
+            self.kitty_reply(&cmd, "ENOTSUPP");
+            return;
+        }
         match cmd.action {
             b'd' => self.kitty_delete(&cmd),
             b'p' => self.kitty_put(&cmd),
@@ -2161,52 +2411,35 @@ impl Terminal {
         }
     }
 
-    /// Honor the common Kitty delete requests; refuse the exotic ones as a safe
-    /// no-op (amendment A6 / T9). Lowercase selectors delete PLACEMENTS only;
-    /// uppercase also frees stored image data.
+    /// Honor the common Kitty delete requests on BOTH screens' placements; refuse
+    /// the exotic ones as a safe no-op (amendment A6 / T9). Lowercase selectors
+    /// delete PLACEMENTS only; uppercase also frees stored image data.
     fn kitty_delete(&mut self, cmd: &KittyCmd) {
-        match cmd.delete {
-            // `a=d` with no selector, or d=a / d=A: delete all KITTY placements
-            // (never sixel — a Kitty clear must not wipe another protocol's images,
-            // M2). `A` additionally frees stored images.
-            0 | b'a' | b'A' => {
-                let mut freed = 0u64;
-                self.placements.retain(|p| {
-                    let del = p.is_kitty;
-                    if del {
-                        freed += p.image.rgba.len() as u64;
-                    }
-                    !del
-                });
-                self.placement_bytes = self.placement_bytes.saturating_sub(freed);
-                if cmd.delete == b'A' {
-                    self.kitty_images.clear();
-                    self.kitty_stored_bytes = 0;
-                }
-            }
-            // d=i / d=I: delete placements whose kitty id matches. `I` also frees
-            // the stored image.
-            b'i' | b'I' => {
-                let key = if cmd.id != 0 { cmd.id } else { cmd.number };
-                let mut freed = 0u64;
-                self.placements.retain(|p| {
-                    let del = p.kitty_id == Some(key);
-                    if del {
-                        freed += p.image.rgba.len() as u64;
-                    }
-                    !del
-                });
-                self.placement_bytes = self.placement_bytes.saturating_sub(freed);
-                if cmd.delete == b'I' {
-                    if let Some(pos) = self.kitty_images.iter().position(|(k, _)| *k == key) {
-                        if let Some((_, old)) = self.kitty_images.remove(pos) {
-                            self.kitty_stored_bytes =
-                                self.kitty_stored_bytes.saturating_sub(old.rgba.len() as u64);
-                        }
-                    }
-                }
-            }
+        let key = if cmd.id != 0 { cmd.id } else { cmd.number };
+        let hit = |p: &ImagePlacement| match cmd.delete {
+            // `a=d` with no selector, or d=a / d=A: every KITTY placement (never a
+            // sixel — a Kitty clear must not wipe another protocol's images, M2).
+            0 | b'a' | b'A' => p.is_kitty,
+            // d=i / d=I: the placements of that image id.
+            b'i' | b'I' => p.kitty_id == Some(key),
             // Any other selector (by row/column/z/cursor): documented no-op.
+            _ => false,
+        };
+        retain_placements(&mut self.placements, &mut self.placement_bytes, |p| !hit(p));
+        retain_placements(&mut self.alt_placements, &mut self.alt_placement_bytes, |p| !hit(p));
+        match cmd.delete {
+            b'A' => {
+                self.kitty_images.clear();
+                self.kitty_stored_bytes = 0;
+            }
+            b'I' => {
+                if let Some(pos) = self.kitty_images.iter().position(|(k, _)| *k == key) {
+                    if let Some((_, old)) = self.kitty_images.remove(pos) {
+                        self.kitty_stored_bytes =
+                            self.kitty_stored_bytes.saturating_sub(old.rgba.len() as u64);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2240,109 +2473,74 @@ impl Terminal {
         let _ = self.reply_tx.send(out);
     }
 
-    /// Place a decoded Kitty image at the cursor, reusing the sixel reserve-and-
-    /// anchor machinery. Diverges from `finish_sixel` in two documented ways:
-    /// the image anchors at the CURRENT cursor COLUMN (not forced col 0), and the
-    /// reserve omits the sixel leading bare CR. Correct-or-absent guards are
-    /// identical (alt screen / anchor reset / active sync / zero cell metric).
+    /// Place a decoded Kitty image at the cursor. Unlike a sixel it anchors at
+    /// the cursor COLUMN, and `C=1` leaves the cursor (and the grid) untouched.
+    /// Guards: a zero cell metric drops it; an in-flight sync update is flushed
+    /// first so the cursor is where the app put it.
     fn place_inline_image(&mut self, img: &Arc<crate::sixel::InlineImage>, cmd: &KittyCmd) {
-        if self.term.mode().contains(TermMode::ALT_SCREEN)
-            || self.sync_deadline().is_some()
-            || self.cell_px_w <= 0.0
-            || self.cell_px_h <= 0.0
-        {
+        if self.cell_px_w <= 0.0 || self.cell_px_h <= 0.0 {
             return;
         }
-
+        if self.sync_deadline().is_some() {
+            self.flush_sync();
+        }
         // Cell footprint: explicit c=/r= override, else derive from pixels (ceil).
-        let (mut cols, rows) = if cmd.cols > 0 && cmd.rows > 0 {
+        let (cols, rows) = if cmd.cols > 0 && cmd.rows > 0 {
             (
                 (cmd.cols as usize).clamp(1, self.cols) as u16,
                 (cmd.rows as usize).clamp(1, MAX_IMAGE_ROWS) as u16,
             )
         } else {
-            let c = ((img.width as f32 / self.cell_px_w).ceil() as usize).clamp(1, self.cols) as u16;
-            let r = ((img.height as f32 / self.cell_px_h).ceil() as usize)
-                .clamp(1, MAX_IMAGE_ROWS) as u16;
-            (c, r)
+            (
+                ((img.width as f32 / self.cell_px_w).ceil() as usize).clamp(1, self.cols) as u16,
+                ((img.height as f32 / self.cell_px_h).ceil() as usize).clamp(1, MAX_IMAGE_ROWS) as u16,
+            )
         };
         // Clamp cols to the grid width unconditionally (A8 — avoid an underflow /
         // panic when cols > self.cols or self.cols == 0).
-        cols = cols.min(self.cols.max(1) as u16);
-
-        // The reserve below scrolls up to `rows` lines before this image is an
-        // anchor; make room so that scroll is counted exactly (see `make_room`).
-        self.make_room(rows as usize + 1);
-        let cur = self.term.grid().cursor.point;
-        let abs_line = self.abs_top + cur.line.0 as i64;
-        // Anchor at the current cursor column, saturating so it can never exceed
-        // the last column that still fits the image (A8).
-        let max_col = (self.cols as u16).saturating_sub(cols);
-        let col = (cur.column.0 as u16).min(max_col);
-
-        // Reserve `rows` lines via CRLF injection (honoring the cursor column, so
-        // no leading bare CR). Feeds the same `advance_slice` path so alacritty
-        // scrolls, grows history, and `abs_top` tracks automatically.
-        let mut reserve = Vec::with_capacity(rows as usize * 2);
-        for _ in 0..rows {
-            reserve.push(b'\r');
-            reserve.push(b'\n');
-        }
-        let epoch = self.anchor_epoch;
-        self.advance_slice(&reserve);
-
-        // A mid-call anchor reset makes the anchor untrustworthy — drop.
-        if self.anchor_epoch != epoch {
-            return;
-        }
-
-        let id = crate::sixel::content_id(img);
-        let bytes = img.rgba.len() as u64;
-        let key = if cmd.id != 0 {
-            cmd.id
-        } else {
-            cmd.number
-        };
-        // Clamp the drawn pixel size to the RESERVED cell box so a mismatched
-        // explicit `c=`/`r=` (smaller than the native image) can never overpaint
-        // the rows below the reservation (M4). No-op for the derived footprint,
-        // where `cols`/`rows` are the ceil of the native pixels so the box already
-        // covers them; only a hostile/hand-crafted small c/r is clamped.
+        let cols = cols.min(self.cols.max(1) as u16);
+        // Clamp the drawn pixel size to the cell box so a mismatched explicit
+        // `c=`/`r=` (smaller than the native image) can never overpaint the rows
+        // below it (M4). No-op for the derived footprint.
         let box_w = ((cols as f32) * self.cell_px_w).ceil().min(u16::MAX as f32) as u16;
         let box_h = ((rows as f32) * self.cell_px_h).ceil().min(u16::MAX as f32) as u16;
-        let px_w = (img.width.min(u16::MAX as u32) as u16).min(box_w);
-        let px_h = (img.height.min(u16::MAX as u32) as u16).min(box_h);
-        self.placements.push_back(ImagePlacement {
-            id,
-            abs_line,
-            col,
+        let key = if cmd.id != 0 { cmd.id } else { cmd.number };
+        let p = ImagePlacement {
+            id: crate::sixel::content_id(img),
+            abs_line: 0,
+            col: 0,
             cols,
             rows,
-            px_w,
-            px_h,
+            px_w: (img.width.min(u16::MAX as u32) as u16).min(box_w),
+            px_h: (img.height.min(u16::MAX as u32) as u16).min(box_h),
             image: img.clone(),
-            kitty_id: if key != 0 { Some(key) } else { None },
+            kitty_id: (key != 0).then_some(key),
+            kitty_placement: (cmd.placement != 0).then_some(cmd.placement),
             is_kitty: true,
-        });
-        self.placement_bytes = self.placement_bytes.saturating_add(bytes);
-        let history = self.term.grid().history_size();
-        self.prune_placements(history);
+            marks_cells: false,
+        };
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            self.place_alt_at_cursor(p, false, !cmd.no_cursor_move);
+        } else {
+            self.place_primary_at_cursor(p, !cmd.no_cursor_move, false);
+        }
     }
 
     /// Currently-visible inline images mapped to VIEWPORT rows, off the per-cell
-    /// snapshot path (SPEED — mirrors `failed_prompt_rows`). Empty on the alt
-    /// screen. A placement is kept iff its row SPAN intersects the visible grid
-    /// `[0, rows)` — the SAME span test as `prune_placements`.
+    /// snapshot path (SPEED — mirrors `failed_prompt_rows`). On the alt screen,
+    /// its own placements (anchored at screen rows); on the primary, the
+    /// scrollback-anchored ones. A placement is kept iff its row SPAN intersects
+    /// the visible grid `[0, rows)` — the SAME span test as `prune_placements`.
     pub fn visible_images(&self) -> Vec<crate::snapshot::VisibleImage> {
-        if self.term.mode().contains(TermMode::ALT_SCREEN) {
-            return Vec::new();
-        }
-        let off = self.term.grid().display_offset() as i64;
-        self.placements
-            .iter()
+        let (list, shift) = if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            (&self.alt_placements, 0)
+        } else {
+            (&self.placements, self.term.grid().display_offset() as i64 - self.abs_top)
+        };
+        list.iter()
             .filter_map(|p| {
                 // Viewport row of the image's top-left cell (may be negative).
-                let top = (p.abs_line - self.abs_top) + off;
+                let top = p.abs_line + shift;
                 let bottom = top + p.rows as i64;
                 if bottom <= 0 || top >= self.rows as i64 {
                     return None; // span does not intersect the visible grid
@@ -2364,7 +2562,11 @@ impl Terminal {
     /// the render layer can upload it once per window. `None` if the placement was
     /// pruned since `visible_images` was called.
     pub fn image_rgba(&self, id: u64) -> Option<Arc<crate::sixel::SixelImage>> {
-        self.placements.iter().find(|p| p.id == id).map(|p| p.image.clone())
+        self.placements
+            .iter()
+            .chain(self.alt_placements.iter())
+            .find(|p| p.id == id)
+            .map(|p| p.image.clone())
     }
 
     /// Viewport rows (0-based) of currently-visible FAILED-command prompts
@@ -2444,11 +2646,12 @@ impl Terminal {
         self.parser.stop_sync(&mut self.term);
         let alt_after = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h1 = self.term.grid().history_size();
-        self.track_abs_top(alt_before, alt_after, h0, h1);
+        self.after_vte(alt_before, alt_after, h0, h1);
     }
 
     pub fn snapshot(&self) -> GridSnapshot {
         let mut cells = vec![CellSnapshot::default(); self.cols * self.rows];
+        let mut graphemes = Vec::new();
         let content = self.term.renderable_content();
         let display_offset = content.display_offset;
         // Dynamic OSC 4/10/11/12 palette overrides (pywal, base16 hooks, etc.)
@@ -2500,22 +2703,18 @@ impl Terminal {
                     // preceding cell already visually spans both columns via the
                     // font, so we force the spacer to a blank to keep columns
                     // aligned (preserving the spacer's own bg).
-                    // KNOWN LIMITATION (F24): alacritty stores combining marks /
-                    // zero-width chars (e.g. NFD accents, U+0301) in the cell's
-                    // `zerowidth()` extra storage, separate from `cell.c`. We copy
-                    // only the base `cell.c` here, so a decomposed "é" renders as a
-                    // bare "e" (visible e.g. on macOS NFD `ls` output). Carrying the
-                    // marks would require making the per-cell `CellSnapshot` (which is
-                    // `Copy` and allocated cols×rows every frame) hold a variable-
-                    // length char list AND reshaping base+marks in the render hot
-                    // path — a cost we deliberately avoid to protect idle/throughput.
-                    // `selection_to_string` DOES preserve them, so copied text is
-                    // correct even though the on-screen base glyph is not composed.
-                    let c = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                        ' '
-                    } else {
-                        cell.c
-                    };
+                    // Combining marks / zero-width chars (NFD accents, VS16, ZWJ)
+                    // live in the cell's `zerowidth()` extra storage, separate from
+                    // `cell.c`. The per-cell `CellSnapshot` stays `Copy` (base char
+                    // only); cells that carry marks are listed SPARSELY in
+                    // `graphemes` (base + marks, capped) for the renderer to compose
+                    // — an empty `Vec`, no allocation, on the common path.
+                    let spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+                    let c = if spacer { ' ' } else { cell.c };
+                    // (`extra` also holds hyperlinks / underline colors: skip empty.)
+                    if let Some(marks) = cell.zerowidth().filter(|m| !spacer && !m.is_empty()) {
+                        graphemes.push(CellGrapheme { row, col, text: grapheme_text(cell.c, marks) });
+                    }
                     // Pack the SGR text attributes we render (bold/italic/strike +
                     // underline style). BLINK (SGR 5/6) is intentionally NOT here:
                     // alacritty_terminal 0.26 drops the blink bit at the VT engine
@@ -2658,6 +2857,7 @@ impl Terminal {
             scroll_offset,
             scroll_max,
             cursor_shape,
+            graphemes,
         }
     }
 
@@ -2832,7 +3032,12 @@ impl Terminal {
         // repaint exactly ONE clean prompt. See `at_clean_prompt` for the gates
         // that keep this from ever erasing real output.
         if clean_prompt {
-            self.advance_slice(b"\x1b[H\x1b[2J\x1b[3J");
+            // Straight through alacritty's `Handler` (= `\e[H\e[2J\e[3J`), never
+            // injected into the parser; the anchors are re-established below.
+            use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+            self.term.goto(0, 0);
+            self.term.clear_screen(ClearMode::All);
+            self.term.clear_screen(ClearMode::Saved);
         }
         // Reflow moved every line; stored search-match Points are stale now.
         // Cheap no-op when no search is active.
@@ -2852,6 +3057,7 @@ impl Terminal {
         // ImageLayer's LRU reclaims their VRAM). Run & Notify state survives:
         // a command running across the resize still yields its completion.
         self.drop_anchors();
+        self.clear_alt_placements();
         // A reflow also invalidates any in-progress Kitty chunk accumulation
         // (its anchor context changed) — drop it so it can't splice post-reflow.
         self.reset_kitty_chunks();
@@ -5381,27 +5587,7 @@ mod tests {
         assert!(t.sixel_buf.is_empty(), "buffer released on finish");
     }
 
-    #[test]
-    fn sixel_dropped_on_alt_screen() {
-        let mut t = Terminal::new(20, 5);
-        t.set_cell_px(10.0, 10.0);
-        t.feed(b"\x1b[?1049h"); // enter alt screen
-        t.feed(&sixel(RED_1X6));
-        assert!(t.placements.is_empty(), "no inline images on the alt screen");
-    }
 
-    #[test]
-    fn sixel_dropped_inside_sync_block() {
-        // A sixel inside a DECSET-2026 synchronized-update block anchors at the
-        // wrong row (vte is buffering) → it must be dropped (amendment P2).
-        let mut t = Terminal::new(20, 5);
-        t.set_cell_px(10.0, 10.0);
-        t.feed(b"\x1b[?2026h"); // BSU
-        assert!(t.sync_deadline().is_some(), "sync armed");
-        t.feed(&sixel(RED_1X6));
-        assert!(t.placements.is_empty(), "sixel inside a sync block is dropped");
-        t.flush_sync();
-    }
 
     #[test]
     fn resize_clears_placements() {
@@ -5604,25 +5790,7 @@ mod tests {
         assert_eq!(t.placements[0].col, 3, "image anchors at the cursor column");
     }
 
-    #[test]
-    fn kitty_dropped_on_alt_screen() {
-        let mut t = Terminal::new(20, 5);
-        t.set_cell_px(10.0, 10.0);
-        t.feed(b"\x1b[?1049h");
-        t.feed(&red_rgba_2x2(""));
-        assert!(t.placements.is_empty(), "no Kitty image on the alt screen");
-    }
 
-    #[test]
-    fn kitty_dropped_inside_sync_block() {
-        let mut t = Terminal::new(20, 5);
-        t.set_cell_px(10.0, 10.0);
-        t.feed(b"\x1b[?2026h");
-        assert!(t.sync_deadline().is_some());
-        t.feed(&red_rgba_2x2(""));
-        assert!(t.placements.is_empty(), "dropped inside a sync block");
-        t.flush_sync();
-    }
 
     #[test]
     fn kitty_split_across_feeds_resumes() {
@@ -5897,6 +6065,374 @@ mod tests {
         assert!(t.marks.is_empty(), "a garbage-sized 133 never binds");
         assert_eq!(t.prompt_count(), 0);
         assert!(t.snapshot().row_text(0).trim().is_empty(), "nothing printed");
+    }
+
+    // ── images: alt screen, sync, stacking, chunking, cancel ──────────────────
+
+    #[test]
+    fn sixel_on_alt_screen_anchors_at_cursor_and_goes_with_the_screen() {
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"\x1b[?1049h\x1b[3;5H"); // alt screen, cursor row 2 col 4
+        t.feed(&sixel(RED_1X12)); // 2 rows
+        let imgs = t.visible_images();
+        assert_eq!(imgs.len(), 1, "a TUI's sixel preview is shown");
+        assert_eq!((imgs[0].top_row, imgs[0].col), (2.0, 4));
+        assert_eq!(t.snapshot().cursor_row, 4, "cursor below the image, nothing scrolled");
+        t.feed(b"\x1b[?1049l");
+        assert!(t.visible_images().is_empty() && t.alt_placements.is_empty());
+    }
+
+    #[test]
+    fn alt_sixel_vanishes_once_a_covered_cell_is_written() {
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"\x1b[?1049h\x1b[3;5H");
+        t.feed(&sixel(RED_1X12)); // rows 2-3, col 4
+        t.feed(b"\x1b[6;1Hzz"); // text elsewhere
+        t.feed(b"\x1b[4;5H\x1b[1;1H"); // the cursor passes over it, writes nothing
+        assert_eq!(t.visible_images().len(), 1, "unrelated text / cursor moves keep it");
+        t.feed(b"\x1b[4;5H "); // yazi's erase: a space over an identical blank cell
+        assert!(t.visible_images().is_empty(), "overwritten sixel pixels are gone");
+    }
+
+    #[test]
+    fn kitty_alt_cursor_moves_past_the_image_even_in_origin_mode() {
+        let mut t = Terminal::new(20, 8);
+        t.set_cell_px(10.0, 10.0);
+        // Scroll region rows 3-6 + DECOM: `CUP 1;1` is screen row 2.
+        t.feed(b"\x1b[?1049h\x1b[3;6r\x1b[?6h\x1b[1;1H");
+        t.feed(&red_rgba_2x2(",i=4")); // one cell
+        assert_eq!(t.visible_images()[0].top_row, 2.0);
+        let snap = t.snapshot();
+        assert_eq!((snap.cursor_row, snap.cursor_col), (2, 1), "past its last column, same row");
+    }
+
+    #[test]
+    fn kitty_alt_c1_keeps_the_cursor_and_delete_clears() {
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"\x1b[?1049h\x1b[2;3H");
+        t.feed(&red_rgba_2x2(",i=4,C=1"));
+        let imgs = t.visible_images();
+        assert_eq!(imgs.len(), 1);
+        assert_eq!((imgs[0].top_row, imgs[0].col), (1.0, 2));
+        let snap = t.snapshot();
+        assert_eq!((snap.cursor_row, snap.cursor_col), (1, 2), "C=1: cursor untouched");
+        t.feed(&apc("a=d,d=i,i=4"));
+        assert!(t.visible_images().is_empty(), "a=d deletes alt-screen placements too");
+    }
+
+    #[test]
+    fn kitty_alt_placement_survives_text_but_not_clear_or_scroll() {
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"\x1b[?1049h\x1b[2;3H");
+        t.feed(&red_rgba_2x2(",i=4,C=1"));
+        t.feed(b"\x1b[5;1Hfile list redraw");
+        assert_eq!(t.visible_images().len(), 1, "partial redraws keep the preview");
+        t.feed(b"\x1b[2J");
+        assert!(t.visible_images().is_empty(), "a cleared screen drops it");
+        t.feed(b"\x1b[2;3H");
+        t.feed(&red_rgba_2x2(",i=4,C=1"));
+        t.feed(b"\x1b[S");
+        assert!(t.visible_images().is_empty(), "a scroll drops it (correct-or-absent)");
+    }
+
+    #[test]
+    fn images_inside_a_sync_block_flush_and_anchor_correctly() {
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"\x1b[?2026h"); // BSU: vte buffers the next bytes
+        t.feed(b"a\r\nb\r\n");
+        t.feed(&sixel(RED_1X6));
+        assert_eq!(t.placements.len(), 1, "placed, not dropped");
+        assert_eq!(t.visible_images()[0].top_row, 2.0, "at the row the app drew it");
+        t.feed(b"\x1b[?2026h");
+        t.feed(&red_rgba_2x2(""));
+        assert_eq!(t.placements.len(), 2);
+        assert!(t.sync_deadline().is_none());
+    }
+
+    #[test]
+    fn in_place_redraws_keep_one_placement() {
+        // chafa / timg animate by re-emitting each frame at the same spot.
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        for _ in 0..300 {
+            t.feed(b"\x1b[H");
+            t.feed(&sixel(RED_1X12));
+        }
+        assert_eq!(t.placements.len(), 1, "each frame evicts the one it covers");
+        // Kitty: the same image id + placement id replaces even when it moves
+        // (the 1-cell image at another spot covers nothing).
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        for k in 0..300 {
+            t.feed(format!("\x1b[1;{}H", 1 + k % 10).as_bytes());
+            t.feed(&red_rgba_2x2(",i=1,p=1"));
+        }
+        assert_eq!(t.placements.len(), 1, "same image id + placement id replaces");
+        assert_eq!(t.visible_images()[0].col, 299 % 10);
+        t.feed(b"\x1b[3;1H");
+        t.feed(&red_rgba_2x2(",i=1,p=2"));
+        assert_eq!(t.placements.len(), 2, "another placement id is a second placement");
+    }
+
+    #[test]
+    fn kitty_spec_chunking_without_action_transmits_only() {
+        // The spec's chunked example opens WITHOUT `a=`: the default is `t`.
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        let payload = b64(&[9u8, 9, 9, 255].repeat(4));
+        let (a, b) = payload.split_at(payload.len() / 2);
+        t.feed(&apc(&format!("f=32,s=2,v=2,i=5,m=1;{a}")));
+        t.feed(&apc(&format!("m=0;{b}")));
+        assert!(t.placements.is_empty(), "transmit only");
+        assert_eq!(t.kitty_images.len(), 1, "stored under i=5");
+        let reply = String::from_utf8_lossy(&t.drain_pty_writes()).to_string();
+        assert!(reply.contains("i=5;OK"), "got {reply:?}");
+        t.feed(&apc("a=p,i=5"));
+        assert_eq!(t.placements.len(), 1, "a=p displays it");
+    }
+
+    #[test]
+    fn kitty_virtual_placement_is_refused() {
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&red_rgba_2x2(",i=7,U=1"));
+        assert!(t.placements.is_empty(), "no placeholder-cell rendering");
+        let reply = String::from_utf8_lossy(&t.drain_pty_writes()).to_string();
+        assert!(reply.contains("ENOTSUPP"), "got {reply:?}");
+    }
+
+    #[test]
+    fn sixel_cancelled_by_can_or_sub_draws_nothing() {
+        for cancel in [0x18u8, 0x1a] {
+            let mut t = Terminal::new(20, 6);
+            t.set_cell_px(10.0, 10.0);
+            let mut bytes = b"\x1bPq".to_vec();
+            bytes.extend_from_slice(RED_1X6.as_bytes());
+            bytes.push(cancel);
+            t.feed(&bytes);
+            assert!(t.placements.is_empty(), "cancelled with {cancel:#04x}");
+        }
+    }
+
+    // ── combining marks / zero-width chars ────────────────────────────────────
+
+    #[test]
+    fn graphemes_carry_combining_marks_sparsely() {
+        let mut t = Terminal::new(20, 3);
+        t.feed(b"\x1b]8;;https://x.test\x1b\\link\x1b]8;;\x1b\\\x1b[58:5:1m\x1b[4mu\x1b[m\r\n");
+        assert!(t.snapshot().graphemes.is_empty(), "nothing composed on plain / linked text");
+        t.feed("e\u{301}x \u{2764}\u{fe0f} \u{1f469}\u{200d}\u{1f4bb}".as_bytes());
+        let g = t.snapshot().graphemes;
+        assert!(g.iter().any(|c| (c.row, c.col) == (1, 0) && c.text == "e\u{301}"), "{g:?}");
+        assert!(g.iter().any(|c| c.text == "\u{2764}\u{fe0f}"), "VS16: {g:?}");
+        assert!(g.iter().any(|c| c.text == "\u{1f469}\u{200d}"), "ZWJ: {g:?}");
+    }
+
+    #[test]
+    fn zalgo_flood_is_capped_on_the_grid_and_in_the_snapshot() {
+        let mut t = Terminal::new(20, 3);
+        t.feed(b"a");
+        let marks = "\u{301}".repeat(100_000);
+        for chunk in marks.as_bytes().chunks(8192) {
+            t.feed(chunk);
+        }
+        let cell_marks = t.term.grid()[Line(0)][Column(0)].zerowidth().map_or(0, |z| z.len());
+        assert!(cell_marks <= GRAPHEME_MAX_MARKS, "grid cell holds {cell_marks} marks");
+        let g = t.snapshot().graphemes;
+        assert_eq!(g.len(), 1);
+        assert!(g[0].text.chars().count() <= 1 + GRAPHEME_MAX_MARKS);
+        assert!(g[0].text.len() <= GRAPHEME_MAX_BYTES);
+    }
+
+    // ── differential fuzz: the pre-scanner vs vte 0.15's real state machine ───
+
+    /// vte 0.15's parser states (`vte/src/lib.rs`, std build).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum VState {
+        Ground,
+        Escape,
+        EscInter,
+        CsiEntry,
+        CsiParam,
+        CsiInter,
+        CsiIgnore,
+        DcsEntry,
+        DcsParam,
+        DcsInter,
+        DcsPass,
+        DcsIgnore,
+        Osc,
+        SosPmApc,
+    }
+
+    /// A transcription of vte 0.15's `advance_*` transition functions, tracking
+    /// the state and how many bytes its (std, unbounded) OSC buffer holds. In
+    /// Ground vte only ever leaves on ESC (UTF-8 decoding never swallows one).
+    struct VteModel {
+        state: VState,
+        osc_len: usize,
+        max_osc: usize,
+    }
+
+    impl VteModel {
+        fn anywhere(&self, b: u8) -> VState {
+            match b {
+                0x18 | 0x1a => VState::Ground,
+                0x1b => VState::Escape,
+                _ => self.state,
+            }
+        }
+
+        fn step(&mut self, b: u8) {
+            use VState::*;
+            let c0 = matches!(b, 0x00..=0x17 | 0x19 | 0x1c..=0x1f);
+            self.state = match self.state {
+                Ground => if b == 0x1b { Escape } else { Ground },
+                Escape => match b {
+                    _ if c0 => Escape,
+                    0x20..=0x2f => EscInter,
+                    0x50 => DcsEntry,
+                    0x58 | 0x5e | 0x5f => SosPmApc,
+                    0x5b => CsiEntry,
+                    0x5d => {
+                        self.osc_len = 0;
+                        Osc
+                    }
+                    0x30..=0x7e | 0x18 | 0x1a => Ground,
+                    _ => Escape, // ESC, DEL, 0x80..=0xFF
+                },
+                EscInter => match b {
+                    _ if c0 => EscInter,
+                    0x20..=0x2f | 0x7f => EscInter,
+                    0x30..=0x7e => Ground,
+                    _ => self.anywhere(b),
+                },
+                CsiEntry => match b {
+                    _ if c0 => CsiEntry,
+                    0x20..=0x2f => CsiInter,
+                    0x30..=0x3f => CsiParam,
+                    0x40..=0x7e => Ground,
+                    _ => self.anywhere(b),
+                },
+                CsiParam => match b {
+                    _ if c0 => CsiParam,
+                    0x20..=0x2f => CsiInter,
+                    0x30..=0x3b | 0x7f => CsiParam,
+                    0x3c..=0x3f => CsiIgnore,
+                    0x40..=0x7e => Ground,
+                    _ => self.anywhere(b),
+                },
+                CsiInter => match b {
+                    _ if c0 => CsiInter,
+                    0x20..=0x2f => CsiInter,
+                    0x30..=0x3f => CsiIgnore,
+                    0x40..=0x7e => Ground,
+                    _ => self.anywhere(b),
+                },
+                CsiIgnore => match b {
+                    _ if c0 => CsiIgnore,
+                    0x20..=0x3f | 0x7f => CsiIgnore,
+                    0x40..=0x7e => Ground,
+                    _ => self.anywhere(b),
+                },
+                DcsEntry => match b {
+                    _ if c0 => DcsEntry,
+                    0x20..=0x2f => DcsInter,
+                    0x30..=0x3f => DcsParam,
+                    0x40..=0x7e => DcsPass,
+                    0x7f => DcsEntry,
+                    _ => self.anywhere(b),
+                },
+                DcsParam => match b {
+                    _ if c0 => DcsParam,
+                    0x20..=0x2f => DcsInter,
+                    0x30..=0x3b | 0x7f => DcsParam,
+                    0x3c..=0x3f => DcsIgnore,
+                    0x40..=0x7e => DcsPass,
+                    _ => self.anywhere(b),
+                },
+                DcsInter => match b {
+                    _ if c0 => DcsInter,
+                    0x20..=0x2f | 0x7f => DcsInter,
+                    0x30..=0x3f => DcsIgnore,
+                    0x40..=0x7e => DcsPass,
+                    _ => self.anywhere(b),
+                },
+                DcsIgnore | SosPmApc => self.anywhere(b),
+                DcsPass => match b {
+                    0x18 | 0x1a | 0x9c => Ground,
+                    0x1b => Escape,
+                    _ => DcsPass,
+                },
+                Osc => match b {
+                    0x07 | 0x18 | 0x1a => Ground,
+                    0x1b => Escape,
+                    0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f | 0x3b => Osc,
+                    _ => {
+                        self.osc_len += 1;
+                        self.max_osc = self.max_osc.max(self.osc_len);
+                        Osc
+                    }
+                },
+            };
+        }
+    }
+
+    #[test]
+    fn scanner_agrees_with_vte_on_escape_and_osc_states_fuzz() {
+        // Whenever vte is collecting an OSC (its only unbounded buffer), the
+        // scanner must be tracking it, and vice versa; whenever vte sits in
+        // Escape, so must the scanner (that is where an OSC can begin); and vte's
+        // OSC buffer must never exceed the cap. Random streams (ESC with C0 /
+        // DEL / high bytes in between, CAN/SUB/BEL/0x9C, DCS/APC/SOS/PM, long
+        // payload runs) are fed at random chunk boundaries; the model replays
+        // exactly the bytes JeTTY handed to vte (incl. its injected CAN).
+        let mut seed: u64 = 0x5eed_1234_abcd_0001;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let alphabet: &[u8] =
+            b"\x1b\x1b\x1b\x1b]]][[P_X^\x07\x18\x1a\x9c\n\r\x01\x7f\x80\xc3\xa90123;;?qGJhlc\\Az=,";
+        for case in 0..400 {
+            let mut t = Terminal::new(30, 8);
+            t.set_cell_px(10.0, 10.0);
+            t.osc_cap = 48;
+            if case % 3 == 0 {
+                t.feed(b"\x1b]133;A\x07"); // live anchors: the isolation paths run too
+            }
+            t.vte_log = Some(Vec::new());
+            let mut model = VteModel { state: VState::Ground, osc_len: 0, max_osc: 0 };
+            let mut stream = Vec::new();
+            while stream.len() < 1500 {
+                match next() % 10 {
+                    0 => stream.extend(std::iter::repeat_n(b'x', (next() % 120) as usize)),
+                    1 => stream.extend_from_slice(b"\x1b]0;"),
+                    2 => stream.extend_from_slice(b"\x1b]133;"),
+                    _ => stream.push(alphabet[next() as usize % alphabet.len()]),
+                }
+            }
+            let (mut i, mut seen) = (0, 0);
+            while i < stream.len() {
+                let end = (i + 1 + (next() % 40) as usize).min(stream.len());
+                t.feed(&stream[i..end]);
+                i = end;
+                let log = t.vte_log.as_ref().unwrap();
+                for &b in &log[seen..] {
+                    model.step(b);
+                }
+                seen = log.len();
+                let scanning_osc = matches!(t.scan, Scan::Prefix { .. } | Scan::Payload { .. } | Scan::Skip);
+                assert_eq!(scanning_osc, model.state == VState::Osc, "case {case} @{i}: scan {:?} vs vte {:?}", t.scan, model.state);
+                assert_eq!(t.scan == Scan::Esc, model.state == VState::Escape, "case {case} @{i}: scan {:?} vs vte {:?}", t.scan, model.state);
+                assert!(model.max_osc <= t.osc_cap as usize, "case {case}: vte buffered {} OSC bytes", model.max_osc);
+            }
+        }
     }
 
     // ── mode getters for the input layer (kitty keyboard / focus / mouse) ────
