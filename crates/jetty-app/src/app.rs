@@ -13635,12 +13635,16 @@ fn render_grid_scene(
     // Cells carrying combining marks / VS16 / ZWJ (sparse; empty = no allocation).
     let graphemes: Vec<(usize, usize, &str)> =
         s.snap.graphemes.iter().map(|g| (g.row, g.col, g.text.as_str())).collect();
+    // The current search match's glyphs, recolored to read on its strong fill
+    // (empty — no allocation — unless a search is open with a current match).
+    let recolor = jetty_render::search_recolor_spans(s.search_hits, s.theme);
     let paint = jetty_render::GridPaint {
         cursor_glyph: cursor_under.map(|_| {
             (s.snap.cursor_row, s.snap.cursor_col, jetty_render::cursor_text_color(s.theme, s.snap.cursor_rgb))
         }),
         selection: Some(selection),
         graphemes: &graphemes,
+        recolor: &recolor,
     };
     // Passes 1 + 2 are recorded into ONE render pass and ONE queue submit (each
     // separate pass + submit cost tens of µs of CPU on every frame). Both uploads

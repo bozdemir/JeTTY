@@ -230,6 +230,12 @@ impl UiPalette {
     }
 }
 
+/// `[r, g, b]` + alpha, for a quad color.
+#[inline]
+pub(crate) fn rgba(c: [u8; 3], a: u8) -> [u8; 4] {
+    [c[0], c[1], c[2], a]
+}
+
 /// Linear sRGB-space blend `a → b` at `t` (0 = `a`, 1 = `b`), rounded — the same
 /// arithmetic as the chrome's historical `lerp` closures.
 pub fn mix(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {

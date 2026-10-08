@@ -1,5 +1,7 @@
 use crate::chrome::{fit_tail, ChromeMeasure, ChromeMetrics, CHROME_ADVANCE};
+use crate::colors::contrast_ratio;
 use crate::quad::SCROLLBAR_W;
+use crate::ui_palette::{mix, rgba, UiPalette};
 use crate::Rect;
 
 /// Geometry + draw data for the scrollback-search bar (Ctrl+Shift+F): a
@@ -20,8 +22,8 @@ pub struct SearchBar {
 const RIGHT_GAP: f32 = 8.0;
 
 /// Build the search bar for a window `win_w` px wide with the grid starting
-/// at `grid_top` (both physical px). All colors derive from the theme's
-/// bg→fg lerp (same surface language as help.rs) — no hardcoded RGB. All
+/// at `grid_top` (both physical px). All colors come from the theme's
+/// [`UiPalette`] (same surface language as help.rs) — no hardcoded RGB. All
 /// metrics scale with the chrome unit `cm` (DPI × UI font), and the prefix,
 /// query and counter are MEASURED with `m` — so the caret hugs the last glyph
 /// and wide (CJK) or proportional text never overlaps the counter (F8). A long
@@ -38,20 +40,10 @@ pub fn build_search_bar(
     current: usize,
     total: usize,
 ) -> SearchBar {
-    let tbg = theme.bg;
-    let tfg = theme.fg;
-    let lerp = |t: f32| -> [u8; 3] {
-        [
-            (tbg[0] as f32 + (tfg[0] as f32 - tbg[0] as f32) * t).round() as u8,
-            (tbg[1] as f32 + (tfg[1] as f32 - tbg[1] as f32) * t).round() as u8,
-            (tbg[2] as f32 + (tfg[2] as f32 - tbg[2] as f32) * t).round() as u8,
-        ]
-    };
-    let bg3 = lerp(0.06);
-    let panel_bg: [u8; 4] = [bg3[0], bg3[1], bg3[2], 242];
-    let border3 = lerp(0.30);
-    let border_col: [u8; 4] = [border3[0], border3[1], border3[2], 255];
-    let text_col = lerp(0.70);
+    let ui = UiPalette::cached(theme);
+    let panel_bg = rgba(ui.surface, 242);
+    let border_col = rgba(ui.border, 255);
+    let text_col = ui.text_dim;
 
     // HiDPI × UI-font scale (the overlay unit; ≈0.983 at 1×/16pt, see `OVERLAY_SCALE`).
     let vscale = cm.overlay_u();
@@ -70,7 +62,7 @@ pub fn build_search_bar(
     } else {
         format!("{current}/{total}")
     };
-    let counter_col = if total == 0 { lerp(0.45) } else { tfg };
+    let counter_col = if total == 0 { ui.text_hint } else { ui.text };
 
     // All text is MEASURED as the chrome layer draws it: CJK/fullwidth query
     // glyphs (explicitly supported via IME commits) render ~2× a monospace
@@ -116,7 +108,7 @@ pub fn build_search_bar(
     // Static caret right after the query text (no animation — the bar never
     // self-drives frames).
     let caret_x = x + pad + label_w + caret_gap;
-    quads.push(Rect::new(caret_x, text_y, caret_w, text_h, [tfg[0], tfg[1], tfg[2], 255]));
+    quads.push(Rect::new(caret_x, text_y, caret_w, text_h, rgba(ui.text, 255)));
 
     // Counter, right-aligned against the close button.
     let close_x = x + bar_w - pad - close_w;
@@ -136,10 +128,61 @@ pub fn build_search_bar(
     SearchBar { quads, labels, panel, close_rect }
 }
 
+/// Weight of the CURRENT match's fill (bg → ANSI yellow): strong, so it reads
+/// as "you are here"; its glyphs are recolored to stay readable on it
+/// ([`search_recolor_spans`]).
+const CURRENT_HIT_T: f32 = 0.85;
+/// Weight of every other match's tint, and the least it backs off to.
+const HIT_T: f32 = 0.45;
+const HIT_T_MIN: f32 = 0.25;
+/// The theme fg must keep this contrast on an ordinary match's tint (its
+/// glyphs keep their own colors there).
+const HIT_TEXT_FLOOR: f32 = 3.0;
+
+/// `(ordinary, current)` match fills. The ordinary tint backs off from
+/// [`HIT_T`] (to [`HIT_T_MIN`] at most) only while the theme fg would fall
+/// under 3:1 on it — a pale yellow (Poimandres) used to leave 1.8:1.
+fn hit_fills(theme: &jetty_core::Theme) -> ([u8; 3], [u8; 3]) {
+    let bg = [theme.bg[0], theme.bg[1], theme.bg[2]];
+    let yellow = theme.palette[3];
+    let mut t = HIT_T;
+    while t > HIT_T_MIN && contrast_ratio(theme.fg, mix(bg, yellow, t)) < HIT_TEXT_FLOOR {
+        t -= 0.01;
+    }
+    (mix(bg, yellow, t.max(HIT_T_MIN)), mix(bg, yellow, CURRENT_HIT_T))
+}
+
+/// The glyph color inside the CURRENT match: readable (≥ 4.5:1) on its strong
+/// fill — the theme bg/fg when one reaches it, else black/white.
+pub fn search_current_fg(theme: &jetty_core::Theme) -> [u8; 3] {
+    UiPalette::cached(theme).on_fill(hit_fills(theme).1)
+}
+
+/// The [`crate::GridPaint::recolor`] spans for the visible `hits`: the CURRENT
+/// match's segments in [`search_current_fg`], sorted by `(row, first col)`.
+/// Shared by app.rs and jetty-shot so both render identically.
+pub fn search_recolor_spans(
+    hits: &[jetty_core::SearchHit],
+    theme: &jetty_core::Theme,
+) -> Vec<(usize, usize, usize, [u8; 3])> {
+    if !hits.iter().any(|h| h.is_current) {
+        return Vec::new();
+    }
+    let fg = search_current_fg(theme);
+    let mut spans: Vec<(usize, usize, usize, [u8; 3])> = hits
+        .iter()
+        .filter(|h| h.is_current && h.col_end >= h.col_start)
+        .map(|h| (h.row, h.col_start, h.col_end, fg))
+        .collect();
+    spans.sort_unstable_by_key(|s| (s.0, s.1));
+    spans
+}
+
 /// Background highlight rects for the visible search matches: every hit gets
-/// a bg→palette[3] (yellow) blend, the CURRENT match a much stronger one.
-/// Opaque (alpha 255) like the selection rects; appended AFTER them so the
-/// match tint wins. Shared by app.rs and jetty-shot so both render identically.
+/// a bg→palette[3] (yellow) tint, the CURRENT match a much stronger fill (with
+/// its glyphs recolored — [`search_recolor_spans`]). Opaque (alpha 255) like
+/// the selection rects; appended AFTER them so the match tint wins. Shared by
+/// app.rs and jetty-shot so both render identically.
 pub fn search_hit_rects(
     hits: &[jetty_core::SearchHit],
     cell_w: f32,
@@ -147,18 +190,8 @@ pub fn search_hit_rects(
     y_offset: f32,
     theme: &jetty_core::Theme,
 ) -> Vec<Rect> {
-    let bg = theme.bg;
-    let accent = theme.palette[3];
-    let blend = |t: f32| -> [u8; 4] {
-        [
-            (bg[0] as f32 + (accent[0] as f32 - bg[0] as f32) * t).round() as u8,
-            (bg[1] as f32 + (accent[1] as f32 - bg[1] as f32) * t).round() as u8,
-            (bg[2] as f32 + (accent[2] as f32 - bg[2] as f32) * t).round() as u8,
-            255,
-        ]
-    };
-    let normal = blend(0.45);
-    let current = blend(0.85);
+    let (normal, current) = hit_fills(theme);
+    let (normal, current) = (rgba(normal, 255), rgba(current, 255));
     hits.iter()
         .map(|h| {
             Rect::new(
@@ -324,6 +357,65 @@ mod tests {
         // Geometry: row 1, cols 2..=6 at 8x16 cells with a 36px offset.
         let r = &rects[1];
         assert_eq!((r.x, r.y, r.w, r.h), (16.0, 16.0, 40.0, 16.0));
+    }
+
+    #[test]
+    fn the_current_match_stays_readable_on_every_theme() {
+        // Its glyphs used to keep their colors on the 85% yellow fill: 1.05–2.3:1.
+        for i in 0..jetty_core::theme::PRESETS.len() {
+            let t = jetty_core::theme::theme_at(i);
+            let (normal, current) = hit_fills(&t);
+            let fg = search_current_fg(&t);
+            assert!(contrast_ratio(fg, current) >= 4.5, "{}: current match glyphs", t.name);
+            // Ordinary hits keep the theme fg readable (or sit at the minimum tint).
+            let bg = [t.bg[0], t.bg[1], t.bg[2]];
+            assert!(
+                contrast_ratio(t.fg, normal) >= 3.0 || normal == mix(bg, t.palette[3], HIT_T_MIN),
+                "{}: fg on an ordinary hit {}",
+                t.name,
+                contrast_ratio(t.fg, normal)
+            );
+            // The current match still stands out from an ordinary one.
+            assert_ne!(normal, current, "{}", t.name);
+        }
+    }
+
+    #[test]
+    fn ordinary_hits_keep_todays_tint_where_it_already_read() {
+        // Catppuccin Mocha's fg reads ≥3:1 on the 45% tint → unchanged.
+        let t = theme();
+        let bg = [t.bg[0], t.bg[1], t.bg[2]];
+        assert_eq!(hit_fills(&t).0, mix(bg, t.palette[3], 0.45));
+        // Poimandres' pale yellow → the tint backs off until fg reads.
+        let p = jetty_core::Theme::by_name("poimandres");
+        assert!(contrast_ratio(p.fg, hit_fills(&p).0) >= 3.0);
+    }
+
+    #[test]
+    fn recolor_spans_cover_only_the_current_match_in_order() {
+        let t = theme();
+        let hits = [
+            jetty_core::SearchHit { row: 3, col_start: 0, col_end: 2, is_current: true },
+            jetty_core::SearchHit { row: 1, col_start: 4, col_end: 9, is_current: false },
+            jetty_core::SearchHit { row: 2, col_start: 70, col_end: 79, is_current: true },
+        ];
+        let spans = search_recolor_spans(&hits, &t);
+        let fg = search_current_fg(&t);
+        assert_eq!(spans, vec![(2, 70, 79, fg), (3, 0, 2, fg)], "current segments, sorted");
+        let none = [jetty_core::SearchHit { row: 0, col_start: 0, col_end: 3, is_current: false }];
+        assert!(search_recolor_spans(&none, &t).is_empty());
+    }
+
+    #[test]
+    fn bar_text_is_readable_on_every_theme() {
+        for i in 0..jetty_core::theme::PRESETS.len() {
+            let t = jetty_core::theme::theme_at(i);
+            let sb = build_search_bar(1000, 36.0, &t, &mut mono(), CM, "q", 0, 0);
+            let surface = [sb.panel.color[0], sb.panel.color[1], sb.panel.color[2]];
+            for (text, _, _, c) in &sb.labels {
+                assert!(contrast_ratio(*c, surface) >= 3.0, "{}: {text:?} {}", t.name, contrast_ratio(*c, surface));
+            }
+        }
     }
 
     #[test]

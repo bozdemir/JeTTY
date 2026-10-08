@@ -635,16 +635,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     jetty_render::shift_x(&mut cursor_over, shot_origin.left);
     let mut bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, shot_origin.top, selection.bg);
+    // The current match's glyph recolor (Pass 2), like the app's render core.
+    let mut search_recolor: Vec<(usize, usize, usize, [u8; 3])> = Vec::new();
     if search_query.is_some() {
         // Same pass-1 placement as the app: match tints under the glyphs,
         // appended after the selection rects so they win where overlapping.
+        let hits = terminal.search_viewport_hits();
         bg_rects.extend(jetty_render::search_hit_rects(
-            &terminal.search_viewport_hits(),
+            &hits,
             cell_w,
             cell_h,
             shot_origin.top,
             terminal.theme(),
         ));
+        search_recolor = jetty_render::search_recolor_spans(&hits, terminal.theme());
     }
     jetty_render::shift_x(&mut bg_rects, shot_origin.left);
     bg_rects.extend(cursor_under);
@@ -667,6 +671,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         selection: Some(selection),
         graphemes: &graphemes,
+        recolor: &search_recolor,
     };
     // Passes 1 + 2 in ONE render pass + submit, exactly like the app's
     // `render_grid_scene`. The clear is the historical premultiplied value: the

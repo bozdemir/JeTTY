@@ -54,7 +54,9 @@ pub use tabbar::{
     DetachedBar, TabActivity, TabBar, CONTROLS_W, STRIP_PAD, TABBAR_H,
 };
 pub use welcome::{build_welcome_overlay, WelcomeOverlay};
-pub use search_bar::{build_search_bar, search_hit_rects, SearchBar};
+pub use search_bar::{
+    build_search_bar, search_current_fg, search_hit_rects, search_recolor_spans, SearchBar,
+};
 pub use hints::{build_copy_pill, build_hint_overlay, copy_cursor_rects, CopyPill, HintOverlay};
 pub use preedit::{build_preedit_overlay, PreeditOverlay, MAX_PREEDIT_CHARS};
 pub use palette::{build_command_palette, CommandPalette, PaletteRow, MAX_PALETTE_ROWS};

@@ -25,6 +25,13 @@ pub struct GridPaint<'a> {
     /// cluster (shaped with font fallback, at the cell origin) instead of the bare
     /// base char. Empty — the common case — costs nothing.
     pub graphemes: &'a [(usize, usize, &'a str)],
+    /// Glyph recolor spans `(row, first col, last col, color)`, sorted by
+    /// `(row, first col)` and non-overlapping: every glyph inside takes `color`
+    /// (the CURRENT search match, drawn on a strong fill — see
+    /// [`crate::search_recolor_spans`]). Concealed text stays concealed. Applied
+    /// after the selection colors, before the block-cursor glyph. Empty — the
+    /// common case — costs one compare per cell.
+    pub recolor: &'a [(usize, usize, usize, [u8; 3])],
 }
 
 /// Pack one cell's DRAWN content — the (possibly blanked) char, its final fg and
@@ -389,6 +396,10 @@ fn pack_grid<'a>(
     let mut cluster_index: FxHashMap<&'a str, u32> = FxHashMap::default();
     let mut cluster_chars = 0usize;
     let mut sel_memo: Option<([u8; 3], [u8; 3])> = None;
+    // Recolor spans, walked with a cursor alongside the cell loop like the
+    // grapheme overrides (sorted by the caller; empty = one compare per cell).
+    let recolor = paint.recolor;
+    let mut r_next = 0usize;
     // Fingerprint for the underline/strike quads (folded in the SAME per-cell
     // loop, so no extra pass): an underline-only change rebuilds decorations
     // without forcing a re-shape.
@@ -404,6 +415,17 @@ fn pack_grid<'a>(
             if cell.selected {
                 if let Some(sel) = &paint.selection {
                     fg = selected_glyph_fg(cell, sel, &mut sel_memo);
+                }
+            }
+            if r_next < recolor.len() {
+                // Drop spans that end before this cell, then test the next one.
+                while r_next < recolor.len() && (recolor[r_next].0, recolor[r_next].2) < (row, col) {
+                    r_next += 1;
+                }
+                if let Some(&(rr, c0, c1, color)) = recolor.get(r_next) {
+                    if rr == row && c0 <= col && col <= c1 && cell.fg != cell.bg {
+                        fg = color;
+                    }
                 }
             }
             if let Some((cr, cc, cursor_fg)) = paint.cursor_glyph {
@@ -1846,6 +1868,40 @@ mod tests {
             }
         }
         assert!(elapsed < std::time::Duration::from_secs(2), "packing a Zalgo flood took {elapsed:?}");
+    }
+
+    #[test]
+    fn recolor_spans_repaint_only_their_glyphs() {
+        // The current search match: its glyphs take the span color; cells outside
+        // keep theirs, a concealed cell (fg == bg) stays concealed, and the block
+        // cursor's glyph still wins.
+        let (cols, rows) = (8, 3);
+        let mut snap = plain_grid(cols, rows);
+        let concealed = [18, 18, 23]; // == the default cell bg
+        snap.cells[cols + 3].fg = concealed;
+        let (red, blue) = ([255, 0, 0], [0, 0, 255]);
+        let spans = [(0, 6, 7, blue), (1, 2, 4, red)];
+        let fg_at = |paint: &GridPaint, row: usize, col: usize| {
+            let packed = pack_grid(&snap, paint, 10.0, 20.0, &mut |_| CellRoute::Inline, PackScratch::default());
+            unpack_cell(packed.keys[row * cols + col]).1
+        };
+        let paint = GridPaint { recolor: &spans, ..Default::default() };
+        let plain = jetty_core::CellSnapshot::default().fg;
+        for row in 0..rows {
+            for col in 0..cols {
+                let want = match (row, col) {
+                    (0, 6..=7) => blue,
+                    (1, 2) | (1, 4) => red,
+                    (1, 3) => concealed,
+                    _ => plain,
+                };
+                assert_eq!(fg_at(&paint, row, col), want, "cell ({row},{col})");
+            }
+        }
+        let with_cursor = GridPaint { recolor: &spans, cursor_glyph: Some((1, 2, [1, 2, 3])), ..Default::default() };
+        assert_eq!(fg_at(&with_cursor, 1, 2), [1, 2, 3]);
+        // No spans: identical to the plain grid.
+        assert_eq!(fg_at(&GridPaint::default(), 0, 6), plain);
     }
 
     #[test]
