@@ -1,3 +1,4 @@
+mod chrome;
 mod colors;
 mod gpu;
 mod text;
@@ -19,6 +20,11 @@ mod caret_fx;
 mod search_bar;
 mod hints;
 mod palette;
+mod status;
+pub use chrome::{
+    clip_head, clip_tail, fit_head, fit_tail, ChromeMeasure, ChromeMetrics, MonoMeasure,
+    CHROME_ADVANCE, MAX_LABEL_CHARS, OVERLAY_SCALE, PILL_H_BASE, STATUS_H_BASE, UI_FONT_BASE,
+};
 pub use gpu::{AcquireError, GpuContext, GpuShared};
 pub use text::{GridPaint, TextLayer};
 pub use colors::{
@@ -36,7 +42,7 @@ pub use focus::FocusPull;
 pub use crt::{Crt, CrtUniform, CRT_FLAG_ROLL, CRT_FLAG_FLICKER, CRT_FLAG_JITTER};
 pub use image_layer::{ImageDraw, ImageLayer};
 pub use caret_fx::{CaretFx, CaretFxUniform};
-pub use menu::{build_context_menu, build_menu, ContextMenu};
+pub use menu::{build_context_menu, build_menu, ContextMenu, MENU_HINTS, MENU_ITEMS};
 pub use help::{build_help_overlay, default_help_rows, HelpOverlay, HELP_ROWS};
 pub use confirm::{build_confirm, build_confirm_close, ConfirmPopup};
 pub use tabbar::{
@@ -47,3 +53,4 @@ pub use welcome::{build_welcome_overlay, WelcomeOverlay};
 pub use search_bar::{build_search_bar, search_hit_rects, SearchBar};
 pub use hints::{build_copy_pill, build_hint_overlay, copy_cursor_rects, CopyPill, HintOverlay};
 pub use palette::{build_command_palette, CommandPalette, PaletteRow, MAX_PALETTE_ROWS};
+pub use status::{build_status_strip, build_toast_pill, StatusStrip, ToastPill};

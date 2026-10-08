@@ -539,6 +539,18 @@ pub struct TextLayer {
     /// the CURSOR quads do (drawn app-side). Consumed via `decoration_rects()`.
     deco_rects: Vec<crate::quad::Rect>,
     deco_cache_key: Option<(u64, u32, u32, u32, u32, u32)>,
+    /// Chrome text measurement (`ChromeMeasure`): rendered width per label for
+    /// non-title [0] and tab-title [1] chrome. Chrome labels are mostly static
+    /// strings rebuilt every rendered frame, so a hit is one hash lookup and a
+    /// miss shapes once. Keys are CLIPPED labels and the caches are BYTE-
+    /// budgeted (`MeasureCache`), so program-controlled text (huge OSC titles)
+    /// can't grow them. Cleared whenever the chrome family/size changes.
+    measure_cache: [crate::chrome::MeasureCache<f32>; 2],
+    /// Per-char boundary x offsets (`ChromeMeasure::char_xs`) for the few
+    /// labels that need them (truncation fits, carets, fuzzy highlights).
+    xs_cache: [crate::chrome::MeasureCache<Vec<f32>>; 2],
+    /// Scratch buffer the measurement shapes into (no per-call allocation).
+    measure_buffer: Buffer,
 }
 
 impl TextLayer {
@@ -618,6 +630,10 @@ impl TextLayer {
         let mut coverage_buffer = Buffer::new(&mut font_system, metrics);
         coverage_buffer.set_size(&mut font_system, None, None);
 
+        // Chrome-measurement scratch buffer (see `ChromeMeasure for TextLayer`).
+        let mut measure_buffer = Buffer::new(&mut font_system, metrics);
+        measure_buffer.set_size(&mut font_system, None, None);
+
         // Measure a monospace cell by shaping a single 'M'.
         let cell_w = measure_advance_family(&mut font_system, metrics, family);
         let cell_h = line_height;
@@ -655,6 +671,9 @@ impl TextLayer {
             shape_gen: 0,
             deco_rects: Vec::new(),
             deco_cache_key: None,
+            measure_cache: Default::default(),
+            xs_cache: Default::default(),
+            measure_buffer,
         }
     }
 
@@ -753,6 +772,9 @@ impl TextLayer {
         self.shape_gen = self.shape_gen.wrapping_add(1);
         // Re-measure cell width with the new family.
         self.cell_w = measure_advance_family(&mut self.font_system, self.metrics, name);
+        // At the default UI family, non-title chrome renders in THIS family, so
+        // every cached chrome width is stale.
+        self.clear_measure_caches();
     }
 
     /// Change the CHROME (UI-overlay) font family at runtime. `None` or an empty
@@ -771,6 +793,7 @@ impl TextLayer {
         // Re-measure the chrome cell advance with the new family so chrome_char_w
         // (and every width reservation derived from it) tracks the UI font.
         self.cell_w = self.measure_chrome_advance();
+        self.clear_measure_caches();
     }
 
     /// Measure the advance (`cell_w`) for the CURRENT chrome family at the current
@@ -824,6 +847,63 @@ impl TextLayer {
         self.fallback_order.clear();
         self.clusters.clear();
         self.shape_gen = self.shape_gen.wrapping_add(1);
+        self.clear_measure_caches();
+    }
+
+    /// Drop every cached chrome measurement (family or size changed).
+    fn clear_measure_caches(&mut self) {
+        for c in &mut self.measure_cache {
+            c.clear();
+        }
+        for c in &mut self.xs_cache {
+            c.clear();
+        }
+    }
+
+    /// Shape `s` as chrome (`title` = tab-title family) into the scratch buffer
+    /// and write every char boundary's x offset into `out` — the SAME family,
+    /// metrics and `Shaping::Advanced` (font fallback included) as
+    /// `render_overlays_inner`, so the numbers match the drawn glyphs.
+    fn shape_char_xs(&mut self, s: &str, title: bool, out: &mut Vec<f32>) {
+        out.clear();
+        out.push(0.0);
+        if s.is_empty() {
+            return;
+        }
+        let ui_family = self.ui_family.clone();
+        let mono_fallback = self.font_family.clone();
+        let metrics = self.metrics;
+        let attrs = Attrs::new().family(ui_family.as_family(title, &mono_fallback));
+        let buf = &mut self.measure_buffer;
+        buf.set_metrics(&mut self.font_system, metrics);
+        buf.set_size(&mut self.font_system, None, Some(metrics.line_height));
+        buf.set_text(&mut self.font_system, s, &attrs, Shaping::Advanced, None);
+        // Byte offset of each char boundary (the last one = len) → boundary x =
+        // the x of the first glyph whose cluster starts at/after it, or the full
+        // width past the last glyph. Chrome labels are single-line LTR runs.
+        let mut starts: Vec<(usize, f32)> = Vec::new();
+        let mut full = 0.0f32;
+        for run in buf.layout_runs() {
+            for g in run.glyphs.iter() {
+                starts.push((g.start, g.x));
+                full = full.max(g.x + g.w);
+            }
+        }
+        starts.sort_by_key(|&(b, _)| b);
+        let mut gi = 0usize;
+        for (byte, _) in s.char_indices().skip(1).chain(std::iter::once((s.len(), ' '))) {
+            while gi < starts.len() && starts[gi].0 < byte {
+                gi += 1;
+            }
+            let x = if byte == s.len() {
+                full
+            } else {
+                starts.get(gi).map(|&(_, x)| x).unwrap_or(full)
+            };
+            // Non-decreasing even across ligature / combining clusters.
+            let prev = *out.last().unwrap_or(&0.0);
+            out.push(x.max(prev));
+        }
     }
 
     /// Returns the currently active font family name.
@@ -1428,7 +1508,11 @@ impl TextLayer {
             // chrome family lacks (emoji, CJK, symbols on a custom UI font)
             // rendered as a tofu box. Chrome is proportional overlay text with
             // no grid-alignment constraint, and overlays only shape on rendered
-            // frames (idle draws nothing), so Advanced is safe here.
+            // frames (idle draws nothing), so Advanced is safe here. Clipped to
+            // MAX_LABEL_CHARS: labels can carry program-controlled text (a
+            // multi-MB OSC title), and shaping that whole per frame is a DoS —
+            // nothing past the clip could be visible anyway.
+            let (text, _) = crate::chrome::clip_head(text);
             buf.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
         }
 
@@ -1494,29 +1578,8 @@ impl TextLayer {
     /// Render NON-TITLE chrome labels (menu, status/perf bar, panel, help,
     /// confirm, welcome, window controls). With a `Named` UI family they render in
     /// it; at the `Sans` default they render in the mono Nerd Font (preserving its
-    /// symbol glyphs ⇧ ⌃ ⚡ ⚙ ✕ …), exactly as before this feature.
-    /// Measure the ACTUAL rendered width (physical px) of a chrome overlay string
-    /// under the current UI family + size, using the SAME Advanced shaping as
-    /// [`Self::render_overlays`]. Chrome overlays are PROPORTIONAL (no grid snap),
-    /// so `chars().count() * cell_size().0` mis-measures a non-monospace UI font —
-    /// use this to right-align the perf HUD / shift-hint pill correctly.
-    pub fn measure_overlay_width(&mut self, text: &str) -> f32 {
-        if text.is_empty() {
-            return 0.0;
-        }
-        let ui_family = self.ui_family.clone();
-        let mono_fallback = self.font_family.clone();
-        let metrics = self.metrics;
-        let mut b = Buffer::new(&mut self.font_system, metrics);
-        let attrs = Attrs::new().family(ui_family.as_family(false, &mono_fallback));
-        b.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
-        b.set_size(&mut self.font_system, None, Some(metrics.line_height));
-        b.layout_runs()
-            .flat_map(|run| run.glyphs.iter())
-            .map(|g| g.x + g.w)
-            .fold(0.0_f32, f32::max)
-    }
-
+    /// symbol glyphs ⇧ ⌃ ⚡ ⚙ ✕ …), exactly as before this feature. Chrome text
+    /// is measured through `ChromeMeasure` (the same shaping as this pass).
     pub fn render_overlays(
         &mut self,
         device: &wgpu::Device,
@@ -1586,6 +1649,56 @@ impl TextLayer {
         self.render_to(&gpu.device, &gpu.queue, &view, gpu.config.width, gpu.config.height, snapshot, true, 0.0)?;
         frame.present();
         Ok(())
+    }
+}
+
+/// Real chrome text measurement: the layer's own family/size/shaping, cached.
+/// Chrome builders take `&mut dyn ChromeMeasure` so a proportional UI font
+/// positions carets, highlights, right-aligned values and truncation by what
+/// is actually drawn (see `crate::chrome`).
+impl crate::chrome::ChromeMeasure for TextLayer {
+    /// Clips `s` to `MAX_LABEL_CHARS` first (bounded shaping for program-
+    /// controlled text); `out` then covers that clipped prefix.
+    fn char_xs(&mut self, s: &str, title: bool, out: &mut Vec<f32>) {
+        let (s, _) = crate::chrome::clip_head(s);
+        let slot = title as usize;
+        if let Some(xs) = self.xs_cache[slot].get(s) {
+            out.clear();
+            out.extend_from_slice(xs);
+            return;
+        }
+        self.shape_char_xs(s, title, out);
+        let bytes = out.len() * std::mem::size_of::<f32>();
+        self.xs_cache[slot].insert(s, out.clone(), bytes);
+    }
+
+    fn text_w(&mut self, s: &str) -> f32 {
+        self.cached_width(s, false)
+    }
+
+    fn title_w(&mut self, s: &str) -> f32 {
+        self.cached_width(s, true)
+    }
+}
+
+impl TextLayer {
+    /// Cached rendered width of a chrome label (`title` = tab-title family).
+    /// Measures at most `MAX_LABEL_CHARS` chars — exactly what the overlay
+    /// pass will draw of it (it clips the same way).
+    fn cached_width(&mut self, s: &str, title: bool) -> f32 {
+        let (s, _) = crate::chrome::clip_head(s);
+        if s.is_empty() {
+            return 0.0;
+        }
+        let slot = title as usize;
+        if let Some(&w) = self.measure_cache[slot].get(s) {
+            return w;
+        }
+        let mut xs = Vec::new();
+        self.shape_char_xs(s, title, &mut xs);
+        let w = xs.last().copied().unwrap_or(0.0);
+        self.measure_cache[slot].insert(s, w, std::mem::size_of::<f32>());
+        w
     }
 }
 

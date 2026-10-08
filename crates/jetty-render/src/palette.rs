@@ -1,4 +1,4 @@
-use crate::search_bar::{char_cells, display_cells};
+use crate::chrome::{fit_head, fit_tail, ChromeMeasure, ChromeMetrics, CHROME_ADVANCE};
 use crate::Rect;
 
 /// Maximum number of result rows visible in the palette at once (the scroll
@@ -32,16 +32,19 @@ pub struct CommandPalette {
 /// Build the centered, HiDPI, theme-derived command palette for a window of
 /// `win_w`×`win_h` physical pixels. Mirrors `help.rs`/`search_bar.rs`: all
 /// colours blend the theme's bg→fg (no hardcoded RGB), all metrics scale with
-/// the measured chrome advance `char_w` via the `char_w/9.8` vscale idiom, and
-/// text is measured in DISPLAY cells so wide (CJK) theme/tab titles never
-/// overflow. `rows` is the already-scrolled VISIBLE slice (≤ `MAX_PALETTE_ROWS`);
-/// `first_visible` + `total_matches` drive the scrollbar thumb.
+/// the chrome unit `cm` (DPI × UI font), and every label is MEASURED with `m`
+/// (the chrome layer's real shaping) — so the caret, the counter and the
+/// per-char fuzzy highlights sit exactly on the drawn glyphs for any UI font,
+/// and wide (CJK) titles truncate by their real width. `rows` is the
+/// already-scrolled VISIBLE slice (≤ `MAX_PALETTE_ROWS`); `first_visible` +
+/// `total_matches` drive the scrollbar thumb.
 #[allow(clippy::too_many_arguments)]
 pub fn build_command_palette(
     win_w: u32,
     win_h: u32,
     theme: &jetty_core::Theme,
-    char_w: f32,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
     query: &str,
     rows: &[PaletteRow],
     total_matches: usize,
@@ -75,8 +78,9 @@ pub fn build_command_palette(
     let thumb3 = lerp(0.40);
     let thumb_col: [u8; 4] = [thumb3[0], thumb3[1], thumb3[2], 255];
 
-    // --- Vertical metrics (scale with DPI; floored so a short window still fits) ---
-    let vscale = (char_w / 9.8).max(0.1);
+    // --- Vertical metrics (scale with DPI × UI font; floored so a short window
+    // still fits) ---
+    let vscale = cm.overlay_u();
     let text_h = 16.0 * vscale;
     let pad_v = (14.0 * vscale).max(6.0);
     let input_h = (34.0 * vscale).max(24.0);
@@ -98,9 +102,7 @@ pub fn build_command_palette(
     let want_lo = (420.0 * vscale).min(max_w);
     let panel_w = (sw * 0.6).clamp(want_lo, max_w).max(0.0);
     let pad_x = (16.0 * vscale).min(panel_w * 0.12).max(4.0);
-    let content_w = (panel_w - 2.0 * pad_x).max(char_w);
-    // Total content cells available on one line.
-    let content_cells = (content_w / char_w).floor().max(1.0) as usize;
+    let content_w = (panel_w - 2.0 * pad_x).max(1.0);
 
     // Anchor the box slightly above centre (spotlight feel), clamped on-screen.
     let px = ((sw - panel_w) / 2.0).max(0.0).floor();
@@ -128,7 +130,6 @@ pub fn build_command_palette(
 
     // --- Input line: "> query" + static caret + right-aligned counter ---
     const PROMPT: &str = "> ";
-    let prompt_cells = display_cells(PROMPT);
     let counter = if total_matches == 0 {
         "no matches".to_string()
     } else if total_matches == 1 {
@@ -136,17 +137,17 @@ pub fn build_command_palette(
     } else {
         format!("{total_matches} results")
     };
-    let counter_cells = display_cells(&counter);
+    let counter_w = m.text_w(&counter);
+    // Gap between the query/caret and the counter (≈ one chrome char).
+    let gap = cm.px(CHROME_ADVANCE);
 
     let input_y = py + pad_v;
     let input_text_y = input_y + (input_h - text_h) / 2.0;
 
     // Budget for the query text: content minus prompt, caret+gap, and counter+gap.
-    let reserve = prompt_cells + 2 + counter_cells + 1;
-    let query_budget = content_cells.saturating_sub(reserve);
+    let query_budget = (content_w - m.text_w(PROMPT) - 2.0 * gap - counter_w).max(0.0);
     // Tail-truncate the query (keep the caret end visible, like the search bar).
-    let shown_query = tail_fit(query, query_budget);
-    let shown_query_cells = display_cells(&shown_query);
+    let shown_query = fit_tail(m, query, query_budget, false);
 
     let input_text = if query.is_empty() {
         format!("{PROMPT}Type a command…")
@@ -154,14 +155,16 @@ pub fn build_command_palette(
         format!("{PROMPT}{shown_query}")
     };
     let input_text_col = if query.is_empty() { placeholder_col } else { input_col };
+    // Static caret right after the TYPED text (bar never self-drives frames) —
+    // measured as drawn, so it hugs the last glyph for any UI font. With an empty
+    // query it sits right after the prompt, before the placeholder.
+    let typed = format!("{PROMPT}{shown_query}");
+    let caret_x = text_x + m.text_w(&typed) + 2.0;
     labels.push((input_text, text_x, input_text_y, input_text_col));
-
-    // Static caret right after the query text (bar never self-drives frames).
-    let caret_x = text_x + (prompt_cells + shown_query_cells) as f32 * char_w + 2.0;
     quads.push(Rect::new(caret_x, input_text_y, 2.0, text_h, caret_col));
 
     // Counter, right-aligned against the right padding.
-    let counter_x = px + panel_w - pad_x - counter_cells as f32 * char_w;
+    let counter_x = px + panel_w - pad_x - counter_w;
     labels.push((counter, counter_x, input_text_y, counter_col));
 
     // Divider between the input line and the result rows.
@@ -170,6 +173,7 @@ pub fn build_command_palette(
 
     // --- Result rows ---
     let rows_top = divider_y + div_h;
+    let mut xs: Vec<f32> = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         let row_top = rows_top + i as f32 * row_h;
         let row_text_y = row_top + (row_h - text_h) / 2.0;
@@ -179,24 +183,30 @@ pub fn build_command_palette(
         if row.selected {
             let sel_x = px + 4.0 * vscale;
             let sel_w = (panel_w - 8.0 * vscale).max(0.0);
-            quads.push(Rect::rounded(sel_x, row_top, sel_w, row_h, sel_bg, 6.0));
+            quads.push(Rect::rounded(sel_x, row_top, sel_w, row_h, sel_bg, cm.px(6.0)));
         }
 
         // Head-truncate the title to the content width (append … when it overflows),
         // and keep only the matched indices that survive inside the visible head.
-        let (shown_title, kept) = head_fit(row.title, content_cells);
+        let shown_title = fit_head(m, row.title, content_w, false);
+        let kept = if shown_title == row.title {
+            shown_title.chars().count()
+        } else {
+            shown_title.chars().count() - 1 // the trailing ellipsis is not original
+        };
         let base_col = if row.selected { tfg } else { row_col };
         labels.push((shown_title.clone(), text_x, row_text_y, base_col));
 
-        // Overlay each surviving matched char in the accent colour, positioned by
-        // its DISPLAY-cell offset (correct for wide glyphs — never char index).
+        // Overlay each surviving matched char in the accent colour at its MEASURED
+        // x inside the drawn title (correct for wide glyphs and proportional fonts).
+        m.char_xs(&shown_title, false, &mut xs);
         let chars: Vec<char> = shown_title.chars().collect();
         for &idx in row.match_indices {
             if idx >= kept {
                 continue; // fell into the truncated tail
             }
-            let prefix_cells: usize = chars[..idx].iter().map(|&c| char_cells(c)).sum();
-            let cx = text_x + prefix_cells as f32 * char_w;
+            let Some(&dx) = xs.get(idx) else { continue };
+            let cx = text_x + dx;
             labels.push((chars[idx].to_string(), cx, row_text_y, accent));
         }
     }
@@ -219,60 +229,39 @@ pub fn build_command_palette(
     CommandPalette { quads, labels, panel, row_hits }
 }
 
-/// Keep the LAST characters of `s` whose summed display width fits `budget`
-/// cells (the caret end stays visible). Used for the typed query.
-fn tail_fit(s: &str, budget: usize) -> String {
-    if display_cells(s) <= budget {
-        return s.to_string();
-    }
-    let mut cells = 0usize;
-    let mut tail: Vec<char> = Vec::new();
-    for c in s.chars().rev() {
-        let w = char_cells(c);
-        if cells + w > budget {
-            break;
-        }
-        cells += w;
-        tail.push(c);
-    }
-    tail.iter().rev().collect()
-}
-
-/// Keep the FIRST characters of `s` that fit `budget` cells; append `…` when it
-/// overflowed. Returns the shown string and the number of ORIGINAL leading chars
-/// kept (excluding the ellipsis) so matched indices can be range-checked.
-fn head_fit(s: &str, budget: usize) -> (String, usize) {
-    if display_cells(s) <= budget {
-        let kept = s.chars().count();
-        return (s.to_string(), kept);
-    }
-    // Reserve one cell for the ellipsis.
-    let budget = budget.saturating_sub(1);
-    let mut cells = 0usize;
-    let mut out = String::new();
-    let mut kept = 0usize;
-    for c in s.chars() {
-        let w = char_cells(c);
-        if cells + w > budget {
-            break;
-        }
-        cells += w;
-        out.push(c);
-        kept += 1;
-    }
-    out.push('…');
-    (out, kept)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::MonoMeasure;
 
     fn theme() -> jetty_core::Theme {
         jetty_core::Theme::by_name("catppuccin_mocha")
     }
 
     const TEST_CHAR_W: f32 = 9.8;
+    const CM: ChromeMetrics = ChromeMetrics::DEFAULT;
+
+    fn mono() -> MonoMeasure {
+        MonoMeasure(TEST_CHAR_W)
+    }
+
+    /// A PROPORTIONAL test font: narrow 'i'/'l'/' ', wide 'M'/'W', 8px otherwise.
+    struct PropMeasure;
+    impl ChromeMeasure for PropMeasure {
+        fn char_xs(&mut self, s: &str, _title: bool, out: &mut Vec<f32>) {
+            out.clear();
+            out.push(0.0);
+            let mut x = 0.0;
+            for c in s.chars() {
+                x += match c {
+                    'i' | 'l' | ' ' | '.' => 4.0,
+                    'M' | 'W' | 'm' | 'w' => 14.0,
+                    _ => 8.0,
+                };
+                out.push(x);
+            }
+        }
+    }
 
     fn sample_rows<'a>(titles: &'a [String], sel: usize) -> Vec<PaletteRow<'a>> {
         titles
@@ -292,12 +281,12 @@ mod tests {
         ];
         for w in [320u32, 500, 700, 1000, 1600] {
             let rows = sample_rows(&titles, 0);
-            let p = build_command_palette(w, 700, &theme(), TEST_CHAR_W, "the", &rows, 4, 0);
+            let p = build_command_palette(w, 700, &theme(), &mut mono(), CM, "the", &rows, 4, 0);
             assert!(p.panel.x >= 0.0 && p.panel.y >= 0.0, "panel off-screen at {w}");
             assert!(p.panel.x + p.panel.w <= w as f32 + 0.5, "panel exceeds width at {w}");
             let panel_right = p.panel.x + p.panel.w;
             for (text, x, _y, _c) in &p.labels {
-                let est_right = x + display_cells(text) as f32 * TEST_CHAR_W;
+                let est_right = x + mono().text_w(text);
                 assert!(
                     est_right <= panel_right + 0.5,
                     "label {text:?} overflows the panel at width {w}: {est_right} > {panel_right}"
@@ -310,7 +299,7 @@ mod tests {
     fn box_is_centered_horizontally() {
         let titles = vec!["New tab".to_string()];
         let rows = sample_rows(&titles, 0);
-        let p = build_command_palette(1000, 700, &theme(), TEST_CHAR_W, "", &rows, 1, 0);
+        let p = build_command_palette(1000, 700, &theme(), &mut mono(), CM, "", &rows, 1, 0);
         let left = p.panel.x;
         let right = 1000.0 - (p.panel.x + p.panel.w);
         assert!((left - right).abs() < 1.5, "box not centered: left {left}, right {right}");
@@ -321,7 +310,7 @@ mod tests {
         let titles = vec!["one".to_string(), "two".to_string(), "three".to_string()];
         // With a selection: a rounded highlight quad exists.
         let rows = sample_rows(&titles, 1);
-        let p = build_command_palette(1000, 700, &theme(), TEST_CHAR_W, "", &rows, 3, 0);
+        let p = build_command_palette(1000, 700, &theme(), &mut mono(), CM, "", &rows, 3, 0);
         let sel_quads = p.quads.iter().filter(|q| q.radius == 6.0).count();
         assert_eq!(sel_quads, 1, "exactly one selection highlight expected");
         // With NO selection: none.
@@ -329,7 +318,7 @@ mod tests {
             .iter()
             .map(|t| PaletteRow { title: t, match_indices: &[], selected: false })
             .collect();
-        let p = build_command_palette(1000, 700, &theme(), TEST_CHAR_W, "", &rows, 3, 0);
+        let p = build_command_palette(1000, 700, &theme(), &mut mono(), CM, "", &rows, 3, 0);
         assert_eq!(p.quads.iter().filter(|q| q.radius == 6.0).count(), 0);
     }
 
@@ -338,37 +327,64 @@ mod tests {
         let titles: Vec<String> = (0..MAX_PALETTE_ROWS).map(|i| format!("row {i}")).collect();
         let rows = sample_rows(&titles, 0);
         // total == visible → no thumb.
-        let p = build_command_palette(1000, 900, &theme(), TEST_CHAR_W, "", &rows, MAX_PALETTE_ROWS, 0);
+        let p = build_command_palette(1000, 900, &theme(), &mut mono(), CM, "", &rows, MAX_PALETTE_ROWS, 0);
         let thin = |q: &Rect| q.w < 6.0 && q.h > 20.0;
         assert!(!p.quads.iter().any(thin), "no thumb when list fits");
         // total > visible → a thumb.
-        let p = build_command_palette(1000, 900, &theme(), TEST_CHAR_W, "", &rows, 40, 0);
+        let p = build_command_palette(1000, 900, &theme(), &mut mono(), CM, "", &rows, 40, 0);
         assert!(p.quads.iter().any(thin), "thumb expected when list overflows");
     }
 
     #[test]
-    fn scales_with_char_w() {
-        // Tall window so no vertical clamp kicks in: 2× char_w → ~2× panel height.
+    fn scales_with_chrome_metrics() {
+        // Tall window so no vertical clamp kicks in: a 2× chrome unit → ~2× panel
+        // height. The scale comes from the METRICS, not from the font's advance.
         let titles = vec!["New tab".to_string(), "Close tab".to_string()];
-        let p1 = build_command_palette(1200, 2000, &theme(), 9.8, "", &sample_rows(&titles, 0), 2, 0);
-        let p2 = build_command_palette(1200, 2000, &theme(), 19.6, "", &sample_rows(&titles, 0), 2, 0);
-        // Everything scales with char_w except the 1px divider, so allow ~1px slack.
+        let p1 = build_command_palette(1200, 2000, &theme(), &mut mono(), CM, "", &sample_rows(&titles, 0), 2, 0);
+        let p2 = build_command_palette(
+            1200, 2000, &theme(), &mut MonoMeasure(19.6), ChromeMetrics::new(2.0, 16.0), "",
+            &sample_rows(&titles, 0), 2, 0,
+        );
+        // Everything scales except the 1px divider, so allow ~1px slack.
         assert!(
             (p2.panel.h - p1.panel.h * 2.0).abs() < 2.0,
-            "panel height must scale with char_w: {} vs {}",
+            "panel height must scale with the chrome unit: {} vs {}",
             p2.panel.h,
             p1.panel.h
         );
+        // A wide-'M' proportional font must NOT inflate the panel (the old
+        // char_w/9.8 idiom scaled everything by the font's 'M' advance).
+        let p3 = build_command_palette(1200, 2000, &theme(), &mut PropMeasure, CM, "", &sample_rows(&titles, 0), 2, 0);
+        assert!((p3.panel.h - p1.panel.h).abs() < 0.01, "font choice changed the panel size");
+    }
+
+    #[test]
+    fn proportional_font_highlights_and_caret_follow_measured_glyphs() {
+        // "Mail list": 'M' is 14px, 'i'/'l'/' ' 4px, others 8px. The matched
+        // 'l' (idx 3) must sit at the MEASURED prefix width 14+8+4 = 26, and the
+        // caret right after the typed "> ml" (8+4+14+4 = 30) + 2.
+        let title = "Mail list".to_string();
+        let idx = vec![0usize, 3, 5];
+        let rows = vec![PaletteRow { title: &title, match_indices: &idx, selected: true }];
+        let p = build_command_palette(1000, 700, &theme(), &mut PropMeasure, CM, "ml", &rows, 1, 0);
+        let accent = theme().palette[4];
+        let base = p.labels.iter().find(|l| l.0 == "Mail list").expect("row label");
+        let xs: Vec<(String, f32)> =
+            p.labels.iter().filter(|l| l.3 == accent).map(|l| (l.0.clone(), l.1 - base.1)).collect();
+        assert_eq!(xs, vec![("M".to_string(), 0.0), ("l".to_string(), 26.0), ("l".to_string(), 34.0)]);
+        let input = p.labels.iter().find(|l| l.0 == "> ml").expect("input label");
+        let caret = p.quads.iter().find(|q| q.w == 2.0 && q.y == input.2).expect("caret quad");
+        assert!((caret.x - (input.1 + 30.0 + 2.0)).abs() < 0.01, "caret at {}", caret.x - input.1);
     }
 
     #[test]
     fn matched_char_highlight_lands_at_cell_offset() {
         // Title "New tab", matched indices [0,4] ('N','t'). Each accent overlay
-        // must sit at text_x + display_cells(prefix)*char_w.
+        // must sit at text_x + the measured prefix width (monospace here).
         let title = "New tab".to_string();
         let indices = vec![0usize, 4usize];
         let rows = vec![PaletteRow { title: &title, match_indices: &indices, selected: true }];
-        let p = build_command_palette(1000, 700, &theme(), TEST_CHAR_W, "nt", &rows, 1, 0);
+        let p = build_command_palette(1000, 700, &theme(), &mut mono(), CM, "nt", &rows, 1, 0);
         let accent = theme().palette[4];
         let accents: Vec<&(String, f32, f32, [u8; 3])> =
             p.labels.iter().filter(|l| l.3 == accent).collect();
@@ -388,9 +404,9 @@ mod tests {
         // and still fit inside the panel.
         let long = "This is an extremely long command title that will not fit".to_string();
         let rows = vec![PaletteRow { title: &long, match_indices: &[], selected: false }];
-        let p = build_command_palette(360, 700, &theme(), TEST_CHAR_W, "", &rows, 1, 0);
+        let p = build_command_palette(360, 700, &theme(), &mut mono(), CM, "", &rows, 1, 0);
         let row_label = p.labels.iter().find(|l| l.0.contains('…')).expect("ellipsis title");
-        let est_right = row_label.1 + display_cells(&row_label.0) as f32 * TEST_CHAR_W;
+        let est_right = row_label.1 + mono().text_w(&row_label.0);
         assert!(est_right <= p.panel.x + p.panel.w + 0.5, "truncated title overflows panel");
     }
 }

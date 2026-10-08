@@ -25,6 +25,15 @@
 ///                    default 16). Drives ALL chrome (tab bar/status/menu/panel/
 ///                    help/confirm/welcome) and the panel's live "Aa" specimen.
 ///   JETTY_SHOT_UI_FONT — UI (chrome) font family (default "" = platform sans).
+///   JETTY_SHOT_SCALE — simulated display DPI scale (0.5..4, default 1; 2 =
+///                    Retina / 4K@200%). Fonts rasterize at size × scale and the
+///                    chrome follows ChromeMetrics, exactly like the live app.
+///                    Pass PHYSICAL JETTY_SHOT_WIDTH/HEIGHT (e.g. 2000×1280).
+///   JETTY_SHOT_TABBAR_N — number of sample tabs for JETTY_SHOT_TABBAR (default 3).
+///   JETTY_SHOT_HELP_SCROLL — first help row for JETTY_SHOT_HELP when its rows
+///                    overflow the window (large UI font / short window).
+///   JETTY_SHOT_PILL="text" — draw the app's toast pill (run-selection status /
+///                    Shift-drag hint surface) above the status strip.
 ///   JETTY_SHOT_TABBAR_ACTIVITY — comma list aligned with the 3 sample tabs
 ///                    (`none|output|bell`, unknown → none), e.g.
 ///                    `none,output,bell` — draws the activity/bell dots on the
@@ -113,6 +122,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse::<f32>().ok())
         .map(|v| v.clamp(6.0, 48.0))
         .unwrap_or(16.0);
+    // JETTY_SHOT_SCALE — simulated display DPI scale (default 1; e.g. 2 for a
+    // Retina / 4K@200% screen). Like the live app, every font is rasterized at
+    // logical × scale and the chrome geometry follows `ChromeMetrics` (DPI × UI
+    // font). Pass a matching JETTY_SHOT_WIDTH/HEIGHT (PHYSICAL px).
+    let dpi: f32 = std::env::var("JETTY_SHOT_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(0.5, 4.0))
+        .unwrap_or(1.0);
 
     let default_input = "\x1b[1;32muser@host\x1b[0m:\x1b[1;34m~/jetty\x1b[0m$ ls --color\r\n\x1b[1;34msrc\x1b[0m  \x1b[33mCargo.toml\x1b[0m  \x1b[31mREADME.md\x1b[0m\r\n\x1b[1;32muser@host\x1b[0m:\x1b[1;34m~/jetty\x1b[0m$ \r\n";
     // JETTY_SHOT_ATTRS=1: built-in text-attribute self-test sample (used only when
@@ -201,19 +220,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- Build TextLayer ---
-    let mut text = TextLayer::new_with_family(&device, &queue, format, font_size, &font_family);
+    let mut text = TextLayer::new_with_family(&device, &queue, format, font_size * dpi, &font_family);
     // Chrome layer at the UI font size, mirroring the live app: ALL window chrome
-    // (tab bar, status bar, context menu, settings panel, help, confirm, welcome)
-    // renders through this in the chosen UI family, independent of JETTY_FONT_SIZE.
-    // The terminal grid renders through `text` (which scales with the font). Built
-    // from the grid layer's font database, like the app (no second font scan).
+    // (tab bar, status bar, context menu, settings panel, help, confirm, palette,
+    // …) renders through this in the chosen UI family, independent of
+    // JETTY_FONT_SIZE. The terminal grid renders through `text` (which scales with
+    // the font). Built from the grid layer's font database, like the app (no
+    // second font scan).
     let mut chrome_text = TextLayer::new_with_family_and_fonts(
-        &device, &queue, format, ui_font_size, &font_family, text.clone_font_system(),
+        &device, &queue, format, ui_font_size * dpi, &font_family, text.clone_font_system(),
     );
     chrome_text.set_ui_family(if ui_font_family.is_empty() { None } else { Some(ui_font_family.as_str()) });
-    // Measured chrome-font advance: used by all overlay builders for scale-correct
-    // width reservations (HiDPI-aware). On a CI/scale-1 run this is ~9.6–9.8 px.
-    let chrome_char_w = chrome_text.cell_size().0;
+    // The chrome geometry (bar/strip/pill heights, paddings) — the SAME metrics
+    // the app derives from its window's DPI × UI font.
+    let cm = jetty_render::ChromeMetrics::new(dpi, ui_font_size);
+    // The Settings panel draws with its OWN layer at the CAPPED body size, like
+    // the app's settings window (the panel body font is clamped to [13, 17] pt).
+    let panel_font = ui_font_size.clamp(13.0, 17.0);
+    let panel_cm = jetty_render::ChromeMetrics::new(dpi, panel_font);
+    let mut panel_text =
+        TextLayer::new_with_family(&device, &queue, format, panel_font * dpi, &font_family);
+    panel_text.set_ui_family(if ui_font_family.is_empty() { None } else { Some(ui_font_family.as_str()) });
     let (cell_w, cell_h) = text.cell_size();
     let mono_families = text.monospace_families();
     // UI-font candidates with the synthetic "System Sans (default)" row at index 0.
@@ -226,8 +253,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (title pill + close ✕), the grid offset below it, and the bottom status
     // strip, mirroring App::render_detached_window for visual verification.
     let detached_shot = std::env::var("JETTY_SHOT_DETACHED").map(|v| v != "0").unwrap_or(false);
-    let shot_grid_top: f32 = if detached_shot { jetty_render::TABBAR_H } else { 0.0 };
-    let shot_status_h: f32 = if detached_shot { 22.0 } else { 0.0 };
+    // JETTY_SHOT_TABBAR lays the grid out like the live main window: below the
+    // bar (or above it with JETTY_TAB_BAR=bottom), above the status strip when a
+    // perf HUD is shown — so a bar that overflows its band is visible in the PNG.
+    let tabbar_shot = env_flag("JETTY_SHOT_TABBAR");
+    let tab_bar_bottom = std::env::var("JETTY_TAB_BAR").map(|v| v == "bottom").unwrap_or(false);
+    let perf_shot = std::env::var("JETTY_SHOT_PERF").map(|v| !v.is_empty()).unwrap_or(false);
+    let shot_grid_top: f32 =
+        if detached_shot || (tabbar_shot && !tab_bar_bottom) { cm.bar_h() } else { 0.0 };
+    let shot_status_h: f32 =
+        if detached_shot || (tabbar_shot && perf_shot) { cm.status_h() } else { 0.0 };
+    // The bar's height when it sits at the BOTTOM (the grid ends above it).
+    let shot_bottom_bar_h: f32 = if tabbar_shot && tab_bar_bottom { cm.bar_h() } else { 0.0 };
 
     // Reserve the scrollbar gutter EXACTLY like the live windows
     // (app.rs grid_dims / detached.rs), so a screenshot builds the same column
@@ -235,7 +272,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SCROLLBAR_GUTTER = jetty_render::SCROLLBAR_W (14) + 4.
     let scrollbar_gutter = jetty_render::SCROLLBAR_W + 4.0;
     let cols = ((width as f32 - scrollbar_gutter) / cell_w).floor().max(2.0) as usize;
-    let rows = (((height as f32 - shot_grid_top - shot_status_h) / cell_h).floor()).max(1.0) as usize;
+    let rows = (((height as f32 - shot_grid_top - shot_status_h - shot_bottom_bar_h) / cell_h).floor()).max(1.0) as usize;
 
     eprintln!("jetty-shot: grid = {cols}x{rows} cells (cell {cell_w:.1}x{cell_h:.1}px)");
 
@@ -643,7 +680,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 opacity: 1.0,
             })
             .collect();
-        let grid_bottom_px = (height as f32 - shot_status_h).max(0.0);
+        let grid_bottom_px = (height as f32 - shot_status_h - shot_bottom_bar_h).max(0.0);
         let sc_y = shot_grid_top.clamp(0.0, height as f32) as u32;
         let sc_h = (grid_bottom_px.clamp(0.0, height as f32) as u32).saturating_sub(sc_y);
         image_layer.render(&device, &queue, &view, width, height, &draws, [0, sc_y, width, sc_h]);
@@ -656,7 +693,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sb_fg = terminal.theme().fg;
         let sb_mix = |i: usize| (sb_bg[i] as f32 + (sb_fg[i] as f32 - sb_bg[i] as f32) * 0.35) as u8;
         let sb_thumb = [sb_mix(0), sb_mix(1), sb_mix(2), 210];
-        if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, shot_grid_top, shot_status_h, sb_thumb) {
+        if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, shot_grid_top, shot_status_h + shot_bottom_bar_h, sb_thumb) {
             rects.push(r);
         }
 
@@ -669,7 +706,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &failed_rows,
                 cell_h,
                 shot_grid_top,
-                3.0,
+                (3.0 * dpi).round().max(2.0),
                 terminal.theme().failed_marker_color(),
             ));
         }
@@ -698,7 +735,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Baseline for the live "Aa" UI-font specimen, set when the panel is built.
         let mut ui_specimen_pos: Option<(f32, f32)> = None;
         let shot_panel = std::env::var("JETTY_SHOT_PANEL").unwrap_or_else(|_| "0".to_string());
-        let mut panel_labels = if shot_panel == "1" {
+        let panel_labels = if shot_panel == "1" {
             // Read opacity + theme_idx from env (same vars as the live app).
             let opacity = std::env::var("JETTY_OPACITY")
                 .ok()
@@ -762,7 +799,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 panel_dx,
                 panel_dy,
                 terminal.theme(),
-                chrome_char_w,
+                &mut panel_text,
+                panel_cm,
                 // JETTY_SHOT_PANEL_SHELL sets the SHELL band's display name
                 // (test-only; defaults to "System default").
                 std::env::var("JETTY_SHOT_PANEL_SHELL")
@@ -840,11 +878,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Vec::new()
         };
 
+        // Every non-panel chrome label renders through `chrome_text` (the UI-size
+        // layer), like the app's main window; the panel's own labels above use
+        // the capped `panel_text` layer, like the app's settings window.
+        let mut chrome_labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
         // Tab titles render in the proportional sans (Family::SansSerif); collect
         // them separately so the harness renders them like the live app does.
         let mut panel_title_labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
-        // Welcome splash labels render with the TERMINAL (monospace) layer, not
-        // chrome_text — kept separate so the block-art logo aligns.
+        // Grid-anchored labels (welcome splash, hint chips) render with the
+        // TERMINAL (monospace) layer, not chrome_text — they live on the grid.
         let mut welcome_labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
 
         // JETTY_SHOT_SEARCH — the themed search bar (top-right of the grid),
@@ -852,10 +894,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(q) = &search_query {
             let (cur, total) = terminal.search_counter();
             let sb = jetty_render::build_search_bar(
-                width, shot_grid_top, terminal.theme(), chrome_char_w, q, cur, total,
+                width, shot_grid_top, terminal.theme(), &mut chrome_text, cm, q, cur, total,
             );
             rects.extend(sb.quads);
-            panel_labels.extend(sb.labels);
+            chrome_labels.extend(sb.labels);
         }
 
         // JETTY_SHOT_HINTS — hint-mode label chips over every visible URL / path /
@@ -875,11 +917,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             let refs: Vec<(&str, usize, usize)> =
                 labeled.iter().map(|(l, r, c)| (l.as_str(), *r, *c)).collect();
+            // Chips are one grid row tall: labels in the TERMINAL font (grid
+            // layer + grid-font metrics), exactly like the app.
+            let grid_cm = jetty_render::ChromeMetrics::new(dpi, font_size);
             let ov = jetty_render::build_hint_overlay(
-                &refs, cell_w, cell_h, shot_grid_top, terminal.theme(), chrome_char_w, &typed, width,
+                &refs, cell_w, cell_h, shot_grid_top, terminal.theme(), &mut text, grid_cm, &typed, width,
             );
             rects.extend(ov.quads);
-            panel_labels.extend(ov.labels);
+            welcome_labels.extend(ov.labels);
             eprintln!(
                 "jetty-shot: JETTY_SHOT_HINTS tokens={} labels_shown={}",
                 tokens.len(),
@@ -895,10 +940,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cr, cc, cell_w, cell_h, shot_grid_top, terminal.theme().cursor,
             ));
             let pill = jetty_render::build_copy_pill(
-                width, shot_grid_top, terminal.theme(), chrome_char_w, line_mode, selecting,
+                width, shot_grid_top, terminal.theme(), &mut chrome_text, cm, line_mode, selecting,
             );
             rects.extend(pill.quads);
-            panel_labels.extend(pill.labels);
+            chrome_labels.extend(pill.labels);
         }
 
         // JETTY_SHOT_MENU — render the right-click context menu for visual checks.
@@ -908,11 +953,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if env_flag("JETTY_SHOT_MENU") {
             let disabled: &[usize] =
                 if env_flag("JETTY_SHOT_MENU_DISABLED") { &[0, 2] } else { &[] };
+            // Hints from the DEFAULT keymap, derived exactly like the app's.
+            let hints = jetty_app::default_context_menu_hints();
+            let hint_refs: Vec<&str> = hints.iter().map(String::as_str).collect();
             let menu = jetty_render::build_context_menu(
-                620.0, 120.0, width, height, Some(1), terminal.theme(), chrome_char_w, disabled,
+                620.0 * dpi, 120.0 * dpi, width, height, Some(1), terminal.theme(),
+                &mut chrome_text, cm, &hint_refs, disabled,
             );
             rects.extend(menu.quads);
-            panel_labels.extend(menu.labels);
+            chrome_labels.extend(menu.labels);
         }
 
         // JETTY_SHOT_DMENU — render the DETACHED window's 4-item context menu
@@ -920,28 +969,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // builder the app uses. JETTY_SHOT_DMENU_DISABLED=1 dims Copy (1) +
         // Run in New Tab (3) — the no-selection state.
         if env_flag("JETTY_SHOT_DMENU") {
-            let items: Vec<(&str, &str)> = jetty_app::detached_menu_items();
+            let owned = jetty_app::detached_menu_items();
+            let items: Vec<(&str, &str)> = owned.iter().map(|(l, h)| (*l, h.as_str())).collect();
             let disabled: &[usize] =
                 if env_flag("JETTY_SHOT_DMENU_DISABLED") { &[1, 3] } else { &[] };
             let menu = jetty_render::build_menu(
-                620.0, 120.0, width, height, Some(0), terminal.theme(), chrome_char_w,
-                &items, &[], disabled,
+                620.0 * dpi, 120.0 * dpi, width, height, Some(0), terminal.theme(),
+                &mut chrome_text, cm, &items, &[], disabled,
             );
             rects.extend(menu.quads);
-            panel_labels.extend(menu.labels);
+            chrome_labels.extend(menu.labels);
         }
 
-        // JETTY_SHOT_HELP — render the Keyboard Shortcuts help overlay.
+        // JETTY_SHOT_HELP — render the Keyboard Shortcuts help overlay;
+        // JETTY_SHOT_HELP_SCROLL=n scrolls it to row n when its rows overflow.
         if env_flag("JETTY_SHOT_HELP") {
+            let scroll: usize = std::env::var("JETTY_SHOT_HELP_SCROLL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             let help = jetty_render::build_help_overlay(
                 width,
                 height,
                 terminal.theme(),
-                chrome_char_w,
+                &mut chrome_text,
+                cm,
                 &jetty_render::default_help_rows(),
+                scroll,
             );
             rects.extend(help.quads);
-            panel_labels.extend(help.labels);
+            chrome_labels.extend(help.labels);
         }
 
         // JETTY_SHOT_PALETTE — render the command palette overlay, driven by the
@@ -981,10 +1038,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect();
             let pal = jetty_render::build_command_palette(
-                width, height, terminal.theme(), chrome_char_w, &query, &prows, total, first,
+                width, height, terminal.theme(), &mut chrome_text, cm, &query, &prows, total, first,
             );
             rects.extend(pal.quads);
-            panel_labels.extend(pal.labels);
+            chrome_labels.extend(pal.labels);
             eprintln!("jetty-shot: JETTY_SHOT_PALETTE query={query:?} sel={sel} rows={total}");
         }
 
@@ -996,11 +1053,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `\e]2;OSC Title\a`) retitles the first tab, so shell-driven
             // titles can be verified headlessly from the PNG.
             let osc_title = terminal.take_title_update().flatten();
-            let tabs = [
-                (osc_title.unwrap_or_else(|| "Tab 1".to_string()), true),
-                ("Tab 2".to_string(), false),
-                ("Tab 3".to_string(), false),
-            ];
+            // JETTY_SHOT_TABBAR_N — how many sample tabs (default 3; tab 1 active).
+            let n_tabs: usize = std::env::var("JETTY_SHOT_TABBAR_N")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(|n: usize| n.clamp(1, 99))
+                .unwrap_or(3);
+            let mut first_title = osc_title;
+            let tabs: Vec<(String, bool)> = (0..n_tabs)
+                .map(|i| {
+                    let t = if i == 0 { first_title.take() } else { None };
+                    (t.unwrap_or_else(|| format!("Tab {}", i + 1)), i == 0)
+                })
+                .collect();
             // JETTY_SHOT_PERF — render the perf HUD ONLY when a human supplies
             // real, measured numbers (read off the live HUD, same glyph/format).
             // A headless one-shot cannot honestly measure fps/CPU/throughput, so
@@ -1031,15 +1096,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 jetty_render::CtrlHover::None,
                 None, // perf HUD now lives in the bottom status bar, not the tab row
-                chrome_char_w,
+                &mut chrome_text,
+                cm,
                 &activity,
             );
-            // JETTY_TAB_BAR=bottom — place the bar flush at the window bottom.
-            // build_tab_bar lays it out at y 0..TABBAR_H; translate it down.
-            let tab_bar_bottom =
-                std::env::var("JETTY_TAB_BAR").map(|v| v == "bottom").unwrap_or(false);
+            // JETTY_TAB_BAR=bottom — place the bar at the window bottom, just above
+            // the status strip (as the app does). build_tab_bar lays it out at
+            // y 0..bar_h; translate it down.
             if tab_bar_bottom {
-                let bar_y = (height as f32 - jetty_render::TABBAR_H).max(0.0);
+                let bar_y = (height as f32 - cm.bar_h() - shot_status_h).max(0.0);
                 for q in &mut bar.quads {
                     q.y += bar_y;
                 }
@@ -1051,31 +1116,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             rects.extend(bar.quads);
-            panel_labels.extend(bar.labels);
+            chrome_labels.extend(bar.labels);
             panel_title_labels.extend(bar.title_labels);
 
             // Bottom STATUS BAR (perf HUD, off the tab row) — mirrors the live app.
             if let Some(perf) = perf_owned.as_deref() {
-                const STATUS_H: f32 = 22.0;
-                let sy = (height as f32 - STATUS_H).max(0.0);
-                let tb = terminal.theme().bg;
-                let tf = terminal.theme().fg;
-                let nl = |t: f32| -> [u8; 4] {
-                    [
-                        (tb[0] as f32 + (tf[0] as f32 - tb[0] as f32) * t) as u8,
-                        (tb[1] as f32 + (tf[1] as f32 - tb[1] as f32) * t) as u8,
-                        (tb[2] as f32 + (tf[2] as f32 - tb[2] as f32) * t) as u8,
-                        255,
-                    ]
-                };
-                rects.push(jetty_render::Rect {
-                    x: 0.0, y: sy, w: width as f32, h: STATUS_H, color: nl(0.05), ..Default::default()
-                });
-                // Measure the ACTUAL proportional width (matches the app fix).
-                let perf_w = chrome_text.measure_overlay_width(perf);
-                let px = (width as f32 - perf_w - 12.0).max(8.0);
-                let dim = nl(0.5);
-                panel_labels.push((perf.to_string(), px, sy + (STATUS_H - 16.0) / 2.0, [dim[0], dim[1], dim[2]]));
+                let strip = jetty_render::build_status_strip(
+                    width, (height as f32 - shot_status_h).max(0.0), shot_status_h, Some(perf),
+                    terminal.theme(), &mut chrome_text, cm,
+                );
+                rects.push(strip.quad);
+                chrome_labels.extend(strip.label);
             }
             eprintln!(
                 "jetty-shot: JETTY_SHOT_TABBAR rendered 3 sample tabs ({})",
@@ -1094,10 +1145,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let title = std::env::var("JETTY_SHOT_DETACHED_TITLE")
                 .unwrap_or_else(|_| "Tab 2".to_string());
             let bar = jetty_render::build_detached_bar(
-                width, &title, terminal.theme(), close_hover, chrome_char_w,
+                width, &title, terminal.theme(), close_hover, &mut chrome_text, cm,
             );
             rects.extend(bar.quads);
-            panel_labels.extend(bar.labels);
+            chrome_labels.extend(bar.labels);
             panel_title_labels.extend(bar.title_labels);
 
             // Bottom STATUS strip (same slim strip as the main window). The perf
@@ -1105,27 +1156,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // values — no fabricated fallback (a headless shot cannot honestly
             // measure fps/CPU/throughput). The strip itself always renders.
             let perf = std::env::var("JETTY_SHOT_PERF").ok().filter(|v| !v.is_empty());
-            let sy = (height as f32 - shot_status_h).max(0.0);
-            let tb = terminal.theme().bg;
-            let tf = terminal.theme().fg;
-            let nl = |t: f32| -> [u8; 4] {
-                [
-                    (tb[0] as f32 + (tf[0] as f32 - tb[0] as f32) * t) as u8,
-                    (tb[1] as f32 + (tf[1] as f32 - tb[1] as f32) * t) as u8,
-                    (tb[2] as f32 + (tf[2] as f32 - tb[2] as f32) * t) as u8,
-                    255,
-                ]
-            };
-            rects.push(jetty_render::Rect {
-                x: 0.0, y: sy, w: width as f32, h: shot_status_h, color: nl(0.05), ..Default::default()
-            });
-            if let Some(perf) = perf {
-                // Measure the ACTUAL proportional width (matches the app fix).
-                let perf_w = chrome_text.measure_overlay_width(&perf);
-                let px = (width as f32 - perf_w - 12.0).max(8.0);
-                let dim = nl(0.5);
-                panel_labels.push((perf, px, sy + (shot_status_h - 16.0) / 2.0, [dim[0], dim[1], dim[2]]));
-            }
+            let strip = jetty_render::build_status_strip(
+                width, (height as f32 - shot_status_h).max(0.0), shot_status_h, perf.as_deref(),
+                terminal.theme(), &mut chrome_text, cm,
+            );
+            rects.push(strip.quad);
+            chrome_labels.extend(strip.label);
 
             eprintln!("jetty-shot: JETTY_SHOT_DETACHED rendered detached-window chrome (title={title:?}, hover={close_hover})");
         }
@@ -1141,7 +1177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let splash = jetty_render::build_welcome_overlay(
                 width,
                 height,
-                jetty_render::TABBAR_H,
+                cm.bar_h(),
                 env!("CARGO_PKG_VERSION"),
                 "Vulkan",
                 terminal.theme(),
@@ -1155,32 +1191,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // JETTY_SHOT_CONFIRM — render the "Close this tab?" confirmation popup.
         if env_flag("JETTY_SHOT_CONFIRM") {
-            let popup = jetty_render::build_confirm_close(width, height, "Tab 2", terminal.theme(), chrome_char_w);
+            let popup = jetty_render::build_confirm_close(
+                width, height, "Tab 2", terminal.theme(), &mut chrome_text, cm,
+            );
             rects.extend(popup.quads);
-            panel_labels.extend(popup.labels);
+            chrome_labels.extend(popup.labels);
         }
 
         // JETTY_SHOT_QUIT — render the whole-app "Quit JeTTY?" confirmation popup.
         if env_flag("JETTY_SHOT_QUIT") {
             let popup = jetty_render::build_confirm(
-                width, height, "Quit JeTTY? — all tabs will close", terminal.theme(), chrome_char_w,
+                width, height, "Quit JeTTY? — all tabs will close", terminal.theme(),
+                &mut chrome_text, cm,
             );
             rects.extend(popup.quads);
-            panel_labels.extend(popup.labels);
+            chrome_labels.extend(popup.labels);
+        }
+
+        // JETTY_SHOT_PILL="text" — render the app's toast pill (the run-selection
+        // status / Shift-drag hint surface) with the SAME metrics-driven geometry
+        // as the main window: centred, above the status strip and a bottom bar.
+        if let Ok(msg) = std::env::var("JETTY_SHOT_PILL") {
+            if !msg.is_empty() {
+                let pill = jetty_render::build_toast_pill(
+                    width,
+                    height as f32 - shot_status_h - shot_bottom_bar_h - cm.px(14.0),
+                    0.0,
+                    &msg,
+                    terminal.theme(),
+                    &mut chrome_text,
+                    cm,
+                );
+                rects.push(pill.quad);
+                chrome_labels.push(pill.label);
+            }
         }
 
         quad.render(&device, &queue, &view, width, height, &rects);
 
-        // Render chrome (panel/tabbar/menu/help/confirm) labels on top of the
-        // quads through the chrome layer (at the UI size), so they don't scale with
-        // the terminal font (this is what proves BUG 1 is fixed across JETTY_FONT_SIZE).
+        // Render chrome labels on top of the quads: the panel through its capped
+        // layer (like the app's settings window), everything else through the
+        // UI-size chrome layer — neither scales with the terminal font (this is
+        // what proves BUG 1 is fixed across JETTY_FONT_SIZE).
         if !panel_labels.is_empty() {
-            chrome_text.render_overlays(&device, &queue, &view, width, height, &panel_labels)?;
+            panel_text.render_overlays(&device, &queue, &view, width, height, &panel_labels)?;
+        }
+        if !chrome_labels.is_empty() {
+            chrome_text.render_overlays(&device, &queue, &view, width, height, &chrome_labels)?;
         }
         if !panel_title_labels.is_empty() {
             chrome_text.render_overlays_sans(&device, &queue, &view, width, height, &panel_title_labels)?;
         }
-        // Welcome splash: terminal (monospace) layer so the block-art logo aligns.
+        // Grid-anchored labels (welcome splash, hint chips): terminal layer.
         if !welcome_labels.is_empty() {
             text.render_overlays(&device, &queue, &view, width, height, &welcome_labels)?;
         }

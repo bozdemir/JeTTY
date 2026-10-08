@@ -2,11 +2,12 @@
 //! (Ctrl+Shift+Space).
 //!
 //! Same surface language as `search_bar.rs` / `help.rs`: all colors derive from
-//! the active theme (bg→accent lerp, no hardcoded RGB) and metrics scale with the
-//! measured chrome-font advance `char_w` (the `char_w/9.8` vscale idiom), so both
-//! overlays are HiDPI-correct. Nothing here self-drives frames — the app draws
+//! the active theme (bg→accent lerp, no hardcoded RGB), metrics scale with the
+//! chrome unit (DPI × UI font) and label widths are MEASURED as drawn, so both
+//! overlays are HiDPI- and proportional-font-correct. Nothing here self-drives frames — the app draws
 //! these only while a mode is active, once per event-driven redraw.
 
+use crate::chrome::{ChromeMeasure, ChromeMetrics};
 use crate::quad::SCROLLBAR_W;
 use crate::Rect;
 
@@ -25,6 +26,11 @@ pub struct HintOverlay {
 /// (clear of the `SCROLLBAR_W` gutter) and a chip that would overlap an already-
 /// placed chip on the same row is skipped (bounds visual clutter on a dense
 /// screen — the token is still copyable once the overlapping one is resolved).
+///
+/// `m` / `cm` are the measurer and metrics of the font the labels are DRAWN
+/// in. Chips are one grid row (`cell_h`) tall, so the app draws their labels in
+/// the terminal grid font (its grid layer + `ChromeMetrics` of the terminal
+/// font size): a large UI font would overflow the row.
 #[allow(clippy::too_many_arguments)]
 pub fn build_hint_overlay(
     labeled: &[(&str, usize, usize)],
@@ -32,7 +38,8 @@ pub fn build_hint_overlay(
     cell_h: f32,
     y_offset: f32,
     theme: &jetty_core::Theme,
-    char_w: f32,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
     typed: &str,
     win_w: u32,
 ) -> HintOverlay {
@@ -57,7 +64,7 @@ pub fn build_hint_overlay(
         (bg[2] as f32 + (accent[2] as f32 - bg[2] as f32) * 0.4).round() as u8,
     ];
 
-    let vscale = (char_w / 9.8).max(0.1);
+    let vscale = cm.overlay_u();
     let pad_x = (3.0 * vscale).max(2.0);
     let text_h = 16.0 * vscale;
     let radius = (cell_h * 0.25).min(6.0);
@@ -69,8 +76,7 @@ pub fn build_hint_overlay(
     let mut row_last_end: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
 
     for (label, row, col) in labeled {
-        let n = label.chars().count() as f32;
-        let text_w = n * char_w;
+        let text_w = m.text_w(label);
         let chip_w = text_w + pad_x * 2.0;
         let mut x = *col as f32 * cell_w;
         if x + chip_w > max_x {
@@ -90,7 +96,7 @@ pub fn build_hint_overlay(
             labels.push((typed.to_string(), tx, ty, text_typed));
             let rest: String = label.chars().skip(typed.chars().count()).collect();
             if !rest.is_empty() {
-                let rx = tx + typed.chars().count() as f32 * char_w;
+                let rx = tx + m.text_w(typed);
                 labels.push((rest, rx, ty, text_full));
             }
         } else {
@@ -115,7 +121,8 @@ pub fn build_copy_pill(
     win_w: u32,
     grid_top: f32,
     theme: &jetty_core::Theme,
-    char_w: f32,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
     line_mode: bool,
     selecting: bool,
 ) -> CopyPill {
@@ -126,11 +133,11 @@ pub fn build_copy_pill(
     } else {
         "COPY".to_string()
     };
-    let vscale = (char_w / 9.8).max(0.1);
+    let vscale = cm.overlay_u();
     let pad = 10.0 * vscale;
     let pill_h = 24.0 * vscale;
     let text_h = 16.0 * vscale;
-    let text_w = text.chars().count() as f32 * char_w;
+    let text_w = m.text_w(&text);
     let pill_w = (text_w + pad * 2.0).min((win_w as f32 - 16.0).max(0.0));
     let x = 8.0f32.min((win_w as f32 - pill_w - 8.0).max(0.0));
     let y = grid_top + 8.0;
@@ -172,11 +179,18 @@ pub fn copy_cursor_rects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::MonoMeasure;
 
     fn theme() -> jetty_core::Theme {
         jetty_core::Theme::by_name("catppuccin_mocha")
     }
     const TEST_CHAR_W: f32 = 9.8;
+
+    const CM: ChromeMetrics = ChromeMetrics::DEFAULT;
+
+    fn mono() -> MonoMeasure {
+        MonoMeasure(TEST_CHAR_W)
+    }
 
     #[test]
     fn chips_stay_in_bounds_across_widths() {
@@ -186,7 +200,7 @@ mod tests {
             let last_col = (w as f32 / cell_w) as usize;
             let labeled: Vec<(&str, usize, usize)> =
                 vec![("a", 0, 0), ("sd", 1, last_col.saturating_sub(1)), ("qw", 2, last_col + 10)];
-            let ov = build_hint_overlay(&labeled, cell_w, 18.0, 36.0, &theme(), TEST_CHAR_W, "", w);
+            let ov = build_hint_overlay(&labeled, cell_w, 18.0, 36.0, &theme(), &mut mono(), CM, "", w);
             for q in &ov.quads {
                 assert!(q.x >= 0.0, "chip off-screen left at width {w}");
                 assert!(
@@ -202,7 +216,7 @@ mod tests {
     #[test]
     fn chip_color_differs_from_bg() {
         let labeled = vec![("a", 0, 0)];
-        let ov = build_hint_overlay(&labeled, 9.0, 18.0, 0.0, &theme(), TEST_CHAR_W, "", 1000);
+        let ov = build_hint_overlay(&labeled, 9.0, 18.0, 0.0, &theme(), &mut mono(), CM, "", 1000);
         assert_eq!(ov.quads.len(), 1);
         let bg = theme().bg;
         let c = ov.quads[0].color;
@@ -214,14 +228,14 @@ mod tests {
         // Two tokens one cell apart on the same row: the second chip would overlap,
         // so it is dropped (bounds visual clutter).
         let labeled = vec![("as", 0, 0), ("df", 0, 1)];
-        let ov = build_hint_overlay(&labeled, 9.0, 18.0, 0.0, &theme(), TEST_CHAR_W, "", 1000);
+        let ov = build_hint_overlay(&labeled, 9.0, 18.0, 0.0, &theme(), &mut mono(), CM, "", 1000);
         assert_eq!(ov.quads.len(), 1, "the overlapping second chip is skipped");
     }
 
     #[test]
     fn typed_prefix_renders_as_two_segments() {
         let labeled = vec![("sd", 0, 5)];
-        let ov = build_hint_overlay(&labeled, 9.0, 18.0, 0.0, &theme(), TEST_CHAR_W, "s", 1000);
+        let ov = build_hint_overlay(&labeled, 9.0, 18.0, 0.0, &theme(), &mut mono(), CM, "s", 1000);
         // "s" (typed) + "d" (remainder) → two label segments.
         assert_eq!(ov.labels.len(), 2);
         assert_eq!(ov.labels[0].0, "s");
@@ -230,14 +244,14 @@ mod tests {
 
     #[test]
     fn pill_fits_and_scales() {
-        let p1 = build_copy_pill(1000, 36.0, &theme(), 9.8, false, false);
-        let p2 = build_copy_pill(1000, 36.0, &theme(), 19.6, true, true);
+        let p1 = build_copy_pill(1000, 36.0, &theme(), &mut mono(), CM, false, false);
+        let p2 = build_copy_pill(1000, 36.0, &theme(), &mut MonoMeasure(19.6), ChromeMetrics::new(2.0, 16.0), true, true);
         assert_eq!(p1.labels[0].0, "COPY");
         assert_eq!(p2.labels[0].0, "COPY · LINE");
-        // Pill scales with char_w (2× advance → ~2× height).
-        assert!((p2.quads[0].h - p1.quads[0].h * 2.0).abs() < 0.5, "pill must scale with char_w");
+        // Pill scales with the chrome unit (2× → ~2× height).
+        assert!((p2.quads[0].h - p1.quads[0].h * 2.0).abs() < 0.5, "pill must scale with the chrome unit");
         // Pill fits a narrow window.
-        let pn = build_copy_pill(200, 10.0, &theme(), 9.8, false, false);
+        let pn = build_copy_pill(200, 10.0, &theme(), &mut mono(), CM, false, false);
         assert!(pn.quads[0].x + pn.quads[0].w <= 200.0 + 0.5, "pill overflows narrow window");
     }
 

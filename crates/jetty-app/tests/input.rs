@@ -557,7 +557,8 @@ fn make_panel_geom_full(
         "Center", "Top", "10k", 0.50, 1.0, false, false, true,
         false, // launch_at_login
         16.0, &ui_families, "", 0,
-        0.0, 0.0, &theme, 9.8,
+        0.0, 0.0, &theme,
+        &mut jetty_render::MonoMeasure(9.8), jetty_render::ChromeMetrics::DEFAULT,
         "System default", // shell_display
         &jetty_render::NotifyParams::default(), // Run & Notify (v0.15)
         active_tab,

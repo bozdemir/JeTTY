@@ -121,6 +121,33 @@ impl Chord {
         }
     }
 
+    /// Compact glyph form for a menu hint: Shift ⇧, Ctrl ⌃, Alt ⌥, Cmd ⌘ (Super
+    /// ❖ off macOS), then the key — the order the menus have always used.
+    fn menu_glyphs(&self) -> String {
+        let mut s = String::new();
+        if self.mods.shift {
+            s.push('⇧');
+        }
+        if self.mods.ctrl {
+            s.push('⌃');
+        }
+        if self.mods.alt {
+            s.push('⌥');
+        }
+        if self.mods.super_ {
+            s.push(if cfg!(target_os = "macos") { '⌘' } else { '❖' });
+        }
+        match &self.key {
+            KeyMatch::Phys(code) => s.push_str(&keycode_menu_glyph(*code)),
+            KeyMatch::Logical { chars, phys_fallback } => match (chars.first(), phys_fallback) {
+                (Some(c), _) => s.push_str(&c.to_uppercase()),
+                (None, Some(code)) => s.push_str(&keycode_menu_glyph(*code)),
+                (None, None) => {}
+            },
+        }
+        s
+    }
+
     /// Human-facing pretty form (symbols instead of words) for the help overlay.
     fn pretty(&self) -> String {
         let mut s = String::new();
@@ -740,6 +767,22 @@ impl KeyMap {
             .unwrap_or_default()
     }
 
+    /// Compact glyph form ("⇧⌃C", "⌘V", "⇧⌃⏎") of an action's PRIMARY chord for
+    /// a context-menu hint — "" when the action is unbound, so a `[keys]` remap
+    /// or unbind shows up in the menus too. On macOS a Cmd chord (the platform's
+    /// menu convention) is preferred over the Ctrl+Shift one when both exist.
+    pub fn menu_hint(&self, action: BindableAction) -> String {
+        let Some((_, chords)) = self.by_action.iter().find(|(a, _)| *a == action) else {
+            return String::new();
+        };
+        let pick = if cfg!(target_os = "macos") {
+            chords.iter().find(|c| c.mods.super_).or(chords.first())
+        } else {
+            chords.first()
+        };
+        pick.map(Chord::menu_glyphs).unwrap_or_default()
+    }
+
     // ── internals ────────────────────────────────────────────────────────────
 
     fn contains_action(&self, ka: &KeyAction) -> bool {
@@ -1175,6 +1218,26 @@ fn keycode_pretty(code: KeyCode) -> String {
     s.to_string()
 }
 
+/// Menu-hint glyph for a keycode: the conventional key symbols (⏎ ⇥ ␣ ⌫ ⌦ ⎋
+/// arrows) where one exists, the pretty name otherwise.
+fn keycode_menu_glyph(code: KeyCode) -> String {
+    use KeyCode::*;
+    let s = match code {
+        Enter => "⏎",
+        Tab => "⇥",
+        Space => "␣",
+        Backspace => "⌫",
+        Delete => "⌦",
+        Escape => "⎋",
+        ArrowUp => "↑",
+        ArrowDown => "↓",
+        ArrowLeft => "←",
+        ArrowRight => "→",
+        _ => return keycode_pretty(code),
+    };
+    s.to_string()
+}
+
 /// US-layout character produced by a physical key (for cross-kind conflict scan).
 fn us_char(code: KeyCode) -> Option<SmolStr> {
     use KeyCode::*;
@@ -1252,6 +1315,28 @@ mod tests {
     }
 
     // ── parse / serialize ─────────────────────────────────────────────────────
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn menu_hints_follow_the_live_keymap() {
+        // Defaults reproduce the menus' historical glyphs exactly …
+        let km = KeyMap::defaults();
+        assert_eq!(km.menu_hint(BindableAction::Copy), "⇧⌃C");
+        assert_eq!(km.menu_hint(BindableAction::Paste), "⇧⌃V");
+        assert_eq!(km.menu_hint(BindableAction::RunSelection), "⇧⌃⏎");
+        assert_eq!(km.menu_hint(BindableAction::CloseTab), "⇧⌃W");
+        assert_eq!(km.menu_hint(BindableAction::DetachTab), "⇧⌃D");
+        assert_eq!(km.menu_hint(BindableAction::SelectAll), "", "no Linux default");
+        // … and a [keys] remap / unbind shows up in the menu.
+        let b = crate::config::KeyBindings {
+            copy: Some(crate::config::ChordSpec::One("Ctrl+Shift+K".to_string())),
+            close_tab: Some(crate::config::ChordSpec::Many(vec![])),
+            ..Default::default()
+        };
+        let km = KeyMap::compile(&b);
+        assert_eq!(km.menu_hint(BindableAction::Copy), "⇧⌃K");
+        assert_eq!(km.menu_hint(BindableAction::CloseTab), "");
+    }
 
     #[test]
     fn parse_basic_and_roundtrip() {

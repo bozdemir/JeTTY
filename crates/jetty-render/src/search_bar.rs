@@ -1,3 +1,4 @@
+use crate::chrome::{fit_tail, ChromeMeasure, ChromeMetrics, CHROME_ADVANCE};
 use crate::quad::SCROLLBAR_W;
 use crate::Rect;
 
@@ -18,32 +19,21 @@ pub struct SearchBar {
 /// Right inset between the bar and the scrollbar gutter / window edge.
 const RIGHT_GAP: f32 = 8.0;
 
-/// Display width of one char in chrome-font cells: CJK/fullwidth glyphs
-/// advance ~2 monospace cells, zero-width (combining) chars 0, everything
-/// else 1. Same width classes the terminal grid uses (via alacritty), so the
-/// query the user typed measures here like it renders. Pure ASCII stays
-/// exactly the old `chars().count()` (F8).
-pub(crate) fn char_cells(c: char) -> usize {
-    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
-}
-
-/// Estimated display width of `s` in chrome-font cells (see [`char_cells`]).
-pub(crate) fn display_cells(s: &str) -> usize {
-    s.chars().map(char_cells).sum()
-}
-
 /// Build the search bar for a window `win_w` px wide with the grid starting
 /// at `grid_top` (both physical px). All colors derive from the theme's
 /// bg→fg lerp (same surface language as help.rs) — no hardcoded RGB. All
-/// metrics scale with the measured chrome-font advance `char_w` via the
-/// char_w/9.8 vscale idiom, so the bar is HiDPI-correct. A long query is
-/// TAIL-truncated so the caret end is always visible; the whole bar clamps
-/// to `win_w - SCROLLBAR_W - 16` so it fits narrow windows.
+/// metrics scale with the chrome unit `cm` (DPI × UI font), and the prefix,
+/// query and counter are MEASURED with `m` — so the caret hugs the last glyph
+/// and wide (CJK) or proportional text never overlaps the counter (F8). A long
+/// query is TAIL-truncated so the caret end is always visible; the whole bar
+/// clamps to `win_w - SCROLLBAR_W - 16` so it fits narrow windows.
+#[allow(clippy::too_many_arguments)]
 pub fn build_search_bar(
     win_w: u32,
     grid_top: f32,
     theme: &jetty_core::Theme,
-    char_w: f32,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
     query: &str,
     current: usize,
     total: usize,
@@ -63,8 +53,8 @@ pub fn build_search_bar(
     let border_col: [u8; 4] = [border3[0], border3[1], border3[2], 255];
     let text_col = lerp(0.70);
 
-    // HiDPI scale from the measured chrome advance (9.8px at scale 1).
-    let vscale = (char_w / 9.8).max(0.1);
+    // HiDPI × UI-font scale (the overlay unit; ≈0.983 at 1×/16pt, see `OVERLAY_SCALE`).
+    let vscale = cm.overlay_u();
     let bar_h = 34.0 * vscale;
     let pad = 10.0 * vscale;
     let caret_w = 2.0;
@@ -82,42 +72,27 @@ pub fn build_search_bar(
     };
     let counter_col = if total == 0 { lerp(0.45) } else { tfg };
 
-    // All text is measured in DISPLAY cells, not chars: CJK/fullwidth query
-    // glyphs (explicitly supported via IME commits) render ~2× the monospace
-    // advance, and char-count measurement made them overflow the pill and
-    // overlap the counter/✕ (F8). ASCII measures identically to before.
+    // All text is MEASURED as the chrome layer draws it: CJK/fullwidth query
+    // glyphs (explicitly supported via IME commits) render ~2× a monospace
+    // cell and a proportional UI font is no cell grid at all — estimating made
+    // them overflow the pill and overlap the counter/✕ (F8).
     const PREFIX: &str = "Find: ";
-    let prefix_w = display_cells(PREFIX) as f32 * char_w;
-    let gap = char_w; // one chrome char between query/counter/close
-    let counter_w = display_cells(&counter) as f32 * char_w;
+    let prefix_w = m.text_w(PREFIX);
+    let gap = cm.px(CHROME_ADVANCE); // one chrome char between query/counter/close
+    let counter_w = m.text_w(&counter);
     // Everything except the query text itself.
     let fixed_w = pad + prefix_w + caret_gap + caret_w + gap + counter_w + gap + close_w + pad;
 
     // Clamp the bar to the window, keeping clear of the scrollbar gutter.
     let max_bar_w = (win_w as f32 - SCROLLBAR_W - 16.0).max(0.0);
-    // Tail-truncate the query: show the LAST chars that fit (by display
-    // width), so the end the user is typing at stays visible next to the
-    // caret.
-    let query_cells = display_cells(query);
-    let avail_cells = (((max_bar_w - fixed_w) / char_w).floor().max(0.0)) as usize;
-    let shown: String = if query_cells > avail_cells {
-        // Walk from the tail, keeping whole chars while their summed display
-        // width still fits the budget.
-        let mut cells = 0usize;
-        let mut tail: Vec<char> = Vec::new();
-        for c in query.chars().rev() {
-            let w = char_cells(c);
-            if cells + w > avail_cells {
-                break;
-            }
-            cells += w;
-            tail.push(c);
-        }
-        tail.iter().rev().collect()
-    } else {
-        query.to_string()
-    };
-    let shown_w = display_cells(&shown) as f32 * char_w;
+    // Tail-truncate the query: show the LAST chars that fit, so the end the
+    // user is typing at stays visible next to the caret.
+    let shown = fit_tail(m, query, (max_bar_w - fixed_w).max(0.0), false);
+    // The prefix + query are ONE drawn label; measure it whole (kerning across
+    // the join included) so the caret lands exactly after the last glyph.
+    let label = format!("{PREFIX}{shown}");
+    let label_w = m.text_w(&label);
+    let shown_w = (label_w - prefix_w).max(0.0);
     let bar_w = (fixed_w + shown_w).min(max_bar_w).max(0.0);
 
     let x = (win_w as f32 - bar_w - SCROLLBAR_W - RIGHT_GAP).max(0.0);
@@ -131,16 +106,16 @@ pub fn build_search_bar(
     let panel = Rect::rounded(x, y, bar_w, bar_h, panel_bg, 8.0);
     quads.push(panel);
 
-    // Chrome text line box is ~16px at scale 1; center it vertically.
+    // Chrome text line box (the UI font's em); center it vertically.
     let text_h = 16.0 * vscale;
     let text_y = y + (bar_h - text_h) / 2.0;
 
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
-    labels.push((format!("{PREFIX}{shown}"), x + pad, text_y, text_col));
+    labels.push((label, x + pad, text_y, text_col));
 
     // Static caret right after the query text (no animation — the bar never
     // self-drives frames).
-    let caret_x = x + pad + prefix_w + shown_w + caret_gap;
+    let caret_x = x + pad + label_w + caret_gap;
     quads.push(Rect::new(caret_x, text_y, caret_w, text_h, [tfg[0], tfg[1], tfg[2], 255]));
 
     // Counter, right-aligned against the close button.
@@ -150,9 +125,10 @@ pub fn build_search_bar(
 
     // ✕ close button (label centered in its square hit area).
     let close_rect = Rect::new(close_x, y + (bar_h - close_w) / 2.0, close_w, close_w, [0, 0, 0, 0]);
+    let close_glyph_w = m.text_w("✕");
     labels.push((
         "✕".to_string(),
-        close_x + (close_w - char_w) / 2.0,
+        close_x + (close_w - close_glyph_w) / 2.0,
         text_y,
         text_col,
     ));
@@ -199,6 +175,7 @@ pub fn search_hit_rects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::MonoMeasure;
 
     fn theme() -> jetty_core::Theme {
         jetty_core::Theme::by_name("catppuccin_mocha")
@@ -206,11 +183,21 @@ mod tests {
 
     /// Scale-1 chrome advance used by the layout tests (matches help.rs).
     const TEST_CHAR_W: f32 = 9.8;
+    const CM: ChromeMetrics = ChromeMetrics::DEFAULT;
+
+    fn mono() -> MonoMeasure {
+        MonoMeasure(TEST_CHAR_W)
+    }
+
+    /// Display width in monospace cells (wide = 2), as `MonoMeasure` counts.
+    fn display_cells(s: &str) -> usize {
+        s.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)).sum()
+    }
 
     #[test]
     fn bar_fits_at_all_widths() {
         for w in [320u32, 500, 700, 1000, 1600] {
-            let sb = build_search_bar(w, 36.0, &theme(), TEST_CHAR_W, "some longish query text", 3, 17);
+            let sb = build_search_bar(w, 36.0, &theme(), &mut mono(), CM, "some longish query text", 3, 17);
             assert!(sb.panel.x >= 0.0, "panel off-screen left at width {w}");
             let right_inset = w as f32 - (sb.panel.x + sb.panel.w);
             assert!(
@@ -222,7 +209,7 @@ mod tests {
 
     #[test]
     fn close_rect_inside_panel() {
-        let sb = build_search_bar(1000, 36.0, &theme(), TEST_CHAR_W, "query", 1, 2);
+        let sb = build_search_bar(1000, 36.0, &theme(), &mut mono(), CM, "query", 1, 2);
         let p = &sb.panel;
         let c = &sb.close_rect;
         assert!(c.x >= p.x && c.x + c.w <= p.x + p.w + 0.5, "✕ outside panel horizontally");
@@ -232,7 +219,7 @@ mod tests {
     #[test]
     fn long_query_tail_truncated() {
         let long: String = "abcdefghij".repeat(30); // 300 chars
-        let sb = build_search_bar(500, 36.0, &theme(), TEST_CHAR_W, &long, 1, 1);
+        let sb = build_search_bar(500, 36.0, &theme(), &mut mono(), CM, &long, 1, 1);
         let panel_right = sb.panel.x + sb.panel.w;
         for (text, x, _y, _c) in &sb.labels {
             let est_right = x + text.chars().count() as f32 * TEST_CHAR_W;
@@ -250,23 +237,12 @@ mod tests {
     }
 
     #[test]
-    fn display_cells_classifies_widths() {
-        // ASCII: identical to chars().count() (the fast path must not change).
-        assert_eq!(display_cells("Find: error"), "Find: error".chars().count());
-        // CJK fullwidth: 2 cells per glyph.
-        assert_eq!(display_cells("エラー"), 6);
-        assert_eq!(char_cells('エ'), 2);
-        // Zero-width combining mark adds nothing.
-        assert_eq!(display_cells("e\u{0301}"), 1);
-    }
-
-    #[test]
     fn cjk_query_measured_by_display_width() {
         // F8: an 8-char CJK query renders ~16 monospace cells wide; the bar
         // must budget for that, not for 8. The caret sits AFTER the glyphs
         // and the query text never reaches the counter.
         let q = "エラーメッセージ"; // 8 chars, 16 cells
-        let sb = build_search_bar(1000, 36.0, &theme(), TEST_CHAR_W, q, 1, 2);
+        let sb = build_search_bar(1000, 36.0, &theme(), &mut mono(), CM, q, 1, 2);
         let find = sb.labels.iter().find(|l| l.0.starts_with("Find: ")).unwrap();
         let est_right = find.1 + display_cells(&find.0) as f32 * TEST_CHAR_W;
         let panel_right = sb.panel.x + sb.panel.w;
@@ -299,7 +275,7 @@ mod tests {
     fn cjk_long_query_tail_truncated_by_display_width() {
         // 150 wide chars = 300 cells — far beyond a 500px window's budget.
         let long: String = "エラー検索".repeat(30);
-        let sb = build_search_bar(500, 36.0, &theme(), TEST_CHAR_W, &long, 1, 1);
+        let sb = build_search_bar(500, 36.0, &theme(), &mut mono(), CM, &long, 1, 1);
         let panel_right = sb.panel.x + sb.panel.w;
         for (text, x, _y, _c) in &sb.labels {
             let est_right = x + display_cells(text) as f32 * TEST_CHAR_W;
@@ -317,14 +293,14 @@ mod tests {
 
     #[test]
     fn counter_shows_cur_slash_total() {
-        let sb = build_search_bar(1000, 36.0, &theme(), TEST_CHAR_W, "q", 3, 17);
+        let sb = build_search_bar(1000, 36.0, &theme(), &mut mono(), CM, "q", 3, 17);
         assert!(sb.labels.iter().any(|l| l.0 == "3/17"), "counter 3/17 missing");
         // 0/0 on no match.
-        let sb = build_search_bar(1000, 36.0, &theme(), TEST_CHAR_W, "q", 0, 0);
+        let sb = build_search_bar(1000, 36.0, &theme(), &mut mono(), CM, "q", 0, 0);
         assert!(sb.labels.iter().any(|l| l.0 == "0/0"), "counter 0/0 missing");
         // capped total renders with a trailing '+'.
         let cap = jetty_core::SEARCH_MAX_MATCHES;
-        let sb = build_search_bar(1000, 36.0, &theme(), TEST_CHAR_W, "q", 1, cap);
+        let sb = build_search_bar(1000, 36.0, &theme(), &mut mono(), CM, "q", 1, cap);
         assert!(
             sb.labels.iter().any(|l| l.0 == format!("1/{cap}+")),
             "capped counter must show {cap}+"
@@ -351,10 +327,22 @@ mod tests {
     }
 
     #[test]
-    fn bar_scales_with_char_w() {
-        // HiDPI: a 2× chrome advance doubles the bar height/paddings.
-        let sb1 = build_search_bar(1000, 36.0, &theme(), 9.8, "q", 1, 1);
-        let sb2 = build_search_bar(1000, 36.0, &theme(), 19.6, "q", 1, 1);
-        assert!((sb2.panel.h - sb1.panel.h * 2.0).abs() < 0.01, "bar height must scale with char_w");
+    fn bar_scales_with_chrome_metrics() {
+        // HiDPI: a 2× chrome unit doubles the bar height/paddings.
+        let sb1 = build_search_bar(1000, 36.0, &theme(), &mut mono(), CM, "q", 1, 1);
+        let sb2 = build_search_bar(
+            1000, 36.0, &theme(), &mut MonoMeasure(19.6), ChromeMetrics::new(2.0, 16.0), "q", 1, 1,
+        );
+        assert!((sb2.panel.h - sb1.panel.h * 2.0).abs() < 0.01, "bar height must scale with the chrome unit");
+    }
+
+    #[test]
+    fn caret_hugs_the_measured_label() {
+        // The caret sits caret_gap (2px) after the MEASURED "Find: query" label,
+        // whatever the font's per-char widths are.
+        let sb = build_search_bar(1000, 36.0, &theme(), &mut mono(), CM, "abc", 1, 1);
+        let find = sb.labels.iter().find(|l| l.0 == "Find: abc").unwrap();
+        let caret = sb.quads.iter().find(|r| r.w == 2.0).unwrap();
+        assert!((caret.x - (find.1 + mono().text_w("Find: abc") + 2.0)).abs() < 0.01);
     }
 }
