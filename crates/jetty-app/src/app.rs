@@ -1150,6 +1150,9 @@ pub struct App {
     /// The timer is shared, but untagged it made EVERY window (main and all
     /// detached) draw the pill and self-drive frames for the 3.5s (F4).
     shift_hint_until: Option<(std::time::Instant, winit::window::WindowId)>,
+    /// The window the Shift+drag hint was last shown on (to clear it there when
+    /// the hint is re-armed on another window).
+    shift_hint_window: Option<WindowId>,
     /// Throttle: the toast won't re-arm until `now` passes this instant.
     /// Deliberately GLOBAL across windows (one hint per 25s app-wide).
     shift_hint_cooldown: Option<std::time::Instant>,
@@ -1159,6 +1162,10 @@ pub struct App {
     /// staged ("press Enter to run") feedback. `None` when idle — the render
     /// path's only cost then is one `Option` check per frame already happening.
     status_pill: Option<(String, std::time::Instant, winit::window::WindowId)>,
+    /// A notice raised while the main window was hidden (a refused save, the
+    /// summon hotkey failing at a `--background` login start, …): its countdown
+    /// would run out unseen, so it waits here and is shown on the next summon.
+    deferred_notice: Option<(String, u64)>,
     /// True while ANY tab (main or detached) may hold a `pending_inject`.
     /// The `about_to_wait` gate: when false (the always case), run-selection
     /// adds ONE bool check per loop iteration and nothing else. Set on arm;
@@ -1759,8 +1766,10 @@ impl App {
             right_click_hint_shown: false,
             scroll_accum: input::ScrollAccumulator::new(),
             shift_hint_until: None,
+            shift_hint_window: None,
             shift_hint_cooldown: None,
             status_pill: None,
+            deferred_notice: None,
             runsel_active: false,
             run_selection_enabled: true,
             dragging_scrollbar: false,
@@ -2114,10 +2123,18 @@ impl App {
 
     /// Show `msg` in the main window's status pill for `ms` milliseconds.
     fn show_notice_pill(&mut self, msg: String, ms: u64) {
+        if !self.visible {
+            self.deferred_notice = Some((msg, ms));
+            return;
+        }
         let Some(id) = self.window.as_ref().map(|w| w.id()) else { return };
+        let previous = self.status_pill.as_ref().map(|p| p.2).filter(|&p| p != id);
         self.status_pill =
             Some((msg, std::time::Instant::now() + std::time::Duration::from_millis(ms), id));
         self.request_main_paint();
+        if let Some(w) = previous {
+            self.request_window_paint(w);
+        }
     }
 
     /// Register the global summon hotkey (`summon_hotkey`) and forward its presses
@@ -5626,14 +5643,16 @@ impl App {
             })
             .or_else(|| self.window.as_ref().map(|w| w.id()));
         let Some(id) = target else { return };
+        // A pill re-tagged to another window must disappear from the one that
+        // showed it: pills paint only on show/expiry, so repaint that one too.
+        let previous = self.status_pill.as_ref().map(|p| p.2).filter(|&p| p != id);
         self.status_pill =
             Some((n.msg.to_string(), std::time::Instant::now() + std::time::Duration::from_millis(4000), id));
-        if self.window.as_ref().is_some_and(|w| w.id() == id) {
-            self.request_main_paint();
-        } else if let Some(dw) = self.detached.iter().find(|d| d.window.id() == id) {
-            dw.request_paint();
+        for w in std::iter::once(id).chain(previous) {
+            self.request_window_paint(w);
         }
     }
+
 
     /// Drain pending PTY output for EVERY tab into its terminal and flush each
     /// tab's query replies back to its own PTY. Background tabs must keep draining
@@ -6537,9 +6556,14 @@ impl App {
     /// hidden — nothing is killed or suspended.
     fn toggle_visibility(&mut self, event_loop: &ActiveEventLoop) {
         let now = std::time::Instant::now();
+        // JeTTY is "in front" when ANY of its windows has focus: F9 from the
+        // Settings window or a detached window hides, like from the main one.
+        let jetty_focused = self.main_focused
+            || self.settings_window.as_ref().is_some_and(|w| w.has_focus())
+            || self.detached.iter().any(|dw| dw.focused);
         match toggle_action(
             self.visible,
-            self.main_focused,
+            jetty_focused,
             self.main_occluded,
             self.focus_lost_at,
             self.autohidden_at,
@@ -6722,6 +6746,9 @@ impl App {
                 self.raise_attempt_at = None;
                 self.autohidden_at = None;
                 self.request_main_paint();
+                if let Some((msg, ms)) = self.deferred_notice.take() {
+                    self.show_notice_pill(msg, ms);
+                }
             } else {
                 // Remember the current spot before hiding so the next Center
                 // summon restores it. Dropdown re-docks, so last_pos is unused.
@@ -7289,7 +7316,14 @@ impl App {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::RedrawRequested => self.render_detached_window(pos),
+            WindowEvent::RedrawRequested => {
+                self.render_detached_window(pos);
+                // The render drained this window's PTY, which can surface a
+                // command completion (OSC 133;D) no Wake will report again — fire
+                // it here, like the main window's RedrawRequested does
+                // (idempotent: take_completions() drains).
+                self.dispatch_completions(event_loop);
+            }
             WindowEvent::Occluded(occluded) if pos < self.detached.len() => {
                 // Track per-window occlusion/minimize so a hidden detached window
                 // stops self-driving CRT/caret animation and PTY-output redraws
@@ -8256,6 +8290,9 @@ impl App {
                 // for a switch-to-detached and the terminal hides as it should.
                 self.switching_to_detached = false;
                 self.detached[pos].focused = false;
+                // F9 decides "hide vs raise" from JeTTY-wide focus: a focus loss
+                // this instant may be the summon hotkey's own grab churn.
+                self.focus_lost_at = Some(std::time::Instant::now());
                 if self.last_focused_window == Some(self.detached[pos].window.id()) {
                     self.last_focused_window = None;
                 }
@@ -9299,6 +9336,9 @@ impl App {
                 // Focused(false) (focus left both Jetty windows to a third app) is
                 // not mistaken for a switch-to-settings and the terminal hides.
                 self.switching_to_settings = false;
+                // F9 decides "hide vs raise" from JeTTY-wide focus: a focus loss
+                // this instant may be the summon hotkey's own grab churn.
+                self.focus_lost_at = Some(std::time::Instant::now());
                 if self.last_focused_window == self.settings_window.as_ref().map(|w| w.id()) {
                     self.last_focused_window = None;
                 }
@@ -9622,8 +9662,16 @@ impl ApplicationHandler<AppEvent> for App {
         // armed and repainted ONCE here at expiry to clear them — never self-
         // driven per frame while they show (that re-rendered the whole scene for
         // ~4 s per pill).
+        // A Shift+drag hint re-armed on ANOTHER window must vanish from the one
+        // that showed it (it paints only when armed and at expiry).
+        let hint_window = self.shift_hint_until.map(|(_, w)| w);
+        if let Some(old) = self.shift_hint_window.filter(|&old| Some(old) != hint_window) {
+            painted |= self.request_window_paint(old);
+        }
+        self.shift_hint_window = hint_window;
         if let Some(wid) = self.shift_hint_until.filter(|(t, _)| now >= *t).map(|(_, w)| w) {
             self.shift_hint_until = None;
+            self.shift_hint_window = None;
             painted |= self.request_window_paint(wid);
         }
         if let Some(wid) = self
@@ -10500,8 +10548,15 @@ impl ApplicationHandler<AppEvent> for App {
                 // several reflows, each leaving a stray prompt). The surface already
                 // resized above, so the window tracks the drag live; the grid snaps
                 // to the new col/row count when the single reflow fires.
-                self.reflow_pending_at =
-                    Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
+                if self.visible {
+                    self.reflow_pending_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
+                } else {
+                    // Hidden — e.g. the async fullscreen exit landing after the
+                    // hide ran: owe the reflow to the next summon (which reflows
+                    // at its own geometry) instead of SIGWINCH-ing every shell now.
+                    self.reflow_deferred_by_hide = true;
+                }
                 self.request_main_paint();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -10525,8 +10580,12 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(t) = self.chrome_text.as_mut() {
                     t.set_font_size(self.ui_font_logical * scale);
                 }
-                self.reflow_pending_at =
-                    Some(std::time::Instant::now() + std::time::Duration::from_millis(120));
+                if self.visible {
+                    self.reflow_pending_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(120));
+                } else {
+                    self.reflow_deferred_by_hide = true;
+                }
                 self.request_main_paint();
             }
             WindowEvent::ModifiersChanged(m) => {

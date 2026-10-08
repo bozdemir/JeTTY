@@ -236,23 +236,58 @@ impl CornerMask {
 /// 1px edge strips (the SDF puts the outermost pixel row/column at d = −0.5, i.e.
 /// coverage ≈ 0.93, whenever any corner is rounded). `radii` = already-clamped
 /// [tl, tr, bl, br].
+///
+/// The rects are DISJOINT: the pass multiplies by coverage once per draw, so a
+/// pixel inside two rects would be masked twice (too transparent). The strips
+/// stop where the corner squares begin, and a target too small for the squares
+/// to stay apart is masked by one full-target rect instead.
 fn mask_regions(width: u32, height: u32, radii: [f32; 4]) -> Vec<[u32; 4]> {
     let mut out = Vec::with_capacity(8);
     if width == 0 || height == 0 {
         return out;
     }
-    let side = |r: f32| ((r.max(0.0).ceil() as u32) + 2).min(width).min(height);
-    let [tl, tr, bl, br] = radii;
-    for (r, right, bottom) in [(tl, false, false), (tr, true, false), (bl, false, true), (br, true, true)] {
-        if r > 0.0 {
-            let s = side(r);
+    let side = |r: f32| if r > 0.0 { (r.ceil() as u32) + 2 } else { 0 };
+    let [tl, tr, bl, br] = radii.map(side);
+    if tl + tr > width || bl + br > width || tl + bl > height || tr + br > height {
+        out.push([0, 0, width, height]);
+        return out;
+    }
+    for (s, right, bottom) in [(tl, false, false), (tr, true, false), (bl, false, true), (br, true, true)] {
+        if s > 0 {
             out.push([if right { width - s } else { 0 }, if bottom { height - s } else { 0 }, s, s]);
         }
     }
-    out.push([0, 0, width, 1]); // top edge
-    out.push([0, height - 1, width, 1]); // bottom edge
-    out.push([0, 0, 1, height]); // left edge
-    out.push([width - 1, 0, 1, height]); // right edge
+    let mut strip = |x: u32, y: u32, w: u32, h: u32| {
+        if w > 0 && h > 0 {
+            out.push([x, y, w, h]);
+        }
+    };
+    // Top/bottom rows between the corner squares (one row when height == 1).
+    strip(tl, 0, width - tl - tr, 1);
+    if height > 1 {
+        strip(bl, height - 1, width - bl - br, 1);
+    }
+    // Left/right columns between the squares, minus the rows the top/bottom
+    // strips already cover (one column when width == 1).
+    let span = |a: u32, b: u32| {
+        let (y0, y1) = (a.max(1), height.saturating_sub(b.max(1)));
+        (y0, y1.saturating_sub(y0))
+    };
+    let (y0, h) = span(tl, bl);
+    strip(0, y0, 1, h);
+    if width > 1 {
+        let (y0, h) = span(tr, br);
+        strip(width - 1, y0, 1, h);
+    }
+    // Pathological shapes (corner squares meeting across a small or very
+    // non-square target) can still make two rects touch the same pixel: mask
+    // the whole target once instead.
+    let overlaps = |a: &[u32; 4], b: &[u32; 4]| {
+        a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+    };
+    if (0..out.len()).any(|i| (i + 1..out.len()).any(|j| overlaps(&out[i], &out[j]))) {
+        return vec![[0, 0, width, height]];
+    }
     out
 }
 
@@ -316,6 +351,27 @@ pub fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32
 #[cfg(test)]
 mod tests {
     use super::{all_radii_flat, mask_regions, rounded_rect_coverage, rounded_rect_coverage_per};
+
+    #[test]
+    fn scissor_regions_never_overlap() {
+        // Each draw multiplies by coverage again: a pixel in two rects would be
+        // masked twice. Check every pixel is covered at most once, across sizes
+        // (incl. tiny targets where the corner squares would collide).
+        for (w, h) in [(1000u32, 640u32), (2000, 1280), (40, 30), (20, 20), (5, 3), (1, 1), (1, 9), (9, 1)] {
+            for radii in [[10.0, 10.0, 10.0, 10.0], [20.0, 0.0, 0.0, 20.0], [0.0; 4], [3.0, 8.0, 0.0, 12.0]] {
+                let mut hits = vec![0u8; (w * h) as usize];
+                for [x, y, rw, rh] in mask_regions(w, h, radii) {
+                    assert!(x + rw <= w && y + rh <= h, "rect out of bounds {w}x{h} {radii:?}");
+                    for py in y..y + rh {
+                        for px in x..x + rw {
+                            hits[(py * w + px) as usize] += 1;
+                        }
+                    }
+                }
+                assert!(hits.iter().all(|&n| n <= 1), "overlapping regions at {w}x{h} {radii:?}");
+            }
+        }
+    }
 
     #[test]
     fn scissor_regions_cover_every_pixel_the_mask_changes() {
