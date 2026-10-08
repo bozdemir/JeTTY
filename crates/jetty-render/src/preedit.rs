@@ -38,16 +38,26 @@ pub fn build_preedit_overlay(
     if cols == 0 || cell_w <= 0.0 || cell_h <= 0.0 {
         return None;
     }
-    let mut shown = String::new();
+    // One label per grid character at its own cell column (combining marks ride
+    // with their base), so the composition sits on the grid exactly like
+    // committed text — a run shaped as a whole would put CJK at the fallback
+    // font's natural advance, off the 2-cell rhythm.
+    let mut cells: Vec<(String, usize)> = Vec::new();
     let mut width = 0usize;
     for ch in text.chars().take(MAX_PREEDIT_CHARS) {
         // Control characters have no width and no business in a composition.
         let Some(w) = ch.width() else { continue };
+        if w == 0 {
+            if let Some((cluster, _)) = cells.last_mut() {
+                cluster.push(ch);
+            }
+            continue;
+        }
         if width + w > cols {
             break;
         }
+        cells.push((ch.to_string(), width));
         width += w;
-        shown.push(ch);
     }
     if width == 0 {
         return None;
@@ -64,7 +74,10 @@ pub fn build_preedit_overlay(
             Rect::new(x, y, w, cell_h, [br, bg, bb, 255]),
             Rect::new(x, y + cell_h - line, w, line, [fr, fg, fb, 255]),
         ],
-        labels: vec![(shown, x, y, theme.fg)],
+        labels: cells
+            .into_iter()
+            .map(|(cluster, off)| (cluster, x + off as f32 * cell_w, y, theme.fg))
+            .collect(),
     })
 }
 
@@ -79,9 +92,12 @@ mod tests {
     #[test]
     fn preedit_sits_on_the_cursor_cell_underlined() {
         let ov = build_preedit_overlay("nihao", 2, 3, 80, 10.0, 20.0, 36.0, &theme(), 1.0).unwrap();
-        assert_eq!(ov.labels.len(), 1);
-        let (t, x, y, _) = &ov.labels[0];
-        assert_eq!((t.as_str(), *x, *y), ("nihao", 30.0, 76.0));
+        let placed: Vec<(&str, f32, f32)> = ov.labels.iter().map(|(t, x, y, _)| (t.as_str(), *x, *y)).collect();
+        assert_eq!(
+            placed,
+            [("n", 30.0, 76.0), ("i", 40.0, 76.0), ("h", 50.0, 76.0), ("a", 60.0, 76.0), ("o", 70.0, 76.0)],
+            "one label per cell, on the grid"
+        );
         // Backdrop covers exactly the composition's cells; underline on its bottom edge.
         assert_eq!((ov.quads[0].x, ov.quads[0].y, ov.quads[0].w, ov.quads[0].h), (30.0, 76.0, 50.0, 20.0));
         assert_eq!((ov.quads[1].y, ov.quads[1].h), (95.0, 1.0));
@@ -89,20 +105,27 @@ mod tests {
 
     #[test]
     fn wide_characters_take_two_cells_and_shift_left_at_the_edge() {
-        // 你好 = 4 cells; the cursor in column 78 of 80 shifts it to start at 76.
+        // 你好 = 4 cells; the cursor in column 78 of 80 shifts it to start at 76,
+        // each glyph on its own 2-cell slot.
         let ov = build_preedit_overlay("你好", 0, 78, 80, 10.0, 20.0, 0.0, &theme(), 2.0).unwrap();
-        assert_eq!(ov.labels[0].1, 760.0);
+        let xs: Vec<f32> = ov.labels.iter().map(|l| l.1).collect();
+        assert_eq!(xs, [760.0, 780.0]);
         assert_eq!(ov.quads[0].w, 40.0);
         assert_eq!(ov.quads[1].h, 2.0, "the underline follows the DPI scale");
     }
 
     #[test]
     fn text_wider_than_the_grid_is_cut_and_controls_are_dropped() {
+        let text_of = |ov: &PreeditOverlay| ov.labels.iter().map(|l| l.0.as_str()).collect::<String>();
         let ov = build_preedit_overlay("a\u{1b}bcdef", 0, 0, 4, 10.0, 20.0, 0.0, &theme(), 1.0).unwrap();
-        assert_eq!(ov.labels[0].0, "abcd");
+        assert_eq!(text_of(&ov), "abcd");
         // A wide char that would straddle the edge stops the cut before it.
         let ov = build_preedit_overlay("ab你", 0, 0, 3, 10.0, 20.0, 0.0, &theme(), 1.0).unwrap();
-        assert_eq!(ov.labels[0].0, "ab");
+        assert_eq!(text_of(&ov), "ab");
+        // A combining mark rides with its base character's label.
+        let ov = build_preedit_overlay("e\u{301}x", 0, 0, 80, 10.0, 20.0, 0.0, &theme(), 1.0).unwrap();
+        let labels: Vec<&str> = ov.labels.iter().map(|l| l.0.as_str()).collect();
+        assert_eq!(labels, ["e\u{301}", "x"]);
     }
 
     #[test]
