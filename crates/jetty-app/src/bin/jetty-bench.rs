@@ -363,6 +363,8 @@ fn numbered_line(k: usize) -> Vec<u8> {
 ///   static — same snapshot again (caret-flash / CRT-only frame)
 ///   typing — one printable char echoed at the prompt per frame
 ///   scroll — one new line per frame (the whole screen moves up one row)
+///   tui    — a btop-like box-drawing frame + braille graph, repainted per frame
+///   boxtype — one char per frame typed inside a full-screen box (Claude Code)
 /// Each frame = snapshot + render_to (CPU) and then the GPU wait (total).
 fn bench_frames(
     device: &wgpu::Device,
@@ -396,8 +398,16 @@ fn bench_frames(
         device.poll(wgpu::PollType::wait_indefinitely())?;
 
         let mut run = |label: &str,
+                       setup: Option<fn(&mut jetty_core::Terminal, usize, usize)>,
                        step: &mut dyn FnMut(&mut jetty_core::Terminal, usize)|
          -> Result<(), Box<dyn std::error::Error>> {
+            if let Some(setup) = setup {
+                // Untimed: draw the scenario's starting screen and render it once.
+                setup(&mut term, cols, rows);
+                let snap = term.snapshot();
+                text.render_to(device, queue, &view, width, height, &snap, true, 0.0)?;
+                device.poll(wgpu::PollType::wait_indefinitely())?;
+            }
             let n = 300usize;
             let mut cpu = Vec::with_capacity(n);
             let mut total = 0.0f64;
@@ -419,8 +429,8 @@ fn bench_frames(
             );
             Ok(())
         };
-        run("static", &mut |_t, _k| {})?;
-        run("typing", &mut |t, k| {
+        run("static", None, &mut |_t, _k| {})?;
+        run("typing", None, &mut |t, k| {
             // Wrap like a long command line would, but stay on the prompt row most
             // of the time: a CR+LF every 100 chars starts a fresh prompt line.
             if k % 100 == 99 {
@@ -430,12 +440,70 @@ fn bench_frames(
             }
         })?;
         let mut line = 1_000_000usize;
-        run("scroll", &mut |t, _k| {
+        run("scroll", None, &mut |t, _k| {
             line += 1;
             t.feed(&numbered_line(line));
         })?;
+        // A btop-like TUI: a rounded box-drawing frame around braille graph rows,
+        // redrawn in place every frame with the graph shifted one column (the
+        // borders stay, every graph row changes).
+        run("tui", None, &mut |t, k| t.feed(&tui_frame(cols, rows, k)))?;
+        // Typing inside a box (Claude Code's input box): the frame stays, one char
+        // per frame lands on the boxed input row.
+        run("boxtype", Some(box_setup), &mut |t, k| {
+            if k % 100 == 99 {
+                t.feed(b"\x1b[2;3H\x1b[K\x1b[2;3H");
+            } else {
+                t.feed(&[b"abcdefghijklmnopqrstuvwxyz"[k % 26]]);
+            }
+        })?;
     }
     bench_scene_passes(device, queue, format, font_size)
+}
+
+/// One full redraw of a btop-like screen: `╭─…─╮`, rows of `│` + a braille graph
+/// (shifted by `k` columns) + `│`, `╰─…─╯`, a block-element bar row, all
+/// cursor-addressed from the home position like a real TUI repaint.
+fn tui_frame(cols: usize, rows: usize, k: usize) -> Vec<u8> {
+    let inner = cols.saturating_sub(2);
+    let mut s = String::with_capacity(rows * cols * 3);
+    s.push_str("\x1b[H\x1b[36m╭");
+    s.extend(std::iter::repeat_n('─', inner));
+    s.push_str("╮\x1b[0m");
+    for r in 1..rows.saturating_sub(2) {
+        s.push_str(&format!("\x1b[{};1H\x1b[36m│\x1b[32m", r + 1));
+        for c in 0..inner {
+            // A deterministic wave: braille dots rising and falling with the column.
+            let v = ((c + k) * 7 + r * 13) % 256;
+            s.push(char::from_u32(0x2800 + v as u32).unwrap_or('⠀'));
+        }
+        s.push_str("\x1b[36m│\x1b[0m");
+    }
+    s.push_str(&format!("\x1b[{};1H\x1b[33m", rows.saturating_sub(1)));
+    for c in 0..cols {
+        s.push(char::from_u32(0x2581 + ((c + k) % 8) as u32).unwrap_or('█'));
+    }
+    s.push_str(&format!("\x1b[0m\x1b[{};1H\x1b[36m╰", rows));
+    s.extend(std::iter::repeat_n('─', inner));
+    s.push_str("╯\x1b[0m");
+    s.into_bytes()
+}
+
+/// Clear the screen and draw a full-screen rounded box with the cursor parked on
+/// its first inner row (the `boxtype` scenario types there).
+fn box_setup(term: &mut jetty_core::Terminal, cols: usize, rows: usize) {
+    let inner = cols.saturating_sub(2);
+    let mut s = String::from("\x1b[2J\x1b[H╭");
+    s.extend(std::iter::repeat_n('─', inner));
+    s.push('╮');
+    for r in 1..rows.saturating_sub(1) {
+        s.push_str(&format!("\x1b[{};1H│\x1b[{};{}H│", r + 1, r + 1, cols));
+    }
+    s.push_str(&format!("\x1b[{};1H╰", rows));
+    s.extend(std::iter::repeat_n('─', inner));
+    s.push('╯');
+    s.push_str("\x1b[2;3H");
+    term.feed(s.as_bytes());
 }
 
 /// The app's whole grid scene per frame — cell-background quads + glyphs, typing —
