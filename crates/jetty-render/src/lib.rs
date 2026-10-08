@@ -47,7 +47,7 @@ pub use menu::{build_context_menu, build_menu, ContextMenu, MENU_HINTS, MENU_ITE
 pub use help::{build_help_overlay, default_help_rows, HelpOverlay, HELP_ROWS};
 pub use confirm::{build_confirm, build_confirm_close, ConfirmPopup};
 pub use tabbar::{
-    build_detached_bar, build_tab_bar, build_tab_bar_ex, detached_close_rect, CtrlHover,
+    build_detached_bar, build_tab_bar, build_tab_bar_ex, detached_close_rect, detached_help_rect, CtrlHover,
     DetachedBar, TabActivity, TabBar, CONTROLS_W, STRIP_PAD, TABBAR_H,
 };
 pub use welcome::{build_welcome_overlay, WelcomeOverlay};

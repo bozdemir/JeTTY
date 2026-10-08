@@ -2962,6 +2962,14 @@ impl App {
         if pos >= self.detached.len() {
             return;
         }
+        // This window's overlays go away with it: close its search (dropping
+        // the tab's compiled regex + matches, which the main window's closed bar
+        // would otherwise carry into every reflow) and its copy-mode selection.
+        let s = Surface::Detached(pos);
+        self.search_close(s);
+        if self.ov_of(s).is_some_and(|o| o.copy_mode.is_some()) {
+            self.cancel_copy_mode(s);
+        }
         // Leave OS fullscreen while the window still exists: dropping a
         // fullscreen window leaks macOS's app-scoped presentation options (an
         // auto-hidden Dock + menu bar for the rest of the session).
@@ -7018,15 +7026,19 @@ impl App {
                 if is_synthetic {
                     return;
                 }
+                // --- THIS window's overlays own the keyboard first, in the main
+                // window's order: command palette, hint mode, copy-mode, then the
+                // help (Esc + scroll keys) and the scrollback-search bar ---
+                let s = Surface::Detached(pos);
+                if self.overlay_key_modal(s, &event, event_loop) || self.overlay_key_bars(s, &event) {
+                    return;
+                }
                 // The SAME key decision as the main window (`decide_window_key`),
                 // against THIS window's own terminal. macOS Cmd chords are folded
                 // into the keymap and dispatched below through the same action
                 // path as the main window; the keymap lookup keeps the "swallow
-                // unmapped Cmd" safety net. Cmd+Q / Cmd+P stay detached no-ops
+                // unmapped Cmd" safety net. Cmd+Q stays a detached no-op
                 // (guarded below).
-                let ctrl = self.modifiers.control_key();
-                let alt = self.modifiers.alt_key();
-                let sup = self.modifiers.super_key();
                 let action = {
                     let Some(dw) = self.detached.get(pos) else { return };
                     decide_window_key(
@@ -7108,18 +7120,23 @@ impl App {
                         for dw in &self.detached { dw.request_paint(); }
                         return;
                     }
-                    // Scrollback search, hint mode and keyboard copy-mode exist
-                    // only in the main window for now: a detached window never
-                    // sends their chords to the PTY nor opens them on the
-                    // unfocused main window — and says so in a pill instead of
-                    // swallowing the key silently.
-                    input::KeyAction::SearchToggle
-                    | input::KeyAction::HintMode
-                    | input::KeyAction::CopyMode => {
-                        if let Some(msg) = crate::detached::main_only_notice(&action) {
-                            let window = self.detached.get(pos).map(|d| d.window.id());
-                            self.show_status_pill(crate::runsel::Notice { msg, window });
-                        }
+                    // Scrollback search, hint mode, keyboard copy-mode and the
+                    // command palette open in THIS window, on its own terminal —
+                    // exactly like the main window's.
+                    input::KeyAction::SearchToggle => {
+                        self.search_toggle(s);
+                        return;
+                    }
+                    input::KeyAction::HintMode => {
+                        self.enter_hint_mode(s);
+                        return;
+                    }
+                    input::KeyAction::CopyMode => {
+                        self.enter_copy_mode(s);
+                        return;
+                    }
+                    input::KeyAction::OpenPalette => {
+                        self.open_palette(s);
                         return;
                     }
                     // Run-selection from a DETACHED window: this window's own
@@ -7128,17 +7145,6 @@ impl App {
                     // in a background tab").
                     input::KeyAction::RunSelection => {
                         self.run_selection_in_new_tab(SelSource::Detached(pos));
-                        return;
-                    }
-                    // The palette is main-window only; keep Ctrl+Shift+P's pre-0.18
-                    // behavior in a detached window (open Settings) so the chord
-                    // isn't silently dropped here. A bare macOS Cmd+P, however, was a
-                    // swallowed no-op in today's detached Cmd block (no p/q arm) — keep
-                    // it a no-op so the fold is byte-identical (amendment 6).
-                    input::KeyAction::OpenPalette => {
-                        if !(sup && !ctrl && !alt) {
-                            self.toggle_settings_window(event_loop);
-                        }
                         return;
                     }
                     // Quit only arises from macOS Cmd+Q, which was a swallowed no-op
@@ -7158,11 +7164,9 @@ impl App {
                         self.reattach_tab(pos, event_loop);
                     }
                     // F11 (macOS also Cmd+Ctrl+F) toggles fullscreen on THIS
-                    // window — the first main-window action that is genuinely
-                    // per-window in a detached window (SearchToggle / HintMode /
-                    // CopyMode above are main-window-only, swallowed no-ops). Same
-                    // shape as the DetachTab arm above: the `dw` borrow is dead in
-                    // this arm, so calling back into `self` is fine.
+                    // window. Same shape as the DetachTab arm above: the `dw`
+                    // borrow is dead in this arm, so calling back into `self` is
+                    // fine.
                     input::KeyAction::ToggleFullscreen => {
                         self.toggle_fullscreen_detached(pos);
                     }
@@ -7240,9 +7244,8 @@ impl App {
                             dw.caret_anim = Some(now);
                         }
                     }
-                    // Every other action (new/close/nav tab, font, opacity,
-                    // panel, scroll, ...) is a main-window-only feature for
-                    // this MVP — ignored in a detached window.
+                    // Everything else was handled above (app-wide actions
+                    // return early) or has no meaning in a detached window.
                     _ => {}
                 }
                 if viewport_moved {
@@ -7285,6 +7288,12 @@ impl App {
                     }
                 }
                 if !text.is_empty() {
+                    // This window's overlays take the commit first (palette /
+                    // search queries; hint/copy-mode drop it) — the main
+                    // window's modal priority.
+                    if self.overlay_ime_commit(Surface::Detached(pos), &text) {
+                        return;
+                    }
                     let caret_flash_enabled = self.fx.caret_flash_enabled;
                     let Some(dw) = self.detached.get_mut(pos) else { return };
                     // Snap to the live bottom (F30) then write to the PTY — the
@@ -7462,6 +7471,24 @@ impl App {
                     /// Leave fullscreen on THIS window (double-click on its bar
                     /// while fullscreen). Deferred out of the `dw` borrow.
                     ExitFullscreen,
+                    /// The bar's help "?" — this window's shortcuts help.
+                    ToggleHelp,
+                }
+                // --- THIS window's overlays first, in the main window's order:
+                // hint mode / copy-mode, the command palette (captures the mouse
+                // while open), then — unless a context menu takes the click —
+                // the help (modal) and the search bar (✕ / panel) ---
+                let s = Surface::Detached(pos);
+                let Some((cx, cy)) = self.detached.get(pos).map(|d| (d.cursor.0 as f32, d.cursor.1 as f32))
+                else {
+                    return;
+                };
+                if self.modes_click(s) || self.palette_click(s, cx, cy, event_loop) {
+                    return;
+                }
+                let menu_open = self.detached.get(pos).is_some_and(|d| d.menu_open.is_some());
+                if !menu_open && (self.help_click(s, cx, cy) || self.search_bar_click(s, cx, cy)) {
+                    return;
                 }
                 // App-wide inputs, read before the dw (self.detached) borrow.
                 let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
@@ -7511,6 +7538,8 @@ impl App {
                         if cy < bar_h {
                             if input::point_in(&jetty_render::detached_close_rect(w, cm), cx, cy) {
                                 Act::Reattach
+                            } else if input::point_in(&jetty_render::detached_help_rect(w, cm), cx, cy) {
+                                Act::ToggleHelp
                             } else {
                                 // Double-click on the bar toggles maximize (same
                                 // ~400ms/5px window as the main strip).
@@ -7642,6 +7671,7 @@ impl App {
                     }
                     Act::RunSelection => self.run_selection_in_new_tab(SelSource::Detached(pos)),
                     Act::ExitFullscreen => self.set_detached_fullscreen(pos, false),
+                    Act::ToggleHelp => self.toggle_help(s),
                     Act::None => {}
                 }
             }
@@ -7774,6 +7804,15 @@ impl App {
                 // menu — except on the grid of a program that tracks the mouse,
                 // which gets the click (Shift, or a JeTTY selection, keeps the
                 // menu): the shared gridmouse routing, as in the main window.
+                // Same modal gates as the main window: no menu over this
+                // window's help or palette, none in hint mode (keyboard-only —
+                // a menu opened there could never be clicked).
+                if self
+                    .ov_of(Surface::Detached(pos))
+                    .is_none_or(|o| o.help_open || o.palette_open || o.hint_mode.is_some())
+                {
+                    return;
+                }
                 let theme = self.current_theme();
                 let run_enabled = self.run_selection_enabled;
                 let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
@@ -7852,10 +7891,16 @@ impl App {
             } => {
                 // Middle click, mirroring the main window's arm with this
                 // window's equivalent gates:
-                //  - the context menu (this window's only modal) open → swallow;
+                //  - its context menu, help or palette open, or hint mode → swallow;
                 //  - only over the terminal grid, never the chrome strips;
                 //  - a program that tracks the mouse (no Shift) gets the click.
                 // Otherwise it pastes the PRIMARY selection (same as main).
+                if self
+                    .ov_of(Surface::Detached(pos))
+                    .is_none_or(|o| o.help_open || o.palette_open || o.hint_mode.is_some())
+                {
+                    return;
+                }
                 let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
@@ -7978,7 +8023,11 @@ impl App {
                 // for an alt-screen pager, else this window's own scrollback;
                 // Shift or the scrollbar keep it on the scrollback). THIS window's
                 // own line accumulator, so a leftover fraction never bleeds across
-                // windows (F26).
+                // windows (F26). This window's overlays own the wheel first
+                // (hint/copy-mode swallow it, the help and palette scroll).
+                if self.overlay_wheel(Surface::Detached(pos), delta) {
+                    return;
+                }
                 let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
@@ -8075,6 +8124,18 @@ impl App {
         // switched to the alt screen mid-mode.
         self.refresh_search_if_due(Surface::Detached(pos), std::time::Instant::now());
         self.exit_modes_on_alt_screen(Surface::Detached(pos));
+        // THIS window's overlays, captured (owned) before the wide borrows — the
+        // main window's capture, from this window's own state.
+        let s = Surface::Detached(pos);
+        let (search_ui, search_hits) = self.search_draw(s);
+        let Some(ov) = self.ov_of(s) else { return };
+        let (palette_ui, hint_ui, copy_mode_ui) = (ov.palette_draw(), ov.hint_draw(), ov.copy_draw());
+        let (help_open, help_scroll) = (ov.help_open, ov.help_scroll);
+        // The IME preedit isn't drawn while one of the window's overlays owns
+        // its keyboard (mirrors the main window).
+        let overlay_owns_keys = ov.owns_keys() || hint_ui.is_some() || copy_mode_ui.is_some();
+        let help_rows: Vec<String> = if help_open { self.help_rows.clone() } else { Vec::new() };
+        let font_logical = self.font_logical;
         let Some(dw) = self.detached.get_mut(pos) else { return };
 
         // Snapshot + theme + chrome inputs are read before the mutable
@@ -8094,7 +8155,7 @@ impl App {
                 winit::dpi::PhysicalSize::new(ime_area.2, ime_area.3),
             );
         }
-        let preedit_ui = dw.ime_preedit.clone();
+        let preedit_ui = if overlay_owns_keys { None } else { dw.ime_preedit.clone() };
         let close_hover = dw.close_hover;
         let menu_open = dw.menu_open;
         let menu_hover = dw.menu_hover;
@@ -8220,12 +8281,10 @@ impl App {
 
         // Passes 1–4 via the shared render core (v0.23 Task 8). The detached
         // title bar (Pass 3) is the mid-scene chrome, injected between the glyph
-        // and scrollbar/cursor passes exactly as before. `slide_y = 0.0`,
-        // `copy_mode = None/false`, and `search_hits = &[]`, so a detached
-        // window gains NO dropdown slide, NO copy-mode cursor, and no search
-        // tint (BLOCKING 5) — its render is byte-identical to the pre-refactor
-        // body. The main-only caret GLOW / summon reveals live only in the main
-        // caller's tail and never reach here.
+        // and scrollbar/cursor passes. `slide_y = 0.0`: a detached window has no
+        // dropdown slide; its own search tint and copy-mode cursor come from
+        // THIS window's overlays. The main-only caret GLOW / summon reveals live
+        // only in the main caller's tail and never reach here.
         let scene = GridScene {
             snap: &snap,
             theme: &theme,
@@ -8234,15 +8293,15 @@ impl App {
             grid_bottom: grid_bottom_px,
             status_h,
             scale,
-            search_hits: &[],
+            search_hits: &search_hits,
             failed_rows: &failed_rows,
             link_spans: link_spans.as_ref(),
             images: &images,
             focused,
             caret_t_for_flash,
             caret_flash_color: fx.caret_flash_color,
-            copy_mode_active: false,
-            copy_mode_ui: None,
+            copy_mode_active: copy_mode_ui.is_some(),
+            copy_mode_ui,
         };
         render_grid_scene(
             gpu,
@@ -8310,6 +8369,28 @@ impl App {
                 &gpu.device, &gpu.queue, scene_view, width, height, &[pill.label],
             );
         }
+        // Pass 5c-: this window's search bar and hint chips (the main window's
+        // Passes 4d / 4e). Hint labels render in the TERMINAL font via the
+        // grid layer, so they always fit their one-row chip.
+        if let Some((q, cur, total)) = &search_ui {
+            let sb = jetty_render::build_search_bar(width, grid_top, &theme, &mut *chrome_text, cm, q, *cur, *total);
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &sb.quads);
+            if !sb.labels.is_empty() {
+                let _ = chrome_text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &sb.labels);
+            }
+        }
+        if let Some((labeled, typed)) = &hint_ui {
+            let refs: Vec<(&str, usize, usize)> = labeled.iter().map(|(l, r, c)| (l.as_str(), *r, *c)).collect();
+            let (cell_w, cell_h) = text.cell_size();
+            let grid_cm = jetty_render::ChromeMetrics::new(scale, font_logical);
+            let ov = jetty_render::build_hint_overlay(
+                &refs, cell_w, cell_h, grid_top, &theme, &mut *text, grid_cm, typed, width,
+            );
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
+            if !ov.labels.is_empty() {
+                let _ = text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &ov.labels);
+            }
+        }
         // Pass 5c: IME preedit at this window's cursor (the main window's
         // Pass 4e' twin): terminal font via the grid layer, underlined.
         if let Some(p) = &preedit_ui {
@@ -8319,6 +8400,14 @@ impl App {
             ) {
                 quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
                 let _ = text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &ov.labels);
+            }
+        }
+        // Pass 5d: this window's copy-mode "COPY" pill (main window's Pass 4f).
+        if let Some((_, _, selecting, line_mode)) = copy_mode_ui {
+            let pill = jetty_render::build_copy_pill(width, grid_top, &theme, &mut *chrome_text, cm, line_mode, selecting);
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pill.quads);
+            if !pill.labels.is_empty() {
+                let _ = chrome_text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &pill.labels);
             }
         }
         // Pass 6: the Reattach/Copy/Paste context menu on top of everything.
@@ -8337,6 +8426,30 @@ impl App {
                 let _ = chrome_text.render_overlays(
                     &gpu.device, &gpu.queue, scene_view, width, height, &menu.labels,
                 );
+            }
+        }
+        // Pass 7: this window's keyboard-shortcuts help, then the command
+        // palette LAST (above everything) — the main window's order.
+        if help_open && palette_ui.is_none() {
+            let help = jetty_render::build_help_overlay(
+                width, height, &theme, &mut *chrome_text, cm, &help_rows, help_scroll,
+            );
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &help.quads);
+            if !help.labels.is_empty() {
+                let _ = chrome_text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &help.labels);
+            }
+        }
+        if let Some((q, prows_data, total, first)) = &palette_ui {
+            let prows: Vec<jetty_render::PaletteRow> = prows_data
+                .iter()
+                .map(|(t, idx, sel)| jetty_render::PaletteRow { title: t, match_indices: idx, selected: *sel })
+                .collect();
+            let pal = jetty_render::build_command_palette(
+                width, height, &theme, &mut *chrome_text, cm, q, &prows, *total, *first,
+            );
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pal.quads);
+            if !pal.labels.is_empty() {
+                let _ = chrome_text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &pal.labels);
             }
         }
         // Final pass: round the window corners — the SAME mask pass the main
