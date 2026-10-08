@@ -1919,6 +1919,14 @@ impl Terminal {
         } else {
             self.advance_slice(seq);
         }
+        // Inside a DEC 2026 synchronized update vte only BUFFERED the ED 3; the
+        // block would later apply as one net history change in which the shrink
+        // can hide (`\e[2J\e[3J` + a redraw that scrolls), leaving old anchors on
+        // new rows. Apply the buffered block now so the shrink is seen in order
+        // (the frame tears at most once, as for a mark or image inside a sync).
+        if kind == IsolatedSeq::EraseSaved && self.has_anchors() && self.sync_deadline().is_some() {
+            self.flush_sync();
+        }
         self.after_isolated(kind);
         k
     }
@@ -5481,6 +5489,34 @@ mod tests {
         t.feed(b"\x1b[H\x1b[2J\x1b[3J\x1b]133;D;0\x07\x1b]133;A\x07$ ");
         assert!(t.failed_prompt_rows().is_empty(), "no stale marker after clear");
         assert_eq!(t.marks.len(), 1, "only the fresh prompt remains");
+    }
+
+    #[test]
+    fn clear_inside_a_sync_update_drops_the_cleared_anchors() {
+        // vte BUFFERS a DEC 2026 synchronized update and applies it at once, so a
+        // `\e[2J\e[3J` + redraw inside one used to show up as a single NET history
+        // change (2J's push − 3J's clear + the redraw's scroll) — old marks then
+        // tracked that net change onto the NEW rows (a red marker beside the
+        // redrawn content, a prompt-jump into it).
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"a\r\nb\r\n\x1b]133;A\x07$ false\r\n\x1b]133;C\x07\x1b]133;D;1\x07");
+        for i in 0..4 {
+            t.feed(format!("out {i}\r\n").as_bytes());
+        }
+        assert_eq!(t.marks.len(), 1, "premise: the failed mark is in scrollback");
+        let mut block = b"\x1b[?2026h\x1b[H\x1b[2J\x1b[3J".to_vec();
+        for i in 0..9 {
+            block.extend_from_slice(format!("redraw {i}\r\n").as_bytes());
+        }
+        block.extend_from_slice(b"\x1b[?2026l");
+        t.feed(&block);
+        assert!(t.marks.is_empty(), "the cleared scrollback took its marks along");
+        assert!(t.failed_prompt_rows().is_empty(), "no marker on the redrawn rows");
+        assert!(!t.jump_prompt(false), "no stale prompt-jump target");
+        assert_eq!(t.snapshot().row_text(0).trim_end(), "redraw 5", "the redraw itself landed");
+        // Tracking stays exact for the next prompt.
+        t.feed(b"\x1b]133;A\x07\x1b]133;D;1\x07");
+        assert_eq!(t.failed_prompt_rows(), vec![4]);
     }
 
     #[test]
