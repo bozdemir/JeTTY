@@ -236,6 +236,13 @@ pub(crate) struct DetachedWindow {
     /// Backoff after this window's `acquire_frame()` failed (mirrors
     /// `App::acquire_retry`); `None` while frames present normally.
     pub acquire_retry: Option<crate::app::AcquireRetry>,
+    /// Perf HUD state for THIS window (mirrors `App::perf_ms`, `last_frame_at`,
+    /// `perf_idle_at`, `perf_idle_shown`): its strip shows its own smoothed frame
+    /// time and flips to "idle" by its own one-shot repaint.
+    pub perf_ms: f32,
+    pub last_frame_at: Option<std::time::Instant>,
+    pub perf_idle_at: Option<std::time::Instant>,
+    pub perf_idle_shown: bool,
     /// Whether THIS detached window is in OS fullscreen (F11 pressed in it).
     /// Session-only and PER WINDOW — detached windows persist no geometry at all,
     /// have no `window_mode`, and are never hidden, so this is purely a live
@@ -444,6 +451,10 @@ impl DetachedWindow {
             caret_anim: None,
             key_paint_due: None,
             acquire_retry: None,
+            perf_ms: 0.0,
+            last_frame_at: None,
+            perf_idle_at: None,
+            perf_idle_shown: false,
             // A freshly-detached window is created focused (the WM focuses it on
             // map); its Focused events keep this current thereafter.
             focused: true,

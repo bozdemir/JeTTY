@@ -460,6 +460,35 @@ fn shift_hint_live_in<I: PartialEq>(
     hint.is_some_and(|(t, wid)| wid == id && now < t)
 }
 
+/// How long after a window's last ACTIVE frame its perf HUD flips to "idle".
+const PERF_IDLE_AFTER: std::time::Duration = std::time::Duration::from_millis(700);
+/// The reading the one-shot idle repaint paints.
+const PERF_IDLE_TEXT: &str = "⚡ idle · 0% CPU · 0 MB/s";
+
+/// Exponentially smoothed frame time (ms) of ONE window: the dt since its
+/// previous rendered frame. A gap over 1 s (idle) restarts the average instead
+/// of spiking it.
+fn smooth_frame_ms(
+    perf_ms: &mut f32,
+    last_frame_at: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) {
+    if let Some(prev) = *last_frame_at {
+        let dt_ms = now.duration_since(prev).as_secs_f32() * 1000.0;
+        if dt_ms <= 1000.0 {
+            *perf_ms = if *perf_ms <= 0.0 { dt_ms } else { *perf_ms * 0.9 + dt_ms * 0.1 };
+        }
+    }
+    *last_frame_at = Some(now);
+}
+
+/// The live perf-HUD line: frame ms, the fps it implies, process CPU%, VT MB/s.
+fn perf_hud_text(ms: f32, cpu: f32, mb: f32) -> String {
+    let ms = if ms > 0.0 { ms } else { 0.0 };
+    let fps = if ms > 0.0 { (1000.0 / ms).round().clamp(0.0, 9999.0) as i32 } else { 0 };
+    format!("⚡ {ms:.1} ms · {fps} fps · {cpu:.0}% CPU · {mb:.0} MB/s")
+}
+
 /// What the perf HUD's idle one-shot owes the loop this iteration. After the
 /// last ACTIVE frame the loop wakes ONCE (`perf_idle_at`) to repaint the HUD as
 /// an honest "idle" reading, then goes fully idle.
@@ -1192,11 +1221,6 @@ pub struct App {
     /// loop. Cleared on the next active frame. This is what keeps idle at ~0 CPU:
     /// exactly ONE extra repaint per activity burst, then a true `Wait`.
     perf_idle_shown: bool,
-    /// The perf-HUD string built on the most recent render, cached so the
-    /// click-time tab-bar hit-test rebuild reserves the IDENTICAL HUD width and
-    /// the tab/close hit-rects line up with what's drawn. `None` when the HUD is
-    /// disabled or hidden (too-narrow window). Not perf-critical (clone on render).
-    perf_label: Option<String>,
     /// Real-window perf instrumentation (`JETTY_PERF_LOG=1`): input latency,
     /// exec→first-frame cold start, idle RSS. `perf.on` is a plain bool read ONCE
     /// from the environment at construction; when false every stamp site below is a
@@ -1686,7 +1710,6 @@ impl App {
             perf_mb: 0.0,
             perf_idle_at: None,
             perf_idle_shown: false,
-            perf_label: None,
             perf: crate::perf::Perf::from_env(),
             frame_log: std::env::var_os("JETTY_FRAME_LOG").is_some(),
             frames_presented: 0,
@@ -1991,8 +2014,11 @@ impl App {
         }
         for dw in &mut self.detached {
             dw.tab.terminal.set_theme(t.clone());
-            dw.request_paint();
         }
+        // Theme AND opacity (also applied through here) are shared visuals:
+        // repaint every surface — main, detached and the Settings panel, whose
+        // swatches/readouts show them — not just the window that changed them.
+        self.mark_dirty_all();
     }
 
     /// Apply a debounced config + themes hot-reload. Runs on the UI thread from
@@ -2085,7 +2111,8 @@ impl App {
             let cr = cfg.corner_radius.clamp(0.0, 24.0);
             if (cr - self.corner_radius).abs() > eps {
                 self.corner_radius = cr;
-                self.request_main_paint();
+                // Detached windows round their corners with it too.
+                self.mark_dirty_all();
             }
         }
         // Summon effect: ASSIGN directly (NOT set_summon_effect, which fires a one-
@@ -2128,12 +2155,9 @@ impl App {
         if sb != self.scrollback_lines {
             self.set_scrollback_lines(sb);
         }
-        // Perf HUD: changes the reserved status-bar height → grid rows, so reflow.
-        if cfg.show_perf_hud != self.show_perf_hud {
-            self.show_perf_hud = cfg.show_perf_hud;
-            self.reflow();
-            self.request_main_paint();
-        }
+        // Perf HUD: changes the reserved status-bar height → grid rows in every
+        // window, so reflow them all.
+        self.set_perf_hud(cfg.show_perf_hud);
         // Visual effects — skip while a Effects slider is being dragged (H4).
         if self.active_fx_drag.is_none() && cfg.effects != self.fx {
             self.fx = cfg.effects.clone();
@@ -2397,6 +2421,16 @@ impl App {
     /// pending inject only through the returned index — arming "the active tab"
     /// on a spawn failure would stage the command into the SOURCE shell.
     fn new_tab_with_cwd(&mut self, cwd: Option<std::path::PathBuf>) -> Option<usize> {
+        let idx = self.spawn_tab(cwd)?;
+        self.set_active_tab(idx);
+        Some(idx)
+    }
+
+    /// Spawn a new main-window tab WITHOUT making it active (a background tab):
+    /// the shared core of `new_tab_with_cwd`, and what a detached window's
+    /// run-selection uses so the main window's active tab — and its search bar,
+    /// hint/copy mode and selection — are left untouched. Returns the new index.
+    fn spawn_tab(&mut self, cwd: Option<std::path::PathBuf>) -> Option<usize> {
         let (cols, rows) = self.grid_dims();
         let proxy_wake = self.proxy.clone();
         let shell = self.opt_shell();
@@ -2457,9 +2491,9 @@ impl App {
             activity: jetty_render::TabActivity::None,
             pending_inject: None,
         });
-        self.active = self.tabs.len() - 1;
+        // The tab bar gained an entry either way (active or background).
         self.request_main_paint();
-        Some(self.active)
+        Some(self.tabs.len() - 1)
     }
 
     /// Close tab `i` (its PtySession Drop kills the child). Fix up `active`. If
@@ -2471,7 +2505,8 @@ impl App {
         if i >= self.tabs.len() {
             return;
         }
-        if i == self.active {
+        let active_removed = i == self.active;
+        if active_removed {
             // The searched (active) tab is going away; the bar must not stay
             // open silently retargeting whichever tab becomes active (F2/F7).
             self.search_close();
@@ -2506,10 +2541,16 @@ impl App {
         self.tab_menu_rects.clear();
         self.tab_menu_labels.clear();
         self.tab_drag = None;
-        // A new tab is under the pointer: revalidate the cached Ctrl+hover
-        // underline against ITS grid (Ctrl+Shift+W keeps Ctrl held) (F12).
-        self.update_link_hover(true);
-        self.request_main_paint();
+        if active_removed {
+            // A different tab is now active: drop the closed tab's hint/copy
+            // mode, wheel remainder and hover (the same reset every switch does).
+            self.entered_new_active_tab();
+        } else {
+            // A new tab may be under the pointer: revalidate the cached Ctrl+hover
+            // underline against ITS grid (Ctrl+Shift+W keeps Ctrl held) (F12).
+            self.update_link_hover(true);
+            self.request_main_paint();
+        }
     }
 
     /// Move tab `idx` out of the main window into a new `DetachedWindow`.
@@ -2537,7 +2578,8 @@ impl App {
         // window lives in the WM's above-normal layer, and demotion on focus loss is
         // WM-specific — not something we may special-case). Leave fullscreen first.
         // This covers the tear-out gesture too, which routes through here.
-        if self.main_fullscreen {
+        let was_fullscreen = self.main_fullscreen;
+        if was_fullscreen {
             self.set_main_fullscreen(false);
         }
         // Original active index, kept so the detach can be fully unwound if the
@@ -2589,17 +2631,15 @@ impl App {
         // indicator so it can't resurface stale on a later reattach.
         tab.activity = jetty_render::TabActivity::None;
 
-        // Derive LOGICAL window size from the GPU physical surface size.
-        // `build_window` takes logical px; dividing by scale_factor converts.
-        let (w_logical, h_logical) = if let (Some(gpu), Some(win)) = (&self.gpu, &self.window) {
-            let scale = win.scale_factor();
-            (
-                (gpu.config.width as f64 / scale).round() as u32,
-                (gpu.config.height as f64 / scale).round() as u32,
-            )
-        } else {
-            (1000, 640) // fallback when GPU not yet initialised
-        };
+        // The new window takes the main window's LOGICAL size (`build_window`
+        // takes logical px) — its WINDOWED size: when we just left fullscreen
+        // above, the exit is asynchronous and the surface is still monitor-sized.
+        let (w_logical, h_logical) = detach_logical_size(
+            self.gpu.as_ref().map(|g| (g.config.width, g.config.height)),
+            self.last_windowed_size.map(|s| (s.width, s.height)),
+            was_fullscreen,
+            self.window.as_ref().map_or(1.0, |w| w.scale_factor()),
+        );
 
         // Focus is about to move to the new detached window, which makes the main
         // window receive Focused(false). Flag it so the auto-hide there does NOT
@@ -2732,11 +2772,18 @@ impl App {
 
         self.detached.push(dw);
 
-        // A different tab now sits under the main-window pointer (Ctrl+Shift+D
-        // keeps Ctrl held): revalidate the cached Ctrl+hover underline (F12).
-        self.update_link_hover(true);
-        // Redraw the main window so the tab bar reflects the removed tab.
-        self.request_main_paint();
+        if idx == prev_active {
+            // The active tab left: a different tab is active now — drop the
+            // outgoing tab's hint/copy mode, wheel remainder and hover, exactly
+            // like a tab switch (the search bar was handled above).
+            self.entered_new_active_tab();
+        } else {
+            // A different tab may sit under the main-window pointer (Ctrl+Shift+D
+            // keeps Ctrl held): revalidate the cached Ctrl+hover underline (F12).
+            self.update_link_hover(true);
+            // Redraw the main window so the tab bar reflects the removed tab.
+            self.request_main_paint();
+        }
     }
 
     /// Move a detached window's tab back into the main window (reattach),
@@ -2750,9 +2797,6 @@ impl App {
         if pos >= self.detached.len() {
             return;
         }
-        // The reattached tab becomes the active one below: close the search
-        // bar and clear the outgoing active tab's state first (F2/F7/F15).
-        self.search_close();
         // Leave OS fullscreen while the window still exists: dropping a
         // fullscreen window leaks macOS's app-scoped presentation options (an
         // auto-hidden Dock + menu bar for the rest of the session).
@@ -2784,7 +2828,12 @@ impl App {
         );
 
         self.tabs.push(tab);
-        self.active = crate::detached::reattach_index(self.tabs.len());
+        // The reattached tab becomes the active one. `set_active_tab` closes the
+        // search bar and clears the OUTGOING tab's state first (F2/F7/F15) — the
+        // push above shifted no index, so `self.active` still names it. (When the
+        // main window had no tabs left — a close path adopting a detached shell —
+        // that caller performs the outgoing-tab reset itself.)
+        self.set_active_tab(crate::detached::reattach_index(self.tabs.len()));
         self.apply_theme();
 
         // If the main window is hidden (e.g. the last main tab's shell exited
@@ -3236,10 +3285,27 @@ impl App {
     /// the wrong size (a bare `= !; persist; redraw` is a bug — see the config
     /// reload path, which reflows for the same reason).
     fn toggle_perf_hud(&mut self) {
-        self.show_perf_hud = !self.show_perf_hud;
-        self.reflow();
+        self.set_perf_hud(!self.show_perf_hud);
         self.persist();
-        self.request_main_paint();
+    }
+
+    /// Show/hide the perf HUD in EVERY window (the palette/key toggle and a
+    /// config hot-reload both land here). The strip reserves grid rows, so the
+    /// main grid reflows now and each detached window's reflow is armed for this
+    /// loop pass (its strip height is its own DPI's) — before, only the main
+    /// window re-gridded and a detached strip covered its last row (the prompt)
+    /// until that window was resized. No-op when unchanged.
+    fn set_perf_hud(&mut self, on: bool) {
+        if on == self.show_perf_hud {
+            return;
+        }
+        self.show_perf_hud = on;
+        self.reflow();
+        let now = std::time::Instant::now();
+        for dw in &mut self.detached {
+            dw.reflow_pending_at = Some(now);
+        }
+        self.mark_dirty_all();
     }
 
     /// THE per-surface paint choke for the MAIN window (v0.23 central paint
@@ -3475,21 +3541,50 @@ impl App {
         if n <= 1 {
             return;
         }
-        // The search bar targets the ACTIVE tab: close it (clearing the
-        // outgoing tab's regex/matches) before the index moves (F2/F7/F15).
-        self.search_close();
-        self.active = if forward {
+        let next = if forward {
             (self.active + 1) % n
         } else {
             (self.active + n - 1) % n
         };
-        // A pending text selection belongs to the previous tab's grid; reset it.
+        self.set_active_tab(next);
+    }
+
+    /// Make tab `idx` (clamped) the main window's active tab. THE single path for
+    /// an active-tab change: new tab, tab switch/select, reattach and (via
+    /// [`Self::entered_new_active_tab`]) the close/detach/exit paths that remove
+    /// the active tab — each used to reset its own subset of the outgoing tab's
+    /// state. Precondition: `self.active` still names the OUTGOING tab, so its
+    /// search state is cleared before the index moves. Re-selecting the active
+    /// tab only repaints.
+    fn set_active_tab(&mut self, idx: usize) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let idx = idx.min(self.tabs.len() - 1);
+        if idx == self.active {
+            self.request_main_paint();
+            return;
+        }
+        // The search bar targets the ACTIVE tab: close it (clearing the
+        // outgoing tab's regex/matches) before the index moves (F2/F7/F15).
+        self.search_close();
+        self.active = idx;
+        self.entered_new_active_tab();
+    }
+
+    /// Drop the transient state that belonged to the previously active tab once
+    /// a DIFFERENT tab is active (after `set_active_tab`, or a removal path whose
+    /// active tab was the one removed): hint chips and the copy-mode cursor are
+    /// anchored on the old grid, an in-progress selection drag and a fractional
+    /// wheel remainder were that tab's, and the cached Ctrl+hover underline must
+    /// be recomputed against the new grid — Ctrl+Tab keeps Ctrl held (no
+    /// ModifiersChanged) and the hovered CELL is unchanged, so without the forced
+    /// recompute tab 1's underline ghosts over tab 2's text (F12).
+    fn entered_new_active_tab(&mut self) {
+        self.hint_mode = None;
+        self.copy_mode = None;
         self.selecting = false;
-        // Same for any fractional wheel remainder (it was that tab's scroll).
         self.scroll_accum.reset();
-        // And the cached link hover — Ctrl+Tab keeps Ctrl held (no
-        // ModifiersChanged) and the hovered CELL is unchanged, so without the
-        // forced recompute tab 1's underline ghosts over tab 2's text (F12).
         self.update_link_hover(true);
         self.request_main_paint();
     }
@@ -3534,23 +3629,7 @@ impl App {
 
     /// Jump to tab `n` (0-based), clamped to the valid range.
     fn select_tab(&mut self, n: usize) {
-        if self.tabs.is_empty() {
-            return;
-        }
-        let target = n.min(self.tabs.len() - 1);
-        if target != self.active {
-            // Active tab changes: close the search bar and clear the OUTGOING
-            // tab's search state before the index moves (F2/F7/F15).
-            self.search_close();
-        }
-        self.active = target;
-        // A pending text selection belongs to the previous tab's grid; reset it.
-        self.selecting = false;
-        // Same for any fractional wheel remainder (it was that tab's scroll).
-        self.scroll_accum.reset();
-        // And the cached link hover — recompute against the NEW tab's grid.
-        self.update_link_hover(true);
-        self.request_main_paint();
+        self.set_active_tab(n);
     }
 
     /// Commit an in-progress tab rename: write `rename_buf` back to the tab's
@@ -4468,8 +4547,16 @@ impl App {
             }
         }
         // 3. Create the destination tab and arm ITS pending (and only its).
-        let prev_active = self.active;
-        let Some(idx) = self.new_tab_with_cwd(cwd) else { return };
+        //    A detached-source run is the browser's BACKGROUND tab (sweep M2):
+        //    spawned without activation, so a shown main window's grid — and its
+        //    search bar / hint or copy mode — never flips under the user.
+        //    Main-window triggers DO switch (the user fired the gesture there,
+        //    and a staged multiline needs their review + Enter).
+        let spawned = match source {
+            SelSource::Main => self.new_tab_with_cwd(cwd),
+            SelSource::Detached(_) => self.spawn_tab(cwd),
+        };
+        let Some(idx) = spawned else { return };
         self.tabs[idx].pending_inject = Some(crate::runsel::PendingInject {
             text,
             run,
@@ -4477,15 +4564,6 @@ impl App {
             wait_for_mark,
             notify_window,
         });
-        // A detached-source run is the browser's BACKGROUND tab (sweep M2):
-        // `new_tab_with_cwd` switched `self.active` to the new tab, which would
-        // visibly flip a shown main window's grid under the user — restore the
-        // tab they were on. Main-window triggers DO switch (the user fired the
-        // gesture there, and a staged multiline needs their review + Enter).
-        if matches!(source, SelSource::Detached(_)) {
-            self.active = prev_active;
-            self.request_main_paint();
-        }
         // Wake the `about_to_wait` deadline fold (one bool; false when unused).
         self.runsel_active = true;
     }
@@ -4977,22 +5055,41 @@ impl App {
             return None;
         }
         let now = std::time::Instant::now();
+        // Frame time: this (main) window's own smoothed dt.
+        smooth_frame_ms(&mut self.perf_ms, &mut self.last_frame_at, now);
+        self.refresh_perf_shared(now);
+        Some(perf_hud_text(self.perf_ms, self.perf_cpu, self.perf_mb))
+    }
 
-        // Frame time: exponentially-smoothed dt since the previous rendered frame.
-        if let Some(prev) = self.last_frame_at {
-            let dt_ms = now.duration_since(prev).as_secs_f32() * 1000.0;
-            // Ignore absurd gaps (e.g. after a long idle) so one stale dt doesn't
-            // spike the smoothed value; treat a >1s gap as a fresh start.
-            if dt_ms <= 1000.0 {
-                if self.perf_ms <= 0.0 {
-                    self.perf_ms = dt_ms;
-                } else {
-                    self.perf_ms = self.perf_ms * 0.9 + dt_ms * 0.1;
-                }
-            }
+    /// The HUD line for detached window `pos`, mirroring the main window's
+    /// two render modes: an ACTIVE frame shows THIS window's own smoothed frame
+    /// time (plus the shared process CPU% / VT MB/s) and re-arms its one-shot
+    /// idle repaint; once that deadline passes with no other frame, the single
+    /// repaint `about_to_wait` owes it shows the honest "idle" reading. Before,
+    /// every detached strip echoed the MAIN window's cached string, which froze
+    /// while the main window was hidden.
+    fn detached_perf_label(&mut self, pos: usize) -> Option<String> {
+        if !self.show_perf_hud {
+            return None;
         }
-        self.last_frame_at = Some(now);
+        let now = std::time::Instant::now();
+        let dw = self.detached.get_mut(pos)?;
+        if !dw.perf_idle_shown && dw.perf_idle_at.is_some_and(|d| now >= d) {
+            dw.perf_idle_shown = true;
+            return Some(PERF_IDLE_TEXT.to_string());
+        }
+        smooth_frame_ms(&mut dw.perf_ms, &mut dw.last_frame_at, now);
+        dw.perf_idle_at = Some(now + PERF_IDLE_AFTER);
+        dw.perf_idle_shown = false;
+        let ms = dw.perf_ms;
+        self.refresh_perf_shared(now);
+        Some(perf_hud_text(ms, self.perf_cpu, self.perf_mb))
+    }
 
+    /// Refresh the HUD's PROCESS-WIDE readings — CPU% of this process and VT
+    /// throughput — whichever window is rendering, so a detached window's strip
+    /// stays live while the main window is hidden. Both are self-throttled.
+    fn refresh_perf_shared(&mut self, now: std::time::Instant) {
         // CPU%: refresh only this process, at most once per second.
         if now.duration_since(self.last_cpu_at) >= std::time::Duration::from_secs(1) {
             self.last_cpu_at = now;
@@ -5014,16 +5111,6 @@ impl App {
             self.vt_window_start = now;
             self.vt_bytes_at_window_start = self.vt_bytes;
         }
-
-        let ms = if self.perf_ms > 0.0 { self.perf_ms } else { 0.0 };
-        let fps = if ms > 0.0 { (1000.0 / ms).round().clamp(0.0, 9999.0) as i32 } else { 0 };
-        Some(format!(
-            "⚡ {ms:.1} ms · {fps} fps · {cpu:.0}% CPU · {mb:.0} MB/s",
-            ms = ms,
-            fps = fps,
-            cpu = self.perf_cpu,
-            mb = self.perf_mb,
-        ))
     }
 
     /// Close every tab index in `exited` (descending so earlier indices stay
@@ -5035,7 +5122,8 @@ impl App {
         if exited.is_empty() {
             return true;
         }
-        if exited.contains(&self.active) {
+        let active_removed = exited.contains(&self.active);
+        if active_removed {
             // The searched (active) tab's shell exited: close the bar before
             // the removals below retarget it (same invariant as close_tab).
             self.search_close();
@@ -5080,7 +5168,12 @@ impl App {
         self.tab_menu_rects.clear();
         self.tab_menu_labels.clear();
         self.tab_drag = None;
-        self.request_main_paint();
+        if active_removed {
+            // A different tab is active now (same reset as a tab switch).
+            self.entered_new_active_tab();
+        } else {
+            self.request_main_paint();
+        }
         true
     }
 
@@ -5177,7 +5270,9 @@ impl App {
             self.update_detached_link_hover(pos, true);
         }
         self.persist();
-        self.request_main_paint();
+        // Every surface: the Settings panel's size readout too (Ctrl+= while it
+        // is open used to leave it stale).
+        self.mark_dirty_all();
     }
 
     /// Change the font family at runtime. Updates `font_family`, tells the
@@ -5202,7 +5297,7 @@ impl App {
         // changes (and avoiding a chrome re-measure on every terminal-font pick).
         self.reflow();
         self.persist();
-        self.request_main_paint();
+        self.mark_dirty_all();
     }
 
     /// Change the UI (chrome) font SIZE at runtime, clamped [10, 28]. Resizes the
@@ -5626,10 +5721,20 @@ impl App {
         // whether a WM demotes it on focus loss is WM-specific — which we may not
         // special-case. So a Settings window opened over a fullscreen terminal would
         // be focused but INVISIBLE behind it, and Settings is the only UI for leaving
-        // Fullscreen mode. Give the window back first (coherent with "▢ while
-        // fullscreen = give me my window back").
-        if self.main_fullscreen {
-            self.set_main_fullscreen(false);
+        // Fullscreen mode. Give the REQUESTING window back first (coherent with "▢
+        // while fullscreen = give me my window back"): the chord/gear was used in
+        // the focused window, so a fullscreen detached window leaves fullscreen,
+        // and the main window is never yanked out of fullscreen by a request that
+        // came from a detached window.
+        let focused_detached = self
+            .detached
+            .iter()
+            .position(|d| d.focused)
+            .map(|p| (p, self.detached[p].fullscreen));
+        match settings_fullscreen_exit(self.main_fullscreen, focused_detached) {
+            FullscreenExit::Main => self.set_main_fullscreen(false),
+            FullscreenExit::Detached(pos) => self.set_detached_fullscreen(pos, false),
+            FullscreenExit::None => {}
         }
 
         let window = match jetty_platform::build_fixed_window(
@@ -5699,8 +5804,42 @@ impl App {
         }
     }
 
+    /// End every Settings-window drag (opacity, radius, dropdown size, Effects
+    /// sliders) and make its value stick: persist it, and re-dock a dropdown-size
+    /// drag — applied on release only, never per move (an X11 resize storm),
+    /// re-asserted post-map via `pending_dock_frames`, inert while fullscreen
+    /// (`dock_reassert_ok`). The button release, focus loss (the release never
+    /// arrives) and the window closing all end drags here; the last two used to
+    /// drop the latches WITHOUT persisting, so the live-applied value was lost
+    /// on the next start.
+    fn end_settings_drags(&mut self) {
+        let end = settings_drag_end(
+            self.dragging_slider || self.dragging_radius || self.active_fx_drag.is_some(),
+            self.dragging_dropdown || self.dragging_dropdown_width,
+        );
+        if end.persist {
+            self.persist();
+        }
+        if end.redock && self.visible && dock_reassert_ok(self.window_mode, self.main_fullscreen) {
+            if let Some(w) = &self.window {
+                dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
+                self.pending_dock_frames = 5;
+                self.request_main_paint();
+            }
+        }
+        self.dragging_slider = false;
+        self.dragging_radius = false;
+        self.dragging_dropdown = false;
+        self.dragging_dropdown_width = false;
+        self.active_fx_drag = None;
+    }
+
     /// Drop the settings window and its render stack (closes/hides the OS window).
     fn close_settings_window(&mut self) {
+        // A drag in progress when the window closes ends here: persist its
+        // live-applied value (it never gets a release) and clear every latch so
+        // nothing misbehaves on reopen.
+        self.end_settings_drags();
         // Drop any focus bookkeeping that pointed at the now-destroyed settings
         // window so the main window's auto-hide guard doesn't malfunction.
         if self.last_focused_window == self.settings_window.as_ref().map(|w| w.id()) {
@@ -5712,13 +5851,6 @@ impl App {
         self.settings_text = None;
         self.settings_specimen_text = None;
         self.settings_quad = None;
-        // Clear all drag flags so any in-progress drag when the window closes
-        // doesn't leave a stale flag set that misbehaves on reopen.
-        self.dragging_slider = false;
-        self.dragging_radius = false;
-        self.dragging_dropdown = false;
-        self.dragging_dropdown_width = false;
-        self.active_fx_drag = None;
         // Collapse the Look-tab theme dropdown so reopening Settings starts with
         // it closed (its "collapsed unless the user opens it" session semantics).
         // The Escape / OS-close paths bypass handle_settings_action where the
@@ -7152,9 +7284,9 @@ impl App {
         } else {
             Vec::new()
         };
-        // Same global HUD string the main status bar shows (built on the main
-        // window's frames). Reading the cache never wakes anything.
-        let perf_label = self.perf_label.clone();
+        // THIS window's own HUD line (its frame time, its idle one-shot; the
+        // process CPU% / VT MB/s are shared). Never wakes anything by itself.
+        let perf_label = self.detached_perf_label(pos);
         // Shift+drag hint toast — the shared timer is tagged with the window
         // the drag happened in; captured here (Copy) and compared against
         // THIS window's id after the dw borrow below, so only that window
@@ -7797,35 +7929,7 @@ impl App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-                // Persist the final value after any drag settles (opacity, radius,
-                // dropdown, or Effects slider). The live updates during drag are
-                // cheap writes to self.* fields; the final persist here is the
-                // authoritative flush to disk.
-                if self.dragging_slider || self.dragging_radius || self.dragging_dropdown || self.dragging_dropdown_width || self.active_fx_drag.is_some() {
-                    self.persist();
-                }
-                // Live-apply a dropdown height/width change on RELEASE only (never
-                // on every mouse-move — that would trigger an X11 resize storm). If
-                // the main window is visible and in Dropdown mode, re-dock the top
-                // strip to the new size immediately (re-asserted post-map via
-                // pending_dock_frames) instead of waiting for the next F9.
-                // Inert while fullscreen (Dropdown + an ad-hoc F11) — see
-                // `dock_reassert_ok`.
-                if (self.dragging_dropdown || self.dragging_dropdown_width)
-                    && self.visible
-                    && dock_reassert_ok(self.window_mode, self.main_fullscreen)
-                {
-                    if let Some(w) = &self.window {
-                        dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
-                        self.pending_dock_frames = 5;
-                        self.request_main_paint();
-                    }
-                }
-                self.dragging_slider = false;
-                self.dragging_radius = false;
-                self.dragging_dropdown = false;
-                self.dragging_dropdown_width = false;
-                self.active_fx_drag = None;
+                self.end_settings_drags();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 let Some(gpu) = &self.settings_gpu else { return };
@@ -7954,13 +8058,10 @@ impl App {
                     self.last_focused_window = None;
                 }
                 // A held slider/drag can never see its button release once focus is
-                // gone — clear every drag latch so sliders don't keep tracking the
-                // cursor with no button held after focus returns (F36).
-                self.dragging_slider = false;
-                self.dragging_radius = false;
-                self.dragging_dropdown = false;
-                self.dragging_dropdown_width = false;
-                self.active_fx_drag = None;
+                // gone — end every drag now (sliders must not keep tracking the
+                // cursor with no button held after focus returns, F36) AND keep
+                // its live-applied value: it is persisted like a release.
+                self.end_settings_drags();
                 // F14: focus leaving the Settings window to a foreign app must
                 // auto-hide the main dropdown too — schedule the deferred hide;
                 // any JeTTY window regaining focus cancels it (Focused(true)).
@@ -8315,6 +8416,16 @@ impl ApplicationHandler<AppEvent> for App {
             self.request_main_paint();
             painted = true;
         }
+        // The same one-shot per DETACHED window, on its own deadline (an occluded
+        // window owes nothing: it repaints when it comes back).
+        for dw in &self.detached {
+            let idle =
+                perf_idle_decision(self.show_perf_hud, dw.perf_idle_shown, dw.perf_idle_at, !dw.occluded, now);
+            if idle == IdleHud::RepaintNow {
+                dw.request_paint();
+                painted = true;
+            }
+        }
 
         // Continuous frames (Poll + re-request) are decided HERE only. Each
         // animation term is gated on the main window being EFFECTIVELY VISIBLE
@@ -8427,6 +8538,13 @@ impl ApplicationHandler<AppEvent> for App {
         // Idle-HUD one-shot (effectively visible windows only — see above).
         if let IdleHud::WakeAt(d) = perf_idle {
             merge_wake(&mut wake_at, d);
+        }
+        for dw in &self.detached {
+            if let IdleHud::WakeAt(d) =
+                perf_idle_decision(self.show_perf_hud, dw.perf_idle_shown, dw.perf_idle_at, !dw.occluded, now)
+            {
+                merge_wake(&mut wake_at, d);
+            }
         }
         // Pill expiries: one wake each to repaint the pill away.
         if let Some((t, _)) = self.shift_hint_until {
@@ -11254,20 +11372,17 @@ impl ApplicationHandler<AppEvent> for App {
                         .is_some_and(|d| std::time::Instant::now() >= d);
                 let perf_string = if render_idle_hud {
                     self.perf_idle_shown = true;
-                    Some("⚡ idle · 0% CPU · 0 MB/s".to_string())
+                    Some(PERF_IDLE_TEXT.to_string())
                 } else {
                     let s = self.update_perf_hud();
                     if self.show_perf_hud {
                         // (Re)arm the one-shot idle repaint for ~700ms after this
                         // active frame; cleared/rescheduled by the next active frame.
-                        self.perf_idle_at = Some(
-                            std::time::Instant::now() + std::time::Duration::from_millis(700),
-                        );
+                        self.perf_idle_at = Some(std::time::Instant::now() + PERF_IDLE_AFTER);
                         self.perf_idle_shown = false;
                     }
                     s
                 };
-                self.perf_label = perf_string.clone();
                 let context_menu = self.context_menu;
                 let menu_hover = self.menu_hover;
                 // Disabled rows computed at menu open (cheap clone of ≤2 idx).
@@ -12936,6 +13051,69 @@ fn capture_pre_fullscreen(
     *last_windowed_size = Some(win.outer_size());
 }
 
+/// Logical size for a window torn out of the main window (detach): the main
+/// surface's physical size ÷ `scale` — except when the main window was
+/// fullscreen at the detach. Leaving fullscreen is asynchronous, so the surface
+/// is still MONITOR-sized at that point and the detached window would come up
+/// covering the whole monitor; the windowed size captured on fullscreen entry
+/// (`capture_pre_fullscreen`) is the size the user actually had. Falls back to
+/// 1000×640 when there is no surface yet.
+fn detach_logical_size(
+    surface: Option<(u32, u32)>,
+    pre_fullscreen: Option<(u32, u32)>,
+    was_fullscreen: bool,
+    scale: f64,
+) -> (u32, u32) {
+    let physical = match (was_fullscreen, pre_fullscreen) {
+        (true, Some(windowed)) => Some(windowed),
+        _ => surface,
+    };
+    let Some((w, h)) = physical else { return (1000, 640) };
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    (
+        ((w as f64 / scale).round() as u32).max(1),
+        ((h as f64 / scale).round() as u32).max(1),
+    )
+}
+
+/// Which window opening Settings must take out of fullscreen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullscreenExit {
+    None,
+    Main,
+    Detached(usize),
+}
+
+/// Pure decision behind the Settings-vs-fullscreen rule: the REQUESTING window
+/// is the focused one — `focused_detached` = `(index, is_fullscreen)` of the
+/// focused detached window, if any — else the main window. Only the requester
+/// leaves fullscreen.
+fn settings_fullscreen_exit(main_fullscreen: bool, focused_detached: Option<(usize, bool)>) -> FullscreenExit {
+    match focused_detached {
+        Some((pos, true)) => FullscreenExit::Detached(pos),
+        Some((_, false)) => FullscreenExit::None,
+        None if main_fullscreen => FullscreenExit::Main,
+        None => FullscreenExit::None,
+    }
+}
+
+/// What ending the Settings-window drags owes (see `App::end_settings_drags`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsDragEnd {
+    /// A drag was live: its value was applied live but never written.
+    persist: bool,
+    /// A dropdown height/width drag: re-dock the window at the new size.
+    redock: bool,
+}
+
+/// Pure decision behind `App::end_settings_drags`: any live drag (`value_drag`:
+/// opacity/radius/Effects; `dropdown_drag`: dropdown height/width) persists,
+/// and only a dropdown drag re-docks. No drag → nothing at all (a stray
+/// release or focus loss must not write the config).
+fn settings_drag_end(value_drag: bool, dropdown_drag: bool) -> SettingsDragEnd {
+    SettingsDragEnd { persist: value_drag || dropdown_drag, redock: dropdown_drag }
+}
+
 /// The top-left a window of `win_size` needs to sit centred inside the monitor
 /// rect `(mon_pos, mon_size)`. All physical px.
 ///
@@ -14147,5 +14325,111 @@ mod window_mode_tests {
         for n in names {
             assert!(n.chars().count() <= 11, "cycler label too long: {n:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod window_parity_tests {
+    use super::{
+        detach_logical_size, perf_hud_text, settings_drag_end, settings_fullscreen_exit, smooth_frame_ms,
+        FullscreenExit, SettingsDragEnd,
+    };
+    use std::time::{Duration, Instant};
+
+    /// Tripwire for the single active-tab path: `self.active` may be ASSIGNED
+    /// only by `set_active_tab` plus the index fix-ups of the paths that REMOVE a
+    /// tab (close / detach incl. its failed-init restore / shell exit — they keep
+    /// the index pointing at the same tab or clamp it, then call
+    /// `entered_new_active_tab` when the active tab itself went away) and the
+    /// first tab in `resumed`. A new direct assignment would skip the outgoing
+    /// tab's search/hint/copy/selection reset again — route it through
+    /// `set_active_tab` (or, for a new removal path, `entered_new_active_tab`).
+    #[test]
+    fn active_tab_changes_go_through_one_path() {
+        let src = include_str!("app.rs");
+        let assigns = src
+            .lines()
+            .filter(|l| {
+                let s = l.trim_start();
+                !s.starts_with("//")
+                    && (s.contains(concat!("self.active ", "= ")) || s.contains(concat!("self.active ", "-= ")))
+            })
+            .count();
+        // close_tab (2) + detach_tab (2 fix-ups + 1 restore) + set_active_tab (1)
+        // + close_exited_tabs (2) + resumed (1).
+        assert_eq!(assigns, 9, "a new direct `self.active` assignment — use set_active_tab");
+    }
+
+    #[test]
+    fn detaching_uses_the_live_surface_size_in_logical_px() {
+        assert_eq!(detach_logical_size(Some((2000, 1280)), None, false, 2.0), (1000, 640));
+        assert_eq!(detach_logical_size(Some((1201, 800)), Some((10, 10)), false, 1.0), (1201, 800));
+    }
+
+    #[test]
+    fn detaching_from_fullscreen_uses_the_windowed_size_not_the_monitor() {
+        // Main was fullscreen on a 3840x2160 @2x monitor; it had been 1600x1000.
+        let monitor = Some((3840, 2160));
+        assert_eq!(detach_logical_size(monitor, Some((1600, 1000)), true, 2.0), (800, 500));
+        // Never captured (no entry recorded) → the surface is all there is.
+        assert_eq!(detach_logical_size(monitor, None, true, 1.0), (3840, 2160));
+    }
+
+    #[test]
+    fn detach_size_has_a_fallback_and_never_zero() {
+        assert_eq!(detach_logical_size(None, None, false, 1.0), (1000, 640));
+        assert_eq!(detach_logical_size(Some((1, 1)), None, false, 4.0), (1, 1));
+        // A bogus scale never divides by zero.
+        assert_eq!(detach_logical_size(Some((800, 600)), None, false, 0.0), (800, 600));
+    }
+
+    #[test]
+    fn interrupted_settings_drags_persist_and_dropdown_drags_redock() {
+        // No drag: a stray release / focus loss / close writes nothing.
+        assert_eq!(settings_drag_end(false, false), SettingsDragEnd { persist: false, redock: false });
+        // Opacity / radius / Effects slider: persist the live value.
+        assert_eq!(settings_drag_end(true, false), SettingsDragEnd { persist: true, redock: false });
+        // Dropdown height/width: persist AND re-dock at the new size.
+        assert_eq!(settings_drag_end(false, true), SettingsDragEnd { persist: true, redock: true });
+        assert_eq!(settings_drag_end(true, true), SettingsDragEnd { persist: true, redock: true });
+    }
+
+    #[test]
+    fn settings_leaves_fullscreen_only_on_the_requesting_window() {
+        // Requested from the main window (no detached window focused).
+        assert_eq!(settings_fullscreen_exit(true, None), FullscreenExit::Main);
+        assert_eq!(settings_fullscreen_exit(false, None), FullscreenExit::None);
+        // Requested from a fullscreen detached window: that one exits; a
+        // fullscreen MAIN window is left alone.
+        assert_eq!(settings_fullscreen_exit(false, Some((2, true))), FullscreenExit::Detached(2));
+        assert_eq!(settings_fullscreen_exit(true, Some((0, true))), FullscreenExit::Detached(0));
+        // Requested from a windowed detached window: nobody is touched, even
+        // with the main window fullscreen.
+        assert_eq!(settings_fullscreen_exit(true, Some((1, false))), FullscreenExit::None);
+    }
+
+    #[test]
+    fn frame_time_is_smoothed_per_window_and_restarts_after_idle() {
+        let t0 = Instant::now();
+        let (mut ms, mut last) = (0.0f32, None);
+        smooth_frame_ms(&mut ms, &mut last, t0);
+        assert_eq!(ms, 0.0, "the first frame has no previous one");
+        smooth_frame_ms(&mut ms, &mut last, t0 + Duration::from_millis(16));
+        assert!((ms - 16.0).abs() < 0.5, "seeded with the first dt, got {ms}");
+        smooth_frame_ms(&mut ms, &mut last, t0 + Duration::from_millis(48));
+        assert!((ms - 17.6).abs() < 0.5, "0.9·16 + 0.1·32, got {ms}");
+        // A 5 s idle gap neither spikes nor resets the mean…
+        smooth_frame_ms(&mut ms, &mut last, t0 + Duration::from_millis(5048));
+        assert!((ms - 17.6).abs() < 0.5, "an idle gap must not spike it, got {ms}");
+        // …but the next frame measures from the end of the gap.
+        smooth_frame_ms(&mut ms, &mut last, t0 + Duration::from_millis(5064));
+        assert!((ms - 17.4).abs() < 0.5, "got {ms}");
+    }
+
+    #[test]
+    fn hud_text_reports_fps_from_frame_time() {
+        assert_eq!(perf_hud_text(16.0, 3.4, 12.6), "⚡ 16.0 ms · 63 fps · 3% CPU · 13 MB/s");
+        assert_eq!(perf_hud_text(0.0, 0.0, 0.0), "⚡ 0.0 ms · 0 fps · 0% CPU · 0 MB/s");
+        assert_eq!(perf_hud_text(-1.0, 0.0, 0.0), "⚡ 0.0 ms · 0 fps · 0% CPU · 0 MB/s");
     }
 }
