@@ -172,8 +172,9 @@ pub struct Config {
     pub macos_option_as_alt: crate::input::OptionAsAlt,
     /// Where a finished mouse selection is copied: `"primary"` (default — the
     /// X11/Wayland select-to-copy convention; a middle click pastes it and the
-    /// clipboard is left alone), `"clipboard"`, `"both"` or `"off"`. macOS and
-    /// Windows have no primary selection: there `"primary"` means the clipboard.
+    /// clipboard is left alone), `"clipboard"` (a middle click in JeTTY then
+    /// pastes the clipboard too), `"both"` or `"off"`. macOS and Windows have no
+    /// primary selection: there `"primary"` means the clipboard.
     #[serde(default)]
     pub copy_on_select: crate::clipboard::CopyOnSelect,
     /// The kitty keyboard protocol: a program that asks for it (`CSI > u`) gets

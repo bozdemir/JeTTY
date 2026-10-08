@@ -257,7 +257,8 @@ pub(crate) enum Press {
     OpenLink(String),
     /// JeTTY's right click: open this window's context menu.
     Menu,
-    /// JeTTY's middle click: paste the PRIMARY selection.
+    /// JeTTY's middle click: paste the PRIMARY selection (the clipboard under
+    /// `copy_on_select = "clipboard"` — see `CopyOnSelect::middle_click_reads_clipboard`).
     PastePrimary,
     /// Nothing to do.
     Ignored,

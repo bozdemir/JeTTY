@@ -8291,13 +8291,15 @@ impl App {
                 //  - its context menu, help or palette open, or hint mode → swallow;
                 //  - only over the terminal grid, never the chrome strips;
                 //  - a program that tracks the mouse (no Shift) gets the click.
-                // Otherwise it pastes the PRIMARY selection (same as main).
+                // Otherwise it pastes the PRIMARY selection (same as main) — the
+                // clipboard under `copy_on_select = "clipboard"`.
                 if self
                     .ov_of(Surface::Detached(pos))
                     .is_none_or(|o| o.help_open || o.palette_open || o.hint_mode.is_some())
                 {
                     return;
                 }
+                let copy_on_select = self.copy_on_select;
                 let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
@@ -8313,7 +8315,7 @@ impl App {
                     crate::gridmouse::press(g, MouseButton::Middle, false, now)
                 }) == crate::gridmouse::Press::PastePrimary
                 {
-                    if let Some(text) = clipboard::get_primary() {
+                    if let Some(text) = clipboard::get_for_middle_click(copy_on_select) {
                         Self::paste_to_tab(&mut dw.tab, &text);
                     }
                 }
@@ -11675,7 +11677,9 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.with_main_grid(|g| crate::gridmouse::press(g, MouseButton::Middle, false, now))
                     == Some(crate::gridmouse::Press::PastePrimary)
                 {
-                    if let Some(text) = clipboard::get_primary() {
+                    // PRIMARY — or the clipboard, where `copy_on_select =
+                    // "clipboard"` put the selection.
+                    if let Some(text) = clipboard::get_for_middle_click(self.copy_on_select) {
                         self.paste_text(&text);
                     }
                 }
