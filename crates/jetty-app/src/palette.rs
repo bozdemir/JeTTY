@@ -186,8 +186,8 @@ pub fn build_registry(
         ("Toggle caret glow", "cursor bloom", PaletteCmd::ToggleCaretGlow),
         ("Toggle performance HUD", "fps stats perf meter", PaletteCmd::TogglePerfHud),
         (
-            "Toggle built-in box & Powerline glyphs",
-            "box drawing border line braille block powerline separator prompt seam font glyph",
+            "Toggle built-in box & braille glyphs",
+            "box drawing border line braille block sextant separator prompt seam font glyph cell exact",
             PaletteCmd::ToggleBuiltinGlyphs,
         ),
         ("Toggle color emoji", "emoji colour smiley font", PaletteCmd::ToggleColorEmoji),
@@ -432,6 +432,15 @@ mod tests {
                 hits[0].title
             );
         }
+    }
+
+    #[test]
+    fn registry_has_the_glyph_toggles() {
+        let r = reg();
+        assert_eq!(filter(&r, "built-in glyphs")[0].cmd, PaletteCmd::ToggleBuiltinGlyphs);
+        assert_eq!(filter(&r, "box drawing")[0].cmd, PaletteCmd::ToggleBuiltinGlyphs);
+        assert_eq!(filter(&r, "color emoji")[0].cmd, PaletteCmd::ToggleColorEmoji);
+        assert_eq!(filter(&r, "bold is bright")[0].cmd, PaletteCmd::ToggleBoldIsBright);
     }
 
     #[test]
