@@ -21,6 +21,10 @@
 //! cursor_text  = "#1e1e2e"      # optional: glyph under a block cursor (default: background)
 //! selection_foreground = "#…"   # optional (alias: selection_fg): every selected glyph's
 //!                               # color (default: own color, unless unreadable on the highlight)
+//! selection_background = "#…"   # optional (alias: selection_bg): the selection highlight
+//!                               # (default: 1/3 background + 2/3 ANSI blue)
+//! accent       = "#89b4fa"      # optional: the UI accent — menu hover, focused/active marks,
+//!                               # the welcome logo (default: ANSI blue; a faint one is shaded)
 //! # 16 ANSI colors — EITHER a flat 16-array `palette = [...]` (REQUIRED unless the
 //! # named tables below are given; if BOTH are present, `palette` WINS):
 //! palette = ["#45475a", "#f38ba8", ...]   # exactly 16 hex colors
@@ -32,15 +36,17 @@
 //! # black="#…"  …  white="#…"
 //! ```
 //! Hex accepts `#rrggbb`, `#rgb`, or the same without the leading `#`. `opacity` is
-//! a GLOBAL setting (config `opacity`), not per-theme — an `opacity`/`selection` key
-//! is accepted-and-ignored for forward-compat.
+//! a GLOBAL setting (config `opacity`), not per-theme — an `opacity` key is
+//! accepted-and-ignored for forward-compat. A plain-color `selection = "#…"` (the
+//! older spelling) is read as `selection_background`; any other `selection` value
+//! (a table, say) is still ignored.
 
 use std::borrow::Cow;
 
 use serde::Deserialize;
 
-/// Raw parsed theme file. Unknown keys (`opacity`, `selection`, …) are ignored by
-/// serde (no `deny_unknown_fields`), so they are accepted-and-ignored.
+/// Raw parsed theme file. Unknown keys (`opacity`, …) are ignored by serde (no
+/// `deny_unknown_fields`), so they are accepted-and-ignored.
 #[derive(Debug, Deserialize)]
 struct ThemeToml {
     name: Option<String>,
@@ -53,6 +59,12 @@ struct ThemeToml {
     cursor_text: Option<String>,
     #[serde(alias = "selection_fg")]
     selection_foreground: Option<String>,
+    #[serde(alias = "selection_bg")]
+    selection_background: Option<String>,
+    /// The older `selection` key: any TOML value, so a table there (another
+    /// terminal's format) never fails the file; only a color string is used.
+    selection: Option<toml::Value>,
+    accent: Option<String>,
     palette: Option<Vec<String>>,
     normal: Option<AnsiTable>,
     bright: Option<AnsiTable>,
@@ -143,6 +155,14 @@ fn theme_from_toml(t: ThemeToml, stem: &str) -> Result<jetty_core::Theme, String
     let cursor = parse_hex(t.cursor.as_deref().ok_or("missing `cursor`")?)?;
     let cursor_text = t.cursor_text.as_deref().map(parse_hex).transpose()?;
     let selection_fg = t.selection_foreground.as_deref().map(parse_hex).transpose()?;
+    let accent = t.accent.as_deref().map(parse_hex).transpose()?;
+    // `selection_background` wins; the older plain-color `selection` is lenient
+    // (it used to be ignored, so a bad value there must not drop the theme now).
+    let selection_bg = match (t.selection_background.as_deref(), &t.selection) {
+        (Some(s), _) => Some(parse_hex(s)?),
+        (None, Some(toml::Value::String(s))) => parse_hex(s).ok(),
+        _ => None,
+    };
 
     // Palette: flat 16-array WINS when present; else the named [normal]/[bright]
     // tables; else it is a required-field error.
@@ -176,8 +196,8 @@ fn theme_from_toml(t: ThemeToml, stem: &str) -> Result<jetty_core::Theme, String
         cursor,
         cursor_text,
         selection_fg,
-        accent: None,
-        selection_bg: None,
+        accent,
+        selection_bg,
         palette,
     })
 }
@@ -394,6 +414,51 @@ palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606"
         assert_eq!(t.selection_fg, Some([0xfa, 0xfa, 0xfa]), "`selection_fg` alias");
         let bad = toml.replace("#202020", "nope");
         assert!(parse(&bad, "x").is_err(), "a bad optional color is still a bad theme");
+    }
+
+    const PAL16: &str = r##"palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606","#070707","#080808","#090909","#0a0a0a","#0b0b0b","#0c0c0c","#0d0d0d","#0e0e0e","#0f0f0f"]"##;
+
+    fn with_keys(extra: &str) -> Result<jetty_core::Theme, String> {
+        let toml = format!(
+            "background = \"#101010\"\nforeground = \"#eeeeee\"\ncursor = \"#ffffff\"\n{extra}\n{PAL16}\n"
+        );
+        parse(&toml, "x")
+    }
+
+    #[test]
+    fn optional_accent_and_selection_background() {
+        let t = with_keys("accent = \"#ff8800\"\nselection_background = \"#334455\"").unwrap();
+        assert_eq!(t.accent, Some([0xff, 0x88, 0x00]));
+        assert_eq!(t.selection_bg, Some([0x33, 0x44, 0x55]));
+        // `selection_bg` alias.
+        let t = with_keys("selection_bg = \"#abc\"").unwrap();
+        assert_eq!(t.selection_bg, Some([0xaa, 0xbb, 0xcc]));
+        // Absent → derived at render time.
+        let t = with_keys("").unwrap();
+        assert_eq!((t.accent, t.selection_bg), (None, None));
+        // A bad value in a documented key is a bad theme, like every other color.
+        assert!(with_keys("accent = \"nope\"").is_err());
+        assert!(with_keys("selection_background = \"#12\"").is_err());
+    }
+
+    #[test]
+    fn the_older_selection_key_is_honored_only_as_a_plain_color() {
+        // A color string: read as the selection background.
+        let t = with_keys("selection = \"#224466\"").unwrap();
+        assert_eq!(t.selection_bg, Some([0x22, 0x44, 0x66]));
+        // `selection_background` wins over it.
+        let t = with_keys("selection_background = \"#010203\"\nselection = \"#224466\"").unwrap();
+        assert_eq!(t.selection_bg, Some([1, 2, 3]));
+        // It used to be ignored, so a bad value or another shape must not drop
+        // the theme: a junk string and an alacritty-style table both load.
+        let t = with_keys("selection = \"not a color\"").unwrap();
+        assert_eq!(t.selection_bg, None);
+        let toml = format!(
+            "background = \"#101010\"\nforeground = \"#eeeeee\"\ncursor = \"#ffffff\"\n{PAL16}\n\
+             [selection]\nbackground = \"#ffffff\"\ntext = \"#000000\"\n"
+        );
+        let t = parse(&toml, "x").expect("a [selection] table must not fail the file");
+        assert_eq!(t.selection_bg, None);
     }
 
     #[test]
