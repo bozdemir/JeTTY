@@ -4,7 +4,9 @@
 //! JeTTY NEVER edits the user's dotfiles. The user opts in with ONE guarded line
 //! they add themselves (printed in `--help` and at the top of each snippet),
 //! which sources the snippet ONLY under JeTTY and produces no output in other
-//! terminals or when the binary is missing (instant-prompt safe).
+//! terminals or when the binary is missing (instant-prompt safe). The line runs
+//! `$JETTY_BIN` — the absolute path JeTTY exports to its shells — so it also works
+//! for AppImage / tarball installs where `jetty` is not on `PATH`.
 //!
 //! Marks emitted: OSC 133 `A` (prompt), `C` (command start), `D;<exit>` (done).
 //! `B` (input start) is intentionally omitted — it is the p10k-fragile part and
@@ -26,7 +28,7 @@ pub const ZSH: &str = r#"# JeTTY zsh shell integration — OSC 133 semantic prom
 # (prompt marks + failed-command markers + Ctrl+Shift+Z/X prompt jump)
 #
 # Opt in from ~/.zshrc with (guarded; silent in other terminals):
-#   [[ -n "$JETTY" ]] && command -v jetty >/dev/null 2>&1 && source <(jetty --print-shell-integration zsh) 2>/dev/null
+#   [[ -n "$JETTY" ]] && source <("${JETTY_BIN:-jetty}" --print-shell-integration zsh 2>/dev/null)
 #
 # powerlevel10k users: the most robust, instant-prompt-safe path is to let p10k
 # emit the marks itself — add  POWERLEVEL9K_TERM_SHELL_INTEGRATION=true  to your
@@ -56,22 +58,25 @@ fi
 
 /// bash snippet — non-destructive; bash-preexec-aware.
 ///
-/// JeTTY's two features need only the A (prompt) and D (exit) marks, both
-/// emittable from precmd, so bash integration rides `PROMPT_COMMAND` ALONE — it
-/// never installs a DEBUG trap, so nothing an existing preexec/DEBUG handler
+/// The A (prompt) and D (exit) marks come from precmd, riding `PROMPT_COMMAND` —
+/// no DEBUG trap is ever installed, so nothing an existing preexec/DEBUG handler
 /// relies on is touched (reading the old trap via `$(trap -p DEBUG)` is
-/// impossible anyway — command substitution resets the DEBUG trap). The C mark,
-/// which would require a DEBUG trap, is intentionally omitted; JeTTY does not
-/// render it. Registers via bash-preexec's `precmd_functions` when present, else
-/// PREPENDS to a scalar or array `PROMPT_COMMAND` so `$?` on the first line is
-/// the user command's true exit status.
+/// impossible anyway — command substitution resets the DEBUG trap). The C
+/// (command start) mark comes from `PS0`, which bash ≥ 4.4 prints after reading
+/// a command line and before running it — appended to any existing `PS0`, and a
+/// plain unused variable to older bash. C gives Run & Notify a real duration and
+/// tells the resize clean-prompt wipe that real output exists. Registers via
+/// bash-preexec's `precmd_functions` when present, else PREPENDS to a scalar or
+/// array `PROMPT_COMMAND` so `$?` on the first line is the user command's true
+/// exit status.
 pub const BASH: &str = r#"# JeTTY bash shell integration — OSC 133 semantic prompts.
 # Opt in from ~/.bashrc with (guarded; silent in other terminals):
-#   [[ -n "$JETTY" ]] && command -v jetty >/dev/null 2>&1 && source <(jetty --print-shell-integration bash) 2>/dev/null
+#   [[ -n "$JETTY" ]] && source <("${JETTY_BIN:-jetty}" --print-shell-integration bash 2>/dev/null)
 #
-# Emits only the A (prompt) and D (exit) marks — all JeTTY needs — from
-# PROMPT_COMMAND, so it installs NO DEBUG trap and is fully non-destructive.
-if [[ $- == *i* && -n "$JETTY" ]]; then
+# A (prompt) and D (exit) come from PROMPT_COMMAND, C (command start) from PS0
+# (bash >= 4.4); no DEBUG trap is installed — fully non-destructive.
+if [[ $- == *i* && -n "$JETTY" && -z "${_jetty_bash_loaded:-}" ]]; then
+  _jetty_bash_loaded=1   # sourcing twice must not register the hook twice
   _jetty_precmd() {
     local ret=$?                                    # user command's exit (first line)
     if [[ -n "${_jetty_started:-}" ]]; then printf '\033]133;D;%s\007' "$ret"; fi
@@ -88,13 +93,15 @@ if [[ $- == *i* && -n "$JETTY" ]]; then
     # Scalar PROMPT_COMMAND: prepend, preserving any existing value.
     PROMPT_COMMAND="_jetty_precmd${PROMPT_COMMAND:+$'\n'$PROMPT_COMMAND}"
   fi
+  # Command start: PS0 is printed after a command line is read, before it runs.
+  [[ "$PS0" == *$'\033]133;C'* ]] || PS0+=$'\033]133;C\007'
 fi
 "#;
 
 /// fish snippet — native events; captures `$status` first in fish_postexec.
 pub const FISH: &str = r#"# JeTTY fish shell integration — OSC 133 semantic prompts.
 # Opt in from ~/.config/fish/config.fish with (guarded; silent elsewhere):
-#   test -n "$JETTY"; and command -q jetty; and jetty --print-shell-integration fish | source
+#   test -n "$JETTY"; and test -n "$JETTY_BIN"; and "$JETTY_BIN" --print-shell-integration fish | source
 if status is-interactive; and set -q JETTY
     function _jetty_prompt --on-event fish_prompt
         printf '\033]133;A\007'
@@ -158,6 +165,19 @@ mod tests {
         assert!(BASH.contains("declare -a "), "handles array-typed PROMPT_COMMAND");
         assert!(BASH.contains("${PROMPT_COMMAND:+"), "preserves an existing scalar PROMPT_COMMAND");
         assert!(BASH.contains("133;D;%s"), "emits the D exit-code mark");
+        // C comes from PS0, APPENDED (an existing PS0 keeps working) and guarded
+        // against sourcing twice.
+        assert!(BASH.contains(r"PS0+=$'\033]133;C\007'"), "C mark via PS0 append");
+        assert!(BASH.contains(r#"[[ "$PS0" == *$'\033]133;C'* ]] ||"#), "idempotent");
+    }
+
+    #[test]
+    fn opt_in_lines_use_jetty_bin() {
+        // AppImage / tarball installs have no `jetty` on PATH; JeTTY exports
+        // $JETTY_BIN to its shells, so every opt-in line must prefer it.
+        assert!(ZSH.contains(r#""${JETTY_BIN:-jetty}" --print-shell-integration zsh"#));
+        assert!(BASH.contains(r#""${JETTY_BIN:-jetty}" --print-shell-integration bash"#));
+        assert!(FISH.contains(r#""$JETTY_BIN" --print-shell-integration fish"#));
     }
 
     #[test]
