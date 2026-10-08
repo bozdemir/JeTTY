@@ -4518,7 +4518,10 @@ impl App {
         let tabs: Vec<(u64, String)> = self.tabs.iter().map(|t| (t.id.0, t.title.clone())).collect();
         let detached: Vec<(u64, String)> =
             self.detached.iter().map(|d| (d.tab.id.0, d.tab.title.clone())).collect();
-        let registry = crate::palette::build_registry(&themes, &tabs, &detached);
+        let mut registry = crate::palette::build_registry(&themes, &tabs, &detached);
+        // The backdrop rows, with the images in `<config dir>/backgrounds/`.
+        let images = crate::backdrop::background_images(&crate::config::Config::dir());
+        registry.extend(crate::palette::backdrop_entries(&images));
         let Some(ov) = self.ov_of_mut(s) else { return };
         ov.help_open = false;
         ov.palette_registry = registry;
@@ -5510,6 +5513,33 @@ impl App {
                     self.reattach_tab(p, event_loop);
                 }
             }
+            C::SetBackdrop(pick) => self.apply_backdrop_pick(pick),
+        }
+    }
+
+    /// A palette backdrop change: edit the `[backdrop]` mirror, (re)start or
+    /// drop the image decode, save the changed keys, repaint every window.
+    fn apply_backdrop_pick(&mut self, pick: crate::palette::BackdropPick) {
+        use crate::palette::BackdropPick as P;
+        let mut cfg = self.backdrop.cfg.clone();
+        match pick {
+            P::Off => cfg.mode = "none".into(),
+            P::Theme => cfg.mode = "theme".into(),
+            P::Gradient => cfg.mode = "gradient".into(),
+            P::Pattern(p) => {
+                cfg.mode = "pattern".into();
+                cfg.pattern = p.into();
+            }
+            P::Image(name) => {
+                cfg.mode = "image".into();
+                cfg.image = name;
+            }
+            P::ToggleAnimate => cfg.animate = !cfg.animate,
+        }
+        if self.backdrop.set_config(cfg) {
+            self.sync_backdrop_image();
+            self.persist();
+            self.mark_dirty_all();
         }
     }
 

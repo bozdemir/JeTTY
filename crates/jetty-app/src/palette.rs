@@ -83,6 +83,8 @@ pub enum PaletteCmd {
     SetTabColor(Option<u8>),
     /// Open Settings at a control ("Settings › Effects › Bloom"), by its id.
     SettingsAt(&'static str),
+    /// Change the `[backdrop]` look (see [`backdrop_entries`]).
+    SetBackdrop(BackdropPick),
 }
 
 /// The chrome entries: tab style / close buttons / window border pickers, the
@@ -136,6 +138,60 @@ fn chrome_entries() -> Vec<PaletteEntry> {
         title: "Tab color: None".to_string(),
         keywords: "tab colour color remove clear",
         cmd: PaletteCmd::SetTabColor(None),
+    });
+    v
+}
+
+/// A `[backdrop]` change the palette offers (visuals v2): a mode, a pattern,
+/// an image from `<config dir>/backgrounds/`, or the animation toggle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackdropPick {
+    Off,
+    Theme,
+    Gradient,
+    /// `stars`, `aurora`, `grid` or `synthwave`.
+    Pattern(&'static str),
+    /// A file name in `<config dir>/backgrounds/`.
+    Image(String),
+    ToggleAnimate,
+}
+
+/// The palette's backdrop rows: off / the theme look / a gradient, each
+/// pattern, one row per image in `<config dir>/backgrounds/` (`images`), and
+/// the animation toggle. Appended to the registry by the app.
+pub fn backdrop_entries(images: &[String]) -> Vec<PaletteEntry> {
+    let kw = "background backdrop wallpaper look";
+    let mut v = vec![
+        PaletteEntry { title: "Backdrop: off".into(), keywords: kw, cmd: PaletteCmd::SetBackdrop(BackdropPick::Off) },
+        PaletteEntry {
+            title: "Backdrop: theme look".into(),
+            keywords: "background backdrop wallpaper glow curated theme",
+            cmd: PaletteCmd::SetBackdrop(BackdropPick::Theme),
+        },
+        PaletteEntry {
+            title: "Backdrop: gradient".into(),
+            keywords: kw,
+            cmd: PaletteCmd::SetBackdrop(BackdropPick::Gradient),
+        },
+    ];
+    for p in ["stars", "aurora", "grid", "synthwave"] {
+        v.push(PaletteEntry {
+            title: format!("Backdrop: {p} pattern"),
+            keywords: "background backdrop wallpaper pattern",
+            cmd: PaletteCmd::SetBackdrop(BackdropPick::Pattern(p)),
+        });
+    }
+    for name in images {
+        v.push(PaletteEntry {
+            title: format!("Backdrop image: {name}"),
+            keywords: "background backdrop wallpaper picture photo image",
+            cmd: PaletteCmd::SetBackdrop(BackdropPick::Image(name.clone())),
+        });
+    }
+    v.push(PaletteEntry {
+        title: "Backdrop: toggle animation".into(),
+        keywords: "background backdrop animate motion move",
+        cmd: PaletteCmd::SetBackdrop(BackdropPick::ToggleAnimate),
     });
     v
 }
@@ -327,6 +383,20 @@ mod tests {
         let themes = jetty_core::theme_list();
         let tabs = vec![(1, "Tab 1".to_string()), (2, "Tab 2".to_string())];
         build_registry(&themes, &tabs, &[])
+    }
+
+    #[test]
+    fn backdrop_rows() {
+        let none = backdrop_entries(&[]);
+        assert!(none.iter().any(|e| e.cmd == PaletteCmd::SetBackdrop(BackdropPick::Off)));
+        assert!(none.iter().any(|e| e.cmd == PaletteCmd::SetBackdrop(BackdropPick::Pattern("aurora"))));
+        assert!(!none.iter().any(|e| matches!(e.cmd, PaletteCmd::SetBackdrop(BackdropPick::Image(_)))));
+        let with = backdrop_entries(&["wall.jpg".to_string()]);
+        assert!(with.iter().any(|e| e.title == "Backdrop image: wall.jpg"
+            && e.cmd == PaletteCmd::SetBackdrop(BackdropPick::Image("wall.jpg".into()))));
+        // Found by a natural query.
+        let hits = filter(&with, "wallpaper");
+        assert!(!hits.is_empty());
     }
 
     #[test]

@@ -214,6 +214,25 @@ impl BackdropState {
     }
 }
 
+/// The image files in `<config_dir>/backgrounds/` (PNG / JPEG by extension,
+/// sorted, at most 64) — what the palette offers (and Settings will list).
+/// Read only when the palette opens; a missing folder is an empty list.
+pub(crate) fn background_images(config_dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(config_dir.join("backgrounds")) else { return Vec::new() };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink()))
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| {
+            let lower = n.to_ascii_lowercase();
+            [".png", ".jpg", ".jpeg"].iter().any(|ext| lower.ends_with(ext))
+        })
+        .collect();
+    names.sort();
+    names.truncate(64);
+    names
+}
+
 /// Decode `key` on a worker thread and wake the event loop with the result.
 pub(crate) fn spawn_decode(proxy: winit::event_loop::EventLoopProxy<crate::app::AppEvent>, gen: u64, key: ImageKey) {
     let spawned = std::thread::Builder::new().name("jetty-backdrop".into()).spawn(move || {
@@ -363,6 +382,20 @@ mod tests {
         assert!(!s.animates(), "never on a CPU adapter");
         let img = BackdropState::new(BackdropConfig { animate: true, ..image_cfg("a.png", 0.0) });
         assert!(!img.animates(), "images do not animate");
+    }
+
+    #[test]
+    fn background_folder_listing() {
+        let dir = std::env::temp_dir().join(format!("jetty-bd-test-{}", std::process::id()));
+        let bg = dir.join("backgrounds");
+        std::fs::create_dir_all(&bg).unwrap();
+        for f in ["b.JPG", "a.png", "notes.txt", "c.jpeg"] {
+            std::fs::write(bg.join(f), b"x").unwrap();
+        }
+        std::fs::create_dir_all(bg.join("sub.png")).unwrap(); // a folder, not an image
+        assert_eq!(background_images(&dir), vec!["a.png", "b.JPG", "c.jpeg"]);
+        assert!(background_images(&dir.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
