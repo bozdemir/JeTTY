@@ -26,7 +26,8 @@
 #     2. fn request_settings_paint — the settings choke DEFINITION
 #     3. fn about_to_wait          — ALL animation/lifecycle drive sites
 #          (main_pending / detached_pending / settings_pending Poll re-requests,
-#           reflow/deadline services). Must stay raw: the macOS Poll/Wait seam.
+#           the paced ≤30 fps effect-animation frames, reflow/deadline
+#           services). Must stay raw: the macOS Poll/Wait seam.
 #          It is the ONLY place that decides another frame: the main and
 #          detached render tails no longer self-drive (pills repaint once at
 #          expiry via WaitUntil), so there is no render-tail whitelist entry.

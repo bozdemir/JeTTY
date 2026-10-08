@@ -13,6 +13,9 @@ pub struct GpuShared {
     device: wgpu::Device,
     queue: wgpu::Queue,
     backend_name: String,
+    /// The adapter is a CPU (software) rasterizer, e.g. lavapipe/llvmpipe:
+    /// every frame costs real CPU, so animations pace slower.
+    cpu: bool,
     /// Max 2D texture dimension the device enforces (surface size clamp).
     max_dim: u32,
     /// Set by the device-lost callback on a genuine loss (driver reset, GPU
@@ -177,6 +180,7 @@ impl GpuContext {
 
         let shared = Arc::new(GpuShared {
             backend_name: format!("{:?}", adapter.get_info().backend),
+            cpu: adapter.get_info().device_type == wgpu::DeviceType::Cpu,
             max_dim: device.limits().max_texture_dimension_2d,
             instance,
             adapter,
@@ -312,6 +316,13 @@ impl GpuContext {
     /// [`Self::with_shared`] / [`Self::new_sharing`] for every further window.
     pub fn shared(&self) -> Arc<GpuShared> {
         Arc::clone(&self.shared)
+    }
+
+    /// Whether the adapter is a CPU (software) rasterizer — lavapipe/llvmpipe,
+    /// WARP — from its reported device type: every frame then costs real CPU,
+    /// so continuous effect animations pace at a lower rate.
+    pub fn is_cpu_adapter(&self) -> bool {
+        self.shared.cpu
     }
 
     /// True once the shared device has been LOST (driver reset, GPU hang,

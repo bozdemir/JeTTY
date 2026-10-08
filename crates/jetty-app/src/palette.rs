@@ -63,6 +63,8 @@ pub enum PaletteCmd {
     SetTheme(usize),
     SelectTab(u64),
     Reattach(u64),
+    /// Apply `effects::effect_presets()[i]`.
+    EffectsPreset(usize),
     // ── Chrome (visuals v2) ──
     /// `tab_style` = the config string.
     SetTabStyle(&'static str),
@@ -238,6 +240,13 @@ pub fn build_registry(
             cmd: PaletteCmd::SetTheme(i),
         });
     }
+    for (i, p) in crate::effects::effect_presets().iter().enumerate() {
+        v.push(PaletteEntry {
+            title: format!("Effects preset: {}", p.name),
+            keywords: "effects look crt retro style preset scanline glow phosphor",
+            cmd: PaletteCmd::EffectsPreset(i),
+        });
+    }
     // Deep links into Settings, one per control ("Settings › Effects › Bloom"),
     // straight from the control table — a new setting gets one by itself.
     for link in crate::settings_ui::deep_links() {
@@ -389,6 +398,29 @@ mod tests {
         for q in ["reset keyboard", "mouse modes", "stuck keys"] {
             let hits = filter(&r, q);
             assert_eq!(hits[0].cmd, PaletteCmd::ResetInputModes, "top hit for {q:?}");
+        }
+    }
+
+    /// One "Effects preset: …" entry per preset, in preset order, each carrying
+    /// its index; typing a preset's name finds it first.
+    #[test]
+    fn registry_contains_every_effects_preset() {
+        let r = reg();
+        let presets = crate::effects::effect_presets();
+        let entries: Vec<&PaletteEntry> =
+            r.iter().filter(|e| e.title.starts_with("Effects preset: ")).collect();
+        assert_eq!(entries.len(), presets.len());
+        for (i, (e, p)) in entries.iter().zip(presets).enumerate() {
+            assert_eq!(e.title, format!("Effects preset: {}", p.name));
+            assert_eq!(e.cmd, PaletteCmd::EffectsPreset(i));
+        }
+        for q in ["green phosphor", "e-ink", "retro crt"] {
+            let hits = filter(&r, q);
+            assert!(
+                matches!(hits[0].cmd, PaletteCmd::EffectsPreset(_)),
+                "top hit for {q:?} is {:?}",
+                hits[0].title
+            );
         }
     }
 

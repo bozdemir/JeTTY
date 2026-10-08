@@ -599,6 +599,11 @@ fn caret_drives_frames(
     caret_anim.is_some() && key_paint_due.is_none()
 }
 
+/// Whether an OSC 133 completion reports a FAILED command (a nonzero exit).
+fn completion_failed(c: &jetty_core::CommandCompletion) -> bool {
+    c.exit_code.is_some_and(|e| e != 0)
+}
+
 /// Whether the user is watching THIS main tab: only the ACTIVE tab of a
 /// watched main window is on screen. A background tab's completion must notify
 /// even while the user looks at another tab of a focused window (its activity
@@ -832,11 +837,11 @@ pub struct App {
     pending_autohide_at: Option<std::time::Instant>,
     /// One-time guard for the Wayland "positioning is a no-op" diagnostic.
     wayland_warned: bool,
-    /// Free-running clock for CRT animation (roll/flicker/jitter). Initialized
-    /// once at construction and never reset; `elapsed().as_secs_f32()` feeds the
-    /// CRT uniform's `time`. The shader uses `sin`, so unbounded growth is
-    /// fine. This clock does NOT by itself drive redraws — the redraw guard only
-    /// self-schedules frames while an animate toggle is on (see `crt_anim_live`).
+    /// Free-running clock for CRT animation (roll/flicker/jitter, the animated
+    /// grain/glitch seeds). Initialized once at construction and never reset;
+    /// `CrtParams::build` wraps it for the shader. This clock does NOT by itself
+    /// drive redraws — `about_to_wait` paces frames only while an animation is
+    /// live (see `crt_anim_live`, `effects::anim_step`).
     crt_clock: std::time::Instant,
     /// Start instant of the active summon (crystallize) animation, or None when
     /// idle. While Some (and the window is effectively visible) `about_to_wait`
@@ -5354,6 +5359,15 @@ impl App {
                     self.redraw_main_and_detached();
                 }
             }
+            // An effects preset is a macro over `[effects]` keys (no preset name
+            // is stored): write them, save, repaint every window.
+            C::EffectsPreset(i) => {
+                if let Some(p) = crate::effects::effect_presets().get(i) {
+                    p.patch.apply_to(&mut self.fx);
+                    self.persist();
+                    self.redraw_main_and_detached();
+                }
+            }
             // Id-bearing dynamic actions: a tab that closed (or moved) between
             // open and Enter resolves to nothing — never to its neighbour.
             C::SelectTab(id) => {
@@ -6477,6 +6491,8 @@ impl App {
         // surfaced after it; empty on every normal pass.
         let mut runsel_notices: Vec<crate::runsel::Notice> = Vec::new();
         let title_mode = self.tab_title_mode;
+        // The ACTIVE tab rang the bell this drain (`glitch_on_bell`).
+        let mut active_bell = false;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             let (had, title_changed, notice) = Self::drain_one_tab(tab, &mut vt_read, title_mode);
             chrome_changed |= title_changed;
@@ -6498,11 +6514,17 @@ impl App {
             if i == self.active && had {
                 active_had_data = true;
             }
+            if i == self.active && rang {
+                active_bell = true;
+            }
             if tab.terminal.child_exited() || tab.pty.child_exited() {
                 exited.push(i);
             }
         }
         self.vt_bytes += vt_read;
+        if active_bell && self.fx.glitch_on_bell {
+            self.trigger_main_glitch();
+        }
         for n in runsel_notices {
             self.show_status_pill(n);
         }
@@ -6852,6 +6874,11 @@ impl App {
                     badge_changed = true;
                 }
             }
+            // Event glitch (`glitch_on_error`): a command FAILED in the tab on
+            // screen. Before `if enabled` — it is not a notification either.
+            if i == active && self.fx.glitch_on_error && completions.iter().any(completion_failed) {
+                self.trigger_main_glitch();
+            }
             if enabled {
                 for c in completions {
                     let watching = main_tab_watched(main_watching, i, active);
@@ -6879,11 +6906,26 @@ impl App {
         }
         for i in 0..self.detached.len() {
             let completions = self.detached[i].tab.terminal.take_completions();
+            if self.fx.glitch_on_error && completions.iter().any(completion_failed) {
+                let dw = &mut self.detached[i];
+                if !dw.occluded && dw.glitch.trigger(std::time::Instant::now()) {
+                    dw.request_paint();
+                }
+            }
             if enabled {
                 for c in completions {
                     self.maybe_notify_detached(i, c);
                 }
             }
+        }
+    }
+
+    /// Start the main window's event glitch (rate-limited to one per second)
+    /// when it is on screen; its first frame paints now, `about_to_wait` paces
+    /// the rest of the 200 ms burst.
+    fn trigger_main_glitch(&mut self) {
+        if self.visible && !self.main_occluded && self.glitch.trigger(std::time::Instant::now()) {
+            self.request_main_paint();
         }
     }
 
@@ -7387,6 +7429,7 @@ impl App {
         // macOS — so they can't pin about_to_wait in Poll and spin 100% CPU while
         // hidden (F18). Re-armed naturally on the next keystroke/summon.
         self.caret_anim = None;
+        self.glitch.cancel();
         self.pending_dock_frames = 0;
         self.pending_center_frames = 0;
         // Paints owed to a now-invisible window: drop them (the next summon
@@ -7656,6 +7699,7 @@ impl App {
                 // RedrawRequested (never delivered to a hidden macOS window) so
                 // they don't pin Poll and spin 100% CPU while hidden (F18).
                 self.caret_anim = None;
+                self.glitch.cancel();
                 self.pending_dock_frames = 0;
                 self.pending_center_frames = 0;
                 // Paints owed to a now-invisible window (idle HUD, keystroke
@@ -10460,6 +10504,10 @@ impl ApplicationHandler<AppEvent> for App {
             self.key_paint_due = None;
             main_settled = true;
         }
+        // An event-glitch burst that just ended owes one clean frame.
+        if self.glitch.expire(now) {
+            main_settled = true;
+        }
         if main_settled && main_visible {
             self.request_main_paint();
             painted = true;
@@ -10472,6 +10520,9 @@ impl ApplicationHandler<AppEvent> for App {
             }
             if dw.key_paint_due.is_some_and(|d| now >= d) {
                 dw.key_paint_due = None;
+                settled = true;
+            }
+            if dw.glitch.expire(now) {
                 settled = true;
             }
             if settled && !dw.occluded {
@@ -10593,19 +10644,18 @@ impl ApplicationHandler<AppEvent> for App {
         // (no acquire retry pending): a hidden, minimized or acquire-failing
         // window must never Poll-render invisible frames (F8/F16/F17/F18). The
         // caret burst starts pumping only after its first frame
-        // (`caret_drives_frames`). `crt_anim_live()` is false whenever CRT
-        // animation is off, so static/off CRT keeps idle at Wait. Poll is
-        // throttled to vsync by Fifo present. The dock/center re-assert counters
-        // only need `visible` (they move the window, they don't paint) and count
-        // down in RedrawRequested, so they are bounded. A pending (debounced)
-        // reflow never selects Poll — it is a single WaitUntil wake below.
+        // (`caret_drives_frames`). Poll is throttled to vsync by Fifo present.
+        // The dock/center re-assert counters only need `visible` (they move the
+        // window, they don't paint) and count down in RedrawRequested, so they
+        // are bounded. A pending (debounced) reflow never selects Poll — it is a
+        // single WaitUntil wake below. Effect animations are NOT here: they are
+        // paced by timed wakes just below.
         let main_can_animate =
             main_visible && self.gpu.is_some() && self.acquire_retry.is_none();
         let main_pending = (main_can_animate
             && (self.summon_anim.is_some()
                 || self.slide_anim.is_some()
                 || self.summon_pending
-                || self.fx.crt_anim_live()
                 || caret_drives_frames(self.caret_anim, self.key_paint_due)))
             || (self.visible && (self.pending_dock_frames > 0 || self.pending_center_frames > 0));
         if main_pending {
@@ -10613,19 +10663,66 @@ impl ApplicationHandler<AppEvent> for App {
                 w.request_redraw();
             }
         }
-        // Detached windows animate under the SAME gates, PER WINDOW: an animated
-        // CRT sub-effect (shared setting) or a live caret-flash burst — only for
-        // windows that are not occluded/minimized and whose swapchain is healthy.
-        let crt_live = self.fx.crt_anim_live();
+        // Detached windows animate under the SAME gates, PER WINDOW: a live
+        // caret-flash burst — only for windows that are not occluded/minimized
+        // and whose swapchain is healthy.
         let detached_animates = |d: &crate::detached::DetachedWindow| {
-            !d.occluded
-                && d.acquire_retry.is_none()
-                && (crt_live || caret_drives_frames(d.caret_anim, d.key_paint_due))
+            !d.occluded && d.acquire_retry.is_none() && caret_drives_frames(d.caret_anim, d.key_paint_due)
         };
         let detached_pending = self.detached.iter().any(detached_animates);
         if detached_pending {
             for dw in self.detached.iter().filter(|d| detached_animates(d)) {
                 dw.window.request_redraw();
+            }
+        }
+        // Paced effect animation — CRT roll/flicker/jitter, animated grain, an
+        // event-glitch burst: at most 30 fps (15 on a CPU adapter) by ONE timed
+        // wake per frame, never Poll at the display rate. A continuous animation
+        // pauses while its window (or the Settings window previewing it) is
+        // unfocused, unless `animate_unfocused`; a bounded glitch burst always
+        // plays out. Same gates per window as above (`anim_step` → Idle).
+        let anim_interval = crate::effects::anim_interval(
+            self.gpu.as_ref().is_some_and(|g| g.is_cpu_adapter()),
+        );
+        let crt_live = self.fx.crt_anim_live();
+        let settings_focused = self
+            .settings_window
+            .as_ref()
+            .is_some_and(|w| self.last_focused_window == Some(w.id()));
+        let continuous = |focused: bool| {
+            crt_live && crate::effects::continuous_anim_allowed(focused || settings_focused, self.fx.animate_unfocused)
+        };
+        let mut anim_wake: Option<std::time::Instant> = None;
+        let mut next_anim = |wake: crate::effects::AnimWake| -> bool {
+            match wake {
+                crate::effects::AnimWake::PaintNow => return true,
+                crate::effects::AnimWake::At(t) => anim_wake = Some(anim_wake.map_or(t, |w| w.min(t))),
+                crate::effects::AnimWake::Idle => {}
+            }
+            false
+        };
+        if next_anim(crate::effects::anim_step(
+            continuous(self.main_focused) || self.glitch.active(now),
+            main_can_animate,
+            self.last_present_at,
+            now,
+            anim_interval,
+        )) {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+                painted = true;
+            }
+        }
+        for dw in &self.detached {
+            if next_anim(crate::effects::anim_step(
+                continuous(dw.focused) || dw.glitch.active(now),
+                !dw.occluded && dw.acquire_retry.is_none(),
+                dw.last_present_at,
+                now,
+                anim_interval,
+            )) {
+                dw.window.request_redraw();
+                painted = true;
             }
         }
         let settings_pending = self.settings_window.is_some()
@@ -10718,6 +10815,18 @@ impl ApplicationHandler<AppEvent> for App {
             {
                 merge_wake(&mut wake_at, d);
             }
+        }
+        // The next paced effect-animation frame, and the end of a glitch burst
+        // (its clean frame) — both strictly future (due ones painted above).
+        if let Some(t) = anim_wake {
+            merge_wake(&mut wake_at, t);
+        }
+        for t in std::iter::once(self.glitch.ends_at())
+            .chain(self.detached.iter().map(|d| d.glitch.ends_at()))
+            .flatten()
+            .filter(|&t| t > now)
+        {
+            merge_wake(&mut wake_at, t);
         }
         // Deferred flood paints (due ones were painted above → strictly future).
         if let Some(t) = self.paced_paint_at {
@@ -16516,17 +16625,18 @@ mod paint_choke_tests {
 
     #[test]
     fn no_new_raw_request_redraw_in_app() {
-        // 11 = request_main_paint def (1) + request_settings_paint def (1)
-        //    + about_to_wait animation/lifecycle drive (6: main/detached reflow
+        // 13 = request_main_paint def (1) + request_settings_paint def (1)
+        //    + about_to_wait animation/lifecycle drive (8: main/detached reflow
         //      services, search refresh, main_pending, detached_pending,
-        //      settings_pending)
+        //      settings_pending, and the PACED effect-animation frame for the
+        //      main window and for each detached window — `effects::anim_step`)
         //    + dock re-assert (1) + center re-assert (1)
         //    + main-window-open first-frame nudge on a local `window` binding (1).
         // The render tails no longer self-drive: `about_to_wait` is the ONLY
         // place that decides another frame.
         assert_eq!(
             raw_calls(include_str!("app.rs")),
-            11,
+            13,
             "raw request_redraw count changed in app.rs — run scripts/check-paint-choke.sh"
         );
     }
