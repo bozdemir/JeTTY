@@ -764,7 +764,7 @@ pub struct TextLayer {
     /// frame (same grid) reuses them — decorations never rebuild per frame; only
     /// the CURSOR quads do (drawn app-side). Consumed via `decoration_rects()`.
     deco_rects: Vec<crate::quad::Rect>,
-    deco_cache_key: Option<(u64, u32, u32, u32, u32, u32, u32, u32)>,
+    deco_cache_key: Option<(u64, u32, u32, u32, u32, u32, u32)>,
     /// Chrome text measurement (`ChromeMeasure`): rendered width per label for
     /// non-title [0] and tab-title [1] chrome. Chrome labels are mostly static
     /// strings rebuilt every rendered frame, so a hit is one hash lookup and a
@@ -788,9 +788,9 @@ pub struct TextLayer {
     emoji_family: Option<Option<Arc<str>>>,
     /// Light line thickness (px) of the built-in glyphs at the current font size.
     builtin_light: u16,
-    /// Where underlines rest, px below a cell's top: the bottom of the font's
-    /// line box (see `measure_underline_bottom`).
-    underline_bottom: f32,
+    /// Where a row's underlines go, measured from the grid font (see
+    /// `measure_underline`).
+    underline: crate::quad::UnderlineGeom,
     /// Per-frame scratch: the built-in glyphs handed to glyphon.
     custom_scratch: Vec<CustomGlyph>,
     /// The (empty) buffer of the text area that carries the built-in glyphs.
@@ -881,7 +881,7 @@ impl TextLayer {
 
         // Measure a monospace cell by shaping a single 'M'.
         let cell_w = measure_advance_family(&mut font_system, metrics, family);
-        let underline_bottom = measure_underline_bottom(&mut font_system, metrics, family);
+        let underline = measure_underline(&mut font_system, metrics, family);
         let cell_h = line_height;
 
         Self {
@@ -925,25 +925,28 @@ impl TextLayer {
             color_emoji: true,
             emoji_family: None,
             builtin_light: builtin::light_thickness(font_size),
-            underline_bottom,
+            underline,
             custom_scratch: Vec::new(),
             empty_buffer: Buffer::new_empty(metrics),
         }
     }
 
-    /// Where underlines rest, in px below a cell's top: the bottom of the grid
-    /// font's line box (baseline + descent), never below the cell. At the default
-    /// line height that is the cell bottom; when a taller line height adds space
-    /// around the text, underlines stay under the text instead of drifting to the
-    /// cell edge. Pass it to `link_underline_rects_at` so link underlines match.
-    pub fn underline_bottom(&self) -> f32 {
-        self.underline_bottom
+    /// Where a grid row's underlines go (px from the row's top), measured from
+    /// the grid font: single / dotted / dashed strokes at the font's underline
+    /// position below the baseline, the undercurl resting on the bottom of the
+    /// line box, a thickness from the font size — so a taller `line_height`
+    /// keeps them with the text instead of at the cell edge. Pass it to
+    /// `link_underline_rects_at` so link underlines match.
+    pub fn underline_geom(&self) -> crate::quad::UnderlineGeom {
+        self.underline
     }
 
-    /// Re-measure `underline_bottom` (font family / size / line height changed).
-    fn refresh_underline_bottom(&mut self) {
+    /// Re-measure `underline` (font family / size / line height changed) and
+    /// drop the cached decoration quads built with the old one.
+    fn refresh_underline(&mut self) {
         let fam = Arc::clone(&self.font_family);
-        self.underline_bottom = measure_underline_bottom(&mut self.font_system, self.metrics, &fam);
+        self.underline = measure_underline(&mut self.font_system, self.metrics, &fam);
+        self.deco_cache_key = None;
     }
 
     /// Draw box drawing (U+2500–257F), block elements, Powerline separators,
@@ -1081,7 +1084,7 @@ impl TextLayer {
         self.shape_gen = self.shape_gen.wrapping_add(1);
         // Re-measure cell width with the new family.
         self.cell_w = measure_advance_family(&mut self.font_system, self.metrics, name);
-        self.refresh_underline_bottom();
+        self.refresh_underline();
         // At the default UI family, non-title chrome renders in THIS family, so
         // every cached chrome width is stale.
         self.clear_measure_caches();
@@ -1150,7 +1153,7 @@ impl TextLayer {
         self.cell_w = self.measure_chrome_advance();
         self.cell_h = line_height;
         self.builtin_light = builtin::light_thickness(font_size);
-        self.refresh_underline_bottom();
+        self.refresh_underline();
         // Cached fallback/grapheme glyphs were shaped at the old size; drop them.
         // The shape-gen bump drops every cached grid row too, so rows are rebuilt
         // at the new metrics with the new cell width as their monospace snap
@@ -1463,17 +1466,16 @@ impl TextLayer {
             top_offset.to_bits(),
             cols as u32,
             rows as u32,
-            self.underline_bottom.to_bits(),
         );
         if self.deco_cache_key != Some(deco_key) {
             self.deco_rects.clear();
             // Built in grid space (x from the grid's left edge), then placed.
-            // Underlines rest on the font's line box (`underline_bottom`).
+            // Underlines are placed by the font (`underline_geom`).
             crate::quad::text_decoration_rects_at(
                 snapshot,
                 cell_w,
                 cell_h,
-                self.underline_bottom,
+                self.underline,
                 top_offset,
                 &mut self.deco_rects,
             );
@@ -2151,21 +2153,39 @@ fn pick_emoji_family<'a>(names: impl Iterator<Item = &'a str>) -> Option<String>
         .map(str::to_string)
 }
 
-/// The bottom of `family`'s line box in a grid row, px below the row's top:
-/// baseline + descent as cosmic-text lays the row out (the box is centred in
-/// the line height), rounded, never below the row. See
-/// [`TextLayer::underline_bottom`].
-fn measure_underline_bottom(font_system: &mut FontSystem, metrics: Metrics, family: &str) -> f32 {
-    let mut b = Buffer::new(font_system, metrics);
-    b.set_size(font_system, None, Some(metrics.line_height));
-    b.set_text(font_system, "M", &Attrs::new().family(Family::Name(family)), Shaping::Basic, None);
-    let baseline = b.layout_runs().next().map(|r| r.line_y - r.line_top);
-    let descent = b.lines.first().and_then(|l| l.layout_opt()).and_then(|l| l.first()).map(|l| l.max_descent);
+/// Where a grid row's underlines go for `family` at `metrics` (see
+/// [`TextLayer::underline_geom`]), from a row laid out like the grid's (the
+/// glyph box centred in the line height):
+/// * `thickness` — `round(0.1 · font px)`, at least 1: the historical
+///   `round(0.075 · cell_h)` at the default line height, but independent of it;
+/// * `bottom` — baseline + descent (the line box bottom), rounded, inside the
+///   row: the cell bottom at the default line height;
+/// * `top` — the font's underline position (the post table's offset of the
+///   stroke's top below the baseline; a fifth of the descent without one),
+///   rounded, at least a pixel under the baseline, the stroke above `bottom`.
+fn measure_underline(font_system: &mut FontSystem, metrics: Metrics, family: &str) -> crate::quad::UnderlineGeom {
     let lh = metrics.line_height;
-    match (baseline, descent) {
-        (Some(y), Some(d)) if (y + d).is_finite() => (y + d).round().clamp(1.0, lh),
-        _ => lh,
-    }
+    let px = metrics.font_size;
+    let thickness = (px * 0.1).round().max(1.0);
+    let mut b = Buffer::new(font_system, metrics);
+    b.set_size(font_system, None, Some(lh));
+    b.set_text(font_system, "M", &Attrs::new().family(Family::Name(family)), Shaping::Basic, None);
+    let probe = b.layout_runs().next().and_then(|r| r.glyphs.first().map(|g| (r.line_y - r.line_top, g.font_id, g.font_weight)));
+    let descent = b.lines.first().and_then(|l| l.layout_opt()).and_then(|l| l.first()).map(|l| l.max_descent);
+    let (Some((baseline, font_id, weight)), Some(descent)) = (probe, descent) else {
+        return crate::quad::UnderlineGeom::cell_bottom(lh);
+    };
+    let below = font_system
+        .get_font(font_id, weight)
+        .and_then(|f| {
+            let m = f.metrics();
+            m.underline.map(|u| -u.offset / m.units_per_em.max(1) as f32 * px)
+        })
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(descent * 0.2);
+    let bottom = (baseline + descent).round().clamp(thickness, lh);
+    let top = (baseline + below.max(1.0)).round().clamp(0.0, bottom - thickness);
+    crate::quad::UnderlineGeom { top, bottom, thickness }
 }
 
 fn measure_advance_family(font_system: &mut FontSystem, metrics: Metrics, family: &str) -> f32 {
@@ -2464,21 +2484,26 @@ mod tests {
     }
 
     #[test]
-    fn underlines_follow_the_line_box_not_the_cell_edge() {
-        // The default 1.3 line height keeps today's look (the cell bottom); a
-        // taller line keeps the underline under the text. Needs a font installed
-        // (any family resolves through fallback) — skipped on a fontless system.
+    fn underlines_follow_the_text_not_the_cell_edge() {
+        // Measured from the font: the stroke just under the baseline, the line
+        // box bottom near the cell bottom at the default line height, and the
+        // whole geometry moving with the text in a taller line. Needs a
+        // monospace font (CI may lack MesloLGS NF) — skipped without one.
         let mut fs = TextLayer::build_font_system();
-        if fs.db().faces().next().is_none() {
-            return;
+        let Some(fam) = mono_family(&fs) else { return };
+        let at = |fs: &mut FontSystem, lh: f32| measure_underline(fs, Metrics::new(16.0, lh), &fam);
+        let d = at(&mut fs, 21.0);
+        assert_eq!(d.thickness, 2.0, "round(0.1 × 16 px), the historical 2 px at 21 px rows");
+        assert!(d.bottom > 18.0 && d.bottom <= 21.0, "{d:?}: the line box bottom, near the cell bottom");
+        assert!(d.top + d.thickness <= d.bottom && d.top > 12.0, "{d:?}: under the baseline, above the bottom");
+        // A 2.0 line height adds 11 px, split above and below the glyph box: the
+        // geometry moves down ~5.5 px with the text, nowhere near the cell edge.
+        let t = at(&mut fs, 32.0);
+        assert_eq!(t.thickness, d.thickness, "thickness ignores the line height");
+        for (a, b) in [(d.top, t.top), (d.bottom, t.bottom)] {
+            assert!((b - a - 5.5).abs() <= 1.0, "{d:?} → {t:?}");
         }
-        let fam = "MesloLGS NF";
-        let at_default = measure_underline_bottom(&mut fs, Metrics::new(16.0, 21.0), fam);
-        assert!((20.0..=21.0).contains(&at_default), "{at_default}");
-        let tall = measure_underline_bottom(&mut fs, Metrics::new(16.0, 32.0), fam);
-        assert!(tall < 30.0 && tall > 16.0, "{tall}: under the text, not at the cell edge");
-        // The extra 11 px are split above and below the text: it moves ~5.5 px.
-        assert!((tall - at_default - 5.5).abs() <= 1.0, "{at_default} → {tall}");
+        assert!(t.bottom < 29.0, "{t:?}");
     }
 
     #[test]

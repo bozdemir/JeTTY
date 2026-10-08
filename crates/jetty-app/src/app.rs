@@ -14536,7 +14536,7 @@ fn render_grid_scene(
         let p12 = s.theme.palette[12];
         // On the same line-box bottom as the SGR underlines.
         let mut link = jetty_render::link_underline_rects_at(
-            spans, [p12[0], p12[1], p12[2], 255], cell_w, cell_h, text.underline_bottom(), grid_origin_y,
+            spans, [p12[0], p12[1], p12[2], 255], cell_w, cell_h, text.underline_geom(), grid_origin_y,
         );
         jetty_render::shift_x(&mut link, origin.left);
         rects.extend(link);

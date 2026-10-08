@@ -1041,7 +1041,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 [p12[0], p12[1], p12[2], 255],
                 cell_w,
                 cell_h,
-                text.underline_bottom(),
+                text.underline_geom(),
                 shot_origin.top,
             );
             jetty_render::shift_x(&mut link, shot_origin.left);

@@ -591,6 +591,42 @@ fn decoration_thickness(cell_h: f32) -> f32 {
     (cell_h * 0.075).round().max(1.0)
 }
 
+/// Where a row's text decorations go, in px from the row's top (the grid
+/// layer measures it from its font: `TextLayer::underline_geom`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UnderlineGeom {
+    /// Top of a (single / dotted / dashed / upper double) underline stroke —
+    /// the font's own underline position below the baseline.
+    pub top: f32,
+    /// Bottom of the text's line box: the undercurl rests on it and no
+    /// underline reaches below it. The cell bottom at the default line height.
+    pub bottom: f32,
+    /// Stroke thickness of underlines and strikethrough.
+    pub thickness: f32,
+}
+
+impl UnderlineGeom {
+    /// Everything resting on the cell bottom — the look before the font's
+    /// underline position was used; what a caller without a text layer gets.
+    pub fn cell_bottom(cell_h: f32) -> Self {
+        let th = decoration_thickness(cell_h);
+        UnderlineGeom { top: cell_h - th, bottom: cell_h, thickness: th }
+    }
+
+    /// Clamped into a `cell_h`-tall row: a thickness of at least 1 px, the
+    /// bottom inside the row, the stroke above the bottom. Garbage (NaN) falls
+    /// back to [`Self::cell_bottom`].
+    fn within(self, cell_h: f32) -> Self {
+        if !(self.top.is_finite() && self.bottom.is_finite() && self.thickness.is_finite()) {
+            return Self::cell_bottom(cell_h);
+        }
+        let thickness = self.thickness.clamp(1.0, (cell_h * 0.5).max(1.0));
+        let bottom = self.bottom.clamp(thickness, cell_h.max(thickness));
+        let top = self.top.clamp(0.0, bottom - thickness);
+        UnderlineGeom { top, bottom, thickness }
+    }
+}
+
 /// Fold ONE cell's decoration state (strike + underline style, and the relevant
 /// colors) into a hasher. Used by both `grid_decoration_key` (the pure,
 /// testable seam) and, inline, by `TextLayer::render_to` so the two never drift.
@@ -631,32 +667,36 @@ fn undercurl_band(th: f32) -> f32 {
 }
 
 /// Emit the quads for ONE horizontal underline run of the given `style` spanning
-/// `[x0, x0+run_w)` with its bottom edge at `bottom`. Single/double are wide
-/// quads; dotted/dashed/undercurl are ONE patterned instance each, anti-aliased
-/// by the shader (`Rect::decoration`). `color` is the resolved underline color
-/// (uline, already falling back to fg cell-side). `x0` is a cell edge.
+/// `[x0, x0+run_w)` in the row whose top is `row_top`, placed by `ul` (already
+/// `within` the row). Single/double are wide quads; dotted/dashed/undercurl are
+/// ONE patterned instance each, anti-aliased by the shader (`Rect::decoration`).
+/// `color` is the resolved underline color (uline, already falling back to fg
+/// cell-side). `x0` is a cell edge.
 #[allow(clippy::too_many_arguments)]
 fn emit_underline(
     out: &mut Vec<Rect>,
     style: u8,
     x0: f32,
     run_w: f32,
-    bottom: f32,
-    th: f32,
+    row_top: f32,
+    ul: UnderlineGeom,
     cell_w: f32,
     color: [u8; 4],
 ) {
     use jetty_core::attr;
-    let y = bottom - th; // top of the (lowest) stroke
+    let th = ul.thickness;
+    let y = row_top + ul.top; // top of the stroke, at the font's underline position
+    let floor = row_top + ul.bottom; // nothing reaches below the line box
     match style {
         attr::UL_SINGLE => {
             out.push(Rect::new(x0, y, run_w, th, color));
         }
         attr::UL_DOUBLE => {
-            // Two strokes separated by a `th` gap: lower flush at the cell bottom,
-            // upper `2*th` above it.
-            out.push(Rect::new(x0, y, run_w, th, color));
-            out.push(Rect::new(x0, y - 2.0 * th, run_w, th, color));
+            // Two strokes a `th` gap apart, the upper on the underline position —
+            // lifted together when the lower one would pass the line box bottom.
+            let lower = (y + 2.0 * th).min(floor - th);
+            out.push(Rect::new(x0, lower - 2.0 * th, run_w, th, color));
+            out.push(Rect::new(x0, lower, run_w, th, color));
         }
         attr::UL_DOTTED => {
             // Round `th`-wide dots on a `2·th` pitch (at least 3 px).
@@ -667,11 +707,12 @@ fn emit_underline(
             out.push(Rect::decoration(x0, y, run_w, th, color, Deco::Dashed, cell_w));
         }
         attr::UL_UNDERCURL => {
-            // A sine of one cell's wavelength in a band resting on the underline's
-            // bottom edge: weight t = max(th, 1.5) → stroke 0.65·t, amplitude
-            // 0.75·t, band 2.15·t + 1 (the shader decodes t from the height).
-            let band = undercurl_band(th);
-            out.push(Rect::decoration(x0, bottom - band, run_w, band, color, Deco::Undercurl, cell_w.max(4.0)));
+            // A sine of one cell's wavelength in a band resting on the line box
+            // bottom (the descender zone, clear of the baseline): weight
+            // t = max(th, 1.5) → stroke 0.65·t, amplitude 0.75·t, band 2.15·t + 1
+            // (the shader decodes t from the height).
+            let band = undercurl_band(th).min(ul.bottom);
+            out.push(Rect::decoration(x0, floor - band, run_w, band, color, Deco::Undercurl, cell_w.max(4.0)));
         }
         _ => {}
     }
@@ -688,8 +729,8 @@ fn emit_underline(
 /// already the theme/SGR-58 color with an fg fallback — and `fg` for strike), so
 /// every theme is covered with no per-theme code.
 ///
-/// Underlines rest on the cell bottom; see [`text_decoration_rects_at`] to rest
-/// them on the font's line box instead (`TextLayer::underline_bottom`).
+/// Underlines rest on the cell bottom; see [`text_decoration_rects_at`] to place
+/// them by the font instead (`TextLayer::underline_geom`).
 pub fn text_decoration_rects(
     snap: &jetty_core::GridSnapshot,
     cell_w: f32,
@@ -697,23 +738,24 @@ pub fn text_decoration_rects(
     y_offset: f32,
     out: &mut Vec<Rect>,
 ) {
-    text_decoration_rects_at(snap, cell_w, cell_h, cell_h, y_offset, out);
+    text_decoration_rects_at(snap, cell_w, cell_h, UnderlineGeom::cell_bottom(cell_h), y_offset, out);
 }
 
-/// [`text_decoration_rects`] with underlines resting `ul_bottom` px below each
-/// cell's top (≤ `cell_h`): the bottom of the text's line box, which a taller
-/// line height moves up from the cell bottom.
+/// [`text_decoration_rects`] with underlines placed by `ul` (px from each row's
+/// top, clamped into the row): the font's underline position, and the line box
+/// bottom for the undercurl — so a taller line height keeps them under the text
+/// instead of at the cell edge.
 pub fn text_decoration_rects_at(
     snap: &jetty_core::GridSnapshot,
     cell_w: f32,
     cell_h: f32,
-    ul_bottom: f32,
+    ul: UnderlineGeom,
     y_offset: f32,
     out: &mut Vec<Rect>,
 ) {
     use jetty_core::attr;
-    let ul_bottom = if ul_bottom > 0.0 && ul_bottom <= cell_h { ul_bottom } else { cell_h };
-    let th = decoration_thickness(cell_h);
+    let ul = ul.within(cell_h);
+    let th = ul.thickness;
     for row in 0..snap.rows {
         // --- underline pass: coalesce equal (style, uline) runs ---
         let mut col = 0;
@@ -736,9 +778,9 @@ pub fn text_decoration_rects_at(
             }
             let x0 = start as f32 * cell_w;
             let run_w = (col - start) as f32 * cell_w;
-            let bottom = y_offset + row as f32 * cell_h + ul_bottom;
+            let row_top = y_offset + row as f32 * cell_h;
             let color = [uline[0], uline[1], uline[2], 255];
-            emit_underline(out, style, x0, run_w, bottom, th, cell_w, color);
+            emit_underline(out, style, x0, run_w, row_top, ul, cell_w, color);
         }
         // --- strikethrough pass: coalesce equal-fg runs, drawn at mid-cell ---
         let mut col = 0;
@@ -778,30 +820,29 @@ pub fn link_underline_rects(
     cell_h: f32,
     y_offset: f32,
 ) -> Vec<Rect> {
-    link_underline_rects_at(spans, color, cell_w, cell_h, cell_h, y_offset)
+    link_underline_rects_at(spans, color, cell_w, cell_h, UnderlineGeom::cell_bottom(cell_h), y_offset)
 }
 
-/// [`link_underline_rects`] resting on `ul_bottom` (see
-/// [`text_decoration_rects_at`]) — pass the grid layer's
-/// `TextLayer::underline_bottom` so link and SGR underlines line up.
+/// [`link_underline_rects`] placed by `ul` (see [`text_decoration_rects_at`]) —
+/// pass the grid layer's `TextLayer::underline_geom` so link and SGR
+/// underlines line up.
 pub fn link_underline_rects_at(
     spans: &[(usize, usize, usize)],
     color: [u8; 4],
     cell_w: f32,
     cell_h: f32,
-    ul_bottom: f32,
+    ul: UnderlineGeom,
     y_offset: f32,
 ) -> Vec<Rect> {
-    let th = decoration_thickness(cell_h);
-    let ul_bottom = if ul_bottom > 0.0 && ul_bottom <= cell_h { ul_bottom } else { cell_h };
+    let ul = ul.within(cell_h);
     spans
         .iter()
         .map(|&(row, c0, c1)| {
             Rect::new(
                 c0 as f32 * cell_w,
-                y_offset + row as f32 * cell_h + ul_bottom - th,
+                y_offset + row as f32 * cell_h + ul.top,
                 (c1 - c0 + 1) as f32 * cell_w,
-                th,
+                ul.thickness,
                 color,
             )
         })
@@ -1239,32 +1280,41 @@ mod tests {
     }
 
     #[test]
-    fn underlines_rest_on_the_given_line_box_bottom() {
-        let mut g = grid(4, 2);
+    fn underlines_are_placed_by_the_underline_geometry() {
+        let mut g = grid(6, 2);
         for c in 0..2 {
-            g.cells[4 + c].attrs = attr::UL_SINGLE << attr::UL_SHIFT; // row 1
-            g.cells[6 + c].attrs = attr::UL_UNDERCURL << attr::UL_SHIFT;
+            g.cells[6 + c].attrs = attr::UL_SINGLE << attr::UL_SHIFT; // row 1
+            g.cells[8 + c].attrs = attr::UL_UNDERCURL << attr::UL_SHIFT;
+            g.cells[10 + c].attrs = attr::UL_DOUBLE << attr::UL_SHIFT;
         }
-        // Default: the cell bottom (same as `text_decoration_rects`).
+        let row_top = 5.0 + 32.0;
+        // `text_decoration_rects` = the cell-bottom geometry.
         let (mut a, mut b) = (Vec::new(), Vec::new());
         text_decoration_rects(&g, 10.0, 32.0, 5.0, &mut a);
-        text_decoration_rects_at(&g, 10.0, 32.0, 32.0, 5.0, &mut b);
+        text_decoration_rects_at(&g, 10.0, 32.0, UnderlineGeom::cell_bottom(32.0), 5.0, &mut b);
         assert_eq!(a.iter().map(|r| (r.y, r.h)).collect::<Vec<_>>(), b.iter().map(|r| (r.y, r.h)).collect::<Vec<_>>());
-        assert_eq!(a[0].y + a[0].h, 5.0 + 2.0 * 32.0);
-        // A taller line: both underlines rest on the line box bottom instead.
+        assert_eq!(a[0].y + a[0].h, row_top + 32.0, "single on the cell bottom");
+        // A font geometry: single at `top`, the undercurl band on `bottom`, the
+        // double's upper stroke at `top` and its lower one above `bottom`.
+        let ul = UnderlineGeom { top: 20.0, bottom: 25.0, thickness: 2.0 };
         let mut c = Vec::new();
-        text_decoration_rects_at(&g, 10.0, 32.0, 26.0, 5.0, &mut c);
-        for r in &c {
-            assert_eq!(r.y + r.h, 5.0 + 32.0 + 26.0, "rests on the line box");
-        }
-        // Out-of-range values fall back to the cell bottom.
+        text_decoration_rects_at(&g, 10.0, 32.0, ul, 5.0, &mut c);
+        assert_eq!((c[0].y, c[0].h), (row_top + 20.0, 2.0), "single");
+        assert_eq!(c[1].y + c[1].h, row_top + 25.0, "undercurl rests on the line box");
+        let (upper, lower) = (c[2], c[3]);
+        assert!(lower.y + lower.h <= row_top + 25.0 && upper.y == lower.y - 4.0, "double: {:?} {:?}", (upper.y, upper.h), (lower.y, lower.h));
+        // Garbage is clamped into the row (never below it).
         let mut d = Vec::new();
-        text_decoration_rects_at(&g, 10.0, 32.0, 99.0, 5.0, &mut d);
-        assert_eq!(d[0].y + d[0].h, 5.0 + 2.0 * 32.0);
-        // Link underlines follow the same bottom.
-        let l = link_underline_rects_at(&[(1, 0, 1)], [0; 4], 10.0, 32.0, 26.0, 5.0);
-        assert_eq!(l[0].y + l[0].h, 5.0 + 32.0 + 26.0);
-        assert_eq!(link_underline_rects(&[(1, 0, 1)], [0; 4], 10.0, 32.0, 5.0)[0].y + l[0].h, 5.0 + 64.0);
+        let wild = UnderlineGeom { top: 99.0, bottom: 99.0, thickness: 0.0 };
+        text_decoration_rects_at(&g, 10.0, 32.0, wild, 5.0, &mut d);
+        assert!(d.iter().all(|r| r.y >= row_top && r.y + r.h <= row_top + 32.0), "{:?}", d.iter().map(|r| (r.y, r.h)).collect::<Vec<_>>());
+        let nan = UnderlineGeom { top: f32::NAN, bottom: 25.0, thickness: 2.0 };
+        assert_eq!(nan.within(32.0), UnderlineGeom::cell_bottom(32.0));
+        // Link underlines take the single-underline place.
+        let l = link_underline_rects_at(&[(1, 0, 1)], [0; 4], 10.0, 32.0, ul, 5.0);
+        assert_eq!((l[0].y, l[0].h), (c[0].y, c[0].h));
+        let l = link_underline_rects(&[(1, 0, 1)], [0; 4], 10.0, 32.0, 5.0);
+        assert_eq!(l[0].y + l[0].h, row_top + 32.0);
     }
 
     #[test]
