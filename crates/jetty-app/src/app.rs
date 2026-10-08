@@ -1009,6 +1009,9 @@ pub struct App {
     /// Installed login shells — the Shell cycler's options — read once each
     /// time Settings opens (never per frame).
     shell_options: Vec<String>,
+    /// The image files in `<config dir>/backgrounds/` — the backdrop picker —
+    /// listed when Settings opens or regains focus (never per frame).
+    backdrop_images: Vec<String>,
     /// The Settings panel geometry of the last paint, for hover hit-tests
     /// (a press rebuilds the panel fresh).
     settings_geom: Option<jetty_render::PanelGeom>,
@@ -1805,6 +1808,7 @@ impl App {
             gallery_filter: jetty_render::ThemeFilter::All,
             gallery: crate::settings_ui::GallerySession::default(),
             shell_options: Vec::new(),
+            backdrop_images: Vec::new(),
             settings_geom: None,
             settings_mods: winit::keyboard::ModifiersState::empty(),
             fx: crate::config::EffectsConfig::default(),
@@ -7941,9 +7945,10 @@ impl App {
                 return;
             }
         };
-        // The Shell cycler's options: /etc/shells, read once per open (never
-        // per frame).
+        // The Shell cycler's options: /etc/shells, and the backdrop images —
+        // read once per open (never per frame).
         self.shell_options = detect_shells();
+        self.backdrop_images = crate::backdrop::background_images(&crate::config::Config::dir());
         // The font lists open at the family that is shown.
         {
             use crate::settings_ui::{list_offset_showing, list_rows};
@@ -8185,6 +8190,7 @@ impl App {
             ui_font_shown: &self.ui_font_family,
             font_offset: self.font_scroll_offset,
             ui_font_offset: self.ui_font_scroll_offset,
+            backdrop_images: &self.backdrop_images,
             collapsed: &self.settings_collapsed,
             drag: self.ctl_drag.as_ref().and_then(|d| d.pending.as_ref().map(|v| (d.id, v))),
         }
@@ -8581,6 +8587,27 @@ impl App {
             _ => return,
         }
         self.request_settings_paint();
+    }
+
+    /// A file dropped on the Settings window: a PNG / JPEG becomes the
+    /// backdrop image (image mode on, saved), and the picker is shown.
+    fn settings_drop_image(&mut self, path: std::path::PathBuf) {
+        let is_image = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| ["png", "jpg", "jpeg"].contains(&e.to_ascii_lowercase().as_str()));
+        if !is_image {
+            self.show_notice_pill("Backdrop: drop a PNG or JPEG image".to_string(), 3000);
+            return;
+        }
+        let image = path.to_string_lossy().into_owned();
+        if self.apply_settings_change(|c| {
+            c.backdrop.mode = "image".to_string();
+            c.backdrop.image = image;
+        }) {
+            self.persist();
+        }
+        self.reveal_setting("backdrop.image");
     }
 
     /// Show Settings control `id` (a palette deep link): its tab, its section
@@ -10383,7 +10410,12 @@ impl App {
                 }
                 self.settings_key(&event.logical_key);
             }
+            WindowEvent::DroppedFile(path) => {
+                self.settings_drop_image(path);
+            }
             WindowEvent::Focused(true) => {
+                // Images added to backgrounds/ meanwhile show up in the picker.
+                self.backdrop_images = crate::backdrop::background_images(&crate::config::Config::dir());
                 // Record that OUR settings window now holds focus so the main
                 // window's Focused(false) auto-hide doesn't fire when the user
                 // merely clicked into Settings.

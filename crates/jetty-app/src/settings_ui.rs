@@ -91,6 +91,9 @@ pub struct Ctx<'a> {
     /// First visible row of each list.
     pub font_offset: usize,
     pub ui_font_offset: usize,
+    /// The image files in `<config dir>/backgrounds/` (the backdrop picker),
+    /// listed when Settings opens — never per frame.
+    pub backdrop_images: &'a [String],
     /// Collapsed section ids.
     pub collapsed: &'a [&'static str],
     /// A drag that applies on release: `(control, value so far)` — shown in
@@ -110,6 +113,7 @@ impl Ctx<'_> {
             ui_font_shown: "",
             font_offset: 0,
             ui_font_offset: 0,
+            backdrop_images: &[],
             collapsed: &[],
             drag: None,
         }
@@ -179,6 +183,9 @@ pub struct Desc {
     pub hint: Option<&'static str>,
     /// Dimmed / disabled from the config or the runtime context.
     pub state: Option<fn(&Config, &Ctx) -> RowState>,
+    /// Shown only when this holds (rows that only matter in one mode — the
+    /// backdrop's image rows in image mode — keep their section short).
+    pub visible: Option<fn(&Config) -> bool>,
     /// Part of "Reset tab".
     pub reset: bool,
     pub special: Option<Special>,
@@ -196,6 +203,7 @@ impl Desc {
         set: |_, _| {},
         hint: None,
         state: None,
+        visible: None,
         reset: true,
         special: None,
     };
@@ -225,7 +233,7 @@ impl Section {
 /// hook points (hidden until a control lands in them).
 pub static SECTIONS: &[Section] = &[
     Section { id: "look.window", tab: LOOK, title: "Opacity & corners", ..Section::DEFAULT },
-    // Hook: the background layer (mode, strength, image, dim, blur, pattern).
+    // The background layer: a mode, then only the rows that mode uses.
     Section { id: "look.backdrop", tab: LOOK, title: "Backdrop", ..Section::DEFAULT },
     // Tab look, close buttons, titles, progress, the window border.
     Section { id: "look.chrome", tab: LOOK, title: "Tabs & border", ..Section::DEFAULT },
@@ -367,6 +375,65 @@ fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
     v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
 }
 
+/// "#rrggbb" → 0..1 channels (`None` for anything else).
+pub fn hex_rgb(s: &str) -> Option<[f32; 3]> {
+    let h = s.trim().strip_prefix('#')?;
+    if h.len() != 6 || !h.is_ascii() {
+        return None;
+    }
+    let ch = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok().map(|v| v as f32 / 255.0);
+    Some([ch(0)?, ch(2)?, ch(4)?])
+}
+
+/// 0..1 channels → "#rrggbb".
+pub fn rgb_hex(c: [f32; 3]) -> String {
+    let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", b(c[0]), b(c[1]), b(c[2]))
+}
+
+/// The two gradient stops a "custom colors" backdrop starts from: the theme's
+/// blue and magenta.
+fn seed_stops(c: &Config) -> [String; 2] {
+    let t = jetty_core::Theme::by_name(&c.theme);
+    let f = |rgb: [u8; 3]| rgb_hex(rgb.map(|v| v as f32 / 255.0));
+    [f(t.palette[4]), f(t.palette[5])]
+}
+
+/// Gradient stop `i`: the configured one, else the seed (both are written
+/// together the first time one is edited).
+fn stop(c: &Config, i: usize) -> [f32; 3] {
+    c.backdrop
+        .colors
+        .get(i)
+        .and_then(|s| hex_rgb(s))
+        .unwrap_or_else(|| hex_rgb(&seed_stops(c)[i]).unwrap_or([0.5; 3]))
+}
+
+fn set_stop(c: &mut Config, i: usize, v: Val) {
+    if let Val::Rgb(x) = v {
+        if c.backdrop.colors.len() < 2 {
+            let seed = seed_stops(c);
+            c.backdrop.colors = seed.to_vec();
+        }
+        c.backdrop.colors[i] = rgb_hex(x);
+    }
+}
+
+/// Backdrop rows by mode.
+fn bd_on(c: &Config) -> bool {
+    !c.backdrop.mode.eq_ignore_ascii_case("none") && !c.backdrop.mode.is_empty()
+}
+fn bd_mode(c: &Config, m: &str) -> bool {
+    c.backdrop.mode.eq_ignore_ascii_case(m)
+}
+fn bd_moves(c: &Config) -> bool {
+    bd_mode(c, "gradient") || bd_mode(c, "pattern") || bd_mode(c, "theme")
+}
+
+fn fmt_deg(v: f32) -> String {
+    format!("{}°", v.round() as i32)
+}
+
 /// The light themes of the registry (built-in and user), `(name, display)`.
 fn light_theme_choices() -> Vec<(String, String)> {
     jetty_render::gallery_order(jetty_render::ThemeFilter::Light)
@@ -436,6 +503,206 @@ pub static DESCS: &[Desc] = &[
         get: get_f!(corner_radius),
         set: set_f!(corner_radius),
         state: Some(radius_state),
+        ..Desc::DEFAULT
+    },
+    // ── Look › Backdrop ───────────────────────────────────────────────────────
+    Desc {
+        id: "backdrop.mode",
+        section: "look.backdrop",
+        label: "Backdrop",
+        kind: Kind::Choice {
+            options: |_| {
+                pairs(&[
+                    ("none", "Off"),
+                    ("theme", "Theme"),
+                    ("gradient", "Gradient"),
+                    ("image", "Image"),
+                    ("pattern", "Pattern"),
+                ])
+            },
+        },
+        get: get_s!(backdrop.mode),
+        set: set_s!(backdrop.mode),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.image",
+        section: "look.backdrop",
+        label: "Image",
+        kind: Kind::Choice {
+            options: |x| {
+                std::iter::once((String::new(), "None".to_string()))
+                    .chain(x.backdrop_images.iter().map(|n| (n.clone(), n.clone())))
+                    .collect()
+            },
+        },
+        get: get_s!(backdrop.image),
+        set: set_s!(backdrop.image),
+        hint: Some("From backgrounds/, or drop a file here"),
+        visible: Some(|c| bd_mode(c, "image")),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.fit",
+        section: "look.backdrop",
+        label: "Fit",
+        kind: Kind::Choice {
+            options: |_| {
+                pairs(&[
+                    ("cover", "Cover"),
+                    ("contain", "Contain"),
+                    ("stretch", "Stretch"),
+                    ("center", "Center"),
+                    ("tile", "Tile"),
+                ])
+            },
+        },
+        get: get_s!(backdrop.fit),
+        set: set_s!(backdrop.fit),
+        visible: Some(|c| bd_mode(c, "image")),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.dim",
+        section: "look.backdrop",
+        label: "Dim",
+        kind: PCT,
+        get: get_f!(backdrop.dim),
+        set: set_f!(backdrop.dim),
+        visible: Some(|c| bd_mode(c, "image")),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.blur",
+        section: "look.backdrop",
+        label: "Blur",
+        kind: PCT,
+        get: get_f!(backdrop.blur),
+        set: set_f!(backdrop.blur),
+        visible: Some(|c| bd_mode(c, "image")),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.pattern",
+        section: "look.backdrop",
+        label: "Pattern",
+        kind: Kind::Choice {
+            options: |_| {
+                pairs(&[("stars", "Stars"), ("aurora", "Aurora"), ("grid", "Grid"), ("synthwave", "Synthwave")])
+            },
+        },
+        get: get_s!(backdrop.pattern),
+        set: set_s!(backdrop.pattern),
+        visible: Some(|c| bd_mode(c, "pattern")),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.angle",
+        section: "look.backdrop",
+        label: "Angle",
+        kind: Kind::Slider { min: 0.0, max: 360.0, step: 1.0, fmt: fmt_deg, live: true },
+        get: get_f!(backdrop.angle),
+        set: set_f!(backdrop.angle),
+        visible: Some(|c| bd_mode(c, "gradient")),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.shape",
+        section: "look.backdrop",
+        label: "Shape",
+        kind: Kind::Choice { options: |_| pairs(&[("linear", "Linear"), ("radial", "Radial")]) },
+        get: get_s!(backdrop.shape),
+        set: set_s!(backdrop.shape),
+        visible: Some(|c| bd_mode(c, "gradient")),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.custom_colors",
+        section: "look.backdrop",
+        label: "Custom colors",
+        kind: Kind::Toggle,
+        get: |c| Val::B(!c.backdrop.colors.is_empty()),
+        set: |c, v| {
+            if let Val::B(on) = v {
+                c.backdrop.colors = if on { seed_stops(c).to_vec() } else { Vec::new() };
+            }
+        },
+        hint: Some("Off: colors from the theme"),
+        visible: Some(|c| bd_mode(c, "gradient")),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.color_start",
+        section: "look.backdrop",
+        label: "Start color",
+        kind: Kind::Rgb,
+        get: |c| Val::Rgb(stop(c, 0)),
+        set: |c, v| set_stop(c, 0, v),
+        visible: Some(|c| bd_mode(c, "gradient") && !c.backdrop.colors.is_empty()),
+        reset: false,
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.color_end",
+        section: "look.backdrop",
+        label: "End color",
+        kind: Kind::Rgb,
+        get: |c| Val::Rgb(stop(c, 1)),
+        set: |c, v| set_stop(c, 1, v),
+        visible: Some(|c| bd_mode(c, "gradient") && !c.backdrop.colors.is_empty()),
+        reset: false,
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.strength",
+        section: "look.backdrop",
+        label: "Strength",
+        kind: PCT,
+        get: get_f!(backdrop.strength),
+        set: set_f!(backdrop.strength),
+        visible: Some(bd_on),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.vignette",
+        section: "look.backdrop",
+        label: "Vignette",
+        kind: PCT,
+        get: get_f!(backdrop.vignette),
+        set: set_f!(backdrop.vignette),
+        visible: Some(bd_on),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.grain",
+        section: "look.backdrop",
+        label: "Grain",
+        kind: PCT,
+        get: get_f!(backdrop.grain),
+        set: set_f!(backdrop.grain),
+        visible: Some(bd_on),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.animate",
+        section: "look.backdrop",
+        label: "Animate",
+        kind: Kind::Toggle,
+        get: get_b!(backdrop.animate),
+        set: set_b!(backdrop.animate),
+        hint: Some("Slow drift, up to 30 fps"),
+        visible: Some(bd_moves),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "backdrop.parallax",
+        section: "look.backdrop",
+        label: "Parallax",
+        kind: Kind::Toggle,
+        get: get_b!(backdrop.parallax),
+        set: set_b!(backdrop.parallax),
+        hint: Some("Moves with the scrollback"),
+        visible: Some(bd_on),
         ..Desc::DEFAULT
     },
     // ── Look › Tabs & border ──────────────────────────────────────────────────
@@ -1106,6 +1373,12 @@ pub static DESCS: &[Desc] = &[
     },
 ];
 
+/// The image files in `<config dir>/backgrounds/` (the backdrop picker's
+/// list) — for jetty-shot; the app caches its own copy.
+pub fn backdrop_images() -> Vec<String> {
+    crate::backdrop::background_images(&Config::dir())
+}
+
 /// The control `id`.
 pub fn find(id: &str) -> Option<&'static Desc> {
     DESCS.iter().find(|d| d.id == id)
@@ -1247,7 +1520,10 @@ fn row_for(d: &Desc, cfg: &Config, ctx: &Ctx, master_off: bool) -> PanelItem {
 pub fn tab_items(tab: usize, cfg: &Config, ctx: &Ctx) -> Vec<PanelItem> {
     let mut out = Vec::new();
     for s in SECTIONS.iter().filter(|s| s.tab == tab) {
-        let rows: Vec<&Desc> = DESCS.iter().filter(|d| d.section == s.id && Some(d.id) != s.master).collect();
+        let rows: Vec<&Desc> = DESCS
+            .iter()
+            .filter(|d| d.section == s.id && Some(d.id) != s.master && d.visible.is_none_or(|v| v(cfg)))
+            .collect();
         let master = s.master.and_then(find).map(|d| (d.id, (d.get)(cfg).b()));
         if rows.is_empty() && master.is_none() {
             continue;
@@ -1505,7 +1781,8 @@ mod tests {
                 }
                 Kind::Steps { steps, .. } => Val::U(cycle_steps(steps, v.u(), true)),
                 Kind::Stepper { min, .. } => Val::F(*min),
-                Kind::Rgb => Val::Rgb([0.25, 0.5, 0.75]),
+                // 8-bit exact: hex-backed colors (the backdrop stops) round-trip.
+                Kind::Rgb => Val::Rgb([64.0 / 255.0, 128.0 / 255.0, 192.0 / 255.0]),
                 Kind::Chips { .. } => Val::Bits(v.bits() ^ 1),
                 Kind::Presets { .. } => Val::U(1),
                 Kind::List { .. } | Kind::Gallery => Val::S("Something Else".into()),
@@ -1685,6 +1962,86 @@ mod tests {
         assert_eq!(row, Some(CtlShow::Slider { frac: (0.75 - 0.25) / 0.75, text: "75%".into() }));
     }
 
+    /// Configs that, between them, show every row a mode or a state hides:
+    /// each backdrop mode (gradient with custom stops), the custom phosphor.
+    fn revealing_configs() -> Vec<Config> {
+        let mut v: Vec<Config> = ["none", "theme", "image", "pattern"].iter().map(|m| with_backdrop(m, &[])).collect();
+        v.push(with_backdrop("gradient", &["#102030", "#405060"]));
+        let mut fx = Config::default();
+        fx.effects.crt_phosphor = crate::config::PhosphorMode::Custom;
+        fx.effects.crt_grain = 0.5;
+        v.push(fx);
+        v
+    }
+
+    fn with_backdrop(mode: &str, colors: &[&str]) -> Config {
+        Config {
+            backdrop: crate::config::BackdropConfig {
+                mode: mode.into(),
+                colors: colors.iter().map(|c| c.to_string()).collect(),
+                ..Default::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    fn backdrop_rows(c: &Config) -> Vec<&'static str> {
+        tab_items(LOOK, c, &Ctx::empty())
+            .into_iter()
+            .filter_map(|it| match it {
+                PanelItem::Row(r) if r.id.starts_with("backdrop.") => Some(r.id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn backdrop_rows_follow_the_mode() {
+        assert_eq!(backdrop_rows(&with_backdrop("none", &[])), ["backdrop.mode"], "off: just the mode");
+        let img = backdrop_rows(&with_backdrop("image", &[]));
+        for id in ["backdrop.image", "backdrop.fit", "backdrop.dim", "backdrop.blur", "backdrop.strength", "backdrop.parallax"] {
+            assert!(img.contains(&id), "image mode lacks {id}");
+        }
+        for id in ["backdrop.angle", "backdrop.pattern", "backdrop.animate", "backdrop.custom_colors"] {
+            assert!(!img.contains(&id), "image mode shows {id}");
+        }
+        let grad = backdrop_rows(&with_backdrop("gradient", &[]));
+        assert!(grad.contains(&"backdrop.angle") && grad.contains(&"backdrop.custom_colors") && grad.contains(&"backdrop.animate"));
+        assert!(!grad.contains(&"backdrop.color_start"), "theme colors: no stop rows");
+        let custom = backdrop_rows(&with_backdrop("gradient", &["#102030", "#405060"]));
+        assert!(custom.contains(&"backdrop.color_start") && custom.contains(&"backdrop.color_end"));
+        let pat = backdrop_rows(&with_backdrop("pattern", &[]));
+        assert!(pat.contains(&"backdrop.pattern") && pat.contains(&"backdrop.animate") && !pat.contains(&"backdrop.image"));
+    }
+
+    #[test]
+    fn backdrop_custom_colors_seed_from_the_theme_and_reset_clears_them() {
+        let mut c = with_backdrop("gradient", &[]);
+        let toggle = find("backdrop.custom_colors").unwrap();
+        (toggle.set)(&mut c, Val::B(true));
+        let t = jetty_core::Theme::by_name(&c.theme);
+        let hex = |rgb: [u8; 3]| rgb_hex(rgb.map(|v| v as f32 / 255.0));
+        assert_eq!(c.backdrop.colors, vec![hex(t.palette[4]), hex(t.palette[5])]);
+        // Editing one stop keeps the other.
+        (find("backdrop.color_end").unwrap().set)(&mut c, Val::Rgb([1.0, 0.0, 0.0]));
+        assert_eq!(c.backdrop.colors[1], "#ff0000");
+        assert_eq!(c.backdrop.colors[0], hex(t.palette[4]));
+        // Reset tab: back to theme colors (the stop rows are not reset alone).
+        assert!(reset_tab(&c, LOOK).backdrop.colors.is_empty());
+        (toggle.set)(&mut c, Val::B(false));
+        assert!(c.backdrop.colors.is_empty());
+    }
+
+    #[test]
+    fn hex_colors_round_trip() {
+        assert_eq!(hex_rgb("#ff8000"), Some([1.0, 128.0 / 255.0, 0.0]));
+        assert_eq!(rgb_hex([1.0, 128.0 / 255.0, 0.0]), "#ff8000");
+        assert_eq!(hex_rgb(" #FF8000 "), Some([1.0, 128.0 / 255.0, 0.0]));
+        assert_eq!(hex_rgb("ff8000"), None);
+        assert_eq!(hex_rgb("#ff80"), None);
+        assert_eq!(hex_rgb("#gg0000"), None);
+    }
+
     #[test]
     fn the_theme_gallery_closes_the_look_tab() {
         // Every theme is a card: anything placed after the gallery would sit
@@ -1727,40 +2084,42 @@ mod tests {
     fn every_tab_fits_at_1x_2x_and_ui_font_13_and_17() {
         let (mono, ui) = fonts();
         let x = ctx(&mono, &ui);
-        let c = Config {
-            shell: "/usr/local/bin/a-shell-with-a-long-name".into(),
-            window_mode: "dropdown".into(),
-            ..Config::default()
-        };
         let theme = jetty_core::Theme::by_name("catppuccin_latte");
-        for (scale, font) in [(1.0, 16.0), (2.0, 16.0), (1.0, 13.0), (1.0, 17.0), (2.0, 13.0)] {
-            let cm = ChromeMetrics::new(scale, font);
-            let u = cm.overlay_u();
-            let (w, h) = ((jetty_render::PANEL_W * u) as u32, (jetty_render::PANEL_H * u) as u32);
-            for tab in 0..N_TABS {
-                let items = tab_items(tab, &c, &x);
-                let mut inp = PanelInput::new(w, h, &theme, cm, &items);
-                inp.active_tab = tab;
-                // Scroll through the whole tab so every row is checked in view.
-                let mut scroll = 0.0;
-                loop {
-                    inp.scroll = scroll;
-                    let v = build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK * u));
-                    let g = &v.geom;
-                    let right = g.panel.x + g.panel.w - 20.0 * u;
-                    for (t, lx, _, _) in v.labels.iter().chain(&v.content_labels) {
-                        let end = lx + t.chars().count() as f32 * CHAR_W_FALLBACK * u;
-                        assert!(end <= right + 0.5, "{scale}×/{font}pt tab {tab}: {t:?} ends {end:.1} > {right:.1}");
-                    }
-                    for (r, hit) in &g.hits {
-                        if let PanelHit::Ctl { .. } = hit {
-                            assert!(r.x + r.w <= right + 0.5, "{scale}×/{font}pt tab {tab}: {hit:?} past the column");
+        for base in revealing_configs() {
+            let c = Config {
+                shell: "/usr/local/bin/a-shell-with-a-long-name".into(),
+                window_mode: "dropdown".into(),
+                ..base
+            };
+            for (scale, font) in [(1.0, 16.0), (2.0, 16.0), (1.0, 13.0), (1.0, 17.0), (2.0, 13.0)] {
+                let cm = ChromeMetrics::new(scale, font);
+                let u = cm.overlay_u();
+                let (w, h) = ((jetty_render::PANEL_W * u) as u32, (jetty_render::PANEL_H * u) as u32);
+                for tab in 0..N_TABS {
+                    let items = tab_items(tab, &c, &x);
+                    let mut inp = PanelInput::new(w, h, &theme, cm, &items);
+                    inp.active_tab = tab;
+                    // Scroll through the whole tab so every row is checked in view.
+                    let mut scroll = 0.0;
+                    loop {
+                        inp.scroll = scroll;
+                        let v = build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK * u));
+                        let g = &v.geom;
+                        let right = g.panel.x + g.panel.w - 20.0 * u;
+                        for (t, lx, _, _) in v.labels.iter().chain(&v.content_labels) {
+                            let end = lx + t.chars().count() as f32 * CHAR_W_FALLBACK * u;
+                            assert!(end <= right + 0.5, "{scale}×/{font}pt tab {tab}: {t:?} ends {end:.1} > {right:.1}");
                         }
+                        for (r, hit) in &g.hits {
+                            if let PanelHit::Ctl { .. } = hit {
+                                assert!(r.x + r.w <= right + 0.5, "{scale}×/{font}pt tab {tab}: {hit:?} past the column");
+                            }
+                        }
+                        if g.scroll >= g.max_scroll {
+                            break;
+                        }
+                        scroll = (g.scroll + g.viewport_h()).min(g.max_scroll);
                     }
-                    if g.scroll >= g.max_scroll {
-                        break;
-                    }
-                    scroll = (g.scroll + g.viewport_h()).min(g.max_scroll);
                 }
             }
         }
@@ -1773,33 +2132,34 @@ mod tests {
     fn every_label_renders_untruncated_at_the_default_font() {
         let (mono, ui) = fonts();
         let x = ctx(&mono, &ui);
-        let c = Config::default();
         let theme = jetty_core::Theme::by_name("catppuccin_mocha");
-        for tab in 0..N_TABS {
-            let items = tab_items(tab, &c, &x);
-            let mut inp = PanelInput::new(420, 592, &theme, ChromeMetrics::DEFAULT, &items);
-            inp.active_tab = tab;
-            inp.scroll = 1.0e9;
-            let max = build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK)).geom.max_scroll;
-            let mut drawn: Vec<String> = Vec::new();
-            let mut scroll = 0.0;
-            loop {
-                inp.scroll = scroll;
-                let v = build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK));
-                drawn.extend(v.content_labels.into_iter().map(|l| l.0));
-                if scroll >= max {
-                    break;
+        for c in revealing_configs() {
+            for tab in 0..N_TABS {
+                let items = tab_items(tab, &c, &x);
+                let mut inp = PanelInput::new(420, 592, &theme, ChromeMetrics::DEFAULT, &items);
+                inp.active_tab = tab;
+                inp.scroll = 1.0e9;
+                let max = build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK)).geom.max_scroll;
+                let mut drawn: Vec<String> = Vec::new();
+                let mut scroll = 0.0;
+                loop {
+                    inp.scroll = scroll;
+                    let v = build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK));
+                    drawn.extend(v.content_labels.into_iter().map(|l| l.0));
+                    if scroll >= max {
+                        break;
+                    }
+                    scroll = (scroll + v.geom.viewport_h()).min(max);
                 }
-                scroll = (scroll + v.geom.viewport_h()).min(max);
-            }
-            for it in &items {
-                let want: Vec<String> = match it {
-                    PanelItem::Section { title, hint, .. } => std::iter::once(title.clone()).chain(hint.clone()).collect(),
-                    PanelItem::Row(r) => std::iter::once(r.label.clone()).chain(r.hint.clone()).collect(),
-                    _ => continue,
-                };
-                for w in want {
-                    assert!(drawn.contains(&w), "tab {tab}: {w:?} is truncated or missing");
+                for it in &items {
+                    let want: Vec<String> = match it {
+                        PanelItem::Section { title, hint, .. } => std::iter::once(title.clone()).chain(hint.clone()).collect(),
+                        PanelItem::Row(r) => std::iter::once(r.label.clone()).chain(r.hint.clone()).collect(),
+                        _ => continue,
+                    };
+                    for w in want {
+                        assert!(drawn.contains(&w), "tab {tab}: {w:?} is truncated or missing");
+                    }
                 }
             }
         }

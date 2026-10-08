@@ -582,7 +582,7 @@ mod tests {
         // first — even where an action's KEYWORDS mention the word ("Toggle
         // caret glow" carries "bloom")…
         let r = reg();
-        for (q, id) in [("bloom", "effects.crt_bloom"), ("vignette", "effects.crt_vignette"), ("line height", "line_height")] {
+        for (q, id) in [("bloom", "effects.crt_bloom"), ("keep colors", "effects.crt_phosphor_hue"), ("line height", "line_height")] {
             let hits = filter(&r, q);
             assert_eq!(hits[0].cmd, PaletteCmd::SettingsAt(id), "top hit for {q:?}");
         }

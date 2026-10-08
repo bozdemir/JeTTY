@@ -138,7 +138,7 @@
 ///                    JETTY_SHOT_PANEL_COLLAPSE=<section id,...>,
 ///                    JETTY_SHOT_PANEL_FOCUS=<control id> (a deep link: its tab,
 ///                    scrolled to it, highlighted), JETTY_SHOT_PANEL_RESET=
-///                    armed|ready|disabled, JETTY_SHOT_PANEL_PRESET=<id> (an effects
+///                    armed|ready|disabled, JETTY_SHOT_PANEL_BACKDROP=<mode>, JETTY_SHOT_PANEL_PRESET=<id> (an effects
 ///                    preset on the panel config only), JETTY_SHOT_PANEL_SESSION=1 (a gallery
 ///                    browsing session's footer hint).
 ///   JETTY_SHOT_COPYMODE="row,col" — copy-mode self-test: draw the keyboard cursor
@@ -449,6 +449,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // chip) — unlike JETTY_SHOT_PRESET, no CRT pass runs over the shot.
         if let Some(p) = var("JETTY_SHOT_PANEL_PRESET").and_then(|n| jetty_app::effects::find_preset(&n)) {
             p.patch.apply_to(&mut cfg.effects);
+        }
+        if let Some(m) = var("JETTY_SHOT_PANEL_BACKDROP") {
+            cfg.backdrop.mode = m;
         }
         cfg
     });
@@ -1227,6 +1230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ if env_flag("JETTY_SHOT_PANEL_SESSION") => "Enter keeps · Esc restores",
                 _ => "",
             };
+            let backdrop_images = sui::backdrop_images();
             // The font lists open at the configured family, as in the app.
             let font_pos = mono_families.iter().position(|f| *f == cfg.font_family);
             let ui_pos = if cfg.ui_font_family.is_empty() {
@@ -1240,6 +1244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui_families: &ui_families,
                 font_shown: &cfg.font_family,
                 ui_font_shown: &cfg.ui_font_family,
+                backdrop_images: &backdrop_images,
                 font_offset: sui::list_offset_showing(mono_families.len(), font_pos, sui::list_rows("font_family")),
                 ui_font_offset: sui::list_offset_showing(ui_families.len(), ui_pos, sui::list_rows("ui_font_family")),
                 collapsed: &collapsed,
