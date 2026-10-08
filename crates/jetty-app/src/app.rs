@@ -13771,13 +13771,11 @@ fn autostart_path() -> std::path::PathBuf {
 }
 
 /// The program the autostart entry launches: the AppImage FILE when running from
-/// one (`$APPIMAGE` — `current_exe()` is then a temporary `/tmp/.mount_*` path that
-/// is gone by the next login), else this executable, else `jetty` from PATH.
-fn autostart_program(appimage: Option<String>, exe: Option<String>) -> String {
-    appimage
-        .filter(|p| !p.is_empty())
-        .or(exe)
-        .unwrap_or_else(|| "jetty".to_string())
+/// one (`current_exe()` is then a temporary `/tmp/.mount_*` path gone by the next
+/// login) — never an AppImage merely inherited from the app that started JeTTY
+/// (see `jetty_core::self_exe`) — else this executable, else `jetty` from PATH.
+fn autostart_program(exe: Option<&jetty_core::SelfExe>) -> String {
+    exe.map_or_else(|| "jetty".to_string(), |e| e.path.to_string_lossy().into_owned())
 }
 
 /// The freedesktop autostart entry. Starts with `--background`: at login JeTTY
@@ -13844,10 +13842,7 @@ fn launch_agent_plist(program: &str) -> String {
 
 /// The program the running JeTTY would register (see `autostart_program`).
 fn current_autostart_program() -> String {
-    autostart_program(
-        std::env::var("APPIMAGE").ok(),
-        std::env::current_exe().ok().and_then(|p| p.to_str().map(str::to_string)),
-    )
+    autostart_program(jetty_core::self_exe().as_ref())
 }
 
 /// What a new or refreshed autostart entry launches, captured once per sync:
@@ -13860,9 +13855,10 @@ struct AutostartTarget {
 
 impl AutostartTarget {
     fn current() -> AutostartTarget {
+        let exe = jetty_core::self_exe();
         AutostartTarget {
-            program: current_autostart_program(),
-            appimage: std::env::var_os("APPIMAGE").is_some_and(|v| !v.is_empty()),
+            program: autostart_program(exe.as_ref()),
+            appimage: exe.is_some_and(|e| e.appimage),
         }
     }
 }
@@ -14866,19 +14862,16 @@ mod autostart_tests {
     }
 
     #[test]
-    fn appimage_file_wins_over_its_temporary_mount() {
-        // Inside an AppImage, current_exe() is /tmp/.mount_XXXX/usr/bin/jetty —
-        // gone by the next login. $APPIMAGE is the real file.
+    fn the_entry_launches_the_stable_self_path() {
+        // Which path that is (an AppImage file over its temporary mount, never an
+        // inherited foreign $APPIMAGE) is `jetty_core::self_exe`'s, tested there.
+        let exe = |p: &str, appimage| jetty_core::SelfExe { path: p.into(), appimage };
         assert_eq!(
-            autostart_program(
-                Some("/home/u/Apps/JeTTY.AppImage".to_string()),
-                Some("/tmp/.mount_abc/usr/bin/jetty".to_string())
-            ),
+            autostart_program(Some(&exe("/home/u/Apps/JeTTY.AppImage", true))),
             "/home/u/Apps/JeTTY.AppImage"
         );
-        assert_eq!(autostart_program(None, Some("/usr/bin/jetty".to_string())), "/usr/bin/jetty");
-        assert_eq!(autostart_program(Some(String::new()), Some("/usr/bin/jetty".to_string())), "/usr/bin/jetty");
-        assert_eq!(autostart_program(None, None), "jetty");
+        assert_eq!(autostart_program(Some(&exe("/usr/bin/jetty", false))), "/usr/bin/jetty");
+        assert_eq!(autostart_program(None), "jetty");
     }
 
     #[test]
