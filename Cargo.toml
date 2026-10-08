@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/jetty-core", "crates/jetty-render", "crates/jetty-platform", "crates/jetty-app"]
+# A plain `cargo test` / `cargo build` at the repo root covers EVERY crate — not
+# just the thin root binary (which has no tests of its own).
+default-members = [".", "crates/jetty-core", "crates/jetty-render", "crates/jetty-platform", "crates/jetty-app"]
 
 [package]
 name = "jetty"
@@ -33,6 +36,7 @@ priority = "optional"
 assets = [
     ["target/release/jetty", "usr/bin/", "755"],
     ["assets/jetty.desktop", "usr/share/applications/", "644"],
+    ["assets/io.github.bozdemir.jetty.metainfo.xml", "usr/share/metainfo/", "644"],
     ["assets/icons/jetty-256.png", "usr/share/icons/hicolor/256x256/apps/jetty.png", "644"],
     ["assets/icons/jetty-128.png", "usr/share/icons/hicolor/128x128/apps/jetty.png", "644"],
     ["assets/icons/jetty-64.png", "usr/share/icons/hicolor/64x64/apps/jetty.png", "644"],
