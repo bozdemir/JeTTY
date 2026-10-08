@@ -291,6 +291,18 @@ fn bench_post_pass(
     }
     println!("post pass     {width}x{height}, Crt::apply incl. bloom chain, GPU-synced (median of 5×30 passes)");
     let crt = jetty_render::Crt::new(device, format);
+    // Warm-up: clock the GPU up first, so the first row is not measured at idle
+    // clocks (an iGPU ramps over ~100 ms of load).
+    {
+        let params = jetty_render::CrtParams::build(&looks[1].1, &frame);
+        let warm = Instant::now();
+        while warm.elapsed().as_millis() < 400 {
+            for _ in 0..10 {
+                crt.apply(device, queue, &out, &scene, &params);
+            }
+            device.poll(wgpu::PollType::wait_indefinitely())?;
+        }
+    }
     for (name, settings) in &looks {
         let params = jetty_render::CrtParams::build(settings, &frame);
         let t = Instant::now();
