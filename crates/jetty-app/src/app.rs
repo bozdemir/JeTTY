@@ -2148,9 +2148,10 @@ impl App {
         if self.scrollback_lines != 10_000 {
             terminal.set_scrollback_lines(self.scrollback_lines);
         }
-        // Surface the shell-fallback notice here too (F2).
-        if let Some(notice) = pty.startup_notice() {
-            terminal.feed(format!("\x1b[33m{notice}\x1b[0m\r\n").as_bytes());
+        // Surface the shell / start-directory fallback notices here too (F2) —
+        // through feed_notice: they carry outside data (paths) and must stay inert.
+        for notice in pty.startup_notices() {
+            terminal.feed_notice(notice);
         }
         let title = format!("Tab {}", self.tabs.len() + 1);
         self.tabs.push(Tab {
@@ -8205,8 +8206,9 @@ impl ApplicationHandler<AppEvent> for App {
         terminal.resize(cols, rows);
         // Surface a one-line notice if the configured shell was unavailable and
         // spawn fell back to another shell, so the fallback is not silent (F2).
-        if let Some(notice) = pty.startup_notice() {
-            terminal.feed(format!("\x1b[33m{notice}\x1b[0m\r\n").as_bytes());
+        // feed_notice keeps the interpolated paths inert (no escape sequences).
+        for notice in pty.startup_notices() {
+            terminal.feed_notice(notice);
         }
         let writer = pty.writer();
         self.tabs.push(Tab {

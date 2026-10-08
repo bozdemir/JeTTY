@@ -171,10 +171,12 @@ pub struct PtySession {
     /// [`PTY_WRITE_QUEUE_CAP`] are dropped instead of growing the queue to OOM
     /// (F13). The writer thread decrements it as it drains each chunk.
     write_queued: Arc<AtomicUsize>,
-    /// One-line notice to surface in the terminal when the configured shell
-    /// override could not be launched and `spawn` fell back to another shell
-    /// (F2). `None` when the requested/auto-detected shell started normally.
-    startup_notice: Option<String>,
+    /// One-line notices to surface in the terminal when `spawn` had to fall
+    /// back: the configured shell override could not be launched (F2), and/or
+    /// the requested start directory could not be entered. Empty when the
+    /// intended shell started where it was asked to. Plain text interpolating
+    /// outside data (paths, OS errors) — show via `Terminal::feed_notice`.
+    startup_notices: Vec<String>,
 }
 
 /// `Write` adapter handed to the app: forwards buffers to the PTY writer
@@ -583,7 +585,7 @@ impl PtySession {
     /// requesting tab's shell cwd sampled at action time. `None` (or a
     /// directory that has since vanished) starts the shell in the home
     /// directory; one that exists but can't be entered falls back to home too,
-    /// with a [`PtySession::startup_notice`] saying so.
+    /// with a [`PtySession::startup_notices`] entry saying so.
     pub fn spawn(
         cols: u16,
         rows: u16,
@@ -734,10 +736,7 @@ impl PtySession {
             )),
             _ => None,
         };
-        let startup_notice = match (shell_notice, cwd_notice) {
-            (Some(a), Some(b)) => Some(format!("{a}\r\n{b}")),
-            (a, b) => a.or(b),
-        };
+        let startup_notices: Vec<String> = shell_notice.into_iter().chain(cwd_notice).collect();
 
         // Dedicated WRITER thread (mirrors the reader thread below): it owns
         // the blocking Write half of the master; the UI thread only ever sends
@@ -877,15 +876,17 @@ impl PtySession {
             pid,
             write_tx,
             write_queued,
-            startup_notice,
+            startup_notices,
         })
     }
 
-    /// A one-line notice describing a shell fallback (the configured `shell`
-    /// override could not be launched), or `None` when the intended shell
-    /// started normally. The app surfaces this in the fresh terminal (F2).
-    pub fn startup_notice(&self) -> Option<&str> {
-        self.startup_notice.as_deref()
+    /// One-line notices describing a spawn fallback — the configured `shell`
+    /// override could not be launched (F2), the requested start directory
+    /// could not be entered — empty when the shell started as asked. Plain
+    /// text with outside data interpolated: the app shows each with
+    /// `Terminal::feed_notice`, which keeps it inert.
+    pub fn startup_notices(&self) -> &[String] {
+        &self.startup_notices
     }
 
     /// Feed queued output to `f`, oldest chunk first, until the queue is empty or

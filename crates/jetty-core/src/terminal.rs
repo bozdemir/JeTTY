@@ -790,6 +790,25 @@ impl Terminal {
         self.osc52_primary.load.load(Ordering::Relaxed)
     }
 
+    /// The exact bytes [`Terminal::feed_notice`] feeds for `text`: the text in
+    /// yellow on its own line, with every control character in it — ESC, BEL,
+    /// all other C0 (TAB/CR/LF too), DEL, C1 — replaced by a visible U+FFFD.
+    /// Only the SGR wrapper JeTTY adds itself reaches the parser as a sequence.
+    pub fn notice_line(text: &str) -> String {
+        let inert: String = text.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect();
+        format!("\x1b[33m{inert}\x1b[0m\r\n")
+    }
+
+    /// Show a one-line JeTTY notice (a shell or start-directory fallback…) in
+    /// this terminal. Notices interpolate outside data — a directory name, a
+    /// shell path, an OS error — so the text is made inert first
+    /// ([`Terminal::notice_line`]): a name carrying `\e]52;…` (clipboard
+    /// write), `\e]0;…` (title), a kitty APC or a query (whose reply would be
+    /// typed into the shell) must show as text, never run through our parser.
+    pub fn feed_notice(&mut self, text: &str) {
+        self.feed(Self::notice_line(text).as_bytes());
+    }
+
     /// Enable or disable OSC 52 clipboard PASTE (remote READ of the local clipboard).
     /// Copy (write) is always permitted. Paste is a SECURITY trade-off (a remote host
     /// / stray output can exfiltrate the clipboard), so it is OFF by default; the
@@ -4525,6 +4544,38 @@ mod tests {
         t.feed(b"\x1b]52;c;aGk=\x07"); // "hi"
         t.feed(b"\x1b]52;c;eWE=\x07"); // base64("ya") == "eWE="
         assert_eq!(t.take_clipboard_store().as_deref(), Some("ya"));
+    }
+
+    // ── JeTTY's own notices ───────────────────────────────────────────────────
+
+    /// A directory / shell name an attacker controls, carrying an OSC 52
+    /// clipboard write, an OSC 0 title, a DSR + DA query (replies are typed into
+    /// the shell), a C1 CSI query, a kitty APC query and an OSC 133 mark.
+    const HOSTILE: &str = "x\x1b]52;c;aGk=\x07 \x1b]0;pwned\x07 \x1b[6n \x1b[c \u{9b}6n \
+        \x1b_Ga=q,i=31;AAAA\x1b\\ \x1b]133;A\x07 tab\tcr\rlf\ndel\x7fend";
+
+    #[test]
+    fn notice_line_keeps_only_our_own_sgr() {
+        let line = Terminal::notice_line(HOSTILE);
+        let inner = line
+            .strip_prefix("\x1b[33m")
+            .and_then(|s| s.strip_suffix("\x1b[0m\r\n"))
+            .expect("our yellow wrapper, nothing else around it");
+        assert!(!inner.chars().any(char::is_control), "a control survived: {inner:?}");
+        assert!(inner.contains("]52;c;aGk=") && inner.contains('\u{fffd}'), "shown as text: {inner:?}");
+    }
+
+    #[test]
+    fn feeding_a_hostile_notice_runs_none_of_its_sequences() {
+        let mut t = Terminal::new(120, 5);
+        assert!(t.drain_pty_writes().is_empty());
+        t.feed_notice(HOSTILE);
+        assert_eq!(t.take_clipboard_store(), None, "no OSC 52 clipboard write");
+        assert_eq!(t.take_title_update(), None, "no OSC 0 title change");
+        assert!(t.drain_pty_writes().is_empty(), "no query reply may reach the shell");
+        let snap = t.snapshot();
+        let row0: String = snap.cells[..snap.cols].iter().map(|c| c.c).collect();
+        assert!(row0.contains("]52;c;aGk="), "the payload is visible text: {row0:?}");
     }
 
     #[test]

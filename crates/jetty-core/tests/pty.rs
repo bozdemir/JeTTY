@@ -172,17 +172,32 @@ fn unenterable_inherited_cwd_falls_back_with_a_notice() {
         return; // root ignores the permission bits — nothing to provoke
     }
     use std::os::unix::fs::PermissionsExt;
-    let dir = unique_temp_dir("locked");
+    // The directory name is attacker-controlled (any cloned repo can carry
+    // one): ESC/BEL/C1 that would write the clipboard and query the terminal.
+    let dir = unique_temp_dir("locked\x1b]52;c;aGk=\x07\u{9b}6n\x1b[c");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
     let res = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), Some(dir.clone()), || {});
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let _ = std::fs::remove_dir(&dir);
     let pty = res.expect("spawn must fall back instead of failing the tab");
-    let notice = pty.startup_notice().expect("the fallback must not be silent");
+    let notices = pty.startup_notices();
+    assert_eq!(notices.len(), 1, "exactly the start-directory notice: {notices:?}");
+    let notice = &notices[0];
     assert!(notice.contains("could not open the shell in"), "notice: {notice}");
-    assert!(!notice.contains("could not be started"), "the shell itself was fine: {notice}");
     std::thread::sleep(Duration::from_millis(200));
     assert!(!pty.child_exited(), "the fallback shell must be alive");
+
+    // Shown the way the app shows it, the name stays text: only our own SGR
+    // wrapper is a sequence, and nothing in it reaches the clipboard, the
+    // title or the shell (as a query reply).
+    let line = jetty_core::Terminal::notice_line(notice);
+    let inner = line.strip_prefix("\x1b[33m").and_then(|s| s.strip_suffix("\x1b[0m\r\n")).unwrap();
+    assert!(!inner.chars().any(char::is_control), "control bytes in the shown notice: {inner:?}");
+    let mut term = jetty_core::Terminal::new(200, 4);
+    term.feed_notice(notice);
+    assert_eq!(term.take_clipboard_store(), None);
+    assert_eq!(term.take_title_update(), None);
+    assert!(term.drain_pty_writes().is_empty(), "a query in the name was answered");
 }
 
 #[cfg(unix)]
