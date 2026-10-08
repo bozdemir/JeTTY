@@ -298,21 +298,29 @@ pub enum AnimWake {
     At(Instant),
 }
 
-/// Pace an animating window: paint when `interval` has passed since its last
-/// presented frame (`last_paint`), else wake once when it will have. A window
-/// that cannot animate (hidden, occluded, no GPU, acquire retry pending) or
-/// has nothing animating stays idle.
+/// Pace an animating window. The next frame is due `interval` after the last
+/// PACED request (`last_request` — a steady clock, so the frame's own render
+/// time does not stretch the cadence), but never sooner than half an interval
+/// after the window's last presented frame (`last_present`), so a slow frame
+/// (a CPU adapter) always leaves idle time behind it. Paint when due, else
+/// wake once when it will be. A window that cannot animate (hidden, occluded,
+/// no GPU, acquire retry pending) or has nothing animating stays idle.
 pub fn anim_step(
     animating: bool,
     can_animate: bool,
-    last_paint: Option<Instant>,
+    last_request: Option<Instant>,
+    last_present: Option<Instant>,
     now: Instant,
     interval: Duration,
 ) -> AnimWake {
     if !animating || !can_animate {
         return AnimWake::Idle;
     }
-    match last_paint.map(|t| t + interval) {
+    let due = [last_request.map(|t| t + interval), last_present.map(|t| t + interval / 2)]
+        .into_iter()
+        .flatten()
+        .max();
+    match due {
         Some(due) if now < due => AnimWake::At(due),
         _ => AnimWake::PaintNow,
     }
@@ -575,6 +583,29 @@ mod tests {
         assert!(toml::from_str::<EffectsConfig>("crt_phosphor = \"purple\"").is_err());
     }
 
+    /// Through the real per-key loader: a bad phosphor name falls back to "off"
+    /// with a warning and every other `[effects]` key still applies.
+    #[test]
+    fn bad_phosphor_value_falls_back_with_a_warning() {
+        let text = "[effects]\ncrt_enabled = true\ncrt_phosphor = \"purple\"\ncrt_grain = 0.3\n";
+        let (cfg, warnings) =
+            crate::config::Config::parse_with_base(text, &crate::config::Config::default(), "using the default")
+                .expect("valid TOML");
+        assert_eq!(cfg.effects.crt_phosphor, PhosphorMode::Off);
+        assert!(cfg.effects.crt_enabled);
+        assert_eq!(cfg.effects.crt_grain, 0.3);
+        assert!(warnings.iter().any(|w| w.contains("crt_phosphor")), "{warnings:?}");
+        let (cfg, warnings) = crate::config::Config::parse_with_base(
+            "[effects]\ncrt_phosphor = \"green\"\ncrt_dither = true\n",
+            &crate::config::Config::default(),
+            "using the default",
+        )
+        .expect("valid TOML");
+        assert_eq!(cfg.effects.crt_phosphor, PhosphorMode::Green);
+        assert!(cfg.effects.crt_dither);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
     #[test]
     fn new_keys_default_off_and_clamp() {
         let d = EffectsConfig::default();
@@ -611,18 +642,54 @@ mod tests {
     fn anim_step_paces_with_timed_wakes() {
         let now = Instant::now();
         let iv = anim_interval(false);
-        assert_eq!(anim_step(false, true, None, now, iv), AnimWake::Idle, "nothing animates");
-        assert_eq!(anim_step(true, false, None, now, iv), AnimWake::Idle, "hidden/occluded window");
-        assert_eq!(anim_step(true, true, None, now, iv), AnimWake::PaintNow, "first frame");
-        let just = now - Duration::from_millis(5);
-        assert_eq!(anim_step(true, true, Some(just), now, iv), AnimWake::At(just + iv), "one timed wake");
-        let old = now - Duration::from_millis(40);
-        assert_eq!(anim_step(true, true, Some(old), now, iv), AnimWake::PaintNow, "overdue");
+        let ms = Duration::from_millis;
+        assert_eq!(anim_step(false, true, None, None, now, iv), AnimWake::Idle, "nothing animates");
+        assert_eq!(anim_step(true, false, None, None, now, iv), AnimWake::Idle, "hidden/occluded window");
+        assert_eq!(anim_step(true, true, None, None, now, iv), AnimWake::PaintNow, "first frame");
+        // The cadence is anchored on the last paced REQUEST: a 3 ms frame does
+        // not stretch the 33 ms interval.
+        let req = now - ms(5);
+        let presented = now - ms(2);
+        assert_eq!(anim_step(true, true, Some(req), Some(presented), now, iv), AnimWake::At(req + iv), "timed wake");
+        let old = now - ms(40);
+        assert_eq!(anim_step(true, true, Some(old), Some(old + ms(3)), now, iv), AnimWake::PaintNow, "overdue");
         // Exactly due paints now (a WaitUntil in the past would spin).
-        assert_eq!(anim_step(true, true, Some(now - iv), now, iv), AnimWake::PaintNow);
-        // A CPU adapter waits twice as long.
+        assert_eq!(anim_step(true, true, Some(now - iv), None, now, iv), AnimWake::PaintNow);
+        // A slow frame (CPU adapter): due a full interval after the request, but
+        // never sooner than half an interval after the present.
         let cpu = anim_interval(true);
-        assert_eq!(anim_step(true, true, Some(old), now, cpu), AnimWake::At(old + cpu));
+        let req = now - ms(70);
+        let presented = now - ms(10);
+        assert_eq!(anim_step(true, true, Some(req), Some(presented), now, cpu), AnimWake::At(presented + cpu / 2));
+        // Another frame (typing) presented just now also defers the next tick.
+        assert_eq!(anim_step(true, true, None, Some(now), now, iv), AnimWake::At(now + iv / 2));
+    }
+
+    /// Simulated steady animation: requests land exactly one interval apart
+    /// whatever the (small) render time, i.e. 30 fps on a GPU, 15 on a CPU
+    /// adapter whose frame takes 26 ms.
+    #[test]
+    fn anim_cadence_matches_the_target_rate() {
+        for (cpu, frame_ms, expect_fps) in [(false, 3u64, 30.0), (true, 26, 15.0)] {
+            let iv = anim_interval(cpu);
+            let t0 = Instant::now();
+            let (mut now, mut req, mut presented) = (t0, None, None);
+            let mut frames = 0u32;
+            while now < t0 + Duration::from_secs(10) {
+                match anim_step(true, true, req, presented, now, iv) {
+                    AnimWake::PaintNow => {
+                        frames += 1;
+                        req = Some(now);
+                        presented = Some(now + Duration::from_millis(frame_ms));
+                        now += Duration::from_millis(frame_ms);
+                    }
+                    AnimWake::At(t) => now = t,
+                    AnimWake::Idle => unreachable!(),
+                }
+            }
+            let fps = frames as f64 / 10.0;
+            assert!((fps - expect_fps).abs() <= 0.5, "cpu={cpu}: {fps} fps");
+        }
     }
 
     #[test]

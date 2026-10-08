@@ -300,6 +300,9 @@ pub(crate) struct DetachedWindow {
     pub crt_key: Option<jetty_render::CrtKey>,
     /// This window's event glitch (a failed command in its tab).
     pub glitch: crate::effects::Glitch,
+    /// When its last PACED effect-animation frame was requested (see
+    /// `App::anim_requested_at`).
+    pub anim_requested_at: Option<std::time::Instant>,
     /// Per-window inline-image (sixel) layer on THIS window's device. Device-
     /// scoped GPU resources cannot be shared with the main window's layer
     /// (amendment R1), so each detached window owns one — same decoded RGBA from
@@ -543,6 +546,7 @@ impl DetachedWindow {
             crt: None,
             crt_key: None,
             glitch: crate::effects::Glitch::default(),
+            anim_requested_at: None,
             image_layer,
             caret_anim: None,
             key_paint_due: None,

@@ -677,6 +677,10 @@ pub struct App {
     /// The main window's event glitch (`glitch_on_error` / `glitch_on_bell`):
     /// a bounded 200 ms burst, rate-limited to one per second.
     glitch: crate::effects::Glitch,
+    /// When `about_to_wait` last requested a PACED effect-animation frame for
+    /// the main window — the anchor of its steady ≤30 fps cadence
+    /// (`effects::anim_step`).
+    anim_requested_at: Option<std::time::Instant>,
     /// Per-window inline-image (sixel) layer on the MAIN device. Draws decoded
     /// images over the grid into `scene_view` (so CRT / corner-mask / summon
     /// compositing apply). Detached windows hold their own on their own device.
@@ -1697,6 +1701,7 @@ impl App {
             crt: None,
             crt_key: None,
             glitch: crate::effects::Glitch::default(),
+            anim_requested_at: None,
             caret_fx: None,
             image_layer: None,
             offscreen: None,
@@ -10685,12 +10690,13 @@ impl ApplicationHandler<AppEvent> for App {
             self.gpu.as_ref().is_some_and(|g| g.is_cpu_adapter()),
         );
         let crt_live = self.fx.crt_anim_live();
+        let animate_unfocused = self.fx.animate_unfocused;
         let settings_focused = self
             .settings_window
             .as_ref()
             .is_some_and(|w| self.last_focused_window == Some(w.id()));
         let continuous = |focused: bool| {
-            crt_live && crate::effects::continuous_anim_allowed(focused || settings_focused, self.fx.animate_unfocused)
+            crt_live && crate::effects::continuous_anim_allowed(focused || settings_focused, animate_unfocused)
         };
         let mut anim_wake: Option<std::time::Instant> = None;
         let mut next_anim = |wake: crate::effects::AnimWake| -> bool {
@@ -10704,24 +10710,28 @@ impl ApplicationHandler<AppEvent> for App {
         if next_anim(crate::effects::anim_step(
             continuous(self.main_focused) || self.glitch.active(now),
             main_can_animate,
+            self.anim_requested_at,
             self.last_present_at,
             now,
             anim_interval,
         )) {
             if let Some(w) = &self.window {
                 w.request_redraw();
+                self.anim_requested_at = Some(now);
                 painted = true;
             }
         }
-        for dw in &self.detached {
+        for dw in &mut self.detached {
             if next_anim(crate::effects::anim_step(
                 continuous(dw.focused) || dw.glitch.active(now),
                 !dw.occluded && dw.acquire_retry.is_none(),
+                dw.anim_requested_at,
                 dw.last_present_at,
                 now,
                 anim_interval,
             )) {
                 dw.window.request_redraw();
+                dw.anim_requested_at = Some(now);
                 painted = true;
             }
         }
@@ -13410,7 +13420,9 @@ impl ApplicationHandler<AppEvent> for App {
                 let crt = self.crt.as_ref();
                 let offscreen = self.offscreen.as_ref();
                 // Post-pass inputs, captured before the mutable gpu/text borrow.
-                let crt_enabled = post.is_some();
+                // (`crt` exists whenever `post` does — `sync_main_post` above —
+                // but a pass without its object must never skip the corner mask.)
+                let crt_enabled = post.is_some() && crt.is_some();
                 let crt_time = self.crt_clock.elapsed().as_secs_f64();
                 let summon_effect = self.summon_effect;
                 // Summon progress: t in [0,1) drives a reveal pass this frame
