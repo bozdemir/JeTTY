@@ -190,6 +190,9 @@
 ///                    left it (trail_ms 200, threshold 2 unless
 ///                    JETTY_SHOT_TRAIL_MS / _THRESHOLD say otherwise) — the
 ///                    app's model and its 6-vertex pass inside the grid pass.
+///   JETTY_SHOT_TRANSFORM_T=t — the Pop / Glide / Fade summon effect
+///                    (JETTY_SHOT_TRANSFORM=pop|glide|fade, default pop) at
+///                    progress t: the real Tier-B pass sampling the frame.
 ///   JETTY_SHOT_GLOW_T=t — the caret glow/ripple pass at progress t around the
 ///                    cursor (additive on a dark theme, multiply on a light
 ///                    one; same color source as JETTY_SHOT_CARET_COLOR).
@@ -1899,7 +1902,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // texture/sampler binding headlessly, mirroring the SUMMON/PHOSPHOR hooks.
     let liquid_t = std::env::var("JETTY_SHOT_LIQUID_T").ok().and_then(|s| s.parse::<f32>().ok());
     let focus_t = std::env::var("JETTY_SHOT_FOCUS_T").ok().and_then(|s| s.parse::<f32>().ok());
-    let tier_b_tex = if liquid_t.is_some() || focus_t.is_some() {
+    let transform_t = std::env::var("JETTY_SHOT_TRANSFORM_T").ok().and_then(|s| s.parse::<f32>().ok());
+    let tier_b_tex = if liquid_t.is_some() || focus_t.is_some() || transform_t.is_some() {
         let tex_b = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("jetty-shot-tex-b"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -1923,6 +1927,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("jetty-shot: applying FocusPull reveal (GPU pass, t={t}, samples frame)");
             let focus = jetty_render::FocusPull::new(&device, format);
             focus.apply(&device, &queue, &view_b, &view, width, height, t);
+        } else if let Some(t) = transform_t {
+            let kind = match std::env::var("JETTY_SHOT_TRANSFORM").unwrap_or_default().as_str() {
+                "glide" => jetty_render::TransformKind::Glide,
+                "fade" => jetty_render::TransformKind::Fade,
+                _ => jetty_render::TransformKind::Pop,
+            };
+            eprintln!(
+                "jetty-shot: applying {kind:?} transform (GPU pass, t={t}, params {:?})",
+                jetty_render::transform_params(kind, t)
+            );
+            let tf = jetty_render::SummonTransform::new(&device, format);
+            tf.apply(&device, &queue, &view_b, &view, width, height, kind, t);
         }
         Some(tex_b)
     } else {
@@ -2118,7 +2134,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let summon_active = std::env::var("JETTY_SHOT_SUMMON_T").is_ok()
         || std::env::var("JETTY_SHOT_PHOSPHOR_T").is_ok()
         || std::env::var("JETTY_SHOT_LIQUID_T").is_ok()
-        || std::env::var("JETTY_SHOT_FOCUS_T").is_ok();
+        || std::env::var("JETTY_SHOT_FOCUS_T").is_ok()
+        || std::env::var("JETTY_SHOT_TRANSFORM_T").is_ok();
     let composited = if bg_alpha < 255 || corner_radius > 0.0 || summon_active {
         eprintln!("jetty-shot: compositing over checkerboard (bg alpha={})", bg_alpha);
         const TILE: u32 = 16;

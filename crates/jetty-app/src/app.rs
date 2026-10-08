@@ -50,23 +50,46 @@ pub enum SummonEffect {
     Liquid,
     /// Focus Pull — Tier-B rack-focus blur + chromatic that samples the frame.
     Focus,
+    /// Pop — Tier-B: 96% → 100% with a light spring, opacity in ~70 ms.
+    Pop,
+    /// Glide — Tier-B: drifts up the last 3% into place while fading in.
+    Glide,
+    /// Fade — Tier-B: opacity only, 90 ms (also the reduce-motion summon).
+    Fade,
 }
 
 impl SummonEffect {
     /// Cycle order for the ‹ / › settings buttons.
-    const ORDER: [SummonEffect; 5] = [
+    const ORDER: [SummonEffect; 8] = [
         SummonEffect::None,
         SummonEffect::Bayer,
         SummonEffect::Phosphor,
         SummonEffect::Liquid,
         SummonEffect::Focus,
+        SummonEffect::Pop,
+        SummonEffect::Glide,
+        SummonEffect::Fade,
     ];
 
     /// Whether this is a Tier-B effect: one that SAMPLES the rendered frame from
-    /// an offscreen texture (Liquid/Focus). Tier-A effects (None/Bayer/Phosphor)
-    /// render straight to the surface, so the normal hot path is untouched.
+    /// an offscreen texture (Liquid/Focus/Pop/Glide/Fade). Tier-A effects
+    /// (None/Bayer/Phosphor) render straight to the surface, so the normal hot
+    /// path is untouched.
     fn is_tier_b(self) -> bool {
-        matches!(self, SummonEffect::Liquid | SummonEffect::Focus)
+        matches!(
+            self,
+            SummonEffect::Liquid | SummonEffect::Focus | SummonEffect::Pop | SummonEffect::Glide | SummonEffect::Fade
+        )
+    }
+
+    /// The transform pass behind Pop / Glide / Fade.
+    fn transform_kind(self) -> Option<jetty_render::TransformKind> {
+        match self {
+            SummonEffect::Pop => Some(jetty_render::TransformKind::Pop),
+            SummonEffect::Glide => Some(jetty_render::TransformKind::Glide),
+            SummonEffect::Fade => Some(jetty_render::TransformKind::Fade),
+            _ => None,
+        }
     }
 
     /// Animation duration in seconds for this effect.
@@ -77,6 +100,9 @@ impl SummonEffect {
             SummonEffect::Phosphor => 0.25,
             SummonEffect::Liquid => 0.25,
             SummonEffect::Focus => 0.25,
+            SummonEffect::Pop | SummonEffect::Glide | SummonEffect::Fade => {
+                jetty_render::transform_secs(self.transform_kind().expect("a transform effect"))
+            }
         }
     }
 
@@ -88,6 +114,9 @@ impl SummonEffect {
             "liquid" => SummonEffect::Liquid,
             "focus" => SummonEffect::Focus,
             "bayer" => SummonEffect::Bayer,
+            "pop" => SummonEffect::Pop,
+            "glide" => SummonEffect::Glide,
+            "fade" => SummonEffect::Fade,
             _ => SummonEffect::Phosphor, // default / unknown → Phosphor
         }
     }
@@ -99,6 +128,9 @@ impl SummonEffect {
             SummonEffect::Phosphor => "phosphor",
             SummonEffect::Liquid => "liquid",
             SummonEffect::Focus => "focus",
+            SummonEffect::Pop => "pop",
+            SummonEffect::Glide => "glide",
+            SummonEffect::Fade => "fade",
         }
     }
 
@@ -110,6 +142,9 @@ impl SummonEffect {
             SummonEffect::Phosphor => "Phosphor",
             SummonEffect::Liquid => "Liquid",
             SummonEffect::Focus => "Focus",
+            SummonEffect::Pop => "Pop",
+            SummonEffect::Glide => "Glide",
+            SummonEffect::Fade => "Fade",
         }
     }
 }
@@ -668,6 +703,12 @@ pub struct App {
     liquid: Option<jetty_render::LiquidDrop>,
     /// Tier-B FocusPull summon effect (samples the offscreen frame).
     focus: Option<jetty_render::FocusPull>,
+    /// Tier-B Pop / Glide / Fade summon effects (one transform pass).
+    ///
+    /// Every summon-effect pass above is built LAZILY — only the one the
+    /// effective summon effect needs (`ensure_summon_fx`), on the first frame
+    /// of a summon or when the effect changes — never all of them in `resumed`.
+    transform: Option<jetty_render::SummonTransform>,
     /// CRT post-effect: when enabled the whole scene is rendered to `offscreen`
     /// and this pass applies the full CRT effect pipeline, writing to the surface.
     /// Built LAZILY by `sync_main_post` the first time CRT (or a glitch trigger)
@@ -1747,6 +1788,7 @@ impl App {
             phosphor: None,
             liquid: None,
             focus: None,
+            transform: None,
             crt: None,
             crt_key: None,
             glitch: crate::effects::Glitch::default(),
@@ -2898,6 +2940,7 @@ impl App {
         let se = SummonEffect::from_config(&cfg.summon_effect);
         if se != self.summon_effect {
             self.summon_effect = se;
+            self.ensure_summon_fx();
         }
         // Window mode: needs the real setter (docks/undocks; a bare assign is only
         // half-applied).
@@ -3069,6 +3112,49 @@ impl App {
         self.reduce_motion.active(self.system_reduced_motion)
     }
 
+    /// The summon reveal that actually plays, and for how long: the selected
+    /// effect — or, with motion reduced, a short fade (`None` stays none).
+    fn summon_plan(&self) -> (SummonEffect, f32) {
+        summon_plan(self.summon_effect, self.motion_reduced())
+    }
+
+    /// Build the pass the effective summon effect needs, if it doesn't exist
+    /// yet (one `Option` check otherwise). Only that effect's pipeline is ever
+    /// compiled — at the first summon, or when the effect / reduce-motion
+    /// changes — instead of all of them at startup.
+    fn ensure_summon_fx(&mut self) {
+        let Some(g) = &self.gpu else { return };
+        let (device, format) = (&g.device, g.format);
+        match self.summon_plan().0 {
+            SummonEffect::None => {}
+            SummonEffect::Bayer => {
+                if self.bayer_reveal.is_none() {
+                    self.bayer_reveal = Some(jetty_render::BayerReveal::new(device, format));
+                }
+            }
+            SummonEffect::Phosphor => {
+                if self.phosphor.is_none() {
+                    self.phosphor = Some(jetty_render::PhosphorIgnition::new(device, format));
+                }
+            }
+            SummonEffect::Liquid => {
+                if self.liquid.is_none() {
+                    self.liquid = Some(jetty_render::LiquidDrop::new(device, format));
+                }
+            }
+            SummonEffect::Focus => {
+                if self.focus.is_none() {
+                    self.focus = Some(jetty_render::FocusPull::new(device, format));
+                }
+            }
+            SummonEffect::Pop | SummonEffect::Glide | SummonEffect::Fade => {
+                if self.transform.is_none() {
+                    self.transform = Some(jetty_render::SummonTransform::new(device, format));
+                }
+            }
+        }
+    }
+
     /// Set `reduce_motion` (hot-reload, Settings, palette).
     fn set_reduce_motion(&mut self, mode: crate::motion::ReduceMotion) {
         if mode == self.reduce_motion {
@@ -3095,6 +3181,7 @@ impl App {
 
     /// Reduce-motion flipped: stop what it forbids at once and repaint.
     fn motion_changed(&mut self) {
+        self.ensure_summon_fx();
         if self.motion_reduced() {
             self.slide_anim = None;
             self.trail.reset();
@@ -8247,10 +8334,12 @@ impl App {
         self.corner_mask = Some(jetty_render::CornerMask::new(device, format));
         // Device-scoped and lazy: rebuilt on the first ring frame after this.
         self.focus_ring = None;
-        self.bayer_reveal = Some(jetty_render::BayerReveal::new(device, format));
-        self.phosphor = Some(jetty_render::PhosphorIgnition::new(device, format));
-        self.liquid = Some(jetty_render::LiquidDrop::new(device, format));
-        self.focus = Some(jetty_render::FocusPull::new(device, format));
+        // Summon passes: rebuilt on the new device by the next summon frame.
+        self.bayer_reveal = None;
+        self.phosphor = None;
+        self.liquid = None;
+        self.focus = None;
+        self.transform = None;
         // Rebuilt lazily on the new device by the next `sync_main_post`.
         self.crt = None;
         self.crt_key = None;
@@ -10932,7 +11021,7 @@ impl ApplicationHandler<AppEvent> for App {
         let mut main_settled = false;
         if self
             .summon_anim
-            .is_some_and(|s| anim_expired(s, self.summon_effect.duration(), now))
+            .is_some_and(|s| anim_expired(s, self.summon_plan().1, now))
         {
             self.summon_anim = None;
             main_settled = true;
@@ -11564,17 +11653,11 @@ impl ApplicationHandler<AppEvent> for App {
             // The focus ring is device-scoped and lazy: never one from an older
             // device (rebuilt on the first frame that draws a ring).
             self.focus_ring = None;
-            // Build the Bayer crystallize reveal (final fullscreen pass) and arm
-            // the first-open summon so the frame materializes out of the dither
-            // lattice the instant the window appears.
-            self.bayer_reveal = Some(jetty_render::BayerReveal::new(&g.device, g.format));
-            self.phosphor = Some(jetty_render::PhosphorIgnition::new(&g.device, g.format));
-            // Tier-B effects + their surface-sized offscreen scene texture. The
-            // texture is allocated up front (cheap) but only WRITTEN/SAMPLED while
-            // a Tier-B effect is summoning or CRT is enabled; Tier-A and normal
-            // (CRT-off) frames never use it.
-            self.liquid = Some(jetty_render::LiquidDrop::new(&g.device, g.format));
-            self.focus = Some(jetty_render::FocusPull::new(&g.device, g.format));
+            // The summon reveal's pass is built by the first frame (only the
+            // selected effect's — `ensure_summon_fx`); arm the first-open summon
+            // so the window materializes through it the instant it appears.
+            // Tier-B effects sample a surface-sized offscreen scene texture,
+            // allocated lazily by the frames that need it.
             // The CRT post pass is NOT built here: `sync_main_post` builds it
             // (and only the pipeline variant the settings need) before the first
             // frame that uses it — CRT off costs nothing at startup.
@@ -13637,6 +13720,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // presenting the window, so the reveal effect is never skipped.
                 if self.summon_pending {
                     self.summon_pending = false;
+                    self.ensure_summon_fx();
                     self.summon_anim = Some(std::time::Instant::now());
                 }
                 // Drain every tab so background shells keep running; close any
@@ -13873,14 +13957,16 @@ impl ApplicationHandler<AppEvent> for App {
                 let post = crate::effects::frame_settings(&self.fx, glitch_level > 0.0);
                 self.sync_main_post();
                 // Lazily (re)allocate the offscreen scene texture when EITHER a
-                // Tier-B effect (Liquid/Focus) is actively summoning OR a post
-                // pass (CRT / glitch burst) runs — and the texture is missing or
-                // stale (wrong size). Otherwise it stays unallocated (the normal
-                // hot path renders straight to the surface). Done before the
-                // `as_ref()` captures below so `offscreen` picks up the
-                // freshly-sized texture.
+                // Tier-B effect (Liquid/Focus/Pop/Glide/Fade) is actively
+                // summoning OR a post pass (CRT / glitch burst) runs — and the
+                // texture is missing or stale (wrong size). Otherwise it stays
+                // unallocated (the normal hot path renders straight to the
+                // surface). Done before the `as_ref()` captures below so
+                // `offscreen` picks up the freshly-sized texture. The summon
+                // that plays is `summon_plan`'s (a short fade with reduced motion).
+                let (summon_effect, summon_secs) = self.summon_plan();
                 let want_offscreen = post.is_some()
-                    || (self.summon_effect.is_tier_b() && self.summon_anim.is_some());
+                    || (summon_effect.is_tier_b() && self.summon_anim.is_some());
                 if want_offscreen {
                     if let Some((gw, gh)) = self.gpu.as_ref().map(|g| (g.config.width, g.config.height)) {
                         let stale = self
@@ -13927,6 +14013,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let phosphor = self.phosphor.as_ref();
                 let liquid = self.liquid.as_ref();
                 let focus = self.focus.as_ref();
+                let transform = self.transform.as_ref();
                 let caret_fx = self.caret_fx.as_ref();
                 let crt = self.crt.as_ref();
                 let offscreen = self.offscreen.as_ref();
@@ -13935,15 +14022,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // but a pass without its object must never skip the corner mask.)
                 let crt_enabled = post.is_some() && crt.is_some();
                 let crt_time = self.crt_clock.elapsed().as_secs_f64();
-                let summon_effect = self.summon_effect;
                 // Summon progress: t in [0,1) drives a reveal pass this frame
                 // (`about_to_wait` pumps the next one); t>=1 ends the animation so
                 // we return to damage-driven idle (0 CPU). None = not animating.
-                // Each effect has its own duration. (None has duration 0 → ends on
-                // the first frame.)
+                // Each effect has its own duration (`summon_plan`: a short fade
+                // under reduce-motion; None has duration 0 → ends on the first
+                // frame).
                 let summon_t = self.summon_anim.map(|start| {
-                    let d = summon_effect.duration();
-                    if d <= 0.0 { 1.0 } else { start.elapsed().as_secs_f32() / d }
+                    if summon_secs <= 0.0 { 1.0 } else { start.elapsed().as_secs_f32() / summon_secs }
                 });
                 // Dropdown slide progress (ease-out cubic). Captured here; the
                 // pixel offset is computed once `height` is bound below.
@@ -14707,6 +14793,16 @@ impl ApplicationHandler<AppEvent> for App {
                                         );
                                     }
                                 }
+                                SummonEffect::Pop | SummonEffect::Glide | SummonEffect::Fade => {
+                                    if let (Some(tf), Some(kind), true) =
+                                        (transform, summon_effect.transform_kind(), tier_b_active)
+                                    {
+                                        tf.apply(
+                                            &gpu.device, &gpu.queue, &view, scene_view,
+                                            width, height, kind, t,
+                                        );
+                                    }
+                                }
                             }
                         } else {
                             // Reveal complete — back to idle (no pass next frame).
@@ -15093,6 +15189,17 @@ fn render_grid_scene(
         rects.extend(copy);
     }
     quad.render(device, queue, scene_view, width, height, &rects);
+}
+
+/// The summon reveal that plays for the selected `effect`, and its length:
+/// with motion `reduced`, every reveal becomes a short fade (no scan line,
+/// ripple, blur, drift or spring) — `None` stays none.
+fn summon_plan(effect: SummonEffect, reduced: bool) -> (SummonEffect, f32) {
+    if reduced && effect != SummonEffect::None {
+        (SummonEffect::Fade, crate::motion::REDUCED_SUMMON_SECS)
+    } else {
+        (effect, effect.duration())
+    }
 }
 
 /// A cursor jump within this long after a flood drain is output, not the
@@ -16807,6 +16914,43 @@ mod printable_keystroke_tests {
     #[test]
     fn ctrl_c_is_not_printable() {
         assert!(!is_printable_keystroke(b"\x03"));
+    }
+}
+
+#[cfg(test)]
+mod summon_motion_tests {
+    use super::{summon_plan, SummonEffect};
+
+    #[test]
+    fn summon_effects_round_trip_and_list_the_new_ones() {
+        for e in SummonEffect::ORDER {
+            assert_eq!(SummonEffect::from_config(e.to_config()), e);
+        }
+        // The Settings choice list (`summon_effect_choices`) follows ORDER.
+        let order = SummonEffect::ORDER;
+        let at = |e| order.iter().position(|&x| x == e).unwrap();
+        assert_eq!(at(SummonEffect::Pop), at(SummonEffect::Focus) + 1);
+        assert_eq!(order.last(), Some(&SummonEffect::Fade));
+        for e in [SummonEffect::Pop, SummonEffect::Glide, SummonEffect::Fade] {
+            assert!(e.is_tier_b() && e.transform_kind().is_some(), "{e:?} samples the frame");
+            assert!(e.duration() > 0.0 && e.duration() <= 0.25, "{e:?} is quick");
+        }
+        assert!(SummonEffect::Fade.duration() <= 0.09);
+    }
+
+    #[test]
+    fn reduce_motion_turns_every_summon_into_a_short_fade() {
+        for e in SummonEffect::ORDER {
+            let (plain, secs) = summon_plan(e, false);
+            assert_eq!((plain, secs), (e, e.duration()), "unchanged when not reduced");
+            let (reduced, secs) = summon_plan(e, true);
+            if e == SummonEffect::None {
+                assert_eq!(reduced, SummonEffect::None);
+            } else {
+                assert_eq!(reduced, SummonEffect::Fade);
+                assert!(secs <= 0.08, "{e:?}: ≤ 80 ms");
+            }
+        }
     }
 }
 
