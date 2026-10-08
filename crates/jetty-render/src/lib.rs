@@ -48,7 +48,7 @@ pub use phosphor::PhosphorIgnition;
 pub use liquid::LiquidDrop;
 pub use focus::FocusPull;
 pub use crt::{
-    anim_seed, bloom_blur_step, crt_bloom_shader_source, crt_shader_source, srgb_to_linear, Crt, CrtExtUniform,
+    anim_seed, bloom_blur, crt_bloom_shader_source, crt_shader_source, srgb_to_linear, Crt, CrtExtUniform,
     CrtFrame, CrtKey, CrtParams, CrtSettings, CrtUniform, Phosphor, ANIM_SEED_FPS, BLOOM_STEP_MAX,
     CRT_FLAG_FLICKER, CRT_FLAG_JITTER, CRT_FLAG_ROLL,
 };

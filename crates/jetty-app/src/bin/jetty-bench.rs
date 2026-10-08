@@ -213,6 +213,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_pipeline_1byte_cpu(&mut term);
     print_font_db_costs(&text);
     bench_frames(&device, &queue, format, font_size)?;
+    bench_post_pass(&device, &queue, format, font_size)?;
+    Ok(())
+}
+
+/// The CRT post pass (`jetty_render::Crt`, the app's own settings path) on a
+/// real rendered terminal frame at 2560×1440: the pipeline build per variant and
+/// the GPU-synchronized ms/pass for CRT off (corners only — the floor), the
+/// shipped defaults, a subtle everyday look, and the effect presets.
+fn bench_post_pass(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    font_size: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jetty_app::effects::{self, EffectsConfig};
+    let (width, height) = (2560u32, 1440u32);
+    let tex = |label: &str| {
+        device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default())
+    };
+    let (scene, out) = (tex("bench-post-scene"), tex("bench-post-out"));
+    // A full screen of colored terminal output as the scene.
+    let mut text = TextLayer::new_with_family(device, queue, format, font_size, "MesloLGS NF");
+    let (cw, ch) = text.cell_size();
+    let (cols, rows) = ((width as f32 / cw) as usize, (height as f32 / ch) as usize);
+    let mut term = jetty_core::Terminal::new(cols.max(1), rows.max(1));
+    for k in 0..rows * 2 {
+        term.feed(&numbered_line(k));
+    }
+    text.render_to(device, queue, &scene, width, height, &term.snapshot(), true, 0.0)?;
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+
+    let theme = jetty_core::Theme::by_name("catppuccin_mocha");
+    let frame = jetty_render::CrtFrame {
+        width,
+        height,
+        corner_radius: 12.0,
+        corner_radius_top: 12.0,
+        time: 0.0,
+        bg: [theme.bg[0], theme.bg[1], theme.bg[2]],
+        fg: theme.fg,
+        premultiplied: true,
+        srgb: format.is_srgb(),
+        dpi_scale: 1.0,
+        glitch: 0.0,
+    };
+    let everyday = EffectsConfig {
+        crt_enabled: true,
+        crt_scanline: 0.10,
+        crt_mask: 0.24,
+        crt_bloom: 0.135,
+        crt_chromatic: 0.15,
+        crt_vignette: 0.50,
+        ..EffectsConfig::default()
+    };
+    let defaults = EffectsConfig { crt_enabled: true, ..EffectsConfig::default() };
+    let mut looks: Vec<(String, jetty_render::CrtSettings)> = vec![
+        ("crt off (corners only)".into(), jetty_render::CrtSettings::PASSTHROUGH),
+        ("defaults".into(), effects::crt_settings(&defaults)),
+        ("everyday (subtle)".into(), effects::crt_settings(&everyday)),
+    ];
+    for p in effects::effect_presets().iter().filter(|p| p.patch.crt_enabled == Some(true)) {
+        let mut fx = EffectsConfig::default();
+        p.patch.apply_to(&mut fx);
+        looks.push((format!("preset {}", p.name), effects::crt_settings(&fx)));
+    }
+    println!("post pass     {width}x{height}, Crt::apply incl. bloom chain, GPU-synced (median of 5×30 passes)");
+    let crt = jetty_render::Crt::new(device, format);
+    for (name, settings) in &looks {
+        let params = jetty_render::CrtParams::build(settings, &frame);
+        let t = Instant::now();
+        crt.prepare(device, params.key);
+        let build_ms = t.elapsed().as_secs_f64() * 1000.0;
+        crt.apply(device, queue, &out, &scene, &params);
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+        let mut runs: Vec<f64> = (0..5)
+            .map(|_| {
+                let t = Instant::now();
+                for _ in 0..30 {
+                    crt.apply(device, queue, &out, &scene, &params);
+                }
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                t.elapsed().as_secs_f64() * 1000.0 / 30.0
+            })
+            .collect();
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        println!(
+            "  {name:<24} {:7.3} ms/pass  (variant {:#06x}, pipeline build {build_ms:5.1} ms)",
+            runs[2],
+            params.key.bits()
+        );
+    }
     Ok(())
 }
 

@@ -72,11 +72,12 @@ pub const CRT_FLAG_FLICKER: u32 = 1 << 1; // bit1: global brightness flicker
 pub const CRT_FLAG_JITTER: u32 = 1 << 2; // bit2: sub-pixel horizontal jitter
 
 /// Bloom blur step (quarter-resolution texels between Gaussian taps) at
-/// `crt_bloom_radius` = 1; the step scales linearly with the radius. Radius 0
-/// (the default — the pre-v2 tight glow) runs NO blur pass: the halo is the 4×4
-/// bright-pass downsample plus the bilinear upsample. Above 0 the separable
-/// 9-tap Gaussian runs twice (H, V, H, V), so the glow widens continuously
-/// (σ ≈ 4.9·radius quarter-res texels ≈ 20 px at 1) without tap ghosting.
+/// `crt_bloom_radius` = 1. Radius 0 (the default — the pre-v2 tight glow) runs
+/// NO blur pass: the halo is the 4×4 bright-pass downsample plus the bilinear
+/// upsample. Up to radius 0.5 the separable 9-tap Gaussian runs once (H, V);
+/// above, twice (H, V, H, V) with a smaller step — σ ≈ 4.9·radius quarter-res
+/// texels (≈ 20 px at 1) either way, continuous across the switch, and no tap
+/// ghosting at wide radii (see [`bloom_blur`]).
 pub const BLOOM_STEP_MAX: f32 = 2.0;
 
 /// The rate (frames per second) the animated seeds (`crt_grain_animate`, the
@@ -95,7 +96,7 @@ const COMMON_WGSL: &str = r#"
 // layout (`CrtExtUniform`, [f32; 4] fields) matches byte-for-byte:
 //   bg     @ 0   rgb theme background (shader color space), w = 1 when the scene is premultiplied
 //   fg     @16   rgb theme foreground, w = bloom blur step (quarter-res texels)
-//   paper  @32   rgb phosphor "unlit" color (paper), w = 1
+//   paper  @32   rgb phosphor "unlit" color (paper), w = bloom radius 0..1
 //   phos   @48   rgb phosphor "lit" color (ink), w = hue keep 0..1
 //   fx     @64   x grain 0..1, y dither/grain cell px, z grain seed, w DPI scale
 //   glitch @80   x burst intensity 0..1, y tear seed, zw reserved
@@ -153,8 +154,8 @@ fn axis_t(c: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>) -> f32 {
 // unlit paper (after the same remap the composite applies) — thresholded on its
 // brightest channel. A light theme's background is not "above" itself, so it
 // never blooms into a wash-out; on a dark theme this is the classic threshold.
-// A wider bloom (radius > 0; x.fg.w = 2·radius) also lowers the threshold, so
-// a soft neon halo catches bright text, not only solid bright areas.
+// A wider bloom (radius > 0, x.paper.w) also lowers the threshold, so a soft
+// neon halo catches bright text, not only solid bright areas.
 fn bright(c: vec4<f32>) -> vec3<f32> {
     let a = alpha_div(c.a);
     var s = c.rgb / a;
@@ -165,7 +166,7 @@ fn bright(c: vec4<f32>) -> vec3<f32> {
     }
     let ex = max(s - base, vec3(0.0, 0.0, 0.0));
     let l = max(ex.r, max(ex.g, ex.b));
-    let r = clamp(x.fg.w * 0.5, 0.0, 1.0);
+    let r = clamp(x.paper.w, 0.0, 1.0);
     return ex * (smoothstep(0.55 - 0.33 * r, 0.9 - 0.32 * r, l) * a);
 }
 
@@ -550,7 +551,7 @@ pub struct CrtExtUniform {
     pub bg: [f32; 4],
     /// rgb = theme foreground; `[3]` = bloom blur step in quarter-res texels. (offset 16)
     pub fg: [f32; 4],
-    /// rgb = phosphor "unlit" color (paper); `[3]` = 1.0. (offset 32)
+    /// rgb = phosphor "unlit" color (paper); `[3]` = bloom radius 0..1. (offset 32)
     pub paper: [f32; 4],
     /// rgb = phosphor "lit" color (ink); `[3]` = hue keep 0..1. (offset 48)
     pub phos: [f32; 4],
@@ -770,11 +771,19 @@ pub fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
 }
 
-/// The bloom blur step (quarter-res texels) for `crt_bloom_radius` 0..1; 0 = no
-/// blur pass at all.
-pub fn bloom_blur_step(radius: f32) -> f32 {
+/// The bloom blur for `crt_bloom_radius` 0..1: `(step in quarter-res texels,
+/// H+V iterations)`. One iteration with a √2 larger step has the σ of two, so
+/// the glow widens continuously while a small radius costs two passes, not
+/// four. Radius 0 → `(0, 0)`: no blur pass at all.
+pub fn bloom_blur(radius: f32) -> (f32, u32) {
     let r = if radius.is_finite() { radius.clamp(0.0, 1.0) } else { 0.0 };
-    BLOOM_STEP_MAX * r
+    if r <= 0.0 {
+        (0.0, 0)
+    } else if r <= 0.5 {
+        (BLOOM_STEP_MAX * r * std::f32::consts::SQRT_2, 1)
+    } else {
+        (BLOOM_STEP_MAX * r, 2)
+    }
 }
 
 /// The animated-seed counter at `time` (seconds): advances [`ANIM_SEED_FPS`]
@@ -825,8 +834,8 @@ impl CrtParams {
         let seed = anim_seed(f.time);
         let ext = CrtExtUniform {
             bg: [bg[0], bg[1], bg[2], if f.premultiplied { 1.0 } else { 0.0 }],
-            fg: [fg[0], fg[1], fg[2], bloom_blur_step(s.bloom_radius)],
-            paper: [paper[0], paper[1], paper[2], 1.0],
+            fg: [fg[0], fg[1], fg[2], bloom_blur(s.bloom_radius).0],
+            paper: [paper[0], paper[1], paper[2], unit01(s.bloom_radius)],
             phos: [ink[0], ink[1], ink[2], unit01(hue)],
             fx: [unit01(s.grain), cell, if s.grain_animate { seed } else { 0.0 }, dpi],
             glitch: [if s.glitch { unit01(f.glitch) } else { 0.0 }, seed, 0.0, 0.0],
@@ -1225,12 +1234,10 @@ impl Crt {
             g.blur.as_ref(),
         ) {
             pass(&mut encoder, "crt-bloom-down", &t.a, down, down_bind);
-            // A wider glow (radius > 0): the separable Gaussian twice.
-            if params.ext.fg[3] > 0.01 {
-                for _ in 0..2 {
-                    pass(&mut encoder, "crt-bloom-blur-h", &t.b, blur_h, &t.bind_h);
-                    pass(&mut encoder, "crt-bloom-blur-v", &t.a, blur_v, &t.bind_v);
-                }
+            // A wider glow (radius > 0): the separable Gaussian, once or twice.
+            for _ in 0..bloom_blur(params.ext.paper[3]).1 {
+                pass(&mut encoder, "crt-bloom-blur-h", &t.b, blur_h, &t.bind_h);
+                pass(&mut encoder, "crt-bloom-blur-v", &t.a, blur_v, &t.bind_v);
             }
         }
         pass(&mut encoder, "crt-pass", dst, main_pipe, &binds.main);
@@ -1495,16 +1502,33 @@ mod tests {
         assert_ne!(t0, t2, "the next step");
     }
 
-    /// Radius 0 = no blur pass (the pre-v2 tight glow); the step grows linearly.
+    /// Radius 0 = no blur pass (the pre-v2 tight glow); one H+V iteration up to
+    /// 0.5, two above — and the Gaussian σ (∝ step·√iterations) grows
+    /// continuously across the switch.
     #[test]
-    fn bloom_step_maps_the_radius() {
-        assert_eq!(bloom_blur_step(0.0), 0.0);
-        assert_eq!(bloom_blur_step(1.0), BLOOM_STEP_MAX);
-        assert_eq!(bloom_blur_step(-3.0), 0.0);
-        assert_eq!(bloom_blur_step(f32::NAN), 0.0);
-        assert_eq!(bloom_blur_step(0.5), BLOOM_STEP_MAX * 0.5);
+    fn bloom_blur_maps_the_radius() {
+        assert_eq!(bloom_blur(0.0), (0.0, 0));
+        assert_eq!(bloom_blur(-3.0), (0.0, 0));
+        assert_eq!(bloom_blur(f32::NAN), (0.0, 0));
+        assert_eq!(bloom_blur(0.3).1, 1);
+        assert_eq!(bloom_blur(0.5).1, 1);
+        assert_eq!(bloom_blur(0.6).1, 2);
+        assert_eq!(bloom_blur(1.0), (BLOOM_STEP_MAX, 2));
+        let sigma = |r: f32| {
+            let (step, n) = bloom_blur(r);
+            step * (n as f32).sqrt()
+        };
+        assert!((sigma(0.5) - sigma(0.5001)).abs() < 1e-3, "continuous at the switch");
+        let mut last = 0.0;
+        for i in 1..=100 {
+            let s = sigma(i as f32 / 100.0);
+            assert!(s > last, "σ grows with the radius");
+            last = s;
+        }
         let s = CrtSettings { bloom: 0.4, bloom_radius: 0.3, ..CrtSettings::PASSTHROUGH };
-        assert_eq!(CrtParams::build(&s, &frame()).ext.fg[3], bloom_blur_step(0.3));
+        let p = CrtParams::build(&s, &frame());
+        assert_eq!(p.ext.fg[3], bloom_blur(0.3).0);
+        assert_eq!(p.ext.paper[3], 0.3, "the radius rides in paper.w");
     }
 
     /// Smoke-test `Crt` on a real device: prepare a few variants (incl. bloom)
