@@ -2,6 +2,8 @@ mod chrome;
 mod colors;
 mod gpu;
 mod text;
+mod builtin;
+mod emoji;
 mod quad;
 mod panel;
 mod menu;
