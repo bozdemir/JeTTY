@@ -15,9 +15,11 @@
 //!   writes all the time — each write would wake the watcher;
 //! * the config dir itself (`config.toml`) and its `themes/` subdir (a symlinked
 //!   dir is followed);
-//! * when `config.toml` is a symlink to a file elsewhere (a dotfiles repo), the
-//!   real file's directory — matched by the real file's exact path, so its own
-//!   name (`jetty.toml`) works and the repo's other files are ignored.
+//! * when `config.toml` — or a `themes/*.toml` — is a symlink to a file
+//!   elsewhere (a dotfiles repo), the real file's directory, matched by the real
+//!   file's exact path, so its own name (`jetty.toml`) works and the repo's other
+//!   files are ignored. A dangling link's target dir is watched too, so the file
+//!   appearing there is noticed.
 //!
 //! Naming gotcha: jetty-app already has a local `mod notify` (desktop toasts), so
 //! the file-watcher crate is referenced as `::notify` throughout.
@@ -41,19 +43,33 @@ struct Targets {
     themes_dir: PathBuf,
     /// The real file `config.toml` points at, when it is a symlink.
     real_config: Option<PathBuf>,
+    /// The real files symlinked `themes/*.toml` point at: an edit lands THERE,
+    /// and the themes dir itself sees nothing.
+    real_themes: Vec<PathBuf>,
 }
 
 impl Targets {
     fn compute(config_dir: &Path) -> Targets {
-        let plain = config_dir.join("config.toml");
-        let real_config = match std::fs::symlink_metadata(&plain) {
-            Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(&plain).ok(),
+        let linked = |p: &Path| match std::fs::symlink_metadata(p) {
+            Ok(m) if m.file_type().is_symlink() => Some(crate::config::real_path(p)),
             _ => None,
         };
+        let themes_dir = config_dir.join("themes");
+        let mut real_themes: Vec<PathBuf> = std::fs::read_dir(&themes_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("toml"))
+            .filter_map(|p| linked(&p))
+            .collect();
+        real_themes.sort();
+        real_themes.dedup();
         Targets {
             config_dir: config_dir.to_path_buf(),
-            themes_dir: config_dir.join("themes"),
-            real_config,
+            themes_dir,
+            real_config: linked(&config_dir.join("config.toml")),
+            real_themes,
         }
     }
 
@@ -80,8 +96,10 @@ impl Targets {
         }
         add(&self.config_dir);
         add(&self.themes_dir);
-        if let Some(dir) = self.real_config.as_deref().and_then(Path::parent) {
-            add(dir);
+        for real in self.real_config.iter().chain(&self.real_themes) {
+            if let Some(dir) = real.parent() {
+                add(dir);
+            }
         }
         out
     }
@@ -101,7 +119,7 @@ impl Targets {
         if p == self.config_dir || p == self.themes_dir || p == self.config_dir.join("config.toml") {
             return true;
         }
-        if self.real_config.as_deref() == Some(p) {
+        if self.real_config.as_deref() == Some(p) || self.real_themes.iter().any(|t| t == p) {
             return true;
         }
         p.parent() == Some(self.themes_dir.as_path())
@@ -230,6 +248,54 @@ mod tests {
         // The dotfiles repo's OTHER files never trigger a reload.
         assert!(!t.is_relevant(&real_dir.join("config.toml")));
         assert!(!t.is_relevant(&real_dir.join("nvim.toml")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_theme_files_are_watched_at_their_target() {
+        // `themes/mine.toml -> ~/dotfiles/themes/mine.toml`: an editor saving the
+        // real file changes nothing in themes/, so it never hot-reloaded.
+        use std::os::unix::fs::symlink;
+        let base = tmp("theme-link");
+        let dotfiles = base.join("dotfiles").join("themes");
+        let cfg_dir = base.join("config").join("jetty");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(cfg_dir.join("themes")).unwrap();
+        std::fs::write(dotfiles.join("mine.toml"), "x = 1\n").unwrap();
+        symlink(dotfiles.join("mine.toml"), cfg_dir.join("themes").join("mine.toml")).unwrap();
+        let t = Targets::compute(&cfg_dir);
+        let real_dir = std::fs::canonicalize(&dotfiles).unwrap();
+        assert!(t.watch_paths().contains(&real_dir), "{:?}", t.watch_paths());
+        assert!(t.is_relevant(&real_dir.join("mine.toml")));
+        assert!(!t.is_relevant(&real_dir.join("other.toml")), "the repo's other files are not ours");
+
+        // End to end: an edit of the REAL file reloads.
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let w = ConfigWatcher::spawn(cfg_dir.clone(), move || {
+            let _ = tx.lock().unwrap().send(());
+        })
+        .expect("watcher");
+        std::fs::write(dotfiles.join("mine.toml"), "x = 2\n").unwrap();
+        assert!(changed(&rx), "edit of the symlinked theme's target");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_config_link_watches_where_its_target_will_appear() {
+        use std::os::unix::fs::symlink;
+        let base = tmp("dangling-link");
+        let dotfiles = base.join("dotfiles");
+        let cfg_dir = base.join("jetty");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        symlink(dotfiles.join("jetty.toml"), cfg_dir.join("config.toml")).unwrap();
+        let t = Targets::compute(&cfg_dir);
+        assert!(t.watch_paths().contains(&dotfiles), "{:?}", t.watch_paths());
+        assert!(t.is_relevant(&dotfiles.join("jetty.toml")));
         let _ = std::fs::remove_dir_all(&base);
     }
 

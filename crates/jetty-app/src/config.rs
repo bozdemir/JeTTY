@@ -567,12 +567,19 @@ impl Config {
         let s = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Loaded {
-                    cfg: Config::default(),
-                    warnings: Vec::new(),
-                    hash: None,
-                    launch_at_login: None,
-                };
+                // A dangling symlink (a dotfiles repo not checked out yet) is not
+                // "no config": say so — the first save writes the link's target.
+                let warnings = symlink_target(path)
+                    .map(|target| {
+                        format!(
+                            "config.toml links to {}, which does not exist — using the default \
+                             settings (a settings change creates it there)",
+                            target.display()
+                        )
+                    })
+                    .into_iter()
+                    .collect();
+                return Loaded { cfg: Config::default(), warnings, hash: None, launch_at_login: None };
             }
             Err(e) => {
                 return Loaded {
@@ -758,6 +765,36 @@ impl Config {
 }
 
 // ── Per-key parsing helpers ──────────────────────────────────────────────────
+
+/// Where `path` finally points when it is a symlink — a chain is followed (at
+/// most 40 links; a relative target resolves against its link's directory) —
+/// WITHOUT requiring the target to exist, unlike `canonicalize`. `None` when
+/// `path` is not a symlink (or the chain loops).
+pub(crate) fn symlink_target(path: &Path) -> Option<PathBuf> {
+    let mut cur = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let next = std::fs::read_link(&cur).ok()?;
+                cur = match cur.parent() {
+                    Some(dir) if next.is_relative() => dir.join(next),
+                    _ => next,
+                };
+            }
+            _ => return (cur != path).then_some(cur),
+        }
+    }
+    None
+}
+
+/// The file a write to `path` must land in: the end of its symlink chain —
+/// canonical when it exists, else the dangling target — or `path` itself.
+pub(crate) fn real_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .ok()
+        .or_else(|| symlink_target(path))
+        .unwrap_or_else(|| path.to_path_buf())
+}
 
 /// `launch_at_login` as config text `s` itself sets it: `None` when the text is
 /// not TOML or the key is missing or not a bool (see [`Loaded::launch_at_login`]).
@@ -1351,10 +1388,11 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     // TARGET, not the link. A rename onto the link path replaces the symlink
     // itself with a plain file, silently detaching the dotfiles repo — every
     // later setting change stops reaching it and the next `stow`/`chezmoi` sync
-    // reverts them (F33). canonicalize errs when the path doesn't exist yet
-    // (first save) — then we keep the original path and create it normally.
-    let path: std::path::PathBuf =
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // reverts them (F33). A DANGLING link (the target not created yet) is written
+    // through too — `canonicalize` fails there, and falling back to the link
+    // path used to replace the link on the first save. Only a path that is no
+    // link at all is created as itself.
+    let path = real_path(path);
     let path = path.as_path();
     let dir = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent dir")
@@ -1427,6 +1465,38 @@ mod tests {
             b"new-data",
             "the symlink target must receive the update"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_config_symlink_warns_and_saves_through_the_link() {
+        // A dotfiles link whose target is not there yet: loading said nothing,
+        // and the first settings change REPLACED the link with a plain file.
+        use std::os::unix::fs::symlink;
+        let base = tmp_dir("dangling");
+        let dotfiles = base.join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("jetty.toml");
+        let link = base.join("config.toml");
+        symlink(&target, &link).unwrap();
+        let loaded = Config::load_from(&link);
+        assert_eq!(loaded.cfg, Config::default());
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        assert!(loaded.warnings[0].contains("jetty.toml"), "{:?}", loaded.warnings);
+        let (mut p, mut cfg, _) = persister_for(&link);
+        cfg.theme = "nord".to_string();
+        p.record(&cfg, Instant::now());
+        assert!(p.flush_and_wait(Duration::from_secs(5)));
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "still a link");
+        assert_eq!(Config::load_from(&link).cfg.theme, "nord", "written through it");
+        assert!(std::fs::read_to_string(&target).unwrap().contains("theme = \"nord\""));
+        // A relative link (as stow makes them) too.
+        let rel = base.join("rel.toml");
+        symlink("dotfiles/rel-target.toml", &rel).unwrap();
+        write_atomic(&rel, b"x = 1\n").unwrap();
+        assert!(std::fs::symlink_metadata(&rel).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(dotfiles.join("rel-target.toml")).unwrap(), "x = 1\n");
         let _ = std::fs::remove_dir_all(&base);
     }
 
