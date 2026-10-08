@@ -309,11 +309,13 @@ pub fn filter(registry: &[PaletteEntry], query: &str) -> Vec<PaletteHit> {
         let indices = title_m.map(|m| m.indices).unwrap_or_default();
         scored.push((best, by_title, i, PaletteHit { title: e.title.clone(), indices, cmd: e.cmd.clone() }));
     }
-    // Score desc; on a tie a title match beats a keyword-only one ("bloom"
-    // finds "Settings › Effects › Bloom" before an action that merely lists the
-    // word); then registry order — actions before the Settings deep links, so a
-    // command you can run beats a link to its control (stable on the index).
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
+    // A title match first, a keyword-only one after ("bloom" finds "Settings ›
+    // Effects › Bloom" before an action that merely lists the word); among
+    // title matches a command you can run before a deep link to its Settings
+    // control ("built-in glyphs" toggles them); then score desc; then registry
+    // order (stable on the index). A plain key, so the order is total.
+    let link = |h: &PaletteHit| matches!(h.cmd, PaletteCmd::SettingsAt(_));
+    scored.sort_by_key(|(score, by_title, i, hit)| (!*by_title, *by_title && link(hit), std::cmp::Reverse(*score), *i));
     scored.into_iter().map(|(_, _, _, hit)| hit).collect()
 }
 

@@ -235,7 +235,7 @@ pub static SECTIONS: &[Section] = &[
     Section { id: "look.theme", tab: LOOK, title: "Theme", ..Section::DEFAULT },
     Section { id: "fonts.terminal", tab: FONTS, title: "Terminal font", ..Section::DEFAULT },
     Section { id: "fonts.ui", tab: FONTS, title: "Interface font", ..Section::DEFAULT },
-    // Line height (hook: built-in glyphs, bold is bright, color emoji).
+    // Line height, built-in glyphs, color emoji, bold is bright.
     Section { id: "fonts.render", tab: FONTS, title: "Rendering", ..Section::DEFAULT },
     Section { id: "window.summon", tab: WINDOW, title: "Summon", ..Section::DEFAULT },
     Section { id: "window.dropdown", tab: WINDOW, title: "Dropdown", ..Section::DEFAULT },
@@ -620,6 +620,38 @@ pub static DESCS: &[Desc] = &[
         },
         get: get_f!(line_height),
         set: set_f!(line_height),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "builtin_glyphs",
+        tab: FONTS,
+        section: "fonts.render",
+        label: "Built-in box & block glyphs",
+        kind: Kind::Toggle,
+        get: get_b!(builtin_glyphs),
+        set: set_b!(builtin_glyphs),
+        hint: Some("Lines, blocks, Powerline, braille"),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "color_emoji",
+        tab: FONTS,
+        section: "fonts.render",
+        label: "Color emoji",
+        kind: Kind::Toggle,
+        get: get_b!(color_emoji),
+        set: set_b!(color_emoji),
+        ..Desc::DEFAULT
+    },
+    Desc {
+        id: "bold_is_bright",
+        tab: FONTS,
+        section: "fonts.render",
+        label: "Bold is bright",
+        kind: Kind::Toggle,
+        get: get_b!(bold_is_bright),
+        set: set_b!(bold_is_bright),
+        hint: Some("Bold text in its bright ANSI color"),
         ..Desc::DEFAULT
     },
     // ── Window ────────────────────────────────────────────────────────────────
