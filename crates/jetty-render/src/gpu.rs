@@ -283,7 +283,14 @@ impl GpuContext {
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // ONE frame in flight (Vulkan: a 2-image swapchain; Metal: 2 drawables).
+            // wgpu: "Choose 1 to minimize latency above all else … For applications
+            // like GUIs doing a small amount of GPU work each frame that need low
+            // latency, this is a reasonable choice." A terminal frame is well under
+            // a millisecond of GPU work, and with 2 a continuously animating frame
+            // (caret flash while typing) kept a second frame queued AHEAD of the
+            // keystroke's echo — up to one extra refresh of input latency.
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&shared.device, &config);
 
