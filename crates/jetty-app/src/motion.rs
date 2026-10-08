@@ -367,6 +367,38 @@ impl RateLimit {
 /// (no scan line, ripple, blur, drift or slide).
 pub const REDUCED_SUMMON_SECS: f32 = 0.08;
 
+/// The CRT settings with every continuous animation off — roll, flicker,
+/// jitter, animated grain — when motion is `reduced` (the static look stays).
+pub fn calm_crt(s: jetty_render::CrtSettings, reduced: bool) -> jetty_render::CrtSettings {
+    if !reduced {
+        return s;
+    }
+    jetty_render::CrtSettings { roll: false, flicker: false, jitter: false, grain_animate: false, ..s }
+}
+
+/// What the post pass runs this frame (`effects::frame_settings`) with motion
+/// `reduced` honored: no animation, and no event-glitch burst at all.
+pub fn post_settings(
+    fx: &crate::config::EffectsConfig,
+    glitch_burst: bool,
+    reduced: bool,
+) -> Option<jetty_render::CrtSettings> {
+    crate::effects::frame_settings(fx, glitch_burst && !reduced).map(|s| calm_crt(s, reduced))
+}
+
+/// The pipeline variant to keep prepared (`effects::prepared_key`) with motion
+/// `reduced` honored — so a reduce-motion toggle prepares its variant at the
+/// toggle, never mid-frame.
+pub fn post_key(fx: &crate::config::EffectsConfig, reduced: bool) -> Option<jetty_render::CrtKey> {
+    if fx.crt_enabled {
+        Some(calm_crt(crate::effects::crt_settings(fx), reduced).key())
+    } else if reduced {
+        None
+    } else {
+        crate::effects::prepared_key(fx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +538,30 @@ mod tests {
         // Out-of-range input clamps.
         assert_eq!(pulse_envelope(-1.0), 0.0);
         assert_eq!(pulse_envelope(2.0), 0.0);
+    }
+
+    #[test]
+    fn reduce_motion_calms_the_post_pass() {
+        let fx = crate::config::EffectsConfig {
+            crt_enabled: true,
+            crt_animate_roll: true,
+            crt_jitter: true,
+            crt_grain: 0.2,
+            crt_grain_animate: true,
+            ..Default::default()
+        };
+        let live = post_settings(&fx, false, false).unwrap();
+        assert!(live.roll && live.jitter && live.grain_animate && live.animated());
+        let calm = post_settings(&fx, false, true).unwrap();
+        assert!(!calm.animated(), "no roll / flicker / jitter / animated grain");
+        assert_eq!((calm.scanline, calm.grain), (live.scanline, live.grain), "the static look stays");
+        assert_eq!(post_key(&fx, true), Some(calm.key()), "the prepared variant matches the frame");
+        assert_eq!(post_key(&fx, false), Some(live.key()));
+        // CRT off: a glitch burst never runs (or is prepared) while reduced.
+        let glitchy = crate::config::EffectsConfig { glitch_on_bell: true, ..Default::default() };
+        assert!(post_settings(&glitchy, true, false).is_some());
+        assert_eq!(post_settings(&glitchy, true, true), None);
+        assert_eq!(post_key(&glitchy, true), None);
     }
 
     #[test]

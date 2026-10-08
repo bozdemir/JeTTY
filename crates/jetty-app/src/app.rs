@@ -3112,6 +3112,23 @@ impl App {
         self.reduce_motion.active(self.system_reduced_motion)
     }
 
+    /// Whether a CRT roll / flicker / jitter animation runs (and pumps
+    /// frames): the toggles, unless motion is reduced.
+    fn crt_anim_live(&self) -> bool {
+        self.fx.crt_anim_live() && !self.motion_reduced()
+    }
+
+    /// Whether the caret glow (halo + ripple) plays — not while motion is
+    /// reduced.
+    fn caret_glow_on(&self) -> bool {
+        self.fx.caret_glow_enabled && !self.motion_reduced()
+    }
+
+    /// Whether a printable keystroke arms a caret burst (flash and/or glow).
+    fn caret_burst_on(&self) -> bool {
+        self.fx.caret_flash_enabled || self.caret_glow_on()
+    }
+
     /// The summon reveal that actually plays, and for how long: the selected
     /// effect — or, with motion reduced, a short fade (`None` stays none).
     fn summon_plan(&self) -> (SummonEffect, f32) {
@@ -3218,7 +3235,9 @@ impl App {
     /// work only when a setting changed (one `Option` compare otherwise). CRT off
     /// with no glitch trigger: nothing is built.
     fn sync_main_post(&mut self) {
-        let want = crate::effects::prepared_key(&self.fx);
+        // `reduce_motion` calms the animation (another variant) and drops the
+        // glitch-only pass.
+        let want = crate::motion::post_key(&self.fx, self.motion_reduced());
         if want == self.crt_key {
             return;
         }
@@ -6923,7 +6942,7 @@ impl App {
             }
         }
         self.vt_bytes += vt_read;
-        if active_bell && self.fx.glitch_on_bell {
+        if active_bell && self.fx.glitch_on_bell && !self.motion_reduced() {
             self.trigger_main_glitch();
         }
         for n in runsel_notices {
@@ -7277,7 +7296,11 @@ impl App {
             }
             // Event glitch (`glitch_on_error`): a command FAILED in the tab on
             // screen. Before `if enabled` — it is not a notification either.
-            if i == active && self.fx.glitch_on_error && completions.iter().any(completion_failed) {
+            if i == active
+                && self.fx.glitch_on_error
+                && !self.motion_reduced()
+                && completions.iter().any(completion_failed)
+            {
                 self.trigger_main_glitch();
             }
             if enabled {
@@ -7307,7 +7330,7 @@ impl App {
         }
         for i in 0..self.detached.len() {
             let completions = self.detached[i].tab.terminal.take_completions();
-            if self.fx.glitch_on_error && completions.iter().any(completion_failed) {
+            if self.fx.glitch_on_error && !self.motion_reduced() && completions.iter().any(completion_failed) {
                 let dw = &mut self.detached[i];
                 if !dw.occluded && dw.glitch.trigger(std::time::Instant::now()) {
                     dw.request_paint();
@@ -9037,6 +9060,9 @@ impl App {
                     }
                     _ => {}
                 }
+                // Whether a printable key arms this window's caret burst
+                // (resolved before the `dw` borrow below).
+                let caret_burst = self.caret_burst_on();
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 // Set when the viewport moved under the pointer this event, so
                 // the link hover is refreshed AFTER the dw borrow ends.
@@ -9122,9 +9148,7 @@ impl App {
                         // Caret flash / glow on printable keystrokes — same
                         // trigger as the main window, on THIS window's own burst
                         // clock (each consumer gates on its own toggle).
-                        if (self.fx.caret_flash_enabled || self.fx.caret_glow_enabled)
-                            && is_printable_keystroke(&bytes)
-                        {
+                        if caret_burst && is_printable_keystroke(&bytes) {
                             dw.caret_anim = Some(now);
                         }
                     }
@@ -9178,7 +9202,7 @@ impl App {
                     if self.overlay_ime_commit(Surface::Detached(pos), &text) {
                         return;
                     }
-                    let caret_burst = self.fx.caret_flash_enabled || self.fx.caret_glow_enabled;
+                    let caret_burst = self.caret_burst_on();
                     let Some(dw) = self.detached.get_mut(pos) else { return };
                     // Snap to the live bottom (F30) then write to the PTY — the
                     // shared input core, same as the Send arm (v0.23 Task 9).
@@ -10129,11 +10153,14 @@ impl App {
         let corner_radius = self.corner_radius;
         let fx = self.fx.clone();
         let crt_time = self.crt_clock.elapsed().as_secs_f64();
-        let post_key = crate::effects::prepared_key(&fx);
+        let reduced = self.motion_reduced();
+        let post_key = crate::motion::post_key(&fx, reduced);
         // Chrome look (the main bar's style; a detached bar is always on top
         // and its single tab always "active").
         let bar_opts = jetty_render::TabBarOpts { bottom: false, ..self.tab_bar_opts(None) };
         let window_border = self.window_border;
+        // Reduce-motion gates, resolved before the window borrow below.
+        let glow_on = self.caret_glow_on();
 
         let Some(dw) = self.detached.get_mut(pos) else { return };
         // This window's chrome geometry (its own DPI × the UI font).
@@ -10223,7 +10250,7 @@ impl App {
             dw.crt_key = post_key;
         }
         let glitch_level = dw.glitch.intensity(std::time::Instant::now());
-        let post = crate::effects::frame_settings(&fx, glitch_level > 0.0);
+        let post = crate::motion::post_settings(&fx, glitch_level > 0.0, reduced);
         let crt_active = post.is_some() && dw.crt.is_some();
         if crt_active
             && dw.offscreen.as_ref().is_none_or(|(t, _)| {
@@ -10235,7 +10262,7 @@ impl App {
         // This window's caret glow (the main window's pass, on its own device):
         // built + the theme's variant compiled on the first frame after the
         // glow is enabled.
-        let glow_look = fx.caret_glow_enabled.then(|| {
+        let glow_look = glow_on.then(|| {
             jetty_render::caret_glow_look(fx.caret_flash_color, [theme.bg[0], theme.bg[1], theme.bg[2]])
         });
         if let Some((light, _, _)) = glow_look {
@@ -11250,7 +11277,8 @@ impl ApplicationHandler<AppEvent> for App {
         // (`anim_step` → Idle). The backdrop never animates on a CPU adapter.
         let cpu_adapter = self.gpu.as_ref().is_some_and(|g| g.is_cpu_adapter());
         let anim_interval = crate::effects::anim_interval(cpu_adapter);
-        let crt_live = self.fx.crt_anim_live() || self.backdrop.animates_on(cpu_adapter);
+        // (`reduce_motion` stops the continuous CRT animations.)
+        let crt_live = self.crt_anim_live() || self.backdrop.animates_on(cpu_adapter);
         let animate_unfocused = self.fx.animate_unfocused;
         let settings_focused = self
             .settings_window
@@ -13568,9 +13596,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // each consumer is independently gated on its own toggle.
                         // The burst starts pumping frames once its first frame
                         // (the echo's) is painted — see `caret_drives_frames`.
-                        if (self.fx.caret_flash_enabled || self.fx.caret_glow_enabled)
-                            && is_printable_keystroke(&bytes)
-                        {
+                        if self.caret_burst_on() && is_printable_keystroke(&bytes) {
                             self.caret_anim = Some(now);
                         }
                     }
@@ -13659,9 +13685,7 @@ impl ApplicationHandler<AppEvent> for App {
                 write_key_to_pty(self.active_tab_mut(), text.as_bytes(), None, true);
                 let now = std::time::Instant::now();
                 self.key_paint_due = Some(now + KEY_ECHO_GRACE);
-                if (self.fx.caret_flash_enabled || self.fx.caret_glow_enabled)
-                    && is_printable_keystroke(text.as_bytes())
-                {
+                if self.caret_burst_on() && is_printable_keystroke(text.as_bytes()) {
                     self.caret_anim = Some(now);
                 }
             }
@@ -13957,7 +13981,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // CRT-off frame), with its pipeline variant built BEFORE the
                 // swapchain image is acquired — on a settings change only.
                 let glitch_level = self.glitch.intensity(std::time::Instant::now());
-                let post = crate::effects::frame_settings(&self.fx, glitch_level > 0.0);
+                let post = crate::motion::post_settings(&self.fx, glitch_level > 0.0, self.motion_reduced());
                 self.sync_main_post();
                 // Lazily (re)allocate the offscreen scene texture when EITHER a
                 // Tier-B effect (Liquid/Focus/Pop/Glide/Fade) is actively
@@ -14002,7 +14026,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // Caret glow look for this theme (blend variant, contrast-safe
                 // color, strength) — and its pipeline, compiled on the first
                 // frame after the glow is enabled (not on the first keystroke).
-                let glow_look = self.fx.caret_glow_enabled.then(|| {
+                let glow_look = self.caret_glow_on().then(|| {
                     let bg = theme.bg;
                     jetty_render::caret_glow_look(self.fx.caret_flash_color, [bg[0], bg[1], bg[2]])
                 });
