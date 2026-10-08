@@ -30,6 +30,8 @@
 ///                    chrome follows ChromeMetrics, exactly like the live app.
 ///                    Pass PHYSICAL JETTY_SHOT_WIDTH/HEIGHT (e.g. 2000×1280).
 ///   JETTY_SHOT_TABBAR_N — number of sample tabs for JETTY_SHOT_TABBAR (default 3).
+///   JETTY_SHOT_HELP_SCROLL — first help row for JETTY_SHOT_HELP when its rows
+///                    overflow the window (large UI font / short window).
 ///   JETTY_SHOT_PILL="text" — draw the app's toast pill (run-selection status /
 ///                    Shift-drag hint surface) above the status strip.
 ///   JETTY_SHOT_TABBAR_ACTIVITY — comma list aligned with the 3 sample tabs
@@ -943,8 +945,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             chrome_labels.extend(menu.labels);
         }
 
-        // JETTY_SHOT_HELP — render the Keyboard Shortcuts help overlay.
+        // JETTY_SHOT_HELP — render the Keyboard Shortcuts help overlay;
+        // JETTY_SHOT_HELP_SCROLL=n scrolls it to row n when its rows overflow.
         if env_flag("JETTY_SHOT_HELP") {
+            let scroll: usize = std::env::var("JETTY_SHOT_HELP_SCROLL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             let help = jetty_render::build_help_overlay(
                 width,
                 height,
@@ -952,6 +959,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut chrome_text,
                 cm,
                 &jetty_render::default_help_rows(),
+                scroll,
             );
             rects.extend(help.quads);
             chrome_labels.extend(help.labels);

@@ -57,13 +57,21 @@ pub fn default_help_rows() -> Vec<String> {
 
 /// Geometry + draw data for the Help overlay.
 pub struct HelpOverlay {
-    /// Quads in draw order: full-screen dim, border, background panel.
+    /// Quads in draw order: full-screen dim, border, background panel, header
+    /// rules, and the scroll thumb when the rows overflow.
     pub quads: Vec<Rect>,
     /// Text labels: (text, x, y, rgb) — title, then per row a section header, a
     /// key + a description label, or nothing (a blank spacer).
     pub labels: Vec<(String, f32, f32, [u8; 3])>,
     /// The panel rect (for hit-testing "click outside closes").
     pub panel: Rect,
+    /// First row shown (the requested scroll, clamped to `max_scroll`).
+    pub first_row: usize,
+    /// Rows hidden when scrolled to the top: 0 when every row fits; otherwise
+    /// the rows scroll (they never overlap — see `build_help_overlay`).
+    pub max_scroll: usize,
+    /// Rows visible at once (one PgUp/PgDn step).
+    pub page_rows: usize,
 }
 
 /// One parsed help row: a section header, a key+description item, or a blank
@@ -81,7 +89,9 @@ enum HelpEntry {
 ///
 /// `m` measures every key/description/header exactly as the chrome layer draws
 /// it (so the description column aligns and the panel fits for any UI font);
-/// `cm` scales the vertical rhythm and paddings with DPI × UI font.
+/// `cm` scales the vertical rhythm and paddings with DPI × UI font. `scroll` is
+/// the first row to show when the rows overflow the window (clamped; see
+/// `HelpOverlay::max_scroll`).
 pub fn build_help_overlay(
     win_w: u32,
     win_h: u32,
@@ -89,6 +99,7 @@ pub fn build_help_overlay(
     m: &mut dyn ChromeMeasure,
     cm: ChromeMetrics,
     rows: &[String],
+    scroll: usize,
 ) -> HelpOverlay {
     let sw = win_w as f32;
     let sh = win_h as f32;
@@ -206,16 +217,33 @@ pub fn build_help_overlay(
     let pad_v = (pad_ideal * scale).max(pad_min_v);
     let title_h = (title_h_ideal * scale).max(title_h_min);
     let mut row_h = (row_h_ideal * scale).max(row_h_min);
-    // Last resort: on a window too short even for the floored metrics, shrink the
-    // row pitch BELOW its readable floor so every row still lands inside the
-    // clamped panel rather than being drawn off the window bottom (the floors
-    // alone can total more than a very short window's height).
+    // Last resort: on a window too short even for the floored metrics, tighten
+    // the row pitch to fit every row — but by at most 10% under its readable
+    // floor (descenders may brush the next row's capitals, never cover them).
+    // Squeezing further overlapped neighbouring rows outright (a 28pt UI font in
+    // an ordinary window); those rows keep the floored pitch and SCROLL instead
+    // (wheel, arrows, PgUp/PgDn, Home/End in the app), with a thumb on the
+    // panel's right edge.
     if 2.0 * pad_v + title_h + row_count * row_h > avail_h && row_count > 0.0 {
-        row_h = ((avail_h - 2.0 * pad_v - title_h) / row_count).clamp(1.0, row_h);
+        let fitted = (avail_h - 2.0 * pad_v - title_h) / row_count;
+        if fitted >= row_h_min * 0.9 {
+            row_h = fitted.clamp(1.0, row_h);
+        }
     }
+    let n_rows = entries.len();
+    let rows_room = avail_h - 2.0 * pad_v - title_h;
+    // Whole rows that fit (the epsilon absorbs the rounding of a pitch that was
+    // just fitted exactly above).
+    let visible = if row_h > 0.0 {
+        ((rows_room / row_h + 1e-3).floor().max(1.0) as usize).min(n_rows)
+    } else {
+        n_rows
+    };
+    let max_scroll = n_rows - visible;
+    let first = scroll.min(max_scroll);
     // Recompute the actual height from the (possibly floored) metrics, then clamp
     // to the window so the panel can never exceed it.
-    let panel_h = (2.0 * pad_v + title_h + row_count * row_h).min(avail_h.max(0.0));
+    let panel_h = (2.0 * pad_v + title_h + visible as f32 * row_h).min(avail_h.max(0.0));
     // `PAD` is the vertical text padding (top inset for the title).
     let pad_top = pad_v;
 
@@ -278,8 +306,8 @@ pub fn build_help_overlay(
     // columns, and blank spacers between sections. The description column starts
     // at a fixed offset so keys and descriptions each line up vertically.
     let rows_top = py + pad_top + title_h;
-    for (i, e) in entries.iter().enumerate() {
-        let y = rows_top + i as f32 * row_h;
+    for (i, e) in entries.iter().enumerate().skip(first).take(visible) {
+        let y = rows_top + (i - first) as f32 * row_h;
         match e {
             HelpEntry::Spacer => {}
             HelpEntry::Header(h) => {
@@ -305,7 +333,25 @@ pub fn build_help_overlay(
         }
     }
 
-    HelpOverlay { quads, labels, panel }
+    // Scroll thumb in the right padding (the palette's idiom), only when rows
+    // overflow: its length is the visible share, its offset the scroll position.
+    if max_scroll > 0 {
+        let track_h = visible as f32 * row_h;
+        let thumb_h = (track_h * visible as f32 / n_rows as f32).max(8.0 * vscale).min(track_h);
+        let thumb_y = rows_top + (track_h - thumb_h) * (first as f32 / max_scroll as f32);
+        let tw = 3.0 * vscale;
+        let thumb3 = lerp(0.40);
+        quads.push(Rect::rounded(
+            px + panel_w - (pad_x + tw) * 0.5,
+            thumb_y,
+            tw,
+            thumb_h,
+            [thumb3[0], thumb3[1], thumb3[2], 255],
+            tw * 0.5,
+        ));
+    }
+
+    HelpOverlay { quads, labels, panel, first_row: first, max_scroll, page_rows: visible }
 }
 
 #[cfg(test)]
@@ -328,7 +374,7 @@ mod tests {
 
     #[test]
     fn panel_is_centered_and_on_screen() {
-        let h = build_help_overlay(1000, 700, &theme(), &mut mono(), CM, &default_help_rows());
+        let h = build_help_overlay(1000, 700, &theme(), &mut mono(), CM, &default_help_rows(), 0);
         assert!(h.panel.x >= 0.0 && h.panel.y >= 0.0);
         assert!(h.panel.x + h.panel.w <= 1000.0 + 0.5);
         assert!(h.panel.y + h.panel.h <= 700.0 + 0.5);
@@ -346,7 +392,7 @@ mod tests {
         // The estimate uses the same advance the test measurer uses, so the
         // panel is always sized to contain the text.
         for w in [320u32, 500, 700, 1000, 1600] {
-            let h = build_help_overlay(w, 700, &theme(), &mut mono(), CM, &default_help_rows());
+            let h = build_help_overlay(w, 700, &theme(), &mut mono(), CM, &default_help_rows(), 0);
             let panel_right = h.panel.x + h.panel.w;
             for (text, x, _y, _c) in &h.labels {
                 let est_right = x + text.chars().count() as f32 * TEST_CHAR_W;
@@ -363,7 +409,7 @@ mod tests {
         // At short window heights the overlay must still fit every row on-screen
         // (the lower rows must not clip off the bottom of the window).
         for h in [360u32, 420, 480, 640] {
-            let overlay = build_help_overlay(700, h, &theme(), &mut mono(), CM, &default_help_rows());
+            let overlay = build_help_overlay(700, h, &theme(), &mut mono(), CM, &default_help_rows(), 0);
             // The panel itself fits the window.
             assert!(
                 overlay.panel.y >= 0.0 && overlay.panel.y + overlay.panel.h <= h as f32 + 0.5,
@@ -385,9 +431,8 @@ mod tests {
         // chrome font ink height (~= font_size = ROW_H_MIN at scale 1) for every
         // window height down to the point where the floored metrics still fit —
         // so adjacent rows never overlap in the readable range. Below that the
-        // builder DELIBERATELY tightens the pitch (last-resort branch) to keep all
-        // rows on-screen rather than clip, which is documented, intentional
-        // behaviour for an extreme (<~381px) window and not exercised here.
+        // rows scroll at the floor pitch (`short_windows_scroll_instead_of_
+        // overlapping`).
         let ink_floor = 16.0_f32; // ROW_H_MIN == font_size at scale 1 (vscale==1)
         // The readable lower bound rises with the ENTRY count: the sectioned
         // overlay now has ~37 entries (headers + items + blank spacers — the
@@ -395,7 +440,7 @@ mod tests {
         // (2·8 + 22 + 37·16 ≈ 630px) need ~660px before the last-resort pitch
         // tightening kicks in. 660 is the smallest clear of that.
         for h in [660u32, 760, 900, 1100] {
-            let overlay = build_help_overlay(700, h, &theme(), &mut mono(), CM, &default_help_rows());
+            let overlay = build_help_overlay(700, h, &theme(), &mut mono(), CM, &default_help_rows(), 0);
             // labels[0] is the title; labels[1..] are the row labels. An item emits
             // a key AND a description label at the SAME y (side-by-side columns),
             // so collapse consecutive equal-y labels to get the distinct row pitch.
@@ -412,6 +457,48 @@ mod tests {
     }
 
     #[test]
+    fn short_windows_scroll_instead_of_overlapping() {
+        // Too short for every row even at the floor pitch (a 28pt UI font in an
+        // ordinary window, or a tiny one at the default): the rows keep their
+        // readable pitch and SCROLL — they used to be squeezed into each other.
+        let rows = default_help_rows();
+        for (cm, h) in [
+            (ChromeMetrics::new(1.0, 28.0), 640u32),
+            (ChromeMetrics::new(1.0, 28.0), 900),
+            (CM, 360),
+            (CM, 480),
+        ] {
+            let mut m = MonoMeasure(CHROME_ADVANCE * cm.u);
+            let floor = 16.0 * cm.overlay_u();
+            let top = build_help_overlay(1000, h, &theme(), &mut m, cm, &rows, 0);
+            assert!(top.max_scroll > 0, "{h}px at {}pt must scroll", 16.0 * cm.u);
+            assert_eq!(top.page_rows + top.max_scroll, rows.len());
+            for o in [&top, &build_help_overlay(1000, h, &theme(), &mut m, cm, &rows, usize::MAX)] {
+                assert!(o.panel.y >= 0.0 && o.panel.y + o.panel.h <= h as f32 + 0.5);
+                let mut ys: Vec<f32> = o.labels[1..].iter().map(|l| l.2).collect();
+                ys.dedup();
+                for pair in ys.windows(2) {
+                    assert!(pair[1] - pair[0] >= floor - 0.01, "rows overlap at {h}px: {pair:?}");
+                }
+                // Every row label sits inside the panel (scrolled-out rows are
+                // not drawn at all).
+                for l in &o.labels[1..] {
+                    assert!(l.2 >= o.panel.y && l.2 + floor <= o.panel.y + o.panel.h + 0.5, "{l:?}");
+                }
+            }
+            // Scrolled to the end (clamped): the last row shows, the first doesn't.
+            let end = build_help_overlay(1000, h, &theme(), &mut m, cm, &rows, usize::MAX);
+            assert_eq!(end.first_row, end.max_scroll);
+            assert!(end.labels.iter().any(|l| l.0 == "Esc"), "last row reachable at {h}px");
+            assert!(!end.labels.iter().any(|l| l.0 == "Ctrl+Shift+T"), "first row scrolled out");
+            assert!(top.labels.iter().any(|l| l.0 == "Ctrl+Shift+T"));
+        }
+        // The default font in a 640px window still fits without scrolling.
+        let fits = build_help_overlay(1000, 640, &theme(), &mut MonoMeasure(CHROME_ADVANCE), CM, &rows, 3);
+        assert_eq!((fits.max_scroll, fits.first_row), (0, 0));
+    }
+
+    #[test]
     fn single_column_rows() {
         // No row contains the two-column "·" separator anymore.
         for r in HELP_ROWS.iter() {
@@ -421,7 +508,7 @@ mod tests {
 
     #[test]
     fn lists_core_bindings() {
-        let h = build_help_overlay(1000, 700, &theme(), &mut mono(), CM, &default_help_rows());
+        let h = build_help_overlay(1000, 700, &theme(), &mut mono(), CM, &default_help_rows(), 0);
         let joined: String = h.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("F9"));
         assert!(joined.contains("Ctrl+Shift+P"));
@@ -435,7 +522,7 @@ mod tests {
         // label stay inside the window instead of running off its right edge.
         let cm = ChromeMetrics::new(1.0, 28.0);
         let mut m = MonoMeasure(9.6 * cm.u);
-        let h = build_help_overlay(1000, 900, &theme(), &mut m, cm, &default_help_rows());
+        let h = build_help_overlay(1000, 900, &theme(), &mut m, cm, &default_help_rows(), 0);
         assert!(h.panel.x >= 0.0 && h.panel.x + h.panel.w <= 1000.0 + 0.5, "panel past the window");
         for (text, x, _y, _c) in &h.labels {
             let right = x + m.text_w(text);
@@ -448,7 +535,7 @@ mod tests {
 
     #[test]
     fn wide_window_keeps_full_descriptions() {
-        let h = build_help_overlay(1600, 1200, &theme(), &mut mono(), CM, &default_help_rows());
+        let h = build_help_overlay(1600, 1200, &theme(), &mut mono(), CM, &default_help_rows(), 0);
         assert!(h.labels.iter().all(|l| !l.0.ends_with('…')), "nothing to squeeze at 1600px");
     }
 }

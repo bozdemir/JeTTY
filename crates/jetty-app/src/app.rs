@@ -1015,6 +1015,9 @@ pub struct App {
     /// top of everything in the main window; dismissed by Esc, the "?" button,
     /// or a click outside the panel.
     help_open: bool,
+    /// First help row shown when the rows overflow the window (large UI font /
+    /// short window); scrolled by the wheel, arrows, PgUp/PgDn, Home/End.
+    help_scroll: usize,
     /// Whether the scrollback-search bar (Ctrl+Shift+F) is open on the ACTIVE
     /// tab of the main window (detached windows are out of scope). While open,
     /// keys edit the query; Esc / ✕ / Ctrl+Shift+F close it and clear matches.
@@ -1475,6 +1478,7 @@ impl App {
             frame_log: std::env::var_os("JETTY_FRAME_LOG").is_some(),
             frames_presented: 0,
             help_open: false,
+            help_scroll: 0,
             search_open: false,
             search_refresh_at: None,
             search_dirty: false,
@@ -2056,6 +2060,30 @@ impl App {
     /// Height of the main window's tab bar (physical px).
     fn bar_h(&self) -> f32 {
         self.chrome_metrics().bar_h()
+    }
+
+    /// The help overlay's scroll range in the main window right now —
+    /// `(max_scroll, page_rows)` — or `None` when every row fits (nothing to
+    /// scroll; the wheel and keys then behave as if the help were not open).
+    fn help_scroll_range(&mut self) -> Option<(usize, usize)> {
+        let (w, h) = self.gpu.as_ref().map(|g| (g.config.width, g.config.height))?;
+        let theme = self.current_theme();
+        let cm = self.chrome_metrics();
+        let mut fallback = mono_fallback(cm);
+        let help = jetty_render::build_help_overlay(
+            w, h, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
+            &self.help_rows, 0,
+        );
+        (help.max_scroll > 0).then_some((help.max_scroll, help.page_rows))
+    }
+
+    /// Move the help overlay to first row `to`, clamped to `[0, max]`.
+    fn set_help_scroll(&mut self, to: isize, max: usize) {
+        let to = to.clamp(0, max as isize) as usize;
+        if to != self.help_scroll {
+            self.help_scroll = to;
+            self.request_main_paint();
+        }
     }
 
     /// Pixel Y origin of the terminal grid. The bar always costs `bar_h` of grid
@@ -9144,7 +9172,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let mut fallback = mono_fallback(cm);
                     let help = jetty_render::build_help_overlay(
                         w, h, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
-                        &self.help_rows,
+                        &self.help_rows, self.help_scroll,
                     );
                     if !input::point_in(&help.panel, cx, cy) {
                         self.help_open = false;
@@ -9247,6 +9275,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // context menu so the two overlays are mutually exclusive.
                         self.help_open = !self.help_open;
                         if self.help_open {
+                            self.help_scroll = 0;
                             self.context_menu = None;
                             self.menu_hover = None;
                         }
@@ -9816,6 +9845,16 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.hint_mode.is_some() || self.copy_mode.is_some() {
                     return;
                 }
+                // The help overlay owns the wheel while its rows overflow the
+                // window (large UI font / short window): scroll the rows, never
+                // the terminal underneath.
+                if self.help_open {
+                    if let Some((max, _)) = self.help_scroll_range() {
+                        let lines = self.scroll_accum.add(wheel_delta_to_lines(delta));
+                        self.set_help_scroll(self.help_scroll.min(max) as isize - lines as isize, max);
+                        return;
+                    }
+                }
                 // The palette owns the wheel while open: scroll its list, never
                 // the terminal underneath (swallow so nothing falls through).
                 if self.palette_open {
@@ -10136,6 +10175,35 @@ impl ApplicationHandler<AppEvent> for App {
                     self.menu_hover = None;
                     self.request_main_paint();
                     return;
+                }
+                // --- Help overlay scroll keys --- only while its rows overflow
+                // the window; otherwise these keys reach the shell as before.
+                if self.help_open {
+                    use winit::keyboard::{Key, NamedKey};
+                    if let Key::Named(
+                        k @ (NamedKey::ArrowUp
+                        | NamedKey::ArrowDown
+                        | NamedKey::PageUp
+                        | NamedKey::PageDown
+                        | NamedKey::Home
+                        | NamedKey::End),
+                    ) = &event.logical_key
+                    {
+                        if let Some((max, page)) = self.help_scroll_range() {
+                            let cur = self.help_scroll.min(max) as isize;
+                            let page = page.max(1) as isize;
+                            let to = match k {
+                                NamedKey::ArrowUp => cur - 1,
+                                NamedKey::ArrowDown => cur + 1,
+                                NamedKey::PageUp => cur - page,
+                                NamedKey::PageDown => cur + page,
+                                NamedKey::Home => 0,
+                                _ => max as isize,
+                            };
+                            self.set_help_scroll(to, max);
+                            return;
+                        }
+                    }
                 }
                 // --- Scrollback-search bar captures all keys while open ---
                 // (after the help-Esc block, so help keeps Esc priority).
@@ -10741,6 +10809,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let tab_menu_hover = self.tab_menu_hover;
                 let tab_menu_labels = self.tab_menu_labels.clone();
                 let help_open = self.help_open;
+                let help_scroll = self.help_scroll;
                 // Clone the (cached, keymap-derived) help rows only when the overlay
                 // is actually open — keeps the hot render path allocation-free.
                 let help_rows: Vec<String> =
@@ -11404,7 +11473,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // else — a dim layer, a bordered panel, and the binding rows.
                     if help_open && palette_ui.is_none() {
                         let help = jetty_render::build_help_overlay(
-                            width, height, &theme, &mut *chrome_text, cm, &help_rows,
+                            width, height, &theme, &mut *chrome_text, cm, &help_rows, help_scroll,
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &help.quads);
                         if !help.labels.is_empty() {
