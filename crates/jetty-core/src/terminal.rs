@@ -40,18 +40,21 @@ fn term_config(scrollback: usize, osc52: Osc52, kitty_keyboard: bool) -> Config 
 /// nets out to "no change" and leaves anchors on the wrong rows. ED 2 erases the
 /// screen's anchors that `\e[2J` did not push into scrollback. ED 2, SU and DL
 /// push up to a whole screen into scrollback from a few bytes, so their
-/// sub-slice is bounded by the screen height, not by its byte count. An
-/// alt-screen toggle freezes `abs_top`, so primary output sharing its slice
-/// would go uncounted.
+/// sub-slice is bounded by the lines they actually push, not by their byte
+/// count (primary screen only: on the alt screen they cannot touch the primary
+/// scrollback and are not split out). An alt-screen toggle freezes `abs_top`, so
+/// primary output sharing its slice would go uncounted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IsolatedSeq {
     /// `ESC [ 2 J` — erase the whole screen.
     EraseScreen,
     /// `ESC [ 3 J` — erase the saved lines (scrollback).
     EraseSaved,
-    /// `ESC [ Ps S` (SU) / `ESC [ Ps M` (DL) — scroll the region up; on the
-    /// primary screen with the region at the top, the lines go into scrollback.
-    ScrollUp,
+    /// `ESC [ Ps S` (SU) / `ESC [ Ps M` (DL, `delete`) — scroll (part of) the
+    /// region up by `count` lines (vte: 0 = 1); on the primary screen with the
+    /// region at the top they go into scrollback — for DL only when the cursor
+    /// is on the top row.
+    ScrollUp { count: u16, delete: bool },
     /// `ESC c` — RIS, full reset (clears screen + scrollback, leaves the alt screen).
     Reset,
     /// `ESC [ ? 47 | 1047 | 1049 h|l` — alternate-screen toggle.
@@ -62,7 +65,7 @@ impl IsolatedSeq {
     /// Whether one such sequence can push up to a whole screen of lines into
     /// scrollback (vte clamps the count to the scroll region).
     fn scrolls_a_screen(self) -> bool {
-        matches!(self, IsolatedSeq::EraseScreen | IsolatedSeq::ScrollUp)
+        matches!(self, IsolatedSeq::EraseScreen | IsolatedSeq::ScrollUp { .. })
     }
 }
 
@@ -196,7 +199,7 @@ fn scroll_csi(digits: &[u8], fin: u8) -> Option<IsolatedSeq> {
             3 => Some(IsolatedSeq::EraseSaved),
             _ => None,
         },
-        b'S' | b'M' => Some(IsolatedSeq::ScrollUp),
+        b'S' | b'M' => Some(IsolatedSeq::ScrollUp { count: decset_param(digits), delete: fin == b'M' }),
         _ => None,
     }
 }
@@ -1492,11 +1495,14 @@ impl Terminal {
                         // two, no extra scanner steps.
                         0x5b if self.has_anchors() => match peek_isolated_csi(&bytes[i + 1..]) {
                             CsiPeek::Isolate(len, kind) => {
-                                let k = i + 1 + len;
-                                start = self.isolate(bytes, start, i, k, kind);
-                                i = k;
-                                self.scan = Scan::Ground;
-                                continue;
+                                if self.isolates(kind) {
+                                    let k = i + 1 + len;
+                                    start = self.isolate(bytes, start, i, k, kind);
+                                    i = k;
+                                    self.scan = Scan::Ground;
+                                    continue;
+                                }
+                                Scan::Ground
                             }
                             // Cut off by the end of this feed: finish it byte-wise.
                             CsiPeek::Incomplete => {
@@ -1585,7 +1591,7 @@ impl Terminal {
                         0x40..=0x7e => {
                             let k = i + 1;
                             if let Some(kind) = isolated_csi(&params[..len as usize], b) {
-                                if self.has_anchors() {
+                                if self.isolates(kind) {
                                     start = self.isolate(bytes, start, seq_start, k, kind);
                                 }
                             }
@@ -2064,13 +2070,19 @@ impl Terminal {
         let s0 = seq_start.max(start);
         self.advance_slice(&bytes[start..s0]);
         let seq = &bytes[s0..k];
-        if kind.scrolls_a_screen() && self.has_anchors() {
-            // A handful of bytes that may scroll a whole screen: make room for
-            // the screen (+1 per byte), or a nearly full scrollback pins at the
-            // cap and every anchor is lost (Ctrl+L in a long-lived tab).
-            self.advance_piece(seq, Some(self.rows + seq.len()));
-        } else {
-            self.advance_slice(seq);
+        // A handful of bytes that may push a whole screen into scrollback: make
+        // room for the lines it really pushes (+1 per byte), or a nearly full
+        // scrollback pins at the cap and every anchor is lost (Ctrl+L in a
+        // long-lived tab). Room beyond the piece budget is not made: that would
+        // trim — or wipe — history for a push that overflows the cap anyway, so
+        // such a piece goes through as before (anchors dropped once). Inside a
+        // synchronized update the bytes are only buffered: nothing to bound.
+        let room = (kind.scrolls_a_screen() && self.has_anchors() && self.sync_deadline().is_none())
+            .then(|| self.lines_pushed_by(kind) + seq.len() + 1)
+            .filter(|&lines| lines <= self.piece_budget());
+        match room {
+            Some(lines) => self.advance_piece(seq, Some(lines)),
+            None => self.advance_slice(seq),
         }
         // Inside a DEC 2026 synchronized update vte only BUFFERED the ED 3; the
         // block would later apply as one net history change in which the shrink
@@ -2082,6 +2094,37 @@ impl Terminal {
         }
         self.after_isolated(kind);
         k
+    }
+
+    /// Whether the scanner splits `kind` out into a sub-slice of its own: only
+    /// while anchors exist, and — for ED 2 / SU / DL, which can only move the
+    /// PRIMARY scrollback — not on the alt screen, where TUIs scroll constantly
+    /// (`abs_top` is frozen there; splitting would only cost a piece each).
+    fn isolates(&self, kind: IsolatedSeq) -> bool {
+        self.has_anchors() && !(kind.scrolls_a_screen() && self.term.mode().contains(TermMode::ALT_SCREEN))
+    }
+
+    /// At most how many lines `kind` (ED 2 / SU / DL, about to run on the primary
+    /// screen with alacritty caught up) pushes into scrollback. ED 2 pushes the
+    /// screen down to its last non-empty row (alacritty's `clear_viewport`); SU
+    /// its count, clamped to the screen (exact for a region at the top, an upper
+    /// bound otherwise — the region is not readable); DL pushes only from the
+    /// top row.
+    fn lines_pushed_by(&self, kind: IsolatedSeq) -> usize {
+        use alacritty_terminal::grid::GridCell;
+        let grid = self.term.grid();
+        match kind {
+            IsolatedSeq::EraseScreen => (0..self.rows)
+                .rev()
+                .find(|&r| {
+                    let row = &grid[Line(r as i32)];
+                    (0..self.cols).any(|c| !row[Column(c)].is_empty())
+                })
+                .map_or(0, |r| r + 1),
+            IsolatedSeq::ScrollUp { delete: true, .. } if grid.cursor.point.line.0 != 0 => 0,
+            IsolatedSeq::ScrollUp { count, .. } => usize::from(count.max(1)).min(self.rows),
+            _ => 0,
+        }
     }
 
     /// A complete kitty keyboard CSI whose final `u` is `bytes[i]` (`marker` `>`
@@ -5636,6 +5679,40 @@ mod tests {
             assert!(t.jump_prompt(false), "{seq:?}: prompt-jump finds the mark");
             assert_eq!(t.failed_prompt_rows(), vec![0], "{seq:?}: on its true row");
         }
+    }
+
+    #[test]
+    fn ctrl_l_with_a_small_scrollback_and_a_tall_window_keeps_the_history() {
+        // `scrollback_lines = 100` (the minimum) and 96 rows: making room for a
+        // whole screen wiped the scrollback before a Ctrl+L that pushes two
+        // lines. Room is made for what the clear really pushes.
+        let mut t = Terminal::new(20, 96);
+        t.set_scrollback_lines(100);
+        for i in 0..300 {
+            t.feed(format!("old {i}\r\n").as_bytes());
+        }
+        t.feed(b"\x1b[H\x1b[2J\x1b[H"); // a clear screen above a full history
+        t.feed(b"\x1b]133;A\x07$ false\x1b]133;D;1\x07\r\nout\r\n");
+        let before = t.scroll_max();
+        assert!(before >= 75, "premise: a nearly full history ({before})");
+        t.feed(b"\x1b[H\x1b[2J"); // two non-empty rows to push
+        assert!(t.scroll_max() >= before, "the history survives: {} < {before}", t.scroll_max());
+        assert_eq!(t.marks.len(), 1, "and so does the mark");
+        assert!(t.jump_prompt(false));
+        assert_eq!(t.failed_prompt_rows(), vec![0]);
+    }
+
+    #[test]
+    fn delete_lines_below_the_top_row_trims_no_history() {
+        // DL off the top row pushes nothing into scrollback; it must not make
+        // room (= trim the oldest history) for a screen it never pushes.
+        let mut t = full_history_with_a_failed_prompt();
+        let before = t.scroll_max();
+        for _ in 0..20 {
+            t.feed(b"\x1b[10;1H\x1b[5M");
+        }
+        assert_eq!(t.scroll_max(), before, "history untouched");
+        assert_eq!(t.failed_prompt_rows(), vec![36], "the mark did not move");
     }
 
     #[test]
