@@ -256,7 +256,8 @@ const KBD_STACK_MAX: u16 = 128;
 /// [`Terminal::restore_kbd`]): the lowest stack depth seen since — what was on
 /// the stack below it belongs to the shell — and whether the active flags were
 /// replaced in place (`CSI = … u`, no push). `provisional` = opened at a prompt
-/// (`A`) because the shell may never send a command-start `C`.
+/// (`A`) because the shell may never send a command-start `C`: it is only
+/// undone by a `D` (a command did run), never by the next `A` alone.
 #[derive(Clone, Copy, Debug)]
 struct KbdWindow {
     floor: u16,
@@ -2182,17 +2183,23 @@ impl Terminal {
 
     /// A prompt arrived: whatever ran since the save point is over. Undo what it
     /// left on the PRIMARY kitty keyboard stack — entries it pushed and never
-    /// popped (a SIGKILLed or crashed program, a dropped ssh) and, unless the
-    /// window is a `provisional` prompt-to-prompt one, flags it set in place — so
-    /// the shell gets legacy keys again (Ctrl+C as `^C`, not `\e[99;5u`; with
-    /// "report all keys" even `reset` could not be typed). What the shell had on
-    /// the stack before the command stays. A no-op while nothing changed.
+    /// popped (a SIGKILLed or crashed program, a dropped ssh) and flags it set in
+    /// place — so the shell gets legacy keys again (Ctrl+C as `^C`, not
+    /// `\e[99;5u`; with "report all keys" even `reset` could not be typed). What
+    /// the shell had on the stack before the command stays. A no-op while
+    /// nothing changed — and for a `provisional` prompt-to-prompt window closed by
+    /// a bare `A` (Ctrl+C or an empty line at the prompt): that window spans only
+    /// the line editor reading input, so what is on the stack then is the
+    /// editor's own (reedline pushes while it reads), not a dead program's; a
+    /// command run without a `C` mark is cleaned up at its `D`.
     fn restore_kbd(&mut self, end_of_command: bool) {
         let Some(w) = self.kbd_window.take() else { return };
+        if w.provisional && !end_of_command {
+            return;
+        }
         let depth = self.kbd_depth[0];
         let extra = depth.saturating_sub(w.floor);
-        let reload = w.set && (end_of_command || !w.provisional);
-        if self.kitty_keyboard && (extra > 0 || reload) {
+        if self.kitty_keyboard && (extra > 0 || w.set) {
             use alacritty_terminal::vte::ansi::Handler;
             // Pops `extra` entries and reloads the active flags from the new
             // stack top — with 0 it only drops flags a `CSI = u` set in place.
@@ -7484,14 +7491,28 @@ mod tests {
 
     #[test]
     fn a_shell_without_c_marks_still_gets_its_keys_back() {
-        // A/D-only integrations (bash < 4.4): the save point is the prompt itself.
+        // A/D-only integrations (bash < 4.4): the save point is the prompt itself,
+        // and the command's D undoes what it left.
         let mut t = kitty_term();
         t.feed(b"\x1b]133;A\x07$ tui\r\n\x1b[>31u");
         t.feed(b"\x1b]133;D;137\x07");
         assert_eq!(t.kitty_keyboard_flags(), 0);
-        // And a new prompt without any D (Ctrl+C at the prompt) undoes a push too.
-        t.feed(b"\x1b]133;A\x07\x1b[>8u^C\r\n\x1b]133;A\x07");
-        assert_eq!(t.kitty_keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn a_new_prompt_without_a_command_keeps_the_line_editors_flags() {
+        // A line editor that pushes its own flags while reading (reedline), then
+        // Ctrl+C at the prompt: a fresh A with no command in between — those
+        // flags are the editor's, still in use, never popped by JeTTY.
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b[>1u^C\r\n\x1b]133;A\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+        // Same for an editor that pushes BEFORE the prompt mark and pops and
+        // re-pushes around the repaint (the window's floor dips to 0 meanwhile).
+        let mut t = kitty_term();
+        t.feed(b"\x1b[>1u\x1b]133;A\x07");
+        t.feed(b"\x1b[<u\x1b[>1u\r\n\x1b]133;A\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 1);
     }
 
     #[test]
