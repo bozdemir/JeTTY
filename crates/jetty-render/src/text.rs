@@ -115,6 +115,30 @@ struct PreparedGrid {
 /// — a Nerd Font, so the zsh prompt's powerline/icon glyphs render correctly.
 const FONT_FAMILY_DEFAULT: &str = "MesloLGS NF";
 
+/// Line height as a multiple of the font size: the long-standing 1.3.
+pub const LINE_HEIGHT_DEFAULT: f32 = 1.3;
+
+/// The whole-pixel size a layer rasterizes a requested physical `size` at.
+///
+/// cosmic-text 0.18's monospace snap (shape.rs, active on every grid row via
+/// `Buffer::set_monospace_width`) rounds `advance_px / (cell_w / font_size)`
+/// to an integer — a px length divided by an EM ratio — which is the identity
+/// only while the font size itself is whole. At a fractional physical size
+/// (13 pt × 1.25 = 16.25 px) every advance snapped from 9.78 to 9.63 px, so
+/// column 99 drew 15 px left of its cell; at 22.5 px the snap rounded the
+/// other way (+30 px). Rounding the size (≤ 0.5 px) keeps every advance
+/// exactly `cell_w`. Non-finite input falls back to 16 px.
+fn rounded_font_px(size: f32) -> f32 {
+    if size.is_finite() { size.round().max(1.0) } else { 16.0 }
+}
+
+/// A layer's metrics: font `px` and a line box `line_height` × px tall, rounded
+/// UP to whole pixels so rows stay pixel-aligned (`(px * 1.3).ceil()` at the
+/// default — the historical cell height).
+fn layer_metrics(px: f32, line_height: f32) -> Metrics {
+    Metrics::new(px, (px * line_height).ceil())
+}
+
 /// Which family the chrome-overlay pass (`render_overlays*`) shapes its labels
 /// in. Distinct from the TERMINAL grid font (`font_family`): chrome — tab
 /// titles, the status bar, the menu, the panel, help/confirm/welcome — renders
@@ -510,6 +534,9 @@ pub struct TextLayer {
     /// `ClusterGlyphCache`).
     clusters: ClusterGlyphCache,
     metrics: Metrics,
+    /// Line height as a multiple of the font size (`LINE_HEIGHT_DEFAULT` unless
+    /// `set_line_height` changed it — the grid layer's `line_height` key).
+    line_height: f32,
     cell_w: f32,
     cell_h: f32,
     /// Growable pool of glyphon Buffers reused across frames for overlay labels.
@@ -643,8 +670,9 @@ impl TextLayer {
         let renderer =
             TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
 
-        let line_height = (font_size * 1.3).ceil();
-        let metrics = Metrics::new(font_size, line_height);
+        // Whole-px size (see `rounded_font_px`) at the default line height.
+        let metrics = layer_metrics(rounded_font_px(font_size), LINE_HEIGHT_DEFAULT);
+        let line_height = metrics.line_height;
 
         // The cursor is drawn as a QuadLayer rect (see `quad::cursor_rects_split`),
         // not a text-atlas block glyph, so there is no cursor buffer to build here.
@@ -678,6 +706,7 @@ impl TextLayer {
             row_index_scratch: FxHashMap::default(),
             clusters: ClusterGlyphCache::default(),
             metrics,
+            line_height: LINE_HEIGHT_DEFAULT,
             cell_w,
             cell_h,
             overlay_buffers: Vec::new(),
@@ -712,10 +741,7 @@ impl TextLayer {
     /// ONLY on grid rows; the chrome overlay buffers are proportional
     /// (Shaping::Advanced) and never get this.
     fn new_row_buffer(&mut self) -> Buffer {
-        let mut b = Buffer::new(&mut self.font_system, self.metrics);
-        b.set_size(&mut self.font_system, None, Some(self.metrics.line_height));
-        b.set_monospace_width(&mut self.font_system, Some(self.cell_w));
-        b
+        grid_row_buffer(&mut self.font_system, self.metrics, self.cell_w)
     }
 
     /// Returns the sorted, deduplicated list of monospaced font family names
@@ -845,8 +871,9 @@ impl TextLayer {
     /// thread per keypress. Re-derives metrics, the layout/cursor buffers, and the
     /// cell measurements. The caller must `reflow()` + `request_redraw()` after.
     pub fn set_font_size(&mut self, font_size: f32) {
-        let line_height = (font_size * 1.3).ceil();
-        self.metrics = Metrics::new(font_size, line_height);
+        // Whole-px size (see `rounded_font_px`) at this layer's line height.
+        self.metrics = layer_metrics(rounded_font_px(font_size), self.line_height);
+        let line_height = self.metrics.line_height;
         // Re-metric the coverage probe buffer too (F6). `route()` shapes the probed
         // char in `coverage_buffer` and compares its advance against the CURRENT
         // `cell_w`; leaving the probe buffer at the construction-time size made a
@@ -1745,6 +1772,15 @@ impl TextLayer {
     }
 }
 
+/// An empty single-line grid-row buffer at `metrics`, every glyph advance
+/// snapped to `cell_w` (see `TextLayer::new_row_buffer`).
+fn grid_row_buffer(font_system: &mut FontSystem, metrics: Metrics, cell_w: f32) -> Buffer {
+    let mut b = Buffer::new(font_system, metrics);
+    b.set_size(font_system, None, Some(metrics.line_height));
+    b.set_monospace_width(font_system, Some(cell_w));
+    b
+}
+
 fn measure_advance_family(font_system: &mut FontSystem, metrics: Metrics, family: &str) -> f32 {
     let mut b = Buffer::new(font_system, metrics);
     let attrs = Attrs::new().family(Family::Name(family));
@@ -1984,5 +2020,72 @@ mod tests {
         evict_fifo_cache(&mut map, &mut order, |k| visible.contains(k), 2);
         assert_eq!(map.len(), 5, "all-visible entries are retained, no hang");
         assert_eq!(order.len(), 5, "order queue preserved");
+    }
+
+    // ── Grid metrics: whole-px font size, line height ───────────────────────
+
+    /// A monospace family to shape with: the default terminal font when it is
+    /// installed, else any monospace face (CI runners lack MesloLGS NF); `None`
+    /// on a machine without one (the shaping tests then have nothing to test).
+    fn mono_family(fs: &FontSystem) -> Option<String> {
+        let faces = || fs.db().faces();
+        if faces().any(|f| f.families.iter().any(|(n, _)| n == FONT_FAMILY_DEFAULT)) {
+            return Some(FONT_FAMILY_DEFAULT.to_string());
+        }
+        faces().find(|f| f.monospaced).and_then(|f| f.families.first().map(|(n, _)| n.clone()))
+    }
+
+    /// Each glyph's x after shaping `text` exactly like a grid row
+    /// (`TextLayer::shape_row`: the terminal family, `Shaping::Basic`, the row
+    /// buffer's monospace snap to `cell_w`).
+    fn row_glyph_xs(fs: &mut FontSystem, family: &str, metrics: Metrics, cell_w: f32, text: &str) -> Vec<f32> {
+        let mut b = grid_row_buffer(fs, metrics, cell_w);
+        let attrs = Attrs::new().family(Family::Name(family));
+        b.set_rich_text(fs, [(text, attrs.clone())], &attrs, Shaping::Basic, None);
+        b.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| g.x).collect::<Vec<_>>()).collect()
+    }
+
+    #[test]
+    fn font_px_rounds_to_whole_pixels() {
+        assert_eq!(rounded_font_px(16.25), 16.0, "13 pt at 1.25×");
+        assert_eq!(rounded_font_px(22.5), 23.0, "15 pt at 1.5×: half rounds away from zero");
+        assert_eq!(rounded_font_px(19.25), 19.0, "11 pt at 1.75×");
+        assert_eq!(rounded_font_px(32.0), 32.0, "16 pt at 2× is untouched");
+        assert_eq!(rounded_font_px(0.2), 1.0);
+        assert_eq!(rounded_font_px(f32::NAN), 16.0);
+        // The historical cell height at the default line height.
+        assert_eq!(layer_metrics(16.0, LINE_HEIGHT_DEFAULT).line_height, 21.0);
+        assert_eq!(layer_metrics(22.0, LINE_HEIGHT_DEFAULT).line_height, 29.0);
+        assert_eq!(layer_metrics(20.0, LINE_HEIGHT_DEFAULT).line_height, 26.0);
+    }
+
+    #[test]
+    fn grid_glyphs_land_on_their_cells_at_fractional_physical_sizes() {
+        let mut fs = TextLayer::build_font_system();
+        let Some(family) = mono_family(&fs) else {
+            eprintln!("no monospace font installed: nothing to shape");
+            return;
+        };
+        let text: String = "M0|iW".repeat(24); // 120 columns
+        // 13 pt × 1.25, 15 pt × 1.5, 13 pt × 1.5, 11 pt × 1.75, and a whole size.
+        for requested in [16.25f32, 22.5, 19.5, 19.25, 16.0] {
+            let metrics = layer_metrics(rounded_font_px(requested), LINE_HEIGHT_DEFAULT);
+            let cell_w = measure_advance_family(&mut fs, metrics, &family);
+            let xs = row_glyph_xs(&mut fs, &family, metrics, cell_w, &text);
+            assert_eq!(xs.len(), 120, "{family} @ {requested}px");
+            for (col, &x) in xs.iter().enumerate() {
+                let want = col as f32 * cell_w;
+                assert!((x - want).abs() < 0.01, "{family} @ {requested}px: col {col} at x {x}, cell at {want}");
+            }
+        }
+        // The bug this guards (research: −15 px at column 99 at 16.25 px, +30 px
+        // at 22.5 px): an UNROUNDED size drifts off the grid.
+        for (requested, sign) in [(16.25f32, -1.0f32), (22.5, 1.0)] {
+            let metrics = layer_metrics(requested, LINE_HEIGHT_DEFAULT);
+            let cell_w = measure_advance_family(&mut fs, metrics, &family);
+            let xs = row_glyph_xs(&mut fs, &family, metrics, cell_w, &text);
+            let drift = xs[99] - 99.0 * cell_w;
+            assert!(drift * sign > 5.0, "{family} @ {requested}px unrounded: col 99 drift {drift}");
+        }
     }
 }
