@@ -241,6 +241,16 @@ mod tests {
     }
 
     #[test]
+    fn bar_clears_the_dpi_scaled_scrollbar_column_at_2x() {
+        let cm2 = ChromeMetrics::new(2.0, 16.0);
+        for w in [800u32, 1400, 2000, 3200] {
+            let sb = build_search_bar(w, 72.0, &theme(), &mut MonoMeasure(19.6), cm2, "a query", 3, 17);
+            let right_inset = w as f32 - (sb.panel.x + sb.panel.w);
+            assert!(right_inset >= 2.0 * SCROLLBAR_W, "2× bar overlaps the 28 px thumb column at {w}: {right_inset}");
+        }
+    }
+
+    #[test]
     fn close_rect_inside_panel() {
         let sb = build_search_bar(1000, 36.0, &theme(), &mut mono(), CM, "query", 1, 2);
         let p = &sb.panel;

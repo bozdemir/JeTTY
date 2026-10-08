@@ -205,6 +205,20 @@ mod tests {
     }
 
     #[test]
+    fn chips_clear_the_dpi_scaled_scrollbar_column_at_2x() {
+        // At 2× the thumb column is 28 px wide: a chip at the last column must
+        // clear THAT, not the 1× 14 px.
+        let cm2 = ChromeMetrics::new(2.0, 16.0);
+        let (w, cell_w) = (2000u32, 19.0);
+        let last_col = (w as f32 / cell_w) as usize;
+        let labeled = vec![("sd", 0, last_col.saturating_sub(1)), ("qw", 1, last_col + 10)];
+        let ov = build_hint_overlay(&labeled, cell_w, 36.0, 72.0, &theme(), &mut MonoMeasure(19.6), cm2, "", w);
+        for q in &ov.quads {
+            assert!(q.x + q.w <= w as f32 - 2.0 * SCROLLBAR_W + 0.5, "chip right {} at 2×", q.x + q.w);
+        }
+    }
+
+    #[test]
     fn chip_color_differs_from_bg() {
         let labeled = vec![("a", 0, 0)];
         let ov = build_hint_overlay(&labeled, 9.0, 18.0, 0.0, &theme(), &mut mono(), CM, "", 1000);
