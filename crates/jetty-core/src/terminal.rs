@@ -38,19 +38,32 @@ fn term_config(scrollback: usize, osc52: Osc52, kitty_keyboard: bool) -> Config 
 /// anchors exist) so `abs_top` bookkeeping sees its history effect in isolation.
 /// ED 3 and RIS SHRINK history — a same-write `\e[2J\e[3J` (`clear`) otherwise
 /// nets out to "no change" and leaves anchors on the wrong rows. ED 2 erases the
-/// screen's anchors that `\e[2J` did not push into scrollback. An alt-screen
-/// toggle freezes `abs_top`, so primary output sharing its slice would go
-/// uncounted.
+/// screen's anchors that `\e[2J` did not push into scrollback. ED 2, SU and DL
+/// push up to a whole screen into scrollback from a few bytes, so their
+/// sub-slice is bounded by the screen height, not by its byte count. An
+/// alt-screen toggle freezes `abs_top`, so primary output sharing its slice
+/// would go uncounted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IsolatedSeq {
     /// `ESC [ 2 J` — erase the whole screen.
     EraseScreen,
     /// `ESC [ 3 J` — erase the saved lines (scrollback).
     EraseSaved,
+    /// `ESC [ Ps S` (SU) / `ESC [ Ps M` (DL) — scroll the region up; on the
+    /// primary screen with the region at the top, the lines go into scrollback.
+    ScrollUp,
     /// `ESC c` — RIS, full reset (clears screen + scrollback, leaves the alt screen).
     Reset,
     /// `ESC [ ? 47 | 1047 | 1049 h|l` — alternate-screen toggle.
     AltToggle,
+}
+
+impl IsolatedSeq {
+    /// Whether one such sequence can push up to a whole screen of lines into
+    /// scrollback (vte clamps the count to the scroll region).
+    fn scrolls_a_screen(self) -> bool {
+        matches!(self, IsolatedSeq::EraseScreen | IsolatedSeq::ScrollUp)
+    }
 }
 
 /// Index of the first OSC terminator in `s` — BEL, CAN, SUB or ESC (vte 0.15's
@@ -165,10 +178,25 @@ fn cap_cursor_zerowidth(term: &mut Term<EventProxy>) {
 
 /// Classify a completed CSI (`ESC [` + `params` + `fin`) the scanner isolates.
 fn isolated_csi(params: &[u8], fin: u8) -> Option<IsolatedSeq> {
-    match (params, fin) {
-        (b"2", b'J') => Some(IsolatedSeq::EraseScreen),
-        (b"3", b'J') => Some(IsolatedSeq::EraseSaved),
-        (b"?47" | b"?1047" | b"?1049", b'h' | b'l') => Some(IsolatedSeq::AltToggle),
+    match params.split_first() {
+        Some((b'?', mode)) => (matches!(mode, b"47" | b"1047" | b"1049") && matches!(fin, b'h' | b'l'))
+            .then_some(IsolatedSeq::AltToggle),
+        _ if params.iter().all(u8::is_ascii_digit) => scroll_csi(params, fin),
+        _ => None,
+    }
+}
+
+/// The history-rewriting CSIs with one decimal parameter (`digits`, maybe
+/// empty): ED 2 / ED 3 (vte reads the number, so `\e[02J` is ED 2 too), and SU /
+/// DL with any count.
+fn scroll_csi(digits: &[u8], fin: u8) -> Option<IsolatedSeq> {
+    match fin {
+        b'J' => match decset_param(digits) {
+            2 => Some(IsolatedSeq::EraseScreen),
+            3 => Some(IsolatedSeq::EraseSaved),
+            _ => None,
+        },
+        b'S' | b'M' => Some(IsolatedSeq::ScrollUp),
         _ => None,
     }
 }
@@ -187,8 +215,9 @@ fn decset_bit(n: u16) -> u8 {
     }
 }
 
-/// Parse the decimal digits of one private-mode parameter (`params` excludes the
-/// `?`), saturating — an over-long number can never alias 9 or 1015.
+/// Parse the decimal digits of one CSI parameter (a private mode's without its
+/// `?`), saturating — an over-long number can never alias a real one (the mouse
+/// modes 9 / 1015, ED 2 / 3).
 fn decset_param(digits: &[u8]) -> u16 {
     digits.iter().fold(0u16, |n, &d| n.saturating_mul(10).saturating_add(u16::from(d.wrapping_sub(b'0'))))
 }
@@ -204,33 +233,38 @@ enum CsiPeek {
     Other,
 }
 
-/// Peek at `rest` (the bytes right after `ESC [`) for an [`IsolatedSeq`]. The
-/// first byte rules out nearly every CSI (SGRs start with a digit other than 2/3
-/// or are `3x;…`), so the common case is one or two compares.
+/// Parameter bytes [`Scan::Csi`] collects when a CSI is cut by a feed boundary.
+const CSI_PARAMS_MAX: usize = 5;
+
+/// Peek at `rest` (the bytes right after `ESC [`) for an [`IsolatedSeq`]. An SGR
+/// costs its first parameter's digits and one compare of the byte after them
+/// (`;` or `m`); a letter-led CSI other than `J`/`S`/`M` costs one compare.
 fn peek_isolated_csi(rest: &[u8]) -> CsiPeek {
-    const SEQS: [(&[u8], IsolatedSeq); 8] = [
-        (b"2J", IsolatedSeq::EraseScreen),
-        (b"3J", IsolatedSeq::EraseSaved),
-        (b"?47h", IsolatedSeq::AltToggle),
-        (b"?47l", IsolatedSeq::AltToggle),
-        (b"?1047h", IsolatedSeq::AltToggle),
-        (b"?1047l", IsolatedSeq::AltToggle),
-        (b"?1049h", IsolatedSeq::AltToggle),
-        (b"?1049l", IsolatedSeq::AltToggle),
-    ];
     match rest.first() {
-        None => return CsiPeek::Incomplete,
-        Some(b'2' | b'3' | b'?') => {}
-        Some(_) => return CsiPeek::Other,
-    }
-    let mut incomplete = false;
-    for (seq, kind) in SEQS {
-        if rest.starts_with(seq) {
-            return CsiPeek::Isolate(seq.len(), kind);
+        None => CsiPeek::Incomplete,
+        Some(b'?') => {
+            const ALT: [&[u8]; 6] = [b"?47h", b"?47l", b"?1047h", b"?1047l", b"?1049h", b"?1049l"];
+            let mut incomplete = false;
+            for seq in ALT {
+                if rest.starts_with(seq) {
+                    return CsiPeek::Isolate(seq.len(), IsolatedSeq::AltToggle);
+                }
+                incomplete |= seq.starts_with(rest);
+            }
+            if incomplete { CsiPeek::Incomplete } else { CsiPeek::Other }
         }
-        incomplete |= seq.starts_with(rest);
+        Some(b'0'..=b'9' | b'J' | b'S' | b'M') => match rest.iter().position(|b| !b.is_ascii_digit()) {
+            Some(n) => match scroll_csi(&rest[..n], rest[n]) {
+                Some(kind) => CsiPeek::Isolate(n + 1, kind),
+                None => CsiPeek::Other,
+            },
+            // The feed ends inside the number: finish it byte-wise (a number too
+            // long for that is not tracked — it can only be absurd).
+            None if rest.len() < CSI_PARAMS_MAX => CsiPeek::Incomplete,
+            None => CsiPeek::Other,
+        },
+        Some(_) => CsiPeek::Other,
     }
-    if incomplete { CsiPeek::Incomplete } else { CsiPeek::Other }
 }
 
 /// Turn a Kitty command's RAW payload (already base64-decoded and accumulated)
@@ -568,11 +602,12 @@ enum Scan {
     Ground,
     /// Saw ESC; a following `]` (0x5d) opens an OSC, `P` (0x50) opens a DCS.
     Esc,
-    /// Saw `ESC [`: collecting up to 5 parameter bytes (`0-9`, `?`) to recognize
-    /// the few CSIs that rewrite history ([`IsolatedSeq`]). Any other byte bails
-    /// to Ground at once (an SGR costs one extra step); vte parses every CSI
-    /// itself regardless — this only decides where `feed` splits its slices.
-    Csi { params: [u8; 5], len: u8 },
+    /// Saw `ESC [` at the end of a feed: collecting up to [`CSI_PARAMS_MAX`]
+    /// parameter bytes (`0-9`, `?`) to recognize the few CSIs that rewrite
+    /// history ([`IsolatedSeq`]). Any other byte bails to Ground at once (an SGR
+    /// costs one extra step); vte parses every CSI itself regardless — this only
+    /// decides where `feed` splits its slices.
+    Csi { params: [u8; CSI_PARAMS_MAX], len: u8 },
     /// Inside a private-mode CSI (`ESC [ ?`), watching for DECSET/DECRST of the
     /// two mouse modes alacritty does not track — X10 (`9`) and urxvt (`1015`).
     /// `cur` is the parameter being read (saturating), `hit` the modes named so
@@ -790,13 +825,13 @@ pub struct Terminal {
     /// `history_size()` then never pins and its growth stays an EXACT scroll
     /// count (a full scrollback no longer disables marks, Run & Notify or
     /// images). With nothing anchored nothing reads it: slices go through whole
-    /// and it may under-count, harmlessly. Only a sub-slice that scrolls
-    /// more than it could be bounded (a sync-update replay, a `CSI 9999 S`
-    /// burst) pins it — that drops every anchor once (correct-or-absent) and
-    /// tracking resumes exactly on the next sub-slice. FROZEN on the alt screen
-    /// and across an alt-screen toggle (that history change is not a scroll);
-    /// toggles are isolated into their own sub-slice so no primary output is
-    /// lost with them.
+    /// and it may under-count, harmlessly. Only a sub-slice that scrolls more
+    /// than it could be bounded (a sync-update replay, a long `CSI Ps b` repeat,
+    /// a screen taller than the scrollback) pins it — that drops every anchor
+    /// once (correct-or-absent) and tracking resumes exactly on the next
+    /// sub-slice. FROZEN on the alt screen and across an alt-screen toggle (that
+    /// history change is not a scroll); toggles are isolated into their own
+    /// sub-slice so no primary output is lost with them.
     abs_top: i64,
     /// The scrollback cap (the alacritty grid's max). While anchors exist, room
     /// is made BEFORE each sub-slice, so the retained history sits between this
@@ -1303,8 +1338,9 @@ impl Terminal {
     /// cursor line is read, then decodes/places the image (or binds the 133).
     /// Image payloads ARE still fed to alacritty (which ignores them) so its own
     /// parser walks the DCS/APC in lockstep and stays consistent. While anchors
-    /// exist, ED 2/3, RIS and alt-screen toggles are advanced in sub-slices of
-    /// their own so `abs_top` sees each one's history effect in isolation.
+    /// exist, ED 2/3, SU/DL, RIS and alt-screen toggles are advanced in
+    /// sub-slices of their own so `abs_top` sees each one's history effect in
+    /// isolation.
     /// Measured with `examples/feed_bench.rs`: within ±1.5% of the pre-scan code
     /// on every workload, including one with live prompt marks.
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -1359,7 +1395,7 @@ impl Terminal {
                             // Cut off by the end of this feed: finish it byte-wise.
                             CsiPeek::Incomplete => {
                                 seq_start = i;
-                                Scan::Csi { params: [0; 5], len: 0 }
+                                Scan::Csi { params: [0; CSI_PARAMS_MAX], len: 0 }
                             }
                             // A private-mode CSI: watch it for the mouse modes
                             // alacritty ignores (the `?` is consumed here).
@@ -1382,7 +1418,7 @@ impl Terminal {
                             Some(_) => Scan::Ground,
                             None => {
                                 seq_start = i;
-                                Scan::Csi { params: [0; 5], len: 0 }
+                                Scan::Csi { params: [0; CSI_PARAMS_MAX], len: 0 }
                             }
                         },
                         // `ESC c` (RIS) resets the screen AND scrollback — and
@@ -1874,7 +1910,15 @@ impl Terminal {
     fn isolate(&mut self, bytes: &[u8], start: usize, seq_start: usize, k: usize, kind: IsolatedSeq) -> usize {
         let s0 = seq_start.max(start);
         self.advance_slice(&bytes[start..s0]);
-        self.advance_slice(&bytes[s0..k]);
+        let seq = &bytes[s0..k];
+        if kind.scrolls_a_screen() && self.has_anchors() {
+            // A handful of bytes that may scroll a whole screen: make room for
+            // the screen (+1 per byte), or a nearly full scrollback pins at the
+            // cap and every anchor is lost (Ctrl+L in a long-lived tab).
+            self.advance_piece(seq, Some(self.rows + seq.len()));
+        } else {
+            self.advance_slice(seq);
+        }
         self.after_isolated(kind);
         k
     }
@@ -1911,8 +1955,8 @@ impl Terminal {
                 });
                 self.placement_bytes = self.placement_bytes.saturating_sub(freed);
             }
-            // ED 3's shrink and a toggle's freeze are fully handled by the
-            // isolated `track_abs_top` call itself.
+            // ED 3's shrink, SU/DL's scroll and a toggle's freeze are fully
+            // handled by the isolated `track_abs_top` call itself.
             _ => {}
         }
     }
@@ -1949,8 +1993,9 @@ impl Terminal {
             self.abs_top += (h1 - h0) as i64;
             // `make_room` keeps history strictly below the cap for any sub-slice
             // within its bound, so reaching the cap means this one scrolled more
-            // than counted (a sync-update replay, a `CSI 9999 S` burst, or no
-            // scrollback at all) and `history_size()` pinned: the count is lost.
+            // than counted (a sync-update replay, a long `CSI Ps b` repeat, a
+            // screen taller than the scrollback) and `history_size()` pinned:
+            // the count is lost.
             // Drop every anchor once (correct-or-absent); the next sub-slice is
             // exact again.
             if h1 >= self.scrollback_limit && (h1 > h0 || self.scrollback_limit == 0) {
@@ -5280,10 +5325,72 @@ mod tests {
         assert_eq!(t.failed_prompt_rows(), vec![4], "marks still exact after the flood");
     }
 
+    /// A 20×40 tab whose 100-line scrollback filled up before the shell
+    /// integration bound anything, then a failed prompt on the bottom row and 3
+    /// more lines: the mark sits on row 36 and the history holds over 60 lines,
+    /// so one more screen (40 lines) would overflow the cap.
+    fn full_history_with_a_failed_prompt() -> Terminal {
+        let mut t = Terminal::new(20, 40);
+        t.set_scrollback_lines(100);
+        for i in 0..150 {
+            t.feed(format!("old {i}\r\n").as_bytes());
+        }
+        t.feed(b"\x1b]133;A\x07$ false\x1b]133;D;1\x07");
+        for i in 0..3 {
+            t.feed(format!("\r\nnew {i}").as_bytes());
+        }
+        assert_eq!(t.failed_prompt_rows(), vec![36], "premise: the mark sits on row 36");
+        assert!(t.scroll_max() + 40 > 100, "premise: a screen more overflows the cap");
+        t
+    }
+
+    #[test]
+    fn ctrl_l_in_a_full_scrollback_keeps_the_marks() {
+        // Ctrl+L (`\e[H\e[2J`) pushes up to a whole screen into scrollback. Its
+        // sub-slice used to be bounded by its 4 bytes, so a nearly full history
+        // pinned at the cap and every mark/image in the tab was dropped.
+        let mut t = full_history_with_a_failed_prompt();
+        t.feed(b"\x1b[H\x1b[2J");
+        assert_eq!(t.marks.len(), 1, "the mark survives the clear");
+        assert!(t.failed_prompt_rows().is_empty(), "it was pushed into scrollback");
+        assert!(t.jump_prompt(false), "and prompt-jump still finds it there");
+        assert_eq!(t.failed_prompt_rows(), vec![0]);
+        assert!(t.scroll_max() < 100, "history stayed below the cap: {}", t.scroll_max());
+    }
+
+    #[test]
+    fn scroll_up_and_delete_lines_in_a_full_scrollback_keep_the_marks() {
+        // `CSI Ps S` (SU) and `CSI Ps M` (DL on the top row) also push up to a
+        // screen of lines into scrollback from a few bytes.
+        for seq in [&b"\x1b[40S"[..], b"\x1b[H\x1b[40M", b"\x1b[0040S"] {
+            let mut t = full_history_with_a_failed_prompt();
+            t.feed(seq);
+            assert_eq!(t.marks.len(), 1, "{seq:?}: the mark survives");
+            t.feed(b"\x1b[40;1H");
+            for i in 0..3 {
+                t.feed(format!("\r\nafter {i}").as_bytes());
+            }
+            assert!(t.jump_prompt(false), "{seq:?}: prompt-jump finds the mark");
+            assert_eq!(t.failed_prompt_rows(), vec![0], "{seq:?}: on its true row");
+        }
+    }
+
+    #[test]
+    fn scroll_up_split_across_feeds_keeps_the_marks() {
+        // The same sequence arriving in pieces (a PTY read boundary inside it).
+        let mut t = full_history_with_a_failed_prompt();
+        t.feed(b"\x1b[");
+        t.feed(b"40");
+        t.feed(b"S");
+        assert_eq!(t.marks.len(), 1, "the mark survives a split SU");
+        assert!(t.jump_prompt(false));
+        assert_eq!(t.failed_prompt_rows(), vec![0]);
+    }
+
     #[test]
     fn pathological_scroll_overflow_resets_anchors_once_then_recovers() {
-        // A single sub-slice that scrolls more than the slack (CSI S with a huge
-        // count, repeated in < SLICE_MAX_BYTES) pins history: the count is lost,
+        // A sub-slice that scrolls more than the whole scrollback can hold (a
+        // `CSI S` count beyond the 30-line cap) pins history: the count is lost,
         // so every anchor is dropped ONCE — and exact tracking resumes after.
         let mut t = Terminal::new(20, 200);
         t.set_scrollback_lines(30);
