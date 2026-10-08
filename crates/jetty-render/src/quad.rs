@@ -701,6 +701,9 @@ pub fn failed_marker_rects(
 /// when unfocused. `caret_t`/`flash_color` apply the keystroke flash (color lerp
 /// cursor_rgb→flash, plus a Block-only center-scale bump), ported from the old
 /// text-glyph cursor path. Returns empty when the cursor is hidden/out of bounds.
+///
+/// All shapes in one list; renderers use [`cursor_rects_split`] instead, so the
+/// solid block can go UNDER the glyphs.
 pub fn cursor_rects(
     snap: &jetty_core::GridSnapshot,
     cell_w: f32,
@@ -710,10 +713,41 @@ pub fn cursor_rects(
     caret_t: Option<f32>,
     flash_color: [f32; 3],
 ) -> Vec<Rect> {
-    use jetty_core::CursorShapeSnap;
-    if !snap.cursor_visible || snap.cursor_col >= snap.cols || snap.cursor_row >= snap.rows {
-        return Vec::new();
+    let (under, mut over) = cursor_rects_split(snap, cell_w, cell_h, y_offset, focused, caret_t, flash_color);
+    if let Some(block) = under {
+        over.insert(0, block);
     }
+    over
+}
+
+/// The cursor quads, split by layer:
+/// * `under` — the SOLID block. Paint it in the background pass, UNDER the
+///   glyphs, and draw the glyph it covers in a contrast color
+///   (`GridPaint::cursor_glyph` + `cursor_text_color`): drawn last and opaque,
+///   it used to hide the very character it sits on.
+/// * `over` — beam, underline and the unfocused hollow block: thin shapes that
+///   cover no glyph, drawn over the text (Pass 4) exactly as before.
+///
+/// On a double-width char the block / hollow block / underline span both cells.
+#[allow(clippy::too_many_arguments)]
+pub fn cursor_rects_split(
+    snap: &jetty_core::GridSnapshot,
+    cell_w: f32,
+    cell_h: f32,
+    y_offset: f32,
+    focused: bool,
+    caret_t: Option<f32>,
+    flash_color: [f32; 3],
+) -> (Option<Rect>, Vec<Rect>) {
+    use jetty_core::CursorShapeSnap;
+    use unicode_width::UnicodeWidthChar;
+    if !snap.cursor_visible || snap.cursor_col >= snap.cols || snap.cursor_row >= snap.rows {
+        return (None, Vec::new());
+    }
+    // A wide (CJK / emoji) char occupies its cell and the spacer after it.
+    let wide = snap.cursor_col + 1 < snap.cols
+        && snap.cell(snap.cursor_row, snap.cursor_col).c.width() == Some(2);
+    let span_w = if wide { cell_w * 2.0 } else { cell_w };
     // Effective shape: an unfocused window hollows out the BLOCK cursor. Beam and
     // Underline stay as-is when unfocused (only Block hollows — v0.13 amendment).
     let shape = if !focused && snap.cursor_shape == CursorShapeSnap::Block {
@@ -743,22 +777,16 @@ pub fn cursor_rects(
     let mut rects = Vec::new();
     match shape {
         CursorShapeSnap::Block => {
-            // Center-scale bump about the cell (matches the old glyph scaling).
-            let w = cell_w * scale;
+            // Center-scale bump about the cell(s) (matches the old glyph scaling).
+            let w = span_w * scale;
             let h = cell_h * scale;
             let raw_top = base_y - (h - cell_h) * 0.5;
-            // Cursor draws in Pass 4, AFTER the tab bar (Pass 3). On grid row 0 the
-            // flash scale-up would lift the top edge above the grid content top
-            // (y_offset) and paint a sliver over the tab bar. Clamp the top to
-            // y_offset so the bump only ever grows downward into the grid there.
+            // On grid row 0 the flash scale-up would lift the top edge above the grid
+            // content top (y_offset), into the tab bar. Clamp the top to y_offset so
+            // the bump only ever grows downward into the grid there.
             let top = raw_top.max(y_offset);
-            rects.push(Rect::new(
-                base_x - (w - cell_w) * 0.5,
-                top,
-                w,
-                raw_top + h - top,
-                color,
-            ));
+            let block = Rect::new(base_x - (w - span_w) * 0.5, top, w, raw_top + h - top, color);
+            return (Some(block), rects);
         }
         CursorShapeSnap::Beam => {
             let w = (cell_w * 0.12).max(1.0);
@@ -766,17 +794,17 @@ pub fn cursor_rects(
         }
         CursorShapeSnap::Underline => {
             let h = (cell_h * 0.12).max(1.0);
-            rects.push(Rect::new(base_x, base_y + cell_h - h, cell_w, h, color));
+            rects.push(Rect::new(base_x, base_y + cell_h - h, span_w, h, color));
         }
         CursorShapeSnap::HollowBlock => {
             let b = (cell_w * 0.1).max(1.0);
-            rects.push(Rect::new(base_x, base_y, cell_w, b, color)); // top
-            rects.push(Rect::new(base_x, base_y + cell_h - b, cell_w, b, color)); // bottom
+            rects.push(Rect::new(base_x, base_y, span_w, b, color)); // top
+            rects.push(Rect::new(base_x, base_y + cell_h - b, span_w, b, color)); // bottom
             rects.push(Rect::new(base_x, base_y, b, cell_h, color)); // left
-            rects.push(Rect::new(base_x + cell_w - b, base_y, b, cell_h, color)); // right
+            rects.push(Rect::new(base_x + span_w - b, base_y, b, cell_h, color)); // right
         }
     }
-    rects
+    (None, rects)
 }
 
 /// Scrollbar thumb width in px. The terminal grid reserves this much on the
@@ -1040,6 +1068,48 @@ mod tests {
         let r = cursor_rects(&g, 10.0, 20.0, 0.0, true, None, [1.0, 1.0, 1.0]);
         assert_eq!(r.len(), 1);
         assert_eq!((r[0].x, r[0].y, r[0].w, r[0].h), (10.0, 40.0, 10.0, 20.0));
+    }
+
+    #[test]
+    fn solid_block_goes_under_the_text_everything_else_over() {
+        // The solid block is the ONLY shape that covers a glyph, so it is the only
+        // one returned for the under-text (background) pass.
+        let mut g = grid(5, 3);
+        g.cursor_visible = true;
+        g.cursor_shape = CursorShapeSnap::Block;
+        let (under, over) = cursor_rects_split(&g, 10.0, 20.0, 0.0, true, None, [1.0; 3]);
+        assert!(under.is_some() && over.is_empty());
+        // Unfocused → hollow outline over the text, nothing under it.
+        let (under, over) = cursor_rects_split(&g, 10.0, 20.0, 0.0, false, None, [1.0; 3]);
+        assert!(under.is_none() && over.len() == 4);
+        for shape in [CursorShapeSnap::Beam, CursorShapeSnap::Underline] {
+            g.cursor_shape = shape;
+            let (under, over) = cursor_rects_split(&g, 10.0, 20.0, 0.0, true, None, [1.0; 3]);
+            assert!(under.is_none() && over.len() == 1, "{shape:?} draws over the text");
+        }
+    }
+
+    #[test]
+    fn cursor_on_a_wide_char_spans_both_cells() {
+        let mut g = grid(5, 3);
+        g.cursor_visible = true;
+        g.cursor_col = 1;
+        g.cells[1].c = '漢';
+        g.cursor_shape = CursorShapeSnap::Block;
+        let (under, _) = cursor_rects_split(&g, 10.0, 20.0, 0.0, true, None, [1.0; 3]);
+        assert_eq!(under.unwrap().w, 20.0, "block covers the char and its spacer");
+        let (_, hollow) = cursor_rects_split(&g, 10.0, 20.0, 0.0, false, None, [1.0; 3]);
+        assert_eq!(hollow[0].w, 20.0, "hollow outline too");
+        g.cursor_shape = CursorShapeSnap::Underline;
+        let (_, ul) = cursor_rects_split(&g, 10.0, 20.0, 0.0, true, None, [1.0; 3]);
+        assert_eq!(ul[0].w, 20.0);
+        // A narrow char keeps one cell; a wide char in the LAST column can't span.
+        g.cells[1].c = 'a';
+        g.cursor_shape = CursorShapeSnap::Block;
+        assert_eq!(cursor_rects_split(&g, 10.0, 20.0, 0.0, true, None, [1.0; 3]).0.unwrap().w, 10.0);
+        g.cursor_col = 4;
+        g.cells[4].c = '漢';
+        assert_eq!(cursor_rects_split(&g, 10.0, 20.0, 0.0, true, None, [1.0; 3]).0.unwrap().w, 10.0);
     }
 
     #[test]

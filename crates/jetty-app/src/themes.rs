@@ -18,6 +18,9 @@
 //! background   = "#1e1e2e"      # required   (alias: bg)
 //! foreground   = "#cdd6f4"      # required   (alias: fg)
 //! cursor       = "#f5e0dc"      # required
+//! cursor_text  = "#1e1e2e"      # optional: glyph under a block cursor (default: background)
+//! selection_foreground = "#…"   # optional (alias: selection_fg): every selected glyph's
+//!                               # color (default: own color, unless unreadable on the highlight)
 //! # 16 ANSI colors — EITHER a flat 16-array `palette = [...]` (REQUIRED unless the
 //! # named tables below are given; if BOTH are present, `palette` WINS):
 //! palette = ["#45475a", "#f38ba8", ...]   # exactly 16 hex colors
@@ -47,6 +50,9 @@ struct ThemeToml {
     #[serde(alias = "fg")]
     foreground: Option<String>,
     cursor: Option<String>,
+    cursor_text: Option<String>,
+    #[serde(alias = "selection_fg")]
+    selection_foreground: Option<String>,
     palette: Option<Vec<String>>,
     normal: Option<AnsiTable>,
     bright: Option<AnsiTable>,
@@ -127,6 +133,8 @@ fn theme_from_toml(t: ThemeToml, stem: &str) -> Result<jetty_core::Theme, String
     let bg3 = parse_hex(t.background.as_deref().ok_or("missing `background`")?)?;
     let fg = parse_hex(t.foreground.as_deref().ok_or("missing `foreground`")?)?;
     let cursor = parse_hex(t.cursor.as_deref().ok_or("missing `cursor`")?)?;
+    let cursor_text = t.cursor_text.as_deref().map(parse_hex).transpose()?;
+    let selection_fg = t.selection_foreground.as_deref().map(parse_hex).transpose()?;
 
     // Palette: flat 16-array WINS when present; else the named [normal]/[bright]
     // tables; else it is a required-field error.
@@ -158,6 +166,8 @@ fn theme_from_toml(t: ThemeToml, stem: &str) -> Result<jetty_core::Theme, String
         bg: [bg3[0], bg3[1], bg3[2], 255],
         fg,
         cursor,
+        cursor_text,
+        selection_fg,
         palette,
     })
 }
@@ -281,6 +291,25 @@ palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606"
         assert_eq!(t.cursor, [245, 224, 220]);
         assert_eq!(t.palette[0], [0, 0, 0]);
         assert_eq!(t.palette[15], [15, 15, 15]);
+        // Optional keys absent → computed defaults at render time.
+        assert_eq!((t.cursor_text, t.selection_fg), (None, None));
+    }
+
+    #[test]
+    fn optional_cursor_text_and_selection_foreground() {
+        let toml = r##"
+background = "#101010"
+foreground = "#eeeeee"
+cursor = "#ffffff"
+cursor_text = "#202020"
+selection_fg = "#fafafa"
+palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606","#070707","#080808","#090909","#0a0a0a","#0b0b0b","#0c0c0c","#0d0d0d","#0e0e0e","#0f0f0f"]
+"##;
+        let t = parse(toml, "x").unwrap();
+        assert_eq!(t.cursor_text, Some([0x20, 0x20, 0x20]));
+        assert_eq!(t.selection_fg, Some([0xfa, 0xfa, 0xfa]), "`selection_fg` alias");
+        let bad = toml.replace("#202020", "nope");
+        assert!(parse(&bad, "x").is_err(), "a bad optional color is still a bad theme");
     }
 
     #[test]
@@ -399,6 +428,8 @@ palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606"
             bg: [1, 2, 3, 255],
             fg: [4, 5, 6],
             cursor: [7, 8, 9],
+            cursor_text: None,
+            selection_fg: None,
             palette: [[0, 0, 0]; 16],
         };
         let novel = jetty_core::Theme {
@@ -407,6 +438,8 @@ palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606"
             bg: [9, 9, 9, 255],
             fg: [4, 5, 6],
             cursor: [7, 8, 9],
+            cursor_text: None,
+            selection_fg: None,
             palette: [[0, 0, 0]; 16],
         };
         let merged = merge_into_builtins(vec![dracula, novel]);

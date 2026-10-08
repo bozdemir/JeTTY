@@ -1269,6 +1269,7 @@ dependencies = [
  "naga",
  "pollster",
  "raw-window-handle",
+ "rustc-hash 2.1.2",
  "unicode-width",
  "wgpu",
 ]

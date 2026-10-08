@@ -11705,26 +11705,47 @@ fn render_grid_scene(
     // is computed at the un-slid `grid_top` and then translated by `slide_y`
     // (matches both windows' pre-refactor behavior; `slide_y == 0` for detached).
     let grid_origin_y = s.grid_top + s.slide_y;
-    let selection_bg = selection_bg_for(s.theme);
+    let selection = jetty_render::selection_paint(s.theme);
     let scrollbar_thumb = scrollbar_thumb_for(s.theme);
+    // The shell cursor, split by layer: the SOLID block is painted under the
+    // glyphs (Pass 1) with the glyph it covers recolored for contrast (Pass 2);
+    // beam / underline / unfocused hollow draw over the text (Pass 4). In
+    // copy-mode (main only) the shell cursor is SUPPRESSED so only the copy-mode
+    // keyboard cursor shows; detached always passes `copy_mode_active = false`.
+    let (cursor_under, cursor_over) = if s.copy_mode_active {
+        (None, Vec::new())
+    } else {
+        jetty_render::cursor_rects_split(
+            s.snap, cell_w, cell_h, grid_origin_y, s.focused, s.caret_t_for_flash, s.caret_flash_color,
+        )
+    };
 
     // Pass 1: clear to the (premultiplied, opacity-correct) theme bg and paint
     // the per-cell background quads under the text. Search-hit tint rects are
     // appended AFTER the selection rects (main-only; empty for detached) so the
-    // match tint wins where they overlap, still under the glyphs.
-    let mut bg_rects = jetty_render::cell_bg_rects(s.snap, cell_w, cell_h, grid_origin_y, selection_bg);
+    // match tint wins where they overlap, still under the glyphs; the block
+    // cursor goes last so it covers both.
+    let mut bg_rects = jetty_render::cell_bg_rects(s.snap, cell_w, cell_h, grid_origin_y, selection.bg);
     if !s.search_hits.is_empty() {
         bg_rects.extend(jetty_render::search_hit_rects(
             s.search_hits, cell_w, cell_h, grid_origin_y, s.theme,
         ));
     }
+    bg_rects.extend(cursor_under);
     quad.render_clear(
         device, queue, scene_view, width, height, &bg_rects,
         jetty_render::default_bg_clear(s.snap, gpu.premultiply_clear),
     );
 
     // Pass 2: glyphs over the painted background, offset down by the grid origin.
-    let _ = text.render_to(device, queue, scene_view, width, height, s.snap, false, grid_origin_y);
+    let paint = jetty_render::GridPaint {
+        cursor_glyph: cursor_under.map(|_| {
+            (s.snap.cursor_row, s.snap.cursor_col, jetty_render::cursor_text_color(s.theme, s.snap.cursor_rgb))
+        }),
+        selection: Some(selection),
+        graphemes: &[],
+    };
+    let _ = text.render_grid(device, queue, scene_view, width, height, s.snap, false, grid_origin_y, &paint);
 
     // Pass 2b: inline images over the grid text, scissored to the grid area
     // (below the bar, above the status strip / bottom tab bar), clamped to the
@@ -11781,14 +11802,9 @@ fn render_grid_scene(
             spans, [p12[0], p12[1], p12[2], 255], cell_w, cell_h, grid_origin_y,
         ));
     }
-    // Cursor last so it draws over glyphs + decorations. In copy-mode (main
-    // only) the shell's block cursor is SUPPRESSED so only the copy-mode
-    // keyboard cursor shows; detached always passes `copy_mode_active = false`.
-    if !s.copy_mode_active {
-        rects.extend(jetty_render::cursor_rects(
-            s.snap, cell_w, cell_h, grid_origin_y, s.focused, s.caret_t_for_flash, s.caret_flash_color,
-        ));
-    }
+    // The thin cursor shapes (beam / underline / unfocused hollow) last, over the
+    // glyphs + decorations; the solid block was painted under the text (Pass 1).
+    rects.extend(cursor_over);
     if let Some((cr, cc, _sel, _lm)) = s.copy_mode_ui {
         rects.extend(jetty_render::copy_cursor_rects(cr, cc, cell_w, cell_h, grid_origin_y, s.theme.cursor));
     }
@@ -11868,21 +11884,6 @@ fn spawn_waker(proxy: EventLoopProxy<AppEvent>) {
             break;
         }
     });
-}
-
-/// Which window-control button (if any) the cursor at `(cx, cy)` is over, given
-/// the surface `width`. Mirrors the control layout in `build_tab_bar_ex`: three
-/// `28px` cells parked at the right of the `TABBAR_H` strip (min, max, close).
-/// Selection-highlight background derived from the active theme: a dim accent
-/// blend (mirrors panel.rs's selected-row color) so selections read on any theme.
-fn selection_bg_for(theme: &jetty_core::Theme) -> [u8; 3] {
-    let bg = theme.bg;
-    let accent = theme.palette[4];
-    [
-        ((bg[0] as u16 + accent[0] as u16 * 2) / 3) as u8,
-        ((bg[1] as u16 + accent[1] as u16 * 2) / 3) as u8,
-        ((bg[2] as u16 + accent[2] as u16 * 2) / 3) as u8,
-    ]
 }
 
 /// Path to the XDG autostart entry: `$XDG_CONFIG_HOME/autostart/jetty.desktop`,
@@ -12058,6 +12059,9 @@ fn scrollbar_thumb_for(theme: &jetty_core::Theme) -> [u8; 4] {
     [mix(0), mix(1), mix(2), 210]
 }
 
+/// Which window-control button (if any) the cursor at `(cx, cy)` is over, given
+/// the surface `width`. Mirrors the control layout in `build_tab_bar_ex`: three
+/// `28px` cells parked at the right of the `TABBAR_H` strip (min, max, close).
 fn ctrl_hover_at(cx: f32, cy: f32, width: u32, bar_y: f32) -> jetty_render::CtrlHover {
     use jetty_render::CtrlHover;
     if cy < bar_y || cy >= bar_y + TABBAR_H {

@@ -1,0 +1,146 @@
+//! Theme-derived colors for the grid's selection highlight and block cursor,
+//! shared by the live app and `jetty-shot` so the two can never drift.
+
+use std::sync::OnceLock;
+
+/// A selected glyph whose own color contrasts LESS than this with the selection
+/// highlight is redrawn in the readable fallback color. Deliberately below WCAG's
+/// 3:1 so only the genuinely unreadable cases change (blue/red text on the blue
+/// highlight) while every readable color keeps its hue.
+pub const SELECTION_MIN_CONTRAST: f32 = 2.0;
+
+/// How selected glyphs are colored (see [`crate::GridPaint::selection`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SelectionPaint {
+    /// The selection highlight painted under selected cells.
+    pub bg: [u8; 3],
+    /// The theme's explicit `selection_fg`: every selected glyph takes it. `None`
+    /// keeps each glyph's own color unless it would be unreadable on `bg`.
+    pub fg: Option<[u8; 3]>,
+    /// Replacement for a glyph below [`SELECTION_MIN_CONTRAST`] on `bg`: the theme
+    /// fg or bg, whichever contrasts more with the highlight.
+    pub fallback_fg: [u8; 3],
+}
+
+/// The selection highlight: a dim accent blend (1/3 theme bg + 2/3 palette blue),
+/// mirroring the Settings panel's selected-row color so it reads on any theme.
+pub fn selection_bg(theme: &jetty_core::Theme) -> [u8; 3] {
+    let bg = theme.bg;
+    let accent = theme.palette[4];
+    [
+        ((bg[0] as u16 + accent[0] as u16 * 2) / 3) as u8,
+        ((bg[1] as u16 + accent[1] as u16 * 2) / 3) as u8,
+        ((bg[2] as u16 + accent[2] as u16 * 2) / 3) as u8,
+    ]
+}
+
+/// The complete selection paint for `theme`.
+pub fn selection_paint(theme: &jetty_core::Theme) -> SelectionPaint {
+    let bg = selection_bg(theme);
+    let tbg = [theme.bg[0], theme.bg[1], theme.bg[2]];
+    SelectionPaint { bg, fg: theme.selection_fg, fallback_fg: more_contrasting(bg, theme.fg, tbg) }
+}
+
+/// The color of the glyph under a SOLID block cursor (`cursor_rgb` = the live
+/// cursor color, which OSC 12 may have changed). The theme's `cursor_text` when
+/// set; otherwise the theme background — the classic inverted cell — unless that
+/// is too close to the cursor color to read, in which case the theme foreground.
+pub fn cursor_text_color(theme: &jetty_core::Theme, cursor_rgb: [u8; 3]) -> [u8; 3] {
+    if let Some(c) = theme.cursor_text {
+        return c;
+    }
+    let tbg = [theme.bg[0], theme.bg[1], theme.bg[2]];
+    if contrast_ratio(tbg, cursor_rgb) >= 3.0 {
+        tbg
+    } else {
+        more_contrasting(cursor_rgb, tbg, theme.fg)
+    }
+}
+
+/// Whichever of `a` / `b` contrasts more with `against` (ties → `a`).
+fn more_contrasting(against: [u8; 3], a: [u8; 3], b: [u8; 3]) -> [u8; 3] {
+    if contrast_ratio(b, against) > contrast_ratio(a, against) {
+        b
+    } else {
+        a
+    }
+}
+
+/// sRGB channel → linear light, as a 256-entry table (the contrast math runs per
+/// selected cell, so no `powf` on the frame path).
+fn srgb_lut() -> &'static [f32; 256] {
+    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0.0f32; 256];
+        for (i, v) in t.iter_mut().enumerate() {
+            let s = i as f32 / 255.0;
+            *v = if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) };
+        }
+        t
+    })
+}
+
+/// WCAG relative luminance of an sRGB color.
+pub fn relative_luminance(c: [u8; 3]) -> f32 {
+    let l = srgb_lut();
+    0.2126 * l[c[0] as usize] + 0.7152 * l[c[1] as usize] + 0.0722 * l[c[2] as usize]
+}
+
+/// WCAG contrast ratio between two sRGB colors (1.0 ..= 21.0).
+pub fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contrast_ratio_matches_wcag_endpoints() {
+        assert!((contrast_ratio([0, 0, 0], [255, 255, 255]) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio([90, 90, 90], [90, 90, 90]) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn catppuccin_blue_on_selection_is_unreadable_and_gets_a_fallback() {
+        // The audit's case: palette blue text on the (blue-accent) highlight.
+        let t = jetty_core::Theme::by_name("catppuccin_mocha");
+        let p = selection_paint(&t);
+        assert!(contrast_ratio(t.palette[4], p.bg) < SELECTION_MIN_CONTRAST);
+        assert!(contrast_ratio(p.fallback_fg, p.bg) >= 3.0, "fallback must be readable");
+        // Ordinary text on the highlight stays above the bar (keeps its color).
+        assert!(contrast_ratio(t.fg, p.bg) >= SELECTION_MIN_CONTRAST);
+    }
+
+    #[test]
+    fn every_builtin_theme_has_a_readable_selection_fallback_and_cursor_text() {
+        for i in 0..jetty_core::theme::PRESETS.len() {
+            let t = jetty_core::theme::theme_at(i);
+            let p = selection_paint(&t);
+            assert!(
+                contrast_ratio(p.fallback_fg, p.bg) >= SELECTION_MIN_CONTRAST,
+                "{}: selection fallback unreadable",
+                t.name
+            );
+            let c = cursor_text_color(&t, t.cursor);
+            assert!(contrast_ratio(c, t.cursor) >= 2.0, "{}: cursor glyph unreadable", t.name);
+        }
+    }
+
+    #[test]
+    fn explicit_theme_colors_win() {
+        let mut t = jetty_core::Theme::by_name("catppuccin_mocha");
+        t.cursor_text = Some([1, 2, 3]);
+        t.selection_fg = Some([4, 5, 6]);
+        assert_eq!(cursor_text_color(&t, t.cursor), [1, 2, 3]);
+        assert_eq!(selection_paint(&t).fg, Some([4, 5, 6]));
+    }
+
+    #[test]
+    fn cursor_text_defaults_to_theme_bg() {
+        let t = jetty_core::Theme::by_name("catppuccin_mocha");
+        assert_eq!(cursor_text_color(&t, t.cursor), [t.bg[0], t.bg[1], t.bg[2]]);
+    }
+}

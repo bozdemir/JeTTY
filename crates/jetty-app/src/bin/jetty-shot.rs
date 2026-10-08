@@ -202,8 +202,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Chrome layer at the UI font size, mirroring the live app: ALL window chrome
     // (tab bar, status bar, context menu, settings panel, help, confirm, welcome)
     // renders through this in the chosen UI family, independent of JETTY_FONT_SIZE.
-    // The terminal grid renders through `text` (which scales with the font).
-    let mut chrome_text = TextLayer::new_with_family(&device, &queue, format, ui_font_size, &font_family);
+    // The terminal grid renders through `text` (which scales with the font). Built
+    // from the grid layer's font database, like the app (no second font scan).
+    let mut chrome_text = TextLayer::new_with_family_and_fonts(
+        &device, &queue, format, ui_font_size, &font_family, text.clone_font_system(),
+    );
     chrome_text.set_ui_family(if ui_font_family.is_empty() { None } else { Some(ui_font_family.as_str()) });
     // Measured chrome-font advance: used by all overlay builders for scale-correct
     // width reservations (HiDPI-aware). On a CI/scale-1 run this is ~9.6–9.8 px.
@@ -535,13 +538,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Pass 1: clear to theme bg + paint per-cell background quads UNDER text ---
     let (cell_w, cell_h) = text.cell_size();
-    let sel_accent = terminal.theme().palette[4];
-    let sel_bg = [
-        ((terminal.theme().bg[0] as u16 + sel_accent[0] as u16 * 2) / 3) as u8,
-        ((terminal.theme().bg[1] as u16 + sel_accent[1] as u16 * 2) / 3) as u8,
-        ((terminal.theme().bg[2] as u16 + sel_accent[2] as u16 * 2) / 3) as u8,
-    ];
-    let mut bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, shot_grid_top, sel_bg);
+    let selection = jetty_render::selection_paint(terminal.theme());
+    // The shell cursor split exactly like the app's render core: the SOLID block
+    // goes under the glyphs (its glyph recolored in Pass 2), the thin shapes over
+    // them. Focused unless JETTY_SHOT_CURSOR_UNFOCUSED is set, so the harness can
+    // screenshot the unfocused-hollow cursor. The shape itself comes from the
+    // snapshot (DECSCUSR in the input, e.g. `\e[5 q` for a beam). Copy-mode
+    // suppresses the shell cursor (only the keyboard cursor shows).
+    let cursor_focused = !env_flag("JETTY_SHOT_CURSOR_UNFOCUSED");
+    let (cursor_under, cursor_over) = if copymode_cursor.is_none() {
+        jetty_render::cursor_rects_split(&snap, cell_w, cell_h, shot_grid_top, cursor_focused, None, [0.0, 0.0, 0.0])
+    } else {
+        (None, Vec::new())
+    };
+    let mut bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, shot_grid_top, selection.bg);
     if search_query.is_some() {
         // Same pass-1 placement as the app: match tints under the glyphs,
         // appended after the selection rects so they win where overlapping.
@@ -553,6 +563,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             terminal.theme(),
         ));
     }
+    bg_rects.extend(cursor_under);
     quad.render_clear(
         &device,
         &queue,
@@ -566,7 +577,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // --- Pass 2: render the grid text on top of the painted background (load) ---
-    text.render_to(&device, &queue, &view, width, height, &snap, false, shot_grid_top)?;
+    let paint = jetty_render::GridPaint {
+        cursor_glyph: cursor_under.map(|_| {
+            (snap.cursor_row, snap.cursor_col, jetty_render::cursor_text_color(terminal.theme(), snap.cursor_rgb))
+        }),
+        selection: Some(selection),
+        graphemes: &[],
+    };
+    text.render_grid(&device, &queue, &view, width, height, &snap, false, shot_grid_top, &paint)?;
 
     // --- Pass 2b: inline (sixel) images over the grid, at native pixel size,
     // scissored to the grid area — the same ImageLayer the live app runs, so the
@@ -641,23 +659,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
 
-        // Cursor as quads (drawn over the glyphs + decorations). Focused unless
-        // JETTY_SHOT_CURSOR_UNFOCUSED is set, so the harness can screenshot the
-        // unfocused-hollow cursor. The shape itself comes from the snapshot
-        // (DECSCUSR in the input, e.g. `\e[5 q` for a beam).
-        let cursor_focused = !env_flag("JETTY_SHOT_CURSOR_UNFOCUSED");
-        // Copy-mode suppresses the shell cursor (only the keyboard cursor shows).
-        if copymode_cursor.is_none() {
-            rects.extend(jetty_render::cursor_rects(
-                &snap,
-                cell_w,
-                cell_h,
-                shot_grid_top,
-                cursor_focused,
-                None,
-                [0.0, 0.0, 0.0],
-            ));
-        }
+        // The thin cursor shapes over the glyphs + decorations (the solid block
+        // was painted under the text in Pass 1).
+        rects.extend(cursor_over);
 
         // Baseline for the live "Aa" UI-font specimen, set when the panel is built.
         let mut ui_specimen_pos: Option<(f32, f32)> = None;
