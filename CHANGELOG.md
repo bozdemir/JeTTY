@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.26.1] — 2026-10-08
+
+### Fixed
+- F9 on a JeTTY window that is open but behind other windows brings it to the
+  front on the first press. v0.26.0 asked the window manager in a way KWin's
+  focus-stealing prevention refused: the first press did nothing and the second
+  hid the window. On X11 a raise the user asked for (F9, `jetty --show`, a
+  detached window's command on the main one) is now the standard EWMH
+  activation request a taskbar click sends; a minimized window is restored too.
+  Found and verified by running JeTTY under KWin 6.6 on a nested X server.
+
 ## [0.26.0] — 2026-10-08
 
 **The audit release.** A full codebase review (~90 findings) — every one fixed.
