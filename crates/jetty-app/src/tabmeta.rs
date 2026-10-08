@@ -145,10 +145,19 @@ pub(crate) fn ring_rgb(
     border.ring_color(focused, fullscreen, lit, ui.border)
 }
 
-/// Drains (with output) a tab keeps re-trying to name the foreground process
-/// of a command whose OSC 133 C arrived before the shell forked it. Bounded,
-/// and only ever on drains that happen anyway — never a poll.
-pub(crate) const FG_RETRIES: u8 = 8;
+/// How many times a tab re-tries to name the foreground process of a command
+/// whose OSC 133 C arrived before the shell forked it (bash prints its C from
+/// PS0, zsh from preexec — both before the fork). Each retry rides a drain that
+/// happens anyway, or one of a short backoff of timed wakes
+/// ([`title_recheck_delay`]) for a silent command — bounded, never a poll.
+pub(crate) const FG_RETRIES: u8 = 4;
+
+/// Delay of the next timed foreground re-check with `retries_left` tries left:
+/// 60, 120, 240, 480 ms (≈0.9 s in all, then it gives up until the next mark).
+pub(crate) fn title_recheck_delay(retries_left: u8) -> std::time::Duration {
+    let step = FG_RETRIES.saturating_sub(retries_left).min(4);
+    std::time::Duration::from_millis(60u64 << step)
+}
 
 /// A tab's chrome state.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -304,6 +313,13 @@ mod tests {
         assert_eq!(main[at].osc_title.as_deref(), Some("build"));
         assert_eq!(main[at].deco().color, Some(5));
         assert_eq!(main[at].deco().progress, tab.progress);
+    }
+
+    #[test]
+    fn foreground_rechecks_back_off_and_stop() {
+        let delays: Vec<u64> = (1..=FG_RETRIES).rev().map(|r| title_recheck_delay(r).as_millis() as u64).collect();
+        assert_eq!(delays, vec![60, 120, 240, 480]);
+        assert!(delays.iter().sum::<u64>() < 1000, "bounded: under a second of wakes in all");
     }
 
     #[test]

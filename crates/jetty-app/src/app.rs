@@ -1423,6 +1423,9 @@ pub struct App {
     /// The focus-ring pass on the MAIN device, built on the first frame that
     /// draws a ring (`window_border` on) — never in `resumed`.
     focus_ring: Option<jetty_render::FocusRing>,
+    /// Smart titles: the next timed re-check of a just-started command's
+    /// foreground process (`tabmeta::title_recheck_delay`); `None` = none owed.
+    title_recheck_at: Option<std::time::Instant>,
 
 
 }
@@ -1922,6 +1925,7 @@ impl App {
             tab_title_mode: crate::tabmeta::TabTitleMode::Osc,
             tab_hover: None,
             focus_ring: None,
+            title_recheck_at: None,
         };
         // Persisted user settings override the env-derived defaults (but env
         // vars still seed the initial values above, so an explicit JETTY_* can
@@ -4678,6 +4682,53 @@ impl App {
         }
     }
 
+    /// Smart titles: schedule ONE timed re-check when a tab (main or
+    /// detached) is waiting to name a just-started command (`fg_retries`) and
+    /// none is scheduled. Only in auto mode; a few bool reads otherwise.
+    fn arm_title_recheck(&mut self) {
+        if self.tab_title_mode != crate::tabmeta::TabTitleMode::Auto || self.title_recheck_at.is_some() {
+            return;
+        }
+        let left = self
+            .tabs
+            .iter()
+            .chain(self.detached.iter().map(|d| &d.tab))
+            .map(|t| t.meta.fg_retries)
+            .max()
+            .unwrap_or(0);
+        if left > 0 {
+            self.title_recheck_at =
+                Some(std::time::Instant::now() + crate::tabmeta::title_recheck_delay(left));
+        }
+    }
+
+    /// The due smart-title re-check: name the foreground command of every tab
+    /// still waiting, repaint where a title changed, and re-arm (backing off)
+    /// while any still waits. Returns whether a paint was requested.
+    fn recheck_smart_titles(&mut self) -> bool {
+        let mode = self.tab_title_mode;
+        let mut main_changed = false;
+        for tab in self.tabs.iter_mut().filter(|t| t.meta.fg_retries > 0) {
+            Self::refresh_smart_title(tab, false);
+            main_changed |= Self::sync_tab_title(tab, mode);
+        }
+        let mut painted = false;
+        for dw in self.detached.iter_mut().filter(|d| d.tab.meta.fg_retries > 0) {
+            Self::refresh_smart_title(&mut dw.tab, false);
+            if Self::sync_tab_title(&mut dw.tab, mode) {
+                dw.sync_os_title();
+                dw.request_paint();
+                painted = true;
+            }
+        }
+        if main_changed && self.visible && !self.main_occluded {
+            self.request_main_paint();
+            painted = true;
+        }
+        self.arm_title_recheck();
+        painted
+    }
+
     /// The tab-bar drawing options for the main window right now.
     fn tab_bar_opts(&self, hover: Option<usize>) -> jetty_render::TabBarOpts {
         jetty_render::TabBarOpts {
@@ -6247,6 +6298,7 @@ impl App {
         for n in runsel_notices {
             self.show_status_pill(n);
         }
+        self.arm_title_recheck();
         (active_had_data, chrome_changed, exited)
     }
 
@@ -9098,6 +9150,7 @@ impl App {
         if let Some(n) = notice {
             self.show_status_pill(n);
         }
+        self.arm_title_recheck();
         // This window's open search: throttled streaming re-collect (the main
         // window's render-path twin), and drop hint/copy-mode if a program
         // switched to the alt screen mid-mode.
@@ -10247,6 +10300,12 @@ impl ApplicationHandler<AppEvent> for App {
             // A reload repaints every surface it changed; deliver those paints.
             painted = true;
         }
+        // Smart titles: a just-started command's foreground re-check (bounded
+        // backoff; the next one folds into WaitUntil below).
+        if self.title_recheck_at.is_some_and(|d| std::time::Instant::now() >= d) {
+            self.title_recheck_at = None;
+            painted |= self.recheck_smart_titles();
+        }
         // Edge auto-scroll of a selection drag held above/below the grid (any
         // window): due steps run HERE, the next one folds into WaitUntil below —
         // a timer, never Poll, and nothing at all without such a drag.
@@ -10536,6 +10595,10 @@ impl ApplicationHandler<AppEvent> for App {
         }
         // The debounced settings-save deadline (an elapsed one was flushed above).
         if let Some(d) = self.persister.borrow().due_at() {
+            merge_wake(&mut wake_at, d);
+        }
+        // The smart-title foreground re-check (an elapsed one ran above).
+        if let Some(d) = self.title_recheck_at {
             merge_wake(&mut wake_at, d);
         }
         // Pending synchronized-update (CSI ?2026) flush deadline: wake exactly
@@ -11117,6 +11180,7 @@ impl ApplicationHandler<AppEvent> for App {
                 for n in runsel_notices {
                     self.show_status_pill(n);
                 }
+                self.arm_title_recheck();
                 // Remove in descending index order so earlier indices stay valid,
                 // mirroring `close_exited_tabs`. Dropping the `DetachedWindow`
                 // closes its OS window; its already-exited child is reaped
