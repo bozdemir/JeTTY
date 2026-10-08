@@ -78,11 +78,12 @@ pub struct Config {
     pub focus_autohide: bool,
     /// Launch JeTTY at login via the freedesktop XDG autostart standard (a
     /// `.desktop` file under `~/.config/autostart/`; a LaunchAgent on macOS).
-    /// Default OFF. When the file SETS it, the key is the source of truth: the
-    /// entry is written to match at startup and on a toggle or hot-reload, and
-    /// removed on a toggle or hot-reload — never at startup, and never from a
-    /// config that failed to load or lacks the key (the app then mirrors the
-    /// entry). With `JETTY_CONFIG_DIR` set the real login item is not touched.
+    /// Default OFF. `true` writes the entry (at startup too); the toggle, or an
+    /// EDIT of the key while JeTTY runs, writes or removes it. Startup never
+    /// removes it: without the key, with a config that failed to load, or with a
+    /// `false` (maybe a stale one — older saves wrote every key) the app mirrors
+    /// the entry instead. With `JETTY_CONFIG_DIR` set the real login item is not
+    /// touched.
     #[serde(default = "default_launch_at_login")]
     pub launch_at_login: bool,
     /// Global summon hotkey, e.g. "F9" (default), "F12", or "Ctrl+Shift+F12".

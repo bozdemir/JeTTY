@@ -824,6 +824,10 @@ pub struct App {
     /// 100..=100_000, default 10_000). Applied live to every tab (main +
     /// detached) when changed via the Settings cycler.
     scrollback_lines: usize,
+    /// `launch_at_login` as config.toml said it when last read (`None` = not set):
+    /// a hot-reload changes the login item only when the file's value CHANGED —
+    /// an edit — never for a stale value the app mirrors differently.
+    launch_at_login_in_file: Option<bool>,
     /// Launch JeTTY at login (config `launch_at_login` — the source of truth: the
     /// XDG autostart entry / macOS LaunchAgent is (re)written or removed to match
     /// at startup, on a hot-reload, and when toggled in Settings or the palette).
@@ -1683,6 +1687,7 @@ impl App {
             focus_autohide: true,
             scrollback_lines: 10_000,
             launch_at_login: false,
+            launch_at_login_in_file: None,
             summon_hotkey: "F9".to_string(),
             shell: String::new(),
             top_flush_pos: false,
@@ -1906,6 +1911,7 @@ impl App {
             &AutostartTarget::current(),
         );
         app.launch_at_login = launch;
+        app.launch_at_login_in_file = launch_set;
         startup_warnings.extend(problem);
         app.summon_hotkey = cfg.summon_hotkey;
         app.shell = cfg.shell;
@@ -2041,6 +2047,22 @@ impl App {
             "Ctrl+D — Close shell (EOF)".to_string(),
             "Esc — Close this help".to_string(),
         ]
+    }
+
+    /// The Settings / palette "Launch at login" toggle: write or remove the login
+    /// item, and flip the setting only when that worked — a refused or failed
+    /// toggle (an entry JeTTY did not write, `JETTY_CONFIG_DIR`, an I/O error)
+    /// says why and leaves the switch as it was. The caller persists.
+    fn toggle_launch_at_login_setting(&mut self) {
+        let want = !self.launch_at_login;
+        match toggle_launch_at_login(want) {
+            Ok(()) => {
+                self.launch_at_login = want;
+                // persist() writes it: the file's value as the next reload sees it.
+                self.launch_at_login_in_file = Some(want);
+            }
+            Err(e) => self.show_config_warnings(&[e]),
+        }
     }
 
     /// Record the current user-tweakable settings for saving. Called whenever a
@@ -2347,12 +2369,18 @@ impl App {
                 match crate::config::Config::parse_with_base(&s, &live, "keeping the current value") {
                     Ok((mut cfg, problems)) => {
                         warnings.extend(problems);
-                        // A file that does not SET launch_at_login (the key
-                        // removed, a typo) keeps the live value: only an explicit
-                        // edit adds or removes the login item.
-                        if crate::config::explicit_launch_at_login(&s).is_none() {
-                            cfg.launch_at_login = self.launch_at_login;
-                        }
+                        // Only an EDIT of launch_at_login adds or removes the
+                        // login item: a file that does not set it (the key
+                        // removed, a typo) or still says what it said (a stale
+                        // `false` beside an entry the app mirrors) keeps the
+                        // live value.
+                        let explicit = crate::config::explicit_launch_at_login(&s);
+                        cfg.launch_at_login = reloaded_launch_at_login(
+                            explicit,
+                            self.launch_at_login_in_file,
+                            self.launch_at_login,
+                        );
+                        self.launch_at_login_in_file = explicit;
                         self.apply_reloaded_config(cfg.clone(), &mut warnings);
                         // The new baseline is the file as the app now holds it —
                         // except a key skipped mid-drag: the FILE holds the edit,
@@ -4530,10 +4558,7 @@ impl App {
                 }
             }
             C::ToggleLaunchAtLogin => {
-                self.launch_at_login = !self.launch_at_login;
-                if let Err(e) = toggle_launch_at_login(self.launch_at_login) {
-                    self.show_config_warnings(&[e]);
-                }
+                self.toggle_launch_at_login_setting();
                 self.persist();
             }
             C::ResetKeybindings => {
@@ -9172,12 +9197,9 @@ impl App {
                 self.focus_autohide = !self.focus_autohide;
             }
             input::MouseAction::ToggleLaunchAtLogin => {
-                self.launch_at_login = !self.launch_at_login;
-                // Write/remove the login autostart entry to match; persist() (below)
-                // saves the config key, which is the source of truth.
-                if let Err(e) = toggle_launch_at_login(self.launch_at_login) {
-                    self.show_config_warnings(&[e]);
-                }
+                // Write/remove the login autostart entry; persist() (below) saves
+                // the config key, which is the source of truth.
+                self.toggle_launch_at_login_setting();
             }
             // The OS title bar moves the window now; in-panel drag/consume are no-ops.
             input::MouseAction::StartDialogDrag
@@ -13977,11 +13999,11 @@ fn set_launch_at_login(path: &std::path::Path, enabled: bool, program: &str) -> 
 ///
 /// * `JETTY_CONFIG_DIR` set (`alt_config_dir`): the file's value, untouched;
 /// * the config SETS `true`: the entry is (re)written ([`sync_launch_at_login`]);
-/// * the config sets `false`: nothing is removed at startup — a stale or
-///   copied config must not silently delete a login item (a toggle or a
-///   hot-reloaded edit does);
-/// * the config does not set it (no file, a broken file, the key missing or
-///   invalid): the app mirrors the existing entry — its `false` is only a default.
+/// * otherwise nothing is removed at startup — the app MIRRORS the entry, so
+///   Settings shows the truth: a config that does not set the key (no file, a
+///   broken file, the key missing or invalid) only has a default, and a `false`
+///   may be a stale or copied one (older JeTTY saves wrote every key). The
+///   toggle, or an edit of the key while JeTTY runs, removes it.
 fn startup_launch_at_login(
     path: &std::path::Path,
     cfg_value: bool,
@@ -13992,13 +14014,20 @@ fn startup_launch_at_login(
     if alt_config_dir {
         return (cfg_value, None);
     }
+    if explicit == Some(true) {
+        return (true, sync_launch_at_login(path, true, target).err());
+    }
+    let ours = std::fs::read_to_string(path).is_ok_and(|c| is_jetty_autostart_entry(&c));
+    (ours, None)
+}
+
+/// The `launch_at_login` a hot-reload applies: the file's value (`explicit`) —
+/// but only when it differs from what the file said when last read
+/// (`last_read`), i.e. the user edited it; otherwise the `live` value stays.
+fn reloaded_launch_at_login(explicit: Option<bool>, last_read: Option<bool>, live: bool) -> bool {
     match explicit {
-        Some(true) => (true, sync_launch_at_login(path, true, target).err()),
-        Some(false) => (false, None),
-        None => {
-            let ours = std::fs::read_to_string(path).is_ok_and(|c| is_jetty_autostart_entry(&c));
-            (ours, None)
-        }
+        Some(v) if explicit != last_read => v,
+        _ => live,
     }
 }
 
@@ -14867,8 +14896,8 @@ mod reload_warning_tests {
 mod autostart_tests {
     use super::{
         autostart_desktop_entry, autostart_entry_for, autostart_entry_program, autostart_program,
-        launch_agent_plist, set_launch_at_login, startup_launch_at_login, sync_autostart_file,
-        AutostartSync, AutostartTarget,
+        launch_agent_plist, reloaded_launch_at_login, set_launch_at_login, startup_launch_at_login,
+        sync_autostart_file, AutostartSync, AutostartTarget,
     };
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -14894,8 +14923,9 @@ mod autostart_tests {
         // No key read (missing, invalid, broken file): mirror the entry.
         assert_eq!(startup_launch_at_login(&path, false, None, false, &target(&exe)), (true, None));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), entry, "untouched");
-        // An explicit `false`: still never removed at startup.
-        assert_eq!(startup_launch_at_login(&path, false, Some(false), false, &target(&exe)), (false, None));
+        // An explicit `false` (maybe a stale one): never removed at startup, and
+        // Settings shows the entry that is really there.
+        assert_eq!(startup_launch_at_login(&path, false, Some(false), false, &target(&exe)), (true, None));
         assert!(path.exists(), "startup never removes the entry");
         // JETTY_CONFIG_DIR: the real login item is not looked at or touched.
         assert_eq!(startup_launch_at_login(&path, false, None, true, &target(&exe)), (false, None));
@@ -14903,13 +14933,28 @@ mod autostart_tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(startup_launch_at_login(&path, true, Some(true), true, &target(&exe)), (true, None));
         assert!(!path.exists(), "an alternate config tree never writes one either");
-        // No entry and no key: off, nothing written.
+        // No entry and no key, or `false`: off, nothing written.
         assert_eq!(startup_launch_at_login(&path, false, None, false, &target(&exe)), (false, None));
+        assert_eq!(startup_launch_at_login(&path, false, Some(false), false, &target(&exe)), (false, None));
         assert!(!path.exists());
         // An explicit `true` writes it.
         assert_eq!(startup_launch_at_login(&path, true, Some(true), false, &target(&exe)), (true, None));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), entry);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reload_changes_the_login_item_only_for_an_edit_of_the_key() {
+        // Mirrored at startup (an entry beside a stale `false`): an unrelated edit
+        // must not remove it…
+        assert!(reloaded_launch_at_login(Some(false), Some(false), true));
+        // …editing the key does, either way.
+        assert!(!reloaded_launch_at_login(Some(false), Some(true), true));
+        assert!(reloaded_launch_at_login(Some(true), Some(false), false));
+        assert!(reloaded_launch_at_login(Some(true), None, false));
+        // A file that does not set it keeps the live value.
+        assert!(reloaded_launch_at_login(None, Some(true), true));
+        assert!(!reloaded_launch_at_login(None, Some(true), false));
     }
 
     #[test]
