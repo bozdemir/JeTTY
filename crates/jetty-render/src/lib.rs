@@ -19,6 +19,7 @@ mod welcome;
 mod caret_fx;
 mod search_bar;
 mod hints;
+mod preedit;
 mod palette;
 mod status;
 pub use chrome::{
@@ -52,5 +53,6 @@ pub use tabbar::{
 pub use welcome::{build_welcome_overlay, WelcomeOverlay};
 pub use search_bar::{build_search_bar, search_hit_rects, SearchBar};
 pub use hints::{build_copy_pill, build_hint_overlay, copy_cursor_rects, CopyPill, HintOverlay};
+pub use preedit::{build_preedit_overlay, PreeditOverlay, MAX_PREEDIT_CHARS};
 pub use palette::{build_command_palette, CommandPalette, PaletteRow, MAX_PALETTE_ROWS};
 pub use status::{build_status_strip, build_toast_pill, StatusStrip, ToastPill};

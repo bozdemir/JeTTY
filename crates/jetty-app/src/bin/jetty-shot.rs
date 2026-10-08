@@ -76,6 +76,9 @@
 ///                    Terminal::hint_tokens + assign_labels + build_hint_overlay);
 ///                    JETTY_SHOT_HINTS_TYPED="s" narrows to matching labels (typed
 ///                    prefix dimmed). Feed a token-rich line via JETTY_SHOT_INPUT.
+///   JETTY_SHOT_PREEDIT="text" — an IME composition at the cursor, drawn by the
+///                    app's own builder (build_preedit_overlay): terminal font,
+///                    theme bg backdrop, underline; shifts left at the edge.
 ///   JETTY_SHOT_GRAPHEMES="row,col,cluster;…" — grapheme-cluster overrides for
 ///                    the renderer (combining marks / VS16 / ZWJ drawn from the
 ///                    whole cluster instead of the cell's base char).
@@ -930,6 +933,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokens.len(),
                 refs.len()
             );
+        }
+
+        // JETTY_SHOT_PREEDIT — an IME composition at the terminal cursor, via the
+        // SAME builder the app uses (terminal font through the grid layer).
+        if let Ok(p) = std::env::var("JETTY_SHOT_PREEDIT") {
+            if let Some(ov) = jetty_render::build_preedit_overlay(
+                &p, snap.cursor_row, snap.cursor_col, snap.cols, cell_w, cell_h, shot_grid_top,
+                terminal.theme(), dpi,
+            ) {
+                rects.extend(ov.quads);
+                welcome_labels.extend(ov.labels);
+            }
         }
 
         // JETTY_SHOT_COPYMODE — the copy-mode keyboard cursor (hollow box) + the

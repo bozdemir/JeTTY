@@ -378,6 +378,9 @@ pub(crate) struct Tab {
     /// rides a `detach_tab` move into a `DetachedWindow` — the detached
     /// funnels cancel it the same way, and the detached drain services it.
     pub(crate) pending_inject: Option<crate::runsel::PendingInject>,
+    /// Keys this tab was sent a press for (their releases are owed to it under
+    /// the kitty keyboard protocol) and its last observed focus (DECSET 1004).
+    pub(crate) input: input::TabInputState,
 }
 
 /// Which surface a run-selection trigger fired from: the main window's active
@@ -1043,6 +1046,17 @@ pub struct App {
     notify_last_at: std::collections::HashMap<NotifyKey, std::time::Instant>,
     /// Track held modifier keys so Ctrl+Shift combos can be detected.
     modifiers: winit::keyboard::ModifiersState,
+    /// The same modifiers with their left/right sides (winit's full
+    /// `ModifiersChanged` payload): the key encoder needs WHICH Option key is
+    /// held for `macos_option_as_alt = "left" | "right"`. One store serves every
+    /// window — only the focused window receives key events.
+    key_modifiers: winit::event::Modifiers,
+    /// The IME's in-progress composition (`Ime::Preedit`) in the main window,
+    /// drawn at the cursor until it commits or is cancelled.
+    ime_preedit: Option<String>,
+    /// Last IME candidate-window anchor handed to winit for the main window
+    /// (`input::ime_cursor_area`): re-sent only when the cursor cell moves.
+    ime_area: Option<(i32, i32, u32, u32)>,
     /// Last known cursor position in physical pixels.
     cursor: (f64, f64),
     /// Where a no-Shift press began while a mouse-reporting app was active (the
@@ -1629,6 +1643,9 @@ impl App {
             notifier: crate::notify::spawn_notifier(),
             notify_last_at: std::collections::HashMap::new(),
             modifiers: winit::keyboard::ModifiersState::empty(),
+            key_modifiers: winit::event::Modifiers::default(),
+            ime_preedit: None,
+            ime_area: None,
             cursor: (0.0, 0.0),
             mouse_grab_press: None,
             scroll_accum: input::ScrollAccumulator::new(),
@@ -2169,6 +2186,7 @@ impl App {
             self.config_watcher = None;
         }
         self.macos_option_as_alt = cfg.macos_option_as_alt;
+        self.apply_option_as_alt_everywhere();
         // Mirror the RESTART-ONLY-EFFECT keys too, so a later panel-driven persist()
         // round-trips the user's external edit instead of clobbering it with the
         // stale startup value. Their live EFFECTS stay restart-only (summon_hotkey is
@@ -2436,6 +2454,10 @@ impl App {
         // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
         // Applied at spawn so new tabs pick up the current setting.
         terminal.set_osc52_allow_paste(self.osc52_allow_paste);
+        // Kitty keyboard protocol: answer `CSI ? u` and track the app's
+        // `CSI > u` flag stack — the key path encodes per those flags
+        // (`decide_window_key`), so a program that opts in gets kitty keys.
+        terminal.set_kitty_keyboard(true);
         // Apply the configured scrollback cap (guard skips the no-op
         // set_options round-trip on the 10k default path).
         if self.scrollback_lines != 10_000 {
@@ -2456,6 +2478,7 @@ impl App {
             manually_renamed: false,
             activity: jetty_render::TabActivity::None,
             pending_inject: None,
+            input: input::TabInputState::default(),
         });
         self.active = self.tabs.len() - 1;
         self.request_main_paint();
@@ -2625,7 +2648,11 @@ impl App {
             gpu_shared.as_ref(),
             self.text.as_ref(),
         ) {
-            Ok(dw) => dw,
+            Ok(dw) => {
+                // macOS: same Option-as-Meta sides as the main window.
+                apply_option_as_alt(&dw.window, self.macos_option_as_alt);
+                dw
+            }
             Err(tab) => {
                 let at = idx.min(self.tabs.len());
                 self.tabs.insert(at, tab);
@@ -4600,6 +4627,37 @@ impl App {
     /// input; an idle tab's latch is cleared so its next output wakes us at
     /// once. Must run after the iteration's drains, i.e. from `about_to_wait`
     /// (see `PtySession::rearm_wake` for why not earlier).
+    /// DECSET 1004 focus reporting, for every tab of every window: the main
+    /// window's ACTIVE tab is focused while that window is shown and has OS
+    /// focus; a detached window's tab while its window has OS focus. Each tab
+    /// reports only when its state CHANGES (`TabInputState::focus_report`), so a
+    /// hide sends `CSI O` once and a summon `CSI I` once whichever event moved it
+    /// — and the X11 hotkey grab's FocusOut/FocusIn churn costs at most one
+    /// `CSI O` + `CSI I` pair. Called from `about_to_wait` after every event
+    /// batch, so no focus/visibility/tab-switch path needs its own hook; it only
+    /// reads a mode bit per tab when nothing changed.
+    fn sync_focus_reports(&mut self) {
+        let main_focused = self.visible && self.main_focused;
+        let active = self.active;
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            report_focus(tab, main_focused && i == active);
+        }
+        for dw in &mut self.detached {
+            report_focus(&mut dw.tab, dw.focused);
+        }
+    }
+
+    /// Re-apply `macos_option_as_alt` to the main and every detached window
+    /// (hot-reload); a no-op off macOS.
+    fn apply_option_as_alt_everywhere(&self) {
+        if let Some(w) = &self.window {
+            apply_option_as_alt(w, self.macos_option_as_alt);
+        }
+        for dw in &self.detached {
+            apply_option_as_alt(&dw.window, self.macos_option_as_alt);
+        }
+    }
+
     fn rearm_pty_wakes(&self) {
         let mut more = false;
         for tab in &self.tabs {
@@ -6008,60 +6066,24 @@ impl App {
                 if is_synthetic {
                     return;
                 }
-                // Same modifier/decode pipeline as the main window's
-                // `KeyboardInput` arm, except `app_cursor`/`alt_screen` are sourced
-                // from THIS window's own terminal and `panel_open` is always false.
-                let ctrl = self.modifiers.control_key();
-                let shift = self.modifiers.shift_key();
-                let alt = self.modifiers.alt_key();
-                // macOS Cmd chords in a detached window are now folded into the
-                // keymap and dispatched below through the SAME action path as the
-                // main window (Copy/Paste/SelectAll/NewTab/CloseTab=reattach/font/
-                // settings). decide_key's keymap lookup preserves the "swallow
+                // The SAME key decision as the main window (`decide_window_key`),
+                // against THIS window's own terminal. macOS Cmd chords are folded
+                // into the keymap and dispatched below through the same action
+                // path as the main window; the keymap lookup keeps the "swallow
                 // unmapped Cmd" safety net. Cmd+Q / Cmd+P stay detached no-ops
-                // (guarded below) — byte-identical with today's detached Cmd block,
-                // which had no q/p arm.
+                // (guarded below).
+                let ctrl = self.modifiers.control_key();
+                let alt = self.modifiers.alt_key();
                 let sup = self.modifiers.super_key();
-                let (app_cursor, alt_screen) = {
+                let action = {
                     let Some(dw) = self.detached.get(pos) else { return };
-                    (dw.tab.terminal.app_cursor_keys(), dw.tab.terminal.alt_screen())
-                };
-                // macOS Option-compose: see the matching comment on the main
-                // window's arm — Alt + a composed non-ASCII glyph is sent as
-                // text instead of being ESC-prefixed by decide_key.
-                let composed: Option<Vec<u8>> = if alt && !ctrl {
-                    event.text.as_ref().and_then(|t| {
-                        if !t.is_empty() && t.chars().all(|c| !c.is_control()) && !t.is_ascii() {
-                            Some(t.as_bytes().to_vec())
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                };
-                // Dead-key composition fallback — mirrors the main window's arm.
-                // GATED on `!sup` so a bare Cmd chord routes through decide_key's
-                // keymap+swallow instead of being sent as composed text.
-                let dead_key = if sup {
-                    None
-                } else {
-                    input::dead_key_text_override(ctrl, alt, &event.logical_key, event.text.as_deref())
-                };
-                let action = match composed.or(dead_key) {
-                    Some(bytes) => input::KeyAction::Send(bytes),
-                    None => input::decide_key(
+                    decide_window_key(
                         &self.keymap,
-                        ctrl,
-                        shift,
-                        alt,
-                        sup,
-                        event.physical_key,
-                        &event.logical_key,
-                        false,
-                        app_cursor,
-                        alt_screen,
-                    ),
+                        &event,
+                        &self.key_modifiers,
+                        &dw.tab.terminal,
+                        self.macos_option_as_alt,
+                    )
                 };
                 // App-WIDE shortcuts advertised in README/help now work in a
                 // detached window too (they were dropped by the `_ => {}` arm — F39).
@@ -6073,23 +6095,31 @@ impl App {
                         self.toggle_settings_window(event_loop);
                         return;
                     }
+                    // New tab / tab switches act on the MAIN window (the only
+                    // tabbed one): bring it up so the user sees the result — summon
+                    // it when hidden, raise + focus it when it is merely behind —
+                    // instead of silently changing a window they can't see.
                     input::KeyAction::NewTab => {
-                        // Inherit THIS detached tab's cwd; the new tab still
-                        // opens in the main window as today.
+                        // Inherit THIS detached tab's cwd; the new tab opens in
+                        // the main window.
                         let cwd = self.detached.get(pos).and_then(|dw| dw.tab.pty.cwd());
-                        let _ = self.new_tab_with_cwd(cwd);
+                        if self.new_tab_with_cwd(cwd).is_some() {
+                            self.set_visibility(true, event_loop);
+                        }
                         return;
                     }
-                    input::KeyAction::NextTab => {
-                        self.switch_tab(true);
-                        return;
-                    }
-                    input::KeyAction::PrevTab => {
-                        self.switch_tab(false);
+                    input::KeyAction::NextTab | input::KeyAction::PrevTab => {
+                        if !self.tabs.is_empty() {
+                            self.switch_tab(action == input::KeyAction::NextTab);
+                            self.set_visibility(true, event_loop);
+                        }
                         return;
                     }
                     input::KeyAction::SelectTab(n) => {
-                        self.select_tab(*n);
+                        if !self.tabs.is_empty() {
+                            self.select_tab(*n);
+                            self.set_visibility(true, event_loop);
+                        }
                         return;
                     }
                     // "Close tab" for a single-tab detached window = reattach it to
@@ -6126,19 +6156,18 @@ impl App {
                         for dw in &self.detached { dw.request_paint(); }
                         return;
                     }
-                    // Scrollback search is main-window-only this release: a
-                    // detached window swallows the chord as a clean no-op —
-                    // it never sends 0x06 to the PTY and never opens the
-                    // main-window bar while unfocused.
-                    input::KeyAction::SearchToggle => {
-                        return;
-                    }
-                    // Hint mode + keyboard copy-mode are main-window + primary-
-                    // screen only this release: a detached window swallows the
-                    // chord as a clean no-op (never leaks to the PTY, never opens
-                    // the mode on the unfocused main window), exactly like
-                    // SearchToggle above.
-                    input::KeyAction::HintMode | input::KeyAction::CopyMode => {
+                    // Scrollback search, hint mode and keyboard copy-mode exist
+                    // only in the main window for now: a detached window never
+                    // sends their chords to the PTY nor opens them on the
+                    // unfocused main window — and says so in a pill instead of
+                    // swallowing the key silently.
+                    input::KeyAction::SearchToggle
+                    | input::KeyAction::HintMode
+                    | input::KeyAction::CopyMode => {
+                        if let Some(msg) = crate::detached::main_only_notice(&action) {
+                            let window = self.detached.get(pos).map(|d| d.window.id());
+                            self.show_status_pill(crate::runsel::Notice { msg, window });
+                        }
                         return;
                     }
                     // Run-selection from a DETACHED window: this window's own
@@ -6246,7 +6275,7 @@ impl App {
                         // while scrolled up goes blind, F30) then write to the PTY
                         // — the shared input core, same as the main Send arm
                         // (v0.23 Task 9).
-                        write_key_to_pty(&mut dw.tab, &bytes);
+                        write_key_to_pty(&mut dw.tab, &bytes, Some(event.physical_key));
                         // No paint here — the echo paints (same rule and fallback
                         // deadline as the main window's Send arm).
                         let now = std::time::Instant::now();
@@ -6268,15 +6297,47 @@ impl App {
                     self.update_detached_link_hover(pos, true);
                 }
             }
+            // Key RELEASE: owed to this window's tab only if it was sent the
+            // press (kitty keyboard protocol event types; a no-op otherwise).
+            // Synthetic releases (keys still held when focus leaves) are
+            // forwarded too, so a program never sees a key stuck down.
+            WindowEvent::KeyboardInput { event, .. } => {
+                let (keymap, mods, opt) = (&self.keymap, self.key_modifiers, self.macos_option_as_alt);
+                if let Some(dw) = self.detached.get_mut(pos) {
+                    write_key_release(keymap, &mut dw.tab, &event, &mods, opt);
+                }
+            }
+            // IME composition in progress in THIS window: drawn at its cursor
+            // until it commits (mirrors the main window's Preedit arm).
+            WindowEvent::Ime(winit::event::Ime::Preedit(text, _)) => {
+                let Some(dw) = self.detached.get_mut(pos) else { return };
+                let next = (!text.is_empty()).then_some(text);
+                if dw.ime_preedit != next {
+                    dw.ime_preedit = next;
+                    dw.request_paint();
+                }
+            }
+            WindowEvent::Ime(winit::event::Ime::Disabled) => {
+                let Some(dw) = self.detached.get_mut(pos) else { return };
+                if dw.ime_preedit.take().is_some() {
+                    dw.request_paint();
+                }
+            }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 // IME commit → typed text to THIS window's PTY (no bracketed
-                // paste). Mirrors the main window's Ime::Commit arm.
+                // paste). Mirrors the main window's Ime::Commit arm; the commit
+                // ends any composition on screen.
+                if let Some(dw) = self.detached.get_mut(pos) {
+                    if dw.ime_preedit.take().is_some() {
+                        dw.request_paint();
+                    }
+                }
                 if !text.is_empty() {
                     let caret_flash_enabled = self.fx.caret_flash_enabled;
                     let Some(dw) = self.detached.get_mut(pos) else { return };
                     // Snap to the live bottom (F30) then write to the PTY — the
                     // shared input core, same as the Send arm (v0.23 Task 9).
-                    write_key_to_pty(&mut dw.tab, text.as_bytes());
+                    write_key_to_pty(&mut dw.tab, text.as_bytes(), None);
                     // The echo paints (fallback deadline), as in the Send arm.
                     let now = std::time::Instant::now();
                     dw.key_paint_due = Some(now + KEY_ECHO_GRACE);
@@ -6309,6 +6370,7 @@ impl App {
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
+                self.key_modifiers = m;
                 // Same discipline as the main window's arm: press arms THIS
                 // window's hover; release sweeps every window (the event is
                 // delivered per-focused-window only).
@@ -7129,6 +7191,20 @@ impl App {
         // gpu/text/quad borrow below (same pattern as the main RedrawRequested).
         let snap = dw.tab.terminal.snapshot();
         let title = dw.tab.title.clone();
+        // The IME candidate window follows this window's cursor cell (handed to
+        // winit only when that cell moves) — mirrors the main window.
+        let ime_area = {
+            let (cw, ch) = dw.text.cell_size();
+            input::ime_cursor_area(snap.cursor_row, snap.cursor_col, cw, ch, dw.chrome_bands(self.ui_font_logical, self.show_perf_hud).0)
+        };
+        if dw.ime_area != Some(ime_area) {
+            dw.ime_area = Some(ime_area);
+            dw.window.set_ime_cursor_area(
+                winit::dpi::PhysicalPosition::new(ime_area.0, ime_area.1),
+                winit::dpi::PhysicalSize::new(ime_area.2, ime_area.3),
+            );
+        }
+        let preedit_ui = dw.ime_preedit.clone();
         let close_hover = dw.close_hover;
         let menu_open = dw.menu_open;
         let menu_hover = dw.menu_hover;
@@ -7343,6 +7419,17 @@ impl App {
             let _ = chrome_text.render_overlays(
                 &gpu.device, &gpu.queue, scene_view, width, height, &[pill.label],
             );
+        }
+        // Pass 5c: IME preedit at this window's cursor (the main window's
+        // Pass 4e' twin): terminal font via the grid layer, underlined.
+        if let Some(p) = &preedit_ui {
+            let (cell_w, cell_h) = text.cell_size();
+            if let Some(ov) = jetty_render::build_preedit_overlay(
+                p, snap.cursor_row, snap.cursor_col, snap.cols, cell_w, cell_h, grid_top, &theme, scale,
+            ) {
+                quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
+                let _ = text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &ov.labels);
+            }
         }
         // Pass 6: the Reattach/Copy/Paste context menu on top of everything.
         if let Some((mx, my)) = menu_open {
@@ -8082,6 +8169,9 @@ impl ApplicationHandler<AppEvent> for App {
         // PTY output left queued by this iteration's drains is scheduled for the
         // next one (and idle tabs re-armed). First, so no early return skips it.
         self.rearm_pty_wakes();
+        // DECSET 1004 focus reports for whatever this event batch changed
+        // (OS focus, summon/hide, a tab switch) — one pass, every window.
+        self.sync_focus_reports();
         // Input-latency percentile emit (JETTY_PERF_LOG only): runs HERE, off the
         // timed present path, so printing a batch never stalls the frame it measured
         // (observer-effect fix). Emits at most once per REPORT_EVERY new samples.
@@ -8523,6 +8613,8 @@ impl ApplicationHandler<AppEvent> for App {
         // `WindowEvent::Ime(Ime::Commit)` and are sent to the PTY as typed
         // text; preedit rendering is intentionally not implemented.
         window.set_ime_allowed(true);
+        // macOS: which Option side(s) are Meta (no-op elsewhere).
+        apply_option_as_alt(&window, self.macos_option_as_alt);
         // First open: place the window per the configured mode. Center mode
         // centers; Dropdown mode docks as a top strip and slides in.
         match self.window_mode {
@@ -8709,6 +8801,10 @@ impl ApplicationHandler<AppEvent> for App {
         // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
         // Applied at spawn so new tabs pick up the current setting.
         terminal.set_osc52_allow_paste(self.osc52_allow_paste);
+        // Kitty keyboard protocol: answer `CSI ? u` and track the app's
+        // `CSI > u` flag stack — the key path encodes per those flags
+        // (`decide_window_key`), so a program that opts in gets kitty keys.
+        terminal.set_kitty_keyboard(true);
         // Apply the configured scrollback cap (guard skips the no-op
         // set_options round-trip on the 10k default path).
         if self.scrollback_lines != 10_000 {
@@ -8751,6 +8847,7 @@ impl ApplicationHandler<AppEvent> for App {
             manually_renamed: false,
             activity: jetty_render::TabActivity::None,
             pending_inject: None,
+            input: input::TabInputState::default(),
         });
         self.active = 0;
 
@@ -9077,6 +9174,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
+                self.key_modifiers = m;
                 // Arm the link hover on modifier press at the current cursor;
                 // a release sweeps EVERY window (this event is per-focused-
                 // window only, so an unfocused sibling would otherwise keep a
@@ -10728,59 +10826,20 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 let ctrl = self.modifiers.control_key();
                 let shift = self.modifiers.shift_key();
-                let alt = self.modifiers.alt_key();
-                // macOS Cmd (winit `super_key()`) chords are now folded into the
-                // keymap (Copy/Paste/SelectAll/NewTab/CloseTab/Quit/OpenPalette/
-                // font/settings, Shift-agnostic) and dispatched through the SAME
-                // action path below. The old inline Cmd block is gone; decide_key's
-                // keymap lookup preserves the "swallow unmapped Cmd" safety net so
-                // nothing leaks to the PTY.
-                let sup = self.modifiers.super_key();
-                let app_cursor = self.active_tab().terminal.app_cursor_keys();
-                let alt_screen = self.active_tab().terminal.alt_screen();
-                // Escape in the main window never closes the settings window
-                // (that window handles its own Escape), so panel_open is always
-                // false here — Escape forwards an ESC byte to the PTY as normal.
-                // macOS Option-compose (no OS gating — keyed on what the OS
-                // produced): Option is the primary compose key (Option+G → ©,
-                // Option+U U → ü). When Alt is held and the OS composed a printable
-                // NON-ASCII glyph in `event.text`, send that glyph to the PTY
-                // instead of letting decide_key ESC-prefix it (the Meta
-                // convention). Alt+ASCII stays Meta (ESC b for word-back, etc.),
-                // and Linux Alt+letter — which produces no composed non-ASCII text —
-                // is unaffected. (Dead-key sequences routed via Ime::Commit instead
-                // of event.text are a separate, larger path — deferred.)
-                let composed: Option<Vec<u8>> = if alt && !ctrl {
-                    event.text.as_ref().and_then(|t| {
-                        if !t.is_empty()
-                            && t.chars().all(|c| !c.is_control())
-                            && !t.is_ascii()
-                        {
-                            Some(t.as_bytes().to_vec())
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                };
-                // Dead-key composition fallback: when a compose sequence puts
-                // the composed glyph in `event.text` (e.g. ' then e → "é") while
-                // logical_key still reports the base char, prefer the text —
-                // otherwise the accent is silently dropped. Never fires for
-                // Ctrl/Alt chords or Named keys (see dead_key_text_override).
-                // GATED on `!sup`: a bare Cmd chord must route through decide_key's
-                // keymap+swallow, never be sent as composed text (byte-identical
-                // with the old Cmd block, which returned before this path).
-                let dead_key = if sup {
-                    None
-                } else {
-                    input::dead_key_text_override(ctrl, alt, &event.logical_key, event.text.as_deref())
-                };
-                let action = match composed.or(dead_key) {
-                    Some(bytes) => input::KeyAction::Send(bytes),
-                    None => input::decide_key(&self.keymap, ctrl, shift, alt, sup, event.physical_key, &event.logical_key, false, app_cursor, alt_screen),
-                };
+                // The shared key decision (keymap chords incl. the folded macOS
+                // Cmd chords and their "swallow unmapped Cmd" net → kitty
+                // keyboard protocol → macOS Option-compose → dead keys → legacy
+                // xterm encoders), against the ACTIVE tab's modes. The detached
+                // windows call the same helper. Escape in the main window never
+                // closes the Settings window (that window handles its own
+                // Escape), so Escape forwards an ESC byte as normal.
+                let action = decide_window_key(
+                    &self.keymap,
+                    &event,
+                    &self.key_modifiers,
+                    &self.active_tab().terminal,
+                    self.macos_option_as_alt,
+                );
                 if self.debug {
                     let action_name = match &action {
                         input::KeyAction::TogglePanel => "TogglePanel",
@@ -10995,7 +11054,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // Any real keystroke jumps back to the bottom so the user
                         // sees their input, then writes to the PTY (shared input
                         // core, v0.23 Task 9).
-                        write_key_to_pty(self.active_tab_mut(), &bytes);
+                        write_key_to_pty(self.active_tab_mut(), &bytes, Some(event.physical_key));
                         // Input-latency START stamp (JETTY_PERF_LOG only): record the
                         // keystroke instant so the frame that reflects its echo can
                         // measure keypress→glyph. Gated on `perf.on` (a bool read once
@@ -11027,13 +11086,40 @@ impl ApplicationHandler<AppEvent> for App {
                     input::KeyAction::None => {}
                 }
             }
+            // Key RELEASE: owed only to the main-window tab that was sent the
+            // press (kitty keyboard protocol event types; a no-op otherwise) —
+            // even if the user switched tabs meanwhile. Synthetic releases
+            // (keys still held when focus leaves) are forwarded too, so a
+            // program never sees a key stuck down.
+            WindowEvent::KeyboardInput { event, .. } => {
+                let (keymap, mods, opt) = (&self.keymap, self.key_modifiers, self.macos_option_as_alt);
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.input.holds(event.physical_key)) {
+                    write_key_release(keymap, tab, &event, &mods, opt);
+                }
+            }
+            // IME composition in progress: shown at the cursor (`ime_preedit`)
+            // until it commits; an empty preedit / Disabled ends it.
+            WindowEvent::Ime(winit::event::Ime::Preedit(text, _)) => {
+                let next = (!text.is_empty()).then_some(text);
+                if self.ime_preedit != next {
+                    self.ime_preedit = next;
+                    self.request_main_paint();
+                }
+            }
+            WindowEvent::Ime(winit::event::Ime::Disabled) => {
+                if self.ime_preedit.take().is_some() {
+                    self.request_main_paint();
+                }
+            }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 // IME commit (CJK input methods, dead-key composition routed
                 // through the IME). It must honor the SAME modal priority chain
                 // as KeyboardInput, or composed text leaks into the shell behind
                 // a rename box / confirm popup (CJK users could not type non-ASCII
-                // tab names at all). Preedit is not rendered (Commit-only IME
-                // support); Enabled/Preedit/Disabled are intentionally ignored.
+                // tab names at all). The commit ends any composition on screen.
+                if self.ime_preedit.take().is_some() {
+                    self.request_main_paint();
+                }
                 if text.is_empty() || self.tabs.is_empty() {
                     return;
                 }
@@ -11097,7 +11183,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // Same discipline as the Send arm: jump to the live bottom then
                 // write to the PTY (shared input core, v0.23 Task 9) — and, like
                 // it, let the echo paint (fallback deadline, no pre-echo frame).
-                write_key_to_pty(self.active_tab_mut(), text.as_bytes());
+                write_key_to_pty(self.active_tab_mut(), text.as_bytes(), None);
                 let now = std::time::Instant::now();
                 self.key_paint_due = Some(now + KEY_ECHO_GRACE);
                 if (self.fx.caret_flash_enabled || self.fx.caret_glow_enabled)
@@ -11234,6 +11320,38 @@ impl ApplicationHandler<AppEvent> for App {
                 // gathered before borrowing the render stack mutably).
                 let snap = self.active_tab().terminal.snapshot();
                 let theme = self.current_theme();
+                // The IME candidate window follows the cursor cell (handed to
+                // winit only when that cell moves, not every frame).
+                let ime_area = self.text.as_ref().map(|t| {
+                    let (cw, ch) = t.cell_size();
+                    input::ime_cursor_area(snap.cursor_row, snap.cursor_col, cw, ch, self.grid_top_offset())
+                });
+                if let Some(area) = ime_area {
+                    if self.ime_area != Some(area) {
+                        self.ime_area = Some(area);
+                        if let Some(w) = &self.window {
+                            w.set_ime_cursor_area(
+                                winit::dpi::PhysicalPosition::new(area.0, area.1),
+                                winit::dpi::PhysicalSize::new(area.2, area.3),
+                            );
+                        }
+                    }
+                }
+                // The IME composition, drawn at the terminal cursor — unless a
+                // modal / rename box / palette / search / hint / copy-mode owns
+                // the keyboard (their own fields receive the commit).
+                let preedit_ui: Option<String> = if self.confirm_quit
+                    || self.confirm_close.is_some()
+                    || self.renaming.is_some()
+                    || self.palette_open
+                    || self.search_open
+                    || self.hint_mode.is_some()
+                    || self.copy_mode.is_some()
+                {
+                    None
+                } else {
+                    self.ime_preedit.clone()
+                };
                 // Refresh the cached tab metadata (rebuilds only on change), then
                 // take it out so the later &mut self.gpu/text borrow doesn't
                 // conflict with this &self borrow; it is restored after rendering.
@@ -11771,6 +11889,27 @@ impl ApplicationHandler<AppEvent> for App {
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
                         if !ov.labels.is_empty() {
+                            let _ = text.render_overlays(
+                                &gpu.device, &gpu.queue, scene_view, width, height, &ov.labels,
+                            );
+                        }
+                    }
+                    // Pass 4e': IME preedit at the cursor — the composition in the
+                    // TERMINAL font via the grid layer (like the hint chips), on
+                    // the theme bg, underlined, until it commits.
+                    if let Some(p) = &preedit_ui {
+                        if let Some(ov) = jetty_render::build_preedit_overlay(
+                            p,
+                            snap.cursor_row,
+                            snap.cursor_col,
+                            snap.cols,
+                            cell_w,
+                            cell_h,
+                            grid_top + slide_y_offset,
+                            &theme,
+                            scale,
+                        ) {
+                            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &ov.quads);
                             let _ = text.render_overlays(
                                 &gpu.device, &gpu.queue, scene_view, width, height, &ov.labels,
                             );
@@ -12466,7 +12605,11 @@ fn render_grid_scene(
 /// the caret-burst arming (gated on different toggles per window; the glow is
 /// main-only), the perf keystroke stamp, welcome-splash dismissal, and every
 /// modal/menu short-circuit stay in the per-window callers.
-fn write_key_to_pty(tab: &mut Tab, bytes: &[u8]) {
+///
+/// `pressed` is the physical key when `bytes` encode a key PRESS (not an IME
+/// commit): the tab then owes that key's release to the program
+/// (`write_key_release`).
+fn write_key_to_pty(tab: &mut Tab, bytes: &[u8], pressed: Option<winit::keyboard::PhysicalKey>) {
     // The user has claimed this prompt: a staged run-selection inject must
     // never splice into their half-typed line. This ONE line covers every
     // funnel that routes here — main + detached keystrokes AND both windows'
@@ -12480,7 +12623,90 @@ fn write_key_to_pty(tab: &mut Tab, bytes: &[u8]) {
     tab.terminal.scroll_to_bottom();
     let _ = tab.writer.write_all(bytes);
     let _ = tab.writer.flush();
+    if let Some(key) = pressed {
+        tab.input.note_press(key);
+    }
 }
+
+/// The shared decision half of the main and detached key paths: one winit key
+/// event (press, auto-repeat or release) → its action, decided against the
+/// modes of the tab it goes to — DECCKM, the alternate screen, the kitty
+/// keyboard flags its program pushed — with this platform's Option rules.
+/// Keymap chords, the kitty protocol, macOS Option-compose, dead keys and the
+/// legacy xterm encoders all live behind `input::decide_key_event`; the main
+/// window's overlays/menus/modals take their keys BEFORE this is called.
+fn decide_window_key(
+    keymap: &crate::keymap::KeyMap,
+    event: &winit::event::KeyEvent,
+    mods: &winit::event::Modifiers,
+    terminal: &Terminal,
+    option_as_alt: input::OptionAsAlt,
+) -> input::KeyAction {
+    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+    let base = event.key_without_modifiers();
+    let ev = input::KeyInput {
+        physical: event.physical_key,
+        logical: &event.logical_key,
+        key_without_modifiers: &base,
+        text: event.text.as_deref(),
+        location: event.location,
+        kind: input::KeyEventKind::from_winit(event.state, event.repeat),
+        mods: input::KeyMods::from_winit(mods),
+    };
+    let modes = input::KeyModes {
+        app_cursor: terminal.app_cursor_keys(),
+        // DECKPAM changes no byte (NumLock overrides it — see `KeyModes`).
+        app_keypad: false,
+        alt_screen: terminal.alt_screen(),
+        kitty_flags: terminal.kitty_keyboard_flags(),
+    };
+    input::decide_key_event(keymap, &ev, &modes, &input::KeyOptions::native(option_as_alt), false)
+}
+
+/// A key RELEASE for `tab`, which was sent the press: report it when the
+/// program asked for event types (kitty protocol flag 2/8 — otherwise the
+/// decision is `None` and nothing is written). Written as-is: no scroll-to-
+/// bottom snap and no run-selection cancel — the press already did both.
+fn write_key_release(
+    keymap: &crate::keymap::KeyMap,
+    tab: &mut Tab,
+    event: &winit::event::KeyEvent,
+    mods: &winit::event::Modifiers,
+    option_as_alt: input::OptionAsAlt,
+) {
+    if !tab.input.take_release(event.physical_key) {
+        return;
+    }
+    if let input::KeyAction::Send(bytes) =
+        decide_window_key(keymap, event, mods, &tab.terminal, option_as_alt)
+    {
+        let _ = tab.writer.write_all(&bytes);
+        let _ = tab.writer.flush();
+    }
+}
+
+/// DECSET 1004 focus reporting for one tab: observe whether it is the focused
+/// one and write `CSI I` / `CSI O` when that CHANGED and its program enabled
+/// the mode (`TabInputState::focus_report`).
+fn report_focus(tab: &mut Tab, focused: bool) {
+    let enabled = tab.terminal.focus_reporting();
+    if let Some(bytes) = tab.input.focus_report(focused, enabled) {
+        let _ = tab.writer.write_all(bytes);
+        let _ = tab.writer.flush();
+    }
+}
+
+/// macOS: tell winit which Option side(s) are Meta (`macos_option_as_alt`) so
+/// it stops composing characters there and reports the plain key — the key
+/// encoder then ESC-prefixes it. A no-op on other platforms (Alt is Meta).
+#[cfg(target_os = "macos")]
+fn apply_option_as_alt(window: &winit::window::Window, option_as_alt: input::OptionAsAlt) {
+    use winit::platform::macos::WindowExtMacOS;
+    window.set_option_as_alt(option_as_alt.to_winit());
+}
+
+#[cfg(not(target_os = "macos"))]
+fn apply_option_as_alt(_window: &winit::window::Window, _option_as_alt: input::OptionAsAlt) {}
 
 
 /// Largest byte index `<= max` that is a char boundary of `s` (a stable stand-in for
