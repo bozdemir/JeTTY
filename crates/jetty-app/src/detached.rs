@@ -181,6 +181,36 @@ pub fn focus_in_detached<I: PartialEq>(last_focused: Option<I>, detached_ids: &[
     }
 }
 
+/// Pill text for a chord whose overlay exists only in the main window
+/// (scrollback search, hint mode, copy-mode) pressed in a detached window, so
+/// the key is not swallowed silently. `None` for every other action.
+pub fn main_only_notice(action: &crate::input::KeyAction) -> Option<&'static str> {
+    use crate::input::KeyAction;
+    match action {
+        KeyAction::SearchToggle => Some("Search works in the main window — reattach this tab to search it"),
+        KeyAction::HintMode => Some("Hint mode works in the main window — reattach this tab to use it"),
+        KeyAction::CopyMode => Some("Copy mode works in the main window — reattach this tab to use it"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod main_only_notice_tests {
+    use super::main_only_notice;
+    use crate::input::KeyAction;
+
+    #[test]
+    fn main_window_overlays_explain_themselves_and_nothing_else_does() {
+        for a in [KeyAction::SearchToggle, KeyAction::HintMode, KeyAction::CopyMode] {
+            let msg = main_only_notice(&a).expect("overlay chords get a pill");
+            assert!(msg.contains("main window"), "{msg}");
+        }
+        for a in [KeyAction::NewTab, KeyAction::Copy, KeyAction::Send(b"x".to_vec()), KeyAction::None] {
+            assert_eq!(main_only_notice(&a), None, "{a:?}");
+        }
+    }
+}
+
 // ── DetachedWindow ────────────────────────────────────────────────────────────
 
 use std::sync::Arc;
@@ -233,6 +263,12 @@ pub(crate) struct DetachedWindow {
     /// Fallback paint deadline for THIS window's latest PTY-bound keystroke
     /// (mirrors `App::key_paint_due`): the echo paints, not the key.
     pub key_paint_due: Option<std::time::Instant>,
+    /// The IME's in-progress composition in this window, drawn at the cursor
+    /// until it commits (mirrors `App::ime_preedit`).
+    pub ime_preedit: Option<String>,
+    /// Last IME candidate-window anchor handed to winit for this window
+    /// (mirrors `App::ime_area`): re-sent only when the cursor cell moves.
+    pub ime_area: Option<(i32, i32, u32, u32)>,
     /// Backoff after this window's `acquire_frame()` failed (mirrors
     /// `App::acquire_retry`); `None` while frames present normally.
     pub acquire_retry: Option<crate::app::AcquireRetry>,
@@ -443,6 +479,8 @@ impl DetachedWindow {
             image_layer,
             caret_anim: None,
             key_paint_due: None,
+            ime_preedit: None,
+            ime_area: None,
             acquire_retry: None,
             // A freshly-detached window is created focused (the WM focuses it on
             // map); its Focused events keep this current thereafter.

@@ -425,6 +425,155 @@ pub fn decide_key(
     )
 }
 
+// ── Per-tab key/focus bookkeeping (main AND detached windows) ────────────────
+
+/// Keyboard state one tab carries across events: which keys it was sent a
+/// press for (so a kitty-protocol app gets exactly the matching releases, never
+/// a release of a key it didn't see go down) and the focus state it last
+/// observed (DECSET 1004 focus reporting).
+#[derive(Debug, Default)]
+pub struct TabInputState {
+    /// Physical keys whose press reached this tab's PTY and are not released
+    /// yet. A handful at most; bounded so a release lost to a window teardown
+    /// can never grow it.
+    keys_down: Vec<PhysicalKey>,
+    /// Focus state at the last observation (`None` before the first): a report
+    /// is due only on a CHANGE, never when the app merely enables the mode.
+    focus_seen: Option<bool>,
+}
+
+impl TabInputState {
+    /// Most keys a tab tracks as held; the oldest is forgotten past this.
+    pub const MAX_KEYS_DOWN: usize = 16;
+
+    /// A press (not an auto-repeat) of `physical` was written to this tab's PTY.
+    pub fn note_press(&mut self, physical: PhysicalKey) {
+        if self.keys_down.contains(&physical) {
+            return;
+        }
+        if self.keys_down.len() == Self::MAX_KEYS_DOWN {
+            self.keys_down.remove(0);
+        }
+        self.keys_down.push(physical);
+    }
+
+    /// `physical` was released. True when this tab saw its press — the release
+    /// belongs to it — and forgets the key.
+    pub fn take_release(&mut self, physical: PhysicalKey) -> bool {
+        match self.keys_down.iter().position(|k| *k == physical) {
+            Some(i) => {
+                self.keys_down.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether this tab saw a press of `physical` that wasn't released yet.
+    pub fn holds(&self, physical: PhysicalKey) -> bool {
+        self.keys_down.contains(&physical)
+    }
+
+    /// Observe whether this tab is the focused one, returning the report due:
+    /// `CSI I` (focus in) / `CSI O` (focus out) when the app enabled focus
+    /// reporting (`enabled`, `\e[?1004h`) and the state CHANGED since the last
+    /// observation. The first observation and enabling the mode never report
+    /// (xterm behavior); the state is tracked even while reporting is off.
+    pub fn focus_report(&mut self, focused: bool, enabled: bool) -> Option<&'static [u8]> {
+        let prev = self.focus_seen.replace(focused);
+        if !enabled || prev.is_none_or(|p| p == focused) {
+            return None;
+        }
+        Some(if focused { b"\x1b[I" } else { b"\x1b[O" })
+    }
+}
+
+/// The IME candidate-window anchor for the cursor at grid cell `(row, col)`:
+/// `(x, y, w, h)` in physical pixels — that cell's rect, the grid starting
+/// `grid_top` px down. winit wants it in window coordinates.
+pub fn ime_cursor_area(
+    row: usize,
+    col: usize,
+    cell_w: f32,
+    cell_h: f32,
+    grid_top: f32,
+) -> (i32, i32, u32, u32) {
+    let x = (col as f32 * cell_w).round() as i32;
+    let y = (grid_top + row as f32 * cell_h).round() as i32;
+    (x, y, cell_w.round().max(1.0) as u32, cell_h.round().max(1.0) as u32)
+}
+
+#[cfg(test)]
+mod tab_input_tests {
+    use super::*;
+
+    const A: PhysicalKey = PhysicalKey::Code(KeyCode::KeyA);
+    const B: PhysicalKey = PhysicalKey::Code(KeyCode::KeyB);
+
+    #[test]
+    fn releases_go_only_to_the_tab_that_saw_the_press() {
+        let mut s = TabInputState::default();
+        assert!(!s.take_release(A), "a release with no press (e.g. the summon key) is not ours");
+        s.note_press(A);
+        s.note_press(A); // auto-repeat / duplicate: still one entry
+        assert!(s.holds(A));
+        assert!(s.take_release(A));
+        assert!(!s.take_release(A), "exactly one release per press");
+        assert!(!s.holds(A));
+    }
+
+    #[test]
+    fn held_keys_stay_bounded() {
+        let mut s = TabInputState::default();
+        for c in [
+            KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD, KeyCode::KeyE,
+            KeyCode::KeyF, KeyCode::KeyG, KeyCode::KeyH, KeyCode::KeyI, KeyCode::KeyJ,
+            KeyCode::KeyK, KeyCode::KeyL, KeyCode::KeyM, KeyCode::KeyN, KeyCode::KeyO,
+            KeyCode::KeyP, KeyCode::KeyQ, KeyCode::KeyR,
+        ] {
+            s.note_press(PhysicalKey::Code(c));
+        }
+        assert_eq!(s.keys_down.len(), TabInputState::MAX_KEYS_DOWN);
+        assert!(!s.holds(A), "the oldest is forgotten first");
+        assert!(!s.holds(B));
+        assert!(s.holds(PhysicalKey::Code(KeyCode::KeyR)));
+    }
+
+    #[test]
+    fn focus_reports_fire_on_changes_only_and_only_when_enabled() {
+        let mut s = TabInputState::default();
+        // First observation never reports, even with the mode on.
+        assert_eq!(s.focus_report(true, true), None);
+        assert_eq!(s.focus_report(true, true), None, "no change, no report");
+        assert_eq!(s.focus_report(false, true), Some(&b"\x1b[O"[..]));
+        assert_eq!(s.focus_report(false, true), None, "a hide after the focus-out sends nothing more");
+        assert_eq!(s.focus_report(true, true), Some(&b"\x1b[I"[..]));
+        // Mode off: the change is tracked but not reported…
+        assert_eq!(s.focus_report(false, false), None);
+        // …and enabling the mode later doesn't fire a stale report.
+        assert_eq!(s.focus_report(false, true), None);
+        assert_eq!(s.focus_report(true, true), Some(&b"\x1b[I"[..]));
+    }
+
+    #[test]
+    fn grab_churn_around_a_hotkey_reports_out_then_in_once_each() {
+        // X11: the summon hotkey's key grab sends FocusOut then FocusIn on a
+        // focused window; each transition reports exactly once.
+        let mut s = TabInputState::default();
+        assert_eq!(s.focus_report(true, true), None);
+        assert_eq!(s.focus_report(false, true), Some(&b"\x1b[O"[..]));
+        assert_eq!(s.focus_report(true, true), Some(&b"\x1b[I"[..]));
+    }
+
+    #[test]
+    fn ime_area_is_the_cursor_cell_below_the_grid_top() {
+        assert_eq!(ime_cursor_area(0, 0, 9.6, 20.0, 36.0), (0, 36, 10, 20));
+        assert_eq!(ime_cursor_area(3, 10, 9.6, 20.0, 36.0), (96, 96, 10, 20));
+        // Degenerate metrics (before the first layout) still give a 1px area.
+        assert_eq!(ime_cursor_area(0, 0, 0.0, 0.0, 0.0), (0, 0, 1, 1));
+    }
+}
+
 fn send_or_none(bytes: Option<Vec<u8>>) -> KeyAction {
     bytes.map_or(KeyAction::None, KeyAction::Send)
 }
