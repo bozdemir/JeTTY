@@ -1266,7 +1266,18 @@ impl Persister {
         lock(&self.shared).self_written == Some(hash)
     }
 
-    /// A hot-reload applied `cfg`, read from bytes hashing to `hash`.
+    /// The settings the file holds, AS THE APP HOLDS THEM — clamped, normalized,
+    /// a missing font remembered by its chosen name — become the baseline. A
+    /// later save then writes only what the user changes: never a clamped
+    /// `opacity`, a normalized `window_mode` or a fallback font over keys they
+    /// never touched. Startup only (nothing is pending yet).
+    pub(crate) fn rebase(&mut self, synced: Config) {
+        debug_assert!(self.pending.is_empty(), "rebase with unsaved changes");
+        self.synced = synced;
+    }
+
+    /// A hot-reload applied the file (read from bytes hashing to `hash`); `cfg`
+    /// is what the app now holds of it (the baseline, as in [`Persister::rebase`]).
     pub(crate) fn note_reloaded(&mut self, cfg: Config, hash: u64) {
         self.synced = cfg;
         let mut s = lock(&self.shared);
@@ -2295,6 +2306,32 @@ caret_glow_enabled = true\n";
         assert!(p.is_self_write(hash_str(&out)));
         // …and an unchanged record is a no-op.
         assert!(!p.record(&cfg, Instant::now()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rebased_baseline_never_writes_values_the_user_did_not_touch() {
+        // The app clamps / normalizes what it loads (opacity 0.05 → 0.1,
+        // "Dropdown" → "dropdown", a missing font → a fallback). With the raw
+        // file as the baseline, the FIRST unrelated settings change wrote all of
+        // those over the user's own text.
+        let dir = tmp_dir("rebase");
+        let path = dir.join("config.toml");
+        let text = "opacity = 0.05\nwindow_mode = \"Dropdown\"\nui_font_family = \"Gone Sans\"\n";
+        std::fs::write(&path, text).unwrap();
+        let (mut p, cfg, _) = persister_for(&path);
+        // What the app holds after applying it.
+        let mut held = cfg.clone();
+        held.opacity = 0.1;
+        held.window_mode = "dropdown".to_string();
+        p.rebase(held.clone());
+        assert!(!p.record(&held, Instant::now()), "nothing the user changed");
+        held.font_size = 18.0;
+        assert!(p.record(&held, Instant::now()));
+        assert!(p.flush_and_wait(Duration::from_secs(5)));
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.starts_with(text), "the user's own lines are untouched: {out}");
+        assert!(out.contains("font_size = 18.0"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

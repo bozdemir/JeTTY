@@ -1056,6 +1056,12 @@ pub struct App {
     /// The kitty keyboard protocol in every tab (mirrors `Config.kitty_keyboard`;
     /// applied at spawn and live to every tab on reload).
     kitty_keyboard: bool,
+    /// The terminal / UI font families the user CHOSE (config, Settings) — what
+    /// `persist` saves. `font_family` / `ui_font_family` are what is SHOWN: a
+    /// chosen family that is not installed shows a fallback, which must never be
+    /// saved over the choice (like `theme_name`).
+    font_family_chosen: String,
+    ui_font_family_chosen: String,
     /// Compiled keybindings (built from `keys` on load / reload). The input path
     /// does ONE cheap hashmap lookup against this per keypress — never per frame.
     keymap: crate::keymap::KeyMap,
@@ -1732,6 +1738,8 @@ impl App {
             macos_option_as_alt: input::OptionAsAlt::default(),
             copy_on_select: clipboard::CopyOnSelect::default(),
             kitty_keyboard: true,
+            font_family_chosen: String::new(),
+            ui_font_family_chosen: String::new(),
             // Placeholder default keymap; rebuilt from cfg.keys below in `new`.
             keymap: crate::keymap::KeyMap::defaults(),
             keys: crate::config::KeyBindings::default(),
@@ -1856,11 +1864,13 @@ impl App {
         app.opacity = cfg.opacity.clamp(0.1, 1.0);
         app.font_logical = cfg.font_size.clamp(6.0, 48.0);
         app.font_family = cfg.font_family;
+        app.font_family_chosen = app.font_family.clone();
         // UI (chrome) font, clamped like the terminal font. "" = platform sans;
         // a non-empty family is validated against the installed proportional
         // faces later in `resumed` (a removed font falls back to "" / sans).
         app.ui_font_logical = cfg.ui_font_size.clamp(UI_FONT_MIN, UI_FONT_MAX);
         app.ui_font_family = cfg.ui_font_family;
+        app.ui_font_family_chosen = app.ui_font_family.clone();
         app.corner_radius = cfg.corner_radius.clamp(0.0, 24.0);
         app.summon_effect = SummonEffect::from_config(&cfg.summon_effect);
         app.window_mode = WindowMode::from_config(&cfg.window_mode);
@@ -1913,6 +1923,10 @@ impl App {
             eprintln!("jetty: {w}");
         }
         app.startup_warnings = startup_warnings;
+        // Save only what the user changes from here on: the baseline is the file
+        // as the app holds it (clamped, normalized), not its raw text.
+        let held = app.settings_snapshot();
+        app.persister.borrow_mut().rebase(held);
 
         // Apply the initial theme+opacity so Terminal::new env defaults are
         // overridden by our managed state (avoids double-reads from env). Also
@@ -2040,8 +2054,9 @@ impl App {
             theme: self.theme_name.clone(),
             opacity: self.opacity,
             font_size: self.font_logical,
-            font_family: self.font_family.clone(),
-            ui_font_family: self.ui_font_family.clone(),
+            // The CHOSEN families, never a fallback shown for a missing one.
+            font_family: self.font_family_chosen.clone(),
+            ui_font_family: self.ui_font_family_chosen.clone(),
             ui_font_size: self.ui_font_logical,
             corner_radius: self.corner_radius,
             summon_effect: self.summon_effect.to_config().to_string(),
@@ -2323,9 +2338,28 @@ impl App {
                             cfg.launch_at_login = self.launch_at_login;
                         }
                         self.apply_reloaded_config(cfg.clone(), &mut warnings);
+                        // The new baseline is the file as the app now holds it —
+                        // except a key skipped mid-drag: the FILE holds the edit,
+                        // and the drag's release must still be saved over it.
+                        let mut held = self.settings_snapshot();
+                        if self.dragging_slider {
+                            held.opacity = cfg.opacity;
+                        }
+                        if self.dragging_radius {
+                            held.corner_radius = cfg.corner_radius;
+                        }
+                        if self.dragging_dropdown {
+                            held.dropdown_height_pct = cfg.dropdown_height_pct;
+                        }
+                        if self.dragging_dropdown_width {
+                            held.dropdown_width_pct = cfg.dropdown_width_pct;
+                        }
+                        if self.active_fx_drag.is_some() {
+                            held.effects = cfg.effects.clone();
+                        }
                         // Records the observed hash too, so an identical later
                         // hand-save no-ops.
-                        self.persister.borrow_mut().note_reloaded(cfg, h);
+                        self.persister.borrow_mut().note_reloaded(held, h);
                     }
                     Err(syntax) => {
                         warnings.push(format!(
@@ -2386,7 +2420,9 @@ impl App {
         if (fs - self.font_logical).abs() > eps {
             self.set_font_size(fs);
         }
-        if cfg.font_family != self.font_family {
+        // Compared with the CHOSEN family: a missing one shows a fallback, which
+        // an unrelated reload must not flip back to the missing name.
+        if cfg.font_family != self.font_family_chosen {
             self.set_font_family(cfg.font_family.clone());
         }
         // UI (chrome) font size / family.
@@ -2394,7 +2430,7 @@ impl App {
         if (ufs - self.ui_font_logical).abs() > eps {
             self.set_ui_font_size(ufs);
         }
-        if cfg.ui_font_family != self.ui_font_family {
+        if cfg.ui_font_family != self.ui_font_family_chosen {
             self.set_ui_font_family(cfg.ui_font_family.clone());
         }
         // Corner radius — skip while dragging the radius slider (H4).
@@ -6397,6 +6433,7 @@ impl App {
     /// Change the font family at runtime. Updates `font_family`, tells the
     /// TextLayer to remeasure, then reflows and requests a redraw.
     fn set_font_family(&mut self, name: String) {
+        self.font_family_chosen = name.clone();
         self.font_family = name;
         if let Some(text) = &mut self.text {
             text.set_font_family(&self.font_family);
@@ -6482,6 +6519,7 @@ impl App {
     /// installed family). Does NOT reflow the grid/PTY (chrome family is
     /// orthogonal to cols/rows), so the hot/idle paths are untouched.
     fn set_ui_font_family(&mut self, name: String) {
+        self.ui_font_family_chosen = name.clone();
         self.ui_font_family = name;
         let fam = if self.ui_font_family.is_empty() {
             None
@@ -10118,6 +10156,8 @@ impl ApplicationHandler<AppEvent> for App {
                         "jetty: configured font family {:?} not found; falling back to {:?}",
                         self.font_family, fallback
                     );
+                    // Shown only: `font_family_chosen` (what is saved) keeps the
+                    // user's choice for when the font is installed again.
                     self.font_family = fallback;
                 }
             }
@@ -10185,6 +10225,7 @@ impl ApplicationHandler<AppEvent> for App {
                     "jetty: configured UI font {:?} not found; falling back to system sans",
                     self.ui_font_family
                 );
+                // Shown only — `ui_font_family_chosen` keeps (and saves) the choice.
                 self.ui_font_family.clear();
             }
             // Apply the (validated) UI family to the chrome layer (no rescan).
