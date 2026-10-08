@@ -24,6 +24,13 @@ fn pack_geom(cols: usize, rows: usize) -> u32 {
     ((cols.min(u16::MAX as usize) as u32) << 16) | (rows.min(u16::MAX as usize) as u32)
 }
 
+/// The ONE place the alacritty `Config` is built. `Term::set_options` replaces the
+/// whole config, so `new` and every runtime rebuild (scrollback, OSC 52, kitty
+/// keyboard) must go through here or a non-default field would silently revert.
+fn term_config(scrollback: usize, osc52: Osc52, kitty_keyboard: bool) -> Config {
+    Config { scrolling_history: scrollback, osc52, kitty_keyboard, ..Default::default() }
+}
+
 /// Turn a Kitty command's RAW payload (already base64-decoded and accumulated)
 /// into a decoded `InlineImage`: apply `o=z` zlib inflate if requested, then
 /// dispatch by `f=` format. `None` on any failure (correct-or-absent). Cold path.
@@ -449,6 +456,12 @@ pub struct Terminal {
     /// reverting an enabled paste back to the default `OnlyCopy`. Toggled by
     /// [`Terminal::set_osc52_allow_paste`].
     osc52_mode: Osc52,
+    /// Whether alacritty's kitty keyboard protocol support (`CSI ? u` query,
+    /// `CSI > u` push / `CSI < u` pop) is enabled. Off by default: an app that
+    /// pushes kitty flags expects kitty-encoded keys, so this must only be turned
+    /// on (via [`Terminal::set_kitty_keyboard`]) once the app's key encoder honors
+    /// [`Terminal::kitty_keyboard_flags`]. Carried through every `Config` rebuild.
+    kitty_keyboard: bool,
     /// The active scrollback-search query (what the user typed, capped at
     /// [`SEARCH_MAX_QUERY`] chars). Empty = no active search.
     search_query: String,
@@ -595,8 +608,8 @@ impl Terminal {
         // CopyPaste when the user opts in. Both `new` and `set_scrollback_lines`
         // build the Config with THIS value so a scrollback change never reverts it.
         let osc52_mode = Osc52::OnlyCopy;
-        let config =
-            Config { scrolling_history: scrollback_limit, osc52: osc52_mode, ..Default::default() };
+        let kitty_keyboard = false;
+        let config = term_config(scrollback_limit, osc52_mode, kitty_keyboard);
         let (tx, pty_write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         // Clone the sender for the synchronous scanner path (Kitty graphics
         // OK/error replies flow out through the same drain as async proxy replies).
@@ -669,6 +682,7 @@ impl Terminal {
             clipboard_load,
             clipboard_load_dirty,
             osc52_mode,
+            kitty_keyboard,
             search_query: String::new(),
             search_regex: None,
             search_matches: Vec::new(),
@@ -767,11 +781,57 @@ impl Terminal {
     /// even when unchanged), so callers may invoke it unconditionally at tab spawn.
     pub fn set_osc52_allow_paste(&mut self, allow: bool) {
         self.osc52_mode = if allow { Osc52::CopyPaste } else { Osc52::OnlyCopy };
-        self.term.set_options(Config {
-            scrolling_history: self.scrollback_limit,
-            osc52: self.osc52_mode,
-            ..Default::default()
-        });
+        self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, self.kitty_keyboard));
+    }
+
+    /// Enable or disable kitty keyboard protocol support (progressive enhancement:
+    /// `CSI ? u` query replies and the `CSI > u` / `CSI < u` flag stack). Turn it on
+    /// only when the key encoder consults [`Terminal::kitty_keyboard_flags`] — an
+    /// app that pushed flags expects kitty-encoded keys. A change clears both
+    /// screens' flag stacks (alacritty `set_options`). No-op when unchanged.
+    pub fn set_kitty_keyboard(&mut self, enabled: bool) {
+        if self.kitty_keyboard == enabled {
+            return;
+        }
+        self.kitty_keyboard = enabled;
+        self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, self.kitty_keyboard));
+    }
+
+    /// The kitty keyboard protocol flags the running app has currently pushed,
+    /// as the protocol's bit values: 1 disambiguate escape codes, 2 report event
+    /// types, 4 report alternate keys, 8 report all keys as escape codes, 16
+    /// report associated text. `0` when support is off or nothing is pushed (the
+    /// legacy encoding applies). The alt screen keeps its own stack (alacritty).
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        let m = self.term.mode();
+        let mut flags = 0u8;
+        if m.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+            flags |= 1;
+        }
+        if m.contains(TermMode::REPORT_EVENT_TYPES) {
+            flags |= 2;
+        }
+        if m.contains(TermMode::REPORT_ALTERNATE_KEYS) {
+            flags |= 4;
+        }
+        if m.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
+            flags |= 8;
+        }
+        if m.contains(TermMode::REPORT_ASSOCIATED_TEXT) {
+            flags |= 16;
+        }
+        flags
+    }
+
+    /// Whether the app enabled focus reporting (`\e[?1004h`): the host must then
+    /// write `\e[I` on focus-in and `\e[O` on focus-out.
+    pub fn focus_reporting(&self) -> bool {
+        self.term.mode().contains(TermMode::FOCUS_IN_OUT)
+    }
+
+    /// Whether the app requested UTF-8 extended mouse coordinates (`\e[?1005h`).
+    pub fn mouse_utf8(&self) -> bool {
+        self.term.mode().contains(TermMode::UTF8_MOUSE)
     }
 
     /// Replace the active theme at runtime. Also refreshes the copy shared with
@@ -792,11 +852,9 @@ impl Terminal {
     /// already-trimmed lines cannot be restored (new output accumulates up to
     /// the new limit).
     ///
-    /// Constraints (both must hold if either construction site changes):
-    /// * `set_options` replaces the ENTIRE alacritty `Config`, so this must use
-    ///   the exact same `..Default::default()` construction as `Terminal::new`;
-    ///   a future non-default field there must be mirrored here or it would be
-    ///   silently reverted.
+    /// Constraints:
+    /// * `set_options` replaces the ENTIRE alacritty `Config`; it is built by
+    ///   [`term_config`] (shared with `Terminal::new`) so no field reverts.
     /// * `set_options` also re-emits the CURRENT title (`Event::Title`/
     ///   `ResetTitle`) via the `EventProxy`. That is benign: the re-emitted
     ///   value equals what's already displayed (the app's apply path is a
@@ -805,11 +863,7 @@ impl Terminal {
         // Preserve the OSC 52 mode: `..Default::default()` would reset `osc52` to
         // OnlyCopy, silently reverting an enabled `osc52_allow_paste` on every
         // scrollback change (amendment O2). Carry the stored mode through.
-        self.term.set_options(Config {
-            scrolling_history: lines,
-            osc52: self.osc52_mode,
-            ..Default::default()
-        });
+        self.term.set_options(term_config(lines, self.osc52_mode, self.kitty_keyboard));
         // Keep the saturation model in lockstep with the live cap. A shrink can
         // pull us to/over the (smaller) cap; a grow can lift us back under it and
         // re-enable exact tracking for future marks.
@@ -2441,6 +2495,17 @@ impl Terminal {
         let pt = viewport_to_point(display_offset, Point::new(viewport_line, Column(col)));
         let side = if left_half { Side::Left } else { Side::Right };
         self.term.selection = Some(Selection::new(SelectionType::Simple, pt, side));
+    }
+
+    /// Start a SEMANTIC (word) selection at the given viewport cell — the
+    /// double-click gesture. alacritty expands it to the surrounding word, bounded
+    /// by its default semantic escape chars (whitespace, ``,│`|:"'()[]{}<>``);
+    /// [`Terminal::selection_update`] then extends it word by word. Replaces any
+    /// prior selection.
+    pub fn selection_start_semantic(&mut self, viewport_line: usize, col: usize) {
+        let display_offset = self.term.grid().display_offset();
+        let pt = viewport_to_point(display_offset, Point::new(viewport_line, Column(col)));
+        self.term.selection = Some(Selection::new(SelectionType::Semantic, pt, Side::Left));
     }
 
     /// Update the end of the current selection to the given viewport cell.
@@ -5131,6 +5196,110 @@ mod tests {
         buf.extend_from_slice(&red_rgba_2x2(""));
         t.feed(&buf);
         assert_eq!(t.placements.len(), 2, "both a sixel and a Kitty image placed");
+    }
+
+    // ── mode getters for the input layer (kitty keyboard / focus / mouse) ────
+
+    #[test]
+    fn kitty_keyboard_off_by_default_ignores_push() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[>1u"); // push "disambiguate"
+        assert_eq!(t.kitty_keyboard_flags(), 0, "support off ⇒ push ignored");
+        t.feed(b"\x1b[?u"); // query
+        assert!(t.drain_pty_writes().is_empty(), "no kitty reply while disabled");
+    }
+
+    #[test]
+    fn kitty_keyboard_push_pop_and_query_when_enabled() {
+        let mut t = Terminal::new(20, 5);
+        t.set_kitty_keyboard(true);
+        t.feed(b"\x1b[>1u");
+        assert_eq!(t.kitty_keyboard_flags(), 1, "disambiguate pushed");
+        t.feed(b"\x1b[>31u");
+        assert_eq!(t.kitty_keyboard_flags(), 31, "all five flags");
+        t.feed(b"\x1b[?u");
+        let reply = String::from_utf8_lossy(&t.drain_pty_writes()).to_string();
+        assert_eq!(reply, "\x1b[?31u", "query reports the current flags");
+        t.feed(b"\x1b[<u"); // pop one
+        assert_eq!(t.kitty_keyboard_flags(), 1, "pop restores the previous entry");
+        // A scrollback rebuild must not silently disable the protocol.
+        t.set_scrollback_lines(500);
+        t.feed(b"\x1b[?u");
+        assert!(!t.drain_pty_writes().is_empty(), "still enabled after a Config rebuild");
+    }
+
+    #[test]
+    fn focus_reporting_and_utf8_mouse_track_their_modes() {
+        let mut t = Terminal::new(20, 5);
+        assert!(!t.focus_reporting());
+        t.feed(b"\x1b[?1004h");
+        assert!(t.focus_reporting());
+        t.feed(b"\x1b[?1004l");
+        assert!(!t.focus_reporting());
+        assert!(!t.mouse_utf8());
+        t.feed(b"\x1b[?1005h");
+        assert!(t.mouse_utf8());
+    }
+
+    #[test]
+    fn semantic_selection_selects_the_word_under_the_cell() {
+        let mut t = Terminal::new(40, 3);
+        t.feed(b"cargo build --release");
+        t.selection_start_semantic(0, 7); // inside "build"
+        assert_eq!(t.selection_text().as_deref(), Some("build"));
+        // Extending to another word grows the selection word-wise.
+        t.selection_update(0, 15, true);
+        assert_eq!(t.selection_text().as_deref(), Some("build --release"));
+    }
+
+    /// CPU-only feed() throughput micro-benchmark (SPEED gate for the hot path).
+    /// Run: `cargo test -p jetty-core --release -- --ignored --nocapture bench_feed`.
+    /// Feeds each workload in 8 KiB chunks (the PTY reader's read size) into a
+    /// 120×40 terminal at the default 10k scrollback, so the saturated-history
+    /// path is what gets measured. Reports the best of 3 runs per workload.
+    #[test]
+    #[ignore]
+    fn bench_feed_throughput() {
+        fn make(unit: &[u8], total: usize) -> Vec<u8> {
+            let mut v = Vec::with_capacity(total + unit.len());
+            while v.len() < total {
+                v.extend_from_slice(unit);
+            }
+            v
+        }
+        const TOTAL: usize = 48 * 1024 * 1024;
+        let long_line = {
+            let mut s = "abcdefghij".repeat(12);
+            s.truncate(118);
+            s.push_str("\r\n");
+            s
+        };
+        let color = b"\x1b[1;32mINFO\x1b[0m \x1b[38;5;208mcompiling\x1b[0m crate v1.2.3 (\x1b[4m/src/lib.rs\x1b[24m)\r\n";
+        let workloads: Vec<(&str, Vec<u8>, bool)> = vec![
+            ("yes (y\\r\\n)", make(b"y\r\n", TOTAL), false),
+            ("long 120-col lines", make(long_line.as_bytes(), TOTAL), false),
+            ("ESC-heavy colored", make(color, TOTAL), false),
+            ("ESC-heavy + OSC133 marks live", make(color, TOTAL), true),
+            ("yes + OSC133 marks live", make(b"y\r\n", TOTAL), true),
+        ];
+        for (name, data, marks) in &workloads {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let mut t = Terminal::new(120, 40);
+                if *marks {
+                    t.feed(b"\x1b]133;A\x07\x1b]133;C\x07");
+                }
+                let start = std::time::Instant::now();
+                for chunk in data.chunks(8192) {
+                    t.feed(chunk);
+                }
+                let secs = start.elapsed().as_secs_f64();
+                best = best.min(secs);
+                std::hint::black_box(t.scroll_max());
+            }
+            let mbps = data.len() as f64 / (1024.0 * 1024.0) / best;
+            println!("BENCH {name:<32} {mbps:>8.1} MB/s");
+        }
     }
 
     #[test]
