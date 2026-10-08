@@ -4,6 +4,7 @@
 //! text is ellipsized instead of running past the window edge.
 
 use crate::chrome::{fit_head, ChromeMeasure, ChromeMetrics};
+use crate::ui_palette::{rgba, UiPalette};
 use crate::Rect;
 
 /// A faint lifted band across the window bottom with its text right-aligned.
@@ -26,25 +27,17 @@ pub fn build_status_strip(
     m: &mut dyn ChromeMeasure,
     cm: ChromeMetrics,
 ) -> StatusStrip {
-    let tb = theme.bg;
-    let tf = theme.fg;
-    // Theme-derived: a faint lifted strip + dim text (the bg→fg surface
-    // language of the rest of the chrome).
-    let nl = |t: f32| -> [u8; 3] {
-        [
-            (tb[0] as f32 + (tf[0] as f32 - tb[0] as f32) * t) as u8,
-            (tb[1] as f32 + (tf[1] as f32 - tb[1] as f32) * t) as u8,
-            (tb[2] as f32 + (tf[2] as f32 - tb[2] as f32) * t) as u8,
-        ]
-    };
+    // Theme-derived: a faint lifted strip (the chrome surface) + dim text that
+    // still reads on it (hint-grade, ≥ 3:1 — the fixed half blend didn't on
+    // light themes).
+    let ui = UiPalette::cached(theme);
     let w = win_w as f32;
-    let band = nl(0.05);
     let quad = Rect {
         x: 0.0,
         y: strip_y,
         w,
         h: status_h,
-        color: [band[0], band[1], band[2], 255],
+        color: rgba(ui.surface, 255),
         ..Default::default()
     };
     let label = text.filter(|t| !t.is_empty()).map(|t| {
@@ -52,7 +45,7 @@ pub fn build_status_strip(
         let left_pad = cm.px(8.0);
         let shown = fit_head(m, t, (w - right_pad - left_pad).max(0.0), false);
         let x = (w - m.text_w(&shown) - right_pad).max(left_pad);
-        (shown, x, strip_y + (status_h - cm.text_h()) / 2.0, nl(0.5))
+        (shown, x, strip_y + (status_h - cm.text_h()) / 2.0, ui.text_hint)
     });
     StatusStrip { quad, label }
 }
@@ -83,9 +76,11 @@ pub fn build_toast_pill(
     let pill_h = cm.pill_h();
     let pill_x = ((w - pill_w) / 2.0).max(0.0);
     let pill_y = (bottom - pill_h).max(0.0) + y_offset;
-    let c = theme.cursor;
-    let quad = Rect::rounded(pill_x, pill_y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0);
-    let label = (shown, pill_x + pad, pill_y + (pill_h - cm.text_h()) / 2.0, [20, 20, 20]);
+    // The pill keeps the theme's cursor color; its text is that fill's own
+    // readable color (a fixed near-black read 1.0–1.6:1 on dark-cursor themes).
+    let ui = UiPalette::cached(theme);
+    let quad = Rect::rounded(pill_x, pill_y, pill_w, pill_h, rgba(ui.cursor, 235), pill_h / 2.0);
+    let label = (shown, pill_x + pad, pill_y + (pill_h - cm.text_h()) / 2.0, ui.on_cursor);
     ToastPill { quad, label }
 }
 
@@ -115,6 +110,23 @@ mod tests {
         assert_eq!(p.quad.w, m.text_w(HINT) + 28.0);
         assert_eq!(p.quad.y, 604.0 - 26.0);
         assert!(build_status_strip(1000, 0.0, 22.0, None, &theme(), &mut m, cm).label.is_none());
+    }
+
+    #[test]
+    fn strip_and_pill_text_read_on_every_theme() {
+        use crate::colors::contrast_ratio as cr;
+        let rgb = |c: [u8; 4]| [c[0], c[1], c[2]];
+        let cm = ChromeMetrics::DEFAULT;
+        for i in 0..jetty_core::theme::PRESETS.len() {
+            let t = jetty_core::theme::theme_at(i);
+            let mut m = MonoMeasure(9.6);
+            let s = build_status_strip(1000, 618.0, 22.0, Some(PERF), &t, &mut m, cm);
+            let c = cr(s.label.unwrap().3, rgb(s.quad.color));
+            assert!(c >= 3.0, "{}: status text {c}", t.name);
+            let p = build_toast_pill(1000, 604.0, 0.0, HINT, &t, &mut m, cm);
+            let c = cr(p.label.3, rgb(p.quad.color));
+            assert!(c >= 4.5, "{}: pill text {c}", t.name);
+        }
     }
 
     #[test]

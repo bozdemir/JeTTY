@@ -1,4 +1,5 @@
 use crate::chrome::{ChromeMeasure, ChromeMetrics};
+use crate::ui_palette::{ensure_contrast, mix, rgba, UiPalette};
 use crate::Rect;
 
 /// The six clickable items in the right-click context menu, in display order.
@@ -163,31 +164,21 @@ pub fn build_menu(
         })
         .fold(cm.px(MENU_W), f32::max);
 
-    // --- Theme-derived menu colors (mirrors panel.rs::build_panel) ---
-    let tbg = theme.bg;
-    let tfg = theme.fg;
-    let accent = theme.palette[4]; // blue accent → hover highlight
-    let lerp = |t: f32| -> [u8; 3] {
-        [
-            (tbg[0] as f32 + (tfg[0] as f32 - tbg[0] as f32) * t).round() as u8,
-            (tbg[1] as f32 + (tfg[1] as f32 - tbg[1] as f32) * t).round() as u8,
-            (tbg[2] as f32 + (tfg[2] as f32 - tbg[2] as f32) * t).round() as u8,
-        ]
-    };
-    let bg3 = lerp(0.06);
-    let menu_bg: [u8; 4] = [bg3[0], bg3[1], bg3[2], 242];
-    let row3 = lerp(0.10);
-    let row_bg: [u8; 4] = [row3[0], row3[1], row3[2], 255];
-    let border3 = lerp(0.30);
-    let border_col: [u8; 4] = [border3[0], border3[1], border3[2], 255];
-    let hover_col: [u8; 4] = [accent[0], accent[1], accent[2], 255];
-    let text_col = lerp(0.85);
-    // Dim color for shortcut hints and the separator line.
-    let hint_col = lerp(0.40);
-    let sep_col: [u8; 4] = {
-        let c = lerp(0.20);
-        [c[0], c[1], c[2], 200]
-    };
+    // --- Theme-derived menu colors (the shared UiPalette) ---
+    let ui = UiPalette::cached(theme);
+    let menu_bg = rgba(ui.surface, 242);
+    let row_bg = rgba(ui.shade(0.10), 255);
+    let border_col = rgba(ui.border, 255);
+    let hover_col = rgba(ui.accent, 255);
+    let text_col = ui.text;
+    // Dim color for shortcut hints and disabled rows.
+    let hint_col = ui.text_hint;
+    let sep_col = rgba(ui.shade(0.20), 200);
+    // The hovered row sits on the accent: its label takes the accent's own text
+    // color (it used to keep the surface's label color — 1.0–1.7:1 on 20 of 22
+    // themes) and its hint a dimmer shade of that, still ≥ 3:1.
+    let hover_text = ui.on_accent;
+    let hover_hint = ensure_contrast(mix(ui.on_accent, ui.accent, 0.3), &[ui.accent], UiPalette::HINT_FLOOR);
 
     // Clamp so the full menu (plus border) stays on-screen.
     let total_w = menu_w + border * 2.0;
@@ -260,16 +251,24 @@ pub fn build_menu(
     // Labels: item name (left-aligned) + shortcut hint (right-aligned, dim).
     // Disabled rows draw the LABEL in the dim hint color too (grayed).
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();
+    let hovered_row = hovered.filter(|&h| h < n_items && !disabled.contains(&h));
     for (i, &(name, hint)) in items.iter().enumerate() {
         let label_y = cy + row_y(i) + cm.px(7.0); // 7 design px from the row top
-        let label_col = if disabled.contains(&i) { hint_col } else { text_col };
+        let on_hover = hovered_row == Some(i);
+        let label_col = if disabled.contains(&i) {
+            hint_col
+        } else if on_hover {
+            hover_text
+        } else {
+            text_col
+        };
         labels.push((name.to_string(), cx + hpad, label_y, label_col));
 
         if !hint.is_empty() {
             // Right-align the shortcut hint flush with the right padding, by its
             // MEASURED width (the ⇧ ⌃ ⌘ glyphs are not one ASCII cell each).
             let hint_x = cx + menu_w - hpad - measured[i].1;
-            labels.push((hint.to_string(), hint_x, label_y, hint_col));
+            labels.push((hint.to_string(), hint_x, label_y, if on_hover { hover_hint } else { hint_col }));
         }
     }
 
@@ -538,6 +537,26 @@ mod tests {
             build_context_menu(50.0, 50.0, 1280, 800, Some(1), &theme(), &mut mono(), CM, &MENU_HINTS, &dis);
         assert_eq!(menu2.quads.len(), 4, "enabled hover keeps its quad");
         assert_eq!(menu2.quads[2].y, menu2.item_rects[1].y);
+    }
+
+    #[test]
+    fn every_label_reads_on_its_row_on_every_theme() {
+        // The hovered label sits on the accent; the others on the menu surface.
+        // Disabled rows and hints are hint-grade (3:1), labels text-grade (4.5:1).
+        use crate::colors::contrast_ratio as cr;
+        for i in 0..jetty_core::theme::PRESETS.len() {
+            let t = jetty_core::theme::theme_at(i);
+            let menu = build_context_menu(50.0, 50.0, 1280, 800, Some(1), &t, &mut mono(), CM, &MENU_HINTS, &[0]);
+            let surface = [menu.quads[1].color[0], menu.quads[1].color[1], menu.quads[1].color[2]];
+            let hover = [menu.quads[2].color[0], menu.quads[2].color[1], menu.quads[2].color[2]];
+            let col = |text: &str| menu.labels.iter().find(|l| l.0 == text).unwrap().3;
+            let n = &t.name;
+            assert!(cr(col("Paste"), hover) >= 4.5, "{n}: hovered label {}", cr(col("Paste"), hover));
+            assert!(cr(col("⇧⌃V"), hover) >= 3.0, "{n}: hovered hint {}", cr(col("⇧⌃V"), hover));
+            assert!(cr(col("Select All"), surface) >= 4.5, "{n}: label {}", cr(col("Select All"), surface));
+            assert!(cr(col("⇧⌃W"), surface) >= 3.0, "{n}: hint {}", cr(col("⇧⌃W"), surface));
+            assert!(cr(col("Copy"), surface) >= 3.0, "{n}: disabled label {}", cr(col("Copy"), surface));
+        }
     }
 
     #[test]

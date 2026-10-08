@@ -1,4 +1,5 @@
 use crate::chrome::{fit_head, ChromeMeasure, ChromeMetrics};
+use crate::ui_palette::{rgba, UiPalette};
 use crate::Rect;
 
 /// Geometry + draw data for a confirmation popup. Reuses the overlay/panel
@@ -34,25 +35,16 @@ pub fn build_confirm(
     let sw = win_w as f32;
     let sh = win_h as f32;
 
-    // --- Theme-derived popup colors (mirrors panel.rs::build_panel) ---
-    let tbg = theme.bg;
-    let tfg = theme.fg;
-    let green = theme.palette[2]; // confirm button = theme green
-    let lerp = |t: f32| -> [u8; 3] {
-        [
-            (tbg[0] as f32 + (tfg[0] as f32 - tbg[0] as f32) * t).round() as u8,
-            (tbg[1] as f32 + (tfg[1] as f32 - tbg[1] as f32) * t).round() as u8,
-            (tbg[2] as f32 + (tfg[2] as f32 - tbg[2] as f32) * t).round() as u8,
-        ]
-    };
-    let bg3 = lerp(0.06);
-    let panel_bg: [u8; 4] = [bg3[0], bg3[1], bg3[2], 242];
-    let border3 = lerp(0.30);
-    let border_col: [u8; 4] = [border3[0], border3[1], border3[2], 255];
-    let text_col = tfg;
-    let close_btn: [u8; 4] = [green[0], green[1], green[2], 255];
-    let cancel3 = lerp(0.18);
-    let cancel_btn: [u8; 4] = [cancel3[0], cancel3[1], cancel3[2], 255];
+    // --- Theme-derived popup colors (the shared UiPalette) ---
+    let ui = UiPalette::cached(theme);
+    let panel_bg = rgba(ui.surface, 242);
+    let border_col = rgba(ui.border, 255);
+    let text_col = ui.text;
+    // Confirm = the theme's green with ITS text color (a fixed near-white label
+    // read under 3:1 on 19 of 22 themes); Cancel = a raised neutral.
+    let close_btn = rgba(ui.success, 255);
+    let close_text = ui.on_success;
+    let cancel_btn = rgba(ui.surface_hi, 255);
 
     // Design px (16pt UI font, 1×), scaled by the chrome unit.
     let pad = cm.px(20.0);
@@ -99,7 +91,7 @@ pub fn build_confirm(
 
     let mut quads: Vec<Rect> = Vec::new();
     // Full-screen dim.
-    quads.push(Rect { x: 0.0, y: 0.0, w: sw, h: sh, color: [0, 0, 0, 150], ..Default::default() });
+    quads.push(Rect { x: 0.0, y: 0.0, w: sw, h: sh, color: ui.scrim, ..Default::default() });
     // Border (rounded).
     quads.push(Rect::rounded(
         px - 2.0, py - 2.0, panel_w + 4.0, panel_h + 4.0,
@@ -125,7 +117,7 @@ pub fn build_confirm(
         let cancel_rect = Rect::rounded(x, btn_y, stacked_btn_w, btn_h, cancel_btn, cm.px(5.0));
         let label_room = (stacked_btn_w - 2.0 * btn_label_pad).max(0.0);
         for (label, y, col) in [
-            (close_label, close_y, [245, 245, 245]),
+            (close_label, close_y, close_text),
             (cancel_label, btn_y, text_col),
         ] {
             let shown = fit_head(m, label, label_room, false);
@@ -140,9 +132,9 @@ pub fn build_confirm(
         let close_rect = Rect::rounded(btn_x0, btn_y, btn_close_w, btn_h, close_btn, cm.px(5.0));
         let cancel_x = btn_x0 + btn_close_w + btn_gap;
         let cancel_rect = Rect::rounded(cancel_x, btn_y, btn_cancel_w, btn_h, cancel_btn, cm.px(5.0));
-        // Button labels: white-on-green for Close, theme fg for Cancel.
+        // Button labels: the green's own text color for Close, the text for Cancel.
         let btn_text_y = btn_y + cm.px(6.0);
-        labels.push((close_label.to_string(), btn_x0 + btn_label_pad, btn_text_y, [245, 245, 245]));
+        labels.push((close_label.to_string(), btn_x0 + btn_label_pad, btn_text_y, close_text));
         labels.push((cancel_label.to_string(), cancel_x + btn_label_pad, btn_text_y, text_col));
         (close_rect, cancel_rect)
     };
@@ -263,6 +255,26 @@ mod tests {
         let p = build_confirm(1000, 700, "Quit JeTTY? — all tabs will close", &theme(), &mut mono(), CM);
         assert_eq!(p.close_rect.y, p.cancel_rect.y);
         assert_eq!(p.labels.len(), 3);
+    }
+
+    #[test]
+    fn buttons_and_prompt_read_on_every_theme() {
+        use crate::colors::contrast_ratio as cr;
+        let rgb = |c: [u8; 4]| [c[0], c[1], c[2]];
+        for i in 0..jetty_core::theme::PRESETS.len() {
+            let t = jetty_core::theme::theme_at(i);
+            let p = build_confirm(1000, 700, "Quit JeTTY? — all tabs will close", &t, &mut mono(), CM);
+            let col = |text: &str| p.labels.iter().find(|l| l.0 == text).unwrap().3;
+            let n = &t.name;
+            let close = cr(col("Enter — Close"), rgb(p.close_rect.color));
+            assert!(close >= 4.5, "{n}: Close label {close}");
+            let cancel = cr(col("Esc — Cancel"), rgb(p.cancel_rect.color));
+            assert!(cancel >= 4.5, "{n}: Cancel label {cancel}");
+            let prompt = cr(p.labels[0].3, rgb(p.panel.color));
+            assert!(prompt >= 4.5, "{n}: prompt {prompt}");
+            // The modal dim comes from the palette (lighter on light themes).
+            assert_eq!(p.quads[0].color, UiPalette::cached(&t).scrim);
+        }
     }
 
     #[test]

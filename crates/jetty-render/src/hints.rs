@@ -2,13 +2,14 @@
 //! (Ctrl+Shift+Space).
 //!
 //! Same surface language as `search_bar.rs` / `help.rs`: all colors derive from
-//! the active theme (bg→accent lerp, no hardcoded RGB), metrics scale with the
+//! the active theme (its `UiPalette`, no hardcoded RGB), metrics scale with the
 //! chrome unit (DPI × UI font) and label widths are MEASURED as drawn, so both
 //! overlays are HiDPI- and proportional-font-correct. Nothing here self-drives frames — the app draws
 //! these only while a mode is active, once per event-driven redraw.
 
 use crate::chrome::{ChromeMeasure, ChromeMetrics};
 use crate::quad::SCROLLBAR_W;
+use crate::ui_palette::{ensure_contrast, mix, rgba, UiPalette};
 use crate::Rect;
 
 /// Geometry + draw data for the hint-mode label chips.
@@ -43,26 +44,15 @@ pub fn build_hint_overlay(
     typed: &str,
     win_w: u32,
 ) -> HintOverlay {
-    let bg = theme.bg;
-    let accent = theme.palette[3];
-    // bg→accent blend for the chip fill (bright, opaque — like a search hit).
-    let chip = |t: f32| -> [u8; 4] {
-        [
-            (bg[0] as f32 + (accent[0] as f32 - bg[0] as f32) * t).round() as u8,
-            (bg[1] as f32 + (accent[1] as f32 - bg[1] as f32) * t).round() as u8,
-            (bg[2] as f32 + (accent[2] as f32 - bg[2] as f32) * t).round() as u8,
-            255,
-        ]
-    };
-    let chip_bg = chip(0.9);
-    // Dark text (theme bg, RGB only) reads clearly on the bright chip; the
-    // consumed prefix is a mid blend so narrowing is visible.
-    let text_full = [bg[0], bg[1], bg[2]];
-    let text_typed = [
-        (bg[0] as f32 + (accent[0] as f32 - bg[0] as f32) * 0.4).round() as u8,
-        (bg[1] as f32 + (accent[1] as f32 - bg[1] as f32) * 0.4).round() as u8,
-        (bg[2] as f32 + (accent[2] as f32 - bg[2] as f32) * 0.4).round() as u8,
-    ];
+    // Chip fill: a strong bg→ANSI-yellow blend (bright, opaque — like a search
+    // hit). Its label takes the fill's own readable color (the theme bg alone
+    // fell to ~2.7:1 on light themes' darker yellows); the consumed prefix is a
+    // dimmer shade of it, still ≥ 3:1, so narrowing stays visible.
+    let ui = UiPalette::cached(theme);
+    let chip_rgb = mix(ui.bg, theme.palette[3], 0.9);
+    let chip_bg = rgba(chip_rgb, 255);
+    let text_full = ui.on_fill(chip_rgb);
+    let text_typed = ensure_contrast(mix(text_full, chip_rgb, 0.45), &[chip_rgb], UiPalette::HINT_FLOOR);
 
     let vscale = cm.overlay_u();
     let pad_x = (3.0 * vscale).max(2.0);
@@ -142,13 +132,14 @@ pub fn build_copy_pill(
     let x = 8.0f32.min((win_w as f32 - pill_w - 8.0).max(0.0));
     let y = grid_top + 8.0;
 
-    let c = theme.cursor;
-    let pill = Rect::rounded(x, y, pill_w, pill_h, [c[0], c[1], c[2], 235], pill_h / 2.0);
+    // The theme's cursor color with that fill's own readable text (the theme bg
+    // read 2.6:1 on Palenight's purple cursor).
+    let ui = UiPalette::cached(theme);
+    let pill = Rect::rounded(x, y, pill_w, pill_h, rgba(ui.cursor, 235), pill_h / 2.0);
     let ty = y + (pill_h - text_h) / 2.0;
-    let tb = theme.bg;
     CopyPill {
         quads: vec![pill],
-        labels: vec![(text, x + pad, ty, [tb[0], tb[1], tb[2]])],
+        labels: vec![(text, x + pad, ty, ui.on_cursor)],
     }
 }
 
@@ -253,6 +244,24 @@ mod tests {
         // Pill fits a narrow window.
         let pn = build_copy_pill(200, 10.0, &theme(), &mut mono(), CM, false, false);
         assert!(pn.quads[0].x + pn.quads[0].w <= 200.0 + 0.5, "pill overflows narrow window");
+    }
+
+    #[test]
+    fn chips_and_pill_read_on_every_theme() {
+        use crate::colors::contrast_ratio as cr;
+        let rgb = |c: [u8; 4]| [c[0], c[1], c[2]];
+        for i in 0..jetty_core::theme::PRESETS.len() {
+            let t = jetty_core::theme::theme_at(i);
+            let ov = build_hint_overlay(&[("sd", 0, 5)], 9.0, 18.0, 0.0, &t, &mut mono(), CM, "s", 1000);
+            let chip = rgb(ov.quads[0].color);
+            let (typed, rest) = (ov.labels[0].3, ov.labels[1].3);
+            assert!(cr(rest, chip) >= 4.5, "{}: chip label {}", t.name, cr(rest, chip));
+            assert!(cr(typed, chip) >= 3.0, "{}: typed prefix {}", t.name, cr(typed, chip));
+            assert_ne!(typed, rest, "{}: the typed prefix must look consumed", t.name);
+            let p = build_copy_pill(1000, 36.0, &t, &mut mono(), CM, false, false);
+            let c = cr(p.labels[0].3, rgb(p.quads[0].color));
+            assert!(c >= 4.5, "{}: COPY pill {c}", t.name);
+        }
     }
 
     #[test]
