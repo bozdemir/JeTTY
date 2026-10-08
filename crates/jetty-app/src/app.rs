@@ -451,6 +451,147 @@ fn shift_hint_live_in<I: PartialEq>(
     hint.is_some_and(|(t, wid)| wid == id && now < t)
 }
 
+/// What the perf HUD's idle one-shot owes the loop this iteration. After the
+/// last ACTIVE frame the loop wakes ONCE (`perf_idle_at`) to repaint the HUD as
+/// an honest "idle" reading, then goes fully idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleHud {
+    /// Nothing owed: HUD off, idle state already painted, never armed, or the
+    /// window is not effectively visible.
+    Nothing,
+    /// The deadline passed: request the single idle repaint now.
+    RepaintNow,
+    /// Wake exactly once at this (future) deadline.
+    WakeAt(std::time::Instant),
+}
+
+/// Pure decision behind [`IdleHud`]. Only an EFFECTIVELY VISIBLE window (shown
+/// AND not occluded) may schedule the repaint: a hidden window's
+/// `RedrawRequested` early-returns before `perf_idle_shown` is set, and winit's
+/// X11 loop delivers redraws to unmapped windows, so requesting it while hidden
+/// re-requested it on every iteration — one core pinned at 100% for as long as
+/// the window stayed hidden. An elapsed deadline must not reach `WaitUntil`
+/// either (a past `WaitUntil` returns immediately → the same spin).
+fn perf_idle_decision(
+    show_hud: bool,
+    idle_shown: bool,
+    idle_at: Option<std::time::Instant>,
+    effectively_visible: bool,
+    now: std::time::Instant,
+) -> IdleHud {
+    match idle_at {
+        Some(d) if show_hud && !idle_shown && effectively_visible => {
+            if now >= d {
+                IdleHud::RepaintNow
+            } else {
+                IdleHud::WakeAt(d)
+            }
+        }
+        _ => IdleHud::Nothing,
+    }
+}
+
+/// What an F9 / `jetty --toggle` / launcher press does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToggleAction {
+    Show,
+    Hide,
+    /// Visible but not in front of the user: raise + focus instead of hiding.
+    Raise,
+}
+
+/// How long a refused raise keeps counting: a toggle within this window of a
+/// raise whose focus never arrived hides instead of raising again.
+const RAISE_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Pure toggle decision. Hiding is right only when the user is LOOKING at the
+/// terminal (shown, focused, not occluded). A window that is shown but behind
+/// other windows or unfocused (`focus_autohide = false` leaves it up after the
+/// user clicks elsewhere) is RAISED instead — the old `!visible` toggle hid it,
+/// so getting it back took a second press. If the compositor refuses the raise
+/// (focus never arrives, e.g. Wayland without an activation token), the next
+/// press within [`RAISE_RETRY_WINDOW`] hides, so the key can never get stuck
+/// re-raising a window it cannot focus.
+fn toggle_action(
+    visible: bool,
+    focused: bool,
+    occluded: bool,
+    last_raise: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> ToggleAction {
+    if !visible {
+        return ToggleAction::Show;
+    }
+    if focused && !occluded {
+        return ToggleAction::Hide;
+    }
+    match last_raise {
+        Some(t) if now.saturating_duration_since(t) < RAISE_RETRY_WINDOW => ToggleAction::Hide,
+        _ => ToggleAction::Raise,
+    }
+}
+
+/// Retry state for a frame whose swapchain acquire failed (`acquire_frame()` →
+/// `None`: Outdated, Lost, Timeout, Occluded, Validation). Without it a failed
+/// acquire on the LAST damage-driven frame left the screen stale until some
+/// unrelated event; re-requesting blindly would spin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AcquireRetry {
+    /// When the next attempt is due.
+    pub(crate) due: std::time::Instant,
+    /// 0 for the first retry; drives the backoff.
+    pub(crate) attempt: u32,
+}
+
+/// The next retry after a failed acquire (or a retry that is being issued now):
+/// the next frame (16 ms), then doubling up to a 1 s ceiling that repeats while
+/// the surface stays broken — bounded wakes, never a spin, never a permanently
+/// stale screen.
+pub(crate) fn next_acquire_retry(
+    prev: Option<AcquireRetry>,
+    now: std::time::Instant,
+) -> AcquireRetry {
+    let attempt = prev.map_or(0, |r| r.attempt.saturating_add(1));
+    let ms = (16u64 << attempt.min(6)).min(1000);
+    AcquireRetry { due: now + std::time::Duration::from_millis(ms), attempt }
+}
+
+/// Wall-clock expiry of a self-driven animation that started at `start` and
+/// lasts `secs` (≤ 0 = ends at once). Animations end by TIME in `about_to_wait`,
+/// not only inside a successfully presented frame, so a window whose swapchain
+/// acquire keeps failing (macOS ordered-out, a Wayland Timeout, the no-GPU
+/// fallback) can never pin the loop in `Poll`.
+fn anim_expired(start: std::time::Instant, secs: f32, now: std::time::Instant) -> bool {
+    secs <= 0.0 || now.saturating_duration_since(start).as_secs_f32() >= secs
+}
+
+/// Grace between a PTY-bound keystroke and its FALLBACK paint. The keystroke
+/// itself does not paint: the shell's echo (drained a few ms later — zsh
+/// highlighters and autosuggestions included) paints the frame that shows it.
+/// Painting on the key rendered a frame WITHOUT the echo, and the echo frame
+/// then queued a vsync behind it (+1 frame of keypress→glyph latency). The
+/// deadline only matters for keys that produce no output (a password prompt,
+/// the snap back to the bottom from scrollback) — 25 ms is below perception.
+const KEY_ECHO_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Whether a caret-flash burst may drive continuous (`Poll`) frames: only once
+/// its FIRST frame was painted by the echo (or the grace fallback) — otherwise
+/// the `Poll` would render exactly the pre-echo frame the deferral avoids.
+fn caret_drives_frames(
+    caret_anim: Option<std::time::Instant>,
+    key_paint_due: Option<std::time::Instant>,
+) -> bool {
+    caret_anim.is_some() && key_paint_due.is_none()
+}
+
+/// Whether the user is watching THIS main tab: only the ACTIVE tab of a
+/// watched main window is on screen. A background tab's completion must notify
+/// even while the user looks at another tab of a focused window (its activity
+/// dot is easy to miss).
+fn main_tab_watched(main_watching: bool, tab: usize, active: usize) -> bool {
+    main_watching && tab == active
+}
+
 // The Settings window size is DERIVED at runtime from the panel's scaled size —
 // see `App::desired_settings_logical_size` — so it fits ANY UI font (size or
 // family), not just the default; the window is also user-resizable.
@@ -610,15 +751,18 @@ pub struct App {
     /// Shell to launch (the `shell` config key). Empty = auto-detect
     /// ($SHELL → passwd → /bin/bash); a path forces that shell.
     shell: String,
+    /// Cached "the window's top edge touches its monitor's top" (drives the
+    /// square top corners in Dropdown mode). On X11 `outer_position()` is a
+    /// blocking server round-trip, so this is recomputed only when
+    /// `top_flush_dirty` (set by Moved / Resized / ScaleFactorChanged / a
+    /// summon) — never per frame — and never mid-slide (the slide is a content
+    /// y-offset; the window itself does not move).
+    top_flush_pos: bool,
+    /// The window may have moved since `top_flush_pos` was computed.
+    top_flush_dirty: bool,
     /// Cached tab-bar metadata (title, is-active), rebuilt only when the tab
     /// titles or the active index change. Avoids cloning every tab title on
     /// every RedrawRequested (incl. animation frames) — speed-first hot path.
-    /// Cached "window top-flush against the monitor" flag (drives top-corner
-    /// rounding in Dropdown mode). Recomputed only on non-animating frames so the
-    /// outer_position()/current_monitor() syscalls don't run ~60fps during a
-    /// dropdown slide (the window doesn't move during the slide — it's a content
-    /// y-offset), and reused from the cache while sliding.
-    cached_top_flush: bool,
     cached_tabs_meta: Vec<(String, bool)>,
     /// Signature (hash of titles + active index) of `cached_tabs_meta`; when it
     /// differs from the live signature, the cache is rebuilt.
@@ -635,6 +779,10 @@ pub struct App {
     /// this — it stays set to the main id after focus leaves when auto-hide is
     /// off). Drives the unfocused-hollow cursor.
     main_focused: bool,
+    /// When a toggle last RAISED (rather than hid) the visible-but-unfocused main
+    /// window. Cleared when focus arrives; a toggle within `RAISE_RETRY_WINDOW`
+    /// of a raise that never got focus hides instead (see `toggle_action`).
+    raise_attempt_at: Option<std::time::Instant>,
     /// Set when the Settings window gains focus; consumed by the main window's
     /// Focused(false) to suppress auto-hide even when X11 delivers the main
     /// Focused(false) BEFORE the settings Focused(true) (the last_focused_window
@@ -665,12 +813,24 @@ pub struct App {
     /// self-schedules frames while an animate toggle is on (see `crt_anim_live`).
     crt_clock: std::time::Instant,
     /// Start instant of the active summon (crystallize) animation, or None when
-    /// idle. While Some, the redraw loop self-drives frames; None = idle 0 CPU.
+    /// idle. While Some (and the window is effectively visible) `about_to_wait`
+    /// pumps frames; it ends by wall clock there (`anim_expired`) as well as in
+    /// the frame that reaches t ≥ 1. None = idle 0 CPU.
     summon_anim: Option<std::time::Instant>,
     /// Start instant of the active caret flash+pulse animation, or None when idle.
-    /// Set on every printable keystroke (re-armed each time); cleared when t≥1.
-    /// While Some, the redraw loop self-drives frames via Poll; None = idle 0 CPU.
+    /// Set on every printable keystroke (re-armed each time); ends by wall clock
+    /// in `about_to_wait` or in the frame that reaches t ≥ 1. While Some it pumps
+    /// frames via Poll — but only after its first frame (`key_paint_due`).
     caret_anim: Option<std::time::Instant>,
+    /// Fallback paint deadline for the latest PTY-bound keystroke in the MAIN
+    /// window (`KEY_ECHO_GRACE` after it). The keystroke does not paint; the echo
+    /// does. Cleared by any main frame; if the echo never comes (no-output key)
+    /// `about_to_wait` paints once at the deadline.
+    key_paint_due: Option<std::time::Instant>,
+    /// Backoff for the main window after `acquire_frame()` failed (see
+    /// `AcquireRetry`); `None` while frames present normally. While `Some`,
+    /// continuous animation is suspended and the retry schedule paints instead.
+    acquire_retry: Option<AcquireRetry>,
     /// Set when a summon is requested; the summon clock (`summon_anim`) starts on
     /// the first redraw AFTER the window is actually shown. On macOS a freshly
     /// shown window can take a beat to present — starting the clock at
@@ -1337,12 +1497,14 @@ impl App {
             launch_at_login: false,
             summon_hotkey: "F9".to_string(),
             shell: String::new(),
-            cached_top_flush: false,
+            top_flush_pos: false,
+            top_flush_dirty: true,
             cached_tabs_meta: Vec::new(),
             cached_tabs_sig: u64::MAX,
             applied_main_os_title: "JeTTY".to_string(),
             last_focused_window: None,
             main_focused: false,
+            raise_attempt_at: None,
             switching_to_settings: false,
             switching_to_detached: false,
             pending_autohide_at: None,
@@ -1352,6 +1514,8 @@ impl App {
             crt_clock: std::time::Instant::now(),
             summon_anim: None,
             caret_anim: None,
+            key_paint_due: None,
+            acquire_retry: None,
             summon_pending: false,
             summon_settle_until: None,
             settings_paint_until: None,
@@ -2955,11 +3119,31 @@ impl App {
     /// `self.visible && !self.main_occluded`, sync-flush `main_visible`, etc.) and
     /// at the `RedrawRequested` `!self.visible` early-out — they MUST stay there
     /// verbatim. Category-D animation continuation is driven by RAW `request_redraw`
-    /// in `about_to_wait` / the render tail and deliberately does NOT route here.
+    /// in `about_to_wait` only (the render tails no longer self-drive) and
+    /// deliberately does NOT route here.
     fn request_main_paint(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    /// Repaint whichever JeTTY window `id` names, if it is EFFECTIVELY VISIBLE
+    /// (main: shown and not occluded; detached: not occluded). A window that is
+    /// gone or hidden is a no-op — it repaints on its own when it comes back.
+    /// Returns whether a paint was requested.
+    fn request_window_paint(&self, id: WindowId) -> bool {
+        if self.window.as_ref().is_some_and(|w| w.id() == id) {
+            if self.visible && !self.main_occluded {
+                self.request_main_paint();
+                return true;
+            }
+        } else if let Some(dw) = self.detached.iter().find(|d| d.window.id() == id) {
+            if !dw.occluded {
+                dw.request_paint();
+                return true;
+            }
+        }
+        false
     }
 
     /// The per-surface paint choke for the SETTINGS window. Same non-stateful,
@@ -4263,11 +4447,6 @@ impl App {
         let _ = w.flush();
     }
 
-    /// Drain pending PTY output into the terminal and flush any query replies.
-    ///
-    /// Returns `true` if any bytes were consumed (PTY data or reply writes),
-    /// so the caller can skip `request_redraw()` when nothing changed — making
-    /// the 100ms heartbeat essentially free when the terminal is idle.
     /// Drain pending PTY output for EVERY tab into its terminal and flush each
     /// tab's query replies back to its own PTY. Background tabs must keep draining
     /// so their shells never block on a full pipe.
@@ -4532,9 +4711,13 @@ impl App {
         let enabled = self.notify_on_finish;
         // Snapshot "is the user watching the main window" ONCE for this batch. An
         // auto-summon triggered by an earlier tab flips self.visible mid-loop; without
-        // the snapshot every LATER completion in the same ~100ms drain would see
+        // the snapshot every LATER completion in the same drain batch would see
         // watching==true and be gated out, and the user would land on the wrong tab.
         let main_watching = self.main_user_watching();
+        // …and which tab is ON SCREEN in it (snapshotted with it: a summon later
+        // in this batch switches tabs). Only that tab is "watched" — a background
+        // tab of a focused window still notifies (`main_tab_watched`).
+        let active = self.active;
         // First failure wins the summon; else the last firing tab.
         let mut summon_target: Option<usize> = None;
         let mut summon_is_failure = false;
@@ -4542,7 +4725,8 @@ impl App {
             let completions = self.tabs[i].terminal.take_completions();
             if enabled {
                 for c in completions {
-                    if let Some(failed) = self.maybe_notify_main(i, c, main_watching) {
+                    let watching = main_tab_watched(main_watching, i, active);
+                    if let Some(failed) = self.maybe_notify_main(i, c, watching) {
                         if self.auto_summon_on_finish && !self.visible {
                             if failed && !summon_is_failure {
                                 summon_target = Some(i);
@@ -4600,10 +4784,11 @@ impl App {
     }
 
     /// Gate + fire a notification for a MAIN-window tab's completion. `watching` is
-    /// the batch-start snapshot of `main_user_watching()` (so an auto-summon earlier
-    /// in the same drain can't suppress this tab). Returns `Some(failed)` when a
-    /// notification fired (the caller decides the single batch auto-summon), or
-    /// `None` when gated out.
+    /// whether THIS tab is on screen per the batch-start snapshot
+    /// (`main_tab_watched` over `main_user_watching()` + the active tab, so an
+    /// auto-summon earlier in the same drain can't suppress this tab). Returns
+    /// `Some(failed)` when a notification fired (the caller decides the single
+    /// batch auto-summon), or `None` when gated out.
     fn maybe_notify_main(
         &mut self,
         tab: usize,
@@ -4629,8 +4814,14 @@ impl App {
         self.notifier.fire(summary, body, failed);
         // Taskbar/dock urgency baseline — the guaranteed macOS signal (dock bounce)
         // and a cross-DE hint on Linux even where no notification daemon runs.
-        if let Some(w) = &self.window {
-            w.request_user_attention(Some(attention_for(failed)));
+        // Skipped while the window holds focus (a BACKGROUND tab of a focused
+        // window now notifies): the user is already here, and an X11 urgency hint
+        // set on the focused window would stay latched — it is only cleared on
+        // the next Focused(true), which never comes for an already-focused window.
+        if !(self.visible && self.main_focused) {
+            if let Some(w) = &self.window {
+                w.request_user_attention(Some(attention_for(failed)));
+            }
         }
         Some(failed)
     }
@@ -5037,6 +5228,11 @@ impl App {
         self.caret_anim = None;
         self.pending_dock_frames = 0;
         self.pending_center_frames = 0;
+        // Paints owed to a now-invisible window: drop them (the next summon
+        // paints anyway). The idle-HUD one-shot in particular must never be
+        // requested for a hidden window (see `perf_idle_decision`); the first
+        // frame after the summon re-arms it.
+        self.disarm_hidden_paints();
         // …and the debounced grid+PTY reflow. Rule F0's exit-fullscreen-while-
         // still-mapped shrinks the frame just above, so a `Resized` may have armed
         // the 250 ms deadline; `reflow_due` is not gated on `self.visible`, so it
@@ -5048,13 +5244,49 @@ impl App {
         self.reflow_deferred_by_hide = deferred;
     }
 
-    /// Toggle window visibility (F9 / Yakuake-style summon).
+    /// Drop every paint owed to the main window that only makes sense while it
+    /// is on screen — shared by both hide paths. Each one is re-armed by the
+    /// first frame after the next summon, so nothing is lost; leaving them armed
+    /// while hidden made `about_to_wait` request redraws for an unmapped window.
+    fn disarm_hidden_paints(&mut self) {
+        self.perf_idle_at = None;
+        self.perf_idle_shown = false;
+        self.key_paint_due = None;
+        self.acquire_retry = None;
+        self.raise_attempt_at = None;
+    }
+
+    /// Toggle window visibility (F9 / Yakuake-style summon / `jetty --toggle`).
     ///
-    /// When summoning (making visible), the window is re-centred on its
-    /// current monitor, focused, and redrawn. The PTY keeps running while the
-    /// window is hidden — nothing is killed or suspended.
+    /// Hidden → summon. Shown AND in front of the user (focused, not occluded)
+    /// → hide. Shown but NOT in front (behind other windows, or unfocused after
+    /// the user clicked elsewhere with `focus_autohide = false`) → raise + focus
+    /// instead of hiding it; if the compositor refuses that raise, the next press
+    /// hides (see `toggle_action`). The PTY keeps running while the window is
+    /// hidden — nothing is killed or suspended.
     fn toggle_visibility(&mut self, event_loop: &ActiveEventLoop) {
-        self.set_visibility(!self.visible, event_loop);
+        let now = std::time::Instant::now();
+        match toggle_action(
+            self.visible,
+            self.main_focused,
+            self.main_occluded,
+            self.raise_attempt_at,
+            now,
+        ) {
+            ToggleAction::Show => self.set_visibility(true, event_loop),
+            ToggleAction::Hide => self.set_visibility(false, event_loop),
+            ToggleAction::Raise => {
+                self.raise_attempt_at = Some(now);
+                // A minimized (iconified) window is "visible" but off-screen:
+                // restore it first (a no-op when it isn't minimized).
+                if let Some(w) = &self.window {
+                    w.set_minimized(false);
+                }
+                // The already-visible branch of `set_visibility(true)` is exactly
+                // a raise: it cancels a scheduled auto-hide, focuses and repaints.
+                self.set_visibility(true, event_loop);
+            }
+        }
     }
 
     fn set_visibility(&mut self, want: bool, _event_loop: &ActiveEventLoop) {
@@ -5210,6 +5442,10 @@ impl App {
                 self.summon_pending = true;
                 self.summon_settle_until =
                     Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+                // The summon may have placed the window anywhere: re-derive the
+                // Dropdown top-flush once, and a fresh show is not a "raise".
+                self.top_flush_dirty = true;
+                self.raise_attempt_at = None;
                 self.request_main_paint();
             } else {
                 // Remember the current spot before hiding so the next Center
@@ -5241,6 +5477,10 @@ impl App {
                 self.caret_anim = None;
                 self.pending_dock_frames = 0;
                 self.pending_center_frames = 0;
+                // Paints owed to a now-invisible window (idle HUD, keystroke
+                // fallback, acquire retry, a pending raise) — same as the
+                // focus-loss hide path.
+                self.disarm_hidden_paints();
                 // …and the debounced reflow (see `reflow_deferred_by_hide`): rule
                 // F0 leaves fullscreen while still mapped just above, so the
                 // deadline may be live — and it would fire 250 ms later, hidden.
@@ -5868,15 +6108,17 @@ impl App {
                         // — the shared input core, same as the main Send arm
                         // (v0.23 Task 9).
                         write_key_to_pty(&mut dw.tab, &bytes);
+                        // No paint here — the echo paints (same rule and fallback
+                        // deadline as the main window's Send arm).
+                        let now = std::time::Instant::now();
+                        dw.key_paint_due = Some(now + KEY_ECHO_GRACE);
                         // Caret flash on printable keystrokes — same trigger as
-                        // the main window (app.rs ~5010), on THIS window's own
-                        // burst clock. Glow is main-window-only (its CaretFx
-                        // pass isn't replicated per-window), so gate on the
-                        // flash toggle alone.
+                        // the main window, on THIS window's own burst clock. Glow
+                        // is main-window-only (its CaretFx pass isn't replicated
+                        // per-window), so gate on the flash toggle alone.
                         if self.fx.caret_flash_enabled && is_printable_keystroke(&bytes) {
-                            dw.caret_anim = Some(std::time::Instant::now());
+                            dw.caret_anim = Some(now);
                         }
-                        dw.request_paint();
                     }
                     // Every other action (new/close/nav tab, font, opacity,
                     // panel, scroll, ...) is a main-window-only feature for
@@ -5896,10 +6138,12 @@ impl App {
                     // Snap to the live bottom (F30) then write to the PTY — the
                     // shared input core, same as the Send arm (v0.23 Task 9).
                     write_key_to_pty(&mut dw.tab, text.as_bytes());
+                    // The echo paints (fallback deadline), as in the Send arm.
+                    let now = std::time::Instant::now();
+                    dw.key_paint_due = Some(now + KEY_ECHO_GRACE);
                     if caret_flash_enabled && is_printable_keystroke(text.as_bytes()) {
-                        dw.caret_anim = Some(std::time::Instant::now());
+                        dw.caret_anim = Some(now);
                     }
-                    dw.request_paint();
                 }
             }
             WindowEvent::Resized(size) => {
@@ -6703,6 +6947,9 @@ impl App {
         // runs in its own scope before the long `dw` borrow below.
         let notice = {
             let Some(dw) = self.detached.get_mut(pos) else { return };
+            // This frame shows the latest keystroke's effect: its fallback paint
+            // is no longer owed (mirrors the main window's RedrawRequested).
+            dw.key_paint_due = None;
             let mut vt_read: u64 = 0;
             let (_, _, notice) = Self::drain_one_tab(&mut dw.tab, &mut vt_read);
             // OSC titles: keep the OS window title in sync (no-op unless changed).
@@ -6748,7 +6995,6 @@ impl App {
         let corner_radius = self.corner_radius;
         let fx = self.fx.clone();
         let crt_time = (self.crt_clock.elapsed().as_secs_f64() % CRT_PHASE_WRAP) as f32;
-        let crt_anim_live = fx.crt_anim_live();
 
         let Some(dw) = self.detached.get_mut(pos) else { return };
         let shift_hint_show =
@@ -6809,7 +7055,13 @@ impl App {
         let offscreen = &dw.offscreen;
         let image_layer = &mut dw.image_layer;
 
-        let Some((frame, view)) = gpu.acquire_frame() else { return };
+        let Some((frame, view)) = gpu.acquire_frame() else {
+            // Acquire failed: this frame's damage was not shown. Start the
+            // bounded retry schedule (`about_to_wait` issues + advances it).
+            dw.acquire_retry
+                .get_or_insert_with(|| next_acquire_retry(None, std::time::Instant::now()));
+            return;
+        };
         let width = gpu.config.width;
         let height = gpu.config.height;
         // Scene target: the offscreen when CRT is on, else the surface directly
@@ -7012,28 +7264,17 @@ impl App {
             );
         }
         frame.present();
+        // The swapchain is healthy again: drop any retry schedule.
+        dw.acquire_retry = None;
         // Missed-paint proof counter (JETTY_FRAME_LOG only; see the field docs).
         // `self.frames_presented`/`self.frame_log` are fields disjoint from the
         // live `dw` borrow of `self.detached`, so this is a plain field bump.
+        // (No self-drive here: `about_to_wait` alone pumps the next frame while
+        // a caret burst / animated CRT is live on this window, and repaints a
+        // pill away once at its expiry.)
         if self.frame_log {
             self.frames_presented += 1;
             eprintln!("JETTY_FRAME {} detached", self.frames_presented);
-        }
-        // Self-drive the next frame ONLY while the caret flash is mid-burst, an
-        // animated CRT sub-effect is on, or the Shift+drag hint toast is still
-        // showing (so it repaints away on expiry instead of freezing on screen)
-        // — the same damage-driven gates as the main window (its RedrawRequested
-        // has the identical hint_live term). Idle returns to 0-CPU once all
-        // clear. Also gated on the window not being occluded/minimized so a
-        // hidden detached window returns to true idle instead of self-driving
-        // forever (F8).
-        if !dw.occluded
-            && (dw.caret_anim.is_some()
-                || crt_anim_live
-                || shift_hint_show
-                || status_pill_msg.is_some())
-        {
-            dw.window.request_redraw();
         }
     }
 
@@ -7617,8 +7858,8 @@ impl App {
     /// elapsed, so bytes buffered since an unmatched BSU (`CSI ?2026h`) become
     /// visible instead of freezing the display until 2 MiB accumulate or an ESU
     /// arrives (F1 — e.g. an nvim/zellij that paused mid-redraw). Requests a
-    /// redraw on each affected, actually-visible window.
-    fn flush_expired_syncs(&mut self, now: std::time::Instant) {
+    /// redraw on each affected, actually-visible window; returns whether it did.
+    fn flush_expired_syncs(&mut self, now: std::time::Instant) -> bool {
         let active = self.active;
         let main_visible = self.visible && !self.main_occluded;
         // Collect whether the active tab flushed while the main window is visible;
@@ -7633,6 +7874,7 @@ impl App {
                 }
             }
         }
+        let mut painted = main_needs_paint;
         if main_needs_paint {
             self.request_main_paint();
         }
@@ -7641,9 +7883,11 @@ impl App {
                 dw.tab.terminal.flush_sync();
                 if !dw.occluded {
                     dw.request_paint();
+                    painted = true;
                 }
             }
         }
+        painted
     }
 }
 
@@ -7671,13 +7915,21 @@ impl ApplicationHandler<AppEvent> for App {
         }
     }
 
-    /// Drive ControlFlow. macOS does NOT deliver a `RedrawRequested` for a
-    /// `request_redraw()` issued under `ControlFlow::Wait` until an input event
-    /// arrives — so self-driving animations stall and freshly-shown windows stay
-    /// blank until clicked. While any visual work is pending, switch to `Poll`
-    /// AND actively re-request the frame, so the loop pumps frames; return to
-    /// `Wait` (idle 0 CPU) the instant nothing is pending. On X11/Wayland this is
-    /// just a brief Poll burst during the animation (redraws already deliver).
+    /// THE scheduler. Every time-based wake and every continuous-frame decision
+    /// lives here — there is NO periodic heartbeat and NO render-tail self-drive:
+    ///
+    /// * elapsed deadlines are serviced at the top (sync flush, reflow debounces,
+    ///   auto-hide, reload, run-selection, search refresh, animation expiry,
+    ///   keystroke fallback paints, pill expiry, acquire retries, idle HUD);
+    /// * continuous animation (`Poll` + re-request) only while an animation is
+    ///   live on an EFFECTIVELY VISIBLE window with a healthy swapchain;
+    /// * otherwise `WaitUntil` the earliest future deadline, or `Wait` (0 CPU).
+    ///
+    /// macOS does NOT deliver a `RedrawRequested` for a `request_redraw()` issued
+    /// under `ControlFlow::Wait` until an input event arrives, so any paint
+    /// requested from in here (`painted`) runs ONE `Poll` iteration to deliver it,
+    /// then the loop settles back to `Wait`. On X11/Wayland a pending redraw never
+    /// blocks the loop anyway, so that extra iteration is free.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Input-latency percentile emit (JETTY_PERF_LOG only): runs HERE, off the
         // timed present path, so printing a batch never stalls the frame it measured
@@ -7688,7 +7940,7 @@ impl ApplicationHandler<AppEvent> for App {
         // Force-flush any elapsed synchronized update (CSI ?2026) FIRST so a
         // stuck BSU can't freeze the terminal; the next pending one is scheduled
         // via WaitUntil below (F1).
-        self.flush_expired_syncs(std::time::Instant::now());
+        let mut painted = self.flush_expired_syncs(std::time::Instant::now());
         // Debounced font-size reflow: when the deadline set by `set_font_size`
         // has elapsed (the user stopped pressing Ctrl+/-), issue ONE pty.resize
         // (via `reflow`) so the shell gets a single SIGWINCH instead of one per
@@ -7701,6 +7953,7 @@ impl ApplicationHandler<AppEvent> for App {
             self.reflow();
             if let Some(w) = &self.window {
                 w.request_redraw();
+                painted = true;
             }
         }
         // Same debounced reflow for the detached windows (their Resized arm
@@ -7734,6 +7987,7 @@ impl ApplicationHandler<AppEvent> for App {
                         (rows as f32 * ch).min(65535.0) as u16,
                     );
                     dw.window.request_redraw();
+                    painted = true;
                     // Same post-reflow hover revalidation as the main
                     // window's reflow() (F6); no-op unless Ctrl is held.
                     self.update_detached_link_hover(pos, true);
@@ -7758,6 +8012,8 @@ impl ApplicationHandler<AppEvent> for App {
         {
             self.pending_reload_at = None;
             self.reload_config_and_themes();
+            // A reload repaints every surface it changed; deliver those paints.
+            painted = true;
         }
         // Run-selection pending-inject deadlines (elapsed ones service HERE,
         // future ones fold into WaitUntil below — the same two-halves pattern
@@ -7787,59 +8043,157 @@ impl ApplicationHandler<AppEvent> for App {
             if self.visible && !self.main_occluded {
                 if let Some(w) = &self.window {
                     w.request_redraw();
+                    painted = true;
                 }
             }
         }
-        // A pending (debounced) reflow does NOT keep the loop in Poll. The old
-        // code folded `reflow_pending_at.is_some()` into `main_pending`, so for up
-        // to 250ms after every font/window resize the loop sat in Poll and
-        // re-rendered the full scene ~15× for nothing (a SPEED-#1 idle regression).
-        // The active resize already drives redraws via per-event request_redraw;
-        // here we only need to WAKE ONCE at the debounce deadline to run the reflow
-        // (handled by `reflow_due` at the top of this fn). So the reflow deadline
-        // is routed through WaitUntil below, never Poll.
-        // `crt_anim_live()` is `false` whenever CRT animation is off (CRT disabled,
-        // or all three animate toggles off), so this term cannot force Poll at idle:
-        // static/off CRT keeps `main_pending` false → `about_to_wait` returns Wait
-        // (0-CPU idle). When animation is ON it selects Poll, which Fifo present
-        // throttles to ~60fps vsync — exactly how summon/slide animate on macOS,
-        // where a `request_redraw` issued under Wait is not delivered until input.
-        // The self-driven animation terms (CRT + caret flash) are gated on the
-        // window being EFFECTIVELY VISIBLE — shown (F9) AND not occluded/minimized.
-        // A hidden dropdown OR a minimized/occluded window must not keep the loop
-        // in Poll rendering invisible frames forever (a permanent CPU+GPU burn
-        // violating the 0-CPU-idle design; F8/F16/F17/F18). Summoning or restoring
-        // the window resumes the animation (free-running clock). The summon/slide/
-        // dock/center terms self-terminate in a handful of frames, so they stay
-        // ungated (they only run while a show is in progress).
+        let now = std::time::Instant::now();
         let main_visible = self.visible && !self.main_occluded;
-        let main_pending = self.summon_anim.is_some()
-            || self.slide_anim.is_some()
-            || self.summon_pending
-            || self.pending_dock_frames > 0
-            || self.pending_center_frames > 0
-            || (main_visible && self.fx.crt_anim_live())
-            || (main_visible && self.caret_anim.is_some());
+        // Wall-clock animation expiry. Every self-driven animation ENDS BY TIME
+        // here, not only inside a frame that reached t ≥ 1 after a successful
+        // acquire+present — so a window whose acquire keeps failing (macOS
+        // ordered-out, a Wayland Timeout, the no-GPU fallback) can never pin the
+        // loop in Poll. An effectively visible window gets one final paint so the
+        // settled (effect-free) frame is what stays on screen.
+        let mut main_settled = false;
+        if self
+            .summon_anim
+            .is_some_and(|s| anim_expired(s, self.summon_effect.duration(), now))
+        {
+            self.summon_anim = None;
+            main_settled = true;
+        }
+        if self.slide_anim.is_some_and(|s| anim_expired(s, DROPDOWN_SLIDE_SECS, now)) {
+            self.slide_anim = None;
+            main_settled = true;
+        }
+        let caret_secs = self.fx.caret_flash_ms / 1000.0;
+        if self.caret_anim.is_some_and(|s| anim_expired(s, caret_secs, now)) {
+            self.caret_anim = None;
+            main_settled = true;
+        }
+        // Keystroke fallback paint: the echo normally painted (and cleared this)
+        // first; a key that produced no output paints once at its deadline.
+        if self.key_paint_due.is_some_and(|d| now >= d) {
+            self.key_paint_due = None;
+            main_settled = true;
+        }
+        if main_settled && main_visible {
+            self.request_main_paint();
+            painted = true;
+        }
+        for dw in &mut self.detached {
+            let mut settled = false;
+            if dw.caret_anim.is_some_and(|s| anim_expired(s, caret_secs, now)) {
+                dw.caret_anim = None;
+                settled = true;
+            }
+            if dw.key_paint_due.is_some_and(|d| now >= d) {
+                dw.key_paint_due = None;
+                settled = true;
+            }
+            if settled && !dw.occluded {
+                dw.request_paint();
+                painted = true;
+            }
+        }
+        // Transient pills (Shift+drag hint, run-selection status): painted when
+        // armed and repainted ONCE here at expiry to clear them — never self-
+        // driven per frame while they show (that re-rendered the whole scene for
+        // ~4 s per pill).
+        if let Some(wid) = self.shift_hint_until.filter(|(t, _)| now >= *t).map(|(_, w)| w) {
+            self.shift_hint_until = None;
+            painted |= self.request_window_paint(wid);
+        }
+        if let Some(wid) = self
+            .status_pill
+            .as_ref()
+            .filter(|(_, t, _)| now >= *t)
+            .map(|(_, _, w)| *w)
+        {
+            self.status_pill = None;
+            painted |= self.request_window_paint(wid);
+        }
+        // Failed-acquire retries (see `AcquireRetry`). The retry is advanced as
+        // it is ISSUED, so a frame that never reaches `acquire_frame` cannot
+        // leave an elapsed deadline behind (which would WaitUntil-spin). A window
+        // that is not effectively visible drops its retry: the next summon /
+        // un-occlude paints anyway.
+        if let Some(r) = self.acquire_retry {
+            if !main_visible || self.gpu.is_none() {
+                self.acquire_retry = None;
+            } else if now >= r.due {
+                self.acquire_retry = Some(next_acquire_retry(Some(r), now));
+                self.request_main_paint();
+                painted = true;
+            }
+        }
+        for dw in &mut self.detached {
+            if let Some(r) = dw.acquire_retry {
+                if dw.occluded {
+                    dw.acquire_retry = None;
+                } else if now >= r.due {
+                    dw.acquire_retry = Some(next_acquire_retry(Some(r), now));
+                    dw.request_paint();
+                    painted = true;
+                }
+            }
+        }
+        // Idle-HUD one-shot: flip the HUD from its last live value to an honest
+        // "idle" reading once the app settles — only for an effectively visible
+        // window (see `perf_idle_decision`: requesting it while hidden spun a core
+        // at 100% for as long as the window stayed hidden).
+        let perf_idle = perf_idle_decision(
+            self.show_perf_hud,
+            self.perf_idle_shown,
+            self.perf_idle_at,
+            main_visible,
+            now,
+        );
+        if perf_idle == IdleHud::RepaintNow {
+            self.request_main_paint();
+            painted = true;
+        }
+
+        // Continuous frames (Poll + re-request) are decided HERE only. Each
+        // animation term is gated on the main window being EFFECTIVELY VISIBLE
+        // (shown + not occluded/minimized), having a GPU, and a healthy swapchain
+        // (no acquire retry pending): a hidden, minimized or acquire-failing
+        // window must never Poll-render invisible frames (F8/F16/F17/F18). The
+        // caret burst starts pumping only after its first frame
+        // (`caret_drives_frames`). `crt_anim_live()` is false whenever CRT
+        // animation is off, so static/off CRT keeps idle at Wait. Poll is
+        // throttled to vsync by Fifo present. The dock/center re-assert counters
+        // only need `visible` (they move the window, they don't paint) and count
+        // down in RedrawRequested, so they are bounded. A pending (debounced)
+        // reflow never selects Poll — it is a single WaitUntil wake below.
+        let main_can_animate =
+            main_visible && self.gpu.is_some() && self.acquire_retry.is_none();
+        let main_pending = (main_can_animate
+            && (self.summon_anim.is_some()
+                || self.slide_anim.is_some()
+                || self.summon_pending
+                || self.fx.crt_anim_live()
+                || caret_drives_frames(self.caret_anim, self.key_paint_due)))
+            || (self.visible && (self.pending_dock_frames > 0 || self.pending_center_frames > 0));
         if main_pending {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
         }
         // Detached windows animate under the SAME gates, PER WINDOW: an animated
-        // CRT sub-effect (shared setting) or a live caret-flash burst — but ONLY
-        // for windows that are not occluded/minimized, so a minimized detached
-        // window returns to true idle instead of burning a core forever (F8/F17).
-        // False whenever no visible detached window animates (0-CPU preserved).
+        // CRT sub-effect (shared setting) or a live caret-flash burst — only for
+        // windows that are not occluded/minimized and whose swapchain is healthy.
         let crt_live = self.fx.crt_anim_live();
-        let detached_pending = self
-            .detached
-            .iter()
-            .any(|d| !d.occluded && (crt_live || d.caret_anim.is_some()));
+        let detached_animates = |d: &crate::detached::DetachedWindow| {
+            !d.occluded
+                && d.acquire_retry.is_none()
+                && (crt_live || caret_drives_frames(d.caret_anim, d.key_paint_due))
+        };
+        let detached_pending = self.detached.iter().any(detached_animates);
         if detached_pending {
-            for dw in &self.detached {
-                if !dw.occluded && (crt_live || dw.caret_anim.is_some()) {
-                    dw.window.request_redraw();
-                }
+            for dw in self.detached.iter().filter(|d| detached_animates(d)) {
+                dw.window.request_redraw();
             }
         }
         let settings_pending = self.settings_window.is_some()
@@ -7852,12 +8206,11 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
 
-        // Earliest FUTURE deadline we owe a single wake for: the reflow debounce
-        // and/or the perf-HUD idle one-shot. Neither polls — we sleep until the
-        // soonest and wake exactly once. (A reflow whose deadline already elapsed
-        // was run by `reflow_due` above, so `reflow_pending_at` here is always in
-        // the future or None.)
-        let now = std::time::Instant::now();
+        // Earliest FUTURE deadline we owe a single wake for. Nothing polls — we
+        // sleep until the soonest and wake exactly once. Every elapsed deadline
+        // was serviced (cleared or advanced) above, so each one merged here is
+        // strictly in the future: a past `WaitUntil` would return immediately and
+        // spin.
         let mut wake_at = self.reflow_pending_at;
         // Merge the earliest future deadline into wake_at (single-wake, no poll).
         let merge_wake = |wake_at: &mut Option<std::time::Instant>,
@@ -7910,28 +8263,38 @@ impl ApplicationHandler<AppEvent> for App {
                 merge_wake(&mut wake_at, t + SEARCH_REFRESH_INTERVAL);
             }
         }
-        // Idle-HUD one-shot: flip the HUD from its last live value to an honest
-        // "idle" reading once the app settles, then go fully idle.
-        let perf_idle_pending = self.show_perf_hud
-            && !self.perf_idle_shown
-            && self.perf_idle_at.is_some();
-        if perf_idle_pending {
-            let d = self.perf_idle_at.unwrap();
-            if now >= d {
-                // Idle repaint is due now: request the single repaint (the redraw
-                // request itself wakes the loop to service it).
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            } else {
-                wake_at = Some(match wake_at {
-                    Some(w) if w <= d => w,
-                    _ => d,
-                });
+        // Idle-HUD one-shot (effectively visible windows only — see above).
+        if let IdleHud::WakeAt(d) = perf_idle {
+            merge_wake(&mut wake_at, d);
+        }
+        // Pill expiries: one wake each to repaint the pill away.
+        if let Some((t, _)) = self.shift_hint_until {
+            merge_wake(&mut wake_at, t);
+        }
+        if let Some((_, t, _)) = &self.status_pill {
+            merge_wake(&mut wake_at, *t);
+        }
+        // Keystroke fallback paints (normally cleared by the echo's frame first).
+        if let Some(d) = self.key_paint_due {
+            merge_wake(&mut wake_at, d);
+        }
+        // Failed-acquire retries (dropped above for windows not effectively
+        // visible, so these only ever wake for a window that can present).
+        if let Some(r) = self.acquire_retry {
+            merge_wake(&mut wake_at, r.due);
+        }
+        for dw in &self.detached {
+            if let Some(d) = dw.key_paint_due {
+                merge_wake(&mut wake_at, d);
+            }
+            if let Some(r) = dw.acquire_retry {
+                merge_wake(&mut wake_at, r.due);
             }
         }
 
-        let control_flow = if main_pending || settings_pending || detached_pending {
+        // `painted`: something above requested a one-off paint — run ONE Poll
+        // iteration so macOS delivers it (see the fn doc), then settle.
+        let control_flow = if main_pending || settings_pending || detached_pending || painted {
             winit::event_loop::ControlFlow::Poll
         } else if let Some(d) = wake_at {
             // Wake exactly once at the soonest pending deadline instead of polling.
@@ -8266,10 +8629,11 @@ impl ApplicationHandler<AppEvent> for App {
             });
         }
 
-        // Slow safety heartbeat — 100ms is enough for any future time-based UI
-        // while virtually eliminating idle CPU waste. Real responsiveness now
-        // comes from the on_data wake above, not from this tick.
-        spawn_waker(self.proxy.clone());
+        // NO periodic heartbeat: every wake source is an event — PTY data/EOF
+        // (reader thread), shell exit (waiter thread), F9 (hotkey thread), IPC,
+        // config changes (watcher) — and every timer is a WaitUntil deadline in
+        // `about_to_wait`. The old 100 ms waker kept the loop at 10 wakes/s
+        // forever, hidden or not.
 
         // Config/theme hot-reload watcher (unless disabled). OS-event-driven, so its
         // thread blocks in the kernel and adds ZERO idle CPU. The returned handle is
@@ -8294,7 +8658,8 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 // A tab whose shell exited (Ctrl+D / `exit`) closes THAT tab,
                 // Yakuake-style; if it was the last tab, close_exited_tabs exits
-                // the loop. The waker fires ~10x/s, so we react within a frame.
+                // the loop. The PTY's waiter thread sends this Wake the moment it
+                // reaps the shell, so we react at once (no polling tick).
                 if !self.close_exited_tabs(exited, event_loop) {
                     return;
                 }
@@ -8308,8 +8673,8 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 // Damage-driven: only request a redraw when the active tab's PTY
                 // produced data (or query replies were sent). Background tabs still
-                // drained above but don't trigger a repaint. When idle, the 100ms
-                // heartbeat drains nothing and we skip the redraw entirely.
+                // drained above but don't trigger a repaint. A Wake only ever
+                // comes from a PTY event (data, EOF, exit), never from a timer.
                 // Also gated on the window being EFFECTIVELY VISIBLE (shown + not
                 // occluded/minimized): a hidden dropdown running `cat bigfile`
                 // must keep draining (so the shell never blocks) but must NOT run
@@ -8475,7 +8840,14 @@ impl ApplicationHandler<AppEvent> for App {
                     self.request_main_paint();
                 }
             }
+            WindowEvent::Moved(_) => {
+                // The only event that can change the Dropdown top-flush answer
+                // without a resize; re-derived once on the next frame instead of
+                // an X11 round-trip on every frame.
+                self.top_flush_dirty = true;
+            }
             WindowEvent::Resized(size) => {
+                self.top_flush_dirty = true;
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
@@ -8515,6 +8887,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // SIGWINCH the shell with the stale surface size. Instead, arm the
                 // debounced reflow and let the Resized event's reflow correct the
                 // grid against the real surface size.
+                self.top_flush_dirty = true;
                 let scale = scale_factor as f32;
                 // Re-scale the font IN-PLACE (reusing the FontSystem) rather than
                 // rebuilding the TextLayers — a DPI change must not rescan
@@ -8546,6 +8919,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // The main terminal window gained focus.
                 self.last_focused_window = Some(id);
                 self.main_focused = true;
+                // A toggle-raise succeeded (or focus came back by itself): the
+                // next toggle should hide, not count as a refused raise.
+                self.raise_attempt_at = None;
                 // Focus implies the window is on-screen again: clear any stale
                 // occluded/minimized flag in case the WM skipped Occluded(false)
                 // on restore, so animations/redraws resume (F17).
@@ -10363,14 +10739,23 @@ impl ApplicationHandler<AppEvent> for App {
                         if self.perf.on {
                             self.perf.note_key_send();
                         }
+                        // NO paint here: the shell's echo (drained a few ms later)
+                        // paints the frame that shows this key — painting now would
+                        // render a pre-echo frame that the echo frame then queues a
+                        // vsync behind. A key that never echoes (password prompt,
+                        // the snap back from scrollback) paints at the fallback
+                        // deadline in `about_to_wait`.
+                        let now = std::time::Instant::now();
+                        self.key_paint_due = Some(now + KEY_ECHO_GRACE);
                         // Trigger caret flash+pulse on printable keystrokes.
                         // Arm the shared burst clock when EITHER caret effect is on;
                         // each consumer is independently gated on its own toggle.
+                        // The burst starts pumping frames once its first frame
+                        // (the echo's) is painted — see `caret_drives_frames`.
                         if (self.fx.caret_flash_enabled || self.fx.caret_glow_enabled)
                             && is_printable_keystroke(&bytes)
                         {
-                            self.caret_anim = Some(std::time::Instant::now());
-                            self.request_main_paint();
+                            self.caret_anim = Some(now);
                         }
                     }
                     input::KeyAction::None => {}
@@ -10444,14 +10829,16 @@ impl ApplicationHandler<AppEvent> for App {
                     self.welcome_open = false;
                 }
                 // Same discipline as the Send arm: jump to the live bottom then
-                // write to the PTY (shared input core, v0.23 Task 9).
+                // write to the PTY (shared input core, v0.23 Task 9) — and, like
+                // it, let the echo paint (fallback deadline, no pre-echo frame).
                 write_key_to_pty(self.active_tab_mut(), text.as_bytes());
+                let now = std::time::Instant::now();
+                self.key_paint_due = Some(now + KEY_ECHO_GRACE);
                 if (self.fx.caret_flash_enabled || self.fx.caret_glow_enabled)
                     && is_printable_keystroke(text.as_bytes())
                 {
-                    self.caret_anim = Some(std::time::Instant::now());
+                    self.caret_anim = Some(now);
                 }
-                self.request_main_paint();
             }
             WindowEvent::RedrawRequested => {
                 // Hidden (F9) window: never run the full render pipeline
@@ -10464,6 +10851,10 @@ impl ApplicationHandler<AppEvent> for App {
                 if !self.visible {
                     return;
                 }
+                // This frame shows the latest keystroke's effect (echo or not), so
+                // its fallback paint is no longer owed; the caret burst may now
+                // pump frames (`caret_drives_frames`).
+                self.key_paint_due = None;
                 // Auto-exit hint/copy-mode if a program switched to the alt screen
                 // while a mode was active (a full-screen TUI launched mid-mode):
                 // both modes are primary-screen only, so drop them cleanly rather
@@ -10738,32 +11129,31 @@ impl ApplicationHandler<AppEvent> for App {
                 // Derive "top-flush" from the window's outer position vs the
                 // monitor top. On Wayland outer_position() is Err → not flush, so
                 // we keep all-4 rounding (accepted degradation, no DE code).
-                // Recompute the (syscall-backed) top-flush flag only on
-                // non-animating frames; during a dropdown slide the window is
-                // stationary, so reuse the cache and skip the per-frame
-                // outer_position()/current_monitor() round-trips.
-                //
-                // Short-circuited while fullscreen: the flag only steers the Dropdown
-                // top-strip's square top corners, and while fullscreen every radius is
-                // already 0 — so the answer is moot. This matters for the
-                // Dropdown + ad-hoc-F11 state, where the `== Dropdown` test below is
-                // still true and would otherwise keep asking the WM about a top edge
-                // that is the monitor's.
-                if self.main_fullscreen {
-                    self.cached_top_flush = false;
-                } else if self.slide_anim.is_none() {
-                    self.cached_top_flush = self.window_mode == WindowMode::Dropdown
-                        && self
-                            .window
-                            .as_ref()
-                            .and_then(|w| {
-                                let p = w.outer_position().ok()?;
-                                let mon = w.current_monitor().or_else(|| w.available_monitors().next())?;
-                                Some(p.y <= mon.position().y + 1)
-                            })
-                            .unwrap_or(false);
+                // The position test is a BLOCKING X11 round-trip, so it runs only
+                // when the window may have moved (`top_flush_dirty`: Moved /
+                // Resized / ScaleFactorChanged / summon) — never per frame, and
+                // never mid-slide (the slide is a content y-offset; the window
+                // itself is stationary). Fullscreen short-circuits it: every radius
+                // is already 0 there, so the answer is moot.
+                if self.window_mode == WindowMode::Dropdown
+                    && !self.main_fullscreen
+                    && self.top_flush_dirty
+                    && self.slide_anim.is_none()
+                {
+                    self.top_flush_dirty = false;
+                    self.top_flush_pos = self
+                        .window
+                        .as_ref()
+                        .and_then(|w| {
+                            let p = w.outer_position().ok()?;
+                            let mon = jetty_platform::monitor_for_window(w)?;
+                            Some(p.y <= mon.position().y + 1)
+                        })
+                        .unwrap_or(false);
                 }
-                let top_flush = self.cached_top_flush;
+                let top_flush = self.window_mode == WindowMode::Dropdown
+                    && !self.main_fullscreen
+                    && self.top_flush_pos;
                 // Lazily (re)allocate the offscreen scene texture when EITHER a
                 // Tier-B effect (Liquid/Focus) is actively summoning OR CRT is
                 // enabled — and the texture is missing or stale (wrong size).
@@ -10796,10 +11186,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // CRT enable flag, captured before the mutable gpu/text borrow.
                 let crt_enabled = self.fx.crt_enabled;
                 let summon_effect = self.summon_effect;
-                // Summon progress: t in [0,1) drives a reveal pass this frame and
-                // self-schedules the next; t>=1 ends the animation so we return to
-                // damage-driven idle (0 CPU). None = not animating. Each effect has
-                // its own duration. (None has duration 0 → ends on the first frame.)
+                // Summon progress: t in [0,1) drives a reveal pass this frame
+                // (`about_to_wait` pumps the next one); t>=1 ends the animation so
+                // we return to damage-driven idle (0 CPU). None = not animating.
+                // Each effect has its own duration. (None has duration 0 → ends on
+                // the first frame.)
                 let summon_t = self.summon_anim.map(|start| {
                     let d = summon_effect.duration();
                     if d <= 0.0 { 1.0 } else { start.elapsed().as_secs_f32() / d }
@@ -11408,7 +11799,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // scene (`scene_view`) and write the displaced/blurred result to
                     // the surface `view`. At t>=1 every effect is fully resolved
                     // (zero residue, identity blit) and we stop the animation;
-                    // otherwise self-drive the next frame.
+                    // otherwise `about_to_wait` pumps the next frame.
                     //
                     // Tier-A dst is `scene_view`, NOT `&view`: when CRT is off (or
                     // bypassed by a Tier-B summon) `scene_view` IS the surface view,
@@ -11461,54 +11852,12 @@ impl ApplicationHandler<AppEvent> for App {
                             self.summon_anim = None;
                         }
                     }
-                    // Dropdown slide self-driver: while the slide is live keep
-                    // requesting redraws; clear it at t>=1 so we return to idle.
+                    // The slide ends at t ≥ 1 here too (and by wall clock in
+                    // `about_to_wait`, which alone decides whether another frame
+                    // is pumped — this tail never self-drives).
                     if let Some(s) = self.slide_anim {
                         if s.elapsed().as_secs_f32() >= DROPDOWN_SLIDE_SECS {
                             self.slide_anim = None;
-                        }
-                    }
-                    // Self-drive the next frame while EITHER animation is live, the
-                    // Shift+drag hint toast is still showing (so it repaints away on
-                    // expiry instead of freezing on screen), OR an animated CRT
-                    // sub-effect is on. Idle CPU returns to ~0 once all have cleared.
-                    // Self-drive only when the hint belongs to THIS window;
-                    // a detached window's pill drives its own frames (F4).
-                    let hint_live = self.window.as_ref().is_some_and(|w| {
-                        shift_hint_live_in(
-                            self.shift_hint_until,
-                            w.id(),
-                            std::time::Instant::now(),
-                        )
-                    });
-                    // Run-selection status pill: keep repainting while ITS
-                    // window is this one and it is live, so it fades out on
-                    // expiry instead of freezing on screen (same rule as the
-                    // shift hint). One Option check; None when unused.
-                    let pill_live = self.window.as_ref().is_some_and(|w| {
-                        self.status_pill.as_ref().is_some_and(|(_, until, wid)| {
-                            *wid == w.id() && std::time::Instant::now() < *until
-                        })
-                    });
-                    // CRT animation self-drive: keep painting ONLY while CRT is on
-                    // AND at least one of roll/flicker/jitter is toggled on. Static
-                    // CRT (enabled, all three off) does NOT match here, so it stays
-                    // damage-driven (0-CPU idle preserved). Same `crt_anim_live()`
-                    // term feeds `about_to_wait`'s `main_pending`, so on macOS the
-                    // loop sits in `Poll` (vsync-throttled by Fifo present) while
-                    // animating and returns to `Wait`/idle the moment it clears.
-                    // Gated on `self.visible` like the `main_pending` term: a
-                    // hidden window must never self-drive CRT frames.
-                    let crt_anim_live = self.visible && self.fx.crt_anim_live();
-                    if self.summon_anim.is_some()
-                        || self.slide_anim.is_some()
-                        || hint_live
-                        || pill_live
-                        || crt_anim_live
-                        || self.caret_anim.is_some()
-                    {
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
                         }
                     }
                     // CRT post-pass: when CRT is active (enabled AND not bypassed by
@@ -11596,6 +11945,8 @@ impl ApplicationHandler<AppEvent> for App {
                         None
                     };
                     frame.present();
+                    // The swapchain is healthy again: drop any retry schedule.
+                    self.acquire_retry = None;
                     // Missed-paint proof counter (JETTY_FRAME_LOG only).
                     if self.frame_log {
                         self.frames_presented += 1;
@@ -11618,6 +11969,13 @@ impl ApplicationHandler<AppEvent> for App {
                             self.perf.log_first_frame(hz);
                         }
                     }
+                } else {
+                    // Acquire failed (Outdated/Lost/Timeout/Occluded/Validation):
+                    // this frame's damage was NOT shown. Start the bounded retry
+                    // schedule (`about_to_wait` issues and advances it) — a retry
+                    // already in flight keeps its schedule, so each retry counts once.
+                    self.acquire_retry
+                        .get_or_insert_with(|| next_acquire_retry(None, std::time::Instant::now()));
                 }
                 // Restore the tab-metadata cache taken above so it persists across
                 // frames (its signature still matches, so it won't rebuild).
@@ -11855,19 +12213,6 @@ fn hash_config_str(s: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
-}
-
-fn spawn_waker(proxy: EventLoopProxy<AppEvent>) {
-    // Slow safety heartbeat: 100ms is sufficient for any time-based UI ticking.
-    // Responsiveness for PTY data (including p10k query replies) is now driven
-    // by the on_data callback in PtySession::spawn, which wakes the loop
-    // immediately on every chunk — so this tick no longer sets the latency floor.
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if proxy.send_event(AppEvent::Wake).is_err() {
-            break;
-        }
-    });
 }
 
 /// Which window-control button (if any) the cursor at `(cx, cy)` is over, given
@@ -12798,6 +13143,155 @@ mod shift_hint_tests {
 }
 
 #[cfg(test)]
+mod scheduler_tests {
+    //! The pure decisions behind `about_to_wait`'s scheduling and the F9 toggle.
+    //! The window itself can't run under `cargo test`, so every rule that keeps
+    //! the loop at 0-CPU idle (or makes it wake) is a pure function tested here.
+    use super::{
+        anim_expired, caret_drives_frames, main_tab_watched, next_acquire_retry,
+        perf_idle_decision, toggle_action, IdleHud, ToggleAction, KEY_ECHO_GRACE,
+        RAISE_RETRY_WINDOW,
+    };
+    use std::time::{Duration, Instant};
+
+    // ── idle HUD one-shot (the hidden-window 100% CPU spin) ──────────────────
+
+    #[test]
+    fn idle_hud_never_repaints_or_wakes_for_a_hidden_window() {
+        let now = Instant::now();
+        let due = Some(now - Duration::from_millis(1));
+        let future = Some(now + Duration::from_millis(500));
+        // Hidden (or occluded) with the deadline elapsed: requesting the repaint
+        // here re-requested it on every loop iteration (the early-returning
+        // RedrawRequested never set `perf_idle_shown`) — must be Nothing…
+        assert_eq!(perf_idle_decision(true, false, due, false, now), IdleHud::Nothing);
+        // …and a future deadline must not even schedule a wake.
+        assert_eq!(perf_idle_decision(true, false, future, false, now), IdleHud::Nothing);
+    }
+
+    #[test]
+    fn idle_hud_repaints_once_when_visible_and_due() {
+        let now = Instant::now();
+        let due = Some(now - Duration::from_millis(1));
+        assert_eq!(perf_idle_decision(true, false, due, true, now), IdleHud::RepaintNow);
+        // Exactly once: after the idle frame painted (`idle_shown`) nothing is owed.
+        assert_eq!(perf_idle_decision(true, true, due, true, now), IdleHud::Nothing);
+    }
+
+    #[test]
+    fn idle_hud_wakes_at_a_future_deadline_only() {
+        let now = Instant::now();
+        let d = now + Duration::from_millis(700);
+        assert_eq!(perf_idle_decision(true, false, Some(d), true, now), IdleHud::WakeAt(d));
+        // HUD off or never armed → nothing at all.
+        assert_eq!(perf_idle_decision(false, false, Some(d), true, now), IdleHud::Nothing);
+        assert_eq!(perf_idle_decision(true, false, None, true, now), IdleHud::Nothing);
+    }
+
+    // ── F9 / launcher toggle ─────────────────────────────────────────────────
+
+    #[test]
+    fn toggle_shows_a_hidden_window_and_hides_a_watched_one() {
+        let now = Instant::now();
+        assert_eq!(toggle_action(false, false, false, None, now), ToggleAction::Show);
+        assert_eq!(toggle_action(false, true, true, Some(now), now), ToggleAction::Show);
+        assert_eq!(toggle_action(true, true, false, None, now), ToggleAction::Hide);
+    }
+
+    #[test]
+    fn toggle_raises_a_visible_window_that_is_not_in_front() {
+        let now = Instant::now();
+        // Unfocused (clicked elsewhere, focus_autohide = false): raise, not hide.
+        assert_eq!(toggle_action(true, false, false, None, now), ToggleAction::Raise);
+        // Covered by other windows / minimized: raise, even if it kept focus.
+        assert_eq!(toggle_action(true, true, true, None, now), ToggleAction::Raise);
+    }
+
+    #[test]
+    fn toggle_hides_after_a_raise_the_compositor_refused() {
+        let t0 = Instant::now();
+        // The raise never produced focus (e.g. Wayland): a press within the
+        // window hides instead of raising forever…
+        let soon = t0 + RAISE_RETRY_WINDOW - Duration::from_millis(1);
+        assert_eq!(toggle_action(true, false, false, Some(t0), soon), ToggleAction::Hide);
+        // …but a much later press is a fresh intent → raise again.
+        let later = t0 + RAISE_RETRY_WINDOW;
+        assert_eq!(toggle_action(true, false, false, Some(t0), later), ToggleAction::Raise);
+    }
+
+    // ── failed-acquire retry backoff ─────────────────────────────────────────
+
+    #[test]
+    fn acquire_retry_starts_next_frame_and_backs_off_to_one_second() {
+        let now = Instant::now();
+        let mut r = next_acquire_retry(None, now);
+        assert_eq!((r.attempt, r.due - now), (0, Duration::from_millis(16)));
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            r = next_acquire_retry(Some(r), now);
+            delays.push((r.due - now).as_millis());
+        }
+        assert_eq!(delays, vec![32, 64, 128, 256, 512, 1000, 1000, 1000]);
+    }
+
+    #[test]
+    fn acquire_retry_never_schedules_in_the_past_or_overflows() {
+        let now = Instant::now();
+        let r = next_acquire_retry(
+            Some(super::AcquireRetry { due: now, attempt: u32::MAX }),
+            now,
+        );
+        assert_eq!(r.attempt, u32::MAX, "saturates instead of wrapping to the 16ms step");
+        assert!(r.due > now, "a retry is always strictly in the future (no WaitUntil spin)");
+    }
+
+    // ── wall-clock animation expiry ──────────────────────────────────────────
+
+    #[test]
+    fn animations_end_by_wall_clock() {
+        let t0 = Instant::now();
+        assert!(!anim_expired(t0, 0.4, t0 + Duration::from_millis(399)));
+        assert!(anim_expired(t0, 0.4, t0 + Duration::from_millis(400)));
+        // Zero / negative duration (the `None` summon effect) ends at once.
+        assert!(anim_expired(t0, 0.0, t0));
+        assert!(anim_expired(t0, -1.0, t0));
+        // A start "in the future" (clock skew between captures) is not expired.
+        assert!(!anim_expired(t0 + Duration::from_millis(5), 0.15, t0));
+    }
+
+    // ── keystroke → echo paint ───────────────────────────────────────────────
+
+    #[test]
+    fn caret_burst_pumps_frames_only_after_its_first_paint() {
+        let now = Instant::now();
+        let due = Some(now + KEY_ECHO_GRACE);
+        // Armed by the key but not yet painted by the echo: no Poll frames
+        // (they would render the pre-echo frame the deferral avoids).
+        assert!(!caret_drives_frames(Some(now), due));
+        // The echo's frame cleared the deadline → the burst animates.
+        assert!(caret_drives_frames(Some(now), None));
+        assert!(!caret_drives_frames(None, None));
+    }
+
+    #[test]
+    fn key_echo_grace_is_imperceptible() {
+        // The fallback is only for keys that never echo; it must stay well
+        // under perception (and a 25 ms window comfortably covers zsh's
+        // highlighter/autosuggest echo).
+        assert!(KEY_ECHO_GRACE <= Duration::from_millis(25));
+    }
+
+    // ── Run & Notify "watching" ──────────────────────────────────────────────
+
+    #[test]
+    fn only_the_visible_tab_of_a_watched_window_is_watched() {
+        assert!(main_tab_watched(true, 2, 2), "the tab on screen is watched");
+        assert!(!main_tab_watched(true, 1, 2), "a background tab must still notify");
+        assert!(!main_tab_watched(false, 2, 2), "hidden/unfocused window → notify");
+    }
+}
+
+#[cfg(test)]
 mod hot_reload_tests {
     use super::{floor_char_boundary, hash_config_str};
 
@@ -12913,14 +13407,17 @@ mod paint_choke_tests {
 
     #[test]
     fn no_new_raw_request_redraw_in_app() {
-        // 14 = request_main_paint def (1) + request_settings_paint def (1)
-        //    + about_to_wait animation/lifecycle self-drive (7)
-        //    + main render-tail (1) + detached render-tail in render_detached_window (1)
+        // 11 = request_main_paint def (1) + request_settings_paint def (1)
+        //    + about_to_wait animation/lifecycle drive (6: main/detached reflow
+        //      services, search refresh, main_pending, detached_pending,
+        //      settings_pending)
         //    + dock re-assert (1) + center re-assert (1)
         //    + main-window-open first-frame nudge on a local `window` binding (1).
+        // The render tails no longer self-drive: `about_to_wait` is the ONLY
+        // place that decides another frame.
         assert_eq!(
             raw_calls(include_str!("app.rs")),
-            14,
+            11,
             "raw request_redraw count changed in app.rs — run scripts/check-paint-choke.sh"
         );
     }
