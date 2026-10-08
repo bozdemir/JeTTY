@@ -42,3 +42,44 @@ fn set_theme_changes_snapshot_bg_rgba() {
     // Gruvbox dark bg is [40, 40, 40, 255]
     assert_eq!(snap.bg_rgba, [40, 40, 40, 255]);
 }
+
+/// Built-ins are only ever APPENDED: the historical 22 keep their indices (an
+/// ordered `theme_idx`, the registry tests' dracula == 3) and the v2 additions
+/// follow in a fixed order.
+#[test]
+fn presets_only_ever_append() {
+    let p = jetty_core::theme::PRESETS;
+    assert_eq!(p.len(), 46);
+    assert_eq!(&p[..4], &["catppuccin_mocha", "tokyo_night", "gruvbox_dark", "dracula"]);
+    assert_eq!(p[21], "catppuccin_macchiato", "the last of the original 22");
+    assert_eq!(p[22], "catppuccin_latte", "the first v2 addition");
+    assert_eq!(p[45], "dayfox");
+}
+
+/// tokyo_night's brights follow the current tokyonight.nvim extras (they used to
+/// repeat the normals); everforest_dark's bright accents are the dark palette's
+/// (they were the LIGHT variant's), equal to its normals as everforest.vim maps them.
+#[test]
+fn tokyo_night_and_everforest_brights_follow_upstream() {
+    let t = Theme::by_name("tokyo_night");
+    let brights: Vec<[u8; 3]> = t.palette[9..15].to_vec();
+    assert_eq!(
+        brights,
+        vec![[0xff, 0x89, 0x9d], [0x9f, 0xe0, 0x44], [0xfa, 0xba, 0x4a], [0x8d, 0xb0, 0xff], [0xc7, 0xa9, 0xff], [0xa4, 0xda, 0xff]]
+    );
+    let e = Theme::by_name("everforest_dark");
+    for i in 1..=6 {
+        assert_eq!(e.palette[8 + i], e.palette[i], "everforest_dark bright {i} == its normal");
+    }
+}
+
+/// The Rose Pine family draws its cursor in the foreground (the upstream Moon /
+/// Dawn cursors are 2.1 and 1.5:1 on their backgrounds).
+#[test]
+fn rose_pine_variants_draw_the_cursor_in_the_foreground() {
+    for name in ["rose_pine", "rose_pine_moon", "rose_pine_dawn"] {
+        let t = Theme::by_name(name);
+        assert_eq!(t.cursor, t.fg, "{name}");
+        assert_eq!(t.cursor_text, None, "{name}");
+    }
+}
