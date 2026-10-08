@@ -22,6 +22,8 @@ fn user_theme(name: &str, display: &str, bg: [u8; 4]) -> Theme {
         cursor: [255, 255, 255],
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [[0, 0, 0]; 16],
     }
 }

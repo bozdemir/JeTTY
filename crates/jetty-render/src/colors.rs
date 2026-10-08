@@ -22,9 +22,13 @@ pub struct SelectionPaint {
     pub fallback_fg: [u8; 3],
 }
 
-/// The selection highlight: a dim accent blend (1/3 theme bg + 2/3 palette blue),
-/// mirroring the Settings panel's selected-row color so it reads on any theme.
+/// The selection highlight: the theme's explicit `selection_bg` when it sets one,
+/// else a dim accent blend (1/3 theme bg + 2/3 palette blue), mirroring the
+/// Settings panel's selected-row color so it reads on any theme.
 pub fn selection_bg(theme: &jetty_core::Theme) -> [u8; 3] {
+    if let Some(c) = theme.selection_bg {
+        return c;
+    }
     let bg = theme.bg;
     let accent = theme.palette[4];
     [
@@ -134,8 +138,11 @@ mod tests {
         let mut t = jetty_core::Theme::by_name("catppuccin_mocha");
         t.cursor_text = Some([1, 2, 3]);
         t.selection_fg = Some([4, 5, 6]);
+        t.selection_bg = Some([7, 8, 9]);
         assert_eq!(cursor_text_color(&t, t.cursor), [1, 2, 3]);
         assert_eq!(selection_paint(&t).fg, Some([4, 5, 6]));
+        assert_eq!(selection_bg(&t), [7, 8, 9]);
+        assert_eq!(selection_paint(&t).bg, [7, 8, 9], "the grid highlight follows the theme too");
     }
 
     #[test]

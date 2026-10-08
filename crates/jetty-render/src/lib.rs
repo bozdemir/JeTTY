@@ -22,6 +22,8 @@ mod hints;
 mod preedit;
 mod palette;
 mod status;
+mod ui_palette;
+pub use ui_palette::{ensure_contrast, UiPalette};
 pub use chrome::{
     clip_head, clip_tail, fit_head, fit_tail, ChromeMeasure, ChromeMetrics, MonoMeasure,
     CHROME_ADVANCE, MAX_LABEL_CHARS, OVERLAY_SCALE, PILL_H_BASE, STATUS_H_BASE, UI_FONT_BASE,

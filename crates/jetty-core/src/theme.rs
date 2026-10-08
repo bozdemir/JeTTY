@@ -31,6 +31,13 @@ pub struct Theme {
     /// Color of every selected glyph. `None` = keep each glyph's own color unless
     /// it would be unreadable on the selection highlight.
     pub selection_fg: Option<[u8; 3]>,
+    /// The UI accent (menu hover, active handles, the welcome logo, …). `None` =
+    /// derived: ANSI blue (`palette[4]`), or bright blue / a shade of it when that
+    /// is too faint on the UI surface (see jetty-render's `UiPalette`).
+    pub accent: Option<[u8; 3]>,
+    /// The selection highlight painted under selected cells. `None` = derived
+    /// (1/3 bg + 2/3 ANSI blue).
+    pub selection_bg: Option<[u8; 3]>,
     pub palette: [[u8; 3]; 16], // standard ANSI 0..=15
 }
 
@@ -184,6 +191,8 @@ pub fn catppuccin_mocha() -> Theme {
         cursor: [245, 224, 220], // rosewater #f5e0dc
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [69, 71, 90],    // 0  surface1 #45475a
             [243, 139, 168], // 1  red      #f38ba8
@@ -215,6 +224,8 @@ pub fn tokyo_night() -> Theme {
         cursor: [192, 202, 245], // #c0caf5
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [21, 22, 30],    // 0  #15161e
             [247, 118, 142], // 1  #f7768e
@@ -246,6 +257,8 @@ pub fn gruvbox_dark() -> Theme {
         cursor: [251, 241, 199],
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [40, 40, 40],    // 0  black (dark0)
             [204, 36, 29],   // 1  red
@@ -277,6 +290,8 @@ pub fn dracula() -> Theme {
         cursor: [248, 248, 242], // #f8f8f2
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [33, 34, 44],    // 0  #21222c
             [255, 85, 85],   // 1  #ff5555
@@ -309,6 +324,8 @@ pub fn onyx() -> Theme {
         cursor: [97, 175, 239],  // #61afef
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [58, 60, 66],    // 0  #3a3c42
             [224, 108, 117], // 1  red     #e06c75
@@ -341,6 +358,8 @@ pub fn nord() -> Theme {
         cursor: [236, 239, 244], // #eceff4
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [59, 66, 82], // 0  black      #3b4252
             [191, 97, 106], // 1  red        #bf616a
@@ -372,6 +391,8 @@ pub fn solarized_dark() -> Theme {
         cursor: [131, 148, 150], // #839496
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [7, 54, 66], // 0  black      #073642
             [220, 50, 47], // 1  red        #dc322f
@@ -403,6 +424,8 @@ pub fn solarized_light() -> Theme {
         cursor: [101, 123, 131], // #657b83
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [7, 54, 66], // 0  black      #073642
             [220, 50, 47], // 1  red        #dc322f
@@ -434,6 +457,8 @@ pub fn one_dark() -> Theme {
         cursor: [171, 178, 191], // #abb2bf
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [33, 37, 43], // 0  black      #21252b
             [224, 108, 117], // 1  red        #e06c75
@@ -465,6 +490,8 @@ pub fn monokai() -> Theme {
         cursor: [192, 193, 181], // #c0c1b5
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [39, 40, 34], // 0  black      #272822
             [249, 38, 114], // 1  red        #f92672
@@ -496,6 +523,8 @@ pub fn monokai_pro() -> Theme {
         cursor: [193, 192, 192], // #c1c0c0
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [45, 42, 46], // 0  black      #2d2a2e
             [255, 97, 136], // 1  red        #ff6188
@@ -527,6 +556,8 @@ pub fn everforest_dark() -> Theme {
         cursor: [230, 152, 117], // #e69875
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [122, 132, 120], // 0  black      #7a8478
             [230, 126, 128], // 1  red        #e67e80
@@ -558,6 +589,8 @@ pub fn rose_pine() -> Theme {
         cursor: [224, 222, 244], // #e0def4
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [38, 35, 58], // 0  black      #26233a
             [235, 111, 146], // 1  red        #eb6f92
@@ -589,6 +622,8 @@ pub fn kanagawa() -> Theme {
         cursor: [220, 215, 186], // #dcd7ba
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [22, 22, 29], // 0  black      #16161d
             [195, 64, 67], // 1  red        #c34043
@@ -620,6 +655,8 @@ pub fn material_dark() -> Theme {
         cursor: [22, 175, 202], // #16afca
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [33, 33, 33], // 0  black      #212121
             [183, 20, 31], // 1  red        #b7141f
@@ -651,6 +688,8 @@ pub fn ayu_dark() -> Theme {
         cursor: [230, 180, 80], // #e6b450
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [17, 21, 28], // 0  black      #11151c
             [234, 108, 115], // 1  red        #ea6c73
@@ -682,6 +721,8 @@ pub fn ayu_mirage() -> Theme {
         cursor: [255, 204, 102], // #ffcc66
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [23, 27, 36], // 0  black      #171b24
             [237, 130, 116], // 1  red        #ed8274
@@ -713,6 +754,8 @@ pub fn tomorrow_night() -> Theme {
         cursor: [197, 200, 198], // #c5c8c6
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [0, 0, 0], // 0  black      #000000
             [204, 102, 102], // 1  red        #cc6666
@@ -744,6 +787,8 @@ pub fn oceanic_next() -> Theme {
         cursor: [192, 197, 206], // #c0c5ce
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [22, 44, 53], // 0  black      #162c35
             [236, 95, 103], // 1  red        #ec5f67
@@ -775,6 +820,8 @@ pub fn github_dark() -> Theme {
         cursor: [88, 166, 255], // #58a6ff
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [72, 79, 88], // 0  black      #484f58
             [255, 123, 114], // 1  red        #ff7b72
@@ -806,6 +853,8 @@ pub fn palenight() -> Theme {
         cursor: [126, 87, 194], // #7e57c2
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [103, 110, 149], // 0  black      #676e95
             [255, 85, 114], // 1  red        #ff5572
@@ -837,6 +886,8 @@ pub fn catppuccin_macchiato() -> Theme {
         cursor: [244, 219, 214], // #f4dbd6
         cursor_text: None,
         selection_fg: None,
+        accent: None,
+        selection_bg: None,
         palette: [
             [73, 77, 100], // 0  black      #494d64
             [237, 135, 150], // 1  red        #ed8796

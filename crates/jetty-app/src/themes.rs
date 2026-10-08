@@ -176,6 +176,8 @@ fn theme_from_toml(t: ThemeToml, stem: &str) -> Result<jetty_core::Theme, String
         cursor,
         cursor_text,
         selection_fg,
+        accent: None,
+        selection_bg: None,
         palette,
     })
 }
@@ -536,6 +538,8 @@ palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606"
             cursor: [7, 8, 9],
             cursor_text: None,
             selection_fg: None,
+            accent: None,
+            selection_bg: None,
             palette: [[0, 0, 0]; 16],
         };
         let novel = jetty_core::Theme {
@@ -546,6 +550,8 @@ palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606"
             cursor: [7, 8, 9],
             cursor_text: None,
             selection_fg: None,
+            accent: None,
+            selection_bg: None,
             palette: [[0, 0, 0]; 16],
         };
         let merged = merge_into_builtins(vec![dracula, novel]);
