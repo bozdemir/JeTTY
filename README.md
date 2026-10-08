@@ -193,7 +193,7 @@ Settings live in one TOML file — the Settings window writes it, and you can ed
 | Linux | `~/.config/jetty/config.toml` (`$XDG_CONFIG_HOME/jetty/…`) | `~/.config/jetty/themes/*.toml` |
 | macOS | `~/Library/Application Support/jetty/config.toml` | `~/Library/Application Support/jetty/themes/*.toml` |
 
-`JETTY_CONFIG_DIR=/some/dir` makes JeTTY use `/some/dir/config.toml` and `/some/dir/themes/` instead; `jetty --help` prints the path in use.
+`JETTY_CONFIG_DIR=/some/dir` makes JeTTY use `/some/dir/config.toml` and `/some/dir/themes/` instead — as a separate instance next to your usual one (which it leaves alone, login item included); `jetty --help` prints the path in use.
 
 - **Live reload** — saving the file (or a theme) applies it immediately; a symlinked config (dotfiles) is followed. `hot_reload = false` turns the watcher off.
 - **Forgiving** — a value of the wrong type (`opacity = "0.9"`) or an unknown key (`fontsize`) is reported in the window and only that key falls back; everything else still applies. A file that isn't valid TOML at all leaves your settings untouched (JeTTY runs on defaults, keeps a copy as `config.toml.bad-<time>` and won't save over it until it's fixed).

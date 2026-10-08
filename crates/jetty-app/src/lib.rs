@@ -54,10 +54,33 @@ pub fn default_context_menu_hints() -> Vec<String> {
 /// would silently swallow every summon (a DoS) and leak our commands — or squat
 /// the lock. We never place the socket directly in world-writable `/tmp`.
 fn ipc_socket_path() -> String {
+    let override_dir = std::env::var_os("JETTY_CONFIG_DIR")
+        .filter(|d| !d.is_empty())
+        .map(std::path::PathBuf::from);
     ipc_runtime_dir()
-        .join("jetty.sock")
+        .join(ipc_socket_name(override_dir.as_deref()))
         .to_string_lossy()
         .into_owned()
+}
+
+/// The IPC socket's file name: `jetty.sock` — or, with `$JETTY_CONFIG_DIR` set
+/// (an alternate config tree), `jetty-<hash of that dir>.sock`. One primary per
+/// config dir: `JETTY_CONFIG_DIR=/x jetty` used to find the user's running
+/// instance and merely summon it, so the variable had no effect while JeTTY ran.
+/// The hash is FNV-1a over the absolute, component-normalized path (`/x/` and
+/// `/x` agree) — stable across builds, unlike std's hasher.
+fn ipc_socket_name(config_dir_override: Option<&std::path::Path>) -> String {
+    let Some(dir) = config_dir_override else {
+        return "jetty.sock".to_string();
+    };
+    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let norm: std::path::PathBuf = abs.components().collect();
+    let hash = norm
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    format!("jetty-{hash:016x}.sock")
 }
 
 /// A per-user, non-world-writable directory to hold the IPC socket + lock.
@@ -440,6 +463,27 @@ pub fn run() {
     // remove-stale-on-bind logic at the start of the next launch. Only unlink
     // the socket if it is still the one WE bound.
     remove_socket_if_ours(&sock_path, bound_ident);
+}
+
+#[cfg(test)]
+mod ipc_socket_tests {
+    use super::ipc_socket_name;
+    use std::path::Path;
+
+    #[test]
+    fn an_alternate_config_dir_gets_its_own_instance() {
+        // The default socket is unchanged — a `jetty --toggle` bound in the
+        // compositor keeps finding the user's instance.
+        assert_eq!(ipc_socket_name(None), "jetty.sock");
+        let a = ipc_socket_name(Some(Path::new("/home/u/try-config")));
+        assert!(a.starts_with("jetty-") && a.ends_with(".sock") && a != "jetty.sock", "{a}");
+        assert_eq!(a, ipc_socket_name(Some(Path::new("/home/u/try-config/"))), "trailing slash");
+        assert_eq!(a, ipc_socket_name(Some(Path::new("/home/u//try-config"))), "doubled slash");
+        assert_ne!(a, ipc_socket_name(Some(Path::new("/home/u/other-config"))));
+        // Stable across runs/builds: a fixed FNV-1a, not std's hasher.
+        assert_eq!(ipc_socket_name(Some(Path::new("/x"))), ipc_socket_name(Some(Path::new("/x"))));
+        assert_eq!(a.len(), "jetty-".len() + 16 + ".sock".len());
+    }
 }
 
 #[cfg(test)]
