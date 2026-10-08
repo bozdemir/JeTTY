@@ -67,6 +67,9 @@
 ///                    Terminal::hint_tokens + assign_labels + build_hint_overlay);
 ///                    JETTY_SHOT_HINTS_TYPED="s" narrows to matching labels (typed
 ///                    prefix dimmed). Feed a token-rich line via JETTY_SHOT_INPUT.
+///   JETTY_SHOT_GRAPHEMES="row,col,cluster;…" — grapheme-cluster overrides for
+///                    the renderer (combining marks / VS16 / ZWJ drawn from the
+///                    whole cluster instead of the cell's base char).
 ///   JETTY_SHOT_COPYMODE="row,col" — copy-mode self-test: draw the keyboard cursor
 ///                    (hollow box) + the "COPY" pill at (row,col). With
 ///                    JETTY_SHOT_COPYMODE_ANCHOR="row,col" also drive a live
@@ -564,27 +567,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
     bg_rects.extend(cursor_under);
-    quad.render_clear(
-        &device,
-        &queue,
-        &view,
-        width,
-        height,
-        &bg_rects,
-        // Headless harness CPU-composites over its own checkerboard, which expects
-        // the historical premultiplied clear — keep it independent of any surface.
-        jetty_render::default_bg_clear(&snap, true),
-    );
 
-    // --- Pass 2: render the grid text on top of the painted background (load) ---
+    // --- Pass 2: the grid text on top of the painted background ---
+    // JETTY_SHOT_GRAPHEMES="row,col,cluster;…" — grapheme-cluster overrides
+    // (e.g. "0,0,e\u{301}" for an NFD é), fed straight to the renderer until the
+    // snapshot carries them itself.
+    let grapheme_spec = std::env::var("JETTY_SHOT_GRAPHEMES").unwrap_or_default();
+    let graphemes: Vec<(usize, usize, &str)> = grapheme_spec
+        .split(';')
+        .filter_map(|e| {
+            let mut it = e.splitn(3, ',');
+            Some((it.next()?.trim().parse().ok()?, it.next()?.trim().parse().ok()?, it.next()?))
+        })
+        .collect();
     let paint = jetty_render::GridPaint {
         cursor_glyph: cursor_under.map(|_| {
             (snap.cursor_row, snap.cursor_col, jetty_render::cursor_text_color(terminal.theme(), snap.cursor_rgb))
         }),
         selection: Some(selection),
-        graphemes: &[],
+        graphemes: &graphemes,
     };
-    text.render_grid(&device, &queue, &view, width, height, &snap, false, shot_grid_top, &paint)?;
+    // Passes 1 + 2 in ONE render pass + submit, exactly like the app's
+    // `render_grid_scene`. The clear is the historical premultiplied value: the
+    // harness CPU-composites over its own checkerboard, independent of any surface.
+    let bg_count = quad.upload(&device, &queue, width, height, &bg_rects);
+    text.prepare_grid(&device, &queue, width, height, &snap, shot_grid_top, &paint)?;
+    {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot-grid") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shot-grid-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(jetty_render::default_bg_clear(&snap, true)),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            quad.draw_uploaded(&mut pass, bg_count);
+            text.draw_grid(&mut pass);
+        }
+        queue.submit(Some(encoder.finish()));
+        text.end_grid_frame();
+    }
 
     // --- Pass 2b: inline (sixel) images over the grid, at native pixel size,
     // scissored to the grid area — the same ImageLayer the live app runs, so the
