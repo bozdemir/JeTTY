@@ -16,7 +16,7 @@ fn pty_echoes_written_bytes() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut seen = Vec::new();
     while Instant::now() < deadline {
-        if let Ok(chunk) = pty.output().recv_timeout(Duration::from_millis(200)) {
+        if let Some(chunk) = pty.recv_output_timeout(Duration::from_millis(200)) {
             seen.extend_from_slice(&chunk);
             if String::from_utf8_lossy(&seen).contains("jetty-marker") {
                 return; // success
@@ -41,7 +41,7 @@ fn child_exit_is_detected() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         // Drain output so the shell can make progress toward exiting.
-        while pty.output().try_recv().is_ok() {}
+        while pty.try_recv_output().is_some() {}
         if pty.child_exited() {
             return; // success: EOF observed, flag set
         }
@@ -97,7 +97,7 @@ fn spawn_inherits_cwd() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut seen = Vec::new();
     while Instant::now() < deadline {
-        if let Ok(chunk) = pty.output().recv_timeout(Duration::from_millis(200)) {
+        if let Some(chunk) = pty.recv_output_timeout(Duration::from_millis(200)) {
             seen.extend_from_slice(&chunk);
             if String::from_utf8_lossy(&seen).contains(&leaf) {
                 let _ = std::fs::remove_dir(&dir);
@@ -116,9 +116,118 @@ fn spawn_with_vanished_cwd_falls_back() {
     let pty =
         PtySession::spawn(80, 24, 0, 0, None, Some(dir.clone()), || {}).expect("spawn must succeed");
     std::thread::sleep(Duration::from_millis(300));
-    while pty.output().try_recv().is_ok() {}
+    while pty.try_recv_output().is_some() {}
     assert!(!pty.child_exited(), "shell died after spawn with a vanished cwd");
     assert_ne!(pty.cwd(), Some(dir), "shell ended up in the deleted directory");
+}
+
+/// Read output until `needle` appears (or 5 s pass); returns everything seen.
+fn read_until(pty: &PtySession, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        if let Some(chunk) = pty.recv_output_timeout(Duration::from_millis(100)) {
+            seen.extend_from_slice(&chunk);
+            if String::from_utf8_lossy(&seen).contains(needle) {
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&seen).into_owned()
+}
+
+fn is_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn spawn_without_cwd_starts_in_home() {
+    // No requested cwd → home (portable-pty's default), whatever directory the
+    // app itself was started from.
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+    let Ok(home) = std::fs::canonicalize(home) else { return };
+    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut cwd = None;
+    while Instant::now() < deadline {
+        cwd = pty.cwd().and_then(|p| std::fs::canonicalize(p).ok());
+        if cwd.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(cwd, Some(home));
+}
+
+#[cfg(unix)]
+#[test]
+fn unenterable_inherited_cwd_falls_back_with_a_notice() {
+    // A directory can still be `is_dir()` yet refuse chdir(2) (mode 000): every
+    // shell candidate then failed for the same reason and the new tab silently
+    // never opened. The spawn must retry the SAME shell in the default dir and
+    // say so.
+    if is_root() {
+        return; // root ignores the permission bits — nothing to provoke
+    }
+    use std::os::unix::fs::PermissionsExt;
+    // The directory name is attacker-controlled (any cloned repo can carry
+    // one): ESC/BEL/C1 that would write the clipboard and query the terminal.
+    let dir = unique_temp_dir("locked\x1b]52;c;aGk=\x07\u{9b}6n\x1b[c");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let res = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), Some(dir.clone()), || {});
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _ = std::fs::remove_dir(&dir);
+    let pty = res.expect("spawn must fall back instead of failing the tab");
+    let notices = pty.startup_notices();
+    assert_eq!(notices.len(), 1, "exactly the start-directory notice: {notices:?}");
+    let notice = &notices[0];
+    assert!(notice.contains("could not open the shell in"), "notice: {notice}");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!pty.child_exited(), "the fallback shell must be alive");
+
+    // Shown the way the app shows it, the name stays text: only our own SGR
+    // wrapper is a sequence, and nothing in it reaches the clipboard, the
+    // title or the shell (as a query reply).
+    let line = jetty_core::Terminal::notice_line(notice);
+    let inner = line.strip_prefix("\x1b[33m").and_then(|s| s.strip_suffix("\x1b[0m\r\n")).unwrap();
+    assert!(!inner.chars().any(char::is_control), "control bytes in the shown notice: {inner:?}");
+    let mut term = jetty_core::Terminal::new(200, 4);
+    term.feed_notice(notice);
+    assert_eq!(term.take_clipboard_store(), None);
+    assert_eq!(term.take_title_update(), None);
+    assert!(term.drain_pty_writes().is_empty(), "a query in the name was answered");
+}
+
+#[cfg(unix)]
+#[test]
+fn launch_environment_identity_does_not_leak_into_shells() {
+    // Activation tokens, the AppImage runtime and another terminal's identity in
+    // JeTTY's own environment must not reach its shells. (Process env is shared
+    // by the test binary's threads; these names are inert for other tests.)
+    for (k, v) in [
+        ("XDG_ACTIVATION_TOKEN", "stale-token"),
+        ("DESKTOP_STARTUP_ID", "stale-id"),
+        ("KITTY_WINDOW_ID", "7"),
+        ("TMUX", "/tmp/tmux-1/default,1,0"),
+        ("WINDOWID", "12345"),
+        ("OWD", "/somewhere"),
+    ] {
+        std::env::set_var(k, v);
+    }
+    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    {
+        use std::io::Write;
+        let mut w = pty.writer();
+        w.write_all(b"env; echo ENV-DONE\n").unwrap();
+    }
+    let out = read_until(&pty, "\nENV-DONE");
+    for k in ["XDG_ACTIVATION_TOKEN=", "DESKTOP_STARTUP_ID=", "KITTY_WINDOW_ID=", "TMUX=", "WINDOWID=", "OWD="] {
+        assert!(!out.lines().any(|l| l.starts_with(k)), "{k} leaked into the shell:\n{out}");
+    }
+    assert!(out.lines().any(|l| l.starts_with("JETTY_BIN=")), "JETTY_BIN missing:\n{out}");
+    assert!(out.lines().any(|l| l.starts_with("TERM_PROGRAM=jetty")), "TERM_PROGRAM:\n{out}");
 }
 
 #[test]
@@ -132,7 +241,7 @@ fn cwd_none_after_exit() {
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        while pty.output().try_recv().is_ok() {}
+        while pty.try_recv_output().is_some() {}
         if pty.child_exited() {
             // The exit guard must prevent reading a recycled PID's cwd.
             assert!(pty.cwd().is_none(), "cwd() returned Some for an exited shell");

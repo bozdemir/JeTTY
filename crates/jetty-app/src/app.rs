@@ -328,12 +328,13 @@ const STATUS_H: f32 = 22.0;
 const SCROLLBAR_GUTTER: f32 = jetty_render::SCROLLBAR_W + 4.0;
 
 /// Maximum bytes of PTY output fed into one tab's terminal per drain pass. Under
-/// an output flood (`yes`, `cat huge.log`) the PTY reader thread enqueues data
-/// far faster than the VT parser consumes it; draining the channel to empty in
-/// one go would never return to the winit loop (no redraws, no keyboard — the
-/// user could not even Ctrl+C the flood, and the backlog grows unbounded). The
-/// drain stops after this many bytes; the reader queued one Wake per chunk, so
-/// the next Wake continues where this left off while input events interleave.
+/// an output flood (`yes`, `cat huge.log`) the PTY can produce faster than the VT
+/// parser consumes; draining to empty in one go would never return to the winit
+/// loop (no redraws, no keyboard — the user could not even Ctrl+C the flood).
+/// The drain stops after this many bytes and `about_to_wait` re-arms the tab's
+/// wake (`PtySession::rearm_wake`), so the rest is drained in the NEXT loop
+/// iteration — after pending input events. The backlog itself is bounded by the
+/// PTY read queue (the reader blocks and the child with it), not by this.
 const PTY_DRAIN_BUDGET: usize = 2 * 1024 * 1024;
 
 /// Minimum interval between open-search match re-collects while output
@@ -2336,7 +2337,13 @@ impl App {
         }) {
             Ok(p) => p,
             Err(e) => {
+                // Not silent: a GUI launch never shows stderr, and a new tab that
+                // simply doesn't appear reads as a dead shortcut.
                 eprintln!("jetty: failed to spawn tab PTY: {e}");
+                self.show_status_pill(crate::runsel::Notice {
+                    msg: "Couldn't open a new tab — no shell could be started",
+                    window: None,
+                });
                 return None;
             }
         };
@@ -2356,9 +2363,10 @@ impl App {
         if self.scrollback_lines != 10_000 {
             terminal.set_scrollback_lines(self.scrollback_lines);
         }
-        // Surface the shell-fallback notice here too (F2).
-        if let Some(notice) = pty.startup_notice() {
-            terminal.feed(format!("\x1b[33m{notice}\x1b[0m\r\n").as_bytes());
+        // Surface the shell / start-directory fallback notices here too (F2) —
+        // through feed_notice: they carry outside data (paths) and must stay inert.
+        for notice in pty.startup_notices() {
+            terminal.feed_notice(notice);
         }
         let title = format!("Tab {}", self.tabs.len() + 1);
         self.tabs.push(Tab {
@@ -4329,48 +4337,19 @@ impl App {
     /// Paste `text` into `tab`'s PTY (bracketed when the app enabled it).
     /// Shared by the main window's paste paths and the detached windows'
     /// context-menu / Ctrl+Shift+V paste, so all windows paste identically.
+    /// The wire bytes — control characters stripped (no `^C` can split a paste
+    /// into typed commands, no ESC can forge the end marker), line breaks
+    /// normalized — come from the pure, unit-tested `runsel::paste_bytes`.
     fn paste_to_tab(tab: &mut Tab, text: &str) {
-        if text.is_empty() {
+        let bytes = crate::runsel::paste_bytes(text, tab.terminal.bracketed_paste());
+        if bytes.is_empty() {
             return;
         }
         // A user paste claims the prompt — cancel any staged run-selection
         // inject for this tab (same rule as write_key_to_pty).
         crate::runsel::cancel_on_user_write(&mut tab.pending_inject);
-        let bracketed = tab.terminal.bracketed_paste();
-        let w = &mut tab.writer;
-        if bracketed {
-            // Strip any embedded end-paste marker (ESC[201~) from the payload so
-            // pasted content can never terminate the bracketed-paste guard early
-            // and inject the remainder as typed commands (the classic paste
-            // injection; xterm/iTerm2/alacritty all do this).
-            let clean = Self::strip_paste_end(text.as_bytes());
-            let _ = w.write_all(b"\x1b[200~");
-            let _ = w.write_all(&clean);
-            let _ = w.write_all(b"\x1b[201~");
-        } else {
-            let _ = w.write_all(text.as_bytes());
-        }
-        let _ = w.flush();
-    }
-
-    /// Remove every embedded bracketed-paste END marker (`ESC[201~`) from
-    /// `bytes`. Borrows unchanged when the marker is absent (the common case),
-    /// so a normal paste pays no allocation. Checks the OUTPUT tail after each
-    /// byte so a marker cannot re-form across a removed one (e.g. the crafted
-    /// `ESC[2` + `ESC[201~` + `01~`).
-    fn strip_paste_end(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-        const END: &[u8] = b"\x1b[201~";
-        if bytes.len() < END.len() || !bytes.windows(END.len()).any(|w| w == END) {
-            return std::borrow::Cow::Borrowed(bytes);
-        }
-        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-        for &b in bytes {
-            out.push(b);
-            if out.ends_with(END) {
-                out.truncate(out.len() - END.len());
-            }
-        }
-        std::borrow::Cow::Owned(out)
+        let _ = tab.writer.write_all(&bytes);
+        let _ = tab.writer.flush();
     }
 
     /// Run the current selection in a NEW tab — the browser's "open link in a
@@ -4567,6 +4546,26 @@ impl App {
         (active_had_data, chrome_changed, exited)
     }
 
+    /// End-of-iteration re-arm of every tab's coalesced PTY wake (main and
+    /// detached). A tab whose drain hit `PTY_DRAIN_BUDGET` — or that received
+    /// output after its last drain — still has bytes queued: ONE Wake (for all
+    /// of them) is sent so they drain in the NEXT iteration, after pending
+    /// input; an idle tab's latch is cleared so its next output wakes us at
+    /// once. Must run after the iteration's drains, i.e. from `about_to_wait`
+    /// (see `PtySession::rearm_wake` for why not earlier).
+    fn rearm_pty_wakes(&self) {
+        let mut more = false;
+        for tab in &self.tabs {
+            more |= tab.pty.rearm_wake();
+        }
+        for dw in &self.detached {
+            more |= dw.tab.pty.rearm_wake();
+        }
+        if more {
+            let _ = self.proxy.send_event(AppEvent::Wake);
+        }
+    }
+
     /// Drain one tab's PTY output into its terminal, and flush any query
     /// replies (DSR/DA, etc.) the terminal produced back to the PTY. Returns
     /// `(had, title_changed)`: whether the tab fed any bytes or sent any
@@ -4589,22 +4588,13 @@ impl App {
         tab: &mut Tab,
         vt_read: &mut u64,
     ) -> (bool, bool, Option<crate::runsel::Notice>) {
-        let mut had = false;
         // Feed at most PTY_DRAIN_BUDGET bytes this pass so a flood can't starve
-        // the event loop (see the const's doc). Any remaining chunks are drained
-        // by the Wakes the reader already queued for them.
-        let mut fed = 0usize;
-        while fed < PTY_DRAIN_BUDGET {
-            match tab.pty.output().try_recv() {
-                Ok(chunk) => {
-                    *vt_read += chunk.len() as u64;
-                    fed += chunk.len();
-                    tab.terminal.feed(&chunk);
-                    had = true;
-                }
-                Err(_) => break,
-            }
-        }
+        // the event loop (see the const's doc). Whatever remains is scheduled
+        // for the next loop iteration by `rearm_pty_wakes` in `about_to_wait`.
+        let terminal = &mut tab.terminal;
+        let fed = tab.pty.drain_output(PTY_DRAIN_BUDGET, |chunk| terminal.feed(chunk));
+        *vt_read += fed as u64;
+        let mut had = fed > 0;
         // Flush any query replies (DSR/DA, etc.) this tab produced back to its
         // own PTY so the shell's startup probes succeed.
         let replies = tab.terminal.drain_pty_writes();
@@ -4634,14 +4624,24 @@ impl App {
         // check when clean, so zero idle cost. `crate::clipboard::set` is a free fn
         // (no self borrow), so this is conflict-free inside `drain_one_tab`.
         if let Some(text) = tab.terminal.take_clipboard_store() {
-            crate::clipboard::set(&text);
+            // OSC 52 names the selection: `p`/`s` → PRIMARY, `c` → clipboard.
+            if tab.terminal.clipboard_store_is_primary() {
+                crate::clipboard::set_primary(&text);
+            } else {
+                crate::clipboard::set(&text);
+            }
         }
         // OSC 52 PASTE (load): a program asked to READ the clipboard. Only ever
         // present when the user enabled `osc52_allow_paste` (else alacritty denies it
         // and no request reaches us). Read the clipboard, CAP the reply length, format
         // via alacritty's supplied formatter, and write it back to the PTY.
         if let Some(fmt) = tab.terminal.take_clipboard_load() {
-            if let Some(mut text) = crate::clipboard::get() {
+            let text = if tab.terminal.clipboard_load_is_primary() {
+                crate::clipboard::get_primary()
+            } else {
+                crate::clipboard::get()
+            };
+            if let Some(mut text) = text {
                 if text.len() > jetty_core::OSC52_MAX_BYTES {
                     text.truncate(floor_char_boundary(&text, jetty_core::OSC52_MAX_BYTES));
                 }
@@ -8012,6 +8012,9 @@ impl ApplicationHandler<AppEvent> for App {
     /// then the loop settles back to `Wait`. On X11/Wayland a pending redraw never
     /// blocks the loop anyway, so that extra iteration is free.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // PTY output left queued by this iteration's drains is scheduled for the
+        // next one (and idle tabs re-armed). First, so no early return skips it.
+        self.rearm_pty_wakes();
         // Input-latency percentile emit (JETTY_PERF_LOG only): runs HERE, off the
         // timed present path, so printing a batch never stalls the frame it measured
         // (observer-effect fix). Emits at most once per REPORT_EVERY new samples.
@@ -8663,8 +8666,9 @@ impl ApplicationHandler<AppEvent> for App {
         terminal.resize(cols, rows);
         // Surface a one-line notice if the configured shell was unavailable and
         // spawn fell back to another shell, so the fallback is not silent (F2).
-        if let Some(notice) = pty.startup_notice() {
-            terminal.feed(format!("\x1b[33m{notice}\x1b[0m\r\n").as_bytes());
+        // feed_notice keeps the interpolated paths inert (no escape sequences).
+        for notice in pty.startup_notices() {
+            terminal.feed_notice(notice);
         }
         let writer = pty.writer();
         self.tabs.push(Tab {
@@ -13135,46 +13139,6 @@ mod url_open_tests {
         // Scheme must be a PREFIX, and multibyte text can't panic the check.
         assert!(!url_scheme_allowed("xhttps://example.com"));
         assert!(!url_scheme_allowed("héllo→"));
-    }
-}
-
-#[cfg(test)]
-mod paste_sanitize_tests {
-    use super::App;
-
-    #[test]
-    fn plain_text_borrows_unchanged() {
-        let s = "echo hello\nworld\t!";
-        let out = App::strip_paste_end(s.as_bytes());
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(&*out, s.as_bytes());
-    }
-
-    #[test]
-    fn embedded_end_marker_is_removed() {
-        // The classic injection: an ESC[201~ in the payload would otherwise
-        // terminate the bracketed-paste guard and run the rest as commands.
-        let out = App::strip_paste_end(b"a\x1b[201~rm -rf ~\n");
-        assert_eq!(&*out, b"arm -rf ~\n");
-        assert!(!contains(&out, b"\x1b[201~"));
-    }
-
-    #[test]
-    fn reformed_marker_across_removal_is_defeated() {
-        // Crafted so a naive single-pass removal would re-form ESC[201~ by
-        // concatenating the surrounding bytes.
-        let out = App::strip_paste_end(b"\x1b[2\x1b[201~01~");
-        assert!(!contains(&out, b"\x1b[201~"));
-    }
-
-    #[test]
-    fn multiple_markers_all_removed() {
-        let out = App::strip_paste_end(b"\x1b[201~x\x1b[201~y\x1b[201~");
-        assert_eq!(&*out, b"xy");
-    }
-
-    fn contains(hay: &[u8], needle: &[u8]) -> bool {
-        hay.windows(needle.len()).any(|w| w == needle)
     }
 }
 

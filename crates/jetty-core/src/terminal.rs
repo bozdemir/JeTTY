@@ -113,6 +113,16 @@ struct EventProxy {
     clipboard_load: Arc<Mutex<Option<ClipboardLoadFmt>>>,
     /// Cheap "a clipboard-paste is pending" flag (mirrors `clipboard_dirty`).
     clipboard_load_dirty: Arc<AtomicBool>,
+    /// Which selection the pending OSC 52 copy / paste names (`c` = clipboard,
+    /// `p`/`s` = the PRIMARY selection), recorded alongside each request.
+    osc52_primary: Arc<Osc52Primary>,
+}
+
+/// OSC 52 `Pc` per pending request: `true` = the PRIMARY selection (`p`/`s`).
+#[derive(Default)]
+struct Osc52Primary {
+    store: AtomicBool,
+    load: AtomicBool,
 }
 
 impl EventProxy {
@@ -196,15 +206,17 @@ impl EventListener for EventProxy {
             // system clipboard. alacritty already base64-decoded + UTF-8-validated
             // the payload and only emits this when its `osc52` mode permits copy
             // (OnlyCopy is JeTTY's default). Coalesce last-wins into a shared slot;
-            // the app commits it on the drain pass. `Selection` (`p`/`s`) is merged
-            // into the system clipboard for v1 (both are permitted remote writes).
-            Event::ClipboardStore(_ty, text) => {
+            // the app commits it on the drain pass — to the PRIMARY selection when
+            // the request named it (`p`/`s` → `Selection`), else the clipboard.
+            Event::ClipboardStore(ty, text) => {
                 // Cap the COMMITTED text (see OSC52_MAX_BYTES): reject an abusive
                 // payload rather than flooding the real clipboard. The transient
                 // decode already happened inside alacritty (bounded by its OSC
                 // buffer), so this is a commit gate, not a memory guard.
                 if text.len() <= OSC52_MAX_BYTES {
                     *self.clipboard_store.lock().unwrap() = Some(text);
+                    let primary = matches!(ty, alacritty_terminal::term::ClipboardType::Selection);
+                    self.osc52_primary.store.store(primary, Ordering::Relaxed);
                     self.clipboard_dirty.store(true, Ordering::Release);
                 }
             }
@@ -213,8 +225,10 @@ impl EventListener for EventProxy {
             // (OnlyPaste/CopyPaste) — never under the default OnlyCopy — so it is
             // inert unless the user set `osc52_allow_paste = true`. Stash the reply
             // formatter; the app reads the clipboard, caps + formats, writes to PTY.
-            Event::ClipboardLoad(_ty, formatter) => {
+            Event::ClipboardLoad(ty, formatter) => {
                 *self.clipboard_load.lock().unwrap() = Some(formatter);
+                let primary = matches!(ty, alacritty_terminal::term::ClipboardType::Selection);
+                self.osc52_primary.load.store(primary, Ordering::Relaxed);
                 self.clipboard_load_dirty.store(true, Ordering::Release);
             }
             // Wakeup / MouseCursorDirty and the rest are intentionally ignored.
@@ -444,6 +458,8 @@ pub struct Terminal {
     /// `osc52_mode` permits paste.
     clipboard_load: Arc<Mutex<Option<ClipboardLoadFmt>>>,
     clipboard_load_dirty: Arc<AtomicBool>,
+    /// The selection each pending OSC 52 request named (shared with the proxy).
+    osc52_primary: Arc<Osc52Primary>,
     /// The OSC 52 mode this terminal was built with. Stored so `set_scrollback_lines`
     /// (which rebuilds the alacritty `Config`) preserves it instead of silently
     /// reverting an enabled paste back to the default `OnlyCopy`. Toggled by
@@ -635,6 +651,7 @@ impl Terminal {
         let clipboard_dirty = Arc::new(AtomicBool::new(false));
         let clipboard_load = Arc::new(Mutex::new(None));
         let clipboard_load_dirty = Arc::new(AtomicBool::new(false));
+        let osc52_primary = Arc::new(Osc52Primary::default());
         let proxy = EventProxy {
             tx,
             geom: Arc::clone(&geom),
@@ -648,6 +665,7 @@ impl Terminal {
             clipboard_dirty: Arc::clone(&clipboard_dirty),
             clipboard_load: Arc::clone(&clipboard_load),
             clipboard_load_dirty: Arc::clone(&clipboard_load_dirty),
+            osc52_primary: Arc::clone(&osc52_primary),
         };
         let term = Term::new(config, &size, proxy);
 
@@ -668,6 +686,7 @@ impl Terminal {
             clipboard_dirty,
             clipboard_load,
             clipboard_load_dirty,
+            osc52_primary,
             osc52_mode,
             search_query: String::new(),
             search_regex: None,
@@ -757,6 +776,37 @@ impl Terminal {
             return None;
         }
         self.clipboard_load.lock().unwrap().take()
+    }
+
+    /// Whether the copy last returned by [`Terminal::take_clipboard_store`] named
+    /// the PRIMARY selection (OSC 52 `p`/`s`) rather than the clipboard (`c`).
+    pub fn clipboard_store_is_primary(&self) -> bool {
+        self.osc52_primary.store.load(Ordering::Relaxed)
+    }
+
+    /// Whether the paste request last returned by
+    /// [`Terminal::take_clipboard_load`] named the PRIMARY selection.
+    pub fn clipboard_load_is_primary(&self) -> bool {
+        self.osc52_primary.load.load(Ordering::Relaxed)
+    }
+
+    /// The exact bytes [`Terminal::feed_notice`] feeds for `text`: the text in
+    /// yellow on its own line, with every control character in it — ESC, BEL,
+    /// all other C0 (TAB/CR/LF too), DEL, C1 — replaced by a visible U+FFFD.
+    /// Only the SGR wrapper JeTTY adds itself reaches the parser as a sequence.
+    pub fn notice_line(text: &str) -> String {
+        let inert: String = text.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect();
+        format!("\x1b[33m{inert}\x1b[0m\r\n")
+    }
+
+    /// Show a one-line JeTTY notice (a shell or start-directory fallback…) in
+    /// this terminal. Notices interpolate outside data — a directory name, a
+    /// shell path, an OS error — so the text is made inert first
+    /// ([`Terminal::notice_line`]): a name carrying `\e]52;…` (clipboard
+    /// write), `\e]0;…` (title), a kitty APC or a query (whose reply would be
+    /// typed into the shell) must show as text, never run through our parser.
+    pub fn feed_notice(&mut self, text: &str) {
+        self.feed(Self::notice_line(text).as_bytes());
     }
 
     /// Enable or disable OSC 52 clipboard PASTE (remote READ of the local clipboard).
@@ -4475,6 +4525,19 @@ mod tests {
     }
 
     #[test]
+    fn osc52_copy_reports_the_named_selection() {
+        // `c` is the clipboard; `p` (and `s`) the PRIMARY selection, so a
+        // remote nvim `"*y` lands where a middle click pastes, not over Ctrl+V.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]52;p;aGk=\x07");
+        assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
+        assert!(t.clipboard_store_is_primary());
+        t.feed(b"\x1b]52;c;aGk=\x07");
+        assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
+        assert!(!t.clipboard_store_is_primary());
+    }
+
+    #[test]
     fn osc52_copy_coalesces_last_wins() {
         // Two copies before a drain coalesce to the LAST one.
         let mut t = Terminal::new(20, 5);
@@ -4483,13 +4546,46 @@ mod tests {
         assert_eq!(t.take_clipboard_store().as_deref(), Some("ya"));
     }
 
+    // ── JeTTY's own notices ───────────────────────────────────────────────────
+
+    /// A directory / shell name an attacker controls, carrying an OSC 52
+    /// clipboard write, an OSC 0 title, a DSR + DA query (replies are typed into
+    /// the shell), a C1 CSI query, a kitty APC query and an OSC 133 mark.
+    const HOSTILE: &str = "x\x1b]52;c;aGk=\x07 \x1b]0;pwned\x07 \x1b[6n \x1b[c \u{9b}6n \
+        \x1b_Ga=q,i=31;AAAA\x1b\\ \x1b]133;A\x07 tab\tcr\rlf\ndel\x7fend";
+
     #[test]
-    fn osc52_selection_type_routes_to_clipboard() {
-        // The PRIMARY selection form (`p`) is merged into the system clipboard for
-        // v1 (both are permitted remote writes under OnlyCopy).
+    fn notice_line_keeps_only_our_own_sgr() {
+        let line = Terminal::notice_line(HOSTILE);
+        let inner = line
+            .strip_prefix("\x1b[33m")
+            .and_then(|s| s.strip_suffix("\x1b[0m\r\n"))
+            .expect("our yellow wrapper, nothing else around it");
+        assert!(!inner.chars().any(char::is_control), "a control survived: {inner:?}");
+        assert!(inner.contains("]52;c;aGk=") && inner.contains('\u{fffd}'), "shown as text: {inner:?}");
+    }
+
+    #[test]
+    fn feeding_a_hostile_notice_runs_none_of_its_sequences() {
+        let mut t = Terminal::new(120, 5);
+        assert!(t.drain_pty_writes().is_empty());
+        t.feed_notice(HOSTILE);
+        assert_eq!(t.take_clipboard_store(), None, "no OSC 52 clipboard write");
+        assert_eq!(t.take_title_update(), None, "no OSC 0 title change");
+        assert!(t.drain_pty_writes().is_empty(), "no query reply may reach the shell");
+        let snap = t.snapshot();
+        let row0: String = snap.cells[..snap.cols].iter().map(|c| c.c).collect();
+        assert!(row0.contains("]52;c;aGk="), "the payload is visible text: {row0:?}");
+    }
+
+    #[test]
+    fn osc52_selection_type_routes_to_primary() {
+        // `s` (the "selection" form) is the PRIMARY selection too, like `p`; both
+        // are permitted remote writes under OnlyCopy.
         let mut t = Terminal::new(20, 5);
-        t.feed(b"\x1b]52;p;aGk=\x07");
+        t.feed(b"\x1b]52;s;aGk=\x07");
         assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
+        assert!(t.clipboard_store_is_primary());
     }
 
     #[test]

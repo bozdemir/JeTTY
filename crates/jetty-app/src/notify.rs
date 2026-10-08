@@ -106,10 +106,48 @@ pub fn spawn_notifier() -> Notifier {
     Notifier { tx }
 }
 
+/// Escape `& < >` so text is shown verbatim by a server that parses the body
+/// as markup — a command's output line like `Vec<String>` would otherwise lose
+/// `<String>`, a bare `&` be mangled, and hostile output inject a clickable
+/// `<a href>` into the toast.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn escape_markup(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(['&', '<', '>']) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Whether the notification server renders the body as markup (it advertises
+/// `body-markup` — Plasma, GNOME Shell, dunst, mako do). Asked ONCE, on a
+/// delivery thread; a server that can't be asked is assumed to (escaping text
+/// for a plain-text server only shows `&amp;`; not escaping for a markup one
+/// lets output inject links).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn body_is_markup() -> bool {
+    static MARKUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MARKUP.get_or_init(|| {
+        notify_rust::get_capabilities()
+            .map(|caps| caps.iter().any(|c| c == "body-markup"))
+            .unwrap_or(true)
+    })
+}
+
 /// Linux/BSD: full freedesktop toast via the pure-Rust zbus backend.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn show(summary: &str, body: &str, critical: bool) {
     use notify_rust::{Hint, Notification, Urgency};
+    // The summary is plain text by spec; only the body may be parsed as markup.
+    let body = if body_is_markup() { escape_markup(body) } else { std::borrow::Cow::Borrowed(body) };
     // Fire-and-forget: the returned handle is dropped (no action callbacks), so
     // we never wait on a click. A slow daemon blocks only THIS worker; zbus'
     // own method-call timeout unwedges it and the bounded queue sheds load
@@ -119,7 +157,7 @@ fn show(summary: &str, body: &str, critical: bool) {
     let _ = Notification::new()
         .appname("JeTTY")
         .summary(summary)
-        .body(body)
+        .body(&body)
         .icon("jetty")
         .hint(Hint::Urgency(if critical { Urgency::Critical } else { Urgency::Normal }))
         .show();
@@ -256,6 +294,17 @@ mod tests {
         ));
         // A tab that never fired (None) is not suppressed.
         assert!(should_notify(false, secs(30), Some(0), 10, false, None, GAP));
+    }
+
+    #[test]
+    fn escape_markup_shows_output_lines_verbatim() {
+        assert!(matches!(escape_markup("cargo build finished"), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(escape_markup("Vec<String> & co"), "Vec&lt;String&gt; &amp; co");
+        assert_eq!(
+            escape_markup("<a href=\"https://evil\">click</a>"),
+            "&lt;a href=\"https://evil\"&gt;click&lt;/a&gt;"
+        );
+        assert_eq!(escape_markup("&amp;"), "&amp;amp;", "pre-escaped text stays literal");
     }
 
     #[test]
