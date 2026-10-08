@@ -328,12 +328,13 @@ const STATUS_H: f32 = 22.0;
 const SCROLLBAR_GUTTER: f32 = jetty_render::SCROLLBAR_W + 4.0;
 
 /// Maximum bytes of PTY output fed into one tab's terminal per drain pass. Under
-/// an output flood (`yes`, `cat huge.log`) the PTY reader thread enqueues data
-/// far faster than the VT parser consumes it; draining the channel to empty in
-/// one go would never return to the winit loop (no redraws, no keyboard — the
-/// user could not even Ctrl+C the flood, and the backlog grows unbounded). The
-/// drain stops after this many bytes; the reader queued one Wake per chunk, so
-/// the next Wake continues where this left off while input events interleave.
+/// an output flood (`yes`, `cat huge.log`) the PTY can produce faster than the VT
+/// parser consumes; draining to empty in one go would never return to the winit
+/// loop (no redraws, no keyboard — the user could not even Ctrl+C the flood).
+/// The drain stops after this many bytes and `about_to_wait` re-arms the tab's
+/// wake (`PtySession::rearm_wake`), so the rest is drained in the NEXT loop
+/// iteration — after pending input events. The backlog itself is bounded by the
+/// PTY read queue (the reader blocks and the child with it), not by this.
 const PTY_DRAIN_BUDGET: usize = 2 * 1024 * 1024;
 
 /// Minimum interval between open-search match re-collects while output
@@ -2121,7 +2122,13 @@ impl App {
         }) {
             Ok(p) => p,
             Err(e) => {
+                // Not silent: a GUI launch never shows stderr, and a new tab that
+                // simply doesn't appear reads as a dead shortcut.
                 eprintln!("jetty: failed to spawn tab PTY: {e}");
+                self.show_status_pill(crate::runsel::Notice {
+                    msg: "Couldn't open a new tab — no shell could be started",
+                    window: None,
+                });
                 return None;
             }
         };
@@ -4334,6 +4341,26 @@ impl App {
         (active_had_data, chrome_changed, exited)
     }
 
+    /// End-of-iteration re-arm of every tab's coalesced PTY wake (main and
+    /// detached). A tab whose drain hit `PTY_DRAIN_BUDGET` — or that received
+    /// output after its last drain — still has bytes queued: ONE Wake (for all
+    /// of them) is sent so they drain in the NEXT iteration, after pending
+    /// input; an idle tab's latch is cleared so its next output wakes us at
+    /// once. Must run after the iteration's drains, i.e. from `about_to_wait`
+    /// (see `PtySession::rearm_wake` for why not earlier).
+    fn rearm_pty_wakes(&self) {
+        let mut more = false;
+        for tab in &self.tabs {
+            more |= tab.pty.rearm_wake();
+        }
+        for dw in &self.detached {
+            more |= dw.tab.pty.rearm_wake();
+        }
+        if more {
+            let _ = self.proxy.send_event(AppEvent::Wake);
+        }
+    }
+
     /// Drain one tab's PTY output into its terminal, and flush any query
     /// replies (DSR/DA, etc.) the terminal produced back to the PTY. Returns
     /// `(had, title_changed)`: whether the tab fed any bytes or sent any
@@ -4356,22 +4383,13 @@ impl App {
         tab: &mut Tab,
         vt_read: &mut u64,
     ) -> (bool, bool, Option<crate::runsel::Notice>) {
-        let mut had = false;
         // Feed at most PTY_DRAIN_BUDGET bytes this pass so a flood can't starve
-        // the event loop (see the const's doc). Any remaining chunks are drained
-        // by the Wakes the reader already queued for them.
-        let mut fed = 0usize;
-        while fed < PTY_DRAIN_BUDGET {
-            match tab.pty.output().try_recv() {
-                Ok(chunk) => {
-                    *vt_read += chunk.len() as u64;
-                    fed += chunk.len();
-                    tab.terminal.feed(&chunk);
-                    had = true;
-                }
-                Err(_) => break,
-            }
-        }
+        // the event loop (see the const's doc). Whatever remains is scheduled
+        // for the next loop iteration by `rearm_pty_wakes` in `about_to_wait`.
+        let terminal = &mut tab.terminal;
+        let fed = tab.pty.drain_output(PTY_DRAIN_BUDGET, |chunk| terminal.feed(chunk));
+        *vt_read += fed as u64;
+        let mut had = fed > 0;
         // Flush any query replies (DSR/DA, etc.) this tab produced back to its
         // own PTY so the shell's startup probes succeed.
         let replies = tab.terminal.drain_pty_writes();
@@ -7679,6 +7697,9 @@ impl ApplicationHandler<AppEvent> for App {
     /// `Wait` (idle 0 CPU) the instant nothing is pending. On X11/Wayland this is
     /// just a brief Poll burst during the animation (redraws already deliver).
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // PTY output left queued by this iteration's drains is scheduled for the
+        // next one (and idle tabs re-armed). First, so no early return skips it.
+        self.rearm_pty_wakes();
         // Input-latency percentile emit (JETTY_PERF_LOG only): runs HERE, off the
         // timed present path, so printing a batch never stalls the frame it measured
         // (observer-effect fix). Emits at most once per REPORT_EVERY new samples.

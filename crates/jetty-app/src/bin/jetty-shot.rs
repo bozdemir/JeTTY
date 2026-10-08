@@ -262,7 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Short sleep = replies go out within ~5ms of each query, well inside
         // p10k's capability-probe timeouts (mirrors the fixed live-app latency).
         for _ in 0..700 {
-            while let Ok(chunk) = pty.output().try_recv() {
+            while let Some(chunk) = pty.try_recv_output() {
                 terminal.feed(&chunk);
             }
             let replies = terminal.drain_pty_writes();
@@ -273,7 +273,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         // Final drain to capture anything emitted during the last sleep.
-        while let Ok(chunk) = pty.output().try_recv() {
+        while let Some(chunk) = pty.try_recv_output() {
             terminal.feed(&chunk);
         }
         eprintln!("jetty-shot: JETTY_SHOT_PTY mode drove a real shell for ~3.5s");
@@ -291,7 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // ~3.5s: 700 iterations of 5ms — tight loop so replies are prompt.
             for _ in 0..700 {
-                while let Ok(chunk) = pty.output().try_recv() {
+                while let Some(chunk) = pty.try_recv_output() {
                     terminal.feed(&chunk);
                 }
                 let replies = terminal.drain_pty_writes();
@@ -302,7 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             // Final drain after the command loop.
-            while let Ok(chunk) = pty.output().try_recv() {
+            while let Some(chunk) = pty.try_recv_output() {
                 terminal.feed(&chunk);
             }
             eprintln!("jetty-shot: ran injected command for ~3.5s");
