@@ -10,6 +10,7 @@ mod runsel;
 /// self-test binary can drive the SAME registry/filter path the app uses.
 pub mod palette;
 mod shell_integration;
+mod tabmeta;
 mod watch;
 /// User theme loading + registry rebuild. Public so the `jetty-shot` self-test
 /// binary can seed user themes before resolving `JETTY_THEME`.
@@ -43,6 +44,34 @@ pub fn detached_menu_items() -> Vec<(&'static str, String)> {
 /// `jetty-shot`; the app derives them from its live keymap the same way).
 pub fn default_context_menu_hints() -> Vec<String> {
     detached::context_menu_hints(&keymap::KeyMap::defaults()).to_vec()
+}
+
+/// The tab context menu's rows (for `jetty-shot`'s JETTY_SHOT_TAB_MENU).
+pub fn shot_tab_menu_items(can_detach: bool) -> Vec<&'static str> {
+    detached::tab_menu_items(can_detach)
+}
+
+/// The tab menu's "Color ▸" list rows (for `jetty-shot`).
+pub fn shot_tab_color_menu_items() -> Vec<&'static str> {
+    detached::tab_color_menu_items()
+}
+
+/// The color list's swatches, exactly as the app draws them (for `jetty-shot`).
+pub fn shot_tab_color_swatches(
+    item_rects: &[jetty_render::Rect],
+    labels: &[&str],
+    theme: &jetty_core::Theme,
+    current: Option<u8>,
+    cm: jetty_render::ChromeMetrics,
+) -> Vec<jetty_render::Rect> {
+    detached::tab_color_swatches(item_rects, labels, theme, current, cm)
+}
+
+/// The window ring's color for `window_border = mode` (a config string), as
+/// the app picks it: the accent or the active tab's color while focused, the
+/// muted border shade (or nothing) while not. For `jetty-shot`.
+pub fn shot_ring_color(mode: &str, focused: bool, theme: &jetty_core::Theme, tab_color: Option<u8>) -> Option<[u8; 3]> {
+    tabmeta::ring_rgb(tabmeta::WindowBorder::from_config(mode), focused, false, theme, tab_color)
 }
 
 /// The default grid padding `(padding_x, padding_y)` in logical px — the

@@ -54,6 +54,74 @@ pub enum PaletteCmd {
     SetTheme(usize),
     SelectTab(u64),
     Reattach(u64),
+    // ── Chrome (visuals v2) ──
+    /// `tab_style` = the config string.
+    SetTabStyle(&'static str),
+    /// `tab_close_button` = the config string.
+    SetCloseButton(&'static str),
+    /// `window_border` = the config string.
+    SetWindowBorder(&'static str),
+    ToggleProgressBar,
+    ToggleSmartTitles,
+    ToggleTabBarOpacity,
+    /// The per-tab color of the tab the palette was opened over (palette index
+    /// 1..=6; `None` removes it).
+    SetTabColor(Option<u8>),
+}
+
+/// The chrome entries: tab style / close buttons / window border pickers, the
+/// progress / smart-title / translucent-bar toggles and the per-tab colors.
+fn chrome_entries() -> Vec<PaletteEntry> {
+    let mut v = Vec::new();
+    for s in jetty_render::TabStyle::ALL {
+        v.push(PaletteEntry {
+            title: format!("Tab style: {}", s.display_name()),
+            keywords: "tabs look bar appearance chrome",
+            cmd: PaletteCmd::SetTabStyle(s.to_config()),
+        });
+    }
+    for m in jetty_render::CloseButton::ALL {
+        v.push(PaletteEntry {
+            title: format!("Tab close buttons: {}", m.display_name()),
+            keywords: "tabs x close button hover",
+            cmd: PaletteCmd::SetCloseButton(m.to_config()),
+        });
+    }
+    for b in crate::tabmeta::WindowBorder::ALL {
+        v.push(PaletteEntry {
+            title: format!("Window border: {}", b.display_name()),
+            keywords: "focus ring outline frame edge accent",
+            cmd: PaletteCmd::SetWindowBorder(b.to_config()),
+        });
+    }
+    v.push(PaletteEntry {
+        title: "Toggle tab progress bars".to_string(),
+        keywords: "osc 9;4 progress cargo claude build percent",
+        cmd: PaletteCmd::ToggleProgressBar,
+    });
+    v.push(PaletteEntry {
+        title: "Toggle smart tab titles".to_string(),
+        keywords: "tab title cwd directory command name auto",
+        cmd: PaletteCmd::ToggleSmartTitles,
+    });
+    v.push(PaletteEntry {
+        title: "Toggle translucent tab bar".to_string(),
+        keywords: "tab bar opacity transparent see through",
+        cmd: PaletteCmd::ToggleTabBarOpacity,
+    });
+    for (i, name) in jetty_render::TAB_COLORS {
+        v.push(PaletteEntry {
+            title: format!("Tab color: {name}"),
+            keywords: "tab colour color label tint",
+            cmd: PaletteCmd::SetTabColor(Some(i)),
+        });
+    }
+    v.push(PaletteEntry {
+        title: "Tab color: None".to_string(),
+        keywords: "tab colour color remove clear",
+        cmd: PaletteCmd::SetTabColor(None),
+    });
+    v
 }
 
 /// One registry row: the human-facing `title` (fuzzy-matched + highlighted),
@@ -131,6 +199,7 @@ pub fn build_registry(
     for (title, keywords, cmd) in statics {
         v.push(PaletteEntry { title: title.to_string(), keywords, cmd });
     }
+    v.extend(chrome_entries());
     for (i, (_name, display)) in themes.iter().enumerate() {
         v.push(PaletteEntry {
             title: format!("Theme: {display}"),
@@ -285,6 +354,38 @@ mod tests {
             let hits = filter(&r, q);
             assert_eq!(hits[0].cmd, PaletteCmd::ResetInputModes, "top hit for {q:?}");
         }
+    }
+
+    #[test]
+    fn registry_has_the_chrome_commands() {
+        let r = reg();
+        for s in jetty_render::TabStyle::ALL {
+            assert!(r.iter().any(|e| e.cmd == PaletteCmd::SetTabStyle(s.to_config())), "{s:?}");
+        }
+        for (i, _) in jetty_render::TAB_COLORS {
+            assert!(r.iter().any(|e| e.cmd == PaletteCmd::SetTabColor(Some(i))));
+        }
+        assert!(r.iter().any(|e| e.cmd == PaletteCmd::SetTabColor(None)));
+        assert_eq!(filter(&r, "tab color red")[0].cmd, PaletteCmd::SetTabColor(Some(1)));
+        assert_eq!(filter(&r, "powerline")[0].cmd, PaletteCmd::SetTabStyle("powerline"));
+        assert_eq!(filter(&r, "window border focus")[0].cmd, PaletteCmd::SetWindowBorder("focus"));
+        assert_eq!(filter(&r, "progress bars")[0].cmd, PaletteCmd::ToggleProgressBar);
+        // Every config string a command carries parses back to itself.
+        for e in &r {
+            match &e.cmd {
+                PaletteCmd::SetTabStyle(s) => assert_eq!(jetty_render::TabStyle::from_config(s).to_config(), *s),
+                PaletteCmd::SetCloseButton(s) => {
+                    assert_eq!(jetty_render::CloseButton::from_config(s).to_config(), *s)
+                }
+                _ => {}
+            }
+        }
+        // Titles stay unique (the palette lists them side by side).
+        let mut titles: Vec<&str> = r.iter().map(|e| e.title.as_str()).collect();
+        titles.sort_unstable();
+        let n = titles.len();
+        titles.dedup();
+        assert_eq!(titles.len(), n, "duplicate palette titles");
     }
 
     #[test]

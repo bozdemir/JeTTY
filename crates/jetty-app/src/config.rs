@@ -138,6 +138,36 @@ pub struct Config {
     /// entirely.
     #[serde(default = "default_show_perf_hud")]
     pub show_perf_hud: bool,
+    // ── Chrome (visuals v2) ───────────────────────────────────────────────────
+    /// Tab look: "pill" (default — a soft rounded pill behind the active tab),
+    /// "underline" (an accent bar under the active title), "slant" (slanted
+    /// tabs), "powerline" (breadcrumb chevrons) or "compact" (the pill look on
+    /// narrower tabs). Unknown values read as "pill".
+    #[serde(default = "default_tab_style")]
+    pub tab_style: String,
+    /// Which tabs show their "×": "always" (default), "hover" (only the tab
+    /// under the pointer) or "active" (the active tab and the hovered one).
+    #[serde(default = "default_tab_close_button")]
+    pub tab_close_button: String,
+    /// `true` lets the tab bar follow `opacity` like the terminal area (and
+    /// show what is behind the window); `false` (default) keeps it opaque.
+    #[serde(default = "default_tab_bar_opacity")]
+    pub tab_bar_opacity: bool,
+    /// Draw OSC 9;4 progress (cargo with `CARGO_TERM_PROGRESS_TERM_INTEGRATION=
+    /// true`, Claude Code, winget…) in the tab and on the bar's grid edge.
+    /// Default `true`.
+    #[serde(default = "default_progress_bar")]
+    pub progress_bar: bool,
+    /// A thin ring around the window: "none" (default), "focus" (while the
+    /// window has keyboard focus) or "always" (muted while unfocused). Drawn in
+    /// the accent, or the active tab's color.
+    #[serde(default = "default_window_border")]
+    pub window_border: String,
+    /// Tab titles: "osc" (default — the program's title, else "Tab N") or
+    /// "auto" (the program's title, else the running command or the shell's
+    /// directory, via shell integration). A manual rename always wins.
+    #[serde(default = "default_tab_title")]
+    pub tab_title: String,
     /// Visual effects (CRT, scanlines, caret). See `EffectsConfig`. Backward
     /// compatible: old configs without `[effects]` load with all defaults.
     #[serde(default)]
@@ -477,6 +507,30 @@ fn default_show_perf_hud() -> bool {
     true
 }
 
+fn default_tab_style() -> String {
+    "pill".to_string()
+}
+
+fn default_tab_close_button() -> String {
+    "always".to_string()
+}
+
+fn default_tab_bar_opacity() -> bool {
+    false
+}
+
+fn default_progress_bar() -> bool {
+    true
+}
+
+fn default_window_border() -> String {
+    "none".to_string()
+}
+
+fn default_tab_title() -> String {
+    "osc".to_string()
+}
+
 /// UI font default: empty string → platform proportional sans. Mirrors the
 /// terminal default look (tab titles already render in sans), so a config
 /// without this key renders chrome exactly as before.
@@ -603,6 +657,12 @@ impl Default for Config {
             scrollback_lines: default_scrollback_lines(),
             show_welcome: default_show_welcome(),
             show_perf_hud: default_show_perf_hud(),
+            tab_style: default_tab_style(),
+            tab_close_button: default_tab_close_button(),
+            tab_bar_opacity: default_tab_bar_opacity(),
+            progress_bar: default_progress_bar(),
+            window_border: default_window_border(),
+            tab_title: default_tab_title(),
             effects: EffectsConfig::default(),
             notify_on_command_finish: default_notify_on_command_finish(),
             notify_min_seconds: default_notify_min_seconds(),
@@ -1793,6 +1853,32 @@ mod tests {
         // defaults ("" = platform sans, 16pt), so an upgrade is visually a no-op.
         assert_eq!(c.ui_font_family, "");
         assert_eq!(c.ui_font_size, 16.0);
+        // …and without the visuals-v2 chrome keys, with today's look (progress
+        // bars are the one new default-on visual).
+        assert_eq!(c.tab_style, "pill");
+        assert_eq!(c.tab_close_button, "always");
+        assert!(!c.tab_bar_opacity);
+        assert!(c.progress_bar);
+        assert_eq!(c.window_border, "none");
+        assert_eq!(c.tab_title, "osc");
+    }
+
+    #[test]
+    fn chrome_keys_load_and_reject_wrong_types_per_key() {
+        let toml = "tab_style = \"slant\"\ntab_close_button = \"active\"\ntab_bar_opacity = true\n\
+                    progress_bar = false\nwindow_border = \"always\"\ntab_title = \"auto\"\n";
+        let (c, warnings) = Config::parse_with_base(toml, &Config::default(), "using the default").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!((c.tab_style.as_str(), c.tab_close_button.as_str()), ("slant", "active"));
+        assert!(c.tab_bar_opacity && !c.progress_bar);
+        assert_eq!((c.window_border.as_str(), c.tab_title.as_str()), ("always", "auto"));
+        // A wrong type falls back for that key alone, with a warning.
+        let (c, warnings) =
+            Config::parse_with_base("progress_bar = \"yes\"\ntab_style = \"underline\"\n", &Config::default(), "using the default")
+                .unwrap();
+        assert!(c.progress_bar, "invalid value → default");
+        assert_eq!(c.tab_style, "underline", "the valid key still applies");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]
@@ -1843,6 +1929,12 @@ mod tests {
             scrollback_lines: 25_000,
             show_welcome: false,
             show_perf_hud: false,
+            tab_style: "powerline".to_string(),
+            tab_close_button: "hover".to_string(),
+            tab_bar_opacity: true,
+            progress_bar: false,
+            window_border: "focus".to_string(),
+            tab_title: "auto".to_string(),
             effects: EffectsConfig::default(),
             notify_on_command_finish: false,
             notify_min_seconds: 30,
@@ -1890,6 +1982,12 @@ mod tests {
             scrollback_lines: 10_000,
             show_welcome: true,
             show_perf_hud: true,
+            tab_style: "pill".to_string(),
+            tab_close_button: "always".to_string(),
+            tab_bar_opacity: false,
+            progress_bar: true,
+            window_border: "none".to_string(),
+            tab_title: "osc".to_string(),
             effects: EffectsConfig::default(),
             notify_on_command_finish: true,
             notify_min_seconds: 10,

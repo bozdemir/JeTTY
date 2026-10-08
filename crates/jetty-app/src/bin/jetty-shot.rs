@@ -47,10 +47,31 @@
 ///                    overflow the window (large UI font / short window).
 ///   JETTY_SHOT_PILL="text" — draw the app's toast pill (run-selection status /
 ///                    Shift-drag hint surface) above the status strip.
-///   JETTY_SHOT_TABBAR_ACTIVITY — comma list aligned with the 3 sample tabs
-///                    (`none|output|bell`, unknown → none), e.g.
-///                    `none,output,bell` — draws the activity/bell dots on the
-///                    inactive tabs for headless inspection.
+///   JETTY_SHOT_TABBAR_ACTIVITY — comma list aligned with the sample tabs
+///                    (`none|output|bell|done|failed`, unknown → none), e.g.
+///                    `none,output,bell` — draws the activity / bell / finished
+///                    / failed badges on the inactive tabs.
+///   JETTY_SHOT_TAB_STYLE — `pill|underline|slant|powerline|compact` (the
+///                    `tab_style` key; default pill). Applies to the tab bar and
+///                    the detached bar.
+///   JETTY_SHOT_TAB_CLOSE — `always|hover|active` (`tab_close_button`).
+///   JETTY_SHOT_TAB_HOVER — index of the tab under the pointer (hover lift).
+///   JETTY_SHOT_TAB_BAR_OPACITY — "1": the bar follows the window opacity
+///                    (`tab_bar_opacity`; combine with JETTY_OPACITY).
+///   JETTY_SHOT_TAB_PROGRESS — comma list aligned with the tabs of OSC 9;4
+///                    states: `40` (40 %), `e30` / `e` (error, with / without a
+///                    value), `i` (indeterminate), `p50` (paused), `-` (none).
+///                    An OSC 9;4 inside JETTY_SHOT_INPUT (`\e]9;4;1;40\e\\`)
+///                    sets tab 1's through the real parser.
+///                    JETTY_SHOT_PROGRESS_BAR=0 hides progress (`progress_bar`).
+///   JETTY_SHOT_TAB_COLORS — comma list of per-tab colors (palette 1–6, `-`
+///                    for none), aligned with the tabs.
+///   JETTY_SHOT_TAB_MENU — "1" draws the tab context menu under tab 1;
+///                    "colors" its Color ▸ list with swatches.
+///   JETTY_SHOT_WINDOW_BORDER — `focus|always` draws the window ring (the real
+///                    GPU pass, before the corner mask) in the accent or tab 1's
+///                    color; JETTY_SHOT_CURSOR_UNFOCUSED=1 shows the unfocused
+///                    state (none / the muted border).
 ///   JETTY_SHOT_DETACHED — "1" renders the DETACHED-window chrome: top bar
 ///                    (title + ✕), grid offset below it, bottom status strip.
 ///                    JETTY_SHOT_DETACHED_TITLE / _HOVER tweak title and the
@@ -1144,6 +1165,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `\e]2;OSC Title\a`) retitles the first tab, so shell-driven
             // titles can be verified headlessly from the PNG.
             let osc_title = terminal.take_title_update().flatten();
+            // …and an OSC 9;4 in the input sets tab 1's progress (real parser).
+            let osc_progress = terminal.take_progress_update().flatten();
             // JETTY_SHOT_TABBAR_N — how many sample tabs (default 3; tab 1 active).
             let n_tabs: usize = std::env::var("JETTY_SHOT_TABBAR_N")
                 .ok()
@@ -1164,23 +1187,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let perf_owned: Option<String> = std::env::var("JETTY_SHOT_PERF")
                 .ok()
                 .filter(|v| !v.is_empty());
-            // JETTY_SHOT_TABBAR_ACTIVITY — per-tab activity dots (see header).
-            let activity: Vec<jetty_render::TabActivity> =
-                std::env::var("JETTY_SHOT_TABBAR_ACTIVITY")
-                    .map(|v| {
-                        v.split(',')
-                            .map(|s| match s.trim() {
-                                "output" => jetty_render::TabActivity::Output,
-                                "bell" => jetty_render::TabActivity::Bell,
-                                _ => jetty_render::TabActivity::None,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-            if !activity.is_empty() {
-                eprintln!("jetty-shot: JETTY_SHOT_TABBAR_ACTIVITY = {activity:?}");
+            // Per-tab decoration (badges, progress, colors — see header) and the
+            // bar options (style, close buttons, hover, opacity).
+            let mut deco = shot_tab_deco(n_tabs);
+            if let (Some(p), Some(d)) = (osc_progress, deco.first_mut()) {
+                d.progress = Some(p);
             }
-            let mut bar = jetty_render::build_tab_bar_ex(
+            let opts = jetty_render::TabBarOpts { bottom: tab_bar_bottom, ..shot_bar_opts() };
+            eprintln!("jetty-shot: tab bar {opts:?} deco {deco:?}");
+            let mut bar = jetty_render::build_tab_bar_styled(
                 width,
                 &tabs,
                 terminal.theme(),
@@ -1189,7 +1204,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None, // perf HUD now lives in the bottom status bar, not the tab row
                 &mut chrome_text,
                 cm,
-                &activity,
+                &deco,
+                &opts,
             );
             // JETTY_TAB_BAR=bottom — place the bar at the window bottom, just above
             // the status strip (as the app does). build_tab_bar lays it out at
@@ -1206,9 +1222,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     l.2 += bar_y;
                 }
             }
+            let tab0 = bar.tab_rects.first().copied();
             rects.extend(bar.quads);
             chrome_labels.extend(bar.labels);
             panel_title_labels.extend(bar.title_labels);
+
+            // JETTY_SHOT_TAB_MENU — the tab context menu (or its color list) just
+            // below tab 1, built and decorated exactly as the app does.
+            if let (Ok(which), Some(t0)) = (std::env::var("JETTY_SHOT_TAB_MENU"), tab0) {
+                let labels: Vec<&str> = if which == "colors" {
+                    jetty_app::shot_tab_color_menu_items()
+                } else {
+                    jetty_app::shot_tab_menu_items(n_tabs >= 2)
+                };
+                let items: Vec<(&str, &str)> = labels.iter().map(|&l| (l, "")).collect();
+                let my = if tab_bar_bottom { (height as f32 - cm.bar_h() - shot_status_h - cm.px(240.0)).max(0.0) } else { cm.bar_h() };
+                let hover = std::env::var("JETTY_SHOT_TAB_MENU_HOVER").ok().and_then(|v| v.parse().ok());
+                let mut menu = jetty_render::build_menu(
+                    t0.x + cm.px(20.0), my, width, height, hover, terminal.theme(), &mut chrome_text, cm, &items, &[], &[],
+                );
+                let current = deco.first().and_then(|d| d.color);
+                menu.quads.extend(jetty_app::shot_tab_color_swatches(&menu.item_rects, &labels, terminal.theme(), current, cm));
+                rects.extend(menu.quads);
+                chrome_labels.extend(menu.labels);
+                eprintln!("jetty-shot: JETTY_SHOT_TAB_MENU={which} rows={labels:?}");
+            }
 
             // Bottom STATUS BAR (perf HUD, off the tab row) — mirrors the live app.
             if let Some(perf) = perf_owned.as_deref() {
@@ -1235,8 +1273,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::env::var("JETTY_SHOT_DETACHED_HOVER").map(|v| v != "0").unwrap_or(false);
             let title = std::env::var("JETTY_SHOT_DETACHED_TITLE")
                 .unwrap_or_else(|_| "Tab 2".to_string());
-            let bar = jetty_render::build_detached_bar(
-                width, &title, terminal.theme(), close_hover, &mut chrome_text, cm,
+            let mut deco = shot_tab_deco(1).first().copied().unwrap_or_default();
+            if let Some(p) = terminal.take_progress_update().flatten() {
+                deco.progress = Some(p);
+            }
+            let opts = jetty_render::TabBarOpts { bottom: false, ..shot_bar_opts() };
+            let bar = jetty_render::build_detached_bar_styled(
+                width, &title, terminal.theme(), close_hover, &mut chrome_text, cm, &deco, &opts,
             );
             // The app draws the bar mid-scene, UNDER this window's overlays (its
             // help / palette dim layers cover it): put its quads first.
@@ -1351,6 +1394,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &device, &queue, &view, width, height,
                 &[("Aa".to_string(), sx, sy, [accent[0], accent[1], accent[2]])],
             )?;
+        }
+    }
+
+    // --- Window border / focus ring (JETTY_SHOT_WINDOW_BORDER) ---
+    // The REAL GPU pass on the scene, BEFORE the corner mask (CPU, after
+    // readback) and the CRT pass — the app's order. Radii as the mask's.
+    if let Ok(mode) = std::env::var("JETTY_SHOT_WINDOW_BORDER") {
+        let focused = !env_flag("JETTY_SHOT_CURSOR_UNFOCUSED");
+        let radius = std::env::var("JETTY_CORNER_RADIUS")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .map(|v| v.clamp(0.0, 24.0) * dpi)
+            .unwrap_or(0.0);
+        let top = if env_flag("JETTY_SHOT_DROPDOWN") { 0.0 } else { radius };
+        let tab_color = shot_tab_deco(1).first().and_then(|d| d.color);
+        if let Some(c) = jetty_app::shot_ring_color(&mode, focused, terminal.theme(), tab_color) {
+            eprintln!("jetty-shot: window border {mode:?} focused={focused} color={c:?} radius={radius}");
+            let ring = jetty_render::FocusRing::new(&device, format);
+            ring.apply(
+                &device, &queue, &view, width, height, [top, top, radius, radius],
+                jetty_render::ring_width_px(dpi), [c[0], c[1], c[2], 255],
+            );
+        } else {
+            eprintln!("jetty-shot: window border {mode:?} focused={focused}: no ring");
         }
     }
 
@@ -1641,4 +1708,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// The tab-bar options from the JETTY_SHOT_TAB_* hooks (see the header).
+fn shot_bar_opts() -> jetty_render::TabBarOpts {
+    let var = |k: &str| std::env::var(k).unwrap_or_default();
+    jetty_render::TabBarOpts {
+        style: jetty_render::TabStyle::from_config(&var("JETTY_SHOT_TAB_STYLE")),
+        close_button: jetty_render::CloseButton::from_config(&var("JETTY_SHOT_TAB_CLOSE")),
+        hover: var("JETTY_SHOT_TAB_HOVER").parse().ok(),
+        opaque: !env_flag("JETTY_SHOT_TAB_BAR_OPACITY"),
+        progress: std::env::var("JETTY_SHOT_PROGRESS_BAR").map(|v| v != "0").unwrap_or(true),
+        bottom: false,
+    }
+}
+
+/// One OSC 9;4 state from JETTY_SHOT_TAB_PROGRESS: `40`, `e30`, `e`, `i`, `p50`.
+fn shot_progress(s: &str) -> Option<jetty_core::Progress> {
+    use jetty_core::{Progress, ProgressState};
+    let s = s.trim();
+    let num = |t: &str| t.parse::<u8>().ok().map(|v| v.min(100));
+    match s.chars().next()? {
+        'i' => Some(Progress { state: ProgressState::Indeterminate, value: None }),
+        'e' => Some(Progress { state: ProgressState::Error, value: num(&s[1..]) }),
+        'p' => Some(Progress { state: ProgressState::Paused, value: num(&s[1..]) }),
+        _ => num(s).map(|v| Progress { state: ProgressState::Normal, value: Some(v) }),
+    }
+}
+
+/// Per-tab decoration from JETTY_SHOT_TABBAR_ACTIVITY / _TAB_PROGRESS /
+/// _TAB_COLORS, `n` entries long.
+fn shot_tab_deco(n: usize) -> Vec<jetty_render::TabDeco> {
+    let list = |k: &str| -> Vec<String> {
+        std::env::var(k).map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default()
+    };
+    let (acts, progs, colors) =
+        (list("JETTY_SHOT_TABBAR_ACTIVITY"), list("JETTY_SHOT_TAB_PROGRESS"), list("JETTY_SHOT_TAB_COLORS"));
+    (0..n)
+        .map(|i| jetty_render::TabDeco {
+            activity: match acts.get(i).map(|s| s.trim()) {
+                Some("output") => jetty_render::TabActivity::Output,
+                Some("bell") => jetty_render::TabActivity::Bell,
+                Some("done") => jetty_render::TabActivity::Done,
+                Some("failed") => jetty_render::TabActivity::Failed,
+                _ => jetty_render::TabActivity::None,
+            },
+            progress: progs.get(i).and_then(|s| shot_progress(s)),
+            color: colors.get(i).and_then(|s| s.trim().parse::<u8>().ok()).and_then(jetty_render::valid_tab_color),
+        })
+        .collect()
 }

@@ -375,9 +375,11 @@ pub(crate) struct Tab {
     /// Once the user commits a manual rename, shell OSC titles are ignored for
     /// this tab forever (manual > auto > default precedence).
     pub(crate) manually_renamed: bool,
-    /// Unseen output/bell that arrived while this tab was INACTIVE, shown as a
-    /// themed dot on its tab label; cleared when it renders as the active tab.
-    pub(crate) activity: jetty_render::TabActivity,
+    /// The tab's chrome state: the unseen-activity badge (output / bell /
+    /// finished / failed, shown while INACTIVE and cleared when it renders as
+    /// the active tab), its OSC 9;4 progress, its per-tab color and the
+    /// smart-title inputs. Travels with the tab between windows.
+    pub(crate) meta: crate::tabmeta::TabMeta,
     /// Run-selection-in-new-tab: a command staged for injection once this
     /// tab's shell is ready (first OSC 133 A + bracketed paste; see
     /// `runsel::poll_pending`). `None` for every tab that never uses the
@@ -402,29 +404,34 @@ pub(crate) enum SelSource {
     Detached(usize),
 }
 
-/// Resolve a pending shell title update against the tab's rename state and
-/// return the new DISPLAY title to apply, or `None` to leave it unchanged.
-/// Precedence: manual rename (permanent) > OSC title > default "Tab N".
-/// `update` is `Terminal::take_title_update`'s inner value: `Some(t)` = shell
-/// set a title, `None` = shell reset/cleared it (restore the default).
+/// Resolve a tab's DISPLAY title from its title inputs, or `None` to leave it
+/// unchanged. Precedence: manual rename (permanent) > the program's OSC 0/2
+/// title (`osc`; `None` = never set, or reset) > in `tab_title = "auto"` mode
+/// the smart title (the running command / the shell's directory) > the
+/// default "Tab N".
 fn resolve_title(
-    update: Option<String>,
+    osc: Option<&str>,
     manually_renamed: bool,
     default_title: &str,
+    mode: crate::tabmeta::TabTitleMode,
+    smart: Option<&str>,
 ) -> Option<String> {
     if manually_renamed {
         return None;
     }
-    match update {
-        // OSC 0/2 titles are program-controlled and can be megabytes: keep only
-        // what any title surface (tab bar, OS title, palette, confirm dialog)
-        // could show, so no downstream path ever measures/draws/matches a huge
-        // string.
-        Some(t) => {
-            let (head, cut) = jetty_render::clip_head(&t);
-            Some(if cut { head.to_string() } else { t })
-        }
-        None => Some(default_title.to_string()),
+    Some(crate::tabmeta::display_title(mode, osc, smart, default_title))
+}
+
+/// An OSC 0/2 title as kept on the tab. Titles are program-controlled and can
+/// be megabytes: keep only what any title surface (tab bar, OS title, palette,
+/// confirm dialog) could show, so no downstream path ever measures / draws /
+/// matches a huge string.
+fn clip_osc_title(t: String) -> String {
+    let (head, cut) = jetty_render::clip_head(&t);
+    if cut {
+        head.to_string()
+    } else {
+        t
     }
 }
 
@@ -1397,6 +1404,25 @@ pub struct App {
     tab_menu_rects: Vec<jetty_render::Rect>,
     /// Tab-menu item currently under the cursor (hover highlight).
     tab_menu_hover: Option<usize>,
+    // ── Chrome (visuals v2): mirrors of the persisted keys ────────────────────
+    /// `tab_style`.
+    tab_style: jetty_render::TabStyle,
+    /// `tab_close_button`.
+    tab_close_button: jetty_render::CloseButton,
+    /// `tab_bar_opacity`: the bar follows the window opacity (else opaque).
+    tab_bar_opacity: bool,
+    /// `progress_bar`: draw OSC 9;4 progress.
+    progress_bar: bool,
+    /// `window_border`.
+    window_border: crate::tabmeta::WindowBorder,
+    /// `tab_title`.
+    tab_title_mode: crate::tabmeta::TabTitleMode,
+    /// The main-window tab under the pointer (hover lift, hover "×"). Updated
+    /// on CursorMoved only when it changes — one repaint per change.
+    tab_hover: Option<usize>,
+    /// The focus-ring pass on the MAIN device, built on the first frame that
+    /// draws a ring (`window_border` on) — never in `resumed`.
+    focus_ring: Option<jetty_render::FocusRing>,
 
 
 }
@@ -1888,6 +1914,14 @@ impl App {
             tab_menu_labels: Vec::new(),
             tab_menu_rects: Vec::new(),
             tab_menu_hover: None,
+            tab_style: jetty_render::TabStyle::Pill,
+            tab_close_button: jetty_render::CloseButton::Always,
+            tab_bar_opacity: false,
+            progress_bar: true,
+            window_border: crate::tabmeta::WindowBorder::None,
+            tab_title_mode: crate::tabmeta::TabTitleMode::Osc,
+            tab_hover: None,
+            focus_ring: None,
         };
         // Persisted user settings override the env-derived defaults (but env
         // vars still seed the initial values above, so an explicit JETTY_* can
@@ -1956,6 +1990,12 @@ impl App {
         app.welcome_open = cfg.show_welcome;
         app.cfg_show_welcome = cfg.show_welcome;
         app.show_perf_hud = cfg.show_perf_hud;
+        app.tab_style = jetty_render::TabStyle::from_config(&cfg.tab_style);
+        app.tab_close_button = jetty_render::CloseButton::from_config(&cfg.tab_close_button);
+        app.tab_bar_opacity = cfg.tab_bar_opacity;
+        app.progress_bar = cfg.progress_bar;
+        app.window_border = crate::tabmeta::WindowBorder::from_config(&cfg.window_border);
+        app.tab_title_mode = crate::tabmeta::TabTitleMode::from_config(&cfg.tab_title);
         app.fx = cfg.effects.clone();
         // Run & Notify: mirror the persisted keys (min-seconds re-clamped for
         // belt-and-suspenders; Config::load's sanitize already applied the range).
@@ -2153,6 +2193,12 @@ impl App {
             // choice exactly as the on-disk read did.
             show_welcome: self.cfg_show_welcome,
             show_perf_hud: self.show_perf_hud,
+            tab_style: self.tab_style.to_config().to_string(),
+            tab_close_button: self.tab_close_button.to_config().to_string(),
+            tab_bar_opacity: self.tab_bar_opacity,
+            progress_bar: self.progress_bar,
+            window_border: self.window_border.to_config().to_string(),
+            tab_title: self.tab_title_mode.to_config().to_string(),
             effects: self.fx.clone(),
             notify_on_command_finish: self.notify_on_finish,
             notify_min_seconds: self.notify_min_seconds,
@@ -2600,6 +2646,8 @@ impl App {
         // Perf HUD: changes the reserved status-bar height → grid rows in every
         // window, so reflow them all.
         self.set_perf_hud(cfg.show_perf_hud);
+        // Chrome (tab look, progress, window border, tab titles) — live.
+        self.set_chrome(crate::tabmeta::ChromeSettings::from_config(&cfg));
         // Visual effects — skip while a Effects slider is being dragged (H4).
         if self.active_fx_drag.is_none() && cfg.effects != self.fx {
             self.fx = cfg.effects.clone();
@@ -3163,6 +3211,7 @@ impl App {
                 ((cols as f32 * cw).min(65535.0) as u16, (rows as f32 * ch).min(65535.0) as u16)
             })
             .unwrap_or((0, 0));
+        let spawn_cwd = cwd.clone();
         let pty = match PtySession::spawn(cols as u16, rows as u16, px_w, px_h, shell, cwd, move || {
             let _ = proxy_wake.send_event(AppEvent::Wake);
         }) {
@@ -3206,7 +3255,7 @@ impl App {
         }
         let title = format!("Tab {}", self.tabs.len() + 1);
         let id = self.alloc_tab_id();
-        self.tabs.push(Tab {
+        let mut tab = Tab {
             id,
             terminal,
             pty,
@@ -3214,10 +3263,12 @@ impl App {
             default_title: title.clone(),
             title,
             manually_renamed: false,
-            activity: jetty_render::TabActivity::None,
+            meta: crate::tabmeta::TabMeta::default(),
             pending_inject: None,
             input: input::TabInputState::default(),
-        });
+        };
+        Self::init_smart_title(&mut tab, self.tab_title_mode, spawn_cwd.as_deref());
+        self.tabs.push(tab);
         // The tab bar gained an entry either way (active or background).
         self.request_main_paint();
         Some(self.tabs.len() - 1)
@@ -3349,8 +3400,9 @@ impl App {
         // Apply the current theme to the detached tab before it leaves.
         tab.terminal.set_theme(self.current_theme());
         // The tab becomes the visible tab of its own window; drop any pending
-        // indicator so it can't resurface stale on a later reattach.
-        tab.activity = jetty_render::TabActivity::None;
+        // indicator so it can't resurface stale on a later reattach (its color,
+        // progress and titles travel with it).
+        tab.meta.moved_to_window();
 
         // The new window takes the main window's LOGICAL size (`build_window`
         // takes logical px) — its WINDOWED size: when we just left fullscreen
@@ -3541,7 +3593,7 @@ impl App {
         self.switching_to_detached = false;
         let mut tab = dw.tab; // move the Tab out before `dw` drops
         // It was visible in its own window until now — no unseen activity.
-        tab.activity = jetty_render::TabActivity::None;
+        tab.meta.moved_to_window();
 
         // Reflow to the MAIN window's grid (tab bar accounted for).
         let (cols, rows) = self.grid_dims();
@@ -3581,6 +3633,41 @@ impl App {
         self.request_main_paint();
     }
 
+    /// Open the tab context menu for `tab` at `(x, y)` with `labels` (the main
+    /// rows, or the "Color ▸" list shown in its place), caching its hit rects.
+    fn open_tab_menu(&mut self, x: f32, y: f32, tab: TabId, labels: Vec<&'static str>) {
+        let Some((w, h)) = self.gpu.as_ref().map(|g| (g.config.width, g.config.height)) else { return };
+        let theme = self.current_theme();
+        let cm = self.chrome_metrics();
+        // Hints from the live keymap (the same strings the draw uses); the item
+        // hit rects are cached once, like the terminal menu's.
+        let hints: Vec<String> = labels.iter().map(|&l| crate::detached::menu_hint(&self.keymap, l)).collect();
+        let items: Vec<(&str, &str)> = labels.iter().zip(&hints).map(|(&l, h)| (l, h.as_str())).collect();
+        let mut fallback = mono_fallback(cm);
+        let menu = jetty_render::build_menu(
+            x, y, w, h, None, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm, &items, &[], &[],
+        );
+        self.tab_menu = Some((x, y, tab));
+        self.tab_menu_hover = None;
+        self.tab_menu_rects = menu.item_rects;
+        self.tab_menu_labels = labels;
+        self.request_main_paint();
+    }
+
+    /// Set (or clear) the per-tab color of tab `id` — a main-window tab or a
+    /// detached window's — and repaint where it shows (its bar, the focus
+    /// ring). Session state: it travels with the tab, never into config.
+    fn set_tab_color(&mut self, id: TabId, color: Option<u8>) {
+        let color = color.and_then(jetty_render::valid_tab_color);
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            tab.meta.color = color;
+            self.request_main_paint();
+        } else if let Some(dw) = self.detached.iter_mut().find(|d| d.tab.id == id) {
+            dw.tab.meta.color = color;
+            dw.request_paint();
+        }
+    }
+
     /// Dismiss the terminal Copy/Paste context menu AND the tab context menu,
     /// clearing their cached hit rects and hover state. The item rects are
     /// ABSOLUTE positions cached once at open (the menu clamps against the
@@ -3605,6 +3692,9 @@ impl App {
     /// stable ids, so a reference to any OTHER tab stays valid untouched — no
     /// index shuffling that could retarget it.
     fn drop_stale_tab_refs(&mut self) {
+        // The hovered tab index may now name another tab: re-derived on the
+        // next pointer move.
+        self.tab_hover = None;
         let live: Vec<TabId> = self.tabs.iter().map(|t| t.id).collect();
         self.renaming = still_open(self.renaming, &live);
         self.confirm_close = still_open(self.confirm_close, &live);
@@ -4540,6 +4630,111 @@ impl App {
         self.mark_dirty_all();
     }
 
+    /// The live chrome settings (tab look, progress, window border, titles).
+    fn chrome_settings(&self) -> crate::tabmeta::ChromeSettings {
+        crate::tabmeta::ChromeSettings {
+            tab_style: self.tab_style,
+            close_button: self.tab_close_button,
+            bar_opacity: self.tab_bar_opacity,
+            progress_bar: self.progress_bar,
+            window_border: self.window_border,
+            title_mode: self.tab_title_mode,
+        }
+    }
+
+    /// Apply chrome settings in every window (a config reload, a palette
+    /// command; Settings will too). None of them moves the grid — the bar height
+    /// is style-independent — so this is a repaint, plus a title refresh when
+    /// the title mode changed. The caller persists. No-op when unchanged.
+    fn set_chrome(&mut self, c: crate::tabmeta::ChromeSettings) {
+        if c == self.chrome_settings() {
+            return;
+        }
+        let titles = c.title_mode != self.tab_title_mode;
+        self.tab_style = c.tab_style;
+        self.tab_close_button = c.close_button;
+        self.tab_bar_opacity = c.bar_opacity;
+        self.progress_bar = c.progress_bar;
+        self.window_border = c.window_border;
+        self.tab_title_mode = c.title_mode;
+        if titles {
+            self.refresh_all_titles();
+        }
+        self.mark_dirty_all();
+    }
+
+    /// Re-derive every tab's display title (main + detached) — after the
+    /// `tab_title` mode changed. In auto mode each smart title is sampled once.
+    fn refresh_all_titles(&mut self) {
+        let mode = self.tab_title_mode;
+        for tab in self.tabs.iter_mut().chain(self.detached.iter_mut().map(|d| &mut d.tab)) {
+            if mode == crate::tabmeta::TabTitleMode::Auto {
+                Self::refresh_smart_title(tab, true);
+            }
+            Self::sync_tab_title(tab, mode);
+        }
+        for dw in &mut self.detached {
+            dw.sync_os_title();
+        }
+    }
+
+    /// The tab-bar drawing options for the main window right now.
+    fn tab_bar_opts(&self, hover: Option<usize>) -> jetty_render::TabBarOpts {
+        jetty_render::TabBarOpts {
+            style: self.tab_style,
+            close_button: self.tab_close_button,
+            hover,
+            opaque: !self.tab_bar_opacity,
+            progress: self.progress_bar,
+            bottom: self.tab_bar_bottom,
+        }
+    }
+
+    /// The tab bar's hit geometry for the main window (no labels measured):
+    /// the rects the drawn bar has, with the "×" visibility of a pointer at
+    /// `(cx, cy)` (the clicked/hovered tab shows its "×" in every mode).
+    fn main_bar_hit_geometry(&mut self, w: u32, bar_y: f32, cx: f32, cy: f32) -> jetty_render::TabBar {
+        let hover = self.main_tab_at(w, bar_y, cx, cy);
+        let mut bar = self.main_bar_geometry(w, hover);
+        if bar_y != 0.0 {
+            translate_bar_rects(&mut bar, bar_y);
+        }
+        bar
+    }
+
+    /// The main window's tab bar laid out at y 0 with no titles (hit geometry
+    /// never depends on text), for pointer `hover`.
+    fn main_bar_geometry(&self, w: u32, hover: Option<usize>) -> jetty_render::TabBar {
+        let cm = self.chrome_metrics();
+        let tabs: Vec<(String, bool)> =
+            (0..self.tabs.len()).map(|i| (String::new(), i == self.active)).collect();
+        jetty_render::build_tab_bar_styled(
+            w, &tabs, &self.active_theme, None, jetty_render::CtrlHover::None, None, &mut mono_fallback(cm), cm,
+            &[], &self.tab_bar_opts(hover),
+        )
+    }
+
+    /// The main-window tab whose cell is under `(cx, cy)` (the bar at `bar_y`).
+    fn main_tab_at(&self, w: u32, bar_y: f32, cx: f32, cy: f32) -> Option<usize> {
+        if cy < bar_y || cy >= bar_y + self.chrome_metrics().bar_h() {
+            return None;
+        }
+        self.main_bar_geometry(w, None).tab_rects.iter().position(|r| input::point_in(r, cx, cy - bar_y))
+    }
+
+    /// Track the main-window tab under the pointer (hover lift, hover "×"):
+    /// one repaint when it changes, nothing otherwise.
+    fn update_tab_hover(&mut self) {
+        let Some((w, h)) = self.gpu.as_ref().map(|g| (g.config.width, g.config.height)) else { return };
+        let bar_y = self.tabbar_y(h as f32);
+        let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let hover = if self.tab_drag.is_none() { self.main_tab_at(w, bar_y, cx, cy) } else { None };
+        if hover != self.tab_hover {
+            self.tab_hover = hover;
+            self.request_main_paint();
+        }
+    }
+
     /// THE per-surface paint choke for the MAIN window (v0.23 central paint
     /// chokepoint). Every producer-category `request_redraw` for the main window
     /// (input, PTY output, resize, overlays/chrome, sync-flush, lifecycle) routes
@@ -4825,6 +5020,40 @@ impl App {
                 self.request_main_paint();
                 reveal_main(self, event_loop);
             }
+            // Chrome (visuals v2): pickers / toggles over the chrome settings.
+            C::SetTabStyle(_)
+            | C::SetCloseButton(_)
+            | C::SetWindowBorder(_)
+            | C::ToggleProgressBar
+            | C::ToggleSmartTitles
+            | C::ToggleTabBarOpacity => {
+                let mut c = self.chrome_settings();
+                match cmd {
+                    C::SetTabStyle(v) => c.tab_style = jetty_render::TabStyle::from_config(v),
+                    C::SetCloseButton(v) => c.close_button = jetty_render::CloseButton::from_config(v),
+                    C::SetWindowBorder(v) => c.window_border = crate::tabmeta::WindowBorder::from_config(v),
+                    C::ToggleProgressBar => c.progress_bar = !c.progress_bar,
+                    C::ToggleSmartTitles => {
+                        c.title_mode = match c.title_mode {
+                            crate::tabmeta::TabTitleMode::Osc => crate::tabmeta::TabTitleMode::Auto,
+                            crate::tabmeta::TabTitleMode::Auto => crate::tabmeta::TabTitleMode::Osc,
+                        }
+                    }
+                    _ => c.bar_opacity = !c.bar_opacity,
+                }
+                self.set_chrome(c);
+                self.persist();
+            }
+            // The tab the palette was opened over (a detached window's own tab).
+            C::SetTabColor(color) => {
+                let id = match s {
+                    Surface::Main => self.tabs.get(self.active).map(|t| t.id),
+                    Surface::Detached(p) => self.detached.get(p).map(|d| d.tab.id),
+                };
+                if let Some(id) = id {
+                    self.set_tab_color(id, color);
+                }
+            }
             // Index-bearing dynamic actions: `.get()`-guard against a stale index.
             C::SetTheme(i) => {
                 if i < jetty_core::theme_count() {
@@ -4895,6 +5124,14 @@ impl App {
     /// ModifiersChanged) and the hovered CELL is unchanged, so without the forced
     /// recompute tab 1's underline ghosts over tab 2's text (F12).
     fn entered_new_active_tab(&mut self) {
+        // Smart titles refresh on a tab switch too (the user looks at it now).
+        let mode = self.tab_title_mode;
+        if mode == crate::tabmeta::TabTitleMode::Auto {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                Self::refresh_smart_title(tab, false);
+                Self::sync_tab_title(tab, mode);
+            }
+        }
         self.ov.hint_mode = None;
         self.ov.copy_mode = None;
         // A selection drag, scrollbar drag, or button the outgoing tab's program
@@ -5980,8 +6217,9 @@ impl App {
         // staged). Collected locally (the loop holds `self.tabs` mutably) and
         // surfaced after it; empty on every normal pass.
         let mut runsel_notices: Vec<crate::runsel::Notice> = Vec::new();
+        let title_mode = self.tab_title_mode;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
-            let (had, title_changed, notice) = Self::drain_one_tab(tab, &mut vt_read);
+            let (had, title_changed, notice) = Self::drain_one_tab(tab, &mut vt_read, title_mode);
             chrome_changed |= title_changed;
             if let Some(n) = notice {
                 runsel_notices.push(n);
@@ -5992,9 +6230,9 @@ impl App {
             // clean tab. Rides the existing event-driven drain — zero idle work.
             let rang = tab.terminal.take_bell();
             if i != self.active {
-                let new = next_activity(tab.activity, had, rang, suppress_output);
-                if new != tab.activity {
-                    tab.activity = new;
+                let new = next_activity(tab.meta.activity, had, rang, suppress_output);
+                if new != tab.meta.activity {
+                    tab.meta.activity = new;
                     chrome_changed = true;
                 }
             }
@@ -6084,6 +6322,7 @@ impl App {
     fn drain_one_tab(
         tab: &mut Tab,
         vt_read: &mut u64,
+        title_mode: crate::tabmeta::TabTitleMode,
     ) -> (bool, bool, Option<crate::runsel::Notice>) {
         // Feed at most PTY_DRAIN_BUDGET bytes this pass so a flood can't starve
         // the event loop (see the const's doc). Whatever remains is scheduled
@@ -6107,13 +6346,25 @@ impl App {
         // no activity-indicator transition (F1/F14).
         let mut title_changed = false;
         if let Some(update) = tab.terminal.take_title_update() {
-            if let Some(new_title) =
-                resolve_title(update, tab.manually_renamed, &tab.default_title)
-            {
-                if new_title != tab.title {
-                    tab.title = new_title;
-                    title_changed = true;
-                }
+            tab.meta.osc_title = update.map(clip_osc_title);
+            title_changed |= Self::sync_tab_title(tab, title_mode);
+        }
+        // Smart titles (`tab_title = "auto"`): the shell started or finished a
+        // command (OSC 133 A/C/D) — re-derive "what runs here". The marks are
+        // consumed in every mode (one bool); only auto mode reads /proc, and
+        // only on these events (plus a few retries while a just-started
+        // command has not been forked yet) — never per frame, never polled.
+        let marks = tab.terminal.take_command_marks();
+        if title_mode == crate::tabmeta::TabTitleMode::Auto && (marks || tab.meta.fg_retries > 0) {
+            Self::refresh_smart_title(tab, marks);
+            title_changed |= Self::sync_tab_title(tab, title_mode);
+        }
+        // OSC 9;4 progress (the tab bar / detached bar draw it). Reported as a
+        // chrome change like a title, so a background tab's bar repaints.
+        if let Some(p) = tab.terminal.take_progress_update() {
+            if tab.meta.progress != p {
+                tab.meta.progress = p;
+                title_changed = true;
             }
         }
         // OSC 52 COPY: a remote/tmux/nvim asked to set a system selection. Ride
@@ -6161,6 +6412,59 @@ impl App {
             notice = n;
         }
         (had, title_changed, notice)
+    }
+
+    /// Re-resolve `tab`'s display title from its inputs (see `resolve_title`);
+    /// true when it changed. A manual rename is never touched.
+    fn sync_tab_title(tab: &mut Tab, mode: crate::tabmeta::TabTitleMode) -> bool {
+        let Some(t) = resolve_title(
+            tab.meta.osc_title.as_deref(),
+            tab.manually_renamed,
+            &tab.default_title,
+            mode,
+            tab.meta.smart_title.as_deref(),
+        ) else {
+            return false;
+        };
+        if t != tab.title {
+            tab.title = t;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A new tab's first smart title (auto mode): its start directory — the
+    /// requested one, else home — until its shell reports a prompt. Reading the
+    /// shell's own cwd this early would race its `chdir`.
+    fn init_smart_title(tab: &mut Tab, mode: crate::tabmeta::TabTitleMode, spawn_cwd: Option<&std::path::Path>) {
+        if mode != crate::tabmeta::TabTitleMode::Auto {
+            return;
+        }
+        let home = crate::tabmeta::home_dir();
+        tab.meta.smart_title = crate::tabmeta::smart_title(None, spawn_cwd.or(home), home);
+        Self::sync_tab_title(tab, mode);
+    }
+
+    /// Re-derive `tab`'s smart title: the foreground command's name while the
+    /// shell runs one (OSC 133 C … D), else the shell's directory. `fresh` =
+    /// a new command mark arrived (restarts the bounded retry budget for a
+    /// command whose OSC 133 C beat its own fork). The cwd is read without
+    /// touching the directory (`title_cwd`), so a dead network mount can't
+    /// block the UI thread.
+    fn refresh_smart_title(tab: &mut Tab, fresh: bool) {
+        let running = tab.terminal.command_running();
+        let fg = if running { tab.pty.foreground_name() } else { None };
+        tab.meta.fg_retries = match (running, fg.is_some()) {
+            (true, false) if fresh => crate::tabmeta::FG_RETRIES,
+            (true, false) => tab.meta.fg_retries.saturating_sub(1),
+            _ => 0,
+        };
+        let cwd = if fg.is_none() { tab.pty.title_cwd() } else { None };
+        let smart = crate::tabmeta::smart_title(fg.as_deref(), cwd.as_deref(), crate::tabmeta::home_dir());
+        if smart.is_some() {
+            tab.meta.smart_title = smart;
+        }
     }
 
     /// Poll + service one tab's pending inject (the drain-hook body and the
@@ -6273,8 +6577,21 @@ impl App {
         // First failure wins the summon; else the last firing tab.
         let mut summon_target: Option<usize> = None;
         let mut summon_is_failure = false;
+        let mut badge_changed = false;
         for i in 0..self.tabs.len() {
             let completions = self.tabs[i].terminal.take_completions();
+            // Finished / failed badges on BACKGROUND tabs — independent of the
+            // notification settings (a badge is not a notification).
+            if i != active && !completions.is_empty() {
+                let meta = &mut self.tabs[i].meta;
+                let next = completions
+                    .iter()
+                    .fold(meta.activity, |a, c| crate::tabmeta::activity_after_completion(a, c.exit_code));
+                if next != meta.activity {
+                    meta.activity = next;
+                    badge_changed = true;
+                }
+            }
             if enabled {
                 for c in completions {
                     let watching = main_tab_watched(main_watching, i, active);
@@ -6290,6 +6607,9 @@ impl App {
                     }
                 }
             }
+        }
+        if badge_changed && self.visible && !self.main_occluded {
+            self.request_main_paint();
         }
         // At most ONE auto-summon for the whole batch, AFTER gating every tab against
         // the pre-loop snapshot (so no sibling completion is suppressed).
@@ -7283,6 +7603,8 @@ impl App {
         let (device, format) = (&gpu.device, gpu.format);
         self.quad = Some(QuadLayer::new(device, format));
         self.corner_mask = Some(jetty_render::CornerMask::new(device, format));
+        // Device-scoped and lazy: rebuilt on the first ring frame after this.
+        self.focus_ring = None;
         self.bayer_reveal = Some(jetty_render::BayerReveal::new(device, format));
         self.phosphor = Some(jetty_render::PhosphorIgnition::new(device, format));
         self.liquid = Some(jetty_render::LiquidDrop::new(device, format));
@@ -8606,6 +8928,9 @@ impl App {
                 // Focus implies on-screen: clear any stale occluded flag in case
                 // the WM skipped Occluded(false) on restore (F17).
                 self.detached[pos].occluded = false;
+                if self.window_border != crate::tabmeta::WindowBorder::None {
+                    self.detached[pos].request_paint();
+                }
                 // Clear any command-finish urgency raised on THIS detached window
                 // (X11 latches it until cleared; parity with the main window).
                 self.detached[pos].window.request_user_attention(None);
@@ -8620,6 +8945,9 @@ impl App {
                 // for a switch-to-detached and the terminal hides as it should.
                 self.switching_to_detached = false;
                 self.detached[pos].focused = false;
+                if self.window_border != crate::tabmeta::WindowBorder::None {
+                    self.detached[pos].request_paint();
+                }
                 // F9 decides "hide vs raise" from JeTTY-wide focus: a focus loss
                 // this instant may be the summon hotkey's own grab churn.
                 self.focus_lost_at = Some(std::time::Instant::now());
@@ -8752,13 +9080,14 @@ impl App {
         // reader queued, which re-request this window's redraw.
         // A run-selection notice needs `&mut self` (pill state), so the drain
         // runs in its own scope before the long `dw` borrow below.
+        let title_mode = self.tab_title_mode;
         let notice = {
             let Some(dw) = self.detached.get_mut(pos) else { return };
             // This frame shows the latest keystroke's effect: its fallback paint
             // is no longer owed (mirrors the main window's RedrawRequested).
             dw.key_paint_due = None;
             let mut vt_read: u64 = 0;
-            let (had, _, notice) = Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+            let (had, _, notice) = Self::drain_one_tab(&mut dw.tab, &mut vt_read, title_mode);
             if had {
                 dw.ov.note_output();
             }
@@ -8853,10 +9182,20 @@ impl App {
         let corner_radius = self.corner_radius;
         let fx = self.fx.clone();
         let crt_time = (self.crt_clock.elapsed().as_secs_f64() % CRT_PHASE_WRAP) as f32;
+        // Chrome look (the main bar's style; a detached bar is always on top
+        // and its single tab always "active").
+        let bar_opts = jetty_render::TabBarOpts { bottom: false, ..self.tab_bar_opts(None) };
+        let window_border = self.window_border;
 
         let Some(dw) = self.detached.get_mut(pos) else { return };
         // This window's chrome geometry (its own DPI × the UI font).
         let cm = dw.chrome_metrics(ui_font);
+        // Its tab's decoration (color, progress) and its focus ring.
+        let tab_deco = dw.tab.meta.deco();
+        let ring_color = crate::tabmeta::ring_rgb(window_border, dw.focused, dw.fullscreen, &theme, tab_deco.color);
+        if ring_color.is_some() && dw.focus_ring.is_none() {
+            dw.focus_ring = Some(jetty_render::FocusRing::new(&dw.gpu.device, dw.gpu.format));
+        }
         let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
         let shift_hint_show =
             shift_hint_live_in(shift_hint_until, dw.window.id(), std::time::Instant::now());
@@ -8913,6 +9252,7 @@ impl App {
         let chrome_text = &mut dw.chrome_text;
         let quad = &mut dw.quad;
         let corner_mask = &dw.corner_mask;
+        let focus_ring = dw.focus_ring.as_ref();
         let crt = &dw.crt;
         let offscreen = dw.offscreen.as_ref();
         let image_layer = &mut dw.image_layer;
@@ -8972,8 +9312,8 @@ impl App {
             &scene,
             // Pass 3: the top bar (title pill + close ✕) over the grid.
             |quad, device, queue, view, w, h| {
-                let bar = jetty_render::build_detached_bar(
-                    w, &title, &theme, close_hover, &mut *chrome_text, cm,
+                let bar = jetty_render::build_detached_bar_styled(
+                    w, &title, &theme, close_hover, &mut *chrome_text, cm, &tab_deco, &bar_opts,
                 );
                 quad.render(device, queue, view, w, h, &bar.quads);
                 if !bar.labels.is_empty() {
@@ -9122,6 +9462,20 @@ impl App {
         // Dropdown top-square nuance never applies here). Skipped while CRT is
         // active: the CRT pass owns the rounded corners then (exactly like the
         // main window's mask/CRT interplay).
+        // Window border / focus ring, before the mask (as in the main window).
+        if let (Some(ring), Some(c)) = (focus_ring, ring_color) {
+            let (r_tl, r_tr, r_bl, r_br) = crate::detached::corner_radii(corner_radius_px);
+            ring.apply(
+                &gpu.device,
+                &gpu.queue,
+                scene_view,
+                width,
+                height,
+                [r_tl, r_tr, r_bl, r_br],
+                jetty_render::ring_width_px(scale),
+                [c[0], c[1], c[2], 255],
+            );
+        }
         if !crt_active {
             let (r_tl, r_tr, r_bl, r_br) = crate::detached::corner_radii(corner_radius_px);
             corner_mask.apply(
@@ -10587,7 +10941,7 @@ impl ApplicationHandler<AppEvent> for App {
         }
         let writer = pty.writer();
         let id = self.alloc_tab_id();
-        self.tabs.push(Tab {
+        let mut tab = Tab {
             id,
             terminal,
             pty,
@@ -10595,10 +10949,13 @@ impl ApplicationHandler<AppEvent> for App {
             title: "Tab 1".to_string(),
             default_title: "Tab 1".to_string(),
             manually_renamed: false,
-            activity: jetty_render::TabActivity::None,
+            meta: crate::tabmeta::TabMeta::default(),
             pending_inject: None,
             input: input::TabInputState::default(),
-        });
+        };
+        // The first shell starts in the home directory.
+        Self::init_smart_title(&mut tab, self.tab_title_mode, None);
+        self.tabs.push(tab);
         self.active = 0;
 
         // Register the global summon hotkey (Yakuake-style toggle). The manager
@@ -10700,10 +11057,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // a detach move); collected locally, surfaced after the loop.
                 let mut runsel_notices: Vec<crate::runsel::Notice> = Vec::new();
                 let frame_interval = self.frame_interval;
+                let title_mode = self.tab_title_mode;
                 for (i, dw) in self.detached.iter_mut().enumerate() {
                     let read_before = vt_read;
                     let (had, title_changed, notice) =
-                        Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+                        Self::drain_one_tab(&mut dw.tab, &mut vt_read, title_mode);
                     // Output rotated the scrollback under this window's open
                     // search: its matches are stale until the next re-collect.
                     if had {
@@ -10974,6 +11332,11 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::Focused(false) => {
                 self.main_focused = false;
+                // The focus ring dims or goes (window_border); nothing else here
+                // repaints on a focus loss.
+                if self.window_border != crate::tabmeta::WindowBorder::None {
+                    self.request_main_paint();
+                }
                 // Stamped for the toggle's churn grace: on X11 pressing the
                 // summon hotkey itself sends this FocusOut (its key grab) just
                 // before the hotkey event — see `FOCUS_CHURN_GRACE`.
@@ -11047,6 +11410,10 @@ impl ApplicationHandler<AppEvent> for App {
                 // The pointer left the window: no gutter hover any more
                 // (`scrollbar = "auto"` hides an idle thumb — one repaint).
                 self.set_main_scrollbar_hover(false);
+                // No tab is hovered once the pointer leaves the window.
+                if self.tab_hover.take().is_some() {
+                    self.request_main_paint();
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let prev = self.cursor;
@@ -11116,6 +11483,9 @@ impl ApplicationHandler<AppEvent> for App {
                         .is_some_and(|t| t.gutter_contains(position.x as f32, position.y as f32));
                     self.set_main_scrollbar_hover(hover);
                 }
+                // The tab under the pointer (hover lift / hover "×"): one repaint
+                // per change.
+                self.update_tab_hover();
                 if self.dragging_scrollbar {
                     // Copy width/height to avoid borrow conflicts.
                     let (w, h) = if let Some(gpu) = &self.gpu {
@@ -11291,7 +11661,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 // --- Tab context menu hit-test (consume the click entirely) ---
-                if let Some((_, _, tab_id)) = self.tab_menu.take() {
+                if let Some((menu_x, menu_y, tab_id)) = self.tab_menu.take() {
                     self.tab_menu_hover = None;
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
@@ -11318,7 +11688,18 @@ impl ApplicationHandler<AppEvent> for App {
                                 // Same confirm-close flow as the × / Ctrl+Shift+W.
                                 self.confirm_close = Some(tab_id);
                             }
-                            _ => {}
+                            // "Color ▸" opens the color list in place (same
+                            // anchor, same tab); a color row sets it.
+                            Some(crate::detached::TAB_MENU_COLOR) => {
+                                self.open_tab_menu(menu_x, menu_y, tab_id, crate::detached::tab_color_menu_items());
+                                return;
+                            }
+                            Some(l) => {
+                                if let Some(color) = crate::detached::tab_color_from_label(l) {
+                                    self.set_tab_color(tab_id, color);
+                                }
+                            }
+                            None => {}
                         }
                     }
                     // Hit or not, the menu is closed — consume the click.
@@ -11441,36 +11822,13 @@ impl ApplicationHandler<AppEvent> for App {
                     );
                     self.last_strip_click = Some((now, cx, cy));
 
-                    let theme = self.current_theme();
-                    let tabs_meta: Vec<(String, bool)> = self
-                        .tabs
-                        .iter()
-                        .enumerate()
-                        .map(|(i, t)| (t.title.clone(), i == self.active))
-                        .collect();
-                    // Field-level borrows (the builder below also borrows the chrome text).
-                    let rename_ref = self
-                        .renaming
-                        .and_then(|id| self.tabs.iter().position(|t| t.id == id))
-                        .map(|i| (i, self.rename_buf.as_str()));
-                    // Build with perf=None to MATCH the drawn bar (the perf HUD
-                    // moved to the bottom status strip, so the drawn tab bar
-                    // reserves no HUD width — see the RedrawRequested build). Passing
-                    // self.perf_label here reserved ~250px of phantom width and
-                    // shrank the hit tab_w below the drawn tab_w, so clicks near a
-                    // tab's right edge / on ✕ / on + landed on the wrong tab (F19).
-                    let cm = self.chrome_metrics();
-                    let mut fallback = mono_fallback(cm);
-                    let mut bar = jetty_render::build_tab_bar_ex(
-                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, None,
-                        measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
-                        &[], // activity never affects geometry; keeps hit rects == drawn rects
-                    );
-                    // build_tab_bar_ex lays the bar out at y 0..bar_h; shift its
-                    // hit-test rects down to the bar's actual position (bottom mode).
-                    if bar_y != 0.0 {
-                        translate_bar_rects(&mut bar, bar_y);
-                    }
+                    // The drawn bar's hit geometry: same style (compact tabs are
+                    // narrower), no perf reservation (the HUD lives in the status
+                    // strip — a phantom reservation once shrank the hit tabs, F19)
+                    // and the "×" shown where the drawn bar shows it for a pointer
+                    // HERE (`tab_close_button`: a hidden "×" never closes). Shifted
+                    // to the bar's actual position (bottom mode).
+                    let bar = self.main_bar_hit_geometry(w, bar_y, cx, cy);
 
                     // Window controls take priority (rightmost region).
                     if input::point_in(&bar.help_rect, cx, cy) {
@@ -11740,33 +12098,9 @@ impl ApplicationHandler<AppEvent> for App {
                 };
                 if cy >= bar_y && cy < bar_y + self.bar_h() {
                     let Some(gpu) = &self.gpu else { return };
-                    let (w, h) = (gpu.config.width, gpu.config.height);
-                    let theme = self.current_theme();
-                    // Rebuild the bar for hit-testing exactly like the left-press
-                    // handler (same tabs/rename/HUD inputs → identical rects).
-                    let tabs_meta: Vec<(String, bool)> = self
-                        .tabs
-                        .iter()
-                        .enumerate()
-                        .map(|(i, t)| (t.title.clone(), i == self.active))
-                        .collect();
-                    let cm = self.chrome_metrics();
-                    let mut fallback = mono_fallback(cm);
-                    // Field-level borrows (the builder below also borrows the chrome text).
-                    let rename_ref = self
-                        .renaming
-                        .and_then(|id| self.tabs.iter().position(|t| t.id == id))
-                        .map(|i| (i, self.rename_buf.as_str()));
-                    // perf=None to match the DRAWN bar (HUD lives in the status
-                    // strip); passing perf_label mis-sized the hit-rects (F19).
-                    let mut bar = jetty_render::build_tab_bar_ex(
-                        w, &tabs_meta, &theme, rename_ref, jetty_render::CtrlHover::None, None,
-                        measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
-                        &[], // activity never affects geometry; keeps hit rects == drawn rects
-                    );
-                    if bar_y != 0.0 {
-                        translate_bar_rects(&mut bar, bar_y);
-                    }
+                    let w = gpu.config.width;
+                    // The drawn bar's hit geometry (same as the left-press handler).
+                    let bar = self.main_bar_hit_geometry(w, bar_y, cx, cy);
                     if let Some(i) = bar
                         .tab_rects
                         .iter()
@@ -11778,31 +12112,8 @@ impl ApplicationHandler<AppEvent> for App {
                         self.ov.help_open = false;
                         self.context_menu = None;
                         self.menu_hover = None;
-                        self.tab_menu = Some((cx, cy, self.tabs[i].id));
-                        self.tab_menu_hover = None;
-                        self.tab_menu_labels = crate::detached::tab_menu_items(
-                            crate::detached::can_detach(self.tabs.len()),
-                        );
-                        // Cache the item hit-test rects once, same as context_menu.
-                        // Hints from the live keymap (same strings the draw uses).
-                        let hints: Vec<String> = self
-                            .tab_menu_labels
-                            .iter()
-                            .map(|&l| crate::detached::menu_hint(&self.keymap, l))
-                            .collect();
-                        let items: Vec<(&str, &str)> = self
-                            .tab_menu_labels
-                            .iter()
-                            .zip(&hints)
-                            .map(|(&l, h)| (l, h.as_str()))
-                            .collect();
-                        let menu = jetty_render::build_menu(
-                            cx, cy, w, h, None, &theme,
-                            measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
-                            &items, &[], &[],
-                        );
-                        self.tab_menu_rects = menu.item_rects;
-                        self.request_main_paint();
+                        let labels = crate::detached::tab_menu_items(crate::detached::can_detach(self.tabs.len()));
+                        self.open_tab_menu(cx, cy, self.tabs[i].id, labels);
                     }
                     return;
                 }
@@ -12619,11 +12930,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // tab is on screen this frame, so its pending dot is consumed.
                 // Covers every switch path (click, Ctrl+Tab, Ctrl+1..9, close
                 // fix-ups, reattach) because each already requests a redraw.
-                self.tabs[self.active].activity = jetty_render::TabActivity::None;
-                // Per-tab activity for the drawn bar, index-aligned with
-                // tabs_meta (frames are damage-driven; no idle-path allocation).
-                let tab_activity: Vec<jetty_render::TabActivity> =
-                    self.tabs.iter().map(|t| t.activity).collect();
+                self.tabs[self.active].meta.activity = jetty_render::TabActivity::None;
+                // Per-tab decoration for the drawn bar (badge, progress, color),
+                // index-aligned with tabs_meta, and the bar's look + pointer.
+                let tab_deco: Vec<jetty_render::TabDeco> = self.tabs.iter().map(|t| t.meta.deco()).collect();
+                let bar_opts = self.tab_bar_opts(self.tab_hover);
                 // Snapshot the ACTIVE tab and build the tab bar (immutable reads
                 // gathered before borrowing the render stack mutably).
                 let snap = self.active_tab().terminal.snapshot();
@@ -12698,6 +13009,10 @@ impl ApplicationHandler<AppEvent> for App {
                 let tab_menu = self.tab_menu;
                 let tab_menu_hover = self.tab_menu_hover;
                 let tab_menu_labels = self.tab_menu_labels.clone();
+                // The color of the tab the menu belongs to (its swatch is ringed).
+                let tab_menu_color = tab_menu
+                    .and_then(|(_, _, id)| self.tab_index(id))
+                    .and_then(|i| self.tabs[i].meta.color);
                 let help_open = self.ov.help_open;
                 let help_scroll = self.ov.help_scroll;
                 // Clone the (cached, keymap-derived) help rows only when the overlay
@@ -12825,6 +13140,22 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                 }
+                // Window border / focus ring (`window_border`): its color for this
+                // frame (None = no ring), and the pass, built the first time a
+                // ring is drawn (zero cost while the key is "none").
+                let ring_color = crate::tabmeta::ring_rgb(
+                    self.window_border,
+                    self.main_focused,
+                    self.main_fullscreen,
+                    &theme,
+                    self.tabs.get(self.active).and_then(|t| t.meta.color),
+                );
+                if ring_color.is_some() && self.focus_ring.is_none() {
+                    if let Some(g) = &self.gpu {
+                        self.focus_ring = Some(jetty_render::FocusRing::new(&g.device, g.format));
+                    }
+                }
+                let focus_ring = self.focus_ring.as_ref();
                 let corner_mask = self.corner_mask.as_ref();
                 let bayer_reveal = self.bayer_reveal.as_ref();
                 let phosphor = self.phosphor.as_ref();
@@ -12957,9 +13288,9 @@ impl ApplicationHandler<AppEvent> for App {
                 let rename_ref = rename_state.as_ref().map(|(i, b)| (*i, b.as_str()));
                 // The perf HUD now lives in the bottom STATUS BAR (off the tab row),
                 // so the tab bar is built WITHOUT it (None).
-                let mut bar = jetty_render::build_tab_bar_ex(
+                let mut bar = jetty_render::build_tab_bar_styled(
                     width, &tabs_meta, &theme, rename_ref, ctrl_hover, None, &mut *chrome_text, cm,
-                    &tab_activity,
+                    &tab_deco, &bar_opts,
                 );
                 // Translate the bar quads + labels to its actual y (bottom mode)
                 // PLUS the dropdown slide so it moves with the content.
@@ -13306,10 +13637,14 @@ impl ApplicationHandler<AppEvent> for App {
                             .zip(&tab_menu_hints)
                             .map(|(&l, h)| (l, h.as_str()))
                             .collect();
-                        let menu = jetty_render::build_menu(
+                        let mut menu = jetty_render::build_menu(
                             mx, my, width, height, tab_menu_hover, &theme, &mut *chrome_text, cm,
                             &items, &[], &[],
                         );
+                        // The color list's swatches (none on the main rows).
+                        menu.quads.extend(crate::detached::tab_color_swatches(
+                            &menu.item_rects, &tab_menu_labels, &theme, tab_menu_color, cm,
+                        ));
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &menu.quads);
                         if !menu.labels.is_empty() {
                             let _ = chrome_text.render_overlays(
@@ -13464,6 +13799,23 @@ impl ApplicationHandler<AppEvent> for App {
                     // mask here to avoid double-rounding. During a Tier-B summon
                     // CRT is bypassed (crt_active is false), so the mask still runs
                     // exactly as today and the summon path is unchanged.
+                    // Window border / focus ring: on the window's own shape (the
+                    // mask's radii), BEFORE the mask so its outer edge is feathered
+                    // like the content's; under CRT it lands in the offscreen and
+                    // is bent with the scene.
+                    if let (Some(ring), Some(c)) = (focus_ring, ring_color) {
+                        let r_top = if top_flush { 0.0 } else { corner_radius_px };
+                        ring.apply(
+                            &gpu.device,
+                            &gpu.queue,
+                            scene_view,
+                            width,
+                            height,
+                            [r_top, r_top, corner_radius_px, corner_radius_px],
+                            jetty_render::ring_width_px(scale),
+                            [c[0], c[1], c[2], 255],
+                        );
+                    }
                     if let (Some(mask), false) = (corner_mask, crt_active) {
                         // Bottom corners always round to corner_radius_px; the top
                         // corners are zeroed when the window is top-flush (Dropdown).
@@ -15479,24 +15831,35 @@ mod url_open_tests {
 mod resolve_title_tests {
     use super::resolve_title;
 
+    use crate::tabmeta::TabTitleMode::{Auto, Osc};
+
     #[test]
     fn osc_title_applies_when_not_renamed() {
-        assert_eq!(
-            resolve_title(Some("x".to_string()), false, "Tab 2"),
-            Some("x".to_string())
-        );
+        assert_eq!(resolve_title(Some("x"), false, "Tab 2", Osc, None), Some("x".to_string()));
     }
 
     #[test]
     fn manual_rename_wins_forever() {
-        // Once manually renamed, both new titles and resets are ignored.
-        assert_eq!(resolve_title(Some("x".to_string()), true, "Tab 2"), None);
-        assert_eq!(resolve_title(None, true, "Tab 2"), None);
+        // Once manually renamed, both new titles and resets are ignored — in
+        // either title mode, smart title or not.
+        for mode in [Osc, Auto] {
+            assert_eq!(resolve_title(Some("x"), true, "Tab 2", mode, Some("src")), None);
+            assert_eq!(resolve_title(None, true, "Tab 2", mode, Some("src")), None);
+        }
     }
 
     #[test]
     fn reset_restores_default() {
-        assert_eq!(resolve_title(None, false, "Tab 2"), Some("Tab 2".to_string()));
+        assert_eq!(resolve_title(None, false, "Tab 2", Osc, None), Some("Tab 2".to_string()));
+        // osc mode never shows the smart title (today's behavior).
+        assert_eq!(resolve_title(None, false, "Tab 2", Osc, Some("src")), Some("Tab 2".to_string()));
+    }
+
+    #[test]
+    fn auto_mode_falls_back_to_the_smart_title() {
+        assert_eq!(resolve_title(None, false, "Tab 2", Auto, Some("cargo")), Some("cargo".to_string()));
+        assert_eq!(resolve_title(Some("vim"), false, "Tab 2", Auto, Some("cargo")), Some("vim".to_string()));
+        assert_eq!(resolve_title(None, false, "Tab 2", Auto, None), Some("Tab 2".to_string()));
     }
 
     #[test]
@@ -15504,10 +15867,10 @@ mod resolve_title_tests {
         // A program can send a multi-MB OSC 0/2 title; only a displayable head
         // is kept, so the tab bar / OS title / palette never handle it whole.
         let huge = "t".repeat(1 << 20);
-        let got = resolve_title(Some(huge), false, "Tab 2").unwrap();
+        let got = super::clip_osc_title(huge);
         assert_eq!(got.chars().count(), jetty_render::MAX_LABEL_CHARS);
         // Ordinary titles pass through untouched (no reallocation path).
-        assert_eq!(resolve_title(Some("vim ~/x".into()), false, "T").unwrap(), "vim ~/x");
+        assert_eq!(super::clip_osc_title("vim ~/x".into()), "vim ~/x");
     }
 }
 
@@ -15888,6 +16251,12 @@ mod hot_reload_tests {
             "macos_option_as_alt",
             "copy_on_select",
             "kitty_keyboard",
+            "tab_style",
+            "tab_close_button",
+            "tab_bar_opacity",
+            "progress_bar",
+            "window_border",
+            "tab_title",
             // shell (new tabs pick up the edited shell) and show_welcome apply live;
             // both are also mirrored in apply_reloaded_config so a later persist()
             // round-trips an external edit instead of clobbering it.

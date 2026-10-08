@@ -111,10 +111,80 @@ pub fn clamp_pos(
 /// "Detach" is present only while detaching is allowed (≥ 2 tabs).
 pub fn tab_menu_items(can_detach: bool) -> Vec<&'static str> {
     if can_detach {
-        vec!["Detach", "Rename", "Close Tab"]
+        vec!["Detach", "Rename", TAB_MENU_COLOR, "Close Tab"]
     } else {
-        vec!["Rename", "Close Tab"]
+        vec!["Rename", TAB_MENU_COLOR, "Close Tab"]
     }
+}
+
+/// The tab menu row that opens the per-tab color list in place.
+pub const TAB_MENU_COLOR: &str = "Color ▸";
+/// The color list's "remove the color" row.
+pub const TAB_MENU_NO_COLOR: &str = "No Color";
+
+/// The tab menu's color list: "No Color", then palette colors 1–6.
+pub fn tab_color_menu_items() -> Vec<&'static str> {
+    std::iter::once(TAB_MENU_NO_COLOR).chain(jetty_render::TAB_COLORS.iter().map(|(_, n)| *n)).collect()
+}
+
+/// What a color-list row sets: `Some(None)` = "No Color", `Some(Some(i))` =
+/// palette color `i`, `None` = not a color row.
+pub fn tab_color_from_label(label: &str) -> Option<Option<u8>> {
+    if label == TAB_MENU_NO_COLOR {
+        return Some(None);
+    }
+    jetty_render::TAB_COLORS.iter().find(|(_, n)| *n == label).map(|(i, _)| Some(*i))
+}
+
+/// Swatches for the color list's rows: a small rounded square of each color
+/// at the right end of its row (where a shortcut hint would sit), the tab's
+/// `current` color ringed. Rows that are not colors get none.
+pub fn tab_color_swatches(
+    item_rects: &[jetty_render::Rect],
+    labels: &[&str],
+    theme: &jetty_core::Theme,
+    current: Option<u8>,
+    cm: jetty_render::ChromeMetrics,
+) -> Vec<jetty_render::Rect> {
+    let ui = jetty_render::UiPalette::cached(theme);
+    let rgba = |c: [u8; 3]| [c[0], c[1], c[2], 255];
+    let d = cm.px(12.0).round();
+    let mut out = Vec::new();
+    for (r, &label) in item_rects.iter().zip(labels) {
+        let Some(choice) = tab_color_from_label(label) else { continue };
+        let x = r.x + r.w - cm.px(14.0) - d;
+        let y = r.y + (r.h - d) * 0.5;
+        if choice == current {
+            let ring = cm.px(2.0).round().max(1.0);
+            out.push(jetty_render::Rect::rounded(
+                x - ring,
+                y - ring,
+                d + ring * 2.0,
+                d + ring * 2.0,
+                rgba(ui.text),
+                cm.px(4.0) + ring,
+            ));
+        }
+        let fill = match choice.and_then(|i| jetty_render::tab_color_rgb(theme, i)) {
+            Some(c) => c,
+            // "No Color": the bar's own background, outlined by the hint shade.
+            None => {
+                out.push(jetty_render::Rect::rounded(x, y, d, d, rgba(ui.text_hint), cm.px(4.0)));
+                let inset = cm.px(1.5);
+                out.push(jetty_render::Rect::rounded(
+                    x + inset,
+                    y + inset,
+                    d - inset * 2.0,
+                    d - inset * 2.0,
+                    rgba(ui.bg),
+                    cm.px(3.0),
+                ));
+                continue;
+            }
+        };
+        out.push(jetty_render::Rect::rounded(x, y, d, d, rgba(fill), cm.px(4.0)));
+    }
+    out
 }
 
 /// Items of a DETACHED window's context menu (right-click anywhere).
@@ -217,6 +287,9 @@ pub(crate) struct DetachedWindow {
     /// `CornerMask` caches its uniform/bind group; sharing across surfaces of
     /// different sizes would thrash it.
     pub corner_mask: jetty_render::CornerMask,
+    /// Per-window focus-ring pass (`window_border`), built on this window's
+    /// device the first time it draws a ring — `None` while the key is "none".
+    pub focus_ring: Option<jetty_render::FocusRing>,
     /// Per-window CRT post-pass. Per-window instance because `Crt` caches its
     /// bind group keyed by the sampled src view — sharing the main window's
     /// instance would thrash the cache between windows.
@@ -461,6 +534,7 @@ impl DetachedWindow {
             // Allocated on the first CRT frame (see the field doc).
             offscreen: None,
             corner_mask,
+            focus_ring: None,
             crt,
             image_layer,
             caret_anim: None,
@@ -538,6 +612,8 @@ impl DetachedWindow {
         self.chrome_text = chrome_text;
         self.quad = QuadLayer::new(&gpu.device, gpu.format);
         self.corner_mask = jetty_render::CornerMask::new(&gpu.device, gpu.format);
+        // Device-scoped: rebuilt lazily on the next ring frame.
+        self.focus_ring = None;
         self.crt = jetty_render::Crt::new(&gpu.device, gpu.format);
         self.image_layer = jetty_render::ImageLayer::new(&gpu.device, gpu.format);
         // Lazily re-allocated on the next CRT frame, on the new device.
@@ -784,8 +860,46 @@ mod tests {
 
     #[test]
     fn tab_menu_hides_detach_at_one_tab() {
-        assert_eq!(tab_menu_items(can_detach(2)), vec!["Detach", "Rename", "Close Tab"]);
-        assert_eq!(tab_menu_items(can_detach(1)), vec!["Rename", "Close Tab"]);
+        assert_eq!(tab_menu_items(can_detach(2)), vec!["Detach", "Rename", "Color ▸", "Close Tab"]);
+        assert_eq!(tab_menu_items(can_detach(1)), vec!["Rename", "Color ▸", "Close Tab"]);
+    }
+
+    #[test]
+    fn tab_color_list_maps_rows_to_palette_indices() {
+        let items = tab_color_menu_items();
+        assert_eq!(items, vec!["No Color", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan"]);
+        assert_eq!(tab_color_from_label("No Color"), Some(None));
+        assert_eq!(tab_color_from_label("Red"), Some(Some(1)));
+        assert_eq!(tab_color_from_label("Cyan"), Some(Some(6)));
+        // The main menu's own rows are not colors (no accidental match).
+        for l in tab_menu_items(true) {
+            assert_eq!(tab_color_from_label(l), None, "{l}");
+        }
+        // No color row carries a shortcut hint (the swatch takes that column).
+        for l in &items {
+            assert!(menu_action(l).is_none(), "{l}");
+        }
+    }
+
+    #[test]
+    fn tab_color_swatches_sit_inside_their_rows_and_ring_the_current_one() {
+        let theme = jetty_core::Theme::by_name("catppuccin_mocha");
+        let cm = jetty_render::ChromeMetrics::DEFAULT;
+        let labels = tab_color_menu_items();
+        let rects: Vec<jetty_render::Rect> = (0..labels.len())
+            .map(|i| jetty_render::Rect::new(100.0, 50.0 + i as f32 * 28.0, 210.0, 28.0, [0; 4]))
+            .collect();
+        let sw = tab_color_swatches(&rects, &labels, &theme, Some(2), cm);
+        // 6 color swatches + the "No Color" outline (2 quads) + one ring.
+        assert_eq!(sw.len(), 6 + 2 + 1);
+        for s in &sw {
+            let row = rects.iter().find(|r| s.y >= r.y - 3.0 && s.y + s.h <= r.y + r.h + 3.0).expect("in a row");
+            assert!(s.x >= row.x && s.x + s.w <= row.x + row.w);
+        }
+        let green = theme.palette[2];
+        assert!(sw.iter().any(|q| q.color == [green[0], green[1], green[2], 255]));
+        // The main menu's rows get no swatches.
+        assert!(tab_color_swatches(&rects[..4], &tab_menu_items(true), &theme, None, cm).is_empty());
     }
 
     #[test]
