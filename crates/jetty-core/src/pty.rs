@@ -407,6 +407,68 @@ fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
     None
 }
 
+/// The working directory of a live process WITHOUT touching the directory
+/// itself: no `stat`/`is_dir`, which blocks for as long as a dead network mount
+/// takes to time out. For DISPLAY (smart tab titles) on the UI thread only —
+/// spawning in a directory still goes through [`pid_cwd`]'s check. A deleted
+/// cwd reads as `None`.
+#[cfg(target_os = "linux")]
+fn pid_cwd_nostat(pid: u32) -> Option<std::path::PathBuf> {
+    let p = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    (!p.as_os_str().as_encoded_bytes().ends_with(b" (deleted)")).then_some(p)
+}
+
+#[cfg(target_os = "macos")]
+fn pid_cwd_nostat(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    // SAFETY: as in `pid_cwd` — the kernel fills at most `size` bytes and
+    // returns the count written; ret == size proves full initialization.
+    let ret = unsafe {
+        libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDVNODEPATHINFO, 0, info.as_mut_ptr().cast(), size)
+    };
+    if ret != size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    // SAFETY: vip_path is 1024 contiguous, NUL-terminated bytes (see `pid_cwd`).
+    let bytes = unsafe { std::slice::from_raw_parts(info.pvi_cdir.vip_path.as_ptr().cast::<u8>(), 1024) };
+    let len = bytes.iter().position(|&b| b == 0)?;
+    (len > 0).then(|| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..len])))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn pid_cwd_nostat(pid: u32) -> Option<std::path::PathBuf> {
+    let _ = pid;
+    None
+}
+
+/// The short name of a live process (`comm`: at most 15 bytes on Linux), or
+/// `None` when it can't be read. Pseudo-filesystem / kernel reads only.
+#[cfg(target_os = "linux")]
+fn pid_name(pid: i32) -> Option<String> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let s = s.trim_end_matches('\n');
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn pid_name(pid: i32) -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: the kernel writes at most `buffersize` bytes into `buf` and
+    // returns the name's length (0 on failure).
+    let n = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let n = usize::try_from(n).ok().filter(|&n| n > 0 && n <= buf.len())?;
+    Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn pid_name(pid: i32) -> Option<String> {
+    let _ = pid;
+    None
+}
+
 /// Variables JeTTY's OWN launch environment may carry that must NOT reach the
 /// shells it spawns (alacritty strips the first two for the same reason).
 const INHERITED_ENV_DENYLIST: &[&str] = &[
@@ -1002,6 +1064,39 @@ impl PtySession {
             return None;
         }
         self.pid.and_then(pid_cwd)
+    }
+
+    /// The shell's cwd for DISPLAY (smart tab titles): like [`PtySession::cwd`]
+    /// but never stats the directory, so a cwd on a dead network mount cannot
+    /// block the UI thread. Not for spawning (the directory may be gone).
+    pub fn title_cwd(&self) -> Option<std::path::PathBuf> {
+        if self.child_exited() {
+            return None;
+        }
+        self.pid.and_then(pid_cwd_nostat)
+    }
+
+    /// Name of the terminal's FOREGROUND process — the running command (`cargo`,
+    /// `vim`, `ssh`) — or `None` while the shell itself is in the foreground (or
+    /// it can't be read). One `tcgetpgrp` plus a small `/proc` read; callers
+    /// sample it on shell events (OSC 133), never per frame.
+    pub fn foreground_name(&self) -> Option<String> {
+        if self.child_exited() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            let pgid = self.master.lock().ok()?.process_group_leader()?;
+            if pgid <= 0 || Some(pgid as u32) == self.pid {
+                return None;
+            }
+            pid_name(pgid)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid_name;
+            None
+        }
     }
 
     /// Returns a writer for the PTY (send keystrokes to the shell).

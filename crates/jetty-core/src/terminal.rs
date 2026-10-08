@@ -679,6 +679,14 @@ enum Scan {
     Decset { cur: u16, hit: u8 },
     /// Inside `ESC ]`, matching the `133;` prefix byte by byte (`n` matched).
     Prefix { n: u8 },
+    /// Inside `ESC ]`, matching the `9;4;` progress prefix (`n` matched, ≥ 1:
+    /// the `9` was read in [`Scan::Prefix`]).
+    Prefix94 { n: u8 },
+    /// Matched `9;4;`: collecting `st ; pr` up to the terminator. `field` 0 is
+    /// `st`, 1 is `pr`, 2 means "past the two known fields" (extra parameters are
+    /// ignored); `digits` counts the current field's digits. Any other byte in
+    /// the first two fields is malformed → [`Scan::Skip`] (no update).
+    Progress { st: Option<u8>, pr: Option<u16>, field: u8, digits: u8 },
     /// Matched `133;`; collecting the letter (A/B/C/D) and the first `;code`.
     /// `code_done` is set by a SECOND `;` so `aid=<n>` params never corrupt the
     /// exit code (only the first param after the letter is the exit status).
@@ -824,6 +832,39 @@ pub struct CommandCompletion {
 /// steady state.
 const MAX_PENDING_COMPLETIONS: usize = 32;
 
+/// The exact OSC 9;4 introducer (ConEmu / Windows Terminal progress) the scanner
+/// matches after `ESC ]`. `OSC 9 ; <text>` (an iTerm2 notification) shares the
+/// `9;` head, so only a full `9;4;` enters [`Scan::Progress`].
+const OSC94_PREFIX: &[u8] = b"9;4;";
+
+/// Most digits one OSC 9;4 field may carry (`100` is the largest meaningful
+/// value). A longer run is malformed: the OSC is skipped, nothing changes.
+const PROGRESS_MAX_DIGITS: u8 = 3;
+
+/// What a program reports through OSC 9;4 (`ESC ] 9 ; 4 ; st ; pr ST`): cargo
+/// (`CARGO_TERM_PROGRESS_TERM_INTEGRATION=true`), Claude Code, winget, … The
+/// state names follow ConEmu's spec (`st` 1–4); `st = 0` clears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressState {
+    /// `st = 1`: a determinate percentage.
+    Normal,
+    /// `st = 2`: something failed (the value is optional).
+    Error,
+    /// `st = 3`: busy, no percentage.
+    Indeterminate,
+    /// `st = 4`: paused / waiting (the value is optional).
+    Paused,
+}
+
+/// A tab's current OSC 9;4 progress. `value` is a percentage `0..=100`; `None`
+/// for [`ProgressState::Indeterminate`], and for an error/paused report that
+/// carried no value with none before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Progress {
+    pub state: ProgressState,
+    pub value: Option<u8>,
+}
+
 pub struct Terminal {
     term: Term<EventProxy>,
     parser: Processor,
@@ -947,6 +988,16 @@ pub struct Terminal {
     /// `&mut self` (not an `Arc`/atomic like `bell`) is correct: `D` is handled by
     /// our own scanner inside `feed(&mut self)`, never the async `EventProxy`.
     completed: Vec<CommandCompletion>,
+    /// The program-reported OSC 9;4 progress (`None` = no progress shown).
+    /// Cleared by `9;4;0`, an OSC 133 `A` or `D` (the program that reported it
+    /// is over) and RIS.
+    progress: Option<Progress>,
+    /// `progress` changed since the last [`Terminal::take_progress_update`].
+    progress_dirty: bool,
+    /// An OSC 133 `A`, `C` or `D` bound since the last
+    /// [`Terminal::take_command_marks`] — the shell started or finished a
+    /// command (smart tab titles re-derive "what runs here" on it).
+    cmd_marks_dirty: bool,
     /// Raw sixel data bytes accumulated while in `Scan::Sixel`, capped at
     /// [`SIXEL_MAX_BYTES`]. Persists across `feed` chunk boundaries.
     sixel_buf: Vec<u8>,
@@ -1151,6 +1202,9 @@ impl Terminal {
             prompts_seen: 0,
             saw_command_output: false,
             completed: Vec::new(),
+            progress: None,
+            progress_dirty: false,
+            cmd_marks_dirty: false,
             sixel_buf: Vec::new(),
             sixel_overflow: false,
             pending_sixel_p2: 0,
@@ -1551,6 +1605,8 @@ impl Terminal {
                             self.mouse_x10 = false;
                             self.mouse_urxvt = false;
                             self.kbd_cleared();
+                            // A reset terminal shows no program's progress.
+                            self.set_progress(None);
                             Scan::Ground
                         }
                         // ESC ESC restarts; C0 controls (vte executes them), DEL and
@@ -1683,11 +1739,79 @@ impl Terminal {
                                 Scan::Prefix { n: n2 }
                             };
                         }
+                        // `9` opens the OSC 9;4 progress candidate.
+                        b'9' if n == 0 => self.scan = Scan::Prefix94 { n: 1 },
                         // Some other OSC (title/hyperlink/color): skip to its end.
                         _ => self.scan = Scan::Skip,
                     }
                     if !matches!(b, 0x07 | 0x18 | 0x1a | 0x1b) {
                         self.osc_len += 1; // OSC payload as vte buffers it
+                    }
+                    i += 1;
+                }
+                Scan::Prefix94 { n } => {
+                    match b {
+                        // Same framing as `Prefix`: ESC restarts, BEL/CAN/SUB end
+                        // an OSC that never became `9;4;` (`ESC]9;4 BEL`).
+                        0x1b => self.scan = Scan::Esc,
+                        0x07 | 0x18 | 0x1a => self.scan = Scan::Ground,
+                        _ if b == OSC94_PREFIX[n as usize] => {
+                            let n2 = n + 1;
+                            self.scan = if n2 as usize == OSC94_PREFIX.len() {
+                                Scan::Progress { st: None, pr: None, field: 0, digits: 0 }
+                            } else {
+                                Scan::Prefix94 { n: n2 }
+                            };
+                        }
+                        // `OSC 9 ; text` (a notification) or any other OSC 9.
+                        _ => self.scan = Scan::Skip,
+                    }
+                    if !matches!(b, 0x07 | 0x18 | 0x1a | 0x1b) {
+                        self.osc_len += 1;
+                    }
+                    i += 1;
+                }
+                // A progress payload overrunning the OSC cap (a C0 flood between
+                // the fields, or endless extra parameters): end it, no update.
+                Scan::Progress { .. }
+                    if self.osc_len >= self.osc_cap && !matches!(b, 0x07 | 0x18 | 0x1a | 0x1b) =>
+                {
+                    start = self.abort_osc(bytes, start, i);
+                }
+                Scan::Progress { st, pr, field, digits } => {
+                    match b {
+                        // BEL / CAN / SUB / ESC(=ST) end the OSC (vte parity, as
+                        // for OSC 133). Nothing here reads the grid, so the bytes
+                        // need no sub-slice of their own.
+                        0x07 | 0x18 | 0x1a | 0x1b => {
+                            self.apply_progress(st, pr);
+                            self.scan = if b == 0x1b { Scan::Esc } else { Scan::Ground };
+                        }
+                        b'0'..=b'9' if field < 2 => {
+                            if digits >= PROGRESS_MAX_DIGITS {
+                                self.scan = Scan::Skip; // malformed: no update
+                            } else {
+                                let d = u16::from(b - b'0');
+                                self.scan = if field == 0 {
+                                    let v = u16::from(st.unwrap_or(0)) * 10 + d;
+                                    Scan::Progress { st: Some(v.min(255) as u8), pr, field, digits: digits + 1 }
+                                } else {
+                                    Scan::Progress { st, pr: Some(pr.unwrap_or(0) * 10 + d), field, digits: digits + 1 }
+                                };
+                            }
+                        }
+                        b';' => {
+                            self.scan = Scan::Progress { st, pr, field: (field + 1).min(2), digits: 0 };
+                        }
+                        // vte ignores C0 controls inside an OSC (never buffered).
+                        0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f => {}
+                        // Extra parameters past `pr` are ignored, not an error.
+                        _ if field >= 2 => {}
+                        // A non-digit in `st` / `pr`: malformed, skip the rest.
+                        _ => self.scan = Scan::Skip,
+                    }
+                    if !matches!(b, 0x07 | 0x18 | 0x1a | 0x1b) {
+                        self.osc_len += 1;
                     }
                     i += 1;
                 }
@@ -2645,6 +2769,10 @@ impl Terminal {
                     last.finished = true;
                 }
                 self.cur_cmd = Some(OpenCmd { prompt: abs, started_at: None });
+                // Back at a prompt: whatever reported progress has ended (a
+                // program killed mid-build never sends its `9;4;0`).
+                self.set_progress(None);
+                self.cmd_marks_dirty = true;
                 // Keyboard: what ran since the last save point is over; save
                 // again here in case this shell never sends a `C`.
                 self.restore_kbd(false);
@@ -2679,6 +2807,7 @@ impl Terminal {
                 }
                 // A command ran: the resize clean-prompt wipe must never fire again.
                 self.saw_command_output = true;
+                self.cmd_marks_dirty = true;
                 // Keyboard: the command starts from the shell's current flags.
                 self.open_kbd_window(false);
             }
@@ -2707,6 +2836,9 @@ impl Terminal {
                 // Also covers integrations that never send C (old bash): once a
                 // command has completed, the clean-prompt wipe is off for good.
                 self.saw_command_output = true;
+                // The command is over, and so is any progress it reported.
+                self.set_progress(None);
+                self.cmd_marks_dirty = true;
                 // Keyboard: drop what the finished command left behind.
                 self.restore_kbd(true);
             }
@@ -3655,6 +3787,61 @@ impl Terminal {
             Vec::new()
         } else {
             std::mem::take(&mut self.completed)
+        }
+    }
+
+    /// The program-reported OSC 9;4 progress, if any is showing.
+    pub fn progress(&self) -> Option<Progress> {
+        self.progress
+    }
+
+    /// Take a pending OSC 9;4 progress change: `None` = unchanged since the last
+    /// call (the common case — one bool test on the drain pass), `Some(p)` = the
+    /// progress is now `p` (`Some(None)` = cleared). Consuming.
+    pub fn take_progress_update(&mut self) -> Option<Option<Progress>> {
+        if !self.progress_dirty {
+            return None;
+        }
+        self.progress_dirty = false;
+        Some(self.progress)
+    }
+
+    /// Whether the shell is running a command right now: an OSC 133 `C` arrived
+    /// and its `D` (or the next prompt's `A`) has not. Always `false` without
+    /// shell integration.
+    pub fn command_running(&self) -> bool {
+        self.cur_cmd.is_some_and(|c| c.started_at.is_some())
+    }
+
+    /// True once if an OSC 133 `A`, `C` or `D` was bound since the last call —
+    /// the shell started or finished a command. Consuming (one bool test).
+    pub fn take_command_marks(&mut self) -> bool {
+        std::mem::take(&mut self.cmd_marks_dirty)
+    }
+
+    /// Apply a complete OSC 9;4 report (`st`, `pr` as parsed; `None` = empty
+    /// field). `st` 0 (or empty) clears; 1 sets a percentage (empty = 0); 2
+    /// (error) and 4 (paused) keep the previous percentage when they carry none;
+    /// 3 is indeterminate. An unknown `st` changes nothing.
+    fn apply_progress(&mut self, st: Option<u8>, pr: Option<u16>) {
+        let value = pr.map(|v| v.min(100) as u8);
+        let prev = self.progress.and_then(|p| p.value);
+        let next = match st.unwrap_or(0) {
+            0 => None,
+            1 => Some(Progress { state: ProgressState::Normal, value: Some(value.unwrap_or(0)) }),
+            2 => Some(Progress { state: ProgressState::Error, value: value.or(prev) }),
+            3 => Some(Progress { state: ProgressState::Indeterminate, value: None }),
+            4 => Some(Progress { state: ProgressState::Paused, value: value.or(prev) }),
+            _ => return,
+        };
+        self.set_progress(next);
+    }
+
+    /// Set the progress, flagging a change only when it really changed.
+    fn set_progress(&mut self, p: Option<Progress>) {
+        if self.progress != p {
+            self.progress = p;
+            self.progress_dirty = true;
         }
     }
 
@@ -4957,6 +5144,161 @@ mod tests {
         t.feed(b"\x1b]2;a\x07\x1b]2;b\x07");
         assert_eq!(t.take_title_update(), Some(Some("b".to_string())));
         assert_eq!(t.take_title_update(), None, "coalesced into one update");
+    }
+
+    // ── OSC 9;4 progress ──────────────────────────────────────────────────────
+
+    fn prog(state: ProgressState, value: Option<u8>) -> Option<Progress> {
+        Some(Progress { state, value })
+    }
+
+    /// Feed `seq` split at EVERY byte boundary (and whole) into a fresh terminal
+    /// that already shows `before`, returning the progress each run ends with.
+    fn progress_after(before: &[u8], seq: &[u8]) -> Vec<Option<Progress>> {
+        (0..=seq.len())
+            .map(|cut| {
+                let mut t = Terminal::new(30, 6);
+                t.feed(before);
+                t.feed(&seq[..cut]);
+                t.feed(&seq[cut..]);
+                t.progress()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn osc94_every_state_parses_at_any_split() {
+        use ProgressState::*;
+        let cases: [(&[u8], &[u8], Option<Progress>); 12] = [
+            (b"", b"\x1b]9;4;1;40\x07", prog(Normal, Some(40))),
+            (b"", b"\x1b]9;4;1;40\x1b\\", prog(Normal, Some(40))), // ST terminator
+            (b"", b"\x1b]9;4;1;250\x07", prog(Normal, Some(100))), // clamped
+            (b"", b"\x1b]9;4;1\x07", prog(Normal, Some(0))),       // no value = 0
+            (b"", b"\x1b]9;4;2;7\x07", prog(Error, Some(7))),
+            (b"\x1b]9;4;1;55\x07", b"\x1b]9;4;2\x07", prog(Error, Some(55))), // keeps value
+            (b"", b"\x1b]9;4;2\x07", prog(Error, None)),
+            (b"", b"\x1b]9;4;3;\x07", prog(Indeterminate, None)),
+            (b"", b"\x1b]9;4;3;80\x07", prog(Indeterminate, None)),
+            (b"\x1b]9;4;1;30\x07", b"\x1b]9;4;4\x07", prog(Paused, Some(30))),
+            (b"\x1b]9;4;1;30\x07", b"\x1b]9;4;0;0\x07", None), // clear
+            (b"\x1b]9;4;1;30\x07", b"\x1b]9;4;\x07", None),    // empty state = clear
+        ];
+        for (before, seq, want) in cases {
+            for got in progress_after(before, seq) {
+                assert_eq!(got, want, "{:?} then {:?}", String::from_utf8_lossy(before), String::from_utf8_lossy(seq));
+            }
+        }
+    }
+
+    #[test]
+    fn osc94_malformed_and_lookalikes_change_nothing() {
+        let before: &[u8] = b"\x1b]9;4;1;20\x07";
+        let kept = prog(ProgressState::Normal, Some(20));
+        for seq in [
+            &b"\x1b]9;hello\x07"[..],      // iTerm2 notification, not progress
+            b"\x1b]9;4\x07",               // prefix never completed
+            b"\x1b]9;4;x;5\x07",           // non-digit state
+            b"\x1b]9;4;1;5a\x07",          // non-digit value
+            b"\x1b]9;4;1;1000\x07",        // too many digits
+            b"\x1b]9;4;9;50\x07",          // unknown state
+            b"\x1b]99;4;1;50\x07",         // OSC 99, not 9
+            b"\x1b]19;4;1;50\x07",
+            b"\x1b]2;9;4;1;50\x07",        // a title that merely contains it
+        ] {
+            for got in progress_after(before, seq) {
+                assert_eq!(got, kept, "{:?}", String::from_utf8_lossy(seq));
+            }
+        }
+        // Extra parameters after `pr` are ignored, not malformed.
+        for got in progress_after(b"", b"\x1b]9;4;1;60;junk;more\x07") {
+            assert_eq!(got, prog(ProgressState::Normal, Some(60)));
+        }
+        // C0 controls inside the OSC are ignored by vte, and so here.
+        for got in progress_after(b"", b"\x1b]9;4;1;\n6\r5\x07") {
+            assert_eq!(got, prog(ProgressState::Normal, Some(65)));
+        }
+    }
+
+    #[test]
+    fn osc94_cleared_by_prompt_marks_and_ris() {
+        let set: &[u8] = b"\x1b]9;4;1;40\x07";
+        // A new prompt (A) and a finished command (D) both clear it…
+        for clear in [&b"\x1b]133;A\x07"[..], b"\x1b]133;D;0\x07", b"\x1bc"] {
+            let mut t = Terminal::new(30, 6);
+            t.feed(b"\x1b]133;A\x07\x1b]133;C\x07");
+            t.feed(set);
+            assert!(t.progress().is_some());
+            let _ = t.take_progress_update();
+            t.feed(clear);
+            assert_eq!(t.progress(), None, "{:?} must clear", String::from_utf8_lossy(clear));
+            assert_eq!(t.take_progress_update(), Some(None), "the clear is reported");
+        }
+        // …but a command START (C) does not: cargo reports right after it.
+        let mut t = Terminal::new(30, 6);
+        t.feed(b"\x1b]133;A\x07");
+        t.feed(set);
+        t.feed(b"\x1b]133;C\x07");
+        assert_eq!(t.progress(), prog(ProgressState::Normal, Some(40)));
+    }
+
+    #[test]
+    fn osc94_update_is_reported_once_and_only_on_change() {
+        let mut t = Terminal::new(30, 6);
+        assert_eq!(t.take_progress_update(), None, "nothing pending initially");
+        t.feed(b"\x1b]9;4;1;10\x07\x1b]9;4;1;20\x07");
+        assert_eq!(t.take_progress_update(), Some(prog(ProgressState::Normal, Some(20))), "coalesced");
+        assert_eq!(t.take_progress_update(), None, "consumed");
+        t.feed(b"\x1b]9;4;1;20\x07");
+        assert_eq!(t.take_progress_update(), None, "an identical report is no change");
+        // Clearing an absent progress (a prompt with nothing showing) is silent.
+        let mut u = Terminal::new(30, 6);
+        u.feed(b"\x1b]133;A\x07\x1b]9;4;0\x07\x1bc");
+        assert_eq!(u.take_progress_update(), None);
+    }
+
+    #[test]
+    fn osc94_bytes_still_reach_vte_and_leave_the_grid_alone() {
+        // The progress OSC is consumed by vte like any other OSC: nothing leaks
+        // onto the grid, text around it lands where it should, and a following
+        // OSC 133 still binds.
+        let mut t = Terminal::new(30, 6);
+        t.feed(b"ab\x1b]9;4;1;40\x07cd");
+        let snap = t.snapshot();
+        let row: String = (0..4).map(|c| snap.cell(0, c).c).collect();
+        assert_eq!(row, "abcd");
+        t.feed(b"\x1b]9;4;3;\x1b\\\x1b]133;A\x07");
+        assert_eq!(t.prompt_count(), 1, "the ST-terminated progress left the scanner in sync");
+    }
+
+    #[test]
+    fn osc94_flood_is_capped_like_every_osc() {
+        // A never-terminated progress payload of ignored C0 bytes is ended at
+        // the OSC cap (vte never buffers more), then discarded to its terminator.
+        let mut t = Terminal::new(30, 6);
+        t.osc_cap = 64;
+        t.feed(b"\x1b]9;4;1;");
+        t.feed(&[b'\n'; 200]);
+        assert!(matches!(t.scan, Scan::OscDiscard), "scan = {:?}", t.scan);
+        t.feed(b"5\x07xy");
+        assert_eq!(t.progress(), None, "a capped OSC applies nothing");
+        let snap = t.snapshot();
+        assert_eq!(snap.cell(0, 0).c, 'x', "the stream resyncs after the terminator");
+    }
+
+    #[test]
+    fn command_running_and_marks_track_osc133() {
+        let mut t = Terminal::new(30, 6);
+        assert!(!t.command_running() && !t.take_command_marks());
+        t.feed(b"\x1b]133;A\x07");
+        assert!(!t.command_running());
+        assert!(t.take_command_marks(), "A is a mark");
+        assert!(!t.take_command_marks(), "consumed");
+        t.feed(b"\x1b]133;B\x07");
+        assert!(!t.take_command_marks(), "B is not a start/finish");
+        t.feed(b"\x1b]133;C\x07");
+        assert!(t.command_running() && t.take_command_marks());
+        t.feed(b"out\r\n\x1b]133;D;1\x07");
+        assert!(!t.command_running() && t.take_command_marks());
     }
 
     #[test]
@@ -7317,6 +7659,7 @@ mod tests {
                     0 => stream.extend(std::iter::repeat_n(b'x', (next() % 120) as usize)),
                     1 => stream.extend_from_slice(b"\x1b]0;"),
                     2 => stream.extend_from_slice(b"\x1b]133;"),
+                    3 => stream.extend_from_slice(b"\x1b]9;4;"),
                     _ => stream.push(alphabet[next() as usize % alphabet.len()]),
                 }
             }
@@ -7330,7 +7673,10 @@ mod tests {
                     model.step(b);
                 }
                 seen = log.len();
-                let scanning_osc = matches!(t.scan, Scan::Prefix { .. } | Scan::Payload { .. } | Scan::Skip);
+                let scanning_osc = matches!(
+                    t.scan,
+                    Scan::Prefix { .. } | Scan::Payload { .. } | Scan::Skip | Scan::Prefix94 { .. } | Scan::Progress { .. }
+                );
                 assert_eq!(scanning_osc, model.state == VState::Osc, "case {case} @{i}: scan {:?} vs vte {:?}", t.scan, model.state);
                 assert_eq!(t.scan == Scan::Esc, model.state == VState::Escape, "case {case} @{i}: scan {:?} vs vte {:?}", t.scan, model.state);
                 assert!(model.max_osc <= t.osc_cap as usize, "case {case}: vte buffered {} OSC bytes", model.max_osc);

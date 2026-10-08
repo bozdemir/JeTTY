@@ -251,3 +251,47 @@ fn cwd_none_after_exit() {
     }
     panic!("child_exited() never flipped true after the shell was told to exit");
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn title_cwd_and_foreground_name_follow_the_shell() {
+    // Smart tab titles read the shell's cwd WITHOUT stat'ing it and the name of
+    // the foreground job. Spawn `sh` in a temp dir and check the cwd; with the
+    // shell idle in the foreground there is "no command"; start a `sleep` and
+    // its name is reported.
+    let dir = unique_temp_dir("title");
+    let canon = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
+    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".to_string()), Some(dir.clone()), || {})
+        .expect("spawn sh");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut cwd_ok = false;
+    while Instant::now() < deadline {
+        while pty.try_recv_output().is_some() {}
+        if pty.title_cwd().and_then(|p| std::fs::canonicalize(p).ok()) == Some(canon.clone()) {
+            cwd_ok = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(cwd_ok, "title_cwd never reported {canon:?}");
+    assert_eq!(pty.foreground_name(), None, "the idle shell is not a command");
+    {
+        let mut w = pty.writer();
+        use std::io::Write;
+        w.write_all(b"sleep 3\n").unwrap();
+        w.flush().unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut name = None;
+    while Instant::now() < deadline {
+        while pty.try_recv_output().is_some() {}
+        name = pty.foreground_name();
+        if name.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(name.as_deref(), Some("sleep"));
+    drop(pty);
+    let _ = std::fs::remove_dir_all(&dir);
+}
