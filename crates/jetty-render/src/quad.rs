@@ -831,56 +831,115 @@ pub fn cursor_rects_split(
     (None, rects)
 }
 
-/// Scrollbar thumb width in px. The terminal grid reserves this much on the
-/// right (a gutter) so content never renders underneath the scrollbar.
+/// Scrollbar thumb column width in LOGICAL px (scaled by the window's DPI —
+/// [`ScrollbarTrack::thumb_w`]): the grab area at the window's right edge.
 pub const SCROLLBAR_W: f32 = 14.0;
 
-/// Gap (px) between the scrollbar track ends and the bars, so the thumb stays
-/// clear of the tab bar / window controls. Shared by the thumb geometry and
-/// the drag inverse below so drawing and dragging can never disagree.
+/// Gap (logical px) between the track ends and the bars, so the thumb stays
+/// clear of the tab bar / window controls — and, as the gutter's extra width,
+/// between the text and the thumb column. Shared by the thumb geometry and the
+/// drag inverse below so drawing and dragging can never disagree.
 pub(crate) const SCROLLBAR_GAP: f32 = 4.0;
 
-/// Minimum thumb height (px) so a huge scrollback still leaves a grabbable thumb.
+/// Minimum thumb height (logical px) so a huge scrollback still leaves a
+/// grabbable thumb.
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
-/// Compute the scrollbar thumb rectangle from raw geometry values.
-/// This is the canonical geometry computation shared by drawing and hit-testing.
-/// Returns `None` when `scroll_max == 0` (nothing to scroll).
-#[allow(clippy::too_many_arguments)]
+/// Horizontal inset (logical px) of the DRAWN thumb inside its grab column: a
+/// slim rounded pill, clear of the window edge, while the whole column still
+/// takes the click.
+const SCROLLBAR_INSET: f32 = 3.0;
+
+/// Width (physical px) of the scrollbar gutter a window's grid reserves at its
+/// right edge: the thumb column plus the gap to the text, DPI-scaled to whole
+/// pixels (18 px at 1×, 36 px at 2×).
+pub fn scrollbar_gutter_px(scale: f32) -> f32 {
+    ((SCROLLBAR_W + SCROLLBAR_GAP) * sane_scale(scale)).round()
+}
+
+fn sane_scale(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 { scale } else { 1.0 }
+}
+
+/// Where a window's scrollbar runs (physical px): the grid BAND — below a top
+/// tab/title bar, above a bottom tab bar and the status strip — at the window's
+/// right edge, sized for the window's DPI. The ONE description drawing, hit
+/// testing and dragging all take, so they can never disagree (the old API
+/// subtracted the unscaled 36 px bar height from the surface: on a 2× display
+/// the track overshot into the status strip).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollbarTrack {
+    /// Window width; the thumb hugs its right edge.
+    pub screen_w: f32,
+    /// y of the grid band's top edge (the top bar's bottom, else 0).
+    pub band_top: f32,
+    /// y of the grid band's bottom edge (a bottom bar's top, else the status
+    /// strip's top, else the window bottom).
+    pub band_bottom: f32,
+    /// The window's DPI scale factor.
+    pub scale: f32,
+}
+
+impl ScrollbarTrack {
+    pub fn new(screen_w: f32, band_top: f32, band_bottom: f32, scale: f32) -> Self {
+        Self { screen_w, band_top, band_bottom, scale: sane_scale(scale) }
+    }
+
+    /// The thumb's grab-column width (whole physical px).
+    pub fn thumb_w(&self) -> f32 {
+        (SCROLLBAR_W * self.scale).round().max(1.0)
+    }
+
+    /// Whether window point `(x, y)` is over the scrollbar GUTTER (the band's
+    /// right-edge strip the grid leaves free) — the `scrollbar = "auto"` hover.
+    pub fn gutter_contains(&self, x: f32, y: f32) -> bool {
+        x >= self.screen_w - scrollbar_gutter_px(self.scale)
+            && x <= self.screen_w
+            && y >= self.band_top
+            && y < self.band_bottom
+    }
+
+    /// `(top, height)` of the thumb's travel track: the band minus a gap at
+    /// each end, whole pixels.
+    fn track(&self) -> (f32, f32) {
+        let gap = (SCROLLBAR_GAP * self.scale).round();
+        let top = self.band_top + gap;
+        (top, (self.band_bottom - gap - top).max(0.0))
+    }
+
+    /// `(track top, travel, thumb height)` for `rows` visible rows over
+    /// `scroll_max` lines of history. The thumb is whole pixels and never
+    /// shorter than the (scaled) minimum; `travel` is 0 when it fills the track.
+    fn thumb(&self, rows: usize, scroll_max: usize) -> (f32, f32, f32) {
+        let (top, track_h) = self.track();
+        let total = (rows + scroll_max).max(1);
+        let min = (SCROLLBAR_MIN_THUMB * self.scale).round();
+        let thumb_h = (track_h * rows as f32 / total as f32).round().max(min);
+        (top, (track_h - thumb_h).max(0.0), thumb_h)
+    }
+}
+
+/// The scrollbar thumb's GRAB rect (the whole thumb column at the window's
+/// right edge, whole pixels) — the canonical geometry hit-testing and dragging
+/// use; [`scrollbar_rect`] draws a slimmer pill inside it. `None` when
+/// `scroll_max == 0` (nothing to scroll).
 pub fn scrollbar_rect_geom(
     rows: usize,
     scroll_offset: usize,
     scroll_max: usize,
-    screen_w: u32,
-    screen_h: u32,
-    top_offset: f32,
-    bottom_reserve: f32,
+    track: &ScrollbarTrack,
     thumb: [u8; 4],
 ) -> Option<Rect> {
     if scroll_max == 0 {
         return None;
     }
-    // The track is the GRID area, which is ALWAYS TABBAR_H shorter than the
-    // surface (the bar takes that height whichever side it sits on). Using
-    // `screen_h - top_offset` overshot in BOTTOM-bar mode (top_offset = 0): the
-    // scrollbar ran the full height and collided with the bottom window controls
-    // (the ✕). A small GAP also keeps the thumb clear of the bar / controls.
-    let track_top = top_offset + SCROLLBAR_GAP;
-    // `bottom_reserve` is the height reserved at the bottom for the status bar
-    // (the perf HUD) — the track must stop above it so the thumb never runs under
-    // the status bar. 0 when there is no status bar.
-    let track_h =
-        (screen_h as f32 - crate::TABBAR_H - bottom_reserve - SCROLLBAR_GAP * 2.0).max(0.0);
-    let total = rows + scroll_max;
-    let thumb_h = (track_h * rows as f32 / total as f32).max(SCROLLBAR_MIN_THUMB);
-    let frac = (scroll_max - scroll_offset) as f32 / scroll_max as f32;
-    let travel = (track_h - thumb_h).max(0.0);
-    let thumb_y = track_top + frac * travel;
-    let thumb_w = SCROLLBAR_W; // wide enough to grab comfortably
+    let (top, travel, thumb_h) = track.thumb(rows, scroll_max);
+    let frac = (scroll_max - scroll_offset.min(scroll_max)) as f32 / scroll_max as f32;
+    let w = track.thumb_w();
     Some(Rect {
-        x: screen_w as f32 - thumb_w,
-        y: thumb_y,
-        w: thumb_w,
+        x: track.screen_w - w,
+        y: (top + frac * travel).round(),
+        w,
         h: thumb_h,
         color: thumb,
         ..Default::default()
@@ -898,49 +957,36 @@ pub fn scrollbar_offset_from_cursor(
     grab_dy: f32,
     rows: usize,
     scroll_max: usize,
-    screen_h: u32,
-    top_offset: f32,
-    bottom_reserve: f32,
+    track: &ScrollbarTrack,
 ) -> Option<usize> {
     if scroll_max == 0 {
         return None;
     }
-    // Deliberate asymmetry, mirroring scrollbar_rect_geom: the track HEIGHT
-    // always subtracts TABBAR_H (the bar takes that height whichever side it
-    // sits on) while the thumb ORIGIN uses `top_offset` (0 in bottom-bar mode).
-    let track_h =
-        (screen_h as f32 - crate::TABBAR_H - bottom_reserve - SCROLLBAR_GAP * 2.0).max(0.0);
-    let total = rows + scroll_max;
-    let thumb_h = (track_h * rows as f32 / total as f32).max(SCROLLBAR_MIN_THUMB);
-    let travel = track_h - thumb_h;
+    let (top, travel, _) = track.thumb(rows, scroll_max);
     if travel <= 0.0 {
         return None;
     }
-    let thumb_top = ((cursor_y - top_offset - SCROLLBAR_GAP) - grab_dy).clamp(0.0, travel);
+    let thumb_top = (cursor_y - top - grab_dy).clamp(0.0, travel);
     // frac=0 → thumb at top → scroll_offset=max (oldest history)
     // frac=1 → thumb at bottom → scroll_offset=0 (live bottom)
     let frac = thumb_top / travel;
     Some(((1.0 - frac) * scroll_max as f32).round() as usize)
 }
 
+/// The DRAWN scrollbar thumb for `snapshot`: the grab rect
+/// ([`scrollbar_rect_geom`]) inset horizontally into a rounded pill
+/// (DPI-scaled, whole pixels). `None` when there is no history.
 pub fn scrollbar_rect(
     snapshot: &jetty_core::GridSnapshot,
-    screen_w: u32,
-    screen_h: u32,
-    top_offset: f32,
-    bottom_reserve: f32,
+    track: &ScrollbarTrack,
     thumb: [u8; 4],
 ) -> Option<Rect> {
-    scrollbar_rect_geom(
-        snapshot.rows,
-        snapshot.scroll_offset,
-        snapshot.scroll_max,
-        screen_w,
-        screen_h,
-        top_offset,
-        bottom_reserve,
-        thumb,
-    )
+    let mut r = scrollbar_rect_geom(snapshot.rows, snapshot.scroll_offset, snapshot.scroll_max, track, thumb)?;
+    let inset = (SCROLLBAR_INSET * track.scale).round().min((r.w - 2.0) * 0.5).max(0.0);
+    r.x += inset;
+    r.w -= 2.0 * inset;
+    r.radius = r.w * 0.5;
+    Some(r)
 }
 
 #[cfg(test)]
@@ -1198,40 +1244,121 @@ mod tests {
     #[test]
     fn scrollbar_offset_from_cursor_none_when_no_history() {
         // No scrollback → nothing to drag.
-        assert_eq!(
-            scrollbar_offset_from_cursor(100.0, 0.0, 40, 0, 640, 36.0, 0.0),
-            None
-        );
+        let t = ScrollbarTrack::new(800.0, 36.0, 640.0, 1.0);
+        assert_eq!(scrollbar_offset_from_cursor(100.0, 0.0, 40, 0, &t), None);
         // Window so short the (min-height) thumb fills the track → no travel.
-        assert_eq!(
-            scrollbar_offset_from_cursor(40.0, 0.0, 1000, 1, 44, 36.0, 0.0),
-            None
-        );
+        let t = ScrollbarTrack::new(800.0, 36.0, 44.0, 1.0);
+        assert_eq!(scrollbar_offset_from_cursor(40.0, 0.0, 1000, 1, &t), None);
     }
 
     #[test]
     fn scrollbar_offset_from_cursor_track_ends() {
-        let (rows, max, h, top, bottom) = (40usize, 200usize, 640u32, 36.0f32, 22.0f32);
-        // Cursor at the track top (top_offset + GAP) → oldest history.
-        let track_top = top + SCROLLBAR_GAP;
-        assert_eq!(
-            scrollbar_offset_from_cursor(track_top, 0.0, rows, max, h, top, bottom),
-            Some(max)
-        );
+        let (rows, max, h) = (40usize, 200usize, 640.0f32);
+        // Top bar 36, status strip 22.
+        let t = ScrollbarTrack::new(800.0, 36.0, h - 22.0, 1.0);
+        // Cursor at the track top (band top + GAP) → oldest history.
+        let track_top = 36.0 + SCROLLBAR_GAP;
+        assert_eq!(scrollbar_offset_from_cursor(track_top, 0.0, rows, max, &t), Some(max));
         // Beyond the top end clamps to the same extreme.
-        assert_eq!(
-            scrollbar_offset_from_cursor(-500.0, 0.0, rows, max, h, top, bottom),
-            Some(max)
-        );
+        assert_eq!(scrollbar_offset_from_cursor(-500.0, 0.0, rows, max, &t), Some(max));
         // At/below the track bottom → live bottom (offset 0), clamped too.
-        assert_eq!(
-            scrollbar_offset_from_cursor(h as f32, 0.0, rows, max, h, top, bottom),
-            Some(0)
-        );
-        assert_eq!(
-            scrollbar_offset_from_cursor(h as f32 + 500.0, 0.0, rows, max, h, top, bottom),
-            Some(0)
-        );
+        assert_eq!(scrollbar_offset_from_cursor(h, 0.0, rows, max, &t), Some(0));
+        assert_eq!(scrollbar_offset_from_cursor(h + 500.0, 0.0, rows, max, &t), Some(0));
+    }
+
+    /// The scrollbar track of a `w` × `h` window at DPI `scale` with the app's
+    /// chrome at the default UI font (36 px bar, 22 px status strip at 1×,
+    /// whole px): the bar on top or at the bottom (above the strip), the
+    /// strip on or off.
+    fn app_track(scale: f32, w: f32, h: f32, bar_bottom: bool, status: bool) -> ScrollbarTrack {
+        let bar_h = (36.0 * scale).round();
+        let status_h = if status { (22.0 * scale).round() } else { 0.0 };
+        let (top, bottom) = if bar_bottom { (0.0, h - status_h - bar_h) } else { (bar_h, h - status_h) };
+        ScrollbarTrack::new(w, top, bottom, scale)
+    }
+
+    /// Every chrome layout the scrollbar lives in, at 1× and 2×.
+    fn every_layout() -> Vec<(String, ScrollbarTrack)> {
+        let mut out = Vec::new();
+        for scale in [1.0f32, 2.0] {
+            for bar_bottom in [false, true] {
+                for status in [true, false] {
+                    let (w, h) = (900.0 * scale, 640.0 * scale);
+                    let name = format!("{scale}× bar {} status {status}", if bar_bottom { "bottom" } else { "top" });
+                    out.push((name, app_track(scale, w, h, bar_bottom, status)));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn scrollbar_thumb_stays_inside_the_band_at_1x_and_2x() {
+        for (name, t) in every_layout() {
+            let gap = (SCROLLBAR_GAP * t.scale).round();
+            let (rows, max) = (30usize, 500usize);
+            let oldest = scrollbar_rect_geom(rows, max, max, &t, [0; 4]).unwrap();
+            let live = scrollbar_rect_geom(rows, 0, max, &t, [0; 4]).unwrap();
+            assert_eq!(oldest.y, t.band_top + gap, "{name}: oldest history at the band top");
+            assert_eq!(live.y + live.h, t.band_bottom - gap, "{name}: live bottom at the band bottom");
+            for r in [oldest, live] {
+                assert_eq!(r.w, (14.0 * t.scale).round(), "{name}: DPI-scaled width");
+                assert_eq!(r.x + r.w, t.screen_w, "{name}: hugs the right edge");
+                assert!(r.h >= (24.0 * t.scale).round(), "{name}: scaled minimum height");
+                for v in [r.x, r.y, r.w, r.h] {
+                    assert_eq!(v.fract(), 0.0, "{name}: whole pixels ({} {} {} {})", r.x, r.y, r.w, r.h);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scrollbar_at_2x_no_longer_runs_into_the_status_strip() {
+        // The old geometry subtracted the UNSCALED 36 px bar from the surface:
+        // at 2× (72 px bar) the live-bottom thumb ended 36 px too low — inside
+        // the 44 px status strip. Now it ends a gap above the strip.
+        let t = app_track(2.0, 1800.0, 1280.0, false, true);
+        let live = scrollbar_rect_geom(30, 0, 500, &t, [0; 4]).unwrap();
+        let strip_top = 1280.0 - 44.0;
+        assert_eq!(live.y + live.h, strip_top - 8.0);
+        // Bottom tab bar: it ends above the bar, which sits above the strip.
+        let t = app_track(2.0, 1800.0, 1280.0, true, true);
+        let live = scrollbar_rect_geom(30, 0, 500, &t, [0; 4]).unwrap();
+        assert_eq!(live.y + live.h, strip_top - 72.0 - 8.0);
+    }
+
+    #[test]
+    fn drawn_thumb_is_a_rounded_pill_inside_the_grab_column() {
+        let mut g = grid(80, 30);
+        g.scroll_max = 300;
+        g.scroll_offset = 120;
+        for (name, t) in every_layout() {
+            let grab = scrollbar_rect_geom(g.rows, g.scroll_offset, g.scroll_max, &t, [9; 4]).unwrap();
+            let pill = scrollbar_rect(&g, &t, [9; 4]).unwrap();
+            let inset = (3.0 * t.scale).round();
+            assert_eq!(pill.x, grab.x + inset, "{name}");
+            assert_eq!(pill.w, grab.w - 2.0 * inset, "{name}");
+            assert_eq!((pill.y, pill.h), (grab.y, grab.h), "{name}: same travel as the grab rect");
+            assert_eq!(pill.radius, pill.w / 2.0, "{name}: fully rounded ends");
+            assert_eq!(pill.color, [9; 4]);
+        }
+        // No history: nothing drawn.
+        g.scroll_max = 0;
+        assert!(scrollbar_rect(&g, &every_layout()[0].1, [9; 4]).is_none());
+    }
+
+    #[test]
+    fn scrollbar_gutter_scales_and_hover_is_the_band_strip() {
+        assert_eq!(scrollbar_gutter_px(1.0), 18.0);
+        assert_eq!(scrollbar_gutter_px(2.0), 36.0);
+        assert_eq!(scrollbar_gutter_px(1.25), 23.0, "22.5 → whole px");
+        assert_eq!(scrollbar_gutter_px(f32::NAN), 18.0);
+        let t = app_track(2.0, 1800.0, 1280.0, false, true);
+        assert!(t.gutter_contains(1799.0, 500.0));
+        assert!(t.gutter_contains(1800.0 - 36.0, 72.0), "the gutter's top-left corner");
+        assert!(!t.gutter_contains(1800.0 - 37.0, 500.0), "the text side");
+        assert!(!t.gutter_contains(1799.0, 71.0), "the tab bar");
+        assert!(!t.gutter_contains(1799.0, 1280.0 - 44.0), "the status strip");
     }
 
     #[test]
@@ -1262,17 +1389,21 @@ mod tests {
     #[test]
     fn scrollbar_offset_round_trips_with_rect_geom() {
         // Drawing (rect_geom) and dragging (offset_from_cursor) must agree
-        // forever: feeding a drawn thumb's y back recovers the same offset.
-        let (rows, max, w, h, top, bottom) = (40usize, 200usize, 800u32, 640u32, 36.0f32, 22.0f32);
-        for off in [0usize, 50, 123, 200] {
-            let rect = scrollbar_rect_geom(rows, off, max, w, h, top, bottom, [0, 0, 0, 0])
-                .expect("thumb rect");
-            let rec = scrollbar_offset_from_cursor(rect.y, 0.0, rows, max, h, top, bottom)
-                .expect("offset");
-            assert!(
-                (rec as i64 - off as i64).abs() <= 1,
-                "offset {off} round-tripped to {rec}"
-            );
+        // forever: feeding a drawn thumb's y back recovers the same offset —
+        // in every chrome layout, at 1× and 2×.
+        let (rows, max) = (40usize, 200usize);
+        let t = ScrollbarTrack::new(800.0, 36.0, 640.0 - 22.0, 1.0);
+        let layouts = std::iter::once(("1× classic".to_string(), t)).chain(every_layout());
+        for (name, t) in layouts {
+            for off in [0usize, 1, 50, 123, 199, 200] {
+                let rect = scrollbar_rect_geom(rows, off, max, &t, [0, 0, 0, 0]).expect("thumb rect");
+                let rec = scrollbar_offset_from_cursor(rect.y, 0.0, rows, max, &t).expect("offset");
+                assert!((rec as i64 - off as i64).abs() <= 1, "{name}: offset {off} round-tripped to {rec}");
+                // A grab anywhere inside the thumb, moved by 0 px, stays put too.
+                let grab = rect.h * 0.5;
+                let rec = scrollbar_offset_from_cursor(rect.y + grab, grab, rows, max, &t).unwrap();
+                assert!((rec as i64 - off as i64).abs() <= 1, "{name}: grabbed mid-thumb {off} → {rec}");
+            }
         }
     }
 }

@@ -577,8 +577,10 @@ fn make_panel_geom() -> jetty_render::PanelGeom {
 
 /// Build a scrollbar rect that is non-None (requires scroll_max > 0).
 fn make_scrollbar_rect() -> jetty_render::Rect {
-    // 30 rows visible, 10 lines of history, scroll_offset=5, 1000×640.
-    jetty_render::scrollbar_rect_geom(30, 5, 10, 1000, 640, 0.0, 0.0, [150, 150, 165, 220])
+    // 30 rows visible, 10 lines of history, scroll_offset=5, 1000×640 (the
+    // grid band is the whole window: no bars), 1×.
+    let track = jetty_render::ScrollbarTrack::new(1000.0, 0.0, 640.0, 1.0);
+    jetty_render::scrollbar_rect_geom(30, 5, 10, &track, [150, 150, 165, 220])
         .expect("scrollbar should be Some when scroll_max > 0")
 }
 

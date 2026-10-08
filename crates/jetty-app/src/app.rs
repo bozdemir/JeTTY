@@ -327,11 +327,11 @@ const FALLBACK_ROWS: usize = 24;
 // at large UI fonts / on HiDPI. See `App::chrome_metrics`, `App::bar_h`,
 // `App::status_h` and `DetachedWindow::chrome_metrics`.
 
-/// Width reserved on the right of the grid for the scrollbar (a gutter), so the
-/// terminal never renders content underneath the scrollbar (which would cover the
-/// last column / p10k's right-aligned prompt at some window widths). Scrollbar
-/// width + a few px of breathing room.
-const SCROLLBAR_GUTTER: f32 = jetty_render::SCROLLBAR_W + 4.0;
+// The grid reserves a scrollbar GUTTER on the right (`jetty_render::
+// scrollbar_gutter_px`, DPI-scaled; none under `scrollbar = "never"`), so the
+// terminal never renders content underneath the scrollbar (which would cover the
+// last column / p10k's right-aligned prompt at some window widths). See
+// `App::gutter_px_at` and `DetachedWindow::fit_grid_dims`.
 
 /// Maximum bytes of PTY output fed into one tab's terminal per drain pass. Under
 /// an output flood (`yes`, `cat huge.log`) the PTY can produce faster than the VT
@@ -1207,6 +1207,12 @@ pub struct App {
     dragging_scrollbar: bool,
     /// Y offset from thumb top where the user grabbed, in px.
     drag_grab_dy: f32,
+    /// When the scrollbar shows (`scrollbar` key: always / auto / never).
+    scrollbar_mode: crate::config::ScrollbarMode,
+    /// Whether the pointer is over the main window's scrollbar gutter — shows
+    /// the thumb under `scrollbar = "auto"` (tracked only in that mode; one
+    /// repaint per change, like the window-control hover).
+    scrollbar_hover: bool,
     /// The separate OS window hosting the Settings UI, when open. `None` when the
     /// settings window is closed. The terminal lives in `window`; settings now
     /// live entirely in this second, movable window.
@@ -1818,6 +1824,8 @@ impl App {
             run_selection_enabled: true,
             dragging_scrollbar: false,
             drag_grab_dy: 0.0,
+            scrollbar_mode: crate::config::ScrollbarMode::Always,
+            scrollbar_hover: false,
             settings_window: None,
             settings_gpu: None,
             settings_text: None,
@@ -1918,6 +1926,7 @@ impl App {
         app.padding_x = cfg.padding_x.clamp(0.0, jetty_render::PADDING_MAX);
         app.padding_y = cfg.padding_y.clamp(0.0, jetty_render::PADDING_MAX);
         app.line_height = jetty_render::clamp_line_height(cfg.line_height);
+        app.scrollbar_mode = cfg.scrollbar;
         app.summon_effect = SummonEffect::from_config(&cfg.summon_effect);
         app.window_mode = WindowMode::from_config(&cfg.window_mode);
         app.tab_bar_bottom = cfg.tab_bar_position == "bottom";
@@ -2125,6 +2134,7 @@ impl App {
             padding_x: self.padding_x,
             padding_y: self.padding_y,
             line_height: self.line_height,
+            scrollbar: self.scrollbar_mode,
             summon_effect: self.summon_effect.to_config().to_string(),
             window_mode: self.window_mode.to_config().to_string(),
             dropdown_height_pct: self.dropdown_height_pct,
@@ -2543,6 +2553,10 @@ impl App {
         if (lh - self.line_height).abs() > eps {
             self.set_line_height(lh);
         }
+        // Scrollbar mode (a gutter change reflows; visibility repaints).
+        if cfg.scrollbar != self.scrollbar_mode {
+            self.set_scrollbar_mode(cfg.scrollbar);
+        }
         // Summon effect: ASSIGN directly (NOT set_summon_effect, which fires a one-
         // shot preview animation on every reload — amendment).
         let se = SummonEffect::from_config(&cfg.summon_effect);
@@ -2737,7 +2751,72 @@ impl App {
         let cm = jetty_render::ChromeMetrics::new(scale, self.ui_font_logical);
         let status_h = if self.show_perf_hud { cm.status_h() } else { 0.0 };
         let (pad_x, pad_y) = self.pad_px_at(cm.dpi);
-        jetty_render::grid_dims(w, h - cm.bar_h() - status_h, cw, ch, SCROLLBAR_GUTTER, pad_x, pad_y)
+        let gutter = self.gutter_px_at(cm.dpi);
+        jetty_render::grid_dims(w, h - cm.bar_h() - status_h, cw, ch, gutter, pad_x, pad_y)
+    }
+
+    /// The scrollbar gutter the grid reserves at DPI `scale` (physical px;
+    /// 0 under `scrollbar = "never"`).
+    fn gutter_px_at(&self, scale: f32) -> f32 {
+        if self.scrollbar_mode.has_gutter() { jetty_render::scrollbar_gutter_px(scale) } else { 0.0 }
+    }
+
+    /// Where the MAIN window's scrollbar runs: its grid band (below a top tab
+    /// bar; above a bottom tab bar and the status strip) at its right edge, at
+    /// its DPI. `None` before the GPU stack exists. Drawing, the press
+    /// hit-test, the wheel and the drag all take this one value.
+    fn main_scrollbar_track(&self) -> Option<jetty_render::ScrollbarTrack> {
+        let gpu = self.gpu.as_ref()?;
+        let (w, h) = (gpu.config.width as f32, gpu.config.height as f32);
+        let bottom = if self.tab_bar_bottom { self.tabbar_y(h) } else { h - self.status_h() };
+        let top = self.grid_top_offset();
+        Some(jetty_render::ScrollbarTrack::new(w, top, bottom.max(top), self.chrome_metrics().dpi))
+    }
+
+    /// The main window's thumb GRAB rect for hit-testing (`None` without
+    /// history, without a GPU stack, or under `scrollbar = "never"`, where the
+    /// right edge belongs to the grid).
+    fn main_scrollbar_hit_rect(&self) -> Option<jetty_render::Rect> {
+        if !self.scrollbar_mode.has_gutter() || self.tabs.is_empty() {
+            return None;
+        }
+        let t = &self.active_tab().terminal;
+        let track = self.main_scrollbar_track()?;
+        jetty_render::scrollbar_rect_geom(t.rows(), t.scroll_offset(), t.scroll_max(), &track, [0, 0, 0, 0])
+    }
+
+    /// Record whether the pointer is over the main window's scrollbar gutter
+    /// (`scrollbar = "auto"`), repainting once when that flips while the
+    /// active tab has history (without history no thumb is drawn either way).
+    fn set_main_scrollbar_hover(&mut self, hover: bool) {
+        if hover != self.scrollbar_hover {
+            self.scrollbar_hover = hover;
+            if !self.tabs.is_empty() && self.active_tab().terminal.scroll_max() > 0 {
+                self.request_main_paint();
+            }
+        }
+    }
+
+    /// Change the scrollbar mode live. A gutter change (to or from `"never"`)
+    /// changes how many columns fit: one debounced reflow per window, like a
+    /// padding change. Visibility alone only repaints.
+    fn set_scrollbar_mode(&mut self, mode: crate::config::ScrollbarMode) {
+        let gutter_changed = mode.has_gutter() != self.scrollbar_mode.has_gutter();
+        self.scrollbar_mode = mode;
+        // Hover is tracked only under "auto"; start clean in any mode.
+        self.scrollbar_hover = false;
+        for dw in &mut self.detached {
+            dw.scrollbar_hover = false;
+        }
+        if gutter_changed {
+            let reflow_at = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            self.reflow_pending_at = Some(reflow_at);
+            for dw in &mut self.detached {
+                dw.reflow_pending_at = Some(reflow_at);
+            }
+        }
+        self.persist();
+        self.mark_dirty_all();
     }
 
     /// The logical grid padding `(x, y)` (config units).
@@ -3402,7 +3481,7 @@ impl App {
         // surface).
         let (cw, ch) = dw.text.cell_size();
         let (cols, rows) =
-            dw.fit_grid_dims(self.ui_font_logical, self.show_perf_hud, SCROLLBAR_GUTTER, self.padding());
+            dw.fit_grid_dims(self.ui_font_logical, self.show_perf_hud, self.scrollbar_mode.has_gutter(), self.padding());
         dw.tab.terminal.resize(cols, rows);
         dw.tab.terminal.set_cell_px(cw, ch);
         dw.tab.pty.resize(
@@ -4892,22 +4971,17 @@ impl App {
     fn apply_scroll_from_cursor(&mut self, w: u32, h: u32) {
         let rows = self.active_tab().terminal.rows();
         let max = self.active_tab().terminal.scroll_max();
-        if let Some(offset) = jetty_render::scrollbar_offset_from_cursor(
-            self.cursor.1 as f32,
-            self.drag_grab_dy,
-            rows,
-            max,
-            h,
-            self.grid_top_offset(),
-            self.status_h(),
-        ) {
+        let offset = self.main_scrollbar_track().and_then(|track| {
+            jetty_render::scrollbar_offset_from_cursor(self.cursor.1 as f32, self.drag_grab_dy, rows, max, &track)
+        });
+        if let Some(offset) = offset {
             self.active_tab_mut().terminal.scroll_to_offset(offset);
         }
         // Scrollbar interaction moved the viewport: refresh (in practice,
         // clear — the drag gate) the link hover so no stale underline rides it.
         self.update_link_hover(true);
-        // suppress unused warning on w
-        let _ = w;
+        // The track comes from the live surface; the size args are vestigial.
+        let _ = (w, h);
     }
 
     /// Compute opacity from a cursor x relative to a slider track rect.
@@ -5498,6 +5572,9 @@ impl App {
     fn reset_main_pointer(&mut self) {
         self.selecting = false;
         self.dragging_scrollbar = false;
+        // A hidden window gets no CursorLeft: forget the gutter hover so an
+        // "auto" thumb isn't shown on the next summon until the pointer moves.
+        self.scrollbar_hover = false;
         self.grid_mouse.reset();
     }
 
@@ -7880,13 +7957,22 @@ impl App {
                     self.clear_all_link_hovers();
                 }
             }
+            WindowEvent::CursorLeft { .. } => {
+                // The pointer left this window: no gutter hover any more
+                // (`scrollbar = "auto"` hides an idle thumb — one repaint).
+                if let Some(dw) = self.detached.get_mut(pos) {
+                    if std::mem::take(&mut dw.scrollbar_hover) && dw.tab.terminal.scroll_max() > 0 {
+                        dw.request_paint();
+                    }
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 // App-wide inputs, read before the dw (self.detached) borrow.
                 let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
+                let scrollbar_mode = self.scrollbar_mode;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 // This window's chrome geometry (its own DPI × the UI font).
                 let cm = dw.chrome_metrics(ui_font);
-                let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
                 dw.cursor = (position.x, position.y);
                 // --- Manual top-bar drag (move the window ourselves) ---
                 // global_cursor = outer_position + local cursor; the window's new
@@ -7912,6 +7998,18 @@ impl App {
                 let (w, h) = (dw.gpu.config.width, dw.gpu.config.height);
                 let cx = position.x as f32;
                 let cy = position.y as f32;
+                // `scrollbar = "auto"`: the thumb shows while the pointer is over
+                // the gutter — one repaint when that flips (only with history).
+                let track = dw.scrollbar_track(ui_font, show_hud);
+                if scrollbar_mode == crate::config::ScrollbarMode::Auto {
+                    let hover = track.gutter_contains(cx, cy);
+                    if hover != dw.scrollbar_hover {
+                        dw.scrollbar_hover = hover;
+                        if dw.tab.terminal.scroll_max() > 0 {
+                            dw.request_paint();
+                        }
+                    }
+                }
                 if dw.menu_open.is_some() {
                     // Menu hover tracking from the cached rects (menu is modal;
                     // no resize/close hover underneath it). Disabled (grayed)
@@ -7935,9 +8033,9 @@ impl App {
                 if dw.dragging_scrollbar {
                     let rows = dw.tab.terminal.rows();
                     let max = dw.tab.terminal.scroll_max();
-                    if let Some(o) = jetty_render::scrollbar_offset_from_cursor(
-                        cy, dw.drag_grab_dy, rows, max, h, bar_h, status_h,
-                    ) {
+                    if let Some(o) =
+                        jetty_render::scrollbar_offset_from_cursor(cy, dw.drag_grab_dy, rows, max, &track)
+                    {
                         dw.tab.terminal.scroll_to_offset(o);
                     }
                     // The drag scrolls content under any hovered link — drop
@@ -8031,10 +8129,11 @@ impl App {
                 }
                 // App-wide inputs, read before the dw (self.detached) borrow.
                 let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
+                let scrollbar_on = self.scrollbar_mode.has_gutter();
                 let act = {
                     let Some(dw) = self.detached.get_mut(pos) else { return };
                     let cm = dw.chrome_metrics(ui_font);
-                    let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
+                    let (bar_h, _) = dw.chrome_bands(ui_font, show_hud);
                     let (cx, cy) = (dw.cursor.0 as f32, dw.cursor.1 as f32);
                     let (w, h) = (dw.gpu.config.width, dw.gpu.config.height);
                     if dw.menu_open.take().is_some() {
@@ -8138,10 +8237,12 @@ impl App {
                             let rows = dw.tab.terminal.rows();
                             let off = dw.tab.terminal.scroll_offset();
                             let max = dw.tab.terminal.scroll_max();
-                            // Color is irrelevant for hit-test geometry.
-                            let sb = jetty_render::scrollbar_rect_geom(
-                                rows, off, max, w, h, bar_h, status_h, [0, 0, 0, 0],
-                            );
+                            // Color is irrelevant for hit-test geometry. Under
+                            // `scrollbar = "never"` the right edge is grid.
+                            let track = dw.scrollbar_track(ui_font, show_hud);
+                            let sb = scrollbar_on
+                                .then(|| jetty_render::scrollbar_rect_geom(rows, off, max, &track, [0, 0, 0, 0]))
+                                .flatten();
                             match input::decide_mouse_press(None, sb.as_ref(), cx, cy) {
                                 input::MouseAction::StartScrollbarDrag { grab_dy } => {
                                     dw.dragging_scrollbar = true;
@@ -8155,7 +8256,7 @@ impl App {
                                     dw.drag_grab_dy =
                                         sb.as_ref().map(|r| r.h / 2.0).unwrap_or(0.0);
                                     if let Some(o) = jetty_render::scrollbar_offset_from_cursor(
-                                        cy, dw.drag_grab_dy, rows, max, h, bar_h, status_h,
+                                        cy, dw.drag_grab_dy, rows, max, &track,
                                     ) {
                                         dw.tab.terminal.scroll_to_offset(o);
                                     }
@@ -8224,6 +8325,7 @@ impl App {
                 // top-bar drag, so handle it first and return. Mirrors the main
                 // window's release logic.
                 let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
+                let auto_scrollbar = self.scrollbar_mode == crate::config::ScrollbarMode::Auto;
                 {
                     let Some(dw) = self.detached.get_mut(pos) else { return };
                     // A release ending a scrollbar drag is a host-widget
@@ -8232,6 +8334,10 @@ impl App {
                     // was_dragging guard).
                     if dw.dragging_scrollbar {
                         dw.dragging_scrollbar = false;
+                        // "auto" showed the thumb for the drag (see main).
+                        if auto_scrollbar {
+                            dw.request_paint();
+                        }
                         return;
                     }
                     // The shared gridmouse release, exactly as the main window
@@ -8574,18 +8680,18 @@ impl App {
                 }
                 let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let mods = self.modifiers;
+                let scrollbar_on = self.scrollbar_mode.has_gutter();
                 let Some(dw) = self.detached.get_mut(pos) else { return };
-                let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
-                let (w, h) = (dw.gpu.config.width, dw.gpu.config.height);
-                let over_scrollbar = {
+                // Over the thumb column the wheel scrolls the host scrollback
+                // (none under `scrollbar = "never"`: the edge is grid).
+                let over_scrollbar = scrollbar_on && {
                     let t = &dw.tab.terminal;
-                    jetty_render::scrollbar_rect_geom(
-                        t.rows(), t.scroll_offset(), t.scroll_max(), w, h, bar_h, status_h, [0, 0, 0, 0],
-                    )
-                    .is_some_and(|r| {
-                        let cx = dw.cursor.0 as f32;
-                        cx >= r.x && cx <= r.x + r.w
-                    })
+                    let track = dw.scrollbar_track(ui_font, show_hud);
+                    jetty_render::scrollbar_rect_geom(t.rows(), t.scroll_offset(), t.scroll_max(), &track, [0, 0, 0, 0])
+                        .is_some_and(|r| {
+                            let cx = dw.cursor.0 as f32;
+                            cx >= r.x && cx <= r.x + r.w
+                        })
                 };
                 let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                 let mut vertical = std::mem::take(&mut dw.scroll_accum);
@@ -8684,6 +8790,11 @@ impl App {
         let Some(dw) = self.detached.get_mut(pos) else { return };
         // Where this window's grid cell (0, 0) sits (below its bar, padded).
         let origin = dw.grid_origin(self.ui_font_logical, padding);
+        // This window's scrollbar track when the thumb shows this frame.
+        let detached_scrollbar = self
+            .scrollbar_mode
+            .shows_thumb(dw.tab.terminal.scroll_offset() > 0, dw.dragging_scrollbar, dw.scrollbar_hover)
+            .then(|| dw.scrollbar_track(self.ui_font_logical, self.show_perf_hud));
 
         // Snapshot + theme + chrome inputs are read before the mutable
         // gpu/text/quad borrow below (same pattern as the main RedrawRequested).
@@ -8835,11 +8946,10 @@ impl App {
         let scene = GridScene {
             snap: &snap,
             theme: &theme,
-            grid_top,
             origin,
             slide_y: 0.0,
             grid_bottom: grid_bottom_px,
-            status_h,
+            scrollbar: detached_scrollbar,
             scale,
             search_hits: &search_hits,
             failed_rows: &failed_rows,
@@ -9736,6 +9846,7 @@ impl ApplicationHandler<AppEvent> for App {
         // the main window's — one SIGWINCH per drag, no p10k prompt scatter).
         {
             let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
+            let gutter = self.scrollbar_mode.has_gutter();
             let now = std::time::Instant::now();
             // Indexed loop (not iter_mut) so the reflowed window's cached
             // Ctrl+hover can be revalidated via &mut self below (F6).
@@ -9744,7 +9855,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if dw.reflow_pending_at.is_some_and(|d| now >= d) {
                     dw.reflow_pending_at = None;
                     let (cw, ch) = dw.text.cell_size();
-                    let (cols, rows) = dw.fit_grid_dims(ui_font, show_hud, SCROLLBAR_GUTTER, padding);
+                    let (cols, rows) = dw.fit_grid_dims(ui_font, show_hud, gutter, padding);
                     dw.tab.terminal.resize(cols, rows);
                     dw.tab.terminal.set_cell_px(cw, ch);
                     dw.tab.pty.resize(
@@ -10932,6 +11043,11 @@ impl ApplicationHandler<AppEvent> for App {
                     );
                 }
             }
+            WindowEvent::CursorLeft { .. } => {
+                // The pointer left the window: no gutter hover any more
+                // (`scrollbar = "auto"` hides an idle thumb — one repaint).
+                self.set_main_scrollbar_hover(false);
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let prev = self.cursor;
                 self.cursor = (position.x, position.y);
@@ -10990,6 +11106,15 @@ impl ApplicationHandler<AppEvent> for App {
                     if before != after {
                         self.request_main_paint();
                     }
+                }
+                // `scrollbar = "auto"`: the thumb shows while the pointer is over
+                // the gutter — the same one-repaint-per-change as the control
+                // hover above (and only when there is history to show).
+                if self.scrollbar_mode == crate::config::ScrollbarMode::Auto {
+                    let hover = self
+                        .main_scrollbar_track()
+                        .is_some_and(|t| t.gutter_contains(position.x as f32, position.y as f32));
+                    self.set_main_scrollbar_hover(hover);
                 }
                 if self.dragging_scrollbar {
                     // Copy width/height to avoid borrow conflicts.
@@ -11477,11 +11602,9 @@ impl ApplicationHandler<AppEvent> for App {
                     self.request_main_paint();
                 }
 
-                let rows = self.active_tab().terminal.rows();
-                let scroll_offset = self.active_tab().terminal.scroll_offset();
-                let scroll_max = self.active_tab().terminal.scroll_max();
-                // Color is irrelevant for hit-test geometry; pass transparent.
-                let scrollbar = jetty_render::scrollbar_rect_geom(rows, scroll_offset, scroll_max, w, h, self.grid_top_offset(), self.status_h(), [0, 0, 0, 0]);
+                // The thumb's grab rect (none under `scrollbar = "never"`: the
+                // right edge is grid there).
+                let scrollbar = self.main_scrollbar_hit_rect();
 
                 // The settings panel no longer lives in this window, so pass no
                 // panel geometry — only the scrollbar and terminal area are hit.
@@ -11784,6 +11907,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // drag and is never forwarded to the app. (Slider drags happen in
                 // the settings window now.)
                 if std::mem::take(&mut self.dragging_scrollbar) {
+                    // `scrollbar = "auto"` showed the thumb for the drag: let a
+                    // release away from the gutter at the live bottom hide it.
+                    if self.scrollbar_mode == crate::config::ScrollbarMode::Auto {
+                        self.request_main_paint();
+                    }
                     return;
                 }
                 // The shared grid release (detached windows run the same): a
@@ -11909,20 +12037,10 @@ impl ApplicationHandler<AppEvent> for App {
                 // host scrollback; an alternate-screen pager without tracking
                 // gets arrow keys (ALTERNATE_SCROLL, F3); otherwise the host
                 // scrollback moves.
-                let over_scrollbar = {
-                    let t = &self.active_tab().terminal;
-                    let (rows, off, max) = (t.rows(), t.scroll_offset(), t.scroll_max());
-                    self.gpu.as_ref().is_some_and(|gpu| {
-                        let (w, h) = (gpu.config.width, gpu.config.height);
-                        jetty_render::scrollbar_rect_geom(
-                            rows, off, max, w, h, self.grid_top_offset(), self.status_h(), [0, 0, 0, 0],
-                        )
-                        .is_some_and(|r| {
-                            let cx = self.cursor.0 as f32;
-                            cx >= r.x && cx <= r.x + r.w
-                        })
-                    })
-                };
+                let over_scrollbar = self.main_scrollbar_hit_rect().is_some_and(|r| {
+                    let cx = self.cursor.0 as f32;
+                    cx >= r.x && cx <= r.x + r.w
+                });
                 let mut vertical = std::mem::take(&mut self.scroll_accum);
                 let outcome = self.with_main_grid(|g| {
                     crate::gridmouse::wheel(g, delta, over_scrollbar, &mut vertical)
@@ -12743,6 +12861,17 @@ impl ApplicationHandler<AppEvent> for App {
                 let bar_h = cm.bar_h();
                 // Where grid cell (0, 0) sits, un-slid (padding + bar).
                 let origin = self.grid_origin();
+                // The scrollbar track when the thumb shows this frame (`auto`:
+                // scrolled back, dragging, or hovering the gutter).
+                let main_scrollbar = self
+                    .scrollbar_mode
+                    .shows_thumb(
+                        self.active_tab().terminal.scroll_offset() > 0,
+                        self.dragging_scrollbar,
+                        self.scrollbar_hover,
+                    )
+                    .then(|| self.main_scrollbar_track())
+                    .flatten();
                 // Metrics of the TERMINAL font, for overlays anchored to grid
                 // cells (hint chips): their labels render in the grid font so
                 // they always fit their one-row chip, whatever the UI font size.
@@ -12905,11 +13034,10 @@ impl ApplicationHandler<AppEvent> for App {
                     let scene = GridScene {
                         snap: &snap,
                         theme: &theme,
-                        grid_top,
                         origin,
                         slide_y: slide_y_offset,
                         grid_bottom: grid_bottom_px,
-                        status_h,
+                        scrollbar: main_scrollbar,
                         scale,
                         search_hits: &search_hits,
                         failed_rows: &failed_rows,
@@ -13564,10 +13692,6 @@ impl ApplicationHandler<AppEvent> for App {
 struct GridScene<'a> {
     snap: &'a jetty_core::GridSnapshot,
     theme: &'a jetty_core::Theme,
-    /// Un-slid top of the grid BAND (0.0, or the bar height below a top bar).
-    /// The scrollbar is computed at this origin and then translated by
-    /// `slide_y` (main dropdown slide).
-    grid_top: f32,
     /// Un-slid position of cell (0, 0): the band top plus the top padding, and
     /// the left padding (`jetty_render::grid_geom`). Every grid-space quad,
     /// the glyphs and the images are placed at `origin.slid(slide_y)`.
@@ -13576,7 +13700,10 @@ struct GridScene<'a> {
     slide_y: f32,
     /// Un-slid grid bottom (image scissor). `slide_y` is added inside the core.
     grid_bottom: f32,
-    status_h: f32,
+    /// The window's scrollbar track — its grid BAND, un-slid; the thumb is
+    /// computed there and translated by `slide_y` — or `None` when the thumb
+    /// is hidden this frame (`scrollbar = "never"`, or `"auto"` while idle).
+    scrollbar: Option<jetty_render::ScrollbarTrack>,
     /// Physical-px scale factor (failed-command marker bar width).
     scale: f32,
     /// Search-hit tint source; empty (`&[]`) unless the main search bar is open.
@@ -13754,7 +13881,7 @@ fn render_grid_scene(
     // Ctrl+hover / OSC 8 link underline, and the cursor — one quad pass.
     let mut rects: Vec<jetty_render::Rect> = Vec::new();
     if let Some(mut r) =
-        jetty_render::scrollbar_rect(s.snap, width, height, s.grid_top, s.status_h, scrollbar_thumb)
+        s.scrollbar.and_then(|track| jetty_render::scrollbar_rect(s.snap, &track, scrollbar_thumb))
     {
         r.y += s.slide_y;
         rects.push(r);

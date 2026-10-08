@@ -76,7 +76,7 @@ pub fn build_search_bar(
     let fixed_w = pad + prefix_w + caret_gap + caret_w + gap + counter_w + gap + close_w + pad;
 
     // Clamp the bar to the window, keeping clear of the scrollbar gutter.
-    let max_bar_w = (win_w as f32 - SCROLLBAR_W - 16.0).max(0.0);
+    let max_bar_w = (win_w as f32 - cm.dpx(SCROLLBAR_W) - 16.0).max(0.0);
     // Tail-truncate the query: show the LAST chars that fit, so the end the
     // user is typing at stays visible next to the caret.
     let shown = fit_tail(m, query, (max_bar_w - fixed_w).max(0.0), false);
@@ -87,7 +87,7 @@ pub fn build_search_bar(
     let shown_w = (label_w - prefix_w).max(0.0);
     let bar_w = (fixed_w + shown_w).min(max_bar_w).max(0.0);
 
-    let x = (win_w as f32 - bar_w - SCROLLBAR_W - RIGHT_GAP).max(0.0);
+    let x = (win_w as f32 - bar_w - cm.dpx(SCROLLBAR_W) - RIGHT_GAP).max(0.0);
     let y = grid_top + 8.0;
 
     let mut quads: Vec<Rect> = Vec::new();

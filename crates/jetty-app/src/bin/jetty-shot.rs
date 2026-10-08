@@ -37,6 +37,11 @@
 ///                    preedit, failed-command bars) moves with it.
 ///   JETTY_SHOT_LINE_HEIGHT — the grid line height as a multiple of the font
 ///                    size (the `line_height` key, 1.0..2.0, default 1.3).
+///   JETTY_SHOT_SCROLLBAR=always|auto|never — the `scrollbar` key (default
+///                    always): "never" drops the thumb AND the gutter (more
+///                    columns); "auto" shows the thumb only while scrolled back
+///                    (JETTY_SHOT_SCROLL) or with JETTY_SHOT_SCROLLBAR_HOVER=1
+///                    (the pointer over the gutter).
 ///   JETTY_SHOT_TABBAR_N — number of sample tabs for JETTY_SHOT_TABBAR (default 3).
 ///   JETTY_SHOT_HELP_SCROLL — first help row for JETTY_SHOT_HELP when its rows
 ///                    overflow the window (large UI font / short window).
@@ -296,10 +301,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shot_origin = jetty_render::GridOrigin::new(pad_x, shot_grid_top + pad_y);
 
     // Reserve the scrollbar gutter EXACTLY like the live windows
-    // (app.rs grid_dims / detached.rs), so a screenshot builds the same column
-    // count the user sees and never lays text UNDER the drawn scrollbar (F22).
-    // SCROLLBAR_GUTTER = jetty_render::SCROLLBAR_W (14) + 4.
-    let scrollbar_gutter = jetty_render::SCROLLBAR_W + 4.0;
+    // (app.rs main_grid_dims_at / detached.rs), so a screenshot builds the same
+    // column count the user sees and never lays text UNDER the drawn scrollbar
+    // (F22): DPI-scaled, none under JETTY_SHOT_SCROLLBAR=never.
+    let scrollbar_mode =
+        jetty_app::ScrollbarMode::parse(&std::env::var("JETTY_SHOT_SCROLLBAR").unwrap_or_default());
+    let scrollbar_gutter =
+        if scrollbar_mode.has_gutter() { jetty_render::scrollbar_gutter_px(dpi) } else { 0.0 };
     let band_h = height as f32 - shot_grid_top - shot_status_h - shot_bottom_bar_h;
     let (cols, rows) = jetty_render::grid_dims(width as f32, band_h, cell_w, cell_h, scrollbar_gutter, pad_x, pad_y);
 
@@ -749,8 +757,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sb_fg = terminal.theme().fg;
         let sb_mix = |i: usize| (sb_bg[i] as f32 + (sb_fg[i] as f32 - sb_bg[i] as f32) * 0.35) as u8;
         let sb_thumb = [sb_mix(0), sb_mix(1), sb_mix(2), 210];
-        if let Some(r) = jetty_render::scrollbar_rect(&snap, width, height, shot_grid_top, shot_status_h + shot_bottom_bar_h, sb_thumb) {
-            rects.push(r);
+        // The grid band: below a top bar, above a bottom bar and the strip.
+        let band_bottom = (height as f32 - shot_status_h - shot_bottom_bar_h).max(shot_grid_top);
+        let track = jetty_render::ScrollbarTrack::new(width as f32, shot_grid_top, band_bottom, dpi);
+        let hover = env_flag("JETTY_SHOT_SCROLLBAR_HOVER");
+        if scrollbar_mode.shows_thumb(snap.scroll_offset > 0, false, hover) {
+            if let Some(r) = jetty_render::scrollbar_rect(&snap, &track, sb_thumb) {
+                rects.push(r);
+            }
         }
 
         // OSC 133 failed-command marker (JETTY_SHOT_OSC133): the same themed

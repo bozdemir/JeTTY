@@ -52,6 +52,10 @@ pub fn default_grid_padding() -> (f32, f32) {
     (d.padding_x, d.padding_y)
 }
 
+/// The `scrollbar` config key's modes and visibility rule (public for
+/// `jetty-shot`'s JETTY_SHOT_SCROLLBAR).
+pub use config::ScrollbarMode;
+
 /// Unix-socket path used for single-instance IPC. Any running primary Jetty
 /// instance listens here; secondary invocations (including `jetty --toggle`)
 /// connect and send a summon message, then exit immediately.

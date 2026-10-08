@@ -58,7 +58,7 @@ pub fn build_hint_overlay(
     let pad_x = (3.0 * vscale).max(2.0);
     let text_h = 16.0 * vscale;
     let radius = (cell_h * 0.25).min(6.0);
-    let max_x = (win_w as f32 - SCROLLBAR_W).max(0.0);
+    let max_x = (win_w as f32 - cm.dpx(SCROLLBAR_W)).max(0.0);
 
     let mut quads: Vec<Rect> = Vec::new();
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();

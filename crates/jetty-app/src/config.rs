@@ -66,6 +66,12 @@ pub struct Config {
     /// taller row; backgrounds, selection and the cursor fill the whole row.
     #[serde(default = "default_line_height")]
     pub line_height: f32,
+    /// When the scrollbar shows: `"always"` (default), `"auto"` (while
+    /// scrolled back, dragging it or hovering its gutter) or `"never"` (no
+    /// thumb and no gutter — the grid gets the full width). See
+    /// [`ScrollbarMode`].
+    #[serde(default)]
+    pub scrollbar: ScrollbarMode,
     /// Window-summon reveal effect: "none", "bayer", "phosphor", "liquid", or
     /// "focus" (the last two are Tier-B effects that sample the rendered frame).
     #[serde(default = "default_summon_effect")]
@@ -344,6 +350,85 @@ fn default_line_height() -> f32 {
     jetty_render::LINE_HEIGHT_DEFAULT
 }
 
+/// When the scrollbar thumb shows (config key `scrollbar`). Every mode only
+/// ever draws a thumb when there IS history to scroll.
+/// * `"always"` (default, the long-standing behaviour) — always;
+/// * `"auto"` — while the view is scrolled back into history, while the thumb
+///   is being dragged, or while the pointer is over the scrollbar gutter. No
+///   fade timer: a change costs exactly one repaint, idle stays idle;
+/// * `"never"` — no thumb and no gutter: the grid gets the full width and the
+///   right edge belongs to the grid (the wheel still scrolls).
+///
+/// Unknown values read as `"always"`; a bool reads as always/never.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScrollbarMode {
+    #[default]
+    Always,
+    Auto,
+    Never,
+}
+
+impl ScrollbarMode {
+    /// The config spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrollbarMode::Always => "always",
+            ScrollbarMode::Auto => "auto",
+            ScrollbarMode::Never => "never",
+        }
+    }
+
+    /// Lenient parse (case-insensitive); anything unknown is the default.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => ScrollbarMode::Auto,
+            "never" | "off" | "none" | "hidden" => ScrollbarMode::Never,
+            _ => ScrollbarMode::Always,
+        }
+    }
+
+    /// Whether the grid reserves the scrollbar gutter — and presses and the
+    /// wheel over the thumb column belong to the scrollbar.
+    pub fn has_gutter(self) -> bool {
+        self != ScrollbarMode::Never
+    }
+
+    /// Whether the thumb is drawn right now (given there is history):
+    /// `scrolled_back` = the view is above the live bottom, `dragging` = the
+    /// thumb is held, `hovering` = the pointer is over the gutter.
+    pub fn shows_thumb(self, scrolled_back: bool, dragging: bool, hovering: bool) -> bool {
+        match self {
+            ScrollbarMode::Always => true,
+            ScrollbarMode::Auto => scrolled_back || dragging || hovering,
+            ScrollbarMode::Never => false,
+        }
+    }
+}
+
+impl Serialize for ScrollbarMode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ScrollbarMode {
+    /// The string spellings and, leniently, a bool (`true` = always,
+    /// `false` = never).
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Str(String),
+            Bool(bool),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Str(s) => ScrollbarMode::parse(&s),
+            Raw::Bool(true) => ScrollbarMode::Always,
+            Raw::Bool(false) => ScrollbarMode::Never,
+        })
+    }
+}
+
 fn default_shell() -> String {
     String::new()
 }
@@ -505,6 +590,7 @@ impl Default for Config {
             padding_x: default_padding_x(),
             padding_y: default_padding_y(),
             line_height: default_line_height(),
+            scrollbar: ScrollbarMode::default(),
             summon_effect: default_summon_effect(),
             window_mode: default_window_mode(),
             dropdown_height_pct: default_dropdown_height_pct(),
@@ -1744,6 +1830,7 @@ mod tests {
             padding_x: 12.0,
             padding_y: 0.0,
             line_height: 1.6,
+            scrollbar: ScrollbarMode::Auto,
             summon_effect: "phosphor".to_string(),
             window_mode: "dropdown".to_string(),
             dropdown_height_pct: 0.6,
@@ -1790,6 +1877,7 @@ mod tests {
             padding_x: 0.0,
             padding_y: 6.5,
             line_height: 1.0,
+            scrollbar: ScrollbarMode::Never,
             summon_effect: "none".to_string(),
             window_mode: "center".to_string(),
             dropdown_height_pct: 0.5,
@@ -1963,6 +2051,52 @@ corner_radius = 8.0
             Config::parse_with_base("padding_x = \"wide\"\n", &Config::default(), "using the default").unwrap();
         assert_eq!(cfg.padding_x, 8.0);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn scrollbar_mode_parses_leniently_and_round_trips() {
+        let parse = |s: &str| Config::parse_with_base(s, &Config::default(), "using the default").unwrap();
+        assert_eq!(Config::default().scrollbar, ScrollbarMode::Always, "today's behaviour");
+        assert_eq!(parse("theme = \"dracula\"\n").0.scrollbar, ScrollbarMode::Always);
+        for (src, want) in [
+            ("scrollbar = \"always\"", ScrollbarMode::Always),
+            ("scrollbar = \"auto\"", ScrollbarMode::Auto),
+            ("scrollbar = \"Never\"", ScrollbarMode::Never),
+            ("scrollbar = \"off\"", ScrollbarMode::Never),
+            ("scrollbar = \"sometimes\"", ScrollbarMode::Always),
+            ("scrollbar = false", ScrollbarMode::Never),
+            ("scrollbar = true", ScrollbarMode::Always),
+        ] {
+            let (cfg, warnings) = parse(src);
+            assert_eq!(cfg.scrollbar, want, "{src}");
+            assert!(warnings.is_empty(), "{src}: {warnings:?}");
+        }
+        // A wrong type falls back with a warning, per key.
+        let (cfg, warnings) = parse("scrollbar = 3\n");
+        assert_eq!((cfg.scrollbar, warnings.len()), (ScrollbarMode::Always, 1));
+        // Saved spelling.
+        for m in [ScrollbarMode::Always, ScrollbarMode::Auto, ScrollbarMode::Never] {
+            let c = Config { scrollbar: m, ..Config::default() };
+            let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+            assert_eq!(back.scrollbar, m);
+        }
+    }
+
+    #[test]
+    fn scrollbar_mode_visibility_rules() {
+        use ScrollbarMode::*;
+        // (scrolled back, dragging, hovering) for every combination.
+        for sb in [false, true] {
+            for d in [false, true] {
+                for h in [false, true] {
+                    assert!(Always.shows_thumb(sb, d, h));
+                    assert!(!Never.shows_thumb(sb, d, h));
+                    assert_eq!(Auto.shows_thumb(sb, d, h), sb || d || h, "auto({sb},{d},{h})");
+                }
+            }
+        }
+        assert!(Always.has_gutter() && Auto.has_gutter(), "auto keeps the gutter: the thumb never covers text");
+        assert!(!Never.has_gutter());
     }
 
     #[test]

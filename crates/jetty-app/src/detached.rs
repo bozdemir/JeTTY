@@ -337,6 +337,9 @@ pub(crate) struct DetachedWindow {
     /// Thumb-local y grab offset captured at drag start, so the thumb never
     /// jumps under the pointer. Mirrors `App::drag_grab_dy`.
     pub drag_grab_dy: f32,
+    /// Whether the pointer is over THIS window's scrollbar gutter — shows the
+    /// thumb under `scrollbar = "auto"`. Mirrors `App::scrollbar_hover`.
+    pub scrollbar_hover: bool,
     /// The link under the pointer while the link modifier is held in THIS
     /// window (underlined; opened on click). Mirrors `App::link_hover`.
     pub link_hover: Option<jetty_core::LinkHit>,
@@ -496,6 +499,7 @@ impl DetachedWindow {
             grid_mouse: crate::gridmouse::GridMouse::default(),
             dragging_scrollbar: false,
             drag_grab_dy: 0.0,
+            scrollbar_hover: false,
             link_hover: None,
             link_hover_cell: None,
         })
@@ -605,22 +609,32 @@ impl DetachedWindow {
     }
 
     /// THIS window's grid cols × rows right now: its surface minus its chrome
-    /// bands, the scrollbar `gutter` and the padding ([`grid_dims`]).
+    /// bands, the scrollbar gutter (at its own DPI; none when `gutter` is off —
+    /// `scrollbar = "never"`) and the padding ([`grid_dims`]).
     pub(crate) fn fit_grid_dims(
         &self,
         ui_font_logical: f32,
         show_perf_hud: bool,
-        gutter: f32,
+        gutter: bool,
         padding: (f32, f32),
     ) -> (usize, usize) {
+        let scale = self.window.scale_factor() as f32;
         grid_dims(
             self.gpu.config.width as f32,
             self.gpu.config.height as f32,
             self.text.cell_size(),
-            gutter,
+            if gutter { jetty_render::scrollbar_gutter_px(scale) } else { 0.0 },
             self.chrome_bands(ui_font_logical, show_perf_hud),
             self.pad_px(padding),
         )
+    }
+
+    /// Where THIS window's scrollbar runs: its grid band (below the title bar,
+    /// above the status strip) at its right edge, at its own DPI.
+    pub(crate) fn scrollbar_track(&self, ui_font_logical: f32, show_perf_hud: bool) -> jetty_render::ScrollbarTrack {
+        let (bar_h, status_h) = self.chrome_bands(ui_font_logical, show_perf_hud);
+        let (w, h) = (self.gpu.config.width as f32, self.gpu.config.height as f32);
+        jetty_render::ScrollbarTrack::new(w, bar_h, (h - status_h).max(bar_h), self.window.scale_factor() as f32)
     }
 }
 
