@@ -445,8 +445,9 @@ const REFLOW_ACTIVITY_GRACE: std::time::Duration = std::time::Duration::from_mil
 
 /// Pure transition for an INACTIVE tab's activity indicator, given what this
 /// drain pass observed. Rules (unit-tested):
-/// * a bell always escalates to `Bell` (sticky — later output never
-///   downgrades it, and the reflow grace never masks it);
+/// * a bell escalates to `Bell` (sticky — later output never downgrades it,
+///   and the reflow grace never masks it) — unless a `Failed` badge, which
+///   outranks it, is already showing;
 /// * output upgrades `None` → `Output`, unless `suppress_output` (the
 ///   post-reflow SIGWINCH grace, F3) is active;
 /// * anything else keeps the current state.
@@ -458,7 +459,8 @@ fn next_activity(
 ) -> jetty_render::TabActivity {
     use jetty_render::TabActivity;
     if rang_bell {
-        TabActivity::Bell
+        // A bell outranks output and a finished command, never a failure.
+        current.max(TabActivity::Bell)
     } else if had_output && !suppress_output && current == TabActivity::None {
         TabActivity::Output
     } else {
@@ -15966,6 +15968,17 @@ mod activity_transition_tests {
         assert_eq!(next_activity(Output, false, true, false), Bell);
         // Later output never downgrades a Bell.
         assert_eq!(next_activity(Bell, true, false, false), Bell);
+    }
+
+    #[test]
+    fn finished_and_failed_badges_keep_their_precedence() {
+        use jetty_render::TabActivity::{Done, Failed};
+        // A bell outranks a finished command but never hides a failure.
+        assert_eq!(next_activity(Done, false, true, false), Bell);
+        assert_eq!(next_activity(Failed, false, true, false), Failed);
+        // Output after a command finished or failed changes nothing.
+        assert_eq!(next_activity(Done, true, false, false), Done);
+        assert_eq!(next_activity(Failed, true, false, false), Failed);
     }
 
     #[test]
