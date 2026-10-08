@@ -570,12 +570,19 @@ impl Config {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // A dangling symlink (a dotfiles repo not checked out yet) is not
-                // "no config": say so — the first save writes the link's target.
+                // "no config": say so — a save writes the link's target, if its
+                // folder exists (JeTTY never creates folders in a dotfiles tree).
                 let warnings = symlink_target(path)
                     .map(|target| {
+                        let then = if target.parent().is_some_and(Path::is_dir) {
+                            "a settings change creates it there"
+                        } else {
+                            "its folder does not exist either: settings changes are not saved \
+                             until it does"
+                        };
                         format!(
                             "config.toml links to {}, which does not exist — using the default \
-                             settings (a settings change creates it there)",
+                             settings ({then})",
                             target.display()
                         )
                     })
@@ -1380,6 +1387,17 @@ fn write_changes_racing(
             std::fs::create_dir_all(dir)
                 .map_err(|e| format!("could not create config dir {}: {e}", dir.display()))?;
         }
+        // Through a dangling symlink the file is created at the link's target —
+        // but never a folder for it (that could be a dotfiles checkout to come).
+        if let Some(target) = symlink_target(path) {
+            if !target.parent().is_some_and(Path::is_dir) {
+                return Err(format!(
+                    "config.toml links to {}, whose folder does not exist — settings changes \
+                     are not saved until it does",
+                    target.display()
+                ));
+            }
+        }
         race();
         let committed = write_atomic_checked(path, new_text.as_bytes(), || {
             read_config_text(path).ok().as_ref() == Some(&before)
@@ -1570,6 +1588,23 @@ mod tests {
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "still a link");
         assert_eq!(Config::load_from(&link).cfg.theme, "nord", "written through it");
         assert!(std::fs::read_to_string(&target).unwrap().contains("theme = \"nord\""));
+        // A link into a folder that does not exist (yet): said so, and a save
+        // fails visibly instead of creating folders in someone's dotfiles tree.
+        let nowhere = base.join("not-cloned").join("jetty.toml");
+        let link2 = base.join("other").join("config.toml");
+        std::fs::create_dir_all(link2.parent().unwrap()).unwrap();
+        symlink(&nowhere, &link2).unwrap();
+        let loaded = Config::load_from(&link2);
+        assert!(loaded.warnings[0].contains("not saved until it does"), "{:?}", loaded.warnings);
+        let (mut p, mut cfg, notices) = persister_for(&link2);
+        cfg.theme = "nord".to_string();
+        p.record(&cfg, Instant::now());
+        assert!(p.flush_and_wait(Duration::from_secs(5)));
+        let n = notices.lock().unwrap().clone();
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert!(n[0].contains("folder does not exist"), "{n:?}");
+        assert!(!base.join("not-cloned").exists(), "no folder created");
+        assert!(std::fs::symlink_metadata(&link2).unwrap().file_type().is_symlink());
         // A relative link (as stow makes them) too.
         let rel = base.join("rel.toml");
         symlink("dotfiles/rel-target.toml", &rel).unwrap();
