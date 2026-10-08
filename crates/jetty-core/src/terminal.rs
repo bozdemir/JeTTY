@@ -127,6 +127,11 @@ fn grapheme_text(base: char, marks: &[char]) -> String {
     text
 }
 
+/// Whether the marks are in ascending `prompt` order (see `Terminal::marks_sorted`).
+fn marks_ascending(marks: &VecDeque<CmdBlock>) -> bool {
+    marks.iter().zip(marks.iter().skip(1)).all(|(a, b)| a.prompt <= b.prompt)
+}
+
 /// Trim the zero-width chars piled on the cells next to the cursor — the only
 /// cells `Term::input` attaches marks to (the previous cell, or the one before a
 /// wide glyph's spacer) — to [`GRAPHEME_MAX_MARKS`]. alacritty appends them
@@ -783,9 +788,14 @@ pub struct Terminal {
     /// Escape scanner state (OSC 133 + sixel DCS), persisted across `feed` calls
     /// (chunk boundaries).
     scan: Scan,
-    /// Per-tab semantic prompt marks (OSC 133 A/B/C/D), append order == ascending
-    /// `abs_top`-relative line, pruned to the live scrollback window on each bind.
+    /// Per-tab semantic prompt marks (OSC 133 A/B/C/D) in append order, pruned to
+    /// the live scrollback window on each bind.
     marks: VecDeque<CmdBlock>,
+    /// Whether `marks` is in ascending `prompt` order — true unless a prompt was
+    /// bound ABOVE an older one (a shell redrawing its prompt higher up). While it
+    /// holds, the out-of-window marks are a prefix and a suffix, so `prune_marks`
+    /// trims both ends in O(pruned) instead of rescanning every mark per prompt.
+    marks_sorted: bool,
     /// Lifetime count of DISTINCT OSC 133 `A` prompt marks this terminal has
     /// seen (post-dedup; never decremented, survives mark pruning). The
     /// run-selection-in-new-tab readiness signal: `> 0` means the shell emits
@@ -990,6 +1000,7 @@ impl Terminal {
             cur_cmd: None,
             scan: Scan::Ground,
             marks: VecDeque::new(),
+            marks_sorted: true,
             prompts_seen: 0,
             saw_command_output: false,
             completed: Vec::new(),
@@ -1871,6 +1882,7 @@ impl Terminal {
     #[inline(never)]
     fn drop_anchors(&mut self) {
         self.marks.clear();
+        self.marks_sorted = true;
         self.clear_placements();
         self.anchor_epoch = self.anchor_epoch.wrapping_add(1);
     }
@@ -1886,14 +1898,35 @@ impl Terminal {
         self.prune_placements(history_size);
     }
 
+    /// Append a prompt mark, keeping `marks_sorted` honest.
+    fn push_mark(&mut self, block: CmdBlock) {
+        if self.marks.back().is_some_and(|b| block.prompt < b.prompt) {
+            self.marks_sorted = false;
+        }
+        self.marks.push_back(block);
+    }
+
     /// Drop marks outside the live window `[abs_top - history_size, abs_top + rows)`
     /// and cap the total (defensive). Called on every A-bind and on a shrink.
+    /// O(pruned) while `marks_sorted`: the out-of-window marks are then a prefix
+    /// (scrolled off) and a suffix (below the screen). Only after an out-of-order
+    /// bind does it rescan, and re-derives the order flag from the survivors.
     #[cold]
     #[inline(never)]
     fn prune_marks(&mut self, history_size: usize) {
         let min_abs = self.abs_top - history_size as i64;
         let max_abs = self.abs_top + self.rows as i64;
-        self.marks.retain(|m| m.prompt >= min_abs && m.prompt < max_abs);
+        if self.marks_sorted {
+            while self.marks.front().is_some_and(|m| m.prompt < min_abs) {
+                self.marks.pop_front();
+            }
+            while self.marks.back().is_some_and(|m| m.prompt >= max_abs) {
+                self.marks.pop_back();
+            }
+        } else {
+            self.marks.retain(|m| m.prompt >= min_abs && m.prompt < max_abs);
+            self.marks_sorted = marks_ascending(&self.marks);
+        }
         while self.marks.len() > MAX_MARKS {
             self.marks.pop_front();
         }
@@ -2142,7 +2175,7 @@ impl Terminal {
                     last.finished = true;
                 }
                 self.cur_cmd = Some(OpenCmd { prompt: abs, started_at: None });
-                self.marks.push_back(CmdBlock {
+                self.push_mark(CmdBlock {
                     prompt: abs,
                     input: None,
                     output: None,
@@ -3834,6 +3867,49 @@ fn resolve_rgb(theme: &Theme, colors: &Colors, color: alacritty_terminal::vte::a
 mod tests {
     use super::*;
     use crate::snapshot::{attr, CursorShapeSnap};
+
+    /// `prune_marks`' O(pruned) fast path must keep EXACTLY the marks a full
+    /// rescan keeps, in the same order — under mostly-ascending binds with
+    /// occasional upward (out-of-order) prompts, which force the rescan path and
+    /// must hand back to the fast path once the order is restored.
+    #[test]
+    fn prune_marks_fast_path_matches_a_full_rescan() {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = move |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        let block = |prompt: i64| CmdBlock { prompt, input: None, output: None, exit: None, finished: true };
+        let mut fast_path_hits = 0;
+        for _ in 0..300 {
+            let mut t = Terminal::new(80, 24);
+            let mut reference: Vec<i64> = Vec::new();
+            let mut line = 0i64;
+            for _ in 0..rnd(80) {
+                line += if rnd(12) == 0 { -(rnd(40) as i64) } else { rnd(6) as i64 };
+                t.push_mark(block(line));
+                reference.push(line);
+                // Prune under a random live window around the newest prompt.
+                t.abs_top = line - rnd(24) as i64;
+                let history = rnd(60) as usize;
+                if t.marks_sorted {
+                    fast_path_hits += 1;
+                }
+                t.prune_marks(history);
+                let (min_abs, max_abs) = (t.abs_top - history as i64, t.abs_top + t.rows as i64);
+                reference.retain(|&p| p >= min_abs && p < max_abs);
+                let got: Vec<i64> = t.marks.iter().map(|m| m.prompt).collect();
+                assert_eq!(got, reference);
+                // The flag may be pessimistic, never optimistic.
+                if t.marks_sorted {
+                    assert!(got.windows(2).all(|w| w[0] <= w[1]), "marks_sorted lied: {got:?}");
+                }
+            }
+        }
+        assert!(fast_path_hits > 1000, "the fast path must be the common case ({fast_path_hits})");
+    }
 
     #[test]
     fn cursor_visible_by_default() {
