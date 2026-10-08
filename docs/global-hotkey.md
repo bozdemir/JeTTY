@@ -1,12 +1,15 @@
-# Global F9 Hotkey (Yakuake-style summon)
+# Global summon hotkey (Yakuake-style)
 
-Jetty supports a global F9 hotkey to show/hide the window from anywhere on
-the desktop — no need to click the taskbar or alt-tab.
+Jetty supports a global hotkey — **F9** by default — to show/hide the window from
+anywhere on the desktop, no need to click the taskbar or alt-tab. Pick another key
+with the `summon_hotkey` config key (`"F12"`, `"Ctrl+Shift+F12"`, …; read at
+startup). An invalid value falls back to F9, and a key that can't be grabbed is
+reported in the window — not only on stderr.
 
 ## X11
 
-On X11, Jetty automatically registers a system-wide F9 key grab at startup
-using the `global-hotkey` crate. No configuration is needed.
+On X11, Jetty automatically registers a system-wide grab of the summon key at
+startup using the `global-hotkey` crate. No configuration is needed.
 
 F9 is a toggle: press it to hide the window, press it again to summon it. On
 summon the window is placed according to `window_mode` — re-centred on the
@@ -26,10 +29,13 @@ hidden window from keeping the desktop's panels out of the way.
 Global key grabs are not available to regular apps on Wayland (by design). Bind
 **`jetty --toggle`** to a key in your compositor: the first press launches Jetty,
 and each press after toggles the running instance over a Unix socket
-(`$XDG_RUNTIME_DIR/jetty.sock`, falling back to `/tmp/jetty.sock`), so it shows or
-hides instantly. Use `jetty --show` / `jetty --hide` instead for a dedicated
-summon / dismiss key. The control invocation forwards the command and exits
-immediately — no window, no GUI work.
+(`$XDG_RUNTIME_DIR/jetty.sock`; without `XDG_RUNTIME_DIR` — always on macOS — a
+private 0700 `jetty/` directory in your cache dir: `~/.cache/jetty/jetty.sock`,
+`~/Library/Caches/jetty/jetty.sock` on macOS. Never a world-writable `/tmp` path),
+so it shows or hides instantly. Use `jetty --show` / `jetty --hide` instead for a
+dedicated summon / dismiss key. The control invocation forwards the command and
+exits immediately — no window, no GUI work. (`jetty --background`, used by
+"Launch at login", starts Jetty hidden and does nothing if it already runs.)
 
 This is a generic, compositor-independent path — no portal, no
 desktop-environment-specific code, works on every compositor.
@@ -58,11 +64,11 @@ bind = , F9, exec, jetty --toggle
 
 ## macOS
 
-The global hotkey is plain **F9** (no `fn` modifier is added by Jetty;
-registration is `HotKey::new(None, Code::F9)`). On a Mac keyboard where the
-function-row keys default to media actions, press `fn`+`F9` so the OS delivers
-F9, or enable "Use F1, F2, etc. keys as standard function keys" in
-System Settings → Keyboard.
+The default global hotkey is plain **F9** (no `fn` modifier is added by Jetty).
+On a Mac keyboard where the function-row keys default to media actions, press
+`fn`+`F9` so the OS delivers F9, or enable "Use F1, F2, etc. keys as standard
+function keys" in System Settings → Keyboard — or set `summon_hotkey` to a chord
+that needs neither (e.g. `"Ctrl+Shift+Space"`).
 
 macOS requires Jetty to be granted Accessibility (and on some versions Input
 Monitoring) permission before a system-wide key tap is delivered: System
@@ -70,9 +76,10 @@ Settings → Privacy & Security → Accessibility → enable Jetty. Without this
 F9 grab is silently inactive; the IPC toggle still works as a fallback
 (bind `jetty --toggle` to a shortcut via a launcher).
 
-Known limitation: macOS global-hotkey support is best-effort (the manager is
-registered off the main thread, which upstream documents as fragile on macOS).
-If F9 does not toggle, bind `jetty --toggle` to a shortcut via a launcher,
+The hotkey manager is created and kept on the main thread, as the
+`global-hotkey` crate requires on macOS (earlier versions registered it on a
+background thread, where it could silently never fire). If the grab fails, Jetty
+says so in the window; binding `jetty --toggle` to a shortcut via a launcher works
 as on Wayland.
 
 ## Notes

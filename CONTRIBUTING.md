@@ -45,7 +45,7 @@ cargo build
 cargo build --release --bin jetty
 ./target/release/jetty
 
-# Run all tests
+# Run all tests (every crate — the workspace's default-members cover them all)
 cargo test
 
 # Run tests for a specific crate
@@ -100,7 +100,9 @@ JETTY_SHOT_HELP=1 JETTY_SHOT_OUT=help.png \
 
 ## Performance (`jetty-bench`)
 
-Performance is a gated requirement — see [`docs/perf-budget.md`](docs/perf-budget.md).
+Performance is a requirement, not an afterthought: measure a hot-path change against
+the budgets in [`docs/perf-budget.md`](docs/perf-budget.md) before sending it (CI only
+reports the CPU-side numbers; it doesn't fail on a regression yet).
 Run the headless benchmark before and after any change that touches the hot path:
 
 ```bash
