@@ -132,7 +132,7 @@
 ///                    (JETTY_THEME, JETTY_OPACITY, JETTY_CORNER_RADIUS,
 ///                    JETTY_SHOT_UI_FONT[_SIZE], JETTY_SHOT_PANEL_WINMODE/EFFECT/
 ///                    DH/DW/AUTOHIDE/LAUNCH/SHELL/FULLSCREEN). Panel state:
-///                    JETTY_SHOT_PANEL_TAB=0..4, JETTY_SHOT_PANEL_SCROLL=<px>|max
+///                    JETTY_SHOT_PANEL_TAB=0..4, JETTY_SHOT_PANEL_SCROLL=<px>|<n>%|max
 ///                    (alias _FX_SCROLL), JETTY_SHOT_PANEL_FILTER=all|dark|light|mine,
 ///                    JETTY_SHOT_PANEL_HOVER=<theme name>|reset|filter:<f>|section:<id>,
 ///                    JETTY_SHOT_PANEL_COLLAPSE=<section id,...>,
@@ -1138,7 +1138,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let items = sui::tab_items(tab, cfg, &ctx);
             let mut inp = jetty_render::PanelInput::new(width, height, &theme, panel_cm, &items);
             inp.active_tab = tab;
-            inp.scroll = match var("JETTY_SHOT_PANEL_SCROLL").or_else(|| var("JETTY_SHOT_PANEL_FX_SCROLL")).as_deref() {
+            // px, "max", or "<n>%" of the tab's scroll range.
+            let scroll_env = var("JETTY_SHOT_PANEL_SCROLL").or_else(|| var("JETTY_SHOT_PANEL_FX_SCROLL"));
+            let scroll_pct = scroll_env
+                .as_deref()
+                .and_then(|v| v.strip_suffix('%'))
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|v| v.clamp(0.0, 100.0) / 100.0);
+            inp.scroll = match scroll_env.as_deref() {
                 Some("max") => 1.0e9,
                 Some(v) => v.parse::<f32>().unwrap_or(0.0),
                 None => 0.0,
@@ -1151,6 +1158,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             inp.reset = reset;
             inp.footer_hint = footer;
             let mut pv = jetty_render::build_panel(&inp, &mut panel_text);
+            if let Some(f) = scroll_pct {
+                inp.scroll = f * pv.geom.max_scroll;
+                pv = jetty_render::build_panel(&inp, &mut panel_text);
+            }
             if let Some((top, _)) = focus.and_then(|f| pv.geom.anchor(f)) {
                 inp.scroll = (top - 12.0 * panel_cm.overlay_u()).clamp(0.0, pv.geom.max_scroll);
                 pv = jetty_render::build_panel(&inp, &mut panel_text);
