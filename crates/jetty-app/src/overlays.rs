@@ -217,7 +217,7 @@ mod tests {
             .map(|i| crate::palette::PaletteEntry {
                 title: format!("Entry {i}"),
                 keywords: "",
-                cmd: crate::palette::PaletteCmd::SelectTab(i),
+                cmd: crate::palette::PaletteCmd::SelectTab(i as u64),
             })
             .collect();
         crate::palette::filter(&reg, "")

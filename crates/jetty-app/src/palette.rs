@@ -11,9 +11,11 @@
 
 use jetty_core::fuzzy_match;
 
-/// A palette action. Index-bearing variants (`SetTheme`/`SelectTab`/`Reattach`)
-/// carry the resolved index at build time; `run_palette_cmd` `.get()`-guards them
-/// so an index that went stale between open and Enter is a clean no-op.
+/// A palette action. `SetTheme` carries the theme index (themes never move
+/// while the palette is open); `SelectTab` / `Reattach` carry the STABLE id of
+/// their target tab (a main-window tab, or the tab a detached window holds), so
+/// a tab closing or moving between open and Enter can never retarget the action
+/// — an id that vanished is a clean no-op.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteCmd {
     NewTab,
@@ -49,8 +51,8 @@ pub enum PaletteCmd {
     Hide,
     Quit,
     SetTheme(usize),
-    SelectTab(usize),
-    Reattach(usize),
+    SelectTab(u64),
+    Reattach(u64),
 }
 
 /// One registry row: the human-facing `title` (fuzzy-matched + highlighted),
@@ -72,11 +74,12 @@ pub struct PaletteHit {
 
 /// Build the full palette registry: the fixed static actions, then one entry per
 /// theme (`Theme: {display}`), per open tab (`Switch to tab: {title}`), and per
-/// detached window (`Reattach: {title}`, only when there are any).
+/// detached window (`Reattach: {title}`, only when there are any). `tabs` and
+/// `detached` are `(stable tab id, title)` pairs.
 pub fn build_registry(
     themes: &[(String, String)],
-    tabs: &[String],
-    detached: &[String],
+    tabs: &[(u64, String)],
+    detached: &[(u64, String)],
 ) -> Vec<PaletteEntry> {
     let statics: [(&str, &str, PaletteCmd); 32] = [
         ("New tab", "create open window shell", PaletteCmd::NewTab),
@@ -129,18 +132,18 @@ pub fn build_registry(
             cmd: PaletteCmd::SetTheme(i),
         });
     }
-    for (i, title) in tabs.iter().enumerate() {
+    for (id, title) in tabs {
         v.push(PaletteEntry {
             title: format!("Switch to tab: {title}"),
             keywords: "tab go window",
-            cmd: PaletteCmd::SelectTab(i),
+            cmd: PaletteCmd::SelectTab(*id),
         });
     }
-    for (i, title) in detached.iter().enumerate() {
+    for (id, title) in detached {
         v.push(PaletteEntry {
             title: format!("Reattach: {title}"),
             keywords: "attach dock window",
-            cmd: PaletteCmd::Reattach(i),
+            cmd: PaletteCmd::Reattach(*id),
         });
     }
     v
@@ -184,14 +187,14 @@ mod tests {
 
     fn reg() -> Vec<PaletteEntry> {
         let themes = jetty_core::theme_list();
-        let tabs = vec!["Tab 1".to_string(), "Tab 2".to_string()];
+        let tabs = vec![(1, "Tab 1".to_string()), (2, "Tab 2".to_string())];
         build_registry(&themes, &tabs, &[])
     }
 
     #[test]
     fn registry_has_all_themes_and_one_per_tab() {
         let themes = jetty_core::theme_list();
-        let tabs = vec!["Tab 1".to_string(), "Tab 2".to_string()];
+        let tabs = vec![(7, "Tab 1".to_string()), (9, "Tab 2".to_string())];
         let r = build_registry(&themes, &tabs, &[]);
         let theme_entries = r.iter().filter(|e| e.title.starts_with("Theme: ")).count();
         assert_eq!(theme_entries, jetty_core::theme_count());
@@ -199,8 +202,11 @@ mod tests {
         assert_eq!(tab_entries, 2);
         // No Reattach entries when there are no detached windows.
         assert!(!r.iter().any(|e| e.title.starts_with("Reattach: ")));
-        // Dynamic indices are captured at build time.
-        assert!(r.iter().any(|e| e.cmd == PaletteCmd::SelectTab(1)));
+        // Tab entries carry the tab's STABLE id, never its position.
+        assert!(r.iter().any(|e| e.cmd == PaletteCmd::SelectTab(9)));
+        assert!(!r.iter().any(|e| e.cmd == PaletteCmd::SelectTab(1)));
+        let r = build_registry(&themes, &tabs, &[(12, "Tab 3".to_string())]);
+        assert!(r.iter().any(|e| e.cmd == PaletteCmd::Reattach(12) && e.title == "Reattach: Tab 3"));
     }
 
     #[test]

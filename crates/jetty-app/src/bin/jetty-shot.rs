@@ -1042,7 +1042,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A representative registry: the SHARED builder over the live theme
             // list plus two sample tabs, filtered exactly like the app.
             let themes = jetty_core::theme_list();
-            let tabs = vec!["Tab 1".to_string(), "Tab 2".to_string()];
+            let tabs = vec![(1, "Tab 1".to_string()), (2, "Tab 2".to_string())];
             let registry = jetty_app::palette::build_registry(&themes, &tabs, &[]);
             let hits = jetty_app::palette::filter(&registry, &query);
             let total = hits.len();

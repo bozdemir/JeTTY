@@ -158,10 +158,11 @@ fn cycle_notify_min(cur: u64, forward: bool) -> u64 {
 const NOTIFY_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Anti-spam key for command-finish notifications: identifies which surface last
-/// fired. Main tabs key on their index; detached windows on their stable id.
+/// fired. Main tabs key on their stable [`TabId`]; detached windows on their
+/// window id.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum NotifyKey {
-    MainTab(usize),
+    MainTab(TabId),
     Detached(WindowId),
 }
 
@@ -348,9 +349,18 @@ const PTY_DRAIN_BUDGET: usize = 2 * 1024 * 1024;
 /// `elapsed().as_secs_f32()` degrades into visible stutter after ~1.5 days).
 const CRT_PHASE_WRAP: f64 = std::f64::consts::TAU;
 
+/// A tab's STABLE identity for its whole life (main window ↔ detached window
+/// included). Long-lived references — the rename box, the close confirmation,
+/// the tab menu, a tab drag, palette entries, notification keys — hold this,
+/// never a `Vec` index, so closing or moving another tab can't retarget them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TabId(pub(crate) u64);
+
 /// A single terminal session: its grid model, PTY, writer, and tab title. One
 /// `Tab` per visible tab. Per-tab scroll/selection live inside `terminal`.
 pub(crate) struct Tab {
+    /// Stable identity (see [`TabId`]).
+    pub(crate) id: TabId,
     pub(crate) terminal: Terminal,
     pub(crate) pty: PtySession,
     pub(crate) writer: Box<dyn Write + Send>,
@@ -1189,8 +1199,10 @@ pub struct App {
     menu_disabled: Vec<usize>,
     /// Index of the menu item currently under the cursor (for hover highlight).
     menu_hover: Option<usize>,
-    /// Inline tab rename: `Some(tab_index)` while the user is editing a tab title.
-    renaming: Option<usize>,
+    /// Next [`TabId`] to hand out (monotonic; ids are never reused).
+    next_tab_id: u64,
+    /// Inline tab rename: `Some(tab)` while the user is editing a tab title.
+    renaming: Option<TabId>,
     /// The edit buffer for the in-progress rename (committed/discarded on Enter/Esc).
     rename_buf: String,
     /// Time + physical-pixel position of the last left press on the top strip,
@@ -1273,10 +1285,11 @@ pub struct App {
     /// (`DetachedWindow::ov`); operations name their window with a
     /// [`Surface`].
     ov: Overlays,
-    /// When `Some(i)`, a "Close this tab?" confirmation popup is open for tab `i`.
-    /// The × click / Ctrl+Shift+W / Ctrl+D set this instead of closing immediately;
-    /// Enter (or the Close button) confirms, Esc (or Cancel / click-outside) clears.
-    confirm_close: Option<usize>,
+    /// When `Some(tab)`, a "Close this tab?" confirmation popup is open for that
+    /// tab. The × click / Ctrl+Shift+W / Ctrl+D set this instead of closing
+    /// immediately; Enter (or the Close button) confirms, Esc (or Cancel /
+    /// click-outside) clears. A tab that vanished meanwhile just drops it.
+    confirm_close: Option<TabId>,
     /// Set when the user tries to close the whole app (window × button or the OS
     /// CloseRequested). Shows a "Quit JeTTY?" popup instead of exiting; Enter
     /// confirms, Esc / Cancel / click-outside dismisses.
@@ -1308,10 +1321,10 @@ pub struct App {
     /// while tearing detaches that tab at the drop position. Cleared on release
     /// and on focus loss (same discipline as `selecting`/`dragging_scrollbar`).
     tab_drag: Option<TabDrag>,
-    /// When `Some((x, y, tab_idx))`, the TAB context menu (Detach / Rename /
-    /// Close Tab) is open at this physical-pixel anchor for tab `tab_idx`.
+    /// When `Some((x, y, tab))`, the TAB context menu (Detach / Rename /
+    /// Close Tab) is open at this physical-pixel anchor for that tab.
     /// Mutually exclusive with `context_menu` (the terminal Copy/Paste menu).
-    tab_menu: Option<(f32, f32, usize)>,
+    tab_menu: Option<(f32, f32, TabId)>,
     /// Item labels of the open tab menu, snapshotted when it opened (the
     /// "Detach" row is present only when detaching was allowed at open time).
     tab_menu_labels: Vec<&'static str>,
@@ -1325,12 +1338,12 @@ pub struct App {
 
 
 
-/// A left-button drag that began on tab `idx` in the main tab bar. `tearing`
+/// A left-button drag that began on tab `tab` in the main tab bar. `tearing`
 /// flips true once the cursor moves > `TEAR_THRESHOLD_PX` vertically out of the
 /// strip (and back false if it returns), so a plain click still selects.
 #[derive(Debug, Clone, Copy)]
 struct TabDrag {
-    idx: usize,
+    tab: TabId,
     tearing: bool,
 }
 
@@ -1726,6 +1739,7 @@ impl App {
             menu_item_rects: Vec::new(),
             menu_disabled: Vec::new(),
             menu_hover: None,
+            next_tab_id: 1,
             renaming: None,
             rename_buf: String::new(),
             last_strip_click: None,
@@ -2004,6 +2018,29 @@ impl App {
         self.summon_pending = true;
         self.request_main_paint();
         self.request_settings_paint();
+    }
+
+    /// The in-progress rename as the tab bar's `(tab index, buffer)`, if the
+    /// renamed tab is (still) in the main window.
+    fn rename_ref(&self) -> Option<(usize, &str)> {
+        self.renaming.and_then(|id| self.tab_index(id)).map(|i| (i, self.rename_buf.as_str()))
+    }
+
+    /// Hand out the next stable [`TabId`].
+    fn alloc_tab_id(&mut self) -> TabId {
+        let id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        id
+    }
+
+    /// The main-window index of tab `id`, if it is (still) there.
+    fn tab_index(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
+    /// The `self.detached` index of the window holding tab `id`, if any.
+    fn detached_index(&self, id: TabId) -> Option<usize> {
+        self.detached.iter().position(|d| d.tab.id == id)
     }
 
     /// The active tab. Panics if `tabs` is empty, which only happens before
@@ -2640,7 +2677,9 @@ impl App {
             terminal.feed_notice(notice);
         }
         let title = format!("Tab {}", self.tabs.len() + 1);
+        let id = self.alloc_tab_id();
         self.tabs.push(Tab {
+            id,
             terminal,
             pty,
             writer,
@@ -2686,16 +2725,13 @@ impl App {
         } else if self.active > i {
             self.active -= 1;
         }
-        // Keep index-bearing UI state aligned with the removed tab so the wrong
-        // tab is never renamed/confirmed, and any in-progress selection is reset.
-        Self::adjust_index_after_remove(&mut self.renaming, i);
-        Self::adjust_index_after_remove(&mut self.confirm_close, i);
-        if self.renaming.is_none() {
-            self.rename_buf.clear();
-        }
+        // A rename box / close confirmation for the removed tab goes with it
+        // (they hold stable ids, so every other tab's stay put); any in-progress
+        // selection is reset.
+        self.drop_stale_tab_refs();
         self.selecting = false;
-        // The tab menu / a held tab drag hold raw indices; the layout just
-        // changed under them, so drop both (transient state, cheap to reopen).
+        // The tab menu / a held tab drag are anchored on the old layout; it
+        // just changed under them, so drop both (transient, cheap to reopen).
         self.tab_menu = None;
         self.tab_menu_hover = None;
         self.tab_menu_rects.clear();
@@ -2756,11 +2792,7 @@ impl App {
         } else if self.active > idx {
             self.active -= 1;
         }
-        Self::adjust_index_after_remove(&mut self.renaming, idx);
-        Self::adjust_index_after_remove(&mut self.confirm_close, idx);
-        if self.renaming.is_none() {
-            self.rename_buf.clear();
-        }
+        self.drop_stale_tab_refs();
         // The tab menu / a held tab drag hold raw indices; the layout just
         // changed under them, so drop both — same invariant as `close_tab` /
         // `close_exited_tabs` (a stale index would rename/close/tear the
@@ -3044,15 +3076,21 @@ impl App {
         self.tab_menu_labels.clear();
     }
 
-    /// Adjust an `Option<usize>` index after the tab at `removed` is removed:
-    /// clear it if it pointed AT the removed tab; decrement it if it pointed to a
-    /// later tab (so it keeps referring to the same logical tab).
-    fn adjust_index_after_remove(idx: &mut Option<usize>, removed: usize) {
-        match *idx {
-            Some(j) if j == removed => *idx = None,
-            Some(j) if j > removed => *idx = Some(j - 1),
-            _ => {}
+    /// Drop the long-lived tab references (rename box, close confirmation)
+    /// whose tab left the main window (closed, exited, detached). They hold
+    /// stable ids, so a reference to any OTHER tab stays valid untouched — no
+    /// index shuffling that could retarget it.
+    fn drop_stale_tab_refs(&mut self) {
+        let live: Vec<TabId> = self.tabs.iter().map(|t| t.id).collect();
+        self.renaming = still_open(self.renaming, &live);
+        self.confirm_close = still_open(self.confirm_close, &live);
+        if self.renaming.is_none() {
+            self.rename_buf.clear();
         }
+        // Ids are never reused, so a gone tab's notification throttle is dead
+        // weight — drop it.
+        self.notify_last_at
+            .retain(|k, _| !matches!(k, NotifyKey::MainTab(id) if !live.contains(id)));
     }
 
     // ── Per-window overlay plumbing ──────────────────────────────────────────
@@ -3604,8 +3642,9 @@ impl App {
             self.welcome_open = false;
         }
         let themes = jetty_core::theme_list();
-        let tabs: Vec<String> = self.tabs.iter().map(|t| t.title.clone()).collect();
-        let detached: Vec<String> = self.detached.iter().map(|d| d.tab.title.clone()).collect();
+        let tabs: Vec<(u64, String)> = self.tabs.iter().map(|t| (t.id.0, t.title.clone())).collect();
+        let detached: Vec<(u64, String)> =
+            self.detached.iter().map(|d| (d.tab.id.0, d.tab.title.clone())).collect();
         let registry = crate::palette::build_registry(&themes, &tabs, &detached);
         let Some(ov) = self.ov_of_mut(s) else { return };
         ov.help_open = false;
@@ -4080,7 +4119,7 @@ impl App {
             },
             C::CloseTab => match s {
                 Surface::Main => {
-                    self.confirm_close = Some(self.active);
+                    self.confirm_close = self.tabs.get(self.active).map(|t| t.id);
                     self.request_main_paint();
                 }
                 Surface::Detached(p) => self.reattach_tab(p, event_loop),
@@ -4224,15 +4263,17 @@ impl App {
                     self.redraw_main_and_detached();
                 }
             }
-            C::SelectTab(i) => {
-                if i < self.tabs.len() {
+            // Id-bearing dynamic actions: a tab that closed (or moved) between
+            // open and Enter resolves to nothing — never to its neighbour.
+            C::SelectTab(id) => {
+                if let Some(i) = self.tab_index(TabId(id)) {
                     self.select_tab(i);
                     reveal_main(self, event_loop);
                 }
             }
-            C::Reattach(i) => {
-                if i < self.detached.len() {
-                    self.reattach_tab(i, event_loop);
+            C::Reattach(id) => {
+                if let Some(p) = self.detached_index(TabId(id)) {
+                    self.reattach_tab(p, event_loop);
                 }
             }
         }
@@ -4341,14 +4382,14 @@ impl App {
     /// title and clear the rename state. No-op when not renaming. An empty buffer
     /// is ignored (keep the previous title) so a tab never ends up nameless.
     fn commit_rename(&mut self) {
-        if let Some(i) = self.renaming.take() {
-            let trimmed = self.rename_buf.trim();
-            if i < self.tabs.len() && !trimmed.is_empty() {
-                self.tabs[i].title = trimmed.to_string();
+        if let Some(id) = self.renaming.take() {
+            let trimmed = self.rename_buf.trim().to_string();
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id).filter(|_| !trimmed.is_empty()) {
+                tab.title = trimmed;
                 // Manual rename permanently wins over shell OSC 0/2 titles for
                 // this tab. An empty rename (no-op above) deliberately does NOT
                 // set the flag, so auto-titles stay live.
-                self.tabs[i].manually_renamed = true;
+                tab.manually_renamed = true;
             }
             self.rename_buf.clear();
             self.request_main_paint();
@@ -5757,7 +5798,9 @@ impl App {
         c: jetty_core::CommandCompletion,
         watching: bool,
     ) -> Option<bool> {
-        let key = NotifyKey::MainTab(tab);
+        // Throttled per TAB (its stable id), not per position: closing an
+        // earlier tab must not hand this tab's throttle to its neighbour.
+        let key = self.tabs.get(tab).map(|t| NotifyKey::MainTab(t.id))?;
         let since_last = self.notify_last_at.get(&key).map(|t| t.elapsed());
         if !crate::notify::should_notify(
             watching,
@@ -5924,9 +5967,8 @@ impl App {
             } else if self.active > i {
                 self.active -= 1;
             }
-            Self::adjust_index_after_remove(&mut self.renaming, i);
-            Self::adjust_index_after_remove(&mut self.confirm_close, i);
         }
+        self.drop_stale_tab_refs();
         if self.tabs.is_empty() {
             // Exit only when NO tabs exist anywhere: while detached windows
             // hold live shells, adopt the first detached tab into the main
@@ -9880,7 +9922,9 @@ impl ApplicationHandler<AppEvent> for App {
             terminal.feed_notice(notice);
         }
         let writer = pty.writer();
+        let id = self.alloc_tab_id();
         self.tabs.push(Tab {
+            id,
             terminal,
             pty,
             writer,
@@ -10565,10 +10609,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // --- Close-tab confirmation popup is modal ---
                 // Clicking Close confirms; Cancel or anywhere outside the panel
                 // cancels. Either way the click is fully consumed.
-                if let Some(i) = self.confirm_close {
+                if let Some(id) = self.confirm_close {
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
-                    let title = self.tabs.get(i).map(|t| t.title.clone()).unwrap_or_default();
+                    let target = self.tab_index(id);
+                    let title = target.map(|i| self.tabs[i].title.clone()).unwrap_or_default();
                     let theme = self.current_theme();
                     let cm = self.chrome_metrics();
                     let mut fallback = mono_fallback(cm);
@@ -10577,7 +10622,9 @@ impl ApplicationHandler<AppEvent> for App {
                     );
                     if input::point_in(&popup.close_rect, cx, cy) {
                         self.confirm_close = None;
-                        self.close_tab(i, event_loop);
+                        if let Some(i) = target {
+                            self.close_tab(i, event_loop);
+                        }
                     } else if input::point_in(&popup.cancel_rect, cx, cy)
                         || !input::point_in(&popup.panel, cx, cy)
                     {
@@ -10589,7 +10636,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 // --- Tab context menu hit-test (consume the click entirely) ---
-                if let Some((_, _, tab_idx)) = self.tab_menu.take() {
+                if let Some((_, _, tab_id)) = self.tab_menu.take() {
                     self.tab_menu_hover = None;
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
@@ -10601,7 +10648,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let label = hit.and_then(|i| self.tab_menu_labels.get(i).copied());
                     self.tab_menu_labels.clear();
                     self.tab_menu_rects.clear();
-                    if tab_idx < self.tabs.len() {
+                    if let Some(tab_idx) = self.tab_index(tab_id) {
                         match label {
                             Some("Detach") => {
                                 // Same flow as Ctrl+Shift+D, for THAT tab.
@@ -10609,12 +10656,12 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                             Some("Rename") => {
                                 // Same inline-rename flow as double-click.
-                                self.renaming = Some(tab_idx);
+                                self.renaming = Some(tab_id);
                                 self.rename_buf = self.tabs[tab_idx].title.clone();
                             }
                             Some("Close Tab") => {
                                 // Same confirm-close flow as the × / Ctrl+Shift+W.
-                                self.confirm_close = Some(tab_idx);
+                                self.confirm_close = Some(tab_id);
                             }
                             _ => {}
                         }
@@ -10685,7 +10732,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 // Close Tab — mirrors the Ctrl+Shift+W handler: set confirm_close
                                 // to open the confirmation popup (or close directly if no child).
                                 // This reuses the exact same flow as KeyAction::CloseTab.
-                                self.confirm_close = Some(self.active);
+                                self.confirm_close = self.tabs.get(self.active).map(|t| t.id);
                             }
                             _ => {}
                         }
@@ -10746,7 +10793,11 @@ impl ApplicationHandler<AppEvent> for App {
                         .enumerate()
                         .map(|(i, t)| (t.title.clone(), i == self.active))
                         .collect();
-                    let rename_ref = self.renaming.map(|i| (i, self.rename_buf.as_str()));
+                    // Field-level borrows (the builder below also borrows the chrome text).
+                    let rename_ref = self
+                        .renaming
+                        .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+                        .map(|i| (i, self.rename_buf.as_str()));
                     // Build with perf=None to MATCH the drawn bar (the perf HUD
                     // moved to the bottom status strip, so the drawn tab bar
                     // reserves no HUD width — see the RedrawRequested build). Passing
@@ -10813,7 +10864,7 @@ impl ApplicationHandler<AppEvent> for App {
 
                     // A click anywhere on the strip commits an in-progress rename
                     // unless it lands on the tab being renamed (handled below).
-                    let renaming_idx = self.renaming;
+                    let renaming_id = self.renaming;
 
                     // Close buttons take priority over the tab body they sit on.
                     if let Some(i) = bar
@@ -10823,7 +10874,7 @@ impl ApplicationHandler<AppEvent> for App {
                     {
                         self.commit_rename();
                         // Ask before closing instead of closing immediately.
-                        self.confirm_close = Some(i);
+                        self.confirm_close = self.tabs.get(i).map(|t| t.id);
                         self.request_main_paint();
                         return;
                     }
@@ -10841,8 +10892,9 @@ impl ApplicationHandler<AppEvent> for App {
                         // double-click on the tab ALREADY being renamed must not
                         // reset the in-progress edit buffer (it would discard the
                         // user's typing); leave the rename untouched.
-                        if is_double && self.renaming != Some(i) {
-                            self.renaming = Some(i);
+                        let tab_id = self.tabs[i].id;
+                        if is_double && self.renaming != Some(tab_id) {
+                            self.renaming = Some(tab_id);
                             self.rename_buf = self.tabs[i].title.clone();
                             self.last_strip_click = None;
                             self.request_main_paint();
@@ -10855,7 +10907,7 @@ impl ApplicationHandler<AppEvent> for App {
                             return;
                         }
                         // Single click on a different tab commits any rename.
-                        if renaming_idx != Some(i) {
+                        if renaming_id != Some(tab_id) {
                             self.commit_rename();
                         }
                         // Select immediately (a plain click), and ARM the
@@ -10863,7 +10915,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // more than TEAR_THRESHOLD_PX before release, the drag
                         // becomes a tear-out and the release detaches this tab.
                         self.select_tab(i);
-                        self.tab_drag = Some(TabDrag { idx: i, tearing: false });
+                        self.tab_drag = Some(TabDrag { tab: tab_id, tearing: false });
                         return;
                     }
 
@@ -11047,7 +11099,11 @@ impl ApplicationHandler<AppEvent> for App {
                         .collect();
                     let cm = self.chrome_metrics();
                     let mut fallback = mono_fallback(cm);
-                    let rename_ref = self.renaming.map(|i| (i, self.rename_buf.as_str()));
+                    // Field-level borrows (the builder below also borrows the chrome text).
+                    let rename_ref = self
+                        .renaming
+                        .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+                        .map(|i| (i, self.rename_buf.as_str()));
                     // perf=None to match the DRAWN bar (HUD lives in the status
                     // strip); passing perf_label mis-sized the hit-rects (F19).
                     let mut bar = jetty_render::build_tab_bar_ex(
@@ -11069,7 +11125,7 @@ impl ApplicationHandler<AppEvent> for App {
                         self.ov.help_open = false;
                         self.context_menu = None;
                         self.menu_hover = None;
-                        self.tab_menu = Some((cx, cy, i));
+                        self.tab_menu = Some((cx, cy, self.tabs[i].id));
                         self.tab_menu_hover = None;
                         self.tab_menu_labels = crate::detached::tab_menu_items(
                             crate::detached::can_detach(self.tabs.len()),
@@ -11185,7 +11241,12 @@ impl ApplicationHandler<AppEvent> for App {
                             .as_ref()
                             .and_then(|w| w.outer_position().ok())
                             .map(|p| (p.x as f64 + self.cursor.0, p.y as f64 + self.cursor.1));
-                        self.detach_tab(drag.idx, event_loop, drop_global);
+                        // The dragged tab by identity: a tab that closed
+                        // mid-drag (shell exit) detaches nothing — never its
+                        // neighbour.
+                        if let Some(idx) = self.tab_index(drag.tab) {
+                            self.detach_tab(idx, event_loop, drop_global);
+                        }
                         return;
                     }
                 }
@@ -11388,12 +11449,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // While the popup is open it is modal: Enter confirms the close,
                 // Esc cancels. Both are fully consumed so they never reach the
                 // shell, close the help, or fall through to other handlers.
-                if let Some(i) = self.confirm_close {
+                if let Some(id) = self.confirm_close {
                     use winit::keyboard::{Key, NamedKey};
                     match &event.logical_key {
                         Key::Named(NamedKey::Enter) => {
                             self.confirm_close = None;
-                            self.close_tab(i, event_loop);
+                            if let Some(i) = self.tab_index(id) {
+                                self.close_tab(i, event_loop);
+                            }
                             return;
                         }
                         Key::Named(NamedKey::Escape) => {
@@ -11411,7 +11474,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // While renaming, keys edit the title buffer and never reach the
                 // PTY: printable chars append, Backspace pops, Enter commits,
                 // Escape cancels. Return early so nothing leaks to the shell.
-                if let Some(i) = self.renaming {
+                if self.renaming.is_some() {
                     use winit::keyboard::{Key, NamedKey};
                     match &event.logical_key {
                         Key::Named(NamedKey::Enter) => {
@@ -11441,8 +11504,6 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                         }
                     }
-                    // Defensive: keep `i` referenced so the renaming index is valid.
-                    let _ = i;
                     return;
                 }
                 // --- The window's modal overlays own the keyboard: command
@@ -11539,7 +11600,7 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     input::KeyAction::CloseTab => {
                         // Ask before closing instead of closing immediately.
-                        self.confirm_close = Some(self.active);
+                        self.confirm_close = self.tabs.get(self.active).map(|t| t.id);
                         self.request_main_paint();
                     }
                     input::KeyAction::DetachTab => {
@@ -12047,9 +12108,10 @@ impl ApplicationHandler<AppEvent> for App {
                 let confirm_quit = self.confirm_quit;
                 let confirm_close: Option<String> = self
                     .confirm_close
-                    .and_then(|i| self.tabs.get(i).map(|t| t.title.clone()));
+                    .and_then(|id| self.tab_index(id))
+                    .map(|i| self.tabs[i].title.clone());
                 let rename_state: Option<(usize, String)> =
-                    self.renaming.map(|i| (i, self.rename_buf.clone()));
+                    self.rename_ref().map(|(i, buf)| (i, buf.to_string()));
                 // Corner-mask inputs captured before the mutable render borrows.
                 // The radius is logical px; scale to physical so it matches the
                 // physical-pixel surface (HiDPI-correct rounding).
@@ -13154,6 +13216,12 @@ fn render_grid_scene(
     quad.render(device, queue, scene_view, width, height, &rects);
 }
 
+/// `r` while its tab is still among `live`, else `None` — the stale-reference
+/// rule for every id-holding piece of UI state.
+fn still_open(r: Option<TabId>, live: &[TabId]) -> Option<TabId> {
+    r.filter(|id| live.contains(id))
+}
+
 /// Shared input core (v0.23 Task 9 / amendment I5): a keystroke (or IME commit)
 /// that was NOT consumed by any chrome/overlay → snap the viewport to the live
 /// bottom and write the decoded bytes to this tab's PTY. Deliberately SMALL —
@@ -14034,35 +14102,24 @@ mod resize_zone_tests {
 }
 
 #[cfg(test)]
-mod index_adjust_tests {
-    use super::App;
+mod stable_tab_id_tests {
+    use super::{still_open, TabId};
 
     #[test]
-    fn clears_when_pointing_at_removed() {
-        let mut idx = Some(2);
-        App::adjust_index_after_remove(&mut idx, 2);
-        assert_eq!(idx, None);
+    fn closing_another_tab_never_retargets_a_reference() {
+        // Tabs A(1) B(2) C(3); the rename box is on C. Closing A shifts every
+        // index down by one — an index-held reference would now name D-or-none;
+        // the id still names C.
+        let renaming = Some(TabId(3));
+        let after_closing_a = [TabId(2), TabId(3)];
+        assert_eq!(still_open(renaming, &after_closing_a), Some(TabId(3)));
     }
 
     #[test]
-    fn decrements_when_pointing_after_removed() {
-        let mut idx = Some(3);
-        App::adjust_index_after_remove(&mut idx, 1);
-        assert_eq!(idx, Some(2));
-    }
-
-    #[test]
-    fn unchanged_when_pointing_before_removed() {
-        let mut idx = Some(1);
-        App::adjust_index_after_remove(&mut idx, 3);
-        assert_eq!(idx, Some(1));
-    }
-
-    #[test]
-    fn none_stays_none() {
-        let mut idx: Option<usize> = None;
-        App::adjust_index_after_remove(&mut idx, 0);
-        assert_eq!(idx, None);
+    fn closing_the_referenced_tab_drops_the_reference() {
+        let confirm = Some(TabId(2));
+        assert_eq!(still_open(confirm, &[TabId(1), TabId(3)]), None);
+        assert_eq!(still_open(None, &[TabId(1)]), None);
     }
 }
 
