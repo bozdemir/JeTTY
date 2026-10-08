@@ -138,6 +138,25 @@
 ///                    JETTY_SHOT_COPYMODE_ANCHOR="row,col" also drive a live
 ///                    selection anchor→cursor (JETTY_SHOT_COPYMODE_LINE=1 = whole
 ///                    lines), rendering the real selection tint.
+///   JETTY_SHOT_CRT   — run the REAL CRT post pass through the app's own settings
+///                    path (`effects::crt_settings` → `CrtParams::build`). "1" =
+///                    the harness look (curvature .24, scanline .55, mask .32,
+///                    bloom .45, chromatic .22, vignette .45); "config" = the
+///                    `[effects]` table of $JETTY_CONFIG_DIR/config.toml.
+///                    Per-key overrides: JETTY_SHOT_CRT_{CURVATURE, SCANLINE,
+///                    MASK, BLOOM, BLOOM_RADIUS, CHROMATIC, VIGNETTE, PHOSPHOR
+///                    (off|amber|green|white|blue|paper|custom), PHOSPHOR_HUE,
+///                    PHOSPHOR_COLOR (#rrggbb), GRAIN, DITHER, ROLL, FLICKER,
+///                    JITTER (0/1), TIME (seconds), RADIUS (corner px)}.
+///   JETTY_SHOT_PRESET=<id|name> — apply an effects preset (`effects::
+///                    effect_presets`: clean, retro_crt, amber, green_phosphor,
+///                    neon, paper, e_ink) on top of the base above (CRT on
+///                    unless Clean); the per-key overrides still apply after it.
+///   JETTY_SHOT_GLITCH=<0..1> — one event-glitch frame at that intensity (with
+///                    CRT off: the glitch-only pass). JETTY_SHOT_CRT_TIME picks
+///                    the tear pattern.
+///   JETTY_SHOT_CRT_BENCH=<n> — time the post pass: pipeline build once, then n
+///                    passes (GPU-synchronized) → ms/pass on stderr.
 ///
 /// If the terminal bg alpha < 255, the rendered image is composited over a
 /// checkerboard (alternating 16px squares of [40,40,40] and [90,90,90]) so
@@ -152,6 +171,100 @@ use jetty_render::{QuadLayer, TextLayer};
 /// can turn a mode off with `=0` instead of the mode staying on for any value.
 fn env_flag(k: &str) -> bool {
     std::env::var(k).map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+}
+
+/// The `[effects]` the shot's post pass renders with (see the JETTY_SHOT_CRT /
+/// JETTY_SHOT_PRESET / JETTY_SHOT_GLITCH docs) and the glitch intensity; `None`
+/// when no post pass was asked for. Base (harness look, config, or defaults) →
+/// preset → per-key overrides → the app's own sanitizing.
+fn shot_effects() -> Option<(jetty_app::effects::EffectsConfig, f32)> {
+    use jetty_app::effects::{self, EffectsConfig, PhosphorMode};
+    let crt = std::env::var("JETTY_SHOT_CRT").unwrap_or_default();
+    let preset = std::env::var("JETTY_SHOT_PRESET").ok().filter(|s| !s.is_empty());
+    let glitch = std::env::var("JETTY_SHOT_GLITCH")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|g| g.is_finite())
+        .map(|g| g.clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+    let crt_on = !crt.is_empty() && crt != "0";
+    if !crt_on && preset.is_none() && glitch <= 0.0 {
+        return None;
+    }
+    let mut fx = if crt == "config" {
+        effects::configured_effects()
+    } else if crt_on {
+        EffectsConfig {
+            crt_enabled: true,
+            crt_curvature: 0.24,
+            crt_scanline: 0.55,
+            crt_mask: 0.32,
+            crt_bloom: 0.45,
+            crt_chromatic: 0.22,
+            crt_vignette: 0.45,
+            ..EffectsConfig::default()
+        }
+    } else {
+        EffectsConfig::default()
+    };
+    if let Some(name) = preset {
+        match effects::find_preset(&name) {
+            Some(p) => {
+                p.patch.apply_to(&mut fx);
+                eprintln!("jetty-shot: effects preset {:?}", p.name);
+            }
+            None => eprintln!("jetty-shot: unknown effects preset {name:?} (ignored)"),
+        }
+    }
+    let f = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
+    let b = |k: &str| std::env::var(k).ok().map(|v| v != "0" && !v.is_empty());
+    macro_rules! set_f {
+        ($($key:literal => $field:ident),* $(,)?) => { $( if let Some(v) = f($key) { fx.$field = v; } )* };
+    }
+    set_f!(
+        "JETTY_SHOT_CRT_CURVATURE" => crt_curvature,
+        "JETTY_SHOT_CRT_SCANLINE" => crt_scanline,
+        "JETTY_SHOT_CRT_MASK" => crt_mask,
+        "JETTY_SHOT_CRT_BLOOM" => crt_bloom,
+        "JETTY_SHOT_CRT_BLOOM_RADIUS" => crt_bloom_radius,
+        "JETTY_SHOT_CRT_CHROMATIC" => crt_chromatic,
+        "JETTY_SHOT_CRT_VIGNETTE" => crt_vignette,
+        "JETTY_SHOT_CRT_PHOSPHOR_HUE" => crt_phosphor_hue,
+        "JETTY_SHOT_CRT_GRAIN" => crt_grain,
+    );
+    if let Some(m) = std::env::var("JETTY_SHOT_CRT_PHOSPHOR").ok() {
+        match PhosphorMode::from_name(&m) {
+            Some(m) => fx.crt_phosphor = m,
+            None => eprintln!("jetty-shot: unknown JETTY_SHOT_CRT_PHOSPHOR {m:?} (ignored)"),
+        }
+    }
+    if let Some(hex) = std::env::var("JETTY_SHOT_CRT_PHOSPHOR_COLOR").ok() {
+        let h = hex.trim().trim_start_matches('#');
+        match u32::from_str_radix(h, 16) {
+            Ok(c) if h.len() == 6 => {
+                fx.crt_phosphor_color =
+                    [(c >> 16) as f32 / 255.0, ((c >> 8) & 0xff) as f32 / 255.0, (c & 0xff) as f32 / 255.0];
+            }
+            _ => eprintln!("jetty-shot: JETTY_SHOT_CRT_PHOSPHOR_COLOR wants #rrggbb, got {hex:?}"),
+        }
+    }
+    if let Some(v) = b("JETTY_SHOT_CRT_DITHER") {
+        fx.crt_dither = v;
+    }
+    if let Some(v) = b("JETTY_SHOT_CRT_ROLL") {
+        fx.crt_animate_roll = v;
+    }
+    if let Some(v) = b("JETTY_SHOT_CRT_FLICKER") {
+        fx.crt_flicker = v;
+    }
+    if let Some(v) = b("JETTY_SHOT_CRT_JITTER") {
+        fx.crt_jitter = v;
+    }
+    if glitch > 0.0 {
+        // The burst needs its trigger on (that is what compiles the glitch in).
+        fx.glitch_on_error = true;
+    }
+    Some((fx.clamped(), glitch))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1574,12 +1687,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|v| v.clamp(0.0, 24.0))
         .unwrap_or(0.0);
 
-    // --- CRT post-process (JETTY_SHOT_CRT) ---
-    // Run the REAL CRT GPU pass (curvature/scanlines/shadow-mask/bloom/chromatic/
-    // vignette) onto a SECOND texture, sampling the rendered scene — mirroring the
-    // Tier-B sample-then-readback pattern. Lets the harness capture the CRT look
-    // headlessly (e.g. the neofetch hero). Params are env-overridable.
-    let crt_tex = if env_flag("JETTY_SHOT_CRT") {
+    // --- CRT post-process (JETTY_SHOT_CRT / JETTY_SHOT_PRESET / JETTY_SHOT_GLITCH) ---
+    // Run the REAL CRT GPU pass onto a SECOND texture, sampling the rendered
+    // scene — mirroring the Tier-B sample-then-readback pattern — through the
+    // app's own settings path (`effects::frame_settings` → `CrtParams::build`),
+    // so the harness captures exactly what the app draws.
+    let shot_post = shot_effects()
+        .and_then(|(fx, glitch)| jetty_app::effects::frame_settings(&fx, glitch > 0.0).map(|s| (s, glitch)));
+    let crt_tex = if let Some((settings, glitch)) = shot_post {
         let getf = |k: &str, d: f32| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(d);
         let ct = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("jetty-shot-crt"),
@@ -1597,28 +1712,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(t) => t.create_view(&wgpu::TextureViewDescriptor::default()),
             None => texture.create_view(&wgpu::TextureViewDescriptor::default()),
         };
-        eprintln!("jetty-shot: applying CRT post-process (GPU pass)");
+        // The CRT pass OWNS the rounded corners while active (the live app
+        // skips the corner mask then and feeds the radius to the uniform):
+        // default to JETTY_CORNER_RADIUS so the interplay matches the app;
+        // JETTY_SHOT_CRT_RADIUS still overrides for isolated experiments. The
+        // shot renders a free-floating (non-top-flush) window: all four corners
+        // round. The scene clear is premultiplied (see Pass 1).
+        let radius = getf("JETTY_SHOT_CRT_RADIUS", corner_radius);
+        let theme = terminal.theme();
+        let params = jetty_render::CrtParams::build(
+            &settings,
+            &jetty_render::CrtFrame {
+                width,
+                height,
+                corner_radius: radius,
+                corner_radius_top: radius,
+                time: getf("JETTY_SHOT_CRT_TIME", 0.0) as f64,
+                bg: [theme.bg[0], theme.bg[1], theme.bg[2]],
+                fg: theme.fg,
+                premultiplied: true,
+                srgb: format.is_srgb(),
+                dpi_scale: dpi,
+                glitch,
+            },
+        );
+        eprintln!("jetty-shot: applying CRT post-process (GPU pass, variant {:#06x})", params.key.bits());
         let crt = jetty_render::Crt::new(&device, format);
-        crt.apply(&device, &queue, &ct_view, &src_view, width, height, &jetty_render::CrtUniform {
-            resolution: [width as f32, height as f32],
-            curvature: getf("JETTY_SHOT_CRT_CURVATURE", 0.24),
-            scanline: getf("JETTY_SHOT_CRT_SCANLINE", 0.55),
-            mask: getf("JETTY_SHOT_CRT_MASK", 0.32),
-            bloom: getf("JETTY_SHOT_CRT_BLOOM", 0.45),
-            chromatic: getf("JETTY_SHOT_CRT_CHROMATIC", 0.22),
-            vignette: getf("JETTY_SHOT_CRT_VIGNETTE", 0.45),
-            tint: [1.0, 1.0, 1.0, 0.0],
-            // The CRT pass OWNS the rounded corners while active (the live app
-            // skips the corner mask then and feeds the radius to this uniform):
-            // default to JETTY_CORNER_RADIUS so the interplay matches the app;
-            // JETTY_SHOT_CRT_RADIUS still overrides for isolated experiments.
-            corner_radius: getf("JETTY_SHOT_CRT_RADIUS", corner_radius),
-            time: 0.0,
-            flags: 0,
-            // The shot renders a free-floating (non-top-flush) window look:
-            // all four corners round, so the top radius matches the bottom.
-            corner_radius_top: getf("JETTY_SHOT_CRT_RADIUS", corner_radius),
-        });
+        let t_build = std::time::Instant::now();
+        crt.prepare(&device, params.key);
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+        eprintln!("jetty-shot: CRT pipeline build {:.1} ms", t_build.elapsed().as_secs_f64() * 1000.0);
+        crt.apply(&device, &queue, &ct_view, &src_view, &params);
+        // JETTY_SHOT_CRT_BENCH=<n>: n more passes in one go (the first above
+        // warmed the targets/bind groups), GPU-synchronized.
+        if let Some(n) = std::env::var("JETTY_SHOT_CRT_BENCH").ok().and_then(|s| s.parse::<u32>().ok()) {
+            device.poll(wgpu::PollType::wait_indefinitely())?;
+            let n = n.max(1);
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                crt.apply(&device, &queue, &ct_view, &src_view, &params);
+            }
+            device.poll(wgpu::PollType::wait_indefinitely())?;
+            eprintln!(
+                "jetty-shot: CRT pass {:.3} ms/pass at {width}x{height} (n={n}, variant {:#06x})",
+                t.elapsed().as_secs_f64() * 1000.0 / n as f64,
+                params.key.bits()
+            );
+        }
         Some(ct)
     } else {
         None

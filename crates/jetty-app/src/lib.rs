@@ -7,6 +7,10 @@ mod appearance;
 pub mod config;
 mod copymode;
 mod detached;
+/// Post-processing glue (CRT settings, effect presets, animation pacing, the
+/// event glitch). Public so `jetty-shot` / `jetty-bench` build the CRT pass
+/// through the SAME settings path as the app.
+pub mod effects;
 mod gridmouse;
 mod notify;
 mod overlays;

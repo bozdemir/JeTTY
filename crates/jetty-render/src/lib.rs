@@ -47,7 +47,11 @@ pub use reveal::{BayerReveal, bayer4, reveal_coverage};
 pub use phosphor::PhosphorIgnition;
 pub use liquid::LiquidDrop;
 pub use focus::FocusPull;
-pub use crt::{Crt, CrtUniform, CRT_FLAG_ROLL, CRT_FLAG_FLICKER, CRT_FLAG_JITTER};
+pub use crt::{
+    anim_seed, bloom_blur_step, crt_bloom_shader_source, crt_shader_source, srgb_to_linear, Crt, CrtExtUniform,
+    CrtFrame, CrtKey, CrtParams, CrtSettings, CrtUniform, Phosphor, ANIM_SEED_FPS, BLOOM_STEP_MAX, BLOOM_STEP_MIN,
+    CRT_FLAG_FLICKER, CRT_FLAG_JITTER, CRT_FLAG_ROLL,
+};
 pub use image_layer::{ImageDraw, ImageLayer};
 pub use caret_fx::{CaretFx, CaretFxUniform};
 pub use menu::{build_context_menu, build_menu, ContextMenu, MENU_HINTS, MENU_ITEMS};

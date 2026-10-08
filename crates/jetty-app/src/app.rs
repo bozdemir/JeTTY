@@ -280,14 +280,6 @@ const FALLBACK_ROWS: usize = 24;
 const PTY_DRAIN_BUDGET: usize = 2 * 1024 * 1024;
 
 
-/// Wrap period (seconds) for the CRT animation phase before it is narrowed to
-/// f32. The three sub-effects all use INTEGER angular frequencies (roll 6,
-/// flicker 50, jitter 80 & 13 rad/s — see `crt.rs`), so every whole multiple of
-/// TAU is a seamless wrap point. Wrapping keeps the value small so f32's 24-bit
-/// mantissa never coarsens the animation step after long uptime (an un-wrapped
-/// `elapsed().as_secs_f32()` degrades into visible stutter after ~1.5 days).
-const CRT_PHASE_WRAP: f64 = std::f64::consts::TAU;
-
 /// A tab's STABLE identity for its whole life (main window ↔ detached window
 /// included). Long-lived references — the rename box, the close confirmation,
 /// the tab menu, a tab drag, palette entries, notification keys — hold this,
@@ -670,8 +662,16 @@ pub struct App {
     focus: Option<jetty_render::FocusPull>,
     /// CRT post-effect: when enabled the whole scene is rendered to `offscreen`
     /// and this pass applies the full CRT effect pipeline, writing to the surface.
-    /// Built in `resumed` with the surface format; `None` until then.
+    /// Built LAZILY by `sync_main_post` the first time CRT (or a glitch trigger)
+    /// is on — CRT off never builds it. `None` until then.
     crt: Option<jetty_render::Crt>,
+    /// The CRT pipeline variant `sync_main_post` last prepared for the current
+    /// settings (`effects::prepared_key`). A settings change that needs another
+    /// variant builds it there, before the frame acquires its swapchain image.
+    crt_key: Option<jetty_render::CrtKey>,
+    /// The main window's event glitch (`glitch_on_error` / `glitch_on_bell`):
+    /// a bounded 200 ms burst, rate-limited to one per second.
+    glitch: crate::effects::Glitch,
     /// Per-window inline-image (sixel) layer on the MAIN device. Draws decoded
     /// images over the grid into `scene_view` (so CRT / corner-mask / summon
     /// compositing apply). Detached windows hold their own on their own device.
@@ -1690,6 +1690,8 @@ impl App {
             liquid: None,
             focus: None,
             crt: None,
+            crt_key: None,
+            glitch: crate::effects::Glitch::default(),
             caret_fx: None,
             image_layer: None,
             offscreen: None,
@@ -2890,6 +2892,27 @@ impl App {
                 self.request_main_paint();
             }
         }
+    }
+
+    /// Keep the main window's CRT post pass in step with the settings: when the
+    /// variant they need (`effects::prepared_key`) differs from the one last
+    /// prepared, build it now — the `Crt` object itself on first use. Runs at the
+    /// top of a main frame, BEFORE the swapchain image is acquired, and does
+    /// work only when a setting changed (one `Option` compare otherwise). CRT off
+    /// with no glitch trigger: nothing is built.
+    fn sync_main_post(&mut self) {
+        let want = crate::effects::prepared_key(&self.fx);
+        if want == self.crt_key {
+            return;
+        }
+        // Nothing to build (or no GPU yet — retried on the next frame).
+        let (Some(key), Some(gpu)) = (want, self.gpu.as_ref()) else {
+            self.crt_key = None;
+            return;
+        };
+        let crt = self.crt.get_or_insert_with(|| jetty_render::Crt::new(&gpu.device, gpu.format));
+        crt.prepare(&gpu.device, key);
+        self.crt_key = Some(key);
     }
 
     /// Allocate a surface-sized offscreen color texture (same format as the
@@ -7863,7 +7886,9 @@ impl App {
         self.phosphor = Some(jetty_render::PhosphorIgnition::new(device, format));
         self.liquid = Some(jetty_render::LiquidDrop::new(device, format));
         self.focus = Some(jetty_render::FocusPull::new(device, format));
-        self.crt = Some(jetty_render::Crt::new(device, format));
+        // Rebuilt lazily on the new device by the next `sync_main_post`.
+        self.crt = None;
+        self.crt_key = None;
         self.image_layer = Some(jetty_render::ImageLayer::new(device, format));
         self.caret_fx = Some(jetty_render::CaretFx::new(device, format));
         // Lazily re-allocated on the next frame that needs it, on the new device.
@@ -9608,7 +9633,8 @@ impl App {
         // SAME settings the main window renders with (visual parity).
         let corner_radius = self.corner_radius;
         let fx = self.fx.clone();
-        let crt_time = (self.crt_clock.elapsed().as_secs_f64() % CRT_PHASE_WRAP) as f32;
+        let crt_time = self.crt_clock.elapsed().as_secs_f64();
+        let post_key = crate::effects::prepared_key(&fx);
         // Chrome look (the main bar's style; a detached bar is always on top
         // and its single tab always "active").
         let bar_opts = jetty_render::TabBarOpts { bottom: false, ..self.tab_bar_opts(None) };
@@ -9662,11 +9688,22 @@ impl App {
         // mutated: suppression is display-time only.
         let scale = dw.window.scale_factor() as f32;
         let corner_radius_px = effective_corner_radius_px(corner_radius, scale, dw.fullscreen);
-        // CRT routing: when enabled, the whole scene renders into this window's
-        // offscreen texture and the CRT pass samples it onto the surface — the
-        // exact main-window flow (no Tier-B summons here, so no bypass case).
-        // Re-allocate the offscreen lazily when stale (same check as main).
-        let crt_active = fx.crt_enabled;
+        // Post-pass routing: while CRT is on (or a glitch burst plays) the whole
+        // scene renders into this window's offscreen texture and the CRT pass
+        // samples it onto the surface — the exact main-window flow (no Tier-B
+        // summons here, so no bypass case). The pipeline variant is prepared on
+        // a settings change, before the acquire (`App::sync_main_post`'s twin);
+        // the offscreen is re-allocated lazily when stale (same check as main).
+        if post_key != dw.crt_key {
+            if let Some(key) = post_key {
+                let crt = dw.crt.get_or_insert_with(|| jetty_render::Crt::new(&dw.gpu.device, dw.gpu.format));
+                crt.prepare(&dw.gpu.device, key);
+            }
+            dw.crt_key = post_key;
+        }
+        let glitch_level = dw.glitch.intensity(std::time::Instant::now());
+        let post = crate::effects::frame_settings(&fx, glitch_level > 0.0);
+        let crt_active = post.is_some() && dw.crt.is_some();
         if crt_active
             && dw.offscreen.as_ref().is_none_or(|(t, _)| {
                 t.width() != dw.gpu.config.width || t.height() != dw.gpu.config.height
@@ -9680,7 +9717,7 @@ impl App {
         let quad = &mut dw.quad;
         let corner_mask = &dw.corner_mask;
         let focus_ring = dw.focus_ring.as_ref();
-        let crt = &dw.crt;
+        let crt = dw.crt.as_ref();
         let offscreen = dw.offscreen.as_ref();
         let image_layer = &mut dw.image_layer;
 
@@ -9909,41 +9946,29 @@ impl App {
                 &gpu.device, &gpu.queue, scene_view, width, height, r_tl, r_tr, r_bl, r_br,
             );
         }
-        // CRT post-pass: sample the offscreen scene onto the surface with the
-        // same parameters (and free-running clock) as the main window. The CRT
-        // uniform carries the corner radius, so corners stay rounded under CRT.
-        if let (true, Some((_, crt_src))) = (crt_active, offscreen) {
-            crt.apply(
-                &gpu.device,
-                &gpu.queue,
-                &view,
-                crt_src,
-                width,
-                height,
-                &jetty_render::CrtUniform {
-                    resolution: [width as f32, height as f32],
-                    curvature: fx.crt_curvature,
-                    scanline: fx.crt_scanline,
-                    mask: fx.crt_mask,
-                    bloom: fx.crt_bloom,
-                    chromatic: fx.crt_chromatic,
-                    vignette: fx.crt_vignette,
-                    tint: [
-                        fx.crt_scanline_tint[0],
-                        fx.crt_scanline_tint[1],
-                        fx.crt_scanline_tint[2],
-                        0.0,
-                    ],
+        // Post pass: sample the offscreen scene onto the surface with the same
+        // settings (and free-running clock) as the main window, through the same
+        // uniform builder. It carries the corner radius, so corners stay rounded;
+        // a detached window is free-floating (never top-flush), so all four
+        // corners round — same as its corner mask.
+        if let (true, Some(settings), Some(crt), Some((_, crt_src))) = (crt_active, post.as_ref(), crt, offscreen) {
+            let params = jetty_render::CrtParams::build(
+                settings,
+                &jetty_render::CrtFrame {
+                    width,
+                    height,
                     corner_radius: corner_radius_px,
-                    time: crt_time,
-                    flags: (if fx.crt_animate_roll { jetty_render::CRT_FLAG_ROLL } else { 0 })
-                        | (if fx.crt_flicker { jetty_render::CRT_FLAG_FLICKER } else { 0 })
-                        | (if fx.crt_jitter { jetty_render::CRT_FLAG_JITTER } else { 0 }),
-                    // A detached window is free-floating (never top-flush), so
-                    // all four corners round — same as its corner mask.
                     corner_radius_top: corner_radius_px,
+                    time: crt_time,
+                    bg: [theme.bg[0], theme.bg[1], theme.bg[2]],
+                    fg: theme.fg,
+                    premultiplied: gpu.premultiply_clear,
+                    srgb: gpu.format.is_srgb(),
+                    dpi_scale: scale,
+                    glitch: glitch_level,
                 },
             );
+            crt.apply(&gpu.device, &gpu.queue, &view, crt_src, &params);
         }
         frame.present();
         // The swapchain is healthy again: drop any retry schedule.
@@ -10955,9 +10980,9 @@ impl ApplicationHandler<AppEvent> for App {
             // (CRT-off) frames never use it.
             self.liquid = Some(jetty_render::LiquidDrop::new(&g.device, g.format));
             self.focus = Some(jetty_render::FocusPull::new(&g.device, g.format));
-            // CRT post-effect (passthrough for now). Same surface format as the
-            // rest of the pipeline so the blit-to-surface target matches.
-            self.crt = Some(jetty_render::Crt::new(&g.device, g.format));
+            // The CRT post pass is NOT built here: `sync_main_post` builds it
+            // (and only the pipeline variant the settings need) before the first
+            // frame that uses it — CRT off costs nothing at startup.
             // Inline-image (sixel) layer on the main device. Same surface format
             // as the scene target; zero cost until an image is visible.
             self.image_layer = Some(jetty_render::ImageLayer::new(&g.device, g.format));
@@ -13223,13 +13248,20 @@ impl ApplicationHandler<AppEvent> for App {
                 let top_flush = self.window_mode == WindowMode::Dropdown
                     && !self.main_fullscreen
                     && self.top_flush_pos;
+                // The post pass this frame runs (CRT, or a glitch burst over a
+                // CRT-off frame), with its pipeline variant built BEFORE the
+                // swapchain image is acquired — on a settings change only.
+                let glitch_level = self.glitch.intensity(std::time::Instant::now());
+                let post = crate::effects::frame_settings(&self.fx, glitch_level > 0.0);
+                self.sync_main_post();
                 // Lazily (re)allocate the offscreen scene texture when EITHER a
-                // Tier-B effect (Liquid/Focus) is actively summoning OR CRT is
-                // enabled — and the texture is missing or stale (wrong size).
-                // Otherwise it stays unallocated (the normal hot path renders
-                // straight to the surface). Done before the `as_ref()` captures
-                // below so `offscreen` picks up the freshly-sized texture.
-                let want_offscreen = self.fx.crt_enabled
+                // Tier-B effect (Liquid/Focus) is actively summoning OR a post
+                // pass (CRT / glitch burst) runs — and the texture is missing or
+                // stale (wrong size). Otherwise it stays unallocated (the normal
+                // hot path renders straight to the surface). Done before the
+                // `as_ref()` captures below so `offscreen` picks up the
+                // freshly-sized texture.
+                let want_offscreen = post.is_some()
                     || (self.summon_effect.is_tier_b() && self.summon_anim.is_some());
                 if want_offscreen {
                     if let Some((gw, gh)) = self.gpu.as_ref().map(|g| (g.config.width, g.config.height)) {
@@ -13268,8 +13300,9 @@ impl ApplicationHandler<AppEvent> for App {
                 let caret_fx = self.caret_fx.as_ref();
                 let crt = self.crt.as_ref();
                 let offscreen = self.offscreen.as_ref();
-                // CRT enable flag, captured before the mutable gpu/text borrow.
-                let crt_enabled = self.fx.crt_enabled;
+                // Post-pass inputs, captured before the mutable gpu/text borrow.
+                let crt_enabled = post.is_some();
+                let crt_time = self.crt_clock.elapsed().as_secs_f64();
                 let summon_effect = self.summon_effect;
                 // Summon progress: t in [0,1) drives a reveal pass this frame
                 // (`about_to_wait` pumps the next one); t>=1 ends the animation so
@@ -14004,79 +14037,40 @@ impl ApplicationHandler<AppEvent> for App {
                             self.slide_anim = None;
                         }
                     }
-                    // CRT post-pass: when CRT is active (enabled AND not bypassed by
-                    // an active Tier-B summon — Tier-B owns the offscreen this frame)
-                    // run the full CRT effect pipeline (curvature, scanlines, bloom,
-                    // chromatic aberration, vignette, roll/flicker/jitter, rounded
-                    // corners) sampling the offscreen onto the surface `view`. `crt`
-                    // and `offscreen` are both guaranteed present when `crt_active`
-                    // (built in `resumed`; offscreen alloc'd above when crt_enabled),
-                    // but guard defensively. src=offscreen, dst=surface — never
-                    // src==dst; the offscreen was cleared+painted this frame, so it
-                    // is never sampled uninitialized. This does NOT request a redraw,
-                    // so enabling CRT does not by itself break 0-CPU idle.
-                    if crt_active {
-                        if let (Some(crt), Some((_, off_view))) = (crt, offscreen) {
-                            crt.apply(
-                                &gpu.device,
-                                &gpu.queue,
-                                &view,
-                                off_view,
+                    // Post pass: when it is active (CRT on, or a glitch burst over
+                    // a CRT-off frame — AND not bypassed by an active Tier-B summon,
+                    // which owns the offscreen this frame) run the CRT pipeline
+                    // sampling the offscreen onto the surface `view`. `crt` exists
+                    // whenever a post pass is wanted (`sync_main_post` above) and
+                    // the offscreen was alloc'd above, but guard defensively.
+                    // src=offscreen, dst=surface — never src==dst; the offscreen was
+                    // cleared+painted this frame, so it is never sampled
+                    // uninitialized. This does NOT request a redraw: a static look
+                    // keeps 0-CPU idle. The pass owns the rounded corners (the
+                    // corner mask is skipped while it runs), fed the same
+                    // per-position radii the mask would use: the TOP corners stay
+                    // square when the window is top-flush (Dropdown), so the pass
+                    // never opens a transparent notch at the monitor's top edge.
+                    if let (true, Some(settings), Some(crt), Some((_, off_view))) =
+                        (crt_active, post.as_ref(), crt, offscreen)
+                    {
+                        let params = jetty_render::CrtParams::build(
+                            settings,
+                            &jetty_render::CrtFrame {
                                 width,
                                 height,
-                                &jetty_render::CrtUniform {
-                                    resolution: [width as f32, height as f32],
-                                    curvature: self.fx.crt_curvature,
-                                    scanline: self.fx.crt_scanline,
-                                    mask: self.fx.crt_mask,
-                                    bloom: self.fx.crt_bloom,
-                                    chromatic: self.fx.crt_chromatic,
-                                    vignette: self.fx.crt_vignette,
-                                    // Scanline tint rgb (+ pad). White => neutral.
-                                    tint: [
-                                        self.fx.crt_scanline_tint[0],
-                                        self.fx.crt_scanline_tint[1],
-                                        self.fx.crt_scanline_tint[2],
-                                        0.0,
-                                    ],
-                                    // The CRT pass owns the rounded corners (the
-                                    // corner mask is skipped while CRT is active),
-                                    // so feed it the same per-position radii the
-                                    // mask would use: bottom corners always round;
-                                    // the TOP corners stay square when the window
-                                    // is top-flush (Dropdown), so CRT-on never
-                                    // opens a transparent notch at the monitor's
-                                    // top edge.
-                                    corner_radius: corner_radius_px,
-                                    corner_radius_top: if top_flush {
-                                        0.0
-                                    } else {
-                                        corner_radius_px
-                                    },
-                                    // Animation (Task 10): free-running phase +
-                                    // roll/flicker/jitter bitfield. When all three
-                                    // toggles are off, flags == 0 and the shader
-                                    // output is identical to the static look (each
-                                    // animated term collapses to its static value),
-                                    // so static CRT is byte-identical here.
-                                    time: (self.crt_clock.elapsed().as_secs_f64()
-                                        % CRT_PHASE_WRAP) as f32,
-                                    flags: (if self.fx.crt_animate_roll {
-                                        jetty_render::CRT_FLAG_ROLL
-                                    } else {
-                                        0
-                                    }) | (if self.fx.crt_flicker {
-                                        jetty_render::CRT_FLAG_FLICKER
-                                    } else {
-                                        0
-                                    }) | (if self.fx.crt_jitter {
-                                        jetty_render::CRT_FLAG_JITTER
-                                    } else {
-                                        0
-                                    }),
-                                },
-                            );
-                        }
+                                corner_radius: corner_radius_px,
+                                corner_radius_top: if top_flush { 0.0 } else { corner_radius_px },
+                                time: crt_time,
+                                bg: [theme.bg[0], theme.bg[1], theme.bg[2]],
+                                fg: theme.fg,
+                                premultiplied: gpu.premultiply_clear,
+                                srgb: gpu.format.is_srgb(),
+                                dpi_scale: scale,
+                                glitch: glitch_level,
+                            },
+                        );
+                        crt.apply(&gpu.device, &gpu.queue, &view, off_view, &params);
                     }
                     // Input-latency SECONDARY stamp (JETTY_PERF_LOG only): captured
                     // AFTER the vsync-throttled acquire + GPU-pass submit, just before

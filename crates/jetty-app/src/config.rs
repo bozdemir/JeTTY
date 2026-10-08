@@ -596,18 +596,114 @@ pub struct EffectsConfig {
     #[serde(default = "ef_false")] pub caret_glow_enabled: bool,
     #[serde(default = "ef_flash_ms")] pub caret_flash_ms: f32,
     #[serde(default = "ef_white")] pub caret_flash_color: [f32; 3],
+    // ── Post-processing v2 ───────────────────────────────────────────────────
+    /// Bloom spread 0..1 (quarter-resolution blur width). The default keeps the
+    /// pre-v2 tight glow.
+    #[serde(default = "ef_bloom_radius")] pub crt_bloom_radius: f32,
+    /// Monochrome display color: "off" (full color), "amber", "green",
+    /// "white", "blue", "paper" (dark ink on light paper) or "custom"
+    /// (`crt_phosphor_color` on black).
+    #[serde(default)] pub crt_phosphor: PhosphorMode,
+    /// The `custom` phosphor color (rgb 0..1).
+    #[serde(default = "ef_phosphor_color")] pub crt_phosphor_color: [f32; 3],
+    /// How much of the text's own hue the phosphor keeps (0 = pure mono, 1 = full).
+    #[serde(default = "ef_zero")] pub crt_phosphor_hue: f32,
+    /// Film grain 0..1 (static unless `crt_grain_animate`).
+    #[serde(default = "ef_zero")] pub crt_grain: f32,
+    /// Re-roll the grain at ≤30 fps (an animation: it repaints continuously).
+    #[serde(default = "ef_false")] pub crt_grain_animate: bool,
+    /// 1-bit ordered dither (8×8 Bayer, DPI-scaled): the e-ink look.
+    #[serde(default = "ef_false")] pub crt_dither: bool,
+    /// A 200 ms color-split/tear glitch on a failed command (OSC 133) …
+    #[serde(default = "ef_false")] pub glitch_on_error: bool,
+    /// … and on the terminal bell. At most one per second.
+    #[serde(default = "ef_false")] pub glitch_on_bell: bool,
+    /// Keep CRT animations (roll/flicker/jitter, animated grain) running while
+    /// the window is unfocused. Default off: an unfocused window is static (0% CPU).
+    #[serde(default = "ef_false")] pub animate_unfocused: bool,
+}
+
+/// The CRT phosphor color mode (`crt_phosphor`). Unknown values fall back to
+/// "off" with a warning (the per-key config loader).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PhosphorMode {
+    #[default]
+    Off,
+    Amber,
+    Green,
+    White,
+    Blue,
+    Paper,
+    Custom,
+}
+
+impl PhosphorMode {
+    /// Every mode, in Settings/palette order.
+    pub const ALL: [PhosphorMode; 7] = [
+        PhosphorMode::Off,
+        PhosphorMode::Amber,
+        PhosphorMode::Green,
+        PhosphorMode::White,
+        PhosphorMode::Blue,
+        PhosphorMode::Paper,
+        PhosphorMode::Custom,
+    ];
+
+    /// The human-facing label.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            PhosphorMode::Off => "Off",
+            PhosphorMode::Amber => "Amber",
+            PhosphorMode::Green => "Green",
+            PhosphorMode::White => "White",
+            PhosphorMode::Blue => "Blue",
+            PhosphorMode::Paper => "Paper",
+            PhosphorMode::Custom => "Custom",
+        }
+    }
+
+    /// The mode named `name` (its config value, case-insensitive).
+    pub fn from_name(name: &str) -> Option<PhosphorMode> {
+        Self::ALL.into_iter().find(|m| m.display_name().eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// The next mode (Settings cycler).
+    pub fn next(self) -> PhosphorMode {
+        let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// `(ink, paper)` — the lit and the unlit color (sRGB 0..1) — or `None` for
+    /// full color. The phosphors glow on a near-black screen tinted like them;
+    /// paper is ink #101010 on #F2F2EC; custom glows `custom` on black.
+    pub fn colors(self, custom: [f32; 3]) -> Option<([f32; 3], [f32; 3])> {
+        let hex = |c: u32| [(c >> 16) as f32 / 255.0, ((c >> 8) & 0xff) as f32 / 255.0, (c & 0xff) as f32 / 255.0];
+        Some(match self {
+            PhosphorMode::Off => return None,
+            PhosphorMode::Amber => (hex(0xFFB000), hex(0x140C02)),
+            PhosphorMode::Green => (hex(0x33FF66), hex(0x03120A)),
+            PhosphorMode::White => (hex(0xE8EEF2), hex(0x0C0E10)),
+            PhosphorMode::Blue => (hex(0x5CB8FF), hex(0x030A16)),
+            PhosphorMode::Paper => (hex(0x101010), hex(0xF2F2EC)),
+            PhosphorMode::Custom => (custom.map(|v| finite_or(v, 1.0).clamp(0.0, 1.0)), [0.0; 3]),
+        })
+    }
 }
 
 fn ef_false() -> bool { false }
 fn ef_true() -> bool { true }
+fn ef_zero() -> f32 { 0.0 }
 fn ef_curvature() -> f32 { 0.0 }
 fn ef_scanline() -> f32 { 0.50 }
 fn ef_mask() -> f32 { 0.30 }
 fn ef_bloom() -> f32 { 0.40 }
+fn ef_bloom_radius() -> f32 { 0.0 }
 fn ef_chromatic() -> f32 { 0.20 }
 fn ef_vignette() -> f32 { 0.40 }
 fn ef_flash_ms() -> f32 { 130.0 }
 fn ef_white() -> [f32; 3] { [1.0, 1.0, 1.0] }
+fn ef_phosphor_color() -> [f32; 3] { [1.0, 0.69, 0.0] }
 
 impl Default for EffectsConfig {
     fn default() -> Self {
@@ -618,6 +714,10 @@ impl Default for EffectsConfig {
             crt_animate_roll: ef_false(), crt_flicker: ef_false(), crt_jitter: ef_false(),
             caret_flash_enabled: ef_true(), caret_glow_enabled: ef_false(),
             caret_flash_ms: ef_flash_ms(), caret_flash_color: ef_white(),
+            crt_bloom_radius: ef_bloom_radius(), crt_phosphor: PhosphorMode::Off,
+            crt_phosphor_color: ef_phosphor_color(), crt_phosphor_hue: ef_zero(),
+            crt_grain: ef_zero(), crt_grain_animate: ef_false(), crt_dither: ef_false(),
+            glitch_on_error: ef_false(), glitch_on_bell: ef_false(), animate_unfocused: ef_false(),
         }
     }
 }
@@ -645,20 +745,33 @@ impl EffectsConfig {
         for ch in &mut self.crt_scanline_tint { *ch = c01(*ch, 1.0); }
         for ch in &mut self.caret_flash_color { *ch = c01(*ch, 1.0); }
         self.caret_flash_ms = finite_or(self.caret_flash_ms, ef_flash_ms()).clamp(60.0, 400.0);
+        self.crt_bloom_radius = c01(self.crt_bloom_radius, ef_bloom_radius());
+        self.crt_phosphor_hue = c01(self.crt_phosphor_hue, 0.0);
+        self.crt_grain = c01(self.crt_grain, 0.0);
+        let pc = ef_phosphor_color();
+        for (ch, d) in self.crt_phosphor_color.iter_mut().zip(pc) { *ch = c01(*ch, d); }
         self
     }
 
-    /// True iff an *animated* CRT sub-effect is live: CRT enabled AND at least one
-    /// of roll/flicker/jitter toggled on. Static CRT (enabled, all three off) is
-    /// `false`, so it stays damage-driven (0-CPU idle). Single source of truth for
-    /// BOTH the `RedrawRequested` self-redraw guard AND the `about_to_wait`
-    /// `main_pending` Poll term — keeping them identical is what makes the loop pump
-    /// frames under `Poll` on macOS (where a `request_redraw` issued under `Wait` is
-    /// not delivered until input) yet fall back to `Wait`/idle the instant animation
-    /// is off. Lives on `EffectsConfig` (not `App`) so callers borrow only the `fx`
-    /// field, leaving `gpu`/`text` free to be mutably borrowed in the render path.
+    /// True iff an *animated* CRT sub-effect is live: CRT enabled AND roll,
+    /// flicker, jitter or animated grain on. Static CRT is `false`, so it stays
+    /// damage-driven (0-CPU idle). The single source of truth for the paced
+    /// animation wake in `about_to_wait` (≤30 fps timed wakes, never Poll; paused
+    /// while unfocused unless `animate_unfocused`). Lives on `EffectsConfig` (not
+    /// `App`) so callers borrow only the `fx` field, leaving `gpu`/`text` free to
+    /// be mutably borrowed in the render path.
     pub fn crt_anim_live(&self) -> bool {
-        self.crt_enabled && (self.crt_animate_roll || self.crt_flicker || self.crt_jitter)
+        self.crt_enabled
+            && (self.crt_animate_roll
+                || self.crt_flicker
+                || self.crt_jitter
+                || (self.crt_grain > 0.0 && self.crt_grain_animate))
+    }
+
+    /// Whether any event-glitch trigger is on (the glitch support is then kept
+    /// compiled, so a burst never builds a pipeline mid-frame).
+    pub fn glitch_enabled(&self) -> bool {
+        self.glitch_on_error || self.glitch_on_bell
     }
 }
 

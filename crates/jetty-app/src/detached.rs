@@ -291,9 +291,15 @@ pub(crate) struct DetachedWindow {
     /// device the first time it draws a ring — `None` while the key is "none".
     pub focus_ring: Option<jetty_render::FocusRing>,
     /// Per-window CRT post-pass. Per-window instance because `Crt` caches its
-    /// bind group keyed by the sampled src view — sharing the main window's
-    /// instance would thrash the cache between windows.
-    pub crt: jetty_render::Crt,
+    /// bind groups keyed by the sampled src view — sharing the main window's
+    /// instance would thrash the cache between windows. Built LAZILY (with only
+    /// the pipeline variant the settings need) by `App::sync_detached_post` the
+    /// first time CRT or a glitch trigger is on; `None` until then.
+    pub crt: Option<jetty_render::Crt>,
+    /// The variant `crt` was last prepared for (see `App::crt_key`).
+    pub crt_key: Option<jetty_render::CrtKey>,
+    /// This window's event glitch (a failed command in its tab).
+    pub glitch: crate::effects::Glitch,
     /// Per-window inline-image (sixel) layer on THIS window's device. Device-
     /// scoped GPU resources cannot be shared with the main window's layer
     /// (amendment R1), so each detached window owns one — same decoded RGBA from
@@ -514,11 +520,10 @@ impl DetachedWindow {
         // Quad layer — same call as both sites in `app.rs` (~1823, ~2735).
         let quad = QuadLayer::new(&gpu.device, gpu.format);
 
-        // Rounded-corner mask + CRT post-pass — same unconditional construction
-        // as the main window's in `App::resumed` (app.rs ~3523/~3537), but as
-        // PER-WINDOW instances (both cache uniforms/bind groups; see field docs).
+        // Rounded-corner mask — same unconditional construction as the main
+        // window's in `App::resumed`, but a PER-WINDOW instance (it caches its
+        // uniform/bind group). The CRT pass is built lazily (see the field doc).
         let corner_mask = jetty_render::CornerMask::new(&gpu.device, gpu.format);
-        let crt = jetty_render::Crt::new(&gpu.device, gpu.format);
         let image_layer = jetty_render::ImageLayer::new(&gpu.device, gpu.format);
 
         // Focus the new window so it receives keyboard events immediately.
@@ -535,7 +540,9 @@ impl DetachedWindow {
             offscreen: None,
             corner_mask,
             focus_ring: None,
-            crt,
+            crt: None,
+            crt_key: None,
+            glitch: crate::effects::Glitch::default(),
             image_layer,
             caret_anim: None,
             key_paint_due: None,
@@ -614,7 +621,9 @@ impl DetachedWindow {
         self.corner_mask = jetty_render::CornerMask::new(&gpu.device, gpu.format);
         // Device-scoped: rebuilt lazily on the next ring frame.
         self.focus_ring = None;
-        self.crt = jetty_render::Crt::new(&gpu.device, gpu.format);
+        // Rebuilt lazily on the new device by the next CRT frame's sync.
+        self.crt = None;
+        self.crt_key = None;
         self.image_layer = jetty_render::ImageLayer::new(&gpu.device, gpu.format);
         // Lazily re-allocated on the next CRT frame, on the new device.
         self.offscreen = None;
