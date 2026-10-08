@@ -214,6 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_font_db_costs(&text);
     bench_frames(&device, &queue, format, font_size)?;
     bench_post_pass(&device, &queue, format, font_size)?;
+    bench_backdrop(&adapter)?;
     Ok(())
 }
 
@@ -537,6 +538,14 @@ fn bench_scene_passes(
     for k in 0..rows * 2 {
         term.feed(&numbered_line(k));
     }
+    // The app's Pass 1 draws the backdrop first; mirror it in the 1-pass variant
+    // when JETTY_BENCH_BACKDROP names a mode/pattern (unset = none = today).
+    let backdrop = std::env::var("JETTY_BENCH_BACKDROP").ok().and_then(|spec| {
+        let s = backdrop_settings(&spec)?;
+        let mut bd = jetty_render::Backdrop::new(device, format);
+        let frame = backdrop_frame(width, height, None);
+        bd.prepare(device, queue, &s, term.theme(), &frame).then_some(bd)
+    });
     let (mut two, mut one) = (Vec::new(), Vec::new());
     for k in 0..600usize {
         if k % 100 == 99 {
@@ -572,6 +581,9 @@ fn bench_scene_passes(
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
+                if let Some(bd) = &backdrop {
+                    bd.draw(&mut pass);
+                }
                 quad.draw_uploaded(&mut pass, n);
                 if ready {
                     text.draw_grid(&mut pass);
@@ -585,10 +597,229 @@ fn bench_scene_passes(
     }
     let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
     println!(
-        "scene         {cols}x{rows} typing, bg quads + glyphs: 2 passes/submits cpu {:.3} ms | 1 pass/submit cpu {:.3} ms",
+        "scene         {cols}x{rows} typing, bg quads + glyphs: 2 passes/submits cpu {:.3} ms | 1 pass/submit cpu {:.3} ms{}",
         mean(&two),
-        mean(&one)
+        mean(&one),
+        if backdrop.is_some() { " (1-pass incl. backdrop)" } else { "" }
     );
+    Ok(())
+}
+
+/// `[backdrop]` settings for a bench spec: a mode (`theme`, `gradient`,
+/// `image`) or a pattern name (`stars`, `aurora`, `grid`, `synthwave`).
+fn backdrop_settings(spec: &str) -> Option<jetty_render::BackdropSettings> {
+    use jetty_render::{BackdropMode, BackdropPattern, BackdropSettings};
+    let mut s = BackdropSettings::default();
+    match spec {
+        "stars" | "aurora" | "grid" | "synthwave" => {
+            s.mode = BackdropMode::Pattern;
+            s.pattern = BackdropPattern::parse(spec);
+        }
+        other => s.mode = BackdropMode::parse(other),
+    }
+    (!s.is_off()).then_some(s)
+}
+
+fn backdrop_frame(
+    width: u32,
+    height: u32,
+    image: Option<&std::sync::Arc<jetty_render::GpuImage>>,
+) -> jetty_render::BackdropFrame<'_> {
+    jetty_render::BackdropFrame {
+        width,
+        height,
+        slide_y: 0.0,
+        scroll_px: 0.0,
+        dpi: 1.0,
+        premultiply: true,
+        time: 0.0,
+        image,
+    }
+}
+
+/// GPU cost of the backdrop layer (visuals v2): ONE render pass of [clear +
+/// backdrop] against [clear] alone, per variant, at 1920×1200 and 2560×1440.
+/// Timed with GPU timestamp queries when the adapter has them (the pass's own
+/// execution time), else with the wall clock around submit + wait. The animated
+/// aurora's half-res re-bake (a separate submit at ≤ 30 fps) is timed on the
+/// wall clock. Runs on its own device so the main bench's device is untouched.
+fn bench_backdrop(adapter: &wgpu::Adapter) -> Result<(), Box<dyn std::error::Error>> {
+    use jetty_render::{BackdropFit, BackdropMode, BackdropSettings};
+    let ts = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("jetty-bench-backdrop"),
+        required_features: if ts { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() },
+        required_limits: wgpu::Limits::default(),
+        memory_hints: wgpu::MemoryHints::default(),
+        trace: wgpu::Trace::Off,
+        ..Default::default()
+    }))?;
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let theme = jetty_core::theme_at(jetty_core::theme_index("tokyo_night").unwrap_or(0));
+    // A synthetic photo-sized image (deterministic noise), decoded once.
+    let (iw, ih) = (2560u32, 1440u32);
+    let rgba: Vec<u8> = (0..iw * ih)
+        .flat_map(|i| {
+            let (x, y) = (i % iw, i / iw);
+            let v = ((x ^ y).wrapping_mul(2_654_435_761) >> 24) as u8;
+            [v, v / 2 + (y / 6) as u8 / 2, 255 - v, 255]
+        })
+        .collect();
+    let raw = || jetty_render::backdrop_image::RawImage { w: iw, h: ih, rgba: rgba.clone() };
+    let sharp = std::sync::Arc::new(
+        jetty_render::GpuImage::upload(&device, &queue, &jetty_render::backdrop_image::prepare(raw(), iw, ih, 0.0))
+            .ok_or("image upload")?,
+    );
+    let frosted = std::sync::Arc::new(
+        jetty_render::GpuImage::upload(&device, &queue, &jetty_render::backdrop_image::prepare(raw(), iw, ih, 0.5))
+            .ok_or("image upload")?,
+    );
+    let mode = |m: BackdropMode| BackdropSettings { mode: m, ..BackdropSettings::default() };
+    let variants: Vec<(&str, Option<BackdropSettings>, Option<&std::sync::Arc<jetty_render::GpuImage>>)> = vec![
+        ("clear only", None, None),
+        ("theme", Some(mode(BackdropMode::Theme)), None),
+        ("gradient", backdrop_settings("gradient"), None),
+        ("image cover", Some(mode(BackdropMode::Image)), Some(&sharp)),
+        (
+            "image tile",
+            Some(BackdropSettings { fit: BackdropFit::Tile, ..mode(BackdropMode::Image) }),
+            Some(&sharp),
+        ),
+        ("image frosted", Some(BackdropSettings { blur: 0.5, ..mode(BackdropMode::Image) }), Some(&frosted)),
+        ("stars", backdrop_settings("stars"), None),
+        ("grid", backdrop_settings("grid"), None),
+        ("synthwave", backdrop_settings("synthwave"), None),
+        ("aurora", backdrop_settings("aurora"), None),
+    ];
+    let n = 200usize;
+    let period = queue.get_timestamp_period() as f64;
+    println!(
+        "backdrop      GPU per frame, one pass [clear + backdrop], n={n}, {}",
+        if ts { "timestamp queries" } else { "wall clock (no timestamp queries)" }
+    );
+    for &(w, h) in &[(1920u32, 1200u32), (2560, 1440)] {
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bench-backdrop-tex"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let qs = ts.then(|| {
+            device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("bench-backdrop-ts"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            })
+        });
+        let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bench-backdrop-resolve"),
+            size: 16,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bench-backdrop-readback"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut baseline = 0.0f64;
+        for (name, settings, image) in &variants {
+            let mut bd = settings.as_ref().map(|_| jetty_render::Backdrop::new(&device, format));
+            let frame = backdrop_frame(w, h, *image);
+            let mut samples = Vec::with_capacity(n);
+            for k in 0..n + 5 {
+                if let (Some(bd), Some(s)) = (bd.as_mut(), settings.as_ref()) {
+                    bd.prepare(&device, &queue, s, &theme, &frame);
+                }
+                let t = Instant::now();
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: None,
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: qs.as_ref().map(|q| wgpu::RenderPassTimestampWrites {
+                            query_set: q,
+                            beginning_of_pass_write_index: Some(0),
+                            end_of_pass_write_index: Some(1),
+                        }),
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    if let Some(bd) = &bd {
+                        bd.draw(&mut pass);
+                    }
+                }
+                if let Some(q) = &qs {
+                    encoder.resolve_query_set(q, 0..2, &resolve, 0);
+                    encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, 16);
+                }
+                queue.submit(Some(encoder.finish()));
+                device.poll(wgpu::PollType::wait_indefinitely())?;
+                let wall = t.elapsed().as_secs_f64() * 1000.0;
+                let gpu_ms = if qs.is_some() {
+                    let slice = readback.slice(..);
+                    slice.map_async(wgpu::MapMode::Read, |_| {});
+                    device.poll(wgpu::PollType::wait_indefinitely())?;
+                    let ticks = {
+                        let data = slice.get_mapped_range();
+                        let a = u64::from_le_bytes(data[0..8].try_into()?);
+                        let b = u64::from_le_bytes(data[8..16].try_into()?);
+                        b.saturating_sub(a)
+                    };
+                    readback.unmap();
+                    ticks as f64 * period / 1.0e6
+                } else {
+                    wall
+                };
+                if k >= 5 {
+                    samples.push(gpu_ms as f32);
+                }
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let med = percentile(&samples, 50.0) as f64;
+            if settings.is_none() {
+                baseline = med;
+            }
+            println!(
+                "  {w}x{h} {name:<14} median {med:6.3} ms | p90 {:6.3} ms | +{:6.3} ms over the clear",
+                percentile(&samples, 90.0),
+                (med - baseline).max(0.0)
+            );
+        }
+        // The animated aurora's re-bake: the half-res noise pass alone.
+        let s = BackdropSettings { animate: true, ..backdrop_settings("aurora").ok_or("aurora")? };
+        let mut bd = jetty_render::Backdrop::new(&device, format);
+        let mut bake = Vec::with_capacity(60);
+        for k in 0..65 {
+            let frame = jetty_render::BackdropFrame { time: k as f32 * 0.05, ..backdrop_frame(w, h, None) };
+            let t = Instant::now();
+            bd.prepare(&device, &queue, &s, &theme, &frame);
+            device.poll(wgpu::PollType::wait_indefinitely())?;
+            if k >= 5 {
+                bake.push(t.elapsed().as_secs_f32() * 1000.0);
+            }
+        }
+        bake.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        println!(
+            "  {w}x{h} aurora re-bake (animated, ≤30/s, half-res, wall clock) median {:6.3} ms",
+            percentile(&bake, 50.0)
+        );
+    }
     Ok(())
 }
 

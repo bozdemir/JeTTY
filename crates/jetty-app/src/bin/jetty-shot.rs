@@ -165,6 +165,17 @@
 ///                    the tear pattern.
 ///   JETTY_SHOT_CRT_BENCH=<n> — time the post pass: pipeline build once, then n
 ///                    passes (GPU-synchronized) → ms/pass on stderr.
+///   JETTY_SHOT_BACKDROP — draw the `[backdrop]` layer (unset = none, today's
+///                    shots unchanged): `config` (the `[backdrop]` table of the
+///                    config in JETTY_CONFIG_DIR), a mode (`theme`, `gradient`,
+///                    `image`, `pattern`, `none`) or a pattern name (`stars`,
+///                    `aurora`, `grid`, `synthwave`). Overrides, each optional:
+///                    JETTY_SHOT_BACKDROP_{COLORS="#a,#b",ANGLE,SHAPE,STRENGTH,
+///                    VIGNETTE,GRAIN,IMAGE=path,FIT,DIM,BLUR,PATTERN}; _TIME=s
+///                    animates to that phase; _SCROLL=px turns on parallax at that
+///                    scrollback position; _SLIDE=px offsets it like the dropdown
+///                    slide. The image is decoded synchronously (the app uses a
+///                    worker thread) and scaled to cover the shot.
 ///
 /// If the terminal bg alpha < 255, the rendered image is composited over a
 /// checkerboard (alternating 16px squares of [40,40,40] and [90,90,90]) so
@@ -173,6 +184,100 @@ use std::fs::File;
 use std::io::BufWriter;
 
 use jetty_render::{QuadLayer, TextLayer};
+
+/// The `JETTY_SHOT_BACKDROP` layer, built and prepared for one frame (see the
+/// header doc), or `None` when the hook is unset / "none".
+#[allow(clippy::too_many_arguments)]
+fn shot_backdrop(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    dpi: f32,
+    theme: &jetty_core::Theme,
+) -> Option<jetty_render::Backdrop> {
+    use jetty_render::{BackdropFit, BackdropMode, BackdropPattern, BackdropSettings, BackdropShape};
+    let spec = std::env::var("JETTY_SHOT_BACKDROP").ok().filter(|v| !v.is_empty())?;
+    let env = |k: &str| std::env::var(format!("JETTY_SHOT_BACKDROP_{k}")).ok().filter(|v| !v.is_empty());
+    let envf = |k: &str| env(k).and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite());
+    let (mut s, mut image) = if spec == "config" {
+        jetty_app::configured_backdrop()
+    } else {
+        (BackdropSettings::default(), None)
+    };
+    match spec.as_str() {
+        "config" => {}
+        "stars" | "aurora" | "grid" | "synthwave" => {
+            s.mode = BackdropMode::Pattern;
+            s.pattern = BackdropPattern::parse(&spec);
+        }
+        other => s.mode = BackdropMode::parse(other),
+    }
+    if let Some(v) = env("COLORS") {
+        s.colors = v.split(',').filter_map(jetty_render::parse_hex_color).collect();
+    }
+    if let Some(v) = env("SHAPE") {
+        s.shape = BackdropShape::parse(&v);
+    }
+    if let Some(v) = env("FIT") {
+        s.fit = BackdropFit::parse(&v);
+    }
+    if let Some(v) = env("PATTERN") {
+        s.pattern = BackdropPattern::parse(&v);
+    }
+    if let Some(v) = env("IMAGE") {
+        image = Some(v.into());
+    }
+    let c01 = |v: f32| v.clamp(0.0, 1.0);
+    s.angle = envf("ANGLE").unwrap_or(s.angle);
+    s.strength = envf("STRENGTH").map(c01).unwrap_or(s.strength);
+    s.vignette = envf("VIGNETTE").map(c01).unwrap_or(s.vignette);
+    s.grain = envf("GRAIN").map(c01).unwrap_or(s.grain);
+    s.dim = envf("DIM").map(c01).unwrap_or(s.dim);
+    s.blur = envf("BLUR").map(c01).unwrap_or(s.blur);
+    let time = envf("TIME");
+    s.animate |= time.is_some();
+    let scroll = envf("SCROLL");
+    s.parallax |= scroll.is_some();
+    if s.is_off() {
+        return None;
+    }
+    eprintln!("jetty-shot: backdrop {s:?}");
+    let gpu_image = match (s.mode, image) {
+        (BackdropMode::Image, Some(path)) => {
+            let t = std::time::Instant::now();
+            match jetty_render::backdrop_image::load(&path, width, height, s.blur) {
+                Ok(img) => {
+                    eprintln!(
+                        "jetty-shot: backdrop image {} decoded in {:.1} ms: {img:?}",
+                        path.display(),
+                        t.elapsed().as_secs_f64() * 1000.0
+                    );
+                    jetty_render::GpuImage::upload(device, queue, &img).map(std::sync::Arc::new)
+                }
+                Err(e) => {
+                    eprintln!("jetty-shot: backdrop image {}: {e} — showing the gradient", path.display());
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let mut bd = jetty_render::Backdrop::new(device, format);
+    let frame = jetty_render::BackdropFrame {
+        width,
+        height,
+        slide_y: envf("SLIDE").unwrap_or(0.0),
+        scroll_px: scroll.unwrap_or(0.0),
+        dpi,
+        // The shot clears premultiplied (the harness composites itself).
+        premultiply: true,
+        time: time.unwrap_or(0.0),
+        image: gpu_image.as_ref(),
+    };
+    bd.prepare(device, queue, &s, theme, &frame).then_some(bd)
+}
 
 /// A boolean shot flag is ON only when set to a non-empty value other than "0",
 /// matching the JETTY_SHOT_DETACHED / JETTY_SHOT_PANEL_* semantics so a harness
@@ -878,6 +983,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut quad = QuadLayer::new(&device, format);
     let mut image_layer = jetty_render::ImageLayer::new(&device, format);
+    // The backdrop (JETTY_SHOT_BACKDROP), drawn first in Pass 1 like the app.
+    let backdrop = shot_backdrop(&device, &queue, format, width, height, dpi, terminal.theme());
 
     // --- Pass 1: clear to theme bg + paint per-cell background quads UNDER text ---
     let (cell_w, cell_h) = text.cell_size();
@@ -965,6 +1072,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some(bd) = &backdrop {
+                bd.draw(&mut pass);
+            }
             quad.draw_uploaded(&mut pass, bg_count);
             text.draw_grid(&mut pass);
         }
