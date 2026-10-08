@@ -39,6 +39,18 @@ impl CursorShapePref {
         }
     }
 
+    /// The next shape in the palette's cycle (wraps).
+    pub fn next(self) -> Self {
+        use CursorShapePref::*;
+        match self {
+            Block => Beam,
+            Beam => Underline,
+            Underline => DoubleUnderline,
+            DoubleUnderline => ThickUnderline,
+            ThickUnderline => Block,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             CursorShapePref::Block => "block",
@@ -86,6 +98,14 @@ impl GuideMode {
             "shell" | "prompt" => GuideMode::Shell,
             "always" | "on" | "true" => GuideMode::Always,
             _ => GuideMode::Off,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            GuideMode::Off => GuideMode::Shell,
+            GuideMode::Shell => GuideMode::Always,
+            GuideMode::Always => GuideMode::Off,
         }
     }
 
@@ -218,6 +238,14 @@ impl ReduceMotion {
         }
     }
 
+    pub fn next(self) -> Self {
+        match self {
+            ReduceMotion::Off => ReduceMotion::On,
+            ReduceMotion::On => ReduceMotion::System,
+            ReduceMotion::System => ReduceMotion::Off,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             ReduceMotion::Off => "off",
@@ -253,6 +281,14 @@ impl VisualBell {
             "flash" | "on" | "true" | "visual" => VisualBell::Flash,
             "rim" | "border" | "edge" => VisualBell::Rim,
             _ => VisualBell::Off,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            VisualBell::Off => VisualBell::Flash,
+            VisualBell::Flash => VisualBell::Rim,
+            VisualBell::Rim => VisualBell::Off,
         }
     }
 
@@ -304,6 +340,14 @@ impl CommandPulse {
             "failures" | "failure" | "errors" | "error" | "on" | "true" => CommandPulse::Failures,
             "all" | "always" => CommandPulse::All,
             _ => CommandPulse::Off,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            CommandPulse::Off => CommandPulse::Failures,
+            CommandPulse::Failures => CommandPulse::All,
+            CommandPulse::All => CommandPulse::Off,
         }
     }
 
@@ -644,6 +688,19 @@ mod tests {
         assert!(post_settings(&glitchy, true, false).is_some());
         assert_eq!(post_settings(&glitchy, true, true), None);
         assert_eq!(post_key(&glitchy, true), None);
+    }
+
+    #[test]
+    fn palette_cycles_visit_every_value_and_wrap() {
+        let mut s = CursorShapePref::Block;
+        for _ in 0..5 {
+            s = s.next();
+        }
+        assert_eq!(s, CursorShapePref::Block, "five shapes");
+        assert_eq!(GuideMode::Always.next(), GuideMode::Off);
+        assert_eq!(ReduceMotion::On.next(), ReduceMotion::System);
+        assert_eq!(VisualBell::Rim.next(), VisualBell::Off);
+        assert_eq!(CommandPulse::Failures.next(), CommandPulse::All);
     }
 
     #[test]

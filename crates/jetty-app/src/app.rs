@@ -5572,6 +5572,42 @@ impl App {
                 self.persist();
                 self.redraw_main_and_detached();
             }
+            // Cursor & motion: each step says where it landed (a pill).
+            C::CycleCursorShape => {
+                let next = crate::motion::CursorShapePref::parse(&self.cursor_cfg.shape).next();
+                let cfg = crate::config::CursorConfig { shape: next.as_str().to_string(), ..self.cursor_cfg.clone() };
+                self.set_cursor_config(&cfg);
+                self.show_notice_pill(format!("Cursor shape: {}", next.as_str().replace('_', " ")), 1800);
+            }
+            C::ToggleCursorTrail => {
+                let cfg = crate::config::CursorConfig { trail: !self.cursor_cfg.trail, ..self.cursor_cfg.clone() };
+                self.set_cursor_config(&cfg);
+                let state = if self.cursor_cfg.trail { "on" } else { "off" };
+                self.show_notice_pill(format!("Cursor trail: {state}"), 1800);
+            }
+            C::CycleCursorGuide => {
+                let next = crate::motion::GuideMode::parse(&self.cursor_cfg.guide).next();
+                let cfg = crate::config::CursorConfig { guide: next.as_str().to_string(), ..self.cursor_cfg.clone() };
+                self.set_cursor_config(&cfg);
+                self.show_notice_pill(format!("Cursor guide: {}", next.as_str()), 1800);
+            }
+            C::CycleReduceMotion => {
+                let next = self.reduce_motion.next();
+                self.set_reduce_motion(next);
+                self.show_notice_pill(format!("Reduce motion: {}", next.as_str()), 1800);
+            }
+            C::CycleVisualBell => {
+                self.visual_bell = self.visual_bell.next();
+                self.persist();
+                self.mark_dirty_all();
+                self.show_notice_pill(format!("Visual bell: {}", self.visual_bell.as_str()), 1800);
+            }
+            C::CycleCommandPulse => {
+                self.command_pulse = self.command_pulse.next();
+                self.persist();
+                self.mark_dirty_all();
+                self.show_notice_pill(format!("Command pulse: {}", self.command_pulse.as_str()), 1800);
+            }
             C::TogglePerfHud => self.toggle_perf_hud(),
             C::ToggleBuiltinGlyphs => {
                 self.set_glyph_options(!self.builtin_glyphs, self.color_emoji);
@@ -14292,8 +14328,10 @@ impl ApplicationHandler<AppEvent> for App {
                     };
                 // Theme accent for the reveal glow (captured before the mutable
                 // gpu/text/quad borrow below).
+                // UiPalette's accent: a theme file's `accent` applies, and a
+                // faint palette[4] falls back to a readable one.
                 let summon_accent: [f32; 3] = {
-                    let a = self.current_theme().palette[4];
+                    let a = jetty_render::UiPalette::cached(&theme).accent;
                     [a[0] as f32 / 255.0, a[1] as f32 / 255.0, a[2] as f32 / 255.0]
                 };
                 // Caret flash+pulse progress: t∈[0,1]. Captured and expired before

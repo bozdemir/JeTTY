@@ -35,6 +35,12 @@ pub enum PaletteCmd {
     ToggleCrtJitter,
     ToggleCaretFlash,
     ToggleCaretGlow,
+    CycleCursorShape,
+    ToggleCursorTrail,
+    CycleCursorGuide,
+    CycleReduceMotion,
+    CycleVisualBell,
+    CycleCommandPulse,
     TogglePerfHud,
     ToggleBuiltinGlyphs,
     ToggleColorEmoji,
@@ -222,7 +228,7 @@ pub fn build_registry(
     tabs: &[(u64, String)],
     detached: &[(u64, String)],
 ) -> Vec<PaletteEntry> {
-    let statics: [(&str, &str, PaletteCmd); 36] = [
+    let statics: [(&str, &str, PaletteCmd); 42] = [
         ("New tab", "create open window shell", PaletteCmd::NewTab),
         ("Close tab", "kill remove", PaletteCmd::CloseTab),
         ("Next tab", "cycle switch forward", PaletteCmd::NextTab),
@@ -240,6 +246,12 @@ pub fn build_registry(
         ("Toggle CRT jitter", "retro animate", PaletteCmd::ToggleCrtJitter),
         ("Toggle caret flash", "cursor blink", PaletteCmd::ToggleCaretFlash),
         ("Toggle caret glow", "cursor bloom", PaletteCmd::ToggleCaretGlow),
+        ("Cursor shape: next", "caret block beam bar underline double thick vintage", PaletteCmd::CycleCursorShape),
+        ("Toggle cursor trail", "caret smear animation motion jump", PaletteCmd::ToggleCursorTrail),
+        ("Cursor guide: next", "caret line row highlight band", PaletteCmd::CycleCursorGuide),
+        ("Reduce motion: next", "animation accessibility calm off on system", PaletteCmd::CycleReduceMotion),
+        ("Visual bell: next", "bell beep flash rim alert", PaletteCmd::CycleVisualBell),
+        ("Command pulse: next", "osc133 failed command finished status rim", PaletteCmd::CycleCommandPulse),
         ("Toggle performance HUD", "fps stats perf meter", PaletteCmd::TogglePerfHud),
         (
             "Toggle built-in box & braille glyphs",
@@ -415,6 +427,23 @@ mod tests {
         assert!(!r.iter().any(|e| e.cmd == PaletteCmd::SelectTab(1)));
         let r = build_registry(&themes, &tabs, &[(12, "Tab 3".to_string())]);
         assert!(r.iter().any(|e| e.cmd == PaletteCmd::Reattach(12) && e.title == "Reattach: Tab 3"));
+    }
+
+    #[test]
+    fn registry_has_the_cursor_and_motion_commands() {
+        let r = reg();
+        for cmd in [
+            PaletteCmd::CycleCursorShape,
+            PaletteCmd::ToggleCursorTrail,
+            PaletteCmd::CycleCursorGuide,
+            PaletteCmd::CycleReduceMotion,
+            PaletteCmd::CycleVisualBell,
+            PaletteCmd::CycleCommandPulse,
+        ] {
+            assert!(r.iter().any(|e| e.cmd == cmd), "{cmd:?}");
+        }
+        assert_eq!(filter(&r, "reduce motion")[0].cmd, PaletteCmd::CycleReduceMotion);
+        assert_eq!(filter(&r, "cursor trail")[0].cmd, PaletteCmd::ToggleCursorTrail);
     }
 
     #[test]
