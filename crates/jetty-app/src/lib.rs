@@ -2,6 +2,7 @@ mod app;
 /// System light/dark preference, reduced motion and accent (freedesktop
 /// settings portal on Linux/BSD; winit's system theme elsewhere).
 mod appearance;
+mod backdrop;
 /// Persisted settings. Public so the `jetty-shot` self-test can render the
 /// Settings panel from a real config file.
 pub mod config;
@@ -96,6 +97,14 @@ pub fn default_grid_padding() -> (f32, f32) {
 /// The `scrollbar` config key's modes and visibility rule (public for
 /// `jetty-shot`'s JETTY_SHOT_SCROLLBAR).
 pub use config::ScrollbarMode;
+
+/// The `[backdrop]` table of the config JeTTY would load (`$JETTY_CONFIG_DIR`
+/// honored), parsed, with its image file resolved — for `jetty-shot`'s
+/// `JETTY_SHOT_BACKDROP=config`, so a shot shows exactly the configured look.
+pub fn configured_backdrop() -> (jetty_render::BackdropSettings, Option<std::path::PathBuf>) {
+    let b = config::Config::load().cfg.backdrop;
+    (b.settings(), b.image_path(&config::Config::dir()))
+}
 
 /// Unix-socket path used for single-instance IPC. Any running primary Jetty
 /// instance listens here; secondary invocations (including `jetty --toggle`)

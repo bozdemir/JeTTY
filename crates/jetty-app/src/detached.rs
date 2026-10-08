@@ -308,6 +308,10 @@ pub(crate) struct DetachedWindow {
     /// (amendment R1), so each detached window owns one — same decoded RGBA from
     /// jetty-core, uploaded to this device on demand.
     pub image_layer: jetty_render::ImageLayer,
+    /// This window's backdrop layer (visuals v2): `None` while `[backdrop]` is
+    /// "none" (nothing built), created on the first frame that draws it. The
+    /// settings and the image texture are the App's, shared on this device.
+    pub backdrop: Option<jetty_render::Backdrop>,
     /// Caret flash burst clock for keystrokes typed in THIS window (mirrors
     /// `App::caret_anim` for the main window). `None` = no burst live.
     pub caret_anim: Option<std::time::Instant>,
@@ -548,6 +552,7 @@ impl DetachedWindow {
             glitch: crate::effects::Glitch::default(),
             anim_requested_at: None,
             image_layer,
+            backdrop: None,
             caret_anim: None,
             key_paint_due: None,
             ov: crate::overlays::Overlays::default(),
@@ -631,6 +636,8 @@ impl DetachedWindow {
         self.image_layer = jetty_render::ImageLayer::new(&gpu.device, gpu.format);
         // Lazily re-allocated on the next CRT frame, on the new device.
         self.offscreen = None;
+        // Rebuilt on the next frame that draws a backdrop, on the new device.
+        self.backdrop = None;
         self.acquire_retry = None;
         self.gpu = gpu;
         true

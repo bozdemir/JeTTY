@@ -29,6 +29,9 @@ pub enum AppEvent {
     /// was read or changed — from the settings-portal watcher thread
     /// (`appearance.rs`), which blocks on the bus in between.
     Appearance(crate::appearance::Appearance),
+    /// The backdrop image decode (worker thread) finished: its request
+    /// generation and the decoded image or a short reason it failed.
+    BackdropImage(u64, Result<Arc<jetty_render::backdrop_image::DecodedImage>, String>),
 }
 
 /// Window-summon reveal effect, selectable in Settings and persisted in config.
@@ -1015,6 +1018,13 @@ pub struct App {
     /// startup; written back to `Config.effects` by `persist()`. UI/renderer tasks
     /// read and write fields here; the next `persist()` call flushes them to disk.
     fx: crate::config::EffectsConfig,
+    /// `[backdrop]` (visuals v2): the config mirror + parsed settings, the image
+    /// texture every window on the main device shares, and the opt-in
+    /// animation's 30 fps pacing. See `crate::backdrop`.
+    backdrop: crate::backdrop::BackdropState,
+    /// The main window's backdrop layer: `None` while the mode is "none" (no
+    /// GPU object exists), created on the first frame that draws it.
+    backdrop_gpu: Option<jetty_render::Backdrop>,
     // ── SSH-ready & yours (v0.16) ──────────────────────────────────────────────
     /// Allow OSC 52 clipboard PASTE (remote READ of the local clipboard). Mirrors
     /// `Config.osc52_allow_paste`; default OFF (secure). Applied to a tab's terminal
@@ -1798,6 +1808,8 @@ impl App {
             settings_geom: None,
             settings_mods: winit::keyboard::ModifiersState::empty(),
             fx: crate::config::EffectsConfig::default(),
+            backdrop: crate::backdrop::BackdropState::new(crate::config::BackdropConfig::default()),
+            backdrop_gpu: None,
             // v0.16 — overridden by config below; safe defaults here.
             osc52_allow_paste: false,
             hot_reload: true,
@@ -2010,6 +2022,9 @@ impl App {
         app.window_border = crate::tabmeta::WindowBorder::from_config(&cfg.window_border);
         app.tab_title_mode = crate::tabmeta::TabTitleMode::from_config(&cfg.tab_title);
         app.fx = cfg.effects.clone();
+        // The backdrop: settings only — an image decode starts in `resumed`,
+        // once the window (and so the monitor size it is scaled to) exists.
+        app.backdrop.set_config(cfg.backdrop.clone());
         // Run & Notify: mirror the persisted keys (min-seconds re-clamped for
         // belt-and-suspenders; Config::load's sanitize already applied the range).
         app.notify_on_finish = cfg.notify_on_command_finish;
@@ -2219,6 +2234,7 @@ impl App {
             window_border: self.window_border.to_config().to_string(),
             tab_title: self.tab_title_mode.to_config().to_string(),
             effects: self.fx.clone(),
+            backdrop: self.backdrop.cfg.clone(),
             notify_on_command_finish: self.notify_on_finish,
             notify_min_seconds: self.notify_min_seconds,
             notify_only_on_failure: self.notify_only_on_failure,
@@ -2871,6 +2887,12 @@ impl App {
                 dw.request_paint();
             }
         }
+        // Backdrop: new settings repaint every window; a new image file (or
+        // blur) starts a decode, leaving image mode drops the texture.
+        if self.backdrop.set_config(cfg.backdrop.clone()) {
+            self.sync_backdrop_image();
+            self.mark_dirty_all();
+        }
         // Run & Notify mirrors.
         self.notify_on_finish = cfg.notify_on_command_finish;
         self.notify_min_seconds = cfg.notify_min_seconds.clamp(1, 86_400);
@@ -2988,6 +3010,27 @@ impl App {
         let crt = self.crt.get_or_insert_with(|| jetty_render::Crt::new(&gpu.device, gpu.format));
         crt.prepare(&gpu.device, key);
         self.crt_key = Some(key);
+    }
+
+    /// Bring the backdrop image in line with `[backdrop]`: start a decode on a
+    /// worker thread for a newly named file (scaled to cover the window's
+    /// monitor), drop the texture when no image is wanted. Cheap no-op when
+    /// nothing changed — called on startup (`resumed`), reload, a settings
+    /// change and a GPU rebuild.
+    fn sync_backdrop_image(&mut self) {
+        let window = self.window.clone();
+        let max = move || {
+            window
+                .as_ref()
+                .and_then(|w| w.current_monitor())
+                .map(|m| (m.size().width, m.size().height))
+                .filter(|&(w, h)| w > 0 && h > 0)
+                .unwrap_or(crate::backdrop::FALLBACK_MONITOR)
+        };
+        let proxy = self.proxy.clone();
+        self.backdrop.sync_image(&crate::config::Config::dir(), max, |gen, key| {
+            crate::backdrop::spawn_decode(proxy, gen, key)
+        });
     }
 
     /// Allocate a surface-sized offscreen color texture (same format as the
@@ -8025,11 +8068,16 @@ impl App {
         self.caret_fx = Some(jetty_render::CaretFx::new(device, format));
         // Lazily re-allocated on the next frame that needs it, on the new device.
         self.offscreen = None;
+        // The backdrop layer and its image texture lived on the lost device: the
+        // layer is rebuilt on the next frame, the image decoded again.
+        self.backdrop_gpu = None;
+        self.backdrop.on_device_rebuilt();
         self.text = Some(text);
         self.apply_glyph_options();
         self.chrome_text = Some(chrome);
         self.gpu = Some(gpu);
         self.acquire_retry = None;
+        self.sync_backdrop_image();
         true
     }
 
@@ -9852,6 +9900,10 @@ impl App {
         {
             dw.offscreen = Some(Self::make_offscreen(&dw.gpu));
         }
+        // The backdrop's CPU-adapter check, once, when this window first draws it.
+        if dw.backdrop.is_none() && !self.backdrop.settings.is_off() {
+            self.backdrop.cpu_adapter |= dw.gpu.device_type() == wgpu::DeviceType::Cpu;
+        }
         let gpu = &mut dw.gpu;
         let text = &mut dw.text;
         let chrome_text = &mut dw.chrome_text;
@@ -9861,6 +9913,7 @@ impl App {
         let crt = dw.crt.as_ref();
         let offscreen = dw.offscreen.as_ref();
         let image_layer = &mut dw.image_layer;
+        let backdrop_slot = &mut dw.backdrop;
 
         let Some((frame, view)) = gpu.acquire_frame() else {
             // Acquire failed: this frame's damage was not shown. Start the
@@ -9888,6 +9941,18 @@ impl App {
         // dropdown slide; its own search tint and copy-mode cursor come from
         // THIS window's overlays. The main-only caret GLOW / summon reveals live
         // only in the main caller's tail and never reach here.
+        //
+        // The backdrop: the same settings and shared image texture as the main
+        // window (this window's own layer, built on first use; no slide here).
+        let backdrop = crate::backdrop::prepare(
+            backdrop_slot,
+            &self.backdrop,
+            gpu,
+            &theme,
+            0.0,
+            snap.scroll_offset as f32 * text.cell_size().1,
+            scale,
+        );
         let scene = GridScene {
             snap: &snap,
             theme: &theme,
@@ -9911,6 +9976,7 @@ impl App {
             text,
             quad,
             image_layer,
+            backdrop,
             scene_view,
             width,
             height,
@@ -10827,6 +10893,27 @@ impl ApplicationHandler<AppEvent> for App {
                 painted = true;
             }
         }
+        // Opt-in backdrop animation (`[backdrop] animate`): ≤ 30 fps as ONE
+        // timed wake per frame — never Poll — and only while a window showing it
+        // can present (the visibility gates above). Off — the default, a look
+        // that does not move (images), or a CPU adapter — costs one bool here.
+        if self.backdrop.animates() {
+            let det_can = |d: &crate::detached::DetachedWindow| !d.occluded && d.acquire_retry.is_none();
+            if !main_can_animate && !self.detached.iter().any(det_can) {
+                self.backdrop.tick_at = None;
+            } else if self.backdrop.tick_at.is_none_or(|t| now >= t) {
+                if main_can_animate {
+                    self.request_main_paint();
+                }
+                for dw in self.detached.iter().filter(|d| det_can(d)) {
+                    dw.request_paint();
+                }
+                painted = true;
+                self.backdrop.tick_at = Some(now + crate::backdrop::ANIM_INTERVAL);
+            }
+        } else {
+            self.backdrop.tick_at = None;
+        }
         let settings_pending = self.settings_window.is_some()
             && self
                 .settings_paint_until
@@ -10942,6 +11029,11 @@ impl ApplicationHandler<AppEvent> for App {
         // A failed GPU rebuild retries once its backoff elapses (a due one ran
         // at the top of this iteration, so this is strictly in the future).
         if let Some(t) = self.gpu_rebuild_retry_at.filter(|&t| t > now) {
+            merge_wake(&mut wake_at, t);
+        }
+        // The animated backdrop's next frame (set above only while it animates
+        // in a window that can present).
+        if let Some(t) = self.backdrop.tick_at {
             merge_wake(&mut wake_at, t);
         }
         // Pill expiries: one wake each to repaint the pill away.
@@ -11256,6 +11348,10 @@ impl ApplicationHandler<AppEvent> for App {
         self.text = text;
         self.apply_glyph_options();
         self.quad = quad;
+        // Backdrop: nothing is built here (the layer is created on the first
+        // frame that draws it); only an image-mode backdrop starts its decode,
+        // on a worker thread, now that the monitor size is known.
+        self.sync_backdrop_image();
         // The Tier-B offscreen scene texture is allocated LAZILY (on the first
         // frame of an actual Liquid/Focus summon) rather than eagerly here — it is
         // a full-surface GPU texture used only by those two effects, so most
@@ -11546,6 +11642,25 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::ConfigNotice(msg) => self.show_config_warnings(&[msg]),
             AppEvent::Appearance(a) => self.apply_appearance(a),
+            AppEvent::BackdropImage(gen, result) => {
+                // Upload a fresh decode to the main device right away (its CPU
+                // pixels are dropped there); a failure keeps the base gradient
+                // and says why. A stale generation is a silent no-op.
+                let mut problem = self.backdrop.on_decoded(gen, result);
+                if let Some(g) = &self.gpu {
+                    problem = problem.or(self.backdrop.upload_pending(&g.device, &g.queue));
+                }
+                if let Some(why) = problem {
+                    let file = self.backdrop.cfg.image.clone();
+                    eprintln!("jetty: backdrop image {file:?}: {why}");
+                    let mut short: String = why.chars().take(64).collect();
+                    if short.len() < why.len() {
+                        short.push('…');
+                    }
+                    self.show_notice_pill(format!("Backdrop image: {short} — showing the gradient"), 8000);
+                }
+                self.mark_dirty_all();
+            }
         }
     }
 
@@ -13714,6 +13829,22 @@ impl ApplicationHandler<AppEvent> for App {
                     // the params, so this is byte-identical to the pre-refactor
                     // body. The main-only caret GLOW, summon-reveal/Tier-B, and
                     // the corner-mask/CRT tail all stay BELOW, in this caller.
+                    //
+                    // The backdrop (visuals v2): `None` for mode "none" — no layer
+                    // exists and the frame is exactly the clear. Built on the first
+                    // frame that draws it; the dropdown slide and parallax move it.
+                    if self.backdrop_gpu.is_none() && !self.backdrop.settings.is_off() {
+                        self.backdrop.cpu_adapter = gpu.device_type() == wgpu::DeviceType::Cpu;
+                    }
+                    let backdrop = crate::backdrop::prepare(
+                        &mut self.backdrop_gpu,
+                        &self.backdrop,
+                        gpu,
+                        &theme,
+                        slide_y_offset,
+                        snap.scroll_offset as f32 * cell_h,
+                        scale,
+                    );
                     let scene = GridScene {
                         snap: &snap,
                         theme: &theme,
@@ -13737,6 +13868,7 @@ impl ApplicationHandler<AppEvent> for App {
                         text,
                         quad,
                         image_layer,
+                        backdrop,
                         scene_view,
                         width,
                         height,
@@ -14407,12 +14539,17 @@ struct GridScene<'a> {
 /// and the corner-mask + CRT tail + present + animation self-drive. The slide
 /// OFFSET is threaded through as data (`slide_y`), never a slide the detached
 /// path can accidentally acquire (it passes `0.0`).
+///
+/// `backdrop` (visuals v2): the window's backdrop layer, already prepared for
+/// this frame by the caller (`crate::backdrop::prepare`) — `None` for
+/// `[backdrop] mode = "none"`, which draws exactly today's clear.
 #[allow(clippy::too_many_arguments)]
 fn render_grid_scene(
     gpu: &GpuContext,
     text: &mut TextLayer,
     quad: &mut QuadLayer,
     image_layer: &mut jetty_render::ImageLayer,
+    backdrop: Option<&jetty_render::Backdrop>,
     scene_view: &wgpu::TextureView,
     width: u32,
     height: u32,
@@ -14502,6 +14639,11 @@ fn render_grid_scene(
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        // The backdrop: one full-screen triangle right after the clear, under
+        // the cell backgrounds (same pass, same submit).
+        if let Some(bd) = backdrop {
+            bd.draw(&mut pass);
+        }
         quad.draw_uploaded(&mut pass, bg_count);
         if text_ready {
             text.draw_grid(&mut pass);

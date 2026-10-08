@@ -206,6 +206,11 @@ pub struct Config {
     /// compatible: old configs without `[effects]` load with all defaults.
     #[serde(default)]
     pub effects: EffectsConfig,
+    /// The background layer under the grid (`[backdrop]` table, visuals v2):
+    /// a curated per-theme look, a gradient, an image or a pattern. See
+    /// `BackdropConfig`. `mode = "none"` (the default) draws and builds nothing.
+    #[serde(default)]
+    pub backdrop: BackdropConfig,
     // ── Run & Notify (v0.15) ──────────────────────────────────────────────────
     /// Notify (freedesktop toast + taskbar/dock urgency) when a command finishes
     /// while JeTTY is hidden/unfocused. Default ON — but inert until the user
@@ -796,6 +801,124 @@ impl EffectsConfig {
     }
 }
 
+/// The `[backdrop]` table: the background layer drawn under the terminal grid
+/// (visuals v2). Every key is optional (`#[serde(default)]`), so an old config
+/// — or a table naming only `mode` — loads with the defaults below. Enum-like
+/// keys are kept as strings and parsed leniently by the renderer (an unknown
+/// value reads as the default, like `window_mode`): one typo never fails a load.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackdropConfig {
+    /// `"none"` (default: nothing is built or drawn — today's look), `"theme"`
+    /// (a curated look per theme), `"gradient"`, `"image"` or `"pattern"`.
+    pub mode: String,
+    /// Gradient stops as `"#rrggbb"` (2–4 used). Empty = derived from the theme.
+    pub colors: Vec<String>,
+    /// Linear gradient direction in degrees, CSS-style: 0 = toward the top, 90 =
+    /// toward the right, 135 (default) = top-left → bottom-right.
+    pub angle: f32,
+    /// `"linear"` (default) or `"radial"`.
+    pub shape: String,
+    /// How strongly the backdrop shows over the theme background: 0 = the
+    /// plain theme bg … 1 = the colors as given. Default 0.5.
+    pub strength: f32,
+    /// Darkening toward the window corners, 0..1 (default 0).
+    pub vignette: f32,
+    /// Film grain, 0..1 (default 0). Dithering against banding is always on.
+    pub grain: f32,
+    /// Image file for `mode = "image"`: absolute, `~/…`, or a name relative to
+    /// `<config dir>/backgrounds/`. PNG or JPEG, up to 8192×8192.
+    pub image: String,
+    /// `"cover"` (default), `"contain"`, `"stretch"`, `"center"` or `"tile"`.
+    pub fit: String,
+    /// Blend of the image toward the theme background, 0..1 (default 0.7). It is
+    /// raised automatically when the image would leave the text below 4.5:1.
+    pub dim: f32,
+    /// Frosted-glass blur of the image, 0..1 (default 0 = sharp).
+    pub blur: f32,
+    /// `"stars"` (default), `"aurora"`, `"grid"` or `"synthwave"`.
+    pub pattern: String,
+    /// Slow motion for gradients and patterns (opt-in; ≤ 30 fps, never on a
+    /// software renderer, paused while the window is hidden). Default false.
+    pub animate: bool,
+    /// Shift the backdrop with the scrollback position. Default false.
+    pub parallax: bool,
+}
+
+impl Default for BackdropConfig {
+    fn default() -> Self {
+        BackdropConfig {
+            mode: "none".to_string(),
+            colors: Vec::new(),
+            angle: 135.0,
+            shape: "linear".to_string(),
+            strength: 0.5,
+            vignette: 0.0,
+            grain: 0.0,
+            image: String::new(),
+            fit: "cover".to_string(),
+            dim: 0.7,
+            blur: 0.0,
+            pattern: "stars".to_string(),
+            animate: false,
+            parallax: false,
+        }
+    }
+}
+
+impl BackdropConfig {
+    /// Clamp the numbers into range (non-finite → default; the angle wraps to
+    /// 0..360). Strings stay verbatim — the renderer parses them leniently, and
+    /// the file keeps what the user wrote. Called on load.
+    pub fn clamped(mut self) -> Self {
+        let d = BackdropConfig::default();
+        let c01 = |v: f32, d: f32| finite_or(v, d).clamp(0.0, 1.0);
+        self.strength = c01(self.strength, d.strength);
+        self.vignette = c01(self.vignette, d.vignette);
+        self.grain = c01(self.grain, d.grain);
+        self.dim = c01(self.dim, d.dim);
+        self.blur = c01(self.blur, d.blur);
+        self.angle = finite_or(self.angle, d.angle).rem_euclid(360.0);
+        self
+    }
+
+    /// The parsed settings the renderer reads (cheap; built on load / reload /
+    /// a settings change, never per frame). Unparseable colors are skipped.
+    pub fn settings(&self) -> jetty_render::BackdropSettings {
+        jetty_render::BackdropSettings {
+            mode: jetty_render::BackdropMode::parse(&self.mode),
+            colors: self.colors.iter().filter_map(|c| jetty_render::parse_hex_color(c)).collect(),
+            angle: self.angle,
+            shape: jetty_render::BackdropShape::parse(&self.shape),
+            strength: self.strength,
+            vignette: self.vignette,
+            grain: self.grain,
+            fit: jetty_render::BackdropFit::parse(&self.fit),
+            dim: self.dim,
+            blur: self.blur,
+            pattern: jetty_render::BackdropPattern::parse(&self.pattern),
+            animate: self.animate,
+            parallax: self.parallax,
+        }
+    }
+
+    /// The image file `image` names, resolved against `config_dir`: `None` when
+    /// empty; `~/…` is the home directory; a relative name lives in
+    /// `<config_dir>/backgrounds/` (where Settings lists images).
+    pub fn image_path(&self, config_dir: &Path) -> Option<PathBuf> {
+        let raw = self.image.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if let Some(rest) = raw.strip_prefix("~/") {
+            let home = std::env::var_os("HOME").map(PathBuf::from).or_else(dirs::home_dir)?;
+            return Some(home.join(rest));
+        }
+        let p = Path::new(raw);
+        Some(if p.is_absolute() { p.to_path_buf() } else { config_dir.join("backgrounds").join(p) })
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -835,6 +958,7 @@ impl Default for Config {
             window_border: default_window_border(),
             tab_title: default_tab_title(),
             effects: EffectsConfig::default(),
+            backdrop: BackdropConfig::default(),
             notify_on_command_finish: default_notify_on_command_finish(),
             notify_min_seconds: default_notify_min_seconds(),
             notify_only_on_failure: default_notify_only_on_failure(),
@@ -1090,6 +1214,7 @@ impl Config {
     fn sanitized(mut self) -> Config {
         self.sanitize_floats();
         self.effects = self.effects.clamped();
+        self.backdrop = self.backdrop.clamped();
         self
     }
 
@@ -2115,6 +2240,22 @@ mod tests {
             window_border: "focus".to_string(),
             tab_title: "auto".to_string(),
             effects: EffectsConfig::default(),
+            backdrop: BackdropConfig {
+                mode: "image".to_string(),
+                colors: vec!["#102030".to_string(), "#abc".to_string()],
+                angle: 45.0,
+                shape: "radial".to_string(),
+                strength: 0.8,
+                vignette: 0.25,
+                grain: 0.1,
+                image: "~/Pictures/wall.jpg".to_string(),
+                fit: "tile".to_string(),
+                dim: 0.4,
+                blur: 0.3,
+                pattern: "aurora".to_string(),
+                animate: true,
+                parallax: true,
+            },
             notify_on_command_finish: false,
             notify_min_seconds: 30,
             notify_only_on_failure: true,
@@ -2174,6 +2315,7 @@ mod tests {
             window_border: "none".to_string(),
             tab_title: "osc".to_string(),
             effects: EffectsConfig::default(),
+            backdrop: BackdropConfig::default(),
             notify_on_command_finish: true,
             notify_min_seconds: 10,
             notify_only_on_failure: false,
@@ -2416,6 +2558,98 @@ corner_radius = 8.0
         assert_eq!(parse("line_height = 0.5\n").line_height, 1.0, "clamped up");
         assert_eq!(parse("line_height = 9.0\n").line_height, 2.0, "clamped down");
         assert_eq!(parse("line_height = nan\n").line_height, 1.3, "non-finite: default");
+    }
+
+    #[test]
+    fn backdrop_defaults_are_off() {
+        let d = Config::default().backdrop;
+        assert_eq!(d.mode, "none");
+        assert!(d.colors.is_empty());
+        assert_eq!((d.angle, d.strength, d.vignette, d.grain), (135.0, 0.5, 0.0, 0.0));
+        assert_eq!((d.fit.as_str(), d.dim, d.blur), ("cover", 0.7, 0.0));
+        assert_eq!((d.shape.as_str(), d.pattern.as_str()), ("linear", "stars"));
+        assert!(!d.animate && !d.parallax && d.image.is_empty());
+        // The renderer sees "off": nothing is built.
+        assert!(d.settings().is_off());
+        assert_eq!(d.settings(), jetty_render::BackdropSettings::default());
+        // A config without the table loads it with no warning.
+        let (cfg, warnings) =
+            Config::parse_with_base("theme = \"nord\"\n", &Config::default(), "using the default").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.backdrop, BackdropConfig::default());
+    }
+
+    #[test]
+    fn backdrop_partial_table_and_clamping() {
+        let (cfg, warnings) = Config::parse_with_base(
+            "[backdrop]\nmode = \"pattern\"\npattern = \"aurora\"\nstrength = 3.0\ndim = -1.0\nangle = -90.0\n\
+             blur = nan\ncolors = [\"#ff0000\", \"bogus\", \"0f0\"]\n",
+            &Config::default(),
+            "using the default",
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let b = &cfg.backdrop;
+        assert_eq!((b.mode.as_str(), b.pattern.as_str()), ("pattern", "aurora"));
+        assert_eq!(b.strength, 1.0, "clamped to 0..1");
+        assert_eq!(b.dim, 0.0);
+        assert_eq!(b.angle, 270.0, "the angle wraps");
+        assert_eq!(b.blur, 0.0, "nan falls back to the default");
+        assert_eq!(b.fit, "cover", "keys left out keep their default");
+        let s = b.settings();
+        assert_eq!(s.mode, jetty_render::BackdropMode::Pattern);
+        assert_eq!(s.pattern, jetty_render::BackdropPattern::Aurora);
+        assert_eq!(s.colors, vec![[255, 0, 0], [0, 255, 0]], "unparseable colors are skipped");
+        // An unknown mode string is kept verbatim but reads as off.
+        let (cfg, _) =
+            Config::parse_with_base("[backdrop]\nmode = \"wallpaper\"\n", &Config::default(), "x").unwrap();
+        assert_eq!(cfg.backdrop.mode, "wallpaper");
+        assert!(cfg.backdrop.settings().is_off());
+    }
+
+    #[test]
+    fn backdrop_bad_values_fall_back_per_key() {
+        let (cfg, warnings) = Config::parse_with_base(
+            "[backdrop]\nmode = \"theme\"\nstrength = \"high\"\nanimate = 1\nnope = true\n",
+            &Config::default(),
+            "using the default",
+        )
+        .unwrap();
+        assert_eq!(cfg.backdrop.mode, "theme", "the valid key still applies");
+        assert_eq!(cfg.backdrop.strength, 0.5);
+        assert!(!cfg.backdrop.animate);
+        assert!(warnings.iter().any(|w| w.contains("backdrop.strength")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("backdrop.animate")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("unknown key `backdrop.nope`")), "{warnings:?}");
+    }
+
+    #[test]
+    fn backdrop_image_paths_resolve() {
+        let dir = Path::new("/cfg/jetty");
+        let with = |s: &str| BackdropConfig { image: s.to_string(), ..BackdropConfig::default() };
+        assert_eq!(with("").image_path(dir), None);
+        assert_eq!(with("   ").image_path(dir), None);
+        assert_eq!(with("/abs/wall.png").image_path(dir), Some(PathBuf::from("/abs/wall.png")));
+        assert_eq!(with("wall.jpg").image_path(dir), Some(PathBuf::from("/cfg/jetty/backgrounds/wall.jpg")));
+        assert_eq!(with("sub/a.png").image_path(dir), Some(PathBuf::from("/cfg/jetty/backgrounds/sub/a.png")));
+        let home = with("~/Pictures/x.png").image_path(dir).unwrap();
+        assert!(home.ends_with("Pictures/x.png") && home.is_absolute(), "{home:?}");
+    }
+
+    #[test]
+    fn backdrop_default_is_never_written() {
+        // A settings change elsewhere must not write a `[backdrop]` table into a
+        // file that never had one (only changed keys are saved).
+        let old = Config::default();
+        let new = Config { opacity: 0.8, ..Config::default() };
+        let changes = diff_configs(&old, &new);
+        assert!(changes.iter().all(|c| c.path[0] != "backdrop"), "{changes:?}");
+        // Changing one backdrop key writes exactly that key.
+        let mut on = Config::default();
+        on.backdrop.mode = "theme".to_string();
+        let changes = diff_configs(&old, &on);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, vec!["backdrop".to_string(), "mode".to_string()]);
     }
 
     #[test]
