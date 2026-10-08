@@ -13767,7 +13767,7 @@ fn render_grid_scene(
     let origin = s.origin.slid(s.slide_y);
     let grid_origin_y = origin.top;
     let selection = jetty_render::selection_paint(s.theme);
-    let scrollbar_thumb = scrollbar_thumb_for(s.theme);
+    let scrollbar_thumb = jetty_render::scrollbar_thumb_color(s.theme);
     // The shell cursor, split by layer: the SOLID block is painted under the
     // glyphs (Pass 1) with the glyph it covers recolored for contrast (Pass 2);
     // beam / underline / unfocused hollow draw over the text (Pass 4). In
@@ -14534,16 +14534,6 @@ fn detect_shells() -> Vec<String> {
         }
     }
     out
-}
-
-/// Scrollbar thumb color derived from the active theme: theme fg at alpha 160.
-fn scrollbar_thumb_for(theme: &jetty_core::Theme) -> [u8; 4] {
-    // A DIM shade just above the background — subtle, not glaring. (fg/accent are
-    // too bright for a scrollbar.) Blend bg→fg ~35%.
-    let bg = theme.bg;
-    let fg = theme.fg;
-    let mix = |i: usize| (bg[i] as f32 + (fg[i] as f32 - bg[i] as f32) * 0.35) as u8;
-    [mix(0), mix(1), mix(2), 210]
 }
 
 /// The text measurer for chrome built OUTSIDE a frame (hit-testing): the

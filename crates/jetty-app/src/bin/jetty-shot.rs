@@ -753,10 +753,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Draw scrollbar quad (and optionally the settings panel) over the text ---
     {
         let mut rects: Vec<jetty_render::Rect> = Vec::new();
-        let sb_bg = terminal.theme().bg;
-        let sb_fg = terminal.theme().fg;
-        let sb_mix = |i: usize| (sb_bg[i] as f32 + (sb_fg[i] as f32 - sb_bg[i] as f32) * 0.35) as u8;
-        let sb_thumb = [sb_mix(0), sb_mix(1), sb_mix(2), 210];
+        // The app's thumb color (one shared definition).
+        let sb_thumb = jetty_render::scrollbar_thumb_color(terminal.theme());
         // The grid band: below a top bar, above a bottom bar and the strip.
         let band_bottom = (height as f32 - shot_status_h - shot_bottom_bar_h).max(shot_grid_top);
         let track = jetty_render::ScrollbarTrack::new(width as f32, shot_grid_top, band_bottom, dpi);

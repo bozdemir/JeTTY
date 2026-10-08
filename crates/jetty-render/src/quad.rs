@@ -973,6 +973,18 @@ pub fn scrollbar_offset_from_cursor(
     Some(((1.0 - frac) * scroll_max as f32).round() as usize)
 }
 
+/// The scrollbar thumb's color for `theme` — the ONE definition the main
+/// window, detached windows and jetty-shot draw with: the palette's
+/// thin-mark role (`UiPalette::text_hint`), pushed until it contrasts at
+/// least 3:1 with the theme background it sits on, opaque (a translucent
+/// thumb would composite below the floor). The old fixed 35 % bg→fg blend
+/// read on dark themes but fell to ~1.5:1 on light ones.
+pub fn scrollbar_thumb_color(theme: &jetty_core::Theme) -> [u8; 4] {
+    let ui = crate::UiPalette::cached(theme);
+    let [r, g, b] = crate::ensure_contrast(ui.text_hint, &[ui.bg], 3.0);
+    [r, g, b, 255]
+}
+
 /// The DRAWN scrollbar thumb for `snapshot`: the grab rect
 /// ([`scrollbar_rect_geom`]) inset horizontally into a rounded pill
 /// (DPI-scaled, whole pixels). `None` when there is no history.
@@ -1345,6 +1357,19 @@ mod tests {
         // No history: nothing drawn.
         g.scroll_max = 0;
         assert!(scrollbar_rect(&g, &every_layout()[0].1, [9; 4]).is_none());
+    }
+
+    #[test]
+    fn scrollbar_thumb_reads_on_every_theme() {
+        use jetty_core::theme::{theme_at, PRESETS};
+        for i in 0..PRESETS.len() {
+            let theme = theme_at(i);
+            let c = scrollbar_thumb_color(&theme);
+            assert_eq!(c[3], 255, "{}: opaque", theme.name);
+            let bg = [theme.bg[0], theme.bg[1], theme.bg[2]];
+            let ratio = crate::contrast_ratio([c[0], c[1], c[2]], bg);
+            assert!(ratio >= 3.0, "{}: thumb {:?} on bg {:?} is only {ratio:.2}:1", theme.name, c, bg);
+        }
     }
 
     #[test]
