@@ -738,7 +738,6 @@ struct U {
 
 // The aurora bake texture is this many window pixels per texel per axis.
 const BAKE_DIV: f32 = 2.0;
-const INV_U32: f32 = 2.3283064e-10;
 
 struct VsOut { @builtin(position) pos: vec4<f32> };
 
@@ -750,22 +749,25 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return o;
 }
 
-// PCG3D (Jarzynski & Olano 2020): three well-mixed u32s from three inputs.
-fn pcg3d(v0: vec3<u32>) -> vec3<u32> {
-    var v = v0 * 1664525u + vec3(1013904223u);
-    v.x = v.x + v.y * v.z;
-    v.y = v.y + v.z * v.x;
-    v.z = v.z + v.x * v.y;
-    v = v ^ (v >> vec3(16u));
-    v.x = v.x + v.y * v.z;
-    v.y = v.y + v.z * v.x;
-    v.z = v.z + v.x * v.y;
-    return v;
+// "Hash without Sine" (Dave Hoskins, MIT): float-only on purpose — 32-bit
+// integer multiplies run at a fraction of the float rate on integrated GPUs,
+// and a PCG hash per pixel cost this pass several times its budget.
+fn hash13(p: vec3<f32>) -> f32 {
+    var p3 = fract(p * 0.1031);
+    p3 = p3 + dot(p3, p3.zyx + 31.32);
+    return fract((p3.x + p3.y) * p3.z);
 }
 
-// Three uniform randoms in [0, 1) for an integer cell + seed.
-fn rand3(p: vec2<i32>, seed: u32) -> vec3<f32> {
-    return vec3<f32>(pcg3d(vec3<u32>(bitcast<vec2<u32>>(p), seed))) * INV_U32;
+fn hash33(p: vec3<f32>) -> vec3<f32> {
+    var p3 = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    p3 = p3 + dot(p3, p3.yxz + 33.33);
+    return fract((p3.xxy + p3.yxx) * p3.zyx);
+}
+
+// Interleaved gradient noise (Jimenez 2014): the standard cheap dither noise,
+// well spread at every scale, for integer pixel coordinates.
+fn ign(p: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
 }
 
 fn oklab_to_linear(c: vec3<f32>) -> vec3<f32> {
@@ -782,26 +784,19 @@ fn oklab_to_linear(c: vec3<f32>) -> vec3<f32> {
     );
 }
 
-// Gradient coordinate 0..1 at content position p (px). time is 0 unless the
-// look animates, which makes every drift term below an exact identity.
+// Gradient coordinate 0..1 at content position p (px). An animated look's
+// sway / drift is already folded into `geom` on the CPU (no trig per pixel).
 fn grad_t(p: vec2<f32>) -> f32 {
     let res = u.resolution;
-    let t = u.misc.x;
     if (u.geom.w < 0.5) {
-        // Linear: project on the direction; the two extreme corners map to 0
-        // and 1. Animate: a slow ±7 degree sway.
-        let w = 0.12 * sin(0.07 * t);
-        let cs = cos(w);
-        let sn = sin(w);
-        let d = vec2(u.geom.x * cs - u.geom.y * sn, u.geom.x * sn + u.geom.y * cs);
+        // Linear: project on the direction; the two extreme corners map to 0 and 1.
+        let d = u.geom.xy;
         let ext = abs(d.x) * res.x + abs(d.y) * res.y;
         return dot(p - res * 0.5, d) / max(ext, 1.0) + 0.5;
     }
-    // Radial: distance from the center over the radius. Animate: a slow drift.
-    let drift = 0.05 * vec2(sin(0.13 * t), sin(0.091 * t));
-    let c = (u.geom.xy + drift) * res;
+    // Radial: distance from the center over the radius.
     let r = u.geom.z * 0.5 * length(res);
-    return length(p - c) / max(r, 1.0);
+    return length(p - u.geom.xy * res) / max(r, 1.0);
 }
 
 // The base gradient in OKLab, mixed over the theme bg by strength. Stops are
@@ -825,9 +820,13 @@ fn base_rgb(p: vec2<f32>) -> vec3<f32> {
     return max(oklab_to_linear(base_lab(p)), vec3(0.0));
 }
 
-// Radial darkening toward the window corners (window space, not content).
-fn vignette(rgb: vec3<f32>, frag: vec2<f32>) -> vec3<f32> {
-    let c = (frag / u.resolution - vec2(0.5)) * 2.0;
+// Radial darkening toward the corners of the backdrop (it is baked with the
+// rest, so it rides the dropdown slide like the strip itself).
+fn vignette(rgb: vec3<f32>, p: vec2<f32>) -> vec3<f32> {
+    if (u.look.y <= 0.0) {
+        return rgb;
+    }
+    let c = (p / u.resolution - vec2(0.5)) * 2.0;
     let d = length(c * vec2(1.0, 0.9)) * 0.7071;
     let f = 1.0 - u.look.y * 0.6 * smoothstep(0.3, 1.0, d);
     return rgb * (f * f * f);
@@ -851,26 +850,29 @@ fn guard(rgb: vec3<f32>) -> vec3<f32> {
 
 // Premultiply (when the surface wants it), then dither: a triangular ±1 code
 // step of noise in the sRGB-encoded output domain (the slope term converts a
-// code step to linear light, ~2·sqrt(x)), plus the optional monochrome grain.
+// code step to linear light, ~2·sqrt(x)), monochrome so it never speckles
+// color, plus the optional film grain (its hash runs only when grain is on).
 // Static per pixel: no shimmer, no per-frame cost difference.
 fn finish(rgb_in: vec3<f32>, frag: vec2<f32>) -> vec4<f32> {
     let a = u.bg.w;
     let cap = select(1.0, a, u.misc.z > 0.5);
     var rgb = clamp(rgb_in, vec3(0.0), vec3(1.0)) * cap;
-    let ip = vec2<i32>(frag);
-    let h1 = rand3(ip, 0x9e3779b9u);
-    let h2 = rand3(ip, 0x85ebca6bu);
-    let tpdf = h1 + h2 - vec3(1.0);
+    let px = floor(frag);
+    // One uniform sample remapped to a triangular distribution on [-1, 1].
+    let v = ign(px) * 2.0 - 1.0;
+    var n = sign(v) * (1.0 - sqrt(max(1.0 - abs(v), 0.0))) * (1.0 / 255.0);
+    if (u.look.z > 0.0) {
+        n = n + (hash13(vec3(px, 7.0)) - 0.5) * 2.0 * u.look.z * 0.06;
+    }
     let slope = max(2.0 * sqrt(rgb), vec3(0.0775));
-    let grain = (h1.x - 0.5) * 2.0 * u.look.z * 0.06;
-    rgb = rgb + slope * (tpdf * (1.0 / 255.0) + vec3(grain));
+    rgb = rgb + slope * n;
     return vec4(clamp(rgb, vec3(0.0), vec3(cap)), a);
 }
 
 @fragment
 fn fs_gradient(in: VsOut) -> @location(0) vec4<f32> {
-    let rgb = base_rgb(in.pos.xy - u.offset);
-    return finish(guard(vignette(rgb, in.pos.xy)), in.pos.xy);
+    let p = in.pos.xy - u.offset;
+    return finish(guard(vignette(base_rgb(p), p)), in.pos.xy);
 }
 
 // ── image ──
@@ -889,16 +891,16 @@ fn fs_image(in: VsOut) -> @location(0) vec4<f32> {
     c = mix(c, u.pc[0].xyz, u.img_fx.w);         // frosted tint (blurred images)
     c = mix(c, u.pc[1].xyz, u.img_fx.x);         // dim toward the theme bg
     let rgb = mix(base, c, cov);
-    return finish(guard(vignette(rgb, in.pos.xy)), in.pos.xy);
+    return finish(guard(vignette(rgb, p)), in.pos.xy);
 }
 
 // ── stars ──
 // One star (or none) per cell, kept away from the cell edges so its glow is
 // never clipped; brightness and size vary per star; animate twinkles them.
-fn star_layer(p: vec2<f32>, cell: f32, density: f32, size: f32, seed: u32, t: f32) -> f32 {
+fn star_layer(p: vec2<f32>, cell: f32, density: f32, size: f32, seed: f32, t: f32) -> f32 {
     let q = p / cell;
     let g = floor(q);
-    let h = rand3(vec2<i32>(g), seed);
+    let h = hash33(vec3(g, seed));
     if (h.x > density) {
         return 0.0;
     }
@@ -917,11 +919,11 @@ fn fs_stars(in: VsOut) -> @location(0) vec4<f32> {
     var rgb = base_rgb(p);
     let dpi = u.misc.y;
     let t = u.misc.x;
-    let s = star_layer(p, 34.0 * dpi, 0.5, 0.7 * dpi, 11u, t) * 0.8
-        + star_layer(p + vec2(13.0, 29.0) * dpi, 91.0 * dpi, 0.35, 1.25 * dpi, 23u, t);
+    let s = star_layer(p, 34.0 * dpi, 0.5, 0.7 * dpi, 11.0, t) * 0.8
+        + star_layer(p + vec2(13.0, 29.0) * dpi, 91.0 * dpi, 0.35, 1.25 * dpi, 23.0, t);
     // The sky is guarded; the stars are not (a 1-2 px point never hides a
     // glyph, and capping them would put them out).
-    let sky = guard(vignette(rgb, in.pos.xy));
+    let sky = guard(vignette(rgb, p));
     rgb = mix(sky, u.pc[0].xyz, clamp(s * u.look.x * 1.6, 0.0, 1.0));
     return finish(rgb, in.pos.xy);
 }
@@ -944,7 +946,7 @@ fn fs_grid(in: VsOut) -> @location(0) vec4<f32> {
     let major = grid_cov(q, 112.0 * dpi, 0.6 * dpi);
     let w = max(minor * 0.08, major * 0.18) * u.look.x * 2.0;
     rgb = mix(rgb, u.pc[0].xyz, clamp(w, 0.0, 1.0));
-    return finish(guard(vignette(rgb, in.pos.xy)), in.pos.xy);
+    return finish(guard(vignette(rgb, p)), in.pos.xy);
 }
 
 // ── synthwave ──
@@ -1001,27 +1003,28 @@ fn fs_synthwave(in: VsOut) -> @location(0) vec4<f32> {
         rgb = mix(rgb, u.pc[2].xyz, clamp(line * 0.7 * k, 0.0, 1.0));
         rgb = rgb + u.pc[1].xyz * exp(-(s / res.y) / 0.03) * 0.12 * k;
     }
-    return finish(guard(vignette(rgb, in.pos.xy)), in.pos.xy);
+    return finish(guard(vignette(rgb, p)), in.pos.xy);
 }
 
 // ── aurora (baked) ──
-fn vnoise(x: vec2<f32>, seed: u32) -> f32 {
+fn vnoise(x: vec2<f32>, seed: f32) -> f32 {
     let i = floor(x);
     let f = x - i;
-    let ii = vec2<i32>(i);
-    let a = rand3(ii, seed).x;
-    let b = rand3(ii + vec2(1, 0), seed).x;
-    let c = rand3(ii + vec2(0, 1), seed).x;
-    let d = rand3(ii + vec2(1, 1), seed).x;
+    let a = hash13(vec3(i, seed));
+    let b = hash13(vec3(i + vec2(1.0, 0.0), seed));
+    let c = hash13(vec3(i + vec2(0.0, 1.0), seed));
+    let d = hash13(vec3(i + vec2(1.0, 1.0), seed));
     let w = f * f * (vec2(3.0) - 2.0 * f);
     return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
 }
 
-fn fbm(x0: vec2<f32>, seed: u32) -> f32 {
+// Three octaves (≈ 0..0.875): plenty for a soft curtain, and every octave
+// costs four hashes per texel.
+fn fbm(x0: vec2<f32>, seed: f32) -> f32 {
     var x = x0;
     var s = 0.0;
     var amp = 0.5;
-    for (var i = 0; i < 4; i = i + 1) {
+    for (var i = 0; i < 3; i = i + 1) {
         s = s + amp * vnoise(x, seed);
         x = x * 2.03 + vec2(13.7, 7.1);
         amp = amp * 0.5;
@@ -1035,8 +1038,14 @@ fn fbm(x0: vec2<f32>, seed: u32) -> f32 {
 @fragment
 fn fs_aurora_bake(in: VsOut) -> @location(0) vec4<f32> {
     let res = u.resolution;
-    let p = in.pos.xy * BAKE_DIV;
+    // Noise texel → cache pixel → backdrop position (the bake offset carries
+    // the parallax margin).
+    let p = in.pos.xy * BAKE_DIV - u.offset;
     let uv = p / res;
+    // The curtains fade out by 70 % of the height: nothing to compute below.
+    if (uv.y > 0.7) {
+        return vec4(0.0);
+    }
     let t = u.misc.x;
     let ax = uv.x * res.x / res.y;
     var col = vec3(0.0);
@@ -1044,13 +1053,13 @@ fn fs_aurora_bake(in: VsOut) -> @location(0) vec4<f32> {
     for (var k = 0; k < 3; k = k + 1) {
         let fk = f32(k);
         let x = ax * (0.9 + 0.3 * fk) + fk * 5.3;
-        let yc = 0.14 + 0.10 * fk + (fbm(vec2(x * 1.1 + t * 0.04, fk * 2.7), 3u) - 0.47) * 0.30;
+        let yc = 0.14 + 0.10 * fk + (fbm(vec2(x * 1.1 + t * 0.04, fk * 2.7), 3.0) - 0.41) * 0.32;
         let d = uv.y - yc;
         let lower = exp(-(d * d) / (0.0016 + 0.0008 * fk));
         let upper = exp(-max(-d, 0.0) / (0.07 + 0.03 * fk));
         var band = select(upper, lower, d > 0.0);
-        let rays = 0.45 + 0.55 * fbm(vec2(x * 7.0 + t * 0.12, uv.y * 0.8 + fk), 5u);
-        let patchy = smoothstep(0.25, 0.75, fbm(vec2(x * 0.8 - t * 0.02, fk * 1.9 + 4.0), 9u));
+        let rays = 0.45 + 0.55 * fbm(vec2(x * 7.0 + t * 0.12, uv.y * 0.8 + fk), 5.0);
+        let patchy = smoothstep(0.22, 0.66, fbm(vec2(x * 0.8 - t * 0.02, fk * 1.9 + 4.0), 9.0));
         band = band * rays * patchy;
         col = col + u.pc[k].xyz * band;
         cov = max(cov, band);
@@ -1065,14 +1074,29 @@ fn fs_aurora_bake(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_baked(in: VsOut) -> @location(0) vec4<f32> {
     let p = in.pos.xy - u.offset;
     var rgb = base_rgb(p);
-    let s = textureSampleLevel(tex, samp, p / u.resolution, 0.0);
+    // The noise layer covers the cache (window + parallax margin) at half size.
+    let s = textureSampleLevel(tex, samp, in.pos.xy / (u.resolution + vec2(0.0, u.offset.y)), 0.0);
     let k = u.look.x * 2.0;
     let lit = rgb * (1.0 - 0.3 * clamp(s.a * k, 0.0, 1.0)) + s.rgb * k;
     // Light themes: a pastel of the curtain's hue (not a gray smudge).
     let hue = s.rgb / max(max(s.r, max(s.g, s.b)), 1e-4);
     let tinted = mix(rgb, mix(hue, vec3(1.0), 0.45), clamp(s.a * k * 0.45, 0.0, 1.0));
     rgb = select(lit, tinted, u.misc.w > 0.5);
-    return finish(guard(vignette(rgb, in.pos.xy)), in.pos.xy);
+    return finish(guard(vignette(rgb, p)), in.pos.xy);
+}
+
+// ── per frame ──
+// Copy the baked cache (group 1) under the grid at the content offset — the
+// slide and parallax shift it, rows past its edge repeat the edge — with the
+// window's opacity, premultiplied when the surface wants it. An exact texel
+// copy: the dither baked into the cache survives untouched at opacity 1.
+@fragment
+fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(tex));
+    let q = clamp(vec2<i32>(floor(in.pos.xy - u.offset)), vec2(0), dims - vec2(1));
+    let c = textureLoad(tex, q, 0).rgb;
+    let a = u.bg.w;
+    return vec4(c * select(1.0, a, u.misc.z > 0.5), a);
 }
 "#;
 
@@ -1290,14 +1314,21 @@ pub fn build_uniform(
         let pos = if n == 1 { i as f32 } else { (i.min(n - 1)) as f32 / (n - 1) as f32 };
         *slot = lab4(c, pos);
     }
+    let time = if s.animates() { f.time } else { 0.0 };
+    // An animated look sways (linear: ±7°) or drifts (radial) slowly; folded in
+    // here so the shader does no trig per pixel. time 0 = exactly static.
     let geom = match look.shape {
         BackdropShape::Linear => {
-            let a = look.angle.to_radians();
+            let a = look.angle.to_radians() + 0.12 * (0.07 * time).sin();
             [a.sin(), -a.cos(), 0.0, 0.0]
         }
-        BackdropShape::Radial => [look.center[0], look.center[1], look.radius.max(0.05), 1.0],
+        BackdropShape::Radial => [
+            look.center[0] + 0.05 * (0.13 * time).sin(),
+            look.center[1] + 0.05 * (0.091 * time).sin(),
+            look.radius.max(0.05),
+            1.0,
+        ],
     };
-    let time = if s.animates() { f.time } else { 0.0 };
 
     let mut u = BackdropUniform {
         resolution: [w, h],
@@ -1401,61 +1432,100 @@ impl ThemeKey {
     }
 }
 
-/// The half-resolution aurora cache.
-struct Bake {
+/// A texture the backdrop bakes into, with the bind group that reads it.
+struct Target {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
-    /// Window size the bake was rendered for.
     size: (u32, u32),
-    /// The uniform it was rendered with (everything but the per-frame offset).
-    from: Option<BackdropUniform>,
 }
 
-/// Format of the aurora bake texture (filterable, no banding in the cache).
-const BAKE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// The per-window cache: the finished backdrop — straight color, guarded,
+/// vignetted and dithered — sRGB-encoded 8-bit, exactly what the surface
+/// stores. A frame only copies it (`fs_composite`).
+const CACHE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-/// An animated aurora re-bakes at most this often.
+/// The aurora's half-resolution noise layer (filterable, no banding in it).
+const NOISE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// An animated look re-bakes at most this often (≤ 30 fps).
 const BAKE_MIN_INTERVAL: f32 = 1.0 / 30.0;
 
+/// Rows baked above the window for `parallax`: the cache covers backdrop rows
+/// `-margin .. height`, so the shift never samples past its top edge.
+pub fn parallax_margin(win_h: f32) -> u32 {
+    (PARALLAX_MAX * win_h.max(0.0)).ceil() as u32
+}
+
+/// Whether a cache baked from `from` still shows `bake`: identical inputs, or —
+/// while the look animates — identical but for a clock that moved less than a
+/// 30 fps frame.
+pub fn bake_is_fresh(from: Option<&BackdropUniform>, bake: &BackdropUniform, animates: bool) -> bool {
+    let Some(from) = from else { return false };
+    if from == bake {
+        return true;
+    }
+    if !animates {
+        return false;
+    }
+    let (mut a, mut b) = (*from, *bake);
+    a.misc[0] = 0.0;
+    b.misc[0] = 0.0;
+    a == b && (bake.misc[0] - from.misc[0]).abs() < BAKE_MIN_INTERVAL
+}
+
 /// One window's backdrop GPU state. Built only when the mode is not `none`
-/// (the app keeps `Option<Backdrop>`); pipelines are created lazily per
-/// variant, the aurora bake texture only for the aurora.
+/// (the app keeps `Option<Backdrop>`).
+///
+/// The look is BAKED into a window-sized cache whenever an input changes —
+/// size, theme, settings, the image, DPI, or (animated looks, ≤ 30 fps) the
+/// clock — by the variant's own shader, which may be as rich as it likes. A
+/// frame then only COPIES the cache under the grid (`fs_composite`: one
+/// texel load + opacity/premultiply), whatever the variant: measured on the
+/// reference iGPU this is a small step over the floor every full-screen pass
+/// pays, where evaluating the gradient per frame cost more than twice that.
+/// The dropdown slide and the parallax shift are offsets of that copy, so
+/// neither re-bakes. Pipelines are built lazily per variant.
 pub struct Backdrop {
     format: wgpu::TextureFormat,
     shader: wgpu::ShaderModule,
-    uniform_buf: wgpu::Buffer,
-    uniform_bg: wgpu::BindGroup,
+    /// Uniform of the bake passes (window layout, straight color).
+    bake_buf: wgpu::Buffer,
+    bake_bg: wgpu::BindGroup,
+    /// Uniform of the per-frame composite (offset, opacity, premultiply).
+    comp_buf: wgpu::Buffer,
+    comp_bg: wgpu::BindGroup,
     layout0: wgpu::PipelineLayout,
     layout01: wgpu::PipelineLayout,
     tex_bgl: wgpu::BindGroupLayout,
     clamp_sampler: wgpu::Sampler,
     repeat_sampler: wgpu::Sampler,
+    /// Bake pipelines per variant (into the cache).
     pipelines: [Option<wgpu::RenderPipeline>; 6],
-    bake_pipeline: Option<wgpu::RenderPipeline>,
+    noise_pipeline: Option<wgpu::RenderPipeline>,
+    composite: Option<wgpu::RenderPipeline>,
     /// Settings + theme the cached look was resolved from.
     resolved: Option<(BackdropSettings, ThemeKey)>,
     look: Option<GradientLook>,
     variant: Variant,
     /// The image bind group: (image identity, tile sampler?, bind group).
     image_bind: Option<(Arc<GpuImage>, bool, wgpu::BindGroup)>,
-    bake: Option<Bake>,
-    last_uniform: Option<BackdropUniform>,
+    cache: Option<Target>,
+    noise: Option<Target>,
+    /// The bake uniform the cache holds.
+    baked: Option<BackdropUniform>,
+    last_comp: Option<BackdropUniform>,
+    /// Cache bakes so far (tests and the bench count them).
+    bakes: u64,
 }
 
 impl Backdrop {
-    /// Build the layer: shader module, uniform buffer, layouts and samplers —
-    /// NO pipeline yet (each is compiled on first use).
+    /// Build the layer: shader module, uniform buffers, layouts and samplers —
+    /// NO pipeline and no texture yet (each is created on first use).
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("backdrop-shader"),
             source: wgpu::ShaderSource::Wgsl(BACKDROP_SHADER.into()),
-        });
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("backdrop-uniform"),
-            size: std::mem::size_of::<BackdropUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
         let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("backdrop-uniform-bgl"),
@@ -1470,11 +1540,22 @@ impl Backdrop {
                 count: None,
             }],
         });
-        let uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("backdrop-uniform-bg"),
-            layout: &uniform_bgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() }],
-        });
+        let uniform = |label: &'static str| {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<BackdropUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &uniform_bgl,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
+            });
+            (buf, bg)
+        };
+        let (bake_buf, bake_bg) = uniform("backdrop-bake-uniform");
+        let (comp_buf, comp_bg) = uniform("backdrop-composite-uniform");
         let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("backdrop-tex-bgl"),
             entries: &[
@@ -1523,19 +1604,25 @@ impl Backdrop {
             clamp_sampler: sampler(wgpu::AddressMode::ClampToEdge, "backdrop-clamp"),
             repeat_sampler: sampler(wgpu::AddressMode::Repeat, "backdrop-repeat"),
             shader,
-            uniform_buf,
-            uniform_bg,
+            bake_buf,
+            bake_bg,
+            comp_buf,
+            comp_bg,
             layout0,
             layout01,
             tex_bgl,
             pipelines: Default::default(),
-            bake_pipeline: None,
+            noise_pipeline: None,
+            composite: None,
             resolved: None,
             look: None,
             variant: Variant::Gradient,
             image_bind: None,
-            bake: None,
-            last_uniform: None,
+            cache: None,
+            noise: None,
+            baked: None,
+            last_comp: None,
+            bakes: 0,
         }
     }
 
@@ -1558,8 +1645,7 @@ impl Backdrop {
             fragment: Some(wgpu::FragmentState {
                 module: &self.shader,
                 entry_point: Some(entry),
-                // REPLACE: the backdrop owns every pixel it covers (the clear
-                // under it only matters where nothing is drawn).
+                // REPLACE: every pass owns every pixel of its target.
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -1575,10 +1661,37 @@ impl Backdrop {
         })
     }
 
+    fn texture_bind_group(&self, device: &wgpu::Device, view: &wgpu::TextureView, sampler: &wgpu::Sampler) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("backdrop-tex-bg"),
+            layout: &self.tex_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+            ],
+        })
+    }
+
+    fn target(&self, device: &wgpu::Device, label: &'static str, size: (u32, u32), format: wgpu::TextureFormat) -> Target {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: size.0.max(1), height: size.1.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.texture_bind_group(device, &view, &self.clamp_sampler);
+        Target { _texture: texture, view, bind_group, size }
+    }
+
     /// Get ready to draw one frame: re-resolve the look when the settings or
-    /// the theme changed, build the variant's pipeline on first use, (re)bind
-    /// the image, re-bake the aurora when stale, and write the uniform when it
-    /// changed. Returns `false` (draw nothing) for `mode = "none"`.
+    /// the theme changed, (re)bind the image, RE-BAKE the cache when any baked
+    /// input changed, and write the composite uniform when it changed (opacity,
+    /// slide, parallax). Returns `false` (draw nothing) for `mode = "none"`.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -1597,10 +1710,6 @@ impl Backdrop {
             self.resolved = Some((settings.clone(), ThemeKey::of(theme)));
         }
         self.variant = variant;
-        let i = variant.index();
-        if self.pipelines[i].is_none() {
-            self.pipelines[i] = Some(self.pipeline(device, variant.entry(), variant.textured(), self.format));
-        }
         // The image bind group follows the image identity and the tile flag.
         if variant == Variant::Image {
             let img = image.expect("Image variant implies an image");
@@ -1610,6 +1719,7 @@ impl Backdrop {
                 let sampler = if tile { &self.repeat_sampler } else { &self.clamp_sampler };
                 let bg = self.texture_bind_group(device, &img.view, sampler);
                 self.image_bind = Some((Arc::clone(img), tile, bg));
+                self.baked = None;
             }
         } else if self.image_bind.is_some() && f.image.is_none() {
             // The image went away (mode change / reload): release the texture.
@@ -1617,119 +1727,133 @@ impl Backdrop {
         }
         let frame = BackdropFrame { image, ..*f };
         let look = self.look.as_ref().expect("resolved above");
-        let uniform = build_uniform(look, variant, settings, theme, &frame);
-        if self.last_uniform != Some(uniform) {
-            queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
-            self.last_uniform = Some(uniform);
+        let full = build_uniform(look, variant, settings, theme, &frame);
+        let (w, h) = (full.resolution[0] as u32, full.resolution[1] as u32);
+        let margin = if settings.parallax { parallax_margin(h as f32) } else { 0 };
+        // The bake: the window's layout in straight color at full alpha, cache
+        // row r holding backdrop row r - margin.
+        let mut bake = full;
+        bake.offset = [0.0, margin as f32];
+        bake.bg[3] = 1.0;
+        bake.misc[2] = 0.0;
+        // The composite: the cache read at the content offset.
+        let mut comp = full;
+        comp.offset = [full.offset[0], full.offset[1] - margin as f32];
+
+        let size = (w.max(1), (h + margin).max(1));
+        if self.cache.as_ref().is_none_or(|c| c.size != size) {
+            self.cache = Some(self.target(device, "backdrop-cache", size, CACHE_FORMAT));
+            self.baked = None;
         }
-        if variant == Variant::Baked {
-            self.ensure_bake(device, queue, &uniform, settings.animates());
-        } else if self.bake.is_some() {
-            self.bake = None; // free the cache when the aurora is not in use
+        if !bake_is_fresh(self.baked.as_ref(), &bake, settings.animates()) {
+            self.bake(device, queue, variant, &bake, size);
+        }
+        if variant != Variant::Baked {
+            self.noise = None; // the aurora's layer is only kept while it shows
+        }
+        if self.composite.is_none() {
+            self.composite = Some(self.pipeline(device, "fs_composite", true, self.format));
+        }
+        if self.last_comp != Some(comp) {
+            queue.write_buffer(&self.comp_buf, 0, bytemuck::bytes_of(&comp));
+            self.last_comp = Some(comp);
         }
         true
     }
 
-    fn texture_bind_group(&self, device: &wgpu::Device, view: &wgpu::TextureView, sampler: &wgpu::Sampler) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("backdrop-tex-bg"),
-            layout: &self.tex_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-            ],
-        })
-    }
-
-    /// (Re)render the aurora into its half-res texture when the window size or
-    /// any baked input changed (the per-frame `offset` is applied when sampling,
-    /// so a dropdown slide or parallax never re-bakes); an animated aurora
-    /// re-bakes at most every [`BAKE_MIN_INTERVAL`].
-    fn ensure_bake(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, u: &BackdropUniform, animates: bool) {
-        let size = (u.resolution[0] as u32, u.resolution[1] as u32);
-        let mut key = *u;
-        key.offset = [0.0, 0.0];
-        let reuse = self.bake.as_ref().is_some_and(|b| {
-            b.size == size
-                && b.from.is_some_and(|from| {
-                    let mut a = from;
-                    let mut c = key;
-                    // Time is compared separately (throttled).
-                    a.misc[0] = 0.0;
-                    c.misc[0] = 0.0;
-                    a == c && (!animates || (key.misc[0] - from.misc[0]).abs() < BAKE_MIN_INTERVAL)
-                })
-        });
-        if reuse {
+    /// Render the look into the cache (the aurora first renders its noise
+    /// layer at half resolution): one encoder, one submit, off the frame's pass.
+    fn bake(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, variant: Variant, u: &BackdropUniform, size: (u32, u32)) {
+        queue.write_buffer(&self.bake_buf, 0, bytemuck::bytes_of(u));
+        let i = variant.index();
+        if self.pipelines[i].is_none() {
+            self.pipelines[i] = Some(self.pipeline(device, variant.entry(), variant.textured(), CACHE_FORMAT));
+        }
+        if variant == Variant::Baked {
+            let nsize = (size.0.div_ceil(2), size.1.div_ceil(2));
+            if self.noise.as_ref().is_none_or(|n| n.size != nsize) {
+                self.noise = Some(self.target(device, "backdrop-noise", nsize, NOISE_FORMAT));
+            }
+            if self.noise_pipeline.is_none() {
+                self.noise_pipeline = Some(self.pipeline(device, "fs_aurora_bake", false, NOISE_FORMAT));
+            }
+        }
+        let group1 = match variant {
+            Variant::Image => self.image_bind.as_ref().map(|(_, _, bg)| bg),
+            Variant::Baked => self.noise.as_ref().map(|n| &n.bind_group),
+            _ => None,
+        };
+        let (Some(cache), Some(pipeline)) = (self.cache.as_ref(), self.pipelines[i].as_ref()) else { return };
+        if variant.textured() && group1.is_none() {
             return;
         }
-        if self.bake.as_ref().is_none_or(|b| b.size != size) {
-            let (bw, bh) = ((size.0.max(1)).div_ceil(2), (size.1.max(1)).div_ceil(2));
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("backdrop-bake"),
-                size: wgpu::Extent3d { width: bw, height: bh, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: BAKE_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind_group = self.texture_bind_group(device, &view, &self.clamp_sampler);
-            self.bake = Some(Bake { _texture: texture, view, bind_group, size, from: None });
+        fn pass_desc(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
+            wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                depth_slice: None,
+            }
         }
-        if self.bake_pipeline.is_none() {
-            self.bake_pipeline = Some(self.pipeline(device, "fs_aurora_bake", false, BAKE_FORMAT));
-        }
-        let (Some(bake), Some(pipeline)) = (self.bake.as_mut(), self.bake_pipeline.as_ref()) else { return };
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("backdrop-bake") });
+        if let (Variant::Baked, Some(noise), Some(np)) = (variant, self.noise.as_ref(), self.noise_pipeline.as_ref()) {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("backdrop-noise-pass"),
+                color_attachments: &[Some(pass_desc(&noise.view))],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(np);
+            pass.set_bind_group(0, &self.bake_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("backdrop-bake-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &bake.view,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-                    depth_slice: None,
-                })],
+                color_attachments: &[Some(pass_desc(&cache.view))],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &self.uniform_bg, &[]);
+            pass.set_bind_group(0, &self.bake_bg, &[]);
+            if let Some(bg) = group1 {
+                pass.set_bind_group(1, bg, &[]);
+            }
             pass.draw(0..3, 0..1);
         }
         queue.submit(Some(encoder.finish()));
-        bake.from = Some(key);
+        self.baked = Some(*u);
+        self.bakes += 1;
     }
 
-    /// Record the backdrop draw into the frame's grid pass (after its clear,
-    /// before the cell backgrounds). [`Self::prepare`] must have returned `true`
-    /// this frame.
+    /// Record the backdrop into the frame's grid pass (after its clear, before
+    /// the cell backgrounds): a copy of the cache. [`Self::prepare`] must have
+    /// returned `true` this frame.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        let Some(pipeline) = self.pipelines[self.variant.index()].as_ref() else { return };
-        let group1 = match self.variant {
-            Variant::Image => self.image_bind.as_ref().map(|(_, _, bg)| bg),
-            Variant::Baked => self.bake.as_ref().map(|b| &b.bind_group),
-            _ => None,
-        };
-        if self.variant.textured() && group1.is_none() {
-            return;
-        }
+        let (Some(pipeline), Some(cache)) = (self.composite.as_ref(), self.cache.as_ref()) else { return };
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &self.uniform_bg, &[]);
-        if let Some(bg) = group1 {
-            pass.set_bind_group(1, bg, &[]);
-        }
+        pass.set_bind_group(0, &self.comp_bg, &[]);
+        pass.set_bind_group(1, &cache.bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
 
     /// The variant [`Self::prepare`] chose for this frame.
     pub fn variant(&self) -> Variant {
         self.variant
+    }
+
+    /// How many times the cache has been baked (an unchanged frame never bakes).
+    pub fn bake_count(&self) -> u64 {
+        self.bakes
+    }
+
+    /// Force a re-bake on the next [`Self::prepare`] (benchmarks).
+    pub fn invalidate(&mut self) {
+        self.baked = None;
     }
 }
 
@@ -1755,7 +1879,49 @@ mod tests {
         for v in Variant::ALL {
             assert!(names.contains(&v.entry()), "missing {}", v.entry());
         }
-        assert!(names.contains(&"fs_aurora_bake") && names.contains(&"vs"));
+        assert!(names.contains(&"fs_aurora_bake") && names.contains(&"vs") && names.contains(&"fs_composite"));
+    }
+
+    #[test]
+    fn bake_freshness() {
+        let t = theme("tokyo_night");
+        let s = BackdropSettings { mode: BackdropMode::Theme, ..Default::default() };
+        let look = resolve_look(&s, &t);
+        let f = BackdropFrame {
+            width: 640,
+            height: 400,
+            slide_y: 0.0,
+            scroll_px: 0.0,
+            dpi: 1.0,
+            premultiply: true,
+            time: 0.0,
+            image: None,
+        };
+        let a = build_uniform(&look, Variant::Gradient, &s, &t, &f);
+        assert!(!bake_is_fresh(None, &a, false), "never baked");
+        assert!(bake_is_fresh(Some(&a), &a, false));
+        let mut b = a;
+        b.resolution = [641.0, 400.0];
+        assert!(!bake_is_fresh(Some(&a), &b, false), "a resize re-bakes");
+        // Animated: the clock may drift by less than a 30 fps frame.
+        let mut t1 = a;
+        t1.misc[0] = 1.0;
+        let mut t2 = t1;
+        t2.misc[0] = 1.0 + BAKE_MIN_INTERVAL * 0.5;
+        assert!(bake_is_fresh(Some(&t1), &t2, true));
+        assert!(!bake_is_fresh(Some(&t1), &t2, false), "a static look re-bakes on any change");
+        t2.misc[0] = 1.0 + BAKE_MIN_INTERVAL * 1.5;
+        assert!(!bake_is_fresh(Some(&t1), &t2, true), "≤ 30 fps, not slower");
+    }
+
+    #[test]
+    fn parallax_margin_covers_the_shift() {
+        for h in [1.0f32, 480.0, 1199.0, 2160.0] {
+            let m = parallax_margin(h) as f32;
+            assert!(m >= parallax_offset(1e9, h), "{h}: the shift stays inside the margin");
+            assert!(m <= PARALLAX_MAX * h + 1.0);
+        }
+        assert_eq!(parallax_margin(0.0), 0);
     }
 
     /// `BackdropUniform` matches the WGSL `struct U` byte for byte.
@@ -2153,5 +2319,29 @@ mod tests {
             assert!(bd.prepare(&device, &queue, &s, &t, &f));
         }
         assert!(!bd.prepare(&device, &queue, &BackdropSettings::default(), &t, &f));
+
+        // The cache bakes on change only: an unchanged frame, a dropdown slide
+        // or an opacity change re-composite without re-baking; a theme change
+        // or a resize bakes again.
+        let s = BackdropSettings { mode: BackdropMode::Theme, ..Default::default() };
+        let mut bd = Backdrop::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        assert!(bd.prepare(&device, &queue, &s, &t, &f));
+        assert_eq!(bd.bake_count(), 1);
+        assert!(bd.prepare(&device, &queue, &s, &t, &f));
+        assert!(bd.prepare(&device, &queue, &s, &t, &BackdropFrame { slide_y: -20.0, ..f }));
+        let mut translucent = t.clone();
+        translucent.bg[3] = 200;
+        assert!(bd.prepare(&device, &queue, &s, &translucent, &f));
+        assert_eq!(bd.bake_count(), 1, "no re-bake for an unchanged look");
+        assert!(bd.prepare(&device, &queue, &s, &theme("dracula"), &f));
+        assert_eq!(bd.bake_count(), 2, "a theme change re-bakes");
+        assert!(bd.prepare(&device, &queue, &s, &theme("dracula"), &BackdropFrame { width: 70, ..f }));
+        assert_eq!(bd.bake_count(), 3, "a resize re-bakes");
+        // Parallax: scrolling shifts the composite, never re-bakes.
+        let sp = BackdropSettings { parallax: true, ..s };
+        assert!(bd.prepare(&device, &queue, &sp, &t, &f));
+        let n = bd.bake_count();
+        assert!(bd.prepare(&device, &queue, &sp, &t, &BackdropFrame { scroll_px: 300.0, ..f }));
+        assert_eq!(bd.bake_count(), n);
     }
 }

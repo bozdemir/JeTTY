@@ -128,6 +128,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }))?
         }
     };
+    // `JETTY_BENCH_ONLY=backdrop`: just the backdrop section (quick repeats).
+    if std::env::var("JETTY_BENCH_ONLY").as_deref() == Ok("backdrop") {
+        return bench_backdrop(&adapter);
+    }
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("jetty-bench"),
         required_features: wgpu::Features::empty(),
@@ -693,9 +697,47 @@ fn bench_backdrop(adapter: &wgpu::Adapter) -> Result<(), Box<dyn std::error::Err
     ];
     let n = 200usize;
     let period = queue.get_timestamp_period() as f64;
+    // The floor every full-screen shaded pass pays on this GPU: a trivial
+    // fragment shader writing one constant color (vs. the clear, which is a
+    // fast clear and shades nothing). The backdrop's own work is what it adds
+    // over THIS.
+    let flat_src = "@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+        var v = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+        return vec4(v[vi], 0.0, 1.0);
+    }
+    @fragment fn fs() -> @location(0) vec4<f32> { return vec4(0.1, 0.2, 0.3, 1.0); }";
+    let flat_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("bench-flat"),
+        source: wgpu::ShaderSource::Wgsl(flat_src.into()),
+    });
+    let flat = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("bench-flat"),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &flat_module,
+            entry_point: Some("vs"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &flat_module,
+            entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
     println!(
-        "backdrop      GPU per frame, one pass [clear + backdrop], n={n}, {}",
-        if ts { "timestamp queries" } else { "wall clock (no timestamp queries)" }
+        "backdrop      GPU per pass [clear + layer], {n} passes back to back (the GPU stays clocked), {}",
+        if ts { "timestamp queries" } else { "wall clock / n (no timestamp queries)" }
     );
     for &(w, h) in &[(1920u32, 1200u32), (2560, 1440)] {
         let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -713,33 +755,30 @@ fn bench_backdrop(adapter: &wgpu::Adapter) -> Result<(), Box<dyn std::error::Err
             device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("bench-backdrop-ts"),
                 ty: wgpu::QueryType::Timestamp,
-                count: 2,
+                count: 2 * n as u32,
             })
         });
+        let bytes = 16 * n as u64;
         let resolve = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bench-backdrop-resolve"),
-            size: 16,
+            size: bytes,
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bench-backdrop-readback"),
-            size: 16,
+            size: bytes,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut baseline = 0.0f64;
-        for (name, settings, image) in &variants {
-            let mut bd = settings.as_ref().map(|_| jetty_render::Backdrop::new(&device, format));
-            let frame = backdrop_frame(w, h, *image);
-            let mut samples = Vec::with_capacity(n);
-            for k in 0..n + 5 {
-                if let (Some(bd), Some(s)) = (bd.as_mut(), settings.as_ref()) {
-                    bd.prepare(&device, &queue, s, &theme, &frame);
-                }
+        // `n` passes of [clear + draw] recorded back to back, one timestamp pair
+        // each; (median, p90) ms per pass. Run twice, the first as a warm-up.
+        let measure = |draw: &dyn Fn(&mut wgpu::RenderPass<'_>)| -> Result<(f64, f64), Box<dyn std::error::Error>> {
+            let mut result = (0.0, 0.0);
+            for _round in 0..2 {
                 let t = Instant::now();
                 let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-                {
+                for k in 0..n as u32 {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: None,
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -754,72 +793,150 @@ fn bench_backdrop(adapter: &wgpu::Adapter) -> Result<(), Box<dyn std::error::Err
                         depth_stencil_attachment: None,
                         timestamp_writes: qs.as_ref().map(|q| wgpu::RenderPassTimestampWrites {
                             query_set: q,
-                            beginning_of_pass_write_index: Some(0),
-                            end_of_pass_write_index: Some(1),
+                            beginning_of_pass_write_index: Some(2 * k),
+                            end_of_pass_write_index: Some(2 * k + 1),
                         }),
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    if let Some(bd) = &bd {
-                        bd.draw(&mut pass);
-                    }
+                    draw(&mut pass);
                 }
                 if let Some(q) = &qs {
-                    encoder.resolve_query_set(q, 0..2, &resolve, 0);
-                    encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, 16);
+                    encoder.resolve_query_set(q, 0..2 * n as u32, &resolve, 0);
+                    encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, bytes);
                 }
                 queue.submit(Some(encoder.finish()));
                 device.poll(wgpu::PollType::wait_indefinitely())?;
-                let wall = t.elapsed().as_secs_f64() * 1000.0;
-                let gpu_ms = if qs.is_some() {
+                let wall = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+                let mut samples: Vec<f32> = if qs.is_some() {
                     let slice = readback.slice(..);
                     slice.map_async(wgpu::MapMode::Read, |_| {});
                     device.poll(wgpu::PollType::wait_indefinitely())?;
-                    let ticks = {
+                    let v = {
                         let data = slice.get_mapped_range();
-                        let a = u64::from_le_bytes(data[0..8].try_into()?);
-                        let b = u64::from_le_bytes(data[8..16].try_into()?);
-                        b.saturating_sub(a)
+                        (0..n)
+                            .map(|k| {
+                                let at = |i: usize| u64::from_le_bytes(data[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+                                (at(2 * k + 1).saturating_sub(at(2 * k)) as f64 * period / 1.0e6) as f32
+                            })
+                            .collect()
                     };
                     readback.unmap();
-                    ticks as f64 * period / 1.0e6
+                    v
                 } else {
-                    wall
+                    vec![wall as f32]
                 };
-                if k >= 5 {
-                    samples.push(gpu_ms as f32);
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                result = (percentile(&samples, 50.0) as f64, percentile(&samples, 90.0) as f64);
+            }
+            Ok(result)
+        };
+        let (clear, _) = measure(&|_pass| {})?;
+        let (floor, floor90) = measure(&|pass| {
+            pass.set_pipeline(&flat);
+            pass.draw(0..3, 0..1);
+        })?;
+        println!("  {w}x{h} {:<14} median {clear:6.3} ms (fast clear, nothing shaded)", "clear only");
+        println!(
+            "  {w}x{h} {:<14} median {floor:6.3} ms | p90 {floor90:6.3} ms (any full-screen shaded pass)",
+            "flat shader"
+        );
+        // Reference: copying a window-sized cached texture (textureLoad, one
+        // read + one write per pixel) — what a pre-baked backdrop costs a frame.
+        let copy_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bench-copy"),
+            source: wgpu::ShaderSource::Wgsl(
+                "@group(0) @binding(0) var t: texture_2d<f32>;
+                @vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+                    var v = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+                    return vec4(v[vi], 0.0, 1.0);
+                }
+                @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+                    return textureLoad(t, vec2<i32>(p.xy), 0);
+                }"
+                .into(),
+            ),
+        });
+        let copy = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("bench-copy"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &copy_module,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &copy_module,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let src = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bench-copy-src"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+        let copy_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &copy.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) }],
+        });
+        let (copy_ms, copy90) = measure(&|pass| {
+            pass.set_pipeline(&copy);
+            pass.set_bind_group(0, &copy_bg, &[]);
+            pass.draw(0..3, 0..1);
+        })?;
+        println!(
+            "  {w}x{h} {:<14} median {copy_ms:6.3} ms | p90 {copy90:6.3} ms (reference: copy a cached texture)",
+            "cached copy"
+        );
+        for (name, settings, image) in variants.iter().skip(1) {
+            let Some(s) = settings else { continue };
+            let mut bd = jetty_render::Backdrop::new(&device, format);
+            let frame = backdrop_frame(w, h, *image);
+            bd.prepare(&device, &queue, s, &theme, &frame);
+            // Per frame: the composite copy of the baked cache.
+            let (med, p90) = measure(&|pass| bd.draw(pass))?;
+            // On a change (resize / theme / settings): one bake, submit + wait.
+            let mut bake = Vec::with_capacity(20);
+            for k in 0..23 {
+                bd.invalidate();
+                let t = Instant::now();
+                bd.prepare(&device, &queue, s, &theme, &frame);
+                device.poll(wgpu::PollType::wait_indefinitely())?;
+                if k >= 3 {
+                    bake.push(t.elapsed().as_secs_f32() * 1000.0);
                 }
             }
-            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let med = percentile(&samples, 50.0) as f64;
-            if settings.is_none() {
-                baseline = med;
-            }
+            bake.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             println!(
-                "  {w}x{h} {name:<14} median {med:6.3} ms | p90 {:6.3} ms | +{:6.3} ms over the clear",
-                percentile(&samples, 90.0),
-                (med - baseline).max(0.0)
+                "  {w}x{h} {name:<14} per frame median {med:6.3} ms | p90 {p90:6.3} ms | +{:6.3} over the flat pass | bake (on change) {:6.3} ms",
+                (med - floor).max(0.0),
+                percentile(&bake, 50.0)
             );
         }
-        // The animated aurora's re-bake: the half-res noise pass alone.
-        let s = BackdropSettings { animate: true, ..backdrop_settings("aurora").ok_or("aurora")? };
-        let mut bd = jetty_render::Backdrop::new(&device, format);
-        let mut bake = Vec::with_capacity(60);
-        for k in 0..65 {
-            let frame = jetty_render::BackdropFrame { time: k as f32 * 0.05, ..backdrop_frame(w, h, None) };
-            let t = Instant::now();
-            bd.prepare(&device, &queue, &s, &theme, &frame);
-            device.poll(wgpu::PollType::wait_indefinitely())?;
-            if k >= 5 {
-                bake.push(t.elapsed().as_secs_f32() * 1000.0);
-            }
-        }
-        bake.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        println!(
-            "  {w}x{h} aurora re-bake (animated, ≤30/s, half-res, wall clock) median {:6.3} ms",
-            percentile(&bake, 50.0)
-        );
     }
+    println!(
+        "              (bake = wall clock incl. submit + wait; paid on a resize / theme / settings change,\n               \
+         and by an animated look once per ≤ 30 fps tick — a static backdrop never bakes per frame)"
+    );
     Ok(())
 }
 
