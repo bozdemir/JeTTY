@@ -193,14 +193,14 @@ Settings live in one TOML file — the Settings window writes it, and you can ed
 | Linux | `~/.config/jetty/config.toml` (`$XDG_CONFIG_HOME/jetty/…`) | `~/.config/jetty/themes/*.toml` |
 | macOS | `~/Library/Application Support/jetty/config.toml` | `~/Library/Application Support/jetty/themes/*.toml` |
 
-`JETTY_CONFIG_DIR=/some/dir` makes JeTTY use `/some/dir/config.toml` and `/some/dir/themes/` instead — as a separate instance next to your usual one (which it leaves alone, login item included); `jetty --help` prints the path in use.
+`JETTY_CONFIG_DIR=/some/dir` makes JeTTY use `/some/dir/config.toml` and `/some/dir/themes/` instead — as a separate instance next to your usual one, which it leaves alone (login item included; give it its own `summon_hotkey` to summon it); `jetty --help` prints the path in use.
 
 - **Live reload** — saving the file (or a theme) applies it immediately; a symlinked config (dotfiles) is followed. `hot_reload = false` turns the watcher off.
 - **Forgiving** — a value of the wrong type (`opacity = "0.9"`) or an unknown key (`fontsize`) is reported in the window and only that key falls back; everything else still applies. A file that isn't valid TOML at all leaves your settings untouched (JeTTY runs on defaults, keeps a copy as `config.toml.bad-<time>` and won't save over it until it's fixed).
 - **Your formatting stays** — Settings changes rewrite only the keys that changed; comments, order and keys JeTTY doesn't know survive.
 - **Keybindings** — a `[keys]` table remaps any shortcut by the names in the [table above](#️-keybindings), e.g. `new_tab = "Ctrl+T"` or `paste = ["Ctrl+Shift+V", "Shift+Insert"]`; `""` unbinds. The palette's **Reset keybindings** (run it twice to confirm) clears the table after saving a `config.toml.bak-<time>` copy.
 - **Keyboard protocol** — programs that ask for the kitty keyboard protocol get it; `kitty_keyboard = false` turns it off. With shell integration, flags a killed or crashed program left pushed are dropped when the next prompt appears; for anything else (a TUI that died on the alternate screen) the palette's **Reset keyboard & mouse modes** clears the tab's keyboard, mouse, focus and paste modes without clearing the screen.
-- **Launch at login** — the Settings toggle (or `launch_at_login = true`) adds a login item that starts JeTTY **hidden** (`jetty --background`): press `F9` and it is there. Linux uses the standard XDG autostart entry, macOS a LaunchAgent.
+- **Launch at login** — the Settings toggle (or `launch_at_login = true`) adds a login item that starts JeTTY **hidden** (`jetty --background`): press `F9` and it is there. Linux uses the standard XDG autostart entry, macOS a LaunchAgent. Starting JeTTY never removes it: use the toggle, or set `launch_at_login = false` while JeTTY runs.
 
 ## ⚡ Performance
 
