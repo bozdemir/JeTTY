@@ -277,13 +277,54 @@ fn rise(bg: [u8; 3], to: [u8; 3], t0: f32, surface: [u8; 3], floor: f32) -> [u8;
 }
 
 /// The first of `candidates` that reaches [`UiPalette::ACCENT_FLOOR`] on
-/// `surface`, else the first one shaded until it does.
+/// `surface`, else the first one shaded until it does. A later candidate (the
+/// bright ANSI slot) only stands in for the first when it is the same color
+/// family — Solarized's "bright" slots are its gray base tones, and a gray must
+/// not replace its green or blue.
 fn first_readable(candidates: &[[u8; 3]], surface: [u8; 3]) -> [u8; 3] {
+    let first = candidates[0];
     candidates
         .iter()
         .copied()
-        .find(|&c| contrast_ratio(c, surface) >= UiPalette::ACCENT_FLOOR)
-        .unwrap_or_else(|| ensure_contrast(candidates[0], &[surface], UiPalette::ACCENT_FLOOR))
+        .enumerate()
+        .find(|&(i, c)| {
+            (i == 0 || same_family(first, c)) && contrast_ratio(c, surface) >= UiPalette::ACCENT_FLOOR
+        })
+        .map(|(_, c)| c)
+        .unwrap_or_else(|| ensure_contrast(first, &[surface], UiPalette::ACCENT_FLOOR))
+}
+
+/// Hue (degrees) and chroma (0..=1, max − min channel) of an sRGB color.
+fn hue_chroma(c: [u8; 3]) -> (f32, f32) {
+    let [r, g, b] = c.map(|v| v as f32 / 255.0);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let chroma = max - min;
+    if chroma <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let h = if max == r {
+        ((g - b) / chroma).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / chroma + 2.0
+    } else {
+        (r - g) / chroma + 4.0
+    };
+    (h * 60.0, chroma)
+}
+
+/// Whether `b` can stand in for `a`: both near-gray, or both colored with hues
+/// within 40° (gruvbox's bright blue for its blue: yes; a gray for a green: no).
+fn same_family(a: [u8; 3], b: [u8; 3]) -> bool {
+    const GRAY: f32 = 0.08;
+    let ((ha, ca), (hb, cb)) = (hue_chroma(a), hue_chroma(b));
+    match (ca < GRAY, cb < GRAY) {
+        (true, true) => true,
+        (false, false) => {
+            let d = (ha - hb).abs();
+            d.min(360.0 - d) <= 40.0
+        }
+        _ => false,
+    }
 }
 
 /// Text for `fill`: whichever of the theme `bg` / `fg` contrasts more, when it
@@ -396,16 +437,34 @@ mod tests {
     #[test]
     fn a_weak_accent_falls_back_to_bright_blue_then_a_shade() {
         let mut t = jetty_core::Theme::by_name("catppuccin_mocha");
-        let bg = [t.bg[0], t.bg[1], t.bg[2]];
-        // palette[4] == bg: invisible → bright blue (palette[12]) is used.
-        t.palette[4] = bg;
+        // A navy palette[4] all but vanishes on the dark surface → the bright
+        // blue (palette[12]) is used.
+        t.palette[4] = [30, 40, 90];
         t.palette[12] = [120, 170, 255];
         assert_eq!(UiPalette::from_theme(&t).accent, [120, 170, 255]);
         // Both faint → a shade of palette[4] that reaches the floor.
-        t.palette[12] = bg;
+        t.palette[12] = [35, 45, 95];
         let ui = UiPalette::from_theme(&t);
         assert!(contrast_ratio(ui.accent, ui.surface) >= 3.0);
         assert!(contrast_ratio(ui.on_accent, ui.accent) >= 4.5);
+        assert!(hue_chroma(ui.accent).1 > 0.1, "still a blue, not a gray: {:?}", ui.accent);
+    }
+
+    #[test]
+    fn a_bright_slot_of_another_family_never_replaces_the_hue() {
+        // Solarized Light: green #859900 is too faint on the surface and bright
+        // green is the gray base tone #586e75 — the role stays a (darker) GREEN.
+        let t = jetty_core::Theme::by_name("solarized_light");
+        let ui = UiPalette::from_theme(&t);
+        assert_ne!(ui.success, t.palette[10], "a gray must not stand in for green");
+        let (h, c) = hue_chroma(ui.success);
+        let (h0, _) = hue_chroma(t.palette[2]);
+        assert!(c > 0.2 && (h - h0).abs() < 15.0, "kept the green hue: {:?}", ui.success);
+        // Gruvbox Dark: its bright blue IS a blue, so it is used as is.
+        let g = jetty_core::Theme::by_name("gruvbox_dark");
+        assert!(same_family(g.palette[4], g.palette[12]));
+        assert!(!same_family(t.palette[2], t.palette[10]));
+        assert!(same_family([90, 90, 90], [200, 200, 205]), "two grays are one family");
     }
 
     #[test]
