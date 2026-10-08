@@ -109,53 +109,6 @@ impl SummonEffect {
             SummonEffect::Focus => "Focus",
         }
     }
-
-    /// The next/previous effect in cycle order (wraps).
-    fn cycle(self, forward: bool) -> SummonEffect {
-        let i = Self::ORDER.iter().position(|&e| e == self).unwrap_or(1);
-        let n = Self::ORDER.len();
-        let j = if forward { (i + 1) % n } else { (i + n - 1) % n };
-        Self::ORDER[j]
-    }
-}
-
-/// Scrollback-cycler steps. 100_000 is alacritty's own UI max (and the config
-/// clamp ceiling): at ≤24 B/cell a fully-filled 100k×120-col history is
-/// ~290 MB per tab, so do not raise it without revisiting memory.
-const SCROLLBACK_STEPS: [usize; 6] = [1_000, 5_000, 10_000, 25_000, 50_000, 100_000];
-
-/// The next/previous scrollback step (wraps like `SummonEffect::cycle`). A
-/// hand-edited config value between steps first snaps to its NEAREST step,
-/// then moves ±1 — so the first click from e.g. 12_345 lands on a canonical
-/// value instead of jumping erratically.
-fn cycle_scrollback(cur: usize, forward: bool) -> usize {
-    let i = SCROLLBACK_STEPS
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, &s)| s.abs_diff(cur))
-        .map(|(i, _)| i)
-        .unwrap_or(2);
-    let n = SCROLLBACK_STEPS.len();
-    let j = if forward { (i + 1) % n } else { (i + n - 1) % n };
-    SCROLLBACK_STEPS[j]
-}
-
-/// Notify minimum-duration cycler steps, in seconds (v0.15). "I stepped away"
-/// granularity: 5s … 5m. A hand-edited config value snaps to its nearest step
-/// on the first click, then moves ±1 (wraps), mirroring `cycle_scrollback`.
-const NOTIFY_MIN_STEPS: [u64; 6] = [5, 10, 30, 60, 120, 300];
-
-/// The next/previous notify-minimum step (wraps).
-fn cycle_notify_min(cur: u64, forward: bool) -> u64 {
-    let i = NOTIFY_MIN_STEPS
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, &s)| s.abs_diff(cur))
-        .map(|(i, _)| i)
-        .unwrap_or(1);
-    let n = NOTIFY_MIN_STEPS.len();
-    let j = if forward { (i + 1) % n } else { (i + n - 1) % n };
-    NOTIFY_MIN_STEPS[j]
 }
 
 /// Per-tab/window anti-spam floor for command-finish notifications: a single tab
@@ -208,16 +161,6 @@ fn attention_for(failed: bool) -> winit::window::UserAttentionType {
     }
 }
 
-/// Display form of a scrollback value: whole thousands render as "Nk" (the
-/// cycler steps), anything else (a hand-edited config value) verbatim.
-fn format_scrollback(n: usize) -> String {
-    if n >= 1000 && n % 1000 == 0 {
-        format!("{}k", n / 1000)
-    } else {
-        n.to_string()
-    }
-}
-
 /// How F9 summons the window. Mirrors `SummonEffect`'s ORDER/cycle/from_config
 /// pattern. `Center` re-summons centered (or at the last position); `Dropdown`
 /// is a Yakuake-style top-anchored full-width strip that slides down;
@@ -248,13 +191,6 @@ impl WindowMode {
             WindowMode::Dropdown => "Dropdown",
             WindowMode::Fullscreen => "Fullscreen",
         }
-    }
-
-    fn cycle(self, forward: bool) -> WindowMode {
-        let i = Self::ORDER.iter().position(|&m| m == self).unwrap_or(0);
-        let n = Self::ORDER.len();
-        let j = if forward { (i + 1) % n } else { (i + n - 1) % n };
-        Self::ORDER[j]
     }
 
     /// Case-SENSITIVE, unknown ⇒ `Center` — unchanged, which is also what gives
@@ -296,10 +232,6 @@ const AUTOHIDE_GRACE_MS: u64 = 100;
 /// Scaled by the display's scale_factor before being passed to TextLayer so
 /// glyphs are rendered at physical-pixel resolution on HiDPI screens.
 const FONT_LOGICAL_DEFAULT: f32 = 16.0;
-
-/// Visible rows in the open theme dropdown. MUST match `panel::MAX_THEME_ROWS`
-/// (panel.rs owns the render-side value; this mirror bounds the scroll clamp).
-const MAX_THEME_ROWS: usize = 9;
 
 /// UI (chrome) font-size range in logical points. The chrome — tab titles, the
 /// status bar, the right-click menu, help/confirm/welcome overlays — scales
@@ -687,26 +619,15 @@ fn main_tab_watched(main_watching: bool, tab: usize, active: usize) -> bool {
 // see `App::desired_settings_logical_size` — so it fits ANY UI font (size or
 // family), not just the default; the window is also user-resizable.
 
-/// Identifies which Effects-tab slider is currently being dragged. One variant
-/// per draggable slider; `None` stored in `App::active_fx_drag` when no drag is
-/// in progress. Mirrors the `dragging_slider` / `dragging_radius` bool pattern
-/// but consolidates 13 sliders into a single optional enum so the struct stays
-/// compact and the `CursorMoved` handler stays readable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FxSlider {
-    CrtCurvature,
-    CrtScanline,
-    CrtMask,
-    CrtBloom,
-    CrtChromatic,
-    CrtVignette,
-    CaretDur,
-    TintR,
-    TintG,
-    TintB,
-    CaretColorR,
-    CaretColorG,
-    CaretColorB,
+/// A Settings control drag in progress (a slider or an RGB channel).
+#[derive(Clone, Debug)]
+struct CtlDrag {
+    id: jetty_render::CtlId,
+    part: jetty_render::CtlPart,
+    /// The value so far for a control that applies on RELEASE (the dropdown
+    /// size: re-docking per move would be an X11 resize storm); `None` for a
+    /// live control, whose every move is applied.
+    pending: Option<crate::settings_ui::Val>,
 }
 
 pub struct App {
@@ -909,10 +830,6 @@ pub struct App {
     /// FocusIn of the sibling JeTTY window the user actually clicked. Fired by
     /// `about_to_wait`; also cleared by any explicit visibility change.
     pending_autohide_at: Option<std::time::Instant>,
-    /// Whether the user is dragging the Dropdown-height slider in Settings.
-    dragging_dropdown: bool,
-    /// Whether the user is dragging the Dropdown-width slider in Settings.
-    dragging_dropdown_width: bool,
     /// One-time guard for the Wayland "positioning is a no-op" diagnostic.
     wayland_warned: bool,
     /// Free-running clock for CRT animation (roll/flicker/jitter). Initialized
@@ -1000,10 +917,6 @@ pub struct App {
     /// frame (amendment T1). Recomputed ONLY in `apply_theme` (i.e. on a theme_idx
     /// change) and on reload; `current_theme` clones it and stamps the live opacity.
     active_theme: jetty_core::Theme,
-    /// Whether the Look-tab theme dropdown is expanded. Session-only (not persisted).
-    theme_dropdown_open: bool,
-    /// First visible row index into the theme list when the dropdown is open.
-    theme_scroll_offset: usize,
     /// Background opacity (0.0..=1.0); modifies theme bg alpha at runtime.
     opacity: f32,
     /// Current logical (device-independent) font size in points. Changed at
@@ -1055,12 +968,40 @@ pub struct App {
     ui_font_families: Vec<String>,
     /// Scroll offset into `ui_font_families` for the panel's UI-font list.
     ui_font_scroll_offset: usize,
-    /// Active settings tab (0=Look, 1=Fonts, 2=Window, 3=Shell). Session-only:
-    /// NOT persisted to config, so it resets to 0 each launch.
+    /// Active settings tab (`jetty_render::TAB_NAMES` order). Session-only:
+    /// NOT persisted to config, so it resets to Look each launch.
     settings_tab: usize,
-    /// Vertical scroll offset (physical px, 0 = top) for the Effects tab (4).
-    /// Clamped to [0, max(0, effects_content_h - visible_h)] by the wheel handler.
-    effects_scroll: f32,
+    /// Per-tab vertical scroll of the Settings content (physical px, 0 = top).
+    /// Clamped by `build_panel`; the clamped value is stored back on every
+    /// Settings paint. Session-only.
+    settings_scroll: [f32; jetty_render::N_TABS],
+    /// Collapsed Settings sections (session-only).
+    settings_collapsed: Vec<&'static str>,
+    /// The Settings control being dragged, if any.
+    ctl_drag: Option<CtlDrag>,
+    /// The Settings scrollbar thumb is being dragged: where it was grabbed
+    /// (pointer y − thumb top, physical px).
+    settings_scroll_grab: Option<f32>,
+    /// The Settings part under the pointer (hover highlight; one repaint per
+    /// change, never per move).
+    settings_hover: Option<jetty_render::PanelHit>,
+    /// A deep-linked Settings control / section, highlighted until the next
+    /// input in Settings.
+    settings_focus: Option<&'static str>,
+    /// "Reset tab" was clicked once; the next click resets the tab.
+    reset_armed: bool,
+    /// The theme gallery's filter chip and browsing session (Enter keeps,
+    /// Esc restores the theme shown when browsing began).
+    gallery_filter: jetty_render::ThemeFilter,
+    gallery: crate::settings_ui::GallerySession,
+    /// Installed login shells — the Shell cycler's options — read once each
+    /// time Settings opens (never per frame).
+    shell_options: Vec<String>,
+    /// The Settings panel geometry of the last paint, for hover hit-tests
+    /// (a press rebuilds the panel fresh).
+    settings_geom: Option<jetty_render::PanelGeom>,
+    /// Modifier keys while the Settings window has focus (Ctrl+Tab).
+    settings_mods: winit::keyboard::ModifiersState,
     /// Runtime mirror of the persisted `EffectsConfig`. Loaded from config on
     /// startup; written back to `Config.effects` by `persist()`. UI/renderer tasks
     /// read and write fields here; the next `persist()` call flushes them to disk.
@@ -1270,13 +1211,6 @@ pub struct App {
     /// Last known cursor position inside the settings window (physical px), used
     /// for hit-testing the panel in the settings window's own coordinate space.
     settings_cursor: (f64, f64),
-    /// Whether the user is currently dragging the opacity slider in the Settings panel.
-    dragging_slider: bool,
-    /// Whether the user is currently dragging the corner-radius slider.
-    dragging_radius: bool,
-    /// Which Effects-tab slider (if any) is currently being dragged. `None` when
-    /// no effects slider drag is in progress. Mirrors `dragging_slider` etc.
-    active_fx_drag: Option<FxSlider>,
     /// Whether the user is currently dragging a text selection with the mouse.
     selecting: bool,
     /// The link under the pointer while the link modifier (Ctrl; also Cmd on
@@ -1790,8 +1724,6 @@ impl App {
             switching_to_settings: false,
             switching_to_detached: false,
             pending_autohide_at: None,
-            dragging_dropdown: false,
-            dragging_dropdown_width: false,
             wayland_warned: false,
             crt_clock: std::time::Instant::now(),
             summon_anim: None,
@@ -1817,8 +1749,6 @@ impl App {
             // Placeholder; `apply_theme()` at the end of `new` recomputes it from the
             // config-resolved theme_idx. Resolved via the registry (seeded above).
             active_theme: jetty_core::theme_at(theme_idx),
-            theme_dropdown_open: false,
-            theme_scroll_offset: 0,
             opacity,
             font_logical: FONT_LOGICAL_DEFAULT,
             reflow_pending_at: None,
@@ -1834,7 +1764,18 @@ impl App {
             ui_font_families: Vec::new(),
             ui_font_scroll_offset: 0,
             settings_tab: 0,
-            effects_scroll: 0.0,
+            settings_scroll: [0.0; jetty_render::N_TABS],
+            settings_collapsed: Vec::new(),
+            ctl_drag: None,
+            settings_scroll_grab: None,
+            settings_hover: None,
+            settings_focus: None,
+            reset_armed: false,
+            gallery_filter: jetty_render::ThemeFilter::All,
+            gallery: crate::settings_ui::GallerySession::default(),
+            shell_options: Vec::new(),
+            settings_geom: None,
+            settings_mods: winit::keyboard::ModifiersState::empty(),
             fx: crate::config::EffectsConfig::default(),
             // v0.16 — overridden by config below; safe defaults here.
             osc52_allow_paste: false,
@@ -1901,9 +1842,6 @@ impl App {
             settings_quad: None,
             settings_specimen_text: None,
             settings_cursor: (0.0, 0.0),
-            dragging_slider: false,
-            dragging_radius: false,
-            active_fx_drag: None,
             selecting: false,
             link_hover: None,
             link_hover_cell: None,
@@ -2550,21 +2488,6 @@ impl App {
         }
     }
 
-    /// Select a new window-summon reveal effect: persist it, fire a one-shot
-    /// PREVIEW summon on the main window so the user immediately SEES the effect,
-    /// and redraw the settings window so the new effect name shows.
-    fn set_summon_effect(&mut self, effect: SummonEffect) {
-        if self.summon_effect == effect {
-            return;
-        }
-        self.summon_effect = effect;
-        self.persist();
-        // One-shot preview on the main window (self-driving loop handles idle-0).
-        self.summon_pending = true;
-        self.request_main_paint();
-        self.request_settings_paint();
-    }
-
     /// The in-progress rename as the tab bar's `(tab index, buffer)`, if the
     /// renamed tab is (still) in the main window.
     fn rename_ref(&self) -> Option<(usize, &str)> {
@@ -2610,11 +2533,6 @@ impl App {
         let mut t = self.active_theme.clone();
         t.bg[3] = (self.opacity.clamp(0.0, 1.0) * 255.0) as u8;
         t
-    }
-
-    /// Largest valid `theme_scroll_offset` so the open dropdown's last page is full.
-    fn max_theme_scroll(&self) -> usize {
-        jetty_core::theme_count().saturating_sub(MAX_THEME_ROWS)
     }
 
     /// Re-resolve the cached `active_theme` from `theme_idx` (via the registry, never
@@ -2698,25 +2616,21 @@ impl App {
                             self.launch_at_login,
                         );
                         self.launch_at_login_in_file = explicit;
-                        self.apply_reloaded_config(cfg.clone(), &mut warnings);
+                        // A Settings control mid-DRAG keeps its live value over a
+                        // concurrent external edit (amendment H4): pin it in the
+                        // incoming config before applying.
+                        let file_cfg = cfg.clone();
+                        let dragged = self.ctl_drag.as_ref().and_then(|d| crate::settings_ui::find(d.id));
+                        if let Some(d) = dragged {
+                            (d.set)(&mut cfg, (d.get)(&self.settings_snapshot()));
+                        }
+                        self.apply_reloaded_config(cfg, &mut warnings);
                         // The new baseline is the file as the app now holds it —
-                        // except a key skipped mid-drag: the FILE holds the edit,
+                        // except the key pinned mid-drag: the FILE holds the edit,
                         // and the drag's release must still be saved over it.
                         let mut held = self.settings_snapshot();
-                        if self.dragging_slider {
-                            held.opacity = cfg.opacity;
-                        }
-                        if self.dragging_radius {
-                            held.corner_radius = cfg.corner_radius;
-                        }
-                        if self.dragging_dropdown {
-                            held.dropdown_height_pct = cfg.dropdown_height_pct;
-                        }
-                        if self.dragging_dropdown_width {
-                            held.dropdown_width_pct = cfg.dropdown_width_pct;
-                        }
-                        if self.active_fx_drag.is_some() {
-                            held.effects = cfg.effects.clone();
+                        if let Some(d) = dragged {
+                            (d.set)(&mut held, (d.get)(&file_cfg));
                         }
                         // Records the observed hash too, so an identical later
                         // hand-save no-ops.
@@ -2759,8 +2673,11 @@ impl App {
     /// Problems found while applying (rejected keybindings, an unwritable autostart
     /// entry) are appended to `warnings`.
     ///
-    /// Keys mid-DRAG in the Settings panel are skipped (amendment H4): the in-flight
-    /// interactive value wins over a concurrent external edit. `summon_hotkey` is
+    /// A key mid-DRAG in the Settings panel was pinned to its live value by the
+    /// caller (amendment H4), so the in-flight interactive value wins over a
+    /// concurrent external edit. The Settings controls apply through here too
+    /// (`apply_settings_change`), so this must stay a pure diff: an unchanged
+    /// key must cost nothing. `summon_hotkey` is
     /// RESTART-only (the global grab is registered once) and deliberately NOT
     /// applied here (only mirrored).
     fn apply_reloaded_config(&mut self, cfg: crate::config::Config, warnings: &mut Vec<String>) {
@@ -2783,13 +2700,11 @@ impl App {
         if (cfg.minimum_contrast - self.minimum_contrast).abs() > eps {
             self.set_minimum_contrast(cfg.minimum_contrast);
         }
-        // Opacity — skip while the user is dragging the opacity slider (H4).
-        if !self.dragging_slider {
-            let op = cfg.opacity.clamp(0.1, 1.0);
-            if (op - self.opacity).abs() > eps {
-                self.opacity = op;
-                self.apply_theme();
-            }
+        // Opacity.
+        let op = cfg.opacity.clamp(0.1, 1.0);
+        if (op - self.opacity).abs() > eps {
+            self.opacity = op;
+            self.apply_theme();
         }
         // Terminal font size / family (real setter cores rebuild the atlas + reflow).
         let fs = cfg.font_size.clamp(6.0, 48.0);
@@ -2809,14 +2724,12 @@ impl App {
         if cfg.ui_font_family != self.ui_font_family_chosen {
             self.set_ui_font_family(cfg.ui_font_family.clone());
         }
-        // Corner radius — skip while dragging the radius slider (H4).
-        if !self.dragging_radius {
-            let cr = cfg.corner_radius.clamp(0.0, 24.0);
-            if (cr - self.corner_radius).abs() > eps {
-                self.corner_radius = cr;
-                // Detached windows round their corners with it too.
-                self.mark_dirty_all();
-            }
+        // Corner radius.
+        let cr = cfg.corner_radius.clamp(0.0, 24.0);
+        if (cr - self.corner_radius).abs() > eps {
+            self.corner_radius = cr;
+            // Detached windows round their corners with it too.
+            self.mark_dirty_all();
         }
         // Grid padding: moves every window's grid origin and changes how many
         // cells fit (a debounced reflow, like a font-size change).
@@ -2836,8 +2749,8 @@ impl App {
         if cfg.scrollbar != self.scrollbar_mode {
             self.set_scrollbar_mode(cfg.scrollbar);
         }
-        // Summon effect: ASSIGN directly (NOT set_summon_effect, which fires a one-
-        // shot preview animation on every reload — amendment).
+        // Summon effect: ASSIGN directly (no one-shot preview on a reload —
+        // amendment; a Settings pick previews in `apply_settings_change`).
         let se = SummonEffect::from_config(&cfg.summon_effect);
         if se != self.summon_effect {
             self.summon_effect = se;
@@ -2853,21 +2766,16 @@ impl App {
         if bottom != self.tab_bar_bottom {
             self.set_tab_bar_bottom(bottom);
         }
-        // Dropdown height/width — skip the one being dragged (H4); re-dock a docked
-        // window on change.
-        if !self.dragging_dropdown {
-            let dh = cfg.dropdown_height_pct.clamp(0.25, 1.0);
-            if (dh - self.dropdown_height_pct).abs() > eps {
-                self.dropdown_height_pct = dh;
-                self.redock_if_dropdown();
-            }
+        // Dropdown height/width — re-dock a docked window on change.
+        let dh = cfg.dropdown_height_pct.clamp(0.25, 1.0);
+        if (dh - self.dropdown_height_pct).abs() > eps {
+            self.dropdown_height_pct = dh;
+            self.redock_if_dropdown();
         }
-        if !self.dragging_dropdown_width {
-            let dw = cfg.dropdown_width_pct.clamp(0.2, 1.0);
-            if (dw - self.dropdown_width_pct).abs() > eps {
-                self.dropdown_width_pct = dw;
-                self.redock_if_dropdown();
-            }
+        let dw = cfg.dropdown_width_pct.clamp(0.2, 1.0);
+        if (dw - self.dropdown_width_pct).abs() > eps {
+            self.dropdown_width_pct = dw;
+            self.redock_if_dropdown();
         }
         // Focus auto-hide.
         self.focus_autohide = cfg.focus_autohide;
@@ -2881,8 +2789,8 @@ impl App {
         self.set_perf_hud(cfg.show_perf_hud);
         // Chrome (tab look, progress, window border, tab titles) — live.
         self.set_chrome(crate::tabmeta::ChromeSettings::from_config(&cfg));
-        // Visual effects — skip while a Effects slider is being dragged (H4).
-        if self.active_fx_drag.is_none() && cfg.effects != self.fx {
+        // Visual effects.
+        if cfg.effects != self.fx {
             self.fx = cfg.effects.clone();
             self.request_main_paint();
             for dw in &self.detached {
@@ -3370,36 +3278,6 @@ impl App {
         } else {
             Some(self.shell.clone())
         }
-    }
-
-    /// Display name for the SHELL cycler band: "System default" for the empty
-    /// (auto-detect) selection, else the basename of the configured shell path.
-    fn shell_display(&self) -> String {
-        shell_display_name(&self.shell)
-    }
-
-    /// Cycle the selected shell. The option list is `["", ...detect_shells()]`
-    /// (index 0 = "System default" = auto-detect). Finds the current selection
-    /// (defaulting to index 0 when `self.shell` is empty or no longer present),
-    /// steps with wraparound, persists, and redraws. New tabs pick the change up
-    /// immediately via `opt_shell()`; existing tabs/shells are untouched.
-    fn cycle_shell(&mut self, forward: bool) {
-        let mut options: Vec<String> = Vec::new();
-        options.push(String::new()); // index 0 = System default
-        options.extend(detect_shells());
-        let cur = options
-            .iter()
-            .position(|s| s == &self.shell)
-            .unwrap_or(0);
-        let n = options.len();
-        let next = if forward {
-            (cur + 1) % n
-        } else {
-            (cur + n - 1) % n
-        };
-        self.shell = options[next].clone();
-        self.persist();
-        self.request_settings_paint();
     }
 
     /// Spawn a new tab in the main window starting in the active tab's shell
@@ -5218,6 +5096,13 @@ impl App {
                     self.toggle_settings_window(event_loop);
                 }
             }
+            C::SettingsAt(id) => {
+                // "Settings › Effects › Bloom": open Settings at that control.
+                if self.settings_window.is_none() {
+                    self.toggle_settings_window(event_loop);
+                }
+                self.reveal_setting(id);
+            }
             C::FontUp => self.set_font_size(self.font_logical + 1.0),
             C::FontDown => self.set_font_size(self.font_logical - 1.0),
             C::FontReset => self.set_font_size(FONT_LOGICAL_DEFAULT),
@@ -5603,39 +5488,6 @@ impl App {
         self.update_link_hover(true);
         // The track comes from the live surface; the size args are vestigial.
         let _ = (w, h);
-    }
-
-    /// Compute opacity from a cursor x relative to a slider track rect.
-    fn opacity_from_cursor(&self, cx: f32, track: &jetty_render::Rect) -> f32 {
-        let frac = ((cx - track.x) / track.w).clamp(0.0, 1.0);
-        (0.1 + frac * 0.9).clamp(0.1, 1.0)
-    }
-
-    /// Compute corner radius (px, [0, 24]) from a cursor x relative to the radius
-    /// slider track rect.
-    fn radius_from_cursor(&self, cx: f32, track: &jetty_render::Rect) -> f32 {
-        let frac = ((cx - track.x) / track.w).clamp(0.0, 1.0);
-        (frac * 24.0).clamp(0.0, 24.0)
-    }
-
-    /// Compute the dropdown-height fraction ([0.25, 1.0]) from a cursor x relative
-    /// to the dropdown-height slider track rect.
-    fn dropdown_pct_from_cursor(&self, cx: f32, track: &jetty_render::Rect) -> f32 {
-        let frac = ((cx - track.x) / track.w).clamp(0.0, 1.0);
-        (0.25 + frac * 0.75).clamp(0.25, 1.0)
-    }
-
-    /// Compute the dropdown-width fraction ([0.2, 1.0]) from a cursor x relative
-    /// to the dropdown-width slider track rect.
-    fn dropdown_width_pct_from_cursor(&self, cx: f32, track: &jetty_render::Rect) -> f32 {
-        let frac = ((cx - track.x) / track.w).clamp(0.0, 1.0);
-        (0.2 + frac * 0.8).clamp(0.2, 1.0)
-    }
-
-    /// Compute a [0, 1] fraction from cursor x relative to a slider track rect.
-    /// Used for all Effects-tab sliders whose value range maps linearly to 0..1.
-    fn fx_frac_from_cursor(&self, cx: f32, track: &jetty_render::Rect) -> f32 {
-        ((cx - track.x) / track.w).clamp(0.0, 1.0)
     }
 
     /// Enter / leave OS fullscreen on the MAIN window — the single chokepoint.
@@ -7845,6 +7697,23 @@ impl App {
                 return;
             }
         };
+        // The Shell cycler's options: /etc/shells, read once per open (never
+        // per frame).
+        self.shell_options = detect_shells();
+        // The font lists open at the family that is shown.
+        {
+            use crate::settings_ui::{list_offset_showing, list_rows};
+            let pos = self.font_families.iter().position(|f| *f == self.font_family);
+            self.font_scroll_offset =
+                list_offset_showing(self.font_families.len(), pos, list_rows("font_family"));
+            let ui_pos = if self.ui_font_family.is_empty() {
+                Some(0)
+            } else {
+                self.ui_font_families.iter().position(|f| *f == self.ui_font_family)
+            };
+            self.ui_font_scroll_offset =
+                list_offset_showing(self.ui_font_families.len(), ui_pos, list_rows("ui_font_family"));
+        }
         self.build_settings_stack(&window);
         window.focus_window();
         window.request_redraw();
@@ -8006,34 +7875,20 @@ impl App {
         true
     }
 
-    /// End every Settings-window drag (opacity, radius, dropdown size, Effects
-    /// sliders) and make its value stick: persist it, and re-dock a dropdown-size
-    /// drag — applied on release only, never per move (an X11 resize storm),
-    /// re-asserted post-map via `pending_dock_frames`, inert while fullscreen
-    /// (`dock_reassert_ok`). The button release, focus loss (the release never
-    /// arrives) and the window closing all end drags here; the last two used to
-    /// drop the latches WITHOUT persisting, so the live-applied value was lost
-    /// on the next start.
+    /// End the Settings drags (a control or the scrollbar thumb) and make a
+    /// control's value stick: apply a release-applied value (the dropdown size,
+    /// whose change re-docks the window once — on release, never per move: an
+    /// X11 resize storm) and persist. The button release, focus loss (the
+    /// release never arrives) and the window closing all end drags here, so a
+    /// live-applied value is never lost on the next start.
     fn end_settings_drags(&mut self) {
-        let end = settings_drag_end(
-            self.dragging_slider || self.dragging_radius || self.active_fx_drag.is_some(),
-            self.dragging_dropdown || self.dragging_dropdown_width,
-        );
-        if end.persist {
-            self.persist();
+        self.settings_scroll_grab = None;
+        let Some((id, pending)) = settings_drag_end(self.ctl_drag.take()) else { return };
+        if let (Some(v), Some(d)) = (pending, crate::settings_ui::find(id)) {
+            self.apply_settings_change(|c| (d.set)(c, v));
         }
-        if end.redock && self.visible && dock_reassert_ok(self.window_mode, self.main_fullscreen) {
-            if let Some(w) = &self.window {
-                dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
-                self.pending_dock_frames = 5;
-                self.request_main_paint();
-            }
-        }
-        self.dragging_slider = false;
-        self.dragging_radius = false;
-        self.dragging_dropdown = false;
-        self.dragging_dropdown_width = false;
-        self.active_fx_drag = None;
+        self.persist();
+        self.request_settings_paint();
     }
 
     /// Drop the settings window and its render stack (closes/hides the OS window).
@@ -8053,144 +7908,90 @@ impl App {
         self.settings_text = None;
         self.settings_specimen_text = None;
         self.settings_quad = None;
-        // Collapse the Look-tab theme dropdown so reopening Settings starts with
-        // it closed (its "collapsed unless the user opens it" session semantics).
-        // The Escape / OS-close paths bypass handle_settings_action where the
-        // collapse normally happens, so without this the panel reopened with the
-        // menu already popped open at a stale scroll offset (F28).
-        self.theme_dropdown_open = false;
-        self.theme_scroll_offset = 0;
+        // Closing keeps the theme the gallery shows (only Esc restores), and
+        // every transient highlight goes, so a reopen starts clean.
+        self.gallery.keep();
+        self.settings_hover = None;
+        self.settings_focus = None;
+        self.reset_armed = false;
+        self.settings_geom = None;
         if self.debug {
             eprintln!("SETTINGS window closed");
         }
     }
 
-    /// Build the panel view for the settings window in its own coordinate space
-    /// (the panel is centred to fill the fixed-size window; no drag offset).
-    /// `&mut self` only to MEASURE labels with the settings text layer (the same
-    /// cached measurement `render_settings_window` uses, so hit-rects match the
-    /// drawn panel exactly).
+    /// The runtime context the Settings controls read besides the config.
+    fn settings_ctx(&self) -> crate::settings_ui::Ctx<'_> {
+        crate::settings_ui::Ctx {
+            main_fullscreen: self.main_fullscreen,
+            mono_families: &self.font_families,
+            ui_families: &self.ui_font_families,
+            shells: &self.shell_options,
+            font_shown: &self.font_family,
+            ui_font_shown: &self.ui_font_family,
+            font_offset: self.font_scroll_offset,
+            ui_font_offset: self.ui_font_scroll_offset,
+            collapsed: &self.settings_collapsed,
+            drag: self.ctl_drag.as_ref().and_then(|d| d.pending.as_ref().map(|v| (d.id, v))),
+        }
+    }
+
+    /// Build the panel view for the settings window's `w`×`h` surface. `&mut
+    /// self` only to MEASURE labels with the settings text layer (the same
+    /// cached measurement the paint uses, so hit-rects match the drawn panel).
     fn settings_panel_view(&mut self, w: u32, h: u32) -> jetty_render::PanelView {
+        use crate::settings_ui::{tab_at_defaults, tab_items, LOOK};
         let theme = self.current_theme();
-        let shell_display = self.shell_display();
+        let cfg = self.settings_snapshot();
+        let tab = self.settings_tab.min(jetty_render::N_TABS - 1);
+        let items = tab_items(tab, &cfg, &self.settings_ctx());
         let cm = self.settings_metrics();
-        let mut fallback = mono_fallback(cm);
-        let fx = jetty_render::EffectsParams {
-            crt_enabled: self.fx.crt_enabled,
-            crt_curvature: self.fx.crt_curvature,
-            crt_scanline: self.fx.crt_scanline,
-            crt_mask: self.fx.crt_mask,
-            crt_bloom: self.fx.crt_bloom,
-            crt_chromatic: self.fx.crt_chromatic,
-            crt_vignette: self.fx.crt_vignette,
-            crt_scanline_tint: self.fx.crt_scanline_tint,
-            crt_animate_roll: self.fx.crt_animate_roll,
-            crt_flicker: self.fx.crt_flicker,
-            crt_jitter: self.fx.crt_jitter,
-            caret_flash_enabled: self.fx.caret_flash_enabled,
-            caret_glow_enabled: self.fx.caret_glow_enabled,
-            caret_flash_ms: self.fx.caret_flash_ms,
-            caret_flash_color: self.fx.caret_flash_color,
+        let reset = if self.reset_armed {
+            jetty_render::ResetState::Armed
+        } else if tab_at_defaults(&cfg, tab) {
+            jetty_render::ResetState::Disabled
+        } else {
+            jetty_render::ResetState::Ready
         };
-        jetty_render::build_panel(
-            w, h, self.opacity, self.theme_idx, self.font_logical,
-            &self.font_families, &self.font_family, self.font_scroll_offset,
-            self.corner_radius, self.summon_effect.display_name(),
-            self.window_mode.display_name(),
-            if self.tab_bar_bottom { "Bottom" } else { "Top" },
-            &format_scrollback(self.scrollback_lines),
-            self.dropdown_height_pct,
-            self.dropdown_width_pct,
-            self.window_mode == WindowMode::Dropdown,
-            corner_radius_band_dimmed(self.main_fullscreen, self.window_mode),
-            self.focus_autohide,
-            self.launch_at_login,
-            self.ui_font_logical, &self.ui_font_families, &self.ui_font_family,
-            self.ui_font_scroll_offset,
-            0.0, 0.0, &theme,
-            measure_or(self.settings_text.as_mut(), &mut fallback),
-            cm,
-            &shell_display,
-            &jetty_render::NotifyParams {
-                enabled: self.notify_on_finish,
-                only_on_failure: self.notify_only_on_failure,
-                min_seconds: self.notify_min_seconds,
-                auto_summon: self.auto_summon_on_finish,
-            },
-            self.settings_tab,
-            &fx,
-            self.effects_scroll,
-            self.theme_dropdown_open,
-            self.theme_scroll_offset,
-        )
+        let footer = if self.reset_armed {
+            "Click again to reset this tab"
+        } else if tab == LOOK && self.gallery.active() {
+            "Enter keeps · Esc restores"
+        } else {
+            ""
+        };
+        let mut inp = jetty_render::PanelInput::new(w, h, &theme, cm, &items);
+        inp.active_tab = tab;
+        inp.scroll = self.settings_scroll[tab];
+        inp.theme_idx = self.theme_idx;
+        inp.filter = self.gallery_filter;
+        inp.hover = self.settings_hover;
+        inp.focus = self.settings_focus;
+        inp.ui_font_size = self.ui_font_logical;
+        inp.reset = reset;
+        inp.footer_hint = footer;
+        inp.scroll_dragging = self.settings_scroll_grab.is_some();
+        let mut fallback = mono_fallback(cm);
+        jetty_render::build_panel(&inp, measure_or(self.settings_text.as_mut(), &mut fallback))
+    }
+
+    /// The panel view for the settings window as it is now (`None` when
+    /// Settings is closed or has no GPU).
+    fn settings_view_now(&mut self) -> Option<jetty_render::PanelView> {
+        let (w, h) = self.settings_gpu.as_ref().map(|g| (g.config.width, g.config.height))?;
+        Some(self.settings_panel_view(w, h))
     }
 
     /// Render the settings panel into the settings window's surface.
     fn render_settings_window(&mut self) {
-        let opacity = self.opacity;
-        let theme_idx = self.theme_idx;
-        let font_logical = self.font_logical;
-        let font_scroll_offset = self.font_scroll_offset;
-        let corner_radius = self.corner_radius;
-        let summon_name = self.summon_effect.display_name();
-        let window_mode_name = self.window_mode.display_name();
-        let dropdown_height_pct = self.dropdown_height_pct;
-        let dropdown_width_pct = self.dropdown_width_pct;
-        let is_dropdown = self.window_mode == WindowMode::Dropdown;
-        // Dims the CORNER RADIUS band while fullscreen (the radius is suppressed at
-        // display time there, so the slider has no visible effect). Must stay
-        // identical to the hit-test view's input in `build_settings_panel`.
-        let fullscreen = corner_radius_band_dimmed(self.main_fullscreen, self.window_mode);
-        let focus_autohide = self.focus_autohide;
-        let launch_at_login = self.launch_at_login;
-        let tab_bar_name = if self.tab_bar_bottom { "Bottom" } else { "Top" };
-        let scrollback_name = format_scrollback(self.scrollback_lines);
-        // Clone the small inputs build_panel needs so we can borrow the render
-        // stack mutably below without overlapping the immutable self borrows.
-        let families = self.font_families.clone();
-        let family = self.font_family.clone();
-        let ui_families = self.ui_font_families.clone();
-        let ui_family = self.ui_font_family.clone();
-        let ui_font_logical = self.ui_font_logical;
-        let ui_font_scroll_offset = self.ui_font_scroll_offset;
-        let shell_display = self.shell_display();
-        let settings_tab = self.settings_tab;
-        let theme = self.current_theme();
-        // The panel's layout scale: the settings window's DPI × the CAPPED panel
-        // text size. Labels are measured with the settings layer that draws them.
-        let cm = self.settings_metrics();
-        // Specimen color: the theme's blue accent, so the preview pops against the
-        // panel surface (same accent the panel chrome uses for handles/selection).
-        let accent = theme.palette[4];
-        let specimen_rgb = [accent[0], accent[1], accent[2]];
-        // Clone Effects params before the mutable borrow of the render stack below.
-        let fx = jetty_render::EffectsParams {
-            crt_enabled: self.fx.crt_enabled,
-            crt_curvature: self.fx.crt_curvature,
-            crt_scanline: self.fx.crt_scanline,
-            crt_mask: self.fx.crt_mask,
-            crt_bloom: self.fx.crt_bloom,
-            crt_chromatic: self.fx.crt_chromatic,
-            crt_vignette: self.fx.crt_vignette,
-            crt_scanline_tint: self.fx.crt_scanline_tint,
-            crt_animate_roll: self.fx.crt_animate_roll,
-            crt_flicker: self.fx.crt_flicker,
-            crt_jitter: self.fx.crt_jitter,
-            caret_flash_enabled: self.fx.caret_flash_enabled,
-            caret_glow_enabled: self.fx.caret_glow_enabled,
-            caret_flash_ms: self.fx.caret_flash_ms,
-            caret_flash_color: self.fx.caret_flash_color,
+        let Some((width, height)) = self.settings_gpu.as_ref().map(|g| (g.config.width, g.config.height)) else {
+            return;
         };
-        let effects_scroll = self.effects_scroll;
-        let theme_dropdown_open = self.theme_dropdown_open;
-        let theme_scroll_offset = self.theme_scroll_offset;
-        // Run & Notify params captured before the mutable render-stack borrow.
-        let notify_params = jetty_render::NotifyParams {
-            enabled: self.notify_on_finish,
-            only_on_failure: self.notify_only_on_failure,
-            min_seconds: self.notify_min_seconds,
-            auto_summon: self.auto_summon_on_finish,
-        };
+        let pv = self.settings_panel_view(width, height);
+        // Store the clamped scroll back: collapsing a section, a reset or a
+        // resize can shrink the content under the old offset.
+        let tab = self.settings_tab.min(jetty_render::N_TABS - 1);
+        self.settings_scroll[tab] = pv.geom.scroll;
         let (Some(gpu), Some(text), Some(quad), Some(specimen)) = (
             &mut self.settings_gpu,
             &mut self.settings_text,
@@ -8199,101 +8000,54 @@ impl App {
         ) else {
             return;
         };
-        let width = gpu.config.width;
-        let height = gpu.config.height;
-        let pv = jetty_render::build_panel(
-            width, height, opacity, theme_idx, font_logical,
-            &families, &family, font_scroll_offset, corner_radius, summon_name,
-            window_mode_name, tab_bar_name, &scrollback_name, dropdown_height_pct, dropdown_width_pct, is_dropdown, fullscreen, focus_autohide,
-            launch_at_login,
-            ui_font_logical, &ui_families, &ui_family, ui_font_scroll_offset,
-            0.0, 0.0, &theme, &mut *text, cm,
-            &shell_display,
-            &notify_params,
-            settings_tab,
-            &fx,
-            effects_scroll,
-            theme_dropdown_open,
-            theme_scroll_offset,
-        );
         if let Some((frame, view)) = gpu.acquire_frame() {
-            // Pass 1: Chrome quads — panel border, bg, chips, opacity/radius tracks,
-            // tab strip highlights, etc. Uses LoadOp::Clear so the surface starts
-            // fresh. No scissor: chrome elements are always fully in-bounds.
-            quad.render_clear(
-                &gpu.device,
-                &gpu.queue,
-                &view,
-                width,
-                height,
-                &pv.quads,
-                wgpu::Color { r: 0.02, g: 0.02, b: 0.03, a: 1.0 },
-            );
-
-            // Pass 2: Effects-tab widget quads — only when on the Effects tab.
-            // Uses LoadOp::Load (composites on existing chrome) + hardware scissor
-            // so widgets that have scrolled outside the content viewport are clipped.
-            if let Some(vp) = pv.effects_viewport {
-                if !pv.effects_quads.is_empty() {
-                    quad.render_load_scissored(
-                        &gpu.device,
-                        &gpu.queue,
-                        &view,
-                        width,
-                        height,
-                        &pv.effects_quads,
-                        vp,
-                    );
+            // Pass 1: the chrome quads — the backdrop fills the whole surface in
+            // the panel color (no dark margins or corner wedges on a light
+            // theme), the title row, tab strip, footer and scrollbar. Owns the
+            // clear (to the same color).
+            quad.render_clear(&gpu.device, &gpu.queue, &view, width, height, &pv.quads, srgb_clear(pv.surface));
+            // Pass 2: the active tab's content, hardware-scissored to its
+            // viewport so rows scrolled under the chrome are clipped.
+            if let Some(vp) = pv.content_viewport {
+                if !pv.content_quads.is_empty() {
+                    quad.render_load_scissored(&gpu.device, &gpu.queue, &view, width, height, &pv.content_quads, vp);
                 }
             }
-
-            // Pass 3: Chrome text — title, tab strip, non-Effects widget labels.
-            // No clip: these are always within bounds.
+            // Pass 3: chrome text (title, tabs, footer).
             if !pv.labels.is_empty() {
-                let _ = text.render_overlays(
-                    &gpu.device,
-                    &gpu.queue,
-                    &view,
-                    width,
-                    height,
-                    &pv.labels,
-                );
+                let _ = text.render_overlays(&gpu.device, &gpu.queue, &view, width, height, &pv.labels);
             }
-
-            // Pass 4: Effects-tab widget labels, clipped to content viewport via
-            // glyphon TextArea.bounds so labels outside the scroll window are
-            // suppressed without a GPU scissor (glyphon handles it per-glyph).
-            if let Some(vp) = pv.effects_viewport {
-                if !pv.effects_labels.is_empty() {
-                    let clip_top = vp[1] as i32;
-                    let clip_bottom = (vp[1] + vp[3]) as i32;
+            // Pass 4: content text, clipped to the viewport (glyphon bounds).
+            if let Some(vp) = pv.content_viewport {
+                if !pv.content_labels.is_empty() {
                     let _ = text.render_overlays_clipped(
                         &gpu.device,
                         &gpu.queue,
                         &view,
                         width,
                         height,
-                        &pv.effects_labels,
-                        clip_top,
-                        clip_bottom,
+                        &pv.content_labels,
+                        vp[1] as i32,
+                        (vp[1] + vp[3]) as i32,
                     );
                 }
             }
-
-            // Overdraw the live "Aa" specimen at the TRUE UI size via the dedicated
-            // specimen layer, AFTER the capped panel-text pass — so the user sees an
-            // honest big/small/typeface preview that tracks ui_font_size. Use the
-            // TITLE path so at the `""` default it previews the platform SANS (the
-            // actual default UI face), and a chosen family otherwise.
+            // The live "Aa" specimen at the TRUE UI size via the dedicated
+            // specimen layer, after the capped panel text — an honest
+            // big/small/typeface preview. The TITLE path previews the platform
+            // SANS at the `""` default (the actual default UI face). Placed only
+            // while it is fully in view (else far offscreen: skipped).
             let (sx, sy) = pv.ui_specimen_pos;
-            let _ = specimen.render_overlays_sans(
-                &gpu.device,
-                &gpu.queue,
-                &view,
-                width,
-                height,
-                &[("Aa".to_string(), sx, sy, specimen_rgb)],
-            );
+            if sy < height as f32 {
+                let _ = specimen.render_overlays_sans(
+                    &gpu.device,
+                    &gpu.queue,
+                    &view,
+                    width,
+                    height,
+                    &[("Aa".to_string(), sx, sy, pv.specimen_rgb)],
+                );
+            }
             frame.present();
             // The swapchain is healthy again: drop any retry schedule.
             self.settings_acquire_retry = None;
@@ -8309,6 +8063,287 @@ impl App {
             self.settings_acquire_retry
                 .get_or_insert_with(|| next_acquire_retry(None, std::time::Instant::now()));
         }
+        self.settings_geom = Some(pv.geom);
+    }
+
+    /// Apply a Settings change through the CONFIG path: snapshot the settings
+    /// as a `Config`, let `change` edit it, and apply the difference exactly
+    /// as a hot-reload of config.toml does (`apply_reloaded_config`, with
+    /// persisting suspended) — so a control can never apply a setting
+    /// differently from an edit of the file, and a new setting needs no
+    /// Settings-specific apply code. Then the UI-only side effects (the
+    /// summon-effect preview) and a repaint of every surface. Returns whether
+    /// anything changed. The caller persists (once, or on a drag's release).
+    fn apply_settings_change(&mut self, change: impl FnOnce(&mut crate::config::Config)) -> bool {
+        let before = self.settings_snapshot();
+        let mut cfg = before.clone();
+        change(&mut cfg);
+        if cfg == before {
+            return false;
+        }
+        let summon_before = self.summon_effect;
+        let was_reloading = std::mem::replace(&mut self.reloading, true);
+        let mut warnings = Vec::new();
+        self.apply_reloaded_config(cfg, &mut warnings);
+        self.reloading = was_reloading;
+        if self.summon_effect != summon_before {
+            // A new summon effect previews once on the main window.
+            self.summon_pending = true;
+        }
+        if !warnings.is_empty() {
+            self.show_config_warnings(&warnings);
+        }
+        self.mark_dirty_all();
+        true
+    }
+
+    /// A press on `part` of Settings control `id`.
+    fn settings_ctl_press(&mut self, id: jetty_render::CtlId, part: jetty_render::CtlPart) {
+        use crate::settings_ui::{press, Press, Special};
+        let Some(d) = crate::settings_ui::find(id) else { return };
+        if d.special == Some(Special::LaunchAtLogin) {
+            if part == jetty_render::CtlPart::Switch {
+                // Writes / removes the login item first; flips only if that worked.
+                self.toggle_launch_at_login_setting();
+                self.persist();
+                self.request_settings_paint();
+            }
+            return;
+        }
+        let cfg = self.settings_snapshot();
+        let action = press(d, part, &cfg, &self.settings_ctx());
+        match action {
+            Press::Set(v) => {
+                if self.apply_settings_change(|c| (d.set)(c, v)) {
+                    self.persist();
+                }
+            }
+            Press::Drag => {
+                self.ctl_drag = Some(CtlDrag { id, part, pending: None });
+                self.settings_drag_to(self.settings_cursor.0 as f32);
+            }
+            Press::Scroll(n) => self.scroll_list(d, n),
+            Press::Nothing => {}
+        }
+    }
+
+    /// Move the dragged Settings control to the pointer at `cx`: a live control
+    /// applies at once (persisted on release); a release-applied one only
+    /// shows the value until then.
+    fn settings_drag_to(&mut self, cx: f32) {
+        let Some(drag) = self.ctl_drag.clone() else { return };
+        let Some(d) = crate::settings_ui::find(drag.id) else { return };
+        let Some(pv) = self.settings_view_now() else { return };
+        let Some(r) = pv.geom.rect_of(jetty_render::PanelHit::Ctl { id: drag.id, part: drag.part }) else {
+            return;
+        };
+        let knob = jetty_render::track_knob(drag.part) * self.settings_metrics().overlay_u();
+        let frac = crate::settings_ui::track_frac(cx, r.x, r.w, knob);
+        let cur = drag.pending.clone().unwrap_or_else(|| (d.get)(&self.settings_snapshot()));
+        let Some(v) = crate::settings_ui::drag_value(d, drag.part, frac, &cur) else { return };
+        if crate::settings_ui::live(d) {
+            self.apply_settings_change(|c| (d.set)(c, v));
+        } else if let Some(dr) = self.ctl_drag.as_mut() {
+            dr.pending = Some(v);
+            self.request_settings_paint();
+        }
+    }
+
+    /// Scroll the active Settings tab by `dy` physical px (clamped).
+    fn scroll_settings_by(&mut self, dy: f32) {
+        let tab = self.settings_tab.min(jetty_render::N_TABS - 1);
+        let max = self.settings_geom.as_ref().map_or(f32::MAX, |g| g.max_scroll.max(0.0));
+        let s = (self.settings_scroll[tab] + dy).clamp(0.0, max);
+        if s != self.settings_scroll[tab] {
+            self.settings_scroll[tab] = s;
+            self.request_settings_paint();
+        }
+    }
+
+    /// Follow a dragged Settings scrollbar thumb whose top is now at `thumb_top`.
+    fn settings_scroll_drag_to(&mut self, thumb_top: f32) {
+        let Some(g) = &self.settings_geom else { return };
+        let Some(t) = g.scroll_thumb else { return };
+        let travel = (g.viewport_h() - t.h).max(1.0);
+        let s = ((thumb_top - g.content_top) / travel).clamp(0.0, 1.0) * g.max_scroll;
+        let tab = self.settings_tab.min(jetty_render::N_TABS - 1);
+        if s != self.settings_scroll[tab] {
+            self.settings_scroll[tab] = s;
+            self.request_settings_paint();
+        }
+    }
+
+    /// Scroll list control `d` by `n` rows.
+    fn scroll_list(&mut self, d: &crate::settings_ui::Desc, n: i32) {
+        use crate::settings_ui::{Kind, ListSrc};
+        let Kind::List { src, rows } = d.kind else { return };
+        let (len, off) = match src {
+            ListSrc::Mono => (self.font_families.len(), &mut self.font_scroll_offset),
+            ListSrc::Ui => (self.ui_font_families.len(), &mut self.ui_font_scroll_offset),
+        };
+        let max = len.saturating_sub(rows) as i64;
+        let next = (*off as i64 + n as i64).clamp(0, max) as usize;
+        if next != *off {
+            *off = next;
+            self.request_settings_paint();
+        }
+    }
+
+    /// The mouse wheel over Settings: a list under the pointer scrolls itself,
+    /// anything else scrolls the tab.
+    fn settings_wheel(&mut self, dy: f32) {
+        let (cx, cy) = (self.settings_cursor.0 as f32, self.settings_cursor.1 as f32);
+        let over_list = self.settings_geom.as_ref().and_then(|g| {
+            if cy < g.content_top || cy >= g.content_bottom {
+                return None;
+            }
+            g.hits.iter().find_map(|(r, h)| match h {
+                jetty_render::PanelHit::Ctl { id, part: jetty_render::CtlPart::Row(_) }
+                    if cx >= r.x && cx <= r.x + r.w && cy >= r.y - 2.0 && cy <= r.y + r.h + 2.0 =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+        });
+        match over_list.and_then(crate::settings_ui::find) {
+            Some(d) => self.scroll_list(d, if dy < 0.0 { -1 } else { 1 }),
+            None => self.scroll_settings_by(dy),
+        }
+    }
+
+    /// Track the part under the pointer for the hover highlight (gallery
+    /// cards, filter chips, section headers, the footer button, the scroll
+    /// thumb) — one repaint per CHANGE, never per move. Uses the geometry of
+    /// the last paint.
+    fn settings_hover_at(&mut self, cx: f32, cy: f32) {
+        use jetty_render::PanelHit as H;
+        let hover = self.settings_geom.as_ref().and_then(|g| g.hit_at(cx, cy)).filter(|h| {
+            matches!(h, H::GalleryCard(_) | H::GalleryFilter(_) | H::Section(_) | H::ResetTab | H::ScrollThumb)
+        });
+        if hover != self.settings_hover {
+            self.settings_hover = hover;
+            self.request_settings_paint();
+        }
+    }
+
+    /// Show theme `i` from the gallery (a click or an arrow key): applied live
+    /// and saved; the browsing session remembers the theme it started from.
+    fn gallery_pick(&mut self, i: usize) {
+        if i >= jetty_core::theme_count() || i == self.theme_idx {
+            return;
+        }
+        self.gallery.begin(self.theme_idx);
+        self.pick_theme(i);
+        self.persist();
+    }
+
+    /// A gallery arrow / Home / End key: move to the next card of the filtered
+    /// grid and keep it in view.
+    fn gallery_key(&mut self, key: crate::settings_ui::GalleryKey) {
+        let order = jetty_render::gallery_order(self.gallery_filter);
+        let Some(next) =
+            crate::settings_ui::gallery_step(&order, jetty_render::GALLERY_COLS, self.theme_idx, key)
+        else {
+            return;
+        };
+        self.gallery_pick(next);
+        let margin = 12.0 * self.settings_metrics().overlay_u();
+        if let Some(pv) = self.settings_view_now() {
+            let g = &pv.geom;
+            if let Some(r) = g.rect_of(jetty_render::PanelHit::GalleryCard(next)) {
+                let top = r.y - g.content_top + g.scroll;
+                self.settings_scroll[crate::settings_ui::LOOK] = g.scroll_to_reveal(top, top + r.h, margin);
+            }
+        }
+        self.request_settings_paint();
+    }
+
+    /// A key pressed in the Settings window.
+    ///
+    /// * Esc: disarms "Reset tab"; else ends a gallery session by restoring the
+    ///   theme it started from; else closes Settings.
+    /// * Enter: keeps the theme the gallery shows (ends the session).
+    /// * Ctrl+Tab / Ctrl+Shift+Tab: next / previous tab.
+    /// * Look tab: arrows / Home / End move through the gallery (live).
+    /// * Other tabs: arrows, Page Up/Down, Home/End scroll.
+    fn settings_key(&mut self, key: &winit::keyboard::Key) {
+        use crate::settings_ui::{GalleryKey as G, LOOK};
+        use winit::keyboard::{Key, NamedKey as N};
+        let Key::Named(k) = key else { return };
+        self.settings_focus = None;
+        let tab = self.settings_tab.min(jetty_render::N_TABS - 1);
+        let line = 40.0 * self.settings_metrics().overlay_u();
+        let page = self.settings_geom.as_ref().map_or(300.0, |g| g.viewport_h() * 0.9);
+        // The arrows browse the gallery only while it is on screen.
+        let gallery = tab == LOOK && !self.settings_collapsed.contains(&"look.theme");
+        match *k {
+            N::Escape => {
+                if std::mem::take(&mut self.reset_armed) {
+                    // Disarmed.
+                } else if let Some(o) = self.gallery.restore() {
+                    if o != self.theme_idx && o < jetty_core::theme_count() {
+                        self.pick_theme(o);
+                        self.persist();
+                    }
+                } else {
+                    self.close_settings_window();
+                    self.request_main_paint();
+                    return;
+                }
+            }
+            N::Enter => {
+                self.gallery.keep();
+            }
+            N::Tab if self.settings_mods.control_key() => {
+                let n = jetty_render::N_TABS;
+                self.gallery.keep();
+                self.reset_armed = false;
+                self.settings_tab = if self.settings_mods.shift_key() { (tab + n - 1) % n } else { (tab + 1) % n };
+            }
+            N::ArrowLeft if gallery => self.gallery_key(G::Left),
+            N::ArrowRight if gallery => self.gallery_key(G::Right),
+            N::ArrowUp if gallery => self.gallery_key(G::Up),
+            N::ArrowDown if gallery => self.gallery_key(G::Down),
+            N::Home if gallery => self.gallery_key(G::Home),
+            N::End if gallery => self.gallery_key(G::End),
+            N::ArrowUp => self.scroll_settings_by(-line),
+            N::ArrowDown => self.scroll_settings_by(line),
+            N::PageUp => self.scroll_settings_by(-page),
+            N::PageDown => self.scroll_settings_by(page),
+            N::Home => self.scroll_settings_by(-self.settings_scroll[tab]),
+            N::End => {
+                let max = self.settings_geom.as_ref().map_or(0.0, |g| g.max_scroll);
+                self.scroll_settings_by(max - self.settings_scroll[tab]);
+            }
+            _ => return,
+        }
+        self.request_settings_paint();
+    }
+
+    /// Show Settings control `id` (a palette deep link): its tab, its section
+    /// expanded, scrolled near the top and highlighted until the next input.
+    /// A section's master switch and the theme gallery reveal their section.
+    fn reveal_setting(&mut self, id: &'static str) {
+        use crate::settings_ui::{find, section, Kind};
+        let Some(d) = find(id) else { return };
+        let header = matches!(d.kind, Kind::Gallery) || section(d.section).is_some_and(|s| s.master == Some(id));
+        let target = if header { d.section } else { id };
+        self.gallery.keep();
+        self.reset_armed = false;
+        self.settings_tab = d.tab;
+        self.settings_collapsed.retain(|s| *s != d.section);
+        self.settings_focus = Some(target);
+        let margin = 12.0 * self.settings_metrics().overlay_u();
+        if let Some(pv) = self.settings_view_now() {
+            if let Some((top, _)) = pv.geom.anchor(target) {
+                self.settings_scroll[d.tab] = (top - margin).clamp(0.0, pv.geom.max_scroll);
+            }
+        }
+        if let Some(w) = &self.settings_window {
+            w.focus_window();
+        }
+        self.request_settings_paint();
     }
 
     /// Route a `WindowEvent` addressed to the detached window at `self.detached[pos]`:
@@ -9928,287 +9963,67 @@ impl App {
         }
     }
 
-    /// Apply a panel `MouseAction` decoded in the settings window. Updates shared
-    /// state AND the live main terminal (theme/font/opacity), then requests a
-    /// redraw of BOTH windows so each reflects the change immediately.
+    /// Apply a panel `MouseAction` decoded in the settings window. Every
+    /// control goes through `settings_ctl_press` (the control table), so this
+    /// match never grows with the settings.
     fn handle_settings_action(
         &mut self,
         action: input::MouseAction,
         geom: &jetty_render::PanelGeom,
     ) {
-        let cx = self.settings_cursor.0 as f32;
-        // Any settings interaction that isn't part of the theme picker collapses
-        // the dropdown (click-outside-to-close behavior).
-        if !matches!(
-            action,
-            input::MouseAction::ToggleThemeDropdown
-                | input::MouseAction::ThemeScrollUp
-                | input::MouseAction::ThemeScrollDown
-                | input::MouseAction::SetTheme(_)
-        ) {
-            self.theme_dropdown_open = false;
+        use input::MouseAction as A;
+        // Any press ends a deep-link highlight, and disarms "Reset tab" unless
+        // it IS the second click on it.
+        self.settings_focus = None;
+        if action != A::ResetTab {
+            self.reset_armed = false;
         }
         match action {
-            input::MouseAction::StartSliderDrag => {
-                self.dragging_slider = true;
-                self.opacity = self.opacity_from_cursor(cx, &geom.slider_track);
-                self.apply_theme();
-            }
-            input::MouseAction::StartRadiusDrag => {
-                self.dragging_radius = true;
-                self.corner_radius = self.radius_from_cursor(cx, &geom.radius_track);
-            }
-            input::MouseAction::SetTheme(i) => {
-                if i < jetty_core::theme_count() {
-                    self.pick_theme(i);
-                }
-                self.theme_dropdown_open = false;
-            }
-            input::MouseAction::ToggleThemeDropdown => {
-                self.theme_dropdown_open = !self.theme_dropdown_open;
-                if self.theme_dropdown_open {
-                    // Open with the active theme scrolled into view (centered-ish).
-                    let start = self.theme_idx.saturating_sub(MAX_THEME_ROWS / 2);
-                    self.theme_scroll_offset = start.min(self.max_theme_scroll());
+            A::Ctl { id, part } => self.settings_ctl_press(id, part),
+            A::SettingsSection(id) => {
+                if let Some(i) = self.settings_collapsed.iter().position(|s| *s == id) {
+                    self.settings_collapsed.remove(i);
+                } else {
+                    self.settings_collapsed.push(id);
                 }
             }
-            input::MouseAction::ThemeScrollUp => {
-                self.theme_scroll_offset = self.theme_scroll_offset.saturating_sub(1);
-            }
-            input::MouseAction::ThemeScrollDown => {
-                self.theme_scroll_offset =
-                    (self.theme_scroll_offset + 1).min(self.max_theme_scroll());
-            }
-            input::MouseAction::FontMinus => {
-                self.set_font_size(self.font_logical - 1.0);
-            }
-            input::MouseAction::FontPlus => {
-                self.set_font_size(self.font_logical + 1.0);
-            }
-            input::MouseAction::FontReset => {
-                self.set_font_size(FONT_LOGICAL_DEFAULT);
-            }
-            input::MouseAction::SetFont(idx) => {
-                if let Some(name) = self.font_families.get(idx) {
-                    let name = name.clone();
-                    self.set_font_family(name);
+            A::GalleryCard(i) => self.gallery_pick(i),
+            A::GalleryFilter(f) => self.gallery_filter = f,
+            A::PanelScrollThumb { grab_dy } => self.settings_scroll_grab = Some(grab_dy),
+            A::PanelScrollTrack => {
+                // Page toward the click.
+                let cy = self.settings_cursor.1 as f32;
+                if let Some(t) = geom.scroll_thumb {
+                    let page = geom.viewport_h() * 0.9;
+                    self.scroll_settings_by(if cy < t.y { -page } else { page });
                 }
             }
-            input::MouseAction::FontScrollUp => {
-                self.font_scroll_offset = self.font_scroll_offset.saturating_sub(1);
-            }
-            input::MouseAction::FontScrollDown => {
-                const MAX_FONT_ROWS: usize = 5;
-                let max_offset = self.font_families.len().saturating_sub(MAX_FONT_ROWS);
-                self.font_scroll_offset = (self.font_scroll_offset + 1).min(max_offset);
-            }
-            input::MouseAction::UiFontMinus => {
-                self.set_ui_font_size(self.ui_font_logical - 1.0);
-            }
-            input::MouseAction::UiFontPlus => {
-                self.set_ui_font_size(self.ui_font_logical + 1.0);
-            }
-            input::MouseAction::UiFontReset => {
-                self.set_ui_font_size(UI_FONT_LOGICAL_DEFAULT);
-            }
-            input::MouseAction::SetUiFont(idx) => {
-                // Index 0 is the synthetic "System Sans (default)" row → "".
-                if idx == 0 {
-                    self.set_ui_font_family(String::new());
-                } else if let Some(name) = self.ui_font_families.get(idx) {
-                    let name = name.clone();
-                    self.set_ui_font_family(name);
+            A::ResetTab => {
+                if std::mem::take(&mut self.reset_armed) {
+                    let tab = self.settings_tab;
+                    if self.apply_settings_change(|c| *c = crate::settings_ui::reset_tab(c, tab)) {
+                        self.persist();
+                    }
+                } else {
+                    self.reset_armed = true;
                 }
             }
-            input::MouseAction::UiFontScrollUp => {
-                self.ui_font_scroll_offset = self.ui_font_scroll_offset.saturating_sub(1);
-            }
-            input::MouseAction::UiFontScrollDown => {
-                // 4-row visible cap (MAX_UI_FONT_ROWS in panel.rs).
-                const MAX_UI_FONT_ROWS: usize = 4;
-                let max_offset = self.ui_font_families.len().saturating_sub(MAX_UI_FONT_ROWS);
-                self.ui_font_scroll_offset = (self.ui_font_scroll_offset + 1).min(max_offset);
-            }
-            input::MouseAction::SummonPrev => {
-                self.set_summon_effect(self.summon_effect.cycle(false));
-            }
-            input::MouseAction::SummonNext => {
-                self.set_summon_effect(self.summon_effect.cycle(true));
-            }
-            input::MouseAction::WinModePrev => {
-                self.set_window_mode(self.window_mode.cycle(false));
-            }
-            input::MouseAction::WinModeNext => {
-                self.set_window_mode(self.window_mode.cycle(true));
-            }
-            input::MouseAction::TabBarPrev | input::MouseAction::TabBarNext => {
-                // Only two positions, so prev and next both toggle.
-                self.set_tab_bar_bottom(!self.tab_bar_bottom);
-            }
-            input::MouseAction::ScrollbackPrev => {
-                let v = cycle_scrollback(self.scrollback_lines, false);
-                self.set_scrollback_lines(v);
-            }
-            input::MouseAction::ScrollbackNext => {
-                let v = cycle_scrollback(self.scrollback_lines, true);
-                self.set_scrollback_lines(v);
-            }
-            input::MouseAction::CycleShellPrev => {
-                self.cycle_shell(false);
-            }
-            input::MouseAction::CycleShellNext => {
-                self.cycle_shell(true);
-            }
-            // RUN & NOTIFY toggles/cycler (Shell tab, v0.15). Each flips a mirror
-            // field; the shared persist()/redraw below flushes and repaints.
-            input::MouseAction::ToggleNotifyOnFinish => {
-                self.notify_on_finish = !self.notify_on_finish;
-            }
-            input::MouseAction::ToggleNotifyOnlyFailure => {
-                self.notify_only_on_failure = !self.notify_only_on_failure;
-            }
-            input::MouseAction::NotifyDurPrev => {
-                self.notify_min_seconds = cycle_notify_min(self.notify_min_seconds, false);
-            }
-            input::MouseAction::NotifyDurNext => {
-                self.notify_min_seconds = cycle_notify_min(self.notify_min_seconds, true);
-            }
-            input::MouseAction::ToggleAutoSummon => {
-                self.auto_summon_on_finish = !self.auto_summon_on_finish;
-            }
-            input::MouseAction::StartDropdownDrag => {
-                // No-op in Center/Fullscreen mode (the slider is grayed/disabled
-                // there) and while fullscreen — the latch is what enables the
-                // release-time re-dock, which must not fire on a fullscreen window.
-                if dock_reassert_ok(self.window_mode, self.main_fullscreen) {
-                    self.dragging_dropdown = true;
-                    self.dropdown_height_pct =
-                        self.dropdown_pct_from_cursor(cx, &geom.dropdown_track);
+            A::SetSettingsTab(i) => {
+                let i = i.min(jetty_render::N_TABS - 1);
+                if i != self.settings_tab {
+                    // Leaving the Look tab keeps the theme the gallery shows.
+                    self.gallery.keep();
+                    self.settings_tab = i;
                 }
-            }
-            input::MouseAction::StartDropdownWidthDrag => {
-                // No-op in Center/Fullscreen mode (the slider is grayed/disabled
-                // there) and while fullscreen — see StartDropdownDrag above.
-                if dock_reassert_ok(self.window_mode, self.main_fullscreen) {
-                    self.dragging_dropdown_width = true;
-                    self.dropdown_width_pct =
-                        self.dropdown_width_pct_from_cursor(cx, &geom.dropdown_width_track);
-                }
-            }
-            // Effects tab toggles: flip the corresponding bool in self.fx.
-            input::MouseAction::ToggleCrt => {
-                self.fx.crt_enabled = !self.fx.crt_enabled;
-            }
-            input::MouseAction::ToggleCrtRoll => {
-                self.fx.crt_animate_roll = !self.fx.crt_animate_roll;
-            }
-            input::MouseAction::ToggleCrtFlicker => {
-                self.fx.crt_flicker = !self.fx.crt_flicker;
-            }
-            input::MouseAction::ToggleCrtJitter => {
-                self.fx.crt_jitter = !self.fx.crt_jitter;
-            }
-            input::MouseAction::ToggleCaretFlash => {
-                self.fx.caret_flash_enabled = !self.fx.caret_flash_enabled;
-            }
-            input::MouseAction::ToggleCaretGlow => {
-                self.fx.caret_glow_enabled = !self.fx.caret_glow_enabled;
-            }
-            // Effects tab sliders: mark the active drag and apply initial value.
-            // The CursorMoved handler updates the value on every subsequent move;
-            // MouseInput::Released clears active_fx_drag and persists the final value.
-            input::MouseAction::StartCrtCurvatureDrag => {
-                self.active_fx_drag = Some(FxSlider::CrtCurvature);
-                self.fx.crt_curvature = self.fx_frac_from_cursor(cx, &geom.crt_curvature_track);
-            }
-            input::MouseAction::StartScanlineDrag => {
-                self.active_fx_drag = Some(FxSlider::CrtScanline);
-                self.fx.crt_scanline = self.fx_frac_from_cursor(cx, &geom.crt_scanline_track);
-            }
-            input::MouseAction::StartMaskDrag => {
-                self.active_fx_drag = Some(FxSlider::CrtMask);
-                self.fx.crt_mask = self.fx_frac_from_cursor(cx, &geom.crt_mask_track);
-            }
-            input::MouseAction::StartBloomDrag => {
-                self.active_fx_drag = Some(FxSlider::CrtBloom);
-                self.fx.crt_bloom = self.fx_frac_from_cursor(cx, &geom.crt_bloom_track);
-            }
-            input::MouseAction::StartChromaticDrag => {
-                self.active_fx_drag = Some(FxSlider::CrtChromatic);
-                self.fx.crt_chromatic = self.fx_frac_from_cursor(cx, &geom.crt_chromatic_track);
-            }
-            input::MouseAction::StartVignetteDrag => {
-                self.active_fx_drag = Some(FxSlider::CrtVignette);
-                self.fx.crt_vignette = self.fx_frac_from_cursor(cx, &geom.crt_vignette_track);
-            }
-            input::MouseAction::StartCaretDurDrag => {
-                self.active_fx_drag = Some(FxSlider::CaretDur);
-                let frac = self.fx_frac_from_cursor(cx, &geom.caret_dur_track);
-                self.fx.caret_flash_ms = 60.0 + frac * 340.0;
-            }
-            input::MouseAction::StartTintRDrag => {
-                self.active_fx_drag = Some(FxSlider::TintR);
-                self.fx.crt_scanline_tint[0] = self.fx_frac_from_cursor(cx, &geom.crt_tint_r_track);
-            }
-            input::MouseAction::StartTintGDrag => {
-                self.active_fx_drag = Some(FxSlider::TintG);
-                self.fx.crt_scanline_tint[1] = self.fx_frac_from_cursor(cx, &geom.crt_tint_g_track);
-            }
-            input::MouseAction::StartTintBDrag => {
-                self.active_fx_drag = Some(FxSlider::TintB);
-                self.fx.crt_scanline_tint[2] = self.fx_frac_from_cursor(cx, &geom.crt_tint_b_track);
-            }
-            input::MouseAction::StartCaretColorRDrag => {
-                self.active_fx_drag = Some(FxSlider::CaretColorR);
-                self.fx.caret_flash_color[0] = self.fx_frac_from_cursor(cx, &geom.caret_color_r_track);
-            }
-            input::MouseAction::StartCaretColorGDrag => {
-                self.active_fx_drag = Some(FxSlider::CaretColorG);
-                self.fx.caret_flash_color[1] = self.fx_frac_from_cursor(cx, &geom.caret_color_g_track);
-            }
-            input::MouseAction::StartCaretColorBDrag => {
-                self.active_fx_drag = Some(FxSlider::CaretColorB);
-                self.fx.caret_flash_color[2] = self.fx_frac_from_cursor(cx, &geom.caret_color_b_track);
-            }
-            input::MouseAction::SetSettingsTab(i) => {
-                // Session-only tab switch: change the active tab and redraw the
-                // settings window. Not persisted (resets to Look on restart).
-                self.settings_tab = i.min(4);
-                self.request_settings_paint();
-                // Nothing to persist for a tab switch; return early so we don't
-                // write config or redraw the main terminal needlessly.
-                return;
-            }
-            input::MouseAction::ToggleFocusAutoHide => {
-                self.focus_autohide = !self.focus_autohide;
-            }
-            input::MouseAction::ToggleLaunchAtLogin => {
-                // Write/remove the login autostart entry; persist() (below) saves
-                // the config key, which is the source of truth.
-                self.toggle_launch_at_login_setting();
             }
             // The OS title bar moves the window now; in-panel drag/consume are no-ops.
-            input::MouseAction::StartDialogDrag
-            | input::MouseAction::ConsumePanel
-            | input::MouseAction::StartScrollbarDrag { .. }
-            | input::MouseAction::ScrollbarTrackJump
-            | input::MouseAction::None => {}
+            A::StartDialogDrag
+            | A::ConsumePanel
+            | A::StartScrollbarDrag { .. }
+            | A::ScrollbarTrackJump
+            | A::None => {}
         }
-        // Persist the new setting. Drag-in-progress (slider/radius) keeps writing
-        // on release too, but a write here is cheap and captures theme/font picks
-        // that don't go through a release event.
-        self.persist();
-        // Redraw both windows: settings shows the updated control, main shows the
-        // new theme/font/opacity live. set_font_size/set_font_family already redraw
-        // the main window, but an extra request is harmless and keeps this simple.
-        self.request_main_paint();
         self.request_settings_paint();
-        // Detached windows share the same theme/opacity/radius/CRT settings —
-        // repaint them too so every surface reflects the change immediately
-        // (one damage-driven request each; no polling).
-        for dw in &self.detached {
-            dw.request_paint();
-        }
     }
 
     /// Handle a `WindowEvent` that belongs to the settings window. Hit-testing
@@ -10245,66 +10060,30 @@ impl App {
                 }
                 self.request_settings_paint();
             }
+            WindowEvent::ModifiersChanged(m) => {
+                self.settings_mods = m.state();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.settings_cursor = (position.x, position.y);
-                // Continue an opacity-, radius-, dropdown-height/-width, or Effects slider drag.
-                if self.dragging_slider || self.dragging_radius || self.dragging_dropdown || self.dragging_dropdown_width || self.active_fx_drag.is_some() {
-                    if let Some(gpu) = &self.settings_gpu {
-                        let (w, h) = (gpu.config.width, gpu.config.height);
-                        let pv = self.settings_panel_view(w, h);
-                        let cx = self.settings_cursor.0 as f32;
-                        if self.dragging_slider {
-                            self.opacity = self.opacity_from_cursor(cx, &pv.geom.slider_track);
-                            self.apply_theme();
-                        }
-                        if self.dragging_radius {
-                            self.corner_radius = self.radius_from_cursor(cx, &pv.geom.radius_track);
-                        }
-                        if self.dragging_dropdown {
-                            self.dropdown_height_pct =
-                                self.dropdown_pct_from_cursor(cx, &pv.geom.dropdown_track);
-                        }
-                        if self.dragging_dropdown_width {
-                            self.dropdown_width_pct =
-                                self.dropdown_width_pct_from_cursor(cx, &pv.geom.dropdown_width_track);
-                        }
-                        if let Some(fx_slider) = self.active_fx_drag {
-                            match fx_slider {
-                                FxSlider::CrtCurvature => self.fx.crt_curvature = self.fx_frac_from_cursor(cx, &pv.geom.crt_curvature_track),
-                                FxSlider::CrtScanline  => self.fx.crt_scanline  = self.fx_frac_from_cursor(cx, &pv.geom.crt_scanline_track),
-                                FxSlider::CrtMask      => self.fx.crt_mask      = self.fx_frac_from_cursor(cx, &pv.geom.crt_mask_track),
-                                FxSlider::CrtBloom     => self.fx.crt_bloom     = self.fx_frac_from_cursor(cx, &pv.geom.crt_bloom_track),
-                                FxSlider::CrtChromatic => self.fx.crt_chromatic = self.fx_frac_from_cursor(cx, &pv.geom.crt_chromatic_track),
-                                FxSlider::CrtVignette  => self.fx.crt_vignette  = self.fx_frac_from_cursor(cx, &pv.geom.crt_vignette_track),
-                                FxSlider::CaretDur => {
-                                    let frac = self.fx_frac_from_cursor(cx, &pv.geom.caret_dur_track);
-                                    self.fx.caret_flash_ms = 60.0 + frac * 340.0;
-                                }
-                                FxSlider::TintR => self.fx.crt_scanline_tint[0] = self.fx_frac_from_cursor(cx, &pv.geom.crt_tint_r_track),
-                                FxSlider::TintG => self.fx.crt_scanline_tint[1] = self.fx_frac_from_cursor(cx, &pv.geom.crt_tint_g_track),
-                                FxSlider::TintB => self.fx.crt_scanline_tint[2] = self.fx_frac_from_cursor(cx, &pv.geom.crt_tint_b_track),
-                                FxSlider::CaretColorR => self.fx.caret_flash_color[0] = self.fx_frac_from_cursor(cx, &pv.geom.caret_color_r_track),
-                                FxSlider::CaretColorG => self.fx.caret_flash_color[1] = self.fx_frac_from_cursor(cx, &pv.geom.caret_color_g_track),
-                                FxSlider::CaretColorB => self.fx.caret_flash_color[2] = self.fx_frac_from_cursor(cx, &pv.geom.caret_color_b_track),
-                            }
-                        }
-                    }
-                    self.request_main_paint();
+                let (cx, cy) = (position.x as f32, position.y as f32);
+                if let Some(grab) = self.settings_scroll_grab {
+                    self.settings_scroll_drag_to(cy - grab);
+                } else if self.ctl_drag.is_some() {
+                    self.settings_drag_to(cx);
+                } else {
+                    self.settings_hover_at(cx, cy);
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if self.settings_hover.take().is_some() {
                     self.request_settings_paint();
-                    // Radius/opacity/CRT sliders apply to detached windows too —
-                    // repaint them live during the drag (damage-driven, no polling).
-                    for dw in &self.detached {
-                        dw.request_paint();
-                    }
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 self.end_settings_drags();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                let Some(gpu) = &self.settings_gpu else { return };
-                let (w, h) = (gpu.config.width, gpu.config.height);
-                let pv = self.settings_panel_view(w, h);
+                let Some(pv) = self.settings_view_now() else { return };
                 let cx = self.settings_cursor.0 as f32;
                 let cy = self.settings_cursor.1 as f32;
                 // Hit-test the panel only (no scrollbar in the settings window).
@@ -10312,77 +10091,12 @@ impl App {
                 self.handle_settings_action(action, &pv.geom);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                // ── Effects tab (4): vertical content scroll ─────────────────────
-                // Wheel anywhere in the settings window while the Effects tab is
-                // active scrolls the content, not the font lists (which are on
-                // different tabs). Clamp to [0, max_scroll] and redraw.
-                if self.settings_tab == 4 {
-                    let delta_px = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
-                        MouseScrollDelta::PixelDelta(p) => -(p.y as f32),
-                    };
-                    // `effects_scroll` accumulates in PHYSICAL px, but build_panel
-                    // divides it by its layout scale (the settings chrome unit) to
-                    // lay bands out in LOGICAL space. So the clamp bound (a LOGICAL
-                    // content/viewport delta) must be scaled by the SAME factor, or
-                    // on HiDPI the bottom bands (caret RGB sliders) stayed
-                    // unreachable and on sub-1× the scroll overshot into blank
-                    // space (F10).
-                    let dpi = self.settings_metrics().overlay_u().max(0.1);
-                    let max_scroll = (jetty_render::EFFECTS_CONTENT_H
-                        - jetty_render::EFFECTS_VISIBLE_H).max(0.0)
-                        * dpi;
-                    self.effects_scroll = (self.effects_scroll + delta_px).clamp(0.0, max_scroll);
-                    self.request_settings_paint();
-                    return;
-                }
-                // ── Font/UI-font list scroll (tabs 1) ────────────────────────────
-                // Wheel over the terminal- OR UI-font list scrolls it (same as the
-                // old in-app panel behaviour), now in the settings window.
-                if self.font_families.is_empty() && self.ui_font_families.is_empty() {
-                    return;
-                }
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (y.round() as i32) * 3,
-                    MouseScrollDelta::PixelDelta(p) => (p.y / 20.0).round() as i32,
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -y * 40.0 * self.settings_metrics().overlay_u(),
+                    MouseScrollDelta::PixelDelta(p) => -(p.y as f32),
                 };
-                if lines == 0 {
-                    return;
-                }
-                let Some(gpu) = &self.settings_gpu else { return };
-                let (w, h) = (gpu.config.width, gpu.config.height);
-                let pv = self.settings_panel_view(w, h);
-                let cx = self.settings_cursor.0 as f32;
-                let cy = self.settings_cursor.1 as f32;
-                let over_list = pv.geom.font_rows.iter().any(|r| {
-                    cx >= r.x && cx <= r.x + r.w
-                        && cy >= pv.geom.font_rows.first().map(|r| r.y).unwrap_or(0.0)
-                        && cy <= pv.geom.font_rows.last().map(|r| r.y + r.h).unwrap_or(0.0)
-                });
-                // Is the cursor over the UI (chrome) font list?
-                let over_ui_list = !pv.geom.ui_font_rows.is_empty() && pv.geom.ui_font_rows.iter().any(|r| {
-                    cx >= r.x && cx <= r.x + r.w
-                        && cy >= pv.geom.ui_font_rows.first().map(|r| r.y).unwrap_or(0.0)
-                        && cy <= pv.geom.ui_font_rows.last().map(|r| r.y + r.h).unwrap_or(0.0)
-                });
-                if over_list {
-                    const MAX_FONT_ROWS: usize = 5;
-                    let max_offset = self.font_families.len().saturating_sub(MAX_FONT_ROWS);
-                    if lines > 0 {
-                        self.font_scroll_offset = self.font_scroll_offset.saturating_sub(1);
-                    } else {
-                        self.font_scroll_offset = (self.font_scroll_offset + 1).min(max_offset);
-                    }
-                    self.request_settings_paint();
-                } else if over_ui_list {
-                    const MAX_UI_FONT_ROWS: usize = 4;
-                    let max_offset = self.ui_font_families.len().saturating_sub(MAX_UI_FONT_ROWS);
-                    if lines > 0 {
-                        self.ui_font_scroll_offset = self.ui_font_scroll_offset.saturating_sub(1);
-                    } else {
-                        self.ui_font_scroll_offset = (self.ui_font_scroll_offset + 1).min(max_offset);
-                    }
-                    self.request_settings_paint();
+                if dy != 0.0 {
+                    self.settings_wheel(dy);
                 }
             }
             WindowEvent::KeyboardInput { event, is_synthetic, .. } if event.state.is_pressed() => {
@@ -10391,11 +10105,7 @@ impl App {
                 if is_synthetic {
                     return;
                 }
-                // Escape closes the settings window.
-                if matches!(event.logical_key, winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)) {
-                    self.close_settings_window();
-                    self.request_main_paint();
-                }
+                self.settings_key(&event.logical_key);
             }
             WindowEvent::Focused(true) => {
                 // Record that OUR settings window now holds focus so the main
@@ -12411,62 +12121,13 @@ impl ApplicationHandler<AppEvent> for App {
                     cy,
                 ) {
                     // Panel actions cannot occur here (panel == None above).
-                    input::MouseAction::StartSliderDrag
-                    | input::MouseAction::StartRadiusDrag
-                    | input::MouseAction::SetTheme(_)
-                    | input::MouseAction::ToggleThemeDropdown
-                    | input::MouseAction::ThemeScrollUp
-                    | input::MouseAction::ThemeScrollDown
-                    | input::MouseAction::FontMinus
-                    | input::MouseAction::FontPlus
-                    | input::MouseAction::FontReset
-                    | input::MouseAction::SetFont(_)
-                    | input::MouseAction::FontScrollUp
-                    | input::MouseAction::FontScrollDown
-                    | input::MouseAction::UiFontMinus
-                    | input::MouseAction::UiFontPlus
-                    | input::MouseAction::UiFontReset
-                    | input::MouseAction::SetUiFont(_)
-                    | input::MouseAction::UiFontScrollUp
-                    | input::MouseAction::UiFontScrollDown
-                    | input::MouseAction::SummonPrev
-                    | input::MouseAction::SummonNext
-                    | input::MouseAction::WinModePrev
-                    | input::MouseAction::WinModeNext
-                    | input::MouseAction::TabBarPrev
-                    | input::MouseAction::TabBarNext
-                    | input::MouseAction::ScrollbackPrev
-                    | input::MouseAction::ScrollbackNext
-                    | input::MouseAction::StartDropdownDrag
-                    | input::MouseAction::StartDropdownWidthDrag
-                    | input::MouseAction::ToggleFocusAutoHide
-                    | input::MouseAction::ToggleLaunchAtLogin
-                    | input::MouseAction::CycleShellPrev
-                    | input::MouseAction::CycleShellNext
-                    | input::MouseAction::ToggleNotifyOnFinish
-                    | input::MouseAction::ToggleNotifyOnlyFailure
-                    | input::MouseAction::NotifyDurPrev
-                    | input::MouseAction::NotifyDurNext
-                    | input::MouseAction::ToggleAutoSummon
-                    | input::MouseAction::ToggleCrt
-                    | input::MouseAction::ToggleCrtRoll
-                    | input::MouseAction::ToggleCrtFlicker
-                    | input::MouseAction::ToggleCrtJitter
-                    | input::MouseAction::ToggleCaretFlash
-                    | input::MouseAction::ToggleCaretGlow
-                    | input::MouseAction::StartCrtCurvatureDrag
-                    | input::MouseAction::StartScanlineDrag
-                    | input::MouseAction::StartMaskDrag
-                    | input::MouseAction::StartBloomDrag
-                    | input::MouseAction::StartChromaticDrag
-                    | input::MouseAction::StartVignetteDrag
-                    | input::MouseAction::StartCaretDurDrag
-                    | input::MouseAction::StartTintRDrag
-                    | input::MouseAction::StartTintGDrag
-                    | input::MouseAction::StartTintBDrag
-                    | input::MouseAction::StartCaretColorRDrag
-                    | input::MouseAction::StartCaretColorGDrag
-                    | input::MouseAction::StartCaretColorBDrag
+                    input::MouseAction::Ctl { .. }
+                    | input::MouseAction::SettingsSection(_)
+                    | input::MouseAction::GalleryCard(_)
+                    | input::MouseAction::GalleryFilter(_)
+                    | input::MouseAction::PanelScrollThumb { .. }
+                    | input::MouseAction::PanelScrollTrack
+                    | input::MouseAction::ResetTab
                     | input::MouseAction::SetSettingsTab(_)
                     | input::MouseAction::StartDialogDrag
                     | input::MouseAction::ConsumePanel => {}
@@ -15339,20 +15000,6 @@ fn is_reload_echo(config_read: bool, themes_changed: bool, warnings: &[String], 
     !config_read && !themes_changed && warnings == shown
 }
 
-/// Display name for a `shell` config value: "System default" for the empty
-/// (auto-detect) selection, else the file basename of the path (e.g. "zsh").
-fn shell_display_name(shell: &str) -> String {
-    if shell.is_empty() {
-        "System default".to_string()
-    } else {
-        std::path::Path::new(shell)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| shell.to_string())
-    }
-}
-
 /// Detect the login shells installed on the system, POSIX-style.
 ///
 /// Reads `/etc/shells` (the standard, desktop-environment-INDEPENDENT registry
@@ -15521,6 +15168,29 @@ fn effective_corner_radius_px(radius_logical: f32, scale: f32, fullscreen: bool)
 /// never diverge.
 fn corner_radius_band_dimmed(main_fullscreen: bool, mode: WindowMode) -> bool {
     main_fullscreen || mode == WindowMode::Fullscreen
+}
+
+/// `corner_radius_band_dimmed` over the `window_mode` config value — the
+/// Settings corner-radius row's dim state (`settings_ui`).
+pub(crate) fn corner_radius_dimmed_for(main_fullscreen: bool, window_mode: &str) -> bool {
+    corner_radius_band_dimmed(main_fullscreen, WindowMode::from_config(window_mode))
+}
+
+/// `dock_reassert_ok` over the `window_mode` config value — whether the
+/// Settings dropdown-size sliders do anything right now (`settings_ui`).
+pub(crate) fn dropdown_controls_live(window_mode: &str, main_fullscreen: bool) -> bool {
+    dock_reassert_ok(WindowMode::from_config(window_mode), main_fullscreen)
+}
+
+/// The Settings "Summon effect" options, `(config value, label)` in cycle
+/// order — straight from `SummonEffect`, so a new effect shows up by itself.
+pub(crate) fn summon_effect_choices() -> Vec<(String, String)> {
+    SummonEffect::ORDER.iter().map(|e| (e.to_config().to_string(), e.display_name().to_string())).collect()
+}
+
+/// The Settings "Window mode" options, `(config value, label)` in cycle order.
+pub(crate) fn window_mode_choices() -> Vec<(String, String)> {
+    WindowMode::ORDER.iter().map(|m| (m.to_config().to_string(), m.display_name().to_string())).collect()
 }
 
 /// Whether the Dropdown dock geometry may be (re-)asserted right now.
@@ -15760,21 +15430,22 @@ fn settings_fullscreen_exit(main_fullscreen: bool, focused_detached: Option<(usi
     }
 }
 
-/// What ending the Settings-window drags owes (see `App::end_settings_drags`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SettingsDragEnd {
-    /// A drag was live: its value was applied live but never written.
-    persist: bool,
-    /// A dropdown height/width drag: re-dock the window at the new size.
-    redock: bool,
+/// What ending a Settings drag owes (see `App::end_settings_drags`): nothing
+/// without a drag — a stray release or focus loss must not write the config —
+/// else `(control, its release-applied value)`: the value to apply first for a
+/// control that applies on release (`None` for a live one, already applied),
+/// then a save.
+fn settings_drag_end(drag: Option<CtlDrag>) -> Option<(jetty_render::CtlId, Option<crate::settings_ui::Val>)> {
+    drag.map(|d| (d.id, d.pending))
 }
 
-/// Pure decision behind `App::end_settings_drags`: any live drag (`value_drag`:
-/// opacity/radius/Effects; `dropdown_drag`: dropdown height/width) persists,
-/// and only a dropdown drag re-docks. No drag → nothing at all (a stray
-/// release or focus loss must not write the config).
-fn settings_drag_end(value_drag: bool, dropdown_drag: bool) -> SettingsDragEnd {
-    SettingsDragEnd { persist: value_drag || dropdown_drag, redock: dropdown_drag }
+/// The wgpu clear color (linear) for an opaque sRGB color.
+fn srgb_clear(c: [u8; 3]) -> wgpu::Color {
+    let lin = |v: u8| {
+        let s = v as f64 / 255.0;
+        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    };
+    wgpu::Color { r: lin(c[0]), g: lin(c[1]), b: lin(c[2]), a: 1.0 }
 }
 
 /// The top-left a window of `win_size` needs to sit centred inside the monitor
@@ -16338,45 +16009,6 @@ mod printable_keystroke_tests {
     #[test]
     fn ctrl_c_is_not_printable() {
         assert!(!is_printable_keystroke(b"\x03"));
-    }
-}
-
-#[cfg(test)]
-mod scrollback_cycle_tests {
-    use super::{cycle_scrollback, format_scrollback, SCROLLBACK_STEPS};
-
-    #[test]
-    fn cycle_scrollback_snaps_and_wraps() {
-        // Exact steps move ±1 with wraparound (SummonEffect::cycle semantics).
-        assert_eq!(cycle_scrollback(10_000, true), 25_000);
-        assert_eq!(cycle_scrollback(100_000, true), 1_000, "forward wraps");
-        assert_eq!(cycle_scrollback(1_000, false), 100_000, "backward wraps");
-        // A hand-edited value snaps to its NEAREST step, then steps.
-        assert_eq!(cycle_scrollback(12_345, true), 25_000);
-        assert_eq!(cycle_scrollback(12_345, false), 5_000);
-    }
-
-    #[test]
-    fn format_scrollback_steps_and_verbatim() {
-        // Every cycler step renders in "Nk" form.
-        for s in SCROLLBACK_STEPS {
-            assert_eq!(format_scrollback(s), format!("{}k", s / 1000));
-        }
-        // Hand-edited values render verbatim.
-        assert_eq!(format_scrollback(12_345), "12345");
-        assert_eq!(format_scrollback(100), "100");
-    }
-
-    #[test]
-    fn cycle_notify_min_snaps_and_wraps() {
-        use super::cycle_notify_min;
-        // Exact steps move ±1 with wraparound.
-        assert_eq!(cycle_notify_min(10, true), 30);
-        assert_eq!(cycle_notify_min(300, true), 5, "forward wraps");
-        assert_eq!(cycle_notify_min(5, false), 300, "backward wraps");
-        // A hand-edited value snaps to its nearest step, then steps.
-        assert_eq!(cycle_notify_min(50, true), 120); // nearest is 60 → next 120
-        assert_eq!(cycle_notify_min(50, false), 30); // nearest is 60 → prev 30
     }
 }
 
@@ -17239,16 +16871,14 @@ mod window_mode_tests {
                 "{m:?} must appear exactly once in ORDER"
             );
         }
-        // Forward: Center → Dropdown → Fullscreen → Center.
-        assert_eq!(WindowMode::Center.cycle(true), WindowMode::Dropdown);
-        assert_eq!(WindowMode::Dropdown.cycle(true), WindowMode::Fullscreen);
-        assert_eq!(WindowMode::Fullscreen.cycle(true), WindowMode::Center);
-        // Backward is the exact inverse.
-        for m in WindowMode::ORDER {
-            assert_eq!(m.cycle(true).cycle(false), m);
-            assert_eq!(m.cycle(false).cycle(true), m);
-            // Three forward steps are the identity.
-            assert_eq!(m.cycle(true).cycle(true).cycle(true), m);
+        // The Settings cycler steps Center → Dropdown → Fullscreen (and wraps,
+        // see settings_ui), each option round-tripping through the config.
+        let choices = super::window_mode_choices();
+        let values: Vec<&str> = choices.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(values, ["center", "dropdown", "fullscreen"]);
+        for (v, label) in &choices {
+            let m = WindowMode::from_config(v);
+            assert_eq!((m.to_config(), m.display_name()), (v.as_str(), label.as_str()));
         }
     }
 
@@ -17268,7 +16898,7 @@ mod window_mode_tests {
 mod window_parity_tests {
     use super::{
         detach_logical_size, gpu_recovery_due, pace_paint, perf_hud_text, refresh_interval, settings_drag_end,
-        settings_fullscreen_exit, smooth_frame_ms, FullscreenExit, PaintPacing, SettingsDragEnd,
+        settings_fullscreen_exit, smooth_frame_ms, CtlDrag, FullscreenExit, PaintPacing,
         GPU_REBUILD_RETRY,
     };
     use std::time::{Duration, Instant};
@@ -17363,14 +16993,17 @@ mod window_parity_tests {
     }
 
     #[test]
-    fn interrupted_settings_drags_persist_and_dropdown_drags_redock() {
+    fn interrupted_settings_drags_persist_and_release_applied_values_land() {
+        use crate::settings_ui::Val;
+        use jetty_render::CtlPart;
         // No drag: a stray release / focus loss / close writes nothing.
-        assert_eq!(settings_drag_end(false, false), SettingsDragEnd { persist: false, redock: false });
-        // Opacity / radius / Effects slider: persist the live value.
-        assert_eq!(settings_drag_end(true, false), SettingsDragEnd { persist: true, redock: false });
-        // Dropdown height/width: persist AND re-dock at the new size.
-        assert_eq!(settings_drag_end(false, true), SettingsDragEnd { persist: true, redock: true });
-        assert_eq!(settings_drag_end(true, true), SettingsDragEnd { persist: true, redock: true });
+        assert!(settings_drag_end(None).is_none());
+        // A live slider (opacity, radius, effects): already applied, just saved.
+        let live = CtlDrag { id: "opacity", part: CtlPart::Track, pending: None };
+        assert_eq!(settings_drag_end(Some(live)), Some(("opacity", None)));
+        // The dropdown size applies on release (its change re-docks once).
+        let dd = CtlDrag { id: "dropdown_height_pct", part: CtlPart::Track, pending: Some(Val::F(0.8)) };
+        assert_eq!(settings_drag_end(Some(dd)), Some(("dropdown_height_pct", Some(Val::F(0.8)))));
     }
 
     #[test]

@@ -76,6 +76,8 @@ pub enum PaletteCmd {
     /// The per-tab color of the tab the palette was opened over (palette index
     /// 1..=6; `None` removes it).
     SetTabColor(Option<u8>),
+    /// Open Settings at a control ("Settings › Effects › Bloom"), by its id.
+    SettingsAt(&'static str),
 }
 
 /// The chrome entries: tab style / close buttons / window border pickers, the
@@ -235,6 +237,11 @@ pub fn build_registry(
             keywords: "theme colour color scheme palette",
             cmd: PaletteCmd::SetTheme(i),
         });
+    }
+    // Deep links into Settings, one per control ("Settings › Effects › Bloom"),
+    // straight from the control table — a new setting gets one by itself.
+    for link in crate::settings_ui::deep_links() {
+        v.push(PaletteEntry { title: link.title, keywords: link.keywords, cmd: PaletteCmd::SettingsAt(link.id) });
     }
     for (id, title) in tabs {
         v.push(PaletteEntry {
@@ -438,6 +445,19 @@ mod tests {
         let first_theme_row = r.iter().position(|e| matches!(e.cmd, PaletteCmd::SetTheme(_))).unwrap();
         assert!(pos(&PaletteCmd::NextTheme) < first_theme_row);
         assert_eq!(r.iter().filter(|e| e.cmd == PaletteCmd::RandomTheme).count(), 1);
+    }
+
+    #[test]
+    fn settings_deep_links_rank_first_for_their_control_name() {
+        // Typing a control's name finds its "Settings › Tab › Control" link
+        // first — even where an action's keywords mention the same word
+        // ("Toggle caret glow" carries "bloom").
+        let r = reg();
+        for (q, id) in [("bloom", "effects.crt_bloom"), ("vignette", "effects.crt_vignette"), ("scrollback", "scrollback_lines")] {
+            let hits = filter(&r, q);
+            assert_eq!(hits[0].cmd, PaletteCmd::SettingsAt(id), "top hit for {q:?}");
+        }
+        assert!(r.iter().any(|e| e.title == "Settings › Effects › Bloom"));
     }
 
     #[test]

@@ -117,6 +117,22 @@
 ///   JETTY_SHOT_GRAPHEMES="row,col,cluster;…" — grapheme-cluster overrides for
 ///                    the renderer (combining marks / VS16 / ZWJ drawn from the
 ///                    whole cluster instead of the cell's base char).
+///   JETTY_SHOT_PANEL=1 — render the Settings window instead of a terminal: the
+///                    frame defaults to the Settings window's physical size and
+///                    the panel content comes from the config in
+///                    JETTY_CONFIG_DIR (defaults without one), so every
+///                    non-default setting shows; env knobs override single keys
+///                    (JETTY_THEME, JETTY_OPACITY, JETTY_CORNER_RADIUS,
+///                    JETTY_SHOT_UI_FONT[_SIZE], JETTY_SHOT_PANEL_WINMODE/EFFECT/
+///                    DH/DW/AUTOHIDE/LAUNCH/SHELL/FULLSCREEN). Panel state:
+///                    JETTY_SHOT_PANEL_TAB=0..4, JETTY_SHOT_PANEL_SCROLL=<px>|max
+///                    (alias _FX_SCROLL), JETTY_SHOT_PANEL_FILTER=all|dark|light|mine,
+///                    JETTY_SHOT_PANEL_HOVER=<theme name>|reset|filter:<f>|section:<id>,
+///                    JETTY_SHOT_PANEL_COLLAPSE=<section id,...>,
+///                    JETTY_SHOT_PANEL_FOCUS=<control id> (a deep link: its tab,
+///                    scrolled to it, highlighted), JETTY_SHOT_PANEL_RESET=
+///                    armed|ready|disabled, JETTY_SHOT_PANEL_SESSION=1 (a gallery
+///                    browsing session's footer hint).
 ///   JETTY_SHOT_COPYMODE="row,col" — copy-mode self-test: draw the keyboard cursor
 ///                    (hollow box) + the "COPY" pill at (row,col). With
 ///                    JETTY_SHOT_COPYMODE_ANCHOR="row,col" also drive a live
@@ -151,8 +167,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clamp to 1..=8192 (the wgpu::Limits::default() max_texture_dimension_2d
     // requested below): 0 or an oversized value would trip a wgpu validation
     // panic deep inside create_texture instead of a usable render.
-    let width: u32 = std::env::var("JETTY_SHOT_WIDTH").ok().and_then(|s| s.parse().ok()).map(|v: u32| v.clamp(1, 8192)).unwrap_or(1000);
-    let height: u32 = std::env::var("JETTY_SHOT_HEIGHT").ok().and_then(|s| s.parse().ok()).map(|v: u32| v.clamp(1, 8192)).unwrap_or(640);
+    let width_env: Option<u32> = std::env::var("JETTY_SHOT_WIDTH").ok().and_then(|s| s.parse().ok()).map(|v: u32| v.clamp(1, 8192));
+    let height_env: Option<u32> = std::env::var("JETTY_SHOT_HEIGHT").ok().and_then(|s| s.parse().ok()).map(|v: u32| v.clamp(1, 8192));
+    // JETTY_SHOT_PANEL=1 renders the Settings window: its content comes from the
+    // config in JETTY_CONFIG_DIR (never the user's real config dir — without the
+    // override the defaults are used), with single keys overridable from env.
+    let shot_cfg: Option<jetty_app::config::Config> = env_flag("JETTY_SHOT_PANEL").then(|| {
+        let mut cfg = if std::env::var_os("JETTY_CONFIG_DIR").is_some() {
+            jetty_app::config::Config::load().cfg
+        } else {
+            jetty_app::config::Config::default()
+        };
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let num = |k: &str| var(k).and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite());
+        if let Some(t) = var("JETTY_THEME") {
+            cfg.theme = t;
+        }
+        if let Some(v) = num("JETTY_OPACITY") {
+            cfg.opacity = v.clamp(0.1, 1.0);
+        }
+        if let Some(v) = num("JETTY_CORNER_RADIUS") {
+            cfg.corner_radius = v.clamp(0.0, 24.0);
+        }
+        if let Some(v) = var("JETTY_SHOT_PANEL_EFFECT") {
+            cfg.summon_effect = v.to_lowercase();
+        }
+        if let Some(v) = var("JETTY_SHOT_PANEL_WINMODE") {
+            cfg.window_mode = v.to_lowercase();
+        }
+        if let Some(v) = var("JETTY_TAB_BAR") {
+            cfg.tab_bar_position = v;
+        }
+        if let Some(v) = num("JETTY_SHOT_PANEL_DH") {
+            cfg.dropdown_height_pct = v.clamp(0.25, 1.0);
+        }
+        if let Some(v) = num("JETTY_SHOT_PANEL_DW") {
+            cfg.dropdown_width_pct = v.clamp(0.2, 1.0);
+        }
+        if let Some(v) = var("JETTY_SHOT_PANEL_AUTOHIDE") {
+            cfg.focus_autohide = v != "0";
+        }
+        if let Some(v) = var("JETTY_SHOT_PANEL_LAUNCH") {
+            cfg.launch_at_login = v != "0";
+        }
+        if let Some(v) = var("JETTY_SHOT_PANEL_SHELL") {
+            cfg.shell = v;
+        }
+        if let Some(v) = num("JETTY_SHOT_UI_FONT_SIZE") {
+            cfg.ui_font_size = v.clamp(10.0, 28.0);
+        }
+        if let Ok(v) = std::env::var("JETTY_SHOT_UI_FONT") {
+            cfg.ui_font_family = v;
+        }
+        cfg
+    });
     // Allow headless renders at different font sizes so the test harness can
     // verify that font-size changes produce a different cell grid.
     let font_size: f32 = std::env::var("JETTY_FONT_SIZE")
@@ -247,12 +315,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // UI (chrome) font: size (10..28, default 16) + family ("" = platform sans).
     // Mirrors the live app's separate UI font — drives ALL chrome and the panel
     // "Aa" specimen, independent of the terminal grid font (JETTY_FONT_SIZE).
-    let ui_font_size: f32 = std::env::var("JETTY_SHOT_UI_FONT_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .map(|v| v.clamp(10.0, 28.0))
-        .unwrap_or(16.0);
-    let ui_font_family = std::env::var("JETTY_SHOT_UI_FONT").unwrap_or_default();
+    let ui_font_size: f32 = match &shot_cfg {
+        Some(cfg) => cfg.ui_font_size.clamp(10.0, 28.0),
+        None => std::env::var("JETTY_SHOT_UI_FONT_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .map(|v| v.clamp(10.0, 28.0))
+            .unwrap_or(16.0),
+    };
+    let ui_font_family = match &shot_cfg {
+        Some(cfg) => cfg.ui_font_family.clone(),
+        None => std::env::var("JETTY_SHOT_UI_FONT").unwrap_or_default(),
+    };
+    // The frame: JETTY_SHOT_WIDTH/HEIGHT, else the Settings window's physical
+    // size in panel mode (the app's `desired_settings_logical_size`: the design
+    // size scaled by the panel's chrome unit, never below it, +2 px each side),
+    // else 1000×640.
+    let (width, height) = {
+        let panel = shot_cfg.as_ref().map(|_| {
+            let u = jetty_render::ChromeMetrics::new(dpi, ui_font_size.clamp(13.0, 17.0)).overlay_u();
+            let f = (u / dpi).max(1.0);
+            let w = (jetty_render::PANEL_W * f).ceil() + 4.0;
+            let h = (jetty_render::PANEL_H * f).ceil() + 4.0;
+            (((w * dpi).round() as u32).clamp(1, 8192), ((h * dpi).round() as u32).clamp(1, 8192))
+        });
+        (
+            width_env.or(panel.map(|p| p.0)).unwrap_or(1000),
+            height_env.or(panel.map(|p| p.1)).unwrap_or(640),
+        )
+    };
     if std::env::var("JETTY_SHOT_UI_FONT_SIZE").is_ok() || std::env::var("JETTY_SHOT_UI_FONT").is_ok() {
         eprintln!("jetty-shot: UI font size={ui_font_size}, family={ui_font_family:?}");
     }
@@ -831,148 +922,116 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // was painted under the text in Pass 1).
         rects.extend(cursor_over);
 
-        // Baseline for the live "Aa" UI-font specimen, set when the panel is built.
+        // Baseline + color of the live "Aa" UI-font specimen, set when the panel
+        // is built.
         let mut ui_specimen_pos: Option<(f32, f32)> = None;
-        let shot_panel = std::env::var("JETTY_SHOT_PANEL").unwrap_or_else(|_| "0".to_string());
-        let panel_labels = if shot_panel == "1" {
-            // Read opacity + theme_idx from env (same vars as the live app).
-            let opacity = std::env::var("JETTY_OPACITY")
-                .ok()
-                .and_then(|s| s.parse::<f32>().ok())
-                .map(|v| v.clamp(0.1, 1.0))
-                .unwrap_or(1.0);
-            let theme_name = std::env::var("JETTY_THEME").unwrap_or_default();
-            let theme_idx = jetty_core::theme_index(&theme_name).unwrap_or(0);
-
-            // JETTY_SHOT_PANEL_OFFSET="dx,dy" — two f32 (default "0,0").
-            // Lets the caller verify the moveable-dialog path at an offset.
-            let (panel_dx, panel_dy) = std::env::var("JETTY_SHOT_PANEL_OFFSET")
-                .ok()
-                .and_then(|s| {
-                    let mut parts = s.splitn(2, ',');
-                    let dx = parts.next()?.parse::<f32>().ok()?;
-                    let dy = parts.next()?.parse::<f32>().ok()?;
-                    Some((dx, dy))
-                })
-                .unwrap_or((0.0, 0.0));
-
-            let panel_radius = std::env::var("JETTY_CORNER_RADIUS")
-                .ok()
-                .and_then(|s| s.parse::<f32>().ok())
-                .map(|v| v.clamp(0.0, 24.0))
-                .unwrap_or(10.0);
-            let pv = jetty_render::build_panel(
-                width, height, opacity, theme_idx, font_size,
-                &mono_families,
-                mono_families.first().map(String::as_str).unwrap_or(""),
-                0,
-                panel_radius,
-                std::env::var("JETTY_SHOT_PANEL_EFFECT").unwrap_or_else(|_| "Bayer".to_string()).as_str(),
-                std::env::var("JETTY_SHOT_PANEL_WINMODE").unwrap_or_else(|_| "Center".to_string()).as_str(),
-                if std::env::var("JETTY_TAB_BAR").map(|v| v == "bottom").unwrap_or(false) { "Bottom" } else { "Top" },
-                // JETTY_SHOT_PANEL_SCROLLBACK sets the SCROLLBACK LINES band's
-                // display value (test-only; defaults to "10k").
-                std::env::var("JETTY_SHOT_PANEL_SCROLLBACK")
-                    .unwrap_or_else(|_| "10k".to_string())
-                    .as_str(),
-                std::env::var("JETTY_SHOT_PANEL_DH").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.50),
-                std::env::var("JETTY_SHOT_PANEL_DW").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0),
-                std::env::var("JETTY_SHOT_PANEL_WINMODE").map(|m| m == "Dropdown").unwrap_or(false),
-                // JETTY_SHOT_PANEL_FULLSCREEN=1 — render the panel as if the main
-                // window were currently in OS fullscreen, which DIMS the CORNER
-                // RADIUS band (the radius is suppressed at display time there).
-                // Defaults to the Fullscreen window mode's own answer so
-                // `JETTY_SHOT_PANEL_WINMODE=Fullscreen` alone already shows the
-                // dimmed state, and can be forced independently to capture the
-                // "Center/Dropdown + ad-hoc F11" case.
-                env_flag("JETTY_SHOT_PANEL_FULLSCREEN")
-                    || std::env::var("JETTY_SHOT_PANEL_WINMODE")
-                        .map(|m| m == "Fullscreen")
-                        .unwrap_or(false),
-                std::env::var("JETTY_SHOT_PANEL_AUTOHIDE").map(|s| s != "0").unwrap_or(true),
-                std::env::var("JETTY_SHOT_PANEL_LAUNCH").map(|s| s != "0").unwrap_or(false),
-                ui_font_size,
-                &ui_families,
-                ui_font_family.as_str(),
-                0,
-                panel_dx,
-                panel_dy,
-                terminal.theme(),
-                &mut panel_text,
-                panel_cm,
-                // JETTY_SHOT_PANEL_SHELL sets the SHELL band's display name
-                // (test-only; defaults to "System default").
-                std::env::var("JETTY_SHOT_PANEL_SHELL")
-                    .unwrap_or_else(|_| "System default".to_string())
-                    .as_str(),
-                // RUN & NOTIFY section (Shell tab, v0.15): default representative
-                // state for the headless shot (on, all-commands, 10s, no summon).
-                &jetty_render::NotifyParams::default(),
-                // JETTY_SHOT_PANEL_TAB (0..=4) selects the active settings tab
-                // (test-only; defaults to 0 = "Look").
-                std::env::var("JETTY_SHOT_PANEL_TAB")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0),
-                &jetty_render::EffectsParams::default(),
-                // JETTY_SHOT_PANEL_FX_SCROLL — Effects-tab scroll offset in px
-                // (test-only; clamped like the app does; default 0 = top).
-                std::env::var("JETTY_SHOT_PANEL_FX_SCROLL")
-                    .ok()
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .map(|v| {
-                        v.clamp(
-                            0.0,
-                            (jetty_render::EFFECTS_CONTENT_H - jetty_render::EFFECTS_VISIBLE_H)
-                                .max(0.0),
-                        )
-                    })
-                    .unwrap_or(0.0),
-                // JETTY_SHOT_PANEL_THEME_OPEN=1 expands the theme dropdown; the
-                // scroll offset comes from JETTY_SHOT_PANEL_THEME_SCROLL (test-only).
-                std::env::var("JETTY_SHOT_PANEL_THEME_OPEN").map(|s| s != "0").unwrap_or(false),
-                std::env::var("JETTY_SHOT_PANEL_THEME_SCROLL")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0),
-            );
-            rects.extend(pv.quads);
-            // Effects-tab content is scissored to the content viewport in the
-            // live app. The harness has no per-pass scissor, so clip the quads
-            // in software (rect ∩ viewport) and drop out-of-viewport labels —
-            // otherwise scrolled-out widgets would leak over the footer/panel
-            // edge in shots and misrepresent the real render.
-            let mut lab = pv.labels;
-            if let Some(vp) = pv.effects_viewport {
-                let (vt, vb) = (vp[1] as f32, (vp[1] + vp[3]) as f32);
-                for mut q in pv.effects_quads {
-                    let top = q.y.max(vt);
-                    let bottom = (q.y + q.h).min(vb);
-                    if bottom - top > 0.5 {
-                        q.h = bottom - top;
-                        if (q.y - top).abs() > 0.01 {
-                            q.y = top;
-                            q.radius = 0.0; // clipped edge: drop rounding
-                        }
-                        rects.push(q);
-                    }
-                }
-                lab.extend(
-                    pv.effects_labels
+        let mut specimen_rgb = [255u8; 3];
+        // The panel's scrolled content — drawn after the chrome, scissored /
+        // clipped to its viewport exactly like the app's Settings window.
+        let mut panel_content: Option<(Vec<jetty_render::Rect>, Vec<jetty_render::Label>, [u32; 4])> = None;
+        let panel_labels = if let Some(cfg) = &shot_cfg {
+            use jetty_app::settings_ui as sui;
+            let theme_idx = jetty_core::theme_index(&cfg.theme).unwrap_or(0);
+            let theme = jetty_core::theme_at(theme_idx);
+            let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+            let mut tab = var("JETTY_SHOT_PANEL_TAB")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0)
+                .min(jetty_render::N_TABS - 1);
+            let collapsed: Vec<&'static str> = var("JETTY_SHOT_PANEL_COLLAPSE")
+                .map(|v| v.split(',').filter_map(|id| sui::section(id.trim()).map(|s| s.id)).collect())
+                .unwrap_or_default();
+            // A deep link: the control's tab, scrolled to it, highlighted (its
+            // section for a master switch or the gallery) — like App::reveal_setting.
+            let focus: Option<&'static str> = var("JETTY_SHOT_PANEL_FOCUS").and_then(|id| sui::find(&id)).map(|d| {
+                tab = d.tab;
+                let header = matches!(d.kind, sui::Kind::Gallery)
+                    || sui::section(d.section).is_some_and(|s| s.master == Some(d.id));
+                if header { d.section } else { d.id }
+            });
+            let filter = match var("JETTY_SHOT_PANEL_FILTER").as_deref() {
+                Some("dark") => jetty_render::ThemeFilter::Dark,
+                Some("light") => jetty_render::ThemeFilter::Light,
+                Some("mine") => jetty_render::ThemeFilter::Mine,
+                _ => jetty_render::ThemeFilter::All,
+            };
+            let hover = var("JETTY_SHOT_PANEL_HOVER").and_then(|h| {
+                if h == "reset" {
+                    Some(jetty_render::PanelHit::ResetTab)
+                } else if let Some(f) = h.strip_prefix("filter:") {
+                    jetty_render::ThemeFilter::ALL
                         .into_iter()
-                        .filter(|l| l.2 >= vt - 1.0 && l.2 + 16.0 <= vb + 1.0),
-                );
+                        .find(|x| x.label().eq_ignore_ascii_case(f))
+                        .map(jetty_render::PanelHit::GalleryFilter)
+                } else if let Some(id) = h.strip_prefix("section:") {
+                    sui::section(id).map(|s| jetty_render::PanelHit::Section(s.id))
+                } else {
+                    jetty_core::theme_index(&h).map(jetty_render::PanelHit::GalleryCard)
+                }
+            });
+            let reset = match var("JETTY_SHOT_PANEL_RESET").as_deref() {
+                Some("armed") => jetty_render::ResetState::Armed,
+                Some("ready") => jetty_render::ResetState::Ready,
+                Some("disabled") => jetty_render::ResetState::Disabled,
+                _ if sui::tab_at_defaults(cfg, tab) => jetty_render::ResetState::Disabled,
+                _ => jetty_render::ResetState::Ready,
+            };
+            let footer = match reset {
+                jetty_render::ResetState::Armed => "Click again to reset this tab",
+                _ if env_flag("JETTY_SHOT_PANEL_SESSION") => "Enter keeps · Esc restores",
+                _ => "",
+            };
+            // The font lists open at the configured family, as in the app.
+            let font_pos = mono_families.iter().position(|f| *f == cfg.font_family);
+            let ui_pos = if cfg.ui_font_family.is_empty() {
+                Some(0)
             } else {
-                rects.extend(pv.effects_quads);
-                lab.extend(pv.effects_labels);
+                ui_families.iter().position(|f| *f == cfg.ui_font_family)
+            };
+            let ctx = sui::Ctx {
+                main_fullscreen: env_flag("JETTY_SHOT_PANEL_FULLSCREEN"),
+                mono_families: &mono_families,
+                ui_families: &ui_families,
+                font_shown: &cfg.font_family,
+                ui_font_shown: &cfg.ui_font_family,
+                font_offset: sui::list_offset_showing(mono_families.len(), font_pos, sui::list_rows("font_family")),
+                ui_font_offset: sui::list_offset_showing(ui_families.len(), ui_pos, sui::list_rows("ui_font_family")),
+                collapsed: &collapsed,
+                ..sui::Ctx::empty()
+            };
+            let items = sui::tab_items(tab, cfg, &ctx);
+            let mut inp = jetty_render::PanelInput::new(width, height, &theme, panel_cm, &items);
+            inp.active_tab = tab;
+            inp.scroll = match var("JETTY_SHOT_PANEL_SCROLL").or_else(|| var("JETTY_SHOT_PANEL_FX_SCROLL")).as_deref() {
+                Some("max") => 1.0e9,
+                Some(v) => v.parse::<f32>().unwrap_or(0.0),
+                None => 0.0,
+            };
+            inp.theme_idx = theme_idx;
+            inp.filter = filter;
+            inp.hover = hover;
+            inp.focus = focus;
+            inp.ui_font_size = ui_font_size;
+            inp.reset = reset;
+            inp.footer_hint = footer;
+            let mut pv = jetty_render::build_panel(&inp, &mut panel_text);
+            if let Some((top, _)) = focus.and_then(|f| pv.geom.anchor(f)) {
+                inp.scroll = (top - 12.0 * panel_cm.overlay_u()).clamp(0.0, pv.geom.max_scroll);
+                pv = jetty_render::build_panel(&inp, &mut panel_text);
+            }
+            rects.extend(pv.quads);
+            if let Some(vp) = pv.content_viewport {
+                panel_content = Some((pv.content_quads, pv.content_labels, vp));
             }
             // The live "Aa" specimen is drawn at the TRUE UI size via chrome_text
             // (here chrome_text IS at the UI size), so capture its baseline.
             ui_specimen_pos = Some(pv.ui_specimen_pos);
+            specimen_rgb = pv.specimen_rgb;
             eprintln!(
-                "jetty-shot: panel enabled (opacity={opacity:.2}, theme_idx={theme_idx}, font_size={font_size}, ui_font_size={ui_font_size}, offset=({panel_dx},{panel_dy}))"
+                "jetty-shot: settings panel (tab={tab}, theme={}, ui_font={ui_font_size}, scroll={:.0}/{:.0}, {}×{})",
+                cfg.theme, pv.geom.scroll, pv.geom.max_scroll, width, height
             );
-            lab
+            pv.labels
         } else {
             Vec::new()
         };
@@ -1372,6 +1431,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         quad.render(&device, &queue, &view, width, height, &rects);
+        // The Settings content, scissored to its viewport (as in the app).
+        if let Some((cq, _, vp)) = &panel_content {
+            if !cq.is_empty() {
+                quad.render_load_scissored(&device, &queue, &view, width, height, cq, *vp);
+            }
+        }
 
         // Render chrome labels on top of the quads: the panel through its capped
         // layer (like the app's settings window), everything else through the
@@ -1379,6 +1444,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // what proves BUG 1 is fixed across JETTY_FONT_SIZE).
         if !panel_labels.is_empty() {
             panel_text.render_overlays(&device, &queue, &view, width, height, &panel_labels)?;
+        }
+        if let Some((_, cl, vp)) = &panel_content {
+            if !cl.is_empty() {
+                let (top, bottom) = (vp[1] as i32, (vp[1] + vp[3]) as i32);
+                panel_text.render_overlays_clipped(&device, &queue, &view, width, height, cl, top, bottom)?;
+            }
         }
         if !chrome_labels.is_empty() {
             chrome_text.render_overlays(&device, &queue, &view, width, height, &chrome_labels)?;
@@ -1394,11 +1465,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the harness), drawn over the capped panel-text pass — mirrors the app's
         // dedicated specimen layer so the panel shot shows the honest preview. Use
         // the TITLE path so the `""` default previews the platform sans.
-        if let Some((sx, sy)) = ui_specimen_pos {
-            let accent = terminal.theme().palette[4];
+        if let Some((sx, sy)) = ui_specimen_pos.filter(|p| p.1 < height as f32) {
+            // The UiPalette accent (a theme file's `accent` applies), like the app.
             chrome_text.render_overlays_sans(
                 &device, &queue, &view, width, height,
-                &[("Aa".to_string(), sx, sy, [accent[0], accent[1], accent[2]])],
+                &[("Aa".to_string(), sx, sy, specimen_rgb)],
             )?;
         }
     }
