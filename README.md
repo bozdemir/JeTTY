@@ -30,6 +30,7 @@
 - [Screenshots](#-screenshots)
 - [Install](#-install)
 - [Keybindings](#️-keybindings)
+- [Configuration](#️-configuration)
 - [Performance](#-performance)
 - [Architecture](#-architecture)
 - [Collaborators wanted](#-collaborators-wanted)
@@ -38,7 +39,7 @@
 
 ## ✨ Features
 
-- 🚀 **Blazing fast** — GPU-rendered with [`wgpu`](https://github.com/gfx-rs/wgpu); ~5.5 ms full-screen frames (144 Hz-ready), **~0 % CPU when idle** (damage-driven redraw), 150+ MB/s VT throughput. See the [performance budget](docs/perf-budget.md).
+- 🚀 **Blazing fast** — GPU-rendered with [`wgpu`](https://github.com/gfx-rs/wgpu); ~1–2 ms to render a full-screen frame (144 Hz-ready), **~0 % CPU when idle** (damage-driven redraw), ~120 MB/s VT parsing. Measured, with the open items, in the [performance budget](docs/perf-budget.md).
 - 🎯 **Global summon hotkey** — press **F9** anywhere to bring JeTTY up. Three modes (switchable in settings):
   - **Center** — drops into the middle of your screen.
   - **Dropdown** — slides down from the top edge, full screen width, Yakuake/Guake style, with adjustable width & height.
@@ -53,7 +54,7 @@
 - 🚀 **Run selection in a new tab** — the browser gesture, transplanted: in a browser you click a link and it opens in a new tab; in JeTTY you **select a command and run it in a new tab**, opened in the selection's own directory. Trigger it from the right-click menu (**Run in New Tab**, dimmed without a selection), **`Ctrl+Shift+Enter`**, the command palette, copy-mode's **`r`** (yank's sibling: select with `v`, run with `r`), or a detached window (the tab opens in the main window without stealing focus — a true background tab). It **composes with Run & Notify**: fire a long command into a background tab from a selection, keep working, get pinged when it finishes. Safety is paste-protection-grade: control bytes and escape sequences are stripped; a **single line runs**; a **multi-line selection is typed but *not* run** — it lands staged at the new prompt (bracketed paste) awaiting *your* Enter, the multiline-paste protection you know from shells; selections over 16 KiB are truncated and staged, never auto-run. A selection ending in `\`, an unclosed quote or a heredoc fragment will sit at the shell's continuation prompt — review it there. With shell integration the injection waits for the new shell's first prompt; without it, it falls back to a short timeout — bracketed whenever the shell supports it (multi-line stages there too); a status pill tells you when a multi-line selection couldn't be staged, or when an injection timed out. It works where you actually live, too: over a mouse-grabbing TUI (Claude Code / vim / htop) select with **Shift+drag** — JeTTY reminds you when you right-click without a selection — and uniform decorations a framed selection drags in (`│` borders, doc-style `$ `/`❯ ` prompt markers) are stripped automatically, so `│ $ cargo build │` runs as `cargo build`. Opt out entirely with `run_selection = false`, or unbind just the chord with `[keys] run_selection = ""`.
 - 📋 **OSC 52 clipboard** — copy from inside `ssh` / `tmux` / `nvim` straight to your **local** system clipboard (write by default; remote paste is opt-in for safety).
 - 🎨 **Bring your own theme** — drop a `~/.config/jetty/themes/*.toml` palette and it appears in the picker (and can shadow a built-in). Plus the 22 built-ins.
-- ♻️ **Config hot-reload** — edit `~/.config/jetty/config.toml` (or a theme file) and JeTTY **applies it live**, no restart — never clobbering your file.
+- ♻️ **Config hot-reload** — edit your [config file](#️-configuration) (or a theme file) and JeTTY **applies it live**, no restart. Your file stays yours: Settings changes are written **in place** (only the keys that changed — comments, formatting and unknown keys survive), and a typo falls back for that one key with a visible warning instead of resetting everything.
 - ⌘ **Command palette** — `Ctrl+Shift+P` (⌘⇧P on macOS) opens a fuzzy, keyboard-first launcher: type to filter every action (new tab, switch theme, toggle effects, jump to prompt, settings…), `Enter` runs it. The fast way to do anything.
 - 🖼️ **Inline images (Sixel + Kitty)** — programs that emit **Sixel** (`img2sixel`, `chafa -f sixel`, matplotlib's sixel backend, `lsix`) or speak the **Kitty graphics protocol** (`chafa -f kitty`, `timg -p kitty`, `kitten icat --transfer-mode=stream`) render a **real bitmap right in the grid**, GPU-textured, at native size, scrolling with your scrollback. Image previews and plots without leaving the terminal.
 - ⌨️ **Remappable keybindings** — a `[keys]` table in your config remaps any shortcut (copy, tabs, search, palette, font…) to your muscle memory; unset keys keep the sensible defaults, and it hot-reloads live. Terminal control bytes (Ctrl+C…) are protected. Setting an action to `""` unbinds it and hands the key back to the shell — e.g. `[keys]` `toggle_fullscreen = ""` gives bare `F11` back to your TUI (it then sends `\e[23~` again); `Shift`/`Ctrl`/`Alt`+`F11` reach the shell either way.
@@ -62,8 +63,8 @@
 - 🎨 **22 built-in themes** — Catppuccin (Mocha/Macchiato), Tokyo Night, Gruvbox, Dracula, Onyx, Nord, Solarized (dark/light), One Dark, Monokai (+Pro), Everforest, Rosé Pine, Kanagawa, Material, Ayu (dark/mirage), Tomorrow Night, Oceanic Next, GitHub Dark, Palenight — exact community palettes, picked from a scrollable dropdown with live color previews. Every UI surface re-skins with the active theme.
 - 🪟 **Custom-decorated window** — borderless client-side decorations, our own title bar, rounded corners (radius slider), runtime opacity.
 - 🔤 **Live font control** — change font **size** (`Ctrl + +/-/0`) and **family** (any installed monospace) at runtime, no restart.
-- 📋 **Selection & clipboard** — drag to select (auto-copies), **Shift+drag** to select even inside mouse-aware TUIs (vim/htop/tmux/Claude Code), right-click **Copy / Paste / Run in New Tab / Select All** menu, `Ctrl+Shift+C/V`, middle-click paste, bracketed-paste aware.
-- ⚙️ **Settings dialog** — `Ctrl+Shift+P` opens a movable dialog (theme, opacity, corner radius, summon effect, window mode, dropdown size, tab-bar position, scrollback size, shell, focus auto-hide, welcome splash, performance HUD, font) — all **persisted** to `~/.config/jetty/config.toml`.
+- 📋 **Selection & clipboard** — drag to select, double-click a word, triple-click a line; a selection goes to the **primary selection** (middle-click pastes it, the X11 way — `copy_on_select` changes that), **Shift+drag** selects even inside mouse-aware TUIs (vim/htop/tmux/Claude Code), right-click **Copy / Paste / Run in New Tab / Select All** menu, `Ctrl+Shift+C/V`, bracketed-paste aware with control characters stripped from pastes.
+- ⚙️ **Settings dialog** — `Ctrl+,` (or `Ctrl+Shift+O`) opens a movable dialog (theme, opacity, corner radius, summon effect, window mode, dropdown size, tab-bar position, scrollback size, shell, focus auto-hide, launch at login, welcome splash, performance HUD, font) — all **persisted** to your [config file](#️-configuration).
 - 📊 **Live performance HUD** — an optional tab-bar overlay showing frame ms · fps · CPU% · VT MB/s in real time, and an honest "idle" state when the app settles (never forces a redraw — idle stays ~0% CPU). Toggle with `show_perf_hud`.
 - 👋 **Welcome overlay** — a neofetch-style splash on first launch (accent ASCII logo + version/backend), dismissed on the first key/click/Esc. Toggle with `show_welcome`.
 - 🖥️ **Desktop-independent** — X11 **and** Wayland, KDE / GNOME / any compositor, every distro. **No DE-specific code**, no compositor libraries.
@@ -151,42 +152,67 @@ cargo build --release && ./target/release/jetty
 
 ## ⌨️ Keybindings
 
-| Key | Action |
-|---|---|
-| `F9` | Summon / hide JeTTY (global; `fn`+`F9` on macOS) |
-| `Ctrl+Shift+P` | Open settings dialog |
-| `Ctrl+Shift+T` | New tab |
-| `Ctrl+Shift+W` | Close tab (with confirm) |
-| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
-| `Ctrl+Shift+D` | Detach tab into its own window / reattach |
-| `F11` | Toggle fullscreen (whole monitor) for the focused window |
-| `Cmd+Ctrl+F` (macOS) | Same — macOS also seeds this, because bare `F11` there is Mission Control's "Show Desktop" (and Volume Down on Apple keyboards without *Use F1, F2… as standard function keys*) |
-| Drag tab off the bar | Detach (drop the window on the bar to reattach) |
-| Right-click tab | Detach / Rename / Close menu |
-| `Ctrl+1`‒`9` | Jump to tab |
-| `Ctrl` + `+` / `-` / `0` | Font size up / down / reset |
-| `Ctrl+Shift` + `+` / `-` | Opacity up / down |
-| Left-drag | Select text (auto-copies) |
-| **Shift**+drag | Select text over mouse-aware apps (vim/htop/tmux/Claude Code) |
-| Right-click | Copy / Paste / Run in New Tab / Select All / Clear / Close Tab menu |
-| `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / Paste |
-| `Ctrl+Shift+Enter` | Run the selection in a new tab (single line runs; multi-line lands staged awaiting your Enter) |
-| `Ctrl+D` | Close the shell (and window) |
+`F9` summons / hides JeTTY from anywhere (`summon_hotkey`; `fn`+`F9` on Mac keyboards). Inside the window, every shortcut below is a default you can remap in the [`[keys]` table](#️-configuration) under the name in the last column (`""` unbinds it). On macOS the `Cmd` forms of the usual shortcuts work too.
 
-*Theme is chosen by clicking a theme card in the Settings dialog (`Ctrl+Shift+P`) — there is no theme keybinding.*
+<!-- keybindings:start — kept in sync with the default keymap by crates/jetty-app/tests/readme_keybindings.rs -->
+| Shortcut | Action | `[keys]` name |
+|---|---|---|
+| `Ctrl+,` · `Ctrl+Shift+O` | Settings | `toggle_settings` |
+| `Ctrl+Shift+P` | Command palette | `open_palette` |
+| `Ctrl+Shift+T` | New tab (in the current tab's directory) | `new_tab` |
+| `Ctrl+Shift+W` | Close tab (with confirm) | `close_tab` |
+| `Ctrl+Shift+D` | Detach the tab into its own window / reattach | `detach_tab` |
+| `Ctrl+Tab` | Next tab | `next_tab` |
+| `Ctrl+Shift+Tab` | Previous tab | `prev_tab` |
+| `Ctrl+1` … `Ctrl+9` | Jump to tab 1–9 | `select_tab_1` … `select_tab_9` |
+| `Ctrl+Shift+F` | Search the scrollback | `search_toggle` |
+| `Ctrl+Shift+Z` · `Ctrl+Shift+X` | Jump to the previous / next prompt (shell integration) | `prev_prompt` · `next_prompt` |
+| `Shift+PageUp` · `Shift+PageDown` | Scroll the scrollback a page (plain `PageUp`/`PageDown` go to the program) | `scroll_page_up` · `scroll_page_down` |
+| `Ctrl+Shift+C` | Copy | `copy` |
+| `Ctrl+Shift+V` · `Shift+Insert` | Paste | `paste` |
+| — (right-click menu; Cmd+A on macOS) | Select all | `select_all` |
+| `Ctrl+Shift+H` | Hint mode — label every URL / path / hash on screen | `hint_mode` |
+| `Ctrl+Shift+Space` | Keyboard copy-mode | `copy_mode` |
+| `Ctrl+Shift+Enter` | Run the selection in a new tab | `run_selection` |
+| `Ctrl+=` · `Ctrl+-` · `Ctrl+0` | Font size up / down / reset (`Ctrl+'+'` works on every layout) | `font_up` · `font_down` · `font_reset` |
+| `Ctrl+Alt+=` · `Ctrl+Alt+-` | Window opacity up / down | `opacity_up` · `opacity_down` |
+| `F11` | Fullscreen (whole monitor) for the focused window | `toggle_fullscreen` |
+| — (command palette; Cmd+Q on macOS) | Quit (with confirm) | `quit` |
+<!-- keybindings:end -->
+
+Mouse: **left-drag** selects (double-click a word, triple-click a line); **Shift+drag** selects even over programs that track the mouse (vim, htop, tmux, Claude Code) — those programs get the clicks otherwise, right and middle buttons included, and **Shift+right-click** opens JeTTY's menu there; **right-click** opens the Copy / Paste / Run in New Tab / Select All / Clear / Close Tab menu; **middle-click** pastes the primary selection; **Ctrl+click** opens a link. Tabs: drag one off the bar to detach it (drop it back on the bar to reattach), right-click a tab for Detach / Rename / Close, double-click to rename. `Ctrl+D` exits the shell.
+
+*The theme is picked in Settings (`Ctrl+,`) or the command palette — there is no theme shortcut.*
+
+## ⚙️ Configuration
+
+Settings live in one TOML file — the Settings window writes it, and you can edit it by hand:
+
+| OS | Config file | User themes |
+|---|---|---|
+| Linux | `~/.config/jetty/config.toml` (`$XDG_CONFIG_HOME/jetty/…`) | `~/.config/jetty/themes/*.toml` |
+| macOS | `~/Library/Application Support/jetty/config.toml` | `~/Library/Application Support/jetty/themes/*.toml` |
+
+`JETTY_CONFIG_DIR=/some/dir` makes JeTTY use `/some/dir/config.toml` and `/some/dir/themes/` instead; `jetty --help` prints the path in use.
+
+- **Live reload** — saving the file (or a theme) applies it immediately; a symlinked config (dotfiles) is followed. `hot_reload = false` turns the watcher off.
+- **Forgiving** — a value of the wrong type (`opacity = "0.9"`) or an unknown key (`fontsize`) is reported in the window and only that key falls back; everything else still applies. A file that isn't valid TOML at all leaves your settings untouched (JeTTY runs on defaults, keeps a copy as `config.toml.bad-<time>` and won't save over it until it's fixed).
+- **Your formatting stays** — Settings changes rewrite only the keys that changed; comments, order and keys JeTTY doesn't know survive.
+- **Keybindings** — a `[keys]` table remaps any shortcut by the names in the [table above](#️-keybindings), e.g. `new_tab = "Ctrl+T"` or `paste = ["Ctrl+Shift+V", "Shift+Insert"]`; `""` unbinds. The palette's **Reset keybindings** (run it twice to confirm) clears the table after saving a `config.toml.bak-<time>` copy.
+- **Launch at login** — the Settings toggle (or `launch_at_login = true`) adds a login item that starts JeTTY **hidden** (`jetty --background`): press `F9` and it is there. Linux uses the standard XDG autostart entry, macOS a LaunchAgent.
 
 ## ⚡ Performance
 
-Measured headlessly on an Intel Arc iGPU at 1920×1200 (`cargo run --release -p jetty-app --bin jetty-bench`):
+Measured headlessly with `jetty-bench` (`cargo run --release -p jetty-app --bin jetty-bench`) on an Intel Arc iGPU, 1920×1200 — the method, the history and the open items are in [`docs/perf-budget.md`](docs/perf-budget.md):
 
 | Metric | JeTTY | Target |
 |---|---|---|
-| Frame render (full screen) | **5.5 ms** (180 fps cap) | ≤ 6.9 ms (144 Hz) |
-| Idle CPU | **~0 %** | 0 % |
-| Per-frame snapshot (11k cells) | **0.047 ms** | ≤ 1 ms |
-| VT throughput | **154 MB/s** | ≥ 150 MB/s |
+| Frame render (full screen, offscreen) | **~1.1–1.8 ms** | ≤ 6.9 ms (144 Hz) |
+| Idle CPU | **~0 %** (damage-driven redraw) | 0 % |
+| Per-frame snapshot (~11k cells) | **~0.08 ms** | ≤ 1 ms |
+| VT throughput (parse + grid) | **~118 MB/s** (median; 105–137) | ≥ 150 MB/s — *open* |
 
-Speed is a gated requirement, not an afterthought — see [`docs/perf-budget.md`](docs/perf-budget.md).
+Speed comes first: changes are measured against these budgets before they ship. CI runs the CPU-only part of the bench on every push as an informational report (shared runners are too noisy to fail a build on).
 
 ## 🧱 Architecture
 

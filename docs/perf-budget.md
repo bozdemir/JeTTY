@@ -101,7 +101,8 @@ Konsole 23.08.5, GNOME Terminal / VTE 0.76.
     instance to the **Vulkan backend** (the default probed every backend), the
     single biggest win. On top of that, the **FontSystem font-DB scan and the
     PTY fork now run on worker threads** that overlap the remaining device
-    acquisition, and **F9 global-hotkey registration moved off the main thread**;
+    acquisition, and **global-hotkey registration moved off the main thread** on
+    Linux (macOS must register it on the main thread — a cheap Carbon call there);
     `[profile.release] lto = "thin"` trims runtime. `gpu_init` measures warm
     ~85–94 ms (cold ~278 ms, first run of a cold cache). The **end-to-end
     exec→first-frame** number (which the gpu_init figure is only a subcomponent of)
@@ -110,7 +111,10 @@ Konsole 23.08.5, GNOME Terminal / VTE 0.76.
   - *Remaining headroom:* a CPU-painted first frame before GPU warmup could
     shave perceived latency further, but it is no longer the bottleneck.
 
-## Gates (CI-style rules)
+## Gates (review rules)
+
+These are enforced by review and by running the bench before a release — **not by
+a failing CI job** (CI only reports; see rule 6).
 
 1. `jetty-bench` render ≤ 6.9 ms/frame and snapshot ≤ 1 ms/frame on the baseline.
 2. Throughput ≥ 150 MB/s. *(Currently unmet on this binary — measures ~118; see the
@@ -126,8 +130,9 @@ Konsole 23.08.5, GNOME Terminal / VTE 0.76.
    + snapshot + `pipeline_1byte_cpu`. It is **non-blocking** (`continue-on-error`,
    and the script always exits 0): hard floors calibrated to a fast dev machine would
    false-fail on a slower, sometimes sustained-contended shared GitHub runner. Hard
-   gating is a **v0.18 follow-up** — set floors at ~50 % of the CI runner's observed
-   minimum after watching its real distribution across many runs. CPU-only avoids
+   gating stays **open** (planned for v0.18, not done): it needs floors at ~50 % of
+   the CI runner's observed minimum, set after watching its real distribution across
+   many runs. Until then nothing in CI fails on a perf regression. CPU-only avoids
    GPU-availability / software-rasterizer timing variance on runners (it is
    display-independent, not a claim that the GPU bench "crashes" there).
 

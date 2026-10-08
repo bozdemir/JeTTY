@@ -1868,10 +1868,10 @@ impl App {
         // above); Config::load's sanitize pass already applied this range.
         app.scrollback_lines = cfg.scrollback_lines.clamp(100, 100_000);
         // The config key is the source of truth: (re)write or remove the login
-        // autostart entry to match — this also refreshes a stale Exec path (an
-        // AppImage moved, a reinstall) on every start.
+        // autostart entry to match — keeping the program an existing entry
+        // launches while it still exists, refreshing a stale one (moved AppImage).
         app.launch_at_login = cfg.launch_at_login;
-        if let Err(e) = set_launch_at_login(app.launch_at_login) {
+        if let Err(e) = sync_launch_at_login(app.launch_at_login) {
             startup_warnings.push(e);
         }
         app.summon_hotkey = cfg.summon_hotkey;
@@ -2471,7 +2471,7 @@ impl App {
         // autostart entry is written/removed to match.
         if cfg.launch_at_login != self.launch_at_login {
             self.launch_at_login = cfg.launch_at_login;
-            if let Err(e) = set_launch_at_login(self.launch_at_login) {
+            if let Err(e) = sync_launch_at_login(self.launch_at_login) {
                 warnings.push(e);
             }
         }
@@ -13737,22 +13737,84 @@ fn launch_agent_plist(program: &str) -> String {
     )
 }
 
-/// Make the login-autostart entry match `enabled` (the config key — the source
-/// of truth): write it, refreshing a stale program path, or remove it. Never
-/// panics; a failure is returned for display.
+/// The program the running JeTTY would register (see `autostart_program`).
+fn current_autostart_program() -> String {
+    autostart_program(
+        std::env::var("APPIMAGE").ok(),
+        std::env::current_exe().ok().and_then(|p| p.to_str().map(str::to_string)),
+    )
+}
+
+/// This platform's autostart entry launching `program`.
+fn autostart_entry_for(program: &str) -> String {
+    if cfg!(target_os = "macos") {
+        launch_agent_plist(program)
+    } else {
+        autostart_desktop_entry(program)
+    }
+}
+
+/// An explicit "Launch at login" toggle (Settings / palette): write the entry for
+/// THIS executable, or remove it. Never panics; a failure is returned for display.
 fn set_launch_at_login(enabled: bool) -> Result<(), String> {
-    let contents = enabled.then(|| {
-        let program = autostart_program(
-            std::env::var("APPIMAGE").ok(),
-            std::env::current_exe().ok().and_then(|p| p.to_str().map(str::to_string)),
-        );
-        if cfg!(target_os = "macos") {
-            launch_agent_plist(&program)
-        } else {
-            autostart_desktop_entry(&program)
-        }
-    });
+    let contents = enabled.then(|| autostart_entry_for(&current_autostart_program()));
     sync_autostart_file(&autostart_path(), contents.as_deref())
+}
+
+/// Bring the login autostart entry in line with the config key (the source of
+/// truth) at startup and on a hot-reload. Unlike an explicit toggle, an existing
+/// JeTTY entry KEEPS the program it launches while that program still exists —
+/// running another build (say `./target/release/jetty`) must not retarget the
+/// user's login item. The entry is only refreshed to the current format (e.g.
+/// `--background`), or pointed at this executable when its program is gone (a
+/// moved AppImage), when there is no entry yet, or when this IS an AppImage —
+/// running a newer AppImage file is choosing that version.
+fn sync_launch_at_login(enabled: bool) -> Result<(), String> {
+    let path = autostart_path();
+    let contents = enabled.then(|| {
+        let running_appimage = std::env::var_os("APPIMAGE").is_some_and(|v| !v.is_empty());
+        let kept = std::fs::read_to_string(&path)
+            .ok()
+            .filter(|c| !running_appimage && is_jetty_autostart_entry(c))
+            .and_then(|c| autostart_entry_program(&c))
+            .filter(|p| std::path::Path::new(p).is_file());
+        autostart_entry_for(&kept.unwrap_or_else(current_autostart_program))
+    });
+    sync_autostart_file(&path, contents.as_deref())
+}
+
+/// The program an autostart entry launches: the first `ProgramArguments` string of
+/// a LaunchAgent, or the program of a `.desktop` `Exec=` line — quoted per the
+/// Desktop Entry spec (undoing `desktop_exec_arg`) or a bare legacy path.
+fn autostart_entry_program(content: &str) -> Option<String> {
+    if content.contains("<plist") {
+        let args = content.split("<key>ProgramArguments</key>").nth(1)?;
+        let raw = args.split("<string>").nth(1)?.split("</string>").next()?;
+        return Some(
+            raw.replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&apos;", "'")
+                .replace("&amp;", "&"),
+        );
+    }
+    let exec = content.lines().find_map(|l| l.strip_prefix("Exec="))?;
+    // Reverse desktop_exec_arg's passes: field codes (%% → %), then the general
+    // string escape (\\ → \), then the quoting (\" \` \$ \\ → the char).
+    let exec = exec.replace("%%", "%").replace("\\\\", "\\");
+    let Some(quoted) = exec.strip_prefix('"') else {
+        return exec.split_whitespace().next().map(str::to_string);
+    };
+    let mut out = String::new();
+    let mut chars = quoted.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push(chars.next()?),
+            '"' => return Some(out),
+            _ => out.push(c),
+        }
+    }
+    None
 }
 
 /// Write `contents` to `path` (only when it differs — no churn on every start) or,
@@ -14538,7 +14600,24 @@ mod desktop_exec_arg_tests {
 
 #[cfg(test)]
 mod autostart_tests {
-    use super::{autostart_desktop_entry, autostart_program, launch_agent_plist, sync_autostart_file};
+    use super::{
+        autostart_desktop_entry, autostart_entry_program, autostart_program, launch_agent_plist,
+        sync_autostart_file,
+    };
+
+    #[test]
+    fn an_entrys_program_round_trips_through_its_escaping() {
+        // A running JeTTY keeps the program an existing entry launches, so it must
+        // read it back exactly — including paths that need every escape.
+        for p in ["/usr/bin/jetty", "/home/u/My Apps/JeTTY.AppImage", "/a$b\"c\\d%e`f/jetty"] {
+            assert_eq!(autostart_entry_program(&autostart_desktop_entry(p)).as_deref(), Some(p), "{p}");
+            assert_eq!(autostart_entry_program(&launch_agent_plist(p)).as_deref(), Some(p), "{p}");
+        }
+        // A pre-v0.26 entry wrote a bare path.
+        let legacy = "[Desktop Entry]\nExec=/usr/bin/jetty\n";
+        assert_eq!(autostart_entry_program(legacy).as_deref(), Some("/usr/bin/jetty"));
+        assert_eq!(autostart_entry_program("[Desktop Entry]\nName=x\n"), None);
+    }
 
     #[test]
     fn appimage_file_wins_over_its_temporary_mount() {
