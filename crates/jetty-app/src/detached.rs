@@ -263,6 +263,9 @@ pub(crate) struct DetachedWindow {
     /// Fallback paint deadline for THIS window's latest PTY-bound keystroke
     /// (mirrors `App::key_paint_due`): the echo paints, not the key.
     pub key_paint_due: Option<std::time::Instant>,
+    /// THIS window's overlays (search bar, help, command palette, hint mode,
+    /// copy-mode) — the main window's twin is `App::ov`.
+    pub ov: crate::overlays::Overlays,
     /// The IME's in-progress composition in this window, drawn at the cursor
     /// until it commits (mirrors `App::ime_preedit`).
     pub ime_preedit: Option<String>,
@@ -490,6 +493,7 @@ impl DetachedWindow {
             image_layer,
             caret_anim: None,
             key_paint_due: None,
+            ov: crate::overlays::Overlays::default(),
             ime_preedit: None,
             ime_area: None,
             acquire_retry: None,
