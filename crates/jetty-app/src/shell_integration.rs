@@ -8,9 +8,11 @@
 //! `$JETTY_BIN` — the absolute path JeTTY exports to its shells — so it also works
 //! for AppImage / tarball installs where `jetty` is not on `PATH`.
 //!
-//! Marks emitted: OSC 133 `A` (prompt), `C` (command start), `D;<exit>` (done).
-//! `B` (input start) is intentionally omitted — it is the p10k-fragile part and
-//! is unused by JeTTY's two features (failed-command marker + prompt jump).
+//! Marks emitted: OSC 133 `A` (prompt), `C` (command start), `D;<exit>` (done),
+//! and — zsh only — `B` (input start), from `zle-line-init`, which runs once the
+//! prompt is drawn: it tells JeTTY where a multi-line prompt ends, so a resize at
+//! a clean prompt may wipe the reflow's fragments. Never by editing `PROMPT` /
+//! `PS1` (the p10k-fragile way).
 //!
 //! KNOWN LIMITATION (tmux/screen): OSC 133 emitted inside a multiplexer reaches
 //! the multiplexer, not JeTTY, unless passthrough is configured, and
@@ -23,7 +25,9 @@
 /// so we do NOT install competing hooks when p10k is detected — instead the user
 /// enables `POWERLEVEL9K_TERM_SHELL_INTEGRATION=true` and p10k emits correct,
 /// instant-prompt-aware OSC 133 itself. On plain zsh (no p10k) our own hooks
-/// capture `$?` on the FIRST line of precmd, which is provably correct.
+/// capture `$?` on the FIRST line of precmd, which is provably correct, and a
+/// `zle-line-init` hook (zsh ≥ 5.3, chained via `add-zle-hook-widget`) marks the
+/// input line with `B` once per prompt. Safe under `setopt nounset`.
 pub const ZSH: &str = r#"# JeTTY zsh shell integration — OSC 133 semantic prompts.
 # (prompt marks + failed-command markers + Ctrl+Shift+Z/X prompt jump)
 #
@@ -43,15 +47,25 @@ if [[ -o interactive && -n "${JETTY-}" ]]; then
     :
   else
     autoload -Uz add-zsh-hook
-    typeset -gi _jetty_run=0
+    typeset -gi _jetty_run=0 _jetty_input=0
     _jetty_precmd() {
       local __jetty_ret=$?                      # MUST be the first line
       (( _jetty_run )) && { print -rn -- $'\033]133;D;'"${__jetty_ret}"$'\007'; _jetty_run=0; }
+      _jetty_input=0
       print -rn -- $'\033]133;A\007'
     }
     _jetty_preexec() { print -rn -- $'\033]133;C\007'; _jetty_run=1; }
     add-zsh-hook precmd  _jetty_precmd
     add-zsh-hook preexec _jetty_preexec
+    # B = input start: zle-line-init runs on the input line once the prompt is
+    # drawn (once per prompt — not again on a continuation line).
+    _jetty_line_init() { (( _jetty_input )) || { print -rn -- $'\033]133;B\007'; _jetty_input=1; }; }
+    autoload -Uz is-at-least
+    if is-at-least 5.3; then
+      autoload -Uz add-zle-hook-widget
+      zle -N _jetty_line_init
+      add-zle-hook-widget line-init _jetty_line_init
+    fi
   fi
 fi
 "#;
@@ -148,6 +162,7 @@ mod tests {
         assert!(ZSH.contains("133;D;"), "zsh emits the D exit-code mark");
         assert!(ZSH.contains("133;A"), "zsh emits the A prompt mark");
         assert!(ZSH.contains("133;C"), "zsh emits the C output mark");
+        assert!(ZSH.contains("add-zle-hook-widget line-init"), "and B from zle-line-init");
         // The exit code is captured on the FIRST line of precmd.
         assert!(ZSH.contains("local __jetty_ret=$?"), "captures $? first");
         // p10k detection / recommendation is present.
@@ -177,42 +192,37 @@ mod tests {
         assert!(BASH.contains(r"133;A;redraw=0"), "the A mark tells JeTTY not to wipe");
     }
 
-    /// The bash snippet run for real: an interactive `bash -u` (nounset — some
-    /// users enable it in their rc) on a PTY, sourcing the snippet, then a
-    /// passing and a failing command. No rc files, no history file, a scratch
-    /// HOME. Skipped when there is no bash.
+    /// Run the first installed of `shells` with `args` on a REAL PTY, in an empty
+    /// scratch HOME (no rc files, no history file), type `source <snippet>` then
+    /// `script` into it, and return everything it printed until it exits (15 s
+    /// at most). `None` when none of `shells` is installed.
     #[cfg(unix)]
-    #[test]
-    fn bash_snippet_runs_clean_under_set_u_in_a_real_pty() {
+    fn run_snippet_in_pty(shells: &[&str], args: &[&str], term: &str, snippet: &str, script: &str) -> Option<String> {
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         use std::io::{Read, Write};
-        let Some(bash) = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash", "/opt/homebrew/bin/bash"]
-            .into_iter()
-            .find(|p| std::path::Path::new(p).is_file())
-        else {
-            eprintln!("no bash — skipped");
-            return;
-        };
-        let dir = std::env::temp_dir().join(format!("jetty-bash-u-{}", std::process::id()));
+        let shell = shells.iter().find(|p| std::path::Path::new(p).is_file())?;
+        let name = std::path::Path::new(shell).file_name().unwrap().to_string_lossy().into_owned();
+        let dir = std::env::temp_dir().join(format!("jetty-{name}-pty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let snippet = dir.join("snippet.bash");
-        std::fs::write(&snippet, BASH).unwrap();
+        let path = dir.join("snippet");
+        std::fs::write(&path, snippet).unwrap();
 
         let pair = native_pty_system()
             .openpty(PtySize { rows: 24, cols: 120, pixel_width: 0, pixel_height: 0 })
             .expect("openpty");
-        let mut cmd = CommandBuilder::new(bash);
-        cmd.args(["--norc", "--noprofile", "-u", "-i"]);
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.args(args);
         cmd.env_clear();
         cmd.env("HOME", &dir);
+        cmd.env("ZDOTDIR", &dir);
         cmd.env("HISTFILE", "/dev/null");
         cmd.env("PATH", "/usr/bin:/bin");
-        cmd.env("TERM", "dumb");
+        cmd.env("TERM", term);
         cmd.env("JETTY", "test");
         cmd.env("PS1", "$ ");
         cmd.cwd(&dir);
-        let mut child = pair.slave.spawn_command(cmd).expect("spawn bash");
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn shell");
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -225,11 +235,7 @@ mod tests {
             }
         });
         let mut writer = pair.master.take_writer().unwrap();
-        let script = format!(
-            "source '{}'\nprintf 'BASHV=%s%02d\\n' \"${{BASH_VERSINFO[0]}}\" \"${{BASH_VERSINFO[1]}}\"\ntrue\nfalse\nexit\n",
-            snippet.display()
-        );
-        writer.write_all(script.as_bytes()).unwrap();
+        writer.write_all(format!("source '{}'\n{script}", path.display()).as_bytes()).unwrap();
         writer.flush().unwrap();
 
         let mut out = Vec::new();
@@ -250,7 +256,26 @@ mod tests {
         }
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&dir);
-        let text = String::from_utf8_lossy(&out);
+        Some(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// The bash snippet run for real: an interactive `bash -u` (nounset — some
+    /// users enable it in their rc) on a PTY, sourcing the snippet, then a
+    /// passing and a failing command. Skipped when there is no bash.
+    #[cfg(unix)]
+    #[test]
+    fn bash_snippet_runs_clean_under_set_u_in_a_real_pty() {
+        let script = "printf 'BASHV=%s%02d\\n' \"${BASH_VERSINFO[0]}\" \"${BASH_VERSINFO[1]}\"\ntrue\nfalse\nexit\n";
+        let Some(text) = run_snippet_in_pty(
+            &["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash", "/opt/homebrew/bin/bash"],
+            &["--norc", "--noprofile", "-u", "-i"],
+            "dumb",
+            BASH,
+            script,
+        ) else {
+            eprintln!("no bash — skipped");
+            return;
+        };
         assert!(!text.contains("unbound variable"), "set -u broke the snippet:\n{text}");
         assert!(text.contains("\x1b]133;A;redraw=0\x07"), "A mark missing:\n{text}");
         assert!(text.contains("\x1b]133;D;0\x07"), "`true` exit mark missing:\n{text}");
@@ -264,6 +289,33 @@ mod tests {
         if version >= 404 {
             assert!(text.contains("\x1b]133;C\x07"), "command-start mark missing:\n{text}");
         }
+    }
+
+    /// The zsh snippet run for real (`zsh -f -i`, `setopt nounset`, a two-line
+    /// prompt): B must land on the INPUT line, after the whole prompt is drawn —
+    /// JeTTY's resize wipe trusts it.
+    #[cfg(unix)]
+    #[test]
+    fn zsh_snippet_marks_the_input_line_in_a_real_pty() {
+        let script = "PROMPT=$'INFO-LINE\\n> '\ntrue\nfalse\nexit\n";
+        let Some(text) = run_snippet_in_pty(
+            &["/bin/zsh", "/usr/bin/zsh", "/usr/local/bin/zsh", "/opt/homebrew/bin/zsh"],
+            &["-f", "-o", "nounset", "-i"],
+            "xterm-256color",
+            ZSH,
+            script,
+        ) else {
+            eprintln!("no zsh — skipped");
+            return;
+        };
+        assert!(!text.contains("parameter not set"), "nounset broke the snippet:\n{text:?}");
+        assert!(text.contains("\x1b]133;D;0\x07") && text.contains("\x1b]133;D;1\x07"), "{text:?}");
+        // The prompt drawn with the new PROMPT, then B, then the input.
+        let at = text.find("INFO-LINE\r\n> ").unwrap_or_else(|| panic!("two-line prompt drawn: {text:?}"));
+        let after = &text[at..];
+        let b = after.find("\x1b]133;B\x07").unwrap_or_else(|| panic!("B after the prompt: {text:?}"));
+        let next = after.find("\x1b]133;D").unwrap_or(after.len());
+        assert!(b < next, "B on this prompt's input line, before the command ran: {text:?}");
     }
 
     #[test]
