@@ -1005,7 +1005,7 @@ mod tests {
     fn braille_dots_spread_over_the_whole_cell() {
         for (w, h) in SIZES {
             let all = mask('\u{28FF}', w, h);
-            let rows: Vec<i32> = (0..h as i32).filter(|&y| row_ink(&all, w, y).len() > 0).collect();
+            let rows: Vec<i32> = (0..h as i32).filter(|&y| !row_ink(&all, w, y).is_empty()).collect();
             // Four dot rows: the first in the top quarter, the last in the bottom one.
             assert!(rows[0] < h as i32 / 4 && *rows.last().unwrap() >= h as i32 * 3 / 4, "{w}x{h}: {rows:?}");
             // Each single dot is its own bit.
