@@ -208,15 +208,24 @@ fn scroll_csi(digits: &[u8], fin: u8) -> Option<IsolatedSeq> {
 const DECSET_X10: u8 = 1;
 /// [`Scan::Decset`] bit: the sequence named mode 1015 (urxvt mouse encoding).
 const DECSET_URXVT: u8 = 2;
+/// [`Scan::Decset`] bit: the sequence named mode 2031 (color-scheme reports).
+const DECSET_2031: u8 = 4;
+/// [`Scan::Decset`] bit: the sequence has more than one parameter (so it is not
+/// the single-parameter `CSI ? 996 n` query).
+const DECSET_MULTI: u8 = 0x80;
 
 /// The [`Scan::Decset`] bit for private mode `n` (0 for every other mode).
 fn decset_bit(n: u16) -> u8 {
     match n {
         9 => DECSET_X10,
         1015 => DECSET_URXVT,
+        2031 => DECSET_2031,
         _ => 0,
     }
 }
+
+/// The private DSR `CSI ? 996 n`: "which color scheme (dark/light) is on?".
+const DSR_COLOR_SCHEME: u16 = 996;
 
 /// Parse the decimal digits of one CSI parameter (a private mode's without its
 /// `?`), saturating — an over-long number can never alias a real one (the mouse
@@ -416,6 +425,26 @@ struct EventProxy {
     clipboard_load: Osc52Pending<ClipboardLoadFmt>,
     /// Cheap "a clipboard-paste is pending" flag (mirrors `clipboard_dirty`).
     clipboard_load_dirty: Arc<AtomicBool>,
+    /// DEC mode 2031 state, shared with the owning `Terminal`'s scanner (see
+    /// `Terminal::color_reports`): alacritty answers `CSI ? 2031 $ p` as "not
+    /// recognized", and neovim only enables the mode after a set/reset answer,
+    /// so that reply is rewritten here from the real state.
+    color_reports: Arc<AtomicBool>,
+}
+
+/// alacritty's DECRQM answer for a private mode it doesn't know, for mode 2031.
+const DECRQM_2031_UNKNOWN: &str = "\x1b[?2031;0$y";
+
+/// The DECRQM answer for mode 2031: `1` = set, `2` = reset.
+fn decrqm_2031(on: bool) -> &'static str {
+    if on { "\x1b[?2031;1$y" } else { "\x1b[?2031;2$y" }
+}
+
+/// The color-scheme report (`CSI ? 997 ; 1 n` dark, `CSI ? 997 ; 2 n` light)
+/// for a theme with background `bg` — the reply to `CSI ? 996 n` and the
+/// unsolicited DEC 2031 notification.
+pub(crate) fn color_scheme_report(bg: [u8; 3]) -> &'static [u8] {
+    if crate::contrast::is_dark(bg) { b"\x1b[?997;1n" } else { b"\x1b[?997;2n" }
 }
 
 impl EventProxy {
@@ -441,9 +470,17 @@ impl EventProxy {
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         match event {
-            // Replies to DSR/DA-style queries the terminal answers itself.
+            // Replies to DSR/DA-style queries the terminal answers itself. The
+            // DECRQM answer for mode 2031 (which alacritty doesn't know) is
+            // rewritten from the scanner-tracked state, so a program that probes
+            // before enabling it (neovim) sees the mode as supported.
             Event::PtyWrite(s) => {
-                let _ = self.tx.send(s.into_bytes());
+                let bytes = if s == DECRQM_2031_UNKNOWN {
+                    decrqm_2031(self.color_reports.load(Ordering::Relaxed)).as_bytes().to_vec()
+                } else {
+                    s.into_bytes()
+                };
+                let _ = self.tx.send(bytes);
             }
             // \e[14t (text area size in pixels) / \e[18t (size in cells). The
             // formatter turns a WindowSize into the proper escape reply. Cell
@@ -671,11 +708,13 @@ enum Scan {
     /// decides where `feed` splits its slices.
     Csi { params: [u8; CSI_PARAMS_MAX], len: u8 },
     /// Inside a private-mode CSI (`ESC [ ?`), watching for DECSET/DECRST of the
-    /// two mouse modes alacritty does not track — X10 (`9`) and urxvt (`1015`).
-    /// `cur` is the parameter being read (saturating), `hit` the modes named so
-    /// far ([`DECSET_X10`] / [`DECSET_URXVT`]). Mirrors vte's CSI states: C0,
-    /// DEL and high bytes stay, ESC restarts, CAN/SUB and anything that is not a
-    /// plain `Pm h/l` sequence end it.
+    /// modes alacritty does not track — the X10 (`9`) and urxvt (`1015`) mouse
+    /// modes and the color-scheme reports (`2031`) — and for the color-scheme
+    /// query `CSI ? 996 n`. `cur` is the parameter being read (saturating), `hit`
+    /// the modes named so far ([`DECSET_X10`] / [`DECSET_URXVT`] /
+    /// [`DECSET_2031`], plus [`DECSET_MULTI`] past a separator). Mirrors vte's
+    /// CSI states: C0, DEL and high bytes stay, ESC restarts, CAN/SUB and
+    /// anything that is not a plain `Pm h/l` / `Ps n` sequence end it.
     Decset { cur: u16, hit: u8 },
     /// Inside `ESC ]`, matching the `133;` prefix byte by byte (`n` matched).
     Prefix { n: u8 },
@@ -1067,6 +1106,16 @@ pub struct Terminal {
     /// The OSC payload cap in force: [`OSC_MAX_BYTES`], lowered only by tests so
     /// the vte differential fuzz reaches it cheaply.
     osc_cap: u32,
+    /// `minimum_contrast` (WCAG ratio, `1.0` = off): text whose final color
+    /// contrasts less than this with its cell background is pushed toward
+    /// white/black in [`Terminal::snapshot`]. Set by the app
+    /// ([`Terminal::set_minimum_contrast`]).
+    min_contrast: f32,
+    /// DEC private mode 2031 (color-scheme change reports, `CSI ? 2031 h`) is
+    /// on: a palette change sends `CSI ? 997 ; 1|2 n`. Tracked by the scanner
+    /// (alacritty doesn't know the mode) and shared with the `EventProxy`, which
+    /// answers the mode's DECRQM query with it.
+    color_reports: Arc<AtomicBool>,
     /// JeTTY's mirror of alacritty's kitty keyboard flag stacks — their DEPTHS
     /// only — `[primary, alternate]` (alacritty swaps the two stacks with the
     /// screens). Fed by the scanner (`Scan::KbdCsi`); zeroed whenever alacritty
@@ -1153,6 +1202,7 @@ impl Terminal {
         let clipboard_dirty = Arc::new(AtomicBool::new(false));
         let clipboard_load = Arc::new(Mutex::new(Vec::new()));
         let clipboard_load_dirty = Arc::new(AtomicBool::new(false));
+        let color_reports = Arc::new(AtomicBool::new(false));
         let proxy = EventProxy {
             tx,
             geom: Arc::clone(&geom),
@@ -1166,6 +1216,7 @@ impl Terminal {
             clipboard_dirty: Arc::clone(&clipboard_dirty),
             clipboard_load: Arc::clone(&clipboard_load),
             clipboard_load_dirty: Arc::clone(&clipboard_load_dirty),
+            color_reports: Arc::clone(&color_reports),
         };
         let term = Term::new(config, &size, proxy);
 
@@ -1229,6 +1280,8 @@ impl Terminal {
             mouse_x10: false,
             mouse_urxvt: false,
             osc_cap: OSC_MAX_BYTES,
+            min_contrast: 1.0,
+            color_reports,
             kbd_depth: [0, 0],
             kbd_window: None,
             #[cfg(test)]
@@ -1419,23 +1472,81 @@ impl Terminal {
         self.mouse_urxvt
     }
 
-    /// Apply a DECSET (`on`) / DECRST of the scanner-tracked mouse modes named by
-    /// `hit` ([`DECSET_X10`] / [`DECSET_URXVT`] bits).
-    fn set_mouse_modes(&mut self, hit: u8, on: bool) {
+    /// A private-mode CSI ending in `fin` at byte `i` (`h` set / `l` reset /
+    /// `n` DSR) named the modes in `hit`; `last` is its last parameter. Applies
+    /// what alacritty doesn't track and returns the new flush `start`:
+    ///
+    /// * the X10 / urxvt mouse modes flip (no flush needed);
+    /// * mode 2031 flips AFTER alacritty has caught up through this sequence, so
+    ///   a DECRQM earlier in the same read is answered with the state it had
+    ///   (the answer is rewritten in `EventProxy` from the shared flag);
+    /// * `CSI ? 996 n` is answered with the color scheme — likewise after the
+    ///   catch-up, so the reply keeps its place among alacritty's own replies.
+    fn private_mode_csi(&mut self, bytes: &[u8], start: usize, i: usize, fin: u8, hit: u8, last: u16) -> usize {
+        if fin == b'n' {
+            if hit & DECSET_MULTI != 0 || last != DSR_COLOR_SCHEME {
+                return start;
+            }
+            self.advance_slice(&bytes[start..=i]);
+            let _ = self.reply_tx.send(color_scheme_report(self.theme_rgb_bg()).to_vec());
+            return i + 1;
+        }
+        let on = fin == b'h';
         if hit & DECSET_X10 != 0 {
             self.mouse_x10 = on;
         }
         if hit & DECSET_URXVT != 0 {
             self.mouse_urxvt = on;
         }
+        if hit & DECSET_2031 != 0 {
+            self.advance_slice(&bytes[start..=i]);
+            self.color_reports.store(on, Ordering::Relaxed);
+            return i + 1;
+        }
+        start
+    }
+
+    /// The theme background without its alpha (what dark/light is judged on).
+    fn theme_rgb_bg(&self) -> [u8; 3] {
+        [self.theme.bg[0], self.theme.bg[1], self.theme.bg[2]]
+    }
+
+    /// Whether a program enabled the DEC 2031 color-scheme reports
+    /// (`CSI ? 2031 h`).
+    pub fn color_reports(&self) -> bool {
+        self.color_reports.load(Ordering::Relaxed)
     }
 
     /// Replace the active theme at runtime. Also refreshes the copy shared with
     /// the `EventProxy` so subsequent OSC 10/11/12/4 color-query replies reflect
     /// the new theme (e.g. so nvim/fzf detect the right background).
+    ///
+    /// When a program enabled the DEC 2031 reports and the colors changed (not
+    /// just the opacity), `CSI ? 997 ; 1|2 n` (dark / light) is queued on the
+    /// reply channel — the app writes it to the PTY with the other replies
+    /// ([`Terminal::drain_pty_writes`]).
     pub fn set_theme(&mut self, theme: Theme) {
+        let recolored = self.theme.fg != theme.fg
+            || self.theme.palette != theme.palette
+            || self.theme.cursor != theme.cursor
+            || self.theme.bg[..3] != theme.bg[..3];
         *self.theme_shared.lock().unwrap() = theme.clone();
         self.theme = theme;
+        if recolored && self.color_reports() {
+            let _ = self.reply_tx.send(color_scheme_report(self.theme_rgb_bg()).to_vec());
+        }
+    }
+
+    /// `minimum_contrast`: the WCAG ratio every glyph's final color must reach
+    /// against its cell background in [`Terminal::snapshot`] (1.0 = off — the
+    /// default — and anything non-finite or below 1 is off; capped at 21).
+    pub fn set_minimum_contrast(&mut self, ratio: f32) {
+        self.min_contrast = crate::contrast::clamp_ratio(ratio);
+    }
+
+    /// The `minimum_contrast` in force (1.0 = off).
+    pub fn minimum_contrast(&self) -> f32 {
+        self.min_contrast
     }
 
     /// Return a reference to the active theme.
@@ -1595,8 +1706,9 @@ impl Terminal {
                             }
                         },
                         // `ESC c` (RIS) resets the screen AND scrollback — and
-                        // every terminal mode, including the two mouse modes and
-                        // the keyboard flag stacks mirrored here.
+                        // every terminal mode, including the two mouse modes,
+                        // the color-scheme reports and the keyboard flag stacks
+                        // mirrored here.
                         b'c' => {
                             let k = i + 1;
                             if self.has_anchors() {
@@ -1604,6 +1716,7 @@ impl Terminal {
                             }
                             self.mouse_x10 = false;
                             self.mouse_urxvt = false;
+                            self.color_reports.store(false, Ordering::Relaxed);
                             self.kbd_cleared();
                             // A reset terminal shows no program's progress.
                             self.set_progress(None);
@@ -1631,7 +1744,7 @@ impl Terminal {
                         // second parameter, a long number): keep reading it for
                         // the mouse modes (an over-long first number names none).
                         b';' if private => {
-                            let hit = decset_bit(decset_param(&params[1..len as usize]));
+                            let hit = decset_bit(decset_param(&params[1..len as usize])) | DECSET_MULTI;
                             self.scan = Scan::Decset { cur: 0, hit };
                         }
                         b'0'..=b'9' if private => self.scan = Scan::Decset { cur: u16::MAX, hit: 0 },
@@ -1652,8 +1765,9 @@ impl Terminal {
                                     start = self.isolate(bytes, start, seq_start, k, kind);
                                 }
                             }
-                            if private && matches!(b, b'h' | b'l') {
-                                self.set_mouse_modes(decset_bit(decset_param(&params[1..len as usize])), b == b'h');
+                            if private && matches!(b, b'h' | b'l' | b'n') {
+                                let n = decset_param(&params[1..len as usize]);
+                                start = self.private_mode_csi(bytes, start, i, b, decset_bit(n), n);
                             }
                             self.scan = Scan::Ground;
                         }
@@ -1700,9 +1814,9 @@ impl Terminal {
                             let cur = cur.saturating_mul(10).saturating_add(u16::from(b - b'0'));
                             self.scan = Scan::Decset { cur, hit };
                         }
-                        b';' => self.scan = Scan::Decset { cur: 0, hit: hit | decset_bit(cur) },
-                        b'h' | b'l' => {
-                            self.set_mouse_modes(hit | decset_bit(cur), b == b'h');
+                        b';' => self.scan = Scan::Decset { cur: 0, hit: hit | decset_bit(cur) | DECSET_MULTI },
+                        b'h' | b'l' | b'n' => {
+                            start = self.private_mode_csi(bytes, start, i, b, hit | decset_bit(cur), cur);
                             self.scan = Scan::Ground;
                         }
                         // ESC restarts, CAN/SUB abort (vte's "anywhere" rules).
@@ -3357,6 +3471,12 @@ impl Terminal {
         // are stored in the Term's color table; consult it so redefined colors
         // actually change on screen, falling back to the static theme.
         let colors = self.term.colors();
+        // `minimum_contrast` memo, seeded with the default text/background pair
+        // (most cells); `None` while the feature is off.
+        let mut mc_memo = (self.min_contrast > 1.0).then(|| {
+            let bg = [self.theme.bg[0], self.theme.bg[1], self.theme.bg[2]];
+            crate::contrast::ContrastMemo::new(self.min_contrast, self.theme.fg, bg)
+        });
 
         // Iterate over all visible cells. Each item has point in terminal coordinates
         // (line 0 = top of current viewport when display_offset=0; negative = history).
@@ -3394,6 +3514,17 @@ impl Terminal {
                     // wins over whatever ended up as fg.
                     if cell.flags.contains(Flags::HIDDEN) {
                         fg = bg;
+                    } else if let Some(memo) = mc_memo.as_mut() {
+                        // `minimum_contrast` (off = one predictable branch): the
+                        // FINAL fg is pushed to the ratio against the final bg —
+                        // even a palette color that equals the background
+                        // (solarized_dark's 8: invisible zsh autosuggestions).
+                        // Concealed text (above) stays invisible; powerline, block
+                        // and sextant glyphs keep their colors (they draw shapes).
+                        // A blank draws no glyph: skipped (the common cell).
+                        if cell.c != ' ' && !crate::contrast::min_contrast_exempt(cell.c) {
+                            fg = memo.get(fg, bg);
+                        }
                     }
                     // A double-width glyph occupies two grid cells: the WIDE_CHAR
                     // cell holds the actual char, and the following

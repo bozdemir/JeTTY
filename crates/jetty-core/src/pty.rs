@@ -528,6 +528,9 @@ const INHERITED_ENV_DENYLIST: &[&str] = &[
     // (e.g. Python's shutil.get_terminal_size) prefer these over TIOCGWINSZ.
     "COLUMNS",
     "LINES",
+    // The launching terminal's dark/light hint: JeTTY sets its own from the
+    // theme on screen (`PtySession::spawn_with_env`).
+    "COLORFGBG",
 ];
 
 /// The path a shell should use to re-invoke JeTTY (`$JETTY_BIN`).
@@ -713,6 +716,24 @@ impl PtySession {
         cwd: Option<std::path::PathBuf>,
         on_data: impl Fn() + Send + 'static,
     ) -> std::io::Result<PtySession> {
+        Self::spawn_with_env(cols, rows, px_w, px_h, shell_override, cwd, Vec::new(), on_data)
+    }
+
+    /// [`PtySession::spawn`], with `env` exported to the shell on top of (and
+    /// overriding) the inherited environment and JeTTY's own variables — e.g.
+    /// `COLORFGBG` describing the theme on screen
+    /// ([`crate::contrast::colorfgbg`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_env(
+        cols: u16,
+        rows: u16,
+        px_w: u16,
+        px_h: u16,
+        shell_override: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+        env: Vec<(String, String)>,
+        on_data: impl Fn() + Send + 'static,
+    ) -> std::io::Result<PtySession> {
         let pty_system = native_pty_system();
         // Report the text-area pixel size (TIOCGWINSZ ws_xpixel/ws_ypixel) so
         // image tools that read it (as a fallback to the \e[14t reply) scale to
@@ -773,6 +794,9 @@ impl PtySession {
             cmd.env("JETTY", &ver);
             if let Some(exe) = &jetty_bin {
                 cmd.env("JETTY_BIN", exe);
+            }
+            for (key, value) in &env {
+                cmd.env(key, value);
             }
             // An explicit cwd (inherited from the requesting tab) wins.
             // Otherwise the shell starts in home: portable-pty's own default for

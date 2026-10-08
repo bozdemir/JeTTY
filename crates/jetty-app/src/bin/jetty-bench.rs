@@ -415,9 +415,22 @@ fn bench_scene_passes(
 /// derives at 1920×1200 @ 16px MesloLGS NF on the reference machine, so the numbers
 /// are comparable). Constructs no wgpu instance/adapter/device and no TextLayer.
 fn run_cpu_only() -> Result<(), Box<dyn std::error::Error>> {
-    let (cols, rows) = (199usize, 57usize);
+    // `JETTY_BENCH_GRID=240x70` overrides the fixed baseline grid;
+    // `JETTY_BENCH_MIN_CONTRAST=4.5` measures the snapshot with `minimum_contrast` on.
+    let (cols, rows) = std::env::var("JETTY_BENCH_GRID")
+        .ok()
+        .and_then(|g| {
+            let (c, r) = g.split_once('x')?;
+            Some((c.parse::<usize>().ok()?.clamp(2, 2000), r.parse::<usize>().ok()?.clamp(1, 1000)))
+        })
+        .unwrap_or((199, 57));
 
     let mut term = jetty_core::Terminal::new(cols, rows);
+    let min_contrast = std::env::var("JETTY_BENCH_MIN_CONTRAST").ok().and_then(|v| v.parse::<f32>().ok());
+    if let Some(r) = min_contrast {
+        term.set_minimum_contrast(r);
+        println!("minimum_contrast {:.2}", term.minimum_contrast());
+    }
 
     // throughput
     let payload = make_payload(50 * 1024 * 1024);
@@ -441,6 +454,31 @@ fn run_cpu_only() -> Result<(), Box<dyn std::error::Error>> {
     println!("grid          {cols}x{rows} cells (fixed baseline; no display)");
     println!("throughput    {mbps:6.0} MB/s   (fed {mb:.0} MB colored VT in {feed_s:.2}s)");
     println!("snapshot      {snap_ms:8.3} ms/frame  ({:.0}k cells)", (cols * rows) as f64 / 1000.0);
+    // With `minimum_contrast` on: an interleaved in-process A/B (same grid, same
+    // noise), so its cost is measurable on a busy machine.
+    if let Some(r) = min_contrast {
+        let (mut off_s, mut on_s) = (0.0f64, 0.0f64);
+        for _ in 0..100 {
+            term.set_minimum_contrast(1.0);
+            let t = Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(term.snapshot());
+            }
+            off_s += t.elapsed().as_secs_f64();
+            term.set_minimum_contrast(r);
+            let t = Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(term.snapshot());
+            }
+            on_s += t.elapsed().as_secs_f64();
+        }
+        println!(
+            "min_contrast  off {:.4} / on {:.4} ms/frame  ({:+.1}% interleaved A/B, n=1000 each)",
+            off_s,
+            on_s,
+            (on_s / off_s - 1.0) * 100.0
+        );
+    }
     print_pipeline_1byte_cpu(&mut term);
     Ok(())
 }

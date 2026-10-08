@@ -1,4 +1,7 @@
 mod base64;
+/// WCAG contrast math: `minimum_contrast` and the dark/light background rule
+/// behind the DEC 2031 reports and `COLORFGBG`.
+pub mod contrast;
 pub mod fuzzy;
 pub mod hints;
 pub mod kitty;
