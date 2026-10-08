@@ -77,9 +77,12 @@ pub struct Config {
     #[serde(default = "default_focus_autohide")]
     pub focus_autohide: bool,
     /// Launch JeTTY at login via the freedesktop XDG autostart standard (a
-    /// `.desktop` file under `~/.config/autostart/`). Default OFF. The autostart
-    /// file's existence is the source of truth at runtime; this stored bool is a
-    /// mirror.
+    /// `.desktop` file under `~/.config/autostart/`; a LaunchAgent on macOS).
+    /// Default OFF. When the file SETS it, the key is the source of truth: the
+    /// entry is written to match at startup and on a toggle or hot-reload, and
+    /// removed on a toggle or hot-reload — never at startup, and never from a
+    /// config that failed to load or lacks the key (the app then mirrors the
+    /// entry). With `JETTY_CONFIG_DIR` set the real login item is not touched.
     #[serde(default = "default_launch_at_login")]
     pub launch_at_login: bool,
     /// Global summon hotkey, e.g. "F9" (default), "F12", or "Ctrl+Shift+F12".
@@ -508,6 +511,11 @@ pub struct Loaded {
     /// Hash of the bytes read (`None` when there was no file): the persister's
     /// baseline for telling its own writes from external edits.
     pub hash: Option<u64>,
+    /// `launch_at_login` as the file itself sets it — `None` when there is no
+    /// file, it could not be read or parsed, or the key is missing or invalid:
+    /// the loaded value is then only a default, which must never decide to
+    /// delete the user's login item.
+    pub launch_at_login: Option<bool>,
 }
 
 impl Config {
@@ -517,6 +525,13 @@ impl Config {
     /// Application Support/jetty` on macOS), falling back to `~/.config/jetty` when
     /// the OS dir is unknown. It holds `config.toml` and `themes/`; the hot-reload
     /// watcher and the theme loader both key off it.
+    /// Whether `$JETTY_CONFIG_DIR` points JeTTY at an alternate config tree (a
+    /// setup being tried out): what belongs to the user's REAL session — the
+    /// login item — is then left alone.
+    pub(crate) fn dir_overridden() -> bool {
+        std::env::var_os("JETTY_CONFIG_DIR").is_some_and(|d| !d.is_empty())
+    }
+
     pub(crate) fn dir() -> PathBuf {
         if let Some(d) = std::env::var_os("JETTY_CONFIG_DIR").filter(|d| !d.is_empty()) {
             return PathBuf::from(d);
@@ -552,7 +567,12 @@ impl Config {
         let s = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Loaded { cfg: Config::default(), warnings: Vec::new(), hash: None };
+                return Loaded {
+                    cfg: Config::default(),
+                    warnings: Vec::new(),
+                    hash: None,
+                    launch_at_login: None,
+                };
             }
             Err(e) => {
                 return Loaded {
@@ -562,12 +582,15 @@ impl Config {
                         path.display()
                     )],
                     hash: None,
+                    launch_at_login: None,
                 };
             }
         };
         let hash = Some(hash_str(&s));
         match Self::parse_with_base(&s, &Config::default(), "using the default") {
-            Ok((cfg, warnings)) => Loaded { cfg, warnings, hash },
+            Ok((cfg, warnings)) => {
+                Loaded { cfg, warnings, hash, launch_at_login: explicit_launch_at_login(&s) }
+            }
             Err(syntax) => {
                 let copy = match preserve_copy(path, "bad") {
                     Ok(p) => format!("a copy is at {}", p.display()),
@@ -581,6 +604,7 @@ impl Config {
                          saved until it is fixed"
                     )],
                     hash,
+                    launch_at_login: None,
                 }
             }
         }
@@ -734,6 +758,12 @@ impl Config {
 }
 
 // ── Per-key parsing helpers ──────────────────────────────────────────────────
+
+/// `launch_at_login` as config text `s` itself sets it: `None` when the text is
+/// not TOML or the key is missing or not a bool (see [`Loaded::launch_at_login`]).
+pub(crate) fn explicit_launch_at_login(s: &str) -> Option<bool> {
+    toml::from_str::<toml::Table>(s).ok()?.get("launch_at_login")?.as_bool()
+}
 
 /// Hash config-file text to a `u64` (self-write guard for hot-reload). Content-
 /// based and dependency-free; only equality matters, so the exact algorithm is
@@ -2036,6 +2066,26 @@ copy = "Ctrl+Shift+Y"
         let _ = Config::load_from(&link);
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "opacity = = 1\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launch_at_login_is_reported_only_when_the_file_sets_it() {
+        // A default `false` must never be mistaken for "the user turned it off":
+        // the startup sync used to DELETE the login item from it.
+        let dir = tmp_dir("launch-explicit");
+        let path = dir.join("config.toml");
+        assert_eq!(Config::load_from(&path).launch_at_login, None, "no file");
+        for (text, want) in [
+            ("launch_at_login = true\n", Some(true)),
+            ("launch_at_login = false\n", Some(false)),
+            ("theme = \"nord\"\n", None),
+            ("launch_at_login = \"yes\"\n", None),
+            ("launch_at_login = = true\n", None), // not TOML
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(Config::load_from(&path).launch_at_login, want, "{text}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

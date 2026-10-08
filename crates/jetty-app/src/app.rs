@@ -1838,7 +1838,7 @@ impl App {
         // window comes up already themed/sized as the user left it. The font
         // size/family are consumed later by `resumed` when it builds the
         // TextLayer; theme+opacity are pushed into the terminals by apply_theme.
-        let crate::config::Loaded { cfg, warnings, .. } = loaded;
+        let crate::config::Loaded { cfg, warnings, launch_at_login: launch_set, .. } = loaded;
         startup_warnings.extend(warnings);
         // The CHOSEN theme is remembered by name even when it can't be shown (a
         // missing/broken user theme file): the fallback on screen is never saved
@@ -1871,13 +1871,20 @@ impl App {
         // Re-clamp for belt-and-suspenders (mirrors the opacity/font clamps
         // above); Config::load's sanitize pass already applied this range.
         app.scrollback_lines = cfg.scrollback_lines.clamp(100, 100_000);
-        // The config key is the source of truth: (re)write or remove the login
-        // autostart entry to match — keeping the program an existing entry
-        // launches while it still exists, refreshing a stale one (moved AppImage).
-        app.launch_at_login = cfg.launch_at_login;
-        if let Err(e) = sync_launch_at_login(app.launch_at_login) {
-            startup_warnings.push(e);
-        }
+        // Launch at login: written to match a config that SETS it (keeping the
+        // program an existing entry launches while it still exists, refreshing a
+        // stale one) — but never removed at startup, never decided by a default
+        // (a broken or key-less config mirrors the entry instead), and never
+        // touched for an alternate config tree (`JETTY_CONFIG_DIR`).
+        let (launch, problem) = startup_launch_at_login(
+            &autostart_path(),
+            cfg.launch_at_login,
+            launch_set,
+            crate::config::Config::dir_overridden(),
+            &AutostartTarget::current(),
+        );
+        app.launch_at_login = launch;
+        startup_warnings.extend(problem);
         app.summon_hotkey = cfg.summon_hotkey;
         app.shell = cfg.shell;
         app.welcome_open = cfg.show_welcome;
@@ -2307,8 +2314,14 @@ impl App {
             if !self.persister.borrow().is_self_write(h) {
                 let live = self.settings_snapshot();
                 match crate::config::Config::parse_with_base(&s, &live, "keeping the current value") {
-                    Ok((cfg, problems)) => {
+                    Ok((mut cfg, problems)) => {
                         warnings.extend(problems);
+                        // A file that does not SET launch_at_login (the key
+                        // removed, a typo) keeps the live value: only an explicit
+                        // edit adds or removes the login item.
+                        if crate::config::explicit_launch_at_login(&s).is_none() {
+                            cfg.launch_at_login = self.launch_at_login;
+                        }
                         self.apply_reloaded_config(cfg.clone(), &mut warnings);
                         // Records the observed hash too, so an identical later
                         // hand-save no-ops.
@@ -2484,12 +2497,21 @@ impl App {
                 dw.tab.terminal.set_kitty_keyboard(cfg.kitty_keyboard);
             }
         }
-        // Launch at login — live: the config key is the source of truth, so the
-        // autostart entry is written/removed to match.
+        // Launch at login — live: an explicit edit of the key writes / removes
+        // the autostart entry to match (the caller keeps the live value when the
+        // file does not set it). An alternate config tree never touches the
+        // user's real login item.
         if cfg.launch_at_login != self.launch_at_login {
             self.launch_at_login = cfg.launch_at_login;
-            if let Err(e) = sync_launch_at_login(self.launch_at_login) {
-                warnings.push(e);
+            if !crate::config::Config::dir_overridden() {
+                let synced = sync_launch_at_login(
+                    &autostart_path(),
+                    self.launch_at_login,
+                    &AutostartTarget::current(),
+                );
+                if let Err(e) = synced {
+                    warnings.push(e);
+                }
             }
         }
         // Mirror the RESTART-ONLY-EFFECT key too, so a later panel-driven persist()
@@ -4454,7 +4476,7 @@ impl App {
             }
             C::ToggleLaunchAtLogin => {
                 self.launch_at_login = !self.launch_at_login;
-                if let Err(e) = set_launch_at_login(self.launch_at_login) {
+                if let Err(e) = toggle_launch_at_login(self.launch_at_login) {
                     self.show_config_warnings(&[e]);
                 }
                 self.persist();
@@ -9094,7 +9116,7 @@ impl App {
                 self.launch_at_login = !self.launch_at_login;
                 // Write/remove the login autostart entry to match; persist() (below)
                 // saves the config key, which is the source of truth.
-                if let Err(e) = set_launch_at_login(self.launch_at_login) {
+                if let Err(e) = toggle_launch_at_login(self.launch_at_login) {
                     self.show_config_warnings(&[e]);
                 }
             }
@@ -13828,6 +13850,34 @@ fn current_autostart_program() -> String {
     )
 }
 
+/// What a new or refreshed autostart entry launches, captured once per sync:
+/// the program, and whether it is an AppImage file (running a newer AppImage
+/// is choosing that version, so it retargets an existing entry).
+struct AutostartTarget {
+    program: String,
+    appimage: bool,
+}
+
+impl AutostartTarget {
+    fn current() -> AutostartTarget {
+        AutostartTarget {
+            program: current_autostart_program(),
+            appimage: std::env::var_os("APPIMAGE").is_some_and(|v| !v.is_empty()),
+        }
+    }
+}
+
+/// What a sync did to the autostart file.
+#[derive(Debug, PartialEq)]
+enum AutostartSync {
+    /// Written (created or refreshed), or removed.
+    Changed,
+    /// Already as wanted.
+    Unchanged,
+    /// A file JeTTY did not write sits at the path: left alone.
+    Foreign,
+}
+
 /// This platform's autostart entry launching `program`.
 fn autostart_entry_for(program: &str) -> String {
     if cfg!(target_os = "macos") {
@@ -13838,32 +13888,79 @@ fn autostart_entry_for(program: &str) -> String {
 }
 
 /// An explicit "Launch at login" toggle (Settings / palette): write the entry for
-/// THIS executable, or remove it. Never panics; a failure is returned for display.
-fn set_launch_at_login(enabled: bool) -> Result<(), String> {
-    let contents = enabled.then(|| autostart_entry_for(&current_autostart_program()));
-    sync_autostart_file(&autostart_path(), contents.as_deref())
+/// THIS executable, or remove it. Never panics. A failure — or an entry JeTTY did
+/// not write, or an alternate config tree, both of which leave the login item
+/// alone — is returned for display: a toggle must never silently do nothing.
+fn toggle_launch_at_login(enabled: bool) -> Result<(), String> {
+    if crate::config::Config::dir_overridden() {
+        return Err("launch at login: not changed while JETTY_CONFIG_DIR points at another \
+                    config (the login item belongs to your own setup)"
+            .to_string());
+    }
+    set_launch_at_login(&autostart_path(), enabled, &current_autostart_program())
 }
 
-/// Bring the login autostart entry in line with the config key (the source of
-/// truth) at startup and on a hot-reload. Unlike an explicit toggle, an existing
-/// JeTTY entry KEEPS the program it launches while that program still exists —
+/// [`toggle_launch_at_login`] for the entry at `path`, launching `program`.
+fn set_launch_at_login(path: &std::path::Path, enabled: bool, program: &str) -> Result<(), String> {
+    let contents = enabled.then(|| autostart_entry_for(program));
+    match sync_autostart_file(path, contents.as_deref())? {
+        AutostartSync::Foreign => Err(format!(
+            "launch at login: {} was not created by JeTTY — left as it is (remove or edit it \
+             yourself)",
+            path.display()
+        )),
+        AutostartSync::Changed | AutostartSync::Unchanged => Ok(()),
+    }
+}
+
+/// Launch-at-login at STARTUP. Returns the app's state and a problem to show.
+///
+/// * `JETTY_CONFIG_DIR` set (`alt_config_dir`): the file's value, untouched;
+/// * the config SETS `true`: the entry is (re)written ([`sync_launch_at_login`]);
+/// * the config sets `false`: nothing is removed at startup — a stale or
+///   copied config must not silently delete a login item (a toggle or a
+///   hot-reloaded edit does);
+/// * the config does not set it (no file, a broken file, the key missing or
+///   invalid): the app mirrors the existing entry — its `false` is only a default.
+fn startup_launch_at_login(
+    path: &std::path::Path,
+    cfg_value: bool,
+    explicit: Option<bool>,
+    alt_config_dir: bool,
+    target: &AutostartTarget,
+) -> (bool, Option<String>) {
+    if alt_config_dir {
+        return (cfg_value, None);
+    }
+    match explicit {
+        Some(true) => (true, sync_launch_at_login(path, true, target).err()),
+        Some(false) => (false, None),
+        None => {
+            let ours = std::fs::read_to_string(path).is_ok_and(|c| is_jetty_autostart_entry(&c));
+            (ours, None)
+        }
+    }
+}
+
+/// Bring the login autostart entry at `path` in line with the config key at
+/// startup and on a hot-reload. Unlike an explicit toggle, an existing JeTTY
+/// entry KEEPS the program it launches while that program still exists —
 /// running another build (say `./target/release/jetty`) must not retarget the
 /// user's login item. The entry is only refreshed to the current format (e.g.
 /// `--background`), or pointed at this executable when its program is gone (a
 /// moved AppImage), when there is no entry yet, or when this IS an AppImage —
-/// running a newer AppImage file is choosing that version.
-fn sync_launch_at_login(enabled: bool) -> Result<(), String> {
-    let path = autostart_path();
+/// running a newer AppImage file is choosing that version. An entry JeTTY did
+/// not write is left alone silently.
+fn sync_launch_at_login(path: &std::path::Path, enabled: bool, target: &AutostartTarget) -> Result<(), String> {
     let contents = enabled.then(|| {
-        let running_appimage = std::env::var_os("APPIMAGE").is_some_and(|v| !v.is_empty());
-        let kept = std::fs::read_to_string(&path)
+        let kept = std::fs::read_to_string(path)
             .ok()
-            .filter(|c| !running_appimage && is_jetty_autostart_entry(c))
+            .filter(|c| !target.appimage && is_jetty_autostart_entry(c))
             .and_then(|c| autostart_entry_program(&c))
             .filter(|p| std::path::Path::new(p).is_file());
-        autostart_entry_for(&kept.unwrap_or_else(current_autostart_program))
+        autostart_entry_for(kept.as_deref().unwrap_or(&target.program))
     });
-    sync_autostart_file(&path, contents.as_deref())
+    sync_autostart_file(path, contents.as_deref()).map(|_| ())
 }
 
 /// The program an autostart entry launches: the first `ProgramArguments` string of
@@ -13902,16 +13999,16 @@ fn autostart_entry_program(content: &str) -> Option<String> {
 
 /// Write `contents` to `path` (only when it differs — no churn on every start) or,
 /// for `None`, remove it (a missing file is already the goal). A file at `path`
-/// that JeTTY did not write is left alone either way.
-fn sync_autostart_file(path: &std::path::Path, contents: Option<&str>) -> Result<(), String> {
+/// that JeTTY did not write is left alone either way ([`AutostartSync::Foreign`]).
+fn sync_autostart_file(path: &std::path::Path, contents: Option<&str>) -> Result<AutostartSync, String> {
     let current = std::fs::read_to_string(path).ok();
     if current.as_deref().is_some_and(|c| !is_jetty_autostart_entry(c)) {
-        return Ok(());
+        return Ok(AutostartSync::Foreign);
     }
     match contents {
         Some(c) => {
             if current.as_deref() == Some(c) {
-                return Ok(());
+                return Ok(AutostartSync::Unchanged);
             }
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| {
@@ -13919,11 +14016,12 @@ fn sync_autostart_file(path: &std::path::Path, contents: Option<&str>) -> Result
                 })?;
             }
             std::fs::write(path, c)
+                .map(|()| AutostartSync::Changed)
                 .map_err(|e| format!("launch at login: could not write {}: {e}", path.display()))
         }
         None => match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(AutostartSync::Changed),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AutostartSync::Unchanged),
             Err(e) => Err(format!("launch at login: could not remove {}: {e}", path.display())),
         },
     }
@@ -14684,9 +14782,74 @@ mod desktop_exec_arg_tests {
 #[cfg(test)]
 mod autostart_tests {
     use super::{
-        autostart_desktop_entry, autostart_entry_program, autostart_program, launch_agent_plist,
-        sync_autostart_file,
+        autostart_desktop_entry, autostart_entry_for, autostart_entry_program, autostart_program,
+        launch_agent_plist, set_launch_at_login, startup_launch_at_login, sync_autostart_file,
+        AutostartSync, AutostartTarget,
     };
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("jetty-autostart-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn target(program: &str) -> AutostartTarget {
+        AutostartTarget { program: program.to_string(), appimage: false }
+    }
+
+    #[test]
+    fn startup_never_deletes_the_login_item() {
+        // The config failed to load / lacks the key / points elsewhere: its
+        // default `false` used to DELETE the user's login item at every start.
+        let dir = scratch("startup");
+        let path = dir.join("autostart").join("jetty.desktop");
+        let exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let entry = autostart_entry_for(&exe);
+        std::fs::write(&path, &entry).unwrap();
+        // No key read (missing, invalid, broken file): mirror the entry.
+        assert_eq!(startup_launch_at_login(&path, false, None, false, &target(&exe)), (true, None));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), entry, "untouched");
+        // An explicit `false`: still never removed at startup.
+        assert_eq!(startup_launch_at_login(&path, false, Some(false), false, &target(&exe)), (false, None));
+        assert!(path.exists(), "startup never removes the entry");
+        // JETTY_CONFIG_DIR: the real login item is not looked at or touched.
+        assert_eq!(startup_launch_at_login(&path, false, None, true, &target(&exe)), (false, None));
+        assert!(path.exists());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(startup_launch_at_login(&path, true, Some(true), true, &target(&exe)), (true, None));
+        assert!(!path.exists(), "an alternate config tree never writes one either");
+        // No entry and no key: off, nothing written.
+        assert_eq!(startup_launch_at_login(&path, false, None, false, &target(&exe)), (false, None));
+        assert!(!path.exists());
+        // An explicit `true` writes it.
+        assert_eq!(startup_launch_at_login(&path, true, Some(true), false, &target(&exe)), (true, None));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), entry);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_toggle_says_so_when_the_entry_is_not_jettys() {
+        // An autostart file the user (or their desktop) made at the same path is
+        // never touched — but a toggle used to do nothing SILENTLY.
+        let dir = scratch("foreign");
+        let path = dir.join("jetty.desktop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let users = "[Desktop Entry]\nName=JeTTY\nExec=jetty --show\n";
+        std::fs::write(&path, users).unwrap();
+        for enabled in [true, false] {
+            let err = set_launch_at_login(&path, enabled, "/usr/bin/jetty").unwrap_err();
+            assert!(err.contains("not created by JeTTY"), "{err}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), users, "left alone");
+        }
+        // Its own entry toggles fine.
+        std::fs::remove_file(&path).unwrap();
+        set_launch_at_login(&path, true, "/usr/bin/jetty").unwrap();
+        assert!(path.exists());
+        set_launch_at_login(&path, false, "/usr/bin/jetty").unwrap();
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_entrys_program_round_trips_through_its_escaping() {
@@ -14741,15 +14904,16 @@ mod autostart_tests {
         let path = dir.join("autostart").join("jetty.desktop");
         let v1 = autostart_desktop_entry("/usr/bin/jetty");
         let v2 = autostart_desktop_entry("/opt/jetty/jetty");
-        sync_autostart_file(&path, Some(&v1)).unwrap();
+        assert_eq!(sync_autostart_file(&path, Some(&v1)), Ok(AutostartSync::Changed));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), v1);
+        assert_eq!(sync_autostart_file(&path, Some(&v1)), Ok(AutostartSync::Unchanged));
         // A stale entry (old program path) is refreshed.
         sync_autostart_file(&path, Some(&v2)).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), v2);
         sync_autostart_file(&path, None).unwrap();
         assert!(!path.exists());
         // Removing what isn't there is fine.
-        sync_autostart_file(&path, None).unwrap();
+        assert_eq!(sync_autostart_file(&path, None), Ok(AutostartSync::Unchanged));
         // A pre-v0.26 JeTTY entry (no marker) is still recognized as ours.
         let legacy = "[Desktop Entry]\nComment=Blazing-fast GPU terminal with a center-summon hotkey (autostart: holds the F9 grab)\nExec=/usr/bin/jetty\n";
         std::fs::write(&path, legacy).unwrap();
@@ -14759,9 +14923,9 @@ mod autostart_tests {
         // rewritten or deleted.
         let users = "[Desktop Entry]\nName=JeTTY\nExec=jetty --show\n";
         std::fs::write(&path, users).unwrap();
-        sync_autostart_file(&path, None).unwrap();
+        assert_eq!(sync_autostart_file(&path, None), Ok(AutostartSync::Foreign));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), users);
-        sync_autostart_file(&path, Some(&v1)).unwrap();
+        assert_eq!(sync_autostart_file(&path, Some(&v1)), Ok(AutostartSync::Foreign));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), users);
         let _ = std::fs::remove_dir_all(&dir);
     }
