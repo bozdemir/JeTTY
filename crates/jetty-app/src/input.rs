@@ -1822,6 +1822,11 @@ pub fn encode_kitty_key(ev: &KeyInput<'_>, modes: &KeyModes, opts: &KeyOptions) 
     let report_events = flags & KITTY_REPORT_EVENT_TYPES != 0;
     let report_all = flags & KITTY_REPORT_ALL_KEYS != 0;
 
+    // A dead key (or the middle of a Compose sequence) inputs nothing by itself:
+    // the key that completes it carries the composed text. Same as legacy.
+    if matches!(ev.logical, Key::Dead(_)) {
+        return None;
+    }
     let m = ev.mods;
     let meta = alt_is_meta(m, opts);
     let mut fkey = functional_key(ev);
@@ -1830,7 +1835,14 @@ pub fn encode_kitty_key(ev: &KeyInput<'_>, modes: &KeyModes, opts: &KeyOptions) 
     }
     let text = kitty_text(ev, meta);
 
-    let alt_bit = m.alt && (meta || fkey.is_some_and(|k| !k.is_textual()));
+    // Alt is reported when it acts as Meta, on non-text functional keys, and —
+    // macOS with Option composing — whenever Option produced no printable
+    // character (Option+Enter / Backspace / Tab / Esc keep their Meta meaning, as
+    // in the legacy encoder).
+    let alt_bit = m.alt
+        && (meta
+            || composed_option_text(ev).is_none()
+            || fkey.is_some_and(|k| !k.is_textual()));
     let mut mods = (u8::from(m.shift) * KM_SHIFT)
         | (u8::from(alt_bit) * KM_ALT)
         | (u8::from(m.ctrl) * KM_CTRL)
@@ -1956,7 +1968,10 @@ fn kitty_text_key(
             if report_all {
                 return Some(kitty_csi(key, None, None, 0, kind, false, None, b'u'));
             }
-            return char::from_u32(key).map(|c| c.to_string().into_bytes());
+            // Text keys already went out as their text; reaching here means the
+            // key produced none (an AltGr combo with no level-3 symbol, …), and
+            // like the legacy encoder we send nothing rather than the key code.
+            return None;
         }
         // Event-types-only mode keeps the legacy bytes where they exist.
         if !disambiguate && !report_all {
@@ -3925,6 +3940,38 @@ mod tests {
     const ALT: KeyMods = KeyMods { ctrl: false, shift: false, alt: true, super_: false, lalt: false, ralt: false };
     const CTRL_SHIFT: KeyMods = KeyMods { ctrl: true, shift: true, alt: false, super_: false, lalt: false, ralt: false };
     const NONE: KeyMods = KeyMods { ctrl: false, shift: false, alt: false, super_: false, lalt: false, ralt: false };
+
+    #[test]
+    fn kitty_dead_and_textless_keys_send_nothing() {
+        for f in [KITTY_DISAMBIGUATE, KITTY_DISAMBIGUATE | KITTY_REPORT_ALTERNATE_KEYS] {
+            // Turkish-Q AltGr+. (dead_abovedot): no input until the key it composes with.
+            let (dead, period) = (Key::Dead(Some('˙')), Key::Character(".".into()));
+            let ev = KeyInput { physical: PhysicalKey::Code(KeyCode::Period), logical: &dead, key_without_modifiers: &period, text: None, location: KeyLocation::Standard, kind: KeyEventKind::Press, mods: NONE };
+            assert_eq!(kitty(&ev, f), None, "dead key, flags {f}");
+            // AltGr+W with no level-3 symbol: winit reports no text — never the plain `w`.
+            let (unid, w) = (Key::Unidentified(winit::keyboard::NativeKey::Unidentified), Key::Character("w".into()));
+            let ev = KeyInput { physical: PhysicalKey::Code(KeyCode::KeyW), logical: &unid, key_without_modifiers: &w, text: None, location: KeyLocation::Standard, kind: KeyEventKind::Press, mods: NONE };
+            assert_eq!(kitty(&ev, f), None, "textless AltGr combo, flags {f}");
+        }
+    }
+
+    #[test]
+    fn kitty_macos_option_keeps_meta_on_keys_it_does_not_compose() {
+        let opts = mac(OptionAsAlt::None);
+        let modes = KeyModes { kitty_flags: KITTY_DISAMBIGUATE, ..KeyModes::default() };
+        let opt = KeyMods { alt: true, lalt: true, ..KeyMods::default() };
+        // Option+Enter / Option+Backspace keep Meta (legacy sent ESC CR / ESC DEL).
+        let enter = Key::Named(NamedKey::Enter);
+        let ev = KeyInput { physical: PhysicalKey::Code(KeyCode::Enter), logical: &enter, key_without_modifiers: &enter, text: Some("\r"), location: KeyLocation::Standard, kind: KeyEventKind::Press, mods: opt };
+        assert_eq!(encode_kitty_key(&ev, &modes, &opts), b("\x1b[13;3u"));
+        let bs = Key::Named(NamedKey::Backspace);
+        let ev = KeyInput { physical: PhysicalKey::Code(KeyCode::Backspace), logical: &bs, key_without_modifiers: &bs, text: None, location: KeyLocation::Standard, kind: KeyEventKind::Press, mods: opt };
+        assert_eq!(encode_kitty_key(&ev, &modes, &opts), b("\x1b[127;3u"));
+        // A character Option composed still goes out as that character (Turkish Mac Option+Q).
+        let (at, q) = (Key::Character("@".into()), Key::Character("q".into()));
+        let ev = KeyInput { physical: PhysicalKey::Code(KeyCode::KeyQ), logical: &at, key_without_modifiers: &q, text: Some("@"), location: KeyLocation::Standard, kind: KeyEventKind::Press, mods: opt };
+        assert_eq!(encode_kitty_key(&ev, &modes, &opts), b("@"));
+    }
 
     #[test]
     fn kitty_disambiguate_flag() {

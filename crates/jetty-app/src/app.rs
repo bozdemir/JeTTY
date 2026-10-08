@@ -7502,7 +7502,7 @@ impl App {
                     input::KeyAction::Send(bytes) => {
                         // Escape closes this window's context menu (if open)
                         // before anything reaches the PTY — mirrors the main window.
-                        if bytes == [0x1b] && dw.menu_open.is_some() {
+                        if is_escape_key(&event) && dw.menu_open.is_some() {
                             dw.menu_open = None;
                             dw.menu_hover = None;
                             dw.menu_rects.clear();
@@ -7514,7 +7514,7 @@ impl App {
                         // while scrolled up goes blind, F30) then write to the PTY
                         // — the shared input core, same as the main Send arm
                         // (v0.23 Task 9).
-                        write_key_to_pty(&mut dw.tab, &bytes, Some(event.physical_key));
+                        write_key_to_pty(&mut dw.tab, &bytes, Some(event.physical_key), !is_modifier_key(&event));
                         // No paint here — the echo paints (same rule and fallback
                         // deadline as the main window's Send arm).
                         let now = std::time::Instant::now();
@@ -7581,7 +7581,7 @@ impl App {
                     let Some(dw) = self.detached.get_mut(pos) else { return };
                     // Snap to the live bottom (F30) then write to the PTY — the
                     // shared input core, same as the Send arm (v0.23 Task 9).
-                    write_key_to_pty(&mut dw.tab, text.as_bytes(), None);
+                    write_key_to_pty(&mut dw.tab, text.as_bytes(), None, true);
                     // The echo paints (fallback deadline), as in the Send arm.
                     let now = std::time::Instant::now();
                     dw.key_paint_due = Some(now + KEY_ECHO_GRACE);
@@ -11974,7 +11974,9 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     input::KeyAction::Send(bytes) => {
                         // Escape closes an open context/tab menu before forwarding to PTY.
-                        if bytes == [0x1b]
+                        // Decided on the KEY, not the encoded bytes: under the kitty
+                        // keyboard protocol Esc encodes as `CSI 27 u`, not 0x1b.
+                        if is_escape_key(&event)
                             && (self.context_menu.is_some() || self.tab_menu.is_some())
                         {
                             self.context_menu = None;
@@ -11994,7 +11996,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // Any real keystroke jumps back to the bottom so the user
                         // sees their input, then writes to the PTY (shared input
                         // core, v0.23 Task 9).
-                        write_key_to_pty(self.active_tab_mut(), &bytes, Some(event.physical_key));
+                        write_key_to_pty(self.active_tab_mut(), &bytes, Some(event.physical_key), !is_modifier_key(&event));
                         // Input-latency START stamp (JETTY_PERF_LOG only): record the
                         // keystroke instant so the frame that reflects its echo can
                         // measure keypress→glyph. Gated on `perf.on` (a bool read once
@@ -12105,7 +12107,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // Same discipline as the Send arm: jump to the live bottom then
                 // write to the PTY (shared input core, v0.23 Task 9) — and, like
                 // it, let the echo paint (fallback deadline, no pre-echo frame).
-                write_key_to_pty(self.active_tab_mut(), text.as_bytes(), None);
+                write_key_to_pty(self.active_tab_mut(), text.as_bytes(), None, true);
                 let now = std::time::Instant::now();
                 self.key_paint_due = Some(now + KEY_ECHO_GRACE);
                 if (self.fx.caret_flash_enabled || self.fx.caret_glow_enabled)
@@ -13476,24 +13478,69 @@ fn still_open(r: Option<TabId>, live: &[TabId]) -> Option<TabId> {
 ///
 /// `pressed` is the physical key when `bytes` encode a key PRESS (not an IME
 /// commit): the tab then owes that key's release to the program
-/// (`write_key_release`).
-fn write_key_to_pty(tab: &mut Tab, bytes: &[u8], pressed: Option<winit::keyboard::PhysicalKey>) {
-    // The user has claimed this prompt: a staged run-selection inject must
-    // never splice into their half-typed line. This ONE line covers every
-    // funnel that routes here — main + detached keystrokes AND both windows'
-    // IME commits. (Mouse REPORTS deliberately don't cancel: they only flow
-    // when an app enabled mouse mode, which no shell has at a fresh prompt,
-    // and they are app input, not command-line editing.)
-    crate::runsel::cancel_on_user_write(&mut tab.pending_inject);
-    // Any real keystroke jumps the view back to the live bottom so typing while
-    // scrolled up into scrollback is visible (F30). Order is irrelevant vs the
-    // PTY write (viewport offset and the PTY writer are independent).
-    tab.terminal.scroll_to_bottom();
+/// (`write_key_release`). `typing` is false for a lone modifier key, which only
+/// reaches the PTY as a kitty "report all keys" event: it is not the user
+/// typing, so it neither snaps the view nor cancels a staged inject (a
+/// Shift+drag selection in the scrollback must not jump to the bottom).
+fn write_key_to_pty(
+    tab: &mut Tab,
+    bytes: &[u8],
+    pressed: Option<winit::keyboard::PhysicalKey>,
+    typing: bool,
+) {
+    if typing {
+        // The user has claimed this prompt: a staged run-selection inject must
+        // never splice into their half-typed line. This ONE line covers every
+        // funnel that routes here — main + detached keystrokes AND both
+        // windows' IME commits. (Mouse REPORTS deliberately don't cancel: they
+        // only flow when an app enabled mouse mode, which no shell has at a
+        // fresh prompt, and they are app input, not command-line editing.)
+        crate::runsel::cancel_on_user_write(&mut tab.pending_inject);
+        // Any real keystroke jumps the view back to the live bottom so typing
+        // while scrolled up into scrollback is visible (F30). Order is
+        // irrelevant vs the PTY write (viewport offset and the PTY writer are
+        // independent).
+        tab.terminal.scroll_to_bottom();
+    }
     let _ = tab.writer.write_all(bytes);
     let _ = tab.writer.flush();
     if let Some(key) = pressed {
         tab.input.note_press(key);
     }
+}
+
+/// Whether `event` is a modifier key on its own (Shift, Ctrl, Alt, Super, the
+/// lock keys, …) — sent to the PTY only under the kitty "report all keys" flag.
+fn is_modifier_key(event: &winit::event::KeyEvent) -> bool {
+    use winit::keyboard::{Key, NamedKey as N};
+    matches!(
+        event.logical_key,
+        Key::Named(
+            N::Shift
+                | N::Control
+                | N::Alt
+                | N::AltGraph
+                | N::Super
+                | N::Meta
+                | N::Hyper
+                | N::CapsLock
+                | N::NumLock
+                | N::ScrollLock
+                | N::Fn
+                | N::FnLock
+                | N::Symbol
+                | N::SymbolLock
+        )
+    )
+}
+
+/// Whether `event` is the Escape key itself — independent of how the active
+/// keyboard protocol encodes it (legacy `0x1b`, kitty `CSI 27 u`).
+fn is_escape_key(event: &winit::event::KeyEvent) -> bool {
+    matches!(
+        event.logical_key,
+        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+    )
 }
 
 /// The shared decision half of the main and detached key paths: one winit key
