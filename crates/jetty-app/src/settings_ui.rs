@@ -220,13 +220,14 @@ impl Section {
 /// hook points (hidden until a control lands in them).
 pub static SECTIONS: &[Section] = &[
     Section { id: "look.window", tab: LOOK, title: "Opacity & corners", ..Section::DEFAULT },
-    Section { id: "look.theme", tab: LOOK, title: "Theme", ..Section::DEFAULT },
-    // Hook: follow the system light/dark setting, the light theme, minimum contrast.
-    Section { id: "look.appearance", tab: LOOK, title: "Light & dark", ..Section::DEFAULT },
     // Hook: the background layer (mode, strength, image, dim, blur, pattern).
     Section { id: "look.backdrop", tab: LOOK, title: "Backdrop", ..Section::DEFAULT },
     // Hook: tab style, window border.
     Section { id: "look.chrome", tab: LOOK, title: "Tabs & border", ..Section::DEFAULT },
+    // Hook: follow the system light/dark setting, the light theme, minimum contrast.
+    Section { id: "look.appearance", tab: LOOK, title: "Light & dark", ..Section::DEFAULT },
+    // The gallery is long (every theme): last, so nothing hides below it.
+    Section { id: "look.theme", tab: LOOK, title: "Theme", ..Section::DEFAULT },
     Section { id: "fonts.terminal", tab: FONTS, title: "Terminal font", ..Section::DEFAULT },
     Section { id: "fonts.ui", tab: FONTS, title: "Interface font", ..Section::DEFAULT },
     // Hook: line height, built-in glyphs, bold is bright, color emoji.
@@ -1313,6 +1314,14 @@ mod tests {
             _ => None,
         });
         assert_eq!(row, Some(CtlShow::Slider { frac: (0.75 - 0.25) / 0.75, text: "75%".into() }));
+    }
+
+    #[test]
+    fn the_theme_gallery_closes_the_look_tab() {
+        // Every theme is a card: anything placed after the gallery would sit
+        // a long scroll down.
+        let items = tab_items(LOOK, &Config::default(), &Ctx::empty());
+        assert_eq!(items.last(), Some(&PanelItem::Gallery));
     }
 
     #[test]
