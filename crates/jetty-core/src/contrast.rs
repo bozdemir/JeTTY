@@ -126,6 +126,9 @@ pub fn min_contrast_exempt(c: char) -> bool {
 /// Slots in [`ContrastMemo`]'s direct-mapped table.
 const MEMO_SLOTS: usize = 16;
 
+/// One memoized pair: `(fg, bg, readable fg)`.
+type MemoEntry = ([u8; 3], [u8; 3], [u8; 3]);
+
 /// Memo for [`ensure_contrast`] over one snapshot. Consecutive cells mostly
 /// share one (fg, bg) pair, so a run costs one compare per cell (the `last`
 /// entry, seeded with the theme's default pair); a change of colors looks in a
@@ -133,10 +136,10 @@ const MEMO_SLOTS: usize = 16;
 /// once per snapshot instead of once per color run.
 pub(crate) struct ContrastMemo {
     min: f32,
-    last: ([u8; 3], [u8; 3], [u8; 3]),
+    last: MemoEntry,
     /// The theme's default pair: colored runs mostly return to it.
-    dflt: ([u8; 3], [u8; 3], [u8; 3]),
-    table: [Option<([u8; 3], [u8; 3], [u8; 3])>; MEMO_SLOTS],
+    dflt: MemoEntry,
+    table: [Option<MemoEntry>; MEMO_SLOTS],
 }
 
 impl ContrastMemo {

@@ -2340,7 +2340,18 @@ impl App {
             self.apply_theme();
         }
         if report {
-            self.show_config_warnings(&warnings);
+            if self.tabs.is_empty() {
+                // Still starting up (no window yet): shown in the first tab with
+                // the other startup problems.
+                for w in warnings {
+                    eprintln!("jetty: {w}");
+                    if !self.startup_warnings.contains(&w) {
+                        self.startup_warnings.push(w);
+                    }
+                }
+            } else {
+                self.show_config_warnings(&warnings);
+            }
         }
     }
 
@@ -2438,12 +2449,13 @@ impl App {
         let pending = (self.follow_system_theme
             && self.appearance_watching
             && self.system_appearance.color_scheme.is_none())
-        .then(|| {
+        .then(|| PendingLightEnv {
+            first: self.appearance_first.clone(),
             // A missing light theme shows the dark slot (resolve_chosen_theme).
-            let light = jetty_core::theme_index(&self.light_theme_name)
+            env: jetty_core::theme_index(&self.light_theme_name)
                 .map(|i| colorfgbg_env(&jetty_core::theme_at(i)))
-                .unwrap_or_else(|| now.clone());
-            (self.appearance_first.clone(), light, self.light_theme_name.clone())
+                .unwrap_or_else(|| now.clone()),
+            light_theme: self.light_theme_name.clone(),
         });
         FirstShellEnv { now, pending }
     }
@@ -14921,9 +14933,16 @@ fn colorfgbg_env(theme: &jetty_core::Theme) -> Vec<(String, String)> {
 struct FirstShellEnv {
     /// For the theme on screen now.
     now: Vec<(String, String)>,
-    /// While the reading is outstanding: its handle, the light slot's env and
-    /// the light theme's name.
-    pending: Option<(crate::appearance::FirstReading, Vec<(String, String)>, String)>,
+    /// While the reading is outstanding: what the light slot would need.
+    pending: Option<PendingLightEnv>,
+}
+
+/// The light slot's side of [`FirstShellEnv`], used if the first reading says
+/// the system is light.
+struct PendingLightEnv {
+    first: crate::appearance::FirstReading,
+    env: Vec<(String, String)>,
+    light_theme: String,
 }
 
 impl FirstShellEnv {
@@ -14934,10 +14953,10 @@ impl FirstShellEnv {
 
     fn resolve(self) -> Vec<(String, String)> {
         match self.pending {
-            Some((first, light_env, light_name)) => {
-                let scheme = first.wait(Self::WAIT).and_then(|a| a.color_scheme);
-                if crate::appearance::light_slot(true, scheme, &light_name) {
-                    light_env
+            Some(p) => {
+                let scheme = p.first.wait(Self::WAIT).and_then(|a| a.color_scheme);
+                if crate::appearance::light_slot(true, scheme, &p.light_theme) {
+                    p.env
                 } else {
                     self.now
                 }
@@ -15983,7 +16002,7 @@ mod stable_tab_id_tests {
 
 #[cfg(test)]
 mod theme_ux_tests {
-    use super::{colorfgbg_env, next_minimum_contrast, random_other, FirstShellEnv};
+    use super::{colorfgbg_env, next_minimum_contrast, random_other, FirstShellEnv, PendingLightEnv};
     use crate::appearance::{Appearance, ColorScheme, FirstReading};
 
     #[test]
@@ -16024,7 +16043,11 @@ mod theme_ux_tests {
             }
             FirstShellEnv {
                 now: d.clone(),
-                pending: Some((first, l.clone(), "solarized_light".to_string())),
+                pending: Some(PendingLightEnv {
+                    first,
+                    env: l.clone(),
+                    light_theme: "solarized_light".to_string(),
+                }),
             }
             .resolve()
         };
