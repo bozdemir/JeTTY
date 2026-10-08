@@ -80,8 +80,8 @@ pub fn build_command_palette(
 
     // --- Vertical metrics (scale with DPI × UI font; floored so a short window
     // still fits) ---
-    let vscale = cm.u;
-    let text_h = cm.text_h();
+    let vscale = cm.overlay_u();
+    let text_h = 16.0 * vscale;
     let pad_v = (14.0 * vscale).max(6.0);
     let input_h = (34.0 * vscale).max(24.0);
     let div_h = 1.0;
@@ -205,7 +205,8 @@ pub fn build_command_palette(
             if idx >= kept {
                 continue; // fell into the truncated tail
             }
-            let cx = text_x + xs[idx];
+            let Some(&dx) = xs.get(idx) else { continue };
+            let cx = text_x + dx;
             labels.push((chars[idx].to_string(), cx, row_text_y, accent));
         }
     }
@@ -307,10 +308,12 @@ mod tests {
     #[test]
     fn selection_quad_present_when_a_row_is_selected() {
         let titles = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        // The highlight's corner radius is 6 design px at the overlay scale.
+        let is_sel = |q: &&Rect| (q.radius - 6.0 * CM.overlay_u()).abs() < 1e-4;
         // With a selection: a rounded highlight quad exists.
         let rows = sample_rows(&titles, 1);
         let p = build_command_palette(1000, 700, &theme(), &mut mono(), CM, "", &rows, 3, 0);
-        let sel_quads = p.quads.iter().filter(|q| q.radius == 6.0).count();
+        let sel_quads = p.quads.iter().filter(is_sel).count();
         assert_eq!(sel_quads, 1, "exactly one selection highlight expected");
         // With NO selection: none.
         let rows: Vec<PaletteRow> = titles
@@ -318,7 +321,7 @@ mod tests {
             .map(|t| PaletteRow { title: t, match_indices: &[], selected: false })
             .collect();
         let p = build_command_palette(1000, 700, &theme(), &mut mono(), CM, "", &rows, 3, 0);
-        assert_eq!(p.quads.iter().filter(|q| q.radius == 6.0).count(), 0);
+        assert_eq!(p.quads.iter().filter(is_sel).count(), 0);
     }
 
     #[test]

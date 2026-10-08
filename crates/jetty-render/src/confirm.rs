@@ -131,6 +131,8 @@ pub fn build_confirm_close(
     m: &mut dyn ChromeMeasure,
     cm: ChromeMetrics,
 ) -> ConfirmPopup {
+    // Clip first: the title is program-controlled (OSC 0/2) and may be huge.
+    let (title, _) = crate::chrome::clip_head(title);
     let shown_title: String = if title.chars().count() > 28 {
         let t: String = title.chars().take(27).collect();
         format!("{t}…")

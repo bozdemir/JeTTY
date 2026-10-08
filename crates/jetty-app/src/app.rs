@@ -403,7 +403,14 @@ fn resolve_title(
         return None;
     }
     match update {
-        Some(t) => Some(t),
+        // OSC 0/2 titles are program-controlled and can be megabytes: keep only
+        // what any title surface (tab bar, OS title, palette, confirm dialog)
+        // could show, so no downstream path ever measures/draws/matches a huge
+        // string.
+        Some(t) => {
+            let (head, cut) = jetty_render::clip_head(&t);
+            Some(if cut { head.to_string() } else { t })
+        }
         None => Some(default_title.to_string()),
     }
 }
@@ -3819,7 +3826,7 @@ impl App {
             .unwrap_or(1.0)
             .max(0.5);
         // Physical panel = PANEL_W × u; logical = that / the window's DPI.
-        let f = (self.settings_metrics().u / scale).max(1.0);
+        let f = (self.settings_metrics().overlay_u() / scale).max(1.0);
         let mut w = (jetty_render::PANEL_W * f).ceil() as u32 + 4;
         let mut h = (jetty_render::PANEL_H * f).ceil() as u32 + 4;
         // Never exceed the monitor (leave a margin) so the window stays on-screen.
@@ -7532,7 +7539,7 @@ impl App {
                     // on HiDPI the bottom bands (caret RGB sliders) stayed
                     // unreachable and on sub-1× the scroll overshot into blank
                     // space (F10).
-                    let dpi = self.settings_metrics().u.max(0.1);
+                    let dpi = self.settings_metrics().overlay_u().max(0.1);
                     let max_scroll = (jetty_render::EFFECTS_CONTENT_H
                         - jetty_render::EFFECTS_VISIBLE_H).max(0.0)
                         * dpi;
@@ -8811,11 +8818,14 @@ impl ApplicationHandler<AppEvent> for App {
                         .as_ref()
                         .map(|g| self.tabbar_y(g.config.height as f32))
                         .unwrap_or(0.0);
+                    // The tear-out band scales with the chrome (a fixed 24px was a
+                    // third of a 72px bar on a 2× display).
+                    let cm = self.chrome_metrics();
                     let now_tearing = crate::detached::tearing(
                         position.y as f32,
                         bar_y,
-                        self.bar_h(),
-                        crate::detached::TEAR_THRESHOLD_PX,
+                        cm.bar_h(),
+                        cm.px(crate::detached::TEAR_THRESHOLD_PX),
                     ) && crate::detached::can_detach(self.tabs.len());
                     if let Some(drag) = self.tab_drag.as_mut() {
                         if drag.tearing != now_tearing {
@@ -12918,6 +12928,17 @@ mod resolve_title_tests {
     #[test]
     fn reset_restores_default() {
         assert_eq!(resolve_title(None, false, "Tab 2"), Some("Tab 2".to_string()));
+    }
+
+    #[test]
+    fn huge_osc_titles_are_clipped_at_ingestion() {
+        // A program can send a multi-MB OSC 0/2 title; only a displayable head
+        // is kept, so the tab bar / OS title / palette never handle it whole.
+        let huge = "t".repeat(1 << 20);
+        let got = resolve_title(Some(huge), false, "Tab 2").unwrap();
+        assert_eq!(got.chars().count(), jetty_render::MAX_LABEL_CHARS);
+        // Ordinary titles pass through untouched (no reallocation path).
+        assert_eq!(resolve_title(Some("vim ~/x".into()), false, "T").unwrap(), "vim ~/x");
     }
 }
 

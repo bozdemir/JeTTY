@@ -170,19 +170,16 @@ pub struct TextLayer {
     /// Chrome text measurement (`ChromeMeasure`): rendered width per label for
     /// non-title [0] and tab-title [1] chrome. Chrome labels are mostly static
     /// strings rebuilt every rendered frame, so a hit is one hash lookup and a
-    /// miss shapes once. Cleared whenever the chrome family/size changes.
-    measure_cache: [std::collections::HashMap<String, f32>; 2],
+    /// miss shapes once. Keys are CLIPPED labels and the caches are BYTE-
+    /// budgeted (`MeasureCache`), so program-controlled text (huge OSC titles)
+    /// can't grow them. Cleared whenever the chrome family/size changes.
+    measure_cache: [crate::chrome::MeasureCache<f32>; 2],
     /// Per-char boundary x offsets (`ChromeMeasure::char_xs`) for the few
     /// labels that need them (truncation fits, carets, fuzzy highlights).
-    xs_cache: [std::collections::HashMap<String, Vec<f32>>; 2],
+    xs_cache: [crate::chrome::MeasureCache<Vec<f32>>; 2],
     /// Scratch buffer the measurement shapes into (no per-call allocation).
     measure_buffer: Buffer,
 }
-
-/// Entries kept per chrome-measurement cache before it is simply cleared.
-/// Chrome shows a few hundred distinct labels at most; the cap only bounds a
-/// pathological stream of unique strings (e.g. a fast-changing title).
-const MEASURE_CACHE_CAP: usize = 2048;
 
 impl TextLayer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, font_size: f32) -> Self {
@@ -1021,7 +1018,11 @@ impl TextLayer {
             // chrome family lacks (emoji, CJK, symbols on a custom UI font)
             // rendered as a tofu box. Chrome is proportional overlay text with
             // no grid-alignment constraint, and overlays only shape on rendered
-            // frames (idle draws nothing), so Advanced is safe here.
+            // frames (idle draws nothing), so Advanced is safe here. Clipped to
+            // MAX_LABEL_CHARS: labels can carry program-controlled text (a
+            // multi-MB OSC title), and shaping that whole per frame is a DoS —
+            // nothing past the clip could be visible anyway.
+            let (text, _) = crate::chrome::clip_head(text);
             buf.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
         }
 
@@ -1171,7 +1172,10 @@ impl TextLayer {
 /// positions carets, highlights, right-aligned values and truncation by what
 /// is actually drawn (see `crate::chrome`).
 impl crate::chrome::ChromeMeasure for TextLayer {
+    /// Clips `s` to `MAX_LABEL_CHARS` first (bounded shaping for program-
+    /// controlled text); `out` then covers that clipped prefix.
     fn char_xs(&mut self, s: &str, title: bool, out: &mut Vec<f32>) {
+        let (s, _) = crate::chrome::clip_head(s);
         let slot = title as usize;
         if let Some(xs) = self.xs_cache[slot].get(s) {
             out.clear();
@@ -1179,11 +1183,8 @@ impl crate::chrome::ChromeMeasure for TextLayer {
             return;
         }
         self.shape_char_xs(s, title, out);
-        let cache = &mut self.xs_cache[slot];
-        if cache.len() >= MEASURE_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(s.to_string(), out.clone());
+        let bytes = out.len() * std::mem::size_of::<f32>();
+        self.xs_cache[slot].insert(s, out.clone(), bytes);
     }
 
     fn text_w(&mut self, s: &str) -> f32 {
@@ -1197,7 +1198,10 @@ impl crate::chrome::ChromeMeasure for TextLayer {
 
 impl TextLayer {
     /// Cached rendered width of a chrome label (`title` = tab-title family).
+    /// Measures at most `MAX_LABEL_CHARS` chars — exactly what the overlay
+    /// pass will draw of it (it clips the same way).
     fn cached_width(&mut self, s: &str, title: bool) -> f32 {
+        let (s, _) = crate::chrome::clip_head(s);
         if s.is_empty() {
             return 0.0;
         }
@@ -1208,11 +1212,7 @@ impl TextLayer {
         let mut xs = Vec::new();
         self.shape_char_xs(s, title, &mut xs);
         let w = xs.last().copied().unwrap_or(0.0);
-        let cache = &mut self.measure_cache[slot];
-        if cache.len() >= MEASURE_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(s.to_string(), w);
+        self.measure_cache[slot].insert(s, w, std::mem::size_of::<f32>());
         w
     }
 }

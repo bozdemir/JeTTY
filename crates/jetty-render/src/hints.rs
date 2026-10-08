@@ -64,9 +64,9 @@ pub fn build_hint_overlay(
         (bg[2] as f32 + (accent[2] as f32 - bg[2] as f32) * 0.4).round() as u8,
     ];
 
-    let vscale = cm.u;
+    let vscale = cm.overlay_u();
     let pad_x = (3.0 * vscale).max(2.0);
-    let text_h = cm.text_h();
+    let text_h = 16.0 * vscale;
     let radius = (cell_h * 0.25).min(6.0);
     let max_x = (win_w as f32 - SCROLLBAR_W).max(0.0);
 
@@ -133,10 +133,10 @@ pub fn build_copy_pill(
     } else {
         "COPY".to_string()
     };
-    let vscale = cm.u;
+    let vscale = cm.overlay_u();
     let pad = 10.0 * vscale;
     let pill_h = 24.0 * vscale;
-    let text_h = cm.text_h();
+    let text_h = 16.0 * vscale;
     let text_w = m.text_w(&text);
     let pill_w = (text_w + pad * 2.0).min((win_w as f32 - 16.0).max(0.0));
     let x = 8.0f32.min((win_w as f32 - pill_w - 8.0).max(0.0));

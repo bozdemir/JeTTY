@@ -1040,6 +1040,42 @@ mod tests {
     }
 
     #[test]
+    fn huge_program_titles_cost_bounded_work_per_frame() {
+        // OSC 0/2 titles are program-controlled; a hostile program can send a
+        // different multi-MB title every frame. Each frame must shape a bounded
+        // amount of text and emit short labels, however long the titles are.
+        struct Spy {
+            inner: MonoMeasure,
+            max_chars: usize,
+            calls: usize,
+        }
+        impl ChromeMeasure for Spy {
+            fn char_xs(&mut self, s: &str, title: bool, out: &mut Vec<f32>) {
+                self.calls += 1;
+                self.max_chars = self.max_chars.max(s.chars().count());
+                self.inner.char_xs(s, title, out);
+            }
+        }
+        let mut tabs = vec![("w".repeat(1 << 20), true), ("v".repeat(1 << 20), false)];
+        let mut spy = Spy { inner: MonoMeasure(CHROME_CHAR_W), max_chars: 0, calls: 0 };
+        for frame in 0..1000 {
+            // A DISTINCT 1 MiB title every frame, without reallocating.
+            tabs[0].0.replace_range(0..6, &format!("{frame:06}"));
+            spy.calls = 0;
+            let bar = build_tab_bar_ex(1000, &tabs, &theme(), None, CtrlHover::None, None, &mut spy, CM, &[]);
+            assert!(spy.calls <= 20, "frame {frame}: {} measurements", spy.calls);
+            for l in bar.title_labels.iter().chain(&bar.labels) {
+                assert!(l.0.chars().count() <= crate::chrome::MAX_LABEL_CHARS + 1);
+            }
+        }
+        assert!(
+            spy.max_chars <= crate::chrome::MAX_LABEL_CHARS,
+            "shaped {} chars of a 1 MiB title",
+            spy.max_chars
+        );
+    }
+
+    #[test]
     fn detached_close_rect_tracks_metrics() {
         let hi = ChromeMetrics::new(2.0, 16.0);
         let r = detached_close_rect(2000, hi);

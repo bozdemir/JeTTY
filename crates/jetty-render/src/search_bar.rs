@@ -53,8 +53,8 @@ pub fn build_search_bar(
     let border_col: [u8; 4] = [border3[0], border3[1], border3[2], 255];
     let text_col = lerp(0.70);
 
-    // HiDPI × UI-font scale (the chrome unit; 1.0 at 1×/16pt).
-    let vscale = cm.u;
+    // HiDPI × UI-font scale (the overlay unit; 0.98 at 1×/16pt, see `OVERLAY_SCALE`).
+    let vscale = cm.overlay_u();
     let bar_h = 34.0 * vscale;
     let pad = 10.0 * vscale;
     let caret_w = 2.0;
@@ -107,7 +107,7 @@ pub fn build_search_bar(
     quads.push(panel);
 
     // Chrome text line box (the UI font's em); center it vertically.
-    let text_h = cm.text_h();
+    let text_h = 16.0 * vscale;
     let text_y = y + (bar_h - text_h) / 2.0;
 
     let mut labels: Vec<(String, f32, f32, [u8; 3])> = Vec::new();

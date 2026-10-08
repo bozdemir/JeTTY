@@ -181,8 +181,9 @@ pub fn build_help_overlay(
     // `ceil(font_size * 1.3)` with `font_size = ui_font_logical * scale`, so it
     // grows with DPI and the UI font. Scale every vertical metric (ideals AND
     // floors) by the same chrome unit the text uses so rows never overlap their
-    // neighbour on a 2× display or at a large UI font. At 1×/16pt `vscale == 1`.
-    let vscale = cm.u;
+    // neighbour on a 2× display or at a large UI font. This is the overlay unit:
+    // 0.98 at 1×/16pt (`OVERLAY_SCALE`), as the default always rendered.
+    let vscale = cm.overlay_u();
     let pad_ideal = PAD_IDEAL * vscale;
     let title_h_ideal = TITLE_H_IDEAL * vscale;
     let row_h_ideal = ROW_H_IDEAL * vscale;
