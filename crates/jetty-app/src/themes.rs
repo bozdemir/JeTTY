@@ -1,7 +1,7 @@
 //! User-imported theme loading.
 //!
 //! Reads `~/.config/jetty/themes/*.toml`, parses each into a `jetty_core::Theme`,
-//! and merges them with the 22 built-ins into the runtime registry (a user theme
+//! and merges them with the 46 built-ins into the runtime registry (a user theme
 //! whose `name` matches a built-in REPLACES it in place; new names append). Parsing
 //! lives here (jetty-app already carries serde/toml/dirs); jetty-core holds only the
 //! parsed data + the registry.

@@ -104,12 +104,13 @@ pub fn build_welcome_overlay(
     // Value column starts after the key column.
     let val_x = info_x + key_w;
 
-    // Info row values.
+    // Info row values. "Themes" names the active theme and how many there are
+    // (built-ins + user themes — the registry the picker lists).
     let info_rows: &[(&str, String)] = &[
         ("JeTTY", version.to_string()),
         ("Render", format!("wgpu · {}", backend)),
         ("Terminal", format!("JeTTY {}", version)),
-        ("Themes", "Mocha · Tokyo · Gruvbox · Dracula · Onyx".to_string()),
+        ("Themes", format!("{} · {} themes", theme.display_name, jetty_core::theme_count())),
     ];
 
     // Compute logo block height so we can vertically center the info rows
@@ -231,6 +232,16 @@ mod tests {
         let w = build_welcome_overlay(1000, 700, 36.0, "1.2.3", "Metal", &theme(), TEST_CHAR_W, 22.0);
         let joined: String = w.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("Metal"), "backend name must appear in Render row");
+    }
+
+    #[test]
+    fn themes_row_names_the_active_theme_and_the_count() {
+        let t = jetty_core::Theme::by_name("gruvbox_light");
+        let w = build_welcome_overlay(1000, 700, 36.0, "0.1.0", "Vulkan", &t, TEST_CHAR_W, 22.0);
+        let n = jetty_core::theme_count();
+        assert!(n >= jetty_core::theme::PRESETS.len());
+        let row = format!("Gruvbox Light · {n} themes");
+        assert!(w.labels.iter().any(|l| l.0 == row), "missing {row:?}");
     }
 
     #[test]

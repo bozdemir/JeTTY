@@ -32,7 +32,7 @@ fn user_theme(name: &str, display: &str, bg: [u8; 4]) -> Theme {
 fn empty_registry_falls_back_to_builtins() {
     let _g = SERIAL.lock().unwrap();
     jetty_core::set_registry(Vec::new());
-    // With no registry, every accessor sees the 22 built-ins.
+    // With no registry, every accessor sees the 46 built-ins.
     assert_eq!(jetty_core::theme_count(), jetty_core::theme::PRESETS.len());
     assert_eq!(jetty_core::theme_index("dracula"), Some(3));
     assert_eq!(jetty_core::theme_at(0).name.as_ref(), "catppuccin_mocha");
