@@ -1491,6 +1491,18 @@ pub struct App {
     /// in one Wake): a cursor jump right after is output, not the user — no
     /// trail for it.
     flood_at: Option<std::time::Instant>,
+    /// The visual bell playing in the main window (start, kind) — a bounded
+    /// animation like `caret_anim` (`BELL_SECS`), at most one per
+    /// `BELL_MIN_GAP` (`bell_limit`).
+    bell_anim: Option<(std::time::Instant, crate::motion::VisualBell)>,
+    bell_limit: crate::motion::RateLimit,
+    /// The command status pulse playing in the main window (start, kind), and
+    /// one owed to the next summon: a command that finished while hidden.
+    pulse_anim: Option<(std::time::Instant, crate::motion::PulseKind)>,
+    pulse_deferred: Option<crate::motion::PulseKind>,
+    /// The rim pass (bell rim / command pulse), built by the first frame once
+    /// either is enabled.
+    rim: Option<jetty_render::RimLayer>,
 
 
 }
@@ -2022,6 +2034,11 @@ impl App {
             trail_layer: None,
             trail_wake: None,
             flood_at: None,
+            bell_anim: None,
+            bell_limit: crate::motion::RateLimit::default(),
+            pulse_anim: None,
+            pulse_deferred: None,
+            rim: None,
         };
         // Persisted user settings override the env-derived defaults (but env
         // vars still seed the initial values above, so an explicit JETTY_* can
@@ -6911,7 +6928,8 @@ impl App {
         // surfaced after it; empty on every normal pass.
         let mut runsel_notices: Vec<crate::runsel::Notice> = Vec::new();
         let title_mode = self.tab_title_mode;
-        // The ACTIVE tab rang the bell this drain (`glitch_on_bell`).
+        // The ACTIVE tab rang the bell (BEL) this drain: the visual bell and
+        // `glitch_on_bell`, after the loop.
         let mut active_bell = false;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             let (had, title_changed, notice) = Self::drain_one_tab(tab, &mut vt_read, title_mode);
@@ -6924,6 +6942,7 @@ impl App {
             // sticky (never downgraded by later output); Output only lights a
             // clean tab. Rides the existing event-driven drain — zero idle work.
             let rang = tab.terminal.take_bell();
+            active_bell |= rang && i == self.active;
             if i != self.active {
                 let new = next_activity(tab.meta.activity, had, rang, suppress_output);
                 if new != tab.meta.activity {
@@ -6949,7 +6968,62 @@ impl App {
             self.show_status_pill(n);
         }
         self.arm_title_recheck();
+        if active_bell {
+            self.ring_main_bell();
+        }
         (active_had_data, chrome_changed, exited)
+    }
+
+    /// The main window's active tab rang the bell: play the visual bell
+    /// (`visual_bell`; the rim while motion is reduced) — at most one per
+    /// `BELL_MIN_GAP`. A shown but unfocused window asks for attention instead;
+    /// a hidden one has nobody to show it to.
+    fn ring_main_bell(&mut self) {
+        let kind = self.visual_bell.effective(self.motion_reduced());
+        if kind == crate::motion::VisualBell::Off || !self.visible || self.main_occluded {
+            return;
+        }
+        if !self.main_focused {
+            if let Some(w) = &self.window {
+                w.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+            }
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.bell_limit.allow(now, crate::motion::BELL_MIN_GAP) {
+            self.bell_anim = Some((now, kind));
+            self.request_main_paint();
+        }
+    }
+
+    /// A detached window's tab rang the bell (the main window's rules).
+    fn ring_detached_bell(&mut self, pos: usize) {
+        let kind = self.visual_bell.effective(self.motion_reduced());
+        let Some(dw) = self.detached.get_mut(pos) else { return };
+        if kind == crate::motion::VisualBell::Off || dw.occluded {
+            return;
+        }
+        if !dw.focused {
+            dw.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+            return;
+        }
+        let now = std::time::Instant::now();
+        if dw.bell_limit.allow(now, crate::motion::BELL_MIN_GAP) {
+            dw.bell_anim = Some((now, kind));
+            dw.request_paint();
+        }
+    }
+
+    /// A command in the main window's active tab finished and earned `kind`:
+    /// pulse now when the window is shown, else on the next summon (a failure
+    /// owed outranks a success).
+    fn play_main_pulse(&mut self, kind: crate::motion::PulseKind) {
+        if self.visible {
+            self.pulse_anim = Some((std::time::Instant::now(), kind));
+            self.request_main_paint();
+        } else {
+            self.pulse_deferred = Some(crate::motion::worse_pulse(self.pulse_deferred, kind));
+        }
     }
 
     /// End-of-iteration re-arm of every tab's coalesced PTY wake (main and
@@ -7280,6 +7354,10 @@ impl App {
         let mut summon_target: Option<usize> = None;
         let mut summon_is_failure = false;
         let mut badge_changed = false;
+        // Command status pulse for the ACTIVE tab (`command_pulse`); "long" is
+        // the notify threshold.
+        let pulse_long = std::time::Duration::from_secs(self.notify_min_seconds);
+        let mut main_pulse: Option<crate::motion::PulseKind> = None;
         for i in 0..self.tabs.len() {
             let completions = self.tabs[i].terminal.take_completions();
             // Finished / failed badges on BACKGROUND tabs — independent of the
@@ -7303,6 +7381,14 @@ impl App {
             {
                 self.trigger_main_glitch();
             }
+            // The active tab's status pulse — independent of notifications too.
+            if i == active {
+                for c in &completions {
+                    if let Some(k) = self.command_pulse.pulse_for(c.exit_code, c.duration, pulse_long) {
+                        main_pulse = Some(crate::motion::worse_pulse(main_pulse, k));
+                    }
+                }
+            }
             if enabled {
                 for c in completions {
                     let watching = main_tab_watched(main_watching, i, active);
@@ -7322,6 +7408,9 @@ impl App {
         if badge_changed && self.visible && !self.main_occluded {
             self.request_main_paint();
         }
+        if let Some(k) = main_pulse {
+            self.play_main_pulse(k);
+        }
         // At most ONE auto-summon for the whole batch, AFTER gating every tab against
         // the pre-loop snapshot (so no sibling completion is suppressed).
         if let Some(tab) = summon_target {
@@ -7336,9 +7425,19 @@ impl App {
                     dw.request_paint();
                 }
             }
-            if enabled {
-                for c in completions {
+            let mut pulse: Option<crate::motion::PulseKind> = None;
+            for c in completions {
+                if let Some(k) = self.command_pulse.pulse_for(c.exit_code, c.duration, pulse_long) {
+                    pulse = Some(crate::motion::worse_pulse(pulse, k));
+                }
+                if enabled {
                     self.maybe_notify_detached(i, c);
+                }
+            }
+            if let (Some(k), Some(dw)) = (pulse, self.detached.get_mut(i)) {
+                if !dw.occluded {
+                    dw.pulse_anim = Some((std::time::Instant::now(), k));
+                    dw.request_paint();
                 }
             }
         }
@@ -7856,6 +7955,8 @@ impl App {
         self.glitch.cancel();
         self.trail.reset();
         self.trail_wake = None;
+        self.bell_anim = None;
+        self.pulse_anim = None;
         self.pending_dock_frames = 0;
         self.pending_center_frames = 0;
         // Paints owed to a now-invisible window: drop them (the next summon
@@ -8131,6 +8232,8 @@ impl App {
                 self.glitch.cancel();
                 self.trail.reset();
                 self.trail_wake = None;
+                self.bell_anim = None;
+                self.pulse_anim = None;
                 self.pending_dock_frames = 0;
                 self.pending_center_frames = 0;
                 // Paints owed to a now-invisible window (idle HUD, keystroke
@@ -10161,6 +10264,8 @@ impl App {
         let window_border = self.window_border;
         // Reduce-motion gates, resolved before the window borrow below.
         let glow_on = self.caret_glow_on();
+        let rim_wanted = self.visual_bell.effective(self.motion_reduced()) == crate::motion::VisualBell::Rim
+            || self.command_pulse != crate::motion::CommandPulse::Off;
 
         let Some(dw) = self.detached.get_mut(pos) else { return };
         // This window's chrome geometry (its own DPI × the UI font).
@@ -10271,6 +10376,21 @@ impl App {
                 .get_or_insert_with(|| jetty_render::CaretFx::new(&g.device, g.format))
                 .prepare(&g.device, light);
         }
+        // This window's bell / pulse (the main window's rules and colors).
+        if rim_wanted && dw.rim.is_none() {
+            dw.rim = Some(jetty_render::RimLayer::new(&dw.gpu.device, dw.gpu.format));
+        }
+        let edge = if dw.bell_anim.is_some() || dw.pulse_anim.is_some() {
+            crate::motion::edge_draw(
+                dw.bell_anim,
+                dw.pulse_anim,
+                &jetty_render::UiPalette::cached(&theme),
+                std::time::Instant::now(),
+            )
+        } else {
+            crate::motion::EdgeDraw::default()
+        };
+        let rim_layer = dw.rim.as_ref();
         let caret_fx = dw.caret_fx.as_ref();
         let trail_layer = dw.trail_layer.as_ref();
         let gpu = &mut dw.gpu;
@@ -10513,6 +10633,26 @@ impl App {
                 jetty_render::ring_width_px(scale),
                 [c[0], c[1], c[2], 255],
             );
+        }
+        // Visual bell / command pulse — the main window's passes (see there).
+        if let Some(veil) = edge.veil {
+            quad.render(
+                &gpu.device, &gpu.queue, scene_view, width, height,
+                &[jetty_render::Rect::new(0.0, 0.0, width as f32, height as f32, veil)],
+            );
+        }
+        if let Some(rim) = rim_layer {
+            for spec in &edge.rims {
+                rim.apply(
+                    &gpu.device,
+                    &gpu.queue,
+                    scene_view,
+                    &jetty_render::RimUniform::new(
+                        width, height, corner_radius_px, corner_radius_px, spec.rgb, spec.strength,
+                        spec.band * scale, 0.0,
+                    ),
+                );
+            }
         }
         // Caret glow/ripple — the main window's pass (see there), BEFORE the
         // corner mask so the mask clips it to the window shape.
@@ -11075,6 +11215,23 @@ impl ApplicationHandler<AppEvent> for App {
         if self.glitch.expire(now) {
             main_settled = true;
         }
+        // The visual bell / command pulse end by the wall clock.
+        if self.bell_anim.is_some_and(|(s, _)| anim_expired(s, crate::motion::BELL_SECS, now)) {
+            self.bell_anim = None;
+            main_settled = true;
+        }
+        if self.pulse_anim.is_some_and(|(s, _)| anim_expired(s, crate::motion::PULSE_SECS, now)) {
+            self.pulse_anim = None;
+            main_settled = true;
+        }
+        // A pulse owed by a command that finished while hidden plays once the
+        // window is back and its summon reveal is over.
+        if self.pulse_deferred.is_some() && main_visible && self.summon_anim.is_none() && !self.summon_pending {
+            if let Some(k) = self.pulse_deferred.take() {
+                self.pulse_anim = Some((now, k));
+                main_settled = true;
+            }
+        }
         // The cursor trail's dwell ended: one paint decides whether it starts.
         if self.trail_wake.is_some_and(|d| now >= d) {
             self.trail_wake = None;
@@ -11109,6 +11266,14 @@ impl ApplicationHandler<AppEvent> for App {
             }
             if dw.trail_wake.is_some_and(|d| now >= d) {
                 dw.trail_wake = None;
+                settled = true;
+            }
+            if dw.bell_anim.is_some_and(|(s, _)| anim_expired(s, crate::motion::BELL_SECS, now)) {
+                dw.bell_anim = None;
+                settled = true;
+            }
+            if dw.pulse_anim.is_some_and(|(s, _)| anim_expired(s, crate::motion::PULSE_SECS, now)) {
+                dw.pulse_anim = None;
                 settled = true;
             }
             if dw.trail.anim().is_some_and(|a| anim_expired(a.started, trail_max_secs, now)) {
@@ -11247,6 +11412,8 @@ impl ApplicationHandler<AppEvent> for App {
                 || self.slide_anim.is_some()
                 || self.summon_pending
                 || self.trail.animating()
+                || self.bell_anim.is_some()
+                || self.pulse_anim.is_some()
                 || caret_drives_frames(self.caret_anim, self.key_paint_due)))
             || (self.visible && (self.pending_dock_frames > 0 || self.pending_center_frames > 0));
         if main_pending {
@@ -11260,7 +11427,10 @@ impl ApplicationHandler<AppEvent> for App {
         let detached_animates = |d: &crate::detached::DetachedWindow| {
             !d.occluded
                 && d.acquire_retry.is_none()
-                && (d.trail.animating() || caret_drives_frames(d.caret_anim, d.key_paint_due))
+                && (d.trail.animating()
+                    || d.bell_anim.is_some()
+                    || d.pulse_anim.is_some()
+                    || caret_drives_frames(d.caret_anim, d.key_paint_due))
         };
         let detached_pending = self.detached.iter().any(detached_animates);
         if detached_pending {
@@ -11942,6 +12112,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // Run-selection pills from detached-tab drains (a pending rides
                 // a detach move); collected locally, surfaced after the loop.
                 let mut runsel_notices: Vec<crate::runsel::Notice> = Vec::new();
+                // Detached windows whose tab rang the bell (visual bell after the loop).
+                let mut detached_bells: Vec<usize> = Vec::new();
                 let frame_interval = self.frame_interval;
                 let title_mode = self.tab_title_mode;
                 for (i, dw) in self.detached.iter_mut().enumerate() {
@@ -11963,7 +12135,9 @@ impl ApplicationHandler<AppEvent> for App {
                     // Consume the bell so a reattach never shows a phantom Bell
                     // dot. Detached windows draw no indicator by design: the tab
                     // IS the visible, active tab of its own window.
-                    let _ = dw.tab.terminal.take_bell();
+                    if dw.tab.terminal.take_bell() {
+                        detached_bells.push(i);
+                    }
                     // OSC titles: sync the OS window title even when occluded
                     // (the taskbar entry of a minimized window must update).
                     dw.sync_os_title();
@@ -12007,6 +12181,9 @@ impl ApplicationHandler<AppEvent> for App {
                     self.show_status_pill(n);
                 }
                 self.arm_title_recheck();
+                for pos in detached_bells {
+                    self.ring_detached_bell(pos);
+                }
                 // Remove in descending index order so earlier indices stay valid,
                 // mirroring `close_exited_tabs`. Dropping the `DetachedWindow`
                 // closes its OS window; its already-exited child is reaped
@@ -14175,6 +14352,28 @@ impl ApplicationHandler<AppEvent> for App {
                     ),
                     _ => None,
                 };
+                // Visual bell / command pulse: this frame's veil + rims (theme
+                // roles via UiPalette), and the rim pass — built by the first
+                // frame once a rim effect is enabled (not on the first bell).
+                let rim_wanted = self.visual_bell.effective(self.motion_reduced())
+                    == crate::motion::VisualBell::Rim
+                    || self.command_pulse != crate::motion::CommandPulse::Off;
+                if rim_wanted && self.rim.is_none() {
+                    if let Some(g) = &self.gpu {
+                        self.rim = Some(jetty_render::RimLayer::new(&g.device, g.format));
+                    }
+                }
+                let edge = if self.bell_anim.is_some() || self.pulse_anim.is_some() {
+                    crate::motion::edge_draw(
+                        self.bell_anim,
+                        self.pulse_anim,
+                        &jetty_render::UiPalette::cached(&theme),
+                        std::time::Instant::now(),
+                    )
+                } else {
+                    crate::motion::EdgeDraw::default()
+                };
+                let rim_layer = self.rim.as_ref();
                 let trail_layer = self.trail_layer.as_ref();
                 let (Some(gpu), Some(text), Some(chrome_text), Some(quad), Some(image_layer)) = (
                     &mut self.gpu,
@@ -14664,6 +14863,30 @@ impl ApplicationHandler<AppEvent> for App {
                         if !pal.labels.is_empty() {
                             let _ = chrome_text.render_overlays(
                                 &gpu.device, &gpu.queue, scene_view, width, height, &pal.labels,
+                            );
+                        }
+                    }
+                    // Visual bell / command pulse: the flash veil over everything,
+                    // then the rim(s) along the window edge (following the corner
+                    // shape and the dropdown slide) — before the corner mask,
+                    // which clips them to the window.
+                    if let Some(veil) = edge.veil {
+                        quad.render(
+                            &gpu.device, &gpu.queue, scene_view, width, height,
+                            &[jetty_render::Rect::new(0.0, slide_y_offset, width as f32, height as f32, veil)],
+                        );
+                    }
+                    if let Some(rim) = rim_layer {
+                        let r_top = if top_flush { 0.0 } else { corner_radius_px };
+                        for spec in &edge.rims {
+                            rim.apply(
+                                &gpu.device,
+                                &gpu.queue,
+                                scene_view,
+                                &jetty_render::RimUniform::new(
+                                    width, height, r_top, corner_radius_px, spec.rgb, spec.strength,
+                                    spec.band * scale, slide_y_offset,
+                                ),
                             );
                         }
                     }

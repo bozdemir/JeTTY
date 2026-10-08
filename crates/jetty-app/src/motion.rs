@@ -346,6 +346,88 @@ pub fn pulse_envelope(t: f32) -> f32 {
     }
 }
 
+/// The worse of two pulses (a failure outranks a success).
+pub fn worse_pulse(a: Option<PulseKind>, b: PulseKind) -> PulseKind {
+    match (a, b) {
+        (Some(PulseKind::Failure), _) | (_, PulseKind::Failure) => PulseKind::Failure,
+        _ => PulseKind::Success,
+    }
+}
+
+/// How far inward (logical px) the bell rim / the command pulse glow.
+pub const BELL_RIM_BAND: f32 = 6.0;
+pub const PULSE_RIM_BAND: f32 = 10.0;
+/// Peak strength of the bell rim and the pulse rim.
+pub const BELL_RIM_STRENGTH: f32 = 0.9;
+pub const PULSE_RIM_STRENGTH: f32 = 1.0;
+/// Peak opacity of the flash veil (the theme fg over the window). It blends in
+/// LINEAR light, where a light veil on a dark page reads far stronger than a
+/// dark one on a light page — so the dark-page veil is the thinner one.
+pub const BELL_FLASH_ALPHA_DARK: f32 = 0.10;
+pub const BELL_FLASH_ALPHA_LIGHT: f32 = 0.24;
+
+/// One rim to draw: color, strength (0..1) and inward reach (logical px).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RimSpec {
+    pub rgb: [u8; 3],
+    pub strength: f32,
+    pub band: f32,
+}
+
+/// What a window draws this frame for its live visual bell and command pulse:
+/// a whole-window veil (the `"flash"` bell: the theme fg over everything) and
+/// up to two rims (the `"rim"` bell in the warn color; the pulse in `danger`
+/// for a failure, the `accent` for a long success). Colors come from the
+/// theme's [`jetty_render::UiPalette`], so a theme file's `accent` applies.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EdgeDraw {
+    pub veil: Option<[u8; 4]>,
+    pub rims: Vec<RimSpec>,
+}
+
+impl EdgeDraw {
+    pub fn is_empty(&self) -> bool {
+        self.veil.is_none() && self.rims.is_empty()
+    }
+}
+
+/// [`EdgeDraw`] for a bell that started at `bell.0` (as `bell.1`) and a pulse
+/// that started at `pulse.0`, at `now`.
+pub fn edge_draw(
+    bell: Option<(Instant, VisualBell)>,
+    pulse: Option<(Instant, PulseKind)>,
+    pal: &jetty_render::UiPalette,
+    now: Instant,
+) -> EdgeDraw {
+    let progress = |start: Instant, secs: f32| now.saturating_duration_since(start).as_secs_f32() / secs;
+    let mut out = EdgeDraw::default();
+    if let Some((start, kind)) = bell {
+        let k = pulse_envelope(progress(start, BELL_SECS));
+        match kind {
+            VisualBell::Flash if k > 0.0 => {
+                let [r, g, b] = pal.fg;
+                let peak = if pal.is_light { BELL_FLASH_ALPHA_LIGHT } else { BELL_FLASH_ALPHA_DARK };
+                out.veil = Some([r, g, b, (k * peak * 255.0).round() as u8]);
+            }
+            VisualBell::Rim if k > 0.0 => {
+                out.rims.push(RimSpec { rgb: pal.warn, strength: k * BELL_RIM_STRENGTH, band: BELL_RIM_BAND });
+            }
+            _ => {}
+        }
+    }
+    if let Some((start, kind)) = pulse {
+        let k = pulse_envelope(progress(start, PULSE_SECS));
+        if k > 0.0 {
+            let rgb = match kind {
+                PulseKind::Failure => pal.danger,
+                PulseKind::Success => pal.accent,
+            };
+            out.rims.push(RimSpec { rgb, strength: k * PULSE_RIM_STRENGTH, band: PULSE_RIM_BAND });
+        }
+    }
+    out
+}
+
 /// Accept at most one event per `gap`: `allow` is true (and records `now`)
 /// only when the previous accepted event is at least `gap` old.
 #[derive(Debug, Clone, Copy, Default)]
@@ -562,6 +644,45 @@ mod tests {
         assert!(post_settings(&glitchy, true, false).is_some());
         assert_eq!(post_settings(&glitchy, true, true), None);
         assert_eq!(post_key(&glitchy, true), None);
+    }
+
+    #[test]
+    fn failures_outrank_successes() {
+        assert_eq!(worse_pulse(None, PulseKind::Success), PulseKind::Success);
+        assert_eq!(worse_pulse(Some(PulseKind::Failure), PulseKind::Success), PulseKind::Failure);
+        assert_eq!(worse_pulse(Some(PulseKind::Success), PulseKind::Failure), PulseKind::Failure);
+    }
+
+    #[test]
+    fn edge_draw_timing_and_colors() {
+        let pal = jetty_render::UiPalette::from_theme(&jetty_core::Theme::by_name("catppuccin_mocha"));
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        // Flash bell: a veil in the theme fg, peaking at the attack end, gone by 150 ms.
+        let d = edge_draw(Some((t0, VisualBell::Flash)), None, &pal, at(22));
+        let veil = d.veil.expect("veil");
+        assert_eq!([veil[0], veil[1], veil[2]], pal.fg);
+        assert!(veil[3] >= 24 && veil[3] <= 26, "dark page: peak ≈ 10%: {}", veil[3]);
+        let light = jetty_render::UiPalette::from_theme(&jetty_core::Theme::by_name("solarized_light"));
+        let lv = edge_draw(Some((t0, VisualBell::Flash)), None, &light, at(22)).veil.expect("veil");
+        assert!(lv[3] > veil[3], "a light page gets the thicker (dark) veil");
+        assert!(edge_draw(Some((t0, VisualBell::Flash)), None, &pal, at(150)).is_empty());
+        // Rim bell: the warn color (amber — red is reserved for failures).
+        let d = edge_draw(Some((t0, VisualBell::Rim)), None, &pal, at(30));
+        assert_eq!(d.rims.len(), 1);
+        assert_eq!(d.rims[0].rgb, pal.warn);
+        assert_eq!(d.rims[0].band, BELL_RIM_BAND);
+        // Pulse: danger for a failure, accent for a success, ~0.4 s.
+        let d = edge_draw(None, Some((t0, PulseKind::Failure)), &pal, at(60));
+        assert_eq!(d.rims[0].rgb, pal.danger);
+        assert!(d.rims[0].strength > 0.99, "peak at the attack end");
+        let d = edge_draw(None, Some((t0, PulseKind::Success)), &pal, at(200));
+        assert_eq!(d.rims[0].rgb, pal.accent);
+        assert!(d.rims[0].strength > 0.0 && d.rims[0].strength < 1.0);
+        assert!(edge_draw(None, Some((t0, PulseKind::Failure)), &pal, at(400)).is_empty());
+        // Both at once: two rims, no veil.
+        let d = edge_draw(Some((t0, VisualBell::Rim)), Some((t0, PulseKind::Failure)), &pal, at(20));
+        assert_eq!((d.rims.len(), d.veil), (2, None));
     }
 
     #[test]

@@ -197,6 +197,13 @@
 ///                    the content moved up by the slide's ease-out offset and
 ///                    the window SHAPE cut at the moving bottom edge (square
 ///                    top, JETTY_CORNER_RADIUS bottom corners — the app's mask).
+///   JETTY_SHOT_BELL=flash|rim — the visual bell at JETTY_SHOT_BELL_T=t (0..1
+///                    of its 150 ms, default 0.15 = the peak).
+///   JETTY_SHOT_PULSE=failure|success — the command status pulse at
+///                    JETTY_SHOT_PULSE_T=t (0..1 of its 0.4 s, default 0.15).
+///                    Both use the app's colors (UiPalette warn / danger /
+///                    accent), its rim pass and the window radius
+///                    (JETTY_CORNER_RADIUS).
 ///   JETTY_SHOT_GLOW_T=t — the caret glow/ripple pass at progress t around the
 ///                    cursor (additive on a dark theme, multiply on a light
 ///                    one; same color source as JETTY_SHOT_CARET_COLOR).
@@ -1867,6 +1874,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             light,
         );
+    }
+
+    // --- Visual bell / command pulse (JETTY_SHOT_BELL / JETTY_SHOT_PULSE) ---
+    // The app's edge draw (veil + rims) at a chosen point of each animation,
+    // through the real quad veil and rim pass.
+    {
+        use jetty_app::motion::{edge_draw, CommandPulse, PulseKind, VisualBell, BELL_SECS, PULSE_SECS};
+        let now = std::time::Instant::now();
+        let ago = |t: f32, secs: f32| now - std::time::Duration::from_secs_f32(t.clamp(0.0, 1.0) * secs);
+        let getf = |k: &str, d: f32| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(d);
+        let bell = std::env::var("JETTY_SHOT_BELL").ok().map(|b| VisualBell::parse(&b)).filter(|b| *b != VisualBell::Off);
+        let pulse = std::env::var("JETTY_SHOT_PULSE").ok().and_then(|p| match p.as_str() {
+            "failure" | "fail" => Some(PulseKind::Failure),
+            "success" | "ok" => Some(PulseKind::Success),
+            other => CommandPulse::parse(other).pulse_for(Some(1), None, std::time::Duration::ZERO),
+        });
+        let edge = edge_draw(
+            bell.map(|b| (ago(getf("JETTY_SHOT_BELL_T", 0.15), BELL_SECS), b)),
+            pulse.map(|k| (ago(getf("JETTY_SHOT_PULSE_T", 0.15), PULSE_SECS), k)),
+            &jetty_render::UiPalette::cached(terminal.theme()),
+            now,
+        );
+        if !edge.is_empty() {
+            eprintln!("jetty-shot: bell {bell:?} / pulse {pulse:?} → {edge:?}");
+            let radius = std::env::var("JETTY_CORNER_RADIUS")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .map(|v| v.clamp(0.0, 24.0) * dpi)
+                .unwrap_or(0.0);
+            if let Some(veil) = edge.veil {
+                quad.render(
+                    &device, &queue, &view, width, height,
+                    &[jetty_render::Rect::new(0.0, 0.0, width as f32, height as f32, veil)],
+                );
+            }
+            if !edge.rims.is_empty() {
+                let rim = jetty_render::RimLayer::new(&device, format);
+                for spec in &edge.rims {
+                    rim.apply(
+                        &device,
+                        &queue,
+                        &view,
+                        &jetty_render::RimUniform::new(
+                            width, height, radius, radius, spec.rgb, spec.strength, spec.band * dpi, 0.0,
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     // --- Bayer Crystallize summon reveal (JETTY_SHOT_SUMMON_T) ---

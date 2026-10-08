@@ -438,6 +438,12 @@ pub(crate) struct DetachedWindow {
     pub trail_wake: Option<std::time::Instant>,
     /// When this window's tab last drained a flood (see `App::flood_at`).
     pub flood_at: Option<std::time::Instant>,
+    /// This window's visual bell / command pulse / rim pass (`App::bell_anim`
+    /// and friends, per window).
+    pub bell_anim: Option<(std::time::Instant, crate::motion::VisualBell)>,
+    pub bell_limit: crate::motion::RateLimit,
+    pub pulse_anim: Option<(std::time::Instant, crate::motion::PulseKind)>,
+    pub rim: Option<jetty_render::RimLayer>,
     /// The hovered 0-based grid cell the cache above was computed for.
     /// Mirrors `App::link_hover_cell`.
     pub link_hover_cell: Option<(usize, usize)>,
@@ -606,6 +612,10 @@ impl DetachedWindow {
             trail_layer: None,
             trail_wake: None,
             flood_at: None,
+            bell_anim: None,
+            bell_limit: crate::motion::RateLimit::default(),
+            pulse_anim: None,
+            rim: None,
         })
     }
 
@@ -655,6 +665,7 @@ impl DetachedWindow {
         // Rebuilt on the new device by the next glow / trail frame.
         self.caret_fx = None;
         self.trail_layer = None;
+        self.rim = None;
         self.acquire_retry = None;
         self.gpu = gpu;
         true
