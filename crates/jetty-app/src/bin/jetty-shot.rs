@@ -114,9 +114,16 @@
 ///   JETTY_SHOT_PREEDIT="text" — an IME composition at the cursor, drawn by the
 ///                    app's own builder (build_preedit_overlay): terminal font,
 ///                    theme bg backdrop, underline; shifts left at the edge.
-///   JETTY_SHOT_GRAPHEMES="row,col,cluster;…" — grapheme-cluster overrides for
-///                    the renderer (combining marks / VS16 / ZWJ drawn from the
-///                    whole cluster instead of the cell's base char).
+///   JETTY_SHOT_GRAPHEMES="row,col,cluster;…" — extra grapheme-cluster overrides
+///                    for the renderer (combining marks / VS16 / ZWJ drawn from
+///                    the whole cluster instead of the cell's base char), on top
+///                    of the ones the snapshot carries for the fed input.
+///   JETTY_SHOT_BUILTIN_GLYPHS=0 — draw box drawing / blocks / Powerline / braille
+///                    / sextants from the font instead of the built-in
+///                    cell-exact glyphs (config `builtin_glyphs`, default on).
+///   JETTY_SHOT_COLOR_EMOJI=0 — no color emoji (config `color_emoji`, default on).
+///   JETTY_SHOT_BOLD_BRIGHT=1 — bold text in the 8 normal ANSI colors renders
+///                    bright (config `bold_is_bright`, default off).
 ///   JETTY_SHOT_PANEL=1 — render the Settings window instead of a terminal: the
 ///                    frame defaults to the Settings window's physical size and
 ///                    the panel content comes from the config in
@@ -468,6 +475,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(lh) = std::env::var("JETTY_SHOT_LINE_HEIGHT").ok().and_then(|s| s.parse::<f32>().ok()) {
         text.set_line_height(lh);
     }
+    // The grid's glyph options (config `builtin_glyphs` / `color_emoji`, both on
+    // by default): `=0` turns one off.
+    let env_off = |k: &str| std::env::var(k).is_ok_and(|v| v == "0");
+    text.set_builtin_glyphs(!env_off("JETTY_SHOT_BUILTIN_GLYPHS"));
+    text.set_color_emoji(!env_off("JETTY_SHOT_COLOR_EMOJI"));
     // Chrome layer at the UI font size, mirroring the live app: ALL window chrome
     // (tab bar, status bar, context menu, settings panel, help, confirm, palette,
     // …) renders through this in the chosen UI family, independent of
@@ -553,6 +565,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminal.set_minimum_contrast(r);
         eprintln!("jetty-shot: minimum_contrast {:.2}", terminal.minimum_contrast());
     }
+    // Config `bold_is_bright` (default off), like the app applies at tab spawn.
+    terminal.set_bold_is_bright(env_flag("JETTY_SHOT_BOLD_BRIGHT"));
 
     if env_flag("JETTY_SHOT_PTY") {
         // Drive a REAL shell offscreen so we can see the live startup prompt
@@ -900,16 +914,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bg_rects.extend(cursor_under);
 
     // --- Pass 2: the grid text on top of the painted background ---
-    // JETTY_SHOT_GRAPHEMES="row,col,cluster;…" — grapheme-cluster overrides
-    // (e.g. "0,0,e\u{301}" for an NFD é), fed straight to the renderer until the
-    // snapshot carries them itself.
+    // The cells carrying combining marks / VS16 / ZWJ, as the app hands them to
+    // the renderer (`render_grid_scene`), plus any JETTY_SHOT_GRAPHEMES
+    // ="row,col,cluster;…" overrides (e.g. "0,0,e\u{301}" for an NFD é).
     let grapheme_spec = std::env::var("JETTY_SHOT_GRAPHEMES").unwrap_or_default();
-    let graphemes: Vec<(usize, usize, &str)> = grapheme_spec
-        .split(';')
-        .filter_map(|e| {
+    let graphemes: Vec<(usize, usize, &str)> = snap
+        .graphemes
+        .iter()
+        .map(|g| (g.row, g.col, g.text.as_str()))
+        .chain(grapheme_spec.split(';').filter_map(|e| {
             let mut it = e.splitn(3, ',');
             Some((it.next()?.trim().parse().ok()?, it.next()?.trim().parse().ok()?, it.next()?))
-        })
+        }))
         .collect();
     let paint = jetty_render::GridPaint {
         cursor_glyph: cursor_under.map(|_| {

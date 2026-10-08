@@ -660,9 +660,10 @@ fn braille(cv: &mut Canvas, bits: u8) {
     let (w, h) = (cv.w, cv.h);
     let xs = [0, w / 2, w];
     let ys = [0, (h + 2) / 4, (h * 2 + 2) / 4, (h * 3 + 2) / 4, h];
-    let sub_w = (w / 2).max(1);
-    let sub_h = (h / 4).max(1);
-    let s = ((sub_w.min(sub_h) as f32 * 0.5).round() as i32).max(1);
+    // The dot size comes from the cell HEIGHT (the same in every column): a
+    // fractional cell width alternates cells of floor/ceil px, and a size taken
+    // from the width would alternate with them. Never wider than its column.
+    let s = ((h as f32 * 0.11).round() as i32).clamp(1, (w / 2 - 1).max(1));
     // Dot bit → (column, row): dots 1-3 left, 4-6 right, 7 left / 8 right bottom.
     const DOTS: [(usize, usize); 8] = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 3), (1, 3)];
     for (bit, &(c, r)) in DOTS.iter().enumerate() {
@@ -1013,6 +1014,11 @@ mod tests {
                 let n = m.iter().filter(|&&v| v == 255).count();
                 assert!(n > 0 && n == all.iter().filter(|&&v| v == 255).count() / 8, "dot {bit} at {w}x{h}");
             }
+            // Cells one pixel apart in width (a fractional cell width alternates
+            // them) draw the same dot size — no checkered graph.
+            let narrower = mask('\u{28FF}', w - 1, h);
+            let dots = |m: &[u8]| m.iter().filter(|&&v| v == 255).count();
+            assert_eq!(dots(&all), dots(&narrower), "dot size at {w}x{h} vs {}x{h}", w - 1);
             // ⠁ (dot 1) is upper left, ⢀ (dot 8) lower right.
             let d1 = mask('\u{2801}', w, h);
             let d8 = mask('\u{2880}', w, h);

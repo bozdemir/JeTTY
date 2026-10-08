@@ -68,6 +68,21 @@ pub struct Config {
     /// chrome size, so the default look is unchanged).
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: f32,
+    /// Draw box drawing (─│╭╮), block elements (▀▄█░), Powerline separators
+    /// (), braille (⣿) and sextants as built-in glyphs sized to the exact
+    /// cell, so borders, prompts and graphs join seamlessly at any font size.
+    /// Default `true`; `false` takes them from the font like any other char.
+    #[serde(default = "default_builtin_glyphs")]
+    pub builtin_glyphs: bool,
+    /// Draw emoji (😀 ✅ and VS16 sequences like ❤️) in color from the
+    /// installed emoji font (the first family named "…Emoji…"), two cells wide.
+    /// Default `true`. Text-style symbols (✔ ❤ ☐) stay text.
+    #[serde(default = "default_color_emoji")]
+    pub color_emoji: bool,
+    /// Bold text in one of the 8 normal ANSI colors renders in its bright twin
+    /// (the classic xterm look some color schemes assume). Default `false`.
+    #[serde(default)]
+    pub bold_is_bright: bool,
     /// Window corner radius in logical px (0..=24).
     #[serde(default = "default_corner_radius")]
     pub corner_radius: f32,
@@ -349,6 +364,12 @@ fn default_osc52_allow_paste() -> bool {
     false
 }
 fn default_run_selection() -> bool {
+    true
+}
+fn default_builtin_glyphs() -> bool {
+    true
+}
+fn default_color_emoji() -> bool {
     true
 }
 fn default_hot_reload() -> bool {
@@ -787,6 +808,9 @@ impl Default for Config {
             font_family: default_font_family(),
             ui_font_family: default_ui_font_family(),
             ui_font_size: default_ui_font_size(),
+            builtin_glyphs: default_builtin_glyphs(),
+            color_emoji: default_color_emoji(),
+            bold_is_bright: false,
             corner_radius: default_corner_radius(),
             padding_x: default_padding_x(),
             padding_y: default_padding_y(),
@@ -2064,6 +2088,9 @@ mod tests {
             font_family: "Fira Code".to_string(),
             ui_font_family: "Inter".to_string(),
             ui_font_size: 20.0,
+            builtin_glyphs: false,
+            color_emoji: false,
+            bold_is_bright: true,
             corner_radius: 6.0,
             padding_x: 12.0,
             padding_y: 0.0,
@@ -2120,6 +2147,9 @@ mod tests {
             font_family: "MesloLGS NF".to_string(),
             ui_font_family: String::new(),
             ui_font_size: 16.0,
+            builtin_glyphs: true,
+            color_emoji: true,
+            bold_is_bright: false,
             corner_radius: 12.0,
             padding_x: 0.0,
             padding_y: 6.5,
@@ -2273,6 +2303,30 @@ corner_radius = 8.0
         assert_eq!(cfg.ui_font_size, 16.0);
         assert_eq!(cfg.dropdown_height_pct, 0.50);
         assert_eq!(cfg.dropdown_width_pct, 1.0);
+    }
+
+    #[test]
+    fn glyph_keys_default_and_parse() {
+        let d = Config::default();
+        assert!(d.builtin_glyphs && d.color_emoji && !d.bold_is_bright);
+        // An older config without the keys loads the defaults, warning-free.
+        let (cfg, warnings) =
+            Config::parse_with_base("theme = \"dracula\"\n", &Config::default(), "using the default").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(cfg.builtin_glyphs && cfg.color_emoji && !cfg.bold_is_bright);
+        let (cfg, warnings) = Config::parse_with_base(
+            "builtin_glyphs = false\ncolor_emoji = false\nbold_is_bright = true\n",
+            &Config::default(),
+            "using the default",
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!cfg.builtin_glyphs && !cfg.color_emoji && cfg.bold_is_bright);
+        // A wrong type falls back per key.
+        let (cfg, warnings) =
+            Config::parse_with_base("builtin_glyphs = \"yes\"\n", &Config::default(), "using the default").unwrap();
+        assert!(cfg.builtin_glyphs);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]

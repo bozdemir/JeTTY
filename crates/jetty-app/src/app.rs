@@ -1032,6 +1032,15 @@ pub struct App {
     /// The kitty keyboard protocol in every tab (mirrors `Config.kitty_keyboard`;
     /// applied at spawn and live to every tab on reload).
     kitty_keyboard: bool,
+    /// Built-in box/block/Powerline/braille/sextant glyphs and color emoji in
+    /// every grid text layer (mirror `Config.builtin_glyphs` / `color_emoji`;
+    /// applied by `apply_glyph_options` whenever a grid layer is built and live
+    /// on reload).
+    builtin_glyphs: bool,
+    color_emoji: bool,
+    /// Bold text in the 8 normal ANSI colors renders bright (mirrors
+    /// `Config.bold_is_bright`; applied at spawn and live to every tab).
+    bold_is_bright: bool,
     /// The terminal / UI font families the user CHOSE (config, Settings) — what
     /// `persist` saves. `font_family` / `ui_font_family` are what is SHOWN: a
     /// chosen family that is not installed shows a fallback, which must never be
@@ -1795,6 +1804,9 @@ impl App {
             macos_option_as_alt: input::OptionAsAlt::default(),
             copy_on_select: clipboard::CopyOnSelect::default(),
             kitty_keyboard: true,
+            builtin_glyphs: true,
+            color_emoji: true,
+            bold_is_bright: false,
             font_family_chosen: String::new(),
             ui_font_family_chosen: String::new(),
             // Placeholder default keymap; rebuilt from cfg.keys below in `new`.
@@ -2010,6 +2022,9 @@ impl App {
         app.macos_option_as_alt = cfg.macos_option_as_alt;
         app.copy_on_select = cfg.copy_on_select;
         app.kitty_keyboard = cfg.kitty_keyboard;
+        app.builtin_glyphs = cfg.builtin_glyphs;
+        app.color_emoji = cfg.color_emoji;
+        app.bold_is_bright = cfg.bold_is_bright;
         // Compile the keybindings (defaults + user `[keys]` overrides). Any invalid
         // chord / conflict / rejected bind is logged; the rest still apply.
         app.keys = cfg.keys;
@@ -2214,6 +2229,9 @@ impl App {
             macos_option_as_alt: self.macos_option_as_alt,
             copy_on_select: self.copy_on_select,
             kitty_keyboard: self.kitty_keyboard,
+            builtin_glyphs: self.builtin_glyphs,
+            color_emoji: self.color_emoji,
+            bold_is_bright: self.bold_is_bright,
             // Preserve the user's `[keys]` overrides verbatim (never editable via the
             // Settings UI — a settings-driven persist must not erase them).
             keys: self.keys.clone(),
@@ -2552,6 +2570,21 @@ impl App {
     /// the themed palette into EVERY tab's terminal — including the tabs living in
     /// detached windows, so a live theme/opacity change repaints them too (visual
     /// parity: one redraw request each, no polling). Non-persisting (safe on reload).
+    /// Push `builtin_glyphs` / `color_emoji` into every grid text layer — the main
+    /// window's and each detached window's. Called whenever a grid layer is built
+    /// and on a live config change; a no-op for a layer already set that way.
+    fn apply_glyph_options(&mut self) {
+        let (builtin, emoji) = (self.builtin_glyphs, self.color_emoji);
+        if let Some(t) = self.text.as_mut() {
+            t.set_builtin_glyphs(builtin);
+            t.set_color_emoji(emoji);
+        }
+        for dw in &mut self.detached {
+            dw.text.set_builtin_glyphs(builtin);
+            dw.text.set_color_emoji(emoji);
+        }
+    }
+
     fn apply_theme(&mut self) {
         // Refresh the cache from the current index (registry-resolved; `theme_at`
         // never panics on a stale/out-of-range index).
@@ -2848,6 +2881,25 @@ impl App {
             for dw in &mut self.detached {
                 dw.tab.terminal.set_kitty_keyboard(cfg.kitty_keyboard);
             }
+        }
+        // Built-in glyphs / color emoji — live in every window (re-routes and
+        // re-shapes the grid once).
+        if (cfg.builtin_glyphs, cfg.color_emoji) != (self.builtin_glyphs, self.color_emoji) {
+            self.builtin_glyphs = cfg.builtin_glyphs;
+            self.color_emoji = cfg.color_emoji;
+            self.apply_glyph_options();
+            self.mark_dirty_all();
+        }
+        // Bold is bright — live in every tab (the next snapshot resolves it).
+        if cfg.bold_is_bright != self.bold_is_bright {
+            self.bold_is_bright = cfg.bold_is_bright;
+            for tab in &mut self.tabs {
+                tab.terminal.set_bold_is_bright(cfg.bold_is_bright);
+            }
+            for dw in &mut self.detached {
+                dw.tab.terminal.set_bold_is_bright(cfg.bold_is_bright);
+            }
+            self.mark_dirty_all();
         }
         // Launch at login — live: an explicit edit of the key writes / removes
         // the autostart entry to match (the caller keeps the live value when the
@@ -3390,6 +3442,7 @@ impl App {
         // encodes per those flags (`decide_window_key`), so a program that opts
         // in gets kitty keys.
         terminal.set_kitty_keyboard(self.kitty_keyboard);
+        terminal.set_bold_is_bright(self.bold_is_bright);
         // Apply the configured scrollback cap (guard skips the no-op
         // set_options round-trip on the 10k default path).
         if self.scrollback_lines != 10_000 {
@@ -3590,6 +3643,9 @@ impl App {
                 apply_option_as_alt(&dw.window, self.macos_option_as_alt);
                 // The grid's row spacing, like the main window's.
                 dw.text.set_line_height(self.line_height);
+                // Same glyph options as the main window's grid.
+                dw.text.set_builtin_glyphs(self.builtin_glyphs);
+                dw.text.set_color_emoji(self.color_emoji);
                 dw
             }
             Err(tab) => {
@@ -7890,6 +7946,8 @@ impl App {
                 );
             }
         }
+        // Rebuilt grid layers start at the defaults: re-apply the glyph options.
+        self.apply_glyph_options();
         if settings_lost {
             if let Some(win) = self.settings_window.clone() {
                 self.build_settings_stack(&win);
@@ -7943,6 +8001,7 @@ impl App {
         // Lazily re-allocated on the next frame that needs it, on the new device.
         self.offscreen = None;
         self.text = Some(text);
+        self.apply_glyph_options();
         self.chrome_text = Some(chrome);
         self.gpu = Some(gpu);
         self.acquire_retry = None;
@@ -11162,6 +11221,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.refresh_frame_interval();
         self.gpu = gpu;
         self.text = text;
+        self.apply_glyph_options();
         self.quad = quad;
         // The Tier-B offscreen scene texture is allocated LAZILY (on the first
         // frame of an actual Liquid/Focus summon) rather than eagerly here — it is
@@ -11188,6 +11248,7 @@ impl ApplicationHandler<AppEvent> for App {
         // encodes per those flags (`decide_window_key`), so a program that opts
         // in gets kitty keys.
         terminal.set_kitty_keyboard(self.kitty_keyboard);
+        terminal.set_bold_is_bright(self.bold_is_bright);
         // Apply the configured scrollback cap (guard skips the no-op
         // set_options round-trip on the 10k default path).
         if self.scrollback_lines != 10_000 {
@@ -16594,6 +16655,9 @@ mod hot_reload_tests {
             "progress_bar",
             "window_border",
             "tab_title",
+            "builtin_glyphs",
+            "color_emoji",
+            "bold_is_bright",
             // shell (new tabs pick up the edited shell) and show_welcome apply live;
             // both are also mirrored in apply_reloaded_config so a later persist()
             // round-trips an external edit instead of clobbering it.
