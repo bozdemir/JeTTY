@@ -7994,8 +7994,11 @@ impl App {
                         win.set_visible(true);
                         dock_window_top(win, self.dropdown_width_pct, self.dropdown_height_pct);
                         self.pending_dock_frames = 5;
-                        // Arm the render-side slide-down.
-                        self.slide_anim = Some(std::time::Instant::now());
+                        // Arm the render-side slide-down (not with reduced
+                        // motion: the window simply appears, docked).
+                        if !self.motion_reduced() {
+                            self.slide_anim = Some(std::time::Instant::now());
+                        }
                     }
                     WindowMode::Fullscreen => {
                         // Show FIRST so the window is mapped: X11 resolves
@@ -14723,11 +14726,15 @@ impl ApplicationHandler<AppEvent> for App {
                             [c[0], c[1], c[2], 255],
                         );
                     }
+                    // During a Dropdown slide the mask moves with the content
+                    // (`slide_y_offset`): the window SHAPE slides in — its
+                    // background and rounded bottom corners — instead of a
+                    // full-height strip whose content alone moves.
+                    let r_top = if top_flush { 0.0 } else { corner_radius_px };
                     if let (Some(mask), false) = (corner_mask, crt_active) {
                         // Bottom corners always round to corner_radius_px; the top
                         // corners are zeroed when the window is top-flush (Dropdown).
-                        let r_top = if top_flush { 0.0 } else { corner_radius_px };
-                        mask.apply(
+                        mask.apply_slid(
                             &gpu.device,
                             &gpu.queue,
                             scene_view,
@@ -14737,6 +14744,7 @@ impl ApplicationHandler<AppEvent> for App {
                             r_top,
                             corner_radius_px,
                             corner_radius_px,
+                            slide_y_offset,
                         );
                     }
                     // Final-final pass: the selected summon reveal effect. After the
@@ -14851,6 +14859,26 @@ impl ApplicationHandler<AppEvent> for App {
                             },
                         );
                         crt.apply(&gpu.device, &gpu.queue, &view, off_view, &params);
+                        // The CRT pass rounds the UN-slid window; mid-slide the
+                        // strip's real (moving) edge is cut by the corner mask
+                        // over the CRT output — only for the ~150 ms slide.
+                        // (Static corners stay the CRT pass's: it owns them.)
+                        if slide_y_offset != 0.0 {
+                            if let Some(mask) = corner_mask {
+                                mask.apply_slid(
+                                    &gpu.device,
+                                    &gpu.queue,
+                                    &view,
+                                    width,
+                                    height,
+                                    r_top,
+                                    r_top,
+                                    corner_radius_px,
+                                    corner_radius_px,
+                                    slide_y_offset,
+                                );
+                            }
+                        }
                     }
                     // Input-latency SECONDARY stamp (JETTY_PERF_LOG only): captured
                     // AFTER the vsync-throttled acquire + GPU-pass submit, just before

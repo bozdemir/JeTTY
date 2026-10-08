@@ -58,7 +58,7 @@ pub use panel::{
     PanelGeom, PanelHit, PanelInput, PanelItem, PanelView, ResetState, RowState, ThemeFilter, CHAR_W_FALLBACK,
     GALLERY_COLS, N_TABS, PANEL_H, PANEL_W, TAB_NAMES,
 };
-pub use mask::{CornerMask, all_radii_flat, rounded_rect_coverage, rounded_rect_coverage_per};
+pub use mask::{CornerMask, all_radii_flat, rounded_rect_coverage, rounded_rect_coverage_per, rounded_rect_coverage_slid};
 pub use reveal::{BayerReveal, bayer4, reveal_coverage};
 pub use phosphor::PhosphorIgnition;
 pub use liquid::LiquidDrop;

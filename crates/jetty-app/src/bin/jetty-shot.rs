@@ -193,6 +193,10 @@
 ///   JETTY_SHOT_TRANSFORM_T=t — the Pop / Glide / Fade summon effect
 ///                    (JETTY_SHOT_TRANSFORM=pop|glide|fade, default pop) at
 ///                    progress t: the real Tier-B pass sampling the frame.
+///   JETTY_SHOT_SLIDE_T=t — a Dropdown slide-in frame at progress t (0..1):
+///                    the content moved up by the slide's ease-out offset and
+///                    the window SHAPE cut at the moving bottom edge (square
+///                    top, JETTY_CORNER_RADIUS bottom corners — the app's mask).
 ///   JETTY_SHOT_GLOW_T=t — the caret glow/ripple pass at progress t around the
 ///                    cursor (additive on a dark theme, multiply on a light
 ///                    one; same color source as JETTY_SHOT_CARET_COLOR).
@@ -2101,7 +2105,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // JETTY_SHOT_DROPDOWN — verify Dropdown mode's BOTTOM-only rounding: the two
     // top corners are square (top-flush), only the bottom corners round.
     let dropdown = env_flag("JETTY_SHOT_DROPDOWN");
-    if corner_radius > 0.0 && crt_tex.is_none() {
+    // JETTY_SHOT_SLIDE_T — the Dropdown slide-in (see the header): move the
+    // content up by the app's ease-out offset (rows above are the cleared bg),
+    // then cut the window shape at the moving bottom edge.
+    let slide_t = std::env::var("JETTY_SHOT_SLIDE_T").ok().and_then(|s| s.parse::<f32>().ok());
+    if let Some(t) = slide_t {
+        let t = t.clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - t).powi(3);
+        let offset = -(height as f32) * (1.0 - eased);
+        let shift = (-offset).round() as u32;
+        eprintln!("jetty-shot: Dropdown slide t={t} → offset {offset:.1}px (radius {corner_radius})");
+        let row = (width * 4) as usize;
+        let bg = snap.bg_rgba;
+        for y in 0..height {
+            let dst = y as usize * row;
+            if y + shift < height {
+                let src = (y + shift) as usize * row;
+                tight.copy_within(src..src + row, dst);
+            } else {
+                for px in tight[dst..dst + row].chunks_mut(4) {
+                    px.copy_from_slice(&[bg[0], bg[1], bg[2], bg[3]]);
+                }
+            }
+        }
+        for y in 0..height {
+            for x in 0..width {
+                let cov = jetty_render::rounded_rect_coverage_slid(
+                    x as f32, y as f32, width as f32, height as f32,
+                    0.0, 0.0, corner_radius, corner_radius, offset,
+                );
+                if cov < 1.0 {
+                    let idx = ((y * width + x) * 4) as usize;
+                    for c in 0..4 {
+                        tight[idx + c] = (tight[idx + c] as f32 * cov).round() as u8;
+                    }
+                }
+            }
+        }
+    }
+    if corner_radius > 0.0 && crt_tex.is_none() && slide_t.is_none() {
         let (r_tl, r_tr) = if dropdown { (0.0, 0.0) } else { (corner_radius, corner_radius) };
         eprintln!(
             "jetty-shot: applying rounded-corner mask (radius={corner_radius}px, dropdown={dropdown})"
@@ -2136,7 +2178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || std::env::var("JETTY_SHOT_LIQUID_T").is_ok()
         || std::env::var("JETTY_SHOT_FOCUS_T").is_ok()
         || std::env::var("JETTY_SHOT_TRANSFORM_T").is_ok();
-    let composited = if bg_alpha < 255 || corner_radius > 0.0 || summon_active {
+    let composited = if bg_alpha < 255 || corner_radius > 0.0 || summon_active || slide_t.is_some() {
         eprintln!("jetty-shot: compositing over checkerboard (bg alpha={})", bg_alpha);
         const TILE: u32 = 16;
         const DARK: [u8; 3] = [40, 40, 40];

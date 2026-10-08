@@ -12,12 +12,19 @@
 //!
 //! With `radius == 0` coverage is 1.0 everywhere → the frame is unchanged, so a
 //! square window renders byte-identical to before.
+//!
+//! The rounded rect can also be moved down by `offset_y` ([`CornerMask::apply_slid`]):
+//! the Dropdown slide-in draws the window SHAPE itself sliding down — its
+//! background and rounded bottom corners, not only the content — by masking
+//! everything below the strip's moving bottom edge.
 
 const MASK_SHADER: &str = r#"
 // Per-corner radii (r_tl/r_tr/r_bl/r_br) so Dropdown mode can round only the
-// BOTTOM corners. Layout is two 16-byte rows: {size.xy, r_tl, r_tr} then
-// {r_bl, r_br, _pad0, _pad1} — keeps std140 alignment (32 bytes total).
-struct Params { size: vec2<f32>, r_tl: f32, r_tr: f32, r_bl: f32, r_br: f32, _pad0: f32, _pad1: f32 };
+// BOTTOM corners, and a vertical offset of the whole rounded rect (the
+// Dropdown slide: the window shape slides down into place). Layout is two
+// 16-byte rows: {size.xy, r_tl, r_tr} then {r_bl, r_br, offset_y, _pad1} —
+// keeps std140 alignment (32 bytes total).
+struct Params { size: vec2<f32>, r_tl: f32, r_tr: f32, r_bl: f32, r_br: f32, offset_y: f32, _pad1: f32 };
 @group(0) @binding(0) var<uniform> params: Params;
 
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
@@ -48,9 +55,9 @@ fn sd_round_rect_per(p: vec2<f32>, b: vec2<f32>, r_tl: f32, r_tr: f32, r_bl: f32
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    // Center-relative pixel coordinate.
+    // Center-relative pixel coordinate of the (possibly slid) rounded rect.
     let hsize = params.size * 0.5;
-    let p = in.uv - hsize;
+    let p = in.uv - vec2(0.0, params.offset_y) - hsize;
     let d = sd_round_rect_per(p, hsize, params.r_tl, params.r_tr, params.r_bl, params.r_br);
     // ~1px antialiased edge: coverage 1 inside, 0 outside, smooth across the seam.
     let cov = 1.0 - smoothstep(-0.75, 0.75, d);
@@ -168,6 +175,30 @@ impl CornerMask {
         r_bl: f32,
         r_br: f32,
     ) {
+        self.apply_slid(device, queue, view, width, height, r_tl, r_tr, r_bl, r_br, 0.0);
+    }
+
+    /// [`CornerMask::apply`] with the rounded rect moved down by `offset_y`
+    /// physical px (≤ 0 while a Dropdown slides in: the strip's bottom edge,
+    /// with its rounded corners, sits at `height + offset_y` and everything
+    /// below it is transparent). At 0 this is exactly `apply`; a non-zero
+    /// offset runs even with square corners (the moving edge needs the mask)
+    /// and masks the whole target (only for the ~150 ms of a slide).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_slid(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        r_tl: f32,
+        r_tr: f32,
+        r_bl: f32,
+        r_br: f32,
+        offset_y: f32,
+    ) {
+        let slid = offset_y != 0.0 && offset_y.is_finite();
         // All-flat corners ⇒ the pass would be a no-op multiply by 1.0: skip it
         // entirely (one fewer render pass + uniform write per frame). The app's
         // fullscreen corner suppression feeds radius 0.0 and so lands here — but
@@ -175,13 +206,13 @@ impl CornerMask {
         // scales with surface AREA, and a fullscreen surface is several times the
         // default window (see the CHANGELOG's honest cost note). Pinned by
         // `all_radii_flat`'s unit test.
-        if all_radii_flat(r_tl, r_tr, r_bl, r_br) {
+        if all_radii_flat(r_tl, r_tr, r_bl, r_br) && !slid {
             return;
         }
         // Clamp each radius so it never exceeds half the smaller dimension.
         let max_r = (width.min(height) as f32) / 2.0;
         let c = |r: f32| r.min(max_r).max(0.0);
-        // Layout: [size.x, size.y, r_tl, r_tr, r_bl, r_br, _pad, _pad] (32 bytes).
+        // Layout: [size.x, size.y, r_tl, r_tr, r_bl, r_br, offset_y, _pad] (32 bytes).
         let params: [f32; 8] = [
             width as f32,
             height as f32,
@@ -189,7 +220,7 @@ impl CornerMask {
             c(r_tr),
             c(r_bl),
             c(r_br),
-            0.0,
+            if slid { offset_y } else { 0.0 },
             0.0,
         ];
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&params));
@@ -221,7 +252,13 @@ impl CornerMask {
             // triangle to just those regions instead of a read-modify-write blend
             // over the WHOLE surface every frame. Pixels outside are multiplied by
             // exactly 1.0 by the old full-screen pass, so the result is identical.
-            for [x, y, w, h] in mask_regions(width, height, [params[2], params[3], params[4], params[5]]) {
+            let regions = if slid {
+                // The moving edge can be anywhere: one full-target draw.
+                vec![[0, 0, width, height]]
+            } else {
+                mask_regions(width, height, [params[2], params[3], params[4], params[5]])
+            };
+            for [x, y, w, h] in regions {
                 pass.set_scissor_rect(x, y, w, h);
                 pass.draw(0..3, 0..1);
             }
@@ -342,6 +379,41 @@ pub fn all_radii_flat(r_tl: f32, r_tr: f32, r_bl: f32, r_br: f32) -> bool {
     r_tl <= 0.0 && r_tr <= 0.0 && r_bl <= 0.0 && r_br <= 0.0
 }
 
+/// [`rounded_rect_coverage_per`] for the rounded rect moved down by
+/// `offset_y` (the Dropdown slide) — the CPU mirror of
+/// [`CornerMask::apply_slid`] for jetty-shot.
+#[allow(clippy::too_many_arguments)]
+pub fn rounded_rect_coverage_slid(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r_tl: f32,
+    r_tr: f32,
+    r_bl: f32,
+    r_br: f32,
+    offset_y: f32,
+) -> f32 {
+    if offset_y == 0.0 {
+        return rounded_rect_coverage_per(x, y, w, h, r_tl, r_tr, r_bl, r_br);
+    }
+    // Mirror the shader exactly (the per-corner fn early-outs on flat radii,
+    // which would ignore the moving edge).
+    let max_r = w.min(h) / 2.0;
+    let clamp_r = |r: f32| r.min(max_r).max(0.0);
+    let (hw, hh) = (w / 2.0, h / 2.0);
+    let px = (x + 0.5) - hw;
+    let py = (y + 0.5) - offset_y - hh;
+    let r_top = if px > 0.0 { r_tr } else { r_tl };
+    let r_bot = if px > 0.0 { r_br } else { r_bl };
+    let r = clamp_r(if py > 0.0 { r_bot } else { r_top });
+    let qx = px.abs() - hw + r;
+    let qy = py.abs() - hh + r;
+    let d = qx.max(qy).min(0.0) + (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() - r;
+    let t = ((d + 0.75) / 1.5).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
+
 /// Uniform-radius shim over [`rounded_rect_coverage_per`] (all four corners
 /// equal). Kept so existing callers (jetty-shot CPU compositing) are unchanged.
 pub fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32 {
@@ -350,7 +422,42 @@ pub fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32
 
 #[cfg(test)]
 mod tests {
-    use super::{all_radii_flat, mask_regions, rounded_rect_coverage, rounded_rect_coverage_per};
+    use super::{
+        all_radii_flat, mask_regions, rounded_rect_coverage, rounded_rect_coverage_per, rounded_rect_coverage_slid,
+        MASK_SHADER,
+    };
+
+    #[test]
+    fn mask_shader_validates_with_the_offset_field() {
+        let module = naga::front::wgsl::parse_str(MASK_SHADER).expect("parses");
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module)
+            .expect("validates");
+        assert!(MASK_SHADER.contains("offset_y: f32"), "the spare _pad0 carries the slide");
+    }
+
+    #[test]
+    fn a_slid_mask_moves_the_bottom_edge_and_its_corners() {
+        // Dropdown mid-slide: a 100x100 strip shown 40 px (offset -60), square
+        // top corners, 16 px bottom radii.
+        let cov = |x: f32, y: f32| rounded_rect_coverage_slid(x, y, 100.0, 100.0, 0.0, 0.0, 16.0, 16.0, -60.0);
+        assert!(cov(50.0, 10.0) > 0.99, "inside the visible strip");
+        assert!(cov(50.0, 45.0) < 0.01, "below the moving edge is transparent");
+        assert!(cov(50.0, 90.0) < 0.01, "…all the way down");
+        assert!(cov(0.0, 39.0) < 0.01, "the bottom-left corner is rounded at the moved edge");
+        assert!(cov(99.0, 39.0) < 0.01, "and the bottom-right");
+        assert!(cov(50.0, 39.0) > 0.5, "the edge itself is the strip's");
+        // Offset 0 is exactly the unslid mask.
+        for (x, y) in [(0.0, 0.0), (99.0, 99.0), (3.0, 96.0), (50.0, 50.0)] {
+            assert_eq!(
+                rounded_rect_coverage_slid(x, y, 100.0, 100.0, 0.0, 0.0, 16.0, 16.0, 0.0),
+                rounded_rect_coverage_per(x, y, 100.0, 100.0, 0.0, 0.0, 16.0, 16.0)
+            );
+        }
+        // Square corners still get the moving edge.
+        let sq = |y: f32| rounded_rect_coverage_slid(50.0, y, 100.0, 100.0, 0.0, 0.0, 0.0, 0.0, -60.0);
+        assert!(sq(10.0) > 0.99 && sq(60.0) < 0.01);
+    }
 
     #[test]
     fn scissor_regions_never_overlap() {
