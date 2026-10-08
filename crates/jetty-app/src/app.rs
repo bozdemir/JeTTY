@@ -5805,27 +5805,28 @@ impl App {
                 }
             }
         }
-        // OSC 52 COPY: a remote/tmux/nvim asked to set the system clipboard. Ride
+        // OSC 52 COPY: a remote/tmux/nvim asked to set a system selection. Ride
         // this same drain pass (main + detached both drain here) — lock-free flag
         // check when clean, so zero idle cost. `crate::clipboard::set` is a free fn
-        // (no self borrow), so this is conflict-free inside `drain_one_tab`.
-        if let Some(text) = tab.terminal.take_clipboard_store() {
+        // (no self borrow), so this is conflict-free inside `drain_one_tab`. One
+        // pending copy PER selection: nvim's `unnamed,unnamedplus` sends `c` and
+        // `p` for every yank, and both must land.
+        for (target, text) in tab.terminal.take_clipboard_stores() {
             // OSC 52 names the selection: `p`/`s` → PRIMARY, `c` → clipboard.
-            if tab.terminal.clipboard_store_is_primary() {
-                crate::clipboard::set_primary(&text);
-            } else {
-                crate::clipboard::set(&text);
+            match target {
+                jetty_core::Osc52Target::Primary => crate::clipboard::set_primary(&text),
+                jetty_core::Osc52Target::Clipboard => crate::clipboard::set(&text),
             }
         }
-        // OSC 52 PASTE (load): a program asked to READ the clipboard. Only ever
+        // OSC 52 PASTE (load): a program asked to READ a selection. Only ever
         // present when the user enabled `osc52_allow_paste` (else alacritty denies it
-        // and no request reaches us). Read the clipboard, CAP the reply length, format
-        // via alacritty's supplied formatter, and write it back to the PTY.
-        if let Some(fmt) = tab.terminal.take_clipboard_load() {
-            let text = if tab.terminal.clipboard_load_is_primary() {
-                crate::clipboard::get_primary()
-            } else {
-                crate::clipboard::get()
+        // and no request reaches us). Read the selection, CAP the reply length, format
+        // via alacritty's supplied formatter, and write it back to the PTY — one
+        // reply per request (a `c;?` + `p;?` pair gets two).
+        for (target, fmt) in tab.terminal.take_clipboard_loads() {
+            let text = match target {
+                jetty_core::Osc52Target::Primary => crate::clipboard::get_primary(),
+                jetty_core::Osc52Target::Clipboard => crate::clipboard::get(),
             };
             if let Some(mut text) = text {
                 if text.len() > jetty_core::OSC52_MAX_BYTES {

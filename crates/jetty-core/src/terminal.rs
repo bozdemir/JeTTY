@@ -299,6 +299,36 @@ pub const OSC52_MAX_BYTES: usize = 100 * 1024;
 /// Matches alacritty's `Event::ClipboardLoad` payload type exactly.
 type ClipboardLoadFmt = Arc<dyn Fn(&str) -> String + Send + Sync + 'static>;
 
+/// The selection an OSC 52 request names: `c` the clipboard, `p` / `s` the
+/// PRIMARY selection (what a middle click pastes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Osc52Target {
+    Clipboard,
+    Primary,
+}
+
+impl Osc52Target {
+    fn of(ty: alacritty_terminal::term::ClipboardType) -> Osc52Target {
+        match ty {
+            alacritty_terminal::term::ClipboardType::Clipboard => Osc52Target::Clipboard,
+            alacritty_terminal::term::ClipboardType::Selection => Osc52Target::Primary,
+        }
+    }
+}
+
+/// Pending OSC 52 requests, at most ONE per selection: a newer request for the
+/// same selection replaces the older one (last wins) and queues behind the other
+/// selection's, so arrival order is kept. nvim with `clipboard=unnamed,unnamedplus`
+/// copies every yank to BOTH selections back to back, and asks for both on a
+/// paste — one shared slot used to let the second overwrite the first.
+type Osc52Pending<T> = Arc<Mutex<Vec<(Osc52Target, T)>>>;
+
+fn push_osc52<T>(pending: &Osc52Pending<T>, target: Osc52Target, item: T) {
+    let mut list = pending.lock().unwrap();
+    list.retain(|(t, _)| *t != target);
+    list.push((target, item));
+}
+
 /// EventListener that captures the terminal's write-back bytes (replies to
 /// host queries such as DSR/DA, text-area size, and OSC color queries) and
 /// forwards them over a channel so the app can write them back to the PTY.
@@ -340,32 +370,23 @@ struct EventProxy {
     /// Set to `true` when the app rings the bell (BEL / ^G, `Event::Bell`).
     /// Shared with the owning `Terminal`; consumed via [`Terminal::take_bell`].
     bell: Arc<AtomicBool>,
-    /// Pending OSC 52 clipboard-COPY text (remote/tmux/nvim asked to set the system
-    /// clipboard). `Some` = text to commit; last-wins coalesce. Committed by the app
-    /// on the drain pass via [`Terminal::take_clipboard_store`]. Only ever set when
-    /// alacritty's `osc52` mode permits copy (OnlyCopy/CopyPaste — the default).
-    clipboard_store: Arc<Mutex<Option<String>>>,
+    /// Pending OSC 52 clipboard-COPY texts (remote/tmux/nvim asked to set a system
+    /// selection), one per selection, last-wins. Committed by the app on the drain
+    /// pass via [`Terminal::take_clipboard_stores`]. Only ever set when alacritty's
+    /// `osc52` mode permits copy (OnlyCopy/CopyPaste — the default).
+    clipboard_store: Osc52Pending<String>,
     /// Cheap "a clipboard-copy is pending" flag so the drain path skips the mutex in
     /// the common no-copy case (lock-free — zero idle cost).
     clipboard_dirty: Arc<AtomicBool>,
-    /// Pending OSC 52 clipboard-PASTE (load) request: the reply formatter alacritty
-    /// supplied. Only ever set when `osc52` mode permits paste (OnlyPaste/CopyPaste),
-    /// i.e. only when the user opted into `osc52_allow_paste`. Drained by the app via
-    /// [`Terminal::take_clipboard_load`], which reads the clipboard, formats, and
-    /// writes the reply to the PTY. Off by default (the secure default).
-    clipboard_load: Arc<Mutex<Option<ClipboardLoadFmt>>>,
+    /// Pending OSC 52 clipboard-PASTE (load) requests: the reply formatter alacritty
+    /// supplied, one per selection. Only ever set when `osc52` mode permits paste
+    /// (OnlyPaste/CopyPaste), i.e. only when the user opted into
+    /// `osc52_allow_paste`. Drained by the app via [`Terminal::take_clipboard_loads`],
+    /// which reads each selection, formats, and writes the replies to the PTY. Off
+    /// by default (the secure default).
+    clipboard_load: Osc52Pending<ClipboardLoadFmt>,
     /// Cheap "a clipboard-paste is pending" flag (mirrors `clipboard_dirty`).
     clipboard_load_dirty: Arc<AtomicBool>,
-    /// Which selection the pending OSC 52 copy / paste names (`c` = clipboard,
-    /// `p`/`s` = the PRIMARY selection), recorded alongside each request.
-    osc52_primary: Arc<Osc52Primary>,
-}
-
-/// OSC 52 `Pc` per pending request: `true` = the PRIMARY selection (`p`/`s`).
-#[derive(Default)]
-struct Osc52Primary {
-    store: AtomicBool,
-    load: AtomicBool,
 }
 
 impl EventProxy {
@@ -443,21 +464,19 @@ impl EventListener for EventProxy {
             Event::Bell => {
                 self.bell.store(true, Ordering::Relaxed);
             }
-            // OSC 52 COPY: a remote host / tmux / nvim (`"+y`) asked to set the
-            // system clipboard. alacritty already base64-decoded + UTF-8-validated
+            // OSC 52 COPY: a remote host / tmux / nvim (`"+y`) asked to set a
+            // system selection. alacritty already base64-decoded + UTF-8-validated
             // the payload and only emits this when its `osc52` mode permits copy
-            // (OnlyCopy is JeTTY's default). Coalesce last-wins into a shared slot;
-            // the app commits it on the drain pass — to the PRIMARY selection when
-            // the request named it (`p`/`s` → `Selection`), else the clipboard.
+            // (OnlyCopy is JeTTY's default). Coalesce last-wins PER SELECTION; the
+            // app commits each on the drain pass — the PRIMARY selection when the
+            // request named it (`p`/`s` → `Selection`), else the clipboard.
             Event::ClipboardStore(ty, text) => {
                 // Cap the COMMITTED text (see OSC52_MAX_BYTES): reject an abusive
                 // payload rather than flooding the real clipboard. The transient
                 // decode already happened inside alacritty (bounded by its OSC
                 // buffer), so this is a commit gate, not a memory guard.
                 if text.len() <= OSC52_MAX_BYTES {
-                    *self.clipboard_store.lock().unwrap() = Some(text);
-                    let primary = matches!(ty, alacritty_terminal::term::ClipboardType::Selection);
-                    self.osc52_primary.store.store(primary, Ordering::Relaxed);
+                    push_osc52(&self.clipboard_store, Osc52Target::of(ty), text);
                     self.clipboard_dirty.store(true, Ordering::Release);
                 }
             }
@@ -467,9 +486,7 @@ impl EventListener for EventProxy {
             // inert unless the user set `osc52_allow_paste = true`. Stash the reply
             // formatter; the app reads the clipboard, caps + formats, writes to PTY.
             Event::ClipboardLoad(ty, formatter) => {
-                *self.clipboard_load.lock().unwrap() = Some(formatter);
-                let primary = matches!(ty, alacritty_terminal::term::ClipboardType::Selection);
-                self.osc52_primary.load.store(primary, Ordering::Relaxed);
+                push_osc52(&self.clipboard_load, Osc52Target::of(ty), formatter);
                 self.clipboard_load_dirty.store(true, Ordering::Release);
             }
             // Wakeup / MouseCursorDirty and the rest are intentionally ignored.
@@ -775,17 +792,15 @@ pub struct Terminal {
     /// Pending-bell flag shared with the `EventProxy` (`Event::Bell`);
     /// consumed by [`Terminal::take_bell`].
     bell: Arc<AtomicBool>,
-    /// Pending OSC 52 clipboard-copy text + flag, shared with the `EventProxy`;
-    /// consumed by [`Terminal::take_clipboard_store`].
-    clipboard_store: Arc<Mutex<Option<String>>>,
+    /// Pending OSC 52 clipboard-copy texts + flag, shared with the `EventProxy`;
+    /// consumed by [`Terminal::take_clipboard_stores`].
+    clipboard_store: Osc52Pending<String>,
     clipboard_dirty: Arc<AtomicBool>,
-    /// Pending OSC 52 clipboard-paste reply formatter + flag, shared with the
-    /// `EventProxy`; consumed by [`Terminal::take_clipboard_load`]. Inert unless
+    /// Pending OSC 52 clipboard-paste reply formatters + flag, shared with the
+    /// `EventProxy`; consumed by [`Terminal::take_clipboard_loads`]. Inert unless
     /// `osc52_mode` permits paste.
-    clipboard_load: Arc<Mutex<Option<ClipboardLoadFmt>>>,
+    clipboard_load: Osc52Pending<ClipboardLoadFmt>,
     clipboard_load_dirty: Arc<AtomicBool>,
-    /// The selection each pending OSC 52 request named (shared with the proxy).
-    osc52_primary: Arc<Osc52Primary>,
     /// The OSC 52 mode this terminal was built with. Stored so `set_scrollback_lines`
     /// (which rebuilds the alacritty `Config`) preserves it instead of silently
     /// reverting an enabled paste back to the default `OnlyCopy`. Toggled by
@@ -1016,11 +1031,10 @@ impl Terminal {
         let title_update = Arc::new(Mutex::new(None));
         let title_dirty = Arc::new(AtomicBool::new(false));
         let bell = Arc::new(AtomicBool::new(false));
-        let clipboard_store = Arc::new(Mutex::new(None));
+        let clipboard_store = Arc::new(Mutex::new(Vec::new()));
         let clipboard_dirty = Arc::new(AtomicBool::new(false));
-        let clipboard_load = Arc::new(Mutex::new(None));
+        let clipboard_load = Arc::new(Mutex::new(Vec::new()));
         let clipboard_load_dirty = Arc::new(AtomicBool::new(false));
-        let osc52_primary = Arc::new(Osc52Primary::default());
         let proxy = EventProxy {
             tx,
             geom: Arc::clone(&geom),
@@ -1034,7 +1048,6 @@ impl Terminal {
             clipboard_dirty: Arc::clone(&clipboard_dirty),
             clipboard_load: Arc::clone(&clipboard_load),
             clipboard_load_dirty: Arc::clone(&clipboard_load_dirty),
-            osc52_primary: Arc::clone(&osc52_primary),
         };
         let term = Term::new(config, &size, proxy);
 
@@ -1055,7 +1068,6 @@ impl Terminal {
             clipboard_dirty,
             clipboard_load,
             clipboard_load_dirty,
-            osc52_primary,
             osc52_mode,
             kitty_keyboard,
             search_query: String::new(),
@@ -1135,39 +1147,29 @@ impl Terminal {
             .map(|u| u.and_then(|s| sanitize_title(&s)))
     }
 
-    /// Take the pending OSC 52 clipboard-COPY text, if any. `None` in the common
-    /// case (a lock-free flag check — zero idle cost). Consuming; multiple copies
-    /// between calls coalesce last-wins. The app writes the returned text to the
-    /// system clipboard (jetty-core does not depend on the clipboard backend).
-    pub fn take_clipboard_store(&mut self) -> Option<String> {
+    /// Take the pending OSC 52 clipboard-COPY texts: at most one per selection,
+    /// in arrival order. Empty in the common case (a lock-free flag check — zero
+    /// idle cost, no allocation). Consuming; copies to the same selection between
+    /// calls coalesce last-wins. The app writes each text to the selection it
+    /// names (jetty-core does not depend on the clipboard backend).
+    pub fn take_clipboard_stores(&mut self) -> Vec<(Osc52Target, String)> {
         if !self.clipboard_dirty.swap(false, Ordering::Acquire) {
-            return None;
+            return Vec::new();
         }
-        self.clipboard_store.lock().unwrap().take()
+        std::mem::take(&mut *self.clipboard_store.lock().unwrap())
     }
 
-    /// Take the pending OSC 52 clipboard-PASTE reply formatter, if any. `None` in the
-    /// common case (a lock-free flag check). Only ever `Some` when the terminal was
-    /// built/toggled to permit paste (`osc52_allow_paste`), so the default (write-
-    /// only) build never yields one. The app reads the system clipboard, caps it,
-    /// calls the formatter, and writes the reply to the PTY.
-    pub fn take_clipboard_load(&mut self) -> Option<ClipboardLoadFmt> {
+    /// Take the pending OSC 52 clipboard-PASTE reply formatters: at most one per
+    /// selection, in arrival order. Empty in the common case (a lock-free flag
+    /// check). Only ever non-empty when the terminal was built/toggled to permit
+    /// paste (`osc52_allow_paste`), so the default (write-only) build never yields
+    /// one. The app reads the named selection, caps it, calls the formatter, and
+    /// writes the reply to the PTY — one reply per request.
+    pub fn take_clipboard_loads(&mut self) -> Vec<(Osc52Target, ClipboardLoadFmt)> {
         if !self.clipboard_load_dirty.swap(false, Ordering::Acquire) {
-            return None;
+            return Vec::new();
         }
-        self.clipboard_load.lock().unwrap().take()
-    }
-
-    /// Whether the copy last returned by [`Terminal::take_clipboard_store`] named
-    /// the PRIMARY selection (OSC 52 `p`/`s`) rather than the clipboard (`c`).
-    pub fn clipboard_store_is_primary(&self) -> bool {
-        self.osc52_primary.store.load(Ordering::Relaxed)
-    }
-
-    /// Whether the paste request last returned by
-    /// [`Terminal::take_clipboard_load`] named the PRIMARY selection.
-    pub fn clipboard_load_is_primary(&self) -> bool {
-        self.osc52_primary.load.load(Ordering::Relaxed)
+        std::mem::take(&mut *self.clipboard_load.lock().unwrap())
     }
 
     /// The exact bytes [`Terminal::feed_notice`] feeds for `text`: the text in
@@ -5774,14 +5776,21 @@ mod tests {
 
     // ── OSC 52 clipboard ──────────────────────────────────────────────────────
 
+    /// The single pending OSC 52 copy, if exactly one is pending.
+    fn one_copy(t: &mut Terminal) -> Option<(Osc52Target, String)> {
+        let mut v = t.take_clipboard_stores();
+        assert!(v.len() <= 1, "expected at most one pending copy: {v:?}");
+        v.pop()
+    }
+
     #[test]
     fn osc52_copy_captures_and_coalesces() {
         // `\e]52;c;<base64("hi")>\a` → the decoded text is captured once, then
-        // consumed (a second drain is None). base64("hi") == "aGk=".
+        // consumed (a second drain is empty). base64("hi") == "aGk=".
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b]52;c;aGk=\x07");
-        assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
-        assert_eq!(t.take_clipboard_store(), None, "consuming: second drain is empty");
+        assert_eq!(one_copy(&mut t), Some((Osc52Target::Clipboard, "hi".to_string())));
+        assert!(t.take_clipboard_stores().is_empty(), "consuming: second drain is empty");
     }
 
     #[test]
@@ -5790,20 +5799,37 @@ mod tests {
         // remote nvim `"*y` lands where a middle click pastes, not over Ctrl+V.
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b]52;p;aGk=\x07");
-        assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
-        assert!(t.clipboard_store_is_primary());
+        assert_eq!(one_copy(&mut t), Some((Osc52Target::Primary, "hi".to_string())));
         t.feed(b"\x1b]52;c;aGk=\x07");
-        assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
-        assert!(!t.clipboard_store_is_primary());
+        assert_eq!(one_copy(&mut t), Some((Osc52Target::Clipboard, "hi".to_string())));
     }
 
     #[test]
     fn osc52_copy_coalesces_last_wins() {
-        // Two copies before a drain coalesce to the LAST one.
+        // Two copies to the same selection before a drain coalesce to the LAST one.
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b]52;c;aGk=\x07"); // "hi"
         t.feed(b"\x1b]52;c;eWE=\x07"); // base64("ya") == "eWE="
-        assert_eq!(t.take_clipboard_store().as_deref(), Some("ya"));
+        assert_eq!(one_copy(&mut t), Some((Osc52Target::Clipboard, "ya".to_string())));
+    }
+
+    #[test]
+    fn osc52_copies_to_both_selections_both_land() {
+        // nvim with `clipboard=unnamed,unnamedplus` sends `c` then `p` for every
+        // yank; one shared slot let the `p` overwrite the `c`, so the CLIPBOARD
+        // (Ctrl+V) never got the text.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]52;c;aGk=\x07\x1b]52;p;aGk=\x07");
+        assert_eq!(
+            t.take_clipboard_stores(),
+            vec![(Osc52Target::Clipboard, "hi".to_string()), (Osc52Target::Primary, "hi".to_string())]
+        );
+        // Still one per selection, newest text, arrival order of the newest.
+        t.feed(b"\x1b]52;p;aGk=\x07\x1b]52;c;aGk=\x07\x1b]52;p;eWE=\x07");
+        assert_eq!(
+            t.take_clipboard_stores(),
+            vec![(Osc52Target::Clipboard, "hi".to_string()), (Osc52Target::Primary, "ya".to_string())]
+        );
     }
 
     // ── JeTTY's own notices ───────────────────────────────────────────────────
@@ -5830,7 +5856,7 @@ mod tests {
         let mut t = Terminal::new(120, 5);
         assert!(t.drain_pty_writes().is_empty());
         t.feed_notice(HOSTILE);
-        assert_eq!(t.take_clipboard_store(), None, "no OSC 52 clipboard write");
+        assert!(t.take_clipboard_stores().is_empty(), "no OSC 52 clipboard write");
         assert_eq!(t.take_title_update(), None, "no OSC 0 title change");
         assert!(t.drain_pty_writes().is_empty(), "no query reply may reach the shell");
         let snap = t.snapshot();
@@ -5844,8 +5870,7 @@ mod tests {
         // are permitted remote writes under OnlyCopy.
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b]52;s;aGk=\x07");
-        assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
-        assert!(t.clipboard_store_is_primary());
+        assert_eq!(one_copy(&mut t), Some((Osc52Target::Primary, "hi".to_string())));
     }
 
     #[test]
@@ -5858,8 +5883,8 @@ mod tests {
         let mut t = Terminal::new(20, 5);
         let seq = format!("\x1b]52;c;{}\x07", "AAAA".repeat(reps));
         t.feed(seq.as_bytes());
-        let got = t.take_clipboard_store();
-        assert_eq!(got.as_ref().map(|s| s.len()), Some(decoded_len));
+        let got = one_copy(&mut t);
+        assert_eq!(got.as_ref().map(|(_, s)| s.len()), Some(decoded_len));
     }
 
     #[test]
@@ -5872,7 +5897,7 @@ mod tests {
         let mut t = Terminal::new(20, 5);
         let seq = format!("\x1b]52;c;{}\x07", "AAAA".repeat(reps));
         t.feed(seq.as_bytes());
-        assert_eq!(t.take_clipboard_store(), None, "oversized copy is rejected");
+        assert!(t.take_clipboard_stores().is_empty(), "oversized copy is rejected");
     }
 
     #[test]
@@ -5881,7 +5906,7 @@ mod tests {
         // denied at the alacritty layer, so no load request ever reaches us.
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b]52;c;?\x07");
-        assert!(t.take_clipboard_load().is_none(), "paste is off by default");
+        assert!(t.take_clipboard_loads().is_empty(), "paste is off by default");
     }
 
     #[test]
@@ -5891,11 +5916,28 @@ mod tests {
         let mut t = Terminal::new(20, 5);
         t.set_osc52_allow_paste(true);
         t.feed(b"\x1b]52;c;?\x07");
-        let fmt = t.take_clipboard_load().expect("paste request captured");
+        let mut loads = t.take_clipboard_loads();
+        assert_eq!(loads.len(), 1, "paste request captured");
+        let (target, fmt) = loads.pop().unwrap();
+        assert_eq!(target, Osc52Target::Clipboard);
         let reply = fmt("hi");
         assert!(reply.starts_with("\x1b]52;"), "reply is an OSC 52 sequence");
         assert!(reply.contains("aGk="), "reply carries base64(\"hi\")");
-        assert!(t.take_clipboard_load().is_none(), "consuming: second drain is empty");
+        assert!(t.take_clipboard_loads().is_empty(), "consuming: second drain is empty");
+    }
+
+    #[test]
+    fn osc52_paste_requests_for_both_selections_each_get_a_reply() {
+        // A `c;?` + `p;?` pair (nvim's paste provider asks for both) must yield TWO
+        // replies, each naming its own selection, in request order.
+        let mut t = Terminal::new(20, 5);
+        t.set_osc52_allow_paste(true);
+        t.feed(b"\x1b]52;c;?\x07\x1b]52;p;?\x07");
+        let loads = t.take_clipboard_loads();
+        let targets: Vec<Osc52Target> = loads.iter().map(|(t, _)| *t).collect();
+        assert_eq!(targets, vec![Osc52Target::Clipboard, Osc52Target::Primary]);
+        assert!(loads[0].1("a").starts_with("\x1b]52;c;"), "the clipboard reply names c");
+        assert!(loads[1].1("b").starts_with("\x1b]52;p;"), "the primary reply names p");
     }
 
     #[test]
@@ -5906,7 +5948,7 @@ mod tests {
         t.set_osc52_allow_paste(true);
         t.set_scrollback_lines(500);
         t.feed(b"\x1b]52;c;?\x07");
-        assert!(t.take_clipboard_load().is_some(), "paste survives a scrollback change");
+        assert_eq!(t.take_clipboard_loads().len(), 1, "paste survives a scrollback change");
     }
 
     // ─────────────────────────── SIXEL DCS scanner + placement ───────────────

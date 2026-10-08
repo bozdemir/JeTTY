@@ -18,7 +18,8 @@ pub use snapshot::{
     GRAPHEME_MAX_MARKS, SHAPE_MASK, VisibleImage,
 };
 pub use terminal::{
-    CommandCompletion, LinkHit, Terminal, OSC52_MAX_BYTES, SEARCH_MAX_MATCHES, SEARCH_MAX_QUERY,
+    CommandCompletion, LinkHit, Osc52Target, Terminal, OSC52_MAX_BYTES, SEARCH_MAX_MATCHES,
+    SEARCH_MAX_QUERY,
 };
 pub use theme::Theme;
 pub use theme::{builtins, set_registry, theme_at, theme_count, theme_index, theme_list};
