@@ -36,6 +36,9 @@ pub enum PaletteCmd {
     ToggleCaretFlash,
     ToggleCaretGlow,
     TogglePerfHud,
+    ToggleBuiltinGlyphs,
+    ToggleColorEmoji,
+    ToggleBoldIsBright,
     ShowWelcome,
     Search,
     HintMode,
@@ -163,7 +166,7 @@ pub fn build_registry(
     tabs: &[(u64, String)],
     detached: &[(u64, String)],
 ) -> Vec<PaletteEntry> {
-    let statics: [(&str, &str, PaletteCmd); 33] = [
+    let statics: [(&str, &str, PaletteCmd); 36] = [
         ("New tab", "create open window shell", PaletteCmd::NewTab),
         ("Close tab", "kill remove", PaletteCmd::CloseTab),
         ("Next tab", "cycle switch forward", PaletteCmd::NextTab),
@@ -182,6 +185,13 @@ pub fn build_registry(
         ("Toggle caret flash", "cursor blink", PaletteCmd::ToggleCaretFlash),
         ("Toggle caret glow", "cursor bloom", PaletteCmd::ToggleCaretGlow),
         ("Toggle performance HUD", "fps stats perf meter", PaletteCmd::TogglePerfHud),
+        (
+            "Toggle built-in box & Powerline glyphs",
+            "box drawing border line braille block powerline separator prompt seam font glyph",
+            PaletteCmd::ToggleBuiltinGlyphs,
+        ),
+        ("Toggle color emoji", "emoji colour smiley font", PaletteCmd::ToggleColorEmoji),
+        ("Toggle bold is bright", "bold bright colors ansi palette xterm", PaletteCmd::ToggleBoldIsBright),
         ("Show welcome screen", "splash about neofetch", PaletteCmd::ShowWelcome),
         ("Search scrollback…", "find grep filter", PaletteCmd::Search),
         ("Hint mode: label URLs/paths", "hint link url path hash copy open keyboard", PaletteCmd::HintMode),

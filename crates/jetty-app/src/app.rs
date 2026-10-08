@@ -2570,6 +2570,35 @@ impl App {
     /// the themed palette into EVERY tab's terminal — including the tabs living in
     /// detached windows, so a live theme/opacity change repaints them too (visual
     /// parity: one redraw request each, no polling). Non-persisting (safe on reload).
+    /// Turn the built-in glyphs / color emoji on or off live (config reload,
+    /// palette): every grid layer re-routes and re-shapes once, every window
+    /// repaints. The caller persists (a reload must not write).
+    fn set_glyph_options(&mut self, builtin: bool, emoji: bool) {
+        if (builtin, emoji) == (self.builtin_glyphs, self.color_emoji) {
+            return;
+        }
+        self.builtin_glyphs = builtin;
+        self.color_emoji = emoji;
+        self.apply_glyph_options();
+        self.mark_dirty_all();
+    }
+
+    /// Turn bold-is-bright on or off live in every tab (the next snapshot
+    /// resolves it). The caller persists.
+    fn set_bold_is_bright(&mut self, on: bool) {
+        if on == self.bold_is_bright {
+            return;
+        }
+        self.bold_is_bright = on;
+        for tab in &mut self.tabs {
+            tab.terminal.set_bold_is_bright(on);
+        }
+        for dw in &mut self.detached {
+            dw.tab.terminal.set_bold_is_bright(on);
+        }
+        self.mark_dirty_all();
+    }
+
     /// Push `builtin_glyphs` / `color_emoji` into every grid text layer — the main
     /// window's and each detached window's. Called whenever a grid layer is built
     /// and on a live config change; a no-op for a layer already set that way.
@@ -2882,25 +2911,9 @@ impl App {
                 dw.tab.terminal.set_kitty_keyboard(cfg.kitty_keyboard);
             }
         }
-        // Built-in glyphs / color emoji — live in every window (re-routes and
-        // re-shapes the grid once).
-        if (cfg.builtin_glyphs, cfg.color_emoji) != (self.builtin_glyphs, self.color_emoji) {
-            self.builtin_glyphs = cfg.builtin_glyphs;
-            self.color_emoji = cfg.color_emoji;
-            self.apply_glyph_options();
-            self.mark_dirty_all();
-        }
-        // Bold is bright — live in every tab (the next snapshot resolves it).
-        if cfg.bold_is_bright != self.bold_is_bright {
-            self.bold_is_bright = cfg.bold_is_bright;
-            for tab in &mut self.tabs {
-                tab.terminal.set_bold_is_bright(cfg.bold_is_bright);
-            }
-            for dw in &mut self.detached {
-                dw.tab.terminal.set_bold_is_bright(cfg.bold_is_bright);
-            }
-            self.mark_dirty_all();
-        }
+        // Built-in glyphs / color emoji / bold is bright — live in every window.
+        self.set_glyph_options(cfg.builtin_glyphs, cfg.color_emoji);
+        self.set_bold_is_bright(cfg.bold_is_bright);
         // Launch at login — live: an explicit edit of the key writes / removes
         // the autostart entry to match (the caller keeps the live value when the
         // file does not set it). An alternate config tree never touches the
@@ -5238,6 +5251,18 @@ impl App {
                 self.redraw_main_and_detached();
             }
             C::TogglePerfHud => self.toggle_perf_hud(),
+            C::ToggleBuiltinGlyphs => {
+                self.set_glyph_options(!self.builtin_glyphs, self.color_emoji);
+                self.persist();
+            }
+            C::ToggleColorEmoji => {
+                self.set_glyph_options(self.builtin_glyphs, !self.color_emoji);
+                self.persist();
+            }
+            C::ToggleBoldIsBright => {
+                self.set_bold_is_bright(!self.bold_is_bright);
+                self.persist();
+            }
             C::ShowWelcome => {
                 self.welcome_open = true;
                 self.request_main_paint();

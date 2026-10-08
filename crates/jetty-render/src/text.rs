@@ -1450,7 +1450,9 @@ impl TextLayer {
         // overdraw cells, the built-in glyph cells and the budgeted grapheme
         // clusters, plus the decoration fingerprint.
         let scratch = std::mem::take(&mut self.pack_scratch);
-        let color_emoji = self.color_emoji && self.active_emoji_family().is_some();
+        // Only clusters read it — the emoji font lookup (a font-database scan)
+        // waits for the first frame that has an emoji or a VS16/ZWJ cluster.
+        let color_emoji = self.color_emoji && !paint.graphemes.is_empty() && self.active_emoji_family().is_some();
         let packed = pack_grid(snapshot, paint, cell_w, cell_h, &mut |c, s| self.route(c, s), color_emoji, scratch);
 
         // ---- 2. Underline/strike quads: rebuilt only when their content, the cell
