@@ -614,7 +614,8 @@ impl Config {
     /// The slow path of [`Config::parse_with_base`]: probe every leaf of `user` on
     /// its own (against the defaults, so a failure can only be that leaf's), swap
     /// each invalid one for `base`'s value (or drop it when `base` has none), then
-    /// deserialize the repaired table.
+    /// deserialize the repaired table — or, should that still fail, re-validate it
+    /// section by section ([`Config::revalidate_sections`]).
     fn fallback_per_key(
         user: &toml::Table,
         base: &Config,
@@ -644,10 +645,51 @@ impl Config {
                 invalid.push(path);
             }
         }
-        match toml::Value::Table(doc).try_into::<Config>() {
+        match toml::Value::Table(doc.clone()).try_into::<Config>() {
             Ok(cfg) => cfg,
-            // Unreachable for this struct (fields are independent), but a wholly
-            // unusable table must still never panic or apply garbage.
+            // No single leaf explains the failure (should not happen — fields are
+            // independent): never reset the whole file for it.
+            Err(_) => Self::revalidate_sections(&doc, base, fallback, warnings, invalid),
+        }
+    }
+
+    /// The last resort when a document fails as a whole: keep each top-level
+    /// entry (a key, or a whole section like `[keys]`) that is valid on its own
+    /// against the defaults, replace each one that is not with `base`'s (or drop
+    /// it), and report it — so one broken section never takes the rest along.
+    pub(crate) fn revalidate_sections(
+        doc: &toml::Table,
+        base: &Config,
+        fallback: &str,
+        warnings: &mut Vec<String>,
+        invalid: &mut Vec<Vec<String>>,
+    ) -> Config {
+        let defaults = to_table(&Config::default());
+        let base_t = to_table(base);
+        let mut kept = toml::Table::new();
+        for (k, v) in doc {
+            let mut probe = defaults.clone();
+            probe.insert(k.clone(), v.clone());
+            match toml::Value::Table(probe).try_into::<Config>() {
+                Ok(_) => {
+                    kept.insert(k.clone(), v.clone());
+                }
+                Err(e) => {
+                    warnings.push(format!(
+                        "`{k}` could not be applied ({}) — {fallback}",
+                        friendly_expected(e.message())
+                    ));
+                    if let Some(b) = base_t.get(k) {
+                        kept.insert(k.clone(), b.clone());
+                    }
+                    invalid.push(vec![k.clone()]);
+                }
+            }
+        }
+        match toml::Value::Table(kept).try_into::<Config>() {
+            Ok(cfg) => cfg,
+            // Every entry is valid alone yet not together: still never panic or
+            // apply garbage.
             Err(e) => {
                 warnings.push(format!(
                     "config.toml could not be applied ({}) — {fallback}",
@@ -747,9 +789,13 @@ fn remove_path(t: &mut toml::Table, path: &[String]) {
     cur.remove(last);
 }
 
-/// Every leaf of `user` with its path. A table is descended into only where the
-/// defaults expect a table there (or have nothing — e.g. the `[keys]` overrides);
-/// a table standing where a scalar belongs is itself one (invalid) leaf.
+/// Every leaf of `user` with its path. A table is descended into where the
+/// defaults expect a table there, or have nothing at all but its PARENT exists
+/// (a top-level section such as `[keys]`, whose overrides have no defaults; an
+/// unknown key inside a known section). Anywhere else a table stands where one
+/// value belongs and is itself ONE (invalid) leaf — `[keys.copy]`,
+/// `copy = { key = "C" }`: split into its own leaves, removing them one by one
+/// left an empty `keys.copy = {}` behind that failed the whole document.
 fn collect_leaves(
     user: &toml::Table,
     defaults: &toml::Table,
@@ -758,11 +804,12 @@ fn collect_leaves(
 ) {
     for (k, v) in user {
         prefix.push(k.clone());
-        let default_here = get_path(defaults, prefix);
+        let descend = match get_path(defaults, prefix) {
+            Some(d) => d.is_table(),
+            None => prefix.len() == 1 || get_path(defaults, &prefix[..prefix.len() - 1]).is_some(),
+        };
         match v {
-            toml::Value::Table(sub) if default_here.is_none_or(|d| d.is_table()) => {
-                collect_leaves(sub, defaults, prefix, out);
-            }
+            toml::Value::Table(sub) if descend => collect_leaves(sub, defaults, prefix, out),
             _ => out.push((prefix.clone(), v.clone())),
         }
         prefix.pop();
@@ -1834,6 +1881,87 @@ copy = "Ctrl+Shift+Y"
         assert!(w[0].contains("true or false"), "{w:?}");
         let (_, w) = Config::parse_with_base("theme = 3\n", &Config::default(), "x").unwrap();
         assert!(w[0].contains("quoted string"), "{w:?}");
+    }
+
+    #[test]
+    fn a_table_under_keys_is_one_bad_binding_not_a_config_reset() {
+        // `[keys]` has no defaults to compare against, and each of these used to
+        // be split into leaves that were removed one by one — leaving an EMPTY
+        // `keys.copy = {}` behind that failed the whole document, so EVERY setting
+        // fell back (at startup: a full reset to defaults).
+        for (src, key) in [
+            ("[keys]\ncopy = { key = \"C\", mods = \"Ctrl+Shift\" }\n", "keys.copy"),
+            ("[keys.copy]\nkey = \"C\"\nmods = \"Ctrl+Shift\"\n", "keys.copy"),
+            ("[keys]\nnew_tab = { chord = \"Ctrl+T\" }\npaste = \"Ctrl+V\"\n", "keys.new_tab"),
+            ("[keys]\nselect_tab_1.key = \"Alt+1\"\n", "keys.select_tab_1"),
+        ] {
+            let full = format!("theme = \"nord\"\nfont_size = 13.0\n{src}");
+            let (cfg, w) = Config::parse_with_base(&full, &Config::default(), "using the default")
+                .expect("valid TOML");
+            assert_eq!(cfg.theme, "nord", "{src}: the rest of the file applies");
+            assert_eq!(cfg.font_size, 13.0, "{src}");
+            assert_eq!(w.len(), 1, "{src}: one warning: {w:?}");
+            assert!(w[0].contains(&format!("`{key} = ")), "{src}: {w:?}");
+            assert!(w[0].contains("chord string"), "{src}: {w:?}");
+        }
+        // The valid binding next to a bad one still applies.
+        let (cfg, _) = Config::parse_with_base(
+            "[keys]\nnew_tab = { chord = \"Ctrl+T\" }\npaste = \"Ctrl+V\"\n",
+            &Config::default(),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(cfg.keys.paste, Some(ChordSpec::One("Ctrl+V".to_string())));
+        assert_eq!(cfg.keys.new_tab, None);
+        // On a hot-reload the bad binding keeps its live value.
+        let live = Config {
+            keys: KeyBindings { copy: Some(ChordSpec::One("Ctrl+Y".to_string())), ..KeyBindings::default() },
+            ..Config::default()
+        };
+        let (cfg, _) =
+            Config::parse_with_base("theme = \"nord\"\n[keys.copy]\nkey = \"C\"\n", &live, "keeping").unwrap();
+        assert_eq!(cfg.theme, "nord");
+        assert_eq!(cfg.keys.copy, Some(ChordSpec::One("Ctrl+Y".to_string())));
+    }
+
+    #[test]
+    fn dotted_unknown_keys_under_keys_are_reported_not_fatal() {
+        // `select_tab.1 = …` (a guess at `select_tab_1`) is a TABLE named
+        // `select_tab`: an unknown key, never a reset.
+        let (cfg, w) = Config::parse_with_base(
+            "theme = \"nord\"\n[keys]\nselect_tab.1 = \"Alt+1\"\ncopy = \"Ctrl+Shift+C\"\n",
+            &Config::default(),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(cfg.theme, "nord");
+        assert_eq!(cfg.keys.copy, Some(ChordSpec::One("Ctrl+Shift+C".to_string())));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("keys.select_tab"), "{w:?}");
+    }
+
+    #[test]
+    fn a_failure_no_single_key_explains_falls_back_per_section() {
+        // The last-resort path (the repaired document still fails) keeps every
+        // top-level entry that is valid on its own instead of resetting all of it.
+        let user: toml::Table = toml::from_str("theme = \"nord\"\nopacity = 0.5\n").unwrap();
+        let mut warnings = Vec::new();
+        let mut invalid = Vec::new();
+        let cfg = Config::revalidate_sections(
+            &user,
+            &Config::default(),
+            "using the default",
+            &mut warnings,
+            &mut invalid,
+        );
+        assert_eq!((cfg.theme.as_str(), cfg.opacity), ("nord", 0.5));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let user: toml::Table = toml::from_str("theme = \"nord\"\nopacity = \"x\"\n").unwrap();
+        let cfg = Config::revalidate_sections(&user, &Config::default(), "x", &mut warnings, &mut invalid);
+        assert_eq!(cfg.theme, "nord", "the valid section survives");
+        assert_eq!(cfg.opacity, Config::default().opacity);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(invalid, vec![vec!["opacity".to_string()]]);
     }
 
     #[test]
