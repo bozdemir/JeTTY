@@ -1,4 +1,5 @@
 use crate::chrome::{fit_head, fit_tail, ChromeMeasure, ChromeMetrics, CHROME_ADVANCE};
+use crate::ui_palette::{ensure_contrast, rgba, UiPalette};
 use crate::Rect;
 
 /// Maximum number of result rows visible in the palette at once (the scroll
@@ -31,7 +32,7 @@ pub struct CommandPalette {
 
 /// Build the centered, HiDPI, theme-derived command palette for a window of
 /// `win_w`×`win_h` physical pixels. Mirrors `help.rs`/`search_bar.rs`: all
-/// colours blend the theme's bg→fg (no hardcoded RGB), all metrics scale with
+/// colours come from the theme's `UiPalette` (no hardcoded RGB), all metrics scale with
 /// the chrome unit `cm` (DPI × UI font), and every label is MEASURED with `m`
 /// (the chrome layer's real shaping) — so the caret, the counter and the
 /// per-char fuzzy highlights sit exactly on the drawn glyphs for any UI font,
@@ -53,30 +54,22 @@ pub fn build_command_palette(
     let sw = win_w as f32;
     let sh = win_h as f32;
 
-    // --- Theme-derived chrome (identical language to help.rs / search_bar.rs) ---
-    let tbg = theme.bg;
-    let tfg = theme.fg;
-    let lerp = |t: f32| -> [u8; 3] {
-        [
-            (tbg[0] as f32 + (tfg[0] as f32 - tbg[0] as f32) * t).round() as u8,
-            (tbg[1] as f32 + (tfg[1] as f32 - tbg[1] as f32) * t).round() as u8,
-            (tbg[2] as f32 + (tfg[2] as f32 - tbg[2] as f32) * t).round() as u8,
-        ]
-    };
-    let bg3 = lerp(0.06);
-    let panel_bg: [u8; 4] = [bg3[0], bg3[1], bg3[2], 242];
-    let border3 = lerp(0.30);
-    let border_col: [u8; 4] = [border3[0], border3[1], border3[2], 255];
-    let sel3 = lerp(0.18);
-    let sel_bg: [u8; 4] = [sel3[0], sel3[1], sel3[2], 255];
-    let input_col = tfg; // typed query
-    let placeholder_col = lerp(0.45);
-    let row_col = lerp(0.70); // unmatched title text, unselected row
-    let counter_col = lerp(0.45);
-    let accent = theme.palette[4]; // matched-char highlight
-    let caret_col: [u8; 4] = [tfg[0], tfg[1], tfg[2], 255];
-    let thumb3 = lerp(0.40);
-    let thumb_col: [u8; 4] = [thumb3[0], thumb3[1], thumb3[2], 255];
+    // --- Theme-derived chrome (the shared UiPalette, like help.rs / search_bar.rs) ---
+    let ui = UiPalette::cached(theme);
+    let panel_bg = rgba(ui.surface, 242);
+    let border_col = rgba(ui.border, 255);
+    let sel_bg = rgba(ui.surface_hi, 255);
+    let input_col = ui.text; // typed query
+    let placeholder_col = ui.text_hint;
+    let row_col = ui.text_dim; // unmatched title text, unselected row
+    let counter_col = ui.text_hint;
+    // Matched-char highlight: the accent, lifted on the selected row's raised
+    // fill when it would be faint there.
+    let accent = ui.accent;
+    let accent_on_sel = ensure_contrast(ui.accent, &[ui.surface_hi], UiPalette::ACCENT_FLOOR);
+    let row_selected_col = ui.text;
+    let caret_col = rgba(ui.text, 255);
+    let thumb_col = rgba(ui.text_hint, 255);
 
     // --- Vertical metrics (scale with DPI × UI font; floored so a short window
     // still fits) ---
@@ -113,7 +106,7 @@ pub fn build_command_palette(
     let mut row_hits: Vec<Rect> = Vec::new();
 
     // Full-screen dim so the palette reads as modal.
-    quads.push(Rect { x: 0.0, y: 0.0, w: sw, h: sh, color: [0, 0, 0, 150], ..Default::default() });
+    quads.push(Rect { x: 0.0, y: 0.0, w: sw, h: sh, color: ui.scrim, ..Default::default() });
     // Border + panel (rounded, matching the window/tab frame).
     quads.push(Rect::rounded(
         (px - 2.0).max(0.0),
@@ -194,7 +187,8 @@ pub fn build_command_palette(
         } else {
             shown_title.chars().count() - 1 // the trailing ellipsis is not original
         };
-        let base_col = if row.selected { tfg } else { row_col };
+        let base_col = if row.selected { row_selected_col } else { row_col };
+        let hl_col = if row.selected { accent_on_sel } else { accent };
         labels.push((shown_title.clone(), text_x, row_text_y, base_col));
 
         // Overlay each surviving matched char in the accent colour at its MEASURED
@@ -207,7 +201,7 @@ pub fn build_command_palette(
             }
             let Some(&dx) = xs.get(idx) else { continue };
             let cx = text_x + dx;
-            labels.push((chars[idx].to_string(), cx, row_text_y, accent));
+            labels.push((chars[idx].to_string(), cx, row_text_y, hl_col));
         }
     }
 
@@ -367,7 +361,8 @@ mod tests {
         let idx = vec![0usize, 3, 5];
         let rows = vec![PaletteRow { title: &title, match_indices: &idx, selected: true }];
         let p = build_command_palette(1000, 700, &theme(), &mut PropMeasure, CM, "ml", &rows, 1, 0);
-        let accent = theme().palette[4];
+        let ui = UiPalette::from_theme(&theme());
+        let accent = ensure_contrast(ui.accent, &[ui.surface_hi], UiPalette::ACCENT_FLOOR);
         let base = p.labels.iter().find(|l| l.0 == "Mail list").expect("row label");
         let xs: Vec<(String, f32)> =
             p.labels.iter().filter(|l| l.3 == accent).map(|l| (l.0.clone(), l.1 - base.1)).collect();
@@ -385,7 +380,8 @@ mod tests {
         let indices = vec![0usize, 4usize];
         let rows = vec![PaletteRow { title: &title, match_indices: &indices, selected: true }];
         let p = build_command_palette(1000, 700, &theme(), &mut mono(), CM, "nt", &rows, 1, 0);
-        let accent = theme().palette[4];
+        let ui = UiPalette::from_theme(&theme());
+        let accent = ensure_contrast(ui.accent, &[ui.surface_hi], UiPalette::ACCENT_FLOOR);
         let accents: Vec<&(String, f32, f32, [u8; 3])> =
             p.labels.iter().filter(|l| l.3 == accent).collect();
         assert_eq!(accents.len(), 2, "two matched-char overlays expected");
@@ -396,6 +392,35 @@ mod tests {
         let t_glyph = accents.iter().find(|l| l.0 == "t").unwrap();
         assert!((n_glyph.1 - text_x).abs() < 0.01, "N at wrong x");
         assert!((t_glyph.1 - (text_x + 4.0 * TEST_CHAR_W)).abs() < 0.01, "t at wrong x");
+    }
+
+    #[test]
+    fn rows_and_highlights_read_on_every_theme() {
+        use crate::colors::contrast_ratio as cr;
+        let rgb = |c: [u8; 4]| [c[0], c[1], c[2]];
+        let titles = ["Theme: Nord".to_string(), "New tab".to_string()];
+        let (i0, i1) = (vec![0usize, 1], vec![0usize, 4]);
+        for i in 0..jetty_core::theme::PRESETS.len() {
+            let t = jetty_core::theme::theme_at(i);
+            let rows = vec![
+                PaletteRow { title: &titles[0], match_indices: &i0, selected: true },
+                PaletteRow { title: &titles[1], match_indices: &i1, selected: false },
+            ];
+            let p = build_command_palette(1000, 700, &t, &mut mono(), CM, "", &rows, 2, 0);
+            let card = rgb(p.panel.color);
+            let sel = rgb(p.quads.iter().find(|q| q.radius == 6.0).expect("selection quad").color);
+            let n = &t.name;
+            for (text, _, y, c) in &p.labels {
+                let on_sel = (*y - p.row_hits[0].y).abs() < p.row_hits[0].h && *y >= p.row_hits[0].y;
+                let (bg, floor) = if on_sel { (sel, 3.0) } else { (card, 3.0) };
+                assert!(cr(*c, bg) >= floor, "{n}: {text:?} {}", cr(*c, bg));
+            }
+            // Full row titles are text-grade on their own row.
+            let col = |s: &str| p.labels.iter().find(|l| l.0 == s).unwrap().3;
+            assert!(cr(col("Theme: Nord"), sel) >= 4.5, "{n}: selected row");
+            assert!(cr(col("New tab"), card) >= 4.5, "{n}: unselected row");
+            assert_eq!(p.quads[0].color, UiPalette::cached(&t).scrim);
+        }
     }
 
     #[test]

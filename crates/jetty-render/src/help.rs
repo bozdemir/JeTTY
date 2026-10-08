@@ -1,4 +1,5 @@
 use crate::chrome::{fit_head, ChromeMeasure, ChromeMetrics, CHROME_ADVANCE};
+use crate::ui_palette::{rgba, UiPalette};
 use crate::Rect;
 
 /// The keyboard-shortcut rows shown in the Help overlay — ONE binding per line
@@ -116,30 +117,21 @@ pub fn build_help_overlay(
     let sw = win_w as f32;
     let sh = win_h as f32;
 
-    // --- Theme-derived overlay chrome (mirrors panel.rs::build_panel) ---
-    // All colors blend the active theme's bg→fg so the overlay re-skins itself
-    // with the theme instead of being a fixed dark card (which was invisible on
-    // the light theme and clashed on Gruvbox/Dracula).
-    let tbg = theme.bg;
-    let tfg = theme.fg;
-    let lerp = |t: f32| -> [u8; 3] {
-        [
-            (tbg[0] as f32 + (tfg[0] as f32 - tbg[0] as f32) * t).round() as u8,
-            (tbg[1] as f32 + (tfg[1] as f32 - tbg[1] as f32) * t).round() as u8,
-            (tbg[2] as f32 + (tfg[2] as f32 - tbg[2] as f32) * t).round() as u8,
-        ]
-    };
-    let bg3 = lerp(0.06);
-    let panel_bg: [u8; 4] = [bg3[0], bg3[1], bg3[2], 242];
-    let border3 = lerp(0.30);
-    let border_col: [u8; 4] = [border3[0], border3[1], border3[2], 255];
-    let title_col = tfg;
+    // --- Theme-derived overlay chrome (the shared UiPalette) ---
+    // Every color follows the active theme, so the overlay re-skins itself
+    // instead of being a fixed dark card (which was invisible on the light
+    // theme and clashed on Gruvbox/Dracula), and reads on light themes too.
+    let ui = UiPalette::cached(theme);
+    let panel_bg = rgba(ui.surface, 242);
+    let border_col = rgba(ui.border, 255);
+    let title_col = ui.text;
     // Colour hierarchy so the dialog scans at a glance: section HEADERS in the
-    // theme's cursor/accent hue, KEYS at full foreground brightness so the
-    // shortcut pops, DESCRIPTIONS muted.
-    let header_col = theme.cursor;
-    let key_col = tfg;
-    let desc_col = lerp(0.60);
+    // theme's cursor hue (lifted when it is faint on the card — Palenight's
+    // purple read 2.6:1), KEYS at full text brightness so the shortcut pops,
+    // DESCRIPTIONS muted but still text-grade.
+    let header_col = ui.readable(theme.cursor, UiPalette::TEXT_FLOOR);
+    let key_col = ui.text;
+    let desc_col = ui.text_dim;
 
     // Ideal vertical metrics. When the window is too SHORT to fit every row, the
     // padding / title / row heights are scaled DOWN proportionally (to a readable
@@ -311,7 +303,7 @@ pub fn build_help_overlay(
     let mut quads: Vec<Rect> = Vec::new();
 
     // Full-screen dim.
-    quads.push(Rect { x: 0.0, y: 0.0, w: sw, h: sh, color: [0, 0, 0, 150], ..Default::default() });
+    quads.push(Rect { x: 0.0, y: 0.0, w: sw, h: sh, color: ui.scrim, ..Default::default() });
     // Border (rounded to match the window/tab frame). Clamp the top to y>=0 so a
     // very short window (py==0) never draws the border off-screen at y=-2.
     let border_y = (py - 2.0).max(0.0);
@@ -383,13 +375,12 @@ pub fn build_help_overlay(
         let thumb_h = (track_h * visible as f32 / n_rows as f32).max(8.0 * vscale).min(track_h);
         let thumb_y = rows_top + (track_h - thumb_h) * (first as f32 / max_scroll as f32);
         let tw = 3.0 * vscale;
-        let thumb3 = lerp(0.40);
         quads.push(Rect::rounded(
             px + panel_w - (pad_x + tw) * 0.5,
             thumb_y,
             tw,
             thumb_h,
-            [thumb3[0], thumb3[1], thumb3[2], 255],
+            rgba(ui.text_hint, 255),
             tw * 0.5,
         ));
     }
@@ -566,6 +557,20 @@ mod tests {
         let key = h.labels.iter().find(|l| l.0 == "Ctrl+Shift+T").unwrap();
         let desc = h.labels.iter().find(|l| l.0 == "New tab").unwrap();
         assert_eq!(desc.2, key.2, "side by side");
+    }
+
+    #[test]
+    fn every_label_reads_on_the_card_on_every_theme() {
+        use crate::colors::contrast_ratio as cr;
+        for i in 0..jetty_core::theme::PRESETS.len() {
+            let t = jetty_core::theme::theme_at(i);
+            let h = build_help_overlay(1000, 900, &t, &mut mono(), CM, &default_help_rows(), 0);
+            let card = [h.panel.color[0], h.panel.color[1], h.panel.color[2]];
+            for (text, _, _, c) in &h.labels {
+                assert!(cr(*c, card) >= 4.5, "{}: {text:?} {}", t.name, cr(*c, card));
+            }
+            assert_eq!(h.quads[0].color, UiPalette::cached(&t).scrim, "{}: palette scrim", t.name);
+        }
     }
 
     #[test]

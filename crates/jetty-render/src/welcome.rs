@@ -1,3 +1,4 @@
+use crate::ui_palette::UiPalette;
 use crate::Rect;
 
 /// The "JETTY" logo in the ANSI-Shadow block style (full-block + box-drawing
@@ -53,26 +54,19 @@ pub fn build_welcome_overlay(
     char_w: f32,
     line_h: f32,
 ) -> WelcomeOverlay {
-    // --- Theme-derived colors (mirrors help.rs / panel.rs) ---
-    // All colors blend the active theme's bg→fg so the overlay re-skins itself
-    // with every theme instead of being a fixed dark card.
-    let tbg = theme.bg;
-    let tfg = theme.fg;
-    let lerp = |t: f32| -> [u8; 3] {
-        [
-            (tbg[0] as f32 + (tfg[0] as f32 - tbg[0] as f32) * t).round() as u8,
-            (tbg[1] as f32 + (tfg[1] as f32 - tbg[1] as f32) * t).round() as u8,
-            (tbg[2] as f32 + (tfg[2] as f32 - tbg[2] as f32) * t).round() as u8,
-        ]
-    };
-    // Accent: palette index 4 (blue-ish in most themes) for the logo + labels.
-    let accent = theme.palette[4];
+    // --- Theme-derived colors (the shared UiPalette, like help.rs) ---
+    // Every color follows the active theme, so the splash re-skins itself with
+    // every theme — and its dim rows still read on light themes (the fixed
+    // 0.35 tip blend did not).
+    let ui = UiPalette::cached(theme);
+    // Accent (the theme's, else its blue — kept readable) for the logo.
+    let accent = ui.accent;
     // Foreground for info values.
-    let fg_col = tfg;
+    let fg_col = ui.text;
     // Dim foreground for info key labels.
-    let dim_col = lerp(0.55);
+    let dim_col = ui.text_dim;
     // Dimmer still for the tip line.
-    let tip_col = lerp(0.35);
+    let tip_col = ui.text_hint;
 
     // --- Layout constants (physical px) ---
     // `char_w` / `line_h` are the caller-supplied MONOSPACE terminal cell metrics
@@ -232,6 +226,19 @@ mod tests {
         let w = build_welcome_overlay(1000, 700, 36.0, "1.2.3", "Metal", &theme(), TEST_CHAR_W, 22.0);
         let joined: String = w.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("Metal"), "backend name must appear in Render row");
+    }
+
+    #[test]
+    fn logo_and_rows_read_on_the_terminal_bg_on_every_theme() {
+        use crate::colors::contrast_ratio as cr;
+        for i in 0..jetty_core::theme::PRESETS.len() {
+            let t = jetty_core::theme::theme_at(i);
+            let bg = [t.bg[0], t.bg[1], t.bg[2]];
+            let w = build_welcome_overlay(1000, 700, 36.0, "0.1.0", "Vulkan", &t, TEST_CHAR_W, 22.0);
+            for (text, _, _, c) in &w.labels {
+                assert!(cr(*c, bg) >= 3.0, "{}: {text:?} {}", t.name, cr(*c, bg));
+            }
+        }
     }
 
     #[test]

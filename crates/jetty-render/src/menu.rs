@@ -523,7 +523,7 @@ mod tests {
             "hovered disabled row must not emit a hover quad (border+bg+separator only)"
         );
         // Compare label colors: disabled labels match the hint color of an
-        // enabled row's hint (the dim lerp), enabled labels do not.
+        // enabled row's hint (the dim hint role), enabled labels do not.
         let enabled = build_context_menu(50.0, 50.0, 1280, 800, None, &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
         let color_of = |m: &ContextMenu, text: &str| {
             m.labels.iter().find(|l| l.0 == text).map(|l| l.3).unwrap()
