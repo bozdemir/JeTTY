@@ -549,6 +549,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (r, c, selecting, line_mode)
         });
 
+    // JETTY_SHOT_CLICK_WORD="row,col" / JETTY_SHOT_CLICK_LINE="row" — the
+    // selections a double / triple click makes (the app's gridmouse press calls
+    // these same Terminal APIs), rendered through the real selection paint.
+    if let Some((r, c)) = std::env::var("JETTY_SHOT_CLICK_WORD").ok().and_then(|s| parse_rc(&s)) {
+        terminal.selection_start_semantic(r, c);
+        eprintln!("jetty-shot: double-click word at ({r},{c}) -> {:?}", terminal.selection_text());
+    }
+    if let Some(r) = std::env::var("JETTY_SHOT_CLICK_LINE").ok().and_then(|s| s.trim().parse::<usize>().ok()) {
+        terminal.selection_start_lines(r);
+        eprintln!("jetty-shot: triple-click line {r} -> {:?}", terminal.selection_text());
+    }
+
     let snap = terminal.snapshot();
 
     let bg_alpha = snap.bg_rgba[3];

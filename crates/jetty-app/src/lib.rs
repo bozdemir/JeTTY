@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod copymode;
 mod detached;
+mod gridmouse;
 mod notify;
 mod runsel;
 /// Command-palette action registry + fuzzy filter. Public so the `jetty-shot`

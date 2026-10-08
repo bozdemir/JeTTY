@@ -173,6 +173,26 @@ fn isolated_csi(params: &[u8], fin: u8) -> Option<IsolatedSeq> {
     }
 }
 
+/// [`Scan::Decset`] bit: the sequence named mode 9 (X10 mouse reporting).
+const DECSET_X10: u8 = 1;
+/// [`Scan::Decset`] bit: the sequence named mode 1015 (urxvt mouse encoding).
+const DECSET_URXVT: u8 = 2;
+
+/// The [`Scan::Decset`] bit for private mode `n` (0 for every other mode).
+fn decset_bit(n: u16) -> u8 {
+    match n {
+        9 => DECSET_X10,
+        1015 => DECSET_URXVT,
+        _ => 0,
+    }
+}
+
+/// Parse the decimal digits of one private-mode parameter (`params` excludes the
+/// `?`), saturating — an over-long number can never alias 9 or 1015.
+fn decset_param(digits: &[u8]) -> u16 {
+    digits.iter().fold(0u16, |n, &d| n.saturating_mul(10).saturating_add(u16::from(d.wrapping_sub(b'0'))))
+}
+
 /// Result of peeking at the bytes after `ESC [` (see [`peek_isolated_csi`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CsiPeek {
@@ -553,6 +573,13 @@ enum Scan {
     /// to Ground at once (an SGR costs one extra step); vte parses every CSI
     /// itself regardless — this only decides where `feed` splits its slices.
     Csi { params: [u8; 5], len: u8 },
+    /// Inside a private-mode CSI (`ESC [ ?`), watching for DECSET/DECRST of the
+    /// two mouse modes alacritty does not track — X10 (`9`) and urxvt (`1015`).
+    /// `cur` is the parameter being read (saturating), `hit` the modes named so
+    /// far ([`DECSET_X10`] / [`DECSET_URXVT`]). Mirrors vte's CSI states: C0,
+    /// DEL and high bytes stay, ESC restarts, CAN/SUB and anything that is not a
+    /// plain `Pm h/l` sequence end it.
+    Decset { cur: u16, hit: u8 },
     /// Inside `ESC ]`, matching the `133;` prefix byte by byte (`n` matched).
     Prefix { n: u8 },
     /// Matched `133;`; collecting the letter (A/B/C/D) and the first `;code`.
@@ -872,6 +899,12 @@ pub struct Terminal {
     /// Payload bytes of the OSC being scanned (bounded by `osc_cap`). Persists
     /// across `feed` calls like `scan`.
     osc_len: u32,
+    /// DECSET 9 (X10 mouse reporting: button presses only) is on. alacritty
+    /// ignores this mode, so the scanner tracks it ([`Scan::Decset`]).
+    mouse_x10: bool,
+    /// DECSET 1015 (urxvt decimal mouse encoding) is on — tracked here for the
+    /// same reason.
+    mouse_urxvt: bool,
     /// The OSC payload cap in force: [`OSC_MAX_BYTES`], lowered only by tests so
     /// the vte differential fuzz reaches it cheaply.
     osc_cap: u32,
@@ -1025,6 +1058,8 @@ impl Terminal {
             kitty_images: VecDeque::new(),
             kitty_stored_bytes: 0,
             osc_len: 0,
+            mouse_x10: false,
+            mouse_urxvt: false,
             osc_cap: OSC_MAX_BYTES,
             #[cfg(test)]
             vte_log: None,
@@ -1180,6 +1215,29 @@ impl Terminal {
         self.term.mode().contains(TermMode::UTF8_MOUSE)
     }
 
+    /// Whether the app requested X10 mouse reporting (`\e[?9h`: button presses
+    /// only). alacritty does not track this mode; the feed scanner does.
+    pub fn mouse_x10(&self) -> bool {
+        self.mouse_x10
+    }
+
+    /// Whether the app requested urxvt-style decimal mouse reports
+    /// (`\e[?1015h`). Tracked by the feed scanner, like [`Terminal::mouse_x10`].
+    pub fn mouse_urxvt(&self) -> bool {
+        self.mouse_urxvt
+    }
+
+    /// Apply a DECSET (`on`) / DECRST of the scanner-tracked mouse modes named by
+    /// `hit` ([`DECSET_X10`] / [`DECSET_URXVT`] bits).
+    fn set_mouse_modes(&mut self, hit: u8, on: bool) {
+        if hit & DECSET_X10 != 0 {
+            self.mouse_x10 = on;
+        }
+        if hit & DECSET_URXVT != 0 {
+            self.mouse_urxvt = on;
+        }
+    }
+
     /// Replace the active theme at runtime. Also refreshes the copy shared with
     /// the `EventProxy` so subsequent OSC 10/11/12/4 color-query replies reflect
     /// the new theme (e.g. so nvim/fzf detect the right background).
@@ -1303,14 +1361,40 @@ impl Terminal {
                                 seq_start = i;
                                 Scan::Csi { params: [0; 5], len: 0 }
                             }
+                            // A private-mode CSI: watch it for the mouse modes
+                            // alacritty ignores (the `?` is consumed here).
+                            CsiPeek::Other if bytes.get(i + 1) == Some(&b'?') => {
+                                self.scan = Scan::Decset { cur: 0, hit: 0 };
+                                i += 2;
+                                continue;
+                            }
                             CsiPeek::Other => Scan::Ground,
                         },
-                        // `ESC c` (RIS) resets the screen AND scrollback.
+                        // Without anchors only private-mode CSIs are followed (a
+                        // one-byte peek; an SGR still costs no extra step). At the
+                        // end of the feed, finish the CSI byte-wise.
+                        0x5b => match bytes.get(i + 1) {
+                            Some(b'?') => {
+                                self.scan = Scan::Decset { cur: 0, hit: 0 };
+                                i += 2;
+                                continue;
+                            }
+                            Some(_) => Scan::Ground,
+                            None => {
+                                seq_start = i;
+                                Scan::Csi { params: [0; 5], len: 0 }
+                            }
+                        },
+                        // `ESC c` (RIS) resets the screen AND scrollback — and
+                        // every terminal mode, including the two mouse modes
+                        // tracked here.
                         b'c' => {
                             let k = i + 1;
                             if self.has_anchors() {
                                 start = self.isolate(bytes, start, i, k, IsolatedSeq::Reset);
                             }
+                            self.mouse_x10 = false;
+                            self.mouse_urxvt = false;
                             Scan::Ground
                         }
                         // ESC ESC restarts; C0 controls (vte executes them), DEL and
@@ -1325,11 +1409,23 @@ impl Terminal {
                     i += 1;
                 }
                 Scan::Csi { mut params, len } => {
+                    let private = len > 0 && params[0] == b'?';
                     match b {
                         b'0'..=b'9' | b'?' if (len as usize) < params.len() => {
                             params[len as usize] = b;
                             self.scan = Scan::Csi { params, len: len + 1 };
                         }
+                        // A private-mode CSI that outgrows the 5-byte window (a
+                        // second parameter, a long number): keep reading it for
+                        // the mouse modes (an over-long first number names none).
+                        b';' if private => {
+                            let hit = decset_bit(decset_param(&params[1..len as usize]));
+                            self.scan = Scan::Decset { cur: 0, hit };
+                        }
+                        b'0'..=b'9' if private => self.scan = Scan::Decset { cur: u16::MAX, hit: 0 },
+                        // vte executes C0 controls and ignores DEL / high bytes
+                        // inside a CSI; a private sequence keeps being read.
+                        0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff if private => {}
                         // Final byte: advance an isolated sequence in a sub-slice of
                         // its own (only while anchors exist — otherwise splitting
                         // buys nothing).
@@ -1340,12 +1436,38 @@ impl Terminal {
                                     start = self.isolate(bytes, start, seq_start, k, kind);
                                 }
                             }
+                            if private && matches!(b, b'h' | b'l') {
+                                self.set_mouse_modes(decset_bit(decset_param(&params[1..len as usize])), b == b'h');
+                            }
                             self.scan = Scan::Ground;
                         }
                         // ESC aborts the CSI and begins a new escape (vte parity).
                         0x1b => self.scan = Scan::Esc,
                         // Anything else (`;`, intermediates, C0): not a sequence we
                         // isolate — stop tracking it.
+                        _ => self.scan = Scan::Ground,
+                    }
+                    i += 1;
+                }
+                Scan::Decset { cur, hit } => {
+                    match b {
+                        b'0'..=b'9' => {
+                            let cur = cur.saturating_mul(10).saturating_add(u16::from(b - b'0'));
+                            self.scan = Scan::Decset { cur, hit };
+                        }
+                        b';' => self.scan = Scan::Decset { cur: 0, hit: hit | decset_bit(cur) },
+                        b'h' | b'l' => {
+                            self.set_mouse_modes(hit | decset_bit(cur), b == b'h');
+                            self.scan = Scan::Ground;
+                        }
+                        // ESC restarts, CAN/SUB abort (vte's "anywhere" rules).
+                        0x1b => self.scan = Scan::Esc,
+                        0x18 | 0x1a => self.scan = Scan::Ground,
+                        // vte executes C0 controls and ignores DEL / high bytes
+                        // without leaving the CSI.
+                        0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff => {}
+                        // Any other final byte, an intermediate, a sub-parameter
+                        // colon or a second private marker: not a DECSET/DECRST.
                         _ => self.scan = Scan::Ground,
                     }
                     i += 1;
@@ -6610,6 +6732,63 @@ mod tests {
                 assert!(model.max_osc <= t.osc_cap as usize, "case {case}: vte buffered {} OSC bytes", model.max_osc);
             }
         }
+    }
+
+    // ── scanner-tracked mouse modes (X10 9 / urxvt 1015) ──────────────────────
+
+    /// Feed `seq` split at EVERY byte boundary (and whole), with and without
+    /// live anchors, and return the (x10, urxvt) flags each run ends with.
+    fn mouse_modes_after(seq: &[u8]) -> Vec<(bool, bool)> {
+        let mut out = Vec::new();
+        for anchors in [false, true] {
+            for cut in 0..=seq.len() {
+                let mut t = Terminal::new(30, 8);
+                if anchors {
+                    t.feed(b"\x1b]133;A\x07");
+                }
+                t.feed(&seq[..cut]);
+                t.feed(&seq[cut..]);
+                out.push((t.mouse_x10(), t.mouse_urxvt()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn urxvt_and_x10_mouse_modes_are_tracked_at_any_split() {
+        let all = |seq: &[u8], want: (bool, bool)| {
+            for got in mouse_modes_after(seq) {
+                assert_eq!(got, want, "{:?}", String::from_utf8_lossy(seq));
+            }
+        };
+        all(b"\x1b[?1015h", (false, true));
+        all(b"\x1b[?9h", (true, false));
+        all(b"\x1b[?1000;1006;1015h", (false, true));
+        all(b"\x1b[?1015;9h", (true, true));
+        all(b"\x1b[?12345;1015h", (false, true));
+        all(b"\x1b[?1015h\x1b[?1015l", (false, false));
+        all(b"\x1b[?9h\x1b[?1015h\x1bc", (false, false)); // RIS resets both
+        // Not a DECSET of these modes: other modes, ANSI SM, other finals, an
+        // intermediate, an over-long number, a sub-parameter, a CAN abort.
+        all(b"\x1b[?25l\x1b[?2004h", (false, false));
+        all(b"\x1b[1015h", (false, false));
+        all(b"\x1b[?1015m", (false, false));
+        all(b"\x1b[?1015$h", (false, false));
+        all(b"\x1b[?10150h", (false, false));
+        all(b"\x1b[?1015:1h", (false, false));
+        all(b"\x1b[?10\x1815h", (false, false));
+        // C0 controls inside the CSI are executed by vte without ending it.
+        all(b"\x1b[?10\n15h", (false, true));
+    }
+
+    #[test]
+    fn tracking_mouse_modes_leaves_the_screen_untouched() {
+        let mut t = Terminal::new(30, 4);
+        t.feed(b"ab\x1b[?1015hcd\x1b[?9h\x1b[1;31mef");
+        assert!(t.mouse_urxvt() && t.mouse_x10());
+        let snap = t.snapshot();
+        let row: String = snap.cells.iter().take(6).map(|c| c.c).collect();
+        assert_eq!(row, "abcdef", "the sequences still reach vte, nothing leaks as text");
     }
 
     // ── mode getters for the input layer (kitty keyboard / focus / mouse) ────
