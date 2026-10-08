@@ -18,7 +18,6 @@ mod phosphor;
 mod liquid;
 mod focus;
 mod transform;
-mod rim;
 mod crt;
 mod image_layer;
 mod welcome;
@@ -69,7 +68,6 @@ pub use crt::{
     CrtFrame, CrtKey, CrtParams, CrtSettings, CrtUniform, Phosphor, ANIM_SEED_FPS, BLOOM_STEP_MAX,
     CRT_FLAG_FLICKER, CRT_FLAG_JITTER, CRT_FLAG_ROLL,
 };
-pub use rim::{rim_regions, RimLayer, RimUniform};
 pub use transform::{transform_params, transform_secs, SummonTransform, TransformKind};
 pub use image_layer::{ImageDraw, ImageLayer};
 pub use caret_fx::{caret_glow_look, caret_glow_scissor, CaretFx, CaretFxUniform};

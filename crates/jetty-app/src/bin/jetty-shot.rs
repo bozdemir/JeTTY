@@ -202,7 +202,7 @@
 ///   JETTY_SHOT_PULSE=failure|success — the command status pulse at
 ///                    JETTY_SHOT_PULSE_T=t (0..1 of its 0.4 s, default 0.15).
 ///                    Both use the app's colors (UiPalette warn / danger /
-///                    accent), its rim pass and the window radius
+///                    accent), its pass (the focus ring, soft) and the window radius
 ///                    (JETTY_CORNER_RADIUS).
 ///   JETTY_SHOT_GLOW_T=t — the caret glow/ripple pass at progress t around the
 ///                    cursor (additive on a dark theme, multiply on a light
@@ -1910,15 +1910,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             if !edge.rims.is_empty() {
-                let rim = jetty_render::RimLayer::new(&device, format);
+                // The app's pass: the focus ring as a soft glow.
+                let ring = jetty_render::FocusRing::new(&device, format);
                 for spec in &edge.rims {
-                    rim.apply(
-                        &device,
-                        &queue,
-                        &view,
-                        &jetty_render::RimUniform::new(
-                            width, height, radius, radius, spec.rgb, spec.strength, spec.band * dpi, 0.0,
-                        ),
+                    ring.apply_soft(
+                        &device, &queue, &view, width, height, [radius; 4], spec.band * dpi, spec.rgba(),
+                        jetty_app::motion::RIM_SOFTNESS,
                     );
                 }
             }

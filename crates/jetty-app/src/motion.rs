@@ -403,6 +403,11 @@ pub fn worse_pulse(a: Option<PulseKind>, b: PulseKind) -> PulseKind {
 /// How far inward (logical px) the bell rim / the command pulse glow.
 pub const BELL_RIM_BAND: f32 = 6.0;
 pub const PULSE_RIM_BAND: f32 = 10.0;
+/// The rims are drawn by the focus-ring pass as a soft glow: solid over the
+/// outer third of the band, then a smooth fade inward (`FocusRing::apply_soft`).
+/// A fast falloff would wash a mid-tone rim out on a light page (the blend is
+/// in linear light).
+pub const RIM_SOFTNESS: f32 = 0.65;
 /// Peak strength of the bell rim and the pulse rim.
 pub const BELL_RIM_STRENGTH: f32 = 0.9;
 pub const PULSE_RIM_STRENGTH: f32 = 1.0;
@@ -418,6 +423,13 @@ pub struct RimSpec {
     pub rgb: [u8; 3],
     pub strength: f32,
     pub band: f32,
+}
+
+impl RimSpec {
+    /// The focus-ring color for this rim (sRGB, straight alpha = strength).
+    pub fn rgba(&self) -> [u8; 4] {
+        [self.rgb[0], self.rgb[1], self.rgb[2], (self.strength.clamp(0.0, 1.0) * 255.0).round() as u8]
+    }
 }
 
 /// What a window draws this frame for its live visual bell and command pulse:

@@ -1500,9 +1500,6 @@ pub struct App {
     /// one owed to the next summon: a command that finished while hidden.
     pulse_anim: Option<(std::time::Instant, crate::motion::PulseKind)>,
     pulse_deferred: Option<crate::motion::PulseKind>,
-    /// The rim pass (bell rim / command pulse), built by the first frame once
-    /// either is enabled.
-    rim: Option<jetty_render::RimLayer>,
 
 
 }
@@ -2038,7 +2035,6 @@ impl App {
             bell_limit: crate::motion::RateLimit::default(),
             pulse_anim: None,
             pulse_deferred: None,
-            rim: None,
         };
         // Persisted user settings override the env-derived defaults (but env
         // vars still seed the initial values above, so an explicit JETTY_* can
@@ -10309,7 +10305,8 @@ impl App {
         // Its tab's decoration (color, progress) and its focus ring.
         let tab_deco = dw.tab.meta.deco();
         let ring_color = crate::tabmeta::ring_rgb(window_border, dw.focused, dw.fullscreen, &theme, tab_deco.color);
-        if ring_color.is_some() && dw.focus_ring.is_none() {
+        // The ring pass also draws this window's bell rim / command pulse.
+        if (ring_color.is_some() || rim_wanted) && dw.focus_ring.is_none() {
             dw.focus_ring = Some(jetty_render::FocusRing::new(&dw.gpu.device, dw.gpu.format));
         }
         let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
@@ -10413,9 +10410,6 @@ impl App {
                 .prepare(&g.device, light);
         }
         // This window's bell / pulse (the main window's rules and colors).
-        if rim_wanted && dw.rim.is_none() {
-            dw.rim = Some(jetty_render::RimLayer::new(&dw.gpu.device, dw.gpu.format));
-        }
         let edge = if dw.bell_anim.is_some() || dw.pulse_anim.is_some() {
             crate::motion::edge_draw(
                 dw.bell_anim,
@@ -10426,7 +10420,6 @@ impl App {
         } else {
             crate::motion::EdgeDraw::default()
         };
-        let rim_layer = dw.rim.as_ref();
         let caret_fx = dw.caret_fx.as_ref();
         let trail_layer = dw.trail_layer.as_ref();
         let gpu = &mut dw.gpu;
@@ -10677,16 +10670,18 @@ impl App {
                 &[jetty_render::Rect::new(0.0, 0.0, width as f32, height as f32, veil)],
             );
         }
-        if let Some(rim) = rim_layer {
+        if let Some(ring) = focus_ring {
             for spec in &edge.rims {
-                rim.apply(
+                ring.apply_soft(
                     &gpu.device,
                     &gpu.queue,
                     scene_view,
-                    &jetty_render::RimUniform::new(
-                        width, height, corner_radius_px, corner_radius_px, spec.rgb, spec.strength,
-                        spec.band * scale, 0.0,
-                    ),
+                    width,
+                    height,
+                    [corner_radius_px; 4],
+                    spec.band * scale,
+                    spec.rgba(),
+                    crate::motion::RIM_SOFTNESS,
                 );
             }
         }
@@ -14230,7 +14225,13 @@ impl ApplicationHandler<AppEvent> for App {
                     &theme,
                     self.tabs.get(self.active).and_then(|t| t.meta.color),
                 );
-                if ring_color.is_some() && self.focus_ring.is_none() {
+                // The same pass draws the visual bell rim / command pulse
+                // (`FocusRing::apply_soft`): build it once either is enabled
+                // too (not on the first bell).
+                let rim_wanted = self.visual_bell.effective(self.motion_reduced())
+                    == crate::motion::VisualBell::Rim
+                    || self.command_pulse != crate::motion::CommandPulse::Off;
+                if (ring_color.is_some() || rim_wanted) && self.focus_ring.is_none() {
                     if let Some(g) = &self.gpu {
                         self.focus_ring = Some(jetty_render::FocusRing::new(&g.device, g.format));
                     }
@@ -14395,16 +14396,7 @@ impl ApplicationHandler<AppEvent> for App {
                     _ => None,
                 };
                 // Visual bell / command pulse: this frame's veil + rims (theme
-                // roles via UiPalette), and the rim pass — built by the first
-                // frame once a rim effect is enabled (not on the first bell).
-                let rim_wanted = self.visual_bell.effective(self.motion_reduced())
-                    == crate::motion::VisualBell::Rim
-                    || self.command_pulse != crate::motion::CommandPulse::Off;
-                if rim_wanted && self.rim.is_none() {
-                    if let Some(g) = &self.gpu {
-                        self.rim = Some(jetty_render::RimLayer::new(&g.device, g.format));
-                    }
-                }
+                // roles via UiPalette; the rims are drawn by the focus-ring pass).
                 let edge = if self.bell_anim.is_some() || self.pulse_anim.is_some() {
                     crate::motion::edge_draw(
                         self.bell_anim,
@@ -14415,7 +14407,6 @@ impl ApplicationHandler<AppEvent> for App {
                 } else {
                     crate::motion::EdgeDraw::default()
                 };
-                let rim_layer = self.rim.as_ref();
                 let trail_layer = self.trail_layer.as_ref();
                 let (Some(gpu), Some(text), Some(chrome_text), Some(quad), Some(image_layer)) = (
                     &mut self.gpu,
@@ -14918,17 +14909,19 @@ impl ApplicationHandler<AppEvent> for App {
                             &[jetty_render::Rect::new(0.0, slide_y_offset, width as f32, height as f32, veil)],
                         );
                     }
-                    if let Some(rim) = rim_layer {
+                    if let Some(ring) = focus_ring {
                         let r_top = if top_flush { 0.0 } else { corner_radius_px };
                         for spec in &edge.rims {
-                            rim.apply(
+                            ring.apply_soft(
                                 &gpu.device,
                                 &gpu.queue,
                                 scene_view,
-                                &jetty_render::RimUniform::new(
-                                    width, height, r_top, corner_radius_px, spec.rgb, spec.strength,
-                                    spec.band * scale, slide_y_offset,
-                                ),
+                                width,
+                                height,
+                                [r_top, r_top, corner_radius_px, corner_radius_px],
+                                spec.band * scale,
+                                spec.rgba(),
+                                crate::motion::RIM_SOFTNESS,
                             );
                         }
                     }

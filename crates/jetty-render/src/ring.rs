@@ -10,13 +10,18 @@
 //! write and a few scissored draws covering only the edge bands (a ring 2 px
 //! wide touches ~0.5% of a 1000×640 window), not a full-screen pass.
 //!
-//! Slice F's visual bell / command pulse are also rim effects; they could share
-//! this pass (same SDF, a time-varying color/width) — see the integration notes.
+//! Slice F's visual bell rim and command status pulse share this pass with a
+//! time-varying color and width and a SOFT inner edge (`soft` > 0: solid
+//! over the outer part of the band, then a smooth fade inward — a glow rather
+//! than a line); the focus ring itself is `soft = 0`.
 
 const RING_SHADER: &str = r#"
 // Two 16-byte rows + the color row (48 bytes, std140-aligned):
-// {size.xy, width, _pad} {r_tl, r_tr, r_bl, r_br} {color rgba (sRGB, straight)}.
-struct Params { size: vec2<f32>, width: f32, _pad: f32, radii: vec4<f32>, color: vec4<f32> };
+// {size.xy, width, soft} {r_tl, r_tr, r_bl, r_br} {color rgba (sRGB, straight)}.
+// soft = 0: a crisp ring `width` px deep (the focus ring); soft in (0, 1]: solid
+// over the outer (1 - soft) of the band, then a smooth fade to nothing at
+// `width` (the bell rim / command pulse glow).
+struct Params { size: vec2<f32>, width: f32, soft: f32, radii: vec4<f32>, color: vec4<f32> };
 @group(0) @binding(0) var<uniform> params: Params;
 
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
@@ -49,8 +54,12 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let d = sd_round_rect_per(in.uv - hsize, hsize, params.radii.x, params.radii.y, params.radii.z, params.radii.w);
     // Inside the window shape (the mask's own edge feather) …
     let shape = 1.0 - smoothstep(-0.75, 0.75, d);
-    // … and within `width` px of its edge (a 1 px feather on the inner side).
-    let band = smoothstep(-params.width - 0.5, -params.width + 0.5, d);
+    // … and within `width` px of its edge (a 1 px feather on the inner side,
+    // or the soft glow's long inward fade).
+    var band = smoothstep(-params.width - 0.5, -params.width + 0.5, d);
+    if (params.soft > 0.0) {
+        band = 1.0 - smoothstep(params.width * (1.0 - params.soft), params.width, -d);
+    }
     let cov = shape * band;
     let c = params.color;
     return vec4(s2l(c.r), s2l(c.g), s2l(c.b), c.a * cov);
@@ -65,7 +74,9 @@ pub struct RingUniform {
     pub size: [f32; 2],
     /// Ring width in physical px. (offset 8)
     pub width: f32,
-    pub _pad: f32,
+    /// 0 = a crisp ring; (0, 1] = a glow fading inward over that fraction of
+    /// `width` (the bell rim / command pulse). (offset 12)
+    pub soft: f32,
     /// Corner radii in physical px: top-left, top-right, bottom-left,
     /// bottom-right (the corner mask's). (offset 16)
     pub radii: [f32; 4],
@@ -167,6 +178,26 @@ impl FocusRing {
         ring_w: f32,
         color: [u8; 4],
     ) {
+        self.apply_soft(device, queue, view, width, height, radii, ring_w, color, 0.0);
+    }
+
+    /// [`FocusRing::apply`] as a soft glow: solid over the outer `1 − soft` of
+    /// the `ring_w` band, then fading inward to nothing at `ring_w` (`soft`
+    /// clamped to 0..=1; 0 is exactly `apply`) — the visual bell rim and the
+    /// command status pulse.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_soft(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        radii: [f32; 4],
+        ring_w: f32,
+        color: [u8; 4],
+        soft: f32,
+    ) {
         if width == 0 || height == 0 || ring_w <= 0.0 || color[3] == 0 {
             return;
         }
@@ -174,7 +205,7 @@ impl FocusRing {
         let u = RingUniform {
             size: [width as f32, height as f32],
             width: ring_w,
-            _pad: 0.0,
+            soft: if soft.is_finite() { soft.clamp(0.0, 1.0) } else { 0.0 },
             radii,
             color: color.map(|c| c as f32 / 255.0),
         };
@@ -283,6 +314,7 @@ mod tests {
         assert_eq!(size_of::<RingUniform>(), 48);
         assert_eq!(offset_of!(RingUniform, size), 0);
         assert_eq!(offset_of!(RingUniform, width), 8);
+        assert_eq!(offset_of!(RingUniform, soft), 12);
         assert_eq!(offset_of!(RingUniform, radii), 16);
         assert_eq!(offset_of!(RingUniform, color), 32);
         assert_eq!(size_of::<RingUniform>() % align_of::<RingUniform>(), 0);
@@ -343,6 +375,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_soft_ring_fades_inward_and_stays_inside_the_scissor() {
+        assert!(RING_SHADER.contains("if (params.soft > 0.0)"));
+        // CPU mirror of the soft band: solid near the edge, half-way faded
+        // inside, nothing past the width — all within the crisp ring's
+        // scissor depth (`ring_regions` covers `ceil(width) + 2` px).
+        let soft_band = |depth: f32, width: f32, soft: f32| {
+            let (e0, e1) = (width * (1.0 - soft), width);
+            let t = ((depth - e0) / (e1 - e0)).clamp(0.0, 1.0);
+            1.0 - t * t * (3.0 - 2.0 * t)
+        };
+        assert_eq!(soft_band(1.0, 10.0, 0.65), 1.0, "solid outer third");
+        let mid = soft_band(6.75, 10.0, 0.65);
+        assert!(mid > 0.3 && mid < 0.7, "fading: {mid}");
+        assert_eq!(soft_band(10.0, 10.0, 0.65), 0.0, "nothing at the width");
     }
 
     #[test]
