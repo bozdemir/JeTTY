@@ -52,6 +52,15 @@ pub struct Config {
     /// Window corner radius in logical px (0..=24).
     #[serde(default = "default_corner_radius")]
     pub corner_radius: f32,
+    /// Inner padding between the window edges and the terminal grid, in
+    /// logical px (scaled by the display's DPI), left and right. The scrollbar
+    /// lives in the right padding, so the right side is at least the scrollbar
+    /// gutter. Clamped to 0..=64; `0` = no padding (the pre-0.27 look).
+    #[serde(default = "default_padding_x")]
+    pub padding_x: f32,
+    /// Inner padding above and below the grid, in logical px (0..=64).
+    #[serde(default = "default_padding_y")]
+    pub padding_y: f32,
     /// Window-summon reveal effect: "none", "bayer", "phosphor", "liquid", or
     /// "focus" (the last two are Tier-B effects that sample the rendered frame).
     #[serde(default = "default_summon_effect")]
@@ -318,6 +327,14 @@ fn default_corner_radius() -> f32 {
     10.0
 }
 
+fn default_padding_x() -> f32 {
+    8.0
+}
+
+fn default_padding_y() -> f32 {
+    4.0
+}
+
 fn default_shell() -> String {
     String::new()
 }
@@ -476,6 +493,8 @@ impl Default for Config {
             ui_font_family: default_ui_font_family(),
             ui_font_size: default_ui_font_size(),
             corner_radius: default_corner_radius(),
+            padding_x: default_padding_x(),
+            padding_y: default_padding_y(),
             summon_effect: default_summon_effect(),
             window_mode: default_window_mode(),
             dropdown_height_pct: default_dropdown_height_pct(),
@@ -758,6 +777,8 @@ impl Config {
         self.font_size = finite_or(self.font_size, 16.0);
         self.ui_font_size = finite_or(self.ui_font_size, default_ui_font_size());
         self.corner_radius = finite_or(self.corner_radius, 10.0);
+        self.padding_x = finite_or(self.padding_x, default_padding_x()).clamp(0.0, jetty_render::PADDING_MAX);
+        self.padding_y = finite_or(self.padding_y, default_padding_y()).clamp(0.0, jetty_render::PADDING_MAX);
         self.dropdown_height_pct =
             finite_or(self.dropdown_height_pct, default_dropdown_height_pct());
         self.dropdown_width_pct =
@@ -1709,6 +1730,8 @@ mod tests {
             ui_font_family: "Inter".to_string(),
             ui_font_size: 20.0,
             corner_radius: 6.0,
+            padding_x: 12.0,
+            padding_y: 0.0,
             summon_effect: "phosphor".to_string(),
             window_mode: "dropdown".to_string(),
             dropdown_height_pct: 0.6,
@@ -1752,6 +1775,8 @@ mod tests {
             ui_font_family: String::new(),
             ui_font_size: 16.0,
             corner_radius: 12.0,
+            padding_x: 0.0,
+            padding_y: 6.5,
             summon_effect: "none".to_string(),
             window_mode: "center".to_string(),
             dropdown_height_pct: 0.5,
@@ -1894,6 +1919,37 @@ corner_radius = 8.0
         assert_eq!(cfg.ui_font_size, 16.0);
         assert_eq!(cfg.dropdown_height_pct, 0.50);
         assert_eq!(cfg.dropdown_width_pct, 1.0);
+    }
+
+    #[test]
+    fn padding_defaults_and_sanitize() {
+        let d = Config::default();
+        assert_eq!((d.padding_x, d.padding_y), (8.0, 4.0));
+        // A config written before the keys existed loads the padded default.
+        let (cfg, warnings) =
+            Config::parse_with_base("theme = \"dracula\"\n", &Config::default(), "using the default").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!((cfg.padding_x, cfg.padding_y), (8.0, 4.0));
+        // 0 keeps the unpadded look; garbage is clamped or replaced.
+        let (cfg, _) = Config::parse_with_base(
+            "padding_x = 0.0\npadding_y = -5.0\n",
+            &Config::default(),
+            "using the default",
+        )
+        .unwrap();
+        assert_eq!((cfg.padding_x, cfg.padding_y), (0.0, 0.0));
+        let (cfg, _) = Config::parse_with_base(
+            "padding_x = nan\npadding_y = 1000.0\n",
+            &Config::default(),
+            "using the default",
+        )
+        .unwrap();
+        assert_eq!((cfg.padding_x, cfg.padding_y), (8.0, jetty_render::PADDING_MAX));
+        // A wrong type falls back to the default with a warning, per key.
+        let (cfg, warnings) =
+            Config::parse_with_base("padding_x = \"wide\"\n", &Config::default(), "using the default").unwrap();
+        assert_eq!(cfg.padding_x, 8.0);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]

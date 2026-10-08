@@ -24,13 +24,20 @@ use crate::input::{
     ScrollAccumulator,
 };
 
-/// Where a window's terminal grid sits (physical px).
+/// Where a window's terminal grid sits (physical px) — the pixel → cell half
+/// of `jetty_render::grid_geom`'s convention (cell (0, 0) at `(left, top)`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GridGeom {
-    /// y of the grid's first row.
+    /// x of the grid's first column (the left padding).
+    pub left: f32,
+    /// y of the grid's first row: the band top plus the top padding.
     pub top: f32,
+    /// y where the grid BAND starts: the bottom edge of a top bar, else 0. The
+    /// padding between it and `top` belongs to the grid — a pointer there is on
+    /// the grid and maps to row 0.
+    pub band_top: f32,
     /// y just past the grid band — above a bottom tab bar or the status strip.
-    /// A pointer in `top..bottom` is ON the grid.
+    /// A pointer in `band_top..bottom` is ON the grid.
     pub bottom: f32,
     pub cell_w: f32,
     pub cell_h: f32,
@@ -41,9 +48,25 @@ impl GridGeom {
         self.cell_w > 0.0 && self.cell_h > 0.0
     }
 
-    /// Whether window y `y` lies on the grid band.
+    /// Whether window y `y` lies on the grid band (padding included).
     pub fn contains_y(&self, y: f32) -> bool {
-        y >= self.top && y < self.bottom
+        y >= self.band_top && y < self.bottom
+    }
+
+    /// The 1-based cell under window point `(x, y)`, clamped to the
+    /// `cols` × `rows` grid — mouse-report coordinates. The padding and the
+    /// scrollbar gutter map to the nearest edge cell, never outside the grid.
+    pub fn report_cell(&self, x: f32, y: f32, cols: usize, rows: usize) -> (usize, usize) {
+        let (gx, gy) = ((x - self.left).max(0.0), (y - self.top).max(0.0));
+        input::cell_at_clamped(gx, gy, self.cell_w, self.cell_h, cols, rows)
+    }
+
+    /// The 0-based viewport cell under window point `(x, y)`, clamped to the
+    /// grid, and whether the pointer is in its left half (selection endpoints,
+    /// link hover). Left of column 0 counts as its left half, right of the
+    /// last column as that column's right half.
+    pub fn select_cell(&self, x: f32, y: f32, cols: usize, rows: usize) -> (usize, usize, bool) {
+        input::cell_at_0_side(x - self.left, (y - self.top).max(0.0), self.cell_w, self.cell_h, cols, rows)
     }
 }
 
@@ -178,16 +201,14 @@ impl Grid<'_> {
     /// coordinates).
     fn report_cell(&self) -> (usize, usize) {
         let (x, y) = self.pointer_f32();
-        let g = self.geom;
-        input::cell_at_clamped(x, (y - g.top).max(0.0), g.cell_w, g.cell_h, self.term.cols(), self.term.rows())
+        self.geom.report_cell(x, y, self.term.cols(), self.term.rows())
     }
 
     /// The 0-based viewport cell under the pointer (clamped) and whether the
     /// pointer is in its left half (selection endpoints).
     fn select_cell(&self) -> (usize, usize, bool) {
         let (x, y) = self.pointer_f32();
-        let g = self.geom;
-        input::cell_at_0_side(x, (y - g.top).max(0.0), g.cell_w, g.cell_h, self.term.cols(), self.term.rows())
+        self.geom.select_cell(x, y, self.term.cols(), self.term.rows())
     }
 
     /// Report `button` / `act` at the pointer with the held modifiers, when the
@@ -509,7 +530,8 @@ mod tests {
 
     const CELL: f32 = 10.0;
     /// An 8×4 grid starting 30 px down (a tab bar above it), 4 rows tall.
-    const GEOM: GridGeom = GridGeom { top: 30.0, bottom: 70.0, cell_w: CELL, cell_h: CELL };
+    const GEOM: GridGeom =
+        GridGeom { left: 0.0, top: 30.0, band_top: 30.0, bottom: 70.0, cell_w: CELL, cell_h: CELL };
 
     struct Win {
         term: Terminal,
@@ -726,6 +748,120 @@ mod tests {
         let mut w = Win::new(b"\x1b[?1049h\x1b[?1000h");
         let (r, bytes) = w.at(0.0, 0.0, ModifiersState::SHIFT, |g| wheel(g, line(1.0), false, &mut acc));
         assert_eq!((r, bytes.as_str()), (Wheel::Scrolled, ""), "tracking + Shift: host scrollback");
+    }
+
+    /// A padded 80×24 grid below a 36-px tab bar at DPI `scale` (MesloLGS-like
+    /// 9.6 × 21 px cells at 1×), padding 8 × 4 logical — the default config.
+    fn padded_geom(scale: f32) -> (GridGeom, usize, usize) {
+        let (cols, rows) = (80usize, 24usize);
+        let (cell_w, cell_h) = (9.6 * scale, 21.0 * scale);
+        let (pad_x, pad_y) = (jetty_render::padding_px(8.0, scale), jetty_render::padding_px(4.0, scale));
+        let band_top = (36.0 * scale).round();
+        let top = band_top + pad_y;
+        // The band ends a little below the last row + the bottom padding (the
+        // leftover of a non-integral fit), above the status strip.
+        let bottom = top + rows as f32 * cell_h + pad_y + 3.0 * scale;
+        (GridGeom { left: pad_x, top, band_top, bottom, cell_w, cell_h }, cols, rows)
+    }
+
+    #[test]
+    fn padded_grid_maps_corners_and_paddings_to_edge_cells_at_1x_and_2x() {
+        for scale in [1.0f32, 2.0] {
+            let (g, cols, rows) = padded_geom(scale);
+            let right = g.left + cols as f32 * g.cell_w; // just past the last column
+            let below = g.top + rows as f32 * g.cell_h; // just past the last row
+            // The four corner cells, a pixel inside each.
+            assert_eq!(g.report_cell(g.left + 1.0, g.top + 1.0, cols, rows), (1, 1), "@{scale}× top-left");
+            assert_eq!(g.report_cell(right - 1.0, g.top + 1.0, cols, rows), (cols, 1), "@{scale}× top-right");
+            assert_eq!(g.report_cell(g.left + 1.0, below - 1.0, cols, rows), (1, rows), "@{scale}× bottom-left");
+            assert_eq!(g.report_cell(right - 1.0, below - 1.0, cols, rows), (cols, rows), "@{scale}× bottom-right");
+            assert_eq!(g.select_cell(g.left + 1.0, g.top + 1.0, cols, rows), (0, 0, true));
+            assert_eq!(g.select_cell(right - 1.0, below - 1.0, cols, rows), (rows - 1, cols - 1, false));
+            // Column/row edges land exactly on the cell boundaries.
+            assert_eq!(g.report_cell(g.left + g.cell_w, g.top + g.cell_h, cols, rows), (2, 2), "@{scale}×");
+            assert_eq!(g.report_cell(g.left + g.cell_w - 0.5, g.top + g.cell_h - 0.5, cols, rows), (1, 1));
+            // The left padding is column 1 (its left half for a selection).
+            for x in [0.0, 1.0, g.left - 0.5] {
+                assert_eq!(g.report_cell(x, g.top + 1.0, cols, rows), (1, 1), "@{scale}× x={x}");
+                assert_eq!(g.select_cell(x, g.top + 1.0, cols, rows), (0, 0, true), "@{scale}× x={x}");
+            }
+            // The top padding is ON the grid and is row 1; the bar above is not.
+            for y in [g.band_top, g.band_top + 1.0, g.top - 0.5] {
+                assert!(g.contains_y(y), "@{scale}× y={y} is grid padding");
+                assert_eq!(g.report_cell(g.left + 1.0, y, cols, rows), (1, 1), "@{scale}× y={y}");
+                assert_eq!(g.select_cell(g.left + 1.0, y, cols, rows), (0, 0, true));
+            }
+            assert!(!g.contains_y(g.band_top - 1.0), "@{scale}× the tab bar is chrome");
+            // The right padding / scrollbar gutter is the last column (its right
+            // half), the bottom padding the last row.
+            for x in [right, right + 3.0, right + 18.0 * scale] {
+                assert_eq!(g.report_cell(x, g.top + 1.0, cols, rows), (cols, 1), "@{scale}× x={x}");
+                assert_eq!(g.select_cell(x, g.top + 1.0, cols, rows), (0, cols - 1, false), "@{scale}× x={x}");
+            }
+            for y in [below, below + 1.0, g.bottom - 0.5] {
+                assert!(g.contains_y(y));
+                assert_eq!(g.report_cell(g.left + 1.0, y, cols, rows), (1, rows), "@{scale}× y={y}");
+            }
+            // Never out of range, wherever the pointer is (even off-window).
+            for x in [-1e6, -50.0, 0.0, 5000.0, 1e6] {
+                for y in [-1e6, -50.0, 0.0, 5000.0, 1e6] {
+                    let (c, r) = g.report_cell(x, y, cols, rows);
+                    assert!((1..=cols).contains(&c) && (1..=rows).contains(&r), "@{scale}× ({x},{y}) → ({c},{r})");
+                    let (l, c0, _) = g.select_cell(x, y, cols, rows);
+                    assert!(l < rows && c0 < cols, "@{scale}× ({x},{y}) → ({l},{c0})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn padded_grid_reports_the_cell_under_the_pointer_to_the_program() {
+        // A click a pixel inside cell (col 3, row 2) of the padded 2× grid
+        // reports exactly that cell (1-based 4;3); one in the left padding of
+        // that row reports column 1.
+        let (g, _, _) = padded_geom(2.0);
+        let mut term = Terminal::new(80, 24);
+        term.feed(SGR_CLICKS);
+        let (mut mouse, mut selecting, mut out) = (GridMouse::default(), false, Vec::new());
+        for (x, expect) in [(g.left + 3.0 * g.cell_w + 1.0, "\x1b[<0;4;3M"), (2.0, "\x1b[<0;1;3M")] {
+            out.clear();
+            let p = press(
+                &mut Grid {
+                    term: &mut term,
+                    mouse: &mut mouse,
+                    selecting: &mut selecting,
+                    geom: g,
+                    pointer: (x as f64, (g.top + 2.0 * g.cell_h + 1.0) as f64),
+                    mods: NONE,
+                    out: &mut out,
+                },
+                MouseButton::Left,
+                false,
+                t0(),
+            );
+            assert_eq!(p, Press::Reported);
+            assert_eq!(String::from_utf8_lossy(&out), expect, "x={x}");
+            let mut grid = Grid {
+                term: &mut term,
+                mouse: &mut mouse,
+                selecting: &mut selecting,
+                geom: g,
+                pointer: (x as f64, (g.top + 2.0 * g.cell_h + 1.0) as f64),
+                mods: NONE,
+                out: &mut out,
+            };
+            release(&mut grid, MouseButton::Left);
+        }
+    }
+
+    #[test]
+    fn padded_grid_autoscrolls_from_the_top_padding_up() {
+        // A selection drag in the top padding (above row 0's top edge) scrolls
+        // history like one over the bar did; over the rows it does not.
+        let (g, _, rows) = padded_geom(1.0);
+        assert_eq!(autoscroll_lines(g, rows, g.top + 1.0), None);
+        assert_eq!(autoscroll_lines(g, rows, g.top - 1.0), Some(1));
+        assert_eq!(autoscroll_lines(g, rows, g.top + rows as f32 * g.cell_h), Some(-1));
     }
 
     #[test]

@@ -489,17 +489,17 @@ impl TabInputState {
 }
 
 /// The IME candidate-window anchor for the cursor at grid cell `(row, col)`:
-/// `(x, y, w, h)` in physical pixels — that cell's rect, the grid starting
-/// `grid_top` px down. winit wants it in window coordinates.
+/// `(x, y, w, h)` in physical pixels — that cell's rect, cell (0, 0) at the
+/// grid `origin` (padding + bar). winit wants it in window coordinates.
 pub fn ime_cursor_area(
     row: usize,
     col: usize,
     cell_w: f32,
     cell_h: f32,
-    grid_top: f32,
+    origin: jetty_render::GridOrigin,
 ) -> (i32, i32, u32, u32) {
-    let x = (col as f32 * cell_w).round() as i32;
-    let y = (grid_top + row as f32 * cell_h).round() as i32;
+    let x = origin.col_x(col, cell_w).round() as i32;
+    let y = origin.row_y(row, cell_h).round() as i32;
     (x, y, cell_w.round().max(1.0) as u32, cell_h.round().max(1.0) as u32)
 }
 
@@ -567,10 +567,13 @@ mod tab_input_tests {
 
     #[test]
     fn ime_area_is_the_cursor_cell_below_the_grid_top() {
-        assert_eq!(ime_cursor_area(0, 0, 9.6, 20.0, 36.0), (0, 36, 10, 20));
-        assert_eq!(ime_cursor_area(3, 10, 9.6, 20.0, 36.0), (96, 96, 10, 20));
+        use jetty_render::GridOrigin;
+        assert_eq!(ime_cursor_area(0, 0, 9.6, 20.0, GridOrigin::new(0.0, 36.0)), (0, 36, 10, 20));
+        assert_eq!(ime_cursor_area(3, 10, 9.6, 20.0, GridOrigin::new(0.0, 36.0)), (96, 96, 10, 20));
+        // The padded origin moves the anchor with the grid (2×: 16 px / 8 px).
+        assert_eq!(ime_cursor_area(3, 10, 19.2, 40.0, GridOrigin::new(16.0, 80.0)), (208, 200, 19, 40));
         // Degenerate metrics (before the first layout) still give a 1px area.
-        assert_eq!(ime_cursor_area(0, 0, 0.0, 0.0, 0.0), (0, 0, 1, 1));
+        assert_eq!(ime_cursor_area(0, 0, 0.0, 0.0, GridOrigin::default()), (0, 0, 1, 1));
     }
 }
 
@@ -1395,12 +1398,16 @@ pub fn cell_at_clamped(
 }
 
 /// Convert a pixel position to 0-based viewport cell coordinates
-/// `(line, col, left_half)` CLAMPED to the grid. `y_grid` is grid-relative
-/// (the caller subtracts the bar origin and floors at 0). `left_half` is
-/// whether the pointer sits in the LEFT half of its cell — selection
-/// start/update derive the endpoint `Side` from it (F4): hardcoding
-/// Left-at-press / Right-at-update dropped the endpoint cells on a reverse
-/// drag. Callers guarantee `cell_w`/`cell_h` > 0.
+/// `(line, col, left_half)` CLAMPED to the grid. `x` and `y_grid` are
+/// grid-relative (the caller subtracts the grid origin — padding and bar — and
+/// floors y at 0). `left_half` is whether the pointer sits in the LEFT half of
+/// its cell — selection start/update derive the endpoint `Side` from it (F4):
+/// hardcoding Left-at-press / Right-at-update dropped the endpoint cells on a
+/// reverse drag. A pointer left of the grid (the left padding) is column 0's
+/// left half and one past its right edge (the right padding / scrollbar
+/// gutter) the last column's right half — so a drag into either padding
+/// selects through the edge cell instead of depending on the sub-pixel spot.
+/// Callers guarantee `cell_w`/`cell_h` > 0.
 pub fn cell_at_0_side(
     x: f32,
     y_grid: f32,
@@ -1409,9 +1416,16 @@ pub fn cell_at_0_side(
     cols: usize,
     rows: usize,
 ) -> (usize, usize, bool) {
-    let col_f = (x / cell_w).floor();
-    let col = (col_f as i64).clamp(0, cols.saturating_sub(1) as i64) as usize;
     let line = ((y_grid / cell_h).floor() as i64).clamp(0, rows.saturating_sub(1) as i64) as usize;
+    let last = cols.saturating_sub(1);
+    if x < 0.0 {
+        return (line, 0, true);
+    }
+    if x >= cols as f32 * cell_w {
+        return (line, last, false);
+    }
+    let col_f = (x / cell_w).floor();
+    let col = (col_f as i64).clamp(0, last as i64) as usize;
     // Sub-cell x fraction: the pointer is in the left half when it sits in
     // the first half-cell-width past the cell's left edge.
     let left_half = (x - col_f * cell_w) < cell_w * 0.5;
@@ -3228,6 +3242,23 @@ mod tests {
         // Degenerate 0×0 grid must not panic (saturating_sub path).
         let (line, col, _) = cell_at_0_side(25.0, 30.0, 10.0, 20.0, 0, 0);
         assert_eq!((line, col), (0, 0));
+    }
+
+    #[test]
+    fn cell_at_0_side_paddings_are_the_edge_cells_outer_halves() {
+        // The left padding (x < 0 grid-relative) is ALWAYS column 0's left half
+        // — before, a pointer a few px left of the grid read as its RIGHT half.
+        for x in [-0.5, -3.0, -6.0, -9.9, -500.0] {
+            assert_eq!(cell_at_0_side(x, 30.0, 10.0, 20.0, 80, 24), (1, 0, true), "x={x}");
+        }
+        // Past the last column (right padding / scrollbar gutter) is ALWAYS
+        // its right half — before, it depended on the sub-pixel spot.
+        for x in [800.0, 801.0, 803.0, 806.0, 818.0, 5000.0] {
+            assert_eq!(cell_at_0_side(x, 30.0, 10.0, 20.0, 80, 24), (1, 79, false), "x={x}");
+        }
+        // The edge cells' own halves are unchanged.
+        assert_eq!(cell_at_0_side(0.0, 30.0, 10.0, 20.0, 80, 24), (1, 0, true));
+        assert_eq!(cell_at_0_side(799.9, 30.0, 10.0, 20.0, 80, 24), (1, 79, false));
     }
 
     // ── Dead-key composed text override (C3) ────────────────────────────────

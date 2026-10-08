@@ -45,6 +45,13 @@ pub fn default_context_menu_hints() -> Vec<String> {
     detached::context_menu_hints(&keymap::KeyMap::defaults()).to_vec()
 }
 
+/// The default grid padding `(padding_x, padding_y)` in logical px — the
+/// config defaults, so `jetty-shot` renders the grid where the app does.
+pub fn default_grid_padding() -> (f32, f32) {
+    let d = config::Config::default();
+    (d.padding_x, d.padding_y)
+}
+
 /// Unix-socket path used for single-instance IPC. Any running primary Jetty
 /// instance listens here; secondary invocations (including `jetty --toggle`)
 /// connect and send a summon message, then exit immediately.

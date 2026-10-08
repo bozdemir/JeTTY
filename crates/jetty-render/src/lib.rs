@@ -24,6 +24,7 @@ mod palette;
 mod status;
 mod ui_palette;
 pub use ui_palette::{ensure_contrast, UiPalette};
+mod grid_geom;
 pub use chrome::{
     clip_head, clip_tail, fit_head, fit_tail, ChromeMeasure, ChromeMetrics, MonoMeasure,
     CHROME_ADVANCE, MAX_LABEL_CHARS, OVERLAY_SCALE, PILL_H_BASE, STATUS_H_BASE, UI_FONT_BASE,
@@ -58,3 +59,4 @@ pub use hints::{build_copy_pill, build_hint_overlay, copy_cursor_rects, CopyPill
 pub use preedit::{build_preedit_overlay, PreeditOverlay, MAX_PREEDIT_CHARS};
 pub use palette::{build_command_palette, CommandPalette, PaletteRow, MAX_PALETTE_ROWS};
 pub use status::{build_status_strip, build_toast_pill, StatusStrip, ToastPill};
+pub use grid_geom::{failed_marker_x, grid_dims, padding_px, shift_labels_x, shift_x, GridOrigin, PADDING_MAX};

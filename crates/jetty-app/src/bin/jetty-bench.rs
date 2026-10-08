@@ -373,7 +373,7 @@ fn bench_scene_passes(
         } else {
             let n = quad.upload(device, queue, width, height, &bg);
             let ready = text
-                .prepare_grid(device, queue, width, height, &snap, 0.0, &jetty_render::GridPaint::default())
+                .prepare_grid(device, queue, width, height, &snap, jetty_render::GridOrigin::default(), &jetty_render::GridPaint::default())
                 .is_ok();
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             {
