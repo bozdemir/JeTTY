@@ -37,8 +37,11 @@ pub use colors::{
     SELECTION_MIN_CONTRAST,
 };
 pub use quad::{QuadLayer, Rect, cell_bg_rects, default_bg_clear, scrollbar_rect, scrollbar_rect_geom, scrollbar_offset_from_cursor, text_decoration_rects, link_underline_rects, failed_marker_rects, grid_decoration_key, cursor_rects, cursor_rects_split, SCROLLBAR_W};
-pub use panel::{build_panel, EffectsParams, NotifyParams, PanelView, PanelGeom, PANEL_W, PANEL_H,
-                EFFECTS_CONTENT_H, EFFECTS_VISIBLE_H, CHAR_W_FALLBACK};
+pub use panel::{
+    build_panel, gallery_order, is_user_theme, theme_is_light, track_knob, CtlId, CtlPart, CtlRow, CtlShow, Label,
+    PanelGeom, PanelHit, PanelInput, PanelItem, PanelView, ResetState, RowState, ThemeFilter, CHAR_W_FALLBACK,
+    GALLERY_COLS, N_TABS, PANEL_H, PANEL_W, TAB_NAMES,
+};
 pub use mask::{CornerMask, all_radii_flat, rounded_rect_coverage, rounded_rect_coverage_per};
 pub use reveal::{BayerReveal, bayer4, reveal_coverage};
 pub use phosphor::PhosphorIgnition;

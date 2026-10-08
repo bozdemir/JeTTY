@@ -531,48 +531,47 @@ fn arrow_keys_app_cursor_mode_all_directions() {
 // decide_mouse_press tests
 // ---------------------------------------------------------------------------
 
-/// Build a real PanelGeom for a 1000×640 window at 70% opacity, theme index 1.
+/// A real Settings panel for a 1000×640 window, built from the real control
+/// table (`settings_ui`) by the real builder: 70% opacity, Dropdown mode (so
+/// the dropdown sliders are live), `active_tab` scrolled `scroll` px.
+fn make_panel_geom_cfg(cfg: &jetty_app::config::Config, active_tab: usize, scroll: f32) -> jetty_render::PanelGeom {
+    use jetty_app::settings_ui::{tab_items, Ctx};
+    let theme = jetty_core::Theme::by_name("catppuccin_mocha");
+    let ui = ["System Sans (default)".to_string()];
+    let ctx = Ctx { ui_families: &ui, ..Ctx::empty() };
+    let items = tab_items(active_tab, cfg, &ctx);
+    let mut inp = jetty_render::PanelInput::new(1000, 640, &theme, jetty_render::ChromeMetrics::DEFAULT, &items);
+    inp.active_tab = active_tab;
+    inp.scroll = scroll;
+    inp.theme_idx = 1;
+    jetty_render::build_panel(&inp, &mut jetty_render::MonoMeasure(9.8)).geom
+}
+
+fn test_cfg() -> jetty_app::config::Config {
+    jetty_app::config::Config { opacity: 0.7, window_mode: "dropdown".into(), ..Default::default() }
+}
+
+fn make_panel_geom_tab_scroll(active_tab: usize, scroll: f32) -> jetty_render::PanelGeom {
+    make_panel_geom_cfg(&test_cfg(), active_tab, scroll)
+}
+
 fn make_panel_geom_tab(active_tab: usize) -> jetty_render::PanelGeom {
     make_panel_geom_tab_scroll(active_tab, 0.0)
 }
 
-/// Build a PanelGeom for `active_tab` with a specific `effects_scroll` offset.
-fn make_panel_geom_tab_scroll(active_tab: usize, effects_scroll: f32) -> jetty_render::PanelGeom {
-    make_panel_geom_full(active_tab, effects_scroll, false, 0)
-}
-
-/// Build a PanelGeom with explicit theme-dropdown state (open + scroll offset).
-fn make_panel_geom_full(
-    active_tab: usize,
-    effects_scroll: f32,
-    theme_open: bool,
-    theme_scroll: usize,
-) -> jetty_render::PanelGeom {
-    let theme = jetty_core::Theme::by_name("catppuccin_mocha");
-    // UI-font args: size 16, a single synthetic "System Sans" row, selected "".
-    let ui_families = ["System Sans (default)".to_string()];
-    jetty_render::build_panel(
-        1000, 640, 0.7, 1, 16.0, &[], "", 0, 10.0, "Bayer",
-        // …, is_dropdown, FULLSCREEN, focus_autohide, launch_at_login, …
-        "Center", "Top", "10k", 0.50, 1.0, false, false, true,
-        false, // launch_at_login
-        16.0, &ui_families, "", 0,
-        0.0, 0.0, &theme,
-        &mut jetty_render::MonoMeasure(9.8), jetty_render::ChromeMetrics::DEFAULT,
-        "System default", // shell_display
-        &jetty_render::NotifyParams::default(), // Run & Notify (v0.15)
-        active_tab,
-        &jetty_render::EffectsParams::default(),
-        effects_scroll,
-        theme_open,
-        theme_scroll,
-    )
-    .geom
-}
-
-/// Tab-0 ("Look") panel geometry: opacity slider, theme combo, etc.
+/// Tab-0 ("Look") panel geometry: opacity / radius sliders, the theme gallery.
 fn make_panel_geom() -> jetty_render::PanelGeom {
     make_panel_geom_tab(0)
+}
+
+/// The rect of part `part` of control `id`.
+fn ctl_rect(g: &jetty_render::PanelGeom, id: &'static str, part: jetty_render::CtlPart) -> jetty_render::Rect {
+    g.rect_of(jetty_render::PanelHit::Ctl { id, part }).unwrap_or_else(|| panic!("no {id} {part:?}"))
+}
+
+/// Click the center of `r` and return the action.
+fn click(g: &jetty_render::PanelGeom, r: &jetty_render::Rect) -> MouseAction {
+    decide_mouse_press(Some(g), None, r.x + r.w / 2.0, r.y + r.h / 2.0)
 }
 
 /// Build a scrollbar rect that is non-None (requires scroll_max > 0).
@@ -586,104 +585,75 @@ fn make_scrollbar_rect() -> jetty_render::Rect {
 
 #[test]
 fn click_slider_track_starts_drag() {
+    use jetty_render::CtlPart;
     let geom = make_panel_geom();
-    let t = &geom.slider_track;
-    // Click the center of the track.
-    let cx = t.x + t.w / 2.0;
-    let cy = t.y + t.h / 2.0;
-    let action = decide_mouse_press(Some(&geom), None, cx, cy);
-    assert_eq!(action, MouseAction::StartSliderDrag);
+    let t = ctl_rect(&geom, "opacity", CtlPart::Track);
+    assert_eq!(click(&geom, &t), MouseAction::Ctl { id: "opacity", part: CtlPart::Track });
+    // Anywhere along the track (its ends included) grabs the knob.
+    let left = decide_mouse_press(Some(&geom), None, t.x + 1.0, t.y + t.h / 2.0);
+    assert_eq!(left, MouseAction::Ctl { id: "opacity", part: CtlPart::Track });
+    let r = ctl_rect(&geom, "corner_radius", CtlPart::Track);
+    assert_eq!(click(&geom, &r), MouseAction::Ctl { id: "corner_radius", part: CtlPart::Track });
 }
 
 #[test]
-fn click_slider_handle_starts_drag() {
-    let geom = make_panel_geom();
-    let h = &geom.slider_handle;
-    let cx = h.x + h.w / 2.0;
-    let cy = h.y + h.h / 2.0;
-    let action = decide_mouse_press(Some(&geom), None, cx, cy);
-    assert_eq!(action, MouseAction::StartSliderDrag);
-}
-
-#[test]
-fn click_dropdown_height_track_starts_drag() {
+fn click_dropdown_size_tracks_start_drags() {
+    use jetty_render::CtlPart;
     let geom = make_panel_geom_tab(2); // Window tab
-    let t = &geom.dropdown_track;
-    let cx = t.x + t.w / 2.0;
-    let cy = t.y + t.h / 2.0;
-    let action = decide_mouse_press(Some(&geom), None, cx, cy);
-    assert_eq!(action, MouseAction::StartDropdownDrag);
-}
-
-#[test]
-fn click_dropdown_width_track_starts_width_drag() {
-    let geom = make_panel_geom_tab(2); // Window tab
-    let t = &geom.dropdown_width_track;
-    let cx = t.x + t.w / 2.0;
-    let cy = t.y + t.h / 2.0;
-    let action = decide_mouse_press(Some(&geom), None, cx, cy);
-    assert_eq!(action, MouseAction::StartDropdownWidthDrag);
-}
-
-#[test]
-fn click_dropdown_width_handle_starts_width_drag() {
-    let geom = make_panel_geom_tab(2); // Window tab
-    let h = &geom.dropdown_width_handle;
-    let cx = h.x + h.w / 2.0;
-    let cy = h.y + h.h / 2.0;
-    let action = decide_mouse_press(Some(&geom), None, cx, cy);
-    assert_eq!(action, MouseAction::StartDropdownWidthDrag);
-}
-
-#[test]
-fn click_theme_combo_toggles_dropdown() {
-    // Closed combo: clicking the header asks to open the dropdown.
-    let geom = make_panel_geom();
-    let c = &geom.theme_combo;
-    let action = decide_mouse_press(Some(&geom), None, c.x + c.w / 2.0, c.y + c.h / 2.0);
-    assert_eq!(action, MouseAction::ToggleThemeDropdown);
-}
-
-#[test]
-fn click_open_dropdown_row_sets_theme_with_offset() {
-    // Open at scroll offset 2: clicking visible row 0 selects preset index 2.
-    let geom = make_panel_geom_full(0, 0.0, true, 2);
-    assert!(geom.theme_open);
-    let row = &geom.theme_rows[0];
-    let action = decide_mouse_press(Some(&geom), None, row.x + row.w / 2.0, row.y + row.h / 2.0);
-    assert_eq!(action, MouseAction::SetTheme(2));
-    // Row 3 maps to preset 2 + 3 = 5.
-    let row3 = &geom.theme_rows[3];
-    let action3 = decide_mouse_press(Some(&geom), None, row3.x + row3.w / 2.0, row3.y + row3.h / 2.0);
-    assert_eq!(action3, MouseAction::SetTheme(5));
-}
-
-#[test]
-fn click_theme_scroll_arrows_page_list() {
-    let geom = make_panel_geom_full(0, 0.0, true, 0);
-    let up = &geom.theme_scroll_up;
-    let dn = &geom.theme_scroll_down;
-    // Only meaningful when the preset list overflows MAX_THEME_ROWS.
-    if jetty_core::theme::PRESETS.len() > geom.theme_rows.len() {
-        assert_eq!(
-            decide_mouse_press(Some(&geom), None, dn.x + dn.w / 2.0, dn.y + dn.h / 2.0),
-            MouseAction::ThemeScrollDown
-        );
-        assert_eq!(
-            decide_mouse_press(Some(&geom), None, up.x + up.w / 2.0, up.y + up.h / 2.0),
-            MouseAction::ThemeScrollUp
-        );
+    for id in ["dropdown_height_pct", "dropdown_width_pct"] {
+        let t = ctl_rect(&geom, id, CtlPart::Track);
+        assert_eq!(click(&geom, &t), MouseAction::Ctl { id, part: CtlPart::Track });
     }
+}
+
+#[test]
+fn dropdown_size_sliders_are_inert_outside_dropdown_mode() {
+    let mut cfg = test_cfg();
+    cfg.window_mode = "center".into();
+    let geom = make_panel_geom_cfg(&cfg, 2, 0.0);
+    assert!(
+        !geom.hits.iter().any(|(_, h)| matches!(
+            h,
+            jetty_render::PanelHit::Ctl { id: "dropdown_height_pct" | "dropdown_width_pct", .. }
+        )),
+        "the dropdown sliders draw dimmed but take no clicks in Center mode"
+    );
+}
+
+#[test]
+fn click_gallery_card_and_filter_chip() {
+    let geom = make_panel_geom();
+    let card = geom
+        .hits
+        .iter()
+        .find_map(|(r, h)| match h {
+            jetty_render::PanelHit::GalleryCard(i) if r.y + r.h < geom.content_bottom => Some((*r, *i)),
+            _ => None,
+        })
+        .expect("a fully visible theme card");
+    assert_eq!(click(&geom, &card.0), MouseAction::GalleryCard(card.1));
+    let chip = geom
+        .rect_of(jetty_render::PanelHit::GalleryFilter(jetty_render::ThemeFilter::Light))
+        .expect("the Light chip");
+    assert_eq!(click(&geom, &chip), MouseAction::GalleryFilter(jetty_render::ThemeFilter::Light));
+}
+
+#[test]
+fn click_section_header_toggles_it() {
+    let geom = make_panel_geom();
+    let hdr = geom.rect_of(jetty_render::PanelHit::Section("look.window")).expect("first section header");
+    assert_eq!(
+        decide_mouse_press(Some(&geom), None, hdr.x + 20.0, hdr.y + hdr.h / 2.0),
+        MouseAction::SettingsSection("look.window")
+    );
 }
 
 #[test]
 fn click_inside_panel_not_widget_consumes() {
     let geom = make_panel_geom();
-    // Click somewhere in the panel background below the title bar (y+40) and
-    // below the opacity slider (y+96), but not over any widget.
-    // This should consume the click without triggering a drag or action.
+    // Left of the content column, below the tab strip: panel, but no widget.
     let cx = geom.panel.x + 5.0;
-    let cy = geom.panel.y + 100.0; // below title bar (36px) and slider (96px)
+    let cy = geom.panel.y + 100.0;
     let action = decide_mouse_press(Some(&geom), None, cx, cy);
     assert_eq!(action, MouseAction::ConsumePanel);
 }
@@ -691,7 +661,7 @@ fn click_inside_panel_not_widget_consumes() {
 #[test]
 fn click_title_bar_starts_dialog_drag() {
     let geom = make_panel_geom();
-    // Click within the title bar strip (top 36px) — not on a widget.
+    // Click within the title row — not on a widget.
     let cx = geom.panel.x + 10.0;
     let cy = geom.panel.y + 10.0;
     let action = decide_mouse_press(Some(&geom), None, cx, cy);
@@ -734,7 +704,7 @@ fn click_outside_everything_is_none() {
 #[test]
 fn click_outside_panel_and_scrollbar_with_panel_open_is_none() {
     let geom = make_panel_geom();
-    // Click at (0,0) — well outside any widget.
+    // At (0,0) — outside the centered content column, above every widget.
     let action = decide_mouse_press(Some(&geom), None, 0.0, 0.0);
     assert_eq!(action, MouseAction::None);
 }
@@ -813,159 +783,101 @@ fn shift_tab_sends_back_tab() {
 // Effects tab (tab index 4) hit-tests
 // ---------------------------------------------------------------------------
 
-/// Build PanelGeom for the Effects tab (index 4) at scroll=0 (top).
-/// The CRT section (bands 0–9) is fully within the [content_top, content_bottom]
-/// viewport at this offset. The Caret section (bands 11–14) is below the
-/// viewport and correctly rejected by the input guard until scrolled into view.
+/// The Effects tab scrolled to the top.
 fn effects_panel_geom() -> jetty_render::PanelGeom {
     make_panel_geom_tab(4)
 }
 
-/// Build PanelGeom for the Effects tab scrolled to maximum offset.
-/// This brings the Caret section (bands 11–14) fully into the content viewport.
+/// The Effects tab scrolled to the end (the builder clamps the offset).
 fn effects_panel_geom_scrolled() -> jetty_render::PanelGeom {
-    // max_scroll = EFFECTS_CONTENT_H - EFFECTS_VISIBLE_H (derive, don't hardcode).
-    make_panel_geom_tab_scroll(
-        4,
-        (jetty_render::EFFECTS_CONTENT_H - jetty_render::EFFECTS_VISIBLE_H).max(0.0),
-    )
+    make_panel_geom_tab_scroll(4, 1.0e9)
 }
 
-/// Click the center of `rect` against the Effects panel and return the action.
-fn click(g: &jetty_render::PanelGeom, r: &jetty_render::Rect) -> MouseAction {
-    decide_mouse_press(Some(g), None, r.x + r.w / 2.0, r.y + r.h / 2.0)
+/// Click control part `(id, part)` on whichever Effects view shows it fully.
+fn click_fx(id: &'static str, part: jetty_render::CtlPart) -> MouseAction {
+    for g in [effects_panel_geom(), effects_panel_geom_scrolled()] {
+        let r = ctl_rect(&g, id, part);
+        if r.y >= g.content_top && r.y + r.h <= g.content_bottom {
+            return click(&g, &r);
+        }
+    }
+    panic!("{id} {part:?} is never fully in view");
 }
 
 #[test]
-fn effects_crt_enabled_toggle_hit_test() {
+fn effects_crt_master_switch_lives_in_its_section_header() {
+    use jetty_render::CtlPart;
+    let want = MouseAction::Ctl { id: "effects.crt_enabled", part: CtlPart::Switch };
+    assert_eq!(click_fx("effects.crt_enabled", CtlPart::Switch), want);
+    // It sits on the "CRT" header row.
     let g = effects_panel_geom();
-    assert_eq!(click(&g, &g.crt_enabled_toggle), MouseAction::ToggleCrt);
+    let sw = ctl_rect(&g, "effects.crt_enabled", CtlPart::Switch);
+    let hdr = g.rect_of(jetty_render::PanelHit::Section("fx.crt")).unwrap();
+    assert!(sw.y >= hdr.y && sw.y + sw.h <= hdr.y + hdr.h + 0.5, "switch on the header row");
 }
 
 #[test]
-fn effects_crt_curvature_track_hit_test() {
-    let g = effects_panel_geom();
-    // Click the slider TRACK center.
-    assert_eq!(click(&g, &g.crt_curvature_track), MouseAction::StartCrtCurvatureDrag);
+fn effects_sliders_start_drags() {
+    use jetty_render::CtlPart;
+    for id in [
+        "effects.crt_curvature",
+        "effects.crt_scanline",
+        "effects.crt_mask",
+        "effects.crt_bloom",
+        "effects.crt_chromatic",
+        "effects.crt_vignette",
+        "effects.caret_flash_ms",
+    ] {
+        assert_eq!(click_fx(id, CtlPart::Track), MouseAction::Ctl { id, part: CtlPart::Track });
+    }
 }
 
 #[test]
-fn effects_crt_curvature_handle_hit_test() {
-    let g = effects_panel_geom();
-    // Click the slider HANDLE — should also start a drag.
-    assert_eq!(click(&g, &g.crt_curvature_handle), MouseAction::StartCrtCurvatureDrag);
+fn effects_rgb_channels_start_drags() {
+    use jetty_render::CtlPart;
+    for id in ["effects.crt_scanline_tint", "effects.caret_flash_color"] {
+        for ch in 0..3u8 {
+            let part = CtlPart::Channel(ch);
+            assert_eq!(click_fx(id, part), MouseAction::Ctl { id, part });
+        }
+    }
 }
 
 #[test]
-fn effects_scanline_drag_hit_test() {
-    let g = effects_panel_geom();
-    assert_eq!(click(&g, &g.crt_scanline_track), MouseAction::StartScanlineDrag);
+fn effects_toggles_and_animation_chips() {
+    use jetty_render::CtlPart;
+    for i in 0..3u8 {
+        let part = CtlPart::Chip(i);
+        assert_eq!(click_fx("effects.crt_animate", part), MouseAction::Ctl { id: "effects.crt_animate", part });
+    }
+    for id in ["effects.caret_flash_enabled", "effects.caret_glow_enabled"] {
+        assert_eq!(click_fx(id, CtlPart::Switch), MouseAction::Ctl { id, part: CtlPart::Switch });
+    }
 }
 
-#[test]
-fn effects_mask_drag_hit_test() {
-    let g = effects_panel_geom();
-    assert_eq!(click(&g, &g.crt_mask_track), MouseAction::StartMaskDrag);
-}
-
-#[test]
-fn effects_bloom_drag_hit_test() {
-    let g = effects_panel_geom();
-    assert_eq!(click(&g, &g.crt_bloom_track), MouseAction::StartBloomDrag);
-}
-
-#[test]
-fn effects_chromatic_drag_hit_test() {
-    let g = effects_panel_geom();
-    assert_eq!(click(&g, &g.crt_chromatic_track), MouseAction::StartChromaticDrag);
-}
-
-#[test]
-fn effects_vignette_drag_hit_test() {
-    let g = effects_panel_geom();
-    assert_eq!(click(&g, &g.crt_vignette_track), MouseAction::StartVignetteDrag);
-}
-
-#[test]
-fn effects_tint_rgb_drag_hit_test() {
-    let g = effects_panel_geom();
-    assert_eq!(click(&g, &g.crt_tint_r_track), MouseAction::StartTintRDrag);
-    assert_eq!(click(&g, &g.crt_tint_g_track), MouseAction::StartTintGDrag);
-    assert_eq!(click(&g, &g.crt_tint_b_track), MouseAction::StartTintBDrag);
-}
-
-#[test]
-fn effects_animation_toggles_hit_test() {
-    let g = effects_panel_geom();
-    assert_eq!(click(&g, &g.crt_roll_toggle),    MouseAction::ToggleCrtRoll);
-    assert_eq!(click(&g, &g.crt_flicker_toggle), MouseAction::ToggleCrtFlicker);
-    assert_eq!(click(&g, &g.crt_jitter_toggle),  MouseAction::ToggleCrtJitter);
-}
-
-#[test]
-fn effects_caret_flash_toggle_hit_test() {
-    // Caret section (band 11) is below the viewport at scroll=0.
-    // Scroll to max to bring it into view.
-    let g = effects_panel_geom_scrolled();
-    assert_eq!(click(&g, &g.caret_flash_toggle), MouseAction::ToggleCaretFlash);
-}
-
-#[test]
-fn effects_caret_glow_toggle_hit_test() {
-    let g = effects_panel_geom_scrolled();
-    assert_eq!(click(&g, &g.caret_glow_toggle), MouseAction::ToggleCaretGlow);
-}
-
-#[test]
-fn effects_caret_dur_drag_hit_test() {
-    let g = effects_panel_geom_scrolled();
-    assert_eq!(click(&g, &g.caret_dur_track), MouseAction::StartCaretDurDrag);
-}
-
-#[test]
-fn effects_caret_color_rgb_drag_hit_test() {
-    let g = effects_panel_geom_scrolled();
-    assert_eq!(click(&g, &g.caret_color_r_track), MouseAction::StartCaretColorRDrag);
-    assert_eq!(click(&g, &g.caret_color_g_track), MouseAction::StartCaretColorGDrag);
-    assert_eq!(click(&g, &g.caret_color_b_track), MouseAction::StartCaretColorBDrag);
-}
-
-/// Scroll-aware hit-test: a widget that is below the viewport at scroll=0 becomes
-/// hittable once scrolled into view, and is correctly rejected when outside.
+/// Scroll-aware hit-test: a control below the viewport at scroll 0 takes no
+/// click there, and does once scrolled into view.
 #[test]
 fn effects_scroll_aware_hit_test() {
-    // caret_flash_toggle is in band 11. At scroll=0 its draw-Y is outside
-    // [content_top, content_bottom] for our 1000×640 test screen, so clicking
-    // at the rect center must not fire the action.
-    let g_top = effects_panel_geom(); // scroll=0
-    let action_outside = click(&g_top, &g_top.caret_flash_toggle);
-    assert_eq!(
-        action_outside,
-        MouseAction::None,
-        "caret_flash_toggle should be invisible (and non-hittable) at scroll=0"
-    );
-
-    // At scroll=192 (max) the same widget is inside the viewport: must fire.
-    let g_scrolled = effects_panel_geom_scrolled(); // scroll=192
-    let action_inside = click(&g_scrolled, &g_scrolled.caret_flash_toggle);
-    assert_eq!(
-        action_inside,
-        MouseAction::ToggleCaretFlash,
-        "caret_flash_toggle should be hittable at max scroll"
-    );
+    use jetty_render::CtlPart;
+    let id = "effects.caret_flash_color";
+    let want = MouseAction::Ctl { id, part: CtlPart::Channel(1) };
+    let top = effects_panel_geom();
+    let r = ctl_rect(&top, id, CtlPart::Channel(1));
+    assert!(r.y >= top.content_bottom, "below the fold at scroll 0");
+    assert_ne!(click(&top, &r), want, "not hittable while scrolled out");
+    let end = effects_panel_geom_scrolled();
+    assert!(end.scroll > 0.0 && end.scroll == end.max_scroll);
+    assert_eq!(click(&end, &ctl_rect(&end, id, CtlPart::Channel(1))), want);
 }
 
-/// Regression: Effects widgets must NOT fire on tab 0 (Look) — their rects are
-/// parked at 1e6 when not on the Effects tab, so any real cursor position misses.
+/// Effects controls exist only on the Effects tab.
 #[test]
 fn effects_widgets_inactive_on_look_tab() {
     let g = make_panel_geom_tab(0);
-    // Spot-check: the crt_enabled_toggle rect is at 1e6 on tab 0, so a center
-    // click at (1e6 + w/2, 1e6 + h/2) is outside any real screen — but we can
-    // verify it doesn't decode as ToggleCrt for any realistic cursor position.
+    assert!(!g.hits.iter().any(|(_, h)| matches!(h, jetty_render::PanelHit::Ctl { id, .. } if id.starts_with("effects."))));
     let action = decide_mouse_press(Some(&g), None, 400.0, 400.0);
-    // A click at (400,400) on tab 0 (Look) should NOT be a ToggleCrt.
-    assert_ne!(action, MouseAction::ToggleCrt);
+    assert!(!matches!(action, MouseAction::Ctl { id, .. } if id.starts_with("effects.")));
 }
 
 // ---------------------------------------------------------------------------

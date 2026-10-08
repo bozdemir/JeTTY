@@ -67,6 +67,8 @@ pub enum PaletteCmd {
     /// The per-tab color of the tab the palette was opened over (palette index
     /// 1..=6; `None` removes it).
     SetTabColor(Option<u8>),
+    /// Open Settings at a control ("Settings › Effects › Bloom"), by its id.
+    SettingsAt(&'static str),
 }
 
 /// The chrome entries: tab style / close buttons / window border pickers, the
@@ -205,6 +207,15 @@ pub fn build_registry(
             title: format!("Theme: {display}"),
             keywords: "theme colour color scheme palette",
             cmd: PaletteCmd::SetTheme(i),
+        });
+    }
+    // Deep links into Settings, one per control ("Settings › Effects › Bloom"),
+    // straight from the control table — a new setting gets one by itself.
+    for (title, id) in crate::settings_ui::deep_links() {
+        v.push(PaletteEntry {
+            title,
+            keywords: "settings preferences option configure",
+            cmd: PaletteCmd::SettingsAt(id),
         });
     }
     for (id, title) in tabs {

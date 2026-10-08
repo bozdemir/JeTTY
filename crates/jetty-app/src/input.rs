@@ -809,126 +809,22 @@ fn encode_legacy(
 /// High-level action decoded from a left mouse button press.
 #[derive(Debug, PartialEq)]
 pub enum MouseAction {
-    /// User pressed on the opacity slider handle or track.
-    StartSliderDrag,
-    /// User pressed on the corner-radius slider handle or track.
-    StartRadiusDrag,
-    /// User clicked a theme row in the OPEN dropdown. The index is into
-    /// `jetty_core::theme::PRESETS` (already offset by `geom.theme_scroll_offset`).
-    SetTheme(usize),
-    /// User clicked the collapsed theme combo header — toggle the dropdown open/closed.
-    ToggleThemeDropdown,
-    /// User clicked the ▲ theme-list scroll button — scroll up (offset−1).
-    ThemeScrollUp,
-    /// User clicked the ▼ theme-list scroll button — scroll down (offset+1).
-    ThemeScrollDown,
-    /// User clicked the font-size decrement button ("−").
-    FontMinus,
-    /// User clicked the font-size increment button ("+").
-    FontPlus,
-    /// User clicked the font-size reset button ("reset").
-    FontReset,
-    /// User clicked a font-family row. The index is
-    /// `geom.font_scroll_offset + row_index` into the families list.
-    SetFont(usize),
-    /// User clicked the ▲ font-list scroll button — scroll up (offset−1).
-    FontScrollUp,
-    /// User clicked the ▼ font-list scroll button — scroll down (offset+1).
-    FontScrollDown,
-    /// User clicked the UI (chrome) font-size decrement button ("−").
-    UiFontMinus,
-    /// User clicked the UI (chrome) font-size increment button ("+").
-    UiFontPlus,
-    /// User clicked the UI (chrome) font-size reset button ("rst").
-    UiFontReset,
-    /// User clicked a UI-font-family row. The index is
-    /// `geom.ui_font_scroll_offset + row_index` into the UI families list
-    /// (index 0 = the synthetic "System Sans (default)" row → "").
-    SetUiFont(usize),
-    /// User clicked the ▲ UI-font-list scroll button — scroll up (offset−1).
-    UiFontScrollUp,
-    /// User clicked the ▼ UI-font-list scroll button — scroll down (offset+1).
-    UiFontScrollDown,
-    /// User clicked the summon-effect "‹" button — cycle to the previous effect.
-    SummonPrev,
-    /// User clicked the summon-effect "›" button — cycle to the next effect.
-    SummonNext,
-    /// User clicked the window-mode "‹" button — cycle to the previous mode.
-    WinModePrev,
-    /// User clicked the window-mode "›" button — cycle to the next mode.
-    WinModeNext,
-    /// User clicked the tab-bar "‹" button — cycle the tab-bar position.
-    TabBarPrev,
-    /// User clicked the tab-bar "›" button — cycle the tab-bar position.
-    TabBarNext,
-    /// User clicked the scrollback "‹" button — previous scrollback-lines step.
-    ScrollbackPrev,
-    /// User clicked the scrollback "›" button — next scrollback-lines step.
-    ScrollbackNext,
-    /// User pressed on the Dropdown-height slider handle or track — start drag.
-    StartDropdownDrag,
-    /// User pressed on the Dropdown-width slider handle or track — start drag.
-    StartDropdownWidthDrag,
-    /// User clicked the "Auto-hide on focus loss" toggle pill.
-    ToggleFocusAutoHide,
-    /// User clicked the "Launch at login" toggle pill (bottom band).
-    ToggleLaunchAtLogin,
-    /// User clicked the shell-picker "‹" button — cycle to the previous shell.
-    CycleShellPrev,
-    /// User clicked the shell-picker "›" button — cycle to the next shell.
-    CycleShellNext,
-    // ── Shell tab: RUN & NOTIFY (v0.15) ────────────────────────────────────────
-    /// User clicked the "Notify on command finish" master toggle.
-    ToggleNotifyOnFinish,
-    /// User clicked the "Only on failure" toggle.
-    ToggleNotifyOnlyFailure,
-    /// User clicked the minimum-duration cycler "‹" — previous step.
-    NotifyDurPrev,
-    /// User clicked the minimum-duration cycler "›" — next step.
-    NotifyDurNext,
-    /// User clicked the "Auto-summon when hidden" toggle.
-    ToggleAutoSummon,
-    // ── Effects tab widgets ────────────────────────────────────────────────────
-    /// User clicked the "CRT enabled" master toggle pill.
-    ToggleCrt,
-    /// User clicked the "CRT roll" animation toggle pill.
-    ToggleCrtRoll,
-    /// User clicked the "CRT flicker" animation toggle pill.
-    ToggleCrtFlicker,
-    /// User clicked the "CRT jitter" animation toggle pill.
-    ToggleCrtJitter,
-    /// User clicked the "caret flash" enabled toggle pill.
-    ToggleCaretFlash,
-    /// User clicked the "caret glow" enabled toggle pill.
-    ToggleCaretGlow,
-    /// User pressed on the CRT curvature slider handle or track — start drag.
-    StartCrtCurvatureDrag,
-    /// User pressed on the CRT scanline-intensity slider handle or track — start drag.
-    StartScanlineDrag,
-    /// User pressed on the CRT shadow-mask slider handle or track — start drag.
-    StartMaskDrag,
-    /// User pressed on the CRT bloom slider handle or track — start drag.
-    StartBloomDrag,
-    /// User pressed on the CRT chromatic-aberration slider handle or track — start drag.
-    StartChromaticDrag,
-    /// User pressed on the CRT vignette slider handle or track — start drag.
-    StartVignetteDrag,
-    /// User pressed on the caret flash-duration slider handle or track — start drag.
-    StartCaretDurDrag,
-    /// User pressed on the CRT scanline-tint R-channel mini-slider — start drag.
-    StartTintRDrag,
-    /// User pressed on the CRT scanline-tint G-channel mini-slider — start drag.
-    StartTintGDrag,
-    /// User pressed on the CRT scanline-tint B-channel mini-slider — start drag.
-    StartTintBDrag,
-    /// User pressed on the caret color R-channel mini-slider — start drag.
-    StartCaretColorRDrag,
-    /// User pressed on the caret color G-channel mini-slider — start drag.
-    StartCaretColorGDrag,
-    /// User pressed on the caret color B-channel mini-slider — start drag.
-    StartCaretColorBDrag,
-    /// User clicked one of the 5 settings tab labels — switch the active tab.
-    /// The index is 0..=4 (Look / Fonts / Window / Shell / Effects).
+    /// A part of a data-driven Settings control (see `settings_ui`): the
+    /// control's id (its config key path) and which part was hit.
+    Ctl { id: jetty_render::CtlId, part: jetty_render::CtlPart },
+    /// A Settings section header — collapse / expand it.
+    SettingsSection(&'static str),
+    /// A theme card in the gallery (theme registry index).
+    GalleryCard(usize),
+    /// A gallery filter chip.
+    GalleryFilter(jetty_render::ThemeFilter),
+    /// The Settings scrollbar thumb. `grab_dy` is `cy - thumb.y`.
+    PanelScrollThumb { grab_dy: f32 },
+    /// The Settings scrollbar track outside the thumb — page toward the click.
+    PanelScrollTrack,
+    /// The footer's "Reset tab" button.
+    ResetTab,
+    /// User clicked one of the settings tab labels — switch the active tab.
     SetSettingsTab(usize),
     /// User pressed on the title bar (not on any widget) — start dialog drag.
     StartDialogDrag,
@@ -948,256 +844,33 @@ pub enum MouseAction {
 /// * `scrollbar` – The current scrollbar thumb [`Rect`], if any.
 /// * `cx`, `cy`  – Cursor position in physical pixels.
 ///
-/// Priority:
-/// 1. If panel open: slider handle/track → StartSliderDrag
-/// 2. If panel open: theme combo / open rows → ToggleThemeDropdown / SetTheme(i)
-/// 3. If panel open: font-size buttons   → FontMinus/Plus/Reset
-/// 4. If panel open: font-scroll buttons → FontScrollUp/FontScrollDown
-/// 5. If panel open: font-family row     → SetFont(idx)
-/// 6. If panel open: title bar (top ~36px, no widget hit) → StartDialogDrag
-/// 7. If panel open: inside panel rect   → ConsumePanel
-/// 8. (Falls through to scrollbar when click is outside open panel)
-/// 9. Inside scrollbar thumb             → StartScrollbarDrag
-/// 10. Inside scrollbar track x-range    → ScrollbarTrackJump
-/// 11. Anything else                     → None
+/// Priority: the panel's parts (`PanelGeom::hit_at`: tabs, then chrome — the
+/// footer button and the scrollbar — then the content, live only inside its
+/// viewport), then its title bar, then anywhere else on the panel (consumed);
+/// outside the panel, the terminal scrollbar thumb / track.
 pub fn decide_mouse_press(
     panel: Option<&jetty_render::PanelGeom>,
     scrollbar: Option<&jetty_render::Rect>,
     cx: f32,
     cy: f32,
 ) -> MouseAction {
+    use jetty_render::PanelHit;
     if let Some(g) = panel {
-        // Tab strip — tested FIRST so a tab switch always wins over any band
-        // widget (the inactive tabs' widgets are offscreen anyway, but the active
-        // tab's first band sits just below the strip, so order still matters).
-        for (i, tab) in g.tab_rects.iter().enumerate() {
-            if point_in(tab, cx, cy) {
-                return MouseAction::SetSettingsTab(i);
-            }
+        if let Some(hit) = g.hit_at(cx, cy) {
+            return match hit {
+                PanelHit::Tab(i) => MouseAction::SetSettingsTab(i),
+                PanelHit::Ctl { id, part } => MouseAction::Ctl { id, part },
+                PanelHit::Section(id) => MouseAction::SettingsSection(id),
+                PanelHit::GalleryCard(i) => MouseAction::GalleryCard(i),
+                PanelHit::GalleryFilter(f) => MouseAction::GalleryFilter(f),
+                PanelHit::ScrollThumb => MouseAction::PanelScrollThumb {
+                    grab_dy: cy - g.scroll_thumb.map_or(cy, |t| t.y),
+                },
+                PanelHit::ScrollTrack => MouseAction::PanelScrollTrack,
+                PanelHit::ResetTab => MouseAction::ResetTab,
+            };
         }
-        // Opacity slider handle or track → start drag.
-        if point_in(&g.slider_handle, cx, cy) || point_in(&g.slider_track, cx, cy) {
-            return MouseAction::StartSliderDrag;
-        }
-        // Corner-radius slider handle or track → start drag.
-        if point_in(&g.radius_handle, cx, cy) || point_in(&g.radius_track, cx, cy) {
-            return MouseAction::StartRadiusDrag;
-        }
-        // Theme picker. When the dropdown is OPEN its rows + scroll arrows take
-        // priority (they overlay the area below the combo). A row click selects a
-        // preset; the scroll arrows page the list. Clicking the combo header itself
-        // toggles the dropdown.
-        if g.theme_open {
-            for (i, row) in g.theme_rows.iter().enumerate() {
-                if point_in(row, cx, cy) {
-                    return MouseAction::SetTheme(g.theme_scroll_offset + i);
-                }
-            }
-            if point_in(&g.theme_scroll_up, cx, cy) {
-                return MouseAction::ThemeScrollUp;
-            }
-            if point_in(&g.theme_scroll_down, cx, cy) {
-                return MouseAction::ThemeScrollDown;
-            }
-        }
-        if point_in(&g.theme_combo, cx, cy) {
-            return MouseAction::ToggleThemeDropdown;
-        }
-        // Font-size buttons (checked before generic ConsumePanel).
-        if point_in(&g.font_minus, cx, cy) {
-            return MouseAction::FontMinus;
-        }
-        if point_in(&g.font_plus, cx, cy) {
-            return MouseAction::FontPlus;
-        }
-        if point_in(&g.font_reset, cx, cy) {
-            return MouseAction::FontReset;
-        }
-        // Font-list scroll buttons.
-        if point_in(&g.font_scroll_up, cx, cy) {
-            return MouseAction::FontScrollUp;
-        }
-        if point_in(&g.font_scroll_down, cx, cy) {
-            return MouseAction::FontScrollDown;
-        }
-        // Summon-effect cycle buttons.
-        if point_in(&g.summon_prev, cx, cy) {
-            return MouseAction::SummonPrev;
-        }
-        if point_in(&g.summon_next, cx, cy) {
-            return MouseAction::SummonNext;
-        }
-        // Window-mode cycle buttons.
-        if point_in(&g.win_mode_prev, cx, cy) {
-            return MouseAction::WinModePrev;
-        }
-        if point_in(&g.win_mode_next, cx, cy) {
-            return MouseAction::WinModeNext;
-        }
-        // Tab-bar position cycle buttons.
-        if point_in(&g.tab_bar_prev, cx, cy) {
-            return MouseAction::TabBarPrev;
-        }
-        if point_in(&g.tab_bar_next, cx, cy) {
-            return MouseAction::TabBarNext;
-        }
-        // Scrollback-lines cycle buttons.
-        if point_in(&g.scrollback_prev, cx, cy) {
-            return MouseAction::ScrollbackPrev;
-        }
-        if point_in(&g.scrollback_next, cx, cy) {
-            return MouseAction::ScrollbackNext;
-        }
-        // Dropdown-height slider handle or track.
-        if point_in(&g.dropdown_handle, cx, cy) || point_in(&g.dropdown_track, cx, cy) {
-            return MouseAction::StartDropdownDrag;
-        }
-        // Dropdown-width slider handle or track.
-        if point_in(&g.dropdown_width_handle, cx, cy) || point_in(&g.dropdown_width_track, cx, cy) {
-            return MouseAction::StartDropdownWidthDrag;
-        }
-        // Auto-hide toggle pill.
-        if point_in(&g.autohide_toggle, cx, cy) {
-            return MouseAction::ToggleFocusAutoHide;
-        }
-        // Launch-at-login toggle pill (bottom band).
-        if point_in(&g.launch_login_toggle, cx, cy) {
-            return MouseAction::ToggleLaunchAtLogin;
-        }
-        // Shell-picker cycle buttons.
-        if point_in(&g.shell_prev, cx, cy) {
-            return MouseAction::CycleShellPrev;
-        }
-        if point_in(&g.shell_next, cx, cy) {
-            return MouseAction::CycleShellNext;
-        }
-        // RUN & NOTIFY section (Shell tab, v0.15).
-        if point_in(&g.notify_toggle, cx, cy) {
-            return MouseAction::ToggleNotifyOnFinish;
-        }
-        if point_in(&g.notify_failure_toggle, cx, cy) {
-            return MouseAction::ToggleNotifyOnlyFailure;
-        }
-        if point_in(&g.notify_dur_prev, cx, cy) {
-            return MouseAction::NotifyDurPrev;
-        }
-        if point_in(&g.notify_dur_next, cx, cy) {
-            return MouseAction::NotifyDurNext;
-        }
-        if point_in(&g.auto_summon_toggle, cx, cy) {
-            return MouseAction::ToggleAutoSummon;
-        }
-        // Font-family list rows.
-        for (i, row) in g.font_rows.iter().enumerate() {
-            if point_in(row, cx, cy) {
-                return MouseAction::SetFont(g.font_scroll_offset + i);
-            }
-        }
-        // UI (chrome) font-size buttons.
-        if point_in(&g.ui_font_minus, cx, cy) {
-            return MouseAction::UiFontMinus;
-        }
-        if point_in(&g.ui_font_plus, cx, cy) {
-            return MouseAction::UiFontPlus;
-        }
-        if point_in(&g.ui_font_reset, cx, cy) {
-            return MouseAction::UiFontReset;
-        }
-        // UI-font-list scroll buttons.
-        if point_in(&g.ui_font_scroll_up, cx, cy) {
-            return MouseAction::UiFontScrollUp;
-        }
-        if point_in(&g.ui_font_scroll_down, cx, cy) {
-            return MouseAction::UiFontScrollDown;
-        }
-        // UI (chrome) font-family list rows. Row index 0 maps to the synthetic
-        // "System Sans (default)" entry (handled app-side as "").
-        for (i, row) in g.ui_font_rows.iter().enumerate() {
-            if point_in(row, cx, cy) {
-                return MouseAction::SetUiFont(g.ui_font_scroll_offset + i);
-            }
-        }
-        // ── Effects-tab widgets ───────────────────────────────────────────────
-        // Rects are at 1e6 when the Effects tab is not active, so these tests are
-        // effectively no-ops on every other tab.
-        //
-        // Viewport guard: clicks in the title/tab-strip chrome area (above
-        // content_top) or below the panel bottom (content_bottom) must NOT fire
-        // Effects widget actions even if a widget rect has scrolled into that zone.
-        // We only apply this guard when the panel is on-screen
-        // (content_top < 1e5 — Y-viewport bound only; cross-tab isolation
-        // relies on the OFF-sentinel rects, not this check).
-        let in_effects_viewport = g.content_top < 1.0e5
-            && cy >= g.content_top
-            && cy < g.content_bottom
-            && cx >= g.panel.x
-            && cx < g.panel.x + g.panel.w;
-
-        if in_effects_viewport {
-            // Toggle pills.
-            if point_in(&g.crt_enabled_toggle, cx, cy) {
-                return MouseAction::ToggleCrt;
-            }
-            if point_in(&g.crt_roll_toggle, cx, cy) {
-                return MouseAction::ToggleCrtRoll;
-            }
-            if point_in(&g.crt_flicker_toggle, cx, cy) {
-                return MouseAction::ToggleCrtFlicker;
-            }
-            if point_in(&g.crt_jitter_toggle, cx, cy) {
-                return MouseAction::ToggleCrtJitter;
-            }
-            if point_in(&g.caret_flash_toggle, cx, cy) {
-                return MouseAction::ToggleCaretFlash;
-            }
-            if point_in(&g.caret_glow_toggle, cx, cy) {
-                return MouseAction::ToggleCaretGlow;
-            }
-            // Effects tab sliders: handle OR track → start drag.
-            if point_in(&g.crt_curvature_handle, cx, cy) || point_in(&g.crt_curvature_track, cx, cy) {
-                return MouseAction::StartCrtCurvatureDrag;
-            }
-            if point_in(&g.crt_scanline_handle, cx, cy) || point_in(&g.crt_scanline_track, cx, cy) {
-                return MouseAction::StartScanlineDrag;
-            }
-            if point_in(&g.crt_mask_handle, cx, cy) || point_in(&g.crt_mask_track, cx, cy) {
-                return MouseAction::StartMaskDrag;
-            }
-            if point_in(&g.crt_bloom_handle, cx, cy) || point_in(&g.crt_bloom_track, cx, cy) {
-                return MouseAction::StartBloomDrag;
-            }
-            if point_in(&g.crt_chromatic_handle, cx, cy) || point_in(&g.crt_chromatic_track, cx, cy) {
-                return MouseAction::StartChromaticDrag;
-            }
-            if point_in(&g.crt_vignette_handle, cx, cy) || point_in(&g.crt_vignette_track, cx, cy) {
-                return MouseAction::StartVignetteDrag;
-            }
-            // CRT scanline-tint RGB mini-sliders.
-            if point_in(&g.crt_tint_r_handle, cx, cy) || point_in(&g.crt_tint_r_track, cx, cy) {
-                return MouseAction::StartTintRDrag;
-            }
-            if point_in(&g.crt_tint_g_handle, cx, cy) || point_in(&g.crt_tint_g_track, cx, cy) {
-                return MouseAction::StartTintGDrag;
-            }
-            if point_in(&g.crt_tint_b_handle, cx, cy) || point_in(&g.crt_tint_b_track, cx, cy) {
-                return MouseAction::StartTintBDrag;
-            }
-            // Caret flash-duration slider.
-            if point_in(&g.caret_dur_handle, cx, cy) || point_in(&g.caret_dur_track, cx, cy) {
-                return MouseAction::StartCaretDurDrag;
-            }
-            // Caret flash-color RGB mini-sliders.
-            if point_in(&g.caret_color_r_handle, cx, cy) || point_in(&g.caret_color_r_track, cx, cy) {
-                return MouseAction::StartCaretColorRDrag;
-            }
-            if point_in(&g.caret_color_g_handle, cx, cy) || point_in(&g.caret_color_g_track, cx, cy) {
-                return MouseAction::StartCaretColorGDrag;
-            }
-            if point_in(&g.caret_color_b_handle, cx, cy) || point_in(&g.caret_color_b_track, cx, cy) {
-                return MouseAction::StartCaretColorBDrag;
-            }
-        }
-        // Title bar (top ~36px) — drag handle; must come before generic consume.
+        // Title bar — drag handle; must come before generic consume.
         if point_in(&g.title_bar, cx, cy) {
             return MouseAction::StartDialogDrag;
         }
@@ -3366,44 +3039,27 @@ mod tests {
         );
     }
 
-    // ── UI-font panel hit-tests ──────────────────────────────────────────────
-    // Build a real panel (large screen so it isn't clamped) and verify clicks on
-    // the new UI-font widgets decode to the right MouseAction. Using build_panel
-    // keeps the geometry in lockstep with the renderer (no hand-rolled rects).
+    // ── Settings panel hit-tests ─────────────────────────────────────────────
+    // Real panels built from the real control table (`settings_ui`) through
+    // `build_panel`, so the geometry is exactly what the Settings window draws.
 
-    /// A representative panel with 5 UI-font families (incl. the synthetic
-    /// "System Sans" row) so the family list and its scroll math are exercised.
-    fn panel_for_tab(active_tab: usize) -> jetty_render::PanelView {
+    fn settings_view(tab: usize, scroll: f32) -> jetty_render::PanelView {
+        use crate::settings_ui::{tab_items, Ctx};
         let theme = jetty_core::Theme::by_name("catppuccin_mocha");
-        let mono: Vec<String> = vec!["JetBrains Mono".into(), "Fira Code".into()];
-        let ui: Vec<String> = vec![
-            "System Sans (default)".into(),
-            "Inter".into(),
-            "Noto Sans".into(),
-            "DejaVu Sans".into(),
-            "Cantarell".into(),
-        ];
-        jetty_render::build_panel(
-            1920, 1280, 0.97, 0, 15.0, &mono, "JetBrains Mono", 0,
-            // …, is_dropdown, FULLSCREEN, focus_autohide, launch_at_login, …
-            8.0, "Phosphor", "Center", "Top", "10k", 0.5, 1.0, false, false, true,
-            false, // launch_at_login
-            18.0, &ui, "", 0,
-            0.0, 0.0, &theme,
-            &mut jetty_render::MonoMeasure(9.8), jetty_render::ChromeMetrics::DEFAULT,
-            "System default", // shell_display
-            &jetty_render::NotifyParams::default(), // Run & Notify (v0.15)
-            active_tab,
-            &jetty_render::EffectsParams::default(),
-            0.0, // effects_scroll (default: top)
-            false, // theme_dropdown_open
-            0, // theme_scroll_offset
-        )
-    }
-
-    /// The Fonts tab (1): font + UI-font widgets are laid out here.
-    fn ui_panel() -> jetty_render::PanelView {
-        panel_for_tab(1)
+        let mono: Vec<String> = ["JetBrains Mono", "Fira Code", "Hack", "Cascadia Code", "Iosevka", "Monaspace"]
+            .map(String::from)
+            .to_vec();
+        let ui: Vec<String> = ["System Sans (default)", "Inter", "Noto Sans", "DejaVu Sans", "Cantarell"]
+            .map(String::from)
+            .to_vec();
+        // Dropdown mode: the dropdown sliders are live.
+        let cfg = crate::config::Config { window_mode: "dropdown".into(), ..Default::default() };
+        let ctx = Ctx { mono_families: &mono, ui_families: &ui, ..Ctx::empty() };
+        let items = tab_items(tab, &cfg, &ctx);
+        let mut inp = jetty_render::PanelInput::new(420, 592, &theme, jetty_render::ChromeMetrics::DEFAULT, &items);
+        inp.active_tab = tab;
+        inp.scroll = scroll;
+        jetty_render::build_panel(&inp, &mut jetty_render::MonoMeasure(9.8))
     }
 
     /// Decode a click at the center of `rect` against the panel geometry.
@@ -3412,107 +3068,114 @@ mod tests {
     }
 
     #[test]
-    fn ui_font_size_buttons_hit_test() {
-        let pv = ui_panel();
-        let g = &pv.geom;
-        assert_eq!(click_rect(g, &g.ui_font_minus), MouseAction::UiFontMinus);
-        assert_eq!(click_rect(g, &g.ui_font_plus), MouseAction::UiFontPlus);
-        assert_eq!(click_rect(g, &g.ui_font_reset), MouseAction::UiFontReset);
+    fn every_visible_control_part_decodes_to_its_ctl_action() {
+        use jetty_render::PanelHit;
+        for tab in 0..jetty_render::N_TABS {
+            let pv = settings_view(tab, 0.0);
+            let g = &pv.geom;
+            let mut seen = 0;
+            for (r, hit) in &g.hits {
+                // Only parts fully inside the viewport are clickable.
+                if r.y < g.content_top || r.y + r.h > g.content_bottom {
+                    continue;
+                }
+                let want = match *hit {
+                    PanelHit::Ctl { id, part } => MouseAction::Ctl { id, part },
+                    PanelHit::Section(id) => MouseAction::SettingsSection(id),
+                    PanelHit::GalleryCard(i) => MouseAction::GalleryCard(i),
+                    PanelHit::GalleryFilter(f) => MouseAction::GalleryFilter(f),
+                    other => panic!("unexpected content hit {other:?}"),
+                };
+                // A section header's hit rect is overlapped by its master switch
+                // on the right — click its left part.
+                let act = if matches!(hit, PanelHit::Section(_)) {
+                    decide_mouse_press(Some(g), None, r.x + 12.0, r.y + r.h / 2.0)
+                } else {
+                    click_rect(g, r)
+                };
+                assert_eq!(act, want, "tab {tab}");
+                seen += 1;
+            }
+            assert!(seen > 0, "tab {tab} has visible parts");
+        }
     }
 
     #[test]
-    fn ui_font_scroll_buttons_hit_test() {
-        let pv = ui_panel();
-        let g = &pv.geom;
-        assert_eq!(click_rect(g, &g.ui_font_scroll_up), MouseAction::UiFontScrollUp);
-        assert_eq!(click_rect(g, &g.ui_font_scroll_down), MouseAction::UiFontScrollDown);
+    fn named_controls_decode_on_their_tabs() {
+        use jetty_render::{CtlPart, PanelHit};
+        for (tab, id, part) in [
+            (0, "opacity", CtlPart::Track),
+            (0, "corner_radius", CtlPart::Track),
+            (1, "font_size", CtlPart::Minus),
+            (1, "font_size", CtlPart::Reset),
+            (1, "font_family", CtlPart::Row(1)),
+            (1, "font_family", CtlPart::ScrollDown),
+            (2, "summon_effect", CtlPart::Next),
+            (2, "window_mode", CtlPart::Prev),
+            (2, "focus_autohide", CtlPart::Switch),
+            (2, "dropdown_height_pct", CtlPart::Track),
+            (3, "shell", CtlPart::Next),
+            (3, "launch_at_login", CtlPart::Switch),
+            (3, "notify_on_command_finish", CtlPart::Switch),
+            (3, "notify_min_seconds", CtlPart::Prev),
+            (4, "effects.crt_enabled", CtlPart::Switch),
+            (4, "effects.crt_curvature", CtlPart::Track),
+            (4, "effects.crt_animate", CtlPart::Chip(2)),
+        ] {
+            let pv = settings_view(tab, 0.0);
+            let g = &pv.geom;
+            let r = g
+                .rect_of(PanelHit::Ctl { id, part })
+                .unwrap_or_else(|| panic!("tab {tab}: no {id} {part:?}"));
+            assert_eq!(click_rect(g, &r), MouseAction::Ctl { id, part }, "tab {tab} {id}");
+        }
     }
 
     #[test]
-    fn ui_font_rows_hit_test_to_offset_plus_index() {
-        let pv = ui_panel();
-        let g = &pv.geom;
-        // Row 0 maps to SetUiFont(offset+0) = SetUiFont(0) (the System Sans row).
-        let r0 = g.ui_font_rows[0];
-        assert_eq!(
-            decide_mouse_press(Some(g), None, r0.x + 4.0, r0.y + r0.h / 2.0),
-            MouseAction::SetUiFont(g.ui_font_scroll_offset),
-        );
-        // Row 2 maps to SetUiFont(offset+2).
-        let r2 = g.ui_font_rows[2];
-        assert_eq!(
-            decide_mouse_press(Some(g), None, r2.x + 4.0, r2.y + r2.h / 2.0),
-            MouseAction::SetUiFont(g.ui_font_scroll_offset + 2),
-        );
-    }
-
-    #[test]
-    fn shell_cycle_buttons_hit_test() {
-        // The shell band lives on the Shell tab (3).
-        let pv = panel_for_tab(3);
-        let g = &pv.geom;
-        assert_eq!(click_rect(g, &g.shell_prev), MouseAction::CycleShellPrev);
-        assert_eq!(click_rect(g, &g.shell_next), MouseAction::CycleShellNext);
-    }
-
-    #[test]
-    fn notify_controls_hit_test() {
-        // RUN & NOTIFY controls also live on the Shell tab (3, v0.15).
-        let pv = panel_for_tab(3);
-        let g = &pv.geom;
-        assert_eq!(click_rect(g, &g.notify_toggle), MouseAction::ToggleNotifyOnFinish);
-        assert_eq!(
-            click_rect(g, &g.notify_failure_toggle),
-            MouseAction::ToggleNotifyOnlyFailure
-        );
-        assert_eq!(click_rect(g, &g.notify_dur_prev), MouseAction::NotifyDurPrev);
-        assert_eq!(click_rect(g, &g.notify_dur_next), MouseAction::NotifyDurNext);
-        assert_eq!(click_rect(g, &g.auto_summon_toggle), MouseAction::ToggleAutoSummon);
-    }
-
-    #[test]
-    fn scrollback_cycler_clicks_decode() {
-        // The scrollback band lives on the Window tab (2).
-        let pv = panel_for_tab(2);
-        let g = &pv.geom;
-        assert_eq!(click_rect(g, &g.scrollback_prev), MouseAction::ScrollbackPrev);
-        assert_eq!(click_rect(g, &g.scrollback_next), MouseAction::ScrollbackNext);
-        // A click on the cycler BODY between the chevrons is not a scrollback
-        // action (the value area is inert).
-        let mid_x = (g.scrollback_prev.x + g.scrollback_prev.w
-            + g.scrollback_next.x) / 2.0;
-        let mid_y = g.scrollback_prev.y + g.scrollback_prev.h / 2.0;
-        let act = decide_mouse_press(Some(g), None, mid_x, mid_y);
-        assert!(
-            act != MouseAction::ScrollbackPrev && act != MouseAction::ScrollbackNext,
-            "cycler body must not decode to a scrollback action, got {act:?}"
-        );
+    fn scrolled_out_controls_are_dead_and_scrolled_in_ones_live() {
+        use jetty_render::{CtlPart, PanelHit};
+        // The caret color sits below the fold on the Effects tab.
+        let hit = PanelHit::Ctl { id: "effects.caret_flash_color", part: CtlPart::Channel(0) };
+        let want = MouseAction::Ctl { id: "effects.caret_flash_color", part: CtlPart::Channel(0) };
+        let top = settings_view(4, 0.0);
+        let r = top.geom.rect_of(hit).expect("laid out even when below the fold");
+        assert!(r.y >= top.geom.content_bottom, "below the fold at scroll 0");
+        assert_ne!(click_rect(&top.geom, &r), want);
+        let bottom = settings_view(4, 1.0e9);
+        let r = bottom.geom.rect_of(hit).unwrap();
+        assert_eq!(click_rect(&bottom.geom, &r), want);
+        // Scrolled to the bottom, the first section header is under the chrome:
+        // a click there must not reach it.
+        let hdr = bottom.geom.rect_of(PanelHit::Section("fx.crt")).unwrap();
+        assert!(hdr.y + hdr.h < bottom.geom.content_top);
     }
 
     #[test]
     fn tab_strip_clicks_select_tab() {
-        // A click on tab label i decodes to SetSettingsTab(i), regardless of which
-        // tab is currently active.
-        let pv = panel_for_tab(0);
+        let pv = settings_view(0, 0.0);
         let g = &pv.geom;
-        for i in 0..4 {
+        for i in 0..jetty_render::N_TABS {
             assert_eq!(click_rect(g, &g.tab_rects[i]), MouseAction::SetSettingsTab(i));
         }
     }
 
     #[test]
-    fn terminal_font_widgets_still_hit_test_after_ui_insert() {
-        // Regression: the UI-font hit-tests are inserted AFTER the terminal-font
-        // ones, so the terminal-font widgets must still decode correctly.
-        let pv = ui_panel();
+    fn scrollbar_thumb_and_track_and_footer_decode() {
+        let pv = settings_view(4, 0.0);
         let g = &pv.geom;
-        assert_eq!(click_rect(g, &g.font_minus), MouseAction::FontMinus);
-        assert_eq!(click_rect(g, &g.font_plus), MouseAction::FontPlus);
-        let r0 = g.font_rows[0];
+        let thumb = g.scroll_thumb.expect("the Effects tab overflows");
         assert_eq!(
-            decide_mouse_press(Some(g), None, r0.x + 4.0, r0.y + r0.h / 2.0),
-            MouseAction::SetFont(g.font_scroll_offset),
+            decide_mouse_press(Some(g), None, thumb.x + thumb.w / 2.0, thumb.y + 5.0),
+            MouseAction::PanelScrollThumb { grab_dy: 5.0 }
         );
+        assert_eq!(
+            decide_mouse_press(Some(g), None, thumb.x + thumb.w / 2.0, g.content_bottom - 2.0),
+            MouseAction::PanelScrollTrack
+        );
+        let reset = g.rect_of(jetty_render::PanelHit::ResetTab).expect("footer button");
+        assert_eq!(click_rect(g, &reset), MouseAction::ResetTab);
+        // The title row is the drag handle.
+        assert_eq!(click_rect(g, &g.title_bar), MouseAction::StartDialogDrag);
     }
 
     // ── Golden table: legacy encoding vs terminfo `xterm-256color` ───────────

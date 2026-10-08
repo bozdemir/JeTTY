@@ -1,5 +1,7 @@
 mod app;
-mod config;
+/// Persisted settings. Public so the `jetty-shot` self-test can render the
+/// Settings panel from a real config file.
+pub mod config;
 mod copymode;
 mod detached;
 mod gridmouse;
@@ -11,6 +13,9 @@ mod runsel;
 pub mod palette;
 mod shell_integration;
 mod tabmeta;
+/// Settings controls as data (the panel's descriptor table). Public so the
+/// `jetty-shot` self-test builds the SAME panel content the app shows.
+pub mod settings_ui;
 mod watch;
 /// User theme loading + registry rebuild. Public so the `jetty-shot` self-test
 /// binary can seed user themes before resolving `JETTY_THEME`.
