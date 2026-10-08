@@ -5,6 +5,11 @@
 // quad into a parallelogram (x shifts by shear × the distance above the rect's
 // vertical centre): the SDF runs in the unsheared frame, so the corners stay
 // rounded and the slanted edges antialiased. 0 = an upright rect.
+//
+// A NEGATIVE radius (never a corner radius) marks a patterned text decoration
+// (see `Deco`): `-radius = style · DECO_STYLE_UNIT + param`. The fragment then
+// draws an anti-aliased undercurl / round dots / even dashes inside the rect
+// instead of filling it — one instance per underline run.
 const QUAD_SHADER: &str = r#"
 struct Screen { size: vec2<f32>, _pad: vec2<f32> };
 @group(0) @binding(0) var<uniform> screen: Screen;
@@ -14,13 +19,15 @@ struct VsOut {
     @location(1) local: vec2<f32>,   // pixel offset from the rect center
     @location(2) hsize: vec2<f32>,   // rect half-size in pixels (NOT `half` — a Metal reserved type)
     @location(3) radius: f32,        // corner radius in pixels
+    @location(4) @interpolate(flat) deco: vec2<f32>, // decoration (style, param); style 0 = none
 };
+const DECO_STYLE_UNIT: f32 = 4096.0;
 @vertex
 fn vs(
     @builtin(vertex_index) vi: u32,
     @location(0) rect: vec4<f32>,
     @location(1) color: vec4<f32>,
-    @location(2) round: vec4<f32>,   // shear, _unused, radius, _pad
+    @location(2) round: vec4<f32>,   // shear, _unused, radius (< 0: decoration), _pad
 ) -> VsOut {
     var corners = array<vec2<f32>, 6>(vec2(0.,0.), vec2(1.,0.), vec2(0.,1.), vec2(0.,1.), vec2(1.,0.), vec2(1.,1.));
     let c = corners[vi];
@@ -33,7 +40,13 @@ fn vs(
     let hsize = rect.zw * 0.5;
     o.local = (c - vec2(0.5, 0.5)) * rect.zw; // center-relative pixel coord
     o.hsize = hsize;
-    o.radius = round.z;
+    o.radius = max(round.z, 0.0);
+    var deco = vec2(0.0, 0.0);
+    if (round.z < 0.0) {
+        let style = floor(-round.z / DECO_STYLE_UNIT);
+        deco = vec2(style, -round.z - style * DECO_STYLE_UNIT);
+    }
+    o.deco = deco;
     return o;
 }
 fn s2l(c: f32) -> f32 { if (c <= 0.04045) { return c / 12.92; } return pow((c + 0.055) / 1.055, 2.4); }
@@ -42,6 +55,43 @@ fn sd_round_rect(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
     let q = abs(p) - b + vec2(r, r);
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0, 0.0))) - r;
 }
+// Coverage of a patterned underline (`in.deco.x` = 1 undercurl, 2 dotted,
+// 3 dashed). x phases run on the ABSOLUTE framebuffer x, so adjacent runs (a
+// colour change mid-word) continue the same wave / dot rhythm seamlessly.
+fn deco_coverage(in: VsOut) -> f32 {
+    let style = u32(in.deco.x + 0.5);
+    let x = in.pos.x;
+    if (style == 1u) {
+        // Undercurl: a sine of wavelength `param` (one cell) through the band's
+        // centre line. The band is 2.15·t + 1 px tall for a weight t: stroke
+        // 0.65·t, amplitude 0.75·t, half a pixel of anti-aliasing above/below.
+        let t = max((in.hsize.y * 2.0 - 1.0) / 2.15, 1.0);
+        let stroke = 0.65 * t;
+        let amp = 0.75 * t;
+        let k = 6.2831853 / max(in.deco.y, 4.0);
+        let yc = amp * sin(k * x);
+        let slope = amp * k * cos(k * x);
+        let d = abs(in.local.y - yc) / sqrt(1.0 + slope * slope);
+        return clamp(stroke * 0.5 + 0.5 - d, 0.0, 1.0);
+    }
+    if (style == 2u) {
+        // Dotted: round dots as wide as the band is tall, every `param` px.
+        let th = in.hsize.y * 2.0;
+        let pitch = max(in.deco.y, th + 1.0);
+        let dx = x - (floor(x / pitch) + 0.5) * pitch;
+        let r = max(th * 0.5, 0.75);
+        return clamp(r + 0.5 - length(vec2(dx, in.local.y)), 0.0, 1.0);
+    }
+    if (style == 3u) {
+        // Dashed: one dash per cell (`param` = cell width; the run starts on a
+        // cell edge), the gap centred on the cell boundary — even everywhere.
+        let cw = max(in.deco.y, 2.0);
+        let t = (in.local.x + in.hsize.x) - floor((in.local.x + in.hsize.x) / cw) * cw;
+        let a = cw * 0.2;
+        return clamp(min(t - a, cw - a - t) + 0.5, 0.0, 1.0);
+    }
+    return 1.0;
+}
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     var cov = 1.0;
@@ -49,10 +99,55 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         let r = min(in.radius, min(in.hsize.x, in.hsize.y));
         let d = sd_round_rect(in.local, in.hsize, r);
         cov = 1.0 - smoothstep(-0.75, 0.75, d);
+    } else if (in.deco.x > 0.5) {
+        cov = deco_coverage(in);
     }
     return vec4(s2l(in.color.r), s2l(in.color.g), s2l(in.color.b), in.color.a * cov);
 }
 "#;
+
+/// A patterned text decoration drawn procedurally by the quad shader (see
+/// [`Rect::decoration`]): one instance spans a whole underline run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Deco {
+    /// A sine wave (wavelength = the param, one cell) filling a band 2.15·t + 1
+    /// tall (stroke 0.65·t, amplitude 0.75·t; see `undercurl_band`).
+    Undercurl = 1,
+    /// Round dots as wide as the rect is tall, the param apart.
+    Dotted = 2,
+    /// One dash per cell (param = cell width), the gaps on the cell boundaries.
+    Dashed = 3,
+}
+
+/// One quad's 12 instance floats — the 48-byte stride the pipeline declares:
+/// rect (xywh), color (rgba, 0..1), shape params (shear, the old half-height
+/// slot — unused by the shader, which derives the half-size from rect — corner
+/// radius or a negative decoration code, _pad).
+#[inline]
+fn instance_floats(r: &Rect) -> [f32; 12] {
+    let c = r.color.map(|v| v as f32 / 255.0);
+    [r.x, r.y, r.w, r.h, c[0], c[1], c[2], c[3], r.shear, r.h * 0.5, r.radius, 0.0]
+}
+
+/// `-radius = style · DECO_STYLE_UNIT + param` (the shader's decoding): params
+/// (a pitch or a cell width, in px) stay below it.
+const DECO_STYLE_UNIT: f32 = 4096.0;
+
+/// The `Rect::radius` encoding of a decoration (`param` clamped into its slot).
+fn deco_radius(style: Deco, param: f32) -> f32 {
+    let p = if param.is_finite() { param.clamp(0.0, DECO_STYLE_UNIT - 1.0) } else { 0.0 };
+    -(style as u32 as f32 * DECO_STYLE_UNIT + p)
+}
+
+/// Decode a `Rect::radius` the way the shader does: `Some((style, param))` for a
+/// decoration, `None` for a plain / rounded quad.
+#[cfg(test)]
+fn decode_deco(radius: f32) -> Option<(u32, f32)> {
+    (radius < 0.0).then(|| {
+        let style = (-radius / DECO_STYLE_UNIT).floor();
+        (style as u32, -radius - style * DECO_STYLE_UNIT)
+    })
+}
 
 #[derive(Clone, Copy)]
 pub struct Rect {
@@ -63,7 +158,8 @@ pub struct Rect {
     pub color: [u8; 4],
     /// Corner radius in pixels. `0.0` = sharp rectangle (the default), so all
     /// existing quads render unchanged. A positive value rounds the corners via
-    /// an antialiased rounded-rect SDF in the shader.
+    /// an antialiased rounded-rect SDF in the shader. Negative values encode a
+    /// patterned decoration — build those with [`Rect::decoration`].
     pub radius: f32,
     /// Horizontal slant: x shifts by `shear × (h/2 − y_local)` px, so a positive
     /// value leans the top edge right (`/`). `0.0` (the default) = upright. The
@@ -95,6 +191,14 @@ impl Rect {
     pub fn sheared_x_span(&self) -> (f32, f32) {
         let lean = (self.shear * self.h * 0.5).abs();
         (self.x - lean, self.x + self.w + lean)
+    }
+
+    /// A patterned text decoration over `[x, x+w) × [y, y+h)`, anti-aliased by
+    /// the shader (`param`: the undercurl wavelength / dot pitch / dash cell
+    /// width, px). Encoded in the otherwise unused NEGATIVE radius range, so the
+    /// instance layout is unchanged.
+    pub fn decoration(x: f32, y: f32, w: f32, h: f32, color: [u8; 4], style: Deco, param: f32) -> Self {
+        Rect { x, y, w, h, color, radius: deco_radius(style, param), shear: 0.0 }
     }
 }
 
@@ -222,21 +326,7 @@ impl QuadLayer {
         self.instance_scratch.clear();
         self.instance_scratch.reserve(rects.len() * 12);
         for r in rects {
-            self.instance_scratch.push(r.x);
-            self.instance_scratch.push(r.y);
-            self.instance_scratch.push(r.w);
-            self.instance_scratch.push(r.h);
-            self.instance_scratch.push(r.color[0] as f32 / 255.0);
-            self.instance_scratch.push(r.color[1] as f32 / 255.0);
-            self.instance_scratch.push(r.color[2] as f32 / 255.0);
-            self.instance_scratch.push(r.color[3] as f32 / 255.0);
-            // Shape params: shear, the old half-height slot (unused by the
-            // shader, which derives the half-size from rect), corner radius,
-            // _pad.
-            self.instance_scratch.push(r.shear);
-            self.instance_scratch.push(r.h * 0.5);
-            self.instance_scratch.push(r.radius);
-            self.instance_scratch.push(0.0);
+            self.instance_scratch.extend_from_slice(&instance_floats(r));
         }
         let bytes = bytemuck::cast_slice::<f32, u8>(&self.instance_scratch);
         let needed = bytes.len() as u64;
@@ -533,10 +623,18 @@ pub fn grid_decoration_key(snap: &jetty_core::GridSnapshot) -> u64 {
     h.finish()
 }
 
+/// Height of the undercurl band for an underline thickness `th` (see the
+/// shader's `deco_coverage`): weight `t = max(th, 1.5)`, band `2.15·t + 1`.
+#[inline]
+fn undercurl_band(th: f32) -> f32 {
+    2.15 * th.max(1.5) + 1.0
+}
+
 /// Emit the quads for ONE horizontal underline run of the given `style` spanning
 /// `[x0, x0+run_w)` with its bottom edge at `bottom`. Single/double are wide
-/// quads; dotted/dashed/undercurl are small patterned quads. `color` is the
-/// resolved underline color (uline, already falling back to fg cell-side).
+/// quads; dotted/dashed/undercurl are ONE patterned instance each, anti-aliased
+/// by the shader (`Rect::decoration`). `color` is the resolved underline color
+/// (uline, already falling back to fg cell-side). `x0` is a cell edge.
 #[allow(clippy::too_many_arguments)]
 fn emit_underline(
     out: &mut Vec<Rect>,
@@ -561,52 +659,19 @@ fn emit_underline(
             out.push(Rect::new(x0, y - 2.0 * th, run_w, th, color));
         }
         attr::UL_DOTTED => {
-            // `th`-wide dots on a `2*th` pitch (dot + equal gap).
-            let step = (th * 2.0).max(2.0);
-            let mut x = x0;
-            while x < x0 + run_w {
-                let w = th.min(x0 + run_w - x);
-                if w <= 0.0 {
-                    break;
-                }
-                out.push(Rect::new(x, y, w, th, color));
-                x += step;
-            }
+            // Round `th`-wide dots on a `2·th` pitch (at least 3 px).
+            out.push(Rect::decoration(x0, y, run_w, th, color, Deco::Dotted, (th * 2.0).max(3.0)));
         }
         attr::UL_DASHED => {
-            // ~0.4·cell_w dashes with ~0.2·cell_w gaps.
-            let dash = (cell_w * 0.4).max(2.0);
-            let gap = (cell_w * 0.2).max(1.0);
-            let step = dash + gap;
-            let mut x = x0;
-            while x < x0 + run_w {
-                let w = dash.min(x0 + run_w - x);
-                if w <= 0.0 {
-                    break;
-                }
-                out.push(Rect::new(x, y, w, th, color));
-                x += step;
-            }
+            // One 0.6-cell dash per cell, the gaps centred on the cell edges.
+            out.push(Rect::decoration(x0, y, run_w, th, color, Deco::Dashed, cell_w));
         }
         attr::UL_UNDERCURL => {
-            // Stepped triangle wave: short `seg`-wide, `th`-tall quads whose y
-            // follows a triangle of amplitude `amp` and period `cell_w`. Sparse in
-            // practice (a squiggle under a diagnostic word), so plain quads suffice.
-            let amp = (th * 1.5).max(1.0);
-            let seg = th.max(1.0);
-            let period = cell_w.max(4.0);
-            let top = bottom - th - amp; // top of the wave band
-            let mut x = x0;
-            while x < x0 + run_w {
-                let w = seg.min(x0 + run_w - x);
-                if w <= 0.0 {
-                    break;
-                }
-                let phase = ((x - x0) / period).fract(); // 0..1
-                let tri = if phase < 0.5 { phase * 2.0 } else { 2.0 - phase * 2.0 };
-                out.push(Rect::new(x, top + tri * amp, w, th, color));
-                x += seg;
-            }
+            // A sine of one cell's wavelength in a band resting on the underline's
+            // bottom edge: weight t = max(th, 1.5) → stroke 0.65·t, amplitude
+            // 0.75·t, band 2.15·t + 1 (the shader decodes t from the height).
+            let band = undercurl_band(th);
+            out.push(Rect::decoration(x0, bottom - band, run_w, band, color, Deco::Undercurl, cell_w.max(4.0)));
         }
         _ => {}
     }
@@ -622,6 +687,9 @@ fn emit_underline(
 /// equal-`fg` cells. Colors come from the cell (`uline` for underlines — which is
 /// already the theme/SGR-58 color with an fg fallback — and `fg` for strike), so
 /// every theme is covered with no per-theme code.
+///
+/// Underlines rest on the cell bottom; see [`text_decoration_rects_at`] to rest
+/// them on the font's line box instead (`TextLayer::underline_bottom`).
 pub fn text_decoration_rects(
     snap: &jetty_core::GridSnapshot,
     cell_w: f32,
@@ -629,7 +697,22 @@ pub fn text_decoration_rects(
     y_offset: f32,
     out: &mut Vec<Rect>,
 ) {
+    text_decoration_rects_at(snap, cell_w, cell_h, cell_h, y_offset, out);
+}
+
+/// [`text_decoration_rects`] with underlines resting `ul_bottom` px below each
+/// cell's top (≤ `cell_h`): the bottom of the text's line box, which a taller
+/// line height moves up from the cell bottom.
+pub fn text_decoration_rects_at(
+    snap: &jetty_core::GridSnapshot,
+    cell_w: f32,
+    cell_h: f32,
+    ul_bottom: f32,
+    y_offset: f32,
+    out: &mut Vec<Rect>,
+) {
     use jetty_core::attr;
+    let ul_bottom = if ul_bottom > 0.0 && ul_bottom <= cell_h { ul_bottom } else { cell_h };
     let th = decoration_thickness(cell_h);
     for row in 0..snap.rows {
         // --- underline pass: coalesce equal (style, uline) runs ---
@@ -653,7 +736,7 @@ pub fn text_decoration_rects(
             }
             let x0 = start as f32 * cell_w;
             let run_w = (col - start) as f32 * cell_w;
-            let bottom = y_offset + (row as f32 + 1.0) * cell_h;
+            let bottom = y_offset + row as f32 * cell_h + ul_bottom;
             let color = [uline[0], uline[1], uline[2], 255];
             emit_underline(out, style, x0, run_w, bottom, th, cell_w, color);
         }
@@ -695,13 +778,28 @@ pub fn link_underline_rects(
     cell_h: f32,
     y_offset: f32,
 ) -> Vec<Rect> {
+    link_underline_rects_at(spans, color, cell_w, cell_h, cell_h, y_offset)
+}
+
+/// [`link_underline_rects`] resting on `ul_bottom` (see
+/// [`text_decoration_rects_at`]) — pass the grid layer's
+/// `TextLayer::underline_bottom` so link and SGR underlines line up.
+pub fn link_underline_rects_at(
+    spans: &[(usize, usize, usize)],
+    color: [u8; 4],
+    cell_w: f32,
+    cell_h: f32,
+    ul_bottom: f32,
+    y_offset: f32,
+) -> Vec<Rect> {
     let th = decoration_thickness(cell_h);
+    let ul_bottom = if ul_bottom > 0.0 && ul_bottom <= cell_h { ul_bottom } else { cell_h };
     spans
         .iter()
         .map(|&(row, c0, c1)| {
             Rect::new(
                 c0 as f32 * cell_w,
-                y_offset + (row as f32 + 1.0) * cell_h - th,
+                y_offset + row as f32 * cell_h + ul_bottom - th,
                 (c1 - c0 + 1) as f32 * cell_w,
                 th,
                 color,
@@ -1115,18 +1213,139 @@ mod tests {
     }
 
     #[test]
-    fn dotted_dashed_undercurl_emit_bounded_multiple_quads() {
-        for style in [attr::UL_DOTTED, attr::UL_DASHED, attr::UL_UNDERCURL] {
-            let mut g = grid(6, 1);
+    fn dotted_dashed_undercurl_are_one_patterned_instance_per_run() {
+        for (style, deco) in [(attr::UL_DOTTED, Deco::Dotted), (attr::UL_DASHED, Deco::Dashed), (attr::UL_UNDERCURL, Deco::Undercurl)] {
+            let mut g = grid(6, 2);
             for c in 0..6 {
                 g.cells[c].attrs = style << attr::UL_SHIFT;
             }
+            // A colour change splits the run: two instances, sharing the edge.
+            g.cells[3].uline = [9, 9, 9];
+            g.cells[4].uline = [9, 9, 9];
+            g.cells[5].uline = [9, 9, 9];
             let mut out = Vec::new();
             text_decoration_rects(&g, 10.0, 20.0, 0.0, &mut out);
-            assert!(out.len() > 1, "patterned style {style} => multiple quads");
-            // Bounded: never more than one quad per physical pixel of run width.
-            assert!(out.len() <= 60, "style {style} quad count {} too high", out.len());
+            assert_eq!(out.len(), 2, "style {style}: one instance per run");
+            assert_eq!((out[0].x, out[0].w, out[1].x, out[1].w), (0.0, 30.0, 30.0, 30.0));
+            for r in &out {
+                let (s, param) = decode_deco(r.radius).expect("a decoration");
+                assert_eq!(s, deco as u32, "style {style}");
+                assert!(param > 0.0);
+                // The pattern rests on the cell bottom, inside the row.
+                assert_eq!(r.y + r.h, 20.0);
+                assert!(r.y >= 0.0);
+            }
         }
+    }
+
+    #[test]
+    fn underlines_rest_on_the_given_line_box_bottom() {
+        let mut g = grid(4, 2);
+        for c in 0..2 {
+            g.cells[4 + c].attrs = attr::UL_SINGLE << attr::UL_SHIFT; // row 1
+            g.cells[6 + c].attrs = attr::UL_UNDERCURL << attr::UL_SHIFT;
+        }
+        // Default: the cell bottom (same as `text_decoration_rects`).
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        text_decoration_rects(&g, 10.0, 32.0, 5.0, &mut a);
+        text_decoration_rects_at(&g, 10.0, 32.0, 32.0, 5.0, &mut b);
+        assert_eq!(a.iter().map(|r| (r.y, r.h)).collect::<Vec<_>>(), b.iter().map(|r| (r.y, r.h)).collect::<Vec<_>>());
+        assert_eq!(a[0].y + a[0].h, 5.0 + 2.0 * 32.0);
+        // A taller line: both underlines rest on the line box bottom instead.
+        let mut c = Vec::new();
+        text_decoration_rects_at(&g, 10.0, 32.0, 26.0, 5.0, &mut c);
+        for r in &c {
+            assert_eq!(r.y + r.h, 5.0 + 32.0 + 26.0, "rests on the line box");
+        }
+        // Out-of-range values fall back to the cell bottom.
+        let mut d = Vec::new();
+        text_decoration_rects_at(&g, 10.0, 32.0, 99.0, 5.0, &mut d);
+        assert_eq!(d[0].y + d[0].h, 5.0 + 2.0 * 32.0);
+        // Link underlines follow the same bottom.
+        let l = link_underline_rects_at(&[(1, 0, 1)], [0; 4], 10.0, 32.0, 26.0, 5.0);
+        assert_eq!(l[0].y + l[0].h, 5.0 + 32.0 + 26.0);
+        assert_eq!(link_underline_rects(&[(1, 0, 1)], [0; 4], 10.0, 32.0, 5.0)[0].y + l[0].h, 5.0 + 64.0);
+    }
+
+    #[test]
+    fn decoration_encoding_round_trips_and_stays_out_of_rounding() {
+        for deco in [Deco::Undercurl, Deco::Dotted, Deco::Dashed] {
+            for param in [3.0f32, 9.6328125, 19.265625, 4000.0] {
+                let r = Rect::decoration(0.0, 0.0, 10.0, 4.0, [0; 4], deco, param);
+                assert!(r.radius < 0.0, "never a corner radius");
+                let (s, p) = decode_deco(r.radius).unwrap();
+                assert_eq!(s, deco as u32);
+                assert!((p - param).abs() < 1e-3, "{param} → {p}");
+            }
+        }
+        // Out-of-range params are clamped into their slot, never into the style.
+        let r = Rect::decoration(0.0, 0.0, 1.0, 1.0, [0; 4], Deco::Dotted, 1e9);
+        assert_eq!(decode_deco(r.radius).unwrap().0, Deco::Dotted as u32);
+        let r = Rect::decoration(0.0, 0.0, 1.0, 1.0, [0; 4], Deco::Dashed, f32::NAN);
+        assert_eq!(decode_deco(r.radius), Some((Deco::Dashed as u32, 0.0)));
+        // Plain and rounded quads decode as no decoration.
+        assert_eq!(decode_deco(0.0), None);
+        assert_eq!(decode_deco(6.0), None);
+    }
+
+    /// The quad shader (rounded rects + patterned decorations) must parse and
+    /// pass naga's validator — the always-run gate for its source, no GPU.
+    #[test]
+    fn quad_shader_compiles() {
+        let module = naga::front::wgsl::parse_str(QUAD_SHADER).expect("QUAD_SHADER must parse as valid WGSL");
+        let mut validator =
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all());
+        validator.validate(&module).expect("QUAD_SHADER must pass naga validation");
+        // The shader decodes with the same unit the CPU encodes with.
+        assert!(QUAD_SHADER.contains(&format!("const DECO_STYLE_UNIT: f32 = {DECO_STYLE_UNIT:.1};")));
+    }
+
+    /// The instance layout the shader reads: three vec4s (rect, color, round)
+    /// per quad — 12 floats, 48 bytes — and the 16-byte screen uniform.
+    #[test]
+    fn quad_instance_and_uniform_layout() {
+        let plain = instance_floats(&Rect::new(1.0, 2.0, 3.0, 4.0, [255, 0, 0, 255]));
+        let deco = instance_floats(&Rect::decoration(0.0, 0.0, 8.0, 2.0, [0; 4], Deco::Dashed, 9.5));
+        assert_eq!(std::mem::size_of_val(&plain), 48, "array_stride");
+        assert_eq!(&plain[..8], &[1.0, 2.0, 3.0, 4.0, 1.0, 0.0, 0.0, 1.0], "rect + color");
+        assert_eq!((plain[8], plain[10]), (0.0, 0.0), "upright, sharp");
+        assert!(deco[10] < 0.0 && deco[8] == 0.0, "a decoration rides the radius slot, never shears");
+        assert_eq!((plain[11], deco[11]), (0.0, 0.0), "the 12th float stays free");
+        assert_eq!(std::mem::size_of::<[f32; 4]>(), 16, "Screen {{ size, _pad }}");
+        assert!(QUAD_SHADER.contains("struct Screen { size: vec2<f32>, _pad: vec2<f32> };"));
+    }
+
+    /// A CPU model of the shader's patterns (same formulas), checked for the
+    /// properties that make them read well: the undercurl continues across a
+    /// run boundary, dots are evenly spaced and round, dashes are centred in
+    /// their cells with the gaps on the cell edges.
+    #[test]
+    fn decoration_patterns_are_continuous_and_even() {
+        // Undercurl: centre line at absolute x — the same value whichever run
+        // (rect) the pixel belongs to.
+        let curl_y = |x: f32, period: f32, th: f32| th * (std::f32::consts::TAU / period * x).sin();
+        let (period, th) = (9.6328125f32, 2.0f32);
+        let edge = 3.0 * period; // a run boundary on a cell edge
+        let left = curl_y(edge - 0.001, period, th);
+        let right = curl_y(edge + 0.001, period, th);
+        assert!((left - right).abs() < 0.01, "the wave is continuous across runs");
+        // ... and it repeats every cell.
+        assert!((curl_y(0.5, period, th) - curl_y(0.5 + 5.0 * period, period, th)).abs() < 1e-3);
+        // Dots: centres every `pitch` px of absolute x.
+        let pitch = 4.0f32;
+        let centre = |x: f32| (x / pitch).floor() * pitch + pitch * 0.5;
+        assert_eq!(centre(0.5), 2.0);
+        assert_eq!(centre(5.5), 6.0);
+        assert_eq!(centre(9.0) - centre(5.0), pitch);
+        // Dashes: within each cell [0.2, 0.8) of the width is inked.
+        let dash = |t: f32, cw: f32| {
+            let t = t - (t / cw).floor() * cw;
+            let a = cw * 0.2;
+            (t - a).min(cw - a - t) + 0.5
+        };
+        let cw = 10.0;
+        assert!(dash(5.0, cw) >= 1.0 && dash(15.0, cw) >= 1.0, "dash centres");
+        assert!(dash(0.5, cw) <= 0.0 && dash(9.5, cw) <= 0.0 && dash(10.5, cw) <= 0.0, "gaps on the cell edges");
     }
 
     #[test]

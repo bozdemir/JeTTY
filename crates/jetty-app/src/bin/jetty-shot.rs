@@ -1036,11 +1036,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (theme bright blue), identical to the app's Pass 4.
         if let Some(hit) = &link_hit {
             let p12 = terminal.theme().palette[12];
-            let mut link = jetty_render::link_underline_rects(
+            let mut link = jetty_render::link_underline_rects_at(
                 &hit.spans,
                 [p12[0], p12[1], p12[2], 255],
                 cell_w,
                 cell_h,
+                text.underline_bottom(),
                 shot_origin.top,
             );
             jetty_render::shift_x(&mut link, shot_origin.left);
