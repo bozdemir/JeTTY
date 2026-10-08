@@ -150,6 +150,12 @@ pub struct Config {
     /// RESTART/external-only even with hot-reload on (documented at those keys).
     #[serde(default = "default_hot_reload")]
     pub hot_reload: bool,
+    /// macOS: which Option key(s) act as Meta (ESC-prefix, like Alt elsewhere)
+    /// instead of composing characters — `"none"` (default: Option types
+    /// `@ { } [ ] | ~` on non-US layouts), `"left"`, `"right"` or `"both"`.
+    /// Ignored on other platforms. Unknown values read as `"none"`.
+    #[serde(default)]
+    pub macos_option_as_alt: crate::input::OptionAsAlt,
     /// User keybinding overrides (`[keys]` table). Every action defaults to its
     /// built-in chord when omitted; `""`/`[]` explicitly UNBINDS an action (the
     /// chord reverts to its raw terminal meaning). Backward compatible: an old
@@ -222,6 +228,11 @@ pub struct KeyBindings {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub run_selection: Option<ChordSpec>,
     /// `toggle_fullscreen = ""` gives bare F11 back to the shell (`\e[23~`).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub toggle_fullscreen: Option<ChordSpec>,
+    /// Host scrollback paging, default Shift+PageUp / Shift+PageDown (plain Page
+    /// keys reach the program). Pre-v0.26 behaviour:
+    /// `scroll_page_up = ["Shift+PageUp", "PageUp"]` (+ the `_down` twin).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub scroll_page_up: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub scroll_page_down: Option<ChordSpec>,
 }
 
 impl KeyBindings {
@@ -453,6 +464,7 @@ impl Default for Config {
             osc52_allow_paste: default_osc52_allow_paste(),
             run_selection: default_run_selection(),
             hot_reload: default_hot_reload(),
+            macos_option_as_alt: crate::input::OptionAsAlt::default(),
             keys: KeyBindings::default(),
         }
     }
@@ -791,6 +803,7 @@ mod tests {
             osc52_allow_paste: true,
             run_selection: false,
             hot_reload: false,
+            macos_option_as_alt: crate::input::OptionAsAlt::Left,
             keys: KeyBindings::default(),
         };
         let s = toml::to_string_pretty(&c).expect("serialize");
@@ -831,6 +844,7 @@ mod tests {
             osc52_allow_paste: false,
             run_selection: true,
             hot_reload: true,
+            macos_option_as_alt: crate::input::OptionAsAlt::None,
             keys: KeyBindings::default(),
         };
         std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();

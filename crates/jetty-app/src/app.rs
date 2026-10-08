@@ -980,6 +980,9 @@ pub struct App {
     /// Whether config/theme hot-reload is enabled (mirrors `Config.hot_reload`). When
     /// false the watcher is never spawned (or is dropped on a live turn-off).
     hot_reload: bool,
+    /// macOS Option-as-Meta sides (mirrors `Config.macos_option_as_alt`; live on
+    /// reload, written back by `persist`). Feeds `input::KeyOptions::native`.
+    macos_option_as_alt: input::OptionAsAlt,
     /// Compiled keybindings (built from `keys` on load / reload). The input path
     /// does ONE cheap hashmap lookup against this per keypress — never per frame.
     keymap: crate::keymap::KeyMap,
@@ -1592,6 +1595,7 @@ impl App {
             // v0.16 — overridden by config below; safe defaults here.
             osc52_allow_paste: false,
             hot_reload: true,
+            macos_option_as_alt: input::OptionAsAlt::default(),
             // Placeholder default keymap; rebuilt from cfg.keys below in `new`.
             keymap: crate::keymap::KeyMap::defaults(),
             keys: crate::config::KeyBindings::default(),
@@ -1743,6 +1747,7 @@ impl App {
         app.osc52_allow_paste = cfg.osc52_allow_paste;
         app.run_selection_enabled = cfg.run_selection;
         app.hot_reload = cfg.hot_reload;
+        app.macos_option_as_alt = cfg.macos_option_as_alt;
         // Compile the keybindings (defaults + user `[keys]` overrides). Any invalid
         // chord / conflict / rejected bind is logged; the rest still apply.
         app.keys = cfg.keys;
@@ -1828,7 +1833,7 @@ impl App {
                 first(A::PrevPrompt),
                 first(A::NextPrompt)
             ),
-            "PageUp / PageDown — Scroll".to_string(),
+            format!("{} / {} — Scroll", first(A::ScrollPageUp), first(A::ScrollPageDown)),
             "Ctrl+L — Clear".to_string(),
             String::new(),
             "## Keyboard modes & links".to_string(),
@@ -1896,6 +1901,7 @@ impl App {
             osc52_allow_paste: self.osc52_allow_paste,
             run_selection: self.run_selection_enabled,
             hot_reload: self.hot_reload,
+            macos_option_as_alt: self.macos_option_as_alt,
             // Preserve the user's `[keys]` overrides verbatim (never editable via the
             // Settings UI — a settings-driven persist must not erase them).
             keys: self.keys.clone(),
@@ -2146,6 +2152,7 @@ impl App {
         if !self.hot_reload {
             self.config_watcher = None;
         }
+        self.macos_option_as_alt = cfg.macos_option_as_alt;
         // Mirror the RESTART-ONLY-EFFECT keys too, so a later panel-driven persist()
         // round-trips the user's external edit instead of clobbering it with the
         // stale startup value. Their live EFFECTS stay restart-only (summon_hotkey is
@@ -6892,9 +6899,9 @@ impl App {
                 // like the main window, then either forward wheel mouse reports
                 // (mouse-mode app, not over the scrollbar) or scroll THIS
                 // window's own scrollback.
-                let delta_lines = wheel_delta_to_lines(delta);
                 let status_h = self.status_h();
                 let Some(dw) = self.detached.get_mut(pos) else { return };
+                let delta_lines = input::wheel_lines(delta, dw.text.cell_size().1);
                 // Use THIS window's own accumulator so a leftover fraction never
                 // bleeds across windows (F26) — the shared self.scroll_accum did.
                 let lines = dw.scroll_accum.add(delta_lines);
@@ -10172,7 +10179,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // per-event round() discarded entirely — the accumulator emits
                 // whole lines and carries the remainder, so gentle scrolls move
                 // both the scrollback and mouse-mode apps.
-                let delta_lines = wheel_delta_to_lines(delta);
+                let cell_h = self.text.as_ref().map_or(0.0, |t| t.cell_size().1);
+                let delta_lines = input::wheel_lines(delta, cell_h);
                 let lines = self.scroll_accum.add(delta_lines);
                 if lines != 0 {
                     // When the app enabled mouse reporting, forward wheel events
@@ -12256,21 +12264,6 @@ fn write_key_to_pty(tab: &mut Tab, bytes: &[u8]) {
     let _ = tab.writer.flush();
 }
 
-/// Shared wheel-delta → fractional-lines conversion (v0.23 Task 9 / amendment
-/// I5). Byte-identical in the main and detached `MouseWheel` arms; the
-/// accumulation (`ScrollAccumulator::add`) and everything downstream stay
-/// per-window because they read window-specific geometry/state.
-fn wheel_delta_to_lines(delta: MouseScrollDelta) -> f32 {
-    match delta {
-        MouseScrollDelta::LineDelta(_, y) => y * 3.0,
-        MouseScrollDelta::PixelDelta(p) => {
-            // Approximate cell height; 20.0 is a reasonable default.
-            const CELL_H: f64 = 20.0;
-            (p.y / CELL_H) as f32
-        }
-    }
-}
-
 
 /// Largest byte index `<= max` that is a char boundary of `s` (a stable stand-in for
 /// the unstable `str::floor_char_boundary`). Used to cap an OSC 52 paste reply
@@ -13524,6 +13517,7 @@ mod hot_reload_tests {
             "effects",
             "osc52_allow_paste",
             "hot_reload",
+            "macos_option_as_alt",
             // shell (new tabs pick up the edited shell) and show_welcome apply live;
             // both are also mirrored in apply_reloaded_config so a later persist()
             // round-trips an external edit instead of clobbering it.
@@ -13780,6 +13774,16 @@ mod fullscreen_helper_tests {
         let idx = rows.iter().position(|r| r == live).unwrap();
         let header = rows[..idx].iter().rfind(|r| r.starts_with("## ")).unwrap();
         assert_eq!(header, "## Tabs & windows");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn help_rows_static_mirror_matches_the_default_keymap_exactly() {
+        // The static jetty_render::HELP_ROWS must equal the live rows for the
+        // default keymap (macOS adds Cmd companions, so Linux-only), so changing
+        // a default chord can never leave the fallback overlay stale.
+        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), "F9");
+        assert_eq!(rows, jetty_render::default_help_rows());
     }
 
     #[test]
