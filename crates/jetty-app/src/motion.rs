@@ -167,8 +167,8 @@ pub(crate) fn cursor_style(cfg: &crate::config::CursorConfig) -> CursorStyle {
         unfocused: parse_unfocused(&cfg.unfocused),
         underline: CursorShapePref::parse(&cfg.shape).underline(),
         color: parse_cursor_color(&cfg.color),
-        // Geometry, not config: each window lifts it per frame (`lifted`).
-        underline_lift: 0.0,
+        // Geometry, not config: each window places it per frame (`placed`).
+        underline_at: None,
     }
 }
 

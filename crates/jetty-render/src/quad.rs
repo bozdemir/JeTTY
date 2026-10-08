@@ -616,7 +616,7 @@ impl UnderlineGeom {
     /// Clamped into a `cell_h`-tall row: a thickness of at least 1 px, the
     /// bottom inside the row, the stroke above the bottom. Garbage (NaN) falls
     /// back to [`Self::cell_bottom`].
-    fn within(self, cell_h: f32) -> Self {
+    pub(crate) fn within(self, cell_h: f32) -> Self {
         if !(self.top.is_finite() && self.bottom.is_finite() && self.thickness.is_finite()) {
             return Self::cell_bottom(cell_h);
         }

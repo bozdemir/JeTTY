@@ -13,7 +13,7 @@
 //! ride the caret flash — so the per-row shaping cache is untouched.
 
 use crate::colors::{caret_flash_target, contrast_ratio, cursor_text_color};
-use crate::quad::Rect;
+use crate::quad::{Rect, UnderlineGeom};
 use jetty_core::{CursorShapeSnap, GridSnapshot, Theme};
 
 /// Beam / underline stroke as a fraction of the cell (beam: of its width,
@@ -84,11 +84,12 @@ pub struct CursorStyle {
     pub unfocused: UnfocusedCursor,
     pub underline: UnderlineCursor,
     pub color: CursorColor,
-    /// Physical px the underline shapes sit above the cell bottom — the grid
-    /// layer's `TextLayer::text_bottom_inset`, so with a tall `line_height`
-    /// the underline stays under the text. Set per window each frame; 0 = the
-    /// cell bottom (the default spacing).
-    pub underline_lift: f32,
+    /// Where the grid font puts its underlines (`TextLayer::underline_geom`):
+    /// the underline shapes start where `SGR 4` underlines do — the font's
+    /// underline position — so they cover an underline under the cursor and
+    /// stay with the text at any `line_height`. Set per window each frame;
+    /// `None` rests them on the cell bottom.
+    pub underline_at: Option<UnderlineGeom>,
 }
 
 impl Default for CursorStyle {
@@ -98,16 +99,44 @@ impl Default for CursorStyle {
             unfocused: UnfocusedCursor::Hollow,
             underline: UnderlineCursor::Single,
             color: CursorColor::Theme,
-            underline_lift: 0.0,
+            underline_at: None,
         }
     }
 }
 
 impl CursorStyle {
-    /// This look with the underline lifted `lift` px (see `underline_lift`).
-    pub fn lifted(self, lift: f32) -> Self {
-        CursorStyle { underline_lift: lift.max(0.0), ..self }
+    /// This look with the underline shapes placed by the grid font's
+    /// underline geometry (see `underline_at`).
+    pub fn placed(self, underline_at: Option<UnderlineGeom>) -> Self {
+        CursorStyle { underline_at, ..self }
     }
+
+    /// The underline shapes' extent `(y, h)` in a `cell_h`-tall row, px from
+    /// the row top. `h` is one stroke, two with a stroke-wide gap (Double), or
+    /// 2.5 strokes (Thick). The top sits on the font's underline position; a
+    /// shape taller than the room below it is lifted to rest on the cell
+    /// bottom — at the default line height that is where the double and thick
+    /// shapes always sat, while the single stroke now covers the text's
+    /// underline. Without font geometry everything rests on the cell bottom.
+    fn underline_extent(&self, cell_h: f32) -> (f32, f32) {
+        let stroke = self.thickness.clamp(CURSOR_THICKNESS_MIN, CURSOR_THICKNESS_MAX);
+        let h = match self.underline {
+            UnderlineCursor::Single => (cell_h * stroke).max(1.0),
+            UnderlineCursor::Double => 3.0 * double_stroke(cell_h, stroke),
+            UnderlineCursor::Thick => (cell_h * stroke * THICK_UNDERLINE_STROKES).min(cell_h * 0.5).max(2.0),
+        };
+        let y = match self.underline_at {
+            Some(ul) => ul.within(cell_h).top.min(cell_h - h).max(0.0),
+            None => cell_h - h,
+        };
+        (y, h)
+    }
+}
+
+/// One stroke of the double underline cursor: whole pixels, so the gap
+/// between the two strokes stays crisp.
+fn double_stroke(cell_h: f32, stroke: f32) -> f32 {
+    (cell_h * stroke * 0.75).round().max(1.0)
 }
 
 /// The cursor's resting colors: `block` paints the shape, `glyph` is the color of
@@ -253,22 +282,15 @@ pub fn cursor_draw(
             out.over.push(Rect::new(base_x, base_y, w, cell_h, color));
         }
         CursorShapeSnap::Underline => {
-            let bottom = base_y + cell_h - style.underline_lift.clamp(0.0, cell_h * 0.5);
-            match style.underline {
-                UnderlineCursor::Single => {
-                    let h = (cell_h * stroke).max(1.0);
-                    out.over.push(Rect::new(base_x, bottom - h, span_w, h, color));
-                }
-                UnderlineCursor::Double => {
-                    // Whole pixels so the gap between the strokes stays crisp.
-                    let s = (cell_h * stroke * 0.75).round().max(1.0);
-                    out.over.push(Rect::new(base_x, bottom - s, span_w, s, color));
-                    out.over.push(Rect::new(base_x, bottom - 3.0 * s, span_w, s, color));
-                }
-                UnderlineCursor::Thick => {
-                    let h = (cell_h * stroke * THICK_UNDERLINE_STROKES).min(cell_h * 0.5).max(2.0);
-                    out.over.push(Rect::new(base_x, bottom - h, span_w, h, color));
-                }
+            let (y, h) = style.underline_extent(cell_h);
+            let top = base_y + y;
+            if style.underline == UnderlineCursor::Double {
+                // Lower stroke first, then the upper one a stroke's gap above.
+                let s = h / 3.0;
+                out.over.push(Rect::new(base_x, top + 2.0 * s, span_w, s, color));
+                out.over.push(Rect::new(base_x, top, span_w, s, color));
+            } else {
+                out.over.push(Rect::new(base_x, top, span_w, h, color));
             }
         }
         CursorShapeSnap::HollowBlock => {
@@ -310,13 +332,8 @@ pub fn cursor_trail_rect(
         CursorShapeSnap::Block | CursorShapeSnap::HollowBlock => [x, y, span_w, cell_h],
         CursorShapeSnap::Beam => [x, y, (cell_w * stroke).max(1.0), cell_h],
         CursorShapeSnap::Underline => {
-            let h = match style.underline {
-                UnderlineCursor::Single => (cell_h * stroke).max(1.0),
-                UnderlineCursor::Double => 3.0 * (cell_h * stroke * 0.75).round().max(1.0),
-                UnderlineCursor::Thick => (cell_h * stroke * THICK_UNDERLINE_STROKES).min(cell_h * 0.5).max(2.0),
-            };
-            let bottom = y + cell_h - style.underline_lift.clamp(0.0, cell_h * 0.5);
-            [x, bottom - h, span_w, h]
+            let (uy, h) = style.underline_extent(cell_h);
+            [x, y + uy, span_w, h]
         }
     })
 }
@@ -465,21 +482,41 @@ mod tests {
     }
 
     #[test]
-    fn a_lifted_underline_stays_under_the_text() {
+    fn the_underline_cursor_sits_where_the_fonts_underlines_do() {
+        // A tall row (40 px) whose text line box ends at 30 px, the font's
+        // underline at 24 px: the stroke starts there, like `SGR 4`.
         let mut g = grid(5, 3);
         g.cursor_shape = CursorShapeSnap::Underline;
-        let style = CursorStyle::default().lifted(5.0);
-        let ul = draw(&g, true, None, &style).over[0];
-        assert!((ul.y + ul.h - 15.0).abs() < 1e-4, "5 px above the 20 px cell bottom");
-        let rect = cursor_trail_rect(&g, 10.0, 20.0, 0.0, 0.0, true, &style).unwrap();
-        assert!((rect[1] + rect[3] - 15.0).abs() < 1e-4, "the trail chases the lifted shape");
+        let ul = UnderlineGeom { top: 24.0, bottom: 30.0, thickness: 2.0 };
+        let style = CursorStyle::default().placed(Some(ul));
+        let draw40 = |g: &GridSnapshot, s: &CursorStyle| cursor_draw(g, &theme(), 10.0, 40.0, 0.0, 0.0, true, None, s);
+        let single = draw40(&g, &style).over[0];
+        assert!((single.y - 24.0).abs() < 1e-4 && (single.h - 4.8).abs() < 1e-4, "{} {}", single.y, single.h);
+        let rect = cursor_trail_rect(&g, 10.0, 40.0, 0.0, 0.0, true, &style).unwrap();
+        assert_eq!((rect[1], rect[3]), (single.y, single.h), "the trail chases the same shape");
+        // Two strokes and a gap (3 × 4 px) from there too: the upper one on
+        // the underline position, the lower one a stroke's gap below.
+        let double = CursorStyle { underline: UnderlineCursor::Double, ..style };
+        let d = draw40(&g, &double).over;
+        assert_eq!((d[0].y, d[0].h, d[1].y, d[1].h), (32.0, 4.0, 24.0, 4.0));
+        let thick = CursorStyle { underline: UnderlineCursor::Thick, ..style };
+        let t = draw40(&g, &thick).over[0];
+        assert!(t.y == 24.0 && (t.h - 12.0).abs() < 1e-4, "{} {}", t.y, t.h);
+        // No room below the underline position: lifted to rest on the cell
+        // bottom (the default-spacing look of the double and thick shapes).
+        let low = UnderlineGeom { top: 34.0, bottom: 38.0, thickness: 2.0 };
+        let d = draw40(&g, &CursorStyle { underline_at: Some(low), ..double }).over;
+        assert_eq!((d[0].y + d[0].h, d[1].y), (40.0, 28.0));
+        let t = draw40(&g, &CursorStyle { underline_at: Some(low), ..thick }).over[0];
+        assert!((t.y + t.h - 40.0).abs() < 1e-4, "{} {}", t.y, t.h);
         // Blocks and beams fill the cell regardless.
         g.cursor_shape = CursorShapeSnap::Block;
-        assert_eq!(draw(&g, true, None, &style).under.unwrap().h, 20.0);
-        // Never lifted out of the lower half of the cell.
+        assert_eq!(draw40(&g, &style).under.unwrap().h, 40.0);
+        // Garbage geometry is clamped into the row.
         g.cursor_shape = CursorShapeSnap::Underline;
-        let silly = CursorStyle::default().lifted(50.0);
-        assert!(draw(&g, true, None, &silly).over[0].y >= 10.0 - 3.0);
+        let silly = CursorStyle::default().placed(Some(UnderlineGeom { top: 90.0, bottom: f32::NAN, thickness: 1.0 }));
+        let s = draw40(&g, &silly).over[0];
+        assert!(s.y >= 0.0 && s.y + s.h <= 40.0 + 1e-4, "{} {}", s.y, s.h);
     }
 
     #[test]
