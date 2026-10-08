@@ -679,7 +679,8 @@ fn bench_backdrop(adapter: &wgpu::Adapter) -> Result<(), Box<dyn std::error::Err
             .ok_or("image upload")?,
     );
     let mode = |m: BackdropMode| BackdropSettings { mode: m, ..BackdropSettings::default() };
-    let variants: Vec<(&str, Option<BackdropSettings>, Option<&std::sync::Arc<jetty_render::GpuImage>>)> = vec![
+    type Variant<'a> = (&'a str, Option<BackdropSettings>, Option<&'a std::sync::Arc<jetty_render::GpuImage>>);
+    let variants: Vec<Variant> = vec![
         ("clear only", None, None),
         ("theme", Some(mode(BackdropMode::Theme)), None),
         ("gradient", backdrop_settings("gradient"), None),

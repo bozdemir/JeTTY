@@ -20,14 +20,18 @@
 //! gradient bands visibly without it (mandatory, always on) — and the optional
 //! `grain` adds a monochrome film grain on top.
 //!
-//! Variants, one pipeline each, built lazily for the mode in use only:
-//!   * gradient  — the base look: 2–4 stops, linear (CSS angle) or radial;
-//!   * image     — a decoded image (see `backdrop_image.rs`) over the base, with
-//!                 fit, dim (+ smart dim) and a frosted (blurred) variant;
-//!   * stars / grid / synthwave — procedural, evaluated per pixel (cheap ALU);
-//!   * baked     — the aurora: its noise is expensive, so it is rendered into a
-//!                 half-resolution texture only when the size / theme / settings
-//!                 change (or at ≤ 30 fps while `animate` is on) and sampled.
+//! Every look is BAKED by its own shader into a window-sized cache when an
+//! input changes, and a frame only copies the cache (see [`Backdrop`]). The
+//! bake variants, one pipeline each, built lazily for the mode in use only:
+//! * gradient — the base look: 2–4 stops, linear (CSS angle) or radial;
+//! * image — a decoded image (see `backdrop_image.rs`) over the base, with
+//!   fit, dim (+ smart dim) and a frosted (blurred) variant;
+//! * stars / grid / synthwave — procedural patterns over the base;
+//! * baked — the aurora, whose noise first renders into a half-resolution
+//!   layer that the bake samples.
+//!
+//! A readability guard in every bake but the stars keeps the backdrop at the
+//! theme text's readable contrast (`readable_ratio`), whatever it shows.
 //!
 //! Self-contained: our own wgpu/WGSL; no desktop-environment / OS-specific code.
 

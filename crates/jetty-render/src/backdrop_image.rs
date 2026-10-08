@@ -185,9 +185,7 @@ fn decode_error(kind: &str, detail: &str) -> String {
 fn decode_png(data: &[u8]) -> Result<RawImage, String> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut limits = png::Limits::default();
-    limits.bytes = PNG_LIMIT_BYTES;
-    decoder.set_limits(limits);
+    decoder.set_limits(png::Limits { bytes: PNG_LIMIT_BYTES });
     let mut reader = decoder.read_info().map_err(|e| decode_error("PNG", &e.to_string()))?;
     {
         let info = reader.info();
