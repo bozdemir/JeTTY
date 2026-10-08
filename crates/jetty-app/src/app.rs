@@ -1045,10 +1045,13 @@ pub struct App {
     modifiers: winit::keyboard::ModifiersState,
     /// Last known cursor position in physical pixels.
     cursor: (f64, f64),
-    /// Where a no-Shift press began while a mouse-reporting app was active (the
-    /// press was forwarded to the app). On release, if the cursor moved, the user
-    /// was likely trying to select — surface the Shift+drag hint. `take`n on release.
-    mouse_grab_press: Option<(f64, f64)>,
+    /// The main window's grid mouse state (buttons held by the program, click
+    /// counting, edge auto-scroll) — the same `gridmouse` logic every detached
+    /// window runs on its own copy.
+    grid_mouse: crate::gridmouse::GridMouse,
+    /// The one-time "Shift+right-click opens JeTTY's menu" pill was shown (a
+    /// right click now goes to a program that tracks the mouse).
+    right_click_hint_shown: bool,
     /// Fractional wheel-scroll accumulator for the main window: slow touchpad
     /// deltas (sub-line PixelDelta/LineDelta) accumulate across events instead
     /// of being rounded to 0 and dropped. Reset on tab switch so one tab's
@@ -1442,6 +1445,73 @@ fn link_modifier_held(m: &winit::keyboard::ModifiersState) -> bool {
     m.control_key() || (cfg!(target_os = "macos") && m.super_key())
 }
 
+/// Write bytes produced for a tab's program (mouse reports, wheel arrows) to
+/// its PTY. Nothing to write is free.
+fn write_pty_bytes(writer: &mut dyn Write, bytes: &[u8]) {
+    if !bytes.is_empty() {
+        let _ = writer.write_all(bytes);
+        let _ = writer.flush();
+    }
+}
+
+/// Where a detached window's grid sits (below its title bar, above its status
+/// strip), for the shared grid mouse handling.
+fn detached_grid_geom(
+    dw: &crate::detached::DetachedWindow,
+    ui_font: f32,
+    show_hud: bool,
+) -> crate::gridmouse::GridGeom {
+    let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
+    let (cell_w, cell_h) = dw.text.cell_size();
+    crate::gridmouse::GridGeom {
+        top: bar_h,
+        bottom: dw.gpu.config.height as f32 - status_h,
+        cell_w,
+        cell_h,
+    }
+}
+
+/// [`App::with_main_grid`] for a detached window: run one shared grid-mouse
+/// step on its tab and write what it produced to its PTY.
+fn with_detached_grid<R>(
+    dw: &mut crate::detached::DetachedWindow,
+    geom: crate::gridmouse::GridGeom,
+    mods: winit::keyboard::ModifiersState,
+    f: impl FnOnce(&mut crate::gridmouse::Grid) -> R,
+) -> R {
+    let mut out = Vec::new();
+    let r = f(&mut crate::gridmouse::Grid {
+        term: &mut dw.tab.terminal,
+        mouse: &mut dw.grid_mouse,
+        selecting: &mut dw.selecting,
+        geom,
+        pointer: dw.cursor,
+        mods,
+        out: &mut out,
+    });
+    write_pty_bytes(&mut dw.tab.writer, &out);
+    r
+}
+
+/// Arm the "Hold Shift while dragging to select text" pill in `window`: after a
+/// drag that went to a mouse-grabbing program (throttled by the shared 25 s
+/// cooldown), or at once (`explicit`) when the user right-clicks for the menu
+/// with nothing selected. Returns whether it was armed (the caller repaints).
+fn arm_shift_hint(
+    until: &mut Option<(std::time::Instant, winit::window::WindowId)>,
+    cooldown: &mut Option<std::time::Instant>,
+    window: winit::window::WindowId,
+    explicit: bool,
+) -> bool {
+    let now = std::time::Instant::now();
+    if !explicit && cooldown.is_some_and(|t| now < t) {
+        return false;
+    }
+    *until = Some((now + std::time::Duration::from_millis(3500), window));
+    *cooldown = Some(now + std::time::Duration::from_secs(25));
+    true
+}
+
 /// The base ASCII letter a key event denotes for hint-mode narrowing,
 /// INDEPENDENT of Alt/compose (BLOCKING 5): prefer the produced logical letter
 /// (layout-correct), falling back to the physical QWERTY position when
@@ -1630,7 +1700,8 @@ impl App {
             notify_last_at: std::collections::HashMap::new(),
             modifiers: winit::keyboard::ModifiersState::empty(),
             cursor: (0.0, 0.0),
-            mouse_grab_press: None,
+            grid_mouse: crate::gridmouse::GridMouse::default(),
+            right_click_hint_shown: false,
             scroll_accum: input::ScrollAccumulator::new(),
             shift_hint_until: None,
             shift_hint_cooldown: None,
@@ -4136,32 +4207,95 @@ impl App {
     /// mouse report (xterm clamps to the grid edge; apps hit-testing panes get
     /// confused otherwise). Returns `None` when the renderer (and thus cell
     /// metrics) is not yet available or no tab exists.
-    fn cursor_cell(&self) -> Option<(usize, usize)> {
-        self.cell_at_pixel(self.cursor.0, self.cursor.1)
+    /// Where the main window's grid sits, for the shared grid mouse handling
+    /// (`crate::gridmouse`): its origin, the band a click counts as on it (above
+    /// a bottom tab bar / the status strip) and the cell size.
+    fn main_grid_geom(&self) -> crate::gridmouse::GridGeom {
+        let h = self.gpu.as_ref().map_or(0.0, |g| g.config.height as f32);
+        let bottom = if self.tab_bar_bottom { self.tabbar_y(h) } else { h - self.status_h() };
+        let (cell_w, cell_h) = self.text.as_ref().map_or((0.0, 0.0), |t| t.cell_size());
+        crate::gridmouse::GridGeom { top: self.grid_top_offset(), bottom, cell_w, cell_h }
     }
 
-    /// Like [`cursor_cell`] but for an arbitrary pixel position (1-based, clamped
-    /// to the grid). Used to detect cross-cell pointer motion for mouse motion
-    /// reports (F5).
-    fn cell_at_pixel(&self, px: f64, py: f64) -> Option<(usize, usize)> {
+    /// Run one shared grid-mouse step on the main window's active tab and write
+    /// what it produced for the program to that tab's PTY. `None` without tabs.
+    fn with_main_grid<R>(&mut self, f: impl FnOnce(&mut crate::gridmouse::Grid) -> R) -> Option<R> {
         if self.tabs.is_empty() {
             return None;
         }
-        let (cell_w, cell_h) = self.text.as_ref()?.cell_size();
-        if cell_w <= 0.0 || cell_h <= 0.0 {
-            return None;
+        let geom = self.main_grid_geom();
+        let mut out = Vec::new();
+        let tab = &mut self.tabs[self.active];
+        let r = f(&mut crate::gridmouse::Grid {
+            term: &mut tab.terminal,
+            mouse: &mut self.grid_mouse,
+            selecting: &mut self.selecting,
+            geom,
+            pointer: self.cursor,
+            mods: self.modifiers,
+            out: &mut out,
+        });
+        write_pty_bytes(&mut tab.writer, &out);
+        Some(r)
+    }
+
+    /// End every pointer gesture in the main window — its release can no longer
+    /// arrive once the window hides or loses focus (a selection, a scrollbar
+    /// drag, buttons the program saw pressed, the edge auto-scroll).
+    fn reset_main_pointer(&mut self) {
+        self.selecting = false;
+        self.dragging_scrollbar = false;
+        self.grid_mouse.reset();
+    }
+
+    /// A right click just went to a program that tracks the mouse: the first
+    /// time, say how to get JeTTY's own menu instead.
+    fn teach_shift_right_click(&mut self, window: winit::window::WindowId) {
+        if !self.right_click_hint_shown {
+            self.right_click_hint_shown = true;
+            self.show_status_pill(crate::runsel::Notice {
+                msg: "Shift+right-click opens JeTTY's menu",
+                window: Some(window),
+            });
         }
-        // Subtract the grid's pixel origin before dividing (0 when the bar is at
-        // the bottom, TABBAR_H when at the top).
-        let y = py as f32 - self.grid_top_offset();
-        Some(input::cell_at_clamped(
-            px as f32,
-            y,
-            cell_w,
-            cell_h,
-            self.active_tab().terminal.cols(),
-            self.active_tab().terminal.rows(),
-        ))
+    }
+
+    /// Run the due edge auto-scroll steps of selection drags in every window.
+    /// Returns whether one repainted.
+    fn service_grid_autoscroll(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let mut painted = false;
+        if self.grid_mouse.autoscroll_due().is_some_and(|t| now >= t) {
+            // A due step always advances (or ends) the schedule, so the merged
+            // wake is never in the past — and with no tab to scroll it ends here.
+            match self.with_main_grid(|g| crate::gridmouse::autoscroll_step(g, now)) {
+                Some(true) => {
+                    self.request_main_paint();
+                    painted = true;
+                }
+                Some(false) => {}
+                None => self.grid_mouse.reset(),
+            }
+        }
+        let (ui_font, show_hud, mods) = (self.ui_font_logical, self.show_perf_hud, self.modifiers);
+        for dw in &mut self.detached {
+            if dw.grid_mouse.autoscroll_due().is_some_and(|t| now >= t) {
+                let geom = detached_grid_geom(dw, ui_font, show_hud);
+                if with_detached_grid(dw, geom, mods, |g| crate::gridmouse::autoscroll_step(g, now)) {
+                    dw.request_paint();
+                    painted = true;
+                }
+            }
+        }
+        painted
+    }
+
+    /// The soonest edge auto-scroll step any window owes.
+    fn grid_autoscroll_due(&self) -> Option<std::time::Instant> {
+        std::iter::once(self.grid_mouse.autoscroll_due())
+            .chain(self.detached.iter().map(|d| d.grid_mouse.autoscroll_due()))
+            .flatten()
+            .min()
     }
 
     /// Convert the current cursor pixel position into 0-based viewport cell
@@ -4509,22 +4643,6 @@ impl App {
         } else if let Some(dw) = self.detached.iter().find(|d| d.window.id() == id) {
             dw.request_paint();
         }
-    }
-
-    /// Encode a mouse event and write it to the PTY. Used only when the running
-    /// application has enabled mouse reporting (`mouse_mode()`). The wire format
-    /// matches what the app requested: SGR (1006) encoding when `mouse_sgr()` is
-    /// true (`\e[?1006h`), otherwise the legacy X10 encoding.
-    fn send_mouse_report(&mut self, event: input::MouseEvent) {
-        let Some((col, row)) = self.cursor_cell() else { return };
-        if self.tabs.is_empty() {
-            return;
-        }
-        let sgr = self.active_tab().terminal.mouse_sgr();
-        let bytes = input::encode_mouse(event, col, row, sgr);
-        let w = &mut self.tabs[self.active].writer;
-        let _ = w.write_all(&bytes);
-        let _ = w.flush();
     }
 
     /// Drain pending PTY output for EVERY tab into its terminal and flush each
@@ -5329,10 +5447,9 @@ impl App {
         // grab and the hotkey event is merely late, that toggle must not re-show
         // the window (see `toggle_action`).
         self.autohidden_at = Some(std::time::Instant::now());
-        // The matching button-release never arrives once hidden — clear the
-        // terminal drag state so it doesn't resume stuck on the next summon.
-        self.selecting = false;
-        self.dragging_scrollbar = false;
+        // The matching button-release never arrives once hidden — end the
+        // pointer gestures so none resumes stuck on the next summon.
+        self.reset_main_pointer();
         // Clear the remaining self-drive terms whose ONLY expiry point is inside
         // RedrawRequested — which a hidden (orderOut) window never receives on
         // macOS — so they can't pin about_to_wait in Poll and spin 100% CPU while
@@ -5582,12 +5699,11 @@ impl App {
                 self.summon_anim = None;
                 self.summon_pending = false;
                 win.set_visible(false);
-                // The matching button-release never arrives once hidden — clear
-                // the terminal drag state so it doesn't resume stuck on the next
-                // summon (mirrors autohide_main_window; the F9/IPC hide path
-                // reaches here too).
-                self.selecting = false;
-                self.dragging_scrollbar = false;
+                // The matching button-release never arrives once hidden — end
+                // the pointer gestures so none resumes stuck on the next summon
+                // (mirrors autohide_main_window; the F9/IPC hide path reaches
+                // here too).
+                self.reset_main_pointer();
                 // Clear the self-drive terms whose only expiry is in
                 // RedrawRequested (never delivered to a hidden macOS window) so
                 // they don't pin Poll and spin 100% CPU while hidden (F18).
@@ -6325,7 +6441,6 @@ impl App {
                 // This window's chrome geometry (its own DPI × the UI font).
                 let cm = dw.chrome_metrics(ui_font);
                 let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
-                let prev = dw.cursor;
                 dw.cursor = (position.x, position.y);
                 // --- Manual top-bar drag (move the window ourselves) ---
                 // global_cursor = outer_position + local cursor; the window's new
@@ -6421,42 +6536,14 @@ impl App {
                         dw.request_paint();
                     }
                 }
-                // --- Text-selection drag continuation / mouse motion reports ---
-                // Mirrors the main window (F37/F5): extend a local selection, or —
-                // for a mouse-reporting app — emit one motion report per cell change.
-                let (cw, ch) = dw.text.cell_size();
-                if cw > 0.0 && ch > 0.0 {
-                    if dw.selecting {
-                        let gy = (cy - bar_h).max(0.0);
-                        let (line, col, left_half) = input::cell_at_0_side(
-                            cx, gy, cw, ch,
-                            dw.tab.terminal.cols(), dw.tab.terminal.rows(),
-                        );
-                        dw.tab.terminal.selection_update(line, col, left_half);
-                        dw.request_paint();
-                    } else {
-                        let drag = dw.tab.terminal.mouse_drag();
-                        let motion = dw.tab.terminal.mouse_motion();
-                        let left_held = dw.mouse_grab_press.is_some();
-                        if (drag || motion) && (motion || left_held) {
-                            let cols_n = dw.tab.terminal.cols();
-                            let rows_n = dw.tab.terminal.rows();
-                            let new_cell = input::cell_at_clamped(
-                                cx, (cy - bar_h).max(0.0), cw, ch, cols_n, rows_n);
-                            let prev_cell = input::cell_at_clamped(
-                                prev.0 as f32, (prev.1 as f32 - bar_h).max(0.0), cw, ch, cols_n, rows_n);
-                            if new_cell != prev_cell {
-                                let base = if left_held { 0u8 } else { 3u8 };
-                                let sgr = dw.tab.terminal.mouse_sgr();
-                                let bytes = input::encode_mouse(
-                                    input::MouseEvent::Motion { button: base },
-                                    new_cell.0, new_cell.1, sgr,
-                                );
-                                let _ = dw.tab.writer.write_all(&bytes);
-                                let _ = dw.tab.writer.flush();
-                            }
-                        }
-                    }
+                // --- Grid pointer motion: the shared gridmouse step, exactly as
+                // the main window runs it — extend a selection drag (edge
+                // auto-scroll past the top/bottom), or report the motion to a
+                // program that tracks it, once per cell. ---
+                let geom = detached_grid_geom(dw, ui_font, show_hud);
+                let now = std::time::Instant::now();
+                if with_detached_grid(dw, geom, self.modifiers, |g| crate::gridmouse::motion(g, now)).paint {
+                    dw.request_paint();
                 }
                 // --- Ctrl+hover link tracking (mirrors the main window) ---
                 self.update_detached_link_hover(pos, false);
@@ -6613,55 +6700,20 @@ impl App {
                                 // anything else falls through to the grid press.
                                 _ => {}
                             }
-                            // Grid-area press (F37): forward a mouse report to a
-                            // mouse-reporting app (unless Shift overrides), else
-                            // begin a local text selection — same as the main window.
-                            let (cw, ch) = dw.text.cell_size();
-                            if cw > 0.0 && ch > 0.0 {
-                                let mouse_mode = dw.tab.terminal.mouse_mode();
-                                let shift = self.modifiers.shift_key();
-                                let gy = (cy - bar_h).max(0.0);
-                                // Ctrl+click on a link opens it and consumes the
-                                // click (same precedence as the main window:
-                                // Shift still forces selection). Same grid-band
-                                // gate as update_detached_link_hover — a click on
-                                // the bottom status strip must not open a
-                                // clamped bottom-row URL (F13).
-                                if link_modifier_held(&self.modifiers)
-                                    && !shift
-                                    && cy < h as f32 - status_h
-                                {
-                                    let (line, col, _) = input::cell_at_0_side(
-                                        cx, gy, cw, ch,
-                                        dw.tab.terminal.cols(), dw.tab.terminal.rows(),
-                                    );
-                                    if let Some(hit) = dw.tab.terminal.link_at(line, col) {
-                                        Self::open_url(&hit.uri);
-                                        return;
-                                    }
-                                }
-                                if mouse_mode && !shift {
-                                    let (col, row) = input::cell_at_clamped(
-                                        cx, gy, cw, ch,
-                                        dw.tab.terminal.cols(), dw.tab.terminal.rows(),
-                                    );
-                                    let sgr = dw.tab.terminal.mouse_sgr();
-                                    let bytes = input::encode_mouse(
-                                        input::MouseEvent::LeftPress, col, row, sgr,
-                                    );
-                                    let _ = dw.tab.writer.write_all(&bytes);
-                                    let _ = dw.tab.writer.flush();
-                                    dw.mouse_grab_press = Some(dw.cursor);
-                                } else {
-                                    dw.tab.terminal.selection_clear();
-                                    let (line, col, left_half) = input::cell_at_0_side(
-                                        cx, gy, cw, ch,
-                                        dw.tab.terminal.cols(), dw.tab.terminal.rows(),
-                                    );
-                                    dw.tab.terminal.selection_start(line, col, left_half);
-                                    dw.selecting = true;
-                                    dw.request_paint();
-                                }
+                            // Grid-area press: the shared gridmouse press, exactly
+                            // as the main window runs it — a link-modifier click
+                            // on a link opens it, a program that tracks the mouse
+                            // gets the press, otherwise a cell / word / line
+                            // selection starts (Shift always selects).
+                            let geom = detached_grid_geom(dw, ui_font, show_hud);
+                            let link_mod = link_modifier_held(&self.modifiers);
+                            let now = std::time::Instant::now();
+                            match with_detached_grid(dw, geom, self.modifiers, |g| {
+                                crate::gridmouse::press(g, MouseButton::Left, link_mod, now)
+                            }) {
+                                crate::gridmouse::Press::OpenLink(uri) => Self::open_url(&uri),
+                                crate::gridmouse::Press::Selecting => dw.request_paint(),
+                                _ => {}
                             }
                             return;
                         }
@@ -6704,10 +6756,9 @@ impl App {
                 // or forward the mouse release report — mutually exclusive with a
                 // top-bar drag, so handle it first and return. Mirrors the main
                 // window's release logic.
-                let ui_font = self.ui_font_logical;
+                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
                 {
                     let Some(dw) = self.detached.get_mut(pos) else { return };
-                    let bar_h = dw.chrome_metrics(ui_font).bar_h();
                     // A release ending a scrollbar drag is a host-widget
                     // interaction: it must never end a selection, emit a mouse
                     // report, or count as a bar-drag drop (mirrors main's
@@ -6716,49 +6767,35 @@ impl App {
                         dw.dragging_scrollbar = false;
                         return;
                     }
-                    if dw.selecting {
-                        dw.selecting = false;
-                        match dw.tab.terminal.selection_text() {
-                            Some(text) if !text.is_empty() => clipboard::set(&text),
-                            // Empty drag (plain click) — clear the highlight.
-                            _ => dw.tab.terminal.selection_clear(),
-                        }
-                        dw.request_paint();
-                        return;
-                    }
-                    if let Some((px, py)) = dw.mouse_grab_press.take() {
-                        let (cw, ch) = dw.text.cell_size();
-                        if cw > 0.0 && ch > 0.0 {
-                            let gy = (dw.cursor.1 as f32 - bar_h).max(0.0);
-                            let (col, row) = input::cell_at_clamped(
-                                dw.cursor.0 as f32, gy, cw, ch,
-                                dw.tab.terminal.cols(), dw.tab.terminal.rows());
-                            let sgr = dw.tab.terminal.mouse_sgr();
-                            let bytes = input::encode_mouse(
-                                input::MouseEvent::LeftRelease, col, row, sgr);
-                            let _ = dw.tab.writer.write_all(&bytes);
-                            let _ = dw.tab.writer.flush();
-                        }
-                        // A no-Shift DRAG over a mouse-reporting app: the user
-                        // was likely trying to select — surface the Shift+drag
-                        // hint, same threshold as main. The COOLDOWN is shared
-                        // App state (global throttle across all windows); the
-                        // visible flag is tagged with THIS window's id so only
-                        // the window the drag happened in draws the pill (F4).
-                        let moved =
-                            ((dw.cursor.0 - px).powi(2) + (dw.cursor.1 - py).powi(2)).sqrt();
-                        let now = std::time::Instant::now();
-                        let off_cooldown = self.shift_hint_cooldown.is_none_or(|t| now >= t);
-                        if moved > 8.0 && off_cooldown {
-                            self.shift_hint_until = Some((
-                                now + std::time::Duration::from_millis(3500),
-                                dw.window.id(),
-                            ));
-                            self.shift_hint_cooldown =
-                                Some(now + std::time::Duration::from_secs(25));
+                    // The shared gridmouse release, exactly as the main window
+                    // runs it: copy-on-select to the PRIMARY selection, or the
+                    // release of a press that went to the program — and, after a
+                    // no-Shift DRAG over a mouse-grabbing program, the Shift+drag
+                    // hint (cooldown shared across windows; drawn only in THIS
+                    // window, F4).
+                    let geom = detached_grid_geom(dw, ui_font, show_hud);
+                    match with_detached_grid(dw, geom, self.modifiers, |g| {
+                        crate::gridmouse::release(g, MouseButton::Left)
+                    }) {
+                        crate::gridmouse::Release::Copy(text) => {
+                            clipboard::set_primary(&text);
                             dw.request_paint();
+                            return;
                         }
-                        return;
+                        crate::gridmouse::Release::Cleared => {
+                            dw.request_paint();
+                            return;
+                        }
+                        crate::gridmouse::Release::Program { dragged } => {
+                            let id = dw.window.id();
+                            if dragged
+                                && arm_shift_hint(&mut self.shift_hint_until, &mut self.shift_hint_cooldown, id, false)
+                            {
+                                dw.request_paint();
+                            }
+                            return;
+                        }
+                        crate::gridmouse::Release::Ignored => {}
                     }
                 }
                 // End of a manual top-bar drag: if the global cursor landed on the
@@ -6835,12 +6872,27 @@ impl App {
                 button: MouseButton::Right,
                 ..
             } => {
-                // Right-click anywhere → Reattach / Copy / Paste / Run in New
-                // Tab context menu.
+                // Right-click → Reattach / Copy / Paste / Run in New Tab context
+                // menu — except on the grid of a program that tracks the mouse,
+                // which gets the click (Shift, or a JeTTY selection, keeps the
+                // menu): the shared gridmouse routing, as in the main window.
                 let theme = self.current_theme();
                 let run_enabled = self.run_selection_enabled;
-                let ui_font = self.ui_font_logical;
+                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+                let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
+                let geom = detached_grid_geom(dw, ui_font, show_hud);
+                if geom.contains_y(dw.cursor.1 as f32) {
+                    let now = std::time::Instant::now();
+                    if with_detached_grid(dw, geom, mods, |g| {
+                        crate::gridmouse::press(g, MouseButton::Right, false, now)
+                    }) == crate::gridmouse::Press::Reported
+                    {
+                        let id = dw.window.id();
+                        self.teach_shift_right_click(id);
+                        return;
+                    }
+                }
                 let cm = dw.chrome_metrics(ui_font);
                 let (cx, cy) = (dw.cursor.0 as f32, dw.cursor.1 as f32);
                 dw.menu_open = Some((cx, cy));
@@ -6859,6 +6911,13 @@ impl App {
                     (true, false) => vec![3],
                     (true, true) => Vec::new(),
                 };
+                // The v0.25.1 teachable moment, as in the main window: a menu
+                // opened (with Shift) over a mouse-grabbing program with nothing
+                // selected gets the Shift+drag hint right away.
+                if !has_sel && crate::gridmouse::tracking(&dw.tab.terminal) != input::MouseTracking::Off {
+                    let id = dw.window.id();
+                    arm_shift_hint(&mut self.shift_hint_until, &mut self.shift_hint_cooldown, id, true);
+                }
                 // Cache the item hit-test rects once (anchor + size fixed for the
                 // menu's lifetime), same pattern as the main context menu. Hints
                 // come from the live keymap; widths from this window's chrome
@@ -6893,29 +6952,56 @@ impl App {
                 button: MouseButton::Middle,
                 ..
             } => {
-                // Middle-click paste, mirroring the main window's arm with this
+                // Middle click, mirroring the main window's arm with this
                 // window's equivalent gates:
                 //  - the context menu (this window's only modal) open → swallow;
-                //  - only paste over the terminal grid, never the chrome strips;
-                //  - when the app grabbed the mouse (mouse_mode) and Shift is not
-                //    held, the button belongs to the app — do NOT inject a paste.
-                // Pastes the CLIPBOARD selection (same source as main).
-                let shift = self.modifiers.shift_key();
+                //  - only over the terminal grid, never the chrome strips;
+                //  - a program that tracks the mouse (no Shift) gets the click.
+                // Otherwise it pastes the PRIMARY selection (same as main).
                 let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+                let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 if dw.menu_open.is_some() {
                     return;
                 }
-                let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
-                let cy = dw.cursor.1 as f32;
-                let h = dw.gpu.config.height as f32;
-                if cy < bar_h || cy >= h - status_h {
+                let geom = detached_grid_geom(dw, ui_font, show_hud);
+                if !geom.contains_y(dw.cursor.1 as f32) {
                     return;
                 }
-                if dw.tab.terminal.mouse_mode() && !shift {
-                    return;
+                let now = std::time::Instant::now();
+                if with_detached_grid(dw, geom, mods, |g| {
+                    crate::gridmouse::press(g, MouseButton::Middle, false, now)
+                }) == crate::gridmouse::Press::PastePrimary
+                {
+                    if let Some(text) = clipboard::get_primary() {
+                        Self::paste_to_tab(&mut dw.tab, &text);
+                    }
                 }
-                if let Some(text) = clipboard::get() {
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: button @ (MouseButton::Middle | MouseButton::Right | MouseButton::Back | MouseButton::Forward),
+                ..
+            } => {
+                // Releases of middle/right presses that went to the program
+                // (their presses have their own arms above), and back/forward
+                // over the grid — the same shared handling as the main window.
+                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+                let mods = self.modifiers;
+                let Some(dw) = self.detached.get_mut(pos) else { return };
+                let geom = detached_grid_geom(dw, ui_font, show_hud);
+                let now = std::time::Instant::now();
+                if state == ElementState::Released {
+                    with_detached_grid(dw, geom, mods, |g| crate::gridmouse::release(g, button));
+                } else if dw.menu_open.is_none() && geom.contains_y(dw.cursor.1 as f32) {
+                    with_detached_grid(dw, geom, mods, |g| crate::gridmouse::press(g, button, false, now));
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                // A file dropped on this window types its shell-quoted path into
+                // its tab (through the sanitizing paste path, like main).
+                if let Some(dw) = self.detached.get_mut(pos) {
+                    let text = crate::gridmouse::dropped_path_text(&path);
                     Self::paste_to_tab(&mut dw.tab, &text);
                 }
             }
@@ -6960,7 +7046,7 @@ impl App {
                     // A selection/press drag can't see its release once focus is
                     // gone — clear it so it doesn't resume stuck (F14).
                     dw.selecting = false;
-                    dw.mouse_grab_press = None;
+                    dw.grid_mouse.reset();
                     dw.dragging_scrollbar = false;
                     // A link underline can't clear itself while unfocused (the
                     // modifier release is delivered elsewhere) — drop it now.
@@ -6989,84 +7075,44 @@ impl App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                // Wheel scrolling in a detached window (the main window handles
-                // this at the sibling arm). Accumulate fractional deltas exactly
-                // like the main window, then either forward wheel mouse reports
-                // (mouse-mode app, not over the scrollbar) or scroll THIS
-                // window's own scrollback.
+                // Wheel over a detached window: the shared gridmouse wheel, as
+                // the main window runs it (reports to a tracking program, arrows
+                // for an alt-screen pager, else this window's own scrollback;
+                // Shift or the scrollbar keep it on the scrollback). THIS window's
+                // own line accumulator, so a leftover fraction never bleeds across
+                // windows (F26).
                 let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+                let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
-                let delta_lines = input::wheel_lines(delta, dw.text.cell_size().1);
-                // Use THIS window's own accumulator so a leftover fraction never
-                // bleeds across windows (F26) — the shared self.scroll_accum did.
-                let lines = dw.scroll_accum.add(delta_lines);
-                if lines == 0 {
-                    return;
-                }
                 let (bar_h, status_h) = dw.chrome_bands(ui_font, show_hud);
                 let (w, h) = (dw.gpu.config.width, dw.gpu.config.height);
-                // Wheeling over the scrollbar always scrolls the host scrollback
-                // even in mouse-mode apps (mirrors the main window).
                 let over_scrollbar = {
-                    let rows = dw.tab.terminal.rows();
-                    let off = dw.tab.terminal.scroll_offset();
-                    let max = dw.tab.terminal.scroll_max();
-                    jetty_render::scrollbar_rect_geom(rows, off, max, w, h, bar_h, status_h, [0, 0, 0, 0])
-                        .map(|r| {
-                            let cx = dw.cursor.0 as f32;
-                            cx >= r.x && cx <= r.x + r.w
-                        })
-                        .unwrap_or(false)
+                    let t = &dw.tab.terminal;
+                    jetty_render::scrollbar_rect_geom(
+                        t.rows(), t.scroll_offset(), t.scroll_max(), w, h, bar_h, status_h, [0, 0, 0, 0],
+                    )
+                    .is_some_and(|r| {
+                        let cx = dw.cursor.0 as f32;
+                        cx >= r.x && cx <= r.x + r.w
+                    })
                 };
-                let (cw, ch) = dw.text.cell_size();
-                if dw.tab.terminal.mouse_mode() && !over_scrollbar {
-                    let event = if lines > 0 {
-                        input::MouseEvent::WheelUp
-                    } else {
-                        input::MouseEvent::WheelDown
-                    };
-                    let notches = ((lines.abs() + 2) / 3).clamp(1, 8);
-                    if cw > 0.0 && ch > 0.0 {
-                        let gy = (dw.cursor.1 as f32 - bar_h).max(0.0);
-                        // 1-based cell coords: the encoders are 1-based, so the
-                        // old 0-based col/row named the cell one row up / one col
-                        // left of the pointer (F12). cell_at_clamped adds the +1,
-                        // matching the main window's cursor_cell() path.
-                        let (col, row) = input::cell_at_clamped(
-                            dw.cursor.0 as f32,
-                            gy,
-                            cw,
-                            ch,
-                            dw.tab.terminal.cols(),
-                            dw.tab.terminal.rows(),
-                        );
-                        let sgr = dw.tab.terminal.mouse_sgr();
-                        for _ in 0..notches {
-                            let bytes = input::encode_mouse(event, col, row, sgr);
-                            let _ = dw.tab.writer.write_all(&bytes);
-                        }
-                        let _ = dw.tab.writer.flush();
-                    }
-                } else if !over_scrollbar
-                    && dw.tab.terminal.alt_screen()
-                    && dw.tab.terminal.alternate_scroll()
-                {
-                    // ALTERNATE_SCROLL: wheel → Up/Down arrows on the alt screen
-                    // so less/man/git log scroll here too (F3), mirroring main.
-                    let app_cursor = dw.tab.terminal.app_cursor_keys();
-                    let seq = input::arrow_scroll_bytes(lines > 0, app_cursor);
-                    let steps = (lines.unsigned_abs() as usize).clamp(1, 12);
+                let geom = detached_grid_geom(dw, ui_font, show_hud);
+                let mut vertical = std::mem::take(&mut dw.scroll_accum);
+                let outcome = with_detached_grid(dw, geom, mods, |g| {
+                    crate::gridmouse::wheel(g, delta, over_scrollbar, &mut vertical)
+                });
+                dw.scroll_accum = vertical;
+                match outcome {
                     // User-originated PTY bytes — same cancel rule as main.
-                    crate::runsel::cancel_on_user_write(&mut dw.tab.pending_inject);
-                    for _ in 0..steps {
-                        let _ = dw.tab.writer.write_all(&seq);
+                    crate::gridmouse::Wheel::Arrows => {
+                        crate::runsel::cancel_on_user_write(&mut dw.tab.pending_inject);
                     }
-                    let _ = dw.tab.writer.flush();
-                } else {
-                    dw.tab.terminal.scroll_lines(lines);
-                    dw.request_paint();
-                    // Viewport moved under a stationary pointer (mirrors main).
-                    self.update_detached_link_hover(pos, true);
+                    crate::gridmouse::Wheel::Scrolled => {
+                        dw.request_paint();
+                        // Viewport moved under a stationary pointer (mirrors main).
+                        self.update_detached_link_hover(pos, true);
+                    }
+                    _ => {}
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -8167,6 +8213,12 @@ impl ApplicationHandler<AppEvent> for App {
             // A reload repaints every surface it changed; deliver those paints.
             painted = true;
         }
+        // Edge auto-scroll of a selection drag held above/below the grid (any
+        // window): due steps run HERE, the next one folds into WaitUntil below —
+        // a timer, never Poll, and nothing at all without such a drag.
+        if self.service_grid_autoscroll() {
+            painted = true;
+        }
         // Run-selection pending-inject deadlines (elapsed ones service HERE,
         // future ones fold into WaitUntil below — the same two-halves pattern
         // as autohide/reload above). A silent destination shell produces no
@@ -8415,6 +8467,10 @@ impl ApplicationHandler<AppEvent> for App {
                     merge_wake(&mut wake_at, p.deadline());
                 }
             }
+        }
+        // The next edge auto-scroll step (due ones ran above, so it's future).
+        if let Some(d) = self.grid_autoscroll_due() {
+            merge_wake(&mut wake_at, d);
         }
         // Skipped (throttled) open-search refresh: wake once at the throttle
         // deadline so the trailing re-collect above runs (F10). An elapsed
@@ -9127,6 +9183,10 @@ impl ApplicationHandler<AppEvent> for App {
                 // summon hotkey itself sends this FocusOut (its key grab) just
                 // before the hotkey event — see `FOCUS_CHURN_GRACE`.
                 self.focus_lost_at = Some(std::time::Instant::now());
+                // A selection / scrollbar drag, buttons the program saw pressed
+                // and the edge auto-scroll can't see their release once focus is
+                // gone — end them so nothing resumes stuck (detached parity, F14).
+                self.reset_main_pointer();
                 // A held tab drag can never see its release once focus is gone —
                 // clear it (and its grabbing cursor) so it doesn't resume stuck.
                 if self.tab_drag.take().is_some() {
@@ -9191,34 +9251,6 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let prev = self.cursor;
                 self.cursor = (position.x, position.y);
-                // --- Mouse motion / drag reports (modes 1002 / 1003) (F5) ---
-                // When the app enabled button-drag (1002) or any-motion (1003)
-                // reporting, emit one motion report per cell change — mirroring
-                // the press/release SGR path. Suppressed while a local Shift
-                // selection is in progress so drag-select still works over a
-                // mouse-mode app. tmux pane-resize and nvim visual-drag rely on
-                // this; previously only press/release were forwarded.
-                if !self.selecting && !self.tabs.is_empty() {
-                    let (drag, motion) = {
-                        let t = &self.active_tab().terminal;
-                        (t.mouse_drag(), t.mouse_motion())
-                    };
-                    if drag || motion {
-                        // A forwarded, still-held left press marks the left button
-                        // as down (mouse_grab_press is taken on release).
-                        let left_held = self.mouse_grab_press.is_some();
-                        // 1002 reports only while a button is held; 1003 reports
-                        // any motion (base 3 == no button when nothing is held).
-                        if motion || left_held {
-                            let new_cell = self.cell_at_pixel(position.x, position.y);
-                            let prev_cell = self.cell_at_pixel(prev.0, prev.1);
-                            if new_cell.is_some() && new_cell != prev_cell {
-                                let base = if left_held { 0u8 } else { 3u8 };
-                                self.send_mouse_report(input::MouseEvent::Motion { button: base });
-                            }
-                        }
-                    }
-                }
                 // --- Resize-edge cursor feedback (borderless window) ---
                 // Only update the cursor when the zone changes, never while a host
                 // drag (scrollbar / selection) is in progress, and never while a
@@ -9330,13 +9362,15 @@ impl ApplicationHandler<AppEvent> for App {
                         self.request_main_paint();
                     }
                 }
-                // --- Text selection drag continuation ---
-                // Gated on `selecting` alone: it is set only when a local selection
-                // actually began (mouse reporting off, or Shift held to override it),
-                // so a Shift-drag over a mouse-mode app still extends the selection.
-                if self.selecting {
-                    if let Some((line, col, left_half)) = self.cursor_cell_0_side() {
-                        self.active_tab_mut().terminal.selection_update(line, col, left_half);
+                // --- Grid pointer motion (shared with detached windows) ---
+                // Extends a local selection drag (and arms the edge auto-scroll
+                // past the grid's top/bottom), or reports the motion to a program
+                // that tracks it (1002 while one of its buttons is held, 1003
+                // always), once per cell. Host drags (scrollbar, tab) own the
+                // pointer meanwhile.
+                if !self.dragging_scrollbar && self.tab_drag.is_none() {
+                    let now = std::time::Instant::now();
+                    if self.with_main_grid(|g| crate::gridmouse::motion(g, now)).is_some_and(|m| m.paint) {
                         self.request_main_paint();
                     }
                 }
@@ -9939,57 +9973,22 @@ impl ApplicationHandler<AppEvent> for App {
                         self.request_main_paint();
                     }
                     input::MouseAction::None => {
-                        // Ctrl+click (also Cmd+click on macOS) on a detected link
-                        // opens it and consumes the click entirely: no mouse report
-                        // (our SGR encoder carries no modifier bits anyway) and no
-                        // selection start. Shift still wins for selection, so
-                        // Ctrl+Shift+click/drag is unchanged. Recomputed at press
-                        // time — a click without a prior hover move still works.
-                        // Gated on the SAME grid band as update_link_hover:
-                        // cursor_cell_0_side CLAMPS into the grid, so a click on
-                        // the status strip (or bottom-mode tab bar) would open a
-                        // bottom-row URL no underline ever advertised (F13).
-                        if link_modifier_held(&self.modifiers) && !self.modifiers.shift_key() {
-                            let grid_bottom = if self.tab_bar_bottom {
-                                self.tabbar_y(h as f32)
-                            } else {
-                                h as f32 - self.status_h()
-                            };
-                            let in_grid =
-                                cy >= self.grid_top_offset() && cy < grid_bottom;
-                            if in_grid {
-                                if let Some((line, col, _)) = self.cursor_cell_0_side() {
-                                    if let Some(hit) =
-                                        self.active_tab().terminal.link_at(line, col)
-                                    {
-                                        Self::open_url(&hit.uri);
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        // The click landed in the terminal area (not a panel or
-                        // scrollbar widget). When the app enabled mouse reporting,
-                        // forward the press; otherwise start a text selection.
-                        //
-                        // Holding Shift OVERRIDES mouse reporting and forces a local
-                        // text selection — the standard terminal convention (Konsole/
-                        // xterm/kitty) so you can still select & copy inside TUIs that
-                        // grab the mouse (Claude Code, vim, htop, tmux).
-                        if self.active_tab().terminal.mouse_mode() && !self.modifiers.shift_key() {
-                            // Remember where this app-bound press started: if the
-                            // user drags (not just clicks), they were probably trying
-                            // to select — we surface the Shift+drag hint on release.
-                            self.mouse_grab_press = Some(self.cursor);
-                            self.send_mouse_report(input::MouseEvent::LeftPress);
-                        } else {
-                            // Clear prior selection and begin a new one.
-                            self.active_tab_mut().terminal.selection_clear();
-                            if let Some((line, col, left_half)) = self.cursor_cell_0_side() {
-                                self.active_tab_mut().terminal.selection_start(line, col, left_half);
-                            }
-                            self.selecting = true;
-                            self.request_main_paint();
+                        // The click landed in the terminal area (not a widget):
+                        // the shared grid press (detached windows run the same).
+                        // A link-modifier click on a link opens it; a program that
+                        // tracks the mouse gets the press (with modifier bits);
+                        // otherwise a selection starts — by cell, word (double
+                        // click) or line (triple click). Shift always selects: the
+                        // terminal convention for copying out of mouse-grabbing
+                        // programs (Claude Code, vim, htop, tmux).
+                        let link_mod = link_modifier_held(&self.modifiers);
+                        let now = std::time::Instant::now();
+                        match self.with_main_grid(|g| {
+                            crate::gridmouse::press(g, MouseButton::Left, link_mod, now)
+                        }) {
+                            Some(crate::gridmouse::Press::OpenLink(uri)) => Self::open_url(&uri),
+                            Some(crate::gridmouse::Press::Selecting) => self.request_main_paint(),
+                            _ => {}
                         }
                     }
                 }
@@ -10001,11 +10000,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // the click while any modal is up / the scene is sliding / tabs is
                 // empty, so no menu appears over a quit/close-confirm or the help,
                 // and no menu opens at coordinates the slide has shifted.
+                // Hint mode is keyboard-only: a menu opened there could never be
+                // clicked (its left press is swallowed by the mode).
                 if self.slide_anim.is_some()
                     || self.confirm_quit
                     || self.confirm_close.is_some()
                     || self.help_open
                     || self.palette_open
+                    || self.hint_mode.is_some()
                     || self.tabs.is_empty()
                 {
                     return;
@@ -10088,6 +10090,20 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     return;
                 }
+                // On the grid, a program that tracks the mouse gets the click
+                // (nvim / tmux / mc menus) — unless Shift is held or JeTTY holds
+                // a selection, which keep JeTTY's menu (shared with detached).
+                if self.main_grid_geom().contains_y(cy) {
+                    let now = std::time::Instant::now();
+                    if self.with_main_grid(|g| crate::gridmouse::press(g, MouseButton::Right, false, now))
+                        == Some(crate::gridmouse::Press::Reported)
+                    {
+                        if let Some(id) = self.window.as_ref().map(|w| w.id()) {
+                            self.teach_shift_right_click(id);
+                        }
+                        return;
+                    }
+                }
                 // Commit any in-progress rename and close the help overlay so the
                 // menu can't be orphaned under it. The tab menu is mutually
                 // exclusive with the terminal menu.
@@ -10115,19 +10131,16 @@ impl ApplicationHandler<AppEvent> for App {
                     (true, true) => Vec::new(),
                 };
                 // THE teachable moment for mouse-grabbing apps (Claude Code,
-                // vim, htop): the user right-clicked wanting Copy / Run in New
-                // Tab, but their drag was forwarded to the app, so there is no
-                // selection and both rows sit dimmed with no explanation.
+                // vim, htop): the user Shift+right-clicked wanting Copy / Run in
+                // New Tab, but their drag was forwarded to the app, so there is
+                // no selection and both rows sit dimmed with no explanation.
                 // Surface the Shift+drag hint alongside the menu — deliberately
                 // BYPASSING the 25s drag-cooldown: an explicit right-click on
                 // dimmed rows is a direct question, not a nag.
-                if !has_sel && self.active_tab().terminal.mouse_mode() {
-                    if let Some(w) = &self.window {
-                        let now = std::time::Instant::now();
-                        self.shift_hint_until =
-                            Some((now + std::time::Duration::from_millis(3500), w.id()));
-                        self.shift_hint_cooldown =
-                            Some(now + std::time::Duration::from_secs(25));
+                let tracking = crate::gridmouse::tracking(&self.active_tab().terminal);
+                if !has_sel && tracking != input::MouseTracking::Off {
+                    if let Some(id) = self.window.as_ref().map(|w| w.id()) {
+                        arm_shift_hint(&mut self.shift_hint_until, &mut self.shift_hint_cooldown, id, true);
                     }
                 }
                 // Cache the item hit-test rects once (anchor + size fixed for the
@@ -10172,73 +10185,32 @@ impl ApplicationHandler<AppEvent> for App {
                 // If we were dragging the scrollbar, the release just ends that
                 // drag and is never forwarded to the app. (Slider drags happen in
                 // the settings window now.)
-                let was_dragging = self.dragging_scrollbar;
-                self.dragging_scrollbar = false;
-                // Capture before the block below clears it: a release that ended a
-                // local selection must NOT also emit a mouse report to the app (the
-                // matching press was never forwarded — e.g. a Shift-drag selection
-                // over a mouse-mode TUI).
-                let was_selecting = self.selecting;
-
-                // End text selection and copy-on-select.
-                if self.selecting {
-                    self.selecting = false;
-                    // Copy-on-select: if we got any text, put it in the clipboard.
-                    if let Some(text) = self.active_tab().terminal.selection_text() {
-                        if !text.is_empty() {
-                            clipboard::set(&text);
-                        } else {
-                            // Empty drag (plain click) — clear the selection highlight.
-                            self.active_tab_mut().terminal.selection_clear();
-                        }
-                    } else {
-                        // No selection text → plain click, clear selection.
-                        self.active_tab_mut().terminal.selection_clear();
+                if std::mem::take(&mut self.dragging_scrollbar) {
+                    return;
+                }
+                // The shared grid release (detached windows run the same): a
+                // selection drag ends with copy-on-select to the PRIMARY
+                // selection (an empty click clears the highlight); a press that
+                // went to the program gets its release — never a phantom one for
+                // a press chrome consumed. A no-Shift DRAG that went to a
+                // mouse-grabbing program means the user was probably trying to
+                // select: teach Shift+drag (throttled).
+                match self.with_main_grid(|g| crate::gridmouse::release(g, MouseButton::Left)) {
+                    Some(crate::gridmouse::Release::Copy(text)) => {
+                        clipboard::set_primary(&text);
+                        self.request_main_paint();
                     }
-                    self.request_main_paint();
-                }
-
-                // The press marker is set ONLY when the matching press was
-                // actually forwarded to the app (terminal-area hit, mouse mode
-                // on). Take it unconditionally so it never goes stale.
-                let grab_press = self.mouse_grab_press.take();
-
-                // Forward a release report only when the app enabled mouse mode,
-                // this release did not terminate a host-widget drag, AND the
-                // matching press WAS forwarded (grab_press). Presses consumed by
-                // chrome — tab titles, +/help/gear buttons, popups, menu
-                // dismissals — early-return before forwarding, and an unmatched
-                // release would register as a phantom click in apps that act on
-                // button-up (X10 mode even encodes it as button 3).
-                if !was_dragging
-                    && !was_selecting
-                    && grab_press.is_some()
-                    && self.active_tab().terminal.mouse_mode()
-                {
-                    self.send_mouse_report(input::MouseEvent::LeftRelease);
-                }
-
-                // If this release ended a no-Shift DRAG over a mouse-reporting app
-                // (press recorded, cursor moved > a few px), the user was likely
-                // trying to select — they just don't know Shift is needed. Surface
-                // a brief, throttled toast telling them how.
-                if let Some((px, py)) = grab_press {
-                    let moved = ((self.cursor.0 - px).powi(2) + (self.cursor.1 - py).powi(2)).sqrt();
-                    let now = std::time::Instant::now();
-                    let off_cooldown = self.shift_hint_cooldown.is_none_or(|t| now >= t);
-                    if moved > 8.0 && off_cooldown {
-                        if let Some(win) = &self.window {
-                            // Tagged with the MAIN window's id: only this
-                            // window draws the pill (F4).
-                            self.shift_hint_until = Some((
-                                now + std::time::Duration::from_millis(3500),
-                                win.id(),
-                            ));
-                            self.shift_hint_cooldown =
-                                Some(now + std::time::Duration::from_secs(25));
-                            self.request_main_paint();
+                    Some(crate::gridmouse::Release::Cleared) => self.request_main_paint(),
+                    Some(crate::gridmouse::Release::Program { dragged: true }) => {
+                        // Tagged with the MAIN window's id: only this window draws
+                        // the pill (F4).
+                        if let Some(id) = self.window.as_ref().map(|w| w.id()) {
+                            if arm_shift_hint(&mut self.shift_hint_until, &mut self.shift_hint_cooldown, id, false) {
+                                self.request_main_paint();
+                            }
                         }
                     }
+                    _ => {}
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Middle, .. } => {
@@ -10247,36 +10219,68 @@ impl ApplicationHandler<AppEvent> for App {
                 // shell hidden behind a modal popup and over the tab bar. Honor
                 // the same modal/hit checks:
                 //  - any modal open (slide/confirm/help/menus) → swallow;
-                //  - only paste over the terminal grid, never the chrome strips;
-                //  - when the app grabbed the mouse (mouse_mode) and Shift is not
-                //    held, the button belongs to the app — do NOT inject a paste.
+                //  - only over the terminal grid, never the chrome strips;
+                //  - when a program tracks the mouse and Shift is not held, the
+                //    button belongs to it — report it instead of pasting.
+                // It pastes the PRIMARY selection (the text last selected
+                // anywhere), not the clipboard.
                 if self.slide_anim.is_some()
                     || self.confirm_quit
                     || self.confirm_close.is_some()
                     || self.help_open
                     || self.palette_open
+                    || self.hint_mode.is_some()
                     || self.context_menu.is_some()
                     || self.tab_menu.is_some()
                     || self.tabs.is_empty()
+                    || self.gpu.is_none()
                 {
                     return;
                 }
-                let height = self.gpu.as_ref().map(|g| g.config.height as f32);
-                let Some(height) = height else { return };
-                let cy = self.cursor.1 as f32;
-                let grid_top = self.grid_top_offset();
-                let grid_bottom = if self.tab_bar_bottom {
-                    self.tabbar_y(height)
-                } else {
-                    height - self.status_h()
-                };
-                if cy < grid_top || cy >= grid_bottom {
+                if !self.main_grid_geom().contains_y(self.cursor.1 as f32) {
                     return;
                 }
-                if self.active_tab().terminal.mouse_mode() && !self.modifiers.shift_key() {
-                    return;
+                let now = std::time::Instant::now();
+                if self.with_main_grid(|g| crate::gridmouse::press(g, MouseButton::Middle, false, now))
+                    == Some(crate::gridmouse::Press::PastePrimary)
+                {
+                    if let Some(text) = clipboard::get_primary() {
+                        self.paste_text(&text);
+                    }
                 }
-                if let Some(text) = clipboard::get() {
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: button @ (MouseButton::Middle | MouseButton::Right | MouseButton::Back | MouseButton::Forward),
+                ..
+            } => {
+                // The rest of the buttons a program can receive: the release of a
+                // middle/right press that went to it (their presses have their
+                // own arms above), and back/forward presses + releases over the
+                // grid. Shared with detached windows.
+                let now = std::time::Instant::now();
+                if state == ElementState::Released {
+                    self.with_main_grid(|g| crate::gridmouse::release(g, button));
+                } else if !self.tabs.is_empty()
+                    && self.gpu.is_some()
+                    && self.main_grid_geom().contains_y(self.cursor.1 as f32)
+                    && !(self.confirm_quit
+                        || self.confirm_close.is_some()
+                        || self.help_open
+                        || self.palette_open
+                        || self.hint_mode.is_some()
+                        || self.context_menu.is_some()
+                        || self.tab_menu.is_some())
+                {
+                    self.with_main_grid(|g| crate::gridmouse::press(g, button, false, now));
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                // A file dropped on the terminal types its shell-quoted path into
+                // the active tab (through the paste path: sanitized, bracketed
+                // when the program asked for it).
+                if !self.tabs.is_empty() {
+                    let text = crate::gridmouse::dropped_path_text(&path);
                     self.paste_text(&text);
                 }
             }
@@ -10321,84 +10325,47 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     return;
                 }
-                // Positive y = wheel up = scroll into history (older output).
-                // Deltas are ACCUMULATED (fractionally) across events: slow
-                // touchpad scrolling arrives as many sub-line deltas that a
-                // per-event round() discarded entirely — the accumulator emits
-                // whole lines and carries the remainder, so gentle scrolls move
-                // both the scrollback and mouse-mode apps.
-                let cell_h = self.text.as_ref().map_or(0.0, |t| t.cell_size().1);
-                let delta_lines = input::wheel_lines(delta, cell_h);
-                let lines = self.scroll_accum.add(delta_lines);
-                if lines != 0 {
-                    // When the app enabled mouse reporting, forward wheel events
-                    // as SGR button 64 (up) / 65 (down) — but only over the
-                    // terminal area, so wheeling over the scrollbar still scrolls
-                    // the host scrollback. One report per LineDelta notch
-                    // (clamped) keeps apps like less/htop responsive without
-                    // flooding the PTY.
-                    let grid_top = self.grid_top_offset();
-                    let status_h = self.status_h();
-                    let over_scrollbar = {
-                        let rows = self.active_tab().terminal.rows();
-                        let off = self.active_tab().terminal.scroll_offset();
-                        let max = self.active_tab().terminal.scroll_max();
-                        if let Some(gpu) = &self.gpu {
-                            let (w, h) = (gpu.config.width, gpu.config.height);
-                            jetty_render::scrollbar_rect_geom(rows, off, max, w, h, grid_top, status_h, [0, 0, 0, 0])
-                                .map(|r| {
-                                    let cx = self.cursor.0 as f32;
-                                    cx >= r.x && cx <= r.x + r.w
-                                })
-                                .unwrap_or(false)
-                        } else {
-                            false
-                        }
-                    };
-
-                    if self.active_tab().terminal.mouse_mode() && !over_scrollbar {
-                        let event = if lines > 0 {
-                            input::MouseEvent::WheelUp
-                        } else {
-                            input::MouseEvent::WheelDown
-                        };
-                        // Emit a bounded number of reports proportional to the
-                        // scroll magnitude (one per ~3 lines, i.e. per notch).
-                        let notches = ((lines.abs() + 2) / 3).clamp(1, 8);
-                        for _ in 0..notches {
-                            self.send_mouse_report(event);
-                        }
-                    } else if !over_scrollbar
-                        && self.active_tab().terminal.alt_screen()
-                        && self.active_tab().terminal.alternate_scroll()
-                    {
-                        // ALTERNATE_SCROLL (F3): alt-screen pagers/editors
-                        // (less/man/git log) have no host scrollback, so a bare
-                        // scroll_lines() is a no-op. Translate wheel ticks into
-                        // Up/Down arrow-key sequences (DECCKM-aware), one arrow
-                        // per line of scroll, bounded so a big touchpad fling
-                        // can't flood the PTY.
-                        let app_cursor = self.active_tab().terminal.app_cursor_keys();
-                        let seq = input::arrow_scroll_bytes(lines > 0, app_cursor);
-                        let steps = (lines.unsigned_abs() as usize).clamp(1, 12);
-                        // User-originated PTY bytes — cancel a staged
-                        // run-selection inject (alt screen structurally can't
-                        // be a fresh prompt, but the rule is uniform).
-                        crate::runsel::cancel_on_user_write(
-                            &mut self.tabs[self.active].pending_inject,
-                        );
-                        let w = &mut self.tabs[self.active].writer;
-                        for _ in 0..steps {
-                            let _ = w.write_all(&seq);
-                        }
-                        let _ = w.flush();
-                    } else {
-                        self.active_tab_mut().terminal.scroll_lines(lines);
+                // The shared grid wheel (detached windows run the same). Deltas
+                // ACCUMULATE fractionally across events (slow touchpad scrolling
+                // is many sub-line deltas). A program that tracks the mouse gets
+                // wheel reports — vertical and horizontal, one per notch — except
+                // over the scrollbar or with Shift held, which always scroll the
+                // host scrollback; an alternate-screen pager without tracking
+                // gets arrow keys (ALTERNATE_SCROLL, F3); otherwise the host
+                // scrollback moves.
+                let over_scrollbar = {
+                    let t = &self.active_tab().terminal;
+                    let (rows, off, max) = (t.rows(), t.scroll_offset(), t.scroll_max());
+                    self.gpu.as_ref().is_some_and(|gpu| {
+                        let (w, h) = (gpu.config.width, gpu.config.height);
+                        jetty_render::scrollbar_rect_geom(
+                            rows, off, max, w, h, self.grid_top_offset(), self.status_h(), [0, 0, 0, 0],
+                        )
+                        .is_some_and(|r| {
+                            let cx = self.cursor.0 as f32;
+                            cx >= r.x && cx <= r.x + r.w
+                        })
+                    })
+                };
+                let mut vertical = std::mem::take(&mut self.scroll_accum);
+                let outcome = self.with_main_grid(|g| {
+                    crate::gridmouse::wheel(g, delta, over_scrollbar, &mut vertical)
+                });
+                self.scroll_accum = vertical;
+                match outcome {
+                    // Arrow keys are user input: cancel a staged run-selection
+                    // inject (an alt screen can't be a fresh prompt, but the rule
+                    // is uniform).
+                    Some(crate::gridmouse::Wheel::Arrows) => {
+                        crate::runsel::cancel_on_user_write(&mut self.tabs[self.active].pending_inject);
+                    }
+                    Some(crate::gridmouse::Wheel::Scrolled) => {
                         self.request_main_paint();
                         // The viewport moved under a stationary pointer: the
                         // hovered CELL is unchanged but its content is not.
                         self.update_link_hover(true);
                     }
+                    _ => {}
                 }
             }
             WindowEvent::KeyboardInput { event, is_synthetic, .. } if event.state.is_pressed() => {

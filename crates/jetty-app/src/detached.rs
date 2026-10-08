@@ -308,10 +308,10 @@ pub(crate) struct DetachedWindow {
     /// Whether a local text selection drag is in progress in this window (F37).
     /// Mirrors `App::selecting` for the main window.
     pub selecting: bool,
-    /// Where a no-Shift left press was forwarded to a mouse-reporting app in this
-    /// window; `Some` marks the left button as held for motion reports (F5/F37).
-    /// Taken on release. Mirrors `App::mouse_grab_press`.
-    pub mouse_grab_press: Option<(f64, f64)>,
+    /// This window's grid mouse state (buttons held by the program, click
+    /// counting, edge auto-scroll) — the same `gridmouse` logic as the main
+    /// window's `App::grid_mouse`.
+    pub grid_mouse: crate::gridmouse::GridMouse,
     /// Whether the scrollbar thumb is being dragged in THIS window. Mirrors
     /// `App::dragging_scrollbar` for the main window.
     pub dragging_scrollbar: bool,
@@ -465,7 +465,7 @@ impl DetachedWindow {
             occluded: false,
             scroll_accum: crate::input::ScrollAccumulator::new(),
             selecting: false,
-            mouse_grab_press: None,
+            grid_mouse: crate::gridmouse::GridMouse::default(),
             dragging_scrollbar: false,
             drag_grab_dy: 0.0,
             link_hover: None,
