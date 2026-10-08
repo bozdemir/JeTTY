@@ -15,7 +15,7 @@ use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{
     Config, Osc52, Term, TermMode, point_to_viewport, viewport_to_point,
 };
-use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb};
+use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Processor, Rgb};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,9 +29,16 @@ fn pack_geom(cols: usize, rows: usize) -> u32 {
 
 /// The ONE place the alacritty `Config` is built. `Term::set_options` replaces the
 /// whole config, so `new` and every runtime rebuild (scrollback, OSC 52, kitty
-/// keyboard) must go through here or a non-default field would silently revert.
-fn term_config(scrollback: usize, osc52: Osc52, kitty_keyboard: bool) -> Config {
-    Config { scrolling_history: scrollback, osc52, kitty_keyboard, ..Default::default() }
+/// keyboard, default cursor shape) must go through here or a non-default field
+/// would silently revert.
+fn term_config(scrollback: usize, osc52: Osc52, kitty_keyboard: bool, cursor: CursorShape) -> Config {
+    Config {
+        scrolling_history: scrollback,
+        osc52,
+        kitty_keyboard,
+        default_cursor_style: CursorStyle { shape: cursor, blinking: false },
+        ..Default::default()
+    }
 }
 
 /// A sequence the `feed` scanner advances in a sub-slice of its OWN (only while
@@ -953,6 +960,11 @@ pub struct Terminal {
     /// Bold text in one of the 8 normal ANSI colors renders in its bright twin
     /// (config `bold_is_bright`, default off). See [`Terminal::set_bold_is_bright`].
     bold_is_bright: bool,
+    /// The cursor shape a program's `CSI 0 SP q` (and a fresh terminal) falls
+    /// back to — the user's `[cursor] shape`. Block unless set via
+    /// [`Terminal::set_default_cursor_shape`]; carried through every `Config`
+    /// rebuild.
+    default_cursor: CursorShape,
     /// The active scrollback-search query (what the user typed, capped at
     /// [`SEARCH_MAX_QUERY`] chars). Empty = no active search.
     search_query: String,
@@ -1166,7 +1178,8 @@ impl Terminal {
         // build the Config with THIS value so a scrollback change never reverts it.
         let osc52_mode = Osc52::OnlyCopy;
         let kitty_keyboard = false;
-        let config = term_config(scrollback_limit, osc52_mode, kitty_keyboard);
+        let default_cursor = CursorShape::Block;
+        let config = term_config(scrollback_limit, osc52_mode, kitty_keyboard, default_cursor);
         let (tx, pty_write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         // Clone the sender for the synchronous scanner path (Kitty graphics
         // OK/error replies flow out through the same drain as async proxy replies).
@@ -1243,6 +1256,7 @@ impl Terminal {
             osc52_mode,
             kitty_keyboard,
             bold_is_bright: false,
+            default_cursor,
             search_query: String::new(),
             search_regex: None,
             search_matches: Vec::new(),
@@ -1379,7 +1393,30 @@ impl Terminal {
     /// even when unchanged), so callers may invoke it unconditionally at tab spawn.
     pub fn set_osc52_allow_paste(&mut self, allow: bool) {
         self.osc52_mode = if allow { Osc52::CopyPaste } else { Osc52::OnlyCopy };
-        self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, self.kitty_keyboard));
+        self.term.set_options(self.config());
+    }
+
+    /// The alacritty `Config` for this terminal's current settings.
+    fn config(&self) -> Config {
+        term_config(self.scrollback_limit, self.osc52_mode, self.kitty_keyboard, self.default_cursor)
+    }
+
+    /// The cursor shape programs reset to (`CSI 0 SP q`) and a fresh screen
+    /// shows — the user's `[cursor] shape`. A program's own DECSCUSR still wins
+    /// until it resets. `HollowBlock` is accepted for completeness. No-op when
+    /// unchanged (`set_options` repaints everything).
+    pub fn set_default_cursor_shape(&mut self, shape: CursorShapeSnap) {
+        let shape = match shape {
+            CursorShapeSnap::Block => CursorShape::Block,
+            CursorShapeSnap::Underline => CursorShape::Underline,
+            CursorShapeSnap::Beam => CursorShape::Beam,
+            CursorShapeSnap::HollowBlock => CursorShape::HollowBlock,
+        };
+        if self.default_cursor == shape {
+            return;
+        }
+        self.default_cursor = shape;
+        self.term.set_options(self.config());
     }
 
     /// Enable or disable kitty keyboard protocol support (progressive enhancement:
@@ -1392,7 +1429,7 @@ impl Terminal {
             return;
         }
         self.kitty_keyboard = enabled;
-        self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, self.kitty_keyboard));
+        self.term.set_options(self.config());
         self.kbd_cleared();
     }
 
@@ -1408,8 +1445,9 @@ impl Terminal {
         if self.kitty_keyboard {
             // A protocol toggle is alacritty's only way to clear BOTH screens'
             // stacks (`set_options`; the re-emitted title is a no-op app-side).
-            self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, false));
-            self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, true));
+            let cursor = self.default_cursor;
+            self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, false, cursor));
+            self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, true, cursor));
         }
         self.kbd_cleared();
         for mode in [
@@ -1582,7 +1620,7 @@ impl Terminal {
         // Preserve the OSC 52 mode: `..Default::default()` would reset `osc52` to
         // OnlyCopy, silently reverting an enabled `osc52_allow_paste` on every
         // scrollback change (amendment O2). Carry the stored mode through.
-        self.term.set_options(term_config(lines, self.osc52_mode, self.kitty_keyboard));
+        self.term.set_options(term_config(lines, self.osc52_mode, self.kitty_keyboard, self.default_cursor));
         self.scrollback_limit = lines;
         // A shrink freed trimmed history rows, so stored search-match Points
         // can reference lines that no longer exist (wrong counter, Enter/F3
@@ -4958,6 +4996,28 @@ mod tests {
         // Hiding the cursor still reports invisible regardless of shape.
         t.feed(b"\x1b[?25l");
         assert!(!t.snapshot().cursor_visible);
+    }
+
+    #[test]
+    fn default_cursor_shape_is_what_programs_reset_to() {
+        let mut t = Terminal::new(20, 5);
+        assert_eq!(t.snapshot().cursor_shape, CursorShapeSnap::Block);
+        // The user's `[cursor] shape` shows on a fresh screen…
+        t.set_default_cursor_shape(CursorShapeSnap::Beam);
+        assert_eq!(t.snapshot().cursor_shape, CursorShapeSnap::Beam);
+        // …a program's DECSCUSR still wins…
+        t.feed(b"\x1b[2 q");
+        assert_eq!(t.snapshot().cursor_shape, CursorShapeSnap::Block);
+        // …until it resets (CSI 0 SP q), which lands on the user's shape.
+        t.feed(b"\x1b[0 q");
+        assert_eq!(t.snapshot().cursor_shape, CursorShapeSnap::Beam);
+        // Survives the other Config rebuilds.
+        t.set_scrollback_lines(500);
+        t.set_kitty_keyboard(true);
+        t.set_osc52_allow_paste(true);
+        assert_eq!(t.snapshot().cursor_shape, CursorShapeSnap::Beam);
+        t.set_default_cursor_shape(CursorShapeSnap::Underline);
+        assert_eq!(t.snapshot().cursor_shape, CursorShapeSnap::Underline);
     }
 
     #[test]

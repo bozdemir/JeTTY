@@ -31,8 +31,11 @@ const THICK_UNDERLINE_STROKES: f32 = 2.5;
 /// `color = "auto"`: below this contrast between the theme cursor and the cell
 /// it sits on, the cursor switches to reverse video (the cell's own colors).
 pub const CURSOR_AUTO_MIN_CONTRAST: f32 = 2.0;
-/// Opacity of the cursor-row guide band (theme fg over the row).
-pub const CURSOR_GUIDE_ALPHA: u8 = 14;
+/// How far the cursor-row guide band moves from the page color toward the
+/// foreground — mixed in sRGB, so it reads equally faint on dark and light
+/// themes (a low-alpha quad blends in LINEAR light: a glaring band on a dark
+/// page, nearly nothing on a light one).
+pub const CURSOR_GUIDE_MIX: f32 = 0.07;
 
 /// How an UNFOCUSED window draws its cursor (`[cursor] unfocused`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -266,11 +269,12 @@ pub fn cursor_draw(
     out
 }
 
-/// The faint band across the cursor's row (`[cursor] guide`): the theme
-/// foreground at [`CURSOR_GUIDE_ALPHA`] over the whole grid row. Painted FIRST
-/// in the background pass, so cells with a background of their own (and the
-/// selection) cover it and the glyphs draw over it. `None` while the cursor is
-/// hidden or scrolled off the grid.
+/// The faint band across the cursor's row (`[cursor] guide`): the page color
+/// [`CURSOR_GUIDE_MIX`] of the way to the foreground, across the whole grid
+/// row, opaque like every cell background. Painted FIRST in the background
+/// pass, so cells with a background of their own (and the selection) cover it
+/// and the glyphs draw over it. `None` while the cursor is hidden or scrolled
+/// off the grid.
 pub fn cursor_guide_rect(
     snap: &GridSnapshot,
     theme: &Theme,
@@ -282,13 +286,16 @@ pub fn cursor_guide_rect(
     if !snap.cursor_visible || snap.cursor_row >= snap.rows {
         return None;
     }
-    let [r, g, b] = theme.fg;
+    let bg = snap.bg_rgba;
+    let mix = |i: usize| {
+        (bg[i] as f32 + (theme.fg[i] as f32 - bg[i] as f32) * CURSOR_GUIDE_MIX).round().clamp(0.0, 255.0) as u8
+    };
     Some(Rect::new(
         x_offset,
         y_offset + snap.cursor_row as f32 * cell_h,
         snap.cols as f32 * cell_w,
         cell_h,
-        [r, g, b, CURSOR_GUIDE_ALPHA],
+        [mix(0), mix(1), mix(2), 255],
     ))
 }
 
@@ -523,7 +530,14 @@ mod tests {
         g.cursor_row = 2;
         let r = cursor_guide_rect(&g, &theme(), 10.0, 20.0, 4.0, 30.0).unwrap();
         assert_eq!((r.x, r.y, r.w, r.h), (4.0, 70.0, 70.0, 20.0));
-        assert_eq!(r.color[3], CURSOR_GUIDE_ALPHA);
+        // 7% of the way from the page (the snapshot's bg, OSC 11 included)
+        // toward the theme fg, opaque.
+        let (bg, fg) = (g.bg_rgba, theme().fg);
+        for i in 0..3 {
+            let want = bg[i] as f32 + (fg[i] as f32 - bg[i] as f32) * CURSOR_GUIDE_MIX;
+            assert!((r.color[i] as f32 - want).abs() <= 0.5);
+        }
+        assert_eq!(r.color[3], 255);
     }
 
     /// The caret flash keeps the cursor visible on EVERY built-in theme, for the

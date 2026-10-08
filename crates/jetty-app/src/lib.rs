@@ -13,6 +13,7 @@ mod detached;
 /// through the SAME settings path as the app.
 pub mod effects;
 mod gridmouse;
+pub mod motion;
 mod notify;
 mod overlays;
 mod runsel;

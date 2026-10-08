@@ -211,6 +211,32 @@ pub struct Config {
     /// `BackdropConfig`. `mode = "none"` (the default) draws and builds nothing.
     #[serde(default)]
     pub backdrop: BackdropConfig,
+    /// The shell cursor's look and motion (`[cursor]`: shape, thickness,
+    /// unfocused look, color, row guide, trail). See `CursorConfig`; an old
+    /// config without the table loads today's cursor.
+    #[serde(default)]
+    pub cursor: CursorConfig,
+    /// Calm the motion down: `"off"` (default), `"on"`, or `"system"` (follow
+    /// the desktop's reduced-motion setting, via the freedesktop settings
+    /// portal / the macOS accessibility flag). While active the summon reveal
+    /// becomes a short fade, the dropdown does not slide, CRT roll / flicker /
+    /// jitter and the caret ripple stop, the cursor trail is off, and the
+    /// visual bell is the rim.
+    #[serde(default = "default_reduce_motion")]
+    pub reduce_motion: String,
+    /// Visual bell (BEL in the active tab): `"off"` (default), `"flash"` (a
+    /// 150 ms flash of the whole window) or `"rim"` (a 150 ms glow along the
+    /// window edge). At most one every 333 ms; an unfocused window asks for
+    /// attention instead.
+    #[serde(default = "default_visual_bell")]
+    pub visual_bell: String,
+    /// Command status pulse (needs OSC 133 shell integration): `"off"`
+    /// (default), `"failures"` (a ~0.4 s red rim pulse when a command in the
+    /// active tab fails) or `"all"` (also an accent pulse when a long command
+    /// succeeds). A command that finished while JeTTY was hidden pulses on the
+    /// next summon.
+    #[serde(default = "default_command_pulse")]
+    pub command_pulse: String,
     // ── Run & Notify (v0.15) ──────────────────────────────────────────────────
     /// Notify (freedesktop toast + taskbar/dock urgency) when a command finishes
     /// while JeTTY is hidden/unfocused. Default ON — but inert until the user
@@ -588,6 +614,107 @@ fn default_tab_title() -> String {
     "osc".to_string()
 }
 
+fn default_reduce_motion() -> String {
+    "off".to_string()
+}
+
+fn default_visual_bell() -> String {
+    "off".to_string()
+}
+
+fn default_command_pulse() -> String {
+    "off".to_string()
+}
+
+/// `[cursor]` — the shell cursor. Every key is `#[serde(default)]`, so a config
+/// without the table (or missing any key) loads today's cursor; unknown words
+/// read as the default (see `crate::motion`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CursorConfig {
+    /// `"block"` (default), `"beam"`, `"underline"`, `"double_underline"` or
+    /// `"thick_underline"` (the "vintage" tall bar). The shape a fresh screen
+    /// shows and programs reset to (`CSI 0 SP q`); a program's own DECSCUSR
+    /// still wins until it resets. The underline variants also style any
+    /// underline cursor a program asks for.
+    #[serde(default = "cur_shape")]
+    pub shape: String,
+    /// Beam / underline stroke as a fraction of the cell (0.04 ..= 0.5,
+    /// default 0.12 — the classic look).
+    #[serde(default = "cur_thickness")]
+    pub thickness: f32,
+    /// The cursor of an unfocused window: `"hollow"` (default — a block becomes
+    /// its outline), `"unchanged"` or `"none"`.
+    #[serde(default = "cur_unfocused")]
+    pub unfocused: String,
+    /// `"theme"` (default — the theme's cursor color), `"cell"` (reverse video
+    /// of the cell under it) or `"auto"` (the theme color, reverse video where
+    /// it would be under 2:1 on its cell).
+    #[serde(default = "cur_color")]
+    pub color: String,
+    /// A faint band across the cursor's row: `"off"` (default), `"shell"` (not
+    /// in full-screen programs — the alternate screen) or `"always"`.
+    #[serde(default = "cur_guide")]
+    pub guide: String,
+    /// Cursor trail: on a jump of `trail_threshold`+ cells the cursor leaves a
+    /// short smear that catches up with it over `trail_ms` (kitty's model).
+    #[serde(default)]
+    pub trail: bool,
+    /// How long the trail takes to catch up (60 ..= 1000 ms, default 200).
+    #[serde(default = "cur_trail_ms")]
+    pub trail_ms: u32,
+    /// The smallest jump (in cells, either axis) that leaves a trail (1 ..= 40,
+    /// default 2 — plain typing never trails).
+    #[serde(default = "cur_trail_threshold")]
+    pub trail_threshold: u32,
+}
+
+fn cur_shape() -> String {
+    "block".to_string()
+}
+fn cur_thickness() -> f32 {
+    0.12
+}
+fn cur_unfocused() -> String {
+    "hollow".to_string()
+}
+fn cur_color() -> String {
+    "theme".to_string()
+}
+fn cur_guide() -> String {
+    "off".to_string()
+}
+fn cur_trail_ms() -> u32 {
+    200
+}
+fn cur_trail_threshold() -> u32 {
+    2
+}
+
+impl Default for CursorConfig {
+    fn default() -> Self {
+        CursorConfig {
+            shape: cur_shape(),
+            thickness: cur_thickness(),
+            unfocused: cur_unfocused(),
+            color: cur_color(),
+            guide: cur_guide(),
+            trail: false,
+            trail_ms: cur_trail_ms(),
+            trail_threshold: cur_trail_threshold(),
+        }
+    }
+}
+
+impl CursorConfig {
+    /// Clamp the numbers into range (non-finite → default). Called on load.
+    pub fn clamped(mut self) -> Self {
+        self.thickness = finite_or(self.thickness, cur_thickness()).clamp(0.04, 0.5);
+        self.trail_ms = self.trail_ms.clamp(60, 1000);
+        self.trail_threshold = self.trail_threshold.clamp(1, 40);
+        self
+    }
+}
+
 /// UI font default: empty string → platform proportional sans. Mirrors the
 /// terminal default look (tab titles already render in sans), so a config
 /// without this key renders chrome exactly as before.
@@ -959,6 +1086,10 @@ impl Default for Config {
             tab_title: default_tab_title(),
             effects: EffectsConfig::default(),
             backdrop: BackdropConfig::default(),
+            cursor: CursorConfig::default(),
+            reduce_motion: default_reduce_motion(),
+            visual_bell: default_visual_bell(),
+            command_pulse: default_command_pulse(),
             notify_on_command_finish: default_notify_on_command_finish(),
             notify_min_seconds: default_notify_min_seconds(),
             notify_only_on_failure: default_notify_only_on_failure(),
@@ -1215,6 +1346,7 @@ impl Config {
         self.sanitize_floats();
         self.effects = self.effects.clamped();
         self.backdrop = self.backdrop.clamped();
+        self.cursor = self.cursor.clamped();
         self
     }
 
@@ -2202,6 +2334,36 @@ mod tests {
     }
 
     #[test]
+    fn cursor_table_defaults_and_clamps() {
+        // No [cursor] table → today's cursor; motion keys default off.
+        let (c, w) = Config::parse_with_base("theme = \"dracula\"\n", &Config::default(), "x").unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.cursor, CursorConfig::default());
+        assert_eq!(c.cursor.shape, "block");
+        assert!((c.cursor.thickness - 0.12).abs() < 1e-6);
+        assert_eq!((c.reduce_motion.as_str(), c.visual_bell.as_str()), ("off", "off"));
+        assert_eq!(c.command_pulse, "off");
+        // Out-of-range numbers clamp; a partial table keeps the other defaults.
+        let (c, w) = Config::parse_with_base(
+            "[cursor]\nthickness = 3.0\ntrail_ms = 5\ntrail_threshold = 0\nshape = \"beam\"\n",
+            &Config::default(),
+            "x",
+        )
+        .unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.cursor.thickness, 0.5);
+        assert_eq!((c.cursor.trail_ms, c.cursor.trail_threshold), (60, 1));
+        assert_eq!((c.cursor.shape.as_str(), c.cursor.color.as_str()), ("beam", "theme"));
+        // A wrong-typed key falls back alone, with a warning.
+        let (c, w) =
+            Config::parse_with_base("[cursor]\ntrail = \"yes\"\nguide = \"always\"\n", &Config::default(), "x")
+                .unwrap();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(!c.cursor.trail);
+        assert_eq!(c.cursor.guide, "always");
+    }
+
+    #[test]
     fn round_trip_through_toml() {
         let c = Config {
             theme: "dracula".to_string(),
@@ -2256,6 +2418,19 @@ mod tests {
                 animate: true,
                 parallax: true,
             },
+            cursor: CursorConfig {
+                shape: "double_underline".to_string(),
+                thickness: 0.2,
+                unfocused: "none".to_string(),
+                color: "auto".to_string(),
+                guide: "shell".to_string(),
+                trail: true,
+                trail_ms: 300,
+                trail_threshold: 3,
+            },
+            reduce_motion: "system".to_string(),
+            visual_bell: "rim".to_string(),
+            command_pulse: "all".to_string(),
             notify_on_command_finish: false,
             notify_min_seconds: 30,
             notify_only_on_failure: true,
@@ -2316,6 +2491,10 @@ mod tests {
             tab_title: "osc".to_string(),
             effects: EffectsConfig::default(),
             backdrop: BackdropConfig::default(),
+            cursor: CursorConfig::default(),
+            reduce_motion: "off".to_string(),
+            visual_bell: "off".to_string(),
+            command_pulse: "off".to_string(),
             notify_on_command_finish: true,
             notify_min_seconds: 10,
             notify_only_on_failure: false,

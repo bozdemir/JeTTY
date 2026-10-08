@@ -179,6 +179,12 @@
 ///   JETTY_SHOT_CARET_T=t — a caret-flash frame at progress t (0..1; the peak
 ///                    is t≈0.29) with JETTY_SHOT_CARET_COLOR="r,g,b" (0..1,
 ///                    default white), through the app's contrast-safe path.
+///   JETTY_SHOT_CURSOR="key=value,…" — a `[cursor]` table in compact form
+///                    (shape, thickness, unfocused, color, guide — e.g.
+///                    "shape=double_underline,thickness=0.2,guide=always"),
+///                    parsed by the app's own parser: the shape becomes the
+///                    terminal's default (DECSCUSR in JETTY_SHOT_INPUT still
+///                    wins), the rest is the render look + the row guide.
 ///   JETTY_SHOT_GLOW_T=t — the caret glow/ripple pass at progress t around the
 ///                    cursor (additive on a dark theme, multiply on a light
 ///                    one; same color source as JETTY_SHOT_CARET_COLOR).
@@ -677,6 +683,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Build terminal snapshot ---
     // Terminal::new picks up JETTY_THEME and JETTY_OPACITY from the environment.
     let mut terminal = jetty_core::Terminal::new(cols, rows);
+    // JETTY_SHOT_CURSOR — the `[cursor]` table (see the header).
+    let shot_cursor = jetty_app::motion::parse_cursor_spec(&std::env::var("JETTY_SHOT_CURSOR").unwrap_or_default());
+    terminal.set_default_cursor_shape(shot_cursor.shape.terminal_shape());
     // Push the real cell metrics so a fed sixel (JETTY_SHOT_SIXEL) reserves the
     // correct row footprint — the shot's analogue of App::reflow's set_cell_px.
     terminal.set_cell_px(cell_w, cell_h);
@@ -1019,7 +1028,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or([1.0; 3]);
             (t.clamp(0.0, 1.0), color)
         });
-    let shot_cursor_style = jetty_render::CursorStyle::default();
+    let shot_cursor_style = shot_cursor.style;
     let cursor = if copymode_cursor.is_none() {
         jetty_render::cursor_draw(
             &snap,
@@ -1037,7 +1046,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // Grid-space builders (x from the grid's left edge), each moved onto the
     // origin right where it is built — the app's `render_grid_scene` order.
-    let mut bg_rects = jetty_render::cell_bg_rects(&snap, cell_w, cell_h, shot_origin.top, selection.bg);
+    // The `[cursor] guide` band first (cells, selection and block cover it).
+    let mut bg_rects: Vec<jetty_render::Rect> = Vec::new();
+    if copymode_cursor.is_none() && shot_cursor.guide.shows(terminal.alt_screen()) {
+        bg_rects.extend(jetty_render::cursor_guide_rect(&snap, terminal.theme(), cell_w, cell_h, 0.0, shot_origin.top));
+    }
+    bg_rects.extend(jetty_render::cell_bg_rects(&snap, cell_w, cell_h, shot_origin.top, selection.bg));
     // The current match's glyph recolor (Pass 2), like the app's render core.
     let mut search_recolor: Vec<(usize, usize, usize, [u8; 3])> = Vec::new();
     if search_query.is_some() {

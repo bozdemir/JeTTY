@@ -1426,6 +1426,21 @@ pub struct App {
     /// foreground process (`tabmeta::title_recheck_delay`); `None` = none owed.
     title_recheck_at: Option<std::time::Instant>,
 
+    // ── Cursor & motion (visuals v2, slice F) ─────────────────────────────────
+    /// The `[cursor]` table as the user set it (canonical spellings, clamped) —
+    /// what `persist` saves. `cursor_spec` is its parsed form.
+    cursor_cfg: crate::config::CursorConfig,
+    /// The parsed `[cursor]` table every window draws with (shape preference,
+    /// render look, row guide). Recomputed only when `cursor_cfg` changes.
+    cursor_spec: crate::motion::CursorSpec,
+    /// `reduce_motion` (off / on / system — `system_reduced_motion`, fed by
+    /// the appearance watcher, decides the last).
+    reduce_motion: crate::motion::ReduceMotion,
+    /// `visual_bell` (off / flash / rim).
+    visual_bell: crate::motion::VisualBell,
+    /// `command_pulse` (off / failures / all).
+    command_pulse: crate::motion::CommandPulse,
+
 
 }
 
@@ -1946,6 +1961,11 @@ impl App {
             tab_hover: None,
             focus_ring: None,
             title_recheck_at: None,
+            cursor_cfg: crate::config::CursorConfig::default(),
+            cursor_spec: crate::motion::parse_cursor_spec(""),
+            reduce_motion: crate::motion::ReduceMotion::Off,
+            visual_bell: crate::motion::VisualBell::Off,
+            command_pulse: crate::motion::CommandPulse::Off,
         };
         // Persisted user settings override the env-derived defaults (but env
         // vars still seed the initial values above, so an explicit JETTY_* can
@@ -2031,6 +2051,15 @@ impl App {
         // The backdrop: settings only — an image decode starts in `resumed`,
         // once the window (and so the monitor size it is scaled to) exists.
         app.backdrop.set_config(cfg.backdrop.clone());
+        // Cursor & motion (no tabs exist yet: each spawn applies the shape).
+        app.cursor_cfg = crate::motion::canonical_cursor(&cfg.cursor);
+        app.cursor_spec = crate::motion::cursor_spec(&app.cursor_cfg);
+        app.reduce_motion = crate::motion::ReduceMotion::parse(&cfg.reduce_motion);
+        // `reduce_motion = "system"` reads the desktop's setting (the watcher
+        // above starts only for the theme otherwise).
+        app.ensure_appearance_watcher();
+        app.visual_bell = crate::motion::VisualBell::parse(&cfg.visual_bell);
+        app.command_pulse = crate::motion::CommandPulse::parse(&cfg.command_pulse);
         // Run & Notify: mirror the persisted keys (min-seconds re-clamped for
         // belt-and-suspenders; Config::load's sanitize already applied the range).
         app.notify_on_finish = cfg.notify_on_command_finish;
@@ -2241,6 +2270,10 @@ impl App {
             tab_title: self.tab_title_mode.to_config().to_string(),
             effects: self.fx.clone(),
             backdrop: self.backdrop.cfg.clone(),
+            cursor: self.cursor_cfg.clone(),
+            reduce_motion: self.reduce_motion.as_str().to_string(),
+            visual_bell: self.visual_bell.as_str().to_string(),
+            command_pulse: self.command_pulse.as_str().to_string(),
             notify_on_command_finish: self.notify_on_finish,
             notify_min_seconds: self.notify_min_seconds,
             notify_only_on_failure: self.notify_only_on_failure,
@@ -2360,9 +2393,10 @@ impl App {
             });
     }
 
-    /// Whether anything follows the system appearance.
+    /// Whether anything follows the system appearance: the light/dark theme
+    /// slot, or `reduce_motion = "system"`.
     fn appearance_wanted(&self) -> bool {
-        self.follow_system_theme
+        self.follow_system_theme || self.reduce_motion == crate::motion::ReduceMotion::System
     }
 
     /// A system appearance report (settings portal, or winit's system theme):
@@ -2375,7 +2409,7 @@ impl App {
         let scheme_before = self.system_appearance.color_scheme;
         self.system_appearance.merge(a);
         if let Some(rm) = a.reduced_motion {
-            self.system_reduced_motion = rm;
+            self.set_system_reduced_motion(rm);
         }
         if let Some(accent) = a.accent {
             self.system_accent = accent;
@@ -2899,6 +2933,11 @@ impl App {
             self.sync_backdrop_image();
             self.mark_dirty_all();
         }
+        // Cursor & motion — live.
+        self.set_cursor_config(&cfg.cursor);
+        self.set_reduce_motion(crate::motion::ReduceMotion::parse(&cfg.reduce_motion));
+        self.visual_bell = crate::motion::VisualBell::parse(&cfg.visual_bell);
+        self.command_pulse = crate::motion::CommandPulse::parse(&cfg.command_pulse);
         // Run & Notify mirrors.
         self.notify_on_finish = cfg.notify_on_command_finish;
         self.notify_min_seconds = cfg.notify_min_seconds.clamp(1, 86_400);
@@ -2978,6 +3017,68 @@ impl App {
             self.keymap = new_km;
             self.help_rows = App::compute_help_rows(&self.keymap, &self.summon_hotkey);
         }
+    }
+
+    /// Apply a `[cursor]` table live (hot-reload, Settings): the shape every
+    /// tab's programs reset to, and the look every window draws. A no-op when
+    /// nothing changed.
+    fn set_cursor_config(&mut self, cfg: &crate::config::CursorConfig) {
+        let cfg = crate::motion::canonical_cursor(&cfg.clone().clamped());
+        if cfg == self.cursor_cfg {
+            return;
+        }
+        let spec = crate::motion::cursor_spec(&cfg);
+        if spec.shape.terminal_shape() != self.cursor_spec.shape.terminal_shape() {
+            let shape = spec.shape.terminal_shape();
+            for tab in &mut self.tabs {
+                tab.terminal.set_default_cursor_shape(shape);
+            }
+            for dw in &mut self.detached {
+                dw.tab.terminal.set_default_cursor_shape(shape);
+            }
+        }
+        self.cursor_cfg = cfg;
+        self.cursor_spec = spec;
+        self.mark_dirty_all();
+        self.persist();
+    }
+
+    /// Whether motion is reduced right now (`reduce_motion`, or the desktop's
+    /// setting under `"system"`).
+    fn motion_reduced(&self) -> bool {
+        self.reduce_motion.active(self.system_reduced_motion)
+    }
+
+    /// Set `reduce_motion` (hot-reload, Settings, palette).
+    fn set_reduce_motion(&mut self, mode: crate::motion::ReduceMotion) {
+        if mode == self.reduce_motion {
+            return;
+        }
+        self.reduce_motion = mode;
+        // "system" needs the desktop's setting: start the watcher (a no-op
+        // when it already runs or nothing wants it).
+        self.ensure_appearance_watcher();
+        self.motion_changed();
+        self.persist();
+    }
+
+    /// The desktop's reduced-motion setting changed (`apply_appearance`: the
+    /// settings portal's `org.freedesktop.appearance reduced-motion`). Only
+    /// matters under `reduce_motion = "system"`; applies live.
+    fn set_system_reduced_motion(&mut self, reduced: bool) {
+        if reduced == self.system_reduced_motion {
+            return;
+        }
+        self.system_reduced_motion = reduced;
+        self.motion_changed();
+    }
+
+    /// Reduce-motion flipped: stop what it forbids at once and repaint.
+    fn motion_changed(&mut self) {
+        if self.motion_reduced() {
+            self.slide_anim = None;
+        }
+        self.mark_dirty_all();
     }
 
     /// Re-dock the main window to the top strip when it is a visible Dropdown — used
@@ -3523,6 +3624,8 @@ impl App {
         // in gets kitty keys.
         terminal.set_kitty_keyboard(self.kitty_keyboard);
         terminal.set_bold_is_bright(self.bold_is_bright);
+        // The `[cursor] shape` programs reset to (a no-op for the block default).
+        terminal.set_default_cursor_shape(self.cursor_spec.shape.terminal_shape());
         // Apply the configured scrollback cap (guard skips the no-op
         // set_options round-trip on the 10k default path).
         if self.scrollback_lines != 10_000 {
@@ -9935,6 +10038,8 @@ impl App {
         // Window focus drives the unfocused-hollow cursor (captured before the
         // gpu/text/quad borrows below).
         let focused = dw.focused;
+        let cursor_style = self.cursor_spec.style;
+        let cursor_guide = self.cursor_spec.guide.shows(dw.tab.terminal.alt_screen());
         // OSC 133 failed-command marker rows for THIS window's tab (captured
         // before the mutable dw borrows below; parity with the main window).
         let failed_rows = dw.tab.terminal.failed_prompt_rows();
@@ -10056,7 +10161,8 @@ impl App {
             focused,
             caret_t_for_flash,
             caret_flash_color: fx.caret_flash_color,
-            cursor_style: jetty_render::CursorStyle::default(),
+            cursor_style,
+            cursor_guide,
             copy_mode_active: copy_mode_ui.is_some(),
             copy_mode_ui,
         };
@@ -11470,6 +11576,8 @@ impl ApplicationHandler<AppEvent> for App {
         // in gets kitty keys.
         terminal.set_kitty_keyboard(self.kitty_keyboard);
         terminal.set_bold_is_bright(self.bold_is_bright);
+        // The `[cursor] shape` programs reset to (a no-op for the block default).
+        terminal.set_default_cursor_shape(self.cursor_spec.shape.terminal_shape());
         // Apply the configured scrollback cap (guard skips the no-op
         // set_options round-trip on the 10k default path).
         if self.scrollback_lines != 10_000 {
@@ -13817,6 +13925,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // Window focus drives the unfocused-hollow cursor (captured before
                 // the mutable gpu/text borrow below).
                 let main_focused = self.main_focused;
+                // The `[cursor]` look + the row guide for the active tab.
+                let cursor_style = self.cursor_spec.style;
+                let cursor_guide = self.cursor_spec.guide.shows(self.active_tab().terminal.alt_screen());
                 let (Some(gpu), Some(text), Some(chrome_text), Some(quad), Some(image_layer)) = (
                     &mut self.gpu,
                     &mut self.text,
@@ -13953,7 +14064,8 @@ impl ApplicationHandler<AppEvent> for App {
                         focused: main_focused,
                         caret_t_for_flash,
                         caret_flash_color,
-                        cursor_style: jetty_render::CursorStyle::default(),
+                        cursor_style,
+                        cursor_guide,
                         copy_mode_active,
                         copy_mode_ui,
                     };
@@ -14601,6 +14713,9 @@ struct GridScene<'a> {
     caret_flash_color: [f32; 3],
     /// The `[cursor]` look (shape variants, stroke, unfocused look, color).
     cursor_style: jetty_render::CursorStyle,
+    /// Paint the `[cursor] guide` band on the cursor row (already resolved
+    /// against the guide mode and the terminal's alternate screen).
+    cursor_guide: bool,
     /// Copy-mode is main-only. Detached passes `false` → the shell cursor is
     /// never suppressed here.
     copy_mode_active: bool,
@@ -14687,7 +14802,13 @@ fn render_grid_scene(
     // appended AFTER the selection rects (main-only; empty for detached) so the
     // match tint wins where they overlap, still under the glyphs; the block
     // cursor goes last so it covers both.
-    let mut bg_rects = jetty_render::cell_bg_rects(s.snap, cell_w, cell_h, grid_origin_y, selection.bg);
+    // The `[cursor] guide` band goes FIRST so cell backgrounds, the selection
+    // and the block cover it (copy-mode hides the shell cursor, and its row).
+    let mut bg_rects: Vec<jetty_render::Rect> = Vec::new();
+    if s.cursor_guide && !s.copy_mode_active {
+        bg_rects.extend(jetty_render::cursor_guide_rect(s.snap, s.theme, cell_w, cell_h, 0.0, grid_origin_y));
+    }
+    bg_rects.extend(jetty_render::cell_bg_rects(s.snap, cell_w, cell_h, grid_origin_y, selection.bg));
     if !s.search_hits.is_empty() {
         bg_rects.extend(jetty_render::search_hit_rects(
             s.search_hits, cell_w, cell_h, grid_origin_y, s.theme,
