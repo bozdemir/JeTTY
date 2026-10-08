@@ -4390,14 +4390,24 @@ impl App {
         // check when clean, so zero idle cost. `crate::clipboard::set` is a free fn
         // (no self borrow), so this is conflict-free inside `drain_one_tab`.
         if let Some(text) = tab.terminal.take_clipboard_store() {
-            crate::clipboard::set(&text);
+            // OSC 52 names the selection: `p`/`s` → PRIMARY, `c` → clipboard.
+            if tab.terminal.clipboard_store_is_primary() {
+                crate::clipboard::set_primary(&text);
+            } else {
+                crate::clipboard::set(&text);
+            }
         }
         // OSC 52 PASTE (load): a program asked to READ the clipboard. Only ever
         // present when the user enabled `osc52_allow_paste` (else alacritty denies it
         // and no request reaches us). Read the clipboard, CAP the reply length, format
         // via alacritty's supplied formatter, and write it back to the PTY.
         if let Some(fmt) = tab.terminal.take_clipboard_load() {
-            if let Some(mut text) = crate::clipboard::get() {
+            let text = if tab.terminal.clipboard_load_is_primary() {
+                crate::clipboard::get_primary()
+            } else {
+                crate::clipboard::get()
+            };
+            if let Some(mut text) = text {
                 if text.len() > jetty_core::OSC52_MAX_BYTES {
                     text.truncate(floor_char_boundary(&text, jetty_core::OSC52_MAX_BYTES));
                 }

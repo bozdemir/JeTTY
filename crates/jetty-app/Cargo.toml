@@ -11,7 +11,11 @@ winit = "0.30"
 pollster = "0.4"
 wgpu = "29.0"
 png = "0.17"
-arboard = "3.6.1"
+# Text-only clipboard: the default `image-data` feature pulled in the `image`
+# crate (and a second `png`) for an API JeTTY never calls. NOT
+# `wayland-data-control` either: that backend forks the process to serve a copy
+# (see clipboard.rs) — XWayland bridges both selections instead.
+arboard = { version = "3.6.1", default-features = false }
 global-hotkey = "0.8.0"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
