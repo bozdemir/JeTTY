@@ -924,7 +924,7 @@ impl TextLayer {
             builtin_glyphs: true,
             color_emoji: true,
             emoji_family: None,
-            builtin_light: builtin::light_thickness(font_size),
+            builtin_light: builtin::light_thickness(metrics.font_size),
             underline,
             custom_scratch: Vec::new(),
             empty_buffer: Buffer::new_empty(metrics),
@@ -1152,7 +1152,7 @@ impl TextLayer {
         // active chrome family, so a UI-font SIZE change re-derives chrome_char_w.
         self.cell_w = self.measure_chrome_advance();
         self.cell_h = line_height;
-        self.builtin_light = builtin::light_thickness(font_size);
+        self.builtin_light = builtin::light_thickness(self.metrics.font_size);
         self.refresh_underline();
         // Cached fallback/grapheme glyphs were shaped at the old size; drop them.
         // The shape-gen bump drops every cached grid row too, so rows are rebuilt
