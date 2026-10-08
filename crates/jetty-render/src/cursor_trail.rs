@@ -57,7 +57,8 @@ pub struct TrailParams {
     /// Seconds for the slow (trailing) corners to close all but 1/1024 of the
     /// distance; the leading corners take [`TRAIL_FAST_RATIO`] of it.
     pub decay_slow: f32,
-    /// The smallest jump (Manhattan cells) that trails.
+    /// A jump must cover MORE than this many cells (Manhattan: rows + columns)
+    /// to trail — kitty's `cursor_trail_start_threshold` rule.
     pub threshold: usize,
 }
 
@@ -200,14 +201,18 @@ impl TrailModel {
         let (seen, since) = self.seen.expect("set above");
         let mut wake = None;
         if seen.cell != settled.cell {
-            if now.saturating_duration_since(since) >= TRAIL_DWELL {
-                // The cursor dwelled on a new cell: chase it — from wherever a
+            if self.anim.is_none() && settled.cells_to(&seen) <= p.threshold {
+                // A small move (typing, a couple of keys landing in one frame):
+                // never a trail, and the start point keeps up at once — so a
+                // typing burst can never add up to a "jump" the moment it
+                // pauses.
+                self.settled = Some(seen);
+            } else if now.saturating_duration_since(since) >= TRAIL_DWELL {
+                // The cursor dwelled on a far cell: chase it — from wherever a
                 // live trail is now, else from where it last dwelled.
-                if self.anim.is_some() || settled.cells_to(&seen) >= p.threshold {
-                    let corners = self.anim.map_or(rect_corners(settled.rect), |a| a.corners);
-                    let started = self.anim.map_or(now, |a| a.started);
-                    self.anim = Some(TrailAnim { corners, target: seen.rect, started, updated: now });
-                }
+                let corners = self.anim.map_or(rect_corners(settled.rect), |a| a.corners);
+                let started = self.anim.map_or(now, |a| a.started);
+                self.anim = Some(TrailAnim { corners, target: seen.rect, started, updated: now });
                 self.settled = Some(seen);
             } else {
                 wake = Some(since + TRAIL_DWELL);
@@ -460,14 +465,38 @@ mod tests {
     fn typing_never_trails() {
         let (mut m, p, t0) = (TrailModel::default(), params(), Instant::now());
         assert_eq!(m.frame(Some(pos(5, 10)), t0, &p), TrailFrame::Idle);
-        // One cell per keystroke: below the threshold, settles without a trail.
+        // One cell per keystroke: below the threshold — no trail, no wake.
         let mut t = t0;
         for col in 11..20 {
             t += Duration::from_millis(60);
-            let f = m.frame(Some(pos(5, col)), t, &p);
-            assert!(matches!(f, TrailFrame::WakeAt(_)), "a move first waits out the dwell");
-            assert_eq!(m.frame(Some(pos(5, col)), t + TRAIL_DWELL, &p), TrailFrame::Idle);
+            assert_eq!(m.frame(Some(pos(5, col)), t, &p), TrailFrame::Idle);
         }
+    }
+
+    #[test]
+    fn a_fast_typing_burst_never_adds_up_to_a_jump() {
+        // Two keys per (slow) frame, faster than the dwell: the start point keeps
+        // up, so pausing after the burst trails nothing.
+        let (mut m, p, t0) = (TrailModel::default(), params(), Instant::now());
+        m.frame(Some(pos(5, 10)), t0, &p);
+        let mut t = t0;
+        for step in 1..=10 {
+            t += Duration::from_millis(12);
+            assert_eq!(m.frame(Some(pos(5, 10 + 2 * step)), t, &p), TrailFrame::Idle);
+        }
+        assert_eq!(m.frame(Some(pos(5, 30)), t + Duration::from_millis(500), &p), TrailFrame::Idle);
+    }
+
+    #[test]
+    fn the_threshold_is_strict_like_kittys() {
+        let (mut m, p, t0) = (TrailModel::default(), params(), Instant::now());
+        m.frame(Some(pos(5, 10)), t0, &p);
+        // Exactly the threshold (2 cells): no trail.
+        assert_eq!(m.frame(Some(pos(5, 12)), t0 + Duration::from_millis(100), &p), TrailFrame::Idle);
+        // One more (3 cells from the new start): a jump — dwell, then trail.
+        let t1 = t0 + Duration::from_millis(200);
+        assert_eq!(m.frame(Some(pos(5, 15)), t1, &p), TrailFrame::WakeAt(t1 + TRAIL_DWELL));
+        assert!(matches!(m.frame(Some(pos(5, 15)), t1 + TRAIL_DWELL, &p), TrailFrame::Draw { .. }));
     }
 
     #[test]

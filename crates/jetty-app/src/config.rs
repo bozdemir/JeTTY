@@ -655,15 +655,17 @@ pub struct CursorConfig {
     /// in full-screen programs — the alternate screen) or `"always"`.
     #[serde(default = "cur_guide")]
     pub guide: String,
-    /// Cursor trail: on a jump of `trail_threshold`+ cells the cursor leaves a
-    /// short smear that catches up with it over `trail_ms` (kitty's model).
+    /// Cursor trail: when the cursor jumps more than `trail_threshold` cells it
+    /// leaves a short smear that catches up with it over `trail_ms` (kitty's
+    /// model).
     #[serde(default)]
     pub trail: bool,
     /// How long the trail takes to catch up (60 ..= 1000 ms, default 200).
     #[serde(default = "cur_trail_ms")]
     pub trail_ms: u32,
-    /// The smallest jump (in cells, either axis) that leaves a trail (1 ..= 40,
-    /// default 2 — plain typing never trails).
+    /// A jump must cover MORE than this many cells (rows + columns) to leave a
+    /// trail — kitty's rule (1 ..= 40, default 2: typing, even a fast burst,
+    /// never trails).
     #[serde(default = "cur_trail_threshold")]
     pub trail_threshold: u32,
 }
