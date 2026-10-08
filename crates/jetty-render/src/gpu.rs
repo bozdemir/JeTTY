@@ -1,4 +1,41 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// The GPU objects every JeTTY window shares: ONE wgpu instance, adapter, device
+/// and queue. Acquiring them is the dominant GPU cost (~70–90 ms of adapter
+/// enumeration + device creation on the reference machine); a second window —
+/// Settings, a detached tab — needs only its own `Surface`, so it reuses these
+/// instead of blocking the UI thread on a whole new device (and every window's
+/// pipelines/atlases live on the same device).
+pub struct GpuShared {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    backend_name: String,
+    /// Max 2D texture dimension the device enforces (surface size clamp).
+    max_dim: u32,
+    /// Set by the device-lost callback on a genuine loss (driver reset, GPU
+    /// hang, suspend) — see [`GpuContext::is_lost`].
+    lost: Arc<AtomicBool>,
+}
+
+/// Why [`GpuContext::acquire_frame`] skipped a frame
+/// ([`GpuContext::last_acquire_error`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireError {
+    /// The configuration was stale (e.g. after a resize): reconfigured, so the
+    /// next acquire should succeed — worth an immediate redraw.
+    Outdated,
+    /// The surface was lost and a reconfigure did not bring it back.
+    Lost,
+    /// The presentation engine did not hand out an image in time.
+    Timeout,
+    /// The window is occluded / minimized: there is nothing to draw into.
+    Occluded,
+    /// The surface reported a validation error.
+    Validation,
+}
 
 pub struct GpuContext {
     pub surface: wgpu::Surface<'static>,
@@ -17,9 +54,17 @@ pub struct GpuContext {
     /// clamped to this so `Surface::configure` never fails validation on very large
     /// (multi-monitor) windows.
     max_dim: u32,
+    /// The instance/adapter/device/queue this window's surface was created from
+    /// (shared with every other window built via [`GpuContext::with_shared`]).
+    shared: Arc<GpuShared>,
+    /// Why the most recent `acquire_frame` returned `None` (`None` = it succeeded).
+    last_acquire_error: Option<AcquireError>,
 }
 
 impl GpuContext {
+    /// Acquire the GPU for the FIRST window: instance, adapter, device and queue
+    /// (shareable afterwards via [`Self::shared`]) plus this window's surface.
+    /// `None` (logged) when no adapter can present to the window.
     pub fn new<W: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + Send + Sync + 'static>(
         window: Arc<W>,
         width: u32,
@@ -78,9 +123,8 @@ impl GpuContext {
                 }
             },
         };
-        let _ = &instance;
-        // Log the adapter ONCE per process (the settings window builds its own
-        // GpuContext each time it opens — no need to reprint on every open).
+        // Log the adapter ONCE per process (a window that cannot share the device
+        // falls back to this path again — no need to reprint).
         use std::sync::Once;
         static LOG_ADAPTER: Once = Once::new();
         LOG_ADAPTER.call_once(|| {
@@ -119,12 +163,78 @@ impl GpuContext {
         device.on_uncaptured_error(Arc::new(|e: wgpu::Error| {
             eprintln!("jetty: wgpu error: {e}");
         }));
+        // A genuine device loss (driver reset / GPU hang / suspend) leaves every
+        // window frozen on its last frame: flag it so the app can rebuild its GPU
+        // stack (`is_lost`). `Destroyed` is our own teardown — not a loss.
+        let lost = Arc::new(AtomicBool::new(false));
+        let lost_flag = Arc::clone(&lost);
+        device.set_device_lost_callback(move |reason, msg| {
+            if reason == wgpu::DeviceLostReason::Unknown {
+                lost_flag.store(true, Ordering::Release);
+                eprintln!("jetty: GPU device lost ({msg}); rendering stops until it is rebuilt");
+            }
+        });
 
-        // Surface width/height must not exceed the device's max 2D texture
-        // dimension, or `Surface::configure` fails validation.
-        let max_dim = device.limits().max_texture_dimension_2d;
+        let shared = Arc::new(GpuShared {
+            backend_name: format!("{:?}", adapter.get_info().backend),
+            max_dim: device.limits().max_texture_dimension_2d,
+            instance,
+            adapter,
+            device,
+            queue,
+            lost,
+        });
+        Some(Self::configure(shared, surface, width, height))
+    }
 
-        let caps = surface.get_capabilities(&adapter);
+    /// A further window on an existing GPU: only its `Surface` is created and
+    /// configured — no adapter enumeration, no device creation. `None` when the
+    /// surface cannot be created or the shared adapter cannot present to it
+    /// (e.g. a window on a screen driven by another GPU); see [`Self::new_sharing`].
+    pub fn with_shared<W: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + Send + Sync + 'static>(
+        shared: &Arc<GpuShared>,
+        window: Arc<W>,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        if shared.lost.load(Ordering::Acquire) {
+            return None;
+        }
+        let surface = match shared.instance.create_surface(window) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("jetty: surface creation on the shared GPU failed ({e})");
+                return None;
+            }
+        };
+        if !shared.adapter.is_surface_supported(&surface) {
+            eprintln!("jetty: the shared GPU cannot present to this window; acquiring another");
+            return None;
+        }
+        Some(Self::configure(Arc::clone(shared), surface, width, height))
+    }
+
+    /// [`Self::with_shared`] when a shared GPU is available and can present to
+    /// the window, else a full [`Self::new`] (its own adapter + device). What every
+    /// window after the first uses.
+    pub fn new_sharing<W: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + Send + Sync + 'static>(
+        shared: Option<&Arc<GpuShared>>,
+        window: Arc<W>,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        if let Some(s) = shared {
+            if let Some(g) = Self::with_shared(s, window.clone(), width, height) {
+                return Some(g);
+            }
+        }
+        Self::new(window, width, height)
+    }
+
+    /// Pick this surface's format + alpha mode from ITS capabilities and configure
+    /// it on the shared device.
+    fn configure(shared: Arc<GpuShared>, surface: wgpu::Surface<'static>, width: u32, height: u32) -> Self {
+        let caps = surface.get_capabilities(&shared.adapter);
         // Prefer an sRGB format; if the driver reports no formats at all (e.g. an
         // incompatible surface returns an empty list), fall back to a sane default
         // rather than panicking on `formats[0]`.
@@ -164,6 +274,7 @@ impl GpuContext {
         // PreMultiplied surface; PostMultiplied/Opaque want straight rgb.
         let premultiply_clear = alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
 
+        let max_dim = shared.max_dim;
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -174,12 +285,41 @@ impl GpuContext {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        surface.configure(&device, &config);
+        surface.configure(&shared.device, &config);
 
-        // Capture the backend name for display in the Welcome overlay.
-        let backend_name = format!("{:?}", adapter.get_info().backend);
+        Self {
+            surface,
+            device: shared.device.clone(),
+            queue: shared.queue.clone(),
+            config,
+            format,
+            backend_name: shared.backend_name.clone(),
+            premultiply_clear,
+            max_dim,
+            shared,
+            last_acquire_error: None,
+        }
+    }
 
-        Some(Self { surface, device, queue, config, format, backend_name, premultiply_clear, max_dim })
+    /// The shared GPU (instance/adapter/device/queue) — pass to
+    /// [`Self::with_shared`] / [`Self::new_sharing`] for every further window.
+    pub fn shared(&self) -> Arc<GpuShared> {
+        Arc::clone(&self.shared)
+    }
+
+    /// True once the shared device has been LOST (driver reset, GPU hang,
+    /// suspend/resume on some drivers). Nothing rendered on it will ever reach the
+    /// screen again: the caller must rebuild its whole GPU stack (`GpuContext` +
+    /// every layer) from a fresh [`Self::new`].
+    pub fn is_lost(&self) -> bool {
+        self.shared.lost.load(Ordering::Acquire)
+    }
+
+    /// Why the most recent [`Self::acquire_frame`] returned `None` (`None` when it
+    /// succeeded). `Outdated` / `Timeout` / a recovered `Lost` deserve an immediate
+    /// retry; `Occluded` should wait for the window to become visible again.
+    pub fn last_acquire_error(&self) -> Option<AcquireError> {
+        self.last_acquire_error
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -192,7 +332,8 @@ impl GpuContext {
 
     /// Acquire the next frame from the swap chain, handling all surface-lost/outdated cases.
     /// Returns `Some((texture, view))` on success, or `None` if the frame should be skipped
-    /// (surface was reconfigured, occluded, or timed out).
+    /// (surface was reconfigured, occluded, or timed out) — the reason is kept in
+    /// [`Self::last_acquire_error`] so the caller can decide whether to retry.
     pub fn acquire_frame(&mut self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
         let texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -201,13 +342,14 @@ impl GpuContext {
                 // Stale configuration (e.g. after a resize); reconfigure and skip
                 // this frame. The next acquire will use the new config.
                 self.surface.configure(&self.device, &self.config);
+                self.last_acquire_error = Some(AcquireError::Outdated);
                 return None;
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 // A genuinely lost surface: reconfigure and retry the acquire
                 // once. Reconfiguring is the best safe recovery available here,
                 // since full surface recreation would require the window handle,
-                // which GpuContext does not retain (DEFERRED — see below).
+                // which GpuContext does not retain.
                 self.surface.configure(&self.device, &self.config);
                 match self.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(t)
@@ -225,14 +367,25 @@ impl GpuContext {
                                  skipping frames (surface recreation not yet supported)"
                             );
                         });
+                        self.last_acquire_error = Some(AcquireError::Lost);
                         return None;
                     }
                 }
             }
-            wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Validation => return None,
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                self.last_acquire_error = Some(AcquireError::Occluded);
+                return None;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.last_acquire_error = Some(AcquireError::Timeout);
+                return None;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                self.last_acquire_error = Some(AcquireError::Validation);
+                return None;
+            }
         };
+        self.last_acquire_error = None;
         let view = texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
         Some((texture, view))
     }

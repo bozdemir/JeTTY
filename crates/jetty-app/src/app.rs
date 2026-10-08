@@ -2311,6 +2311,7 @@ impl App {
         // window. On GPU/window init failure the constructor hands the tab back
         // intact: re-insert it where it came from, restore the active index, and
         // abort the detach — never panic (which would SIGKILL every shell).
+        let gpu_shared = self.gpu.as_ref().map(|g| g.shared());
         let mut dw = match crate::detached::DetachedWindow::new(
             event_loop,
             tab,
@@ -2320,6 +2321,8 @@ impl App {
             self.ui_font_logical,
             &self.font_family,
             &self.ui_font_family,
+            gpu_shared.as_ref(),
+            self.text.as_ref(),
         ) {
             Ok(dw) => dw,
             Err(tab) => {
@@ -5291,7 +5294,13 @@ impl App {
         };
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
-        let gpu = GpuContext::new(window.clone(), size.width, size.height);
+        // Only a new SURFACE on the main window's device (no adapter enumeration or
+        // device creation on the UI thread), and fonts from the already-loaded font
+        // database (no fontconfig rescan) — opening Settings used to stall every
+        // window and the PTY drain for both.
+        let shared = self.gpu.as_ref().map(|g| g.shared());
+        let gpu = GpuContext::new_sharing(shared.as_ref(), window.clone(), size.width, size.height);
+        let fonts = || self.text.as_ref().map_or_else(TextLayer::build_font_system, |t| t.clone_font_system());
         if let Some(ref g) = gpu {
             // The settings panel body text renders at the CAPPED UI size ([13,17])
             // so the absolute-px panel layout never overflows its fixed window,
@@ -5299,8 +5308,8 @@ impl App {
             // set_ui_family (no rescan). The true UI size is used only for the live
             // "Aa" specimen, drawn separately via chrome_text.
             let capped = self.ui_font_logical.clamp(PANEL_TEXT_MIN, PANEL_TEXT_MAX);
-            let mut text = TextLayer::new_with_family(
-                &g.device, &g.queue, g.format, capped * scale, &self.font_family,
+            let mut text = TextLayer::new_with_family_and_fonts(
+                &g.device, &g.queue, g.format, capped * scale, &self.font_family, fonts(),
             );
             let ui_fam = if self.ui_font_family.is_empty() {
                 None
@@ -5310,8 +5319,8 @@ impl App {
             text.set_ui_family(ui_fam);
             // Dedicated TRUE-size specimen layer on the settings device for the
             // live "Aa" preview (the panel body text above is capped).
-            let mut specimen = TextLayer::new_with_family(
-                &g.device, &g.queue, g.format, self.ui_font_logical * scale, &self.font_family,
+            let mut specimen = TextLayer::new_with_family_and_fonts(
+                &g.device, &g.queue, g.format, self.ui_font_logical * scale, &self.font_family, fonts(),
             );
             specimen.set_ui_family(ui_fam);
             let quad = QuadLayer::new(&g.device, g.format);
@@ -6795,10 +6804,11 @@ impl App {
         // Re-allocate the offscreen lazily when stale (same check as main).
         let crt_active = fx.crt_enabled;
         if crt_active
-            && (dw.offscreen.0.width() != dw.gpu.config.width
-                || dw.offscreen.0.height() != dw.gpu.config.height)
+            && dw.offscreen.as_ref().is_none_or(|(t, _)| {
+                t.width() != dw.gpu.config.width || t.height() != dw.gpu.config.height
+            })
         {
-            dw.offscreen = Self::make_offscreen(&dw.gpu);
+            dw.offscreen = Some(Self::make_offscreen(&dw.gpu));
         }
         let gpu = &mut dw.gpu;
         let text = &mut dw.text;
@@ -6806,7 +6816,7 @@ impl App {
         let quad = &mut dw.quad;
         let corner_mask = &dw.corner_mask;
         let crt = &dw.crt;
-        let offscreen = &dw.offscreen;
+        let offscreen = dw.offscreen.as_ref();
         let image_layer = &mut dw.image_layer;
 
         let Some((frame, view)) = gpu.acquire_frame() else { return };
@@ -6814,7 +6824,10 @@ impl App {
         let height = gpu.config.height;
         // Scene target: the offscreen when CRT is on, else the surface directly
         // (byte-identical to the pre-CRT hot path).
-        let scene_view: &wgpu::TextureView = if crt_active { &offscreen.1 } else { &view };
+        let scene_view: &wgpu::TextureView = match (crt_active, offscreen) {
+            (true, Some((_, off))) => off,
+            _ => &view,
+        };
 
         // The grid sits below the top bar (and above the status strip).
         let grid_top = TABBAR_H;
@@ -6978,12 +6991,12 @@ impl App {
         // CRT post-pass: sample the offscreen scene onto the surface with the
         // same parameters (and free-running clock) as the main window. The CRT
         // uniform carries the corner radius, so corners stay rounded under CRT.
-        if crt_active {
+        if let (true, Some((_, crt_src))) = (crt_active, offscreen) {
             crt.apply(
                 &gpu.device,
                 &gpu.queue,
                 &view,
-                &offscreen.1,
+                crt_src,
                 width,
                 height,
                 &jetty_render::CrtUniform {
@@ -8124,8 +8137,12 @@ impl ApplicationHandler<AppEvent> for App {
         // overflow when the terminal font changes. A UI-font SIZE change resizes it
         // IN-PLACE; a FAMILY change swaps ui_family — neither rebuilds the layer.
         if let Some(ref g) = gpu {
-            let mut chrome = TextLayer::new_with_family(
-                &g.device, &g.queue, g.format, self.ui_font_logical * scale, &self.font_family,
+            // Built from the grid layer's already-loaded font database: a second
+            // fontconfig scan here cost ~15–20ms on the main thread at EVERY cold
+            // start, undoing the worker-thread overlap above.
+            let fonts = text.as_ref().map_or_else(TextLayer::build_font_system, |t| t.clone_font_system());
+            let mut chrome = TextLayer::new_with_family_and_fonts(
+                &g.device, &g.queue, g.format, self.ui_font_logical * scale, &self.font_family, fonts,
             );
             // Populate the UI-font picker list: a synthetic "System Sans (default)"
             // row (→ "") first, then the installed proportional families.

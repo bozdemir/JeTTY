@@ -19,7 +19,7 @@ mod caret_fx;
 mod search_bar;
 mod hints;
 mod palette;
-pub use gpu::GpuContext;
+pub use gpu::{AcquireError, GpuContext, GpuShared};
 pub use text::{GridPaint, TextLayer};
 pub use colors::{
     contrast_ratio, cursor_text_color, relative_luminance, selection_bg, selection_paint, SelectionPaint,
