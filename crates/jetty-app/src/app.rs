@@ -4680,6 +4680,8 @@ impl App {
         for dw in &mut self.detached {
             dw.sync_os_title();
         }
+        // A command running right now may not be nameable yet.
+        self.arm_title_recheck();
     }
 
     /// Smart titles: schedule ONE timed re-check when a tab (main or
@@ -4744,7 +4746,7 @@ impl App {
     /// The tab bar's hit geometry for the main window (no labels measured):
     /// the rects the drawn bar has, with the "×" visibility of a pointer at
     /// `(cx, cy)` (the clicked/hovered tab shows its "×" in every mode).
-    fn main_bar_hit_geometry(&mut self, w: u32, bar_y: f32, cx: f32, cy: f32) -> jetty_render::TabBar {
+    fn main_bar_hit_geometry(&self, w: u32, bar_y: f32, cx: f32, cy: f32) -> jetty_render::TabBar {
         let hover = self.main_tab_at(w, bar_y, cx, cy);
         let mut bar = self.main_bar_geometry(w, hover);
         if bar_y != 0.0 {
@@ -9509,12 +9511,6 @@ impl App {
                 let _ = chrome_text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &pal.labels);
             }
         }
-        // Final pass: round the window corners — the SAME mask pass the main
-        // window runs, at the SAME configured radius. A detached window is a
-        // free-floating window, so ALL FOUR corners round (the main window's
-        // Dropdown top-square nuance never applies here). Skipped while CRT is
-        // active: the CRT pass owns the rounded corners then (exactly like the
-        // main window's mask/CRT interplay).
         // Window border / focus ring, before the mask (as in the main window).
         if let (Some(ring), Some(c)) = (focus_ring, ring_color) {
             let (r_tl, r_tr, r_bl, r_br) = crate::detached::corner_radii(corner_radius_px);
@@ -9529,6 +9525,12 @@ impl App {
                 [c[0], c[1], c[2], 255],
             );
         }
+        // Final pass: round the window corners — the SAME mask pass the main
+        // window runs, at the SAME configured radius. A detached window is a
+        // free-floating window, so ALL FOUR corners round (the main window's
+        // Dropdown top-square nuance never applies here). Skipped while CRT is
+        // active: the CRT pass owns the rounded corners then (exactly like the
+        // main window's mask/CRT interplay).
         if !crt_active {
             let (r_tl, r_tr, r_bl, r_br) = crate::detached::corner_radii(corner_radius_px);
             corner_mask.apply(
@@ -10870,6 +10872,9 @@ impl ApplicationHandler<AppEvent> for App {
         // main window, using the same surface format as the rest of the pipeline.
         if let Some(ref g) = gpu {
             self.corner_mask = Some(jetty_render::CornerMask::new(&g.device, g.format));
+            // The focus ring is device-scoped and lazy: never one from an older
+            // device (rebuilt on the first frame that draws a ring).
+            self.focus_ring = None;
             // Build the Bayer crystallize reveal (final fullscreen pass) and arm
             // the first-open summon so the frame materializes out of the dither
             // lattice the instant the window appears.
