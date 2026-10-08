@@ -468,13 +468,69 @@ const INHERITED_ENV_DENYLIST: &[&str] = &[
     "LINES",
 ];
 
-/// The path a shell should use to re-invoke JeTTY (`$JETTY_BIN`). Under an
-/// AppImage `current_exe()` is the transient `/tmp/.mount_*` path that vanishes
-/// with the app, so the stable `$APPIMAGE` file wins when set.
+/// The path a shell should use to re-invoke JeTTY (`$JETTY_BIN`).
 fn jetty_bin_path() -> Option<std::ffi::OsString> {
-    std::env::var_os("APPIMAGE")
-        .filter(|p| !p.is_empty())
-        .or_else(|| std::env::current_exe().ok().map(std::path::PathBuf::into_os_string))
+    self_exe().map(|s| s.path.into_os_string())
+}
+
+/// How to run THIS JeTTY again from outside it (a shell's `$JETTY_BIN`, the
+/// login item): its executable — or, when it runs from an AppImage, the
+/// AppImage FILE (`current_exe()` is then a transient `/tmp/.mount_*` path that
+/// vanishes with the app).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelfExe {
+    pub path: std::path::PathBuf,
+    /// `path` is an AppImage file.
+    pub appimage: bool,
+}
+
+/// [`SelfExe`] for the running process.
+pub fn self_exe() -> Option<SelfExe> {
+    self_exe_from(
+        std::env::var_os("APPIMAGE"),
+        std::env::var_os("APPDIR"),
+        std::env::current_exe().ok(),
+        &std::env::temp_dir(),
+    )
+}
+
+/// [`self_exe`] from its inputs. `$APPIMAGE` is INHERITED by everything an
+/// AppImage app starts: JeTTY launched from Cursor's (or any AppImage's)
+/// terminal sees Cursor's — and would hand it out as `$JETTY_BIN`, so the
+/// integration line ran Cursor on every shell start, and the login item could
+/// launch it. So it is trusted only when THIS executable runs from inside an
+/// AppImage: under `$APPDIR` (set by the same runtime) or under a `.mount_*`
+/// dir of the temp dir. `current_exe()` loses a trailing ` (deleted)` (Linux
+/// reports one after an in-place upgrade replaced the binary).
+pub(crate) fn self_exe_from(
+    appimage: Option<std::ffi::OsString>,
+    appdir: Option<std::ffi::OsString>,
+    exe: Option<std::path::PathBuf>,
+    tmp: &std::path::Path,
+) -> Option<SelfExe> {
+    let exe = exe.map(strip_deleted);
+    let non_empty = |v: Option<std::ffi::OsString>| v.filter(|v| !v.is_empty());
+    if let (Some(image), Some(exe)) = (non_empty(appimage), exe.as_deref()) {
+        let in_appdir = non_empty(appdir).is_some_and(|d| exe.starts_with(d));
+        let in_mount = exe.ancestors().any(|a| {
+            a.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".mount_"))
+                && a.parent().is_some_and(|p| p == tmp || p == std::path::Path::new("/tmp"))
+        });
+        if in_appdir || in_mount {
+            return Some(SelfExe { path: image.into(), appimage: true });
+        }
+    }
+    exe.map(|path| SelfExe { path, appimage: false })
+}
+
+/// `path` without the ` (deleted)` Linux appends to `/proc/self/exe` once the
+/// running binary's file was replaced (an in-place upgrade): the NEW file is
+/// what a relaunch wants.
+fn strip_deleted(path: std::path::PathBuf) -> std::path::PathBuf {
+    match path.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
+        Some(live) => std::path::PathBuf::from(live),
+        None => path,
+    }
 }
 
 /// Whether `path` is an executable file (macOS login-shell pre-check: the
@@ -976,6 +1032,57 @@ impl PtySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appimage_is_trusted_only_from_inside_the_appimage() {
+        use std::path::{Path, PathBuf};
+        let tmp = Path::new("/var/tmp-x");
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        let exe = |s: &str| Some(PathBuf::from(s));
+        let img = |s: &str| Some(SelfExe { path: PathBuf::from(s), appimage: true });
+        let bin = |s: &str| Some(SelfExe { path: PathBuf::from(s), appimage: false });
+        // Our own AppImage: the stable file, not the transient mount.
+        let mount = "/tmp/.mount_JeTTYab12/usr/bin/jetty";
+        assert_eq!(
+            self_exe_from(os("/home/u/JeTTY.AppImage"), os("/tmp/.mount_JeTTYab12"), exe(mount), tmp),
+            img("/home/u/JeTTY.AppImage")
+        );
+        // …also without $APPDIR, by the mount dir (under /tmp or $TMPDIR).
+        assert_eq!(self_exe_from(os("/a/J.AppImage"), None, exe(mount), tmp), img("/a/J.AppImage"));
+        let in_tmpdir = "/var/tmp-x/.mount_J1/usr/bin/jetty";
+        assert_eq!(self_exe_from(os("/a/J.AppImage"), None, exe(in_tmpdir), tmp), img("/a/J.AppImage"));
+        // Extracted and run (`--appimage-extract-and-run`): under $APPDIR.
+        let extracted = "/tmp/appimage_extracted_9/usr/bin/jetty";
+        assert_eq!(
+            self_exe_from(os("/a/J.AppImage"), os("/tmp/appimage_extracted_9"), exe(extracted), tmp),
+            img("/a/J.AppImage")
+        );
+        // Started from ANOTHER AppImage's terminal (Cursor): its variables are
+        // inherited, but this executable is not inside it.
+        assert_eq!(
+            self_exe_from(
+                os("/home/u/Apps/Cursor.AppImage"),
+                os("/tmp/.mount_CursorXY"),
+                exe("/usr/bin/jetty"),
+                tmp
+            ),
+            bin("/usr/bin/jetty")
+        );
+        // A `.mount_` dir that is not the temp dir's does not count.
+        assert_eq!(
+            self_exe_from(os("/a/C.AppImage"), None, exe("/home/u/.mount_x/jetty"), tmp),
+            bin("/home/u/.mount_x/jetty")
+        );
+        // No (or empty) $APPIMAGE.
+        assert_eq!(self_exe_from(None, None, exe("/usr/bin/jetty"), tmp), bin("/usr/bin/jetty"));
+        assert_eq!(self_exe_from(os(""), os(""), exe("/usr/bin/jetty"), tmp), bin("/usr/bin/jetty"));
+        assert_eq!(self_exe_from(os("/a/J.AppImage"), None, None, tmp), None);
+        // An in-place upgrade replaced the running binary.
+        assert_eq!(
+            self_exe_from(None, None, exe("/home/u/.cargo/bin/jetty (deleted)"), tmp),
+            bin("/home/u/.cargo/bin/jetty")
+        );
+    }
 
     fn mk_writer(tx: Sender<Vec<u8>>) -> ChannelWriter {
         ChannelWriter { tx, queued: Arc::new(AtomicUsize::new(0)) }

@@ -77,9 +77,13 @@ pub struct Config {
     #[serde(default = "default_focus_autohide")]
     pub focus_autohide: bool,
     /// Launch JeTTY at login via the freedesktop XDG autostart standard (a
-    /// `.desktop` file under `~/.config/autostart/`). Default OFF. The autostart
-    /// file's existence is the source of truth at runtime; this stored bool is a
-    /// mirror.
+    /// `.desktop` file under `~/.config/autostart/`; a LaunchAgent on macOS).
+    /// Default OFF. `true` writes the entry (at startup too); the toggle, or an
+    /// EDIT of the key while JeTTY runs, writes or removes it. Startup never
+    /// removes it: without the key, with a config that failed to load, or with a
+    /// `false` (maybe a stale one — older saves wrote every key) the app mirrors
+    /// the entry instead. With `JETTY_CONFIG_DIR` set the real login item is not
+    /// touched.
     #[serde(default = "default_launch_at_login")]
     pub launch_at_login: bool,
     /// Global summon hotkey, e.g. "F9" (default), "F12", or "Ctrl+Shift+F12".
@@ -169,10 +173,18 @@ pub struct Config {
     pub macos_option_as_alt: crate::input::OptionAsAlt,
     /// Where a finished mouse selection is copied: `"primary"` (default — the
     /// X11/Wayland select-to-copy convention; a middle click pastes it and the
-    /// clipboard is left alone), `"clipboard"`, `"both"` or `"off"`. macOS and
-    /// Windows have no primary selection: there `"primary"` means the clipboard.
+    /// clipboard is left alone), `"clipboard"` (a middle click in JeTTY then
+    /// pastes the clipboard too), `"both"` or `"off"`. macOS and Windows have no
+    /// primary selection: there `"primary"` means the clipboard.
     #[serde(default)]
     pub copy_on_select: crate::clipboard::CopyOnSelect,
+    /// The kitty keyboard protocol: a program that asks for it (`CSI > u`) gets
+    /// unambiguous key reports (Ctrl+I ≠ Tab, key releases, …). Default `true`;
+    /// `false` turns it off in every tab, so programs see a terminal without it
+    /// and use legacy keys. Hot-reloadable (a change resets the flags programs
+    /// pushed).
+    #[serde(default = "default_kitty_keyboard")]
+    pub kitty_keyboard: bool,
     /// User keybinding overrides (`[keys]` table). Every action defaults to its
     /// built-in chord when omitted; `""`/`[]` explicitly UNBINDS an action (the
     /// chord reverts to its raw terminal meaning). Backward compatible: an old
@@ -267,6 +279,9 @@ fn default_run_selection() -> bool {
     true
 }
 fn default_hot_reload() -> bool {
+    true
+}
+fn default_kitty_keyboard() -> bool {
     true
 }
 
@@ -483,6 +498,7 @@ impl Default for Config {
             hot_reload: default_hot_reload(),
             macos_option_as_alt: crate::input::OptionAsAlt::default(),
             copy_on_select: crate::clipboard::CopyOnSelect::default(),
+            kitty_keyboard: default_kitty_keyboard(),
             keys: KeyBindings::default(),
         }
     }
@@ -497,6 +513,11 @@ pub struct Loaded {
     /// Hash of the bytes read (`None` when there was no file): the persister's
     /// baseline for telling its own writes from external edits.
     pub hash: Option<u64>,
+    /// `launch_at_login` as the file itself sets it — `None` when there is no
+    /// file, it could not be read or parsed, or the key is missing or invalid:
+    /// the loaded value is then only a default, which must never decide to
+    /// delete the user's login item.
+    pub launch_at_login: Option<bool>,
 }
 
 impl Config {
@@ -506,6 +527,13 @@ impl Config {
     /// Application Support/jetty` on macOS), falling back to `~/.config/jetty` when
     /// the OS dir is unknown. It holds `config.toml` and `themes/`; the hot-reload
     /// watcher and the theme loader both key off it.
+    /// Whether `$JETTY_CONFIG_DIR` points JeTTY at an alternate config tree (a
+    /// setup being tried out): what belongs to the user's REAL session — the
+    /// login item — is then left alone.
+    pub(crate) fn dir_overridden() -> bool {
+        std::env::var_os("JETTY_CONFIG_DIR").is_some_and(|d| !d.is_empty())
+    }
+
     pub(crate) fn dir() -> PathBuf {
         if let Some(d) = std::env::var_os("JETTY_CONFIG_DIR").filter(|d| !d.is_empty()) {
             return PathBuf::from(d);
@@ -541,7 +569,26 @@ impl Config {
         let s = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Loaded { cfg: Config::default(), warnings: Vec::new(), hash: None };
+                // A dangling symlink (a dotfiles repo not checked out yet) is not
+                // "no config": say so — a save writes the link's target, if its
+                // folder exists (JeTTY never creates folders in a dotfiles tree).
+                let warnings = symlink_target(path)
+                    .map(|target| {
+                        let then = if target.parent().is_some_and(Path::is_dir) {
+                            "a settings change creates it there"
+                        } else {
+                            "its folder does not exist either: settings changes are not saved \
+                             until it does"
+                        };
+                        format!(
+                            "config.toml links to {}, which does not exist — using the default \
+                             settings ({then})",
+                            target.display()
+                        )
+                    })
+                    .into_iter()
+                    .collect();
+                return Loaded { cfg: Config::default(), warnings, hash: None, launch_at_login: None };
             }
             Err(e) => {
                 return Loaded {
@@ -551,12 +598,15 @@ impl Config {
                         path.display()
                     )],
                     hash: None,
+                    launch_at_login: None,
                 };
             }
         };
         let hash = Some(hash_str(&s));
         match Self::parse_with_base(&s, &Config::default(), "using the default") {
-            Ok((cfg, warnings)) => Loaded { cfg, warnings, hash },
+            Ok((cfg, warnings)) => {
+                Loaded { cfg, warnings, hash, launch_at_login: explicit_launch_at_login(&s) }
+            }
             Err(syntax) => {
                 let copy = match preserve_copy(path, "bad") {
                     Ok(p) => format!("a copy is at {}", p.display()),
@@ -570,6 +620,7 @@ impl Config {
                          saved until it is fixed"
                     )],
                     hash,
+                    launch_at_login: None,
                 }
             }
         }
@@ -603,7 +654,8 @@ impl Config {
     /// The slow path of [`Config::parse_with_base`]: probe every leaf of `user` on
     /// its own (against the defaults, so a failure can only be that leaf's), swap
     /// each invalid one for `base`'s value (or drop it when `base` has none), then
-    /// deserialize the repaired table.
+    /// deserialize the repaired table — or, should that still fail, re-validate it
+    /// section by section ([`Config::revalidate_sections`]).
     fn fallback_per_key(
         user: &toml::Table,
         base: &Config,
@@ -633,10 +685,51 @@ impl Config {
                 invalid.push(path);
             }
         }
-        match toml::Value::Table(doc).try_into::<Config>() {
+        match toml::Value::Table(doc.clone()).try_into::<Config>() {
             Ok(cfg) => cfg,
-            // Unreachable for this struct (fields are independent), but a wholly
-            // unusable table must still never panic or apply garbage.
+            // No single leaf explains the failure (should not happen — fields are
+            // independent): never reset the whole file for it.
+            Err(_) => Self::revalidate_sections(&doc, base, fallback, warnings, invalid),
+        }
+    }
+
+    /// The last resort when a document fails as a whole: keep each top-level
+    /// entry (a key, or a whole section like `[keys]`) that is valid on its own
+    /// against the defaults, replace each one that is not with `base`'s (or drop
+    /// it), and report it — so one broken section never takes the rest along.
+    pub(crate) fn revalidate_sections(
+        doc: &toml::Table,
+        base: &Config,
+        fallback: &str,
+        warnings: &mut Vec<String>,
+        invalid: &mut Vec<Vec<String>>,
+    ) -> Config {
+        let defaults = to_table(&Config::default());
+        let base_t = to_table(base);
+        let mut kept = toml::Table::new();
+        for (k, v) in doc {
+            let mut probe = defaults.clone();
+            probe.insert(k.clone(), v.clone());
+            match toml::Value::Table(probe).try_into::<Config>() {
+                Ok(_) => {
+                    kept.insert(k.clone(), v.clone());
+                }
+                Err(e) => {
+                    warnings.push(format!(
+                        "`{k}` could not be applied ({}) — {fallback}",
+                        friendly_expected(e.message())
+                    ));
+                    if let Some(b) = base_t.get(k) {
+                        kept.insert(k.clone(), b.clone());
+                    }
+                    invalid.push(vec![k.clone()]);
+                }
+            }
+        }
+        match toml::Value::Table(kept).try_into::<Config>() {
+            Ok(cfg) => cfg,
+            // Every entry is valid alone yet not together: still never panic or
+            // apply garbage.
             Err(e) => {
                 warnings.push(format!(
                     "config.toml could not be applied ({}) — {fallback}",
@@ -681,6 +774,42 @@ impl Config {
 }
 
 // ── Per-key parsing helpers ──────────────────────────────────────────────────
+
+/// Where `path` finally points when it is a symlink — a chain is followed (at
+/// most 40 links; a relative target resolves against its link's directory) —
+/// WITHOUT requiring the target to exist, unlike `canonicalize`. `None` when
+/// `path` is not a symlink (or the chain loops).
+pub(crate) fn symlink_target(path: &Path) -> Option<PathBuf> {
+    let mut cur = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let next = std::fs::read_link(&cur).ok()?;
+                cur = match cur.parent() {
+                    Some(dir) if next.is_relative() => dir.join(next),
+                    _ => next,
+                };
+            }
+            _ => return (cur != path).then_some(cur),
+        }
+    }
+    None
+}
+
+/// The file a write to `path` must land in: the end of its symlink chain —
+/// canonical when it exists, else the dangling target — or `path` itself.
+pub(crate) fn real_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .ok()
+        .or_else(|| symlink_target(path))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// `launch_at_login` as config text `s` itself sets it: `None` when the text is
+/// not TOML or the key is missing or not a bool (see [`Loaded::launch_at_login`]).
+pub(crate) fn explicit_launch_at_login(s: &str) -> Option<bool> {
+    toml::from_str::<toml::Table>(s).ok()?.get("launch_at_login")?.as_bool()
+}
 
 /// Hash config-file text to a `u64` (self-write guard for hot-reload). Content-
 /// based and dependency-free; only equality matters, so the exact algorithm is
@@ -736,9 +865,13 @@ fn remove_path(t: &mut toml::Table, path: &[String]) {
     cur.remove(last);
 }
 
-/// Every leaf of `user` with its path. A table is descended into only where the
-/// defaults expect a table there (or have nothing — e.g. the `[keys]` overrides);
-/// a table standing where a scalar belongs is itself one (invalid) leaf.
+/// Every leaf of `user` with its path. A table is descended into where the
+/// defaults expect a table there, or have nothing at all but its PARENT exists
+/// (a top-level section such as `[keys]`, whose overrides have no defaults; an
+/// unknown key inside a known section). Anywhere else a table stands where one
+/// value belongs and is itself ONE (invalid) leaf — `[keys.copy]`,
+/// `copy = { key = "C" }`: split into its own leaves, removing them one by one
+/// left an empty `keys.copy = {}` behind that failed the whole document.
 fn collect_leaves(
     user: &toml::Table,
     defaults: &toml::Table,
@@ -747,11 +880,12 @@ fn collect_leaves(
 ) {
     for (k, v) in user {
         prefix.push(k.clone());
-        let default_here = get_path(defaults, prefix);
+        let descend = match get_path(defaults, prefix) {
+            Some(d) => d.is_table(),
+            None => prefix.len() == 1 || get_path(defaults, &prefix[..prefix.len() - 1]).is_some(),
+        };
         match v {
-            toml::Value::Table(sub) if default_here.is_none_or(|d| d.is_table()) => {
-                collect_leaves(sub, defaults, prefix, out);
-            }
+            toml::Value::Table(sub) if descend => collect_leaves(sub, defaults, prefix, out),
             _ => out.push((prefix.clone(), v.clone())),
         }
         prefix.pop();
@@ -1013,6 +1147,12 @@ struct SyncShared {
     known: Option<u64>,
     /// Hash of JeTTY's own last write: its watcher echo is skipped on reload.
     self_written: Option<u64>,
+    /// A write merged an EXTERNAL edit the app has not applied yet. Until a reload
+    /// applies the file (`note_reloaded`), no write counts as purely our own —
+    /// or a second settings change before that reload would mark the merged file
+    /// as a self-write and the edit would never be applied (file says dracula,
+    /// app shows nord).
+    external_pending: bool,
     /// Writes handed to the writer thread and not finished yet.
     inflight: usize,
 }
@@ -1135,13 +1275,26 @@ impl Persister {
         lock(&self.shared).self_written == Some(hash)
     }
 
-    /// A hot-reload applied `cfg`, read from bytes hashing to `hash`.
+    /// The settings the file holds, AS THE APP HOLDS THEM — clamped, normalized,
+    /// a missing font remembered by its chosen name — become the baseline. A
+    /// later save then writes only what the user changes: never a clamped
+    /// `opacity`, a normalized `window_mode` or a fallback font over keys they
+    /// never touched. Startup only (nothing is pending yet).
+    pub(crate) fn rebase(&mut self, synced: Config) {
+        debug_assert!(self.pending.is_empty(), "rebase with unsaved changes");
+        self.synced = synced;
+    }
+
+    /// A hot-reload applied the file (read from bytes hashing to `hash`); `cfg`
+    /// is what the app now holds of it (the baseline, as in [`Persister::rebase`]).
     pub(crate) fn note_reloaded(&mut self, cfg: Config, hash: u64) {
         self.synced = cfg;
         let mut s = lock(&self.shared);
         s.known = Some(hash);
         // An identical later re-save of the same content is then a no-op too.
         s.self_written = Some(hash);
+        // Whatever external edit our writes merged is applied now.
+        s.external_pending = false;
     }
 
     /// A reload saw bytes hashing to `hash` but couldn't apply them (syntax error).
@@ -1205,12 +1358,81 @@ fn write_changes(
     full: &Config,
     shared: &Mutex<SyncShared>,
 ) -> Result<(), String> {
-    let before = match std::fs::read_to_string(path) {
-        Ok(s) => Some(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("could not read {} to save settings: {e}", path.display())),
-    };
-    let new_text = match &before {
+    write_changes_racing(path, changes, full, shared, &mut || {})
+}
+
+/// How many times a save re-merges because an editor saved `config.toml` while
+/// it was being written, before giving up (with a notice).
+const SAVE_ATTEMPTS: usize = 5;
+
+/// [`write_changes`], with `race` run between reading the file and committing
+/// the rewrite — a test hook standing in for an editor saving right then. The
+/// file is re-checked just before the rename: if it changed since it was read,
+/// the merge is redone on top of the new content, so the editor's save is never
+/// overwritten (what remains is the instant between that check and the rename).
+fn write_changes_racing(
+    path: &Path,
+    changes: &[Change],
+    full: &Config,
+    shared: &Mutex<SyncShared>,
+    race: &mut dyn FnMut(),
+) -> Result<(), String> {
+    for _ in 0..SAVE_ATTEMPTS {
+        let before = read_config_text(path)?;
+        let new_text = merged_text(before.as_deref(), changes, full)?;
+        if before.as_deref() == Some(new_text.as_str()) {
+            return Ok(()); // nothing to change on disk
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("could not create config dir {}: {e}", dir.display()))?;
+        }
+        // Through a dangling symlink the file is created at the link's target —
+        // but never a folder for it (that could be a dotfiles checkout to come).
+        if let Some(target) = symlink_target(path) {
+            if !target.parent().is_some_and(Path::is_dir) {
+                return Err(format!(
+                    "config.toml links to {}, whose folder does not exist — settings changes \
+                     are not saved until it does",
+                    target.display()
+                ));
+            }
+        }
+        race();
+        let committed = write_atomic_checked(path, new_text.as_bytes(), || {
+            read_config_text(path).ok().as_ref() == Some(&before)
+        })
+        .map_err(|e| format!("could not save settings to {}: {e}", path.display()))?;
+        if committed {
+            let h = hash_str(&new_text);
+            let mut s = lock(shared);
+            if s.known != before.as_deref().map(hash_str) {
+                s.external_pending = true;
+            }
+            s.self_written = if s.external_pending { None } else { Some(h) };
+            s.known = Some(h);
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "config.toml kept changing while settings were saved ({SAVE_ATTEMPTS} tries) — the \
+         change was not saved"
+    ))
+}
+
+/// The config text at `path` (`None` = no file).
+fn read_config_text(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("could not read {} to save settings: {e}", path.display())),
+    }
+}
+
+/// `before` (the file's text, `None` = no file) with `changes` applied in place
+/// — or, without a file, every setting of `full`.
+fn merged_text(before: Option<&str>, changes: &[Change], full: &Config) -> Result<String, String> {
+    Ok(match before {
         // No file yet: write every setting, so the file documents them all.
         None => toml::to_string_pretty(full).map_err(|e| format!("could not serialize settings: {e}"))?,
         Some(text) => {
@@ -1229,23 +1451,7 @@ fn write_changes(
             }
             doc.to_string()
         }
-    };
-    if before.as_deref() == Some(new_text.as_str()) {
-        return Ok(()); // nothing to change on disk
-    }
-    let h = hash_str(&new_text);
-    {
-        let mut s = lock(shared);
-        let external = s.known != before.as_deref().map(hash_str);
-        s.self_written = if external { None } else { Some(h) };
-        s.known = Some(h);
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("could not create config dir {}: {e}", dir.display()))?;
-    }
-    write_atomic(path, new_text.as_bytes())
-        .map_err(|e| format!("could not save settings to {}: {e}", path.display()))
+    })
 }
 
 /// Write `data` to `path` atomically: write + fsync a temp file in the SAME
@@ -1256,17 +1462,26 @@ fn write_changes(
 /// defaults, losing every setting. The temp name is PID-suffixed so two
 /// processes never share one temp file; rename is atomic on POSIX, so readers
 /// always see either the old or the new complete file.
-fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+///
+/// The rename happens only if `unchanged()` still holds right before it (after
+/// the slow write + fsync of the temp file): `Ok(false)` — temp removed, `path`
+/// untouched — when it does not.
+fn write_atomic_checked(
+    path: &std::path::Path,
+    data: &[u8],
+    unchanged: impl Fn() -> bool,
+) -> std::io::Result<bool> {
     use std::io::Write as _;
     // If `path` is a symlink (common dotfiles setup: ~/.config/jetty/config.toml
     // → ~/dotfiles/jetty/config.toml), resolve it and atomic-rename over the
     // TARGET, not the link. A rename onto the link path replaces the symlink
     // itself with a plain file, silently detaching the dotfiles repo — every
     // later setting change stops reaching it and the next `stow`/`chezmoi` sync
-    // reverts them (F33). canonicalize errs when the path doesn't exist yet
-    // (first save) — then we keep the original path and create it normally.
-    let path: std::path::PathBuf =
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // reverts them (F33). A DANGLING link (the target not created yet) is written
+    // through too — `canonicalize` fails there, and falling back to the link
+    // path used to replace the link on the first save. Only a path that is no
+    // link at all is created as itself.
+    let path = real_path(path);
     let path = path.as_path();
     let dir = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent dir")
@@ -1276,7 +1491,7 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("config.toml");
     let tmp = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
+    let result = (|| -> std::io::Result<bool> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;
         // Flush file contents to disk BEFORE the rename so a crash/power loss
@@ -1292,6 +1507,9 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
                 std::fs::Permissions::from_mode(meta.permissions().mode()),
             );
         }
+        if !unchanged() {
+            return Ok(false);
+        }
         std::fs::rename(&tmp, path)?;
         // fsync the parent directory so the rename (the directory-entry update)
         // is itself durable: without it, a power loss just after rename() can
@@ -1300,10 +1518,10 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         if let Ok(dir_file) = std::fs::File::open(dir) {
             let _ = dir_file.sync_all();
         }
-        Ok(())
+        Ok(true)
     })();
-    if result.is_err() {
-        // Best-effort cleanup of the temp file on any failure.
+    if !matches!(result, Ok(true)) {
+        // Best-effort cleanup of the temp file on a failure or a refused commit.
         let _ = std::fs::remove_file(&tmp);
     }
     result
@@ -1312,6 +1530,11 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`write_atomic_checked`] without a precondition.
+    fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+        write_atomic_checked(path, data, || true).map(|_| ())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1342,6 +1565,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_config_symlink_warns_and_saves_through_the_link() {
+        // A dotfiles link whose target is not there yet: loading said nothing,
+        // and the first settings change REPLACED the link with a plain file.
+        use std::os::unix::fs::symlink;
+        let base = tmp_dir("dangling");
+        let dotfiles = base.join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("jetty.toml");
+        let link = base.join("config.toml");
+        symlink(&target, &link).unwrap();
+        let loaded = Config::load_from(&link);
+        assert_eq!(loaded.cfg, Config::default());
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        assert!(loaded.warnings[0].contains("jetty.toml"), "{:?}", loaded.warnings);
+        let (mut p, mut cfg, _) = persister_for(&link);
+        cfg.theme = "nord".to_string();
+        p.record(&cfg, Instant::now());
+        assert!(p.flush_and_wait(Duration::from_secs(5)));
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "still a link");
+        assert_eq!(Config::load_from(&link).cfg.theme, "nord", "written through it");
+        assert!(std::fs::read_to_string(&target).unwrap().contains("theme = \"nord\""));
+        // A link into a folder that does not exist (yet): said so, and a save
+        // fails visibly instead of creating folders in someone's dotfiles tree.
+        let nowhere = base.join("not-cloned").join("jetty.toml");
+        let link2 = base.join("other").join("config.toml");
+        std::fs::create_dir_all(link2.parent().unwrap()).unwrap();
+        symlink(&nowhere, &link2).unwrap();
+        let loaded = Config::load_from(&link2);
+        assert!(loaded.warnings[0].contains("not saved until it does"), "{:?}", loaded.warnings);
+        let (mut p, mut cfg, notices) = persister_for(&link2);
+        cfg.theme = "nord".to_string();
+        p.record(&cfg, Instant::now());
+        assert!(p.flush_and_wait(Duration::from_secs(5)));
+        let n = notices.lock().unwrap().clone();
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert!(n[0].contains("folder does not exist"), "{n:?}");
+        assert!(!base.join("not-cloned").exists(), "no folder created");
+        assert!(std::fs::symlink_metadata(&link2).unwrap().file_type().is_symlink());
+        // A relative link (as stow makes them) too.
+        let rel = base.join("rel.toml");
+        symlink("dotfiles/rel-target.toml", &rel).unwrap();
+        write_atomic(&rel, b"x = 1\n").unwrap();
+        assert!(std::fs::symlink_metadata(&rel).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(dotfiles.join("rel-target.toml")).unwrap(), "x = 1\n");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn default_has_sensible_values() {
         let c = Config::default();
@@ -1366,6 +1638,9 @@ mod tests {
         assert!(c.show_perf_hud);
         assert!(!c.osc52_allow_paste, "osc52 paste is off by default (secure)");
         assert!(c.hot_reload, "hot reload is on by default");
+        assert!(c.kitty_keyboard, "the kitty keyboard protocol is on by default");
+        let off: Config = toml::from_str("kitty_keyboard = false").unwrap();
+        assert!(!off.kitty_keyboard);
     }
 
     #[test]
@@ -1456,6 +1731,7 @@ mod tests {
             hot_reload: false,
             macos_option_as_alt: crate::input::OptionAsAlt::Left,
             copy_on_select: crate::clipboard::CopyOnSelect::Both,
+            kitty_keyboard: false,
             keys: KeyBindings::default(),
         };
         let s = toml::to_string_pretty(&c).expect("serialize");
@@ -1498,6 +1774,7 @@ mod tests {
             hot_reload: true,
             macos_option_as_alt: crate::input::OptionAsAlt::None,
             copy_on_select: crate::clipboard::CopyOnSelect::Primary,
+            kitty_keyboard: true,
             keys: KeyBindings::default(),
         };
         std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
@@ -1821,6 +2098,87 @@ copy = "Ctrl+Shift+Y"
     }
 
     #[test]
+    fn a_table_under_keys_is_one_bad_binding_not_a_config_reset() {
+        // `[keys]` has no defaults to compare against, and each of these used to
+        // be split into leaves that were removed one by one — leaving an EMPTY
+        // `keys.copy = {}` behind that failed the whole document, so EVERY setting
+        // fell back (at startup: a full reset to defaults).
+        for (src, key) in [
+            ("[keys]\ncopy = { key = \"C\", mods = \"Ctrl+Shift\" }\n", "keys.copy"),
+            ("[keys.copy]\nkey = \"C\"\nmods = \"Ctrl+Shift\"\n", "keys.copy"),
+            ("[keys]\nnew_tab = { chord = \"Ctrl+T\" }\npaste = \"Ctrl+V\"\n", "keys.new_tab"),
+            ("[keys]\nselect_tab_1.key = \"Alt+1\"\n", "keys.select_tab_1"),
+        ] {
+            let full = format!("theme = \"nord\"\nfont_size = 13.0\n{src}");
+            let (cfg, w) = Config::parse_with_base(&full, &Config::default(), "using the default")
+                .expect("valid TOML");
+            assert_eq!(cfg.theme, "nord", "{src}: the rest of the file applies");
+            assert_eq!(cfg.font_size, 13.0, "{src}");
+            assert_eq!(w.len(), 1, "{src}: one warning: {w:?}");
+            assert!(w[0].contains(&format!("`{key} = ")), "{src}: {w:?}");
+            assert!(w[0].contains("chord string"), "{src}: {w:?}");
+        }
+        // The valid binding next to a bad one still applies.
+        let (cfg, _) = Config::parse_with_base(
+            "[keys]\nnew_tab = { chord = \"Ctrl+T\" }\npaste = \"Ctrl+V\"\n",
+            &Config::default(),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(cfg.keys.paste, Some(ChordSpec::One("Ctrl+V".to_string())));
+        assert_eq!(cfg.keys.new_tab, None);
+        // On a hot-reload the bad binding keeps its live value.
+        let live = Config {
+            keys: KeyBindings { copy: Some(ChordSpec::One("Ctrl+Y".to_string())), ..KeyBindings::default() },
+            ..Config::default()
+        };
+        let (cfg, _) =
+            Config::parse_with_base("theme = \"nord\"\n[keys.copy]\nkey = \"C\"\n", &live, "keeping").unwrap();
+        assert_eq!(cfg.theme, "nord");
+        assert_eq!(cfg.keys.copy, Some(ChordSpec::One("Ctrl+Y".to_string())));
+    }
+
+    #[test]
+    fn dotted_unknown_keys_under_keys_are_reported_not_fatal() {
+        // `select_tab.1 = …` (a guess at `select_tab_1`) is a TABLE named
+        // `select_tab`: an unknown key, never a reset.
+        let (cfg, w) = Config::parse_with_base(
+            "theme = \"nord\"\n[keys]\nselect_tab.1 = \"Alt+1\"\ncopy = \"Ctrl+Shift+C\"\n",
+            &Config::default(),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(cfg.theme, "nord");
+        assert_eq!(cfg.keys.copy, Some(ChordSpec::One("Ctrl+Shift+C".to_string())));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("keys.select_tab"), "{w:?}");
+    }
+
+    #[test]
+    fn a_failure_no_single_key_explains_falls_back_per_section() {
+        // The last-resort path (the repaired document still fails) keeps every
+        // top-level entry that is valid on its own instead of resetting all of it.
+        let user: toml::Table = toml::from_str("theme = \"nord\"\nopacity = 0.5\n").unwrap();
+        let mut warnings = Vec::new();
+        let mut invalid = Vec::new();
+        let cfg = Config::revalidate_sections(
+            &user,
+            &Config::default(),
+            "using the default",
+            &mut warnings,
+            &mut invalid,
+        );
+        assert_eq!((cfg.theme.as_str(), cfg.opacity), ("nord", 0.5));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let user: toml::Table = toml::from_str("theme = \"nord\"\nopacity = \"x\"\n").unwrap();
+        let cfg = Config::revalidate_sections(&user, &Config::default(), "x", &mut warnings, &mut invalid);
+        assert_eq!(cfg.theme, "nord", "the valid section survives");
+        assert_eq!(cfg.opacity, Config::default().opacity);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(invalid, vec![vec!["opacity".to_string()]]);
+    }
+
+    #[test]
     fn a_table_where_a_value_belongs_is_one_invalid_key() {
         let (cfg, w) =
             Config::parse_with_base("opacity = { a = 1 }\ntheme = \"nord\"\n", &Config::default(), "x")
@@ -1892,6 +2250,26 @@ copy = "Ctrl+Shift+Y"
         let _ = Config::load_from(&link);
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "opacity = = 1\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launch_at_login_is_reported_only_when_the_file_sets_it() {
+        // A default `false` must never be mistaken for "the user turned it off":
+        // the startup sync used to DELETE the login item from it.
+        let dir = tmp_dir("launch-explicit");
+        let path = dir.join("config.toml");
+        assert_eq!(Config::load_from(&path).launch_at_login, None, "no file");
+        for (text, want) in [
+            ("launch_at_login = true\n", Some(true)),
+            ("launch_at_login = false\n", Some(false)),
+            ("theme = \"nord\"\n", None),
+            ("launch_at_login = \"yes\"\n", None),
+            ("launch_at_login = = true\n", None), // not TOML
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(Config::load_from(&path).launch_at_login, want, "{text}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1969,6 +2347,32 @@ caret_glow_enabled = true\n";
     }
 
     #[test]
+    fn a_rebased_baseline_never_writes_values_the_user_did_not_touch() {
+        // The app clamps / normalizes what it loads (opacity 0.05 → 0.1,
+        // "Dropdown" → "dropdown", a missing font → a fallback). With the raw
+        // file as the baseline, the FIRST unrelated settings change wrote all of
+        // those over the user's own text.
+        let dir = tmp_dir("rebase");
+        let path = dir.join("config.toml");
+        let text = "opacity = 0.05\nwindow_mode = \"Dropdown\"\nui_font_family = \"Gone Sans\"\n";
+        std::fs::write(&path, text).unwrap();
+        let (mut p, cfg, _) = persister_for(&path);
+        // What the app holds after applying it.
+        let mut held = cfg.clone();
+        held.opacity = 0.1;
+        held.window_mode = "dropdown".to_string();
+        p.rebase(held.clone());
+        assert!(!p.record(&held, Instant::now()), "nothing the user changed");
+        held.font_size = 18.0;
+        assert!(p.record(&held, Instant::now()));
+        assert!(p.flush_and_wait(Duration::from_secs(5)));
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.starts_with(text), "the user's own lines are untouched: {out}");
+        assert!(out.contains("font_size = 18.0"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn save_keeps_float_text_short_and_value_comments() {
         let dir = tmp_dir("floats");
         let path = dir.join("config.toml");
@@ -1998,6 +2402,82 @@ caret_glow_enabled = true\n";
         assert!(out.contains("font_size = 20.0"), "{out}");
         // NOT marked as our own write, so the hot-reload applies the merged file.
         assert!(!p.is_self_write(hash_str(&out)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_save_before_the_reload_still_leaves_the_external_edit_to_apply() {
+        // The user edits config.toml (theme → dracula); before the hot-reload
+        // runs, TWO settings changes are saved. The first merges the edit and is
+        // rightly not our own — but the second used to read that merged file as
+        // "what we last saw", mark ITS write as our own, and the reload then
+        // skipped it as an echo: the file said dracula, the app showed nord.
+        let dir = tmp_dir("external-pending");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "theme = \"nord\"\nfont_size = 15.0\n").unwrap();
+        let (mut p, mut cfg, _) = persister_for(&path);
+        std::fs::write(&path, "theme = \"dracula\"\nfont_size = 15.0\n").unwrap();
+        for size in [20.0, 21.0] {
+            cfg.font_size = size;
+            p.record(&cfg, Instant::now());
+            assert!(p.flush_and_wait(Duration::from_secs(5)));
+        }
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("dracula") && out.contains("21.0"), "{out}");
+        assert!(!p.is_self_write(hash_str(&out)), "the reload must still apply the edit");
+        // Once a reload applied it, our writes are our own again.
+        let (applied, _) = Config::parse_with_base(&out, &cfg, "x").unwrap();
+        p.note_reloaded(applied.clone(), hash_str(&out));
+        let mut cfg = applied;
+        cfg.font_size = 22.0;
+        p.record(&cfg, Instant::now());
+        assert!(p.flush_and_wait(Duration::from_secs(5)));
+        assert!(p.is_self_write(hash_str(&std::fs::read_to_string(&path).unwrap())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_editor_save_between_read_and_rename_is_merged_not_overwritten() {
+        let dir = tmp_dir("race");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "theme = \"nord\"\nfont_size = 15.0\n").unwrap();
+        let loaded = Config::load_from(&path);
+        let shared = Mutex::new(SyncShared { known: loaded.hash, ..SyncShared::default() });
+        let mut cfg = loaded.cfg.clone();
+        cfg.font_size = 20.0;
+        let changes = diff_configs(&loaded.cfg, &cfg);
+        let mut raced = 0;
+        let mut editor = || {
+            // The editor saves right after JeTTY read the file (first try only).
+            if raced == 0 {
+                std::fs::write(&path, "theme = \"dracula\"\nfont_size = 15.0\nopacity = 0.8\n").unwrap();
+            }
+            raced += 1;
+        };
+        write_changes_racing(&path, &changes, &cfg, &shared, &mut editor).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("theme = \"dracula\""), "the editor's save survives: {out}");
+        assert!(out.contains("opacity = 0.8"), "{out}");
+        assert!(out.contains("font_size = 20.0"), "and the setting is saved: {out}");
+        assert_eq!(raced, 2, "merged again once");
+        assert!(lock(&shared).self_written.is_none(), "the merged edit is left to the reload");
+        // An editor that never stops saving: give up, never clobber.
+        cfg.font_size = 25.0;
+        let changes = diff_configs(&loaded.cfg, &cfg);
+        let mut flip = 0u32;
+        let mut changing = || {
+            flip += 1;
+            std::fs::write(&path, format!("theme = \"edit{flip}\"\n")).unwrap();
+        };
+        let err = write_changes_racing(&path, &changes, &cfg, &shared, &mut changing).unwrap_err();
+        assert!(err.contains("kept changing"), "{err}");
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with("theme = \"edit"), "untouched");
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftovers, 0, "no temp file left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -195,7 +195,7 @@ fn unenterable_inherited_cwd_falls_back_with_a_notice() {
     assert!(!inner.chars().any(char::is_control), "control bytes in the shown notice: {inner:?}");
     let mut term = jetty_core::Terminal::new(200, 4);
     term.feed_notice(notice);
-    assert_eq!(term.take_clipboard_store(), None);
+    assert!(term.take_clipboard_stores().is_empty());
     assert_eq!(term.take_title_update(), None);
     assert!(term.drain_pty_writes().is_empty(), "a query in the name was answered");
 }

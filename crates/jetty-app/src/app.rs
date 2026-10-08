@@ -824,6 +824,10 @@ pub struct App {
     /// 100..=100_000, default 10_000). Applied live to every tab (main +
     /// detached) when changed via the Settings cycler.
     scrollback_lines: usize,
+    /// `launch_at_login` as config.toml said it when last read (`None` = not set):
+    /// a hot-reload changes the login item only when the file's value CHANGED —
+    /// an edit — never for a stale value the app mirrors differently.
+    launch_at_login_in_file: Option<bool>,
     /// Launch JeTTY at login (config `launch_at_login` — the source of truth: the
     /// XDG autostart entry / macOS LaunchAgent is (re)written or removed to match
     /// at startup, on a hot-reload, and when toggled in Settings or the palette).
@@ -1053,6 +1057,15 @@ pub struct App {
     /// Where a finished mouse selection is copied (mirrors
     /// `Config.copy_on_select`; live on reload, written back by `persist`).
     copy_on_select: clipboard::CopyOnSelect,
+    /// The kitty keyboard protocol in every tab (mirrors `Config.kitty_keyboard`;
+    /// applied at spawn and live to every tab on reload).
+    kitty_keyboard: bool,
+    /// The terminal / UI font families the user CHOSE (config, Settings) — what
+    /// `persist` saves. `font_family` / `ui_font_family` are what is SHOWN: a
+    /// chosen family that is not installed shows a fallback, which must never be
+    /// saved over the choice (like `theme_name`).
+    font_family_chosen: String,
+    ui_font_family_chosen: String,
     /// Compiled keybindings (built from `keys` on load / reload). The input path
     /// does ONE cheap hashmap lookup against this per keypress — never per frame.
     keymap: crate::keymap::KeyMap,
@@ -1086,6 +1099,12 @@ pub struct App {
     /// Config / theme / keybinding problems found while starting up, printed in
     /// the first tab once it exists (a desktop launch has no visible stderr).
     startup_warnings: Vec<String>,
+    /// The theme files as last loaded ([`crate::themes::fingerprint`]) and the
+    /// warnings last shown for a config/theme load: a hot-reload that is only
+    /// the watcher echo of JeTTY's own settings save (config skipped, themes
+    /// unchanged) does not re-show the very same warnings after every save.
+    themes_fp: u64,
+    shown_warnings: Vec<String>,
     /// "Reset keybindings" asks for confirmation: the first run arms it until this
     /// instant; running it again before then resets (after writing a backup).
     reset_keys_armed_until: Option<std::time::Instant>,
@@ -1599,7 +1618,9 @@ impl App {
         // resolution below (amendment T4): otherwise a `JETTY_THEME`/config value
         // naming a USER theme would resolve to idx 0 and the custom default be lost.
         // Problems (a skipped theme file) are shown in the first tab.
-        let mut startup_warnings = crate::themes::rebuild_registry();
+        let theme_warnings = crate::themes::rebuild_registry();
+        let themes_fp = crate::themes::fingerprint();
+        let mut startup_warnings = theme_warnings.clone();
         // The persisted settings (per-key: one bad value never resets the rest).
         let loaded = crate::config::Config::load();
         // Saves are written by a background thread; it reports a refused save (the
@@ -1673,6 +1694,7 @@ impl App {
             focus_autohide: true,
             scrollback_lines: 10_000,
             launch_at_login: false,
+            launch_at_login_in_file: None,
             summon_hotkey: "F9".to_string(),
             shell: String::new(),
             top_flush_pos: false,
@@ -1735,6 +1757,9 @@ impl App {
             hot_reload: true,
             macos_option_as_alt: input::OptionAsAlt::default(),
             copy_on_select: clipboard::CopyOnSelect::default(),
+            kitty_keyboard: true,
+            font_family_chosen: String::new(),
+            ui_font_family_chosen: String::new(),
             // Placeholder default keymap; rebuilt from cfg.keys below in `new`.
             keymap: crate::keymap::KeyMap::defaults(),
             keys: crate::config::KeyBindings::default(),
@@ -1745,6 +1770,8 @@ impl App {
             // Set from the config below.
             theme_name: String::new(),
             startup_warnings: Vec::new(),
+            themes_fp,
+            shown_warnings: theme_warnings,
             reset_keys_armed_until: None,
             start_hidden: false,
             pending_reload_at: None,
@@ -1843,7 +1870,7 @@ impl App {
         // window comes up already themed/sized as the user left it. The font
         // size/family are consumed later by `resumed` when it builds the
         // TextLayer; theme+opacity are pushed into the terminals by apply_theme.
-        let crate::config::Loaded { cfg, warnings, .. } = loaded;
+        let crate::config::Loaded { cfg, warnings, launch_at_login: launch_set, .. } = loaded;
         startup_warnings.extend(warnings);
         // The CHOSEN theme is remembered by name even when it can't be shown (a
         // missing/broken user theme file): the fallback on screen is never saved
@@ -1851,21 +1878,25 @@ impl App {
         app.theme_name = cfg.theme.clone();
         match jetty_core::theme_index(&cfg.theme) {
             Some(i) => app.theme_idx = i,
-            None => startup_warnings.push(theme_missing_warning(
-                &cfg.theme,
-                &jetty_core::theme_at(app.theme_idx).display_name,
-            )),
+            None => {
+                let w = theme_missing_warning(&cfg.theme, &jetty_core::theme_at(app.theme_idx).display_name);
+                // What a reload re-derives from the same files (see `shown_warnings`).
+                app.shown_warnings.push(w.clone());
+                startup_warnings.push(w);
+            }
         }
         // Clamp opacity to a VISIBLE floor: a persisted 0.0 would load a fully
         // transparent (invisible) window, which looks like a launch failure.
         app.opacity = cfg.opacity.clamp(0.1, 1.0);
         app.font_logical = cfg.font_size.clamp(6.0, 48.0);
         app.font_family = cfg.font_family;
+        app.font_family_chosen = app.font_family.clone();
         // UI (chrome) font, clamped like the terminal font. "" = platform sans;
         // a non-empty family is validated against the installed proportional
         // faces later in `resumed` (a removed font falls back to "" / sans).
         app.ui_font_logical = cfg.ui_font_size.clamp(UI_FONT_MIN, UI_FONT_MAX);
         app.ui_font_family = cfg.ui_font_family;
+        app.ui_font_family_chosen = app.ui_font_family.clone();
         app.corner_radius = cfg.corner_radius.clamp(0.0, 24.0);
         app.summon_effect = SummonEffect::from_config(&cfg.summon_effect);
         app.window_mode = WindowMode::from_config(&cfg.window_mode);
@@ -1876,13 +1907,21 @@ impl App {
         // Re-clamp for belt-and-suspenders (mirrors the opacity/font clamps
         // above); Config::load's sanitize pass already applied this range.
         app.scrollback_lines = cfg.scrollback_lines.clamp(100, 100_000);
-        // The config key is the source of truth: (re)write or remove the login
-        // autostart entry to match — keeping the program an existing entry
-        // launches while it still exists, refreshing a stale one (moved AppImage).
-        app.launch_at_login = cfg.launch_at_login;
-        if let Err(e) = sync_launch_at_login(app.launch_at_login) {
-            startup_warnings.push(e);
-        }
+        // Launch at login: written to match a config that SETS it (keeping the
+        // program an existing entry launches while it still exists, refreshing a
+        // stale one) — but never removed at startup, never decided by a default
+        // (a broken or key-less config mirrors the entry instead), and never
+        // touched for an alternate config tree (`JETTY_CONFIG_DIR`).
+        let (launch, problem) = startup_launch_at_login(
+            &autostart_path(),
+            cfg.launch_at_login,
+            launch_set,
+            crate::config::Config::dir_overridden(),
+            &AutostartTarget::current(),
+        );
+        app.launch_at_login = launch;
+        app.launch_at_login_in_file = launch_set;
+        startup_warnings.extend(problem);
         app.summon_hotkey = cfg.summon_hotkey;
         app.shell = cfg.shell;
         app.welcome_open = cfg.show_welcome;
@@ -1900,6 +1939,7 @@ impl App {
         app.hot_reload = cfg.hot_reload;
         app.macos_option_as_alt = cfg.macos_option_as_alt;
         app.copy_on_select = cfg.copy_on_select;
+        app.kitty_keyboard = cfg.kitty_keyboard;
         // Compile the keybindings (defaults + user `[keys]` overrides). Any invalid
         // chord / conflict / rejected bind is logged; the rest still apply.
         app.keys = cfg.keys;
@@ -1910,6 +1950,10 @@ impl App {
             eprintln!("jetty: {w}");
         }
         app.startup_warnings = startup_warnings;
+        // Save only what the user changes from here on: the baseline is the file
+        // as the app holds it (clamped, normalized), not its raw text.
+        let held = app.settings_snapshot();
+        app.persister.borrow_mut().rebase(held);
 
         // Apply the initial theme+opacity so Terminal::new env defaults are
         // overridden by our managed state (avoids double-reads from env). Also
@@ -2014,6 +2058,22 @@ impl App {
         ]
     }
 
+    /// The Settings / palette "Launch at login" toggle: write or remove the login
+    /// item, and flip the setting only when that worked — a refused or failed
+    /// toggle (an entry JeTTY did not write, `JETTY_CONFIG_DIR`, an I/O error)
+    /// says why and leaves the switch as it was. The caller persists.
+    fn toggle_launch_at_login_setting(&mut self) {
+        let want = !self.launch_at_login;
+        match toggle_launch_at_login(want) {
+            Ok(()) => {
+                self.launch_at_login = want;
+                // persist() writes it: the file's value as the next reload sees it.
+                self.launch_at_login_in_file = Some(want);
+            }
+            Err(e) => self.show_config_warnings(&[e]),
+        }
+    }
+
     /// Record the current user-tweakable settings for saving. Called whenever a
     /// setting changes. Cheap and non-blocking: only the keys that differ from the
     /// file's last-synced state are queued, and they are written ~400 ms after the
@@ -2037,8 +2097,9 @@ impl App {
             theme: self.theme_name.clone(),
             opacity: self.opacity,
             font_size: self.font_logical,
-            font_family: self.font_family.clone(),
-            ui_font_family: self.ui_font_family.clone(),
+            // The CHOSEN families, never a fallback shown for a missing one.
+            font_family: self.font_family_chosen.clone(),
+            ui_font_family: self.ui_font_family_chosen.clone(),
             ui_font_size: self.ui_font_logical,
             corner_radius: self.corner_radius,
             summon_effect: self.summon_effect.to_config().to_string(),
@@ -2069,6 +2130,7 @@ impl App {
             hot_reload: self.hot_reload,
             macos_option_as_alt: self.macos_option_as_alt,
             copy_on_select: self.copy_on_select,
+            kitty_keyboard: self.kitty_keyboard,
             // Preserve the user's `[keys]` overrides verbatim (never editable via the
             // Settings UI — a settings-driven persist must not erase them).
             keys: self.keys.clone(),
@@ -2310,20 +2372,55 @@ impl App {
 
         // (A) Themes — always. Rebuild the registry from disk.
         warnings.extend(crate::themes::rebuild_registry());
+        let themes_fp = crate::themes::fingerprint();
+        let themes_changed = std::mem::replace(&mut self.themes_fp, themes_fp) != themes_fp;
+        let mut config_read = false;
 
         // (B) Config — per-key, hash-guarded.
         if let Ok(s) = std::fs::read_to_string(crate::config::Config::config_path()) {
             let h = crate::config::hash_str(&s);
             // Skip our own write echoing back through the watcher.
             if !self.persister.borrow().is_self_write(h) {
+                config_read = true;
                 let live = self.settings_snapshot();
                 match crate::config::Config::parse_with_base(&s, &live, "keeping the current value") {
-                    Ok((cfg, problems)) => {
+                    Ok((mut cfg, problems)) => {
                         warnings.extend(problems);
+                        // Only an EDIT of launch_at_login adds or removes the
+                        // login item: a file that does not set it (the key
+                        // removed, a typo) or still says what it said (a stale
+                        // `false` beside an entry the app mirrors) keeps the
+                        // live value.
+                        let explicit = crate::config::explicit_launch_at_login(&s);
+                        cfg.launch_at_login = reloaded_launch_at_login(
+                            explicit,
+                            self.launch_at_login_in_file,
+                            self.launch_at_login,
+                        );
+                        self.launch_at_login_in_file = explicit;
                         self.apply_reloaded_config(cfg.clone(), &mut warnings);
+                        // The new baseline is the file as the app now holds it —
+                        // except a key skipped mid-drag: the FILE holds the edit,
+                        // and the drag's release must still be saved over it.
+                        let mut held = self.settings_snapshot();
+                        if self.dragging_slider {
+                            held.opacity = cfg.opacity;
+                        }
+                        if self.dragging_radius {
+                            held.corner_radius = cfg.corner_radius;
+                        }
+                        if self.dragging_dropdown {
+                            held.dropdown_height_pct = cfg.dropdown_height_pct;
+                        }
+                        if self.dragging_dropdown_width {
+                            held.dropdown_width_pct = cfg.dropdown_width_pct;
+                        }
+                        if self.active_fx_drag.is_some() {
+                            held.effects = cfg.effects.clone();
+                        }
                         // Records the observed hash too, so an identical later
                         // hand-save no-ops.
-                        self.persister.borrow_mut().note_reloaded(cfg, h);
+                        self.persister.borrow_mut().note_reloaded(held, h);
                     }
                     Err(syntax) => {
                         warnings.push(format!(
@@ -2347,7 +2444,10 @@ impl App {
         }
 
         self.reloading = false;
-        self.show_config_warnings(&warnings);
+        if !is_reload_echo(config_read, themes_changed, &warnings, &self.shown_warnings) {
+            self.show_config_warnings(&warnings);
+        }
+        self.shown_warnings = warnings;
         // Repaint chrome (theme/settings) once the reload settled.
         self.request_main_paint();
         self.request_settings_paint();
@@ -2384,7 +2484,9 @@ impl App {
         if (fs - self.font_logical).abs() > eps {
             self.set_font_size(fs);
         }
-        if cfg.font_family != self.font_family {
+        // Compared with the CHOSEN family: a missing one shows a fallback, which
+        // an unrelated reload must not flip back to the missing name.
+        if cfg.font_family != self.font_family_chosen {
             self.set_font_family(cfg.font_family.clone());
         }
         // UI (chrome) font size / family.
@@ -2392,7 +2494,7 @@ impl App {
         if (ufs - self.ui_font_logical).abs() > eps {
             self.set_ui_font_size(ufs);
         }
-        if cfg.ui_font_family != self.ui_font_family {
+        if cfg.ui_font_family != self.ui_font_family_chosen {
             self.set_ui_font_family(cfg.ui_font_family.clone());
         }
         // Corner radius — skip while dragging the radius slider (H4).
@@ -2484,12 +2586,32 @@ impl App {
         self.macos_option_as_alt = cfg.macos_option_as_alt;
         self.apply_option_as_alt_everywhere();
         self.copy_on_select = cfg.copy_on_select;
-        // Launch at login — live: the config key is the source of truth, so the
-        // autostart entry is written/removed to match.
+        // Kitty keyboard protocol — live in every tab (a change resets the flag
+        // stacks programs pushed, as alacritty does on any toggle).
+        if cfg.kitty_keyboard != self.kitty_keyboard {
+            self.kitty_keyboard = cfg.kitty_keyboard;
+            for tab in &mut self.tabs {
+                tab.terminal.set_kitty_keyboard(cfg.kitty_keyboard);
+            }
+            for dw in &mut self.detached {
+                dw.tab.terminal.set_kitty_keyboard(cfg.kitty_keyboard);
+            }
+        }
+        // Launch at login — live: an explicit edit of the key writes / removes
+        // the autostart entry to match (the caller keeps the live value when the
+        // file does not set it). An alternate config tree never touches the
+        // user's real login item.
         if cfg.launch_at_login != self.launch_at_login {
             self.launch_at_login = cfg.launch_at_login;
-            if let Err(e) = sync_launch_at_login(self.launch_at_login) {
-                warnings.push(e);
+            if !crate::config::Config::dir_overridden() {
+                let synced = sync_launch_at_login(
+                    &autostart_path(),
+                    self.launch_at_login,
+                    &AutostartTarget::current(),
+                );
+                if let Err(e) = synced {
+                    warnings.push(e);
+                }
             }
         }
         // Mirror the RESTART-ONLY-EFFECT key too, so a later panel-driven persist()
@@ -2883,10 +3005,11 @@ impl App {
         // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
         // Applied at spawn so new tabs pick up the current setting.
         terminal.set_osc52_allow_paste(self.osc52_allow_paste);
-        // Kitty keyboard protocol: answer `CSI ? u` and track the app's
-        // `CSI > u` flag stack — the key path encodes per those flags
-        // (`decide_window_key`), so a program that opts in gets kitty keys.
-        terminal.set_kitty_keyboard(true);
+        // Kitty keyboard protocol (config `kitty_keyboard`, default on): answer
+        // `CSI ? u` and track the app's `CSI > u` flag stack — the key path
+        // encodes per those flags (`decide_window_key`), so a program that opts
+        // in gets kitty keys.
+        terminal.set_kitty_keyboard(self.kitty_keyboard);
         // Apply the configured scrollback cap (guard skips the no-op
         // set_options round-trip on the 10k default path).
         if self.scrollback_lines != 10_000 {
@@ -4452,10 +4575,7 @@ impl App {
                 }
             }
             C::ToggleLaunchAtLogin => {
-                self.launch_at_login = !self.launch_at_login;
-                if let Err(e) = set_launch_at_login(self.launch_at_login) {
-                    self.show_config_warnings(&[e]);
-                }
+                self.toggle_launch_at_login_setting();
                 self.persist();
             }
             C::ResetKeybindings => {
@@ -4497,6 +4617,22 @@ impl App {
                     None => "Keybindings reset to defaults".to_string(),
                 };
                 self.show_notice_pill(msg, 6000);
+            }
+            // A crashed program's keyboard / mouse modes, dropped for the tab the
+            // palette was opened over — the screen and scrollback stay.
+            C::ResetInputModes => {
+                if let Some(term) = self.term_of_mut(s) {
+                    term.reset_input_modes();
+                }
+                let window = match s {
+                    Surface::Main => self.window.as_ref().map(|w| w.id()),
+                    Surface::Detached(p) => self.detached.get(p).map(|d| d.window.id()),
+                };
+                self.show_status_pill(crate::runsel::Notice {
+                    msg: "Keyboard & mouse modes reset for this tab",
+                    window,
+                });
+                self.paint_surface(s);
             }
             // Fullscreen toggles the window the palette was opened in.
             C::ToggleFullscreen => match s {
@@ -5824,27 +5960,28 @@ impl App {
                 }
             }
         }
-        // OSC 52 COPY: a remote/tmux/nvim asked to set the system clipboard. Ride
+        // OSC 52 COPY: a remote/tmux/nvim asked to set a system selection. Ride
         // this same drain pass (main + detached both drain here) — lock-free flag
         // check when clean, so zero idle cost. `crate::clipboard::set` is a free fn
-        // (no self borrow), so this is conflict-free inside `drain_one_tab`.
-        if let Some(text) = tab.terminal.take_clipboard_store() {
+        // (no self borrow), so this is conflict-free inside `drain_one_tab`. One
+        // pending copy PER selection: nvim's `unnamed,unnamedplus` sends `c` and
+        // `p` for every yank, and both must land.
+        for (target, text) in tab.terminal.take_clipboard_stores() {
             // OSC 52 names the selection: `p`/`s` → PRIMARY, `c` → clipboard.
-            if tab.terminal.clipboard_store_is_primary() {
-                crate::clipboard::set_primary(&text);
-            } else {
-                crate::clipboard::set(&text);
+            match target {
+                jetty_core::Osc52Target::Primary => crate::clipboard::set_primary(&text),
+                jetty_core::Osc52Target::Clipboard => crate::clipboard::set(&text),
             }
         }
-        // OSC 52 PASTE (load): a program asked to READ the clipboard. Only ever
+        // OSC 52 PASTE (load): a program asked to READ a selection. Only ever
         // present when the user enabled `osc52_allow_paste` (else alacritty denies it
-        // and no request reaches us). Read the clipboard, CAP the reply length, format
-        // via alacritty's supplied formatter, and write it back to the PTY.
-        if let Some(fmt) = tab.terminal.take_clipboard_load() {
-            let text = if tab.terminal.clipboard_load_is_primary() {
-                crate::clipboard::get_primary()
-            } else {
-                crate::clipboard::get()
+        // and no request reaches us). Read the selection, CAP the reply length, format
+        // via alacritty's supplied formatter, and write it back to the PTY — one
+        // reply per request (a `c;?` + `p;?` pair gets two).
+        for (target, fmt) in tab.terminal.take_clipboard_loads() {
+            let text = match target {
+                jetty_core::Osc52Target::Primary => crate::clipboard::get_primary(),
+                jetty_core::Osc52Target::Clipboard => crate::clipboard::get(),
             };
             if let Some(mut text) = text {
                 if text.len() > jetty_core::OSC52_MAX_BYTES {
@@ -6359,6 +6496,7 @@ impl App {
     /// Change the font family at runtime. Updates `font_family`, tells the
     /// TextLayer to remeasure, then reflows and requests a redraw.
     fn set_font_family(&mut self, name: String) {
+        self.font_family_chosen = name.clone();
         self.font_family = name;
         if let Some(text) = &mut self.text {
             text.set_font_family(&self.font_family);
@@ -6444,6 +6582,7 @@ impl App {
     /// installed family). Does NOT reflow the grid/PTY (chrome family is
     /// orthogonal to cols/rows), so the hot/idle paths are untouched.
     fn set_ui_font_family(&mut self, name: String) {
+        self.ui_font_family_chosen = name.clone();
         self.ui_font_family = name;
         let fam = if self.ui_font_family.is_empty() {
             None
@@ -8211,13 +8350,15 @@ impl App {
                 //  - its context menu, help or palette open, or hint mode → swallow;
                 //  - only over the terminal grid, never the chrome strips;
                 //  - a program that tracks the mouse (no Shift) gets the click.
-                // Otherwise it pastes the PRIMARY selection (same as main).
+                // Otherwise it pastes the PRIMARY selection (same as main) — the
+                // clipboard under `copy_on_select = "clipboard"`.
                 if self
                     .ov_of(Surface::Detached(pos))
                     .is_none_or(|o| o.help_open || o.palette_open || o.hint_mode.is_some())
                 {
                     return;
                 }
+                let copy_on_select = self.copy_on_select;
                 let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
@@ -8233,7 +8374,7 @@ impl App {
                     crate::gridmouse::press(g, MouseButton::Middle, false, now)
                 }) == crate::gridmouse::Press::PastePrimary
                 {
-                    if let Some(text) = clipboard::get_primary() {
+                    if let Some(text) = clipboard::get_for_middle_click(copy_on_select) {
                         Self::paste_to_tab(&mut dw.tab, &text);
                     }
                 }
@@ -9093,12 +9234,9 @@ impl App {
                 self.focus_autohide = !self.focus_autohide;
             }
             input::MouseAction::ToggleLaunchAtLogin => {
-                self.launch_at_login = !self.launch_at_login;
-                // Write/remove the login autostart entry to match; persist() (below)
-                // saves the config key, which is the source of truth.
-                if let Err(e) = set_launch_at_login(self.launch_at_login) {
-                    self.show_config_warnings(&[e]);
-                }
+                // Write/remove the login autostart entry; persist() (below) saves
+                // the config key, which is the source of truth.
+                self.toggle_launch_at_login_setting();
             }
             // The OS title bar moves the window now; in-panel drag/consume are no-ops.
             input::MouseAction::StartDialogDrag
@@ -10109,6 +10247,8 @@ impl ApplicationHandler<AppEvent> for App {
                         "jetty: configured font family {:?} not found; falling back to {:?}",
                         self.font_family, fallback
                     );
+                    // Shown only: `font_family_chosen` (what is saved) keeps the
+                    // user's choice for when the font is installed again.
                     self.font_family = fallback;
                 }
             }
@@ -10176,6 +10316,7 @@ impl ApplicationHandler<AppEvent> for App {
                     "jetty: configured UI font {:?} not found; falling back to system sans",
                     self.ui_font_family
                 );
+                // Shown only — `ui_font_family_chosen` keeps (and saves) the choice.
                 self.ui_font_family.clear();
             }
             // Apply the (validated) UI family to the chrome layer (no rescan).
@@ -10206,10 +10347,11 @@ impl ApplicationHandler<AppEvent> for App {
         // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
         // Applied at spawn so new tabs pick up the current setting.
         terminal.set_osc52_allow_paste(self.osc52_allow_paste);
-        // Kitty keyboard protocol: answer `CSI ? u` and track the app's
-        // `CSI > u` flag stack — the key path encodes per those flags
-        // (`decide_window_key`), so a program that opts in gets kitty keys.
-        terminal.set_kitty_keyboard(true);
+        // Kitty keyboard protocol (config `kitty_keyboard`, default on): answer
+        // `CSI ? u` and track the app's `CSI > u` flag stack — the key path
+        // encodes per those flags (`decide_window_key`), so a program that opts
+        // in gets kitty keys.
+        terminal.set_kitty_keyboard(self.kitty_keyboard);
         // Apply the configured scrollback cap (guard skips the no-op
         // set_options round-trip on the 10k default path).
         if self.scrollback_lines != 10_000 {
@@ -11616,7 +11758,9 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.with_main_grid(|g| crate::gridmouse::press(g, MouseButton::Middle, false, now))
                     == Some(crate::gridmouse::Press::PastePrimary)
                 {
-                    if let Some(text) = clipboard::get_primary() {
+                    // PRIMARY — or the clipboard, where `copy_on_select =
+                    // "clipboard"` put the selection.
+                    if let Some(text) = clipboard::get_for_middle_click(self.copy_on_select) {
                         self.paste_text(&text);
                     }
                 }
@@ -13772,13 +13916,11 @@ fn autostart_path() -> std::path::PathBuf {
 }
 
 /// The program the autostart entry launches: the AppImage FILE when running from
-/// one (`$APPIMAGE` — `current_exe()` is then a temporary `/tmp/.mount_*` path that
-/// is gone by the next login), else this executable, else `jetty` from PATH.
-fn autostart_program(appimage: Option<String>, exe: Option<String>) -> String {
-    appimage
-        .filter(|p| !p.is_empty())
-        .or(exe)
-        .unwrap_or_else(|| "jetty".to_string())
+/// one (`current_exe()` is then a temporary `/tmp/.mount_*` path gone by the next
+/// login) — never an AppImage merely inherited from the app that started JeTTY
+/// (see `jetty_core::self_exe`) — else this executable, else `jetty` from PATH.
+fn autostart_program(exe: Option<&jetty_core::SelfExe>) -> String {
+    exe.map_or_else(|| "jetty".to_string(), |e| e.path.to_string_lossy().into_owned())
 }
 
 /// The freedesktop autostart entry. Starts with `--background`: at login JeTTY
@@ -13845,10 +13987,36 @@ fn launch_agent_plist(program: &str) -> String {
 
 /// The program the running JeTTY would register (see `autostart_program`).
 fn current_autostart_program() -> String {
-    autostart_program(
-        std::env::var("APPIMAGE").ok(),
-        std::env::current_exe().ok().and_then(|p| p.to_str().map(str::to_string)),
-    )
+    autostart_program(jetty_core::self_exe().as_ref())
+}
+
+/// What a new or refreshed autostart entry launches, captured once per sync:
+/// the program, and whether it is an AppImage file (running a newer AppImage
+/// is choosing that version, so it retargets an existing entry).
+struct AutostartTarget {
+    program: String,
+    appimage: bool,
+}
+
+impl AutostartTarget {
+    fn current() -> AutostartTarget {
+        let exe = jetty_core::self_exe();
+        AutostartTarget {
+            program: autostart_program(exe.as_ref()),
+            appimage: exe.is_some_and(|e| e.appimage),
+        }
+    }
+}
+
+/// What a sync did to the autostart file.
+#[derive(Debug, PartialEq)]
+enum AutostartSync {
+    /// Written (created or refreshed), or removed.
+    Changed,
+    /// Already as wanted.
+    Unchanged,
+    /// A file JeTTY did not write sits at the path: left alone.
+    Foreign,
 }
 
 /// This platform's autostart entry launching `program`.
@@ -13861,32 +14029,86 @@ fn autostart_entry_for(program: &str) -> String {
 }
 
 /// An explicit "Launch at login" toggle (Settings / palette): write the entry for
-/// THIS executable, or remove it. Never panics; a failure is returned for display.
-fn set_launch_at_login(enabled: bool) -> Result<(), String> {
-    let contents = enabled.then(|| autostart_entry_for(&current_autostart_program()));
-    sync_autostart_file(&autostart_path(), contents.as_deref())
+/// THIS executable, or remove it. Never panics. A failure — or an entry JeTTY did
+/// not write, or an alternate config tree, both of which leave the login item
+/// alone — is returned for display: a toggle must never silently do nothing.
+fn toggle_launch_at_login(enabled: bool) -> Result<(), String> {
+    if crate::config::Config::dir_overridden() {
+        return Err("launch at login: not changed while JETTY_CONFIG_DIR points at another \
+                    config (the login item belongs to your own setup)"
+            .to_string());
+    }
+    set_launch_at_login(&autostart_path(), enabled, &current_autostart_program())
 }
 
-/// Bring the login autostart entry in line with the config key (the source of
-/// truth) at startup and on a hot-reload. Unlike an explicit toggle, an existing
-/// JeTTY entry KEEPS the program it launches while that program still exists —
+/// [`toggle_launch_at_login`] for the entry at `path`, launching `program`.
+fn set_launch_at_login(path: &std::path::Path, enabled: bool, program: &str) -> Result<(), String> {
+    let contents = enabled.then(|| autostart_entry_for(program));
+    match sync_autostart_file(path, contents.as_deref())? {
+        AutostartSync::Foreign => Err(format!(
+            "launch at login: {} was not created by JeTTY — left as it is (remove or edit it \
+             yourself)",
+            path.display()
+        )),
+        AutostartSync::Changed | AutostartSync::Unchanged => Ok(()),
+    }
+}
+
+/// Launch-at-login at STARTUP. Returns the app's state and a problem to show.
+///
+/// * `JETTY_CONFIG_DIR` set (`alt_config_dir`): the file's value, untouched;
+/// * the config SETS `true`: the entry is (re)written ([`sync_launch_at_login`]);
+/// * otherwise nothing is removed at startup — the app MIRRORS the entry, so
+///   Settings shows the truth: a config that does not set the key (no file, a
+///   broken file, the key missing or invalid) only has a default, and a `false`
+///   may be a stale or copied one (older JeTTY saves wrote every key). The
+///   toggle, or an edit of the key while JeTTY runs, removes it.
+fn startup_launch_at_login(
+    path: &std::path::Path,
+    cfg_value: bool,
+    explicit: Option<bool>,
+    alt_config_dir: bool,
+    target: &AutostartTarget,
+) -> (bool, Option<String>) {
+    if alt_config_dir {
+        return (cfg_value, None);
+    }
+    if explicit == Some(true) {
+        return (true, sync_launch_at_login(path, true, target).err());
+    }
+    let ours = std::fs::read_to_string(path).is_ok_and(|c| is_jetty_autostart_entry(&c));
+    (ours, None)
+}
+
+/// The `launch_at_login` a hot-reload applies: the file's value (`explicit`) —
+/// but only when it differs from what the file said when last read
+/// (`last_read`), i.e. the user edited it; otherwise the `live` value stays.
+fn reloaded_launch_at_login(explicit: Option<bool>, last_read: Option<bool>, live: bool) -> bool {
+    match explicit {
+        Some(v) if explicit != last_read => v,
+        _ => live,
+    }
+}
+
+/// Bring the login autostart entry at `path` in line with the config key at
+/// startup and on a hot-reload. Unlike an explicit toggle, an existing JeTTY
+/// entry KEEPS the program it launches while that program still exists —
 /// running another build (say `./target/release/jetty`) must not retarget the
 /// user's login item. The entry is only refreshed to the current format (e.g.
 /// `--background`), or pointed at this executable when its program is gone (a
 /// moved AppImage), when there is no entry yet, or when this IS an AppImage —
-/// running a newer AppImage file is choosing that version.
-fn sync_launch_at_login(enabled: bool) -> Result<(), String> {
-    let path = autostart_path();
+/// running a newer AppImage file is choosing that version. An entry JeTTY did
+/// not write is left alone silently.
+fn sync_launch_at_login(path: &std::path::Path, enabled: bool, target: &AutostartTarget) -> Result<(), String> {
     let contents = enabled.then(|| {
-        let running_appimage = std::env::var_os("APPIMAGE").is_some_and(|v| !v.is_empty());
-        let kept = std::fs::read_to_string(&path)
+        let kept = std::fs::read_to_string(path)
             .ok()
-            .filter(|c| !running_appimage && is_jetty_autostart_entry(c))
+            .filter(|c| !target.appimage && is_jetty_autostart_entry(c))
             .and_then(|c| autostart_entry_program(&c))
             .filter(|p| std::path::Path::new(p).is_file());
-        autostart_entry_for(&kept.unwrap_or_else(current_autostart_program))
+        autostart_entry_for(kept.as_deref().unwrap_or(&target.program))
     });
-    sync_autostart_file(&path, contents.as_deref())
+    sync_autostart_file(path, contents.as_deref()).map(|_| ())
 }
 
 /// The program an autostart entry launches: the first `ProgramArguments` string of
@@ -13925,16 +14147,16 @@ fn autostart_entry_program(content: &str) -> Option<String> {
 
 /// Write `contents` to `path` (only when it differs — no churn on every start) or,
 /// for `None`, remove it (a missing file is already the goal). A file at `path`
-/// that JeTTY did not write is left alone either way.
-fn sync_autostart_file(path: &std::path::Path, contents: Option<&str>) -> Result<(), String> {
+/// that JeTTY did not write is left alone either way ([`AutostartSync::Foreign`]).
+fn sync_autostart_file(path: &std::path::Path, contents: Option<&str>) -> Result<AutostartSync, String> {
     let current = std::fs::read_to_string(path).ok();
     if current.as_deref().is_some_and(|c| !is_jetty_autostart_entry(c)) {
-        return Ok(());
+        return Ok(AutostartSync::Foreign);
     }
     match contents {
         Some(c) => {
             if current.as_deref() == Some(c) {
-                return Ok(());
+                return Ok(AutostartSync::Unchanged);
             }
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| {
@@ -13942,11 +14164,12 @@ fn sync_autostart_file(path: &std::path::Path, contents: Option<&str>) -> Result
                 })?;
             }
             std::fs::write(path, c)
+                .map(|()| AutostartSync::Changed)
                 .map_err(|e| format!("launch at login: could not write {}: {e}", path.display()))
         }
         None => match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(AutostartSync::Changed),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AutostartSync::Unchanged),
             Err(e) => Err(format!("launch at login: could not remove {}: {e}", path.display())),
         },
     }
@@ -13983,6 +14206,14 @@ fn desktop_exec_arg(path: &str) -> String {
     let string_escaped = quoted.replace('\\', "\\\\");
     // Field-code escaping over the whole value.
     string_escaped.replace('%', "%%")
+}
+
+/// Whether a hot-reload's `warnings` merely repeat what the user was already
+/// shown: nothing they did changed (the config was our own save's echo, no theme
+/// file changed) and the warnings are the very same. Then they are not shown
+/// again — every settings save used to re-pop a broken theme's warning.
+fn is_reload_echo(config_read: bool, themes_changed: bool, warnings: &[String], shown: &[String]) -> bool {
+    !config_read && !themes_changed && warnings == shown
 }
 
 /// Display name for a `shell` config value: "System default" for the empty
@@ -14705,11 +14936,108 @@ mod desktop_exec_arg_tests {
 }
 
 #[cfg(test)]
+mod reload_warning_tests {
+    use super::is_reload_echo;
+
+    #[test]
+    fn a_save_echo_does_not_reshow_the_same_warnings() {
+        let w = vec!["theme file themes/x.toml skipped: bad".to_string()];
+        assert!(is_reload_echo(false, false, &w, &w), "our own save's echo: quiet");
+        assert!(!is_reload_echo(true, false, &w, &w), "the user edited config.toml: show");
+        assert!(!is_reload_echo(false, true, &w, &w), "a theme file was edited (still broken): show");
+        let other = vec!["theme file themes/y.toml skipped: bad".to_string()];
+        assert!(!is_reload_echo(false, false, &other, &w), "a new problem: show");
+        assert!(is_reload_echo(false, false, &[], &[]), "nothing to show either way");
+    }
+}
+
+#[cfg(test)]
 mod autostart_tests {
     use super::{
-        autostart_desktop_entry, autostart_entry_program, autostart_program, launch_agent_plist,
-        sync_autostart_file,
+        autostart_desktop_entry, autostart_entry_for, autostart_entry_program, autostart_program,
+        launch_agent_plist, reloaded_launch_at_login, set_launch_at_login, startup_launch_at_login,
+        sync_autostart_file, AutostartSync, AutostartTarget,
     };
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("jetty-autostart-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn target(program: &str) -> AutostartTarget {
+        AutostartTarget { program: program.to_string(), appimage: false }
+    }
+
+    #[test]
+    fn startup_never_deletes_the_login_item() {
+        // The config failed to load / lacks the key / points elsewhere: its
+        // default `false` used to DELETE the user's login item at every start.
+        let dir = scratch("startup");
+        let path = dir.join("autostart").join("jetty.desktop");
+        let exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let entry = autostart_entry_for(&exe);
+        std::fs::write(&path, &entry).unwrap();
+        // No key read (missing, invalid, broken file): mirror the entry.
+        assert_eq!(startup_launch_at_login(&path, false, None, false, &target(&exe)), (true, None));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), entry, "untouched");
+        // An explicit `false` (maybe a stale one): never removed at startup, and
+        // Settings shows the entry that is really there.
+        assert_eq!(startup_launch_at_login(&path, false, Some(false), false, &target(&exe)), (true, None));
+        assert!(path.exists(), "startup never removes the entry");
+        // JETTY_CONFIG_DIR: the real login item is not looked at or touched.
+        assert_eq!(startup_launch_at_login(&path, false, None, true, &target(&exe)), (false, None));
+        assert!(path.exists());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(startup_launch_at_login(&path, true, Some(true), true, &target(&exe)), (true, None));
+        assert!(!path.exists(), "an alternate config tree never writes one either");
+        // No entry and no key, or `false`: off, nothing written.
+        assert_eq!(startup_launch_at_login(&path, false, None, false, &target(&exe)), (false, None));
+        assert_eq!(startup_launch_at_login(&path, false, Some(false), false, &target(&exe)), (false, None));
+        assert!(!path.exists());
+        // An explicit `true` writes it.
+        assert_eq!(startup_launch_at_login(&path, true, Some(true), false, &target(&exe)), (true, None));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), entry);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reload_changes_the_login_item_only_for_an_edit_of_the_key() {
+        // Mirrored at startup (an entry beside a stale `false`): an unrelated edit
+        // must not remove it…
+        assert!(reloaded_launch_at_login(Some(false), Some(false), true));
+        // …editing the key does, either way.
+        assert!(!reloaded_launch_at_login(Some(false), Some(true), true));
+        assert!(reloaded_launch_at_login(Some(true), Some(false), false));
+        assert!(reloaded_launch_at_login(Some(true), None, false));
+        // A file that does not set it keeps the live value.
+        assert!(reloaded_launch_at_login(None, Some(true), true));
+        assert!(!reloaded_launch_at_login(None, Some(true), false));
+    }
+
+    #[test]
+    fn a_toggle_says_so_when_the_entry_is_not_jettys() {
+        // An autostart file the user (or their desktop) made at the same path is
+        // never touched — but a toggle used to do nothing SILENTLY.
+        let dir = scratch("foreign");
+        let path = dir.join("jetty.desktop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let users = "[Desktop Entry]\nName=JeTTY\nExec=jetty --show\n";
+        std::fs::write(&path, users).unwrap();
+        for enabled in [true, false] {
+            let err = set_launch_at_login(&path, enabled, "/usr/bin/jetty").unwrap_err();
+            assert!(err.contains("not created by JeTTY"), "{err}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), users, "left alone");
+        }
+        // Its own entry toggles fine.
+        std::fs::remove_file(&path).unwrap();
+        set_launch_at_login(&path, true, "/usr/bin/jetty").unwrap();
+        assert!(path.exists());
+        set_launch_at_login(&path, false, "/usr/bin/jetty").unwrap();
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_entrys_program_round_trips_through_its_escaping() {
@@ -14726,19 +15054,16 @@ mod autostart_tests {
     }
 
     #[test]
-    fn appimage_file_wins_over_its_temporary_mount() {
-        // Inside an AppImage, current_exe() is /tmp/.mount_XXXX/usr/bin/jetty —
-        // gone by the next login. $APPIMAGE is the real file.
+    fn the_entry_launches_the_stable_self_path() {
+        // Which path that is (an AppImage file over its temporary mount, never an
+        // inherited foreign $APPIMAGE) is `jetty_core::self_exe`'s, tested there.
+        let exe = |p: &str, appimage| jetty_core::SelfExe { path: p.into(), appimage };
         assert_eq!(
-            autostart_program(
-                Some("/home/u/Apps/JeTTY.AppImage".to_string()),
-                Some("/tmp/.mount_abc/usr/bin/jetty".to_string())
-            ),
+            autostart_program(Some(&exe("/home/u/Apps/JeTTY.AppImage", true))),
             "/home/u/Apps/JeTTY.AppImage"
         );
-        assert_eq!(autostart_program(None, Some("/usr/bin/jetty".to_string())), "/usr/bin/jetty");
-        assert_eq!(autostart_program(Some(String::new()), Some("/usr/bin/jetty".to_string())), "/usr/bin/jetty");
-        assert_eq!(autostart_program(None, None), "jetty");
+        assert_eq!(autostart_program(Some(&exe("/usr/bin/jetty", false))), "/usr/bin/jetty");
+        assert_eq!(autostart_program(None), "jetty");
     }
 
     #[test]
@@ -14764,15 +15089,16 @@ mod autostart_tests {
         let path = dir.join("autostart").join("jetty.desktop");
         let v1 = autostart_desktop_entry("/usr/bin/jetty");
         let v2 = autostart_desktop_entry("/opt/jetty/jetty");
-        sync_autostart_file(&path, Some(&v1)).unwrap();
+        assert_eq!(sync_autostart_file(&path, Some(&v1)), Ok(AutostartSync::Changed));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), v1);
+        assert_eq!(sync_autostart_file(&path, Some(&v1)), Ok(AutostartSync::Unchanged));
         // A stale entry (old program path) is refreshed.
         sync_autostart_file(&path, Some(&v2)).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), v2);
         sync_autostart_file(&path, None).unwrap();
         assert!(!path.exists());
         // Removing what isn't there is fine.
-        sync_autostart_file(&path, None).unwrap();
+        assert_eq!(sync_autostart_file(&path, None), Ok(AutostartSync::Unchanged));
         // A pre-v0.26 JeTTY entry (no marker) is still recognized as ours.
         let legacy = "[Desktop Entry]\nComment=Blazing-fast GPU terminal with a center-summon hotkey (autostart: holds the F9 grab)\nExec=/usr/bin/jetty\n";
         std::fs::write(&path, legacy).unwrap();
@@ -14782,9 +15108,9 @@ mod autostart_tests {
         // rewritten or deleted.
         let users = "[Desktop Entry]\nName=JeTTY\nExec=jetty --show\n";
         std::fs::write(&path, users).unwrap();
-        sync_autostart_file(&path, None).unwrap();
+        assert_eq!(sync_autostart_file(&path, None), Ok(AutostartSync::Foreign));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), users);
-        sync_autostart_file(&path, Some(&v1)).unwrap();
+        assert_eq!(sync_autostart_file(&path, Some(&v1)), Ok(AutostartSync::Foreign));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), users);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15318,6 +15644,7 @@ mod hot_reload_tests {
             "hot_reload",
             "macos_option_as_alt",
             "copy_on_select",
+            "kitty_keyboard",
             // shell (new tabs pick up the edited shell) and show_welcome apply live;
             // both are also mirrored in apply_reloaded_config so a later persist()
             // round-trips an external edit instead of clobbering it.

@@ -9,12 +9,17 @@
 //!
 //! What is watched (recomputed by [`ConfigWatcher::rearm`] after every reload):
 //! * the config dir's PARENT (`~/.config`) — so the config dir being created,
-//!   deleted-and-recreated or re-linked (stow / home-manager) is noticed;
+//!   deleted-and-recreated or re-linked (stow / home-manager) is noticed. Not on
+//!   macOS while the config dir exists: FSEvents watches recursively whatever is
+//!   asked, and that parent is `~/Library/Application Support`, where every app
+//!   writes all the time — each write would wake the watcher;
 //! * the config dir itself (`config.toml`) and its `themes/` subdir (a symlinked
 //!   dir is followed);
-//! * when `config.toml` is a symlink to a file elsewhere (a dotfiles repo), the
-//!   real file's directory — matched by the real file's exact path, so its own
-//!   name (`jetty.toml`) works and the repo's other files are ignored.
+//! * when `config.toml` — or a `themes/*.toml` — is a symlink to a file
+//!   elsewhere (a dotfiles repo), the real file's directory, matched by the real
+//!   file's exact path, so its own name (`jetty.toml`) works and the repo's other
+//!   files are ignored. A dangling link's target dir is watched too, so the file
+//!   appearing there is noticed.
 //!
 //! Naming gotcha: jetty-app already has a local `mod notify` (desktop toasts), so
 //! the file-watcher crate is referenced as `::notify` throughout.
@@ -23,6 +28,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ::notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+
+/// Whether the OS watcher backend watches directories RECURSIVELY regardless of
+/// the mode asked for (macOS FSEvents) — then a busy parent dir is not watched.
+const RECURSIVE_BACKEND: bool = cfg!(target_os = "macos");
 
 /// The paths that matter right now. Recomputed on every `rearm`, read by the
 /// event callback.
@@ -34,24 +43,46 @@ struct Targets {
     themes_dir: PathBuf,
     /// The real file `config.toml` points at, when it is a symlink.
     real_config: Option<PathBuf>,
+    /// The real files symlinked `themes/*.toml` point at: an edit lands THERE,
+    /// and the themes dir itself sees nothing.
+    real_themes: Vec<PathBuf>,
 }
 
 impl Targets {
     fn compute(config_dir: &Path) -> Targets {
-        let plain = config_dir.join("config.toml");
-        let real_config = match std::fs::symlink_metadata(&plain) {
-            Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(&plain).ok(),
+        let linked = |p: &Path| match std::fs::symlink_metadata(p) {
+            Ok(m) if m.file_type().is_symlink() => Some(crate::config::real_path(p)),
             _ => None,
         };
+        let themes_dir = config_dir.join("themes");
+        let mut real_themes: Vec<PathBuf> = std::fs::read_dir(&themes_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("toml"))
+            .filter_map(|p| linked(&p))
+            .collect();
+        real_themes.sort();
+        real_themes.dedup();
         Targets {
             config_dir: config_dir.to_path_buf(),
-            themes_dir: config_dir.join("themes"),
-            real_config,
+            themes_dir,
+            real_config: linked(&config_dir.join("config.toml")),
+            real_themes,
         }
     }
 
     /// The directories to watch (each non-recursively), existing ones only.
     fn watch_paths(&self) -> Vec<PathBuf> {
+        self.watch_paths_for(RECURSIVE_BACKEND)
+    }
+
+    /// [`Targets::watch_paths`] for a backend that is (`recursive`) or is not
+    /// recursive whatever is asked: a recursive one watches the config dir's
+    /// parent only while the config dir is missing (to see it appear) — once it
+    /// exists, the dir's own watch reports its removal.
+    fn watch_paths_for(&self, recursive: bool) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
         let mut add = |p: &Path| {
             if p.is_dir() && !out.iter().any(|q| q == p) {
@@ -59,12 +90,16 @@ impl Targets {
             }
         };
         if let Some(parent) = self.config_dir.parent() {
-            add(parent);
+            if !recursive || !self.config_dir.is_dir() {
+                add(parent);
+            }
         }
         add(&self.config_dir);
         add(&self.themes_dir);
-        if let Some(dir) = self.real_config.as_deref().and_then(Path::parent) {
-            add(dir);
+        for real in self.real_config.iter().chain(&self.real_themes) {
+            if let Some(dir) = real.parent() {
+                add(dir);
+            }
         }
         out
     }
@@ -84,7 +119,7 @@ impl Targets {
         if p == self.config_dir || p == self.themes_dir || p == self.config_dir.join("config.toml") {
             return true;
         }
-        if self.real_config.as_deref() == Some(p) {
+        if self.real_config.as_deref() == Some(p) || self.real_themes.iter().any(|t| t == p) {
             return true;
         }
         p.parent() == Some(self.themes_dir.as_path())
@@ -216,11 +251,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_theme_files_are_watched_at_their_target() {
+        // `themes/mine.toml -> ~/dotfiles/themes/mine.toml`: an editor saving the
+        // real file changes nothing in themes/, so it never hot-reloaded.
+        use std::os::unix::fs::symlink;
+        let base = tmp("theme-link");
+        let dotfiles = base.join("dotfiles").join("themes");
+        let cfg_dir = base.join("config").join("jetty");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(cfg_dir.join("themes")).unwrap();
+        std::fs::write(dotfiles.join("mine.toml"), "x = 1\n").unwrap();
+        symlink(dotfiles.join("mine.toml"), cfg_dir.join("themes").join("mine.toml")).unwrap();
+        let t = Targets::compute(&cfg_dir);
+        let real_dir = std::fs::canonicalize(&dotfiles).unwrap();
+        assert!(t.watch_paths().contains(&real_dir), "{:?}", t.watch_paths());
+        assert!(t.is_relevant(&real_dir.join("mine.toml")));
+        assert!(!t.is_relevant(&real_dir.join("other.toml")), "the repo's other files are not ours");
+
+        // End to end: an edit of the REAL file reloads.
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let w = ConfigWatcher::spawn(cfg_dir.clone(), move || {
+            let _ = tx.lock().unwrap().send(());
+        })
+        .expect("watcher");
+        std::fs::write(dotfiles.join("mine.toml"), "x = 2\n").unwrap();
+        assert!(changed(&rx), "edit of the symlinked theme's target");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_config_link_watches_where_its_target_will_appear() {
+        use std::os::unix::fs::symlink;
+        let base = tmp("dangling-link");
+        let dotfiles = base.join("dotfiles");
+        let cfg_dir = base.join("jetty");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        symlink(dotfiles.join("jetty.toml"), cfg_dir.join("config.toml")).unwrap();
+        let t = Targets::compute(&cfg_dir);
+        assert!(t.watch_paths().contains(&dotfiles), "{:?}", t.watch_paths());
+        assert!(t.is_relevant(&dotfiles.join("jetty.toml")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn missing_config_dir_still_watches_its_parent() {
         let base = tmp("missing");
         let t = Targets::compute(&base.join("jetty"));
         assert_eq!(t.watch_paths(), vec![base.clone()]);
+        assert_eq!(t.watch_paths_for(true), vec![base.clone()], "recursive backend too");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_recursive_backend_skips_the_busy_parent_once_the_dir_exists() {
+        // macOS FSEvents is recursive whatever is asked: watching the parent
+        // (`~/Library/Application Support`) woke the watcher on every write of
+        // every app. Only the config dir itself (and themes/) is watched then.
+        let base = tmp("recursive");
+        let cfg_dir = base.join("jetty");
+        std::fs::create_dir_all(cfg_dir.join("themes")).unwrap();
+        let t = Targets::compute(&cfg_dir);
+        assert_eq!(t.watch_paths_for(true), vec![cfg_dir.clone(), cfg_dir.join("themes")]);
+        // inotify (non-recursive) keeps the cheap parent watch: it also sees the
+        // config dir re-linked (stow), which its own watch cannot.
+        assert_eq!(
+            t.watch_paths_for(false),
+            vec![base.clone(), cfg_dir.clone(), cfg_dir.join("themes")]
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

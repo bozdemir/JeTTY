@@ -46,3 +46,8 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 #   is the winit request_user_attention dock bounce (no dep required); see notify.rs.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 notify-rust = { version = "4", default-features = false, features = ["z"] }
+
+[dev-dependencies]
+# Tests drive the shell-integration snippets in a REAL shell on a PTY (bash -u).
+# Already in the lockfile via jetty-core — no new download.
+portable-pty = "0.9"

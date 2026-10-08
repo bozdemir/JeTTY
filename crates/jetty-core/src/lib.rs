@@ -11,14 +11,15 @@ pub mod url;
 
 pub use fuzzy::{fuzzy_match, FuzzyMatch};
 pub use hints::{HintToken, TokenKind};
-pub use pty::{set_advertised_version, PtySession};
+pub use pty::{self_exe, set_advertised_version, PtySession, SelfExe};
 pub use sixel::{decode_sixel, InlineImage, SixelCaps, SixelImage, SIXEL_CAPS};
 pub use snapshot::{
     attr, CellGrapheme, CellSnapshot, CursorShapeSnap, GridSnapshot, SearchHit, GRAPHEME_MAX_BYTES,
     GRAPHEME_MAX_MARKS, SHAPE_MASK, VisibleImage,
 };
 pub use terminal::{
-    CommandCompletion, LinkHit, Terminal, OSC52_MAX_BYTES, SEARCH_MAX_MATCHES, SEARCH_MAX_QUERY,
+    CommandCompletion, LinkHit, Osc52Target, Terminal, OSC52_MAX_BYTES, SEARCH_MAX_MATCHES,
+    SEARCH_MAX_QUERY,
 };
 pub use theme::Theme;
 pub use theme::{builtins, set_registry, theme_at, theme_count, theme_index, theme_list};

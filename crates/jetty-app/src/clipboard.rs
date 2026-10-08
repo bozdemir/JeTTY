@@ -74,9 +74,10 @@ pub fn get_primary() -> Option<String> {
 /// Where a finished mouse selection is copied (config key `copy_on_select`):
 /// `"primary"` (default — the X11/Wayland select-to-copy convention: a middle
 /// click pastes it, the clipboard is left alone), `"clipboard"` (overwrite the
-/// clipboard, as JeTTY did before v0.26), `"both"`, or `"off"`. Platforms
-/// without a primary selection (macOS, Windows) treat `"primary"` as the
-/// clipboard, their own copy-on-select convention.
+/// clipboard, as JeTTY did before v0.26 — and, as then, a middle click in JeTTY
+/// pastes the clipboard), `"both"`, or `"off"`. Platforms without a primary
+/// selection (macOS, Windows) treat `"primary"` as the clipboard, their own
+/// copy-on-select convention.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CopyOnSelect {
     #[default]
@@ -106,6 +107,15 @@ impl CopyOnSelect {
             "off" | "none" | "false" => CopyOnSelect::Off,
             _ => CopyOnSelect::Primary,
         }
+    }
+
+    /// Whether JeTTY's middle click pastes the CLIPBOARD rather than the PRIMARY
+    /// selection: under `"clipboard"`, where a selection goes. PRIMARY there is
+    /// never written by JeTTY, so it held whatever ANOTHER app selected last —
+    /// a middle click pasted that stale text instead of the selection just
+    /// made. Every other mode keeps the X11 convention.
+    pub fn middle_click_reads_clipboard(self) -> bool {
+        self == CopyOnSelect::Clipboard
     }
 
     /// `(primary, clipboard)`: which selections a copy-on-select writes on a
@@ -150,6 +160,16 @@ impl<'de> serde::Deserialize<'de> for CopyOnSelect {
 pub const HAS_PRIMARY: bool =
     cfg!(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))));
 
+/// What JeTTY's middle click pastes under `copy_on_select` `mode` (see
+/// [`CopyOnSelect::middle_click_reads_clipboard`]).
+pub fn get_for_middle_click(mode: CopyOnSelect) -> Option<String> {
+    if mode.middle_click_reads_clipboard() {
+        get()
+    } else {
+        get_primary()
+    }
+}
+
 /// Copy a finished mouse selection per the user's `copy_on_select` policy.
 pub fn copy_on_select(text: &str, mode: CopyOnSelect) {
     let (primary, clipboard) = mode.targets(HAS_PRIMARY);
@@ -177,6 +197,16 @@ mod copy_on_select_tests {
         assert_eq!(CopyOnSelect::Both.targets(false), (false, true));
         assert_eq!(CopyOnSelect::Clipboard.targets(false), (false, true));
         assert_eq!(CopyOnSelect::Off.targets(false), (false, false));
+    }
+
+    #[test]
+    fn a_middle_click_pastes_where_the_selection_went() {
+        // "clipboard" never writes PRIMARY, so reading it pasted another app's
+        // stale selection instead of the one just made in JeTTY.
+        assert!(CopyOnSelect::Clipboard.middle_click_reads_clipboard());
+        for m in [CopyOnSelect::Primary, CopyOnSelect::Both, CopyOnSelect::Off] {
+            assert!(!m.middle_click_reads_clipboard(), "{m:?} keeps the X11 convention");
+        }
     }
 
     #[test]

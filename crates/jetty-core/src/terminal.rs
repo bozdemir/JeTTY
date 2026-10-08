@@ -38,19 +38,35 @@ fn term_config(scrollback: usize, osc52: Osc52, kitty_keyboard: bool) -> Config 
 /// anchors exist) so `abs_top` bookkeeping sees its history effect in isolation.
 /// ED 3 and RIS SHRINK history — a same-write `\e[2J\e[3J` (`clear`) otherwise
 /// nets out to "no change" and leaves anchors on the wrong rows. ED 2 erases the
-/// screen's anchors that `\e[2J` did not push into scrollback. An alt-screen
-/// toggle freezes `abs_top`, so primary output sharing its slice would go
-/// uncounted.
+/// screen's anchors that `\e[2J` did not push into scrollback. ED 2, SU and DL
+/// push up to a whole screen into scrollback from a few bytes, so their
+/// sub-slice is bounded by the lines they actually push, not by their byte
+/// count (primary screen only: on the alt screen they cannot touch the primary
+/// scrollback and are not split out). An alt-screen toggle freezes `abs_top`, so
+/// primary output sharing its slice would go uncounted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IsolatedSeq {
     /// `ESC [ 2 J` — erase the whole screen.
     EraseScreen,
     /// `ESC [ 3 J` — erase the saved lines (scrollback).
     EraseSaved,
+    /// `ESC [ Ps S` (SU) / `ESC [ Ps M` (DL, `delete`) — scroll (part of) the
+    /// region up by `count` lines (vte: 0 = 1); on the primary screen with the
+    /// region at the top they go into scrollback — for DL only when the cursor
+    /// is on the top row.
+    ScrollUp { count: u16, delete: bool },
     /// `ESC c` — RIS, full reset (clears screen + scrollback, leaves the alt screen).
     Reset,
     /// `ESC [ ? 47 | 1047 | 1049 h|l` — alternate-screen toggle.
     AltToggle,
+}
+
+impl IsolatedSeq {
+    /// Whether one such sequence can push up to a whole screen of lines into
+    /// scrollback (vte clamps the count to the scroll region).
+    fn scrolls_a_screen(self) -> bool {
+        matches!(self, IsolatedSeq::EraseScreen | IsolatedSeq::ScrollUp { .. })
+    }
 }
 
 /// Index of the first OSC terminator in `s` — BEL, CAN, SUB or ESC (vte 0.15's
@@ -165,10 +181,25 @@ fn cap_cursor_zerowidth(term: &mut Term<EventProxy>) {
 
 /// Classify a completed CSI (`ESC [` + `params` + `fin`) the scanner isolates.
 fn isolated_csi(params: &[u8], fin: u8) -> Option<IsolatedSeq> {
-    match (params, fin) {
-        (b"2", b'J') => Some(IsolatedSeq::EraseScreen),
-        (b"3", b'J') => Some(IsolatedSeq::EraseSaved),
-        (b"?47" | b"?1047" | b"?1049", b'h' | b'l') => Some(IsolatedSeq::AltToggle),
+    match params.split_first() {
+        Some((b'?', mode)) => (matches!(mode, b"47" | b"1047" | b"1049") && matches!(fin, b'h' | b'l'))
+            .then_some(IsolatedSeq::AltToggle),
+        _ if params.iter().all(u8::is_ascii_digit) => scroll_csi(params, fin),
+        _ => None,
+    }
+}
+
+/// The history-rewriting CSIs with one decimal parameter (`digits`, maybe
+/// empty): ED 2 / ED 3 (vte reads the number, so `\e[02J` is ED 2 too), and SU /
+/// DL with any count.
+fn scroll_csi(digits: &[u8], fin: u8) -> Option<IsolatedSeq> {
+    match fin {
+        b'J' => match decset_param(digits) {
+            2 => Some(IsolatedSeq::EraseScreen),
+            3 => Some(IsolatedSeq::EraseSaved),
+            _ => None,
+        },
+        b'S' | b'M' => Some(IsolatedSeq::ScrollUp { count: decset_param(digits), delete: fin == b'M' }),
         _ => None,
     }
 }
@@ -187,8 +218,9 @@ fn decset_bit(n: u16) -> u8 {
     }
 }
 
-/// Parse the decimal digits of one private-mode parameter (`params` excludes the
-/// `?`), saturating — an over-long number can never alias 9 or 1015.
+/// Parse the decimal digits of one CSI parameter (a private mode's without its
+/// `?`), saturating — an over-long number can never alias a real one (the mouse
+/// modes 9 / 1015, ED 2 / 3).
 fn decset_param(digits: &[u8]) -> u16 {
     digits.iter().fold(0u16, |n, &d| n.saturating_mul(10).saturating_add(u16::from(d.wrapping_sub(b'0'))))
 }
@@ -204,33 +236,64 @@ enum CsiPeek {
     Other,
 }
 
-/// Peek at `rest` (the bytes right after `ESC [`) for an [`IsolatedSeq`]. The
-/// first byte rules out nearly every CSI (SGRs start with a digit other than 2/3
-/// or are `3x;…`), so the common case is one or two compares.
+/// Parameter bytes [`Scan::Csi`] collects when a CSI is cut by a feed boundary.
+const CSI_PARAMS_MAX: usize = 5;
+
+/// Bytes vte executes (C0 controls but CAN / SUB / ESC) or ignores (DEL, 0x80..)
+/// inside a CSI WITHOUT leaving it — so `ESC [ <LF> > 1 u` is still a push.
+fn csi_transparent(b: u8) -> bool {
+    matches!(b, 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff)
+}
+
+/// Most kitty keyboard flag-stack entries JeTTY lets a screen hold. A push past
+/// it is dropped before it reaches alacritty: alacritty 0.26 caps its stack at
+/// 4096 by evicting from the TITLE stack — a panic (the whole terminal gone)
+/// when that is empty, so `printf '\e[>1u%.0s' {1..4097}` crashed JeTTY. Real
+/// programs push one or two levels; the margin to 4096 absorbs any mirror drift.
+const KBD_STACK_MAX: u16 = 128;
+
+/// The PRIMARY-screen kitty keyboard state a command started from (see
+/// [`Terminal::restore_kbd`]): the lowest stack depth seen since — what was on
+/// the stack below it belongs to the shell — and whether the active flags were
+/// replaced in place (`CSI = … u`, no push). `provisional` = opened at a prompt
+/// (`A`) because the shell may never send a command-start `C`: it is only
+/// undone by a `D` (a command did run), never by the next `A` alone.
+#[derive(Clone, Copy, Debug)]
+struct KbdWindow {
+    floor: u16,
+    set: bool,
+    provisional: bool,
+}
+
+/// Peek at `rest` (the bytes right after `ESC [`) for an [`IsolatedSeq`]. An SGR
+/// costs its first parameter's digits and one compare of the byte after them
+/// (`;` or `m`); a letter-led CSI other than `J`/`S`/`M` costs one compare.
 fn peek_isolated_csi(rest: &[u8]) -> CsiPeek {
-    const SEQS: [(&[u8], IsolatedSeq); 8] = [
-        (b"2J", IsolatedSeq::EraseScreen),
-        (b"3J", IsolatedSeq::EraseSaved),
-        (b"?47h", IsolatedSeq::AltToggle),
-        (b"?47l", IsolatedSeq::AltToggle),
-        (b"?1047h", IsolatedSeq::AltToggle),
-        (b"?1047l", IsolatedSeq::AltToggle),
-        (b"?1049h", IsolatedSeq::AltToggle),
-        (b"?1049l", IsolatedSeq::AltToggle),
-    ];
     match rest.first() {
-        None => return CsiPeek::Incomplete,
-        Some(b'2' | b'3' | b'?') => {}
-        Some(_) => return CsiPeek::Other,
-    }
-    let mut incomplete = false;
-    for (seq, kind) in SEQS {
-        if rest.starts_with(seq) {
-            return CsiPeek::Isolate(seq.len(), kind);
+        None => CsiPeek::Incomplete,
+        Some(b'?') => {
+            const ALT: [&[u8]; 6] = [b"?47h", b"?47l", b"?1047h", b"?1047l", b"?1049h", b"?1049l"];
+            let mut incomplete = false;
+            for seq in ALT {
+                if rest.starts_with(seq) {
+                    return CsiPeek::Isolate(seq.len(), IsolatedSeq::AltToggle);
+                }
+                incomplete |= seq.starts_with(rest);
+            }
+            if incomplete { CsiPeek::Incomplete } else { CsiPeek::Other }
         }
-        incomplete |= seq.starts_with(rest);
+        Some(b'0'..=b'9' | b'J' | b'S' | b'M') => match rest.iter().position(|b| !b.is_ascii_digit()) {
+            Some(n) => match scroll_csi(&rest[..n], rest[n]) {
+                Some(kind) => CsiPeek::Isolate(n + 1, kind),
+                None => CsiPeek::Other,
+            },
+            // The feed ends inside the number: finish it byte-wise (a number too
+            // long for that is not tracked — it can only be absurd).
+            None if rest.len() < CSI_PARAMS_MAX => CsiPeek::Incomplete,
+            None => CsiPeek::Other,
+        },
+        Some(_) => CsiPeek::Other,
     }
-    if incomplete { CsiPeek::Incomplete } else { CsiPeek::Other }
 }
 
 /// Turn a Kitty command's RAW payload (already base64-decoded and accumulated)
@@ -264,6 +327,36 @@ pub const OSC52_MAX_BYTES: usize = 100 * 1024;
 /// clipboard text it returns the full `\e]52;…\a` reply to write back to the PTY.
 /// Matches alacritty's `Event::ClipboardLoad` payload type exactly.
 type ClipboardLoadFmt = Arc<dyn Fn(&str) -> String + Send + Sync + 'static>;
+
+/// The selection an OSC 52 request names: `c` the clipboard, `p` / `s` the
+/// PRIMARY selection (what a middle click pastes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Osc52Target {
+    Clipboard,
+    Primary,
+}
+
+impl Osc52Target {
+    fn of(ty: alacritty_terminal::term::ClipboardType) -> Osc52Target {
+        match ty {
+            alacritty_terminal::term::ClipboardType::Clipboard => Osc52Target::Clipboard,
+            alacritty_terminal::term::ClipboardType::Selection => Osc52Target::Primary,
+        }
+    }
+}
+
+/// Pending OSC 52 requests, at most ONE per selection: a newer request for the
+/// same selection replaces the older one (last wins) and queues behind the other
+/// selection's, so arrival order is kept. nvim with `clipboard=unnamed,unnamedplus`
+/// copies every yank to BOTH selections back to back, and asks for both on a
+/// paste — one shared slot used to let the second overwrite the first.
+type Osc52Pending<T> = Arc<Mutex<Vec<(Osc52Target, T)>>>;
+
+fn push_osc52<T>(pending: &Osc52Pending<T>, target: Osc52Target, item: T) {
+    let mut list = pending.lock().unwrap();
+    list.retain(|(t, _)| *t != target);
+    list.push((target, item));
+}
 
 /// EventListener that captures the terminal's write-back bytes (replies to
 /// host queries such as DSR/DA, text-area size, and OSC color queries) and
@@ -306,32 +399,23 @@ struct EventProxy {
     /// Set to `true` when the app rings the bell (BEL / ^G, `Event::Bell`).
     /// Shared with the owning `Terminal`; consumed via [`Terminal::take_bell`].
     bell: Arc<AtomicBool>,
-    /// Pending OSC 52 clipboard-COPY text (remote/tmux/nvim asked to set the system
-    /// clipboard). `Some` = text to commit; last-wins coalesce. Committed by the app
-    /// on the drain pass via [`Terminal::take_clipboard_store`]. Only ever set when
-    /// alacritty's `osc52` mode permits copy (OnlyCopy/CopyPaste — the default).
-    clipboard_store: Arc<Mutex<Option<String>>>,
+    /// Pending OSC 52 clipboard-COPY texts (remote/tmux/nvim asked to set a system
+    /// selection), one per selection, last-wins. Committed by the app on the drain
+    /// pass via [`Terminal::take_clipboard_stores`]. Only ever set when alacritty's
+    /// `osc52` mode permits copy (OnlyCopy/CopyPaste — the default).
+    clipboard_store: Osc52Pending<String>,
     /// Cheap "a clipboard-copy is pending" flag so the drain path skips the mutex in
     /// the common no-copy case (lock-free — zero idle cost).
     clipboard_dirty: Arc<AtomicBool>,
-    /// Pending OSC 52 clipboard-PASTE (load) request: the reply formatter alacritty
-    /// supplied. Only ever set when `osc52` mode permits paste (OnlyPaste/CopyPaste),
-    /// i.e. only when the user opted into `osc52_allow_paste`. Drained by the app via
-    /// [`Terminal::take_clipboard_load`], which reads the clipboard, formats, and
-    /// writes the reply to the PTY. Off by default (the secure default).
-    clipboard_load: Arc<Mutex<Option<ClipboardLoadFmt>>>,
+    /// Pending OSC 52 clipboard-PASTE (load) requests: the reply formatter alacritty
+    /// supplied, one per selection. Only ever set when `osc52` mode permits paste
+    /// (OnlyPaste/CopyPaste), i.e. only when the user opted into
+    /// `osc52_allow_paste`. Drained by the app via [`Terminal::take_clipboard_loads`],
+    /// which reads each selection, formats, and writes the replies to the PTY. Off
+    /// by default (the secure default).
+    clipboard_load: Osc52Pending<ClipboardLoadFmt>,
     /// Cheap "a clipboard-paste is pending" flag (mirrors `clipboard_dirty`).
     clipboard_load_dirty: Arc<AtomicBool>,
-    /// Which selection the pending OSC 52 copy / paste names (`c` = clipboard,
-    /// `p`/`s` = the PRIMARY selection), recorded alongside each request.
-    osc52_primary: Arc<Osc52Primary>,
-}
-
-/// OSC 52 `Pc` per pending request: `true` = the PRIMARY selection (`p`/`s`).
-#[derive(Default)]
-struct Osc52Primary {
-    store: AtomicBool,
-    load: AtomicBool,
 }
 
 impl EventProxy {
@@ -409,21 +493,19 @@ impl EventListener for EventProxy {
             Event::Bell => {
                 self.bell.store(true, Ordering::Relaxed);
             }
-            // OSC 52 COPY: a remote host / tmux / nvim (`"+y`) asked to set the
-            // system clipboard. alacritty already base64-decoded + UTF-8-validated
+            // OSC 52 COPY: a remote host / tmux / nvim (`"+y`) asked to set a
+            // system selection. alacritty already base64-decoded + UTF-8-validated
             // the payload and only emits this when its `osc52` mode permits copy
-            // (OnlyCopy is JeTTY's default). Coalesce last-wins into a shared slot;
-            // the app commits it on the drain pass — to the PRIMARY selection when
-            // the request named it (`p`/`s` → `Selection`), else the clipboard.
+            // (OnlyCopy is JeTTY's default). Coalesce last-wins PER SELECTION; the
+            // app commits each on the drain pass — the PRIMARY selection when the
+            // request named it (`p`/`s` → `Selection`), else the clipboard.
             Event::ClipboardStore(ty, text) => {
                 // Cap the COMMITTED text (see OSC52_MAX_BYTES): reject an abusive
                 // payload rather than flooding the real clipboard. The transient
                 // decode already happened inside alacritty (bounded by its OSC
                 // buffer), so this is a commit gate, not a memory guard.
                 if text.len() <= OSC52_MAX_BYTES {
-                    *self.clipboard_store.lock().unwrap() = Some(text);
-                    let primary = matches!(ty, alacritty_terminal::term::ClipboardType::Selection);
-                    self.osc52_primary.store.store(primary, Ordering::Relaxed);
+                    push_osc52(&self.clipboard_store, Osc52Target::of(ty), text);
                     self.clipboard_dirty.store(true, Ordering::Release);
                 }
             }
@@ -433,9 +515,7 @@ impl EventListener for EventProxy {
             // inert unless the user set `osc52_allow_paste = true`. Stash the reply
             // formatter; the app reads the clipboard, caps + formats, writes to PTY.
             Event::ClipboardLoad(ty, formatter) => {
-                *self.clipboard_load.lock().unwrap() = Some(formatter);
-                let primary = matches!(ty, alacritty_terminal::term::ClipboardType::Selection);
-                self.osc52_primary.load.store(primary, Ordering::Relaxed);
+                push_osc52(&self.clipboard_load, Osc52Target::of(ty), formatter);
                 self.clipboard_load_dirty.store(true, Ordering::Release);
             }
             // Wakeup / MouseCursorDirty and the rest are intentionally ignored.
@@ -466,8 +546,8 @@ impl Dimensions for Size {
 const MAX_MARKS: usize = 4096;
 
 /// [`Terminal::at_clean_prompt`] bounds: the cursor may sit at most this many rows
-/// below the open prompt mark (a multi-line prompt plus wrapped typed input),
-/// and at most this many (blank) lines may lie above it.
+/// below the open prompt's input line (typed input soft-wrapping that far), and
+/// at most this many (blank) lines may lie above the prompt.
 const CLEAN_PROMPT_MAX_ROWS: i64 = 8;
 const CLEAN_PROMPT_MAX_ABOVE: i64 = 256;
 
@@ -494,6 +574,22 @@ fn count_line_feeds(s: &[u8]) -> usize {
 
 /// The exact OSC 133 introducer the scanner matches after `ESC ]`.
 const OSC133_PREFIX: &[u8] = b"133;";
+
+/// The `redraw=0` parameter of an OSC 133 `A` (kitty's extension): the shell
+/// does NOT repaint its whole prompt after a resize — readline repaints only the
+/// LAST line of a multi-line PS1 — so the resize wipe must not erase the rest.
+const REDRAW_OFF: &[u8] = b"redraw=0";
+
+/// [`Scan::Payload`] `kv`: the current parameter can no longer be `redraw=0`.
+const KV_MISMATCH: u8 = u8::MAX;
+
+/// Advance the `redraw=0` match of the current OSC 133 parameter by one byte.
+fn redraw_step(kv: u8, b: u8) -> u8 {
+    match REDRAW_OFF.get(usize::from(kv)) {
+        Some(&want) if want == b => kv + 1,
+        _ => KV_MISMATCH,
+    }
+}
 
 /// Cap on the sixel carry buffer (`sixel_buf`). A never-terminated or hostile
 /// sixel cannot grow memory without bound: past this the scanner latches
@@ -568,11 +664,12 @@ enum Scan {
     Ground,
     /// Saw ESC; a following `]` (0x5d) opens an OSC, `P` (0x50) opens a DCS.
     Esc,
-    /// Saw `ESC [`: collecting up to 5 parameter bytes (`0-9`, `?`) to recognize
-    /// the few CSIs that rewrite history ([`IsolatedSeq`]). Any other byte bails
-    /// to Ground at once (an SGR costs one extra step); vte parses every CSI
-    /// itself regardless — this only decides where `feed` splits its slices.
-    Csi { params: [u8; 5], len: u8 },
+    /// Saw `ESC [` at the end of a feed: collecting up to [`CSI_PARAMS_MAX`]
+    /// parameter bytes (`0-9`, `?`) to recognize the few CSIs that rewrite
+    /// history ([`IsolatedSeq`]). Any other byte bails to Ground at once (an SGR
+    /// costs one extra step); vte parses every CSI itself regardless — this only
+    /// decides where `feed` splits its slices.
+    Csi { params: [u8; CSI_PARAMS_MAX], len: u8 },
     /// Inside a private-mode CSI (`ESC [ ?`), watching for DECSET/DECRST of the
     /// two mouse modes alacritty does not track — X10 (`9`) and urxvt (`1015`).
     /// `cur` is the parameter being read (saturating), `hit` the modes named so
@@ -585,7 +682,9 @@ enum Scan {
     /// Matched `133;`; collecting the letter (A/B/C/D) and the first `;code`.
     /// `code_done` is set by a SECOND `;` so `aid=<n>` params never corrupt the
     /// exit code (only the first param after the letter is the exit status).
-    Payload { letter: u8, code: Option<u32>, in_code: bool, code_done: bool },
+    /// `kv` matches the current parameter against [`REDRAW_OFF`];
+    /// `no_redraw` latches once one matched (an `A;redraw=0`).
+    Payload { letter: u8, code: Option<u32>, in_code: bool, code_done: bool, kv: u8, no_redraw: bool },
     /// Inside some OTHER OSC (title/hyperlink/color); skip to its terminator.
     Skip,
     /// An OSC overran [`OSC_MAX_BYTES`]: vte was handed CAN to end it, and every
@@ -611,6 +710,14 @@ enum Scan {
     /// An APC that is NOT `_G…` (some other APC use): skip to the terminator,
     /// accumulate nothing, emit nothing.
     ApcOther,
+    /// Inside `ESC [ >`, `ESC [ <` or `ESC [ =` — a kitty keyboard-protocol
+    /// candidate (`CSI > Ps u` push, `CSI < Ps u` pop, `CSI = Ps ; Pm u` set),
+    /// read so JeTTY can mirror each screen's flag-stack DEPTH (`kbd_depth`;
+    /// alacritty keeps the stacks private). `n` = the first parameter
+    /// (saturating, like vte), `seps` = parameter separators so far, `odd` =
+    /// something vte would not dispatch as a plain push/pop/set (an
+    /// intermediate, a second marker, too many parameters).
+    KbdCsi { marker: u8, n: u16, seps: u8, odd: bool },
 }
 
 /// One shell command's OSC 133 semantic marks. `prompt`/`input`/`output` are
@@ -628,6 +735,9 @@ struct CmdBlock {
     exit: Option<i32>,
     /// Set once a D arrives (or a later A closes an abandoned command, e.g. ^C).
     finished: bool,
+    /// The shell repaints this whole prompt after a resize (false for an
+    /// `A;redraw=0`, e.g. bash: readline repaints only a prompt's last line).
+    redraws: bool,
 }
 
 /// The shell command between its prompt mark (`A`) and its completion (`D`) —
@@ -740,17 +850,15 @@ pub struct Terminal {
     /// Pending-bell flag shared with the `EventProxy` (`Event::Bell`);
     /// consumed by [`Terminal::take_bell`].
     bell: Arc<AtomicBool>,
-    /// Pending OSC 52 clipboard-copy text + flag, shared with the `EventProxy`;
-    /// consumed by [`Terminal::take_clipboard_store`].
-    clipboard_store: Arc<Mutex<Option<String>>>,
+    /// Pending OSC 52 clipboard-copy texts + flag, shared with the `EventProxy`;
+    /// consumed by [`Terminal::take_clipboard_stores`].
+    clipboard_store: Osc52Pending<String>,
     clipboard_dirty: Arc<AtomicBool>,
-    /// Pending OSC 52 clipboard-paste reply formatter + flag, shared with the
-    /// `EventProxy`; consumed by [`Terminal::take_clipboard_load`]. Inert unless
+    /// Pending OSC 52 clipboard-paste reply formatters + flag, shared with the
+    /// `EventProxy`; consumed by [`Terminal::take_clipboard_loads`]. Inert unless
     /// `osc52_mode` permits paste.
-    clipboard_load: Arc<Mutex<Option<ClipboardLoadFmt>>>,
+    clipboard_load: Osc52Pending<ClipboardLoadFmt>,
     clipboard_load_dirty: Arc<AtomicBool>,
-    /// The selection each pending OSC 52 request named (shared with the proxy).
-    osc52_primary: Arc<Osc52Primary>,
     /// The OSC 52 mode this terminal was built with. Stored so `set_scrollback_lines`
     /// (which rebuilds the alacritty `Config`) preserves it instead of silently
     /// reverting an enabled paste back to the default `OnlyCopy`. Toggled by
@@ -790,13 +898,13 @@ pub struct Terminal {
     /// `history_size()` then never pins and its growth stays an EXACT scroll
     /// count (a full scrollback no longer disables marks, Run & Notify or
     /// images). With nothing anchored nothing reads it: slices go through whole
-    /// and it may under-count, harmlessly. Only a sub-slice that scrolls
-    /// more than it could be bounded (a sync-update replay, a `CSI 9999 S`
-    /// burst) pins it — that drops every anchor once (correct-or-absent) and
-    /// tracking resumes exactly on the next sub-slice. FROZEN on the alt screen
-    /// and across an alt-screen toggle (that history change is not a scroll);
-    /// toggles are isolated into their own sub-slice so no primary output is
-    /// lost with them.
+    /// and it may under-count, harmlessly. Only a sub-slice that scrolls more
+    /// than it could be bounded (a sync-update replay, a long `CSI Ps b` repeat,
+    /// a screen taller than the scrollback) pins it — that drops every anchor
+    /// once (correct-or-absent) and tracking resumes exactly on the next
+    /// sub-slice. FROZEN on the alt screen and across an alt-screen toggle (that
+    /// history change is not a scroll); toggles are isolated into their own
+    /// sub-slice so no primary output is lost with them.
     abs_top: i64,
     /// The scrollback cap (the alacritty grid's max). While anchors exist, room
     /// is made BEFORE each sub-slice, so the retained history sits between this
@@ -908,6 +1016,15 @@ pub struct Terminal {
     /// The OSC payload cap in force: [`OSC_MAX_BYTES`], lowered only by tests so
     /// the vte differential fuzz reaches it cheaply.
     osc_cap: u32,
+    /// JeTTY's mirror of alacritty's kitty keyboard flag stacks — their DEPTHS
+    /// only — `[primary, alternate]` (alacritty swaps the two stacks with the
+    /// screens). Fed by the scanner (`Scan::KbdCsi`); zeroed whenever alacritty
+    /// clears the stacks (RIS, a protocol toggle). It keeps a push flood below
+    /// alacritty's panicking limit ([`KBD_STACK_MAX`]) and lets a prompt undo
+    /// what a dead program left pushed ([`Terminal::restore_kbd`]).
+    kbd_depth: [u16; 2],
+    /// The keyboard state the running command started from; `None` outside one.
+    kbd_window: Option<KbdWindow>,
     /// Test-only: every byte handed to vte, in order (the differential fuzz
     /// replays it through a model of vte's state machine).
     #[cfg(test)]
@@ -981,11 +1098,10 @@ impl Terminal {
         let title_update = Arc::new(Mutex::new(None));
         let title_dirty = Arc::new(AtomicBool::new(false));
         let bell = Arc::new(AtomicBool::new(false));
-        let clipboard_store = Arc::new(Mutex::new(None));
+        let clipboard_store = Arc::new(Mutex::new(Vec::new()));
         let clipboard_dirty = Arc::new(AtomicBool::new(false));
-        let clipboard_load = Arc::new(Mutex::new(None));
+        let clipboard_load = Arc::new(Mutex::new(Vec::new()));
         let clipboard_load_dirty = Arc::new(AtomicBool::new(false));
-        let osc52_primary = Arc::new(Osc52Primary::default());
         let proxy = EventProxy {
             tx,
             geom: Arc::clone(&geom),
@@ -999,7 +1115,6 @@ impl Terminal {
             clipboard_dirty: Arc::clone(&clipboard_dirty),
             clipboard_load: Arc::clone(&clipboard_load),
             clipboard_load_dirty: Arc::clone(&clipboard_load_dirty),
-            osc52_primary: Arc::clone(&osc52_primary),
         };
         let term = Term::new(config, &size, proxy);
 
@@ -1020,7 +1135,6 @@ impl Terminal {
             clipboard_dirty,
             clipboard_load,
             clipboard_load_dirty,
-            osc52_primary,
             osc52_mode,
             kitty_keyboard,
             search_query: String::new(),
@@ -1061,6 +1175,8 @@ impl Terminal {
             mouse_x10: false,
             mouse_urxvt: false,
             osc_cap: OSC_MAX_BYTES,
+            kbd_depth: [0, 0],
+            kbd_window: None,
             #[cfg(test)]
             vte_log: None,
         }
@@ -1100,39 +1216,29 @@ impl Terminal {
             .map(|u| u.and_then(|s| sanitize_title(&s)))
     }
 
-    /// Take the pending OSC 52 clipboard-COPY text, if any. `None` in the common
-    /// case (a lock-free flag check — zero idle cost). Consuming; multiple copies
-    /// between calls coalesce last-wins. The app writes the returned text to the
-    /// system clipboard (jetty-core does not depend on the clipboard backend).
-    pub fn take_clipboard_store(&mut self) -> Option<String> {
+    /// Take the pending OSC 52 clipboard-COPY texts: at most one per selection,
+    /// in arrival order. Empty in the common case (a lock-free flag check — zero
+    /// idle cost, no allocation). Consuming; copies to the same selection between
+    /// calls coalesce last-wins. The app writes each text to the selection it
+    /// names (jetty-core does not depend on the clipboard backend).
+    pub fn take_clipboard_stores(&mut self) -> Vec<(Osc52Target, String)> {
         if !self.clipboard_dirty.swap(false, Ordering::Acquire) {
-            return None;
+            return Vec::new();
         }
-        self.clipboard_store.lock().unwrap().take()
+        std::mem::take(&mut *self.clipboard_store.lock().unwrap())
     }
 
-    /// Take the pending OSC 52 clipboard-PASTE reply formatter, if any. `None` in the
-    /// common case (a lock-free flag check). Only ever `Some` when the terminal was
-    /// built/toggled to permit paste (`osc52_allow_paste`), so the default (write-
-    /// only) build never yields one. The app reads the system clipboard, caps it,
-    /// calls the formatter, and writes the reply to the PTY.
-    pub fn take_clipboard_load(&mut self) -> Option<ClipboardLoadFmt> {
+    /// Take the pending OSC 52 clipboard-PASTE reply formatters: at most one per
+    /// selection, in arrival order. Empty in the common case (a lock-free flag
+    /// check). Only ever non-empty when the terminal was built/toggled to permit
+    /// paste (`osc52_allow_paste`), so the default (write-only) build never yields
+    /// one. The app reads the named selection, caps it, calls the formatter, and
+    /// writes the reply to the PTY — one reply per request.
+    pub fn take_clipboard_loads(&mut self) -> Vec<(Osc52Target, ClipboardLoadFmt)> {
         if !self.clipboard_load_dirty.swap(false, Ordering::Acquire) {
-            return None;
+            return Vec::new();
         }
-        self.clipboard_load.lock().unwrap().take()
-    }
-
-    /// Whether the copy last returned by [`Terminal::take_clipboard_store`] named
-    /// the PRIMARY selection (OSC 52 `p`/`s`) rather than the clipboard (`c`).
-    pub fn clipboard_store_is_primary(&self) -> bool {
-        self.osc52_primary.store.load(Ordering::Relaxed)
-    }
-
-    /// Whether the paste request last returned by
-    /// [`Terminal::take_clipboard_load`] named the PRIMARY selection.
-    pub fn clipboard_load_is_primary(&self) -> bool {
-        self.osc52_primary.load.load(Ordering::Relaxed)
+        std::mem::take(&mut *self.clipboard_load.lock().unwrap())
     }
 
     /// The exact bytes [`Terminal::feed_notice`] feeds for `text`: the text in
@@ -1176,6 +1282,38 @@ impl Terminal {
         }
         self.kitty_keyboard = enabled;
         self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, self.kitty_keyboard));
+        self.kbd_cleared();
+    }
+
+    /// Drop every keyboard / mouse mode a program may have left behind — the
+    /// kitty keyboard flag stacks of BOTH screens, mouse reporting and its
+    /// encodings, focus reporting and bracketed paste — without touching the
+    /// screen, the scrollback or the cursor. The way out when a program died
+    /// with them on (Ctrl+C sent as `\e[99;5u`, clicks typed as escape codes),
+    /// e.g. a TUI killed on the alternate screen, where no prompt mark can
+    /// restore anything.
+    pub fn reset_input_modes(&mut self) {
+        use alacritty_terminal::vte::ansi::{Handler, NamedPrivateMode, PrivateMode};
+        if self.kitty_keyboard {
+            // A protocol toggle is alacritty's only way to clear BOTH screens'
+            // stacks (`set_options`; the re-emitted title is a no-op app-side).
+            self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, false));
+            self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, true));
+        }
+        self.kbd_cleared();
+        for mode in [
+            NamedPrivateMode::ReportMouseClicks,
+            NamedPrivateMode::ReportCellMouseMotion,
+            NamedPrivateMode::ReportAllMouseMotion,
+            NamedPrivateMode::Utf8Mouse,
+            NamedPrivateMode::SgrMouse,
+            NamedPrivateMode::ReportFocusInOut,
+            NamedPrivateMode::BracketedPaste,
+        ] {
+            self.term.unset_private_mode(PrivateMode::Named(mode));
+        }
+        self.mouse_x10 = false;
+        self.mouse_urxvt = false;
     }
 
     /// The kitty keyboard protocol flags the running app has currently pushed,
@@ -1303,8 +1441,9 @@ impl Terminal {
     /// cursor line is read, then decodes/places the image (or binds the 133).
     /// Image payloads ARE still fed to alacritty (which ignores them) so its own
     /// parser walks the DCS/APC in lockstep and stays consistent. While anchors
-    /// exist, ED 2/3, RIS and alt-screen toggles are advanced in sub-slices of
-    /// their own so `abs_top` sees each one's history effect in isolation.
+    /// exist, ED 2/3, SU/DL, RIS and alt-screen toggles are advanced in
+    /// sub-slices of their own so `abs_top` sees each one's history effect in
+    /// isolation.
     /// Measured with `examples/feed_bench.rs`: within ±1.5% of the pre-scan code
     /// on every workload, including one with live prompt marks.
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -1344,22 +1483,32 @@ impl Terminal {
                         }
                         0x50 => Scan::DcsParams { p2: 0, field: 0, inter: false }, // 'P' opens a DCS
                         0x5f => Scan::ApcIntro,        // '_' opens an APC (Kitty graphics)
-                        // '[' opens a CSI. Only while anchors exist is it checked for
-                        // the few history-rewriting sequences ([`IsolatedSeq`]), by
-                        // peeking ahead in this buffer — an SGR costs a byte compare,
-                        // no extra scanner steps.
+                        // '[' opens a CSI. A kitty keyboard push/pop/set is always
+                        // followed (the flag-stack mirror, `kbd_depth`).
+                        0x5b if matches!(bytes.get(i + 1), Some(b'<' | b'=' | b'>')) => {
+                            self.scan = Scan::KbdCsi { marker: bytes[i + 1], n: 0, seps: 0, odd: false };
+                            i += 2;
+                            continue;
+                        }
+                        // Only while anchors exist is it checked for the few
+                        // history-rewriting sequences ([`IsolatedSeq`]), by peeking
+                        // ahead in this buffer — an SGR costs a byte compare or
+                        // two, no extra scanner steps.
                         0x5b if self.has_anchors() => match peek_isolated_csi(&bytes[i + 1..]) {
                             CsiPeek::Isolate(len, kind) => {
-                                let k = i + 1 + len;
-                                start = self.isolate(bytes, start, i, k, kind);
-                                i = k;
-                                self.scan = Scan::Ground;
-                                continue;
+                                if self.isolates(kind) {
+                                    let k = i + 1 + len;
+                                    start = self.isolate(bytes, start, i, k, kind);
+                                    i = k;
+                                    self.scan = Scan::Ground;
+                                    continue;
+                                }
+                                Scan::Ground
                             }
                             // Cut off by the end of this feed: finish it byte-wise.
                             CsiPeek::Incomplete => {
                                 seq_start = i;
-                                Scan::Csi { params: [0; 5], len: 0 }
+                                Scan::Csi { params: [0; CSI_PARAMS_MAX], len: 0 }
                             }
                             // A private-mode CSI: watch it for the mouse modes
                             // alacritty ignores (the `?` is consumed here).
@@ -1368,26 +1517,32 @@ impl Terminal {
                                 i += 2;
                                 continue;
                             }
+                            // A control vte executes inside the CSI: read on.
+                            CsiPeek::Other if bytes.get(i + 1).is_some_and(|&c| csi_transparent(c)) => {
+                                seq_start = i;
+                                Scan::Csi { params: [0; CSI_PARAMS_MAX], len: 0 }
+                            }
                             CsiPeek::Other => Scan::Ground,
                         },
                         // Without anchors only private-mode CSIs are followed (a
                         // one-byte peek; an SGR still costs no extra step). At the
-                        // end of the feed, finish the CSI byte-wise.
+                        // end of the feed — or past a control vte executes inside
+                        // the CSI — finish it byte-wise.
                         0x5b => match bytes.get(i + 1) {
                             Some(b'?') => {
                                 self.scan = Scan::Decset { cur: 0, hit: 0 };
                                 i += 2;
                                 continue;
                             }
-                            Some(_) => Scan::Ground,
-                            None => {
+                            Some(&c) if !csi_transparent(c) => Scan::Ground,
+                            _ => {
                                 seq_start = i;
-                                Scan::Csi { params: [0; 5], len: 0 }
+                                Scan::Csi { params: [0; CSI_PARAMS_MAX], len: 0 }
                             }
                         },
                         // `ESC c` (RIS) resets the screen AND scrollback — and
-                        // every terminal mode, including the two mouse modes
-                        // tracked here.
+                        // every terminal mode, including the two mouse modes and
+                        // the keyboard flag stacks mirrored here.
                         b'c' => {
                             let k = i + 1;
                             if self.has_anchors() {
@@ -1395,6 +1550,7 @@ impl Terminal {
                             }
                             self.mouse_x10 = false;
                             self.mouse_urxvt = false;
+                            self.kbd_cleared();
                             Scan::Ground
                         }
                         // ESC ESC restarts; C0 controls (vte executes them), DEL and
@@ -1423,16 +1579,20 @@ impl Terminal {
                             self.scan = Scan::Decset { cur: 0, hit };
                         }
                         b'0'..=b'9' if private => self.scan = Scan::Decset { cur: u16::MAX, hit: 0 },
+                        // A kitty keyboard push/pop/set (its marker comes first).
+                        b'<' | b'=' | b'>' if len == 0 => {
+                            self.scan = Scan::KbdCsi { marker: b, n: 0, seps: 0, odd: false };
+                        }
                         // vte executes C0 controls and ignores DEL / high bytes
-                        // inside a CSI; a private sequence keeps being read.
-                        0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff if private => {}
+                        // inside a CSI without leaving it: keep reading.
+                        _ if csi_transparent(b) => {}
                         // Final byte: advance an isolated sequence in a sub-slice of
                         // its own (only while anchors exist — otherwise splitting
                         // buys nothing).
                         0x40..=0x7e => {
                             let k = i + 1;
                             if let Some(kind) = isolated_csi(&params[..len as usize], b) {
-                                if self.has_anchors() {
+                                if self.isolates(kind) {
                                     start = self.isolate(bytes, start, seq_start, k, kind);
                                 }
                             }
@@ -1446,6 +1606,35 @@ impl Terminal {
                         // Anything else (`;`, intermediates, C0): not a sequence we
                         // isolate — stop tracking it.
                         _ => self.scan = Scan::Ground,
+                    }
+                    i += 1;
+                }
+                Scan::KbdCsi { marker, n, seps, odd } => {
+                    match b {
+                        b'0'..=b'9' if seps == 0 => {
+                            let n = n.saturating_mul(10).saturating_add(u16::from(b - b'0'));
+                            self.scan = Scan::KbdCsi { marker, n, seps, odd };
+                        }
+                        b'0'..=b'9' => {}
+                        // A parameter / sub-parameter separator (vte dispatches
+                        // nothing past 32 of them; stay well clear of the edge).
+                        b';' | b':' => {
+                            let seps = seps.saturating_add(1);
+                            self.scan = Scan::KbdCsi { marker, n, seps, odd: odd || seps >= 30 };
+                        }
+                        b'u' => {
+                            start = self.kitty_kbd_csi(bytes, start, i, marker, n, odd);
+                            self.scan = Scan::Ground;
+                        }
+                        // Any other final byte (`CSI > 4 ; 2 m`, `CSI > c`, …).
+                        0x40..=0x7e => self.scan = Scan::Ground,
+                        // ESC restarts, CAN/SUB abort (vte's "anywhere" rules).
+                        0x1b => self.scan = Scan::Esc,
+                        0x18 | 0x1a => self.scan = Scan::Ground,
+                        _ if csi_transparent(b) => {}
+                        // An intermediate or a second private marker: vte does not
+                        // dispatch it as a push/pop/set (read on to the final byte).
+                        _ => self.scan = Scan::KbdCsi { marker, n, seps, odd: true },
                     }
                     i += 1;
                 }
@@ -1487,6 +1676,8 @@ impl Terminal {
                                     code: None,
                                     in_code: false,
                                     code_done: false,
+                                    kv: KV_MISMATCH,
+                                    no_redraw: false,
                                 }
                             } else {
                                 Scan::Prefix { n: n2 }
@@ -1507,7 +1698,7 @@ impl Terminal {
                 {
                     start = self.abort_osc(bytes, start, i);
                 }
-                Scan::Payload { letter, code, in_code, code_done } => match b {
+                Scan::Payload { letter, code, in_code, code_done, kv, no_redraw } => match b {
                     // BEL / CAN / SUB / ESC(=ST) all end the OSC (vte parity).
                     0x07 | 0x18 | 0x1a | 0x1b => {
                         let is_esc = b == 0x1b;
@@ -1516,7 +1707,8 @@ impl Terminal {
                         // read the cursor NOW (OSC 133 never moves it, so the line
                         // is identical whether read in this feed or a later split).
                         self.advance_slice(&bytes[start..k]);
-                        self.bind_mark(letter, code.map(|c| c as i32));
+                        let redraws = !(no_redraw || usize::from(kv) == REDRAW_OFF.len());
+                        self.bind_mark(letter, code.map(|c| c as i32), redraws);
                         // ESC leaves alacritty in Escape state and may begin a new
                         // sequence (the trailing `\` of an ST is consumed there).
                         self.scan = if is_esc { Scan::Esc } else { Scan::Ground };
@@ -1531,6 +1723,8 @@ impl Terminal {
                             code,
                             in_code: true,
                             code_done: in_code || code_done,
+                            kv: 0,
+                            no_redraw: no_redraw || usize::from(kv) == REDRAW_OFF.len(),
                         };
                         self.osc_len += 1;
                         i += 1;
@@ -1547,7 +1741,8 @@ impl Terminal {
                             .saturating_mul(10)
                             .saturating_add((b - b'0') as u32)
                             .min(EXIT_CODE_MAX);
-                        self.scan = Scan::Payload { letter, code: Some(next), in_code, code_done };
+                        let kv = redraw_step(kv, b);
+                        self.scan = Scan::Payload { letter, code: Some(next), in_code, code_done, kv, no_redraw };
                         self.osc_len += 1;
                         i += 1;
                     }
@@ -1556,12 +1751,13 @@ impl Terminal {
                         // non-digit inside the code field (e.g. `k=v`) makes the
                         // exit code unknown (None), closed so trailing digits do
                         // not resurrect it.
+                        let kv = if in_code { redraw_step(kv, b) } else { kv };
                         self.scan = if letter == 0 && !in_code {
-                            Scan::Payload { letter: b, code, in_code, code_done }
+                            Scan::Payload { letter: b, code, in_code, code_done, kv, no_redraw }
                         } else if in_code && !code_done {
-                            Scan::Payload { letter, code: None, in_code, code_done: true }
+                            Scan::Payload { letter, code: None, in_code, code_done: true, kv, no_redraw }
                         } else {
-                            Scan::Payload { letter, code, in_code, code_done }
+                            Scan::Payload { letter, code, in_code, code_done, kv, no_redraw }
                         };
                         self.osc_len += 1;
                         i += 1;
@@ -1874,9 +2070,147 @@ impl Terminal {
     fn isolate(&mut self, bytes: &[u8], start: usize, seq_start: usize, k: usize, kind: IsolatedSeq) -> usize {
         let s0 = seq_start.max(start);
         self.advance_slice(&bytes[start..s0]);
-        self.advance_slice(&bytes[s0..k]);
+        let seq = &bytes[s0..k];
+        // A handful of bytes that may push a whole screen into scrollback: make
+        // room for the lines it really pushes (+1 per byte), or a nearly full
+        // scrollback pins at the cap and every anchor is lost (Ctrl+L in a
+        // long-lived tab). Room beyond the piece budget is not made: that would
+        // trim — or wipe — history for a push that overflows the cap anyway, so
+        // such a piece goes through as before (anchors dropped once). Inside a
+        // synchronized update the bytes are only buffered: nothing to bound.
+        let room = (kind.scrolls_a_screen() && self.has_anchors() && self.sync_deadline().is_none())
+            .then(|| self.lines_pushed_by(kind) + seq.len() + 1)
+            .filter(|&lines| lines <= self.piece_budget());
+        match room {
+            Some(lines) => self.advance_piece(seq, Some(lines)),
+            None => self.advance_slice(seq),
+        }
+        // Inside a DEC 2026 synchronized update vte only BUFFERED the ED 3; the
+        // block would later apply as one net history change in which the shrink
+        // can hide (`\e[2J\e[3J` + a redraw that scrolls), leaving old anchors on
+        // new rows. Apply the buffered block now so the shrink is seen in order
+        // (the frame tears at most once, as for a mark or image inside a sync).
+        if kind == IsolatedSeq::EraseSaved && self.has_anchors() && self.sync_deadline().is_some() {
+            self.flush_sync();
+        }
         self.after_isolated(kind);
         k
+    }
+
+    /// Whether the scanner splits `kind` out into a sub-slice of its own: only
+    /// while anchors exist, and — for ED 2 / SU / DL, which can only move the
+    /// PRIMARY scrollback — not on the alt screen, where TUIs scroll constantly
+    /// (`abs_top` is frozen there; splitting would only cost a piece each).
+    fn isolates(&self, kind: IsolatedSeq) -> bool {
+        self.has_anchors() && !(kind.scrolls_a_screen() && self.term.mode().contains(TermMode::ALT_SCREEN))
+    }
+
+    /// At most how many lines `kind` (ED 2 / SU / DL, about to run on the primary
+    /// screen with alacritty caught up) pushes into scrollback. ED 2 pushes the
+    /// screen down to its last non-empty row (alacritty's `clear_viewport`); SU
+    /// its count, clamped to the screen (exact for a region at the top, an upper
+    /// bound otherwise — the region is not readable); DL pushes only from the
+    /// top row.
+    fn lines_pushed_by(&self, kind: IsolatedSeq) -> usize {
+        use alacritty_terminal::grid::GridCell;
+        let grid = self.term.grid();
+        match kind {
+            IsolatedSeq::EraseScreen => (0..self.rows)
+                .rev()
+                .find(|&r| {
+                    let row = &grid[Line(r as i32)];
+                    (0..self.cols).any(|c| !row[Column(c)].is_empty())
+                })
+                .map_or(0, |r| r + 1),
+            IsolatedSeq::ScrollUp { delete: true, .. } if grid.cursor.point.line.0 != 0 => 0,
+            IsolatedSeq::ScrollUp { count, .. } => usize::from(count.max(1)).min(self.rows),
+            _ => 0,
+        }
+    }
+
+    /// A complete kitty keyboard CSI whose final `u` is `bytes[i]` (`marker` `>`
+    /// push, `<` pop, `=` set; `n` its first parameter; `odd` = vte would not
+    /// dispatch it as one). Catches alacritty up to the `u` — so the screen it
+    /// acts on is known, and a synchronized update applied first, as for a mark
+    /// — then mirrors it in `kbd_depth` and returns the new `start`. A push that
+    /// would exceed [`KBD_STACK_MAX`] is DROPPED: vte gets CAN instead of the `u`.
+    /// Errs safe where it must guess: an odd push still counts, an odd pop does
+    /// not, so the mirror never under-counts what alacritty holds.
+    #[cold]
+    #[inline(never)]
+    fn kitty_kbd_csi(&mut self, bytes: &[u8], start: usize, i: usize, marker: u8, n: u16, odd: bool) -> usize {
+        self.advance_slice(&bytes[start..i]);
+        if !self.kitty_keyboard {
+            return i; // alacritty ignores the protocol: nothing to mirror
+        }
+        if self.sync_deadline().is_some() {
+            self.flush_sync();
+        }
+        let screen = usize::from(self.term.mode().contains(TermMode::ALT_SCREEN));
+        let primary = screen == 0;
+        let depth = self.kbd_depth[screen];
+        match marker {
+            b'>' if depth >= KBD_STACK_MAX => {
+                self.advance_slice(b"\x18");
+                return i + 1;
+            }
+            b'>' => self.kbd_depth[screen] = depth + 1,
+            b'<' if !odd => {
+                // vte: a missing or zero count pops one.
+                let depth = depth.saturating_sub(n.max(1));
+                self.kbd_depth[screen] = depth;
+                if let Some(w) = self.kbd_window.as_mut().filter(|_| primary) {
+                    w.floor = w.floor.min(depth);
+                }
+            }
+            b'=' => {
+                if let Some(w) = self.kbd_window.as_mut().filter(|_| primary) {
+                    w.set = true;
+                }
+            }
+            _ => {}
+        }
+        i
+    }
+
+    /// alacritty just cleared BOTH kitty keyboard stacks (RIS, a protocol toggle).
+    fn kbd_cleared(&mut self) {
+        self.kbd_depth = [0, 0];
+        if let Some(w) = self.kbd_window.as_mut() {
+            w.floor = 0;
+        }
+    }
+
+    /// A prompt arrived: whatever ran since the save point is over. Undo what it
+    /// left on the PRIMARY kitty keyboard stack — entries it pushed and never
+    /// popped (a SIGKILLed or crashed program, a dropped ssh) and flags it set in
+    /// place — so the shell gets legacy keys again (Ctrl+C as `^C`, not
+    /// `\e[99;5u`; with "report all keys" even `reset` could not be typed). What
+    /// the shell had on the stack before the command stays. A no-op while
+    /// nothing changed — and for a `provisional` prompt-to-prompt window closed by
+    /// a bare `A` (Ctrl+C or an empty line at the prompt): that window spans only
+    /// the line editor reading input, so what is on the stack then is the
+    /// editor's own (reedline pushes while it reads), not a dead program's; a
+    /// command run without a `C` mark is cleaned up at its `D`.
+    fn restore_kbd(&mut self, end_of_command: bool) {
+        let Some(w) = self.kbd_window.take() else { return };
+        if w.provisional && !end_of_command {
+            return;
+        }
+        let depth = self.kbd_depth[0];
+        let extra = depth.saturating_sub(w.floor);
+        if self.kitty_keyboard && (extra > 0 || w.set) {
+            use alacritty_terminal::vte::ansi::Handler;
+            // Pops `extra` entries and reloads the active flags from the new
+            // stack top — with 0 it only drops flags a `CSI = u` set in place.
+            self.term.pop_keyboard_modes(extra);
+            self.kbd_depth[0] = depth - extra;
+        }
+    }
+
+    /// Start a keyboard save point at the current primary stack depth.
+    fn open_kbd_window(&mut self, provisional: bool) {
+        self.kbd_window = Some(KbdWindow { floor: self.kbd_depth[0], set: false, provisional });
     }
 
     /// Whether any row-anchored state exists — the only time the scanner pays to
@@ -1911,8 +2245,8 @@ impl Terminal {
                 });
                 self.placement_bytes = self.placement_bytes.saturating_sub(freed);
             }
-            // ED 3's shrink and a toggle's freeze are fully handled by the
-            // isolated `track_abs_top` call itself.
+            // ED 3's shrink, SU/DL's scroll and a toggle's freeze are fully
+            // handled by the isolated `track_abs_top` call itself.
             _ => {}
         }
     }
@@ -1949,8 +2283,9 @@ impl Terminal {
             self.abs_top += (h1 - h0) as i64;
             // `make_room` keeps history strictly below the cap for any sub-slice
             // within its bound, so reaching the cap means this one scrolled more
-            // than counted (a sync-update replay, a `CSI 9999 S` burst, or no
-            // scrollback at all) and `history_size()` pinned: the count is lost.
+            // than counted (a sync-update replay, a long `CSI Ps b` repeat, a
+            // screen taller than the scrollback) and `history_size()` pinned:
+            // the count is lost.
             // Drop every anchor once (correct-or-absent); the next sub-slice is
             // exact again.
             if h1 >= self.scrollback_limit && (h1 > h0 || self.scrollback_limit == 0) {
@@ -2217,10 +2552,17 @@ impl Terminal {
     /// * no command has run in this tab yet (`saw_command_output`, latched by a
     ///   `C`, or by a `D` from integrations that never send `C`);
     /// * the newest prompt block is open and has not started a command;
+    /// * the shell repaints that whole prompt after a resize (no `A;redraw=0`:
+    ///   bash's readline repaints only the last line of a multi-line PS1, so the
+    ///   wipe would erase the rest for good);
     /// * nothing but blank lines exists ABOVE that prompt's line — output printed
     ///   before the first prompt (login banner, motd, fastfetch) must survive;
-    /// * the cursor is still within [`CLEAN_PROMPT_MAX_ROWS`] of the prompt line
-    ///   (a `C`-less shell running its very first command has moved it further);
+    /// * the cursor is still on the prompt's INPUT line — its `B` mark when the
+    ///   integration sends one, else the `A` line — or on rows soft-wrapped from
+    ///   it (typed input longer than a row), within [`CLEAN_PROMPT_MAX_ROWS`].
+    ///   Below a hard line break sits either a multi-line prompt drawn after an
+    ///   `A` without a `B`, or the first command's output from a shell that sends
+    ///   no `C`; the two look alike, and the output must survive;
     /// * the shell is not mid-write: no escape sequence cut by a read boundary,
     ///   no synchronized update still buffered in vte (its output isn't settled,
     ///   so a wipe now could erase or reorder part of it).
@@ -2238,14 +2580,20 @@ impl Terminal {
         let Some(m) = self.marks.back() else {
             return false;
         };
-        if m.finished || m.output.is_some() {
+        if m.finished || m.output.is_some() || !m.redraws {
             return false;
         }
         let grid = self.term.grid();
-        // Grid line of the prompt mark (negative = in scrollback).
+        // Grid lines of the prompt mark and of where input starts (negative = in
+        // scrollback).
         let prompt_line = m.prompt - self.abs_top;
+        let input_line = m.input.map_or(prompt_line, |b| (b - self.abs_top).max(prompt_line));
         let cursor_line = grid.cursor.point.line.0 as i64;
-        if cursor_line - prompt_line > CLEAN_PROMPT_MAX_ROWS {
+        if cursor_line < input_line || cursor_line - input_line > CLEAN_PROMPT_MAX_ROWS {
+            return false;
+        }
+        let last_col = Column(self.cols - 1);
+        if (input_line..cursor_line).any(|l| !grid[Line(l as i32)][last_col].flags.contains(Flags::WRAPLINE)) {
             return false;
         }
         let top = grid.topmost_line().0 as i64;
@@ -2263,7 +2611,7 @@ impl Terminal {
     /// has been advanced. No-op on the alt screen (OSC 133 inside a TUI is
     /// meaningless). Coalesces a duplicate A on the same line so p10k + our own
     /// snippet both emitting A cannot create two blocks.
-    fn bind_mark(&mut self, letter: u8, exit: Option<i32>) {
+    fn bind_mark(&mut self, letter: u8, exit: Option<i32>, redraws: bool) {
         if self.term.mode().contains(TermMode::ALT_SCREEN) {
             return;
         }
@@ -2297,12 +2645,17 @@ impl Terminal {
                     last.finished = true;
                 }
                 self.cur_cmd = Some(OpenCmd { prompt: abs, started_at: None });
+                // Keyboard: what ran since the last save point is over; save
+                // again here in case this shell never sends a `C`.
+                self.restore_kbd(false);
+                self.open_kbd_window(true);
                 self.push_mark(CmdBlock {
                     prompt: abs,
                     input: None,
                     output: None,
                     exit: None,
                     finished: false,
+                    redraws,
                 });
                 let history = self.term.grid().history_size();
                 self.prune_marks(history);
@@ -2326,6 +2679,8 @@ impl Terminal {
                 }
                 // A command ran: the resize clean-prompt wipe must never fire again.
                 self.saw_command_output = true;
+                // Keyboard: the command starts from the shell's current flags.
+                self.open_kbd_window(false);
             }
             b'D' => {
                 // Failed-command marker: bind to the most-recent still-open block
@@ -2352,6 +2707,8 @@ impl Terminal {
                 // Also covers integrations that never send C (old bash): once a
                 // command has completed, the clean-prompt wipe is off for good.
                 self.saw_command_output = true;
+                // Keyboard: drop what the finished command left behind.
+                self.restore_kbd(true);
             }
             _ => {} // unknown 133 sub-command: ignore
         }
@@ -4003,7 +4360,8 @@ mod tests {
             state ^= state << 17;
             state % m
         };
-        let block = |prompt: i64| CmdBlock { prompt, input: None, output: None, exit: None, finished: true };
+        let block =
+            |prompt: i64| CmdBlock { prompt, input: None, output: None, exit: None, finished: true, redraws: true };
         let mut fast_path_hits = 0;
         for _ in 0..300 {
             let mut t = Terminal::new(80, 24);
@@ -5280,10 +5638,106 @@ mod tests {
         assert_eq!(t.failed_prompt_rows(), vec![4], "marks still exact after the flood");
     }
 
+    /// A 20×40 tab whose 100-line scrollback filled up before the shell
+    /// integration bound anything, then a failed prompt on the bottom row and 3
+    /// more lines: the mark sits on row 36 and the history holds over 60 lines,
+    /// so one more screen (40 lines) would overflow the cap.
+    fn full_history_with_a_failed_prompt() -> Terminal {
+        let mut t = Terminal::new(20, 40);
+        t.set_scrollback_lines(100);
+        for i in 0..150 {
+            t.feed(format!("old {i}\r\n").as_bytes());
+        }
+        t.feed(b"\x1b]133;A\x07$ false\x1b]133;D;1\x07");
+        for i in 0..3 {
+            t.feed(format!("\r\nnew {i}").as_bytes());
+        }
+        assert_eq!(t.failed_prompt_rows(), vec![36], "premise: the mark sits on row 36");
+        assert!(t.scroll_max() + 40 > 100, "premise: a screen more overflows the cap");
+        t
+    }
+
+    #[test]
+    fn ctrl_l_in_a_full_scrollback_keeps_the_marks() {
+        // Ctrl+L (`\e[H\e[2J`) pushes up to a whole screen into scrollback. Its
+        // sub-slice used to be bounded by its 4 bytes, so a nearly full history
+        // pinned at the cap and every mark/image in the tab was dropped.
+        let mut t = full_history_with_a_failed_prompt();
+        t.feed(b"\x1b[H\x1b[2J");
+        assert_eq!(t.marks.len(), 1, "the mark survives the clear");
+        assert!(t.failed_prompt_rows().is_empty(), "it was pushed into scrollback");
+        assert!(t.jump_prompt(false), "and prompt-jump still finds it there");
+        assert_eq!(t.failed_prompt_rows(), vec![0]);
+        assert!(t.scroll_max() < 100, "history stayed below the cap: {}", t.scroll_max());
+    }
+
+    #[test]
+    fn scroll_up_and_delete_lines_in_a_full_scrollback_keep_the_marks() {
+        // `CSI Ps S` (SU) and `CSI Ps M` (DL on the top row) also push up to a
+        // screen of lines into scrollback from a few bytes.
+        for seq in [&b"\x1b[40S"[..], b"\x1b[H\x1b[40M", b"\x1b[0040S"] {
+            let mut t = full_history_with_a_failed_prompt();
+            t.feed(seq);
+            assert_eq!(t.marks.len(), 1, "{seq:?}: the mark survives");
+            t.feed(b"\x1b[40;1H");
+            for i in 0..3 {
+                t.feed(format!("\r\nafter {i}").as_bytes());
+            }
+            assert!(t.jump_prompt(false), "{seq:?}: prompt-jump finds the mark");
+            assert_eq!(t.failed_prompt_rows(), vec![0], "{seq:?}: on its true row");
+        }
+    }
+
+    #[test]
+    fn ctrl_l_with_a_small_scrollback_and_a_tall_window_keeps_the_history() {
+        // `scrollback_lines = 100` (the minimum) and 96 rows: making room for a
+        // whole screen wiped the scrollback before a Ctrl+L that pushes two
+        // lines. Room is made for what the clear really pushes.
+        let mut t = Terminal::new(20, 96);
+        t.set_scrollback_lines(100);
+        for i in 0..300 {
+            t.feed(format!("old {i}\r\n").as_bytes());
+        }
+        t.feed(b"\x1b[H\x1b[2J\x1b[H"); // a clear screen above a full history
+        t.feed(b"\x1b]133;A\x07$ false\x1b]133;D;1\x07\r\nout\r\n");
+        let before = t.scroll_max();
+        assert!(before >= 75, "premise: a nearly full history ({before})");
+        t.feed(b"\x1b[H\x1b[2J"); // two non-empty rows to push
+        assert!(t.scroll_max() >= before, "the history survives: {} < {before}", t.scroll_max());
+        assert_eq!(t.marks.len(), 1, "and so does the mark");
+        assert!(t.jump_prompt(false));
+        assert_eq!(t.failed_prompt_rows(), vec![0]);
+    }
+
+    #[test]
+    fn delete_lines_below_the_top_row_trims_no_history() {
+        // DL off the top row pushes nothing into scrollback; it must not make
+        // room (= trim the oldest history) for a screen it never pushes.
+        let mut t = full_history_with_a_failed_prompt();
+        let before = t.scroll_max();
+        for _ in 0..20 {
+            t.feed(b"\x1b[10;1H\x1b[5M");
+        }
+        assert_eq!(t.scroll_max(), before, "history untouched");
+        assert_eq!(t.failed_prompt_rows(), vec![36], "the mark did not move");
+    }
+
+    #[test]
+    fn scroll_up_split_across_feeds_keeps_the_marks() {
+        // The same sequence arriving in pieces (a PTY read boundary inside it).
+        let mut t = full_history_with_a_failed_prompt();
+        t.feed(b"\x1b[");
+        t.feed(b"40");
+        t.feed(b"S");
+        assert_eq!(t.marks.len(), 1, "the mark survives a split SU");
+        assert!(t.jump_prompt(false));
+        assert_eq!(t.failed_prompt_rows(), vec![0]);
+    }
+
     #[test]
     fn pathological_scroll_overflow_resets_anchors_once_then_recovers() {
-        // A single sub-slice that scrolls more than the slack (CSI S with a huge
-        // count, repeated in < SLICE_MAX_BYTES) pins history: the count is lost,
+        // A sub-slice that scrolls more than the whole scrollback can hold (a
+        // `CSI S` count beyond the 30-line cap) pins history: the count is lost,
         // so every anchor is dropped ONCE — and exact tracking resumes after.
         let mut t = Terminal::new(20, 200);
         t.set_scrollback_lines(30);
@@ -5377,6 +5831,34 @@ mod tests {
     }
 
     #[test]
+    fn clear_inside_a_sync_update_drops_the_cleared_anchors() {
+        // vte BUFFERS a DEC 2026 synchronized update and applies it at once, so a
+        // `\e[2J\e[3J` + redraw inside one used to show up as a single NET history
+        // change (2J's push − 3J's clear + the redraw's scroll) — old marks then
+        // tracked that net change onto the NEW rows (a red marker beside the
+        // redrawn content, a prompt-jump into it).
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"a\r\nb\r\n\x1b]133;A\x07$ false\r\n\x1b]133;C\x07\x1b]133;D;1\x07");
+        for i in 0..4 {
+            t.feed(format!("out {i}\r\n").as_bytes());
+        }
+        assert_eq!(t.marks.len(), 1, "premise: the failed mark is in scrollback");
+        let mut block = b"\x1b[?2026h\x1b[H\x1b[2J\x1b[3J".to_vec();
+        for i in 0..9 {
+            block.extend_from_slice(format!("redraw {i}\r\n").as_bytes());
+        }
+        block.extend_from_slice(b"\x1b[?2026l");
+        t.feed(&block);
+        assert!(t.marks.is_empty(), "the cleared scrollback took its marks along");
+        assert!(t.failed_prompt_rows().is_empty(), "no marker on the redrawn rows");
+        assert!(!t.jump_prompt(false), "no stale prompt-jump target");
+        assert_eq!(t.snapshot().row_text(0).trim_end(), "redraw 5", "the redraw itself landed");
+        // Tracking stays exact for the next prompt.
+        t.feed(b"\x1b]133;A\x07\x1b]133;D;1\x07");
+        assert_eq!(t.failed_prompt_rows(), vec![4]);
+    }
+
+    #[test]
     fn clear_in_one_write_drops_the_image() {
         let mut t = Terminal::new(20, 5);
         t.set_cell_px(10.0, 10.0);
@@ -5459,6 +5941,88 @@ mod tests {
         let snap = t.snapshot();
         let found = (0..snap.rows).any(|r| snap.row_text(r).contains("LOGLINE 11"));
         assert!(found, "output of a running first command survives a resize");
+    }
+
+    /// Whether any row of `t`'s screen contains `needle`.
+    fn screen_has(t: &Terminal, needle: &str) -> bool {
+        let snap = t.snapshot();
+        (0..snap.rows).any(|r| snap.row_text(r).contains(needle))
+    }
+
+    #[test]
+    fn resize_wipe_spares_a_short_first_command_without_c() {
+        // A shell that sends no C, running its very first command: three output
+        // lines keep the cursor well within the old 8-row allowance, but a hard
+        // line break separates them from the prompt — never a clean prompt.
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]133;A\x07$ cat notes\r\n");
+        t.feed(b"NOTE_ONE\r\nNOTE_TWO\r\n");
+        t.resize(40, 12);
+        assert!(screen_has(&t, "NOTE_ONE") && screen_has(&t, "NOTE_TWO"), "the output survives");
+    }
+
+    #[test]
+    fn resize_wipe_spares_a_prompt_that_will_not_redraw() {
+        // bash: readline repaints only the LAST line of a multi-line PS1 after
+        // SIGWINCH, and the snippet says so with `A;redraw=0`; wiping would lose
+        // the info line for good.
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]133;A;redraw=0\x07[INFO_LINE]\r\n$ ");
+        t.resize(40, 12);
+        assert!(screen_has(&t, "INFO_LINE"), "the first prompt line survives");
+        // Even a single-line prompt: the shell said it will not repaint it.
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]133;A;aid=7;redraw=0\x07BASH_PROMPT$ ");
+        t.resize(40, 12);
+        assert!(screen_has(&t, "BASH_PROMPT"));
+    }
+
+    #[test]
+    fn redraw_param_is_read_from_any_a_parameter() {
+        let parse = |payload: &[u8]| {
+            let mut t = Terminal::new(20, 5);
+            t.feed(payload);
+            t.marks.back().map(|m| m.redraws)
+        };
+        assert_eq!(parse(b"\x1b]133;A\x07"), Some(true));
+        assert_eq!(parse(b"\x1b]133;A;redraw=0\x07"), Some(false));
+        assert_eq!(parse(b"\x1b]133;A;cl=m;redraw=0;aid=3\x1b\\"), Some(false));
+        assert_eq!(parse(b"\x1b]133;A;redraw=1\x07"), Some(true));
+        assert_eq!(parse(b"\x1b]133;A;redraw=00\x07"), Some(true));
+        assert_eq!(parse(b"\x1b]133;A;xredraw=0\x07"), Some(true));
+        // Split across feeds at every byte.
+        let mut t = Terminal::new(20, 5);
+        for b in b"\x1b]133;A;redraw=0\x07" {
+            t.feed(&[*b]);
+        }
+        assert_eq!(t.marks.back().map(|m| m.redraws), Some(false));
+    }
+
+    #[test]
+    fn resize_wipe_still_fires_with_wrapped_typed_input() {
+        // Typed input longer than a row soft-wraps: still the input line.
+        let mut t = Terminal::new(20, 10);
+        t.feed(b"\x1b]133;A\x07\xe2\x9d\xaf ");
+        t.feed("x".repeat(30).as_bytes()); // wraps onto a second row
+        assert_eq!(t.snapshot().cursor_row, 1, "premise: the input wrapped");
+        t.resize(12, 8);
+        assert!(!screen_has(&t, "\u{276f}"), "the clean prompt was wiped (the shell repaints it)");
+    }
+
+    #[test]
+    fn resize_wipe_uses_the_b_mark_for_a_multi_line_prompt() {
+        // p10k / starship with B: the prompt's first line is above the input
+        // line, joined by a HARD break — B says where input starts, so this is
+        // still a clean prompt and its stray fragments are wiped.
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]133;A\x07~/src/jetty  main\r\n\x1b]133;B\x07\xe2\x9d\xaf ");
+        t.resize(40, 12);
+        assert!(!screen_has(&t, "~/src/jetty"), "wiped: the shell repaints both lines");
+        // Without B the same two lines are not provably a prompt: kept.
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]133;A\x07~/src/jetty  main\r\n\xe2\x9d\xaf ");
+        t.resize(40, 12);
+        assert!(screen_has(&t, "~/src/jetty"), "no B: never wiped");
     }
 
     #[test]
@@ -5631,14 +6195,21 @@ mod tests {
 
     // ── OSC 52 clipboard ──────────────────────────────────────────────────────
 
+    /// The single pending OSC 52 copy, if exactly one is pending.
+    fn one_copy(t: &mut Terminal) -> Option<(Osc52Target, String)> {
+        let mut v = t.take_clipboard_stores();
+        assert!(v.len() <= 1, "expected at most one pending copy: {v:?}");
+        v.pop()
+    }
+
     #[test]
     fn osc52_copy_captures_and_coalesces() {
         // `\e]52;c;<base64("hi")>\a` → the decoded text is captured once, then
-        // consumed (a second drain is None). base64("hi") == "aGk=".
+        // consumed (a second drain is empty). base64("hi") == "aGk=".
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b]52;c;aGk=\x07");
-        assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
-        assert_eq!(t.take_clipboard_store(), None, "consuming: second drain is empty");
+        assert_eq!(one_copy(&mut t), Some((Osc52Target::Clipboard, "hi".to_string())));
+        assert!(t.take_clipboard_stores().is_empty(), "consuming: second drain is empty");
     }
 
     #[test]
@@ -5647,20 +6218,37 @@ mod tests {
         // remote nvim `"*y` lands where a middle click pastes, not over Ctrl+V.
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b]52;p;aGk=\x07");
-        assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
-        assert!(t.clipboard_store_is_primary());
+        assert_eq!(one_copy(&mut t), Some((Osc52Target::Primary, "hi".to_string())));
         t.feed(b"\x1b]52;c;aGk=\x07");
-        assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
-        assert!(!t.clipboard_store_is_primary());
+        assert_eq!(one_copy(&mut t), Some((Osc52Target::Clipboard, "hi".to_string())));
     }
 
     #[test]
     fn osc52_copy_coalesces_last_wins() {
-        // Two copies before a drain coalesce to the LAST one.
+        // Two copies to the same selection before a drain coalesce to the LAST one.
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b]52;c;aGk=\x07"); // "hi"
         t.feed(b"\x1b]52;c;eWE=\x07"); // base64("ya") == "eWE="
-        assert_eq!(t.take_clipboard_store().as_deref(), Some("ya"));
+        assert_eq!(one_copy(&mut t), Some((Osc52Target::Clipboard, "ya".to_string())));
+    }
+
+    #[test]
+    fn osc52_copies_to_both_selections_both_land() {
+        // nvim with `clipboard=unnamed,unnamedplus` sends `c` then `p` for every
+        // yank; one shared slot let the `p` overwrite the `c`, so the CLIPBOARD
+        // (Ctrl+V) never got the text.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b]52;c;aGk=\x07\x1b]52;p;aGk=\x07");
+        assert_eq!(
+            t.take_clipboard_stores(),
+            vec![(Osc52Target::Clipboard, "hi".to_string()), (Osc52Target::Primary, "hi".to_string())]
+        );
+        // Still one per selection, newest text, arrival order of the newest.
+        t.feed(b"\x1b]52;p;aGk=\x07\x1b]52;c;aGk=\x07\x1b]52;p;eWE=\x07");
+        assert_eq!(
+            t.take_clipboard_stores(),
+            vec![(Osc52Target::Clipboard, "hi".to_string()), (Osc52Target::Primary, "ya".to_string())]
+        );
     }
 
     // ── JeTTY's own notices ───────────────────────────────────────────────────
@@ -5687,7 +6275,7 @@ mod tests {
         let mut t = Terminal::new(120, 5);
         assert!(t.drain_pty_writes().is_empty());
         t.feed_notice(HOSTILE);
-        assert_eq!(t.take_clipboard_store(), None, "no OSC 52 clipboard write");
+        assert!(t.take_clipboard_stores().is_empty(), "no OSC 52 clipboard write");
         assert_eq!(t.take_title_update(), None, "no OSC 0 title change");
         assert!(t.drain_pty_writes().is_empty(), "no query reply may reach the shell");
         let snap = t.snapshot();
@@ -5701,8 +6289,7 @@ mod tests {
         // are permitted remote writes under OnlyCopy.
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b]52;s;aGk=\x07");
-        assert_eq!(t.take_clipboard_store().as_deref(), Some("hi"));
-        assert!(t.clipboard_store_is_primary());
+        assert_eq!(one_copy(&mut t), Some((Osc52Target::Primary, "hi".to_string())));
     }
 
     #[test]
@@ -5715,8 +6302,8 @@ mod tests {
         let mut t = Terminal::new(20, 5);
         let seq = format!("\x1b]52;c;{}\x07", "AAAA".repeat(reps));
         t.feed(seq.as_bytes());
-        let got = t.take_clipboard_store();
-        assert_eq!(got.as_ref().map(|s| s.len()), Some(decoded_len));
+        let got = one_copy(&mut t);
+        assert_eq!(got.as_ref().map(|(_, s)| s.len()), Some(decoded_len));
     }
 
     #[test]
@@ -5729,7 +6316,7 @@ mod tests {
         let mut t = Terminal::new(20, 5);
         let seq = format!("\x1b]52;c;{}\x07", "AAAA".repeat(reps));
         t.feed(seq.as_bytes());
-        assert_eq!(t.take_clipboard_store(), None, "oversized copy is rejected");
+        assert!(t.take_clipboard_stores().is_empty(), "oversized copy is rejected");
     }
 
     #[test]
@@ -5738,7 +6325,7 @@ mod tests {
         // denied at the alacritty layer, so no load request ever reaches us.
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b]52;c;?\x07");
-        assert!(t.take_clipboard_load().is_none(), "paste is off by default");
+        assert!(t.take_clipboard_loads().is_empty(), "paste is off by default");
     }
 
     #[test]
@@ -5748,11 +6335,28 @@ mod tests {
         let mut t = Terminal::new(20, 5);
         t.set_osc52_allow_paste(true);
         t.feed(b"\x1b]52;c;?\x07");
-        let fmt = t.take_clipboard_load().expect("paste request captured");
+        let mut loads = t.take_clipboard_loads();
+        assert_eq!(loads.len(), 1, "paste request captured");
+        let (target, fmt) = loads.pop().unwrap();
+        assert_eq!(target, Osc52Target::Clipboard);
         let reply = fmt("hi");
         assert!(reply.starts_with("\x1b]52;"), "reply is an OSC 52 sequence");
         assert!(reply.contains("aGk="), "reply carries base64(\"hi\")");
-        assert!(t.take_clipboard_load().is_none(), "consuming: second drain is empty");
+        assert!(t.take_clipboard_loads().is_empty(), "consuming: second drain is empty");
+    }
+
+    #[test]
+    fn osc52_paste_requests_for_both_selections_each_get_a_reply() {
+        // A `c;?` + `p;?` pair (nvim's paste provider asks for both) must yield TWO
+        // replies, each naming its own selection, in request order.
+        let mut t = Terminal::new(20, 5);
+        t.set_osc52_allow_paste(true);
+        t.feed(b"\x1b]52;c;?\x07\x1b]52;p;?\x07");
+        let loads = t.take_clipboard_loads();
+        let targets: Vec<Osc52Target> = loads.iter().map(|(t, _)| *t).collect();
+        assert_eq!(targets, vec![Osc52Target::Clipboard, Osc52Target::Primary]);
+        assert!(loads[0].1("a").starts_with("\x1b]52;c;"), "the clipboard reply names c");
+        assert!(loads[1].1("b").starts_with("\x1b]52;p;"), "the primary reply names p");
     }
 
     #[test]
@@ -5763,7 +6367,7 @@ mod tests {
         t.set_osc52_allow_paste(true);
         t.set_scrollback_lines(500);
         t.feed(b"\x1b]52;c;?\x07");
-        assert!(t.take_clipboard_load().is_some(), "paste survives a scrollback change");
+        assert_eq!(t.take_clipboard_loads().len(), 1, "paste survives a scrollback change");
     }
 
     // ─────────────────────────── SIXEL DCS scanner + placement ───────────────
@@ -6819,6 +7423,179 @@ mod tests {
         t.set_scrollback_lines(500);
         t.feed(b"\x1b[?u");
         assert!(!t.drain_pty_writes().is_empty(), "still enabled after a Config rebuild");
+    }
+
+    /// A terminal with the kitty keyboard protocol on (as every app tab is).
+    fn kitty_term() -> Terminal {
+        let mut t = Terminal::new(40, 10);
+        t.set_kitty_keyboard(true);
+        t
+    }
+
+    #[test]
+    fn flags_a_killed_program_pushed_are_dropped_at_the_next_prompt() {
+        // A main-screen program pushes "report all keys" and dies (SIGKILL, a
+        // crash, a dropped ssh) without popping. The shell's next prompt must not
+        // inherit it: Ctrl+C would reach the shell as `\e[99;5u`.
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07$ tui\r\n\x1b]133;C\x07");
+        t.feed(b"\x1b[>15u");
+        assert_eq!(t.kitty_keyboard_flags(), 15, "premise: the program's flags are live");
+        t.feed(b"\x1b]133;D;137\x07\x1b]133;A\x07$ ");
+        assert_eq!(t.kitty_keyboard_flags(), 0, "the prompt gets legacy keys back");
+        t.feed(b"\x1b[?u");
+        assert_eq!(t.drain_pty_writes(), b"\x1b[?0u", "the stack itself is empty again");
+    }
+
+    #[test]
+    fn flags_the_shell_had_before_the_command_are_kept() {
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b[>1u$ tui\r\n\x1b]133;C\x07"); // the shell's own entry
+        t.feed(b"\x1b[>8u\x1b[>31u"); // the program's two, never popped
+        t.feed(b"\x1b]133;D;1\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 1, "only the program's entries are dropped");
+        t.feed(b"\x1b[<u");
+        assert_eq!(t.kitty_keyboard_flags(), 0, "the shell's entry is still the bottom one");
+    }
+
+    #[test]
+    fn a_program_that_cleans_up_is_left_alone() {
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b]133;C\x07\x1b[>15u\x1b[<u\x1b]133;D;0\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        assert_eq!(t.kbd_depth, [0, 0]);
+    }
+
+    #[test]
+    fn flags_set_in_place_by_a_killed_program_are_dropped() {
+        // `CSI = flags u` replaces the active flags without a push.
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b]133;C\x07\x1b[=8u");
+        assert_eq!(t.kitty_keyboard_flags(), 8);
+        t.feed(b"\x1b]133;D;137\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn a_shell_popping_its_own_entry_after_c_is_not_undone() {
+        // A line editor that pushes while reading (reedline) and pops just after
+        // the shell emitted C: the floor follows the pop, so only the program's
+        // push is undone — the shell's popped entry is never resurrected.
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b[>1u$ cmd\r\n\x1b]133;C\x07\x1b[<u");
+        t.feed(b"\x1b[>8u"); // the program, killed
+        t.feed(b"\x1b]133;D;137\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        assert_eq!(t.kbd_depth[0], 0);
+    }
+
+    #[test]
+    fn a_shell_without_c_marks_still_gets_its_keys_back() {
+        // A/D-only integrations (bash < 4.4): the save point is the prompt itself,
+        // and the command's D undoes what it left.
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07$ tui\r\n\x1b[>31u");
+        t.feed(b"\x1b]133;D;137\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn a_new_prompt_without_a_command_keeps_the_line_editors_flags() {
+        // A line editor that pushes its own flags while reading (reedline), then
+        // Ctrl+C at the prompt: a fresh A with no command in between — those
+        // flags are the editor's, still in use, never popped by JeTTY.
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b[>1u^C\r\n\x1b]133;A\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+        // Same for an editor that pushes BEFORE the prompt mark and pops and
+        // re-pushes around the repaint (the window's floor dips to 0 meanwhile).
+        let mut t = kitty_term();
+        t.feed(b"\x1b[>1u\x1b]133;A\x07");
+        t.feed(b"\x1b[<u\x1b[>1u\r\n\x1b]133;A\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+    }
+
+    #[test]
+    fn a_prompt_repaint_keeps_flags_the_shell_set_while_reading() {
+        // fish sets its flags in place (`CSI = 5 u`) while reading a line; a
+        // Ctrl+C repaint emits a fresh A with no command in between — those
+        // flags are the shell's, not a dead program's.
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b[=5u");
+        t.feed(b"^C\r\n\x1b]133;A\x07");
+        assert_eq!(t.kitty_keyboard_flags(), 5);
+    }
+
+    #[test]
+    fn the_alternate_screen_stack_is_not_touched_by_prompts() {
+        let mut t = kitty_term();
+        t.feed(b"\x1b]133;A\x07\x1b]133;C\x07\x1b[?1049h\x1b[>15u");
+        assert_eq!(t.kbd_depth, [0, 1]);
+        t.feed(b"\x1b[?1049l");
+        assert_eq!(t.kitty_keyboard_flags(), 0, "the primary stack was never pushed");
+        t.feed(b"\x1b]133;D;0\x07");
+        assert_eq!(t.kbd_depth, [0, 1], "a prompt only restores the primary stack");
+    }
+
+    #[test]
+    fn a_push_flood_cannot_crash_the_terminal() {
+        // alacritty 0.26 caps its stack at 4096 by evicting from the TITLE stack,
+        // which panics when that is empty: `printf '\e[>1u%.0s' {1..4097}` used
+        // to kill the whole terminal. Controls vte executes inside the CSI are
+        // seen through, so they cannot hide a push from the mirror.
+        for unit in [&b"\x1b[>1u"[..], b"\x1b[\x00>1u", b"\x1b[\x07>\x7f1\x0au", b"\x1b[>;1u"] {
+            let mut t = kitty_term();
+            let flood = unit.repeat(5000);
+            t.feed(&flood);
+            assert!(t.kbd_depth[0] <= KBD_STACK_MAX, "{unit:?}: depth {}", t.kbd_depth[0]);
+        }
+        // Split across feeds at every byte.
+        let mut t = kitty_term();
+        for _ in 0..4200 {
+            for b in b"\x1b[>1u" {
+                t.feed(&[*b]);
+            }
+        }
+        assert_eq!(t.kbd_depth[0], KBD_STACK_MAX);
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+    }
+
+    #[test]
+    fn the_depth_mirror_follows_pops_resets_and_toggles() {
+        let mut t = kitty_term();
+        t.feed(b"\x1b[>1u\x1b[>2u\x1b[>4u");
+        assert_eq!(t.kbd_depth[0], 3);
+        t.feed(b"\x1b[<2u");
+        assert_eq!((t.kbd_depth[0], t.kitty_keyboard_flags()), (1, 1));
+        t.feed(b"\x1b[<0u"); // vte: a zero count pops one
+        assert_eq!(t.kbd_depth[0], 0);
+        t.feed(b"\x1b[>1u\x1bc"); // RIS clears both stacks
+        assert_eq!((t.kbd_depth, t.kitty_keyboard_flags()), ([0, 0], 0));
+        t.feed(b"\x1b[>1u");
+        t.set_kitty_keyboard(false);
+        assert_eq!((t.kbd_depth, t.kitty_keyboard_flags()), ([0, 0], 0));
+        t.feed(b"\x1b[>1u");
+        assert_eq!(t.kbd_depth, [0, 0], "ignored while the protocol is off");
+    }
+
+    #[test]
+    fn reset_input_modes_clears_modes_but_keeps_the_screen() {
+        let mut t = kitty_term();
+        t.feed(b"keep me\r\n");
+        t.feed(b"\x1b[>15u\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[?9h\x1b[?1015h");
+        t.feed(b"\x1b[?1049h\x1b[>8u\x1b[?1003h"); // a TUI that then died on the alt screen
+        assert!(t.mouse_mode() && t.kitty_keyboard_flags() == 8);
+        t.reset_input_modes();
+        assert_eq!(t.kitty_keyboard_flags(), 0, "alt-screen flags gone");
+        assert!(!t.mouse_mode() && !t.mouse_drag() && !t.mouse_motion());
+        assert!(!t.sgr_mouse() && !t.focus_reporting() && !t.bracketed_paste());
+        assert!(!t.mouse_x10() && !t.mouse_urxvt());
+        assert!(t.alt_screen(), "the screen itself is left alone");
+        t.feed(b"\x1b[?1049l");
+        assert_eq!(t.kitty_keyboard_flags(), 0, "the primary stack was cleared too");
+        assert_eq!(t.snapshot().row_text(0).trim_end(), "keep me");
+        t.feed(b"\x1b[?u");
+        assert_eq!(t.drain_pty_writes(), b"\x1b[?0u", "the protocol is still on");
     }
 
     #[test]
