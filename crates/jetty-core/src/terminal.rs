@@ -950,6 +950,9 @@ pub struct Terminal {
     /// on (via [`Terminal::set_kitty_keyboard`]) once the app's key encoder honors
     /// [`Terminal::kitty_keyboard_flags`]. Carried through every `Config` rebuild.
     kitty_keyboard: bool,
+    /// Bold text in one of the 8 normal ANSI colors renders in its bright twin
+    /// (config `bold_is_bright`, default off). See [`Terminal::set_bold_is_bright`].
+    bold_is_bright: bool,
     /// The active scrollback-search query (what the user typed, capped at
     /// [`SEARCH_MAX_QUERY`] chars). Empty = no active search.
     search_query: String,
@@ -1239,6 +1242,7 @@ impl Terminal {
             clipboard_load_dirty,
             osc52_mode,
             kitty_keyboard,
+            bold_is_bright: false,
             search_query: String::new(),
             search_regex: None,
             search_matches: Vec::new(),
@@ -1515,6 +1519,14 @@ impl Terminal {
     /// (`CSI ? 2031 h`).
     pub fn color_reports(&self) -> bool {
         self.color_reports.load(Ordering::Relaxed)
+    }
+
+    /// Bold text whose foreground is one of the 8 normal ANSI colors (SGR 30–37,
+    /// or 256-color 0–7) renders in its bright twin (8–15) — the classic xterm
+    /// `boldColors` look some color schemes are designed around. Default off (the
+    /// bold face alone marks bold). Takes effect on the next snapshot.
+    pub fn set_bold_is_bright(&mut self, on: bool) {
+        self.bold_is_bright = on;
     }
 
     /// Replace the active theme at runtime. Also refreshes the copy shared with
@@ -3487,7 +3499,14 @@ impl Terminal {
                 let col = vp.column.0;
                 if row < self.rows && col < self.cols {
                     let cell = item.cell;
-                    let mut fg = resolve_rgb(&self.theme, colors, cell.fg);
+                    // `bold_is_bright`: a bold cell's normal ANSI foreground (0–7)
+                    // takes its bright twin (8–15) before it is resolved.
+                    let fg_color = if self.bold_is_bright && cell.flags.contains(Flags::BOLD) {
+                        bright_for_bold(cell.fg)
+                    } else {
+                        cell.fg
+                    };
+                    let mut fg = resolve_rgb(&self.theme, colors, fg_color);
                     let mut bg = resolve_rgb(&self.theme, colors, cell.bg);
                     // Reverse video (`\e[7m`, also used by selections and `ls`
                     // highlights): swap fg/bg after resolving to RGB so the cell
@@ -3497,15 +3516,12 @@ impl Terminal {
                     }
                     // SGR 2 (dim): alacritty sets Flags::DIM but leaves fg as a
                     // named color resolving to full brightness, so dim text would
-                    // be indistinguishable from normal. Apply the conventional
-                    // ~0.66 brightness multiplier to the foreground here. Done
-                    // after INVERSE so the dimmed channel is whichever ends up fg.
+                    // be indistinguishable from normal. Pull the foreground a third
+                    // of the way toward the cell's background (`faint`) — less
+                    // contrast on dark AND light themes. Done after INVERSE so the
+                    // dimmed channel is whichever ends up fg.
                     if cell.flags.contains(Flags::DIM) {
-                        fg = [
-                            (fg[0] as f32 * 0.66) as u8,
-                            (fg[1] as f32 * 0.66) as u8,
-                            (fg[2] as f32 * 0.66) as u8,
-                        ];
+                        fg = faint(fg, bg);
                     }
                     // SGR 8 (conceal): the glyph must not be readable (password
                     // echoes, secret-masking TUIs). Paint the foreground with the
@@ -4620,6 +4636,36 @@ fn index_to_rgb(theme: &Theme, i: u8) -> [u8; 3] {
 /// True-color is exact; named and indexed colors resolve through the theme
 /// palette, unless a dynamic OSC 4/10/11/12 override is present in `colors`
 /// (indexed by the same slot numbering as alacritty's color table), which wins.
+/// SGR 2 (faint): `fg` mixed 66% of the way from `bg` — always toward the
+/// background, so faint text loses contrast on light themes too (the old plain
+/// darkening pushed dark-on-light text toward black: MORE contrast).
+pub(crate) fn faint(fg: [u8; 3], bg: [u8; 3]) -> [u8; 3] {
+    let mix = |f: u8, b: u8| (b as f32 + (f as f32 - b as f32) * 0.66).round().clamp(0.0, 255.0) as u8;
+    [mix(fg[0], bg[0]), mix(fg[1], bg[1]), mix(fg[2], bg[2])]
+}
+
+/// `bold_is_bright`: the 8 normal ANSI colors (named, or indexed 0–7) of a bold
+/// cell's foreground become their bright twins (8–15), like xterm's
+/// `boldColors`; every other color is unchanged.
+fn bright_for_bold(color: alacritty_terminal::vte::ansi::Color) -> alacritty_terminal::vte::ansi::Color {
+    use alacritty_terminal::vte::ansi::{Color, NamedColor as N};
+    match color {
+        Color::Indexed(i) if i < 8 => Color::Indexed(i + 8),
+        Color::Named(n) => Color::Named(match n {
+            N::Black => N::BrightBlack,
+            N::Red => N::BrightRed,
+            N::Green => N::BrightGreen,
+            N::Yellow => N::BrightYellow,
+            N::Blue => N::BrightBlue,
+            N::Magenta => N::BrightMagenta,
+            N::Cyan => N::BrightCyan,
+            N::White => N::BrightWhite,
+            other => other,
+        }),
+        other => other,
+    }
+}
+
 fn resolve_rgb(theme: &Theme, colors: &Colors, color: alacritty_terminal::vte::ansi::Color) -> [u8; 3] {
     use alacritty_terminal::vte::ansi::{Color, NamedColor};
     // Indexed and named colors map onto slots in the override table (Indexed(i)
@@ -4762,6 +4808,54 @@ mod tests {
                 < (normal[0] as u16 + normal[1] as u16 + normal[2] as u16),
             "dim fg {dim:?} should be darker than normal fg {normal:?}"
         );
+    }
+
+    #[test]
+    fn faint_mixes_toward_the_background() {
+        // The math: 66% of the way from bg to fg, per channel, rounded.
+        assert_eq!(faint([255, 255, 255], [0, 0, 0]), [168, 168, 168]);
+        assert_eq!(faint([0, 0, 0], [255, 255, 255]), [87, 87, 87]);
+        assert_eq!(faint([200, 100, 50], [200, 100, 50]), [200, 100, 50], "fg == bg stays put");
+        // On a LIGHT theme faint text gets lighter (less contrast), not darker.
+        let mut t = Terminal::new(20, 5);
+        t.set_theme(crate::theme::solarized_light());
+        t.feed(b"A\x1b[2mB\x1b[0m");
+        let snap = t.snapshot();
+        let (normal, dim, bg) = (snap.cell(0, 0).fg, snap.cell(0, 1).fg, snap.cell(0, 1).bg);
+        let dist = |a: [u8; 3], b: [u8; 3]| (0..3).map(|i| (a[i] as i32 - b[i] as i32).abs()).sum::<i32>();
+        assert!(dist(dim, bg) < dist(normal, bg), "faint {dim:?} is closer to bg {bg:?} than {normal:?}");
+        // Faint after reverse video dims whichever color ended up in front.
+        t.feed(b"\r\n\x1b[2;7mC\x1b[0m");
+        let c = *t.snapshot().cell(1, 0);
+        assert_eq!(c.fg, faint(normal_bg_of(&t), c.bg));
+    }
+
+    /// The default (theme) background as a cell resolves it.
+    fn normal_bg_of(t: &Terminal) -> [u8; 3] {
+        let bg = t.theme().bg;
+        [bg[0], bg[1], bg[2]]
+    }
+
+    #[test]
+    fn bold_is_bright_maps_the_normal_ansi_colors() {
+        let mut t = Terminal::new(40, 5);
+        let theme = t.theme().clone();
+        // Bold red (SGR 31 named), bold 256-color 2, bold 256-color 9 (already
+        // bright), bold truecolor, and a plain (non-bold) red.
+        let line = b"\x1b[1;31mA\x1b[0m\x1b[1;38;5;2mB\x1b[0m\x1b[1;38;5;9mC\x1b[0m\x1b[1;38;2;1;2;3mD\x1b[0m\x1b[31mE\x1b[0m";
+        t.feed(line);
+        let off = t.snapshot();
+        assert_eq!(off.cell(0, 0).fg, theme.palette[1], "off by default: bold red stays red");
+        t.set_bold_is_bright(true);
+        let on = t.snapshot();
+        assert_eq!(on.cell(0, 0).fg, theme.palette[9], "bold red → bright red");
+        assert_eq!(on.cell(0, 1).fg, theme.palette[10], "bold 256-color 2 → 10");
+        assert_eq!(on.cell(0, 2).fg, theme.palette[9], "already bright: unchanged");
+        assert_eq!(on.cell(0, 3).fg, [1, 2, 3], "truecolor: unchanged");
+        assert_eq!(on.cell(0, 4).fg, theme.palette[1], "not bold: unchanged");
+        // The default foreground is not one of the 8 colors.
+        t.feed(b"\r\n\x1b[1mF\x1b[0m");
+        assert_eq!(t.snapshot().cell(1, 0).fg, theme.fg);
     }
 
     #[test]
