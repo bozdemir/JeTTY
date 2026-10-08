@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.26.0] — 2026-10-08
+
+**The audit release.** A full codebase review (~90 findings) — every one fixed.
+See `docs/release-notes/v0.26.0.md` for the long version.
+
+### Changed (behavior)
+- Plain PageUp/PageDown go to the program; Shift+PageUp/PageDown scroll the
+  scrollback on every screen (`[keys] scroll_page_up/down` to restore).
+- Transparency moved to Ctrl+Alt+=/-; Ctrl++ zooms on every layout (Turkish-Q);
+  Ctrl+Shift+- sends Ctrl+_ (undo) again.
+- Copy-on-select fills PRIMARY, not the clipboard (`copy_on_select` =
+  `primary` | `clipboard` | `both` | `off`).
+- Mouse-tracking programs receive right/middle clicks; Shift+right-click (or an
+  existing selection) opens JeTTY's menu.
+- Kitty keyboard protocol enabled (Shift+Enter → `CSI 13;2u`); flags a dead
+  program left pushed are undone at the next prompt; `kitty_keyboard = false`
+  turns it off; palette "Reset keyboard & mouse modes".
+- Settings saves edit `config.toml` in place (comments/unknown keys survive),
+  debounced off the UI thread.
+- Letter shortcuts follow the key label on every layout (Dvorak, AZERTY,
+  Turkish-F); letter `[keys]` bindings likewise.
+
+### Added
+- Double/triple-click word/line selection with edge auto-scroll; full mouse
+  reporting (all buttons, modifiers, SGR/UTF-8/urxvt, X10/1015); focus
+  reporting (DECSET 1004); drag & drop file paths; IME preedit + candidate
+  placement; search/help/palette/hint/copy mode in detached windows;
+  `macos_option_as_alt`; `--background`; `$JETTY_CONFIG_DIR`; theme
+  `cursor_text` / `selection_foreground`; AppStream metainfo; CI macOS check.
+
+### Fixed
+- Hidden window spinning a CPU core at 100% (perf HUD idle repaint).
+- Home/End ignoring application cursor mode (dead at oh-my-zsh prompts).
+- Block cursor hiding the glyph under it; unreadable selected text.
+- OSC 133 marks, Run & Notify, prompt jumps, failed markers and images dying
+  once the scrollback filled; Run & Notify lost across a resize.
+- Resize wiping bash tabs' output (and startup banners); bash now emits
+  OSC 133;C.
+- `clear` leaving stale markers/images; images on the alternate screen; stacked
+  animation frames; kitty default action / chunking; sixel CAN/SUB; OSC 133
+  inside sync updates.
+- F9 hiding a visible-but-covered window (now raises; X11 hotkey-grab focus
+  churn handled).
+- Theme hex parser panic; one bad config value resetting everything; broken
+  theme losing the choice; watcher missing symlinked/recreated dirs; launch at
+  login with the AppImage and on macOS; macOS hotkey thread; Option key on
+  non-US Mac layouts; macOS login shells.
+- Combining marks / VS16 / ZWJ not drawn; chrome overflowing at large UI fonts
+  and HiDPI; proportional UI fonts misplacing highlights/carets.
+- Detached-window parity (overlays, Shift-drag hint, HUD, fullscreen sizing,
+  Settings-vs-fullscreen, stale tab indices → stable tab ids).
+- Unbounded PTY read queue (GBs under floods, Ctrl+C lag); unbounded OSC
+  buffering; reader thread leak on tab close; unenterable inherited cwd;
+  launcher env leaking into shells.
+- Final review: Esc closing a menu reaching the program under the kitty
+  protocol; Ctrl+L / SU / DL in a full scrollback dropping marks; OSC 52 copies
+  to both selections overwriting each other; a broken config deleting the login
+  item; table-valued `[keys]` resetting the config; 4096 kitty pushes crashing
+  alacritty; bash prompts wiped on resize; `set -u` shells; inherited
+  `$APPIMAGE`; dead keys leaking under the kitty protocol; detached-window
+  completions lost; corner-mask double coverage; notices expiring while hidden.
+
+### Security
+- Paste sanitizer (pastejacking via ^C/^Z/^\ in pasted text), neutralized
+  in-terminal notices, OSC cap matched to vte's state machine (differential
+  fuzz), notification markup escaping, Zalgo caps.
+
+### Performance
+- Per-row shaping: 240×70 typing frame 4.40 → 0.49 ms CPU; unchanged frames
+  skip glyph preparation.
+- No periodic idle wakeups; no frame before a keystroke's echo; frame
+  latency 1; one GPU device + font DB shared by every window (no ~100 ms stall
+  on detach/Settings, no second font scan at startup); coalesced PTY wakes.
+
+---
+
 ## [0.25.2] — 2026-10-02
 
 **Prebuilt packages run on older distros again.** No code changes — this is a

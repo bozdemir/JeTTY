@@ -11,12 +11,21 @@ reported in the window — not only on stderr.
 On X11, Jetty automatically registers a system-wide grab of the summon key at
 startup using the `global-hotkey` crate. No configuration is needed.
 
-F9 is a toggle: press it to hide the window, press it again to summon it. On
-summon the window is placed according to `window_mode` — re-centred on the
+F9 does what you'd expect from the window's state:
+
+- **hidden** → summons it;
+- **shown and in front** (any JeTTY window — the terminal, Settings or a
+  detached tab — has focus) → hides it;
+- **shown but behind other windows** (e.g. with `focus_autohide = false`, after
+  you clicked elsewhere) → raises it instead of hiding, so one press brings it
+  back. If the compositor refuses to give it focus, the next press within
+  1.5 s hides it.
+
+On summon the window is placed according to `window_mode` — re-centred on the
 current monitor (Center), re-docked to the top strip (Dropdown), or expanded to
 cover the whole monitor (Fullscreen) — then takes keyboard focus and replays the
-reveal effect. (Jetty launches visible, so the first F9 press after startup
-hides it.)
+reveal effect. (Jetty launches visible — unless started with `--background` —
+so the first F9 press after startup hides it.)
 
 In Fullscreen mode the OS fullscreen state is dropped on every hide and
 re-applied on every summon: it is never held while the window is hidden. That is
