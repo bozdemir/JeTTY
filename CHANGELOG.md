@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased] — visuals v2
+
+New themes, a background layer, a faster and richer effects pass, built-in box
+glyphs, tab styles and a rebuilt Settings window. Everything new is off by
+default unless listed under "Changed". Plan:
+`docs/superpowers/plans/2026-10-08-visuals-v2.md`.
+
+### Added
+- **24 new themes (46 in all, 11 light):** Catppuccin Latte/Frappé, Tokyo
+  Night Storm/Moon/Day, Rosé Pine Moon/Dawn, Gruvbox Light, GitHub Light,
+  Alucard (Dracula Light), Flexoki Light/Dark, Everforest Light, Kanagawa
+  Dragon/Lotus, Dayfox, Night Owl, Carbonfox, Poimandres, Melange Dark,
+  Iceberg, Synthwave '84, Phosphor Green/Amber — exact upstream palettes. Theme
+  files may set their own UI `accent` and `selection_background`.
+- **Theme gallery** in Settings › Look (All / Dark / Light / Mine; click or
+  arrow to preview, `Enter` keeps, `Esc` restores) and live preview while
+  arrowing over `Theme: …` in the command palette; Next / Previous / Random
+  theme commands (`[keys] next_theme` / `prev_theme`, unbound by default).
+- **Follow the system light/dark setting** (`follow_system_theme`,
+  `light_theme`): the freedesktop settings portal on Linux, the system
+  appearance on macOS. Programs that ask (DEC mode 2031 — neovim, helix…) are
+  told when it flips; `COLORFGBG` is set for new shells.
+- **`minimum_contrast`** — lifts text that would be unreadable on its
+  background (e.g. Solarized Dark's autosuggestions), keeping its hue.
+- **Backdrop** (`[backdrop]`): a subtle per-theme look, gradients, images
+  (PNG/JPEG; cover/contain/stretch/center/tile, dim with a readability guard,
+  blur for a frosted look — no compositor needed) and patterns (stars, aurora,
+  grid, synthwave), optional slow drift and parallax. Baked once, copied per
+  frame (~0.2–0.4 ms GPU at 1440p). Drop an image on the Settings window to use
+  it.
+- **Effects:** presets (Clean, Retro CRT, Amber, Green Phosphor, Neon, Paper,
+  E-ink — Settings chips and palette entries), phosphor color modes
+  (amber/green/white/blue/paper/custom, with "keep colors"), film grain, a 1-bit
+  dither "e-ink" look, a bloom radius, and an optional 200 ms glitch on a
+  failed command or the bell.
+- **Tabs:** five styles (`tab_style` = pill / underline / slant / powerline /
+  compact), close-button modes, a translucent tab bar, per-tab colors (tab
+  menu › Color), smart titles (`tab_title = "auto"`), finished/failed/bell
+  badges on background tabs, and **OSC 9;4 progress** under the tab's title
+  (Claude Code, cargo with `CARGO_TERM_PROGRESS_TERM_INTEGRATION=true`).
+- **Window border** (`window_border` = none / focus / always) — a thin ring on
+  JeTTY's own rounded shape.
+- **Layout:** inner padding (`padding_x` / `padding_y`), `line_height`, and
+  `scrollbar` = always / auto / never.
+- **Text:** `bold_is_bright`; color emoji; smooth (anti-aliased) undercurl,
+  dotted and dashed underlines that connect across color changes.
+- **Settings rebuilt** around one control table: every tab scrolls, sections
+  fold, **Reset tab**, and every control is a palette search away
+  ("bloom" → *Settings › Effects › Bloom*).
+- `scripts/nested-live.sh` — runs the real binary live on an invisible nested X
+  server (software Vulkan, optional real window manager) for testing next to
+  the JeTTY you are using.
+
+### Changed
+- **Inner padding is on by default** (8 px at the sides, 4 px top/bottom):
+  text no longer touches the window edge; failed-command bars sit in the left
+  padding. `padding_x = 0` / `padding_y = 0` restores the old layout.
+- **Box drawing, blocks, Powerline separators, braille and sextants are drawn
+  by JeTTY** (cell-exact, no seams — powerlevel10k prompts, tmux borders, btop
+  graphs); `builtin_glyphs = false` goes back to the font's glyphs.
+- **Faint text** blends toward the background (it got darker — more prominent —
+  on light themes).
+- Underlines sit at the font's underline position (about 1 px higher).
+- The CRT pass is rebuilt: ~45% faster on the owner's look (1.59 → 0.86 ms at
+  1440p on an Intel iGPU), pixel-identical to the eye; bloom is keyed to
+  brightness above the background (light themes no longer wash out); CRT
+  animations run at 30 fps on timed wakes (15 fps on a software renderer) and
+  pause while unfocused (`animate_unfocused`).
+- Chrome colors come from one contrast-aware palette: menus, confirm buttons,
+  pills, hint chips, the current search match, tab close buttons and the
+  scrollbar read on every theme (menu hover labels were 1.0–1.7:1 on 20 of 22
+  themes).
+
+### Fixed
+- Text drifted off the grid at fractional font sizes (e.g. 13 pt at 125 %
+  scale: 1.5 cells at column 99).
+- Bold box-drawing characters rendered as empty boxes (MesloLGS NF Bold has no
+  box glyphs and the fallback didn't kick in); any character missing from the
+  bold/italic face now falls back.
+- The scrollbar was mis-sized on 2× displays.
+- The launch splash covered a two-line prompt's input line.
+- Tokyo Night's bright colors and Everforest Dark's brights were off upstream.
+
 ## [0.26.1] — 2026-10-08
 
 ### Fixed
