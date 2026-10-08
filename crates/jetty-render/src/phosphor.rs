@@ -45,8 +45,13 @@ fn sd_round_rect(pt: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
 fn fs_reveal(in: VsOut) -> @location(0) vec4<f32> {
     let t = clamp(p.t, 0.0, 1.0);
     let scan_y = smoothstep(0.15, 1.0, t);
-    // 1 below the descending line (revealed), 0 above (still dark).
-    let wipe = smoothstep(scan_y - 0.02, scan_y + 0.05, in.uv.y);
+    // 1 ABOVE the descending line (already revealed — the beam has passed it),
+    // 0 below (still dark). uv.y grows downward, so "above" is uv.y < scan_y.
+    // The `1.0 -` is load-bearing: bf44be9 swapped the smoothstep edges into
+    // ascending order (edge0 > edge1 is undefined in WGSL) but dropped the
+    // inversion, which played the reveal upside down (the window ~90% dark,
+    // then popping in at t = 1). `phosphor_reveal_wipe` mirrors this line.
+    let wipe = 1.0 - smoothstep(scan_y - 0.02, scan_y + 0.05, in.uv.y);
     let b = mix(0.10, 1.0, wipe);
     return vec4<f32>(b, b, b, b);
 }
@@ -226,5 +231,72 @@ impl PhosphorIgnition {
             pass.draw(0..3, 0..1);
         }
         queue.submit(Some(encoder.finish()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CPU mirror of `fs_reveal`'s brightness at row `uv_y` (0 = top, 1 = bottom)
+    /// and progress `t` — the reveal's direction, pinned by tests (the shader
+    /// itself needs a GPU; jetty-shot's `JETTY_SHOT_PHOSPHOR_T` renders it).
+    fn phosphor_reveal_brightness(uv_y: f32, t: f32) -> f32 {
+        fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+            let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        }
+        let t = t.clamp(0.0, 1.0);
+        let scan_y = smoothstep(0.15, 1.0, t);
+        let wipe = 1.0 - smoothstep(scan_y - 0.02, scan_y + 0.05, uv_y);
+        0.10 + (1.0 - 0.10) * wipe
+    }
+
+    #[test]
+    fn phosphor_shader_validates() {
+        let module = naga::front::wgsl::parse_str(PHOSPHOR_SHADER).expect("PHOSPHOR_SHADER parses");
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module)
+            .expect("PHOSPHOR_SHADER validates");
+    }
+
+    #[test]
+    fn the_shader_keeps_the_inverted_wipe() {
+        // The regression line itself: without the `1.0 -` the reveal plays upside
+        // down (bf44be9).
+        assert!(PHOSPHOR_SHADER
+            .contains("let wipe = 1.0 - smoothstep(scan_y - 0.02, scan_y + 0.05, in.uv.y);"));
+    }
+
+    #[test]
+    fn the_reveal_runs_top_down() {
+        // Mid-reveal: the top (already swept) is lit, the bottom still dark.
+        let top = phosphor_reveal_brightness(0.05, 0.5);
+        let bottom = phosphor_reveal_brightness(0.95, 0.5);
+        assert!(top > 0.99, "top must be revealed mid-sweep, got {top}");
+        assert!(bottom < 0.11, "bottom must still be dark mid-sweep, got {bottom}");
+        // Monotonic down the frame at any t: never brighter below than above.
+        for t in [0.2, 0.4, 0.6, 0.8] {
+            let mut prev = f32::INFINITY;
+            for i in 0..=20 {
+                let b = phosphor_reveal_brightness(i as f32 / 20.0, t);
+                assert!(b <= prev + 1e-6, "t={t}: brighter below row {i}");
+                prev = b;
+            }
+        }
+    }
+
+    #[test]
+    fn the_reveal_starts_dark_and_ends_fully_lit() {
+        // t = 0: the beam sits at the top edge — everything below it is dark.
+        assert!(phosphor_reveal_brightness(0.5, 0.0) < 0.11);
+        assert!(phosphor_reveal_brightness(0.99, 0.0) < 0.11);
+        // t = 1: the whole frame is revealed except the last ~2% band the beam
+        // is still leaving (the animation ends there and the next frame has no
+        // pass at all).
+        for i in 0..=48 {
+            let y = i as f32 / 50.0;
+            assert!(phosphor_reveal_brightness(y, 1.0) > 0.99, "row {y} dark at t=1");
+        }
     }
 }
