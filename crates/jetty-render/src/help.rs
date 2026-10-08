@@ -1,4 +1,4 @@
-use crate::chrome::{fit_head, ChromeMeasure, ChromeMetrics};
+use crate::chrome::{fit_head, ChromeMeasure, ChromeMetrics, CHROME_ADVANCE};
 use crate::Rect;
 
 /// The keyboard-shortcut rows shown in the Help overlay — ONE binding per line
@@ -171,7 +171,7 @@ pub fn build_help_overlay(
         }
     }
     // Gap between the key and description columns (2.5 chrome chars).
-    let col_gap = cm.px(2.5 * 9.6);
+    let col_gap = cm.px(2.5 * CHROME_ADVANCE);
     let desc_x_off = key_w + col_gap;
     let content_w = (desc_x_off + desc_w)
         .max(header_w)
@@ -182,7 +182,7 @@ pub fn build_help_overlay(
     // grows with DPI and the UI font. Scale every vertical metric (ideals AND
     // floors) by the same chrome unit the text uses so rows never overlap their
     // neighbour on a 2× display or at a large UI font. This is the overlay unit:
-    // 0.98 at 1×/16pt (`OVERLAY_SCALE`), as the default always rendered.
+    // ≈0.983 at 1×/16pt (`OVERLAY_SCALE`), as the default always rendered.
     let vscale = cm.overlay_u();
     let pad_ideal = PAD_IDEAL * vscale;
     let title_h_ideal = TITLE_H_IDEAL * vscale;

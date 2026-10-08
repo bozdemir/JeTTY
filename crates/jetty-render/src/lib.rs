@@ -21,8 +21,7 @@ mod hints;
 mod palette;
 pub use chrome::{
     clip_head, clip_tail, fit_head, fit_tail, ChromeMeasure, ChromeMetrics, MonoMeasure,
-    MAX_LABEL_CHARS, OVERLAY_SCALE, PILL_H_BASE, STATUS_H_BASE,
-    UI_FONT_BASE,
+    CHROME_ADVANCE, MAX_LABEL_CHARS, OVERLAY_SCALE, PILL_H_BASE, STATUS_H_BASE, UI_FONT_BASE,
 };
 pub use gpu::GpuContext;
 pub use text::TextLayer;

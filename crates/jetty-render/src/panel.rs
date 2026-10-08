@@ -566,9 +566,10 @@ pub fn build_panel(
     // bounded). It used to be recovered from the font's measured 'M' advance,
     // which inflated the whole panel ~1.5× for a proportional UI font; now the
     // FONT only decides text widths (measured with `m`, converted to logical px by
-    // `tw`), never the layout scale. It carries `OVERLAY_SCALE` (0.98 at
-    // 1×/16pt, as the 9.6/9.8 advance ratio always gave), so the default look is
-    // unchanged. Physical inputs (drag, scroll) are converted to logical here.
+    // `tw`), never the layout scale. It carries `OVERLAY_SCALE` (≈0.983 at
+    // 1×/16pt, the ratio the measured advance / 9.8 always gave), so the default
+    // look is unchanged. Physical inputs (drag, scroll) are converted to logical
+    // here.
     let dpi = cm.overlay_u().max(0.1);
     // Rendered width of a label in the panel's LOGICAL space.
     let tw = |m: &mut dyn ChromeMeasure, s: &str| -> f32 { m.text_w(s) / dpi };
@@ -1084,13 +1085,14 @@ pub fn build_panel(
         mini_slider_at(rgb_b_x, t_fx_tint, effects.crt_scanline_tint[2]);
 
     // CRT animation toggle chips (band 9): Roll / Flicker / Jitter, right-aligned.
-    // Widened only if a MEASURED label (+2px a side) would not fit the classic
-    // 72px — never at the default font, so its look is unchanged.
+    // Widened only if a MEASURED label (+1px a side) would not fit the classic
+    // 72px — never at the default font ("Flicker" is 68.6 logical px there), so
+    // its look is unchanged.
     const CHIP_W_MIN: f32 = 72.0;
     const CHIP_H: f32 = 24.0;
     let chip_w = ["Roll", "Flicker", "Jitter"]
         .iter()
-        .map(|t| tw(m, t) + 4.0)
+        .map(|t| tw(m, t) + 2.0)
         .fold(CHIP_W_MIN, f32::max);
     let chip_x2 = px + PANEL_W - PAD - chip_w;
     let chip_x1 = chip_x2 - chip_w - 8.0;

@@ -1,4 +1,4 @@
-use crate::chrome::{fit_tail, ChromeMeasure, ChromeMetrics};
+use crate::chrome::{fit_tail, ChromeMeasure, ChromeMetrics, CHROME_ADVANCE};
 use crate::quad::SCROLLBAR_W;
 use crate::Rect;
 
@@ -53,7 +53,7 @@ pub fn build_search_bar(
     let border_col: [u8; 4] = [border3[0], border3[1], border3[2], 255];
     let text_col = lerp(0.70);
 
-    // HiDPI × UI-font scale (the overlay unit; 0.98 at 1×/16pt, see `OVERLAY_SCALE`).
+    // HiDPI × UI-font scale (the overlay unit; ≈0.983 at 1×/16pt, see `OVERLAY_SCALE`).
     let vscale = cm.overlay_u();
     let bar_h = 34.0 * vscale;
     let pad = 10.0 * vscale;
@@ -78,7 +78,7 @@ pub fn build_search_bar(
     // them overflow the pill and overlap the counter/✕ (F8).
     const PREFIX: &str = "Find: ";
     let prefix_w = m.text_w(PREFIX);
-    let gap = cm.px(9.6); // ≈ one chrome char between query/counter/close
+    let gap = cm.px(CHROME_ADVANCE); // one chrome char between query/counter/close
     let counter_w = m.text_w(&counter);
     // Everything except the query text itself.
     let fixed_w = pad + prefix_w + caret_gap + caret_w + gap + counter_w + gap + close_w + pad;

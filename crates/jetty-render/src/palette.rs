@@ -1,4 +1,4 @@
-use crate::chrome::{fit_head, fit_tail, ChromeMeasure, ChromeMetrics};
+use crate::chrome::{fit_head, fit_tail, ChromeMeasure, ChromeMetrics, CHROME_ADVANCE};
 use crate::Rect;
 
 /// Maximum number of result rows visible in the palette at once (the scroll
@@ -139,7 +139,7 @@ pub fn build_command_palette(
     };
     let counter_w = m.text_w(&counter);
     // Gap between the query/caret and the counter (≈ one chrome char).
-    let gap = cm.px(9.6);
+    let gap = cm.px(CHROME_ADVANCE);
 
     let input_y = py + pad_v;
     let input_text_y = input_y + (input_h - text_h) / 2.0;
@@ -183,7 +183,7 @@ pub fn build_command_palette(
         if row.selected {
             let sel_x = px + 4.0 * vscale;
             let sel_w = (panel_w - 8.0 * vscale).max(0.0);
-            quads.push(Rect::rounded(sel_x, row_top, sel_w, row_h, sel_bg, 6.0 * vscale));
+            quads.push(Rect::rounded(sel_x, row_top, sel_w, row_h, sel_bg, cm.px(6.0)));
         }
 
         // Head-truncate the title to the content width (append … when it overflows),
@@ -308,12 +308,10 @@ mod tests {
     #[test]
     fn selection_quad_present_when_a_row_is_selected() {
         let titles = vec!["one".to_string(), "two".to_string(), "three".to_string()];
-        // The highlight's corner radius is 6 design px at the overlay scale.
-        let is_sel = |q: &&Rect| (q.radius - 6.0 * CM.overlay_u()).abs() < 1e-4;
         // With a selection: a rounded highlight quad exists.
         let rows = sample_rows(&titles, 1);
         let p = build_command_palette(1000, 700, &theme(), &mut mono(), CM, "", &rows, 3, 0);
-        let sel_quads = p.quads.iter().filter(is_sel).count();
+        let sel_quads = p.quads.iter().filter(|q| q.radius == 6.0).count();
         assert_eq!(sel_quads, 1, "exactly one selection highlight expected");
         // With NO selection: none.
         let rows: Vec<PaletteRow> = titles
@@ -321,7 +319,7 @@ mod tests {
             .map(|t| PaletteRow { title: t, match_indices: &[], selected: false })
             .collect();
         let p = build_command_palette(1000, 700, &theme(), &mut mono(), CM, "", &rows, 3, 0);
-        assert_eq!(p.quads.iter().filter(is_sel).count(), 0);
+        assert_eq!(p.quads.iter().filter(|q| q.radius == 6.0).count(), 0);
     }
 
     #[test]

@@ -102,9 +102,9 @@ pub fn build_tab_bar(width: u32, tabs: &[(String, bool)], theme: &Theme) -> TabB
     )
 }
 
-/// Advance of the default monospace chrome font at the design size (MesloLGS NF
-/// at 16px). Only used by the [`build_tab_bar`] baseline wrapper.
-const CHROME_CHAR_W: f32 = 9.6;
+/// Advance of the default monospace chrome font at the design size. Only used
+/// by the [`build_tab_bar`] baseline wrapper.
+const CHROME_CHAR_W: f32 = crate::chrome::CHROME_ADVANCE;
 /// Gap (design px) between the perf HUD's left edge and the nearest tab/+button,
 /// so the reserved area never visually touches the tabs.
 const PERF_GAP: f32 = 16.0;

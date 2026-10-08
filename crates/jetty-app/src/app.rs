@@ -12230,9 +12230,9 @@ fn measure_or<'a>(
 }
 
 /// Monospace fallback measurer at metrics `cm` (the default chrome font's
-/// 9.6px design advance, scaled).
+/// design advance, scaled).
 fn mono_fallback(cm: jetty_render::ChromeMetrics) -> jetty_render::MonoMeasure {
-    jetty_render::MonoMeasure(9.6 * cm.u)
+    jetty_render::MonoMeasure(jetty_render::CHROME_ADVANCE * cm.u)
 }
 
 fn ctrl_hover_at(

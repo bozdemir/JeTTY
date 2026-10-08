@@ -26,13 +26,19 @@ pub const STATUS_H_BASE: f32 = 22.0;
 /// Unscaled height of a toast pill (Shift-drag hint, run-selection status).
 pub const PILL_H_BASE: f32 = 26.0;
 
+/// Advance of one chrome character at the design baseline: the default chrome
+/// font (MesloLGS NF, 1233/2048 em) at 16px. Spacings authored in characters
+/// (a one-char gap, the help overlay's 2.5-char column gap) use it, scaled by
+/// the chrome unit — never a live font's advance.
+pub const CHROME_ADVANCE: f32 = 9.6328125;
+
 /// The OVERLAY surfaces (command palette, help, search bar, hint chips, copy
-/// pill, Settings panel) were tuned against a 9.8px reference advance while the
-/// default chrome font measures 9.6px, so at the default they have always been
-/// drawn at 9.6/9.8 of their design size. That ratio is kept — as a CONSTANT,
-/// never re-derived from a font's advance — so the default look is unchanged
-/// while the UI-font family can no longer resize them.
-pub const OVERLAY_SCALE: f32 = 9.6 / 9.8;
+/// pill, Settings panel) were tuned against a 9.8px reference advance and
+/// scaled by `measured advance / 9.8`, so at the default they have always been
+/// drawn at `CHROME_ADVANCE / 9.8` (≈0.983) of their design size. That ratio
+/// is kept — as a CONSTANT, never re-derived from a font's advance — so the
+/// default look is unchanged while the UI-font family can no longer resize them.
+pub const OVERLAY_SCALE: f32 = CHROME_ADVANCE / 9.8;
 
 /// Chrome size for one window: its DPI scale and the UI font size, folded into
 /// a single chrome unit `u` (physical px per design px).
