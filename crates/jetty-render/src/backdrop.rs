@@ -459,11 +459,14 @@ pub fn derived_look(theme: &jetty_core::Theme) -> ThemeLook {
     }
 }
 
-/// The contrast a backdrop stop must keep with the theme's text: 4.5:1, or the
-/// theme's own fg/bg contrast when that is already lower — minus 8 % slack.
-pub fn readable_floor(theme: &jetty_core::Theme) -> f32 {
+/// The contrast every backdrop keeps with the theme's text: 4.5:1 — or, for a
+/// low-contrast theme (solarized is ~4.1–4.8:1 on its own), 92 % of the
+/// theme's own fg/bg contrast, so a backdrop may cost such a theme at most 8 %
+/// rather than having to vanish. One ratio for the curated stops, the shader's
+/// readability guard and smart dim.
+pub fn readable_ratio(theme: &jetty_core::Theme) -> f32 {
     let bg = [theme.bg[0], theme.bg[1], theme.bg[2]];
-    crate::colors::contrast_ratio(theme.fg, bg).min(4.5) * 0.92
+    (crate::colors::contrast_ratio(theme.fg, bg) * 0.92).min(4.5)
 }
 
 /// The largest `t ≤ amount` for which `color(t)` keeps `floor` contrast with
@@ -484,18 +487,24 @@ fn readable_amount(fg: [u8; 3], floor: f32, amount: f32, color: impl Fn(f32) -> 
     lo
 }
 
-/// The three stops of a theme look on `theme`: glow → bg → deep. Each outer
-/// stop leans only as far as keeps the theme's text readable
-/// ([`readable_floor`]) — a low-contrast theme (solarized) gets a fainter
-/// glow, and a user theme can never be made unreadable by its backdrop.
-pub fn look_stops(look: &ThemeLook, theme: &jetty_core::Theme) -> [[u8; 3]; 3] {
+/// The three stops of a theme look on `theme`: glow → bg → deep, for a
+/// backdrop shown at `strength` (the stops are mixed over the bg by it). Each
+/// outer stop leans only as far as keeps the theme's text readable where it is
+/// SHOWN ([`readable_ratio`]) — a low-contrast theme (solarized) gets a
+/// fainter glow, and no theme can be made unreadable by its backdrop.
+pub fn look_stops(look: &ThemeLook, theme: &jetty_core::Theme, strength: f32) -> [[u8; 3]; 3] {
     let bg = [theme.bg[0], theme.bg[1], theme.bg[2]];
-    let floor = readable_floor(theme);
+    let floor = readable_ratio(theme);
     let accent = hex(look.accent);
-    let glow = readable_amount(theme.fg, floor, look.glow, |t| mix_oklab(bg, accent, t));
+    let k = strength.clamp(0.0, 1.0);
+    // Each candidate is judged exactly as shown: the (8-bit) stop, mixed over
+    // the bg at the strength.
+    let glow_at = |t: f32| mix_oklab(bg, accent, t);
+    let glow = readable_amount(theme.fg, floor, look.glow, |t| mix_oklab(bg, glow_at(t), k));
     // `deep` is a lightness multiplier: walk it from 1 (the bg) toward the target.
-    let deep_t = readable_amount(theme.fg, floor, 1.0, |t| scale_lightness(bg, 1.0 + (look.deep - 1.0) * t));
-    [mix_oklab(bg, accent, glow), bg, scale_lightness(bg, 1.0 + (look.deep - 1.0) * deep_t)]
+    let deep_at = |t: f32| scale_lightness(bg, 1.0 + (look.deep - 1.0) * t);
+    let deep = readable_amount(theme.fg, floor, 1.0, |t| mix_oklab(bg, deep_at(t), k));
+    [glow_at(glow), bg, deep_at(deep)]
 }
 
 /// A theme's look: curated when the table has its id, else derived.
@@ -526,22 +535,22 @@ pub struct GradientLook {
 /// Resolve the base gradient for `settings` on `theme`.
 pub fn resolve_look(s: &BackdropSettings, theme: &jetty_core::Theme) -> GradientLook {
     let tl = look_for_theme(theme);
-    let derived = look_stops(&tl, theme).to_vec();
     if s.mode == BackdropMode::Theme {
+        let strength = (s.strength * tl.gain).clamp(0.0, 1.0);
         return GradientLook {
             shape: tl.shape,
             angle: tl.angle,
             center: tl.center,
             radius: tl.radius,
-            stops: derived,
-            strength: (s.strength * tl.gain).clamp(0.0, 1.0),
+            stops: look_stops(&tl, theme, strength).to_vec(),
+            strength,
             vignette: tl.vignette.max(s.vignette),
             grain: tl.grain.max(s.grain),
             accent: hex(tl.accent),
         };
     }
     let stops: Vec<[u8; 3]> = if s.colors.is_empty() {
-        derived
+        look_stops(&tl, theme, s.strength).to_vec()
     } else {
         s.colors.iter().copied().take(4).collect()
     };
@@ -608,15 +617,16 @@ pub fn fit_transform(fit: BackdropFit, img: (f32, f32), tex_w: f32, win: (f32, f
 }
 
 /// Smart dim: the smallest blend of the image toward the theme bg that keeps
-/// the theme's text at ≥ 4.5:1 against the image's bright end (light text —
-/// its 95th-percentile luminance) or dark end (dark text — 5th percentile),
-/// raised from the user's `dim`. Luminances are WCAG relative (linear) and the
-/// dim mixes in linear light, so luminance mixes linearly too.
-pub fn smart_dim(dim: f32, lum_p5: f32, lum_p95: f32, fg_lum: f32, bg_lum: f32) -> f32 {
+/// the theme's text at ≥ `ratio`:1 (4.5 — see [`readable_ratio`]) against the
+/// image's bright end (light text — its 95th-percentile luminance) or dark end
+/// (dark text — 5th percentile), raised from the user's `dim`. Luminances are
+/// WCAG relative (linear) and the dim mixes in linear light, so luminance
+/// mixes linearly too.
+pub fn smart_dim(dim: f32, lum_p5: f32, lum_p95: f32, fg_lum: f32, bg_lum: f32, ratio: f32) -> f32 {
     let dim = dim.clamp(0.0, 1.0);
     let need = if fg_lum >= bg_lum {
         // Light text: whatever is behind it must stay at or below `target`.
-        let target = (fg_lum + 0.05) / 4.5 - 0.05;
+        let target = (fg_lum + 0.05) / ratio - 0.05;
         if lum_p95 <= target {
             0.0
         } else if bg_lum >= target {
@@ -626,7 +636,7 @@ pub fn smart_dim(dim: f32, lum_p5: f32, lum_p95: f32, fg_lum: f32, bg_lum: f32) 
         }
     } else {
         // Dark text: whatever is behind it must stay at or above `target`.
-        let target = 4.5 * (fg_lum + 0.05) - 0.05;
+        let target = ratio * (fg_lum + 0.05) - 0.05;
         if lum_p5 >= target {
             0.0
         } else if bg_lum <= target {
@@ -636,6 +646,22 @@ pub fn smart_dim(dim: f32, lum_p5: f32, lum_p95: f32, fg_lum: f32, bg_lum: f32) 
         }
     };
     dim.max(need.clamp(0.0, 1.0))
+}
+
+/// The readability guard's bounds for `theme`, as the shader reads them:
+/// `[cap, floor, bg luminance, 0]`. A dark theme (light text) caps the
+/// backdrop's luminance at the text's [`readable_ratio`] point — never below
+/// the theme bg's own luminance; a light theme floors it the same way. The
+/// unused bound is off (cap 1, floor 0).
+pub fn readability_bounds(theme: &jetty_core::Theme) -> [f32; 4] {
+    let fg = crate::colors::relative_luminance(theme.fg);
+    let bg = crate::colors::relative_luminance([theme.bg[0], theme.bg[1], theme.bg[2]]);
+    let r = readable_ratio(theme);
+    if fg >= bg {
+        [((fg + 0.05) / r - 0.05).max(bg), 0.0, bg, 0.0]
+    } else {
+        [1.0, (r * (fg + 0.05) - 0.05).min(bg), bg, 0.0]
+    }
 }
 
 /// Largest parallax shift, as a fraction of the window height.
@@ -655,7 +681,7 @@ pub fn parallax_offset(scroll_px: f32, win_h: f32) -> f32 {
 
 // ── GPU uniform + shader ─────────────────────────────────────────────────────
 
-/// Per-frame uniform (224 bytes, vec4-aligned; layout pinned by a test). Every
+/// Per-frame uniform (240 bytes, vec4-aligned; layout pinned by a test). Every
 /// field is `[f32; N]` so the `#[repr(C)]` layout matches the WGSL `struct U`
 /// byte for byte (offset table on `BACKDROP_SHADER`).
 #[repr(C)]
@@ -683,11 +709,15 @@ pub struct BackdropUniform {
     pub misc: [f32; 4],
     /// Pattern / image colors (linear RGB in xyz).
     pub pc: [[f32; 4]; 3],
+    /// Readability guard ([`readability_bounds`]): max luminance (1 = off),
+    /// min luminance (0 = off), the theme bg's luminance, unused.
+    pub guard: [f32; 4],
 }
 
 // Field byte offsets (Rust == WGSL):
 //   resolution 0 · offset 8 · bg 16 · stops 32..96 · geom 96 · look 112 ·
-//   img_xf 128 · img_fx 144 · misc 160 · pc 176..224  => 224 bytes, align 16.
+//   img_xf 128 · img_fx 144 · misc 160 · pc 176..224 · guard 224
+//   => 240 bytes, align 16.
 pub(crate) const BACKDROP_SHADER: &str = r#"
 struct U {
     resolution: vec2<f32>,
@@ -700,6 +730,7 @@ struct U {
     img_fx: vec4<f32>,
     misc: vec4<f32>,
     pc: array<vec4<f32>, 3>,
+    guard: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(1) @binding(0) var tex: texture_2d<f32>;
@@ -802,6 +833,22 @@ fn vignette(rgb: vec3<f32>, frag: vec2<f32>) -> vec3<f32> {
     return rgb * (f * f * f);
 }
 
+// Readability guard: whatever the backdrop shows, keep it at the theme text's
+// 4.5:1 point — cap its luminance on dark themes (scaled, so the hue stays),
+// lift it toward the bg on light themes. Exact identity inside the bounds.
+fn guard(rgb: vec3<f32>) -> vec3<f32> {
+    let y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    var c = rgb;
+    if (y > u.guard.x) {
+        c = c * (u.guard.x / y);
+    }
+    if (y < u.guard.y) {
+        let bg = max(oklab_to_linear(u.bg.xyz), vec3(0.0));
+        c = mix(c, bg, clamp((u.guard.y - y) / max(u.guard.z - y, 1e-4), 0.0, 1.0));
+    }
+    return c;
+}
+
 // Premultiply (when the surface wants it), then dither: a triangular ±1 code
 // step of noise in the sRGB-encoded output domain (the slope term converts a
 // code step to linear light, ~2·sqrt(x)), plus the optional monochrome grain.
@@ -823,7 +870,7 @@ fn finish(rgb_in: vec3<f32>, frag: vec2<f32>) -> vec4<f32> {
 @fragment
 fn fs_gradient(in: VsOut) -> @location(0) vec4<f32> {
     let rgb = base_rgb(in.pos.xy - u.offset);
-    return finish(vignette(rgb, in.pos.xy), in.pos.xy);
+    return finish(guard(vignette(rgb, in.pos.xy)), in.pos.xy);
 }
 
 // ── image ──
@@ -842,7 +889,7 @@ fn fs_image(in: VsOut) -> @location(0) vec4<f32> {
     c = mix(c, u.pc[0].xyz, u.img_fx.w);         // frosted tint (blurred images)
     c = mix(c, u.pc[1].xyz, u.img_fx.x);         // dim toward the theme bg
     let rgb = mix(base, c, cov);
-    return finish(vignette(rgb, in.pos.xy), in.pos.xy);
+    return finish(guard(vignette(rgb, in.pos.xy)), in.pos.xy);
 }
 
 // ── stars ──
@@ -872,8 +919,11 @@ fn fs_stars(in: VsOut) -> @location(0) vec4<f32> {
     let t = u.misc.x;
     let s = star_layer(p, 34.0 * dpi, 0.5, 0.7 * dpi, 11u, t) * 0.8
         + star_layer(p + vec2(13.0, 29.0) * dpi, 91.0 * dpi, 0.35, 1.25 * dpi, 23u, t);
-    rgb = mix(rgb, u.pc[0].xyz, clamp(s * u.look.x * 1.6, 0.0, 1.0));
-    return finish(vignette(rgb, in.pos.xy), in.pos.xy);
+    // The sky is guarded; the stars are not (a 1-2 px point never hides a
+    // glyph, and capping them would put them out).
+    let sky = guard(vignette(rgb, in.pos.xy));
+    rgb = mix(sky, u.pc[0].xyz, clamp(s * u.look.x * 1.6, 0.0, 1.0));
+    return finish(rgb, in.pos.xy);
 }
 
 // ── grid ──
@@ -892,9 +942,9 @@ fn fs_grid(in: VsOut) -> @location(0) vec4<f32> {
     let q = p + vec2(0.0, u.misc.x * 8.0 * dpi);
     let minor = grid_cov(q, 28.0 * dpi, 0.5 * dpi);
     let major = grid_cov(q, 112.0 * dpi, 0.6 * dpi);
-    let w = max(minor * 0.10, major * 0.24) * u.look.x * 2.0;
+    let w = max(minor * 0.08, major * 0.18) * u.look.x * 2.0;
     rgb = mix(rgb, u.pc[0].xyz, clamp(w, 0.0, 1.0));
-    return finish(vignette(rgb, in.pos.xy), in.pos.xy);
+    return finish(guard(vignette(rgb, in.pos.xy)), in.pos.xy);
 }
 
 // ── synthwave ──
@@ -928,24 +978,30 @@ fn fs_synthwave(in: VsOut) -> @location(0) vec4<f32> {
         let v = clamp((p.y - (sc.y - r)) / (2.0 * r), 0.0, 1.0);
         rgb = mix(rgb, mix(u.pc[0].xyz, u.pc[1].xyz, v), sun * clamp(0.55 * k, 0.0, 1.0));
     } else {
-        // Floor: lines every world unit in x (lateral) and z (depth).
-        let yd = (p.y - hz) / res.y;
-        let z = 0.10 / max(yd, 0.0005);
-        let wx = (p.x - res.x * 0.5) / res.y * z * 3.0;
-        let wz = z * 1.5 + t * 0.8;
+        // Floor: a perspective plane. s = px below the horizon; depth z = 1 at
+        // the bottom edge → ∞ at the horizon. Grid cells are `cell` px square
+        // at the bottom edge; lines are 1 world unit apart on both axes.
+        let s = max(p.y - hz, 0.25);
+        let smax = max(res.y - hz, 1.0);
+        let z = smax / s;
+        let cell = 64.0 * dpi;
+        let wx = (p.x - res.x * 0.5) * z / cell;
+        let wz = z * smax / cell + t * 1.5;
         let gx = abs(fract(wx + 0.5) - 0.5);
         let gz = abs(fract(wz + 0.5) - 0.5);
-        // World units per pixel along each axis (the line AA width).
-        let ux = z * 3.0 / res.y;
-        let uz = 0.15 / (max(yd, 0.0005) * max(yd, 0.0005)) / res.y;
-        let lw = 0.9 * dpi;
-        let lx = (1.0 - smoothstep(lw * ux * 0.5, lw * ux * 1.5, gx)) * clamp(1.5 - 6.0 * ux, 0.0, 1.0);
-        let lz = (1.0 - smoothstep(lw * uz * 0.5, lw * uz * 1.5, gz)) * clamp(1.5 - 6.0 * uz, 0.0, 1.0);
-        let line = max(lx, lz) * smoothstep(0.0, 0.04, yd);
-        rgb = mix(rgb, u.pc[2].xyz, clamp(line * 0.75 * k, 0.0, 1.0));
-        rgb = rgb + u.pc[1].xyz * exp(-yd / 0.03) * 0.12 * k;
+        // World units per pixel along each axis: the AA width, and — once lines
+        // crowd closer than a few pixels — the fade that keeps the horizon free
+        // of moiré.
+        let ux = z / cell;
+        let uz = smax * smax / (s * s * cell);
+        let lw = 0.8 * dpi;
+        let lx = (1.0 - smoothstep(lw * ux * 0.5, lw * ux * 1.5, gx)) * (1.0 - smoothstep(0.12, 0.35, ux));
+        let lz = (1.0 - smoothstep(lw * uz * 0.5, lw * uz * 1.5, gz)) * (1.0 - smoothstep(0.12, 0.35, uz));
+        let line = max(lx, lz);
+        rgb = mix(rgb, u.pc[2].xyz, clamp(line * 0.7 * k, 0.0, 1.0));
+        rgb = rgb + u.pc[1].xyz * exp(-(s / res.y) / 0.03) * 0.12 * k;
     }
-    return finish(vignette(rgb, in.pos.xy), in.pos.xy);
+    return finish(guard(vignette(rgb, in.pos.xy)), in.pos.xy);
 }
 
 // ── aurora (baked) ──
@@ -1000,7 +1056,7 @@ fn fs_aurora_bake(in: VsOut) -> @location(0) vec4<f32> {
         cov = max(cov, band);
     }
     let fade = 1.0 - smoothstep(0.2, 0.7, uv.y);
-    return vec4(col * fade * 0.55, clamp(cov * fade, 0.0, 1.0));
+    return vec4(col * fade * 0.32, clamp(cov * fade, 0.0, 1.0));
 }
 
 // The base with the baked layer composited: emissive light on dark themes, a
@@ -1012,10 +1068,11 @@ fn fs_baked(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSampleLevel(tex, samp, p / u.resolution, 0.0);
     let k = u.look.x * 2.0;
     let lit = rgb * (1.0 - 0.3 * clamp(s.a * k, 0.0, 1.0)) + s.rgb * k;
-    let hue = s.rgb / max(s.a, 1e-4);
-    let tinted = mix(rgb, hue, clamp(s.a * k * 0.35, 0.0, 1.0));
+    // Light themes: a pastel of the curtain's hue (not a gray smudge).
+    let hue = s.rgb / max(max(s.r, max(s.g, s.b)), 1e-4);
+    let tinted = mix(rgb, mix(hue, vec3(1.0), 0.45), clamp(s.a * k * 0.45, 0.0, 1.0));
     rgb = select(lit, tinted, u.misc.w > 0.5);
-    return finish(vignette(rgb, in.pos.xy), in.pos.xy);
+    return finish(guard(vignette(rgb, in.pos.xy)), in.pos.xy);
 }
 "#;
 
@@ -1107,8 +1164,18 @@ impl GpuImage {
     pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, img: &DecodedImage) -> Option<GpuImage> {
         let max = device.limits().max_texture_dimension_2d;
         let first = img.mips.iter().position(|m| m.w <= max && m.h <= max)?;
-        let levels = &img.mips[first..];
-        let l0 = levels.first()?;
+        let l0 = img.mips.get(first)?;
+        // Only the prefix that follows the GPU's mip size rule (level k is
+        // max(1, size >> k)) — wgpu rejects anything else.
+        let valid = img.mips[first..]
+            .iter()
+            .enumerate()
+            .take_while(|(k, m)| {
+                let k = *k as u32;
+                k < 32 && (m.w, m.h) == ((l0.w >> k).max(1), (l0.h >> k).max(1))
+            })
+            .count();
+        let levels = &img.mips[first..first + valid];
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("backdrop-image"),
             size: wgpu::Extent3d { width: l0.w, height: l0.h, depth_or_array_layers: 1 },
@@ -1243,6 +1310,7 @@ pub fn build_uniform(
         img_fx: [0.0; 4],
         misc: [time, f.dpi.max(0.5), if f.premultiply { 1.0 } else { 0.0 }, if light { 1.0 } else { 0.0 }],
         pc: [[0.0; 4]; 3],
+        guard: readability_bounds(theme),
     };
     // A one-color "gradient": both used stops are that color.
     if n == 1 {
@@ -1279,6 +1347,7 @@ pub fn build_uniform(
                     p95,
                     crate::colors::relative_luminance(fg),
                     crate::colors::relative_luminance(bg),
+                    readable_ratio(theme),
                 );
                 u.img_xf = fit.xf;
                 u.img_fx = [dim, fit.lod, if s.fit == BackdropFit::Tile { 1.0 } else { 0.0 }, frost];
@@ -1693,7 +1762,7 @@ mod tests {
     #[test]
     fn backdrop_uniform_layout() {
         use std::mem::{align_of, offset_of, size_of};
-        assert_eq!(size_of::<BackdropUniform>(), 224);
+        assert_eq!(size_of::<BackdropUniform>(), 240);
         assert_eq!(offset_of!(BackdropUniform, resolution), 0);
         assert_eq!(offset_of!(BackdropUniform, offset), 8);
         assert_eq!(offset_of!(BackdropUniform, bg), 16);
@@ -1704,9 +1773,10 @@ mod tests {
         assert_eq!(offset_of!(BackdropUniform, img_fx), 144);
         assert_eq!(offset_of!(BackdropUniform, misc), 160);
         assert_eq!(offset_of!(BackdropUniform, pc), 176);
+        assert_eq!(offset_of!(BackdropUniform, guard), 224);
         assert_eq!(size_of::<BackdropUniform>() % 16, 0);
         assert_eq!(align_of::<BackdropUniform>(), 4);
-        // naga agrees on the WGSL side: the struct is 224 bytes with the same
+        // naga agrees on the WGSL side: the struct is 240 bytes with the same
         // member offsets.
         let module = naga::front::wgsl::parse_str(BACKDROP_SHADER).unwrap();
         let ty = module
@@ -1716,7 +1786,7 @@ mod tests {
             .map(|(_, t)| t)
             .expect("struct U");
         let naga::TypeInner::Struct { members, span } = &ty.inner else { panic!("U is a struct") };
-        assert_eq!(*span, 224);
+        assert_eq!(*span, 240);
         let offs: Vec<(String, u32)> =
             members.iter().map(|m| (m.name.clone().unwrap_or_default(), m.offset)).collect();
         let want = [
@@ -1730,6 +1800,7 @@ mod tests {
             ("img_fx", 144),
             ("misc", 160),
             ("pc", 176),
+            ("guard", 224),
         ];
         for (name, off) in want {
             assert!(offs.contains(&(name.to_string(), off)), "{name} @ {off}: {offs:?}");
@@ -1820,19 +1891,21 @@ mod tests {
         assert!(l.glow < 0.3 && l.deep > 0.9, "{l:?}");
     }
 
-    /// The curated glow/bg/deep stops keep the theme's text readable at the
-    /// default and the full strength: no worse than 4.5:1, or than the theme's
-    /// own fg/bg contrast when that is already lower.
+    /// The curated glow/bg/deep stops keep the theme's text readable at low,
+    /// default and full strength: at least 4.5:1, or 92 % of the theme's own
+    /// fg/bg contrast when that is already lower.
     #[test]
     fn theme_looks_keep_text_readable() {
         for name in jetty_core::theme::PRESETS {
             let t = theme(name);
             let bg = [t.bg[0], t.bg[1], t.bg[2]];
-            let floor = crate::colors::contrast_ratio(t.fg, bg).min(4.5) * 0.92;
+            let floor = (crate::colors::contrast_ratio(t.fg, bg) * 0.92).min(4.5);
+            assert_eq!(floor, readable_ratio(&t));
             let look = look_for_theme(&t);
-            for strength in [0.5f32, 1.0] {
-                for stop in look_stops(&look, &t) {
-                    let shown = mix_oklab(bg, stop, (strength * look.gain).min(1.0));
+            for strength in [0.25f32, 0.5, 1.0] {
+                let k = (strength * look.gain).min(1.0);
+                for stop in look_stops(&look, &t, k) {
+                    let shown = mix_oklab(bg, stop, k);
                     let cr = crate::colors::contrast_ratio(t.fg, shown);
                     assert!(cr >= floor, "{name} at {strength}: {cr:.2} < {floor:.2} ({shown:?})");
                 }
@@ -1869,7 +1942,7 @@ mod tests {
         assert_eq!(look.center, [0.5, 0.5]);
         // Empty colors → the theme-derived stops.
         let derived = resolve_look(&BackdropSettings { mode: BackdropMode::Gradient, ..Default::default() }, &t);
-        assert_eq!(derived.stops, look_stops(&look_for_theme(&t), &t).to_vec());
+        assert_eq!(derived.stops, look_stops(&look_for_theme(&t), &t, 0.5).to_vec());
     }
 
     #[test]
@@ -1911,21 +1984,29 @@ mod tests {
         let white = 1.0;
         let near_black = 0.01;
         // Dark theme (light text): a bright image needs dimming.
-        let need = smart_dim(0.0, 0.0, 0.8, white, near_black);
+        let need = smart_dim(0.0, 0.0, 0.8, white, near_black, 4.5);
         let target = (white + 0.05) / 4.5 - 0.05;
         let shown = 0.8 * (1.0 - need) + near_black * need;
         assert!((shown - target).abs() < 1e-4, "dims exactly to the 4.5:1 point");
         // Already dark enough: the user's dim is kept.
-        assert_eq!(smart_dim(0.3, 0.0, 0.05, white, near_black), 0.3);
+        assert_eq!(smart_dim(0.3, 0.0, 0.05, white, near_black, 4.5), 0.3);
         // A larger user dim always wins.
-        assert_eq!(smart_dim(0.95, 0.0, 0.8, white, near_black), 0.95);
+        assert_eq!(smart_dim(0.95, 0.0, 0.8, white, near_black, 4.5), 0.95);
         // Light theme (dark text): a dark image needs lifting toward the bg.
-        let need = smart_dim(0.0, 0.02, 0.9, 0.01, 0.9);
+        let need = smart_dim(0.0, 0.02, 0.9, 0.01, 0.9, 4.5);
         let target = 4.5 * (0.01 + 0.05) - 0.05;
         let shown = 0.02 * (1.0 - need) + 0.9 * need;
         assert!((shown - target).abs() < 1e-4);
         // Impossible (bg itself too close to the text): full dim.
-        assert_eq!(smart_dim(0.0, 0.0, 0.9, 0.2, 0.3), 1.0);
+        assert_eq!(smart_dim(0.0, 0.0, 0.9, 0.2, 0.3, 4.5), 1.0);
+        // A lower ratio (a low-contrast theme) needs less dim.
+        assert!(smart_dim(0.0, 0.0, 0.8, white, near_black, 3.5) < smart_dim(0.0, 0.0, 0.8, white, near_black, 4.5));
+        // On a real theme the ratio is the theme's readable ratio: 4.5 for a
+        // high-contrast one, less for solarized (it may lose at most 8 %).
+        assert_eq!(readable_ratio(&theme("ayu_dark")), 4.5);
+        let sol = theme("solarized_light");
+        let own = crate::colors::contrast_ratio(sol.fg, [sol.bg[0], sol.bg[1], sol.bg[2]]);
+        assert!(own < 4.5 && (readable_ratio(&sol) - own * 0.92).abs() < 1e-5);
     }
 
     #[test]
@@ -1980,12 +2061,38 @@ mod tests {
     }
 
     #[test]
+    fn readability_bounds_keep_text_at_4_5() {
+        // Dark theme: a cap at the text's 4.5:1 point, no floor.
+        let dark = theme("ayu_dark");
+        let [cap, floor, bg_y, _] = readability_bounds(&dark);
+        assert_eq!(floor, 0.0);
+        let fg_y = crate::colors::relative_luminance(dark.fg);
+        assert!(((fg_y + 0.05) / (cap + 0.05) - 4.5).abs() < 1e-3, "cap is the 4.5:1 point");
+        assert!(cap > bg_y, "the theme bg itself is never capped");
+        // Light theme: a floor at the 4.5:1 point, no cap.
+        let light = theme("solarized_light");
+        let [cap, floor, bg_y, _] = readability_bounds(&light);
+        assert_eq!(cap, 1.0);
+        assert!(floor <= bg_y, "never above the theme bg");
+        let fg_y = crate::colors::relative_luminance(light.fg);
+        assert!(floor <= 4.5 * (fg_y + 0.05) - 0.05 + 1e-6);
+        // A low-contrast dark theme (solarized: fg/bg ≈ 4.8:1 — the 4.5:1 point
+        // sits close to its bg): the cap never drops below the bg luminance.
+        for name in jetty_core::theme::PRESETS {
+            let t = theme(name);
+            let [cap, floor, bg_y, _] = readability_bounds(&t);
+            assert!(cap >= bg_y - 1e-6 && floor <= bg_y + 1e-6, "{name}");
+            assert!((0.0..=1.0).contains(&cap) && (0.0..=1.0).contains(&floor), "{name}");
+        }
+    }
+
+    #[test]
     fn strength_zero_is_the_theme_bg() {
         // At strength 0 the base mixes 0 % of the stops: the shader shows the
         // bg (the stops' OKLab is irrelevant). Check the CPU mirror of the mix.
         let t = theme("dracula");
         let bg = [t.bg[0], t.bg[1], t.bg[2]];
-        for stop in look_stops(&look_for_theme(&t), &t) {
+        for stop in look_stops(&look_for_theme(&t), &t, 0.5) {
             assert_eq!(mix_oklab(bg, stop, 0.0), bg);
         }
     }

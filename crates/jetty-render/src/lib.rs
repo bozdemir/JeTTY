@@ -81,7 +81,8 @@ pub use text::{clamp_line_height, LINE_HEIGHT_DEFAULT, LINE_HEIGHT_MAX, LINE_HEI
 pub use quad::{scrollbar_gutter_px, scrollbar_thumb_color, ScrollbarTrack};
 pub use ring::{ring_coverage, ring_width_px, FocusRing, RingUniform};
 pub use backdrop::{
-    build_uniform as backdrop_uniform, curated_theme_ids, fit_transform, parallax_offset, parse_hex_color, resolve_look, smart_dim,
+    build_uniform as backdrop_uniform, curated_theme_ids, fit_transform, parallax_offset, parse_hex_color,
+    readability_bounds, readable_ratio, resolve_look, smart_dim,
     theme_look, Backdrop, BackdropFit, BackdropFrame, BackdropMode, BackdropPattern, BackdropSettings, BackdropShape,
     BackdropUniform, GpuImage, ThemeLook,
 };

@@ -172,13 +172,23 @@ pub fn decode_bytes(data: &[u8]) -> Result<RawImage, String> {
     }
 }
 
+/// A decoder's error as ONE short line ("bad JPEG (…)"): the reason feeds a
+/// notice pill, and some decoders' messages span lines.
+fn decode_error(kind: &str, detail: &str) -> String {
+    let mut d: String = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    if d.chars().count() > 80 {
+        d = d.chars().take(79).collect::<String>() + "…";
+    }
+    format!("bad {kind} ({d})")
+}
+
 fn decode_png(data: &[u8]) -> Result<RawImage, String> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut limits = png::Limits::default();
     limits.bytes = PNG_LIMIT_BYTES;
     decoder.set_limits(limits);
-    let mut reader = decoder.read_info().map_err(|e| format!("bad PNG ({e})"))?;
+    let mut reader = decoder.read_info().map_err(|e| decode_error("PNG", &e.to_string()))?;
     {
         let info = reader.info();
         check_dims(info.width, info.height)?;
@@ -190,7 +200,7 @@ fn decode_png(data: &[u8]) -> Result<RawImage, String> {
         return Err("bad PNG (frame size)".into());
     }
     let mut buf = vec![0u8; size];
-    let frame = reader.next_frame(&mut buf).map_err(|e| format!("bad PNG ({e})"))?;
+    let frame = reader.next_frame(&mut buf).map_err(|e| decode_error("PNG", &e.to_string()))?;
     let (w, h) = (frame.width, frame.height);
     check_dims(w, h)?;
     let px = w as usize * h as usize;
@@ -234,11 +244,11 @@ fn decode_jpeg(data: &[u8]) -> Result<RawImage, String> {
         .set_max_width(MAX_IMAGE_DIM as usize)
         .set_max_height(MAX_IMAGE_DIM as usize);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(data), options);
-    decoder.decode_headers().map_err(|e| format!("bad JPEG ({e:?})"))?;
+    decoder.decode_headers().map_err(|e| decode_error("JPEG", &format!("{e:?}")))?;
     let info = decoder.info().ok_or("bad JPEG (no header)")?;
     let (w, h) = (info.width as u32, info.height as u32);
     check_dims(w, h)?;
-    let pixels = decoder.decode().map_err(|e| format!("bad JPEG ({e:?})"))?;
+    let pixels = decoder.decode().map_err(|e| decode_error("JPEG", &format!("{e:?}")))?;
     let px = w as usize * h as usize;
     if pixels.len() != px * 4 {
         return Err("bad JPEG (unexpected output size)".into());
@@ -415,39 +425,20 @@ pub fn blur3(rgba: &[u8], w: u32, h: u32, radius: u32) -> Vec<u8> {
         .collect()
 }
 
-/// The full mip chain of `level0` (each level half the previous, rounded up,
-/// down to 1×1; 2×2 box average in linear light, clamped at odd edges).
+/// The full mip chain of `level0`, sized exactly as the GPU expects: level `k`
+/// is `max(1, w >> k)` × `max(1, h >> k)`, down to 1×1 (so the level count is
+/// `floor(log2(max(w, h))) + 1`). Each level is an exact area downscale of the
+/// previous in linear light — an odd edge column/row is shared, not dropped.
 pub fn build_mips(level0: MipLevel) -> Vec<MipLevel> {
-    let lut = to_linear_lut();
     let mut mips = vec![level0];
     loop {
         let prev = mips.last().expect("level 0 present");
         if prev.w <= 1 && prev.h <= 1 {
             break;
         }
-        let (pw, ph) = (prev.w as usize, prev.h as usize);
-        let (nw, nh) = (pw.div_ceil(2).max(1), ph.div_ceil(2).max(1));
-        let mut out = vec![0u8; nw * nh * 4];
-        for y in 0..nh {
-            for x in 0..nw {
-                let mut px = [0.0f32; 4];
-                for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                    let sx = (x * 2 + dx).min(pw - 1);
-                    let sy = (y * 2 + dy).min(ph - 1);
-                    let i = (sy * pw + sx) * 4;
-                    px[0] += lut[prev.rgba[i] as usize];
-                    px[1] += lut[prev.rgba[i + 1] as usize];
-                    px[2] += lut[prev.rgba[i + 2] as usize];
-                    px[3] += prev.rgba[i + 3] as f32 / 255.0;
-                }
-                let o = (y * nw + x) * 4;
-                out[o] = encode(px[0] * 0.25);
-                out[o + 1] = encode(px[1] * 0.25);
-                out[o + 2] = encode(px[2] * 0.25);
-                out[o + 3] = alpha_code(px[3] * 0.25);
-            }
-        }
-        mips.push(MipLevel { w: nw as u32, h: nh as u32, rgba: out });
+        let (nw, nh) = ((prev.w / 2).max(1), (prev.h / 2).max(1));
+        let rgba = resize_area(&prev.rgba, prev.w, prev.h, nw, nh);
+        mips.push(MipLevel { w: nw, h: nh, rgba });
     }
     mips
 }
@@ -602,6 +593,11 @@ mod tests {
         bad_png.truncate(20);
         assert!(decode_bytes(&bad_png).is_err());
         assert!(decode_bytes(&JPEG_16X8[..40]).is_err());
+        // Every reason is one short line (it is shown in a notice pill).
+        let mut junk = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        junk.extend((0..4000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8));
+        let err = decode_bytes(&junk).unwrap_err();
+        assert!(!err.contains('\n') && err.chars().count() < 100, "{err:?}");
         assert!(decode_bytes(&[]).is_err());
     }
 
@@ -674,14 +670,23 @@ mod tests {
     }
 
     #[test]
-    fn mips_go_down_to_one_pixel() {
+    fn mips_follow_the_gpu_size_rule() {
         let l0 = MipLevel { w: 5, h: 3, rgba: vec![255; 5 * 3 * 4] };
         let mips = build_mips(l0);
         let sizes: Vec<(u32, u32)> = mips.iter().map(|m| (m.w, m.h)).collect();
-        assert_eq!(sizes, vec![(5, 3), (3, 2), (2, 1), (1, 1)]);
+        assert_eq!(sizes, vec![(5, 3), (2, 1), (1, 1)]);
         assert!(mips.iter().all(|m| m.rgba.len() == (m.w * m.h * 4) as usize));
         // A uniform white image stays white at every level.
         assert!(mips.iter().all(|m| m.rgba.iter().all(|&v| v == 255)));
+        // Level k is max(1, size >> k) and the count is floor(log2(max)) + 1 —
+        // what wgpu validates (a 1100×733 chain has 11 levels, not 12).
+        for (w, h) in [(1100u32, 733u32), (275, 183), (1, 1), (4096, 7), (3, 1000)] {
+            let mips = build_mips(MipLevel { w, h, rgba: vec![9; (w * h * 4) as usize] });
+            assert_eq!(mips.len() as u32, 32 - w.max(h).leading_zeros(), "{w}×{h}");
+            for (k, m) in mips.iter().enumerate() {
+                assert_eq!((m.w, m.h), ((w >> k).max(1), (h >> k).max(1)), "{w}×{h} level {k}");
+            }
+        }
     }
 
     #[test]
