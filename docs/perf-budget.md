@@ -79,6 +79,37 @@ Konsole 23.08.5, GNOME Terminal / VTE 0.76.
 > ≥150 MB/s target is retained but **currently unmet on this binary** (OPEN — see the
 > TODO list). No unverified figure is shipped.
 
+### Visuals v2 vs v0.26.1 (2026-10-09)
+
+The overnight visuals program (themes, padding, built-in glyphs, backdrop, effects,
+cursor, tabs, Settings) was checked against v0.26.1 with a **round-robin** of eleven
+`jetty-bench` binaries (v0.26.1, nine merge points, HEAD), four rounds, medians,
+Intel ARL iGPU, quiet machine:
+
+| Metric (CPU ms/frame) | v0.26.1 | HEAD | Δ |
+|---|---|---|---|
+| 240×70 typing | 0.499 | 0.486 | −0.013 |
+| 240×70 scroll | 0.502 | 0.489 | −0.013 |
+| 240×70 static | 0.215 | 0.226 | +0.011 |
+| 120×40 typing | 0.243 | 0.235 | −0.008 |
+| 120×40 static | 0.093 | 0.094 | +0.001 |
+| snapshot | 0.072 | 0.074 | +0.002 |
+| pipeline_1byte p50 | 0.071 | 0.073 | +0.002 |
+| throughput (MB/s) | 141 | 142 | — |
+| render, gpu exec (median) | 0.468 | 0.470 | — |
+
+New scenarios: `tui` (btop-like box + braille, 240×70) **2.33 → 1.06 ms** and
+`boxtype` (typing inside a box) **0.90 → 0.28 ms** — built-in glyphs skip font
+fallback. CRT post pass (owner's look, 2560×1440): **1.59 → 0.86 ms**; CRT off: nothing
+built. Backdrop: none = nothing built; on = 0.19–0.44 ms/frame GPU (baked once, copied
+per frame).
+
+> **⚠ Measuring the GPU here is noisy.** `render … gpu exec` (a `device.poll` wait)
+> follows the iGPU's frequency state: two builds of *identical* render code measured
+> 0.47 vs 0.71 ms in alternating pairs, and a fresh build measured right after a
+> compile runs slower (the CPU and iGPU share one power budget). Compare GPU numbers
+> only in a round-robin of many binaries over several rounds, never from one pair.
+
 ## Where we lead vs. match vs. must improve
 
 - **Lead (architecture already gives us the edge):**
