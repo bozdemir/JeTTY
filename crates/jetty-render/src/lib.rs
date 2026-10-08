@@ -28,6 +28,8 @@ mod ring;
 mod ui_palette;
 pub use ui_palette::{ensure_contrast, UiPalette};
 mod grid_geom;
+mod backdrop;
+pub mod backdrop_image;
 pub use chrome::{
     clip_head, clip_tail, fit_head, fit_tail, ChromeMeasure, ChromeMetrics, MonoMeasure,
     CHROME_ADVANCE, MAX_LABEL_CHARS, OVERLAY_SCALE, PILL_H_BASE, STATUS_H_BASE, UI_FONT_BASE,
@@ -78,3 +80,8 @@ pub use grid_geom::{failed_marker_x, grid_dims, padding_px, shift_labels_x, shif
 pub use text::{clamp_line_height, LINE_HEIGHT_DEFAULT, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN};
 pub use quad::{scrollbar_gutter_px, scrollbar_thumb_color, ScrollbarTrack};
 pub use ring::{ring_coverage, ring_width_px, FocusRing, RingUniform};
+pub use backdrop::{
+    build_uniform as backdrop_uniform, curated_theme_ids, fit_transform, parallax_offset, parse_hex_color, resolve_look, smart_dim,
+    theme_look, Backdrop, BackdropFit, BackdropFrame, BackdropMode, BackdropPattern, BackdropSettings, BackdropShape,
+    BackdropUniform, GpuImage, ThemeLook,
+};

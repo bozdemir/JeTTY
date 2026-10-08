@@ -19,6 +19,14 @@ wgpu = { version = "29.0", features = ["wgsl"] }
 # Already in the tree via swash (glyphon's rasterizer) — no new download. The
 # anti-aliased path rasterizer behind the built-in arcs / Powerline shapes.
 zeno = { version = "0.3", default-features = false, features = ["eval", "std"] }
+# Backdrop images (`[backdrop] image = …`), decoded once on a worker thread.
+# PNG: already in the workspace lockfile (jetty-core / jetty-app use 0.18.1) — no
+# new download. JPEG: zune-jpeg — the ONE new crate of visuals v2: small, pure
+# Rust, MIT/Apache-2.0/Zlib, its only dependency is zune-core (re-exported).
+# Default features dropped (no x86/neon SIMD paths): a one-off background decode
+# needs no SIMD, and `std` is all the file-reader path uses.
+png = "0.18.1"
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 naga = "29"
