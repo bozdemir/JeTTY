@@ -3027,10 +3027,28 @@ impl App {
                 .filter(|&(w, h)| w > 0 && h > 0)
                 .unwrap_or(crate::backdrop::FALLBACK_MONITOR)
         };
+        // First show a decode that landed (also one that arrived while no GPU
+        // existed — startup race, a device rebuild), then start whatever the
+        // settings want now: the landed image stays up while that decodes.
+        let problem = self.gpu.as_ref().and_then(|g| self.backdrop.upload_pending(&g.device, &g.queue));
+        if let Some(why) = problem {
+            self.backdrop_notice(&why);
+        }
         let proxy = self.proxy.clone();
         self.backdrop.sync_image(&crate::config::Config::dir(), max, |gen, key| {
             crate::backdrop::spawn_decode(proxy, gen, key)
         });
+    }
+
+    /// Tell the user why the backdrop image is not shown (stderr + a pill).
+    fn backdrop_notice(&mut self, why: &str) {
+        let file = self.backdrop.cfg.image.clone();
+        eprintln!("jetty: backdrop image {file:?}: {why}");
+        let mut short: String = why.chars().take(64).collect();
+        if short.len() < why.len() {
+            short.push('…');
+        }
+        self.show_notice_pill(format!("Backdrop image: {short} — showing the gradient"), 8000);
     }
 
     /// Allocate a surface-sized offscreen color texture (same format as the
@@ -11673,22 +11691,14 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::ConfigNotice(msg) => self.show_config_warnings(&[msg]),
             AppEvent::Appearance(a) => self.apply_appearance(a),
             AppEvent::BackdropImage(gen, result) => {
-                // Upload a fresh decode to the main device right away (its CPU
-                // pixels are dropped there); a failure keeps the base gradient
-                // and says why. A stale generation is a silent no-op.
-                let mut problem = self.backdrop.on_decoded(gen, result);
-                if let Some(g) = &self.gpu {
-                    problem = problem.or(self.backdrop.upload_pending(&g.device, &g.queue));
+                // A failure keeps the base gradient and says why; a stale
+                // generation is a silent no-op. Then re-sync: it uploads the
+                // fresh decode to the main device right away (its CPU pixels
+                // are dropped there) and starts a request that waited behind it.
+                if let Some(why) = self.backdrop.on_decoded(gen, result) {
+                    self.backdrop_notice(&why);
                 }
-                if let Some(why) = problem {
-                    let file = self.backdrop.cfg.image.clone();
-                    eprintln!("jetty: backdrop image {file:?}: {why}");
-                    let mut short: String = why.chars().take(64).collect();
-                    if short.len() < why.len() {
-                        short.push('…');
-                    }
-                    self.show_notice_pill(format!("Backdrop image: {short} — showing the gradient"), 8000);
-                }
+                self.sync_backdrop_image();
                 self.mark_dirty_all();
             }
         }

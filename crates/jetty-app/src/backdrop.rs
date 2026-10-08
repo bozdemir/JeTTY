@@ -41,18 +41,16 @@ impl ImageKey {
     }
 }
 
-/// The backdrop image's life cycle.
+/// The decode pipeline of the backdrop image.
 #[derive(Debug)]
 pub(crate) enum ImageSlot {
-    /// No image wanted (mode is not "image", or no file named).
+    /// Nothing in flight.
     None,
     /// Decoding on the worker thread.
     Loading(ImageKey),
-    /// Decoded; waiting for the main GPU (startup race / device rebuild).
+    /// Decoded; waiting for a GPU to upload to (startup race / device rebuild).
     Decoded(ImageKey, Arc<DecodedImage>),
-    /// On the GPU, shared by every window on that device.
-    Ready(ImageKey, Arc<GpuImage>),
-    /// Could not be loaded (a notice was shown): the base gradient shows.
+    /// Could not be loaded (a notice was shown); not retried until it changes.
     Failed(ImageKey),
 }
 
@@ -60,7 +58,7 @@ impl ImageSlot {
     fn key(&self) -> Option<&ImageKey> {
         match self {
             ImageSlot::None => None,
-            ImageSlot::Loading(k) | ImageSlot::Decoded(k, _) | ImageSlot::Ready(k, _) | ImageSlot::Failed(k) => Some(k),
+            ImageSlot::Loading(k) | ImageSlot::Decoded(k, _) | ImageSlot::Failed(k) => Some(k),
         }
     }
 }
@@ -71,7 +69,12 @@ pub(crate) struct BackdropState {
     pub cfg: BackdropConfig,
     /// The parsed settings the renderer reads.
     pub settings: BackdropSettings,
+    /// The decode pipeline (what is loading, decoded but not uploaded, failed).
     pub image: ImageSlot,
+    /// The image on the GPU now, shared by every window on its device. It
+    /// stays up while a newer request decodes (no flash of the gradient while
+    /// a slider is dragged); a failed request or leaving image mode drops it.
+    shown: Option<(ImageKey, Arc<GpuImage>)>,
     /// Generation of the latest decode request: a stale result is dropped.
     gen: u64,
     /// The animation clock.
@@ -88,6 +91,7 @@ impl BackdropState {
             settings: cfg.settings(),
             cfg,
             image: ImageSlot::None,
+            shown: None,
             gen: 0,
             clock: Instant::now(),
             tick_at: None,
@@ -126,43 +130,51 @@ impl BackdropState {
         Some(ImageKey { path, blur_q: (self.settings.blur.clamp(0.0, 1.0) * 1000.0).round() as u16, max })
     }
 
-    /// Bring the image slot in line with the settings: drop it when no image is
-    /// wanted, else start a decode (via `spawn(generation, key)`) unless the
-    /// same image is already loading / loaded / known broken. `max` (the monitor
-    /// size, an X11 round-trip) is only asked for when an image is wanted.
+    /// Bring the image in line with the settings: drop everything when no image
+    /// is wanted, else start a decode (via `spawn(generation, key)`) unless the
+    /// same image is already shown / loading / decoded / known broken. One
+    /// decode at a time: a request made while one is in flight (a slider being
+    /// dragged) waits — the app re-syncs when the decode lands, so only the
+    /// latest request is decoded next. `max` (the monitor size, an X11
+    /// round-trip) is only asked for when an image is wanted.
     pub fn sync_image(
         &mut self,
         config_dir: &Path,
         max: impl FnOnce() -> (u32, u32),
         spawn: impl FnOnce(u64, ImageKey),
     ) {
-        if self.settings.mode != BackdropMode::Image || self.cfg.image.trim().is_empty() {
+        let wanted = if self.settings.mode == BackdropMode::Image && !self.cfg.image.trim().is_empty() {
+            self.wanted_image(config_dir, max())
+        } else {
+            None
+        };
+        let Some(key) = wanted else {
             self.image = ImageSlot::None;
+            self.shown = None;
+            return;
+        };
+        if self.image.key() == Some(&key) || self.shown.as_ref().is_some_and(|(k, _)| *k == key) {
             return;
         }
-        match self.wanted_image(config_dir, max()) {
-            None => {
-                self.image = ImageSlot::None;
-            }
-            Some(key) => {
-                if self.image.key() == Some(&key) {
-                    return;
-                }
-                self.gen = self.gen.wrapping_add(1);
-                self.image = ImageSlot::Loading(key.clone());
-                spawn(self.gen, key);
-            }
+        if matches!(self.image, ImageSlot::Loading(_)) {
+            return;
         }
+        self.gen = self.gen.wrapping_add(1);
+        self.image = ImageSlot::Loading(key.clone());
+        spawn(self.gen, key);
     }
 
-    /// A decode finished. A stale generation is ignored. Returns the error to
-    /// show the user when this (current) decode failed.
+    /// A decode finished. A stale generation, or one whose request was dropped
+    /// meanwhile (image mode left), is ignored. Returns the error to show the
+    /// user when this (current) decode failed — the gradient then shows. The
+    /// caller re-syncs afterwards (a request may have waited behind this one).
     pub fn on_decoded(&mut self, gen: u64, result: Result<Arc<DecodedImage>, String>) -> Option<String> {
         if gen != self.gen {
             return None;
         }
-        let ImageSlot::Loading(key) = std::mem::replace(&mut self.image, ImageSlot::None) else {
-            return None;
+        let key = match &self.image {
+            ImageSlot::Loading(k) => k.clone(),
+            _ => return None,
         };
         match result {
             Ok(img) => {
@@ -171,13 +183,14 @@ impl BackdropState {
             }
             Err(e) => {
                 self.image = ImageSlot::Failed(key);
+                self.shown = None;
                 Some(e)
             }
         }
     }
 
-    /// Upload a decoded image to `device` (then its CPU pixels are dropped).
-    /// Returns an error to show when the device cannot hold it.
+    /// Upload a decoded image to `device` (its CPU pixels are dropped then) and
+    /// show it. Returns an error to show when the device cannot hold it.
     pub fn upload_pending(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<String> {
         if !matches!(self.image, ImageSlot::Decoded(..)) {
             return None;
@@ -187,30 +200,26 @@ impl BackdropState {
         };
         match GpuImage::upload(device, queue, &img) {
             Some(gpu) => {
-                self.image = ImageSlot::Ready(key, Arc::new(gpu));
+                self.shown = Some((key, Arc::new(gpu)));
                 None
             }
             None => {
                 self.image = ImageSlot::Failed(key);
+                self.shown = None;
                 Some("too large for this GPU".to_string())
             }
         }
     }
 
-    /// The uploaded image, when ready (windows on another device skip it).
+    /// The image on the GPU, when there is one (windows on another device skip it).
     pub fn gpu_image(&self) -> Option<&Arc<GpuImage>> {
-        match &self.image {
-            ImageSlot::Ready(_, img) => Some(img),
-            _ => None,
-        }
+        self.shown.as_ref().map(|(_, img)| img)
     }
 
     /// The main device was rebuilt (GPU loss): a texture on the old device is
     /// useless — forget it so the next `sync_image` decodes again.
     pub fn on_device_rebuilt(&mut self) {
-        if matches!(self.image, ImageSlot::Ready(..)) {
-            self.image = ImageSlot::None;
-        }
+        self.shown = None;
     }
 }
 
@@ -360,14 +369,43 @@ mod tests {
     }
 
     #[test]
+    fn requests_coalesce_behind_an_in_flight_decode() {
+        let dir = Path::new("/cfg");
+        let mut s = BackdropState::new(image_cfg("a.png", 0.0));
+        let mut spawned = Vec::new();
+        s.sync_image(dir, || (800, 600), |g, k| spawned.push((g, k)));
+        // A drag: three more blur values while the first decode runs.
+        for blur in [0.2, 0.4, 0.6] {
+            s.set_config(image_cfg("a.png", blur));
+            s.sync_image(dir, || (800, 600), |g, k| spawned.push((g, k)));
+        }
+        assert_eq!(spawned.len(), 1, "one decode in flight at a time");
+        // The first lands; the re-sync decodes only the LATEST request.
+        let (gen, _) = spawned[0].clone();
+        s.on_decoded(gen, Ok(tiny_image()));
+        s.sync_image(dir, || (800, 600), |g, k| spawned.push((g, k)));
+        assert_eq!(spawned.len(), 2);
+        assert_eq!(spawned[1].1.blur_q, 600);
+        // Leaving image mode while a decode runs drops its result.
+        s.set_config(BackdropConfig::default());
+        s.sync_image(dir, || (800, 600), |_, _| panic!("no decode when off"));
+        assert_eq!(s.on_decoded(spawned[1].0, Ok(tiny_image())), None);
+        assert!(matches!(s.image, ImageSlot::None));
+    }
+
+    #[test]
     fn blur_change_re_decodes() {
         let dir = Path::new("/cfg");
         let mut s = BackdropState::new(image_cfg("a.png", 0.0));
-        let mut n = 0;
-        s.sync_image(dir, || (800, 600), |_, _| n += 1);
+        let mut gens = Vec::new();
+        s.sync_image(dir, || (800, 600), |g, _| gens.push(g));
+        s.on_decoded(gens[0], Ok(tiny_image()));
+        // The blur is baked into the decode: a new value decodes again.
         s.set_config(image_cfg("a.png", 0.5));
-        s.sync_image(dir, || (800, 600), |_, _| n += 1);
-        assert_eq!(n, 2);
+        s.sync_image(dir, || (800, 600), |g, _| gens.push(g));
+        assert_eq!(gens.len(), 2);
+        // The same value again does not.
+        s.sync_image(dir, || (800, 600), |_, _| panic!("already loading this one"));
     }
 
     #[test]
