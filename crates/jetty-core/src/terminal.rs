@@ -131,10 +131,12 @@ fn grapheme_text(base: char, marks: &[char]) -> String {
 /// cells `Term::input` attaches marks to (the previous cell, or the one before a
 /// wide glyph's spacer) — to [`GRAPHEME_MAX_MARKS`]. alacritty appends them
 /// unbounded (`Cell::push_zerowidth`), so a Zalgo stream on ONE cell would grow
-/// without limit; run after every sub-slice, a cell holds at most this many plus
-/// one sub-slice's worth (≤ 8 KiB of input) at any time. RESIDUAL (documented):
+/// without limit; run after every sub-slice, this stops that. RESIDUAL
+/// (documented): what one sub-slice piles on a cell the cursor then leaves stays
+/// (bounded by that sub-slice — a PTY read, or a sync-update flush ≤ 2 MiB), and
 /// marks spread one-per-base-char across many cells are bounded only by the
-/// input still in the scrollback (each mark is a 4-byte `char` in its cell).
+/// input still in the scrollback (each mark is a 4-byte `char` in its cell). The
+/// snapshot reads at most [`GRAPHEME_MAX_MARKS`] of any cell's marks either way.
 fn cap_cursor_zerowidth(term: &mut Term<EventProxy>) {
     let point = term.grid().cursor.point;
     let grid = term.grid_mut();
@@ -734,11 +736,13 @@ pub struct Terminal {
     ///
     /// alacritty 0.26 has no saturation-proof scroll counter: once
     /// `history_size()` reaches the grid's max it pins while scrolling continues.
-    /// So before every sub-slice, [`Terminal::make_room`] trims the oldest
-    /// history until the most lines that sub-slice can scroll fit strictly below
-    /// the max; `history_size()` then never pins and its growth stays an EXACT
-    /// scroll count for the tab's whole life (a full scrollback no longer
-    /// disables marks, Run & Notify or images). Only a sub-slice that scrolls
+    /// So while anything is anchored (marks, primary-screen images), before every
+    /// sub-slice [`Terminal::make_room`] trims the oldest history until the most
+    /// lines that sub-slice can scroll fit strictly below the max;
+    /// `history_size()` then never pins and its growth stays an EXACT scroll
+    /// count (a full scrollback no longer disables marks, Run & Notify or
+    /// images). With nothing anchored nothing reads it: slices go through whole
+    /// and it may under-count, harmlessly. Only a sub-slice that scrolls
     /// more than it could be bounded (a sync-update replay, a `CSI 9999 S`
     /// burst) pins it — that drops every anchor once (correct-or-absent) and
     /// tracking resumes exactly on the next sub-slice. FROZEN on the alt screen
@@ -746,9 +750,10 @@ pub struct Terminal {
     /// toggles are isolated into their own sub-slice so no primary output is
     /// lost with them.
     abs_top: i64,
-    /// The scrollback cap (the alacritty grid's max). Because room is made
-    /// BEFORE each sub-slice, the retained history sits between this minus the
-    /// last sub-slice's bound (≤ [`SLICE_MAX_LINES`] + 1) and this minus one.
+    /// The scrollback cap (the alacritty grid's max). While anchors exist, room
+    /// is made BEFORE each sub-slice, so the retained history sits between this
+    /// minus the last sub-slice's bound (≤ [`SLICE_MAX_LINES`] + 1) and this
+    /// minus one; with none, it fills to this.
     scrollback_limit: usize,
     /// Bumped whenever every anchor is dropped and/or `abs_top` re-anchored (a
     /// reflow, a scroll overflow, RIS). An image placement captures it before
@@ -1844,8 +1849,8 @@ impl Terminal {
         }
     }
 
-    /// Empty the placement list and reset the live-bytes counter. Used on
-    /// saturation / reflow (correct-or-absent).
+    /// Empty the PRIMARY placement list and reset the live-bytes counter (part
+    /// of [`Terminal::drop_anchors`]: correct-or-absent).
     fn clear_placements(&mut self) {
         self.placements.clear();
         self.placement_bytes = 0;

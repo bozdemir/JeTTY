@@ -169,8 +169,9 @@ pub struct GridSnapshot {
     pub graphemes: Vec<CellGrapheme>,
 }
 
-/// Most zero-width chars carried per cell, here and on the grid itself (the
-/// terminal trims a Zalgo stack to this as it is written).
+/// Most zero-width chars a [`CellGrapheme`] carries. The terminal also trims
+/// the cells being written to this after each parse step, so a Zalgo stream
+/// cannot grow one cell without bound.
 pub const GRAPHEME_MAX_MARKS: usize = 32;
 /// Byte cap on one [`CellGrapheme::text`].
 pub const GRAPHEME_MAX_BYTES: usize = 256;
