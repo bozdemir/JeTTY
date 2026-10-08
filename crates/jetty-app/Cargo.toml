@@ -10,7 +10,7 @@ jetty-platform = { path = "../jetty-platform" }
 winit = "0.30"
 pollster = "0.4"
 wgpu = "29.0"
-png = "0.17"
+png = "0.18.1"
 # Text-only clipboard: the default `image-data` feature pulled in the `image`
 # crate (and a second `png`) for an API JeTTY never calls. NOT
 # `wayland-data-control` either: that backend forks the process to serve a copy
@@ -19,6 +19,9 @@ arboard = { version = "3.6.1", default-features = false }
 global-hotkey = "0.8.0"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
+# In-place config.toml edits (only changed keys; comments/formatting/unknown keys
+# survive). Already in the lockfile — no new download.
+toml_edit = "0.25"
 dirs = "6.0.0"
 # Cross-platform, OS-event-driven filesystem watcher for config + theme hot-reload
 # (inotify on Linux, FSEvents on macOS, kqueue on BSD). DE-INDEPENDENT — no

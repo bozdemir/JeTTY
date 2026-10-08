@@ -16,7 +16,7 @@ memchr = "2"
 # `miniz_oxide` are already in the workspace lockfile (via jetty-app /
 # jetty-platform), so this adds no new download or supply-chain surface. Never
 # touched by the render/feed hot path.
-png = "0.17"
+png = "0.18.1"
 miniz_oxide = "0.8"
 
 [target.'cfg(unix)'.dependencies]

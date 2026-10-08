@@ -258,25 +258,30 @@ pub fn run() {
                     "JeTTY {version} — a blazing-fast GPU terminal with a global summon hotkey.\n\n\
                      USAGE:\n    jetty [FLAGS]\n\n\
                      FLAGS:\n\
-                     \x20   --toggle     Show/hide a running instance (or launch one); same as plain `jetty`.\n\
-                     \x20   --show       Summon a running instance (or launch one).\n\
-                     \x20   --hide       Hide a running instance.\n\
-                     \x20   --version    Print version and exit.\n\
-                     \x20   --help       Print this help and exit.\n\
+                     \x20   --toggle       Show/hide a running instance (or launch one); same as plain `jetty`.\n\
+                     \x20   --show         Summon a running instance (or launch one).\n\
+                     \x20   --hide         Hide a running instance.\n\
+                     \x20   --background   Launch hidden — no window until the first summon. Does nothing\n\
+                     \x20                  if JeTTY is already running (\"Launch at login\" uses this).\n\
+                     \x20   --version      Print version and exit.\n\
+                     \x20   --help         Print this help and exit.\n\
                      \x20   --print-shell-integration <zsh|bash|fish>\n\
-                     \x20                Print the OSC 133 shell-integration snippet to stdout.\n\n\
+                     \x20                  Print the OSC 133 shell-integration snippet to stdout.\n\n\
                      Bind `jetty --toggle` to a key in your compositor to summon from anywhere.\n\
-                     Settings: Ctrl+Shift+P. Config: ~/.config/jetty/config.toml\n\
-                     Shell integration (prompt marks + Ctrl+Shift+Z/X jump). Add to your rc file:\n\
-                     \x20 zsh:  [[ -n \"$JETTY\" ]] && command -v jetty >/dev/null 2>&1 && source <(jetty --print-shell-integration zsh) 2>/dev/null\n\
-                     \x20 bash: [[ -n \"$JETTY\" ]] && command -v jetty >/dev/null 2>&1 && source <(jetty --print-shell-integration bash) 2>/dev/null\n\
-                     \x20 fish: test -n \"$JETTY\"; and command -q jetty; and jetty --print-shell-integration fish | source"
+                     Settings: Ctrl+, or Ctrl+Shift+O · Command palette: Ctrl+Shift+P\n\
+                     Config: {config} (another dir: set JETTY_CONFIG_DIR)\n\
+                     Shell integration (prompt marks, Ctrl+Shift+Z/X jump, Run & Notify). Add to your rc file:\n\
+                     \x20 zsh:  [[ -n \"$JETTY\" ]] && source <(\"${{JETTY_BIN:-jetty}}\" --print-shell-integration zsh)\n\
+                     \x20 bash: [[ -n \"$JETTY\" ]] && source <(\"${{JETTY_BIN:-jetty}}\" --print-shell-integration bash)\n\
+                     \x20 fish: set -q JETTY; and \"$JETTY_BIN\" --print-shell-integration fish | source",
+                    config = config::Config::config_path().display(),
                 );
                 std::process::exit(0);
             }
             Some("--toggle") => cmd = "toggle",
             Some("--show") => cmd = "show",
             Some("--hide") => cmd = "hide",
+            Some("--background") => cmd = "background",
             _ => {}
         }
     }
@@ -415,7 +420,9 @@ pub fn run() {
                     b"show" => AppEvent::SetVisible(true),
                     b"hide" => AppEvent::SetVisible(false),
                     b"toggle" => AppEvent::ToggleVisibility,
-                    _ => continue, // unknown command: no-op, don't toggle
+                    // `--background` / unknown command: no-op, don't toggle (a login
+                    // autostart must never pop up an instance that's already running).
+                    _ => continue,
                 };
                 if proxy_ipc.send_event(event).is_err() {
                     break;
@@ -426,6 +433,7 @@ pub fn run() {
     }
 
     let mut app = app::App::new(proxy);
+    app.set_start_hidden(cmd == "background");
     event_loop.run_app(&mut app).expect("run_app");
 
     // Best-effort cleanup on normal exit. Crashes are handled by the

@@ -248,7 +248,7 @@ pub fn decode_png(data: &[u8], caps: SixelCaps) -> Option<InlineImage> {
     if data.len() > MAX_DECODE_BYTES {
         return None;
     }
-    let mut decoder = png::Decoder::new(data);
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
     // EXPAND: palette / <8-bit / tRNS → 8-bit RGB(A) or grayscale(+alpha).
     // STRIP_16: 16-bit channels → 8-bit. Bounds the per-pixel width we handle.
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
@@ -264,7 +264,7 @@ pub fn decode_png(data: &[u8], caps: SixelCaps) -> Option<InlineImage> {
         let info = reader.info();
         checked_pixels(info.width, info.height, caps)?;
     }
-    let size = reader.output_buffer_size();
+    let size = reader.output_buffer_size()?;
     // Bound 4: output-buffer cap (defensive, independent of the header check).
     if size as u64 > caps.max_pixels as u64 * 4 {
         return None;
