@@ -211,12 +211,8 @@ pub fn build_registry(
     }
     // Deep links into Settings, one per control ("Settings › Effects › Bloom"),
     // straight from the control table — a new setting gets one by itself.
-    for (title, id) in crate::settings_ui::deep_links() {
-        v.push(PaletteEntry {
-            title,
-            keywords: "settings preferences option configure",
-            cmd: PaletteCmd::SettingsAt(id),
-        });
+    for link in crate::settings_ui::deep_links() {
+        v.push(PaletteEntry { title: link.title, keywords: link.keywords, cmd: PaletteCmd::SettingsAt(link.id) });
     }
     for (id, title) in tabs {
         v.push(PaletteEntry {
@@ -397,6 +393,19 @@ mod tests {
         let n = titles.len();
         titles.dedup();
         assert_eq!(titles.len(), n, "duplicate palette titles");
+    }
+
+    #[test]
+    fn settings_deep_links_rank_first_for_their_control_name() {
+        // Typing a control's name finds its "Settings › Tab › Control" link
+        // first — even where an action's keywords mention the same word
+        // ("Toggle caret glow" carries "bloom").
+        let r = reg();
+        for (q, id) in [("bloom", "effects.crt_bloom"), ("vignette", "effects.crt_vignette"), ("scrollback", "scrollback_lines")] {
+            let hits = filter(&r, q);
+            assert_eq!(hits[0].cmd, PaletteCmd::SettingsAt(id), "top hit for {q:?}");
+        }
+        assert!(r.iter().any(|e| e.title == "Settings › Effects › Bloom"));
     }
 
     #[test]

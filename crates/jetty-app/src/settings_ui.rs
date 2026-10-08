@@ -981,12 +981,27 @@ pub fn live(d: &Desc) -> bool {
     !matches!(d.kind, Kind::Slider { live: false, .. })
 }
 
-/// Palette deep links: `("Settings › {tab} › {label}", id)` for every setting.
-pub fn deep_links() -> Vec<(String, CtlId)> {
+/// One palette deep link into Settings.
+pub struct DeepLink {
+    /// "Settings › Effects › Bloom".
+    pub title: String,
+    /// The control it opens.
+    pub id: CtlId,
+    /// Extra fuzzy keywords: the control's own label, so typing it ranks the
+    /// link first (an exact-prefix keyword match beats a mid-title one).
+    pub keywords: &'static str,
+}
+
+/// Palette deep links, one per setting.
+pub fn deep_links() -> Vec<DeepLink> {
     DESCS
         .iter()
         .filter(|d| d.is_setting())
-        .map(|d| (format!("Settings › {} › {}", TAB_NAMES[d.tab], d.label), d.id))
+        .map(|d| DeepLink {
+            title: format!("Settings › {} › {}", TAB_NAMES[d.tab], d.label),
+            id: d.id,
+            keywords: d.label,
+        })
         .collect()
 }
 
@@ -1377,13 +1392,13 @@ mod tests {
     fn deep_links_cover_every_setting_once() {
         let links = deep_links();
         assert_eq!(links.len(), DESCS.iter().filter(|d| d.is_setting()).count());
-        let mut titles: Vec<&str> = links.iter().map(|l| l.0.as_str()).collect();
+        let mut titles: Vec<&str> = links.iter().map(|l| l.title.as_str()).collect();
         titles.sort();
         let n = titles.len();
         titles.dedup();
         assert_eq!(titles.len(), n, "duplicate deep-link title");
-        assert!(links.iter().any(|(t, id)| t == "Settings › Effects › Bloom" && *id == "effects.crt_bloom"));
-        assert!(links.iter().all(|(_, id)| find(id).is_some()));
+        assert!(links.iter().any(|l| l.title == "Settings › Effects › Bloom" && l.id == "effects.crt_bloom"));
+        assert!(links.iter().all(|l| find(l.id).is_some_and(|d| d.label == l.keywords)));
     }
 
     #[test]
