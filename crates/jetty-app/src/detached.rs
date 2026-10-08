@@ -521,9 +521,12 @@ impl DetachedWindow {
             return false;
         };
         let (grid_fonts, chrome_fonts) = (self.text.clone_font_system(), self.text.clone_font_system());
+        // The rebuilt grid layer keeps the lost one's row spacing.
+        let line_height = self.text.line_height();
         self.text = TextLayer::new_with_family_and_fonts(
             &gpu.device, &gpu.queue, gpu.format, font_logical * scale, font_family, grid_fonts,
         );
+        self.text.set_line_height(line_height);
         let mut chrome_text = TextLayer::new_with_family_and_fonts(
             &gpu.device, &gpu.queue, gpu.format, ui_font_logical * scale, font_family, chrome_fonts,
         );

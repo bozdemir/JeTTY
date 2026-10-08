@@ -115,8 +115,19 @@ struct PreparedGrid {
 /// — a Nerd Font, so the zsh prompt's powerline/icon glyphs render correctly.
 const FONT_FAMILY_DEFAULT: &str = "MesloLGS NF";
 
-/// Line height as a multiple of the font size: the long-standing 1.3.
+/// Line height as a multiple of the font size: the default (the long-standing
+/// 1.3) and the range the `line_height` config key is clamped to. Only the
+/// terminal grid layer changes it (`TextLayer::set_line_height`); chrome
+/// layers keep the default. cosmic-text centres the glyphs in the taller line.
 pub const LINE_HEIGHT_DEFAULT: f32 = 1.3;
+pub const LINE_HEIGHT_MIN: f32 = 1.0;
+pub const LINE_HEIGHT_MAX: f32 = 2.0;
+
+/// `mult` clamped to `LINE_HEIGHT_MIN..=LINE_HEIGHT_MAX`; non-finite → the
+/// default.
+pub fn clamp_line_height(mult: f32) -> f32 {
+    if mult.is_finite() { mult.clamp(LINE_HEIGHT_MIN, LINE_HEIGHT_MAX) } else { LINE_HEIGHT_DEFAULT }
+}
 
 /// The whole-pixel size a layer rasterizes a requested physical `size` at.
 ///
@@ -899,6 +910,27 @@ impl TextLayer {
         self.clusters.clear();
         self.shape_gen = self.shape_gen.wrapping_add(1);
         self.clear_measure_caches();
+    }
+
+    /// Set the line height — a multiple of the font size, clamped by
+    /// [`clamp_line_height`] (the grid layer's `line_height` key). The cell
+    /// height becomes `ceil(font px × mult)` and cosmic-text centres each glyph
+    /// in the taller line; everything else is re-derived exactly like a size
+    /// change (rows re-shape). The caller reflows + repaints. Returns whether
+    /// anything changed (a no-op keeps every cache).
+    pub fn set_line_height(&mut self, mult: f32) -> bool {
+        let mult = clamp_line_height(mult);
+        if mult == self.line_height {
+            return false;
+        }
+        self.line_height = mult;
+        self.set_font_size(self.metrics.font_size);
+        true
+    }
+
+    /// The line-height multiple this layer lays rows out with.
+    pub fn line_height(&self) -> f32 {
+        self.line_height
     }
 
     /// Drop every cached chrome measurement (family or size changed).
@@ -2057,6 +2089,44 @@ mod tests {
         assert_eq!(layer_metrics(16.0, LINE_HEIGHT_DEFAULT).line_height, 21.0);
         assert_eq!(layer_metrics(22.0, LINE_HEIGHT_DEFAULT).line_height, 29.0);
         assert_eq!(layer_metrics(20.0, LINE_HEIGHT_DEFAULT).line_height, 26.0);
+    }
+
+    #[test]
+    fn line_height_sets_the_cell_height_and_centres_the_glyphs() {
+        // The cell height is ceil(px × mult) over the whole key range.
+        assert_eq!(layer_metrics(16.0, 1.0).line_height, 16.0);
+        assert_eq!(layer_metrics(16.0, 1.3).line_height, 21.0, "the default: today's cell");
+        assert_eq!(layer_metrics(16.0, 1.5).line_height, 24.0);
+        assert_eq!(layer_metrics(16.0, 2.0).line_height, 32.0);
+        assert_eq!(layer_metrics(19.0, 1.3).line_height, 25.0, "24.7 rounds up to whole px");
+        assert_eq!(layer_metrics(32.0, 1.3).line_height, 42.0, "2×: exactly twice the 1× cell");
+        assert_eq!(clamp_line_height(0.5), LINE_HEIGHT_MIN);
+        assert_eq!(clamp_line_height(2.5), LINE_HEIGHT_MAX);
+        assert_eq!(clamp_line_height(1.45), 1.45);
+        assert_eq!(clamp_line_height(f32::NAN), LINE_HEIGHT_DEFAULT);
+
+        // Shaped like a grid row, the extra line space splits evenly above and
+        // below the glyphs: the baseline moves down by half of it.
+        let mut fs = TextLayer::build_font_system();
+        let Some(family) = mono_family(&fs) else {
+            eprintln!("no monospace font installed: nothing to shape");
+            return;
+        };
+        let mut baseline = |m: Metrics| -> (f32, f32) {
+            let mut b = grid_row_buffer(&mut fs, m, 9.6);
+            let attrs = Attrs::new().family(Family::Name(&family));
+            b.set_rich_text(&mut fs, [("Mg", attrs.clone())], &attrs, Shaping::Basic, None);
+            let run = b.layout_runs().next().expect("one laid-out line");
+            (run.line_y, run.line_height)
+        };
+        let (y_tight, h_tight) = baseline(layer_metrics(16.0, 1.0));
+        for mult in [1.3f32, 1.6, 2.0] {
+            let (y, h) = baseline(layer_metrics(16.0, mult));
+            assert_eq!(h, (16.0 * mult).ceil(), "line box = the cell height");
+            let moved = y - y_tight;
+            let half_extra = (h - h_tight) / 2.0;
+            assert!((moved - half_extra).abs() <= 0.5, "×{mult}: baseline moved {moved}, half the extra is {half_extra}");
+        }
     }
 
     #[test]

@@ -967,6 +967,10 @@ pub struct App {
     /// (`jetty_render::padding_px`). 0 × 0 = the unpadded pre-0.27 grid.
     padding_x: f32,
     padding_y: f32,
+    /// Grid line height as a multiple of the font size (`line_height` key,
+    /// clamped [1.0, 2.0]; 1.3 = the long-standing spacing). Applied to every
+    /// window's grid text layer (`TextLayer::set_line_height`).
+    line_height: f32,
     /// All open terminal sessions, one per tab. Always non-empty once `resumed`
     /// has run; when it becomes empty the event loop exits.
     tabs: Vec<Tab>,
@@ -1739,6 +1743,7 @@ impl App {
             // Replaced by the config's values in `new` below.
             padding_x: 0.0,
             padding_y: 0.0,
+            line_height: jetty_render::LINE_HEIGHT_DEFAULT,
             tabs: Vec::new(),
             active: 0,
             theme_idx,
@@ -1912,6 +1917,7 @@ impl App {
         app.corner_radius = cfg.corner_radius.clamp(0.0, 24.0);
         app.padding_x = cfg.padding_x.clamp(0.0, jetty_render::PADDING_MAX);
         app.padding_y = cfg.padding_y.clamp(0.0, jetty_render::PADDING_MAX);
+        app.line_height = jetty_render::clamp_line_height(cfg.line_height);
         app.summon_effect = SummonEffect::from_config(&cfg.summon_effect);
         app.window_mode = WindowMode::from_config(&cfg.window_mode);
         app.tab_bar_bottom = cfg.tab_bar_position == "bottom";
@@ -2118,6 +2124,7 @@ impl App {
             corner_radius: self.corner_radius,
             padding_x: self.padding_x,
             padding_y: self.padding_y,
+            line_height: self.line_height,
             summon_effect: self.summon_effect.to_config().to_string(),
             window_mode: self.window_mode.to_config().to_string(),
             dropdown_height_pct: self.dropdown_height_pct,
@@ -2531,6 +2538,11 @@ impl App {
         if (px - self.padding_x).abs() > eps || (py - self.padding_y).abs() > eps {
             self.set_grid_padding(px, py);
         }
+        // Line height: the cell height of every window's grid (same reflow).
+        let lh = jetty_render::clamp_line_height(cfg.line_height);
+        if (lh - self.line_height).abs() > eps {
+            self.set_line_height(lh);
+        }
         // Summon effect: ASSIGN directly (NOT set_summon_effect, which fires a one-
         // shot preview animation on every reload — amendment).
         let se = SummonEffect::from_config(&cfg.summon_effect);
@@ -2760,6 +2772,31 @@ impl App {
             dw.reflow_pending_at = Some(reflow_at);
         }
         // The pointer's cell moved under a held link modifier.
+        self.update_link_hover(true);
+        for pos in 0..self.detached.len() {
+            self.update_detached_link_hover(pos, true);
+        }
+        self.persist();
+        self.mark_dirty_all();
+    }
+
+    /// Change the grid line height (a multiple of the font size) live: every
+    /// window's grid text layer re-derives its cell height at once and ONE
+    /// debounced grid + PTY reflow per window follows — the row count changes
+    /// (the same path as a font-size change, so a slider drag sends the shell
+    /// one SIGWINCH, not one per step).
+    fn set_line_height(&mut self, mult: f32) {
+        self.line_height = jetty_render::clamp_line_height(mult);
+        if let Some(t) = self.text.as_mut() {
+            t.set_line_height(self.line_height);
+        }
+        let reflow_at = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        self.reflow_pending_at = Some(reflow_at);
+        for dw in &mut self.detached {
+            dw.text.set_line_height(self.line_height);
+            dw.reflow_pending_at = Some(reflow_at);
+        }
+        // Rows moved under a still pointer: revalidate a held link hover.
         self.update_link_hover(true);
         for pos in 0..self.detached.len() {
             self.update_detached_link_hover(pos, true);
@@ -3270,9 +3307,11 @@ impl App {
             gpu_shared.as_ref(),
             self.text.as_ref(),
         ) {
-            Ok(dw) => {
+            Ok(mut dw) => {
                 // macOS: same Option-as-Meta sides as the main window.
                 apply_option_as_alt(&dw.window, self.macos_option_as_alt);
+                // The grid's row spacing, like the main window's.
+                dw.text.set_line_height(self.line_height);
                 dw
             }
             Err(tab) => {
@@ -7152,9 +7191,10 @@ impl App {
         let Some(gpu) = GpuContext::new(window, size.width, size.height) else { return false };
         let font_db = || self.text.as_ref().map_or_else(TextLayer::build_font_system, |t| t.clone_font_system());
         let (grid_fonts, chrome_fonts) = (font_db(), font_db());
-        let text = TextLayer::new_with_family_and_fonts(
+        let mut text = TextLayer::new_with_family_and_fonts(
             &gpu.device, &gpu.queue, gpu.format, self.font_logical * scale, &self.font_family, grid_fonts,
         );
+        text.set_line_height(self.line_height);
         let mut chrome = TextLayer::new_with_family_and_fonts(
             &gpu.device, &gpu.queue, gpu.format, self.ui_font_logical * scale, &self.font_family, chrome_fonts,
         );
@@ -10253,10 +10293,11 @@ impl ApplicationHandler<AppEvent> for App {
         // parallel with the GPU block above, so this join is typically free).
         let font_system = font_handle.join().expect("font worker panicked");
         let (text, quad, cols, rows) = if let Some(ref g) = gpu {
-            let text = TextLayer::new_with_family_and_fonts(
+            let mut text = TextLayer::new_with_family_and_fonts(
                 &g.device, &g.queue, g.format, self.font_logical * scale, &self.font_family,
                 font_system,
             );
+            text.set_line_height(self.line_height);
             let (cw, ch) = text.cell_size();
             // Derive the grid from the physical pixel size and the physical cell
             // size, the chrome bands and padding at THIS window's scale

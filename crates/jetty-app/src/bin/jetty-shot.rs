@@ -35,6 +35,8 @@
 ///                    JETTY_SHOT_SCALE like the app; every grid-anchored layer
 ///                    (cells, glyphs, cursor, decorations, images, hint chips,
 ///                    preedit, failed-command bars) moves with it.
+///   JETTY_SHOT_LINE_HEIGHT — the grid line height as a multiple of the font
+///                    size (the `line_height` key, 1.0..2.0, default 1.3).
 ///   JETTY_SHOT_TABBAR_N — number of sample tabs for JETTY_SHOT_TABBAR (default 3).
 ///   JETTY_SHOT_HELP_SCROLL — first help row for JETTY_SHOT_HELP when its rows
 ///                    overflow the window (large UI font / short window).
@@ -230,6 +232,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Build TextLayer ---
     let mut text = TextLayer::new_with_family(&device, &queue, format, font_size * dpi, &font_family);
+    // JETTY_SHOT_LINE_HEIGHT — the grid's row spacing, like the app's
+    // `line_height` key (clamped to 1.0..2.0 by the layer).
+    if let Some(lh) = std::env::var("JETTY_SHOT_LINE_HEIGHT").ok().and_then(|s| s.parse::<f32>().ok()) {
+        text.set_line_height(lh);
+    }
     // Chrome layer at the UI font size, mirroring the live app: ALL window chrome
     // (tab bar, status bar, context menu, settings panel, help, confirm, palette,
     // …) renders through this in the chosen UI family, independent of

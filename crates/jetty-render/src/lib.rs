@@ -62,3 +62,4 @@ pub use preedit::{build_preedit_overlay, PreeditOverlay, MAX_PREEDIT_CHARS};
 pub use palette::{build_command_palette, CommandPalette, PaletteRow, MAX_PALETTE_ROWS};
 pub use status::{build_status_strip, build_toast_pill, StatusStrip, ToastPill};
 pub use grid_geom::{failed_marker_x, grid_dims, padding_px, shift_labels_x, shift_x, GridOrigin, PADDING_MAX};
+pub use text::{clamp_line_height, LINE_HEIGHT_DEFAULT, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN};

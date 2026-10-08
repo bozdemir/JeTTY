@@ -61,6 +61,11 @@ pub struct Config {
     /// Inner padding above and below the grid, in logical px (0..=64).
     #[serde(default = "default_padding_y")]
     pub padding_y: f32,
+    /// Terminal line height as a multiple of the font size (1.0..=2.0;
+    /// default 1.3, the long-standing spacing). Each glyph is centred in its
+    /// taller row; backgrounds, selection and the cursor fill the whole row.
+    #[serde(default = "default_line_height")]
+    pub line_height: f32,
     /// Window-summon reveal effect: "none", "bayer", "phosphor", "liquid", or
     /// "focus" (the last two are Tier-B effects that sample the rendered frame).
     #[serde(default = "default_summon_effect")]
@@ -335,6 +340,10 @@ fn default_padding_y() -> f32 {
     4.0
 }
 
+fn default_line_height() -> f32 {
+    jetty_render::LINE_HEIGHT_DEFAULT
+}
+
 fn default_shell() -> String {
     String::new()
 }
@@ -495,6 +504,7 @@ impl Default for Config {
             corner_radius: default_corner_radius(),
             padding_x: default_padding_x(),
             padding_y: default_padding_y(),
+            line_height: default_line_height(),
             summon_effect: default_summon_effect(),
             window_mode: default_window_mode(),
             dropdown_height_pct: default_dropdown_height_pct(),
@@ -779,6 +789,7 @@ impl Config {
         self.corner_radius = finite_or(self.corner_radius, 10.0);
         self.padding_x = finite_or(self.padding_x, default_padding_x()).clamp(0.0, jetty_render::PADDING_MAX);
         self.padding_y = finite_or(self.padding_y, default_padding_y()).clamp(0.0, jetty_render::PADDING_MAX);
+        self.line_height = jetty_render::clamp_line_height(self.line_height);
         self.dropdown_height_pct =
             finite_or(self.dropdown_height_pct, default_dropdown_height_pct());
         self.dropdown_width_pct =
@@ -1732,6 +1743,7 @@ mod tests {
             corner_radius: 6.0,
             padding_x: 12.0,
             padding_y: 0.0,
+            line_height: 1.6,
             summon_effect: "phosphor".to_string(),
             window_mode: "dropdown".to_string(),
             dropdown_height_pct: 0.6,
@@ -1777,6 +1789,7 @@ mod tests {
             corner_radius: 12.0,
             padding_x: 0.0,
             padding_y: 6.5,
+            line_height: 1.0,
             summon_effect: "none".to_string(),
             window_mode: "center".to_string(),
             dropdown_height_pct: 0.5,
@@ -1950,6 +1963,18 @@ corner_radius = 8.0
             Config::parse_with_base("padding_x = \"wide\"\n", &Config::default(), "using the default").unwrap();
         assert_eq!(cfg.padding_x, 8.0);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn line_height_default_and_clamp() {
+        assert_eq!(Config::default().line_height, 1.3, "the long-standing spacing");
+        let parse = |s: &str| Config::parse_with_base(s, &Config::default(), "using the default").unwrap().0;
+        assert_eq!(parse("theme = \"dracula\"\n").line_height, 1.3, "an older config loads the default");
+        assert_eq!(parse("line_height = 1.5\n").line_height, 1.5);
+        assert_eq!(parse("line_height = \"tall\"\n").line_height, 1.3, "the wrong type: default");
+        assert_eq!(parse("line_height = 0.5\n").line_height, 1.0, "clamped up");
+        assert_eq!(parse("line_height = 9.0\n").line_height, 2.0, "clamped down");
+        assert_eq!(parse("line_height = nan\n").line_height, 1.3, "non-finite: default");
     }
 
     #[test]
