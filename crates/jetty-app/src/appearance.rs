@@ -23,6 +23,8 @@
 /// color-scheme`: 0 no preference, 1 prefer dark, 2 prefer light).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorScheme {
+    /// Only the portal reports "no preference" (winit knows dark/light).
+    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     NoPreference,
     Dark,
     Light,
@@ -30,6 +32,7 @@ pub enum ColorScheme {
 
 impl ColorScheme {
     /// The portal's number for it; unknown values (a future spec) → `None`.
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn from_portal(v: u32) -> Option<Self> {
         match v {
             0 => Some(ColorScheme::NoPreference),
@@ -67,6 +70,7 @@ pub struct Appearance {
 
 impl Appearance {
     /// Nothing reported.
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn is_empty(&self) -> bool {
         *self == Appearance::default()
     }

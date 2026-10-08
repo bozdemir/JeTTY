@@ -2368,6 +2368,9 @@ impl App {
     /// remember it, and follow it where asked. Idempotent — the same report twice
     /// changes nothing.
     fn apply_appearance(&mut self, a: crate::appearance::Appearance) {
+        if self.debug {
+            eprintln!("jetty: system appearance {a:?}");
+        }
         let scheme_before = self.system_appearance.color_scheme;
         self.system_appearance.merge(a);
         if let Some(rm) = a.reduced_motion {
