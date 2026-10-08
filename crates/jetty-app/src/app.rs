@@ -12355,12 +12355,15 @@ fn render_grid_scene(
     bg_rects.extend(cursor_under);
 
     // Pass 2: glyphs over the painted background, offset down by the grid origin.
+    // Cells carrying combining marks / VS16 / ZWJ (sparse; empty = no allocation).
+    let graphemes: Vec<(usize, usize, &str)> =
+        s.snap.graphemes.iter().map(|g| (g.row, g.col, g.text.as_str())).collect();
     let paint = jetty_render::GridPaint {
         cursor_glyph: cursor_under.map(|_| {
             (s.snap.cursor_row, s.snap.cursor_col, jetty_render::cursor_text_color(s.theme, s.snap.cursor_rgb))
         }),
         selection: Some(selection),
-        graphemes: &[],
+        graphemes: &graphemes,
     };
     // Passes 1 + 2 are recorded into ONE render pass and ONE queue submit (each
     // separate pass + submit cost tens of µs of CPU on every frame). Both uploads

@@ -163,6 +163,29 @@ pub struct GridSnapshot {
     /// Renderable cursor shape (block / underline / beam / hollow). Only meaningful
     /// when `cursor_visible`. One byte on the per-FRAME header (not per cell).
     pub cursor_shape: CursorShapeSnap,
+    /// Cells whose glyph needs composing — a base char carrying combining marks /
+    /// zero-width chars (NFD accents, VS16 emoji presentation, ZWJ sequences).
+    /// SPARSE: empty (no allocation) on the common path.
+    pub graphemes: Vec<CellGrapheme>,
+}
+
+/// Most zero-width chars a [`CellGrapheme`] carries. The terminal also trims
+/// the cells being written to this after each parse step, so a Zalgo stream
+/// cannot grow one cell without bound.
+pub const GRAPHEME_MAX_MARKS: usize = 32;
+/// Byte cap on one [`CellGrapheme::text`].
+pub const GRAPHEME_MAX_BYTES: usize = 256;
+
+/// One composed cell of [`GridSnapshot::graphemes`]: the base char followed by
+/// its zero-width chars (at most [`GRAPHEME_MAX_MARKS`], [`GRAPHEME_MAX_BYTES`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellGrapheme {
+    /// Viewport row.
+    pub row: usize,
+    /// Grid column (the base cell; a wide glyph's first column).
+    pub col: usize,
+    /// Base char + zero-width chars, in order.
+    pub text: String,
 }
 
 impl GridSnapshot {

@@ -27,6 +27,9 @@
 //!   never make us open a path). `o=z` zlib IS supported (via miniz_oxide).
 //! * server-side `c`/`r` scale-to-box is not applied (marquee tools pre-scale
 //!   client-side); we draw native px, clamping drawn rows to the reservation.
+//! * `C=1` (do not move the cursor) is honored; `U=1` virtual placements (shown
+//!   through Unicode placeholder cells) are refused with `ENOTSUPP` so clients
+//!   fall back instead of printing placeholder glyphs.
 
 use crate::sixel::{InlineImage, SixelCaps};
 
@@ -70,19 +73,26 @@ pub struct KittyCmd {
     pub compressed: bool,
     /// `d=` delete selector (`a`/`A` all, `i`/`I` by id; 0 = unset).
     pub delete: u8,
-    /// Whether `a=` was present at all. Kitty continuation chunks OMIT the action
-    /// key, so this disambiguates a continuation (`false`) from a fresh command
-    /// (`true`) — the chunk state machine gates on it (amendment BLOCKING 1).
+    /// `C=1`: do not move the cursor after displaying (TUIs place images this way).
+    pub no_cursor_move: bool,
+    /// `U=1`: a virtual placement shown through Unicode placeholder cells —
+    /// not supported, so such a display is refused (the client then falls back).
+    pub virtual_placement: bool,
+    /// Whether `a=` was present at all.
     pub has_action: bool,
+    /// Whether any key other than `m=`/`q=` was present. Continuation chunks
+    /// carry only `m` (and optionally `q`); a first chunk carries the image's
+    /// keys even when it omits `a=` (the spec's own chunked example does), so
+    /// this — not `has_action` — tells a new transmission from a continuation.
+    pub has_control: bool,
 }
 
 impl Default for KittyCmd {
     fn default() -> Self {
         KittyCmd {
-            // Effective default when `a=` is absent AND this is not a continuation:
-            // treat as transmit+display so a bare transmit still shows (matches the
-            // blueprint and every marquee tool, which always send a=T anyway).
-            action: b'T',
+            // The spec's default when `a=` is absent: transmit only (`t`). Every
+            // display tool (icat, chafa, timg, yazi) sends `a=T`/`a=p` explicitly.
+            action: b't',
             format: 32,
             medium: b'd',
             id: 0,
@@ -96,7 +106,10 @@ impl Default for KittyCmd {
             quiet: 0,
             compressed: false,
             delete: 0,
+            no_cursor_move: false,
+            virtual_placement: false,
             has_action: false,
+            has_control: false,
         }
     }
 }
@@ -129,6 +142,9 @@ impl KittyCmd {
             if key.is_empty() {
                 continue;
             }
+            if key != b"m" && key != b"q" {
+                cmd.has_control = true;
+            }
             match key {
                 b"a" => {
                     cmd.has_action = true;
@@ -149,6 +165,8 @@ impl KittyCmd {
                 b"q" => cmd.quiet = parse_u32(value).min(255) as u8,
                 b"o" => cmd.compressed = value.first().copied() == Some(b'z'),
                 b"d" => cmd.delete = value.first().copied().unwrap_or(0),
+                b"C" => cmd.no_cursor_move = parse_u32(value) == 1,
+                b"U" => cmd.virtual_placement = parse_u32(value) == 1,
                 _ => {} // unknown key: ignore (forward-compat)
             }
         }
@@ -367,6 +385,32 @@ mod tests {
     fn parse_empty_is_continuation() {
         let c = KittyCmd::parse(b"");
         assert!(!c.has_action, "no a= ⇒ continuation candidate");
+    }
+
+    #[test]
+    fn missing_action_defaults_to_transmit_only() {
+        // The spec's key table: `a` defaults to `t` (transmit, no display).
+        let c = KittyCmd::parse(b"f=32,s=2,v=2,i=5");
+        assert!(!c.has_action);
+        assert_eq!(c.action, b't');
+    }
+
+    #[test]
+    fn control_keys_tell_a_first_chunk_from_a_continuation() {
+        // The spec's chunked example opens WITHOUT `a=` but with image keys…
+        assert!(KittyCmd::parse(b"s=100,v=30,m=1").has_control);
+        // …while continuations carry only `m` (and optionally `q`).
+        assert!(!KittyCmd::parse(b"m=1").has_control);
+        assert!(!KittyCmd::parse(b"m=0,q=2").has_control);
+        assert!(!KittyCmd::parse(b"").has_control);
+    }
+
+    #[test]
+    fn cursor_policy_and_virtual_placement_parse() {
+        let c = KittyCmd::parse(b"a=T,C=1,U=1");
+        assert!(c.no_cursor_move && c.virtual_placement);
+        let d = KittyCmd::parse(b"a=T");
+        assert!(!d.no_cursor_move && !d.virtual_placement);
     }
 
     #[test]

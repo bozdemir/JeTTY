@@ -959,6 +959,7 @@ mod tests {
             scroll_offset: 0,
             scroll_max: 0,
             cursor_shape: CursorShapeSnap::Block,
+            graphemes: Vec::new(),
         }
     }
 
