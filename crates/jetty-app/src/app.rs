@@ -7946,7 +7946,8 @@ impl App {
         let tab = self.settings_tab.min(jetty_render::N_TABS - 1);
         let line = 40.0 * self.settings_metrics().overlay_u();
         let page = self.settings_geom.as_ref().map_or(300.0, |g| g.viewport_h() * 0.9);
-        let gallery = tab == LOOK;
+        // The arrows browse the gallery only while it is on screen.
+        let gallery = tab == LOOK && !self.settings_collapsed.contains(&"look.theme");
         match *k {
             N::Escape => {
                 if std::mem::take(&mut self.reset_armed) {

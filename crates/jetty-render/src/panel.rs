@@ -444,9 +444,11 @@ const RESET_W: f32 = 64.0;
 /// Chips.
 const CHIP_W_MIN: f32 = 72.0;
 const CHIP_H: f32 = 24.0;
-/// RGB mini sliders.
-const MINI_W: f32 = 90.0;
-const MINI_GAP: f32 = 15.0;
+/// RGB rows: the gap between the three channel sliders, the room for each
+/// channel letter, and the color swatch beside the label.
+const MINI_GAP: f32 = 16.0;
+const RGB_LETTER_W: f32 = 16.0;
+const RGB_SWATCH_W: f32 = 30.0;
 /// List rows inside their inset card.
 const LIST_ROW_H: f32 = 24.0;
 const LIST_ROW_GAP: f32 = 2.0;
@@ -832,23 +834,32 @@ impl Lay<'_> {
         }
     }
 
+    /// Line 1: the label (full width) and a swatch of the color; line 2: one
+    /// mini slider per channel, each after its letter.
     fn rgb(&mut self, y: f32, row: &CtlRow, v: [f32; 3]) {
         let c = self.c;
         let st = row.state;
-        let bx = |i: usize| self.x0 + self.cw - (3 - i) as f32 * MINI_W - (2 - i) as f32 * MINI_GAP;
-        let xs = [bx(0), bx(1), bx(2)];
-        self.row_label(row, y, xs[0]);
+        let (x0, cw) = (self.x0, self.cw);
+        let ch = |i: usize| if v[i].is_finite() { v[i].clamp(0.0, 1.0) } else { 0.0 };
+        let swatch_x = x0 + cw - RGB_SWATCH_W;
+        self.row_label(row, y, swatch_x);
+        let to8 = |f: f32| (f * 255.0).round() as u8;
+        self.quad(faded(Rect::rounded(swatch_x - 1.0, y + 1.0, RGB_SWATCH_W + 2.0, 18.0, c.hair, 5.0), st));
+        self.quad(faded(Rect::rounded(swatch_x, y + 2.0, RGB_SWATCH_W, 16.0, [to8(ch(0)), to8(ch(1)), to8(ch(2)), 255], 4.0), st));
+        let seg_w = (cw - 2.0 * MINI_GAP) / 3.0;
+        let track_w = seg_w - RGB_LETTER_W;
         for (i, name) in ["R", "G", "B"].iter().enumerate() {
-            let x = xs[i];
-            let f = if v[i].is_finite() { v[i].clamp(0.0, 1.0) } else { 0.0 };
+            let sx = x0 + i as f32 * (seg_w + MINI_GAP);
+            let x = sx + RGB_LETTER_W;
+            let f = ch(i);
             let lc = c.label(st);
-            self.label(name.to_string(), x, y, lc);
-            self.quad(faded(Rect::rounded(x, y + 30.0, MINI_W, 4.0, c.track, 2.0), st));
-            let fill_w = (f * (MINI_W - 14.0) + 7.0).clamp(4.0, MINI_W);
+            self.label(name.to_string(), sx, y + 22.0, lc);
+            self.quad(faded(Rect::rounded(x, y + 30.0, track_w, 4.0, c.track, 2.0), st));
+            let fill_w = (f * (track_w - 14.0) + 7.0).clamp(4.0, track_w);
             self.quad(faded(Rect::rounded(x, y + 30.0, fill_w, 4.0, c.accent_fill, 2.0), st));
-            self.quad(faded(Rect::rounded(x + f * (MINI_W - 14.0), y + 25.0, 14.0, 14.0, c.accent, 7.0), st));
+            self.quad(faded(Rect::rounded(x + f * (track_w - 14.0), y + 25.0, 14.0, 14.0, c.accent, 7.0), st));
             if self.live(row) {
-                self.hit(area(x, y + 20.0, MINI_W, 24.0), PanelHit::Ctl { id: row.id, part: CtlPart::Channel(i as u8) });
+                self.hit(area(x, y + 20.0, track_w, 24.0), PanelHit::Ctl { id: row.id, part: CtlPart::Channel(i as u8) });
             }
         }
     }

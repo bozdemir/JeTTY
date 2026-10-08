@@ -1388,6 +1388,43 @@ mod tests {
         }
     }
 
+    /// Every control label and section title renders WHOLE (never ellipsized)
+    /// with the widest realistic chrome font — the monospace default — so a
+    /// new control's label must fit its row, not just get cut to fit.
+    #[test]
+    fn every_label_renders_untruncated_at_the_default_font() {
+        let (mono, ui) = fonts();
+        let x = ctx(&mono, &ui);
+        let c = Config::default();
+        let theme = jetty_core::Theme::by_name("catppuccin_mocha");
+        for tab in 0..N_TABS {
+            let items = tab_items(tab, &c, &x);
+            let mut inp = PanelInput::new(420, 592, &theme, ChromeMetrics::DEFAULT, &items);
+            inp.active_tab = tab;
+            inp.scroll = 1.0e9;
+            let max = build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK)).geom.max_scroll;
+            let mut drawn: Vec<String> = Vec::new();
+            let mut scroll = 0.0;
+            loop {
+                inp.scroll = scroll;
+                let v = build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK));
+                drawn.extend(v.content_labels.into_iter().map(|l| l.0));
+                if scroll >= max {
+                    break;
+                }
+                scroll = (scroll + v.geom.viewport_h()).min(max);
+            }
+            for it in &items {
+                let want = match it {
+                    PanelItem::Section { title, .. } => title.clone(),
+                    PanelItem::Row(r) => r.label.clone(),
+                    _ => continue,
+                };
+                assert!(drawn.contains(&want), "tab {tab}: {want:?} is truncated or missing");
+            }
+        }
+    }
+
     #[test]
     fn deep_links_cover_every_setting_once() {
         let links = deep_links();
