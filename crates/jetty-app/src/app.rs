@@ -11688,14 +11688,16 @@ struct GridScene<'a> {
 /// `RedrawRequested` arm ∩ `render_detached_window` (v0.23 Task 8 / BLOCKING 5).
 ///
 /// It performs ONLY the common sequence:
-///   Pass 1  clear + per-cell background quads (+ main-only search-hit tint)
-///   Pass 2  glyphs
+///   Pass 1  clear + per-cell background quads (+ main-only search-hit tint) + the
+///           solid block cursor (under its glyph)
+///   Pass 2  glyphs (recorded into the SAME render pass + submit as Pass 1)
 ///   Pass 2b inline (sixel/kitty) images, scissored to the grid area
 ///   Pass 3  CALLER-INJECTED mid-scene chrome (`draw_chrome`) — the main tab
 ///           bar or the detached title bar, drawn BETWEEN the glyph pass and
 ///           the scrollbar/cursor pass exactly as both windows do today
 ///   Pass 4  scrollbar + failed-command markers + SGR decorations + link
-///           underline + cursor (+ main-only copy-mode cursor)
+///           underline + the thin cursor shapes (beam / underline / unfocused
+///           hollow) (+ main-only copy-mode cursor)
 ///
 /// Everything else stays in the caller: the main-only caret GLOW pass, the
 /// summon-reveal / Tier-B routing, the dropdown-slide *decision*, the overlay
@@ -11749,10 +11751,6 @@ fn render_grid_scene(
         ));
     }
     bg_rects.extend(cursor_under);
-    quad.render_clear(
-        device, queue, scene_view, width, height, &bg_rects,
-        jetty_render::default_bg_clear(s.snap, gpu.premultiply_clear),
-    );
 
     // Pass 2: glyphs over the painted background, offset down by the grid origin.
     let paint = jetty_render::GridPaint {
@@ -11762,7 +11760,36 @@ fn render_grid_scene(
         selection: Some(selection),
         graphemes: &[],
     };
-    let _ = text.render_grid(device, queue, scene_view, width, height, s.snap, false, grid_origin_y, &paint);
+    // Passes 1 + 2 are recorded into ONE render pass and ONE queue submit (each
+    // separate pass + submit cost tens of µs of CPU on every frame). Both uploads
+    // land at that submit, ahead of the draws.
+    let bg_count = quad.upload(device, queue, width, height, &bg_rects);
+    let text_ready = text.prepare_grid(device, queue, width, height, s.snap, grid_origin_y, &paint).is_ok();
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("grid") });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("grid-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: scene_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(jetty_render::default_bg_clear(s.snap, gpu.premultiply_clear)),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        quad.draw_uploaded(&mut pass, bg_count);
+        if text_ready {
+            text.draw_grid(&mut pass);
+        }
+    }
+    queue.submit(Some(encoder.finish()));
+    text.end_grid_frame();
 
     // Pass 2b: inline images over the grid text, scissored to the grid area
     // (below the bar, above the status strip / bottom tab bar), clamped to the

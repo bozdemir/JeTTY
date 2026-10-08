@@ -216,10 +216,44 @@ impl CornerMask {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            // Coverage is < 1 only near the rounded corners and on the outermost
+            // pixel row/column (the ~1px edge feather), so scissor the fullscreen
+            // triangle to just those regions instead of a read-modify-write blend
+            // over the WHOLE surface every frame. Pixels outside are multiplied by
+            // exactly 1.0 by the old full-screen pass, so the result is identical.
+            for [x, y, w, h] in mask_regions(width, height, [params[2], params[3], params[4], params[5]]) {
+                pass.set_scissor_rect(x, y, w, h);
+                pass.draw(0..3, 0..1);
+            }
         }
         queue.submit(Some(encoder.finish()));
     }
+}
+
+/// The scissor rects `[x, y, w, h]` (physical px, within a `width`×`height`
+/// target) outside of which the corner mask's coverage is exactly 1.0: one square
+/// per rounded corner — its radius plus the ~1px antialias feather — and the four
+/// 1px edge strips (the SDF puts the outermost pixel row/column at d = −0.5, i.e.
+/// coverage ≈ 0.93, whenever any corner is rounded). `radii` = already-clamped
+/// [tl, tr, bl, br].
+fn mask_regions(width: u32, height: u32, radii: [f32; 4]) -> Vec<[u32; 4]> {
+    let mut out = Vec::with_capacity(8);
+    if width == 0 || height == 0 {
+        return out;
+    }
+    let side = |r: f32| ((r.max(0.0).ceil() as u32) + 2).min(width).min(height);
+    let [tl, tr, bl, br] = radii;
+    for (r, right, bottom) in [(tl, false, false), (tr, true, false), (bl, false, true), (br, true, true)] {
+        if r > 0.0 {
+            let s = side(r);
+            out.push([if right { width - s } else { 0 }, if bottom { height - s } else { 0 }, s, s]);
+        }
+    }
+    out.push([0, 0, width, 1]); // top edge
+    out.push([0, height - 1, width, 1]); // bottom edge
+    out.push([0, 0, 1, height]); // left edge
+    out.push([width - 1, 0, 1, height]); // right edge
+    out
 }
 
 /// Antialiased rounded-rectangle coverage at pixel `(x, y)` for a `w`×`h` frame
@@ -281,7 +315,41 @@ pub fn rounded_rect_coverage(x: f32, y: f32, w: f32, h: f32, radius: f32) -> f32
 
 #[cfg(test)]
 mod tests {
-    use super::{all_radii_flat, rounded_rect_coverage, rounded_rect_coverage_per};
+    use super::{all_radii_flat, mask_regions, rounded_rect_coverage, rounded_rect_coverage_per};
+
+    #[test]
+    fn scissor_regions_cover_every_pixel_the_mask_changes() {
+        // The scissored pass must be byte-identical to the old full-screen one:
+        // every pixel OUTSIDE the regions must have coverage exactly 1.0 (so the
+        // full-screen multiply left it unchanged). Checked against the CPU mirror of
+        // the shader, for symmetric, Dropdown (square top) and odd/huge radii.
+        let cases: [(u32, u32, [f32; 4]); 5] = [
+            (160, 90, [10.0, 10.0, 10.0, 10.0]),
+            (160, 90, [0.0, 0.0, 16.0, 16.0]),
+            (97, 61, [7.5, 3.2, 12.9, 0.4]),
+            (64, 40, [20.0, 20.0, 20.0, 20.0]),
+            (33, 200, [16.0, 16.0, 16.0, 16.0]),
+        ];
+        for (w, h, r) in cases {
+            let regions = mask_regions(w, h, r);
+            for &[x, y, rw, rh] in &regions {
+                assert!(x + rw <= w && y + rh <= h, "region {x},{y} {rw}x{rh} outside {w}x{h}");
+            }
+            for py in 0..h {
+                for px in 0..w {
+                    let inside = regions
+                        .iter()
+                        .any(|&[x, y, rw, rh]| px >= x && px < x + rw && py >= y && py < y + rh);
+                    if !inside {
+                        let c = rounded_rect_coverage_per(
+                            px as f32, py as f32, w as f32, h as f32, r[0], r[1], r[2], r[3],
+                        );
+                        assert_eq!(c, 1.0, "{w}x{h} r={r:?}: ({px},{py}) has coverage {c} but is not scissored in");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn corner_mask_zero_radius_is_a_no_op() {

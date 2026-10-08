@@ -294,12 +294,7 @@ impl QuadLayer {
             return;
         }
 
-        let uniform_data: [f32; 4] = [screen_w as f32, screen_h as f32, 0.0, 0.0];
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&uniform_data));
-
-        if !rects.is_empty() {
-            self.upload_instances(device, queue, rects);
-        }
+        let count = self.upload(device, queue, screen_w, screen_h, rects);
 
         let load = match clear_color {
             Some(c) => wgpu::LoadOp::Clear(c),
@@ -333,15 +328,41 @@ impl QuadLayer {
             if let Some([sx, sy, sw, sh]) = scissor {
                 pass.set_scissor_rect(sx, sy, sw, sh);
             }
-            if !rects.is_empty() {
-                let buf = self.instance_buf.as_ref().unwrap();
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(0..6, 0..rects.len() as u32);
-            }
+            self.draw_uploaded(&mut pass, count);
         }
         queue.submit(Some(encoder.finish()));
+    }
+
+    /// Upload `rects` (instances + the screen-size uniform) for a draw recorded by
+    /// [`Self::draw_uploaded`] into a CALLER-owned render pass — so several layers
+    /// can share one pass and one queue submit (each pass + submit costs tens of µs
+    /// of CPU on the frame path). The upload lands at the next `queue.submit`, so
+    /// that submit must carry the recorded draw before this layer uploads again.
+    /// Returns the instance count to pass to `draw_uploaded`.
+    pub fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        screen_w: u32,
+        screen_h: u32,
+        rects: &[Rect],
+    ) -> u32 {
+        let uniform_data: [f32; 4] = [screen_w as f32, screen_h as f32, 0.0, 0.0];
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&uniform_data));
+        if !rects.is_empty() {
+            self.upload_instances(device, queue, rects);
+        }
+        rects.len() as u32
+    }
+
+    /// Record the draw of the last [`Self::upload`] (`count` instances) into `pass`.
+    pub fn draw_uploaded(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
+        // No instances (or no upload yet): nothing to draw.
+        let Some(buf) = self.instance_buf.as_ref().filter(|_| count > 0) else { return };
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, buf.slice(..));
+        pass.draw(0..6, 0..count);
     }
 
     /// Render `rects` on top of existing content (`LoadOp::Load`) with a

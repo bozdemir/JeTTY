@@ -321,6 +321,92 @@ fn bench_frames(
             t.feed(&numbered_line(line));
         })?;
     }
+    bench_scene_passes(device, queue, format, font_size)
+}
+
+/// The app's whole grid scene per frame — cell-background quads + glyphs, typing —
+/// recorded as two render passes + two submits (the pre-batching render core) vs.
+/// ONE pass + ONE submit (what `render_grid_scene` does now). Interleaved frame by
+/// frame so machine load hits both variants alike.
+fn bench_scene_passes(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    font_size: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (cols, rows) = (240usize, 70usize);
+    let mut text = TextLayer::new_with_family(device, queue, format, font_size, "MesloLGS NF");
+    let mut quad = jetty_render::QuadLayer::new(device, format);
+    let (cw, ch) = text.cell_size();
+    let width = (cols as f32 * cw).ceil() as u32 + 1;
+    let height = (rows as f32 * ch).ceil() as u32 + 1;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("bench-scene-tex"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut term = jetty_core::Terminal::new(cols, rows);
+    for k in 0..rows * 2 {
+        term.feed(&numbered_line(k));
+    }
+    let (mut two, mut one) = (Vec::new(), Vec::new());
+    for k in 0..600usize {
+        if k % 100 == 99 {
+            term.feed(b"\r\n$ ");
+        } else {
+            term.feed(&[b"abcdefghijklmnopqrstuvwxyz"[k % 26]]);
+        }
+        let t = Instant::now();
+        let snap = term.snapshot();
+        let bg = jetty_render::cell_bg_rects(&snap, cw, ch, 0.0, [60, 80, 120]);
+        let clear = jetty_render::default_bg_clear(&snap, true);
+        if k % 2 == 0 {
+            quad.render_clear(device, queue, &view, width, height, &bg, clear);
+            text.render_to(device, queue, &view, width, height, &snap, false, 0.0)?;
+            two.push(t.elapsed().as_secs_f32() * 1000.0);
+        } else {
+            let n = quad.upload(device, queue, width, height, &bg);
+            let ready = text
+                .prepare_grid(device, queue, width, height, &snap, 0.0, &jetty_render::GridPaint::default())
+                .is_ok();
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                quad.draw_uploaded(&mut pass, n);
+                if ready {
+                    text.draw_grid(&mut pass);
+                }
+            }
+            queue.submit(Some(encoder.finish()));
+            text.end_grid_frame();
+            one.push(t.elapsed().as_secs_f32() * 1000.0);
+        }
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+    }
+    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+    println!(
+        "scene         {cols}x{rows} typing, bg quads + glyphs: 2 passes/submits cpu {:.3} ms | 1 pass/submit cpu {:.3} ms",
+        mean(&two),
+        mean(&one)
+    );
     Ok(())
 }
 

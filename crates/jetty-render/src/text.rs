@@ -688,6 +688,83 @@ impl TextLayer {
         top_offset: f32,
         paint: &GridPaint,
     ) -> Result<(), PrepareError> {
+        self.prepare_grid(device, queue, width, height, snapshot, top_offset, paint)?;
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("text") });
+        {
+            // When clearing, build the clear color from the snapshot's theme bg.
+            // Premultiplied by alpha so the value is correct for PreMultiplied
+            // alpha_mode surfaces and harmless for Opaque ones. This matches the
+            // per-cell background pass's `default_bg_clear`. When `clear` is false
+            // the background was already painted by a prior quad pass, so we load.
+            let load = if clear {
+                // This text-owned clear is not the live macOS surface clear (the
+                // app loads over the quad pass's clear at default_bg_clear); keep
+                // the historical premultiplied value for the bench/convenience paths.
+                wgpu::LoadOp::Clear(crate::quad::default_bg_clear(snapshot, true))
+            } else {
+                wgpu::LoadOp::Load
+            };
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("text-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.draw_grid(&mut pass);
+        }
+        queue.submit(Some(encoder.finish()));
+        self.end_grid_frame();
+        Ok(())
+    }
+
+    /// Record the glyphs of the last successful [`Self::prepare_grid`] into a
+    /// caller-owned render pass — e.g. the SAME pass as the background quads, so a
+    /// frame's grid costs one pass and one submit instead of two of each.
+    pub fn draw_grid(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if let Err(e) = self.renderer.render(&self.atlas, &self.viewport, pass) {
+            eprintln!("jetty: text render error: {e:?}");
+        }
+    }
+
+    /// Call once the pass carrying [`Self::draw_grid`] is recorded: unpin this
+    /// frame's glyphs so the NEXT prepare can LRU-evict stale ones. glyphon pins
+    /// every rendered glyph in `glyphs_in_use` and only trim() clears it; without
+    /// this per-frame trim the atlas grows unbounded until AtlasFull. (Unpinning is
+    /// CPU bookkeeping only — the recorded draw is unaffected. A frame that skipped
+    /// prepare pinned nothing new; no prepare on this atlas runs before the next
+    /// grid prepare except an overlay's, and that one invalidates `prepared` — so
+    /// an evicted glyph is never drawn from stale vertices.)
+    pub fn end_grid_frame(&mut self) {
+        self.atlas.trim();
+    }
+
+    /// Everything [`Self::render_grid`] does before recording the draw: pack the
+    /// cells, rebuild decorations, shape new rows and glyphon-prepare — or nothing
+    /// at all when the grid is unchanged. Pair with [`Self::draw_grid`] +
+    /// [`Self::end_grid_frame`]; on `Err` there is nothing valid to draw.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_grid(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        snapshot: &GridSnapshot,
+        top_offset: f32,
+        paint: &GridPaint,
+    ) -> Result<(), PrepareError> {
         let cell_w = self.cell_w;
         let cell_h = self.cell_h;
         let (rows, cols) = (snapshot.rows, snapshot.cols);
@@ -912,55 +989,7 @@ impl TextLayer {
         self.fallback_cells_scratch = fallback_cells;
         self.grapheme_cells_scratch = grapheme_cells;
         self.grapheme_sort_scratch = g_order;
-        result?;
-
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("text") });
-        {
-            // When clearing, build the clear color from the snapshot's theme bg.
-            // Premultiplied by alpha so the value is correct for PreMultiplied
-            // alpha_mode surfaces and harmless for Opaque ones. This matches the
-            // per-cell background pass's `default_bg_clear`. When `clear` is false
-            // the background was already painted by a prior quad pass, so we load.
-            let load = if clear {
-                // This text-owned clear is not the live macOS surface clear (the
-                // app loads over the quad pass's clear at default_bg_clear); keep
-                // the historical premultiplied value for the bench/convenience paths.
-                wgpu::LoadOp::Clear(crate::quad::default_bg_clear(snapshot, true))
-            } else {
-                wgpu::LoadOp::Load
-            };
-
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("text-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            if let Err(e) = self.renderer.render(&self.atlas, &self.viewport, &mut pass) {
-                eprintln!("jetty: text render error: {e:?}");
-            }
-        }
-        queue.submit(Some(encoder.finish()));
-        // Unpin this frame's glyphs so the NEXT prepare can LRU-evict stale ones.
-        // glyphon pins every rendered glyph in `glyphs_in_use` and only trim() clears
-        // it; without this per-frame trim the atlas grows unbounded until AtlasFull.
-        // (A frame that skipped prepare pinned nothing new; no prepare on this atlas
-        // runs before the next grid prepare except an overlay's, and that one
-        // invalidates `prepared` — so an evicted glyph is never drawn from stale
-        // vertices.)
-        self.atlas.trim();
-        Ok(())
+        result
     }
 
     /// Map every viewport row to a shaped buffer in the row cache, shaping only the
