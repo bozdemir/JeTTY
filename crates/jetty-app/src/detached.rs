@@ -243,6 +243,10 @@ pub(crate) struct DetachedWindow {
     pub last_frame_at: Option<std::time::Instant>,
     pub perf_idle_at: Option<std::time::Instant>,
     pub perf_idle_shown: bool,
+    /// Flood frame pacing for THIS window (mirrors `App::last_present_at` /
+    /// `App::paced_paint_at`; see `pace_paint`).
+    pub last_present_at: Option<std::time::Instant>,
+    pub paced_paint_at: Option<std::time::Instant>,
     /// Whether THIS detached window is in OS fullscreen (F11 pressed in it).
     /// Session-only and PER WINDOW — detached windows persist no geometry at all,
     /// have no `window_mode`, and are never hidden, so this is purely a live
@@ -455,6 +459,8 @@ impl DetachedWindow {
             last_frame_at: None,
             perf_idle_at: None,
             perf_idle_shown: false,
+            last_present_at: None,
+            paced_paint_at: None,
             // A freshly-detached window is created focused (the WM focuses it on
             // map); its Focused events keep this current thereafter.
             focused: true,
@@ -482,6 +488,45 @@ impl DetachedWindow {
             link_hover: None,
             link_hover_cell: None,
         })
+    }
+
+    /// Rebuild this window's GPU stack after a device loss — a new surface on
+    /// `gpu_shared` (or a device of its own when that cannot present here) and
+    /// fresh layers built like `new` does, the fonts from this window's own
+    /// already-loaded font database. The window, its tab and every piece of UI
+    /// state are kept. Returns `false` (keeping the lost stack, for a later
+    /// retry) when no GPU can be acquired.
+    pub(crate) fn rebuild_gpu(
+        &mut self,
+        gpu_shared: Option<&Arc<jetty_render::GpuShared>>,
+        font_logical: f32,
+        ui_font_logical: f32,
+        font_family: &str,
+        ui_font_family: &str,
+    ) -> bool {
+        let size = self.window.inner_size();
+        let scale = self.window.scale_factor() as f32;
+        let Some(gpu) = GpuContext::new_sharing(gpu_shared, self.window.clone(), size.width, size.height) else {
+            return false;
+        };
+        let (grid_fonts, chrome_fonts) = (self.text.clone_font_system(), self.text.clone_font_system());
+        self.text = TextLayer::new_with_family_and_fonts(
+            &gpu.device, &gpu.queue, gpu.format, font_logical * scale, font_family, grid_fonts,
+        );
+        let mut chrome_text = TextLayer::new_with_family_and_fonts(
+            &gpu.device, &gpu.queue, gpu.format, ui_font_logical * scale, font_family, chrome_fonts,
+        );
+        chrome_text.set_ui_family(if ui_font_family.is_empty() { None } else { Some(ui_font_family) });
+        self.chrome_text = chrome_text;
+        self.quad = QuadLayer::new(&gpu.device, gpu.format);
+        self.corner_mask = jetty_render::CornerMask::new(&gpu.device, gpu.format);
+        self.crt = jetty_render::Crt::new(&gpu.device, gpu.format);
+        self.image_layer = jetty_render::ImageLayer::new(&gpu.device, gpu.format);
+        // Lazily re-allocated on the next CRT frame, on the new device.
+        self.offscreen = None;
+        self.acquire_retry = None;
+        self.gpu = gpu;
+        true
     }
 
     /// Keep the OS window title (title bar / taskbar) in sync with the tab's

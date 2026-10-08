@@ -927,6 +927,18 @@ pub struct App {
     /// `AcquireRetry` schedule as the main/detached windows); `None` while its
     /// frames present normally or while it is closed.
     settings_acquire_retry: Option<AcquireRetry>,
+    /// After a GPU device loss whose rebuild failed (the driver still resetting),
+    /// the next attempt is not before this instant — see `recover_lost_gpu`.
+    gpu_rebuild_retry_at: Option<std::time::Instant>,
+    /// When the main window last presented a frame — the anchor of flood frame
+    /// pacing (`pace_paint`).
+    last_present_at: Option<std::time::Instant>,
+    /// The main window's display refresh interval (from its monitor's rate;
+    /// 60 Hz when unknown), refreshed on create / move / DPI change.
+    frame_interval: std::time::Duration,
+    /// A flood paint deferred to the next refresh (`pace_paint`); serviced by
+    /// `about_to_wait` as a single WaitUntil wake.
+    paced_paint_at: Option<std::time::Instant>,
     /// Window corner radius in logical px, clamped [0, 24]. 0 = square corners.
     corner_radius: f32,
     /// All open terminal sessions, one per tab. Always non-empty once `resumed`
@@ -1605,6 +1617,10 @@ impl App {
             summon_settle_until: None,
             settings_paint_until: None,
             settings_acquire_retry: None,
+            gpu_rebuild_retry_at: None,
+            last_present_at: None,
+            frame_interval: refresh_interval(None),
+            paced_paint_at: None,
             corner_radius,
             tabs: Vec::new(),
             active: 0,
@@ -5751,12 +5767,33 @@ impl App {
                 return;
             }
         };
+        self.build_settings_stack(&window);
+        window.focus_window();
+        window.request_redraw();
+        self.settings_window = Some(window);
+        // macOS: keep repainting under Poll for a short window so the surface
+        // presents once macOS has displayed the new window (a single redraw on
+        // open is dropped, leaving it blank until clicked).
+        self.settings_paint_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
+        // …and draw the first frame SYNCHRONOUSLY now, before returning to the
+        // event loop, so the window is never shown blank even for a frame.
+        self.render_settings_window();
+        if self.debug {
+            eprintln!("SETTINGS window opened");
+        }
+    }
+
+    /// (Re)build the Settings window's GPU stack — surface, panel text, specimen
+    /// text, quads — for `window`: on open, and after a GPU device loss. Only a
+    /// new SURFACE on the main window's device (no adapter enumeration or device
+    /// creation on the UI thread), and fonts from the already-loaded font
+    /// database (no fontconfig rescan) — opening Settings used to stall every
+    /// window and the PTY drain for both. `settings_gpu` is `None` (and the
+    /// window simply stays blank) when no GPU can present to it.
+    fn build_settings_stack(&mut self, window: &Arc<Window>) {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
-        // Only a new SURFACE on the main window's device (no adapter enumeration or
-        // device creation on the UI thread), and fonts from the already-loaded font
-        // database (no fontconfig rescan) — opening Settings used to stall every
-        // window and the PTY drain for both.
         let shared = self.gpu.as_ref().map(|g| g.shared());
         let gpu = GpuContext::new_sharing(shared.as_ref(), window.clone(), size.width, size.height);
         let fonts = || self.text.as_ref().map_or_else(TextLayer::build_font_system, |t| t.clone_font_system());
@@ -5788,20 +5825,104 @@ impl App {
             self.settings_quad = Some(quad);
         }
         self.settings_gpu = gpu;
-        window.focus_window();
-        window.request_redraw();
-        self.settings_window = Some(window);
-        // macOS: keep repainting under Poll for a short window so the surface
-        // presents once macOS has displayed the new window (a single redraw on
-        // open is dropped, leaving it blank until clicked).
-        self.settings_paint_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
-        // …and draw the first frame SYNCHRONOUSLY now, before returning to the
-        // event loop, so the window is never shown blank even for a frame.
-        self.render_settings_window();
-        if self.debug {
-            eprintln!("SETTINGS window opened");
+    }
+
+    /// Re-read the main window's display refresh interval (flood pacing). Cheap:
+    /// called on create, move and DPI change, never per frame.
+    fn refresh_frame_interval(&mut self) {
+        let mhz = self
+            .window
+            .as_ref()
+            .and_then(|w| w.current_monitor())
+            .and_then(|m| m.refresh_rate_millihertz());
+        self.frame_interval = refresh_interval(mhz);
+    }
+
+    /// GPU device-loss recovery. A lost device (driver reset, GPU hang, some
+    /// suspend/resume paths) never presents again — every JeTTY window stayed
+    /// frozen on its last frame until a restart. Rebuild the main window's GPU
+    /// stack from a fresh device, then re-surface every detached window and the
+    /// Settings window whose device was lost (they share the main one). When no
+    /// GPU can be acquired yet (the driver still resetting) the attempt repeats
+    /// after `GPU_REBUILD_RETRY`, as a single `WaitUntil` wake — never a spin.
+    /// Returns whether a rebuild was attempted (the caller repaints).
+    fn recover_lost_gpu(&mut self, now: std::time::Instant) -> bool {
+        let main_lost = self.gpu.as_ref().is_some_and(|g| g.is_lost());
+        let detached_lost = self.detached.iter().any(|d| d.gpu.is_lost());
+        let settings_lost = self.settings_gpu.as_ref().is_some_and(|g| g.is_lost());
+        if !gpu_recovery_due(main_lost || detached_lost || settings_lost, self.gpu_rebuild_retry_at, now) {
+            return false;
         }
+        let mut ok = true;
+        if main_lost {
+            ok &= self.rebuild_main_gpu();
+        }
+        // Everything else re-surfaces on the (possibly new) main device.
+        let shared = self.gpu.as_ref().filter(|g| !g.is_lost()).map(|g| g.shared());
+        let (font_logical, ui_font_logical) = (self.font_logical, self.ui_font_logical);
+        for dw in &mut self.detached {
+            if dw.gpu.is_lost() {
+                ok &= dw.rebuild_gpu(
+                    shared.as_ref(),
+                    font_logical,
+                    ui_font_logical,
+                    &self.font_family,
+                    &self.ui_font_family,
+                );
+            }
+        }
+        if settings_lost {
+            if let Some(win) = self.settings_window.clone() {
+                self.build_settings_stack(&win);
+                self.settings_acquire_retry = None;
+                ok &= self.settings_gpu.as_ref().is_some_and(|g| !g.is_lost());
+            }
+        }
+        self.gpu_rebuild_retry_at = if ok { None } else { Some(now + GPU_REBUILD_RETRY) };
+        self.mark_dirty_all();
+        true
+    }
+
+    /// Rebuild the MAIN window's whole GPU stack on a fresh device (see
+    /// `recover_lost_gpu`): the same layers `resumed` builds, at the current font
+    /// sizes/families, fonts from the already-loaded font database (no rescan).
+    /// Tabs, grids and every UI state are untouched. `false` (keeping the lost
+    /// stack for a later retry) when no GPU can present to the window yet.
+    fn rebuild_main_gpu(&mut self) -> bool {
+        let Some(window) = self.window.clone() else { return false };
+        let size = window.inner_size();
+        let scale = window.scale_factor() as f32;
+        let Some(gpu) = GpuContext::new(window, size.width, size.height) else { return false };
+        let font_db = || self.text.as_ref().map_or_else(TextLayer::build_font_system, |t| t.clone_font_system());
+        let (grid_fonts, chrome_fonts) = (font_db(), font_db());
+        let text = TextLayer::new_with_family_and_fonts(
+            &gpu.device, &gpu.queue, gpu.format, self.font_logical * scale, &self.font_family, grid_fonts,
+        );
+        let mut chrome = TextLayer::new_with_family_and_fonts(
+            &gpu.device, &gpu.queue, gpu.format, self.ui_font_logical * scale, &self.font_family, chrome_fonts,
+        );
+        chrome.set_ui_family(if self.ui_font_family.is_empty() {
+            None
+        } else {
+            Some(self.ui_font_family.as_str())
+        });
+        let (device, format) = (&gpu.device, gpu.format);
+        self.quad = Some(QuadLayer::new(device, format));
+        self.corner_mask = Some(jetty_render::CornerMask::new(device, format));
+        self.bayer_reveal = Some(jetty_render::BayerReveal::new(device, format));
+        self.phosphor = Some(jetty_render::PhosphorIgnition::new(device, format));
+        self.liquid = Some(jetty_render::LiquidDrop::new(device, format));
+        self.focus = Some(jetty_render::FocusPull::new(device, format));
+        self.crt = Some(jetty_render::Crt::new(device, format));
+        self.image_layer = Some(jetty_render::ImageLayer::new(device, format));
+        self.caret_fx = Some(jetty_render::CaretFx::new(device, format));
+        // Lazily re-allocated on the next frame that needs it, on the new device.
+        self.offscreen = None;
+        self.text = Some(text);
+        self.chrome_text = Some(chrome);
+        self.gpu = Some(gpu);
+        self.acquire_retry = None;
+        true
     }
 
     /// End every Settings-window drag (opacity, radius, dropdown size, Effects
@@ -7545,6 +7666,9 @@ impl App {
         frame.present();
         // The swapchain is healthy again: drop any retry schedule.
         dw.acquire_retry = None;
+        // Flood pacing anchor (see the main window's present).
+        dw.last_present_at = Some(std::time::Instant::now());
+        dw.paced_paint_at = None;
         // Missed-paint proof counter (JETTY_FRAME_LOG only; see the field docs).
         // `self.frames_presented`/`self.frame_log` are fields disjoint from the
         // live `dw` borrow of `self.detached`, so this is a plain field bump.
@@ -8193,6 +8317,8 @@ impl ApplicationHandler<AppEvent> for App {
         // stuck BSU can't freeze the terminal; the next pending one is scheduled
         // via WaitUntil below (F1).
         let mut painted = self.flush_expired_syncs(std::time::Instant::now());
+        // A lost GPU device is rebuilt before anything below tries to render on it.
+        painted |= self.recover_lost_gpu(std::time::Instant::now());
         // Debounced font-size reflow: when the deadline set by `set_font_size`
         // has elapsed (the user stopped pressing Ctrl+/-), issue ONE pty.resize
         // (via `reflow`) so the shell gets a single SIGWINCH instead of one per
@@ -8401,6 +8527,29 @@ impl ApplicationHandler<AppEvent> for App {
                 painted = true;
             }
         }
+        // Flood paints deferred to the next refresh (`pace_paint`): a due one
+        // paints now — one frame per refresh while a flood lasts. A window that
+        // is hidden/occluded drops it (it repaints when it comes back).
+        if let Some(t) = self.paced_paint_at {
+            if !main_visible {
+                self.paced_paint_at = None;
+            } else if now >= t {
+                self.paced_paint_at = None;
+                self.request_main_paint();
+                painted = true;
+            }
+        }
+        for dw in &mut self.detached {
+            if let Some(t) = dw.paced_paint_at {
+                if dw.occluded {
+                    dw.paced_paint_at = None;
+                } else if now >= t {
+                    dw.paced_paint_at = None;
+                    dw.request_paint();
+                    painted = true;
+                }
+            }
+        }
         // Idle-HUD one-shot: flip the HUD from its last live value to an honest
         // "idle" reading once the app settles — only for an effectively visible
         // window (see `perf_idle_decision`: requesting it while hidden spun a core
@@ -8545,6 +8694,20 @@ impl ApplicationHandler<AppEvent> for App {
             {
                 merge_wake(&mut wake_at, d);
             }
+        }
+        // Deferred flood paints (due ones were painted above → strictly future).
+        if let Some(t) = self.paced_paint_at {
+            merge_wake(&mut wake_at, t);
+        }
+        for dw in &self.detached {
+            if let Some(t) = dw.paced_paint_at {
+                merge_wake(&mut wake_at, t);
+            }
+        }
+        // A failed GPU rebuild retries once its backoff elapses (a due one ran
+        // at the top of this iteration, so this is strictly in the future).
+        if let Some(t) = self.gpu_rebuild_retry_at.filter(|&t| t > now) {
+            merge_wake(&mut wake_at, t);
         }
         // Pill expiries: one wake each to repaint the pill away.
         if let Some((t, _)) = self.shift_hint_until {
@@ -8810,6 +8973,7 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         self.window = Some(window);
+        self.refresh_frame_interval();
         self.gpu = gpu;
         self.text = text;
         self.quad = quad;
@@ -8938,7 +9102,9 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, ev: AppEvent) {
         match ev {
             AppEvent::Wake => {
+                let vt_before = self.vt_bytes;
                 let (had_data, chrome_changed, exited) = self.drain_pty();
+                let main_flood = self.vt_bytes - vt_before >= FLOOD_PACE_BYTES;
                 // Input-latency echo signal (JETTY_PERF_LOG only): the Wake drain is
                 // usually where the shell's keystroke echo is consumed (before the
                 // redraw re-drains empty), so mark it here too. Gated on `perf.on`;
@@ -8976,7 +9142,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // not one per Wake — while a background OSC 0/2 title update
                 // still reaches the tab bar and taskbar title (F1/F14).
                 if (had_data || chrome_changed) && self.visible && !self.main_occluded {
-                    self.request_main_paint();
+                    // Flood output paints at most once per refresh (`pace_paint`);
+                    // interactive output paints now.
+                    match pace_paint(main_flood, self.last_present_at, self.frame_interval, std::time::Instant::now()) {
+                        PaintPacing::Now => self.request_main_paint(),
+                        PaintPacing::At(t) => {
+                            self.paced_paint_at = Some(self.paced_paint_at.map_or(t, |p| p.min(t)));
+                        }
+                    }
                     // Grid content changed under an ACTIVE Ctrl+hover: revalidate
                     // the cached spans so the underline tracks (or vanishes with)
                     // the moved text. Only runs while a link is hovered — zero
@@ -8996,9 +9169,12 @@ impl ApplicationHandler<AppEvent> for App {
                 // Run-selection pills from detached-tab drains (a pending rides
                 // a detach move); collected locally, surfaced after the loop.
                 let mut runsel_notices: Vec<crate::runsel::Notice> = Vec::new();
+                let frame_interval = self.frame_interval;
                 for (i, dw) in self.detached.iter_mut().enumerate() {
+                    let read_before = vt_read;
                     let (had, title_changed, notice) =
                         Self::drain_one_tab(&mut dw.tab, &mut vt_read);
+                    let flood = vt_read - read_before >= FLOOD_PACE_BYTES;
                     if let Some(n) = notice {
                         runsel_notices.push(n);
                     }
@@ -9015,7 +9191,13 @@ impl ApplicationHandler<AppEvent> for App {
                     // (F16). A title-only change repaints too: the detached
                     // top bar draws the title (F1/F14).
                     if (had || title_changed) && !dw.occluded {
-                        dw.request_paint();
+                        // Same flood pacing as the main window.
+                        match pace_paint(flood, dw.last_present_at, frame_interval, std::time::Instant::now()) {
+                            PaintPacing::Now => dw.request_paint(),
+                            PaintPacing::At(t) => {
+                                dw.paced_paint_at = Some(dw.paced_paint_at.map_or(t, |p| p.min(t)));
+                            }
+                        }
                         // Grid content changed under an ACTIVE Ctrl+hover in this
                         // window: revalidate the cached spans at the same cell
                         // (mirrors the main window's Wake-drain recompute; only
@@ -9135,6 +9317,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // without a resize; re-derived once on the next frame instead of
                 // an X11 round-trip on every frame.
                 self.top_flush_dirty = true;
+                // The window may now be on a monitor with another refresh rate.
+                self.refresh_frame_interval();
             }
             WindowEvent::Resized(size) => {
                 self.top_flush_dirty = true;
@@ -9178,6 +9362,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // debounced reflow and let the Resized event's reflow correct the
                 // grid against the real surface size.
                 self.top_flush_dirty = true;
+                self.refresh_frame_interval();
                 let scale = scale_factor as f32;
                 // Re-scale the font IN-PLACE (reusing the FontSystem) rather than
                 // rebuilding the TextLayers — a DPI change must not rescan
@@ -12323,6 +12508,10 @@ impl ApplicationHandler<AppEvent> for App {
                     frame.present();
                     // The swapchain is healthy again: drop any retry schedule.
                     self.acquire_retry = None;
+                    // Flood pacing anchor; this frame carries every drained byte,
+                    // so a deferred flood paint is now redundant.
+                    self.last_present_at = Some(std::time::Instant::now());
+                    self.paced_paint_at = None;
                     // Missed-paint proof counter (JETTY_FRAME_LOG only).
                     if self.frame_log {
                         self.frames_presented += 1;
@@ -13074,6 +13263,58 @@ fn detach_logical_size(
         ((w as f64 / scale).round() as u32).max(1),
         ((h as f64 / scale).round() as u32).max(1),
     )
+}
+
+/// Bytes drained in one pass above which PTY output is a FLOOD (`cat bigfile`,
+/// `yes`, a build log) rather than interactive: a keystroke echoes a few bytes,
+/// a prompt redraw a few hundred, a screenful of `ls` a few KiB.
+const FLOOD_PACE_BYTES: u64 = 64 * 1024;
+
+/// When to paint freshly drained PTY output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaintPacing {
+    Now,
+    At(std::time::Instant),
+}
+
+/// Frame pacing for PTY output (pure). Interactive output always paints NOW —
+/// no added latency for an echo. During a FLOOD, a window renders only once a
+/// full refresh has passed since its last present: with Fifo and one frame in
+/// flight, an earlier render blocks the UI thread inside the swapchain acquire
+/// until the previous frame reaches the screen, and that blocked time is time
+/// NOT spent draining — the flood was capped at about one drain budget per
+/// refresh. The deferred paint lands at `last_present + interval`, when the
+/// acquire no longer waits.
+fn pace_paint(
+    flood: bool,
+    last_present: Option<std::time::Instant>,
+    interval: std::time::Duration,
+    now: std::time::Instant,
+) -> PaintPacing {
+    match last_present {
+        Some(t) if flood && now < t + interval => PaintPacing::At(t + interval),
+        _ => PaintPacing::Now,
+    }
+}
+
+/// The display refresh interval for a monitor rate in millihertz (winit's
+/// `refresh_rate_millihertz`), clamped to 20–250 Hz; 60 Hz when unknown.
+fn refresh_interval(mhz: Option<u32>) -> std::time::Duration {
+    match mhz {
+        Some(m) if m > 0 => std::time::Duration::from_micros((1_000_000_000u64 / m as u64).clamp(4_000, 50_000)),
+        _ => std::time::Duration::from_micros(16_667),
+    }
+}
+
+/// Pause between GPU rebuild attempts while the device stays unavailable (a
+/// driver reset can take seconds; each attempt enumerates adapters on the UI
+/// thread, so it must not repeat every frame).
+const GPU_REBUILD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether `App::recover_lost_gpu` should attempt a rebuild now: a device is
+/// lost and no failed attempt is still backing off.
+fn gpu_recovery_due(any_lost: bool, retry_at: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    any_lost && retry_at.is_none_or(|t| now >= t)
 }
 
 /// Which window opening Settings must take out of fullscreen.
@@ -14331,10 +14572,53 @@ mod window_mode_tests {
 #[cfg(test)]
 mod window_parity_tests {
     use super::{
-        detach_logical_size, perf_hud_text, settings_drag_end, settings_fullscreen_exit, smooth_frame_ms,
-        FullscreenExit, SettingsDragEnd,
+        detach_logical_size, gpu_recovery_due, pace_paint, perf_hud_text, refresh_interval, settings_drag_end,
+        settings_fullscreen_exit, smooth_frame_ms, FullscreenExit, PaintPacing, SettingsDragEnd,
+        GPU_REBUILD_RETRY,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn interactive_output_always_paints_immediately() {
+        // An echo / prompt (not a flood) never waits — even right after a frame.
+        let now = Instant::now();
+        let hz60 = refresh_interval(Some(60_000));
+        assert_eq!(pace_paint(false, Some(now), hz60, now), PaintPacing::Now);
+        assert_eq!(pace_paint(false, None, hz60, now), PaintPacing::Now);
+    }
+
+    #[test]
+    fn flood_paints_at_most_once_per_refresh() {
+        let t0 = Instant::now();
+        let hz60 = refresh_interval(Some(60_000));
+        // First flood frame (nothing presented yet / long ago) paints now.
+        assert_eq!(pace_paint(true, None, hz60, t0), PaintPacing::Now);
+        assert_eq!(pace_paint(true, Some(t0), hz60, t0 + hz60), PaintPacing::Now);
+        // Within the refresh: deferred to exactly one interval after the present.
+        assert_eq!(pace_paint(true, Some(t0), hz60, t0 + Duration::from_millis(3)), PaintPacing::At(t0 + hz60));
+    }
+
+    #[test]
+    fn refresh_interval_follows_the_monitor_and_stays_sane() {
+        assert_eq!(refresh_interval(Some(60_000)), Duration::from_micros(16_666));
+        assert_eq!(refresh_interval(Some(144_000)), Duration::from_micros(6_944));
+        // Unknown / bogus rates: 60 Hz, and clamped to 20–250 Hz.
+        assert_eq!(refresh_interval(None), Duration::from_micros(16_667));
+        assert_eq!(refresh_interval(Some(0)), Duration::from_micros(16_667));
+        assert_eq!(refresh_interval(Some(1_000)), Duration::from_micros(50_000));
+        assert_eq!(refresh_interval(Some(1_000_000)), Duration::from_micros(4_000));
+    }
+
+    #[test]
+    fn gpu_recovery_runs_on_loss_and_backs_off_after_a_failed_rebuild() {
+        let now = Instant::now();
+        assert!(!gpu_recovery_due(false, None, now), "nothing lost → nothing to do");
+        assert!(gpu_recovery_due(true, None, now), "a loss is rebuilt at once");
+        // A failed rebuild waits for its backoff — never a per-frame retry loop…
+        assert!(!gpu_recovery_due(true, Some(now + GPU_REBUILD_RETRY), now));
+        // …and retries once it elapses.
+        assert!(gpu_recovery_due(true, Some(now), now));
+    }
 
     /// Tripwire for the single active-tab path: `self.active` may be ASSIGNED
     /// only by `set_active_tab` plus the index fix-ups of the paths that REMOVE a
