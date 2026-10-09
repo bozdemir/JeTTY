@@ -195,8 +195,9 @@ pub(crate) struct GridMouse {
 }
 
 impl GridMouse {
-    /// Forget every gesture in flight — its release can no longer arrive
-    /// (window hidden, focus lost).
+    /// Forget every gesture in flight, reporting nothing — for a tab whose
+    /// program is gone or no longer gets this window's mouse ([`end_gestures`]
+    /// reports the releases first).
     pub fn reset(&mut self) {
         *self = Self::default();
     }
@@ -427,6 +428,23 @@ pub(crate) fn release(g: &mut Grid, button: MouseButton) -> Release {
         g.report(Some(btn), MouseAct::Release);
     }
     Release::Program { dragged }
+}
+
+/// The window's gestures end where their releases can't follow (focus lost,
+/// the window hidden, another tab shown): a selection drag stops, and the
+/// program gets the release of every button it saw pressed — at the pointer's
+/// last cell — so it never stays mid-drag (tmux stuck in a copy-mode
+/// selection). Then everything in flight is forgotten ([`GridMouse::reset`]).
+pub(crate) fn end_gestures(g: &mut Grid) {
+    if g.geom.usable() {
+        for btn in [MouseBtn::Left, MouseBtn::Middle, MouseBtn::Right, MouseBtn::Back, MouseBtn::Forward] {
+            if g.mouse.held & held_bit(btn) != 0 {
+                g.report(Some(btn), MouseAct::Release);
+            }
+        }
+    }
+    *g.selecting = false;
+    g.mouse.reset();
 }
 
 /// What the caller does after [`motion`].
@@ -1299,6 +1317,31 @@ mod tests {
         assert_eq!(w.at(2.0, 0.0, NONE, |g| motion(g, t0())).1, "\x1b[<32;3;1M");
         let (r, bytes) = w.at(2.0, 3.0, NONE, |g| release(g, MouseButton::Left));
         assert_eq!((r, bytes.as_str()), (Release::Program { dragged: true }, "\x1b[<0;3;3m"));
+    }
+
+    #[test]
+    fn an_abandoned_gesture_releases_what_the_program_saw_pressed() {
+        // Focus lost, the window hidden or another tab shown mid-drag: the
+        // real release can no longer reach this tab, and tmux / vim stayed
+        // mid-drag (tmux stuck in a copy-mode selection).
+        let mut w = Win::new(b"\x1b[?1002h\x1b[?1006h");
+        w.at(2.0, 1.0, NONE, |g| press(g, MouseButton::Left, false, t0()));
+        w.at(2.0, 1.0, NONE, |g| press(g, MouseButton::Right, false, t0()));
+        w.at(4.0, 1.0, NONE, |g| motion(g, t0()));
+        assert_eq!(w.at(4.0, 1.0, NONE, |g| end_gestures(g)).1, "\x1b[<0;5;2m\x1b[<2;5;2m");
+        // The physical release that may still arrive is not reported again.
+        assert_eq!(w.at(4.0, 1.0, NONE, |g| release(g, MouseButton::Left)), (Release::Ignored, String::new()));
+        assert_eq!(w.at(4.0, 1.0, NONE, |g| motion(g, t0())).1, "", "1002: nothing held any more");
+        // A local selection drag just ends (nothing for the program).
+        let mut w = Win::new(b"hello world");
+        w.at(0.0, 0.0, NONE, |g| press(g, MouseButton::Left, false, t0()));
+        assert!(w.selecting);
+        assert_eq!(w.at(4.0, 0.0, NONE, |g| end_gestures(g)).1, "");
+        assert!(!w.selecting);
+        // X10 (mode 9) has no releases to send.
+        let mut w = Win::new(b"\x1b[?9h");
+        w.at(0.0, 0.0, NONE, |g| press(g, MouseButton::Left, false, t0()));
+        assert_eq!(w.at(0.0, 0.0, NONE, |g| end_gestures(g)).1, "");
     }
 
     #[test]

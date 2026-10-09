@@ -7005,6 +7005,9 @@ impl App {
         // The search bar targets the ACTIVE tab: close it (clearing the
         // outgoing tab's regex/matches) before the index moves (F2/F7/F15).
         self.search_close(Surface::Main);
+        // Buttons its program saw pressed are released to it now: the real
+        // releases would reach the new tab, which never saw the presses.
+        self.with_main_grid(crate::gridmouse::end_gestures);
         self.active = idx;
         self.trail.reset();
         self.trail_wake = None;
@@ -7041,7 +7044,7 @@ impl App {
         self.dismiss_menus();
         // A selection drag, scrollbar drag, or button the outgoing tab's program
         // saw pressed can't be released into the new tab.
-        self.reset_main_pointer();
+        self.forget_main_pointer();
         self.scroll_accum.reset();
         self.update_link_hover(true);
         self.request_main_paint();
@@ -7681,8 +7684,18 @@ impl App {
 
     /// End every pointer gesture in the main window — its release can no longer
     /// arrive once the window hides or loses focus (a selection, a scrollbar
-    /// drag, buttons the program saw pressed, the edge auto-scroll).
+    /// drag, buttons the program saw pressed, the edge auto-scroll). The active
+    /// tab's program gets the release of each button it saw pressed, so it
+    /// never stays mid-drag (`gridmouse::end_gestures`).
     fn reset_main_pointer(&mut self) {
+        self.with_main_grid(crate::gridmouse::end_gestures);
+        self.forget_main_pointer();
+    }
+
+    /// [`Self::reset_main_pointer`] without the releases: the gestures belonged
+    /// to a tab that is no longer the active one (switched away from — it got
+    /// its releases first — closed or detached).
+    fn forget_main_pointer(&mut self) {
         self.selecting = false;
         self.dragging_scrollbar = false;
         // A hidden window gets no CursorLeft: forget the gutter hover so an
@@ -11515,14 +11528,16 @@ impl App {
                 // window for a while, and its last frame would keep showing a
                 // dead menu that the arrows and Enter no longer reach.
                 self.dismiss_surface_menus(Surface::Detached(pos));
+                let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 if let Some(dw) = self.detached.get_mut(pos) {
                     dw.bar_drag = None;
                     dw.bar_drag_start = None;
                     dw.last_bar_click = None;
                     // A selection/press drag can't see its release once focus is
-                    // gone — clear it so it doesn't resume stuck (F14).
-                    dw.selecting = false;
-                    dw.grid_mouse.reset();
+                    // gone — end it so it doesn't resume stuck (F14), the
+                    // program getting the releases of what it saw pressed.
+                    let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
+                    with_detached_grid(dw, geom, self.modifiers, crate::gridmouse::end_gestures);
                     dw.dragging_scrollbar = false;
                     // A link underline can't clear itself while unfocused (the
                     // modifier release is delivered elsewhere) — drop it now.
