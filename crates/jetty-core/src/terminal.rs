@@ -9218,4 +9218,310 @@ mod tests {
             }
         }
     }
+
+    // ── robustness: seeded random streams of garbage AND valid sequences ─────
+
+    /// xorshift64* — a tiny seeded generator (no new dependency).
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+
+        fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
+            xs[self.below(xs.len())]
+        }
+
+        fn chance(&mut self, one_in: usize) -> bool {
+            self.below(one_in) == 0
+        }
+    }
+
+    /// A CSI / mode parameter: mostly small, sometimes 0, empty or huge.
+    fn fuzz_param(r: &mut Rng, out: &mut Vec<u8>) {
+        match r.below(8) {
+            0 => {}
+            1 => out.push(b'0'),
+            2 => out.extend_from_slice(r.pick(&[&b"65535"[..], b"99999999999", b"4294967296"])),
+            _ => out.extend_from_slice(r.below(140).to_string().as_bytes()),
+        }
+    }
+
+    /// Append one random token: raw garbage, or a valid (sometimes mangled)
+    /// sequence of the kinds real programs emit.
+    fn fuzz_token(r: &mut Rng, out: &mut Vec<u8>) {
+        const TEXT: [&str; 14] = [
+            "hello", "a", " ", "x\u{301}", "中文", "😀", "👩\u{200d}💻", "❤\u{fe0f}", "\u{1f1e9}\u{1f1ea}",
+            "\u{200b}", "\u{fe0f}", "\u{301}\u{302}\u{303}", "ﷺ", "e\u{20e3}",
+        ];
+        const CONTROLS: &[u8] = b"\r\n\t\x08\x0b\x0c\x0e\x0f\x07\x18\x1a\x00\x7f\x05";
+        const CSI_FINALS: &[u8] = b"@ABCDEFGHIJKLMPSTXZ`abcdefghlmnpqrstuxy";
+        const ESC_FINALS: &[u8] = b"78DEHMNOPVWZ\\c=>n|}~";
+        const MODES: [&[u8]; 26] = [
+            b"1", b"3", b"5", b"6", b"7", b"9", b"12", b"25", b"47", b"66", b"69", b"1000", b"1002",
+            b"1003", b"1004", b"1005", b"1006", b"1007", b"1015", b"1047", b"1048", b"1049", b"2004",
+            b"2026", b"2031", b"9999",
+        ];
+        match r.below(30) {
+            // Raw garbage, any byte.
+            0..=2 => {
+                for _ in 0..1 + r.below(24) {
+                    out.push(r.next() as u8);
+                }
+            }
+            3..=6 => out.extend_from_slice(r.pick(&TEXT).as_bytes()),
+            7..=8 => {
+                for _ in 0..1 + r.below(4) {
+                    out.push(r.pick(CONTROLS));
+                }
+            }
+            // A run of printable text (line-filling, wrapping).
+            9 => {
+                let n = r.below(200);
+                out.extend((0..n).map(|i| b'a' + (i % 26) as u8));
+            }
+            // CSI with random params / markers / intermediates / finals.
+            10..=15 => {
+                out.extend_from_slice(b"\x1b[");
+                if r.chance(3) {
+                    out.push(r.pick(b"?><=!"));
+                }
+                for k in 0..r.below(5) {
+                    if k > 0 {
+                        out.push(if r.chance(5) { b':' } else { b';' });
+                    }
+                    fuzz_param(r, out);
+                }
+                if r.chance(6) {
+                    out.push(r.pick(b" $\"'!#"));
+                }
+                if r.chance(20) {
+                    out.push(r.pick(CONTROLS)); // a C0 inside the CSI
+                }
+                out.push(if r.chance(10) { 0x40 + r.below(0x3f) as u8 } else { r.pick(CSI_FINALS) });
+            }
+            // DEC private modes: set, reset or query.
+            16..=17 => {
+                out.extend_from_slice(b"\x1b[?");
+                out.extend_from_slice(r.pick(&MODES));
+                if r.chance(4) {
+                    out.push(b';');
+                    out.extend_from_slice(r.pick(&MODES));
+                }
+                out.extend_from_slice(r.pick(&[&b"h"[..], b"l", b"h", b"l", b"$p"]));
+            }
+            // Scroll regions and absolute moves.
+            18 => out.extend_from_slice(format!("\x1b[{};{}r", r.below(30), r.below(30)).as_bytes()),
+            19 => out.extend_from_slice(format!("\x1b[{};{}H", r.below(40), r.below(140)).as_bytes()),
+            // ESC + one byte (DECSC/DECRC/IND/NEL/RI/RIS/charsets…).
+            20 => {
+                out.push(0x1b);
+                match r.below(4) {
+                    0 => out.extend_from_slice(r.pick(&[&b"(0"[..], b"(B", b")0", b"*A", b"#8", b" G"])),
+                    _ => out.push(r.pick(ESC_FINALS)),
+                }
+            }
+            // OSC: titles, colors (set / query / reset), links, clipboard, marks.
+            21..=23 => {
+                out.extend_from_slice(b"\x1b]");
+                let body: &[u8] = r.pick(&[
+                    &b"0;title"[..], b"2;t\xc3\xa9", b"1;icon", b"4;1;#123456", b"4;300;?", b"4;7;?",
+                    b"10;?", b"11;?", b"12;?", b"10;#abcdef", b"11;rgb:12/34/56", b"104", b"104;1",
+                    b"110", b"111", b"112", b"8;;https://x.test", b"8;;", b"52;c;aGk=", b"52;p;?",
+                    b"7;file:///tmp", b"133;A", b"133;B", b"133;C", b"133;D;1", b"133;D", b"9;4;1;50",
+                    b"9;4;3", b"9;4;0", b"777;notify;a;b", b"", b"9;hi",
+                ]);
+                out.extend_from_slice(body);
+                if r.chance(8) {
+                    out.extend(std::iter::repeat_n(b'z', r.below(300)));
+                }
+                out.extend_from_slice(r.pick(&[&b"\x07"[..], b"\x1b\\", b"\x1b\\", b"\x18", b"", b"\x9c"]));
+            }
+            // DCS: sixel (valid and broken), DECRQSS, XTGETTCAP, tmux.
+            24..=25 => {
+                out.extend_from_slice(b"\x1bP");
+                let body: &[u8] = r.pick(&[
+                    &b"q#0;2;100;0;0#0~~-~~"[..], b"0;1;0q\"1;1;4;4#1~", b"q!5~$-!300~", b"$qm",
+                    b"$q q", b"$qr", b"+q544e", b"tmux;\x1b\x1b[1m", b"1$t", b"q#9999;2;0;0;0",
+                ]);
+                out.extend_from_slice(body);
+                out.extend_from_slice(r.pick(&[&b"\x1b\\"[..], b"\x9c", b"\x18", b""]));
+            }
+            // APC: kitty graphics (valid, chunked, garbage) and other APCs.
+            26 => {
+                out.extend_from_slice(b"\x1b_");
+                let body: &[u8] = r.pick(&[
+                    &b"Gf=32,s=1,v=1,a=T;/wAA/w=="[..], b"Gf=24,s=1,v=1,a=T,i=3;/wAA", b"Ga=q,i=9;",
+                    b"Ga=d", b"Ga=d,d=i,i=3", b"Gm=1,f=32,s=2,v=1;AAAA", b"Gm=0;AAAAAAAAAAA=",
+                    b"Ga=p,i=3", b"Gq=2,a=T,f=100;iVBORw0K", b"other apc", b"G",
+                ]);
+                out.extend_from_slice(body);
+                out.extend_from_slice(r.pick(&[&b"\x1b\\"[..], b"\x9c", b"\x1a", b""]));
+            }
+            // C1 bytes and broken UTF-8.
+            27 => {
+                for _ in 0..1 + r.below(4) {
+                    out.push(r.pick(&[0x84u8, 0x85, 0x88, 0x8d, 0x90, 0x9b, 0x9c, 0x9d, 0x9f, 0xc2, 0xe4, 0xf0, 0xff]));
+                }
+            }
+            // Kitty keyboard stack, synchronized updates, queries.
+            28 => out.extend_from_slice(r.pick(&[
+                &b"\x1b[>1u"[..], b"\x1b[<u", b"\x1b[=5;1u", b"\x1b[?u", b"\x1b[<99u", b"\x1b[?2026h",
+                b"\x1b[?2026l", b"\x1b[>q", b"\x1b[c", b"\x1b[>c", b"\x1b[6n", b"\x1b[?996n",
+            ])),
+            // Repeat, tabs, erase, insert/delete — the editing family, big counts.
+            _ => {
+                let f = r.pick(b"b@PXLMIZgJKST");
+                out.extend_from_slice(format!("\x1b[{}{}", r.below(300), f as char).as_bytes());
+            }
+        }
+    }
+
+    /// Assert what must hold whatever the input: the grid's geometry, both
+    /// cursors and every bounded buffer, and a snapshot consistent with them.
+    fn assert_terminal_invariants(t: &Terminal, deep: bool, ctx: &str) {
+        let grid = t.term.grid();
+        assert_eq!(grid.columns(), t.cols, "{ctx}: grid columns");
+        assert_eq!(grid.screen_lines(), t.rows, "{ctx}: grid lines");
+        for (what, c) in [("cursor", &grid.cursor), ("saved cursor", &grid.saved_cursor)] {
+            let p = c.point;
+            assert!(p.line.0 >= 0 && (p.line.0 as usize) < t.rows, "{ctx}: {what} at {p:?}");
+            assert!(p.column.0 < t.cols, "{ctx}: {what} at {p:?}");
+        }
+        assert!(grid.display_offset() <= grid.history_size(), "{ctx}: display offset");
+        assert!(grid.history_size() <= t.scrollback_limit, "{ctx}: history over the cap");
+        if deep {
+            for l in grid.topmost_line().0..=grid.bottommost_line().0 {
+                assert_eq!(grid[Line(l)].len(), t.cols, "{ctx}: row {l} length");
+            }
+        }
+        assert!(t.osc_len <= t.osc_cap, "{ctx}: OSC buffer {}", t.osc_len);
+        assert!(t.sixel_buf.len() <= SIXEL_MAX_BYTES, "{ctx}: sixel buffer");
+        assert!(t.apc_buf.len() <= APC_MAX_BYTES, "{ctx}: APC buffer");
+        assert!(t.chunk_buf.len() <= KITTY_RAW_BUDGET, "{ctx}: kitty chunks");
+        assert!(t.kbd_depth.iter().all(|&d| d <= KBD_STACK_MAX), "{ctx}: kbd depth {:?}", t.kbd_depth);
+        assert!(t.marks.len() <= MAX_MARKS, "{ctx}: marks");
+        assert!(t.completed.len() <= MAX_PENDING_COMPLETIONS, "{ctx}: completions");
+        assert!(t.placements.len() <= MAX_PLACEMENTS && t.alt_placements.len() <= MAX_PLACEMENTS, "{ctx}: placements");
+        let live: u64 = t.placements.iter().map(|p| p.image.rgba.len() as u64).sum();
+        assert_eq!(live, t.placement_bytes, "{ctx}: placement byte counter");
+        let live: u64 = t.alt_placements.iter().map(|p| p.image.rgba.len() as u64).sum();
+        assert_eq!(live, t.alt_placement_bytes, "{ctx}: alt placement byte counter");
+        let snap = t.snapshot();
+        assert_eq!(snap.cells.len(), t.rows * t.cols, "{ctx}: snapshot size");
+        assert!(snap.cursor_row < t.rows && snap.cursor_col < t.cols, "{ctx}: snapshot cursor");
+        for g in &snap.graphemes {
+            assert!(g.row < t.rows && g.col < t.cols, "{ctx}: grapheme at {},{}", g.row, g.col);
+            assert!(g.text.len() <= GRAPHEME_MAX_BYTES, "{ctx}: grapheme bytes");
+            assert!(g.text.chars().count() <= 1 + GRAPHEME_MAX_MARKS, "{ctx}: grapheme marks");
+        }
+        for img in t.visible_images() {
+            assert!(img.cols >= 1 && usize::from(img.col) + usize::from(img.cols) <= t.cols, "{ctx}: image span");
+        }
+    }
+
+    /// Drive one terminal through `steps` random writes (split at random feed
+    /// boundaries) interleaved with the app's own calls — resizes, scrollback
+    /// changes, scrolling, selections, search, links, hints, sync flushes, reply
+    /// drains — checking the invariants after every step.
+    fn fuzz_terminal(seed: u64, steps: usize) {
+        let mut r = Rng(seed | 1);
+        let size = |r: &mut Rng| {
+            let tiny = r.chance(4);
+            (2 + r.below(if tiny { 6 } else { 120 }), 1 + r.below(if tiny { 4 } else { 40 }))
+        };
+        let (cols, rows) = size(&mut r);
+        let mut t = Terminal::new(cols, rows);
+        t.set_cell_px(1.0 + r.below(20) as f32, 1.0 + r.below(40) as f32);
+        t.set_kitty_keyboard(!r.chance(3));
+        if r.chance(3) {
+            t.set_scrollback_lines(r.pick(&[0usize, 1, 3, 50, 1000]));
+        }
+        if r.chance(2) {
+            t.osc_cap = 64 + r.below(512) as u32;
+        }
+        if r.chance(2) {
+            t.feed(b"\x1b]133;A\x07$ \x1b]133;C\x07"); // live anchors: the isolation paths run
+        }
+        let mut buf = Vec::new();
+        for step in 0..steps {
+            buf.clear();
+            for _ in 0..1 + r.below(12) {
+                fuzz_token(&mut r, &mut buf);
+            }
+            let mut i = 0;
+            while i < buf.len() {
+                let end = (i + 1 + r.below(64)).min(buf.len());
+                t.feed(&buf[i..end]);
+                i = end;
+            }
+            match r.below(40) {
+                0 => {
+                    let (c, l) = size(&mut r);
+                    t.resize(c, l);
+                }
+                1 => t.set_scrollback_lines(r.pick(&[0usize, 2, 40, 10_000])),
+                2 => t.scroll_lines(r.below(60) as i32 - 30),
+                3 => {
+                    t.selection_start(r.below(t.rows), r.below(t.cols), r.chance(2));
+                    t.selection_update(r.below(t.rows), r.below(t.cols), r.chance(2));
+                    let _ = t.selection_text();
+                }
+                4 => {
+                    let _ = t.search_set_query(r.pick(&["a", "中", "x\u{301}", "(", "zz"]));
+                    let _ = t.search_nav(r.chance(2));
+                    let _ = t.search_viewport_hits();
+                }
+                5 => {
+                    let _ = t.link_at(r.below(t.rows), r.below(t.cols));
+                    let _ = t.hint_tokens();
+                    let _ = t.viewport_rows_chars();
+                }
+                6 => t.flush_sync(),
+                7 => {
+                    let _ = t.jump_prompt(r.chance(2));
+                    let _ = t.failed_prompt_rows();
+                    let _ = t.take_completions();
+                }
+                8 => t.reset_input_modes(),
+                9 => t.selection_start_semantic(r.below(t.rows), r.below(t.cols)),
+                _ => {}
+            }
+            let _ = t.drain_pty_writes();
+            let _ = t.take_title_update();
+            let _ = t.take_clipboard_stores();
+            assert_terminal_invariants(&t, step % 16 == 0, &format!("seed {seed:#x} step {step}"));
+        }
+    }
+
+    #[test]
+    fn random_streams_never_panic_and_keep_the_grid_consistent() {
+        for seed in 1..=24u64 {
+            fuzz_terminal(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), 150);
+        }
+    }
+
+    /// The long run (minutes):
+    /// `cargo test -p jetty-core --release -- --ignored random_streams_long`.
+    /// `JETTY_FUZZ_SEEDS` overrides the number of seeds; `JETTY_FUZZ_SEED=0x…`
+    /// replays the one seed a failure names.
+    #[test]
+    #[ignore]
+    fn random_streams_long() {
+        if let Some(seed) = std::env::var("JETTY_FUZZ_SEED").ok().and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()) {
+            return fuzz_terminal(seed, 600);
+        }
+        let seeds: u64 = std::env::var("JETTY_FUZZ_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
+        for seed in 1..=seeds {
+            fuzz_terminal(seed.wrapping_mul(0xd1b5_4a32_d192_ed03), 600);
+        }
+    }
 }
