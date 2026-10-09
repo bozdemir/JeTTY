@@ -272,7 +272,7 @@ pub struct Config {
     /// a remote host over SSH) READ the local system clipboard. Default `false`
     /// (the SECURE default alacritty enforces): OSC 52 COPY always works, but paste
     /// can exfiltrate whatever is on the clipboard (passwords/tokens), so it is
-    /// strictly opt-in. Applies to newly-spawned tabs.
+    /// strictly opt-in. Hot-reloadable: applies to every open tab.
     #[serde(default = "default_osc52_allow_paste")]
     pub osc52_allow_paste: bool,
     /// Run-selection-in-a-new-tab (the "open link in a new tab" gesture for

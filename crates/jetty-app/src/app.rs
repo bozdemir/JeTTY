@@ -1884,8 +1884,8 @@ fn url_scheme_allowed(url: &str) -> bool {
 impl App {
     pub fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
         // Seed the theme registry (built-ins + user themes) BEFORE any theme
-        // resolution below (amendment T4): otherwise a `JETTY_THEME`/config value
-        // naming a USER theme would resolve to idx 0 and the custom default be lost.
+        // resolution below (amendment T4): otherwise a config value naming a
+        // USER theme would resolve to idx 0 and the custom default be lost.
         // Problems (a skipped theme file) are shown in the first tab.
         let theme_warnings = crate::themes::rebuild_registry();
         let themes_fp = crate::themes::fingerprint();
@@ -1904,31 +1904,10 @@ impl App {
             }),
         );
 
-        // Resolve initial theme index from JETTY_THEME env var (consults the
-        // registry, so a user theme name resolves too).
-        let theme_name = std::env::var("JETTY_THEME").unwrap_or_default();
-        let theme_idx = jetty_core::theme_index(&theme_name).unwrap_or(0);
-
-        // Resolve initial opacity from JETTY_OPACITY env var.
-        let opacity = std::env::var("JETTY_OPACITY")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .map(|v| v.clamp(0.0, 1.0))
-            .unwrap_or(1.0);
-
-        // Resolve initial corner radius from JETTY_CORNER_RADIUS env var.
-        let corner_radius = std::env::var("JETTY_CORNER_RADIUS")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .map(|v| v.clamp(0.0, 24.0))
-            .unwrap_or(10.0);
-
         let debug = std::env::var("JETTY_DEBUG").is_ok();
 
-        // Resolve initial font family from JETTY_FONT_FAMILY env var.
-        let font_family = std::env::var("JETTY_FONT_FAMILY")
-            .unwrap_or_else(|_| "MesloLGS NF".to_string());
-
+        // The theme, opacity, corner radius and fonts below are placeholders:
+        // the config sets every one of them before anything is drawn.
         let mut app = App {
             proxy,
             window: None,
@@ -1999,23 +1978,23 @@ impl App {
             last_present_at: None,
             frame_interval: refresh_interval(None),
             paced_paint_at: None,
-            corner_radius,
+            corner_radius: 10.0,
             // Replaced by the config's values in `new` below.
             padding_x: 0.0,
             padding_y: 0.0,
             line_height: jetty_render::LINE_HEIGHT_DEFAULT,
             tabs: Vec::new(),
             active: 0,
-            theme_idx,
+            theme_idx: 0,
             // Placeholder; `apply_theme()` at the end of `new` recomputes it from the
             // config-resolved theme_idx. Resolved via the registry (seeded above).
-            active_theme: jetty_core::theme_at(theme_idx),
-            opacity,
+            active_theme: jetty_core::theme_at(0),
+            opacity: 1.0,
             font_logical: FONT_LOGICAL_DEFAULT,
             reflow_pending_at: None,
             reflow_deferred_by_hide: false,
             reflow_resized_at: None,
-            font_family,
+            font_family: String::new(),
             font_families: Vec::new(),
             font_scroll_offset: 0,
             // UI font defaults (overridden by config below): "" = platform sans,
@@ -2195,12 +2174,11 @@ impl App {
             pulse_anim: None,
             pulse_deferred: None,
         };
-        // Persisted user settings override the env-derived defaults (but env
-        // vars still seed the initial values above, so an explicit JETTY_* can
-        // win on a fresh config). Apply config BEFORE the first render so the
-        // window comes up already themed/sized as the user left it. The font
-        // size/family are consumed later by `resumed` when it builds the
-        // TextLayer; theme+opacity are pushed into the terminals by apply_theme.
+        // The persisted user settings (the defaults where the file has none).
+        // Apply config BEFORE the first render so the window comes up already
+        // themed/sized as the user left it. The font size/family are consumed
+        // later by `resumed` when it builds the TextLayer; theme+opacity are
+        // pushed into the terminals by apply_theme.
         let crate::config::Loaded { cfg, warnings, launch_at_login: launch_set, .. } = loaded;
         startup_warnings.extend(warnings);
         // The CHOSEN theme is remembered by name even when it can't be shown (a
