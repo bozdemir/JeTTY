@@ -977,6 +977,13 @@ pub struct Terminal {
     search_matches: Vec<Match>,
     /// Index into `search_matches` of the CURRENT match (the counter's "n").
     search_current: usize,
+    /// While a double-click selection that began on a plain-text URL is live:
+    /// `true` when the selection's START is that URL's first cell, `false` when
+    /// its END is the URL's last cell (the drag went left of it). The URL is
+    /// re-detected from that endpoint on every update — alacritty moves the
+    /// selection with scrolling output, so no stored point goes stale. Reset
+    /// by every new selection ([`Terminal::set_selection`]).
+    url_select: Option<bool>,
     /// Absolute grid-line index of the active-region top (grid `Line(0)`).
     /// Advanced by `history_size()` growth in [`Terminal::advance_piece`] /
     /// [`Terminal::flush_sync`]; the stable anchor that lets OSC 133 prompt marks
@@ -1266,6 +1273,7 @@ impl Terminal {
             search_regex: None,
             search_matches: Vec::new(),
             search_current: 0,
+            url_select: None,
             abs_top: 0,
             scrollback_limit,
             anchor_epoch: 0,
@@ -4103,7 +4111,14 @@ impl Terminal {
         let display_offset = self.term.grid().display_offset();
         let pt = viewport_to_point(display_offset, Point::new(viewport_line, Column(col)));
         let side = if left_half { Side::Left } else { Side::Right };
-        self.term.selection = Some(Selection::new(SelectionType::Simple, pt, side));
+        self.set_selection(Some(Selection::new(SelectionType::Simple, pt, side)));
+    }
+
+    /// Replace the selection. Every `selection_start*`, the clear and select-all
+    /// go through here, which ends a URL double-click drag.
+    fn set_selection(&mut self, sel: Option<Selection>) {
+        self.url_select = None;
+        self.term.selection = sel;
     }
 
     /// Start a SEMANTIC (word) selection at the given viewport cell — the
@@ -4111,10 +4126,19 @@ impl Terminal {
     /// by its default semantic escape chars (whitespace, ``,│`|:"'()[]{}<>``);
     /// [`Terminal::selection_update`] then extends it word by word. Replaces any
     /// prior selection.
+    ///
+    /// On a plain-text URL the "word" is the whole URL (`:` would otherwise
+    /// cut `https` off it): exactly the URL is selected, it stays whole while
+    /// the pointer moves inside it, and a drag past it extends word by word.
     pub fn selection_start_semantic(&mut self, viewport_line: usize, col: usize) {
         let display_offset = self.term.grid().display_offset();
         let pt = viewport_to_point(display_offset, Point::new(viewport_line, Column(col)));
-        self.term.selection = Some(Selection::new(SelectionType::Semantic, pt, Side::Left));
+        if let Some((first, last)) = self.plain_url_range(pt) {
+            self.set_selection(Some(cell_range_selection(first, last)));
+            self.url_select = Some(true);
+            return;
+        }
+        self.set_selection(Some(Selection::new(SelectionType::Semantic, pt, Side::Left)));
     }
 
     /// Update the end of the current selection to the given viewport cell.
@@ -4123,10 +4147,39 @@ impl Terminal {
     pub fn selection_update(&mut self, viewport_line: usize, col: usize, left_half: bool) {
         let display_offset = self.term.grid().display_offset();
         let pt = viewport_to_point(display_offset, Point::new(viewport_line, Column(col)));
+        if self.url_select.is_some() && self.extend_url_selection(pt) {
+            return;
+        }
         let side = if left_half { Side::Left } else { Side::Right };
         if let Some(sel) = self.term.selection.as_mut() {
             sel.update(pt, side);
         }
+    }
+
+    /// Drag a URL double-click selection to buffer point `pt`: inside the URL
+    /// it stays exactly the URL; past either end it grows from the URL by
+    /// words (alacritty's semantic boundaries). `false` when the URL is gone
+    /// (overwritten, scrolled off) — the caller then extends plainly.
+    fn extend_url_selection(&mut self, pt: Point) -> bool {
+        let Some(pin_start) = self.url_select else { return false };
+        let Some(range) = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term)) else {
+            return false;
+        };
+        let pinned = if pin_start { range.start } else { range.end };
+        let Some((first, last)) = self.plain_url_range(pinned) else {
+            self.url_select = None;
+            return false;
+        };
+        let (from, to, pin_start) = if pt < first {
+            (self.term.semantic_search_left(pt), last, false)
+        } else if pt > last {
+            (first, self.term.semantic_search_right(pt), true)
+        } else {
+            (first, last, true)
+        };
+        self.term.selection = Some(cell_range_selection(from, to));
+        self.url_select = Some(pin_start);
+        true
     }
 
     /// Convert a viewport row (0 = top of the visible grid) to its ABSOLUTE
@@ -4145,7 +4198,7 @@ impl Terminal {
     pub fn selection_start_abs(&mut self, buffer_line: i32, col: usize, left_half: bool) {
         let pt = Point::new(Line(buffer_line), Column(col));
         let side = if left_half { Side::Left } else { Side::Right };
-        self.term.selection = Some(Selection::new(SelectionType::Simple, pt, side));
+        self.set_selection(Some(Selection::new(SelectionType::Simple, pt, side)));
     }
 
     /// Update the end of the current selection to an ABSOLUTE buffer cell.
@@ -4162,12 +4215,12 @@ impl Terminal {
     /// buffer line, so a line-mode copy-mode anchor survives scrolling.
     pub fn selection_start_lines_abs(&mut self, buffer_line: i32) {
         let pt = Point::new(Line(buffer_line), Column(0));
-        self.term.selection = Some(Selection::new(SelectionType::Lines, pt, Side::Left));
+        self.set_selection(Some(Selection::new(SelectionType::Lines, pt, Side::Left)));
     }
 
     /// Clear the active selection.
     pub fn selection_clear(&mut self) {
-        self.term.selection = None;
+        self.set_selection(None);
     }
 
     /// Return the currently-selected text, or `None` if no selection is active
@@ -4214,8 +4267,36 @@ impl Terminal {
             return Some(LinkHit { uri: link.uri().to_string(), spans });
         }
 
-        // Plain-text branch: assemble the logical (unwrapped) line. A row
-        // continues onto the next when ITS last cell carries WRAPLINE.
+        // Plain-text branch: the URL in the logical line around the cell.
+        let (start_line, chars, s, e) = self.plain_url_chars(pt)?;
+        let uri: String = chars[s..e].iter().collect();
+        // Map the char range back to viewport spans, keeping only visible rows.
+        let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+        for i in s..e {
+            let term_line = start_line + (i / self.cols) as i32;
+            let c = i % self.cols;
+            if let Some(vp) = point_to_viewport(display_offset, Point::new(Line(term_line), Column(c))) {
+                if vp.line < self.rows {
+                    match spans.last_mut() {
+                        Some(sp) if sp.0 == vp.line && sp.2 + 1 == c => sp.2 = c,
+                        _ => spans.push((vp.line, c, c)),
+                    }
+                }
+            }
+        }
+        Some(LinkHit { uri, spans })
+    }
+
+    /// The plain-text URL covering buffer point `pt`, as `(first row of its
+    /// logical line, that line's chars, start, end)`: chars `start..end` are the
+    /// URL, char `i` is the cell `(first + i / cols, i % cols)`. The logical
+    /// (unwrapped) line is assembled around `pt` — a row continues onto the
+    /// next when ITS last cell carries WRAPLINE — at most
+    /// [`crate::url::MAX_WRAP_WALK`] rows each way, exactly `cols` chars per row
+    /// with wide-char spacers blanked to ' ' (same rule as `snapshot`) so cell
+    /// and char indices stay aligned.
+    fn plain_url_chars(&self, pt: Point) -> Option<(i32, Vec<char>, usize, usize)> {
+        let grid = self.term.grid();
         let last_col = Column(self.cols - 1);
         let wrapped = |l: i32| grid[Line(l)][last_col].flags.contains(Flags::WRAPLINE);
         let mut start_line = pt.line.0;
@@ -4236,9 +4317,6 @@ impl Terminal {
                 break;
             }
         }
-        // Exactly `cols` chars per row so char index i maps back to cell
-        // (start_line + i/cols, i % cols); wide-char spacers blank to ' '
-        // (same rule as `snapshot`) to keep cell/char indices aligned.
         let mut chars: Vec<char> =
             Vec::with_capacity((end_line - start_line + 1) as usize * self.cols);
         for l in start_line..=end_line {
@@ -4252,24 +4330,17 @@ impl Terminal {
                 });
             }
         }
-        let idx = (pt.line.0 - start_line) as usize * self.cols + col;
+        let idx = (pt.line.0 - start_line) as usize * self.cols + pt.column.0;
         let (s, e) = crate::url::find_url_at(&chars, idx)?;
-        let uri: String = chars[s..e].iter().collect();
-        // Map the char range back to viewport spans, keeping only visible rows.
-        let mut spans: Vec<(usize, usize, usize)> = Vec::new();
-        for i in s..e {
-            let term_line = start_line + (i / self.cols) as i32;
-            let c = i % self.cols;
-            if let Some(vp) = point_to_viewport(display_offset, Point::new(Line(term_line), Column(c))) {
-                if vp.line < self.rows {
-                    match spans.last_mut() {
-                        Some(sp) if sp.0 == vp.line && sp.2 + 1 == c => sp.2 = c,
-                        _ => spans.push((vp.line, c, c)),
-                    }
-                }
-            }
-        }
-        Some(LinkHit { uri, spans })
+        Some((start_line, chars, s, e))
+    }
+
+    /// The plain-text URL covering buffer point `pt`, as its first and last
+    /// cells (inclusive).
+    fn plain_url_range(&self, pt: Point) -> Option<(Point, Point)> {
+        let (first, _, s, e) = self.plain_url_chars(pt)?;
+        let cell = |i: usize| Point::new(Line(first + (i / self.cols) as i32), Column(i % self.cols));
+        Some((cell(s), cell(e - 1)))
     }
 
     /// Scan every visible URL / file-path / git-hash / IPv4 token for HINT MODE
@@ -4410,7 +4481,7 @@ impl Terminal {
     pub fn selection_start_lines(&mut self, viewport_line: usize) {
         let display_offset = self.term.grid().display_offset();
         let pt = viewport_to_point(display_offset, Point::new(viewport_line, Column(0)));
-        self.term.selection = Some(Selection::new(SelectionType::Lines, pt, Side::Left));
+        self.set_selection(Some(Selection::new(SelectionType::Lines, pt, Side::Left)));
     }
 
     /// Whether the terminal has bracketed paste mode enabled (`\e[?2004h`).
@@ -4444,7 +4515,7 @@ impl Terminal {
         let bottom = Point::new(Line(rows as i32 - 1), Column(cols.saturating_sub(1)));
         let mut sel = Selection::new(SelectionType::Simple, top, Side::Left);
         sel.update(bottom, Side::Right);
-        self.term.selection = Some(sel);
+        self.set_selection(Some(sel));
     }
 
     /// Set (or replace) the scrollback-search query and recompute all matches.
@@ -4655,6 +4726,13 @@ impl Terminal {
         let target = (self.rows as i32 / 2 - start.line.0).clamp(0, max);
         self.scroll_to_offset(target as usize);
     }
+}
+
+/// A Simple selection covering the cells `first..=last`.
+fn cell_range_selection(first: Point, last: Point) -> Selection {
+    let mut sel = Selection::new(SelectionType::Simple, first, Side::Left);
+    sel.update(last, Side::Right);
+    sel
 }
 
 /// Escape ASCII regex metacharacters so a user query is matched literally
@@ -5272,6 +5350,53 @@ mod tests {
             assert!(!snap2.cell(0, col).selected,
                 "cell (0, {col}) should not be selected after clear");
         }
+    }
+
+    #[test]
+    fn double_click_on_a_url_selects_the_whole_url() {
+        // `:` is a word separator, so a double-click on a URL selected
+        // `//example.com/a/b?c=1` (or just `https`) — never a usable URL.
+        let url = "https://example.com/a/b?c=1"; // cols 4..=30
+        let mut t = Terminal::new(60, 5);
+        t.feed(format!("see {url} now, foo:bar").as_bytes());
+        for col in [4, 6, 10, 30] {
+            t.selection_start_semantic(0, col);
+            assert_eq!(t.selection_text().as_deref(), Some(url), "double-click at col {col}");
+        }
+        // Pointer jitter between the clicks (motion inside the URL) keeps it.
+        t.selection_start_semantic(0, 8);
+        t.selection_update(0, 9, true);
+        t.selection_update(0, 5, false);
+        assert_eq!(t.selection_text().as_deref(), Some(url));
+        // Dragging past it extends word by word, the URL kept whole.
+        t.selection_update(0, 33, true); // in "now,"
+        assert_eq!(t.selection_text().as_deref(), Some(&*format!("{url} now")));
+        t.selection_update(0, 1, true); // back left, in "see"
+        assert_eq!(t.selection_text().as_deref(), Some(&*format!("see {url}")));
+        // Other words keep the usual separators: `:` still splits `foo:bar`.
+        t.selection_start_semantic(0, 38);
+        assert_eq!(t.selection_text().as_deref(), Some("foo"));
+        t.selection_update(0, 39, false);
+        assert_eq!(t.selection_text().as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn double_click_on_a_wrapped_url_selects_all_of_it() {
+        let url = "https://example.com/some/long/path/x";
+        let mut t = Terminal::new(20, 5);
+        t.feed(format!("go {url} ok").as_bytes());
+        t.selection_start_semantic(1, 5); // the wrapped continuation row
+        assert_eq!(t.selection_text().as_deref(), Some(url));
+        // Output scrolls it into history mid-drag: the pinned URL moves with
+        // its text, so the pointer over it (two rows up now) still means it.
+        t.feed(b"\r\nmore\r\nlines\r\n\r\n");
+        t.scroll_lines(2);
+        assert!(t.snapshot().row_text(1).starts_with("om/some"));
+        t.selection_update(1, 5, true);
+        assert_eq!(t.selection_text().as_deref(), Some(url));
+        // Past its end (onto "ok") it extends by words.
+        t.selection_update(2, 1, false);
+        assert_eq!(t.selection_text().as_deref(), Some(&*format!("{url} ok")));
     }
 
     #[test]
