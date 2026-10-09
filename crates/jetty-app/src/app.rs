@@ -11037,36 +11037,37 @@ impl App {
             width,
             height,
             &scene,
-            // Pass 3: the top bar (title pill + close ✕) over the grid.
+            // Pass 3: the top bar (title pill + close ✕) over the grid, and the
+            // bottom STATUS strip (perf HUD) when enabled — the same slim
+            // theme-derived strip as the main window; it may show the same global
+            // HUD string (built by the main window's frames). Quads, labels and
+            // the title (in the platform's proportional sans, like main tab
+            // titles) in ONE pass + submit; neither touches the grid band.
             |quad, device, queue, view, w, h| {
                 let bar = jetty_render::build_detached_bar_styled(
                     w, &title, &theme, close_hover, &mut *chrome_text, cm, &tab_deco, &bar_opts,
                 );
-                quad.render(device, queue, view, w, h, &bar.quads);
-                if !bar.labels.is_empty() {
-                    let _ = chrome_text.render_overlays(device, queue, view, w, h, &bar.labels);
+                let (mut quads, mut labels) = (bar.quads, bar.labels);
+                if status_h > 0.0 {
+                    let strip = jetty_render::build_status_strip(
+                        w, h as f32 - status_h, status_h, perf_label.as_deref(), &theme,
+                        &mut *chrome_text, cm,
+                    );
+                    quads.push(strip.quad);
+                    labels.extend(strip.label);
                 }
-                if !bar.title_labels.is_empty() {
-                    // Title in the platform's proportional sans, like main tab titles.
-                    let _ = chrome_text.render_overlays_sans(device, queue, view, w, h, &bar.title_labels);
-                }
+                let _ = chrome_text.render_chrome(
+                    device,
+                    queue,
+                    view,
+                    w,
+                    h,
+                    quad,
+                    &quads,
+                    &[(&labels, false), (&bar.title_labels, true)],
+                );
             },
         );
-        // Pass 5: bottom STATUS strip (perf HUD) when enabled — the same slim
-        // theme-derived strip as the main window; it may show the same global
-        // HUD string (built by the main window's frames).
-        if status_h > 0.0 {
-            let strip = jetty_render::build_status_strip(
-                width, height as f32 - status_h, status_h, perf_label.as_deref(), &theme,
-                &mut *chrome_text, cm,
-            );
-            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[strip.quad]);
-            if let Some(label) = strip.label {
-                let _ = chrome_text.render_overlays(
-                    &gpu.device, &gpu.queue, scene_view, width, height, &[label],
-                );
-            }
-        }
         // Pass 5b: Shift+drag hint toast — the main window's Pass 4c pill,
         // positioned above the status strip (the detached bar is always on top,
         // so no bottom-bar / slide offset terms apply). Drawn only on frames
@@ -15192,6 +15193,26 @@ impl ApplicationHandler<AppEvent> for App {
                         copy_mode_active,
                         copy_mode_ui,
                     };
+                    // The bottom STATUS BAR (the perf HUD, OFF the tab row): a slim
+                    // strip at the very bottom with the perf metrics right-aligned,
+                    // only when show_perf_hud reserved the room (status_h > 0). It
+                    // rides the dropdown slide like the rest, and is drawn in the
+                    // tab bar's pass below (neither touches the grid band, so the
+                    // cursor/scrollbar pass between them never overlapped it).
+                    let mut chrome_quads = bar.quads;
+                    let mut chrome_labels = bar.labels;
+                    if status_h > 0.0 {
+                        if let Some(perf) = perf_string.as_deref() {
+                            let sy = (height as f32 - status_h) + slide_y_offset;
+                            // Right-aligned, measured, ellipsized to the window
+                            // (shared with detached windows and jetty-shot).
+                            let strip = jetty_render::build_status_strip(
+                                width, sy, status_h, Some(perf), &theme, &mut *chrome_text, cm,
+                            );
+                            chrome_quads.push(strip.quad);
+                            chrome_labels.extend(strip.label);
+                        }
+                    }
                     render_grid_scene(
                         gpu,
                         text,
@@ -15204,43 +15225,24 @@ impl ApplicationHandler<AppEvent> for App {
                         height,
                         &scene,
                         // Pass 3: the tab bar (already translated to its actual y
-                        // + dropdown slide above) over the grid.
+                        // + dropdown slide above) and the status strip over the
+                        // grid — quads, labels and titles in ONE pass + submit.
+                        // Chrome: the UI-font layer, so the bar text never scales
+                        // with the TERMINAL font; tab TITLES in the platform's
+                        // proportional sans, the ×/+/overflow/HUD/controls mono.
                         |quad, device, queue, view, w, h| {
-                            quad.render(device, queue, view, w, h, &bar.quads);
-                            if !bar.labels.is_empty() {
-                                // Chrome: the UI-font layer, so the bar text never
-                                // scales with the TERMINAL font; the bar itself is
-                                // sized by the same ChromeMetrics as this text.
-                                let _ = chrome_text.render_overlays(device, queue, view, w, h, &bar.labels);
-                            }
-                            if !bar.title_labels.is_empty() {
-                                // Tab TITLES in the platform's proportional sans;
-                                // the ×/+/overflow/HUD/controls stay monospace.
-                                let _ = chrome_text.render_overlays_sans(device, queue, view, w, h, &bar.title_labels);
-                            }
+                            let _ = chrome_text.render_chrome(
+                                device,
+                                queue,
+                                view,
+                                w,
+                                h,
+                                quad,
+                                &chrome_quads,
+                                &[(&chrome_labels, false), (&bar.title_labels, true)],
+                            );
                         },
                     );
-
-                    // Pass 4a: bottom STATUS BAR (the perf HUD, OFF the tab row).
-                    // A slim strip at the very bottom with the perf metrics
-                    // right-aligned. Drawn only when show_perf_hud reserved the room
-                    // (status_h > 0). It rides the dropdown slide like the rest.
-                    if status_h > 0.0 {
-                        if let Some(perf) = perf_string.as_deref() {
-                            let sy = (height as f32 - status_h) + slide_y_offset;
-                            // Right-aligned, measured, ellipsized to the window
-                            // (shared with detached windows and jetty-shot).
-                            let strip = jetty_render::build_status_strip(
-                                width, sy, status_h, Some(perf), &theme, &mut *chrome_text, cm,
-                            );
-                            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[strip.quad]);
-                            if let Some(label) = strip.label {
-                                let _ = chrome_text.render_overlays(
-                                    &gpu.device, &gpu.queue, scene_view, width, height, &[label],
-                                );
-                            }
-                        }
-                    }
                     // Pass 4c: Shift+drag hint toast — a brief, centered pill shown
                     // when the user drags (no Shift) inside a mouse-reporting app, so
                     // they discover the Shift+drag-to-select gesture. Throttled.

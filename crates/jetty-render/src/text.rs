@@ -769,6 +769,23 @@ fn pack_grid<'a>(
     PackedGrid { keys, row_hashes, fallback, graphemes, clusters, builtin, deco: deco_hasher.finish(), order }
 }
 
+/// A render pass over `view` that keeps its contents (`LoadOp::Load`).
+fn load_pass<'e>(encoder: &'e mut wgpu::CommandEncoder, view: &wgpu::TextureView, label: &'static str) -> wgpu::RenderPass<'e> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
 pub struct TextLayer {
     font_system: FontSystem,
     swash: SwashCache,
@@ -1979,8 +1996,38 @@ impl TextLayer {
         // by glyphon before they ever reach the GPU.
         clip_y: Option<(i32, i32)>,
     ) -> Result<(), PrepareError> {
-        if labels.is_empty() {
+        if !self.prepare_overlay_sets(device, queue, width, height, &[(labels, is_title)], clip_y)? {
             return Ok(());
+        }
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("overlay-text"),
+        });
+        {
+            let mut pass = load_pass(&mut encoder, view, "overlay-text-pass");
+            self.draw_prepared_overlays(&mut pass);
+        }
+        queue.submit(Some(encoder.finish()));
+        // Unpin this frame's glyphs so the next prepare can LRU-evict (see render_to).
+        self.atlas.trim();
+        Ok(())
+    }
+
+    /// Glyphon-prepare every label of `sets` — `(labels, is_title)` pairs, each
+    /// in its family (see `render_overlays_inner`) — for ONE draw
+    /// ([`Self::draw_prepared_overlays`]). Returns whether there is anything to
+    /// draw. Labels are shaped once and cached by content (`OverlayCache`).
+    #[allow(clippy::type_complexity)]
+    fn prepare_overlay_sets(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        sets: &[(&[(String, f32, f32, [u8; 3])], bool)],
+        clip_y: Option<(i32, i32)>,
+    ) -> Result<bool, PrepareError> {
+        if sets.iter().all(|(labels, _)| labels.is_empty()) {
+            return Ok(false);
         }
 
         let (clip_top, clip_bottom) = clip_y.unwrap_or((0, height as i32));
@@ -2003,48 +2050,53 @@ impl TextLayer {
         let mono_fallback = self.font_family.clone();
         let metrics = self.metrics;
         let frame = self.overlays.next_frame();
-        for (text, _x, _y, _rgb) in labels {
-            // Clipped to MAX_LABEL_CHARS: labels can carry program-controlled text
-            // (a multi-MB OSC title), and shaping that whole per frame is a DoS —
-            // nothing past the clip could be visible anyway. It also bounds every
-            // cached key.
-            let (text, _) = crate::chrome::clip_head(text);
-            let font_system = &mut self.font_system;
-            self.overlays.ensure(is_title, text, height, frame, font_system, |font_system| {
-                let mut buf = Buffer::new(font_system, metrics);
-                buf.set_size(font_system, None, Some(height as f32));
-                // A `Named` UI family unifies ALL chrome onto it; the `Sans` default
-                // keeps today's split (titles → sans, rest → mono Nerd Font) so the
-                // default look — including symbol glyphs — is byte-identical.
-                let attrs = Attrs::new().family(ui_family.as_family(is_title, &mono_fallback));
-                // Shaping::Advanced: chrome text carries user/shell-controlled
-                // strings (OSC tab titles, search queries, rename buffers), so it
-                // needs cosmic-text's font fallback — under Basic every glyph the
-                // chrome family lacks (emoji, CJK, symbols on a custom UI font)
-                // rendered as a tofu box. Chrome is proportional overlay text with
-                // no grid-alignment constraint, so Advanced is safe here.
-                buf.set_text(font_system, text, &attrs, Shaping::Advanced, None);
-                buf
-            });
+        for &(labels, is_title) in sets {
+            for (text, _x, _y, _rgb) in labels {
+                // Clipped to MAX_LABEL_CHARS: labels can carry program-controlled
+                // text (a multi-MB OSC title), and shaping that whole per frame is
+                // a DoS — nothing past the clip could be visible anyway. It also
+                // bounds every cached key.
+                let (text, _) = crate::chrome::clip_head(text);
+                let font_system = &mut self.font_system;
+                self.overlays.ensure(is_title, text, height, frame, font_system, |font_system| {
+                    let mut buf = Buffer::new(font_system, metrics);
+                    buf.set_size(font_system, None, Some(height as f32));
+                    // A `Named` UI family unifies ALL chrome onto it; the `Sans`
+                    // default keeps today's split (titles → sans, rest → mono Nerd
+                    // Font) so the default look — including symbol glyphs — is
+                    // byte-identical.
+                    let attrs = Attrs::new().family(ui_family.as_family(is_title, &mono_fallback));
+                    // Shaping::Advanced: chrome text carries user/shell-controlled
+                    // strings (OSC tab titles, search queries, rename buffers), so
+                    // it needs cosmic-text's font fallback — under Basic every glyph
+                    // the chrome family lacks (emoji, CJK, symbols on a custom UI
+                    // font) rendered as a tofu box. Chrome is proportional overlay
+                    // text with no grid-alignment constraint, so Advanced is safe.
+                    buf.set_text(font_system, text, &attrs, Shaping::Advanced, None);
+                    buf
+                });
+            }
         }
         // Keep the cache bounded; never evicts a label drawn this frame.
         self.overlays.evict(frame);
 
         // Second pass: build TextAreas with shared refs (no mutation of font_system
-        // needed). Repeated labels (a "×" per tab) share one buffer.
-        let mut areas: Vec<TextArea> = Vec::with_capacity(labels.len());
-        for (text, x, y, rgb) in labels {
-            let (text, _) = crate::chrome::clip_head(text);
-            let Some(buffer) = self.overlays.get(is_title, text) else { continue };
-            areas.push(TextArea {
-                buffer,
-                left: *x,
-                top: *y,
-                scale: 1.0,
-                bounds: win_bounds,
-                default_color: Color::rgb(rgb[0], rgb[1], rgb[2]),
-                custom_glyphs: &[],
-            });
+        // needed), set by set. Repeated labels (a "×" per tab) share one buffer.
+        let mut areas: Vec<TextArea> = Vec::with_capacity(sets.iter().map(|(l, _)| l.len()).sum());
+        for &(labels, is_title) in sets {
+            for (text, x, y, rgb) in labels {
+                let (text, _) = crate::chrome::clip_head(text);
+                let Some(buffer) = self.overlays.get(is_title, text) else { continue };
+                areas.push(TextArea {
+                    buffer,
+                    left: *x,
+                    top: *y,
+                    scale: 1.0,
+                    bounds: win_bounds,
+                    default_color: Color::rgb(rgb[0], rgb[1], rgb[2]),
+                    custom_glyphs: &[],
+                });
+            }
         }
 
         self.viewport.update(queue, Resolution { width, height });
@@ -2064,35 +2116,57 @@ impl TextLayer {
             &mut self.swash,
             rasterize_builtin,
         )?;
+        Ok(true)
+    }
 
+    /// Record the labels of the last [`Self::prepare_overlay_sets`].
+    fn draw_prepared_overlays(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if let Err(e) = self.renderer.render(&self.atlas, &self.viewport, pass) {
+            eprintln!("jetty: overlay text render error: {e:?}");
+        }
+    }
+
+    /// Draw a chrome layer — `quads` under every label of `sets` (`(labels,
+    /// is_title)` pairs: each label in the family `render_overlays` (false) or
+    /// `render_overlays_sans` (true) uses) — over `view` in ONE render pass and
+    /// ONE submit, instead of a pass + submit per layer (each costs tens of µs of
+    /// CPU and ~65 allocations). Quads first, then the labels set by set: the
+    /// same stacking as drawing them one after another, as long as no quad covers
+    /// a label of an earlier set.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn render_chrome(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        quad: &mut crate::quad::QuadLayer,
+        quads: &[crate::quad::Rect],
+        sets: &[(&[(String, f32, f32, [u8; 3])], bool)],
+    ) -> Result<(), PrepareError> {
+        let quad_count = quad.upload(device, queue, width, height, quads);
+        let text = self.prepare_overlay_sets(device, queue, width, height, sets, None);
+        let has_text = matches!(text, Ok(true));
+        if quad_count == 0 && !has_text {
+            return text.map(|_| ());
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("overlay-text"),
+            label: Some("chrome"),
         });
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("overlay-text-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            if let Err(e) = self.renderer.render(&self.atlas, &self.viewport, &mut pass) {
-                eprintln!("jetty: overlay text render error: {e:?}");
+            let mut pass = load_pass(&mut encoder, view, "chrome-pass");
+            quad.draw_uploaded(&mut pass, quad_count);
+            if has_text {
+                self.draw_prepared_overlays(&mut pass);
             }
         }
         queue.submit(Some(encoder.finish()));
-        // Unpin this frame's glyphs so the next prepare can LRU-evict (see render_to).
-        self.atlas.trim();
-        Ok(())
+        if has_text {
+            // Unpin this frame's glyphs so the next prepare can LRU-evict.
+            self.atlas.trim();
+        }
+        text.map(|_| ())
     }
 
     /// Render NON-TITLE chrome labels (menu, status/perf bar, panel, help,
@@ -2881,5 +2955,98 @@ mod tests {
             let drift = xs[99] - 99.0 * cell_w;
             assert!(drift * sign > 5.0, "{family} @ {requested}px unrounded: col 99 drift {drift}");
         }
+    }
+
+    /// GPU: `render_chrome` (quads + mono labels + titles in ONE pass) draws
+    /// exactly the pixels of the pass-per-layer sequence it replaces — the main
+    /// window's tab bar + status strip. `#[ignore]`: needs a GPU adapter (the
+    /// low-power one). Run: `cargo test -p jetty-render chrome_in_one -- --ignored`.
+    #[test]
+    #[ignore]
+    fn chrome_in_one_pass_matches_a_pass_per_layer() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let (w, h) = (640u32, 200u32);
+        let cm = crate::ChromeMetrics::new(1.0, crate::UI_FONT_BASE);
+        let theme = jetty_core::Theme::by_name("catppuccin_mocha");
+        let tabs: Vec<(String, bool)> = vec![("burak@omen: ~".into(), true), ("cargo build".into(), false)];
+        let deco = vec![crate::TabDeco::default(); tabs.len()];
+        let render = |one_pass: bool| -> Vec<u8> {
+            let mut chrome = TextLayer::new_with_family(&device, &queue, format, crate::UI_FONT_BASE, "MesloLGS NF");
+            let mut quad = crate::quad::QuadLayer::new(&device, format);
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("chrome-test"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            // Two frames: the second draws from the shaped-label cache.
+            for _ in 0..2 {
+                quad.render_clear(&device, &queue, &view, w, h, &[], wgpu::Color::BLACK);
+                let bar = crate::build_tab_bar_styled(
+                    w, &tabs, &theme, None, crate::CtrlHover::None, None, &mut chrome, cm, &deco,
+                    &crate::TabBarOpts::default(),
+                );
+                let strip = crate::build_status_strip(
+                    w, h as f32 - cm.status_h(), cm.status_h(), Some("⚡ idle · 0% CPU · 0 MB/s"), &theme,
+                    &mut chrome, cm,
+                );
+                if one_pass {
+                    let mut quads = bar.quads;
+                    quads.push(strip.quad);
+                    let mut labels = bar.labels;
+                    labels.extend(strip.label);
+                    chrome
+                        .render_chrome(&device, &queue, &view, w, h, &mut quad, &quads, &[(&labels, false), (&bar.title_labels, true)])
+                        .unwrap();
+                } else {
+                    quad.render(&device, &queue, &view, w, h, &bar.quads);
+                    chrome.render_overlays(&device, &queue, &view, w, h, &bar.labels).unwrap();
+                    chrome.render_overlays_sans(&device, &queue, &view, w, h, &bar.title_labels).unwrap();
+                    quad.render(&device, &queue, &view, w, h, &[strip.quad]);
+                    chrome.render_overlays(&device, &queue, &view, w, h, &strip.label.into_iter().collect::<Vec<_>>()).unwrap();
+                }
+            }
+            let row = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (row * h) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            enc.copy_texture_to_buffer(
+                tex.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            queue.submit(Some(enc.finish()));
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let data = buf.slice(..).get_mapped_range().to_vec();
+            data
+        };
+        let (layered, one) = (render(false), render(true));
+        assert!(layered.iter().any(|&b| b != 0), "the chrome drew nothing");
+        assert!(layered == one, "one-pass chrome differs from the pass-per-layer draw");
     }
 }

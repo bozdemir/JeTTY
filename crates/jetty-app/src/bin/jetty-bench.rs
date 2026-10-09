@@ -686,9 +686,12 @@ fn bench_chrome(
     let opts = jetty_render::TabBarOpts::default();
     let status_h = cm.status_h();
     let n = 300usize;
-    let mut cpu = Vec::with_capacity(n);
-    let mut allocs = 0u64;
-    for k in 0..n + 20 {
+    // [a pass + submit per layer (bar quads, labels, titles, strip quad, strip
+    // label), ONE pass for all of it (`render_chrome`)], interleaved frame by frame.
+    let mut cpu = [Vec::with_capacity(n), Vec::with_capacity(n)];
+    let mut allocs = [0u64; 2];
+    for k in 0..2 * n + 40 {
+        let variant = k % 2;
         let hud = format!("⚡ {:.1} ms · {} fps · {}% CPU · 0 MB/s", 16.0 + (k % 7) as f32 * 0.1, 60 - k % 3, k % 5);
         let t = Instant::now();
         let a0 = alloc_counts().0;
@@ -704,9 +707,6 @@ fn bench_chrome(
             &deco,
             &opts,
         );
-        quad.render(device, queue, &view, width, height, &bar.quads);
-        let _ = chrome.render_overlays(device, queue, &view, width, height, &bar.labels);
-        let _ = chrome.render_overlays_sans(device, queue, &view, width, height, &bar.title_labels);
         let strip = jetty_render::build_status_strip(
             width,
             height as f32 - status_h,
@@ -716,24 +716,47 @@ fn bench_chrome(
             &mut chrome,
             cm,
         );
-        quad.render(device, queue, &view, width, height, &[strip.quad]);
-        if let Some(label) = strip.label {
-            let _ = chrome.render_overlays(device, queue, &view, width, height, &[label]);
+        if variant == 0 {
+            quad.render(device, queue, &view, width, height, &bar.quads);
+            let _ = chrome.render_overlays(device, queue, &view, width, height, &bar.labels);
+            let _ = chrome.render_overlays_sans(device, queue, &view, width, height, &bar.title_labels);
+            quad.render(device, queue, &view, width, height, &[strip.quad]);
+            if let Some(label) = strip.label {
+                let _ = chrome.render_overlays(device, queue, &view, width, height, &[label]);
+            }
+        } else {
+            let mut quads = bar.quads;
+            quads.push(strip.quad);
+            let mut labels = bar.labels;
+            labels.extend(strip.label);
+            let _ = chrome.render_chrome(
+                device,
+                queue,
+                &view,
+                width,
+                height,
+                &mut quad,
+                &quads,
+                &[(&labels, false), (&bar.title_labels, true)],
+            );
         }
         // The first frames shape and cache; measure the steady state.
-        if k >= 20 {
-            cpu.push(t.elapsed().as_secs_f32() * 1000.0);
-            allocs += alloc_counts().0 - a0;
+        if k >= 40 {
+            cpu[variant].push(t.elapsed().as_secs_f32() * 1000.0);
+            allocs[variant] += alloc_counts().0 - a0;
         }
         device.poll(wgpu::PollType::wait_indefinitely())?;
     }
-    let mean = cpu.iter().sum::<f32>() / n as f32;
-    cpu.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    println!(
-        "chrome        tab bar (4 tabs) + status HUD, {width}x{height}: cpu {mean:.3} ms (p50 {:.3}) | {:.0} allocs/frame",
-        percentile(&cpu, 50.0),
-        allocs as f64 / n as f64
-    );
+    for (variant, label) in ["pass per layer", "one pass"].iter().enumerate() {
+        let v = &mut cpu[variant];
+        let mean = v.iter().sum::<f32>() / v.len() as f32;
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        println!(
+            "chrome        tab bar (4 tabs) + status HUD, {width}x{height}, {label:<14}: cpu {mean:.3} ms (p50 {:.3}) | {:.0} allocs/frame",
+            percentile(v, 50.0),
+            allocs[variant] as f64 / v.len() as f64
+        );
+    }
     Ok(())
 }
 
