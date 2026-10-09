@@ -783,6 +783,9 @@ struct CmdBlock {
     prompt: i64,
     /// OSC 133 B — input start (refinement; unused by the two shipped features).
     input: Option<i64>,
+    /// Column of that B: where the command line starts on the `input` row
+    /// (the leftmost B on that row — see the `B` arm of `bind_mark`).
+    input_col: usize,
     /// OSC 133 C — command-output start.
     output: Option<i64>,
     /// OSC 133 D exit code (None = no/empty/non-numeric code → unknown).
@@ -2911,6 +2914,33 @@ impl Terminal {
         })
     }
 
+    /// Whether NOTHING was typed on block `m`'s command line before a `C` at
+    /// absolute line `c_line`, column `c_col`: an Enter (or ^C) on an empty
+    /// prompt. p10k and iTerm2-style integrations still report that as a
+    /// command — `C;` + `D;<$?>`, with `$?` the PREVIOUS command's status.
+    /// Only claimed when provable: `m` is the open block and has a `B`, the `C`
+    /// sits on a LATER row (as after every real Enter) at most
+    /// [`CLEAN_PROMPT_MAX_ROWS`] below it, and every cell from the `B` up to the
+    /// `C` is blank. Anything else is a command, as before.
+    fn command_line_blank(&self, m: &CmdBlock, c_line: i64, c_col: usize) -> bool {
+        let Some(b_line) = m.input else { return false };
+        if m.finished || m.output.is_some() || c_line <= b_line || c_line - b_line > CLEAN_PROMPT_MAX_ROWS {
+            return false;
+        }
+        let grid = self.term.grid();
+        let top = grid.topmost_line().0 as i64;
+        (b_line..=c_line).all(|abs| {
+            let l = abs - self.abs_top;
+            if l < top || l >= self.rows as i64 {
+                return false;
+            }
+            let row = &grid[Line(l as i32)];
+            let from = if abs == b_line { m.input_col.min(self.cols) } else { 0 };
+            let to = if abs == c_line { c_col.min(self.cols) } else { self.cols };
+            (from..to).all(|c| matches!(row[Column(c)].c, ' ' | '\0'))
+        })
+    }
+
     /// Record an OSC 133 mark for the given sub-command letter (and D's exit
     /// code). Reads the cursor's absolute line immediately after the terminator
     /// has been advanced. No-op on the alt screen (OSC 133 inside a TUI is
@@ -2961,6 +2991,7 @@ impl Terminal {
                 self.push_mark(CmdBlock {
                     prompt: abs,
                     input: None,
+                    input_col: 0,
                     output: None,
                     exit: None,
                     finished: false,
@@ -2970,21 +3001,38 @@ impl Terminal {
                 self.prune_marks(history);
             }
             b'B' => {
+                let col = self.term.grid().cursor.point.column.0;
                 if let Some(last) = self.marks.back_mut() {
+                    // The leftmost B on a row wins: an integration that also ends
+                    // a RIGHT prompt with B (p10k under Warp) must not move the
+                    // command line's start past the typed command.
+                    if last.input != Some(abs) || col < last.input_col {
+                        last.input_col = col;
+                    }
                     last.input = Some(abs);
                 }
             }
             b'C' => {
+                let col = self.term.grid().cursor.point.column.0;
+                let blank = self.marks.back().is_some_and(|m| self.command_line_blank(m, abs, col));
                 if let Some(last) = self.marks.back_mut() {
                     last.output = Some(abs);
+                    // Nothing typed, nothing ran: close the block WITHOUT an exit
+                    // code, so the `D` that follows marks nothing failed.
+                    last.finished |= blank;
                 }
-                // Command START: stamp the monotonic clock so `D` can compute a
-                // duration. One `Instant::now()`, once per command, on the
-                // already-off-hot-path OSC-133 scanner (never per byte).
-                let now = std::time::Instant::now();
-                match self.cur_cmd.as_mut() {
-                    Some(c) => c.started_at = Some(now),
-                    None => self.cur_cmd = Some(OpenCmd { prompt: abs, started_at: Some(now) }),
+                if blank {
+                    // …and completes nothing (notification, pulse, tab badge).
+                    self.cur_cmd = None;
+                } else {
+                    // Command START: stamp the monotonic clock so `D` can compute
+                    // a duration. One `Instant::now()`, once per command, on the
+                    // already-off-hot-path OSC-133 scanner (never per byte).
+                    let now = std::time::Instant::now();
+                    match self.cur_cmd.as_mut() {
+                        Some(c) => c.started_at = Some(now),
+                        None => self.cur_cmd = Some(OpenCmd { prompt: abs, started_at: Some(now) }),
+                    }
                 }
                 // A command ran: the resize clean-prompt wipe must never fire again.
                 self.saw_command_output = true;
@@ -4898,8 +4946,15 @@ mod tests {
             state ^= state << 17;
             state % m
         };
-        let block =
-            |prompt: i64| CmdBlock { prompt, input: None, output: None, exit: None, finished: true, redraws: true };
+        let block = |prompt: i64| CmdBlock {
+            prompt,
+            input: None,
+            input_col: 0,
+            output: None,
+            exit: None,
+            finished: true,
+            redraws: true,
+        };
         let mut fast_path_hits = 0;
         for _ in 0..300 {
             let mut t = Terminal::new(80, 24);
@@ -6981,6 +7036,75 @@ mod tests {
         t.feed(b"\x1b]133;A\x07");
         t.feed(b"\x1b]133;A\x07"); // same line, duplicate
         assert_eq!(t.marks.len(), 1, "duplicate A on the same line is coalesced");
+    }
+
+    /// What powerlevel10k (`POWERLEVEL9K_TERM_SHELL_INTEGRATION=true`, two-line
+    /// prompt, transient prompt) prints — recorded from a real zsh, SGR trimmed.
+    const P10K_PROMPT: &[u8] =
+        b"\x1b]133;A\x07\r\n\r\n\x1b[A\xe2\x95\xad\xe2\x94\x80 ~\r\n\xe2\x95\xb0\xe2\x94\x80 \x1b]133;B\x07";
+
+    /// Enter on [`P10K_PROMPT`] with `cmd` typed: the transient prompt redraws
+    /// both lines as `❯ <cmd>`, then the newline.
+    fn p10k_accept(cmd: &str) -> Vec<u8> {
+        format!("\r\r\x1b[A\x1b[J\x1b]133;A\x07\u{276f} \x1b]133;B\x07{cmd}\x1b[K\r\r\n").into_bytes()
+    }
+
+    /// zsh's PROMPT_SP at 40 columns: `%` + padding, then back to column 0.
+    fn p10k_prompt_sp() -> Vec<u8> {
+        format!("\x1b[7m%\x1b[0m{}\r \r", " ".repeat(39)).into_bytes()
+    }
+
+    #[test]
+    fn an_empty_enter_is_not_a_command_even_when_the_shell_reports_one() {
+        // p10k (like iTerm2's own script) answers an empty Enter with `C;` and
+        // `D;<$?>` — `$?` still being the PREVIOUS command's status — so every
+        // empty Enter after a failure drew another failed marker (and pulsed).
+        // Nothing was typed between the prompt's B and the C: no command ran.
+        let mut t = Terminal::new(40, 24);
+        t.feed(P10K_PROMPT);
+        t.feed(b"false");
+        t.feed(&p10k_accept("false"));
+        t.feed(b"\x1b]133;C;\x07"); // preexec
+        t.feed(&p10k_prompt_sp());
+        t.feed(b"\x1b]133;D;1\x07"); // precmd: false failed
+        t.feed(P10K_PROMPT);
+        let failed = t.failed_prompt_rows();
+        assert_eq!(failed.len(), 1, "premise: `false` is marked failed");
+        for _ in 0..2 {
+            // Empty Enter: no preexec — precmd sends `C;` + the stale `D;1`.
+            t.feed(&p10k_accept(""));
+            t.feed(&p10k_prompt_sp());
+            t.feed(b"\x1b]133;C;\x07\x1b]133;D;1\x07");
+            t.feed(P10K_PROMPT);
+        }
+        assert_eq!(t.failed_prompt_rows(), failed, "only the `false` prompt is marked failed");
+        let done = t.take_completions();
+        assert_eq!(done.len(), 1, "only `false` completed: {done:?}");
+        assert_eq!(done[0].exit_code, Some(1));
+        assert!(!t.command_running());
+        // A command typed on the same prompt still counts, whatever ran before.
+        t.feed(b"true");
+        t.feed(&p10k_accept("true"));
+        t.feed(b"\x1b]133;C;\x07");
+        t.feed(&p10k_prompt_sp());
+        t.feed(b"\x1b]133;D;0\x07");
+        t.feed(P10K_PROMPT);
+        let done = t.take_completions();
+        assert_eq!(done.len(), 1, "`true` completed: {done:?}");
+        assert_eq!(done[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn a_right_prompt_b_mark_never_hides_the_typed_command() {
+        // An integration that also ends a right prompt with B (p10k does so for
+        // Warp) puts a second B at the far right of the input line: the command
+        // typed LEFT of it must still count — the leftmost B on a row wins.
+        let mut t = Terminal::new(40, 10);
+        t.feed(b"\x1b]133;A\x07\xe2\x9d\xaf \x1b]133;B\x07"); // left prompt `❯ `
+        t.feed(b"\x1b[36G12:00\x1b]133;B\x07\x1b[3G"); // right prompt, cursor back
+        t.feed(b"false\r\n\x1b]133;C\x07\x1b]133;D;1\x07");
+        assert_eq!(t.failed_prompt_rows(), vec![0], "the failed command keeps its marker");
+        assert_eq!(t.take_completions().len(), 1);
     }
 
     // ── OSC 133 command-completion event (v0.15 Run & Notify) ─────────────────
