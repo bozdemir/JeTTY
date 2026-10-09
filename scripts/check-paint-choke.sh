@@ -4,8 +4,9 @@
 #
 # Asserts that NO raw `.request_redraw()` call survives in the MIGRATEABLE
 # A/B/C/E producer sites (input / PTY output / resize / overlay+chrome / lifecycle
-# paints). Every such paint MUST route through one of the auditable per-surface
-# chokes instead:
+# paints) anywhere in crates/jetty-app/src — every module, not only app.rs and
+# detached.rs, so a raw redraw in a new module is caught too. Every such paint
+# MUST route through one of the auditable per-surface chokes instead:
 #
 #     App::request_main_paint(&self)        -> main window
 #     App::request_settings_paint(&self)    -> settings window
@@ -19,7 +20,8 @@
 # through any wrapper risks a dropped frame across the macOS Wait/Poll seam.
 #
 # EXPLICIT WHITELIST — the only raw `.request_redraw()` calls allowed to remain
-# (each verified by CONTEXT, not by line number, so the check survives edits):
+# (each verified by CONTEXT, not by line number, so the check survives edits);
+# every other module may have none:
 #
 #   app.rs
 #     1. fn request_main_paint     — the main choke DEFINITION
@@ -34,7 +36,8 @@
 #     5. dock re-assert  — guarded by `pending_dock_frames > 0`
 #     6. center re-assert — guarded by `pending_center_frames > 0`
 #     7. settings-window-open first-frame nudge — a bare local `window` binding
-#        (in `open_settings`, right before `self.settings_window = Some(window)`)
+#        (in `toggle_settings_window`, right before
+#        `self.settings_window = Some(window)`)
 #   detached.rs
 #     8. fn request_paint          — the detached choke DEFINITION
 #    10. DetachedWindow::new first-frame nudge — a bare local `window` binding
@@ -47,8 +50,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python3 - "$ROOT" <<'PY'
 import re, sys, os
 root = sys.argv[1]
-app = os.path.join(root, "crates/jetty-app/src/app.rs")
-det = os.path.join(root, "crates/jetty-app/src/detached.rs")
+src = os.path.join(root, "crates/jetty-app/src")
 
 def fn_range(lines, sig):
     start = next(i for i,l in enumerate(lines) if l.startswith(sig))
@@ -59,61 +61,66 @@ CALL = re.compile(r"\.request_redraw\(\s*\)")
 offenders = []
 
 # ---------- app.rs ----------
-lines = open(app).read().split("\n")
-main_s, main_e   = fn_range(lines, "    fn request_main_paint(")
-set_s,  set_e    = fn_range(lines, "    fn request_settings_paint(")
-atw_s,  atw_e    = fn_range(lines, "    fn about_to_wait(")
+def app_rule(lines):
+    main_s, main_e   = fn_range(lines, "    fn request_main_paint(")
+    set_s,  set_e    = fn_range(lines, "    fn request_settings_paint(")
+    atw_s,  atw_e    = fn_range(lines, "    fn about_to_wait(")
 
-def allowed_app(i):
-    l = lines[i]; s = l.strip()
-    prev = lines[i-1].strip() if i>0 else ""
-    # whitelist 1/2: choke definitions
-    if main_s <= i < main_e or set_s <= i < set_e:
-        return True
-    # whitelist 3: entire about_to_wait
-    if atw_s <= i < atw_e:
-        return True
-    # whitelist 7 / 10-style: bare local `window` binding (window-open nudge).
-    # NOTE (scoped-grep limitation): this rule is NAME-based, not context-based —
-    # a future producer that happens to bind a local `window` and calls
-    # `window.request_redraw();` would evade the choke here. The tripwire COUNT
-    # test + code review are the backstop; keep the local-`window` name reserved
-    # for the two window-open nudges (items 7, 10).
-    if re.match(r"^window\.request_redraw\(\);$", s):
-        return True
-    # whitelist 5/6: dock / center re-assert
-    if "pending_dock_frames > 0" in prev or "pending_center_frames > 0" in prev:
-        return True
-    return False
-
-for i,l in enumerate(lines):
-    if not CALL.search(l): continue
-    s = l.strip()
-    if s.startswith("//") or s.startswith("///") or s.startswith("*"): continue  # comment mention
-    if not allowed_app(i):
-        offenders.append(f"app.rs:{i+1}: {s}")
+    def allowed_app(i):
+        l = lines[i]; s = l.strip()
+        prev = lines[i-1].strip() if i>0 else ""
+        # whitelist 1/2: choke definitions
+        if main_s <= i < main_e or set_s <= i < set_e:
+            return True
+        # whitelist 3: entire about_to_wait
+        if atw_s <= i < atw_e:
+            return True
+        # whitelist 7 / 10-style: bare local `window` binding (window-open nudge).
+        # NOTE (scoped-grep limitation): this rule is NAME-based, not context-based —
+        # a future producer that happens to bind a local `window` and calls
+        # `window.request_redraw();` would evade the choke here. The tripwire COUNT
+        # test + code review are the backstop; keep the local-`window` name reserved
+        # for the two window-open nudges (items 7, 10).
+        if re.match(r"^window\.request_redraw\(\);$", s):
+            return True
+        # whitelist 5/6: dock / center re-assert
+        if "pending_dock_frames > 0" in prev or "pending_center_frames > 0" in prev:
+            return True
+        return False
+    return allowed_app
 
 # ---------- detached.rs ----------
-dlines = open(det).read().split("\n")
-rp_s, rp_e = fn_range(dlines, "    pub(crate) fn request_paint(")
+def det_rule(dlines):
+    rp_s, rp_e = fn_range(dlines, "    pub(crate) fn request_paint(")
 
-def allowed_det(i):
-    l = dlines[i]; s = l.strip()
-    prev = dlines[i-1].strip() if i>0 else ""
-    # whitelist 8: choke definition
-    if rp_s <= i < rp_e:
-        return True
-    # whitelist 10: bare local `window` nudge in the constructor
-    if re.match(r"^window\.request_redraw\(\);$", s):
-        return True
-    return False
+    def allowed_det(i):
+        s = dlines[i].strip()
+        # whitelist 8: choke definition
+        if rp_s <= i < rp_e:
+            return True
+        # whitelist 10: bare local `window` nudge in the constructor
+        if re.match(r"^window\.request_redraw\(\);$", s):
+            return True
+        return False
+    return allowed_det
 
-for i,l in enumerate(dlines):
-    if not CALL.search(l): continue
-    s = l.strip()
-    if s.startswith("//") or s.startswith("///") or s.startswith("*"): continue
-    if not allowed_det(i):
-        offenders.append(f"detached.rs:{i+1}: {s}")
+RULES = {"app.rs": app_rule, "detached.rs": det_rule}
+
+for dirpath, dirnames, files in os.walk(src):
+    dirnames.sort()
+    for f in sorted(files):
+        if not f.endswith(".rs"):
+            continue
+        path = os.path.join(dirpath, f)
+        rel = os.path.relpath(path, src)
+        lines = open(path).read().split("\n")
+        allowed = RULES[rel](lines) if rel in RULES else (lambda i: False)
+        for i,l in enumerate(lines):
+            if not CALL.search(l): continue
+            s = l.strip()
+            if s.startswith("//") or s.startswith("///") or s.startswith("*"): continue  # comment mention
+            if not allowed(i):
+                offenders.append(f"{rel}:{i+1}: {s}")
 
 if offenders:
     print("FAIL: raw .request_redraw() in a migrateable producer site — route it")

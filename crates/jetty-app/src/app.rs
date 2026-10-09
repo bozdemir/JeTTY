@@ -21104,7 +21104,8 @@ mod paint_choke_tests {
         //      settings_pending, and the PACED effect-animation frame for the
         //      main window and for each detached window — `effects::anim_step`)
         //    + dock re-assert (1) + center re-assert (1)
-        //    + main-window-open first-frame nudge on a local `window` binding (1).
+        //    + the Settings window's first-frame nudge on a local `window`
+        //      binding in `toggle_settings_window` (1).
         // The render tails no longer self-drive: `about_to_wait` is the ONLY
         // place that decides another frame.
         assert_eq!(
