@@ -2893,10 +2893,21 @@ impl Terminal {
     /// edge (xterm); onto a Kitty image's last row, right of it (kitty — a wrap
     /// pending at the edge). Through alacritty's `Handler`, never by injecting
     /// bytes into a parser that may sit mid-sequence (e.g. in the Escape state
-    /// an ESC-ended DCS or APC leaves it in). Room for that scroll is made first
-    /// so it is counted exactly; an anchor reset on the way drops `p`.
-    fn place_primary_at_cursor(&mut self, mut p: ImagePlacement, reserve: bool, sixel: bool) {
+    /// an ESC-ended DCS or APC leaves it in). The lines it feeds are paid for
+    /// first (`Err(IMAGE_BUSY)`: nothing happens), and room for their scroll is
+    /// made so it is counted exactly; an anchor reset on the way drops `p`.
+    fn place_primary_at_cursor(&mut self, mut p: ImagePlacement, reserve: bool, sixel: bool) -> Result<(), &'static str> {
         use alacritty_terminal::vte::ansi::Handler;
+        let lines = match (reserve, sixel) {
+            (false, _) => 0,
+            (true, true) => p.rows,
+            (true, false) => p.rows.saturating_sub(1),
+        };
+        // Each line fed writes a row of cells, paid for from the image-work
+        // bank like the image's pixels: a 24-byte `a=p` with `r=1024` feeds
+        // 1,024 of them.
+        let row = self.cols * std::mem::size_of::<alacritty_terminal::term::cell::Cell>();
+        self.pay_image_work(u64::from(lines) * row as u64)?;
         self.make_room(p.rows as usize + 1);
         let cur = self.term.grid().cursor.point;
         p.abs_line = self.abs_top + cur.line.0 as i64;
@@ -2905,7 +2916,6 @@ impl Terminal {
             let epoch = self.anchor_epoch;
             let h0 = self.term.grid().history_size();
             let d0 = self.term.grid().display_offset();
-            let lines = if sixel { p.rows } else { p.rows.saturating_sub(1) };
             for _ in 0..lines {
                 self.term.linefeed();
             }
@@ -2915,7 +2925,7 @@ impl Terminal {
             }
             self.track_abs_top(false, false, h0, h1);
             if self.anchor_epoch != epoch {
-                return;
+                return Ok(());
             }
             let col = usize::from(if sixel { p.col } else { p.col + p.cols });
             let cursor = &mut self.term.grid_mut().cursor;
@@ -2925,6 +2935,7 @@ impl Terminal {
         insert_placement(&mut self.placements, &mut self.placement_bytes, p);
         let history = self.term.grid().history_size();
         self.prune_placements(history);
+        Ok(())
     }
 
     /// Anchor `p` at the cursor on the ALT screen (a TUI preview: yazi, ranger,
@@ -3289,7 +3300,8 @@ impl Terminal {
         if self.term.mode().contains(TermMode::ALT_SCREEN) {
             self.place_alt_at_cursor(p, true, true);
         } else {
-            self.place_primary_at_cursor(p, true, true);
+            // Rows the bank cannot pay for drop the sixel (correct-or-absent).
+            let _ = self.place_primary_at_cursor(p, true, true);
         }
     }
 
@@ -3448,10 +3460,11 @@ impl Terminal {
                             self.kitty_store(&cmd, id, img.clone());
                         }
                         // Display on `a=T`.
-                        if cmd.action == b'T' {
-                            self.place_inline_image(&img, id, &cmd);
-                        }
-                        self.kitty_reply(&cmd, "OK");
+                        let shown = match cmd.action {
+                            b'T' => self.place_inline_image(&img, id, &cmd),
+                            _ => Ok(()),
+                        };
+                        self.kitty_reply(&cmd, shown.err().unwrap_or("OK"));
                     }
                     Err(code) => self.kitty_reply(&cmd, code),
                 }
@@ -3561,8 +3574,8 @@ impl Terminal {
             .map(|(_, id, img)| (*id, img.clone()));
         match found {
             Some((id, img)) => {
-                self.place_inline_image(&img, id, cmd);
-                self.kitty_reply(cmd, "OK");
+                let shown = self.place_inline_image(&img, id, cmd);
+                self.kitty_reply(cmd, shown.err().unwrap_or("OK"));
             }
             None => self.kitty_reply(cmd, "ENOENT"),
         }
@@ -3633,10 +3646,11 @@ impl Terminal {
     /// Place a decoded Kitty image (content id `id`) at the cursor, moved left
     /// to fit; `C=1` leaves the cursor (and the grid) untouched. Guards: a zero
     /// cell metric drops it; an in-flight sync update is flushed first so the
-    /// cursor is where the app put it.
-    fn place_inline_image(&mut self, img: &Arc<crate::sixel::InlineImage>, id: u64, cmd: &KittyCmd) {
+    /// cursor is where the app put it. `Err` is the reply: [`IMAGE_BUSY`] when
+    /// the image-work bank cannot pay for the rows it reserves.
+    fn place_inline_image(&mut self, img: &Arc<crate::sixel::InlineImage>, id: u64, cmd: &KittyCmd) -> Result<(), &'static str> {
         if self.cell_px_w <= 0.0 || self.cell_px_h <= 0.0 {
-            return;
+            return Ok(());
         }
         if self.sync_deadline().is_some() {
             self.flush_sync();
@@ -3678,8 +3692,9 @@ impl Terminal {
         };
         if self.term.mode().contains(TermMode::ALT_SCREEN) {
             self.place_alt_at_cursor(p, false, !cmd.no_cursor_move);
+            Ok(())
         } else {
-            self.place_primary_at_cursor(p, !cmd.no_cursor_move, false);
+            self.place_primary_at_cursor(p, !cmd.no_cursor_move, false)
         }
     }
 
@@ -9340,6 +9355,32 @@ mod tests {
         assert_eq!(t.placements.len(), before + 3, "all three placed once the bank holds enough");
         assert!(t.drain_pty_writes().is_empty(), "no errors");
         assert!(t.image_work < IMAGE_WORK_MAX, "and paid for");
+    }
+
+    #[test]
+    fn the_rows_an_image_reserves_are_paid_for() {
+        // On the primary screen an image line-feeds the rows it reserves: a
+        // 24-byte `a=p` with `r=1024` fed 1,024 lines, and 15,000 of them
+        // (360 KB) kept the UI thread busy for seconds.
+        let mut t = Terminal::new(80, 24);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&apc(&format!("a=t,f=32,s=1,v=1,i=1,q=2;{}", b64(&[1, 2, 3, 255]))));
+        let flood = apc("a=p,i=1,c=1,r=1024,q=2").repeat(15_000);
+        let top = t.abs_top;
+        t.feed(&flood);
+        // Each line fed writes a row of cells, paid from the bank and what the
+        // flood itself earned.
+        let row = 80 * std::mem::size_of::<alacritty_terminal::term::cell::Cell>() as u64;
+        let earned = IMAGE_WORK_MAX + flood.len() as u64 * IMAGE_WORK_PER_BYTE;
+        let fed = (t.abs_top - top) as u64;
+        assert!(fed <= earned / row, "fed {fed} lines");
+        assert!(fed > 50_000, "puts it can pay for still scroll: {fed}");
+        let reply = String::from_utf8_lossy(&{
+            t.feed(&apc("a=p,i=1,c=1,r=1024"));
+            t.drain_pty_writes()
+        })
+        .to_string();
+        assert_eq!(reply, "\x1b_Gi=1;EBUSY\x1b\\", "a put the bank cannot pay for says so");
     }
 
     #[test]
