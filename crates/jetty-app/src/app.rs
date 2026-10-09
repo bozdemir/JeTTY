@@ -4585,23 +4585,7 @@ impl App {
     /// [`Self::reattach_tab`], naming who asked: a hidden main window is
     /// summoned for the tab, and only a USER reattach may take focus for it.
     fn reattach_tab_by(&mut self, pos: usize, by: SummonBy, event_loop: &ActiveEventLoop) {
-        if pos >= self.detached.len() {
-            return;
-        }
-        self.close_detached_overlays(pos);
-        // Leave OS fullscreen while the window still exists: dropping a
-        // fullscreen window leaks macOS's app-scoped presentation options (an
-        // auto-hidden Dock + menu bar for the rest of the session).
-        self.exit_detached_fullscreen_bare(pos);
-        let dw = self.detached.remove(pos);
-        // Drop focus bookkeeping that pointed at the now-destroyed detached window
-        // so the main window's auto-hide guard doesn't keep suppressing on a stale
-        // id/flag (mirrors `close_settings_window`).
-        let dw_id = dw.window.id();
-        if self.last_focused_window == Some(dw_id) {
-            self.last_focused_window = None;
-        }
-        self.switching_to_detached = false;
+        let Some(dw) = self.remove_detached(pos) else { return };
         let mut tab = dw.tab; // move the Tab out before `dw` drops
         // It was visible in its own window until now — no unseen activity.
         tab.meta.moved_to_window();
@@ -4656,6 +4640,48 @@ impl App {
         if self.ov_of(s).is_some_and(|o| o.copy_mode.is_some()) {
             self.cancel_copy_mode(s);
         }
+    }
+
+    /// Take detached window `pos` out of the app — THE teardown every path
+    /// shares (a reattach, its "✕" / CloseRequested, its shell exiting). Its
+    /// overlays end first (`close_detached_overlays`). It leaves OS fullscreen
+    /// while it still exists: dropping a fullscreen window leaks macOS's
+    /// app-scoped presentation options (an auto-hidden Dock + menu bar for the
+    /// rest of the session). And nothing keeps naming it: the focus
+    /// bookkeeping (a stale id or switch latch kept the main window's auto-hide
+    /// suppressed — mirrors `close_settings_window`), its notification
+    /// throttle, the Shift hint shown in it; a status pill shown in it moves to
+    /// the main window. Returns the window — move its tab out before it drops.
+    fn remove_detached(&mut self, pos: usize) -> Option<crate::detached::DetachedWindow> {
+        if pos >= self.detached.len() {
+            return None;
+        }
+        self.close_detached_overlays(pos);
+        self.exit_detached_fullscreen_bare(pos);
+        let dw = self.detached.remove(pos);
+        let id = dw.window.id();
+        if self.last_focused_window == Some(id) {
+            self.last_focused_window = None;
+        }
+        // Its Focused(false) can no longer reach here: the switch latch stays
+        // only while another detached window holds the focus.
+        self.switching_to_detached = self.detached.iter().any(|d| d.focused);
+        self.notify_last_at.remove(&NotifyKey::Detached(id));
+        if self.shift_hint_until.is_some_and(|(_, w)| w == id) {
+            self.shift_hint_until = None;
+            self.shift_hint_window = None;
+        }
+        let main = self.window.as_ref().map(|w| w.id());
+        if let Some(pill) = self.status_pill.as_mut().filter(|p| p.2 == id) {
+            match main {
+                Some(m) => {
+                    pill.2 = m;
+                    self.request_window_paint(m);
+                }
+                None => self.status_pill = None,
+            }
+        }
+        Some(dw)
     }
 
     /// Open the tab context menu for `tab` at `(x, y)` with `labels` (the main
@@ -13909,30 +13935,14 @@ impl ApplicationHandler<AppEvent> for App {
                     self.ring_detached_bell(pos);
                 }
                 // Remove in descending index order so earlier indices stay valid,
-                // mirroring `close_exited_tabs`. Dropping the `DetachedWindow`
-                // closes its OS window; its already-exited child is reaped
-                // harmlessly by `PtySession::Drop`.
+                // mirroring `close_exited_tabs`, through the teardown a reattach
+                // runs too (`remove_detached`: overlays, fullscreen, the focus
+                // latches — the dying window usually holds focus, the user typed
+                // `exit` in it). Dropping the `DetachedWindow` closes its OS
+                // window; its already-exited child is reaped harmlessly by
+                // `PtySession::Drop`.
                 for i in exited_detached.into_iter().rev() {
-                    if i < self.detached.len() {
-                        // Its overlays go first (a live palette theme preview
-                        // must not outlive the window), as in `reattach_tab`.
-                        self.close_detached_overlays(i);
-                        // Same reason as `reattach_tab`: never DROP a fullscreen
-                        // window (macOS presentation-options leak).
-                        self.exit_detached_fullscreen_bare(i);
-                        let dw = self.detached.remove(i);
-                        // The dying window usually holds focus (the user typed
-                        // `exit` in it); once the entry is gone its Focused(false)
-                        // can no longer be routed here, so clear the focus
-                        // bookkeeping NOW (mirrors reattach_tab) — otherwise
-                        // switching_to_detached stays latched true and the main
-                        // window's focus auto-hide is silently disabled until the
-                        // next detach/reattach cycle.
-                        if self.last_focused_window == Some(dw.window.id()) {
-                            self.last_focused_window = None;
-                            self.switching_to_detached = false;
-                        }
-                    }
+                    self.remove_detached(i);
                 }
                 // Fire "command finished" notifications for OSC 133 completions the
                 // drains above surfaced. Placed AFTER both the main drain and the
