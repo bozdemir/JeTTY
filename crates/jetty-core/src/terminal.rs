@@ -316,23 +316,6 @@ fn peek_isolated_csi(rest: &[u8]) -> CsiPeek {
     }
 }
 
-/// Turn a Kitty command's RAW payload (already base64-decoded and accumulated)
-/// into a decoded `InlineImage`: apply `o=z` zlib inflate if requested, then
-/// dispatch by `f=` format. `None` on any failure (correct-or-absent). Cold path.
-fn decode_kitty_image(cmd: &KittyCmd, raw: Vec<u8>) -> Option<crate::sixel::InlineImage> {
-    let data = if cmd.compressed {
-        crate::kitty::inflate_zlib(&raw, KITTY_RAW_BUDGET)?
-    } else {
-        raw
-    };
-    match cmd.format {
-        24 => crate::kitty::decode_rgb(cmd.width, cmd.height, &data, crate::sixel::SIXEL_CAPS),
-        32 => crate::kitty::decode_rgba(cmd.width, cmd.height, &data, crate::sixel::SIXEL_CAPS),
-        100 => crate::kitty::decode_png(&data, crate::sixel::SIXEL_CAPS),
-        _ => None,
-    }
-}
-
 /// Maximum decoded OSC 52 clipboard-copy payload (bytes) that we COMMIT to the
 /// system clipboard. This is NOT a memory guard: alacritty/vte base64-decode and
 /// UTF-8-validate the whole payload into a `String` BEFORE `Event::ClipboardStore`
@@ -691,6 +674,24 @@ const MAX_KITTY_STORED_BYTES: u64 = 64 * 1024 * 1024;
 /// their decoded RGBA (`Arc<SixelImage>`). Oldest are dropped first.
 const MAX_PLACEMENTS: usize = 256;
 const MAX_PLACEMENT_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Image work (bytes an image writes: its inflated `o=z` payload and decoded
+/// RGBA) one byte of output earns, and the most [`Terminal::image_work`] banks —
+/// four full-size (16 Mpx) images. Decoding runs on the UI thread and a few KB
+/// of sixel `!` repeats, PNG or zlib can unpack to 64 MB, so every image is paid
+/// for from the bank before it allocates: photos and screenshots earn more than
+/// they cost, while a flood of such bombs empties the bank and is then dropped
+/// (correct-or-absent) — the work stays a bounded multiple of the output.
+const IMAGE_WORK_PER_BYTE: u64 = 64;
+const IMAGE_WORK_MAX: u64 = 256 * 1024 * 1024;
+
+/// The Kitty reply to an image the image-work bank cannot pay for right now.
+const IMAGE_BUSY: &str = "EBUSY";
+
+/// [`crate::sixel::content_id`] protocol tags: the same bytes are a different
+/// image to the sixel and the Kitty decoder.
+const SIXEL_TAG: u32 = 0;
+const KITTY_TAG: u32 = 1;
 
 /// Upper clamp for a parsed OSC 133 D exit code. Shell exit statuses are 8-bit
 /// (0..=255; a signal death reports 128+signum), so anything larger is
@@ -1128,6 +1129,10 @@ pub struct Terminal {
     kitty_images: VecDeque<(u32, u64, Arc<crate::sixel::InlineImage>)>,
     /// Running sum of `rgba.len()` across `kitty_images` (the registry byte budget).
     kitty_stored_bytes: u64,
+    /// The image-work bank: bytes images may still write (decoded RGBA,
+    /// inflated payloads). Every byte fed earns [`IMAGE_WORK_PER_BYTE`], up to
+    /// [`IMAGE_WORK_MAX`]; an image is paid for before it allocates, or dropped.
+    image_work: u64,
     /// Payload bytes of the OSC being scanned (bounded by `osc_cap`). Persists
     /// across `feed` calls like `scan`.
     osc_len: u32,
@@ -1327,6 +1332,7 @@ impl Terminal {
             chunk_count: 0,
             kitty_images: VecDeque::new(),
             kitty_stored_bytes: 0,
+            image_work: IMAGE_WORK_MAX,
             osc_len: 0,
             mouse_x10: false,
             mouse_urxvt: false,
@@ -1710,6 +1716,9 @@ impl Terminal {
     /// Measured with `examples/feed_bench.rs`: within ±1.5% of the pre-scan code
     /// on every workload, including one with live prompt marks.
     pub fn feed(&mut self, bytes: &[u8]) {
+        // Output earns image work (see `image_work`): one add per feed.
+        let earned = (bytes.len() as u64).saturating_mul(IMAGE_WORK_PER_BYTE);
+        self.image_work = self.image_work.saturating_add(earned).min(IMAGE_WORK_MAX);
         let mut i = 0;
         let mut start = 0; // first byte not yet handed to alacritty
         // Index of the ESC that opened the CSI being scanned (0 when it arrived in
@@ -3199,8 +3208,9 @@ impl Terminal {
     ///
     /// Correct-or-absent guards (drop, touch nothing): a buffer overflow or a
     /// CAN/SUB-cancelled DCS (`sixel_overflow`), a zero cell metric, a decode
-    /// failure, or an anchor reset caused by the reserve itself. A synchronized
-    /// update in flight is flushed first, so the cursor is where the app put it.
+    /// failure, an image the image-work bank cannot pay for, or an anchor reset
+    /// caused by the reserve itself. A synchronized update in flight is flushed
+    /// first, so the cursor is where the app put it.
     fn finish_sixel(&mut self) {
         let buf = std::mem::take(&mut self.sixel_buf);
         let overflow = std::mem::take(&mut self.sixel_overflow);
@@ -3208,9 +3218,17 @@ impl Terminal {
         if overflow || self.cell_px_w <= 0.0 || self.cell_px_h <= 0.0 {
             return;
         }
-        let Some(img) = crate::sixel::decode_sixel(p2, &buf, crate::sixel::SIXEL_CAPS) else {
+        // The decoder's measuring pass (one walk over the bytes) refuses an
+        // image larger than the bank can pay for before anything is allocated;
+        // the one it draws is paid for here.
+        let caps = crate::sixel::SixelCaps {
+            max_pixels: (self.image_work / 4).min(u64::from(crate::sixel::SIXEL_CAPS.max_pixels)) as u32,
+            ..crate::sixel::SIXEL_CAPS
+        };
+        let Some(img) = crate::sixel::decode_sixel(p2, &buf, caps) else {
             return;
         };
+        self.image_work = self.image_work.saturating_sub(img.rgba.len() as u64);
         if self.sync_deadline().is_some() {
             self.flush_sync();
         }
@@ -3218,7 +3236,7 @@ impl Terminal {
         let cols = ((img.width as f32 / self.cell_px_w).ceil() as usize).clamp(1, self.cols) as u16;
         let rows = ((img.height as f32 / self.cell_px_h).ceil() as usize).clamp(1, MAX_IMAGE_ROWS) as u16;
         let p = ImagePlacement {
-            id: crate::sixel::content_id(&img),
+            id: crate::sixel::content_id(&[SIXEL_TAG, p2], &buf),
             abs_line: 0,
             col: 0,
             cols,
@@ -3358,14 +3376,18 @@ impl Terminal {
             b'd' => self.kitty_delete(&cmd),
             b'p' => self.kitty_put(&cmd),
             b'q' => {
-                // Validate/decode WITHOUT displaying or storing, then reply.
-                if cmd.medium != b'd' {
-                    self.kitty_reply(&cmd, "ENOTSUPP");
-                } else if decode_kitty_image(&cmd, raw).is_some() {
-                    self.kitty_reply(&cmd, "OK");
-                } else {
-                    self.kitty_reply(&cmd, "EBADF");
+                // Validate/decode WITHOUT displaying or storing, then reply. A
+                // reply nobody receives (no `i=`/`I=`, or `q=2`) is worth no
+                // work: kitty drops an unaddressed query before loading it too.
+                if !cmd.addressable() || cmd.quiet >= 2 {
+                    return;
                 }
+                let reply = if cmd.medium != b'd' {
+                    "ENOTSUPP"
+                } else {
+                    self.decode_kitty_image(&cmd, raw).map_or_else(|code| code, |_| "OK")
+                };
+                self.kitty_reply(&cmd, reply);
             }
             b't' | b'T' => {
                 // Only direct base64 transmission is supported (safety: an
@@ -3374,12 +3396,18 @@ impl Terminal {
                     self.kitty_reply(&cmd, "ENOTSUPP");
                     return;
                 }
-                match decode_kitty_image(&cmd, raw) {
-                    Some(img) => {
-                        let id = crate::sixel::content_id(&img);
+                // Transmit-only without an `i=`/`I=`: nothing could ever put or
+                // answer it, so there is nothing to decode.
+                if cmd.action == b't' && !cmd.addressable() {
+                    return;
+                }
+                let params = [KITTY_TAG, cmd.format.into(), cmd.width, cmd.height, cmd.compressed.into()];
+                let id = crate::sixel::content_id(&params, &raw);
+                match self.decode_kitty_image(&cmd, raw) {
+                    Ok(img) => {
                         let img = Arc::new(img);
                         // Transmit: store in the registry if addressable.
-                        if cmd.id != 0 || cmd.number != 0 {
+                        if cmd.addressable() {
                             self.kitty_store(&cmd, id, img.clone());
                         }
                         // Display on `a=T`.
@@ -3388,7 +3416,7 @@ impl Terminal {
                         }
                         self.kitty_reply(&cmd, "OK");
                     }
-                    None => self.kitty_reply(&cmd, "EBADF"),
+                    Err(code) => self.kitty_reply(&cmd, code),
                 }
             }
             // Empty `a=` (action 0) is a malformed command.
@@ -3396,6 +3424,67 @@ impl Terminal {
             // Animation (`a=a`/`a=f`) and any other action: documented non-goal.
             _ => self.kitty_reply(&cmd, "ENOTSUPP"),
         }
+    }
+
+    /// Turn a Kitty command's RAW payload (already base64-decoded and
+    /// accumulated) into a decoded `InlineImage`: apply `o=z` zlib inflate if
+    /// requested, then dispatch by `f=` format. Each step is paid from the
+    /// image-work bank BEFORE it runs — the inflate's output, then the RGBA
+    /// sized from the header (`s`×`v`, or the PNG's `IHDR`) — and the decoder is
+    /// capped at what was paid for. `Err` is the reply: `EBADF` for a bad
+    /// payload (correct-or-absent), [`IMAGE_BUSY`] when the bank cannot pay.
+    fn decode_kitty_image(&mut self, cmd: &KittyCmd, raw: Vec<u8>) -> Result<crate::sixel::InlineImage, &'static str> {
+        use crate::kitty::{checked_pixels, decode_png, decode_rgb, decode_rgba, inflate_zlib, png_size};
+        use crate::sixel::{SixelCaps, SIXEL_CAPS};
+        // Bytes per pixel of a raw format, which declares its size (`s`×`v`);
+        // 0 for a PNG, whose header does.
+        let bpp = match cmd.format {
+            24 => 3,
+            32 => 4,
+            100 => 0,
+            _ => return Err("EBADF"),
+        };
+        let data = if cmd.compressed {
+            // A raw format inflates to exactly its pixels' bytes, a PNG to at
+            // most the raw budget: pay that up front; a stream that inflates
+            // gets back what it did not use.
+            let max = match bpp {
+                0 => KITTY_RAW_BUDGET,
+                _ => checked_pixels(cmd.width, cmd.height, SIXEL_CAPS).ok_or("EBADF")? * bpp,
+            };
+            self.pay_image_work(max as u64)?;
+            let data = inflate_zlib(&raw, max).ok_or("EBADF")?;
+            self.image_work += (max - data.len()) as u64;
+            data
+        } else {
+            raw
+        };
+        let (w, h) = match bpp {
+            0 => png_size(&data).ok_or("EBADF")?,
+            _ => (cmd.width, cmd.height),
+        };
+        let px = checked_pixels(w, h, SIXEL_CAPS).ok_or("EBADF")?;
+        if bpp != 0 && data.len() != px * bpp {
+            return Err("EBADF"); // the wrong amount of pixel data decodes to nothing
+        }
+        self.pay_image_work(px as u64 * 4)?;
+        let caps = SixelCaps { max_w: w, max_h: h, max_pixels: px as u32 };
+        match bpp {
+            3 => decode_rgb(w, h, &data, caps),
+            4 => decode_rgba(w, h, &data, caps),
+            _ => decode_png(&data, caps),
+        }
+        .ok_or("EBADF")
+    }
+
+    /// Take `bytes` from the image-work bank — or nothing, and `Err(IMAGE_BUSY)`,
+    /// when it holds less: the image is then dropped.
+    fn pay_image_work(&mut self, bytes: u64) -> Result<(), &'static str> {
+        if bytes > self.image_work {
+            return Err(IMAGE_BUSY);
+        }
+        self.image_work -= bytes;
+        Ok(())
     }
 
     /// Store a decoded image (and its content `id`) in the transmit-then-put
@@ -8973,6 +9062,116 @@ mod tests {
         assert_eq!(t.placements.len(), 2, "both a sixel and a Kitty image placed");
     }
 
+    // ── image work: what images cost the UI thread ────────────────────────────
+
+    /// A 1-bit grayscale PNG of `w`×`h` black pixels: a few hundred bytes that
+    /// decode to `w * h * 4` bytes of RGBA.
+    fn black_png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, w, h);
+            enc.set_color(png::ColorType::Grayscale);
+            enc.set_depth(png::BitDepth::One);
+            let mut wr = enc.write_header().unwrap();
+            wr.write_image_data(&vec![0u8; w.div_ceil(8) as usize * h as usize]).unwrap();
+        }
+        out
+    }
+
+    /// A sixel of `bands` bands, each one `!1000~` run: ~10 bytes per 24,000
+    /// bytes of RGBA.
+    fn sixel_bomb(bands: usize) -> Vec<u8> {
+        sixel(&format!("#0;2;100;0;0{}", "#0!1000~-".repeat(bands)))
+    }
+
+    #[test]
+    fn work_nobody_can_receive_is_not_done() {
+        // An unaddressed `a=q` (or one at `q=2`) has no reply to send, and an
+        // anonymous `a=t` can never be put: they used to inflate and decode
+        // anyway — a 62 KB zlib query unpacked 64 MB for nothing.
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        let z = b64(&miniz_oxide::deflate::compress_to_vec_zlib(&[0u8; 256 * 256 * 4], 6));
+        for control in ["a=q", "a=q,i=4,q=2", "a=t", "f=32"] {
+            t.feed(&apc(&format!("{control},f=32,o=z,s=256,v=256;{z}")));
+            assert_eq!(t.image_work, IMAGE_WORK_MAX, "{control}: nothing paid, nothing decoded");
+        }
+        assert!(t.drain_pty_writes().is_empty() && t.placements.is_empty() && t.kitty_images.is_empty());
+        // A query someone receives is still answered from a real decode.
+        t.feed(&apc(&format!("a=q,i=4,f=32,o=z,s=256,v=256;{z}")));
+        assert_eq!(String::from_utf8_lossy(&t.drain_pty_writes()), "\x1b_Gi=4;OK\x1b\\");
+        t.feed(&apc(&format!("a=q,i=4,f=32,o=z,s=256,v=255;{z}")));
+        assert_eq!(String::from_utf8_lossy(&t.drain_pty_writes()), "\x1b_Gi=4;EBADF\x1b\\");
+    }
+
+    #[test]
+    fn image_bombs_are_paid_for_or_dropped() {
+        // A few hundred bytes of sixel `!` repeats, PNG or zlib unpack to
+        // hundreds of KB here (64 MB at full size), on the UI thread: a 2 MiB
+        // stream of them froze JeTTY for tens of seconds. Each image is paid
+        // for from the image-work bank before it allocates; output refills it.
+        let mut t = Terminal::new(40, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.image_work = 0; // as after a flood
+        t.feed(&sixel_bomb(20)); // 1000×120 px
+        assert!(t.placements.is_empty(), "a sixel bomb the bank cannot pay for is dropped");
+        t.feed(&sixel(RED_1X12));
+        assert_eq!(t.placements.len(), 1, "an image its own bytes pay for still draws");
+        let png = b64(&black_png(256, 256));
+        t.feed(&apc(&format!("a=T,f=100,i=5;{png}")));
+        let z = b64(&miniz_oxide::deflate::compress_to_vec_zlib(&[0u8; 256 * 256 * 4], 6));
+        t.feed(&apc(&format!("a=T,f=32,o=z,s=256,v=256,i=6;{z}")));
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_writes()),
+            "\x1b_Gi=5;EBUSY\x1b\\\x1b_Gi=6;EBUSY\x1b\\",
+            "Kitty bombs are refused, saying why"
+        );
+        assert!(t.kitty_images.is_empty() && t.placements.len() == 1);
+        // Output earns the work back (64 bytes per byte): the same images fit.
+        t.feed(&b"\r\n".repeat(16 * 1024));
+        let before = t.placements.len();
+        t.feed(&sixel_bomb(20));
+        t.feed(&apc(&format!("a=T,f=100,i=5,q=1;{png}")));
+        t.feed(&apc(&format!("a=T,f=32,o=z,s=256,v=256,i=6,q=1;{z}")));
+        assert_eq!(t.placements.len(), before + 3, "all three placed once the bank holds enough");
+        assert!(t.drain_pty_writes().is_empty(), "no errors");
+        assert!(t.image_work < IMAGE_WORK_MAX, "and paid for");
+    }
+
+    #[test]
+    fn a_full_bank_bounds_a_bomb_flood() {
+        // From a full bank, a stream of bombs decodes what the bank and the
+        // stream's own bytes pay for, then drops the rest.
+        let mut t = Terminal::new(40, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.image_work = 3 * 1000 * 120 * 4; // three of them
+        let bomb = sixel_bomb(20);
+        let stream = bomb.repeat(10);
+        t.feed(&stream);
+        let decoded = t.placements.iter().filter(|p| p.px_w == 1000).count();
+        assert_eq!(decoded, 3, "the bank, plus {} bytes earned", stream.len() as u64 * IMAGE_WORK_PER_BYTE);
+    }
+
+    #[test]
+    fn image_ids_follow_the_input() {
+        // The texture-cache key hashes what was received, so a re-sent frame
+        // reuses its texture; the same bytes under another geometry or
+        // protocol are another image.
+        let mut t = Terminal::new(20, 8);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&sixel(RED_1X6));
+        t.feed(&sixel(RED_1X6));
+        t.feed(&sixel("#0;2;100;0;1#0~"));
+        let ids: Vec<u64> = t.placements.iter().map(|p| p.id).collect();
+        assert_eq!(ids[0], ids[1], "the same sixel twice");
+        assert_ne!(ids[0], ids[2], "another color");
+        let px = b64(&[255u8, 0, 0, 255].repeat(4));
+        t.feed(&apc(&format!("a=T,f=32,s=2,v=2;{px}")));
+        t.feed(&apc(&format!("a=T,f=32,s=4,v=1;{px}")));
+        let n = t.placements.len();
+        assert_ne!(t.placements[n - 1].id, t.placements[n - 2].id, "the same pixels at another size");
+    }
+
     // ── OSC size cap ──────────────────────────────────────────────────────────
 
     /// Resident set size of this process in bytes (Linux; 0 elsewhere).
@@ -9913,6 +10112,7 @@ mod tests {
         assert!(t.sixel_buf.len() <= SIXEL_MAX_BYTES, "{ctx}: sixel buffer");
         assert!(t.apc_buf.len() <= APC_MAX_BYTES, "{ctx}: APC buffer");
         assert!(t.chunk_buf.len() <= KITTY_RAW_BUDGET, "{ctx}: kitty chunks");
+        assert!(t.image_work <= IMAGE_WORK_MAX, "{ctx}: image-work bank");
         assert!(t.kbd_depth.iter().all(|&d| d <= KBD_STACK_MAX), "{ctx}: kbd depth {:?}", t.kbd_depth);
         assert!(t.marks.len() <= MAX_MARKS, "{ctx}: marks");
         assert!(t.completed.len() <= MAX_PENDING_COMPLETIONS, "{ctx}: completions");

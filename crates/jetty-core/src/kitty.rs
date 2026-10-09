@@ -187,9 +187,9 @@ fn premul(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
     (f(r), f(g), f(b))
 }
 
-/// Common dimension guard shared by the raw decoders. Returns the pixel count on
+/// Common dimension guard shared by the decoders. Returns the pixel count on
 /// success, `None` if any cap is exceeded (all math in `u64`, pre-allocation).
-fn checked_pixels(width: u32, height: u32, caps: SixelCaps) -> Option<usize> {
+pub fn checked_pixels(width: u32, height: u32, caps: SixelCaps) -> Option<usize> {
     if width == 0 || height == 0 || width > caps.max_w || height > caps.max_h {
         return None;
     }
@@ -238,6 +238,19 @@ pub fn decode_rgba(width: u32, height: u32, data: &[u8], caps: SixelCaps) -> Opt
         rgba[i * 4 + 3] = a;
     }
     Some(InlineImage { width, height, rgba })
+}
+
+/// The pixel size a PNG declares in its header chunk (`IHDR`, which the format
+/// puts first), read without decoding anything — so the caller can pay for the
+/// decode before it runs. `None` when `data` does not start like a PNG; the
+/// decoder reads the same header, so a lie here only makes the decode fail.
+pub fn png_size(data: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if data.len() < 24 || &data[..8] != SIGNATURE || &data[12..16] != b"IHDR" {
+        return None;
+    }
+    let be = |i: usize| u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+    Some((be(16), be(20)))
 }
 
 /// Decode an `f=100` PNG payload into a PREMULTIPLIED RGBA `InlineImage` under
@@ -520,6 +533,17 @@ mod tests {
         let img = decode_png(&out, CAPS).unwrap();
         assert_eq!(&img.rgba[0..4], &[10, 10, 10, 255]);
         assert_eq!(&img.rgba[4..8], &[200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn png_size_reads_the_header_only() {
+        assert_eq!(png_size(&make_png_rgba_2x2()), Some((2, 2)));
+        // A header claiming a huge image, with nothing after it.
+        let mut out = Vec::new();
+        let _ = png::Encoder::new(&mut out, 99999, 7).write_header();
+        assert_eq!(png_size(&out), Some((99999, 7)));
+        assert_eq!(png_size(b"not a png at all, not at all"), None);
+        assert_eq!(png_size(&make_png_rgba_2x2()[..20]), None, "truncated header");
     }
 
     #[test]

@@ -41,8 +41,8 @@ pub struct SixelImage {
 /// The canonical decoded inline-image type. Sixel and Kitty both produce a
 /// tightly-packed premultiplied-safe RGBA8 buffer; the Kitty code (`kitty.rs`)
 /// uses this alias so its call sites read honestly, while the struct keeps the
-/// `SixelImage` name so `content_id`, `ImagePlacement`, and the render layer stay
-/// unchanged (the misnomer is contained to the type name).
+/// `SixelImage` name so `ImagePlacement` and the render layer stay unchanged (the
+/// misnomer is contained to the type name).
 pub type InlineImage = SixelImage;
 
 /// Hard size caps enforced by [`decode_sixel`]. A decode that would exceed any
@@ -90,27 +90,22 @@ pub fn decode_sixel(p2: u32, data: &[u8], caps: SixelCaps) -> Option<SixelImage>
     Some(SixelImage { width, height, rgba })
 }
 
-/// FNV-1a content id over `(width, height, rgba)`. Folding the dimensions in
-/// (not just the pixel bytes) makes an id collision require matching BOTH the
-/// content and the geometry — so two DISTINCT images can share a texture only on
-/// an astronomically unlikely full-64-bit collision. Used to dedupe identical
-/// repainted frames (a TUI redrawing the same image reuses its GPU texture).
-pub fn content_id(img: &SixelImage) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    let mut fold = |b: u8| {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    };
-    for &b in &img.width.to_le_bytes() {
-        fold(b);
+/// Content id of an image's ENCODED form — the texture-cache key: a hash of
+/// `params` (everything besides `data` that decides the pixels, led by a
+/// protocol tag) and of the bytes the decoder reads. The decoders are pure, so
+/// equal input means the same image (a TUI redrawing it reuses its GPU texture),
+/// and two DISTINCT images share a texture only on a 64-bit collision. Hashing
+/// the input rather than the decoded RGBA keeps the cost proportional to the
+/// bytes received: a few KB of sixel or PNG can decode to 64 MB. SipHash (std's
+/// `DefaultHasher`, fixed keys) runs at several GB/s.
+pub fn content_id(params: &[u32], data: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut hash = std::hash::DefaultHasher::new();
+    for &p in params {
+        hash.write_u32(p);
     }
-    for &b in &img.height.to_le_bytes() {
-        fold(b);
-    }
-    for &b in &img.rgba {
-        fold(b);
-    }
-    hash
+    hash.write(data);
+    hash.finish()
 }
 
 /// Bounded measuring pass: determine the true drawn extent (rightmost and
@@ -650,12 +645,13 @@ mod tests {
     }
 
     #[test]
-    fn content_id_folds_dimensions() {
-        // Same pixels, different declared geometry → different ids. (Constructed
-        // directly since a real decode ties pixels to dims.)
-        let a = SixelImage { width: 2, height: 1, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] };
-        let b = SixelImage { width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] };
-        assert_ne!(content_id(&a), content_id(&b), "dims fold into the id");
-        assert_eq!(content_id(&a), content_id(&a.clone()), "stable");
+    fn content_id_folds_params() {
+        // The same bytes under different params (protocol, geometry) are a
+        // different image; the same input is the same id.
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        assert_ne!(content_id(&[1, 2, 1], &data), content_id(&[1, 1, 2], &data), "params fold into the id");
+        assert_ne!(content_id(&[0], &data), content_id(&[1], &data), "the protocol tag too");
+        assert_ne!(content_id(&[0], &data), content_id(&[0], &data[..7]), "and every byte");
+        assert_eq!(content_id(&[0, 7], &data), content_id(&[0, 7], &data.clone()), "stable");
     }
 }
