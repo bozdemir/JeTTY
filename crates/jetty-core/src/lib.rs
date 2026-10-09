@@ -11,6 +11,9 @@ pub mod sixel;
 mod snapshot;
 mod terminal;
 pub mod theme;
+/// Text JeTTY did not write (titles, process and directory names, link
+/// targets) made safe to show in the chrome.
+pub mod untrusted;
 pub mod url;
 
 pub use fuzzy::{fuzzy_match, FuzzyMatch};

@@ -1993,10 +1993,13 @@ fn link_modifier_held(m: &winit::keyboard::ModifiersState) -> bool {
 
 /// The target to preview for a Ctrl+hovered link: an OSC 8 hyperlink whose
 /// text is not its target (`LinkHit::hidden_target`) shows where a click would
-/// really go. `None` without the link modifier, or for a link that shows its
-/// own address (a plain-text URL).
+/// really go — host first, nothing that reorders or hides text
+/// ([`jetty_core::untrusted::link_preview`]). `None` without the link
+/// modifier, or for a link that shows its own address (a plain-text URL).
 fn link_target_preview(m: &winit::keyboard::ModifiersState, hover: Option<&jetty_core::LinkHit>) -> Option<String> {
-    hover.filter(|h| h.hidden_target && link_modifier_held(m)).map(|h| h.uri.clone())
+    hover
+        .filter(|h| h.hidden_target && link_modifier_held(m))
+        .map(|h| jetty_core::untrusted::link_preview(&h.uri))
 }
 
 /// Write bytes produced for a tab's program (mouse reports, wheel arrows) to
@@ -20467,6 +20470,13 @@ mod url_open_tests {
         assert_eq!(link_target_preview(&ctrl, Some(&hit(false))), None, "text = target: nothing to add");
         assert_eq!(link_target_preview(&ModifiersState::empty(), Some(&hit(true))), None, "no Ctrl: no hover");
         assert_eq!(link_target_preview(&ctrl, None), None);
+        // The pill keeps a long text's head: the real host must lead it.
+        let spoof = jetty_core::LinkHit {
+            uri: format!("https://good.example:443-login-{}@evil.example/", "a".repeat(300)),
+            spans: vec![(0, 0, 4)],
+            hidden_target: true,
+        };
+        assert_eq!(link_target_preview(&ctrl, Some(&spoof)).as_deref(), Some("https://…@evil.example/"));
     }
 }
 

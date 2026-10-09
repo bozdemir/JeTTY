@@ -1515,7 +1515,12 @@ impl Terminal {
     /// * `None` — nothing pending (the common case; a lock-free flag check).
     /// * `Some(Some(title))` — the shell set a new (sanitized) title.
     /// * `Some(None)` — reset to the default title (explicit reset, or a title
-    ///   that sanitized to empty, e.g. `\e]0;\a`).
+    ///   that sanitized to empty, e.g. `\e]0;\a` — vte delivers that as
+    ///   `Title("")`, not `ResetTitle`).
+    ///
+    /// Sanitized by [`crate::untrusted::display`]: no control or reordering /
+    /// invisible format character, at most [`crate::untrusted::TITLE_MAX_CHARS`]
+    /// chars, trimmed.
     ///
     /// Consuming: a second call returns `None` until the next OSC arrives.
     /// Multiple OSCs between calls coalesce last-wins. NOTE: RIS (`\ec`) clears
@@ -1529,7 +1534,7 @@ impl Terminal {
             .lock()
             .unwrap()
             .take()
-            .map(|u| u.and_then(|s| sanitize_title(&s)))
+            .map(|u| u.and_then(|s| crate::untrusted::display(&s, crate::untrusted::TITLE_MAX_CHARS)))
     }
 
     /// Take the pending OSC 52 clipboard-COPY texts: at most one per selection,
@@ -4777,9 +4782,9 @@ impl Terminal {
                 }
                 s.push(cell.c);
             }
-            let t = s.trim();
-            if !t.is_empty() {
-                return t.chars().take(MAX_CHARS).collect();
+            // It becomes a notification's text: shown like any untrusted text.
+            if let Some(t) = crate::untrusted::display(s.trim_start(), MAX_CHARS) {
+                return t;
             }
         }
         String::new()
@@ -5855,18 +5860,6 @@ fn escape_regex_literal(query: &str) -> String {
         out.push(c);
     }
     out
-}
-
-/// Sanitize a shell-provided OSC 0/2 title: strip control characters
-/// (ESC/BEL/C0/DEL — nothing a shell legitimately puts in a title), cap at 256
-/// chars (char-boundary safe by construction; the cap also bounds the per-tab
-/// title hashing in the app's tab-bar cache), and trim whitespace. Returns
-/// `None` when the result is empty, which the caller must treat as "reset to
-/// the default title" (vte delivers `\e]0;\a` as `Title("")`, not `ResetTitle`).
-fn sanitize_title(s: &str) -> Option<String> {
-    let t: String = s.chars().filter(|c| !c.is_control()).take(256).collect();
-    let t = t.trim();
-    if t.is_empty() { None } else { Some(t.to_string()) }
 }
 
 /// Convert a 256-color palette index to RGB (standard xterm scheme):
@@ -7103,6 +7096,9 @@ mod tests {
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b]2;a\x01b\x08c\x7fd\x07");
         assert_eq!(t.take_title_update(), Some(Some("abcd".to_string())));
+        // So are the format chars that reorder or hide text in the tab bar.
+        t.feed("\x1b]2;\u{202E}gnp.exe\u{2066}\x07".as_bytes());
+        assert_eq!(t.take_title_update(), Some(Some("gnp.exe".to_string())));
         let long = "x".repeat(1000);
         t.feed(format!("\x1b]2;{long}\x07").as_bytes());
         let got = t.take_title_update().flatten().unwrap();

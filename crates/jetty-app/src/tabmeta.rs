@@ -215,18 +215,22 @@ pub(crate) fn display_title(mode: TabTitleMode, osc: Option<&str>, smart: Option
 
 /// The smart title: the running command's name when one runs, else the last
 /// component of the shell's directory — "~" for the home directory itself, "/"
-/// for the root. `None` when neither is known.
+/// for the root. `None` when neither is known. Both names are untrusted (a
+/// program renames itself with `prctl`, a cloned repo names its directories),
+/// so they are shown like an OSC title ([`jetty_core::untrusted::display`]): a
+/// newline in a name drew a second line over the grid.
 pub(crate) fn smart_title(running: Option<&str>, cwd: Option<&Path>, home: Option<&Path>) -> Option<String> {
-    if let Some(cmd) = running.map(str::trim).filter(|c| !c.is_empty()) {
-        return Some(cmd.to_string());
+    use jetty_core::untrusted::{display, TITLE_MAX_CHARS};
+    if let Some(cmd) = running.and_then(|c| display(c, TITLE_MAX_CHARS)) {
+        return Some(cmd);
     }
     let cwd = cwd?;
     if home.is_some_and(|h| h == cwd) {
         return Some("~".to_string());
     }
     match cwd.file_name() {
-        Some(name) => Some(name.to_string_lossy().into_owned()),
-        None => Some(cwd.to_string_lossy().into_owned()).filter(|s| !s.is_empty()),
+        Some(name) => display(&name.to_string_lossy(), TITLE_MAX_CHARS),
+        None => display(&cwd.to_string_lossy(), TITLE_MAX_CHARS),
     }
 }
 
@@ -358,6 +362,11 @@ mod tests {
         assert_eq!(smart_title(None, Some(&p("/home/u/")), h).as_deref(), Some("~"), "trailing slash");
         assert_eq!(smart_title(None, None, h), None);
         assert_eq!(smart_title(None, Some(&p("/srv/www")), None).as_deref(), Some("www"));
+        // Names are untrusted: no line break, no reordering override.
+        assert_eq!(smart_title(Some("ev\nil\u{202E}"), None, h).as_deref(), Some("evil"));
+        assert_eq!(smart_title(Some("\u{202E}"), Some(&p("/home/u/proj")), h).as_deref(), Some("proj"));
+        assert_eq!(smart_title(None, Some(&p("/home/u/a\nb\x1b[31m")), h).as_deref(), Some("ab[31m"));
+        assert_eq!(smart_title(None, Some(&p("/home/u/\u{2067}")), h), None);
     }
 
     #[test]
