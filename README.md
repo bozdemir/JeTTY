@@ -61,7 +61,7 @@
 - 🧭 **Shell integration (OSC 133)** — opt in with one line at the end of your rc file (silent in other terminals) and JeTTY marks **failed commands** with a themed bar and jumps between prompts with `Ctrl+Shift+Z` / `Ctrl+Shift+X`:
   - zsh, `~/.zshrc`: `[[ -r "${JETTY_SHELL_INTEGRATION_DIR-}/jetty.zsh" ]] && source "$JETTY_SHELL_INTEGRATION_DIR/jetty.zsh"`
   - bash, `~/.bashrc`: `[[ -r "${JETTY_SHELL_INTEGRATION_DIR-}/jetty.bash" ]] && source "$JETTY_SHELL_INTEGRATION_DIR/jetty.bash"`
-  - fish, `~/.config/fish/config.fish`: `test -r "$JETTY_SHELL_INTEGRATION_DIR/jetty.fish"; and source "$JETTY_SHELL_INTEGRATION_DIR/jetty.fish"`
+  - fish 3, `~/.config/fish/config.fish`: `test -r "$JETTY_SHELL_INTEGRATION_DIR/jetty.fish"; and source "$JETTY_SHELL_INTEGRATION_DIR/jetty.fish"` (fish 4 marks its prompts itself — nothing to add)
 
   The line sources a file JeTTY writes for each run, so no process starts with your shell. Never edits your dotfiles; powerlevel10k-aware (switches on p10k's own marks — `POWERLEVEL9K_TERM_SHELL_INTEGRATION` — unless your `~/.p10k.zsh` sets it). The older `source <(jetty --print-shell-integration zsh)` line keeps working.
 - 🔔 **Run & Notify** — kick off a long build, summon JeTTY away, and it **pings you when the command finishes** (desktop notification naming the tab + exit code + duration + last output line, plus a taskbar/dock urgency hint) — only when you're not already watching. Optional auto-summon on finish. The summon terminal's superpower.

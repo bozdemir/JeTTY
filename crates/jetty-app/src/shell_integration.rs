@@ -30,7 +30,8 @@ pub const ZSH_LINE: &str =
 /// The rc-file line that opts bash in (end of `~/.bashrc`).
 pub const BASH_LINE: &str =
     r#"[[ -r "${JETTY_SHELL_INTEGRATION_DIR-}/jetty.bash" ]] && source "$JETTY_SHELL_INTEGRATION_DIR/jetty.bash""#;
-/// The line that opts fish in (`~/.config/fish/config.fish`).
+/// The line that opts fish in (`~/.config/fish/config.fish`); fish 4 marks its
+/// prompts itself, and the snippet then adds nothing.
 pub const FISH_LINE: &str =
     r#"test -r "$JETTY_SHELL_INTEGRATION_DIR/jetty.fish"; and source "$JETTY_SHELL_INTEGRATION_DIR/jetty.fish""#;
 
@@ -151,19 +152,25 @@ fi
 "#;
 
 /// fish snippet — native events; captures `$status` first in fish_postexec.
+/// fish 4.0+ marks its prompts itself (A, C, `D;status`), so the handlers are
+/// installed only for fish 3 — or when fish 4's `no-mark-prompt` feature
+/// turned its own marks off; otherwise every command got a second C and D.
 pub const FISH: &str = r#"# JeTTY fish shell integration — OSC 133 semantic prompts.
 # Opt in from ~/.config/fish/config.fish with (guarded; silent elsewhere):
 #   test -r "$JETTY_SHELL_INTEGRATION_DIR/jetty.fish"; and source "$JETTY_SHELL_INTEGRATION_DIR/jetty.fish"
+# fish 4+ marks its prompts itself: there this adds nothing.
 if status is-interactive; and set -q JETTY
-    function _jetty_prompt --on-event fish_prompt
-        printf '\033]133;A\007'
-    end
-    function _jetty_preexec --on-event fish_preexec
-        printf '\033]133;C\007'
-    end
-    function _jetty_postexec --on-event fish_postexec
-        set -l ret $status               # MUST be the first statement
-        printf '\033]133;D;%s\007' $ret
+    if string match -qr '^[0-3]\.' -- $version; or status test-feature no-mark-prompt 2>/dev/null
+        function _jetty_prompt --on-event fish_prompt
+            printf '\033]133;A\007'
+        end
+        function _jetty_preexec --on-event fish_preexec
+            printf '\033]133;C\007'
+        end
+        function _jetty_postexec --on-event fish_postexec
+            set -l ret $status               # MUST be the first statement
+            printf '\033]133;D;%s\007' $ret
+        end
     end
 end
 "#;
@@ -675,5 +682,15 @@ mod tests {
     fn fish_captures_status_first() {
         assert!(FISH.contains("set -l ret $status"));
         assert!(FISH.contains("status is-interactive"));
+    }
+
+    #[test]
+    fn fish_adds_marks_only_where_fish_sends_none() {
+        // fish 4.0+ sends A, C and D;status itself (unless `no-mark-prompt`):
+        // every handler sits inside the version / feature check.
+        let guard = "    if string match -qr '^[0-3]\\.' -- $version; or status test-feature no-mark-prompt 2>/dev/null\n";
+        let (before, guarded) = FISH.split_once(guard).expect("the fish 3 / no-mark-prompt guard");
+        assert!(!before.contains("function "), "no handler before it");
+        assert_eq!(guarded.matches("        function _jetty_").count(), 3, "all three inside it");
     }
 }

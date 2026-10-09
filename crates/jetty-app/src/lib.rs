@@ -391,7 +391,8 @@ pub fn run() {
                      Shell integration (prompt marks, Ctrl+Shift+Z/X jump, Run & Notify). Add to your rc file:\n\
                      \x20 zsh:  {zsh}\n\
                      \x20 bash: {bash}\n\
-                     \x20 fish: {fish}",
+                     \x20 fish: {fish}\n\
+                     \x20       (fish 4+ marks its prompts itself — nothing to add)",
                     config = config::Config::config_path().display(),
                     zsh = shell_integration::ZSH_LINE,
                     bash = shell_integration::BASH_LINE,
