@@ -26,11 +26,22 @@ pub enum TokenKind {
 /// (`(row, col_start, col_end)` inclusive, visible rows only). The label anchors
 /// on the first span; the copied/opened text is the complete `text` (which may
 /// extend beyond the viewport for a wrapped token — see `Terminal::hint_tokens`).
+/// The spans are the scan's; where the chip goes once the grid moved is
+/// `Terminal::hint_chip_cell`'s.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HintToken {
     pub text: String,
     pub kind: TokenKind,
     pub spans: Vec<(usize, usize, usize)>,
+    /// Where `text` starts in the buffer — its first cell, on the absolute
+    /// line scale — and the anchor epoch that scale was on: where
+    /// `Terminal::hint_chip_cell` looks for the text again.
+    pub(crate) at: (i64, usize),
+    pub(crate) epoch: u64,
+    /// The char in the cell right after the token at the scan (a space past
+    /// the buffer): a line still being printed then may have grown the token
+    /// since.
+    pub(crate) next: char,
 }
 
 /// Home-row-first label alphabet (fastest keys first).

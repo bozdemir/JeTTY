@@ -50,22 +50,26 @@ pub enum SelKind {
 
 /// The modal copy-mode state: a keyboard cursor over the viewport plus, once
 /// `v`/`V`/Ctrl+V is pressed, a selection anchored at the cursor's position at
-/// that moment.
+/// that moment. The view is pinned meanwhile (`Terminal::set_view_pinned`), so
+/// the cursor's row keeps showing the same text while output scrolls in.
 #[derive(Clone, Copy, Debug)]
 pub struct CopyMode {
     pub row: usize,
     pub col: usize,
     pub selecting: bool,
     pub kind: SelKind,
-    /// Fixed selection anchor as an ABSOLUTE buffer line (captured when `v`/`V`
-    /// was pressed). Content-pinned, NOT viewport-pinned: scrolling while
-    /// selecting extends into scrollback instead of sliding the whole selection.
-    pub anchor_line: i32,
+    /// Fixed selection anchor as an ABSOLUTE line (`Terminal::viewport_row_abs`,
+    /// captured when `v`/`V` was pressed) and the anchor epoch it is on.
+    /// Content-pinned, NOT viewport-pinned: scrolling while selecting extends
+    /// into scrollback instead of sliding the whole selection, and output
+    /// scrolling in does not move it either.
+    pub anchor_line: i64,
+    pub anchor_epoch: u64,
     pub anchor_col: usize,
-    /// The view's scroll offset when copy-mode was entered. Motions scroll
-    /// freely; leaving ([`leave`]) puts the view back here — the live bottom,
+    /// Where the view was when copy-mode was entered. Motions scroll freely;
+    /// leaving ([`leave`]) puts the view back there — the live bottom,
     /// usually — the way tmux / WezTerm copy-modes return to the prompt.
-    pub entry_offset: usize,
+    pub entry: jetty_core::ViewSpot,
 }
 
 impl CopyMode {
@@ -78,28 +82,31 @@ impl CopyMode {
             selecting: false,
             kind: SelKind::Chars,
             anchor_line: 0,
+            anchor_epoch: 0,
             anchor_col: col,
-            entry_offset: 0,
+            entry: jetty_core::ViewSpot::default(),
         }
     }
 
     /// Begin (or restart) a selection anchored at the current cursor cell.
-    /// `anchor_line` is the cursor's ABSOLUTE buffer line right now — the app
-    /// computes it from the terminal so the anchor is pinned to content.
-    pub fn begin_select(&mut self, kind: SelKind, anchor_line: i32) {
+    /// `anchor` is the cursor's ABSOLUTE line right now and the terminal's
+    /// anchor epoch — the app reads both from the terminal so the anchor is
+    /// pinned to content.
+    pub fn begin_select(&mut self, kind: SelKind, anchor: (i64, u64)) {
         self.selecting = true;
         self.kind = kind;
-        self.anchor_line = anchor_line;
+        (self.anchor_line, self.anchor_epoch) = anchor;
         self.anchor_col = self.col;
     }
 
     /// The `v` / `V` / Ctrl+V key, vim's way: start a `kind` selection at the
-    /// cursor (`anchor_line` = its absolute buffer line); with one active,
-    /// switch it to `kind` keeping its anchor, or — the same kind again — stop
-    /// selecting. Returns whether a selection is active afterwards.
-    pub fn select(&mut self, kind: SelKind, anchor_line: i32) -> bool {
+    /// cursor (`anchor` = its absolute line and the anchor epoch); with one
+    /// active, switch it to `kind` keeping its anchor, or — the same kind
+    /// again — stop selecting. Returns whether a selection is active
+    /// afterwards.
+    pub fn select(&mut self, kind: SelKind, anchor: (i64, u64)) -> bool {
         if !self.selecting {
-            self.begin_select(kind, anchor_line);
+            self.begin_select(kind, anchor);
         } else if self.kind == kind {
             self.selecting = false;
         } else {
@@ -133,10 +140,12 @@ pub fn block_sides(anchor_col: usize, cursor_col: usize) -> (bool, bool) {
 }
 
 /// Leave copy-mode on `term` (Esc, the chord, `y`/Enter, `r`): drop the
-/// selection and put the view back where copy-mode was entered.
+/// selection, release the pinned view and put it back where copy-mode was
+/// entered.
 pub fn leave(cm: &CopyMode, term: &mut jetty_core::Terminal) {
     term.selection_clear();
-    term.scroll_to_offset(cm.entry_offset);
+    term.set_view_pinned(false);
+    term.scroll_to_spot(cm.entry);
 }
 
 /// The grid under copy-mode was just resized from `before` = `(cols, rows)`.
@@ -505,21 +514,21 @@ mod tests {
     #[test]
     fn v_shift_v_and_ctrl_v_switch_kinds_keeping_the_anchor() {
         let mut m = cm(3, 4);
-        assert!(m.select(SelKind::Chars, 10), "v starts a selection");
+        assert!(m.select(SelKind::Chars, (10, 0)), "v starts a selection");
         assert_eq!((m.anchor_line, m.anchor_col), (10, 4));
         m.col = 9;
         m.row = 5;
         // Ctrl+V / V switch the kind; the anchor stays where `v` put it.
-        assert!(m.select(SelKind::Block, 12));
+        assert!(m.select(SelKind::Block, (12, 0)));
         assert_eq!((m.kind, m.anchor_line, m.anchor_col), (SelKind::Block, 10, 4));
-        assert!(m.select(SelKind::Lines, 12));
+        assert!(m.select(SelKind::Lines, (12, 0)));
         assert_eq!((m.kind, m.anchor_line), (SelKind::Lines, 10));
         assert_eq!(m.pill(), jetty_render::CopySelect::Lines);
         // The active kind's key again stops selecting.
-        assert!(!m.select(SelKind::Lines, 12));
+        assert!(!m.select(SelKind::Lines, (12, 0)));
         assert_eq!(m.pill(), jetty_render::CopySelect::None);
         // The next one starts afresh at the cursor.
-        assert!(m.select(SelKind::Block, 12));
+        assert!(m.select(SelKind::Block, (12, 0)));
         assert_eq!((m.anchor_line, m.anchor_col), (12, 9));
         assert_eq!(m.pill(), jetty_render::CopySelect::Block);
     }
@@ -554,7 +563,7 @@ mod tests {
             t.feed(format!("line {i}\r\n").as_bytes());
         }
         let mut m = CopyMode::new(9, 15);
-        assert!(m.select(SelKind::Chars, t.viewport_line_to_buffer(9)));
+        assert!(m.select(SelKind::Chars, (t.viewport_row_abs(9), t.anchor_epoch())));
         t.selection_start(9, 15, true);
         t.selection_update(9, 15, false);
         let before = (t.cols(), t.rows());
@@ -565,7 +574,7 @@ mod tests {
         assert_eq!(t.selection_text(), None);
         // A same-size reflow (a font change that kept the grid) changes nothing.
         let mut m = CopyMode::new(1, 2);
-        assert!(m.select(SelKind::Lines, t.viewport_line_to_buffer(1)));
+        assert!(m.select(SelKind::Lines, (t.viewport_row_abs(1), t.anchor_epoch())));
         t.selection_start_lines(1);
         let same = (t.cols(), t.rows());
         after_resize(&mut m, &mut t, same);
@@ -581,7 +590,7 @@ mod tests {
         for i in 0..100 {
             t.feed(format!("line {i}\r\n").as_bytes());
         }
-        let cm = CopyMode { entry_offset: t.scroll_offset(), ..CopyMode::new(4, 0) };
+        let cm = CopyMode { entry: t.view_spot(), ..CopyMode::new(4, 0) };
         t.scroll_lines(40);
         t.selection_start(0, 0, true);
         t.selection_update(1, 5, false);
@@ -590,10 +599,37 @@ mod tests {
         assert_eq!(t.selection_text(), None, "the selection is dropped");
         // Entered while reading history: back to that spot, not the bottom.
         t.scroll_lines(30);
-        let cm = CopyMode { entry_offset: t.scroll_offset(), ..CopyMode::new(0, 0) };
+        let cm = CopyMode { entry: t.view_spot(), ..CopyMode::new(0, 0) };
         t.scroll_lines(25);
         leave(&cm, &mut t);
         assert_eq!(t.scroll_offset(), 30);
+    }
+
+    #[test]
+    fn output_scrolling_in_keeps_the_selection_on_its_text() {
+        // `ping` streaming at the bottom: copy-mode, `v` on icmp_seq=7, two
+        // lines arrive, `j`. The anchor was a buffer line, which every
+        // scrolled line moves: the next motion re-anchored the selection two
+        // lines down and `y` yanked lines nobody selected.
+        let mut t = jetty_core::Terminal::new(30, 5);
+        for i in 1..=10 {
+            t.feed(format!("icmp_seq={i}\r\n").as_bytes());
+        }
+        // Entering pins the view (as `App::enter_copy_mode` does).
+        let mut m = CopyMode { entry: t.view_spot(), ..CopyMode::new(0, 0) };
+        t.set_view_pinned(true);
+        assert!(m.select(SelKind::Lines, (t.viewport_row_abs(0), t.anchor_epoch())));
+        t.feed(b"icmp_seq=11\r\nicmp_seq=12\r\n");
+        // `j`, and the selection rebuilt from the anchor (as
+        // `App::copy_mode_refresh_selection` does).
+        m.row = 1;
+        t.selection_start_lines_abs(t.abs_to_buffer_line(m.anchor_line));
+        t.selection_update_abs(t.viewport_line_to_buffer(m.row), 0, false);
+        assert_eq!(t.selection_text().as_deref(), Some("icmp_seq=7\nicmp_seq=8\n"));
+        leave(&m, &mut t);
+        assert_eq!(t.scroll_offset(), 0, "back at the live bottom, following the output again");
+        t.feed(b"icmp_seq=13\r\n");
+        assert_eq!(t.scroll_offset(), 0);
     }
 
     #[test]

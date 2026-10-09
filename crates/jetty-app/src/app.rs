@@ -4427,6 +4427,11 @@ impl App {
         // Original active index, kept so the detach can be fully unwound if the
         // detached window's GPU/window init fails (see the Err arm below).
         let prev_active = self.active;
+        // The main window's hint mode / copy-mode act on its active tab: end
+        // them on it before it leaves.
+        if idx == prev_active {
+            self.end_modes(Surface::Main);
+        }
         let Some(mut tab) = crate::detached::take_tab(&mut self.tabs, idx) else {
             return;
         };
@@ -4653,14 +4658,13 @@ impl App {
     /// exiting): its palette — a live theme preview there would otherwise stay
     /// on every window — its search (dropping the tab's compiled regex +
     /// matches, which the main window's closed bar would otherwise carry into
-    /// every reflow) and its copy-mode selection.
+    /// every reflow) and its hint mode / copy-mode (their selection and
+    /// pinned view).
     fn close_detached_overlays(&mut self, pos: usize) {
         let s = Surface::Detached(pos);
         self.close_palette(s);
         self.search_close(s);
-        if self.ov_of(s).is_some_and(|o| o.copy_mode.is_some()) {
-            self.cancel_copy_mode(s);
-        }
+        self.end_modes(s);
     }
 
     /// Take detached window `pos` out of the app — THE teardown every path
@@ -5561,31 +5565,72 @@ impl App {
     /// Esc), a pill says why instead — a chord that silently does nothing reads
     /// as a broken one. The layers that capture every key (palette, menus,
     /// rename, confirmations, copy-mode) take the chord before it gets here.
+    /// The chips point at text on the screen, so the view is pinned to it
+    /// meanwhile: output scrolls in below instead of sliding the text from
+    /// under its chip.
     fn enter_hint_mode(&mut self, s: Surface) {
-        let Some(term) = self.term_of(s) else { return };
+        let Some(term) = self.term_of_mut(s) else { return };
         if term.alt_screen() {
             self.surface_pill(s, MSG_MODES_ALT_SCREEN);
             return;
         }
+        // Pinned before the scan: pinning may apply a pending synchronized
+        // update.
+        let entry = term.view_spot();
+        term.set_view_pinned(true);
         let tokens = term.hint_tokens();
         if tokens.is_empty() {
+            term.set_view_pinned(false);
             self.surface_pill(s, "Hint mode: nothing to label on screen");
             return;
         }
         let labels = jetty_core::hints::assign_labels(tokens.len());
+        let epoch = term.anchor_epoch();
         self.take_keyboard(s, Layer::Hint);
         if let Some(ov) = self.ov_of_mut(s) {
-            ov.hint_mode = Some(HintState { tokens, labels, typed: String::new() });
+            ov.hint_mode = Some(HintState { tokens, labels, typed: String::new(), entry, epoch });
         }
         self.paint_surface(s);
     }
 
-    /// Cancel window `s`'s hint mode (Esc / after firing).
+    /// Cancel window `s`'s hint mode (Esc / after firing): the view released
+    /// and put back where hint mode began.
     fn exit_hint_mode(&mut self, s: Surface) {
-        if let Some(ov) = self.ov_of_mut(s) {
-            ov.hint_mode = None;
+        let entry = self.ov_of_mut(s).and_then(|o| o.hint_mode.take()).map(|hs| hs.entry);
+        if let (Some(entry), Some(term)) = (entry, self.term_of_mut(s)) {
+            term.set_view_pinned(false);
+            term.scroll_to_spot(entry);
         }
         self.paint_surface(s);
+    }
+
+    /// Hint mode's tokens sit on the absolute line scale: when a reflow (or a
+    /// lost scroll count) re-anchored it since the scan, scan window `s`'s
+    /// screen again, each token keeping its label by text
+    /// ([`HintState::rescan`]); none left ends hint mode. One compare
+    /// otherwise.
+    fn rescan_hints(&mut self, s: Surface) {
+        let Some((ov, term)) = self.ov_term_mut(s) else { return };
+        let Some(hs) = ov.hint_mode.as_mut() else { return };
+        let epoch = term.anchor_epoch();
+        if hs.epoch == epoch || term.alt_screen() {
+            return;
+        }
+        hs.rescan(term.hint_tokens(), epoch);
+        if hs.tokens.is_empty() {
+            self.exit_hint_mode(s);
+        }
+    }
+
+    /// Window `s`'s hint chips ([`Overlays::hint_draw`]), its tokens re-scanned
+    /// first when a reflow re-anchored them. `None` while hint mode is off —
+    /// one `Option` test then.
+    fn hint_draw(&mut self, s: Surface) -> Option<HintDrawData> {
+        if self.ov_of(s).is_none_or(|o| o.hint_mode.is_none()) {
+            return None;
+        }
+        self.rescan_hints(s);
+        self.ov_of(s)?.hint_draw(self.term_of(s)?)
     }
 
     /// Handle one key while hint mode owns window `s`'s keyboard. Letters narrow
@@ -5623,13 +5668,18 @@ impl App {
             Narrow(String),
             Ignore,
         }
+        self.rescan_hints(s);
         let outcome = {
             let Some(hs) = self.ov_of(s).and_then(|o| o.hint_mode.as_ref()) else { return };
+            let Some(term) = self.term_of(s) else { return };
             let mut typed = hs.typed.clone();
             typed.push(ch);
-            if let Some(idx) = hs.labels.iter().position(|l| *l == typed) {
+            // Only a token whose chip is up — its text still on the screen —
+            // answers to its label.
+            let up = |i: usize| term.hint_chip_cell(&hs.tokens[i]).is_some();
+            if let Some(idx) = (0..hs.labels.len()).find(|&i| hs.labels[i] == typed && up(i)) {
                 Outcome::Fire(hs.tokens[idx].clone())
-            } else if hs.labels.iter().any(|l| l.starts_with(&typed)) {
+            } else if (0..hs.labels.len()).any(|i| hs.labels[i].starts_with(&typed) && up(i)) {
                 Outcome::Narrow(typed)
             } else {
                 Outcome::Ignore
@@ -5675,6 +5725,11 @@ impl App {
         }
         self.take_keyboard(s, Layer::Copy);
         let Some(term) = self.term_of_mut(s) else { return };
+        // The cursor points at text on the screen: pin the view to it (before
+        // reading the grid — pinning may apply a pending synchronized update),
+        // so output scrolls in below instead of sliding the text from under it.
+        let entry = term.view_spot();
+        term.set_view_pinned(true);
         let snap = term.snapshot();
         let (row, col) = if snap.cursor_visible {
             (
@@ -5685,17 +5740,19 @@ impl App {
             (snap.rows.saturating_sub(1), 0)
         };
         term.selection_clear();
-        let entry_offset = term.scroll_offset();
         if let Some(ov) = self.ov_of_mut(s) {
-            ov.copy_mode = Some(crate::copymode::CopyMode { entry_offset, ..crate::copymode::CopyMode::new(row, col) });
+            ov.copy_mode = Some(crate::copymode::CopyMode { entry, ..crate::copymode::CopyMode::new(row, col) });
         }
         self.paint_surface(s);
     }
 
-    /// Exit window `s`'s copy-mode (Esc / after yank).
+    /// Exit window `s`'s copy-mode (Esc / after yank), releasing the pinned
+    /// view where it is (`cancel_copy_mode` puts it back first).
     fn exit_copy_mode(&mut self, s: Surface) {
-        if let Some(ov) = self.ov_of_mut(s) {
-            ov.copy_mode = None;
+        if self.ov_of_mut(s).and_then(|o| o.copy_mode.take()).is_some() {
+            if let Some(term) = self.term_of_mut(s) {
+                term.set_view_pinned(false);
+            }
         }
         self.paint_surface(s);
     }
@@ -5764,7 +5821,7 @@ impl App {
                     // new tab the main window's active one.
                     if let Some((ov, term)) = self.ov_term_mut(s) {
                         if let Some(cm) = ov.copy_mode {
-                            term.scroll_to_offset(cm.entry_offset);
+                            term.scroll_to_spot(cm.entry);
                         }
                     }
                     // run_selection_in_new_tab captures + clears the SOURCE
@@ -5850,13 +5907,14 @@ impl App {
     /// start a `kind` selection at the cursor, switch the active one to `kind`
     /// (keeping its anchor), or stop selecting.
     fn copy_mode_select(&mut self, s: Surface, kind: crate::copymode::SelKind) {
-        // Content-pinned anchor: capture the BUFFER line under the cursor NOW,
+        // Content-pinned anchor: capture the ABSOLUTE line under the cursor NOW,
         // so scrolling while selecting extends into scrollback rather than
-        // sliding the whole selection with the viewport.
+        // sliding the whole selection with the viewport, and output scrolling
+        // in moves neither.
         let Some((ov, term)) = self.ov_term_mut(s) else { return };
         let Some(cm) = ov.copy_mode.as_mut() else { return };
-        let anchor_line = term.viewport_line_to_buffer(cm.row);
-        if cm.select(kind, anchor_line) {
+        let anchor = (term.viewport_row_abs(cm.row), term.anchor_epoch());
+        if cm.select(kind, anchor) {
             self.copy_mode_refresh_selection(s);
         } else {
             term.selection_clear();
@@ -5875,10 +5933,20 @@ impl App {
         if !cm.selecting {
             return;
         }
-        let anchor = (cm.anchor_line, cm.anchor_col);
-        // The cursor's CURRENT absolute buffer line (viewport row → buffer at the
-        // present scroll offset); the anchor is already absolute + fixed, so a
-        // scroll extends the selection through scrollback instead of sliding it.
+        // A reflow or a lost scroll count re-anchored the lines since `v`: the
+        // anchor names other text — back to moving the cursor, as after a
+        // resize.
+        if cm.anchor_epoch != term.anchor_epoch() {
+            if let Some(cm) = ov.copy_mode.as_mut() {
+                cm.selecting = false;
+            }
+            term.selection_clear();
+            return;
+        }
+        // The anchor's buffer line now (the absolute line is fixed, so a scroll
+        // extends the selection through scrollback instead of sliding it), and
+        // the cursor's (viewport row → buffer at the present scroll offset).
+        let anchor = (term.abs_to_buffer_line(cm.anchor_line), cm.anchor_col);
         let cursor_line = term.viewport_line_to_buffer(cm.row);
         let cursor = (cursor_line, cm.col);
         match cm.kind {
@@ -6295,8 +6363,28 @@ impl App {
             if ov.copy_mode.is_some() {
                 term.selection_clear();
             }
+            // The primary screen is out of reach now: its view stays on the
+            // lines the mode pinned it to, as a scrolled-back view does.
+            term.set_view_pinned(false);
             ov.hint_mode = None;
             ov.copy_mode = None;
+        }
+    }
+
+    /// End window `s`'s hint mode / copy-mode on its terminal before that
+    /// terminal stops being the window's (another tab becomes active, the tab
+    /// is detached or reattached): as Esc would — the copy-mode selection
+    /// dropped, the view released and put back where the mode began. Left to
+    /// the later reset, the outgoing tab kept the selection and its view stayed
+    /// pinned deep in history.
+    fn end_modes(&mut self, s: Surface) {
+        let Some(ov) = self.ov_of(s) else { return };
+        let (hint, copy) = (ov.hint_mode.is_some(), ov.copy_mode.is_some());
+        if hint {
+            self.exit_hint_mode(s);
+        }
+        if copy {
+            self.cancel_copy_mode(s);
         }
     }
 
@@ -6313,10 +6401,9 @@ impl App {
             if let Some(term) = self.term_of_mut(s) {
                 term.selection_clear();
             }
-            if let Some(ov) = self.ov_of_mut(s) {
-                ov.copy_mode = None;
-            }
-            self.paint_surface(s);
+            // The view stays put (the click is aimed at what it shows), and
+            // follows the output again.
+            self.exit_copy_mode(s);
         }
         false
     }
@@ -7099,8 +7186,10 @@ impl App {
             return;
         }
         // The search bar targets the ACTIVE tab: close it (clearing the
-        // outgoing tab's regex/matches) before the index moves (F2/F7/F15).
+        // outgoing tab's regex/matches) before the index moves (F2/F7/F15) —
+        // and so do hint mode and copy-mode.
         self.search_close(Surface::Main);
+        self.end_modes(Surface::Main);
         // Buttons its program saw pressed are released to it now: the real
         // releases would reach the new tab, which never saw the presses.
         self.with_main_grid(crate::gridmouse::end_gestures);
@@ -11876,8 +11965,9 @@ impl App {
         // main window's capture, from this window's own state.
         let s = Surface::Detached(pos);
         let (search_ui, search_hits) = self.search_draw(s);
+        let hint_ui = self.hint_draw(s);
         let Some(ov) = self.ov_of(s) else { return };
-        let (palette_ui, hint_ui, copy_mode_ui) = (ov.palette_draw(), ov.hint_draw(), ov.copy_draw());
+        let (palette_ui, copy_mode_ui) = (ov.palette_draw(), ov.copy_draw());
         let (help_open, help_scroll) = (ov.help_open, ov.help_scroll);
         // The IME preedit isn't drawn while a layer that takes the commit owns
         // the window's keyboard (the main window's gate).
@@ -15841,7 +15931,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // each token whose label still matches the typed prefix, captured
                 // OWNED before the mutable gpu/text borrow. None while inactive
                 // (one Option test on the hot path, zero allocation).
-                let hint_ui: Option<HintDrawData> = self.ov.hint_draw();
+                let hint_ui: Option<HintDrawData> = self.hint_draw(Surface::Main);
                 // Copy-mode cursor + pill: (row, col, pill state). None
                 // while inactive; `copy_mode_active` suppresses the shell cursor.
                 let copy_mode_ui = self.ov.copy_draw();

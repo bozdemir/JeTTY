@@ -110,11 +110,47 @@ pub(crate) enum ThemePreview {
 }
 
 /// Hint-mode capture state: the scanned tokens, their parallel labels, and the
-/// typed label prefix.
+/// typed label prefix. The tokens are pinned to their text (the view is pinned
+/// meanwhile, and a chip is drawn only where its text still is — see
+/// `Terminal::hint_chip_cell`).
 pub(crate) struct HintState {
     pub tokens: Vec<jetty_core::HintToken>,
     pub labels: Vec<String>,
     pub typed: String,
+    /// Where the view was when hint mode began: put back when it ends.
+    pub entry: jetty_core::ViewSpot,
+    /// The terminal's anchor epoch at the scan: a reflow since re-anchored
+    /// the tokens' lines, so the screen is scanned again ([`HintState::rescan`]).
+    pub epoch: u64,
+}
+
+impl HintState {
+    /// Take `tokens`, a scan of the same window after a reflow re-anchored the
+    /// old ones (`epoch` is the new anchor epoch): each keeps the label of the
+    /// old token with its text — a chip the user already read keeps its
+    /// letter — and the rest take the old labels left over, in the old
+    /// tokens' order (still prefix-free); tokens past those go unlabelled. The typed prefix stays
+    /// while some label still starts with it.
+    pub fn rescan(&mut self, tokens: Vec<jetty_core::HintToken>, epoch: u64) {
+        let mut by_text: std::collections::HashMap<String, String> =
+            self.tokens.drain(..).map(|t| t.text).zip(self.labels.iter().cloned()).collect();
+        let kept: Vec<Option<String>> = tokens.iter().map(|t| by_text.remove(&t.text)).collect();
+        let spare: Vec<String> =
+            self.labels.iter().filter(|&l| !kept.iter().any(|k| k.as_ref() == Some(l))).cloned().collect();
+        let mut spare = spare.into_iter();
+        let mut labels = Vec::new();
+        for (tok, label) in tokens.into_iter().zip(kept) {
+            if let Some(label) = label.or_else(|| spare.next()) {
+                self.tokens.push(tok);
+                labels.push(label);
+            }
+        }
+        self.labels = labels;
+        self.epoch = epoch;
+        if !self.labels.iter().any(|l| l.starts_with(&self.typed)) {
+            self.typed.clear();
+        }
+    }
 }
 
 /// One window's overlays. Zero cost while everything is closed: the vectors are
@@ -319,9 +355,11 @@ impl Overlays {
         }
     }
 
-    /// Hint chips to draw: `(label, row, col)` of every token whose label still
-    /// matches the typed prefix, plus the prefix. `None` while inactive.
-    pub fn hint_draw(&self) -> Option<HintDrawData> {
+    /// Hint chips to draw on `term` (this window's terminal): `(label, row,
+    /// col)` of every token whose label still matches the typed prefix, on
+    /// its text where that is now — none for a token whose text is gone or
+    /// off screen — plus the prefix. `None` while inactive.
+    pub fn hint_draw(&self, term: &jetty_core::Terminal) -> Option<HintDrawData> {
         self.hint_mode.as_ref().map(|hs| {
             let typed = hs.typed.clone();
             let labeled = hs
@@ -329,7 +367,7 @@ impl Overlays {
                 .iter()
                 .zip(hs.tokens.iter())
                 .filter(|(lab, _)| typed.is_empty() || lab.starts_with(&typed))
-                .filter_map(|(lab, tok)| tok.spans.first().map(|(r, c, _)| (lab.clone(), *r, *c)))
+                .filter_map(|(lab, tok)| term.hint_chip_cell(tok).map(|(r, c)| (lab.clone(), r, c)))
                 .collect();
             (labeled, typed)
         })
@@ -571,9 +609,35 @@ mod tests {
     }
 
     #[test]
+    fn a_rescan_keeps_each_token_its_label_by_text() {
+        // A reflow re-anchored the tokens: the new scan finds `/b` first now
+        // and a new `/d`, while `/a` scrolled away. `/b` and `/c` keep the
+        // letters the user read; `/d` takes the one `/a` left.
+        let mut t = jetty_core::Terminal::new(40, 6);
+        t.feed(b"/a\r\n/b\r\n/c\r\n");
+        let tokens = t.hint_tokens();
+        let labels = jetty_core::hints::assign_labels(tokens.len());
+        let mut hs = HintState { tokens, labels, typed: "s".into(), entry: t.view_spot(), epoch: 0 };
+        let mut t = jetty_core::Terminal::new(40, 6);
+        t.feed(b"/b x\r\n/d\r\n/c\r\n");
+        hs.rescan(t.hint_tokens(), 7);
+        let got: Vec<(&str, &str)> = hs.tokens.iter().map(|t| t.text.as_str()).zip(hs.labels.iter().map(String::as_str)).collect();
+        assert_eq!(got, vec![("/b", "s"), ("/d", "a"), ("/c", "d")]);
+        assert_eq!((hs.typed.as_str(), hs.epoch), ("s", 7), "`s` still leads to /b");
+        // More tokens than labels: the extras go unlabelled; a dead prefix clears.
+        hs.typed = "f".into();
+        let mut t = jetty_core::Terminal::new(40, 6);
+        t.feed(b"/e\r\n/f\r\n/g\r\n/h\r\n");
+        hs.rescan(t.hint_tokens(), 8);
+        assert_eq!(hs.labels, vec!["s", "a", "d"], "the labels left over, in the old tokens' order");
+        assert_eq!(hs.tokens.len(), 3);
+        assert_eq!(hs.typed, "");
+    }
+
+    #[test]
     fn closed_overlays_draw_nothing() {
         let ov = Overlays::default();
-        assert!(ov.hint_draw().is_none());
+        assert!(ov.hint_draw(&jetty_core::Terminal::new(10, 2)).is_none());
         assert!(ov.palette_draw().is_none());
         assert!(ov.copy_draw().is_none());
     }

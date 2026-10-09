@@ -1066,6 +1066,12 @@ pub struct Terminal {
     /// Bumped on every switch between the primary and the alternate screen:
     /// stored search matches belong to the screen they were collected on.
     screen_switches: u64,
+    /// While set (keyboard copy-mode, hint mode — modes that point at text on
+    /// the screen), the view stays on the lines it shows even at the live
+    /// bottom: output scrolls in below them instead of moving them, as tmux's
+    /// copy mode does. An anchor, so the count of scrolled lines stays exact.
+    /// See [`Terminal::set_view_pinned`].
+    view_pinned: bool,
     /// While a double-click selection that began on a plain-text URL is live:
     /// `true` when the selection's START is that URL's first cell, `false` when
     /// its END is the URL's last cell (the drag went left of it). The URL is
@@ -1305,6 +1311,18 @@ struct SearchScan {
     capped: bool,
 }
 
+/// Where the view was in the scrollback — the lines it showed — so a mode
+/// that moved it can put it back ([`Terminal::view_spot`]). The default is the
+/// live bottom.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewSpot {
+    /// The scroll offset then (0: the live bottom).
+    offset: usize,
+    /// The absolute line at the view's top then, and the anchor epoch it is on.
+    top: i64,
+    epoch: u64,
+}
+
 /// A link found under the pointer by [`Terminal::link_at`]: the target URI
 /// plus where to underline it in the viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1419,6 +1437,7 @@ impl Terminal {
             search_current: 0,
             search_scan: None,
             screen_switches: 0,
+            view_pinned: false,
             url_select: None,
             abs_top: 0,
             scrollback_limit,
@@ -2755,10 +2774,10 @@ impl Terminal {
 
     /// Whether any row-anchored state exists — the only time the scanner pays to
     /// isolate history-rewriting sequences (see [`IsolatedSeq`]). An active
-    /// search counts: its matches sit on the absolute line scale.
+    /// search and a pinned view count: they sit on the absolute line scale.
     #[inline(always)]
     fn has_anchors(&self) -> bool {
-        !self.marks.is_empty() || !self.placements.is_empty() || self.search_regex.is_some()
+        !self.marks.is_empty() || !self.placements.is_empty() || self.search_regex.is_some() || self.view_pinned
     }
 
     /// Apply what an isolated sequence (just advanced in its own sub-slice) means
@@ -2854,8 +2873,9 @@ impl Terminal {
     #[inline(never)]
     fn keep_view_on_content(&mut self, before: Option<(usize, usize)>, h1: usize) {
         let d1 = self.term.grid().display_offset();
-        // Back at the bottom — put there by ED 3 or RIS: nothing to keep.
-        if d1 == 0 {
+        // Back at the bottom — put there by ED 3 or RIS: nothing to keep. A
+        // pinned view that WAS at the bottom is kept on its lines too.
+        if d1 == 0 && !(self.view_pinned && before.is_some_and(|(d0, _)| d0 == 0)) {
             return;
         }
         let want = match before {
@@ -2997,8 +3017,9 @@ impl Terminal {
             self.forget_alt_images();
             self.screen_switches = self.screen_switches.wrapping_add(1);
         }
-        // Back on (or still on) the primary screen with its view scrolled back.
-        if !alt_after && (d0 != 0 || alt_before) {
+        // Back on (or still on) the primary screen with its view scrolled back
+        // — or pinned.
+        if !alt_after && (d0 != 0 || alt_before || self.view_pinned) {
             self.keep_view_on_content((!alt_before).then_some((d0, h0)), h1);
         }
         self.track_abs_top(alt_before, alt_after, h0, h1);
@@ -3071,7 +3092,7 @@ impl Terminal {
                 self.term.linefeed();
             }
             let h1 = self.term.grid().history_size();
-            if d0 != 0 {
+            if d0 != 0 || self.view_pinned {
                 self.keep_view_on_content(Some((d0, h0)), h1);
             }
             self.track_abs_top(false, false, h0, h1);
@@ -4844,14 +4865,67 @@ impl Terminal {
         true
     }
 
-    /// Convert a viewport row (0 = top of the visible grid) to its ABSOLUTE
-    /// buffer line at the current scroll offset. Copy-mode captures its anchor
-    /// this way so the anchor stays pinned to CONTENT — not the viewport — and
-    /// scrolling extends the selection into scrollback instead of sliding the
-    /// whole selection with the viewport.
+    /// Convert a viewport row (0 = top of the visible grid) to its buffer line
+    /// at the current scroll offset — independent of the scroll offset, but
+    /// moved by every line output scrolls into history; keep a line across
+    /// output as [`Terminal::viewport_row_abs`].
     pub fn viewport_line_to_buffer(&self, viewport_line: usize) -> i32 {
         let display_offset = self.term.grid().display_offset();
         viewport_to_point(display_offset, Point::new(viewport_line, Column(0))).line.0
+    }
+
+    /// The line viewport row `row` shows on the absolute scale marks and
+    /// images use: it keeps naming the same text while output scrolls (a
+    /// copy-mode selection anchor). Exact while something is anchored — a
+    /// pinned view is — and until [`Terminal::anchor_epoch`] changes.
+    pub fn viewport_row_abs(&self, row: usize) -> i64 {
+        self.abs_top - self.term.grid().display_offset() as i64 + row as i64
+    }
+
+    /// The buffer line (as [`Terminal::viewport_line_to_buffer`] gives) of
+    /// absolute line `abs`, clamped into the buffer: a line that scrolled out
+    /// of its top is the topmost one left.
+    pub fn abs_to_buffer_line(&self, abs: i64) -> i32 {
+        let grid = self.term.grid();
+        let (top, bottom) = (grid.topmost_line().0 as i64, grid.bottommost_line().0 as i64);
+        (abs - self.abs_top).clamp(top, bottom) as i32
+    }
+
+    /// Bumped whenever the absolute lines are re-anchored — a reflow, a lost
+    /// scroll count, RIS: an absolute line kept from before names other text.
+    pub fn anchor_epoch(&self) -> u64 {
+        self.anchor_epoch
+    }
+
+    /// Pin the view to the lines it shows (`true`) — even at the live bottom,
+    /// output then scrolls in below them — for a mode that points at text on
+    /// the screen (copy-mode's cursor, hint chips); `false` lets it follow
+    /// the output again (put it back with [`Terminal::scroll_to_spot`]).
+    pub fn set_view_pinned(&mut self, on: bool) {
+        // The pin makes an anchor: a synchronized update still buffering bytes
+        // the scanner saw without one is applied first (as for a search).
+        if on && !self.view_pinned {
+            self.apply_pending_sync();
+        }
+        self.view_pinned = on;
+    }
+
+    /// Where the view is now, to put it back with [`Terminal::scroll_to_spot`].
+    pub fn view_spot(&self) -> ViewSpot {
+        let offset = self.term.grid().display_offset();
+        ViewSpot { offset, top: self.abs_top - offset as i64, epoch: self.anchor_epoch }
+    }
+
+    /// Put the view back on `spot`: at the live bottom when it was there, else
+    /// on the lines it showed — output that scrolled in since does not move
+    /// them — or, once a reflow re-anchored the lines, at its old offset.
+    pub fn scroll_to_spot(&mut self, spot: ViewSpot) {
+        let offset = if spot.offset == 0 || spot.epoch != self.anchor_epoch {
+            spot.offset
+        } else {
+            (self.abs_top - spot.top).max(0) as usize
+        };
+        self.scroll_to_offset(offset);
     }
 
     /// Like [`Terminal::selection_start`] but anchored at an ABSOLUTE buffer
@@ -5193,7 +5267,17 @@ impl Terminal {
                 if !seen.insert(text.clone()) {
                     continue; // dedup identical on-screen tokens
                 }
-                tokens.push(HintToken { text, kind, spans });
+                let at = (self.abs_top + (gs + (s / self.cols) as i32) as i64, s % self.cols);
+                // The cell after it: in its logical line, else the next row's first.
+                let next = chars.get(e).copied().unwrap_or_else(|| {
+                    if ge < bottom {
+                        let cell = &grid[Line(ge + 1)][Column(0)];
+                        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) { ' ' } else { cell.c }
+                    } else {
+                        ' '
+                    }
+                });
+                tokens.push(HintToken { text, kind, spans, at, epoch: self.anchor_epoch, next });
                 if tokens.len() >= TOKEN_CAP {
                     break 'lines;
                 }
@@ -5202,6 +5286,49 @@ impl Terminal {
         }
         tokens.reverse();
         tokens
+    }
+
+    /// Where hint token `tok`'s chip goes now: the viewport cell of the first
+    /// of its cells on screen — the scan's first span while nothing moved, the
+    /// text's new place after the view or the lines did. `None` once the text
+    /// is no longer where it was scanned (rewritten, scrolled out of the
+    /// buffer, the lines re-anchored by a reflow) or none of it is on screen.
+    /// O(token length); per frame only while hint mode is up.
+    pub fn hint_chip_cell(&self, tok: &HintToken) -> Option<(usize, usize)> {
+        if tok.epoch != self.anchor_epoch || self.cols == 0 {
+            return None;
+        }
+        let grid = self.term.grid();
+        let top = self.abs_top - grid.history_size() as i64;
+        let bottom = self.abs_top + self.rows as i64 - 1;
+        let view_top = self.abs_top - grid.display_offset() as i64;
+        let (line, col) = tok.at;
+        let mut chip = None;
+        // One char per cell, a wide char's spacer read as ' ' — as scanned —
+        // and the cell after it unchanged too: a line still being printed at
+        // the scan has not grown the token since.
+        let len = tok.text.chars().count();
+        for (i, ch) in tok.text.chars().chain([tok.next]).enumerate() {
+            let abs = line + ((col + i) / self.cols) as i64;
+            let c = (col + i) % self.cols;
+            let after = i == len;
+            if abs < top || abs > bottom {
+                if after {
+                    break;
+                }
+                return None;
+            }
+            let cell = &grid[Line((abs - self.abs_top) as i32)][Column(c)];
+            let got = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) { ' ' } else { cell.c };
+            if got != ch {
+                return None;
+            }
+            let row = abs - view_top;
+            if !after && chip.is_none() && (0..self.rows as i64).contains(&row) {
+                chip = Some((row as usize, c));
+            }
+        }
+        chip
     }
 
     /// The visible viewport as rows-of-chars (`rows` × `cols`, blank cells
@@ -9571,6 +9698,90 @@ mod tests {
         t.feed(b"https://x.io/a\r\nhttps://x.io/a\r\n");
         let toks = t.hint_tokens();
         assert_eq!(toks.iter().filter(|h| h.text == "https://x.io/a").count(), 1);
+    }
+
+    /// The viewport's rows as text.
+    fn screen_rows(t: &Terminal) -> Vec<String> {
+        let snap = t.snapshot();
+        (0..t.rows()).map(|r| snap.row_text(r).trim_end().to_string()).collect()
+    }
+
+    #[test]
+    fn a_pinned_view_keeps_its_lines_while_output_scrolls() {
+        // Copy-mode / hint mode pin the view: at the live bottom, output used
+        // to scroll the text out from under the copy cursor and the chips.
+        // Also with a full scrollback and nothing else anchored, where the
+        // count of scrolled lines is otherwise lost.
+        for scrollback in [10_000usize, 50] {
+            let mut t = Terminal::new(20, 4);
+            t.set_scrollback_lines(scrollback);
+            for i in 0..80 {
+                t.feed(format!("line {i}\r\n").as_bytes());
+            }
+            let spot = t.view_spot();
+            let before = screen_rows(&t);
+            let anchor = t.viewport_row_abs(1);
+            t.set_view_pinned(true);
+            for i in 80..83 {
+                t.feed(format!("line {i}\r\n").as_bytes());
+            }
+            // The cursor's (empty) row took `line 80` before it scrolled.
+            assert_eq!(screen_rows(&t)[..3], before[..3], "scrollback {scrollback}: the view stays on its lines");
+            assert_eq!(t.scroll_offset(), 3);
+            assert_eq!(t.abs_to_buffer_line(anchor), t.viewport_line_to_buffer(1), "the absolute line follows its text");
+            t.set_view_pinned(false);
+            t.scroll_to_spot(spot);
+            assert_eq!(t.scroll_offset(), 0, "back at the live bottom");
+            assert_eq!(screen_rows(&t)[2], "line 82");
+        }
+    }
+
+    #[test]
+    fn a_spot_scrolled_back_is_found_again_after_output() {
+        let mut t = Terminal::new(20, 4);
+        for i in 0..80 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        t.scroll_lines(30);
+        let spot = t.view_spot();
+        let before = screen_rows(&t);
+        t.feed(b"more\r\nand more\r\n");
+        t.scroll_lines(-10);
+        t.scroll_to_spot(spot);
+        assert_eq!(screen_rows(&t), before, "the same lines, not the same offset");
+    }
+
+    #[test]
+    fn a_hint_chip_follows_its_text_and_goes_when_the_text_does() {
+        let mut t = Terminal::new(30, 4);
+        t.feed(b"see /etc/hosts\r\nand /tmp/x\r\n");
+        let toks = t.hint_tokens();
+        let hosts = toks.iter().find(|h| h.text == "/etc/hosts").unwrap();
+        assert_eq!(t.hint_chip_cell(hosts), Some((0, 4)), "where the scan found it");
+        // Output scrolls it up a row (the view is not pinned here).
+        t.feed(b"x\r\ny\r\n");
+        assert_eq!(t.hint_chip_cell(hosts), None, "scrolled off the screen");
+        t.scroll_lines(1);
+        assert_eq!(t.hint_chip_cell(hosts), Some((0, 4)), "on its text again");
+        // Rewritten in place: the chip goes.
+        let tmp = toks.iter().find(|h| h.text == "/tmp/x").unwrap();
+        t.scroll_to_bottom();
+        assert_eq!(t.hint_chip_cell(tmp), Some((0, 4)));
+        t.feed(b"\x1b[1;5H/tmp/y");
+        assert_eq!(t.hint_chip_cell(tmp), None, "its text was overwritten");
+        // A reflow re-anchors the lines.
+        let toks = t.hint_tokens();
+        t.resize(25, 4);
+        assert!(toks.iter().all(|h| t.hint_chip_cell(h).is_none()));
+        // A line still being printed when hint mode scanned it: once it goes
+        // on, the token under the chip is longer than the one its label copies.
+        let mut t = Terminal::new(40, 4);
+        t.feed(b"GET https://example.com/page/5");
+        let toks = t.hint_tokens();
+        assert_eq!(toks[0].text, "https://example.com/page/5");
+        assert!(t.hint_chip_cell(&toks[0]).is_some());
+        t.feed(b"8\r\n");
+        assert_eq!(t.hint_chip_cell(&toks[0]), None, "the text under it is now page/58");
     }
 
     #[test]

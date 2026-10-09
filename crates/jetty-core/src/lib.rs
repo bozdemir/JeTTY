@@ -22,7 +22,7 @@ pub use snapshot::{
     GRAPHEME_MAX_MARKS, SHAPE_MASK, VisibleImage,
 };
 pub use terminal::{
-    CommandCompletion, LinkHit, Osc52Target, Progress, ProgressState, Terminal, OSC52_MAX_BYTES,
+    CommandCompletion, LinkHit, Osc52Target, Progress, ProgressState, Terminal, ViewSpot, OSC52_MAX_BYTES,
     SEARCH_MAX_MATCHES, SEARCH_MAX_QUERY, WIDE_SPACER,
 };
 pub use theme::Theme;
