@@ -478,12 +478,13 @@ pub fn run() {
             // out from under it. Booting a second primary here would split-brain
             // (two windows, two config writers, the hotkey and --toggle driving
             // different instances) — the very bug the lock exists to prevent.
-            // Refuse to duplicate; the existing instance is alive (F23).
+            // Refuse to duplicate; the existing instance is alive (F23). Exit
+            // non-zero: a launcher or the login item must not see success.
             eprintln!(
                 "jetty: another instance holds the lock but its IPC socket at \
                  {sock_path} is unreachable; not starting a second instance"
             );
-            return;
+            std::process::exit(1);
         }
     };
 
@@ -549,7 +550,20 @@ pub fn run() {
         use winit::platform::macos::EventLoopBuilderExtMacOS;
         builder.with_activate_ignoring_other_apps(false);
     }
-    let event_loop = builder.build().expect("event loop");
+    let event_loop = match builder.build() {
+        Ok(event_loop) => event_loop,
+        Err(e) => {
+            // No display to open a window on (an SSH or console session, a dead
+            // compositor): say so and exit 1 — not a panic (status 101) — and
+            // leave no socket behind for the next launch to clean up.
+            eprintln!(
+                "jetty: can't reach a display ({e}) — JeTTY needs an X11 or Wayland \
+                 session (DISPLAY / WAYLAND_DISPLAY)"
+            );
+            remove_socket_if_ours(&sock_path, bound_ident);
+            std::process::exit(1);
+        }
+    };
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 

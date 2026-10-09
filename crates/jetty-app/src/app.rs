@@ -13501,19 +13501,28 @@ impl ApplicationHandler<AppEvent> for App {
         });
 
         // Startup: a failure to create the main window is genuinely fatal (there
-        // is nothing to fall back to), so surface it as a clean panic here — the
-        // runtime detach/settings call sites handle their `Err` gracefully.
+        // is nothing to fall back to): say why and exit 1 like a missing GPU
+        // below — the runtime detach/settings call sites handle their `Err`
+        // gracefully.
         // `jetty --background` (the login autostart entry) creates the window
         // UNMAPPED — no flash at login. The first summon then places, maps and
         // reveals it per `window_mode` through the normal show path, exactly like
         // any later summon (rule F0: never fullscreen while hidden).
-        let window = jetty_platform::build_window_with_visibility(
+        let window = match jetty_platform::build_window_with_visibility(
             event_loop,
             "JeTTY",
             (1000, 640),
             !self.start_hidden,
-        )
-        .expect("create_window failed");
+        ) {
+            Ok(window) => window,
+            Err(e) => {
+                eprintln!("jetty: could not create the window: {e}");
+                drop(pty_handle.join());
+                self.startup_failed = true;
+                event_loop.exit();
+                return;
+            }
+        };
         // Allow IME on the terminal window (winit disables it by default):
         // without this, CJK/complex input methods can never commit text and
         // dead-key composition is degraded. Commits arrive as
