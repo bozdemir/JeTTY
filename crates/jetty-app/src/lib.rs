@@ -92,6 +92,13 @@ pub fn default_welcome_tip() -> String {
     welcome_tip(&keymap::KeyMap::defaults())
 }
 
+/// The welcome splash's Summon row: the global key JeTTY grabs (`key`), or —
+/// where it grabs none (Wayland, `summon_hotkey = "none"`) — the binding to
+/// make.
+pub fn welcome_summon(key: Option<&str>) -> String {
+    key.map_or_else(|| "bind a key to jetty --toggle".to_string(), str::to_string)
+}
+
 /// The tab context menu's rows (for `jetty-shot`'s JETTY_SHOT_TAB_MENU).
 pub fn shot_tab_menu_items(can_detach: bool) -> Vec<&'static str> {
     detached::tab_menu_items(can_detach)

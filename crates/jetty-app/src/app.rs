@@ -16451,6 +16451,9 @@ impl ApplicationHandler<AppEvent> for App {
                 };
                 // The welcome splash's tip names the palette chord as bound.
                 let welcome_tip = if welcome_open { crate::welcome_tip(&self.keymap) } else { String::new() };
+                // …and its Summon row the key JeTTY grabs, or the binding to make.
+                let welcome_summon =
+                    if welcome_open { crate::welcome_summon(self.summon_key_shown().as_deref()) } else { String::new() };
                 let tab_menu_hints: Vec<String> = if tab_menu.is_some() {
                     tab_menu_labels
                         .iter()
@@ -16820,6 +16823,7 @@ impl ApplicationHandler<AppEvent> for App {
                             origin.top + slide_y_offset + prompt_rows as f32 * welcome_ch,
                             env!("CARGO_PKG_VERSION"),
                             &gpu_backend_name,
+                            &welcome_summon,
                             &welcome_tip,
                             &theme,
                             welcome_cw,

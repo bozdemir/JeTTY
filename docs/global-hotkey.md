@@ -4,7 +4,9 @@ Jetty supports a global hotkey — **F9** by default — to show/hide the window
 anywhere on the desktop, no need to click the taskbar or alt-tab. Pick another key
 with the `summon_hotkey` config key (`"F12"`, `"Ctrl+Shift+F12"`, …; read at
 startup). An invalid value falls back to F9, and a key that can't be grabbed is
-reported in the window — not only on stderr.
+reported in the window — not only on stderr. `summon_hotkey = "none"` grabs no
+key at all: bind `jetty --toggle` in your window manager instead, and the key
+stays with your other apps.
 
 ## X11
 
@@ -30,8 +32,8 @@ F9 does what you'd expect from the window's state:
   press brings it back; a minimized window is restored. On X11 JeTTY asks the
   window manager the way a taskbar click does (the standard EWMH activation
   request with the "user action" source), so focus-stealing prevention — KWin's,
-  for one — lets it through. If the window manager still refuses (Wayland
-  without an activation token), the next press within 1.5 s hides it.
+  for one — lets it through. If the window manager still refuses, the next
+  press within 1.5 s hides it. (Wayland: see below.)
 
 On summon the window is placed according to `window_mode` — centred the first
 time, then back where you left it as long as that spot is on a connected monitor
@@ -48,27 +50,36 @@ hidden window from keeping the desktop's panels out of the way.
 
 ## Wayland
 
-Global key grabs are not available to regular apps on Wayland (by design). Bind
-**`jetty --toggle`** to a key in your compositor: the first press launches Jetty,
-and each press after toggles the running instance over a Unix socket
-(`$XDG_RUNTIME_DIR/jetty.sock`; without `XDG_RUNTIME_DIR` — always on macOS — a
-private 0700 `jetty/` directory in your cache dir: `~/.cache/jetty/jetty.sock`,
-`~/Library/Caches/jetty/jetty.sock` on macOS. Never a world-writable `/tmp` path),
-so it shows or hides instantly. Use `jetty --show` / `jetty --hide` instead for a
-dedicated summon / dismiss key. The control invocation forwards the command and
-exits immediately — no window, no GUI work. (`jetty --background`, used by
-"Launch at login", starts Jetty hidden and does nothing if it already runs.)
+Global key grabs are not available to regular apps on Wayland (by design), so
+JeTTY grabs no key there (not even through XWayland, where it would take the
+key from the X11 apps only). Bind **`jetty --toggle`** to a key in your
+compositor: the first press launches Jetty, and each press after toggles the
+running instance over a Unix socket (`$XDG_RUNTIME_DIR/jetty.sock`; without
+`XDG_RUNTIME_DIR` — always on macOS — a private 0700 `jetty/` directory in your
+cache dir: `~/.cache/jetty/jetty.sock`, `~/Library/Caches/jetty/jetty.sock` on
+macOS. Never a world-writable `/tmp` path). Use `jetty --show` / `jetty --hide`
+instead for a dedicated summon / dismiss key. The control invocation forwards
+the command and exits immediately — no window, no GUI work. (`jetty
+--background`, used by "Launch at login", starts Jetty hidden and does nothing
+if it already runs.) The welcome splash and the help (`?`) say the same.
+
+A Wayland app can't take its own window off screen, and a compositor brings an
+existing window back to the front only for an activation token handed over
+with it. So on Wayland a hide **closes** the window — every tab and shell keeps
+running — and a summon **opens it again**, at the size it had: the compositor
+places and focuses it the way it does any newly opened window. The activation
+token your compositor gives the `jetty --toggle` it launches
+(`XDG_ACTIVATION_TOKEN`) travels along, for a compositor that focuses a new
+window only with one (KWin's "Extreme" focus-stealing prevention, for one). A
+summon of a window that is open but behind another app closes and reopens it
+the same way, in front. Hidden, JeTTY has no taskbar entry, as on X11.
 
 This is a generic, compositor-independent path — no portal, no
-desktop-environment-specific code, works on every compositor. Once hidden, the
-window comes back only through that binding (or `jetty --show`, or launching
-JeTTY again from the app menu, which forwards a toggle): a Wayland app cannot
-listen for a key it doesn't have focus for.
-
-JeTTY's X11 grab still reaches XWayland in a Wayland session, so `summon_hotkey`
-fires only while an X11 (XWayland) window has focus — which looks like a flaky
-hotkey. Bind `jetty --toggle` to the same key in the compositor instead; JeTTY
-doesn't report the grab as a problem there.
+desktop-environment-specific code, works on every compositor (KWin, Mutter,
+sway, Hyprland, niri — tiling ones included). Once hidden, the window comes
+back only through that binding (or `jetty --show`, or launching JeTTY again
+from the app menu, which forwards a toggle): a Wayland app cannot listen for a
+key it doesn't have focus for.
 
 ### KDE Plasma (Wayland)
 

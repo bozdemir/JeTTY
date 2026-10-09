@@ -1853,10 +1853,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (wcw, wch) = text.cell_size();
             // Below the prompt, as in the app (the cursor row + 1).
             let prompt_rows = snap.cursor_row.min(snap.rows.saturating_sub(1)) + 1;
+            // The default summon key (`JETTY_SHOT_WELCOME_SUMMON=` for none, as on Wayland).
+            let summon = std::env::var("JETTY_SHOT_WELCOME_SUMMON").map_or(Some("F9".to_string()), |v| {
+                (!v.is_empty()).then_some(v)
+            });
             let splash = jetty_render::build_welcome_overlay(
                 shot_origin.top + prompt_rows as f32 * wch,
                 env!("CARGO_PKG_VERSION"),
                 jetty_render::backend_display_name(adapter.get_info().backend),
+                &jetty_app::welcome_summon(summon.as_deref()),
                 &jetty_app::default_welcome_tip(),
                 terminal.theme(),
                 wcw,

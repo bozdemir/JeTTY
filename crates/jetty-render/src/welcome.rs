@@ -35,23 +35,27 @@ pub struct WelcomeOverlay {
 ///  [LOGO lines]     JeTTY  │ <version>
 ///                   Render │ wgpu · <backend>
 ///                   ...
+///                   Summon │ <summon>
 ///                   [████ 16-color palette swatch]
 ///                   tip: …
 ///
 /// All coordinates are in physical pixels. `grid_top_px` is the pixel Y of the
 /// grid origin (0 when the tab bar is at the bottom, `TABBAR_H` when at top).
 /// The overlay is drawn at a fixed inset; it clips gracefully for tiny windows.
-/// `tip` is the last line (see [`welcome_tip`]).
+/// `summon` is how JeTTY is summoned from anywhere — its hotkey, or (Wayland,
+/// no grab) what to bind; `tip` is the last line (see [`welcome_tip`]).
 ///
 /// `char_w` / `line_h` are the terminal cell (from `TextLayer::cell_size()`),
 /// which the splash is drawn in. Its insets, gaps and swatches are authored
 /// for the default cell (MesloLGS NF at 16 px on a 1× display) and scale
 /// with the cell, so they keep their proportion to the text on a HiDPI
 /// display or at a larger font size.
+#[allow(clippy::too_many_arguments)]
 pub fn build_welcome_overlay(
     grid_top_px: f32,
     version: &str,
     backend: &str,
+    summon: &str,
     tip: &str,
     theme: &jetty_core::Theme,
     char_w: f32,
@@ -96,7 +100,7 @@ pub fn build_welcome_overlay(
     let info_x = left_inset + logo_px_w + col_gap;
 
     // Key label column width: longest key label + a separator " │ " (3 chars).
-    let key_labels = ["JeTTY", "Render", "Terminal", "Themes"];
+    let key_labels = ["JeTTY", "Render", "Terminal", "Themes", "Summon"];
     let key_col_chars = key_labels.iter().map(|k| k.chars().count()).max().unwrap_or(0);
     let sep = " | "; // ASCII pipe separator (portable, no fancy Unicode in all fonts)
     let key_w = (key_col_chars + sep.chars().count()) as f32 * char_w;
@@ -105,12 +109,15 @@ pub fn build_welcome_overlay(
     let val_x = info_x + key_w;
 
     // Info row values. "Themes" names the active theme and how many there are
-    // (built-ins + user themes — the registry the picker lists).
+    // (built-ins + user themes — the registry the picker lists). "Summon" is
+    // the one thing a new user can't find in the window: how to bring it back
+    // from anywhere.
     let info_rows: &[(&str, String)] = &[
         ("JeTTY", version.to_string()),
         ("Render", format!("wgpu · {}", backend)),
         ("Terminal", format!("JeTTY {}", version)),
         ("Themes", format!("{} · {} themes", theme.display_name, jetty_core::theme_count())),
+        ("Summon", summon.to_string()),
     ];
 
     // Compute logo block height so we can vertically center the info rows
@@ -200,27 +207,27 @@ mod tests {
 
     #[test]
     fn labels_non_empty() {
-        let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", "tip: test", &theme(), TEST_CHAR_W, 22.0);
+        let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", "F9", "tip: test", &theme(), TEST_CHAR_W, 22.0);
         assert!(!w.labels.is_empty(), "welcome overlay must have labels");
     }
 
     #[test]
     fn swatch_quad_count_is_16() {
-        let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", "tip: test", &theme(), TEST_CHAR_W, 22.0);
+        let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", "F9", "tip: test", &theme(), TEST_CHAR_W, 22.0);
         // All quads are swatches (16 ANSI colors).
         assert_eq!(w.quads.len(), 16, "expected exactly 16 swatch quads");
     }
 
     #[test]
     fn content_includes_jetty() {
-        let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", "tip: test", &theme(), TEST_CHAR_W, 22.0);
+        let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", "F9", "tip: test", &theme(), TEST_CHAR_W, 22.0);
         let joined: String = w.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("JeTTY"), "welcome overlay must mention JeTTY");
     }
 
     #[test]
     fn content_includes_tip() {
-        let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", "tip: test", &theme(), TEST_CHAR_W, 22.0);
+        let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", "F9", "tip: test", &theme(), TEST_CHAR_W, 22.0);
         let joined: String = w.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("tip:"), "welcome overlay must include a tip line");
     }
@@ -228,13 +235,13 @@ mod tests {
     #[test]
     fn works_at_small_window() {
         // Should not panic at small sizes; we just clip gracefully.
-        let w = build_welcome_overlay(36.0, "0.1.0", "Gl", "tip: test", &theme(), TEST_CHAR_W, 22.0);
+        let w = build_welcome_overlay(36.0, "0.1.0", "Gl", "F9", "tip: test", &theme(), TEST_CHAR_W, 22.0);
         assert_eq!(w.quads.len(), 16);
     }
 
     #[test]
     fn backend_name_appears_in_render_row() {
-        let w = build_welcome_overlay(36.0, "1.2.3", "Metal", "tip: test", &theme(), TEST_CHAR_W, 22.0);
+        let w = build_welcome_overlay(36.0, "1.2.3", "Metal", "F9", "tip: test", &theme(), TEST_CHAR_W, 22.0);
         let joined: String = w.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("Metal"), "backend name must appear in Render row");
     }
@@ -245,7 +252,7 @@ mod tests {
         for i in 0..jetty_core::theme::PRESETS.len() {
             let t = jetty_core::theme::theme_at(i);
             let bg = [t.bg[0], t.bg[1], t.bg[2]];
-            let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", "tip: test", &t, TEST_CHAR_W, 22.0);
+            let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", "F9", "tip: test", &t, TEST_CHAR_W, 22.0);
             for (text, _, _, c) in &w.labels {
                 assert!(cr(*c, bg) >= 3.0, "{}: {text:?} {}", t.name, cr(*c, bg));
             }
@@ -255,16 +262,30 @@ mod tests {
     #[test]
     fn themes_row_names_the_active_theme_and_the_count() {
         let t = jetty_core::Theme::by_name("gruvbox_light");
-        let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", "tip: test", &t, TEST_CHAR_W, 22.0);
+        let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", "F9", "tip: test", &t, TEST_CHAR_W, 22.0);
         let n = jetty_core::theme_count();
         assert!(n >= jetty_core::theme::PRESETS.len());
         let row = format!("Gruvbox Light · {n} themes");
         assert!(w.labels.iter().any(|l| l.0 == row), "missing {row:?}");
     }
 
+    /// How to summon JeTTY from anywhere: the hotkey — or, where JeTTY grabs
+    /// none (Wayland), the binding to make: a new Wayland user was told it
+    /// nowhere, and F9 did nothing.
+    #[test]
+    fn the_splash_says_how_to_summon() {
+        let row = |summon: &str| {
+            let w = build_welcome_overlay(36.0, "0.1.0", "Vulkan", summon, "tip: test", &theme(), TEST_CHAR_W, 22.0);
+            let key = w.labels.iter().position(|l| l.0.trim_start() == "Summon | ").expect("a Summon row");
+            w.labels[key + 1].0.clone()
+        };
+        assert_eq!(row("F9"), "F9");
+        assert_eq!(row("bind a key to jetty --toggle"), "bind a key to jetty --toggle");
+    }
+
     #[test]
     fn version_appears() {
-        let w = build_welcome_overlay(36.0, "9.8.7", "Vulkan", "tip: test", &theme(), TEST_CHAR_W, 22.0);
+        let w = build_welcome_overlay(36.0, "9.8.7", "Vulkan", "F9", "tip: test", &theme(), TEST_CHAR_W, 22.0);
         let joined: String = w.labels.iter().map(|l| l.0.clone()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("9.8.7"), "version must appear in welcome");
     }
@@ -275,8 +296,8 @@ mod tests {
     /// default 1× layout is the one it always was.
     #[test]
     fn the_splash_scales_with_the_cell() {
-        let one = build_welcome_overlay(30.0, "1.0.0", "Vulkan", "tip: x", &theme(), CHROME_ADVANCE, 21.0);
-        let two = build_welcome_overlay(60.0, "1.0.0", "Vulkan", "tip: x", &theme(), 2.0 * CHROME_ADVANCE, 42.0);
+        let one = build_welcome_overlay(30.0, "1.0.0", "Vulkan", "F9", "tip: x", &theme(), CHROME_ADVANCE, 21.0);
+        let two = build_welcome_overlay(60.0, "1.0.0", "Vulkan", "F9", "tip: x", &theme(), 2.0 * CHROME_ADVANCE, 42.0);
         assert_eq!((one.quads[0].x, one.quads[0].w, one.quads[0].h), (16.0, 16.0, 16.0), "1× unchanged");
         let near = |a: f32, b: f32| (b - 2.0 * a).abs() <= 1.0;
         for (a, b) in one.quads.iter().zip(&two.quads) {
@@ -295,7 +316,7 @@ mod tests {
         assert_eq!(welcome_tip("Ctrl+Shift+P"), "tip: Ctrl+Shift+P opens the command palette — or just start typing.");
         let unbound = welcome_tip("");
         assert!(unbound.starts_with("tip: ") && !unbound.contains("bench") && !unbound.contains("theme <"));
-        let w = build_welcome_overlay(0.0, "1", "Vulkan", &welcome_tip("Cmd+Shift+P"), &theme(), TEST_CHAR_W, 22.0);
+        let w = build_welcome_overlay(0.0, "1", "Vulkan", "F9", &welcome_tip("Cmd+Shift+P"), &theme(), TEST_CHAR_W, 22.0);
         assert!(w.labels.iter().any(|l| l.0.contains("Cmd+Shift+P")));
     }
 }

@@ -117,4 +117,9 @@ case ":$PATH:" in
   *":$PREFIX/bin:"*) ;;
   *) printf '\033[1;33mnote:\033[0m add %s to your PATH:\n  export PATH="%s:$PATH"\n' "$PREFIX/bin" "$PREFIX/bin" ;;
 esac
-printf 'Launch it with: \033[1;36mjetty\033[0m   (press F9 to summon)\n'
+# On Wayland JeTTY grabs no key: the compositor's shortcut summons it.
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  printf 'Launch it with: \033[1;36mjetty\033[0m   (to summon it from anywhere, bind \033[1;36mjetty --toggle\033[0m to a key in your compositor)\n'
+else
+  printf 'Launch it with: \033[1;36mjetty\033[0m   (press F9 to summon)\n'
+fi
