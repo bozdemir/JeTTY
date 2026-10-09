@@ -4377,7 +4377,62 @@ impl Terminal {
     /// Return the currently-selected text, or `None` if no selection is active
     /// or the selection is empty.
     pub fn selection_text(&self) -> Option<String> {
-        self.term.selection_to_string()
+        // Built from the selection's range rather than `selection_to_string`,
+        // whose rows ending in a wrapped wide char's placeholder copied a stray
+        // character (see `text_between`); otherwise the same text.
+        let sel = self.term.selection.as_ref()?;
+        let range = sel.to_range(&self.term)?;
+        if sel.ty != SelectionType::Block {
+            let mut text = self.text_between(range.start, range.end, true);
+            if sel.ty == SelectionType::Lines {
+                text.push('\n');
+            }
+            return Some(text);
+        }
+        // A block: each row's slice of the rectangle, trailing blanks trimmed,
+        // one line per row. As in alacritty, a row ending in a placeholder
+        // takes its wrapped wide char along on the last row, and on the others
+        // when the block does not start in column 0.
+        let mut text = String::new();
+        for line in range.start.line.0..=range.end.line.0 {
+            let line = Line(line);
+            let wrapped = line == range.end.line || range.start.column.0 != 0;
+            let row = self.text_between(
+                Point::new(line, range.start.column),
+                Point::new(line, range.end.column),
+                wrapped,
+            );
+            text += row.trim_end();
+            if line != range.end.line {
+                text.push('\n');
+            }
+        }
+        Some(text)
+    }
+
+    /// `Term::bounds_to_string(start, end)` without alacritty 0.26's bug: when
+    /// the text ENDS on a row whose last cell is the placeholder of a wide char
+    /// that did not fit and wrapped to the next row, it appended the char at the
+    /// start of the row ABOVE (`line - 1`) — a stray character in the copy, and
+    /// out of range on the top row of the history (a debug panic, garbage in
+    /// release). With `wrapped`, the wrapped wide char itself is taken along,
+    /// as intended.
+    fn text_between(&self, start: Point, end: Point, wrapped: bool) -> String {
+        let grid = self.term.grid();
+        let last = Column(self.cols - 1);
+        if end.column != last || !grid[end.line][last].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+            return self.term.bounds_to_string(start, end);
+        }
+        // Stop short of the placeholder: it holds no text.
+        let mut text = self.term.bounds_to_string(start, Point::new(end.line, last - 1));
+        if wrapped && end.line < grid.bottommost_line() {
+            let cell = &grid[end.line + 1i32][Column(0)];
+            if cell.flags.contains(Flags::WIDE_CHAR) {
+                text.push(cell.c);
+                text.extend(cell.zerowidth().into_iter().flatten());
+            }
+        }
+        text
     }
 
     /// Find a link at the given 0-based viewport cell, or `None`.
@@ -7226,6 +7281,51 @@ mod tests {
             t.feed(format!("new {i}\r\n").as_bytes());
         }
         assert_eq!(t.snapshot().row_text(0), before, "viewport content did not move");
+    }
+
+    #[test]
+    fn copying_a_row_whose_wide_char_wrapped_copies_that_char() {
+        // "abcd中" in 5 columns: 中 does not fit in the last column, so it wraps
+        // and leaves a placeholder there. A selection ending on that row copied
+        // the character at the start of the row ABOVE (alacritty's `line - 1`):
+        // "abcdQ". On the top row of the history that index was out of range —
+        // a debug panic, a garbage character in release.
+        let mut t = Terminal::new(5, 3);
+        t.feed("Qxxxx\r\nabcd中e".as_bytes());
+        t.selection_start(1, 0, true);
+        t.selection_update(1, 4, false);
+        assert_eq!(t.selection_text().as_deref(), Some("abcd中"));
+        t.selection_update(1, 3, false);
+        assert_eq!(t.selection_text().as_deref(), Some("abcd"), "the placeholder not selected");
+        t.selection_update(2, 2, false);
+        assert_eq!(t.selection_text().as_deref(), Some("abcd中e"));
+        t.selection_start_lines(1);
+        assert_eq!(t.selection_text().as_deref(), Some("abcd中e\n"));
+        let mut t = Terminal::new(5, 3);
+        t.feed("abcd中e".as_bytes());
+        t.selection_start(0, 0, true);
+        t.selection_update(0, 4, false);
+        assert_eq!(t.selection_text().as_deref(), Some("abcd中"));
+        t.selection_start(0, 4, false);
+        t.selection_update(0, 0, true);
+        assert_eq!(t.selection_text().as_deref(), Some("abcd中"), "dragged backwards");
+        // Block selections (copy mode's Ctrl+V): per row, the wrapped char comes
+        // along on the last row, and on the others when the block does not
+        // start in column 0 — alacritty's rule, minus the stray char.
+        let mut t = Terminal::new(5, 3);
+        t.feed("Qxxxx\r\nabcd中e".as_bytes());
+        let block = |t: &mut Terminal, (l0, c0): (i32, usize), (l1, c1): (i32, usize)| {
+            t.selection_start_block_abs(l0, c0, true);
+            t.selection_update_abs(l1, c1, false);
+            t.selection_text()
+        };
+        assert_eq!(block(&mut t, (1, 1), (1, 4)).as_deref(), Some("bcd中"));
+        assert_eq!(block(&mut t, (0, 0), (1, 4)).as_deref(), Some("Qxxxx\nabcd中"));
+        assert_eq!(block(&mut t, (1, 0), (2, 4)).as_deref(), Some("abcd\n中e"));
+        assert_eq!(block(&mut t, (0, 1), (2, 4)).as_deref(), Some("xxxx\nbcd中\n中e"));
+        let mut t = Terminal::new(5, 3);
+        t.feed("abcd中e".as_bytes());
+        assert_eq!(block(&mut t, (0, 1), (0, 4)).as_deref(), Some("bcd中"), "on the top row");
     }
 
     #[test]
