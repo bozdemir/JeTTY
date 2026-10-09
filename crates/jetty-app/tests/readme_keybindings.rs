@@ -5,10 +5,12 @@
 //! `[keys]` name(s) in the last column. Every bindable action must have a row with
 //! exactly its default chords, and every name in the table must be a real action —
 //! so a changed default, a new action or a renamed one fails here until the README
-//! is updated.
+//! is updated. And every `[keys]` example in README.md and docs/configuration.md
+//! must compile without a warning.
 
 use std::collections::BTreeSet;
 
+use jetty_app::config::KeyBindings;
 use jetty_app::keymap::{BindableAction, KeyMap};
 
 /// Rows the README already documents with a NEWER default than this build's keymap
@@ -126,6 +128,64 @@ fn readme_keybindings_table_matches_the_default_keymap() {
         }
     }
     assert!(problems.is_empty(), "README keybindings table is out of date:\n{}", problems.join("\n"));
+}
+
+/// Every `[keys]` example in README.md and docs/configuration.md, as `(where,
+/// TOML)`: the lines under a fenced block's `[keys]` header, and each inline
+/// `` `name = "…"` `` / `` `[keys] name = […]` `` naming a bindable action (a
+/// chord string or a list — `run_selection = false` is the top-level switch).
+fn documented_keys_examples() -> Vec<(String, String)> {
+    let known: BTreeSet<String> = BindableAction::ALL.iter().map(|a| keys_name(*a)).collect();
+    let mut out = Vec::new();
+    for file in ["README.md", "docs/configuration.md"] {
+        let text = std::fs::read_to_string(format!("{}/../../{file}", env!("CARGO_MANIFEST_DIR"))).expect(file);
+        let (mut fenced, mut block) = (false, None::<(String, String)>);
+        for (n, line) in text.lines().enumerate() {
+            let at = format!("{file}:{}", n + 1);
+            let t = line.trim();
+            if t.starts_with("```") || (fenced && t.starts_with('[')) {
+                out.extend(block.take());
+                fenced ^= t.starts_with("```");
+            }
+            if fenced {
+                if t == "[keys]" {
+                    block = Some((at, String::new()));
+                } else if let Some((_, body)) = &mut block {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+                continue;
+            }
+            for span in line.split('`').skip(1).step_by(2) {
+                let span = span.strip_prefix("[keys] ").unwrap_or(span);
+                let Some((name, value)) = span.split_once(" = ") else { continue };
+                if known.contains(name) && value.starts_with(['"', '[']) {
+                    out.push((at.clone(), span.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A `[keys]` example a user copies must work as written: README's
+/// `new_tab = "Ctrl+T"` was rejected (Ctrl+letter is a control byte) — and
+/// took New tab's default chord with it.
+#[test]
+fn documented_keys_examples_compile_without_warnings() {
+    let known: BTreeSet<String> = BindableAction::ALL.iter().map(|a| keys_name(*a)).collect();
+    let examples = documented_keys_examples();
+    assert!(examples.len() >= 5, "the examples were not found: {examples:?}");
+    for (at, example) in &examples {
+        let table: toml::Table =
+            toml::from_str(example).unwrap_or_else(|e| panic!("{at}: `{example}` is not TOML: {e}"));
+        for name in table.keys() {
+            assert!(known.contains(name), "{at}: `{name}` is not a bindable action");
+        }
+        let bindings: KeyBindings = toml::from_str(example).unwrap_or_else(|e| panic!("{at}: `{example}`: {e}"));
+        let km = KeyMap::compile(&bindings);
+        assert!(km.warnings().is_empty(), "{at}: `{}` → {:?}", example.trim(), km.warnings());
+    }
 }
 
 #[test]

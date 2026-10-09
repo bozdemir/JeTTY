@@ -212,7 +212,7 @@ Every shortcut is a default you can remap here, by the names in the
 
 ```toml
 [keys]
-new_tab = "Ctrl+T"
+new_tab = "Ctrl+Shift+N"
 paste = ["Ctrl+Shift+V", "Shift+Insert"]   # several chords for one action
 toggle_fullscreen = ""                       # "" unbinds: F11 goes to the program
 context_menu = ["Menu", "Shift+F10"]       # Shift+F10 too, for keyboards without a Menu key
@@ -223,8 +223,10 @@ Only F-keys, `PageUp` / `PageDown` and `Menu` (the context-menu key) may be boun
 without a modifier.
 A chord you bind is taken from the action that had it by default (the help
 overlay shows the result). An unknown action name or a chord that cannot be
-parsed is reported and ignored; the rest still apply. Terminal control bytes
-(`Ctrl+C` …) cannot be taken over.
+parsed is reported and ignored; the rest still apply. Terminal control bytes —
+`Ctrl` with a letter, `Space`, `[`, `\`, `]` or `/` (`Ctrl+C`, `Ctrl+T` …) —
+cannot be taken over: add `Shift` or `Alt`. An action none of whose chords can
+be used keeps its default.
 The command palette's **Reset keybindings** clears the table (after saving a
 `config.toml.bak-<time>` copy).
 
