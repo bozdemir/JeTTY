@@ -11,13 +11,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// A fresh, short directory tree for one run (a Unix socket path is capped at
-/// 108 bytes, so it stays under the system temp dir).
+/// 108 bytes, so it stays under the system temp dir). Its runtime dir is 0700
+/// like a real `$XDG_RUNTIME_DIR` — JeTTY uses no other for its socket.
 fn sandbox(tag: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("jetty-cli-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for sub in ["run", "home", "config", "cache"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
+    std::fs::set_permissions(dir.join("run"), std::fs::Permissions::from_mode(0o700)).unwrap();
     dir
 }
 

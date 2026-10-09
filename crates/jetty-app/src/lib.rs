@@ -150,7 +150,7 @@ pub fn configured_backdrop() -> (jetty_render::BackdropSettings, Option<std::pat
 /// instance listens here; secondary invocations (including `jetty --toggle`)
 /// connect and send a summon message, then exit immediately.
 ///
-/// The socket lives inside a per-user, non-world-writable directory (see
+/// The socket lives inside a per-user, private directory (see
 /// [`ipc_runtime_dir`]) so no other local user can pre-bind our path — which
 /// would silently swallow every summon (a DoS) and leak our commands — or squat
 /// the lock. We never place the socket directly in world-writable `/tmp`.
@@ -162,9 +162,27 @@ fn ipc_socket_path(display: Option<&ipc::Display>) -> String {
         .filter(|d| !d.is_empty())
         .map(std::path::PathBuf::from);
     ipc_runtime_dir()
+        .0
         .join(ipc_socket_name(override_dir.as_deref(), display))
         .to_string_lossy()
         .into_owned()
+}
+
+/// The instance lock for the socket at `sock_path`: beside it in the session's
+/// `$XDG_RUNTIME_DIR` (a tmpfs nothing cleans while the session runs), else in
+/// JeTTY's state directory ([`ipc_lock_dir`]). The cache directory the socket
+/// then uses is fair game for cleaners — and for macOS freeing disk space —
+/// and with the lock purged alongside, the next launch took a fresh lock and
+/// started a second primary while the first still ran (F23's split brain).
+fn ipc_lock_path(sock_path: &str) -> String {
+    let name = std::path::Path::new(sock_path).file_name().map(|n| n.to_string_lossy().into_owned());
+    match (ipc_runtime_dir().1, name) {
+        (false, Some(name)) => match ipc_lock_dir() {
+            Some(stable) => stable.join(format!("{name}.lock")).to_string_lossy().into_owned(),
+            None => format!("{sock_path}.lock"),
+        },
+        _ => format!("{sock_path}.lock"),
+    }
 }
 
 /// The IPC socket's file name: `jetty.sock` — or, with `$JETTY_CONFIG_DIR` set
@@ -196,44 +214,86 @@ fn ipc_socket_name(config_dir_override: Option<&std::path::Path>, display: Optio
     format!("jetty-{hash:016x}.sock")
 }
 
-/// A per-user, non-world-writable directory to hold the IPC socket + lock.
+/// A private directory to hold the IPC socket, and whether it is the session's
+/// own `$XDG_RUNTIME_DIR` (the instance lock then sits beside the socket — see
+/// [`ipc_lock_path`]). Decided once per process.
 ///
 /// `$XDG_RUNTIME_DIR` is a per-user 0700 tmpfs on logind systems and the ideal
-/// home for a Unix socket. When it is unset (always on macOS, common on minimal
-/// Linux) we must NOT fall back to bare `/tmp`: it is world-writable, so another
+/// home for a Unix socket — when it is what the XDG spec promises: absolute,
+/// ours, 0700. A misconfigured one (`/tmp` in containers, `su` and WSL set-ups,
+/// a relative path) is skipped, and so is bare `/tmp` always: there another
 /// local user could pre-bind our (otherwise predictable) socket path or squat
 /// the lock. Instead we use a private `jetty` subdir of the user's cache dir
 /// (under `$HOME`, already per-user), and only as a last resort a 0700 subdir of
-/// the system temp dir. Because the socket then lives in a directory only we can
-/// traverse, any socket found there is ours by construction — that directory
-/// permission authenticates the peer, standing in for an explicit uid check
-/// (which would need a libc dependency this crate does not carry).
-fn ipc_runtime_dir() -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
+/// the system temp dir named by our uid. Because the socket then lives in a
+/// directory only we can traverse ([`private_dir`]), any socket found there is
+/// ours by construction — that directory permission authenticates the peer.
+/// With none of them private, the "directory" is `/dev/null`, under which
+/// nothing can be connected to, locked or bound: JeTTY runs, without
+/// single-instance IPC.
+fn ipc_runtime_dir() -> &'static (std::path::PathBuf, bool) {
+    static DIR: std::sync::OnceLock<(std::path::PathBuf, bool)> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        if !dir.is_empty() {
-            return std::path::PathBuf::from(dir);
+        if let Some(dir) = session_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR")) {
+            return (dir, true);
         }
-    }
 
-    // Private per-user dir under the cache directory (~/.cache on Linux,
-    // ~/Library/Caches on macOS): inside $HOME, so not world-writable.
-    if let Some(cache) = dirs::cache_dir() {
-        let dir = cache.join("jetty");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-            return dir;
+        // Private per-user dir under the cache directory (~/.cache on Linux,
+        // ~/Library/Caches on macOS): inside $HOME, so not world-writable.
+        if let Some(cache) = dirs::cache_dir() {
+            let dir = cache.join("jetty");
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+                if private_dir(&dir) {
+                    return (dir, false);
+                }
+            }
         }
-    }
 
-    // Last resort (no runtime dir and no cache/home): a 0700 subdir of the
-    // system temp dir. Tighten perms so it is at least not world-writable.
-    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-    let dir = std::env::temp_dir().join(format!("jetty-{user}"));
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    dir
+        // Last resort (no runtime dir and no cache/home): a 0700 subdir of the
+        // system temp dir, named by our uid ($USER is anyone's to set). Created
+        // 0700 in one step, and used only when it really is ours — another user
+        // may have made it first.
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let dir = std::env::temp_dir().join(format!("jetty-{uid}"));
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+        if private_dir(&dir) {
+            return (dir, false);
+        }
+        eprintln!(
+            "jetty: no private directory for the IPC socket ({} is not ours); \
+             single-instance IPC disabled",
+            dir.display()
+        );
+        (std::path::PathBuf::from("/dev/null"), true)
+    })
+}
+
+/// `$XDG_RUNTIME_DIR` (`var`) when it can hold the socket: absolute and private.
+fn session_runtime_dir(var: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    var.map(std::path::PathBuf::from).filter(|d| d.is_absolute() && private_dir(d))
+}
+
+/// Whether `dir` is a directory only this user can reach: a real directory
+/// (not a symlink someone could swap), owned by us, no group / other access.
+fn private_dir(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|m| m.file_type().is_dir() && m.uid() == uid && m.permissions().mode() & 0o077 == 0)
+}
+
+/// The instance lock's directory outside `$XDG_RUNTIME_DIR` (see
+/// [`ipc_lock_path`]): JeTTY's state directory, which no cleaner purges —
+/// `$XDG_STATE_HOME/jetty` (`~/.local/state/jetty`), or `~/Library/Application
+/// Support/jetty` on macOS (no state dir there).
+fn ipc_lock_dir() -> Option<std::path::PathBuf> {
+    let dir = dirs::state_dir().or_else(dirs::data_local_dir)?.join("jetty");
+    std::fs::create_dir_all(&dir).ok().map(|_| dir)
 }
 
 /// Outcome of an IPC connect attempt.
@@ -564,7 +624,7 @@ pub fn run() {
     }
 
     // Become the primary. The stale-socket unlink+bind below is serialized by
-    // an exclusive kernel lock (`<sock>.lock`): the plain connect→unlink→bind
+    // an exclusive kernel lock (`ipc_lock_path`): the plain connect→unlink→bind
     // dance is only TOCTOU-safe against a LIVE primary — two concurrent COLD
     // starts racing over the same stale socket could both see ECONNREFUSED and
     // then unlink each other's freshly bound socket, yielding two primaries.
@@ -577,15 +637,15 @@ pub fn run() {
     // to this display's own (`forward_here`): its lock is taken instead.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let lock_file: Option<std::fs::File> = loop {
-        let lock_path = format!("{sock_path}.lock");
+        let lock_path = ipc_lock_path(&sock_path);
         let lock = match try_acquire_primary_lock(&lock_path) {
             LockAttempt::Acquired(f) => Some(f),
             LockAttempt::Unavailable => {
-                // The lock file can never be created here. Retrying would just
-                // spin the full 2 s for nothing — degrade to a lockless bind NOW
-                // so the first frame is not delayed 2 s (F34). No reachable
-                // primary exists in this environment (the socket lives under the
-                // same broken dir), so a lockless bind is safe.
+                // The lock can never be taken here. Retrying would just spin the
+                // full 2 s for nothing — degrade to a lockless bind NOW so the
+                // first frame is not delayed 2 s (F34). No primary answered on
+                // the socket, so a lockless bind only risks two cold starts
+                // racing at the same instant.
                 eprintln!(
                     "jetty: single-instance lock at {lock_path} is unavailable; \
                      proceeding without it"
@@ -611,7 +671,8 @@ pub fn run() {
                     // must not see success.
                     eprintln!(
                         "jetty: another instance holds the lock but its IPC socket at \
-                         {sock_path} is unreachable; not starting a second instance"
+                         {sock_path} is unreachable (deleted?); not starting a second \
+                         instance — quit the running one first"
                     );
                     std::process::exit(1);
                 }
@@ -878,6 +939,51 @@ mod primary_lock_tests {
             try_acquire_primary_lock(path),
             LockAttempt::Unavailable
         ));
+    }
+}
+
+#[cfg(test)]
+mod ipc_dir_tests {
+    use super::{private_dir, session_runtime_dir};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A fresh directory under the system temp dir with `mode`.
+    fn dir(tag: &str, mode: u32) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("jetty-dir-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+        d
+    }
+
+    #[test]
+    fn only_a_directory_of_our_own_holds_the_socket() {
+        let private = dir("private", 0o700);
+        let open = dir("open", 0o755);
+        let shared = dir("shared", 0o1777); // what `/tmp` is
+        assert!(private_dir(&private));
+        assert!(!private_dir(&open), "group/other may traverse it");
+        assert!(!private_dir(&shared), "anyone may create in it");
+        // A symlink to a private directory could be swapped under us.
+        let link = std::env::temp_dir().join(format!("jetty-dir-test-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        assert!(!private_dir(&link));
+        // Not a directory, or not there at all.
+        let file = private.join("f");
+        std::fs::write(&file, b"").unwrap();
+        assert!(!private_dir(&file));
+        assert!(!private_dir(&private.join("missing")));
+        // $XDG_RUNTIME_DIR: only an absolute, private one is used.
+        assert_eq!(session_runtime_dir(Some(private.clone().into())), Some(private.clone()));
+        assert_eq!(session_runtime_dir(Some(shared.clone().into())), None);
+        assert_eq!(session_runtime_dir(Some("relative/run".into())), None);
+        assert_eq!(session_runtime_dir(Some("".into())), None);
+        assert_eq!(session_runtime_dir(None), None);
+        let _ = std::fs::remove_file(&link);
+        for d in [private, open, shared] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }
 

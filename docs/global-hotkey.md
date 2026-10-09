@@ -54,12 +54,14 @@ Global key grabs are not available to regular apps on Wayland (by design), so
 JeTTY grabs no key there (not even through XWayland, where it would take the
 key from the X11 apps only). Bind **`jetty --toggle`** to a key in your
 compositor: the first press launches Jetty, and each press after toggles the
-running instance over a Unix socket (`$XDG_RUNTIME_DIR/jetty.sock`; without
-`XDG_RUNTIME_DIR` — always on macOS — a private 0700 `jetty/` directory in your
-cache dir: `~/.cache/jetty/jetty.sock`, `~/Library/Caches/jetty/jetty.sock` on
-macOS. Never a world-writable `/tmp` path). Use `jetty --show` / `jetty --hide`
-instead for a dedicated summon / dismiss key. The control invocation forwards
-the command and exits immediately — no window, no GUI work. (`jetty
+running instance over a Unix socket (`$XDG_RUNTIME_DIR/jetty.sock`; without an
+`XDG_RUNTIME_DIR` that is yours and 0700 — always on macOS — a private 0700
+`jetty/` directory in your cache dir: `~/.cache/jetty/jetty.sock`,
+`~/Library/Caches/jetty/jetty.sock` on macOS, with the instance lock kept in
+`~/.local/state/jetty` / `~/Library/Application Support/jetty`, where no cache
+cleaner removes it. Never a world-writable `/tmp` path). Use `jetty --show` /
+`jetty --hide` instead for a dedicated summon / dismiss key. The control
+invocation forwards the command and exits immediately — no window, no GUI work. (`jetty
 --background`, used by "Launch at login", starts Jetty hidden and does nothing
 if it already runs.) The welcome splash and the help (`?`) say the same.
 Scripts can write the same words to the socket themselves:
