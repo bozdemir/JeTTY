@@ -1461,21 +1461,55 @@ pub fn parallax_margin(win_h: f32) -> u32 {
     (PARALLAX_MAX * win_h.max(0.0)).ceil() as u32
 }
 
-/// Whether a cache baked from `from` still shows `bake`: identical inputs, or —
-/// while the look animates — identical but for a clock that moved less than a
-/// 30 fps frame.
-pub fn bake_is_fresh(from: Option<&BackdropUniform>, bake: &BackdropUniform, animates: bool) -> bool {
+/// What a baked cache shows: the bake inputs with the clock stopped at 0 —
+/// an animated look's sway / drift is folded into `geom` on the CPU, so the
+/// clock changes more than `misc[0]` — plus the clock it was baked at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BakeStamp {
+    pub still: BackdropUniform,
+    pub time: f32,
+}
+
+/// The bake pass's uniform for a frame's `full` uniform: the window's layout in
+/// straight color at full alpha, cache row r holding backdrop row r - `margin`.
+fn bake_of(full: &BackdropUniform, margin: u32) -> BackdropUniform {
+    let mut bake = *full;
+    bake.offset = [0.0, margin as f32];
+    bake.bg[3] = 1.0;
+    bake.misc[2] = 0.0;
+    bake
+}
+
+/// The bake uniform of frame `f` (whose full uniform is `full`) and the cache
+/// stamp it would leave (see [`BakeStamp`]). A still look is its own stamp; an
+/// animated one is rebuilt with the clock at 0 (pure CPU math, only while it
+/// animates).
+#[allow(clippy::too_many_arguments)]
+pub fn bake_stamp(
+    full: &BackdropUniform,
+    look: &GradientLook,
+    variant: Variant,
+    s: &BackdropSettings,
+    theme: &jetty_core::Theme,
+    f: &BackdropFrame,
+    margin: u32,
+) -> (BackdropUniform, BakeStamp) {
+    let bake = bake_of(full, margin);
+    let still = if s.animates() {
+        bake_of(&build_uniform(look, variant, s, theme, &BackdropFrame { time: 0.0, ..*f }), margin)
+    } else {
+        bake
+    };
+    (bake, BakeStamp { still, time: bake.misc[0] })
+}
+
+/// Whether a cache stamped `from` still shows `now`: identical inputs at the
+/// same clock, or — while the look animates — a clock that moved less than a
+/// 30 fps frame (so typing or an output flood never re-bakes faster).
+pub fn bake_is_fresh(from: Option<&BakeStamp>, now: &BakeStamp, animates: bool) -> bool {
     let Some(from) = from else { return false };
-    if from == bake {
-        return true;
-    }
-    if !animates {
-        return false;
-    }
-    let (mut a, mut b) = (*from, *bake);
-    a.misc[0] = 0.0;
-    b.misc[0] = 0.0;
-    a == b && (bake.misc[0] - from.misc[0]).abs() < BAKE_MIN_INTERVAL
+    from.still == now.still
+        && (from.time == now.time || (animates && (now.time - from.time).abs() < BAKE_MIN_INTERVAL))
 }
 
 /// One window's backdrop GPU state. Built only when the mode is not `none`
@@ -1516,8 +1550,8 @@ pub struct Backdrop {
     image_bind: Option<(Arc<GpuImage>, bool, wgpu::BindGroup)>,
     cache: Option<Target>,
     noise: Option<Target>,
-    /// The bake uniform the cache holds.
-    baked: Option<BackdropUniform>,
+    /// What the cache holds (see [`BakeStamp`]).
+    baked: Option<BakeStamp>,
     last_comp: Option<BackdropUniform>,
     /// Cache bakes so far (tests and the bench count them).
     bakes: u64,
@@ -1735,11 +1769,8 @@ impl Backdrop {
         let (w, h) = (full.resolution[0] as u32, full.resolution[1] as u32);
         let margin = if settings.parallax { parallax_margin(h as f32) } else { 0 };
         // The bake: the window's layout in straight color at full alpha, cache
-        // row r holding backdrop row r - margin.
-        let mut bake = full;
-        bake.offset = [0.0, margin as f32];
-        bake.bg[3] = 1.0;
-        bake.misc[2] = 0.0;
+        // row r holding backdrop row r - margin; and what it would leave cached.
+        let (bake, stamp) = bake_stamp(&full, look, variant, settings, theme, &frame, margin);
         // The composite: the cache read at the content offset.
         let mut comp = full;
         comp.offset = [full.offset[0], full.offset[1] - margin as f32];
@@ -1749,8 +1780,10 @@ impl Backdrop {
             self.cache = Some(self.target(device, "backdrop-cache", size, CACHE_FORMAT));
             self.baked = None;
         }
-        if !bake_is_fresh(self.baked.as_ref(), &bake, settings.animates()) {
-            self.bake(device, queue, variant, &bake, size);
+        if !bake_is_fresh(self.baked.as_ref(), &stamp, settings.animates())
+            && self.bake(device, queue, variant, &bake, size)
+        {
+            self.baked = Some(stamp);
         }
         if variant != Variant::Baked {
             self.noise = None; // the aurora's layer is only kept while it shows
@@ -1767,7 +1800,8 @@ impl Backdrop {
 
     /// Render the look into the cache (the aurora first renders its noise
     /// layer at half resolution): one encoder, one submit, off the frame's pass.
-    fn bake(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, variant: Variant, u: &BackdropUniform, size: (u32, u32)) {
+    /// Returns whether it baked (a textured variant without its texture waits).
+    fn bake(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, variant: Variant, u: &BackdropUniform, size: (u32, u32)) -> bool {
         queue.write_buffer(&self.bake_buf, 0, bytemuck::bytes_of(u));
         let i = variant.index();
         if self.pipelines[i].is_none() {
@@ -1787,9 +1821,9 @@ impl Backdrop {
             Variant::Baked => self.noise.as_ref().map(|n| &n.bind_group),
             _ => None,
         };
-        let (Some(cache), Some(pipeline)) = (self.cache.as_ref(), self.pipelines[i].as_ref()) else { return };
+        let (Some(cache), Some(pipeline)) = (self.cache.as_ref(), self.pipelines[i].as_ref()) else { return false };
         if variant.textured() && group1.is_none() {
-            return;
+            return false;
         }
         fn pass_desc(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
             wgpu::RenderPassColorAttachment {
@@ -1830,8 +1864,8 @@ impl Backdrop {
             pass.draw(0..3, 0..1);
         }
         queue.submit(Some(encoder.finish()));
-        self.baked = Some(*u);
         self.bakes += 1;
+        true
     }
 
     /// Record the backdrop into the frame's grid pass (after its clear, before
@@ -1901,21 +1935,90 @@ mod tests {
             time: 0.0,
             image: None,
         };
-        let a = build_uniform(&look, Variant::Gradient, &s, &t, &f);
+        let full = build_uniform(&look, Variant::Gradient, &s, &t, &f);
+        let (_, a) = bake_stamp(&full, &look, Variant::Gradient, &s, &t, &f, 0);
         assert!(!bake_is_fresh(None, &a, false), "never baked");
         assert!(bake_is_fresh(Some(&a), &a, false));
         let mut b = a;
-        b.resolution = [641.0, 400.0];
+        b.still.resolution = [641.0, 400.0];
         assert!(!bake_is_fresh(Some(&a), &b, false), "a resize re-bakes");
         // Animated: the clock may drift by less than a 30 fps frame.
-        let mut t1 = a;
-        t1.misc[0] = 1.0;
-        let mut t2 = t1;
-        t2.misc[0] = 1.0 + BAKE_MIN_INTERVAL * 0.5;
+        let t1 = BakeStamp { time: 1.0, ..a };
+        let t2 = BakeStamp { time: 1.0 + BAKE_MIN_INTERVAL * 0.5, ..a };
         assert!(bake_is_fresh(Some(&t1), &t2, true));
         assert!(!bake_is_fresh(Some(&t1), &t2, false), "a static look re-bakes on any change");
-        t2.misc[0] = 1.0 + BAKE_MIN_INTERVAL * 1.5;
-        assert!(!bake_is_fresh(Some(&t1), &t2, true), "≤ 30 fps, not slower");
+        let t3 = BakeStamp { time: 1.0 + BAKE_MIN_INTERVAL * 1.5, ..a };
+        assert!(!bake_is_fresh(Some(&t1), &t3, true), "≤ 30 fps, not slower");
+    }
+
+    /// An animated look re-bakes at most once per 30 fps frame however often
+    /// the window repaints (typing, a flood): two frames inside one bake
+    /// interval share the cache. The clock also moves the look's geometry (the
+    /// sway / drift folded into `geom`), which must not count as a new look.
+    #[test]
+    fn an_animated_look_rebakes_at_most_at_30_fps() {
+        let t = theme("tokyo_night");
+        let looks = [
+            BackdropSettings { mode: BackdropMode::Theme, animate: true, ..Default::default() },
+            BackdropSettings { mode: BackdropMode::Gradient, animate: true, ..Default::default() },
+            BackdropSettings {
+                mode: BackdropMode::Gradient,
+                shape: BackdropShape::Radial,
+                colors: vec![[10, 20, 30], [200, 100, 50]],
+                animate: true,
+                ..Default::default()
+            },
+            BackdropSettings { mode: BackdropMode::Pattern, pattern: BackdropPattern::Stars, animate: true, ..Default::default() },
+            BackdropSettings { mode: BackdropMode::Pattern, pattern: BackdropPattern::Aurora, animate: true, ..Default::default() },
+        ];
+        for s in looks {
+            let look = resolve_look(&s, &t);
+            let variant = variant_for(&s, false).unwrap();
+            // The stamp `prepare` leaves for a frame at `time` in a `w`-wide window.
+            let at = |time: f32, width: u32| {
+                let f = BackdropFrame {
+                    width,
+                    height: 500,
+                    slide_y: 0.0,
+                    scroll_px: 0.0,
+                    dpi: 1.0,
+                    premultiply: true,
+                    time,
+                    image: None,
+                };
+                let full = build_uniform(&look, variant, &s, &t, &f);
+                let (bake, stamp) = bake_stamp(&full, &look, variant, &s, &t, &f, 0);
+                assert_eq!(bake.misc[0], time, "the bake shows the live clock");
+                stamp
+            };
+            let baked = at(100.0, 800);
+            let soon = at(100.0 + BAKE_MIN_INTERVAL * 0.5, 800);
+            assert!(bake_is_fresh(Some(&baked), &soon, true), "{:?}/{:?}: re-baked inside one 30 fps frame", s.mode, s.pattern);
+            assert!(!bake_is_fresh(Some(&baked), &at(100.0 + BAKE_MIN_INTERVAL * 1.5, 800), true), "{:?}: frozen", s.mode);
+            // A real change inside the interval still re-bakes (a resize, an angle).
+            let resized = at(100.0 + BAKE_MIN_INTERVAL * 0.5, 801);
+            assert!(!bake_is_fresh(Some(&baked), &resized, true), "{:?}: a resize re-bakes", s.mode);
+        }
+        // The angle of an animated gradient lives in `geom` with the sway: a new
+        // angle is a new look even inside the interval.
+        let s = BackdropSettings { mode: BackdropMode::Gradient, animate: true, ..Default::default() };
+        let turned = BackdropSettings { angle: s.angle + 30.0, ..s.clone() };
+        let stamp = |s: &BackdropSettings| {
+            let look = resolve_look(s, &t);
+            let f = BackdropFrame {
+                width: 800,
+                height: 500,
+                slide_y: 0.0,
+                scroll_px: 0.0,
+                dpi: 1.0,
+                premultiply: true,
+                time: 100.0,
+                image: None,
+            };
+            let full = build_uniform(&look, Variant::Gradient, s, &t, &f);
+            bake_stamp(&full, &look, Variant::Gradient, s, &t, &f, 0).1
+        };
+        assert!(!bake_is_fresh(Some(&stamp(&s)), &stamp(&turned), true));
     }
 
     #[test]
@@ -2347,5 +2450,15 @@ mod tests {
         let n = bd.bake_count();
         assert!(bd.prepare(&device, &queue, &sp, &t, &BackdropFrame { scroll_px: 300.0, ..f }));
         assert_eq!(bd.bake_count(), n);
+        // An animated look: repaints 10 ms apart share one bake; the next
+        // 30 fps step bakes again.
+        let sa = BackdropSettings { mode: BackdropMode::Pattern, animate: true, ..Default::default() };
+        assert!(bd.prepare(&device, &queue, &sa, &t, &BackdropFrame { time: 5.0, ..f }));
+        let n = bd.bake_count();
+        assert!(bd.prepare(&device, &queue, &sa, &t, &BackdropFrame { time: 5.01, ..f }));
+        assert!(bd.prepare(&device, &queue, &sa, &t, &BackdropFrame { time: 5.02, ..f }));
+        assert_eq!(bd.bake_count(), n, "no re-bake inside one 30 fps frame");
+        assert!(bd.prepare(&device, &queue, &sa, &t, &BackdropFrame { time: 5.05, ..f }));
+        assert_eq!(bd.bake_count(), n + 1);
     }
 }
