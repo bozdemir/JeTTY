@@ -596,6 +596,12 @@ const MAX_MARKS: usize = 4096;
 const CLEAN_PROMPT_MAX_ROWS: i64 = 8;
 const CLEAN_PROMPT_MAX_ABOVE: i64 = 256;
 
+/// Blank cells right after a prompt's `B` that prove nothing was typed on its
+/// row (see [`Terminal::command_line_blank`]): a command line never starts with
+/// this many spaces, while the right prompt zsh leaves on an accepted line
+/// (RPROMPT without `TRANSIENT_RPROMPT`) sits further along that row.
+const EMPTY_INPUT_CELLS: usize = 3;
+
 /// Upper bound on the lines one `parser.advance` call may scroll (see
 /// [`Terminal::advance_slice`]). Kept below alacritty's 1000-row `Storage` row
 /// cache so the room made before it never frees rows the next scroll would have
@@ -2999,8 +3005,10 @@ impl Terminal {
     /// command — `C;` + `D;<$?>`, with `$?` the PREVIOUS command's status.
     /// Only claimed when provable: `m` is the open block and has a `B`, the `C`
     /// sits on a LATER row (as after every real Enter) at most
-    /// [`CLEAN_PROMPT_MAX_ROWS`] below it, and every cell from the `B` up to the
-    /// `C` is blank. Anything else is a command, as before.
+    /// [`CLEAN_PROMPT_MAX_ROWS`] below it, the [`EMPTY_INPUT_CELLS`] cells from
+    /// the `B` are blank — whatever lies further along the `B` row is a right
+    /// prompt — and so is every cell on the rows after it up to the `C`.
+    /// Anything else is a command, as before.
     fn command_line_blank(&self, m: &CmdBlock, c_line: i64, c_col: usize) -> bool {
         let Some(b_line) = m.input else { return false };
         if m.finished || m.output.is_some() || c_line <= b_line || c_line - b_line > CLEAN_PROMPT_MAX_ROWS {
@@ -3014,8 +3022,14 @@ impl Terminal {
                 return false;
             }
             let row = &grid[Line(l as i32)];
-            let from = if abs == b_line { m.input_col.min(self.cols) } else { 0 };
-            let to = if abs == c_line { c_col.min(self.cols) } else { self.cols };
+            let (from, to) = if abs == b_line {
+                let from = m.input_col.min(self.cols);
+                (from, (from + EMPTY_INPUT_CELLS).min(self.cols))
+            } else if abs == c_line {
+                (0, c_col.min(self.cols))
+            } else {
+                (0, self.cols)
+            };
             (from..to).all(|c| matches!(row[Column(c)].c, ' ' | '\0'))
         })
     }
@@ -7896,6 +7910,17 @@ mod tests {
         format!("\x1b[7m%\x1b[0m{}\r \r", " ".repeat(39)).into_bytes()
     }
 
+    /// p10k prompts at 40 columns with the transient prompt OFF whose input row
+    /// carries right-aligned text, shaped like recorded zsh 5.9 streams (SGR
+    /// trimmed): after the `B` zsh draws RPROMPT at the far right and returns
+    /// to the `B`. A one-line prompt with right segments, and the two-line
+    /// frame (`╰─ … ─╯`), whose right end is RPROMPT too.
+    const P10K_RPROMPTS: [&[u8]; 2] = [
+        b"\x1b]133;A\x07~/proj \xe2\x9d\xaf \x1b]133;B\x07\x1b[K\x1b[21C\xe2\x9c\x98 1 12:00\x1b[30D",
+        b"\x1b]133;A\x07\r\n\r\n\x1b[A\xe2\x95\xad\xe2\x94\x80 ~ 12:00 \xe2\x94\x80\xe2\x95\xae\r\n\
+          \xe2\x95\xb0\xe2\x94\x80 \x1b]133;B\x07\x1b[K\x1b[34C\xe2\x94\x80\xe2\x95\xaf\x1b[36D",
+    ];
+
     #[test]
     fn an_empty_enter_is_not_a_command_even_when_the_shell_reports_one() {
         // p10k (like iTerm2's own script) answers an empty Enter with `C;` and
@@ -7934,6 +7959,41 @@ mod tests {
         let done = t.take_completions();
         assert_eq!(done.len(), 1, "`true` completed: {done:?}");
         assert_eq!(done[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn an_empty_enter_under_a_right_prompt_is_not_a_command() {
+        // Without the transient prompt zsh keeps RPROMPT on the accepted line,
+        // so the input row of an empty Enter still holds right-aligned text.
+        // That is not a typed command: p10k's `C;` + stale `D;1` after a
+        // failure must mark nothing failed and complete nothing.
+        for prompt in P10K_RPROMPTS {
+            let mut t = Terminal::new(40, 24);
+            t.feed(prompt);
+            t.feed(b"false\r\r\n\x1b]133;C;\x07"); // preexec
+            t.feed(&p10k_prompt_sp());
+            t.feed(b"\x1b]133;D;1\x07\x1b[K\r\n"); // precmd, add-newline
+            t.feed(prompt);
+            let failed = t.failed_prompt_rows();
+            assert_eq!(failed.len(), 1, "premise: `false` is marked failed");
+            assert_eq!(t.take_completions().len(), 1);
+            for _ in 0..2 {
+                // Empty Enter: no preexec — precmd sends `C;` + the stale `D;1`.
+                t.feed(b"\r\r\n");
+                t.feed(&p10k_prompt_sp());
+                t.feed(b"\x1b]133;C;\x07\x1b]133;D;1\x07\x1b[K\r\n");
+                t.feed(prompt);
+            }
+            assert_eq!(t.failed_prompt_rows(), failed, "only the `false` prompt is marked failed");
+            assert!(t.take_completions().is_empty(), "an empty Enter completes nothing");
+            // A command typed on such a prompt still counts.
+            t.feed(b"false\r\r\n\x1b]133;C;\x07");
+            t.feed(&p10k_prompt_sp());
+            t.feed(b"\x1b]133;D;1\x07\x1b[K\r\n");
+            t.feed(prompt);
+            assert_eq!(t.failed_prompt_rows().len(), 2, "the second `false` is marked too");
+            assert_eq!(t.take_completions().len(), 1);
+        }
     }
 
     #[test]
