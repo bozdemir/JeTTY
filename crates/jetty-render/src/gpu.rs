@@ -141,6 +141,53 @@ fn renders_to(device: &wgpu::Device, format: wgpu::TextureFormat) -> bool {
     !failed
 }
 
+/// Log an uncaptured wgpu error — each distinct message once. A pass the driver
+/// cannot run fails the same way every frame: on a GLES 3.0 GPU with CRT on that
+/// was ~50 identical lines a second into the session log, for as long as JeTTY ran.
+fn log_wgpu_error(msg: &str) {
+    static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut seen) = SEEN.lock() else { return };
+    match first_report(&mut seen, msg) {
+        Report::New => eprintln!("jetty: wgpu error: {msg}"),
+        Report::Last => {
+            eprintln!("jetty: wgpu error: {msg}");
+            eprintln!("jetty: further distinct wgpu errors are not logged");
+        }
+        Report::Repeat => {}
+    }
+}
+
+/// How many distinct wgpu error messages [`log_wgpu_error`] prints at most.
+const MAX_LOGGED_WGPU_ERRORS: usize = 32;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Report {
+    /// Never seen: print it.
+    New,
+    /// Never seen, and the last one that will be printed.
+    Last,
+    /// Seen before (or past the cap): stay quiet.
+    Repeat,
+}
+
+/// [`log_wgpu_error`]'s bookkeeping: `seen` holds the hashes of the messages
+/// already printed.
+fn first_report(seen: &mut Vec<u64>, msg: &str) -> Report {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    msg.hash(&mut h);
+    let key = h.finish();
+    if seen.len() >= MAX_LOGGED_WGPU_ERRORS || seen.contains(&key) {
+        return Report::Repeat;
+    }
+    seen.push(key);
+    if seen.len() == MAX_LOGGED_WGPU_ERRORS {
+        Report::Last
+    } else {
+        Report::New
+    }
+}
+
 /// Why [`GpuContext::acquire_frame`] skipped a frame
 /// ([`GpuContext::last_acquire_error`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,9 +327,7 @@ impl GpuContext {
         // note above) — would abort the process here instead of degrading. Install a
         // non-fatal handler so such failures log and the app keeps running (with no
         // rendering) rather than crashing.
-        device.on_uncaptured_error(Arc::new(|e: wgpu::Error| {
-            eprintln!("jetty: wgpu error: {e}");
-        }));
+        device.on_uncaptured_error(Arc::new(|e: wgpu::Error| log_wgpu_error(&e.to_string())));
         // A genuine device loss (driver reset / GPU hang / suspend) leaves every
         // window frozen on its last frame: flag it so the app can rebuild its GPU
         // stack (`is_lost`). `Destroyed` is our own teardown — not a loss.
@@ -592,6 +637,23 @@ mod tests {
         assert_eq!(effect_format(Backend::Gl, false), Rgba8UnormSrgb);
         // Only GL is ever probed; any other backend renders half-float.
         assert_eq!(effect_format(Backend::Vulkan, false), Rgba16Float);
+    }
+
+    /// An error that recurs every frame is printed once, not ~50 times a second.
+    #[test]
+    fn a_recurring_wgpu_error_is_reported_once() {
+        use super::{first_report, Report, MAX_LOGGED_WGPU_ERRORS};
+        let mut seen = Vec::new();
+        assert_eq!(first_report(&mut seen, "Format Rgba16Float is not renderable"), Report::New);
+        assert_eq!(first_report(&mut seen, "Format Rgba16Float is not renderable"), Report::Repeat);
+        assert_eq!(first_report(&mut seen, "TextureView is invalid"), Report::New);
+        // Bounded: the last one printed says so; past the cap all stay quiet.
+        for i in 2..MAX_LOGGED_WGPU_ERRORS - 1 {
+            assert_eq!(first_report(&mut seen, &format!("error {i}")), Report::New);
+        }
+        assert_eq!(first_report(&mut seen, "the last one"), Report::Last);
+        assert_eq!(first_report(&mut seen, "past the cap"), Report::Repeat);
+        assert_eq!(seen.len(), MAX_LOGGED_WGPU_ERRORS);
     }
 
     #[test]
