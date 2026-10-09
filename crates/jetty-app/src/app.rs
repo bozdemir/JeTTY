@@ -2936,7 +2936,7 @@ impl App {
                     self.hotkey_manager = Some(manager);
                     std::thread::spawn(move || forward_hotkey_presses(&proxy));
                 }
-                Err(e) => report_hotkey_failure(&proxy, &spec, &e.to_string()),
+                Err(e) => report_hotkey_failure(&proxy, &spec, HotkeyFailure::of_macos(&e), &e.to_string()),
             }
         }
         // Linux/BSD: our own X11 grab (`x11_hotkey`) on a thread that BLOCKS on its
@@ -2951,7 +2951,7 @@ impl App {
                     hotkey,
                     |r| {
                         if let Err(e) = r {
-                            report_hotkey_failure(&proxy, &spec, &e);
+                            report_hotkey_failure(&proxy, &spec, HotkeyFailure::of_x11(&e), &e.to_string());
                         }
                     },
                     || proxy.send_event(AppEvent::ToggleVisibility).is_ok(),
@@ -17660,20 +17660,77 @@ fn forward_hotkey_presses(proxy: &EventLoopProxy<AppEvent>) {
     }
 }
 
-/// Report that the global summon hotkey could not be registered. Logged always;
-/// shown in-app unless this is a Wayland session, where apps can't grab keys by
-/// design and `jetty --toggle` bound in the compositor is the documented path.
-fn report_hotkey_failure(proxy: &EventLoopProxy<AppEvent>, spec: &str, err: &str) {
+/// Why the summon hotkey could not be registered — each wants its own advice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HotkeyFailure {
+    /// Another program holds the chord (X11), or macOS refused it. A macOS
+    /// hotkey is a Carbon registration that needs no permission: it fails for a
+    /// chord in use, or (macOS 15) one with only Option / Shift.
+    Taken,
+    /// No key on this keyboard (layout) makes it.
+    NoKey,
+    /// Nothing to grab it with: no X11 connection — or, for a macOS media key,
+    /// no event tap (that one needs Accessibility permission).
+    NoAccess,
+    /// Anything else.
+    Other,
+}
+
+impl HotkeyFailure {
+    #[cfg(not(target_os = "macos"))]
+    fn of_x11(e: &jetty_platform::hotkey::HotkeyError) -> HotkeyFailure {
+        use jetty_platform::hotkey::HotkeyError as E;
+        match e {
+            E::Taken => HotkeyFailure::Taken,
+            E::NoKeycode => HotkeyFailure::NoKey,
+            E::NoDisplay(_) => HotkeyFailure::NoAccess,
+            E::Failed(_) => HotkeyFailure::Other,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn of_macos(e: &global_hotkey::Error) -> HotkeyFailure {
+        match e {
+            global_hotkey::Error::FailedToWatchMediaKeyEvent => HotkeyFailure::NoAccess,
+            global_hotkey::Error::FailedToRegister(m) if m.starts_with("Unknown scancode") => {
+                HotkeyFailure::NoKey
+            }
+            global_hotkey::Error::FailedToRegister(_) | global_hotkey::Error::AlreadyRegistered(_) => {
+                HotkeyFailure::Taken
+            }
+            _ => HotkeyFailure::Other,
+        }
+    }
+}
+
+/// The in-app notice for summon hotkey `spec` that `failure` kept from working:
+/// what happened in a few words, then what to do — the part the pill keeps
+/// whole (`config_pill_text`). The error itself goes to stderr.
+fn hotkey_failure_notice(spec: &str, failure: HotkeyFailure) -> String {
+    let mac = cfg!(target_os = "macos");
+    let (what, fix) = match failure {
+        HotkeyFailure::Taken if mac => {
+            ("was refused by macOS", "choose a chord with Ctrl or Cmd, or bind `jetty --toggle`")
+        }
+        HotkeyFailure::Taken => ("is held by another app", "set another `summon_hotkey`, or bind `jetty --toggle`"),
+        HotkeyFailure::NoKey => ("has no key on this keyboard", "set another `summon_hotkey`"),
+        HotkeyFailure::NoAccess if mac => {
+            ("needs Accessibility permission", "allow JeTTY in Privacy & Security › Accessibility")
+        }
+        HotkeyFailure::NoAccess => ("can't be grabbed (no X11 connection)", "bind `jetty --toggle` to a key instead"),
+        HotkeyFailure::Other => ("could not be registered", "set another `summon_hotkey`, or bind `jetty --toggle`"),
+    };
+    format!("summon hotkey {spec} {what} — {fix}")
+}
+
+/// Report that the global summon hotkey could not be registered (`err`: the
+/// error as the platform put it). Logged always; shown in-app unless this is a
+/// Wayland session, where apps can't grab keys by design and `jetty --toggle`
+/// bound in the compositor is the documented path.
+fn report_hotkey_failure(proxy: &EventLoopProxy<AppEvent>, spec: &str, failure: HotkeyFailure, err: &str) {
     eprintln!("jetty: global hotkey {spec} unavailable — {err}");
     if !wayland_session() {
-        let hint = if cfg!(target_os = "macos") {
-            "grant JeTTY Accessibility permission, or bind `jetty --toggle` to a shortcut"
-        } else {
-            "another app may hold it — set another `summon_hotkey`, or bind `jetty --toggle`"
-        };
-        let _ = proxy.send_event(AppEvent::ConfigNotice(format!(
-            "summon hotkey {spec} unavailable ({err}) — {hint}"
-        )));
+        let _ = proxy.send_event(AppEvent::ConfigNotice(hotkey_failure_notice(spec, failure)));
     }
 }
 
@@ -18862,6 +18919,38 @@ mod config_pill_tests {
                          byte (Ctrl+letter / Ctrl+Space/[/\\/]//) — new_tab keeps its default"
             .to_string()];
         assert!(config_pill_text(&rejected).ends_with("… — new_tab keeps its default"));
+    }
+}
+
+#[cfg(test)]
+mod hotkey_notice_tests {
+    use super::{config_pill_text, hotkey_failure_notice, HotkeyFailure};
+
+    #[test]
+    fn a_failed_summon_hotkey_says_what_to_do_in_the_pill() {
+        let all = [HotkeyFailure::Taken, HotkeyFailure::NoKey, HotkeyFailure::NoAccess, HotkeyFailure::Other];
+        for failure in all {
+            // The default key fits whole; a long chord loses only its cause.
+            let n = hotkey_failure_notice("F9", failure);
+            assert!(n.chars().count() <= 96, "{failure:?}: {n}");
+            let fix = n.rsplit(" — ").next().unwrap().to_string();
+            let pill = config_pill_text(&[hotkey_failure_notice("Ctrl+Shift+Alt+Super+F12", failure)]);
+            assert!(pill.ends_with(&fix), "{failure:?}: {pill}");
+            // The advice points at something that helps: another key, the
+            // compositor/launcher-bound `jetty --toggle` (or, for a macOS media
+            // key, the permission its event tap needs).
+            let helps = ["summon_hotkey", "jetty --toggle", "Accessibility"];
+            assert!(helps.iter().any(|h| fix.contains(h)), "{failure:?}: {fix}");
+        }
+        // A key another X client grabs: the fix, not a guess about the cause.
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            hotkey_failure_notice("F9", HotkeyFailure::Taken),
+            "summon hotkey F9 is held by another app — set another `summon_hotkey`, or bind `jetty --toggle`"
+        );
+        // A macOS hotkey needs no permission (only the media keys' tap does).
+        #[cfg(target_os = "macos")]
+        assert!(!hotkey_failure_notice("F9", HotkeyFailure::Taken).contains("Accessibility"));
     }
 }
 

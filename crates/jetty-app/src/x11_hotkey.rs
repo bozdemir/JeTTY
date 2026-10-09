@@ -12,7 +12,7 @@
 //! to layout.
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use jetty_platform::hotkey::{HotkeyKey, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_SUPER};
+use jetty_platform::hotkey::{HotkeyError, HotkeyKey, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_SUPER};
 use xkeysym::key;
 
 /// The X11 keysym bound for `code` (`None`: the key has no X11 binding).
@@ -188,14 +188,15 @@ pub(crate) fn mods(mods: Modifiers) -> u16 {
 
 /// Grab `hotkey` and call `on_press` for each press, on the calling thread: it
 /// blocks for the life of the X connection (spawn a thread). `ready` gets the
-/// grab's outcome before any press — `Err` with a user-facing reason when the key
-/// cannot be grabbed (nothing is listened for then).
-pub(crate) fn run(hotkey: HotKey, ready: impl FnOnce(Result<(), String>), on_press: impl FnMut() -> bool) {
+/// grab's outcome before any press — `Err` with the reason when the key cannot
+/// be grabbed (nothing is listened for then); a key X11 has no keysym for is
+/// `NoKeycode`, like one the keyboard layout lacks.
+pub(crate) fn run(hotkey: HotKey, ready: impl FnOnce(Result<(), HotkeyError>), on_press: impl FnMut() -> bool) {
     let Some(sym) = keysym(hotkey.key) else {
-        return ready(Err(format!("{} has no X11 key", hotkey.key)));
+        return ready(Err(HotkeyError::NoKeycode));
     };
     let key = HotkeyKey { keysym: sym, position: position(hotkey.key) };
-    jetty_platform::hotkey::run_x11_hotkey(key, mods(hotkey.mods), |r| ready(r.map_err(|e| e.to_string())), on_press);
+    jetty_platform::hotkey::run_x11_hotkey(key, mods(hotkey.mods), ready, on_press);
 }
 
 #[cfg(test)]
@@ -254,11 +255,10 @@ mod tests {
 
     #[test]
     fn a_key_without_an_x11_binding_is_refused_before_any_x_call() {
-        // `Fn` has no keysym: refused up front, with the key named.
+        // `Fn` has no keysym: refused up front, as a key no keyboard produces.
         let hk = HotKey::new(None, Code::Fn);
         let mut got = None;
         run(hk, |r| got = Some(r), || true);
-        let err = got.expect("ready is always called").unwrap_err();
-        assert!(err.contains("Fn"), "{err}");
+        assert_eq!(got.expect("ready is always called"), Err(HotkeyError::NoKeycode));
     }
 }

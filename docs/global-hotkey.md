@@ -87,17 +87,19 @@ On a Mac keyboard where the function-row keys default to media actions, press
 function keys" in System Settings → Keyboard — or set `summon_hotkey` to a chord
 that needs neither (e.g. `"Ctrl+Shift+Space"`).
 
-macOS requires Jetty to be granted Accessibility (and on some versions Input
-Monitoring) permission before a system-wide key tap is delivered: System
-Settings → Privacy & Security → Accessibility → enable Jetty. Without this the
-F9 grab is silently inactive; the IPC toggle still works as a fallback
-(bind `jetty --toggle` to a shortcut via a launcher).
+The hotkey is a system-wide hotkey registration (Carbon's `RegisterEventHotKey`,
+through the `global-hotkey` crate), which needs **no** Accessibility or Input
+Monitoring permission — granting one changes nothing. macOS refuses a chord
+another app has registered, and macOS 15 one whose only modifier is Option (or
+Option+Shift); Jetty then says so in the window. Choose a chord with Ctrl or Cmd
+(`"Ctrl+Shift+Space"`, `"Cmd+F9"`), or bind `jetty --toggle` to a shortcut via a
+launcher, which works as on Wayland. Only a media key (play/pause, volume) is
+watched through an event tap, and that one needs Jetty allowed in System
+Settings → Privacy & Security → Accessibility.
 
 The hotkey manager is created and kept on the main thread, as the
 `global-hotkey` crate requires on macOS (earlier versions registered it on a
-background thread, where it could silently never fire). If the grab fails, Jetty
-says so in the window; binding `jetty --toggle` to a shortcut via a launcher works
-as on Wayland.
+background thread, where it could silently never fire).
 
 Hiding the terminal (F9, `jetty --hide`) while no other JeTTY window is open
 hides the whole application, as Cmd+H does, so the keyboard goes back to the app
