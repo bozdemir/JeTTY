@@ -98,12 +98,26 @@ pub fn build_hint_overlay(
     HintOverlay { quads, labels }
 }
 
-/// The small COPY-MODE status pill (top-left of the grid). Reads "COPY" (char
-/// select) or "COPY · LINE" (line select). Same rounded/themed idiom as the
+/// The small COPY-MODE status pill (top-left of the grid). Reads "COPY" while
+/// the cursor just moves, "COPY · SEL" / "COPY · LINE" / "COPY · BLOCK" while
+/// selecting characters / lines / a block. Same rounded/themed idiom as the
 /// shift-drag hint pill.
 pub struct CopyPill {
     pub quads: Vec<Rect>,
     pub labels: Vec<(String, f32, f32, [u8; 3])>,
+}
+
+/// What copy-mode is doing, as its pill shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopySelect {
+    /// Moving the cursor, nothing selected.
+    None,
+    /// `v`: characters in reading order.
+    Chars,
+    /// `V`: whole lines.
+    Lines,
+    /// Ctrl+V: a rectangle.
+    Block,
 }
 
 /// What the copy-mode pill must not cover: the keyboard cursor and the
@@ -159,17 +173,16 @@ pub fn build_copy_pill(
     theme: &jetty_core::Theme,
     m: &mut dyn ChromeMeasure,
     cm: ChromeMetrics,
-    line_mode: bool,
-    selecting: bool,
+    select: CopySelect,
     avoid: Option<&PillAvoid>,
 ) -> CopyPill {
-    let text = if line_mode {
-        "COPY · LINE".to_string()
-    } else if selecting {
-        "COPY · SEL".to_string()
-    } else {
-        "COPY".to_string()
-    };
+    let text = match select {
+        CopySelect::None => "COPY",
+        CopySelect::Chars => "COPY · SEL",
+        CopySelect::Lines => "COPY · LINE",
+        CopySelect::Block => "COPY · BLOCK",
+    }
+    .to_string();
     let vscale = cm.overlay_u();
     let pad = 10.0 * vscale;
     let pill_h = 24.0 * vscale;
@@ -313,14 +326,14 @@ mod tests {
 
     #[test]
     fn pill_fits_and_scales() {
-        let p1 = build_copy_pill(1000, 36.0, &theme(), &mut mono(), CM, false, false, None);
-        let p2 = build_copy_pill(1000, 36.0, &theme(), &mut MonoMeasure(19.6), ChromeMetrics::new(2.0, 16.0), true, true, None);
+        let p1 = build_copy_pill(1000, 36.0, &theme(), &mut mono(), CM, CopySelect::None, None);
+        let p2 = build_copy_pill(1000, 36.0, &theme(), &mut MonoMeasure(19.6), ChromeMetrics::new(2.0, 16.0), CopySelect::Lines, None);
         assert_eq!(p1.labels[0].0, "COPY");
         assert_eq!(p2.labels[0].0, "COPY · LINE");
         // Pill scales with the chrome unit (2× → ~2× height).
         assert!((p2.quads[0].h - p1.quads[0].h * 2.0).abs() < 0.5, "pill must scale with the chrome unit");
         // Pill fits a narrow window.
-        let pn = build_copy_pill(200, 10.0, &theme(), &mut mono(), CM, false, false, None);
+        let pn = build_copy_pill(200, 10.0, &theme(), &mut mono(), CM, CopySelect::None, None);
         assert!(pn.quads[0].x + pn.quads[0].w <= 200.0 + 0.5, "pill overflows narrow window");
     }
 
@@ -336,7 +349,7 @@ mod tests {
             assert!(cr(rest, chip) >= 4.5, "{}: chip label {}", t.name, cr(rest, chip));
             assert!(cr(typed, chip) >= 3.0, "{}: typed prefix {}", t.name, cr(typed, chip));
             assert_ne!(typed, rest, "{}: the typed prefix must look consumed", t.name);
-            let p = build_copy_pill(1000, 36.0, &t, &mut mono(), CM, false, false, None);
+            let p = build_copy_pill(1000, 36.0, &t, &mut mono(), CM, CopySelect::None, None);
             let c = cr(p.labels[0].3, rgb(p.quads[0].color));
             assert!(c >= 4.5, "{}: COPY pill {c}", t.name);
         }
@@ -381,7 +394,7 @@ mod tests {
             cursor,
             band_bottom: 400.0,
         };
-        build_copy_pill(1000, 36.0, &theme(), &mut mono(), CM, false, false, Some(&avoid)).quads[0].y
+        build_copy_pill(1000, 36.0, &theme(), &mut mono(), CM, CopySelect::None, Some(&avoid)).quads[0].y
     }
 
     #[test]
@@ -426,7 +439,7 @@ mod tests {
             cursor: (0, 0),
             band_bottom: 40.0 + 36.0,
         };
-        let p = build_copy_pill(1000, 36.0, &theme(), &mut mono(), CM, false, false, Some(&avoid));
+        let p = build_copy_pill(1000, 36.0, &theme(), &mut mono(), CM, CopySelect::None, Some(&avoid));
         assert_eq!(p.quads[0].y, PILL_TOP);
     }
 

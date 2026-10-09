@@ -60,6 +60,13 @@ pub fn default_context_menu_hints() -> Vec<String> {
     detached::context_menu_hints(&keymap::KeyMap::defaults()).to_vec()
 }
 
+/// Copy-mode's block-selection sides `(anchor_left_half, cursor_left_half)`
+/// for a rectangle between `anchor_col` and `cursor_col` (for `jetty-shot`'s
+/// JETTY_SHOT_COPYMODE_BLOCK; the app's Ctrl+V uses the same rule).
+pub fn copy_mode_block_sides(anchor_col: usize, cursor_col: usize) -> (bool, bool) {
+    copymode::block_sides(anchor_col, cursor_col)
+}
+
 /// The tab context menu's rows (for `jetty-shot`'s JETTY_SHOT_TAB_MENU).
 pub fn shot_tab_menu_items(can_detach: bool) -> Vec<&'static str> {
     detached::tab_menu_items(can_detach)

@@ -4211,6 +4211,16 @@ impl Terminal {
         }
     }
 
+    /// Start a BLOCK (rectangular) selection at an ABSOLUTE buffer cell —
+    /// copy-mode's Ctrl+V. [`Terminal::selection_update_abs`] moves the
+    /// opposite corner; the copied text is each row's slice of the rectangle,
+    /// trailing blanks trimmed, one line per row.
+    pub fn selection_start_block_abs(&mut self, buffer_line: i32, col: usize, left_half: bool) {
+        let pt = Point::new(Line(buffer_line), Column(col));
+        let side = if left_half { Side::Left } else { Side::Right };
+        self.set_selection(Some(Selection::new(SelectionType::Block, pt, side)));
+    }
+
     /// Like [`Terminal::selection_start_lines`] but anchored at an ABSOLUTE
     /// buffer line, so a line-mode copy-mode anchor survives scrolling.
     pub fn selection_start_lines_abs(&mut self, buffer_line: i32) {

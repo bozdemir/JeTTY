@@ -38,15 +38,25 @@ pub enum ScrollReq {
     Bottom,
 }
 
+/// What a copy-mode selection covers: characters in reading order (`v`),
+/// whole lines (`V`) or a rectangle (Ctrl+V).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SelKind {
+    #[default]
+    Chars,
+    Lines,
+    Block,
+}
+
 /// The modal copy-mode state: a keyboard cursor over the viewport plus, once
-/// `v`/`V` is pressed, a selection anchored at the cursor's position at that
-/// moment.
+/// `v`/`V`/Ctrl+V is pressed, a selection anchored at the cursor's position at
+/// that moment.
 #[derive(Clone, Copy, Debug)]
 pub struct CopyMode {
     pub row: usize,
     pub col: usize,
     pub selecting: bool,
-    pub line_mode: bool,
+    pub kind: SelKind,
     /// Fixed selection anchor as an ABSOLUTE buffer line (captured when `v`/`V`
     /// was pressed). Content-pinned, NOT viewport-pinned: scrolling while
     /// selecting extends into scrollback instead of sliding the whole selection.
@@ -62,17 +72,63 @@ impl CopyMode {
     pub fn new(row: usize, col: usize) -> Self {
         // `anchor_line` is unused until `begin_select` captures a real one
         // (guarded by `selecting`), so 0 is a safe placeholder here.
-        CopyMode { row, col, selecting: false, line_mode: false, anchor_line: 0, anchor_col: col, entry_offset: 0 }
+        CopyMode {
+            row,
+            col,
+            selecting: false,
+            kind: SelKind::Chars,
+            anchor_line: 0,
+            anchor_col: col,
+            entry_offset: 0,
+        }
     }
 
     /// Begin (or restart) a selection anchored at the current cursor cell.
     /// `anchor_line` is the cursor's ABSOLUTE buffer line right now — the app
     /// computes it from the terminal so the anchor is pinned to content.
-    pub fn begin_select(&mut self, line_mode: bool, anchor_line: i32) {
+    pub fn begin_select(&mut self, kind: SelKind, anchor_line: i32) {
         self.selecting = true;
-        self.line_mode = line_mode;
+        self.kind = kind;
         self.anchor_line = anchor_line;
         self.anchor_col = self.col;
+    }
+
+    /// The `v` / `V` / Ctrl+V key, vim's way: start a `kind` selection at the
+    /// cursor (`anchor_line` = its absolute buffer line); with one active,
+    /// switch it to `kind` keeping its anchor, or — the same kind again — stop
+    /// selecting. Returns whether a selection is active afterwards.
+    pub fn select(&mut self, kind: SelKind, anchor_line: i32) -> bool {
+        if !self.selecting {
+            self.begin_select(kind, anchor_line);
+        } else if self.kind == kind {
+            self.selecting = false;
+        } else {
+            self.kind = kind;
+        }
+        self.selecting
+    }
+
+    /// What the COPY pill says about this state.
+    pub fn pill(&self) -> jetty_render::CopySelect {
+        match (self.selecting, self.kind) {
+            (false, _) => jetty_render::CopySelect::None,
+            (true, SelKind::Chars) => jetty_render::CopySelect::Chars,
+            (true, SelKind::Lines) => jetty_render::CopySelect::Lines,
+            (true, SelKind::Block) => jetty_render::CopySelect::Block,
+        }
+    }
+}
+
+/// A block selection's sub-cell sides, as `(anchor_left_half,
+/// cursor_left_half)`: the rectangle's LEFT column takes `Side::Left` and its
+/// right column `Side::Right`, whichever row each corner sits on — alacritty
+/// orders a block by column, so reading-order sides (as `v` uses) would trim
+/// both edge columns off a rectangle drawn right-to-left.
+pub fn block_sides(anchor_col: usize, cursor_col: usize) -> (bool, bool) {
+    if cursor_col >= anchor_col {
+        (true, false)
+    } else {
+        (false, true)
     }
 }
 
@@ -424,6 +480,48 @@ mod tests {
         assert_eq!(snap_to_char(&v, 0, 6), 5);
         assert_eq!(snap_to_char(&v, 0, 5), 5);
         assert_eq!(snap_to_char(&v, 0, 9), 9);
+    }
+
+    #[test]
+    fn v_shift_v_and_ctrl_v_switch_kinds_keeping_the_anchor() {
+        let mut m = cm(3, 4);
+        assert!(m.select(SelKind::Chars, 10), "v starts a selection");
+        assert_eq!((m.anchor_line, m.anchor_col), (10, 4));
+        m.col = 9;
+        m.row = 5;
+        // Ctrl+V / V switch the kind; the anchor stays where `v` put it.
+        assert!(m.select(SelKind::Block, 12));
+        assert_eq!((m.kind, m.anchor_line, m.anchor_col), (SelKind::Block, 10, 4));
+        assert!(m.select(SelKind::Lines, 12));
+        assert_eq!((m.kind, m.anchor_line), (SelKind::Lines, 10));
+        assert_eq!(m.pill(), jetty_render::CopySelect::Lines);
+        // The active kind's key again stops selecting.
+        assert!(!m.select(SelKind::Lines, 12));
+        assert_eq!(m.pill(), jetty_render::CopySelect::None);
+        // The next one starts afresh at the cursor.
+        assert!(m.select(SelKind::Block, 12));
+        assert_eq!((m.anchor_line, m.anchor_col), (12, 9));
+        assert_eq!(m.pill(), jetty_render::CopySelect::Block);
+    }
+
+    #[test]
+    fn block_selection_keeps_both_edge_columns_in_any_direction() {
+        // "abcdef" on three rows; a rectangle over cols 1–3 drawn from each
+        // corner must copy "bcd" from every row.
+        let mut t = jetty_core::Terminal::new(10, 4);
+        t.feed(b"abcdef\r\nabcdef\r\nabcdef");
+        let top = t.viewport_line_to_buffer(0);
+        for (anchor, cursor) in [((0, 1), (2, 3)), ((0, 3), (2, 1)), ((2, 1), (0, 3)), ((2, 3), (0, 1))] {
+            let (a_left, c_left) = block_sides(anchor.1, cursor.1);
+            t.selection_start_block_abs(top + anchor.0, anchor.1, a_left);
+            t.selection_update_abs(top + cursor.0, cursor.1, c_left);
+            assert_eq!(t.selection_text().as_deref(), Some("bcd\nbcd\nbcd"), "{anchor:?} → {cursor:?}");
+        }
+        // A one-column block.
+        let (a_left, c_left) = block_sides(2, 2);
+        t.selection_start_block_abs(top, 2, a_left);
+        t.selection_update_abs(top + 1, 2, c_left);
+        assert_eq!(t.selection_text().as_deref(), Some("c\nc"));
     }
 
     #[test]

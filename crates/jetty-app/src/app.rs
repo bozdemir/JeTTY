@@ -2259,7 +2259,7 @@ impl App {
                 first(A::HintMode)
             ),
             format!(
-                "{} — Copy-mode: keyboard select   (hjkl, v/V, y = yank, r = run)",
+                "{} — Copy-mode: keyboard select   (hjkl, v/V/Ctrl+V, y = yank, r = run)",
                 first(A::CopyMode)
             ),
             "Ctrl+click — Open URL   (Ctrl+hover underlines)".to_string(),
@@ -4664,6 +4664,7 @@ impl App {
                 match code {
                     KeyCode::KeyU => self.copy_mode_motion(s, Motion::HalfPageUp),
                     KeyCode::KeyD => self.copy_mode_motion(s, Motion::HalfPageDown),
+                    KeyCode::KeyV => self.copy_mode_select(s, crate::copymode::SelKind::Block),
                     _ => {}
                 }
             }
@@ -4711,32 +4712,12 @@ impl App {
                 return;
             }
             Key::Character(c) if c.as_str() == "v" || c.as_str() == "V" => {
-                let line = c.as_str() == "V";
-                // Content-pinned anchor: capture the BUFFER line under the cursor
-                // NOW, so scrolling while selecting extends into scrollback rather
-                // than sliding the whole selection with the viewport.
-                let Some((ov, term)) = self.ov_term_mut(s) else { return };
-                let now_selecting = match ov.copy_mode.as_mut() {
-                    Some(cm) => {
-                        let anchor_line = term.viewport_line_to_buffer(cm.row);
-                        if cm.selecting && cm.line_mode == line {
-                            cm.selecting = false;
-                            false
-                        } else {
-                            cm.begin_select(line, anchor_line);
-                            true
-                        }
-                    }
-                    None => false,
-                };
-                if now_selecting {
-                    self.copy_mode_refresh_selection(s);
+                let kind = if c.as_str() == "V" {
+                    crate::copymode::SelKind::Lines
                 } else {
-                    if let Some(term) = self.term_of_mut(s) {
-                        term.selection_clear();
-                    }
-                    self.paint_surface(s);
-                }
+                    crate::copymode::SelKind::Chars
+                };
+                self.copy_mode_select(s, kind);
                 return;
             }
             _ => {}
@@ -4800,10 +4781,29 @@ impl App {
         self.paint_surface(s);
     }
 
+    /// `v` / `V` / Ctrl+V in window `s`'s copy-mode (`CopyMode::select`):
+    /// start a `kind` selection at the cursor, switch the active one to `kind`
+    /// (keeping its anchor), or stop selecting.
+    fn copy_mode_select(&mut self, s: Surface, kind: crate::copymode::SelKind) {
+        // Content-pinned anchor: capture the BUFFER line under the cursor NOW,
+        // so scrolling while selecting extends into scrollback rather than
+        // sliding the whole selection with the viewport.
+        let Some((ov, term)) = self.ov_term_mut(s) else { return };
+        let Some(cm) = ov.copy_mode.as_mut() else { return };
+        let anchor_line = term.viewport_line_to_buffer(cm.row);
+        if cm.select(kind, anchor_line) {
+            self.copy_mode_refresh_selection(s);
+        } else {
+            term.selection_clear();
+        }
+        self.paint_surface(s);
+    }
+
     /// Rebuild window `s`'s selection from the copy-mode anchor + cursor with the
     /// DERIVED sub-cell sides (BLOCKING 2) — reading-order start=Left, end=Right
-    /// — so the highlight/yank is inclusive on both ends regardless of
-    /// direction. No-op when not selecting (never clobbers a cleared selection).
+    /// (a block: left column Left, right column Right) — so the highlight/yank
+    /// is inclusive on both ends regardless of direction. No-op when not
+    /// selecting (never clobbers a cleared selection).
     fn copy_mode_refresh_selection(&mut self, s: Surface) {
         let Some((ov, term)) = self.ov_term_mut(s) else { return };
         let Some(cm) = ov.copy_mode else { return };
@@ -4816,18 +4816,26 @@ impl App {
         // scroll extends the selection through scrollback instead of sliding it.
         let cursor_line = term.viewport_line_to_buffer(cm.row);
         let cursor = (cursor_line, cm.col);
-        if cm.line_mode {
-            let (sr, er) = if cursor.0 >= anchor.0 {
-                (anchor.0, cursor.0)
-            } else {
-                (cursor.0, anchor.0)
-            };
-            term.selection_start_lines_abs(sr);
-            term.selection_update_abs(er, cm.col, false);
-        } else {
-            let (start, end) = crate::copymode::selection_endpoints(anchor, cursor);
-            term.selection_start_abs(start.0, start.1, start.2);
-            term.selection_update_abs(end.0, end.1, end.2);
+        match cm.kind {
+            crate::copymode::SelKind::Lines => {
+                let (sr, er) = if cursor.0 >= anchor.0 {
+                    (anchor.0, cursor.0)
+                } else {
+                    (cursor.0, anchor.0)
+                };
+                term.selection_start_lines_abs(sr);
+                term.selection_update_abs(er, cm.col, false);
+            }
+            crate::copymode::SelKind::Block => {
+                let (anchor_left, cursor_left) = crate::copymode::block_sides(anchor.1, cursor.1);
+                term.selection_start_block_abs(anchor.0, anchor.1, anchor_left);
+                term.selection_update_abs(cursor.0, cursor.1, cursor_left);
+            }
+            crate::copymode::SelKind::Chars => {
+                let (start, end) = crate::copymode::selection_endpoints(anchor, cursor);
+                term.selection_start_abs(start.0, start.1, start.2);
+                term.selection_update_abs(end.0, end.1, end.2);
+            }
         }
     }
 
@@ -10711,7 +10719,7 @@ impl App {
             }
         }
         // Pass 5d: this window's copy-mode "COPY" pill (main window's Pass 4f).
-        if let Some((cr, cc, selecting, line_mode)) = copy_mode_ui {
+        if let Some((cr, cc, select)) = copy_mode_ui {
             let (cell_w, cell_h) = text.cell_size();
             let avoid = jetty_render::PillAvoid {
                 snap: &snap,
@@ -10722,7 +10730,7 @@ impl App {
                 band_bottom: grid_bottom_px,
             };
             let pill = jetty_render::build_copy_pill(
-                width, grid_top, &theme, &mut *chrome_text, cm, line_mode, selecting, Some(&avoid),
+                width, grid_top, &theme, &mut *chrome_text, cm, select, Some(&avoid),
             );
             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pill.quads);
             if !pill.labels.is_empty() {
@@ -14236,9 +14244,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // OWNED before the mutable gpu/text borrow. None while inactive
                 // (one Option test on the hot path, zero allocation).
                 let hint_ui: Option<HintDrawData> = self.ov.hint_draw();
-                // Copy-mode cursor + pill: (row, col, selecting, line_mode). None
+                // Copy-mode cursor + pill: (row, col, pill state). None
                 // while inactive; `copy_mode_active` suppresses the shell cursor.
-                let copy_mode_ui: Option<(usize, usize, bool, bool)> = self.ov.copy_draw();
+                let copy_mode_ui = self.ov.copy_draw();
                 let copy_mode_active = copy_mode_ui.is_some();
                 // Pill only when the hint is live AND belongs to THIS (the
                 // main) window — a detached-window drag must not light it
@@ -14844,7 +14852,7 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     // Pass 4f: copy-mode "COPY" pill (top-left, discoverability +
                     // screenshot-verify surface).
-                    if let Some((cr, cc, selecting, line_mode)) = copy_mode_ui {
+                    if let Some((cr, cc, select)) = copy_mode_ui {
                         // Never over the copy cursor or the selection.
                         let avoid = jetty_render::PillAvoid {
                             snap: &snap,
@@ -14860,8 +14868,7 @@ impl ApplicationHandler<AppEvent> for App {
                             &theme,
                             &mut *chrome_text,
                             cm,
-                            line_mode,
-                            selecting,
+                            select,
                             Some(&avoid),
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pill.quads);
@@ -15447,7 +15454,7 @@ struct GridScene<'a> {
     /// never suppressed here.
     copy_mode_active: bool,
     /// Copy-mode keyboard cursor. Detached passes `None` → no extra cursor.
-    copy_mode_ui: Option<(usize, usize, bool, bool)>,
+    copy_mode_ui: Option<(usize, usize, jetty_render::CopySelect)>,
 }
 
 /// The genuinely-shared per-window grid render body, extracted from the main
@@ -15678,7 +15685,7 @@ fn render_grid_scene(
     // The thin cursor shapes (beam / underline / unfocused hollow) last, over the
     // glyphs + decorations; the solid block was painted under the text (Pass 1).
     rects.extend(cursor.over);
-    if let Some((cr, cc, _sel, _lm)) = s.copy_mode_ui {
+    if let Some((cr, cc, _)) = s.copy_mode_ui {
         let mut copy = jetty_render::copy_cursor_rects(s.snap, cr, cc, cell_w, cell_h, grid_origin_y, s.theme.cursor);
         jetty_render::shift_x(&mut copy, origin.left);
         rects.extend(copy);

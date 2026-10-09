@@ -250,9 +250,9 @@ impl Overlays {
         Some((self.palette_query.clone(), rows, self.palette_filtered.len(), first))
     }
 
-    /// Copy-mode cursor + pill state: `(row, col, selecting, line_mode)`.
-    pub fn copy_draw(&self) -> Option<(usize, usize, bool, bool)> {
-        self.copy_mode.as_ref().map(|c| (c.row, c.col, c.selecting, c.line_mode))
+    /// Copy-mode cursor + pill state: `(row, col, what the pill says)`.
+    pub fn copy_draw(&self) -> Option<(usize, usize, jetty_render::CopySelect)> {
+        self.copy_mode.as_ref().map(|c| (c.row, c.col, c.pill()))
     }
 }
 

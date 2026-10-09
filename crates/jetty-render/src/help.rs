@@ -40,7 +40,7 @@ pub const HELP_ROWS: &[&str] = &[
     "",
     "## Keyboard modes & links",
     "Ctrl+Shift+H — Hint mode: copy a URL / path   (Alt = open, Esc cancel)",
-    "Ctrl+Shift+Space — Copy-mode: keyboard select   (hjkl, v/V, y = yank, r = run)",
+    "Ctrl+Shift+Space — Copy-mode: keyboard select   (hjkl, v/V/Ctrl+V, y = yank, r = run)",
     "Ctrl+click — Open URL   (Ctrl+hover underlines)",
     "",
     "## Other",

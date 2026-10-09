@@ -147,7 +147,8 @@
 ///                    (hollow box) + the "COPY" pill at (row,col). With
 ///                    JETTY_SHOT_COPYMODE_ANCHOR="row,col" also drive a live
 ///                    selection anchor→cursor (JETTY_SHOT_COPYMODE_LINE=1 = whole
-///                    lines), rendering the real selection tint.
+///                    lines, JETTY_SHOT_COPYMODE_BLOCK=1 = a rectangle),
+///                    rendering the real selection tint.
 ///   JETTY_SHOT_CRT   — run the REAL CRT post pass through the app's own settings
 ///                    path (`effects::crt_settings` → `CrtParams::build`). "1" =
 ///                    the harness look (curvature .24, scanline .55, mask .32,
@@ -959,27 +960,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let c = it.next()?.trim().parse().ok()?;
         Some((r, c))
     };
-    let copymode_cursor: Option<(usize, usize, bool, bool)> = std::env::var("JETTY_SHOT_COPYMODE")
+    let copymode_cursor: Option<(usize, usize, jetty_render::CopySelect)> = std::env::var("JETTY_SHOT_COPYMODE")
         .ok()
         .and_then(|s| parse_rc(&s))
         .map(|(r, c)| {
             let line_mode = env_flag("JETTY_SHOT_COPYMODE_LINE");
-            let mut selecting = false;
+            let block_mode = env_flag("JETTY_SHOT_COPYMODE_BLOCK");
+            let mut select = jetty_render::CopySelect::None;
             if let Some(a) = std::env::var("JETTY_SHOT_COPYMODE_ANCHOR").ok().and_then(|s| parse_rc(&s)) {
-                selecting = true;
                 let cursor = (r, c);
                 if line_mode {
+                    select = jetty_render::CopySelect::Lines;
                     let (sr, er) = if cursor >= a { (a.0, cursor.0) } else { (cursor.0, a.0) };
                     terminal.selection_start_lines(sr);
                     terminal.selection_update(er, c, false);
+                } else if block_mode {
+                    // The app's own block path (copymode::block_sides).
+                    select = jetty_render::CopySelect::Block;
+                    let (a_left, c_left) = jetty_app::copy_mode_block_sides(a.1, c);
+                    let top = terminal.viewport_line_to_buffer(0);
+                    terminal.selection_start_block_abs(top + a.0 as i32, a.1, a_left);
+                    terminal.selection_update_abs(top + r as i32, c, c_left);
                 } else {
+                    select = jetty_render::CopySelect::Chars;
                     let (start, end) = if cursor >= a { (a, cursor) } else { (cursor, a) };
                     terminal.selection_start(start.0, start.1, true); // Left
                     terminal.selection_update(end.0, end.1, false); // Right
                 }
             }
-            eprintln!("jetty-shot: JETTY_SHOT_COPYMODE cursor=({r},{c}) selecting={selecting} line={line_mode}");
-            (r, c, selecting, line_mode)
+            eprintln!("jetty-shot: JETTY_SHOT_COPYMODE cursor=({r},{c}) select={select:?}");
+            (r, c, select)
         });
 
     // JETTY_SHOT_CLICK_WORD="row,col" / JETTY_SHOT_CLICK_LINE="row" — the
@@ -1470,7 +1480,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // JETTY_SHOT_COPYMODE — the copy-mode keyboard cursor (hollow box) + the
         // "COPY" pill. The selection tint (when an anchor is set) is already drawn
         // by the cell_bg_rects path above (the selection was applied pre-snapshot).
-        if let Some((cr, cc, selecting, line_mode)) = copymode_cursor {
+        if let Some((cr, cc, select)) = copymode_cursor {
             let mut copy = jetty_render::copy_cursor_rects(
                 &snap, cr, cc, cell_w, cell_h, shot_origin.top, terminal.theme().cursor,
             );
@@ -1485,7 +1495,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 band_bottom: (height as f32 - shot_status_h - shot_bottom_bar_h).max(shot_grid_top),
             };
             let pill = jetty_render::build_copy_pill(
-                width, shot_grid_top, terminal.theme(), &mut chrome_text, cm, line_mode, selecting, Some(&avoid),
+                width, shot_grid_top, terminal.theme(), &mut chrome_text, cm, select, Some(&avoid),
             );
             rects.extend(pill.quads);
             chrome_labels.extend(pill.labels);
