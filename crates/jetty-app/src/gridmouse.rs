@@ -41,6 +41,9 @@ pub(crate) struct GridGeom {
     pub bottom: f32,
     pub cell_w: f32,
     pub cell_h: f32,
+    /// The window's DPI scale (physical px per logical px): the edge
+    /// auto-scroll zones are logical sizes.
+    pub scale: f32,
 }
 
 impl GridGeom {
@@ -126,6 +129,9 @@ fn motion_button(held: u8) -> Option<MouseBtn> {
 pub(crate) const AUTOSCROLL_TICK: Duration = Duration::from_millis(50);
 /// Lines per auto-scroll step at the farthest pointer distance.
 const AUTOSCROLL_MAX_LINES: i32 = 8;
+/// The least height (logical px) of the edge auto-scroll zones: the default
+/// top / bottom padding, so only a thinner one changes anything.
+const AUTOSCROLL_EDGE: f32 = 4.0;
 /// Pointer travel (px) after which a left press that went to the program counts
 /// as a drag — an attempt to select.
 const DRAG_HINT_PX: f64 = 8.0;
@@ -144,17 +150,24 @@ struct AutoScroll {
 /// Edge auto-scroll speed for a selection drag with the pointer at window y
 /// `y`: `None` while it is over the grid's `rows`; above them `+n` lines per
 /// step (into history), below them `-n` — one more line per cell height of
-/// distance, capped.
+/// distance, capped. Each zone is [`AUTOSCROLL_EDGE`] tall at least, reaching
+/// into the first / last row when the padding is thinner: a grid flush with
+/// the window's edge, in a window flush with the monitor's, left the pointer
+/// no room past the rows (a bottom tab bar with `padding_y = 0` could never
+/// scroll a drag into the history).
 pub(crate) fn autoscroll_lines(geom: GridGeom, rows: usize, y: f32) -> Option<i32> {
     if !geom.usable() {
         return None;
     }
-    let rows_bottom = (geom.top + rows as f32 * geom.cell_h).min(geom.bottom);
+    // Whole pixels, as the padding is (`jetty_render::padding_px`).
+    let edge = (AUTOSCROLL_EDGE * geom.scale).round();
+    let up_above = geom.top.max(geom.band_top + edge);
+    let down_from = (geom.top + rows as f32 * geom.cell_h).min(geom.bottom - edge);
     let speed = |dist: f32| (1 + (dist / geom.cell_h) as i32).min(AUTOSCROLL_MAX_LINES);
-    if y < geom.top {
-        Some(speed(geom.top - y))
-    } else if y >= rows_bottom {
-        Some(-speed(y - rows_bottom))
+    if y < up_above {
+        Some(speed(up_above - y))
+    } else if y >= down_from {
+        Some(-speed(y - down_from))
     } else {
         None
     }
@@ -625,7 +638,7 @@ mod tests {
     const CELL: f32 = 10.0;
     /// An 8×4 grid starting 30 px down (a tab bar above it), 4 rows tall.
     const GEOM: GridGeom =
-        GridGeom { left: 0.0, top: 30.0, band_top: 30.0, bottom: 70.0, cell_w: CELL, cell_h: CELL };
+        GridGeom { left: 0.0, top: 30.0, band_top: 30.0, bottom: 70.0, cell_w: CELL, cell_h: CELL, scale: 1.0 };
 
     struct Win {
         term: Terminal,
@@ -1003,7 +1016,7 @@ mod tests {
         // The band ends a little below the last row + the bottom padding (the
         // leftover of a non-integral fit), above the status strip.
         let bottom = top + rows as f32 * cell_h + pad_y + 3.0 * scale;
-        (GridGeom { left: pad_x, top, band_top, bottom, cell_w, cell_h }, cols, rows)
+        (GridGeom { left: pad_x, top, band_top, bottom, cell_w, cell_h, scale }, cols, rows)
     }
 
     #[test]
@@ -1100,10 +1113,33 @@ mod tests {
     fn padded_grid_autoscrolls_from_the_top_padding_up() {
         // A selection drag in the top padding (above row 0's top edge) scrolls
         // history like one over the bar did; over the rows it does not.
-        let (g, _, rows) = padded_geom(1.0);
-        assert_eq!(autoscroll_lines(g, rows, g.top + 1.0), None);
-        assert_eq!(autoscroll_lines(g, rows, g.top - 1.0), Some(1));
-        assert_eq!(autoscroll_lines(g, rows, g.top + rows as f32 * g.cell_h), Some(-1));
+        for scale in [1.0, 2.0] {
+            let (g, _, rows) = padded_geom(scale);
+            assert_eq!(autoscroll_lines(g, rows, g.top + 1.0), None, "@{scale}×");
+            assert_eq!(autoscroll_lines(g, rows, g.top - 1.0), Some(1), "@{scale}×");
+            assert_eq!(autoscroll_lines(g, rows, g.top + rows as f32 * g.cell_h - 1.0), None, "@{scale}×");
+            assert_eq!(autoscroll_lines(g, rows, g.top + rows as f32 * g.cell_h), Some(-1), "@{scale}×");
+        }
+    }
+
+    #[test]
+    fn a_grid_flush_with_the_window_edges_still_has_edge_zones() {
+        // tab_bar_position = "bottom" with padding_y = 0: row 0 starts at the
+        // window's top, and a window flush with the monitor's top (dropdown,
+        // maximized, fullscreen) left the pointer no y above it — a drag could
+        // never auto-scroll into the history. The zones now reach into the
+        // first and last rows, the default padding's height at least.
+        for scale in [1.0f32, 2.0] {
+            let (cell_h, rows) = (21.0 * scale, 24usize);
+            let h = rows as f32 * cell_h;
+            let g = GridGeom { left: 0.0, top: 0.0, band_top: 0.0, bottom: h, cell_w: 9.6 * scale, cell_h, scale };
+            assert_eq!(autoscroll_lines(g, rows, 0.0), Some(1), "@{scale}× the window's top pixel row");
+            assert_eq!(autoscroll_lines(g, rows, 4.0 * scale - 0.5), Some(1), "@{scale}×");
+            assert_eq!(autoscroll_lines(g, rows, 4.0 * scale), None, "@{scale}× past the zone: row 0 selects");
+            assert_eq!(autoscroll_lines(g, rows, h - 4.0 * scale - 0.5), None, "@{scale}×");
+            assert_eq!(autoscroll_lines(g, rows, h - 4.0 * scale), Some(-1), "@{scale}×");
+            assert_eq!(autoscroll_lines(g, rows, h - 1.0), Some(-1), "@{scale}× the window's bottom pixel row");
+        }
     }
 
     #[test]

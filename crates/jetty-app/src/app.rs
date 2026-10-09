@@ -1814,6 +1814,7 @@ fn detached_grid_geom(
         bottom: dw.gpu.config.height as f32 - status_h,
         cell_w,
         cell_h,
+        scale: dw.window.scale_factor() as f32,
     }
 }
 
@@ -7652,6 +7653,7 @@ impl App {
             bottom,
             cell_w,
             cell_h,
+            scale: self.chrome_metrics().dpi,
         }
     }
 
