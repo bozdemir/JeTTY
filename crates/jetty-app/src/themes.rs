@@ -363,6 +363,14 @@ pub fn load_user_themes() -> (Vec<jetty_core::Theme>, Vec<String>) {
     load_user_themes_from(&crate::config::Config::dir().join("themes"))
 }
 
+/// `" — did you mean "x"?"` naming the theme closest to `name` — a theme name
+/// that found no theme — or `""` when none is close.
+pub fn name_hint(name: &str) -> String {
+    let list = jetty_core::theme_list();
+    let ids: Vec<&str> = list.iter().map(|(id, _)| id.as_str()).collect();
+    crate::config::check::closest(name, &ids).map(|s| format!(" — did you mean {s:?}?")).unwrap_or_default()
+}
+
 /// Merge the built-ins (PRESETS order) with `user` themes: a user theme whose `name`
 /// matches a built-in REPLACES it in place; a new name appends. Pure + testable.
 fn merge_into_builtins(user: Vec<jetty_core::Theme>) -> Vec<jetty_core::Theme> {
@@ -735,6 +743,14 @@ palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606"
             ["theme file themes/mine.toml: unknown key `selection_backgrond` is ignored — did you mean `selection_background`?"]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_theme_name_that_finds_nothing_gets_the_closest_one() {
+        assert_eq!(name_hint("draculaa"), " — did you mean \"dracula\"?");
+        assert_eq!(name_hint("solarized_lite"), " — did you mean \"solarized_light\"?");
+        assert_eq!(name_hint("tokyonight storm"), " — did you mean \"tokyo_night_storm\"?");
+        assert_eq!(name_hint("qqqq"), "");
     }
 
     #[test]

@@ -2426,8 +2426,9 @@ impl App {
                 let shown = jetty_core::theme_at(self.theme_idx).display_name;
                 warnings.push(if light {
                     format!(
-                        "light_theme {want:?} not found (missing or invalid theme file?) — showing \
-                         {shown:?} while the system is light"
+                        "light_theme {want:?} not found (missing or invalid theme file?){} — showing \
+                         {shown:?} while the system is light",
+                        crate::themes::name_hint(want)
                     )
                 } else {
                     theme_missing_warning(want, &shown)
@@ -16090,8 +16091,9 @@ impl FirstShellEnv {
 
 fn theme_missing_warning(name: &str, shown: &str) -> String {
     format!(
-        "theme {name:?} not found (missing or invalid theme file?) — showing \
-         {shown:?} until it loads"
+        "theme {name:?} not found (missing or invalid theme file?){} — showing \
+         {shown:?} until it loads",
+        crate::themes::name_hint(name)
     )
 }
 

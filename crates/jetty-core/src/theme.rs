@@ -91,14 +91,31 @@ pub fn theme_at(idx: usize) -> Theme {
 }
 
 /// Ordered index of the theme named `name`, or `None` when absent. Consults the
-/// registry (user shadow included), else the built-in `PRESETS` order.
+/// registry (user shadow included), else the built-in `PRESETS` order. An exact
+/// id wins; otherwise the name matches loosely — in any letter case, with `-`
+/// or spaces for `_`, or as the display name the Settings gallery shows
+/// (`"Solarized Light"`, `"tokyo-night"`, `"Dracula"`).
 pub fn theme_index(name: &str) -> Option<usize> {
     let reg = REGISTRY.read().unwrap();
+    let key = loose_name(name);
     if reg.is_empty() {
-        PRESETS.iter().position(|&n| n == name)
+        PRESETS.iter().position(|&n| n == name).or_else(|| {
+            PRESETS.iter().position(|&n| {
+                !key.is_empty() && (loose_name(n) == key || loose_name(&builtin_by_name(n).display_name) == key)
+            })
+        })
     } else {
-        reg.iter().position(|t| t.name.as_ref() == name)
+        reg.iter().position(|t| t.name.as_ref() == name).or_else(|| {
+            reg.iter()
+                .position(|t| !key.is_empty() && (loose_name(&t.name) == key || loose_name(&t.display_name) == key))
+        })
     }
+}
+
+/// A theme name with case and separators dropped, for [`theme_index`]'s loose
+/// match: `Solarized Light`, `solarized-light` and `solarized_light` agree.
+fn loose_name(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
 /// Ordered `(name, display_name)` pairs for the picker/cycle. Built-ins then user

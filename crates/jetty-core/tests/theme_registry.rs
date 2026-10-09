@@ -96,3 +96,34 @@ fn theme_at_reclamps_when_registry_shrinks() {
 
     jetty_core::set_registry(Vec::new());
 }
+
+#[test]
+fn a_theme_is_found_by_any_spelling_of_its_name() {
+    // The Settings gallery shows display names ("Solarized Light"); writing one
+    // in config.toml (`light_theme = "Solarized Light"`, `theme = "Dracula"`)
+    // found no theme, so the fallback was shown instead.
+    let _g = SERIAL.lock().unwrap();
+    for registry in [Vec::new(), jetty_core::builtins()] {
+        jetty_core::set_registry(registry);
+        let sl = jetty_core::theme_index("solarized_light");
+        assert!(sl.is_some());
+        for spelling in ["Solarized Light", "solarized-light", "SOLARIZED_LIGHT", " solarized light "] {
+            assert_eq!(jetty_core::theme_index(spelling), sl, "{spelling:?}");
+        }
+        assert_eq!(jetty_core::theme_index("Dracula"), jetty_core::theme_index("dracula"));
+        assert_eq!(jetty_core::theme_index("Tokyo Night Storm"), jetty_core::theme_index("tokyo_night_storm"));
+        // Still nothing for a name that is not there.
+        assert_eq!(jetty_core::theme_index("solarized_lite"), None);
+        assert_eq!(jetty_core::theme_index(""), None);
+    }
+    // A user theme by its display name; an exact id always wins over a loose match.
+    let mut entries = jetty_core::builtins();
+    entries.push(user_theme("my_theme", "Midnight Oil", [9, 9, 9, 255]));
+    entries.push(user_theme("dracula2", "Dracula", [1, 1, 1, 255]));
+    let n = entries.len();
+    jetty_core::set_registry(entries);
+    assert_eq!(jetty_core::theme_index("Midnight Oil"), Some(n - 2));
+    assert_eq!(jetty_core::theme_index("My Theme"), Some(n - 2), "the id, loosely");
+    assert_eq!(jetty_core::theme_index("dracula"), Some(3), "the exact id wins");
+    jetty_core::set_registry(Vec::new());
+}
