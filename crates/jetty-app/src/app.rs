@@ -6026,6 +6026,20 @@ impl App {
         false
     }
 
+    /// Whether window `s`'s IME composition is NOT drawn at its text cursor:
+    /// a layer that takes the commit away from the shell owns the keyboard —
+    /// a confirmation drops it, the rename box and the palette / search query
+    /// type it, hint mode / copy-mode drop it. Under the help or a menu the
+    /// commit still reaches the shell, so its preedit shows where it lands.
+    /// The one gate of both windows' preedit (mirrors `overlay_ime_commit`).
+    fn preedit_hidden(&self, s: Surface) -> bool {
+        let window = self
+            .ov_of(s)
+            .is_some_and(|o| o.palette_open || o.search_open || o.hint_mode.is_some() || o.copy_mode.is_some());
+        let main = s == Surface::Main && (self.confirm_quit || self.confirm_close.is_some() || self.renaming.is_some());
+        window || main
+    }
+
     /// Hint mode and copy-mode are primary-screen only: when a program switched
     /// window `s`'s terminal to the alt screen mid-mode (a full-screen TUI
     /// launched), drop them cleanly rather than draw stale chips / a cursor over
@@ -11395,10 +11409,9 @@ impl App {
         let Some(ov) = self.ov_of(s) else { return };
         let (palette_ui, hint_ui, copy_mode_ui) = (ov.palette_draw(), ov.hint_draw(), ov.copy_draw());
         let (help_open, help_scroll) = (ov.help_open, ov.help_scroll);
-        // The IME preedit isn't drawn while one of the window's overlays owns
-        // its keyboard (mirrors the main window).
-        let overlay_owns_keys =
-            ov.palette_open || ov.help_open || ov.search_open || hint_ui.is_some() || copy_mode_ui.is_some();
+        // The IME preedit isn't drawn while a layer that takes the commit owns
+        // the window's keyboard (the main window's gate).
+        let preedit_hidden = self.preedit_hidden(s);
         let help_rows: Vec<String> = if help_open { self.help_rows.clone() } else { Vec::new() };
         let font_logical = self.font_logical;
         let padding = self.padding();
@@ -11428,7 +11441,7 @@ impl App {
                 winit::dpi::PhysicalSize::new(ime_area.2, ime_area.3),
             );
         }
-        let preedit_ui = if overlay_owns_keys { None } else { dw.ime_preedit.clone() };
+        let preedit_ui = if preedit_hidden { None } else { dw.ime_preedit.clone() };
         let close_hover = dw.close_hover;
         let menu_open = dw.menu_open;
         let menu_hover = dw.menu_hover;
@@ -15215,18 +15228,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // The IME composition, drawn at the terminal cursor — unless a
                 // modal / rename box / palette / search / hint / copy-mode owns
                 // the keyboard (their own fields receive the commit).
-                let preedit_ui: Option<String> = if self.confirm_quit
-                    || self.confirm_close.is_some()
-                    || self.renaming.is_some()
-                    || self.ov.palette_open
-                    || self.ov.search_open
-                    || self.ov.hint_mode.is_some()
-                    || self.ov.copy_mode.is_some()
-                {
-                    None
-                } else {
-                    self.ime_preedit.clone()
-                };
+                let preedit_ui: Option<String> =
+                    if self.preedit_hidden(Surface::Main) { None } else { self.ime_preedit.clone() };
                 // Refresh the cached tab metadata (rebuilds only on change), then
                 // take it out so the later &mut self.gpu/text borrow doesn't
                 // conflict with this &self borrow; it is restored after rendering.
