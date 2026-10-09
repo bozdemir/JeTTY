@@ -19,24 +19,36 @@ use std::cell::RefCell;
 use arboard::Clipboard;
 
 thread_local! {
-    /// Built lazily on first use. `None` if no clipboard is available (e.g. a
-    /// headless session) — every operation then degrades to a silent no-op.
-    static CLIPBOARD: RefCell<Option<Clipboard>> = RefCell::new(Clipboard::new().ok());
+    /// Opened on first use. `None` while no clipboard is available (e.g. a
+    /// headless session) — every operation then degrades to a silent no-op,
+    /// and the next one tries to open it again: one failed open (a display
+    /// that was not up yet) never disables copy and paste for the session.
+    static CLIPBOARD: RefCell<Option<Clipboard>> = const { RefCell::new(None) };
+}
+
+/// Run `f` on the clipboard, opening it first when it is not open yet.
+fn with_clipboard<R>(f: impl FnOnce(&mut Clipboard) -> Option<R>) -> Option<R> {
+    CLIPBOARD.with(|cell| f(open_lazily(&mut cell.borrow_mut(), || Clipboard::new().ok())?))
+}
+
+/// The value in `slot`, created by `open` while there is none: a failed open
+/// is tried again on the next call, never remembered.
+fn open_lazily<T>(slot: &mut Option<T>, open: impl FnOnce() -> Option<T>) -> Option<&mut T> {
+    if slot.is_none() {
+        *slot = open();
+    }
+    slot.as_mut()
 }
 
 /// Write `text` to the system clipboard. Errors are silently discarded.
 pub fn set(text: &str) {
-    CLIPBOARD.with(|cell| {
-        if let Some(cb) = cell.borrow_mut().as_mut() {
-            let _ = cb.set_text(text.to_owned());
-        }
-    });
+    with_clipboard(|cb| cb.set_text(text.to_owned()).ok());
 }
 
 /// Read a `String` from the system clipboard. Returns `None` on error or when
 /// the clipboard contains no text.
 pub fn get() -> Option<String> {
-    CLIPBOARD.with(|cell| cell.borrow_mut().as_mut()?.get_text().ok())
+    with_clipboard(|cb| cb.get_text().ok())
 }
 
 /// Write `text` to the PRIMARY selection — the copy-on-select target, pasted
@@ -47,11 +59,7 @@ pub fn set_primary(text: &str) {
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
     {
         use arboard::{LinuxClipboardKind, SetExtLinux};
-        CLIPBOARD.with(|cell| {
-            if let Some(cb) = cell.borrow_mut().as_mut() {
-                let _ = cb.set().clipboard(LinuxClipboardKind::Primary).text(text.to_owned());
-            }
-        });
+        with_clipboard(|cb| cb.set().clipboard(LinuxClipboardKind::Primary).text(text.to_owned()).ok());
     }
     #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")))))]
     set(text);
@@ -64,8 +72,7 @@ pub fn get_primary() -> Option<String> {
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
     {
         use arboard::{GetExtLinux, LinuxClipboardKind};
-        CLIPBOARD
-            .with(|cell| cell.borrow_mut().as_mut()?.get().clipboard(LinuxClipboardKind::Primary).text().ok())
+        with_clipboard(|cb| cb.get().clipboard(LinuxClipboardKind::Primary).text().ok())
     }
     #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")))))]
     get()
@@ -178,6 +185,21 @@ pub fn copy_on_select(text: &str, mode: CopyOnSelect) {
     }
     if clipboard {
         set(text);
+    }
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::open_lazily;
+
+    #[test]
+    fn a_failed_open_is_retried_on_the_next_use() {
+        let mut slot: Option<u32> = None;
+        let mut tries = 0;
+        assert_eq!(open_lazily(&mut slot, || { tries += 1; None }), None, "no clipboard yet");
+        assert_eq!(open_lazily(&mut slot, || { tries += 1; Some(7) }).copied(), Some(7), "the next use opens it");
+        assert_eq!(open_lazily(&mut slot, || { tries += 1; Some(8) }).copied(), Some(7), "and keeps it");
+        assert_eq!(tries, 2, "an open clipboard is never reopened");
     }
 }
 
