@@ -9443,8 +9443,11 @@ impl App {
         self.crt = None;
         self.crt_key = None;
         self.image_layer = Some(jetty_render::ImageLayer::new(device, format));
-        // Rebuilt on the new device by the next frame that wants it.
+        // Rebuilt on the new device by the next frame that wants it. A layer of
+        // the lost device must never reach a pass on the new one: its ids name
+        // nothing (or something else) there, and wgpu panics on them.
         self.caret_fx = None;
+        self.trail_layer = None;
         // Lazily re-allocated on the next frame that needs it, on the new device.
         self.offscreen = None;
         // The backdrop layer and its image texture lived on the lost device: the
