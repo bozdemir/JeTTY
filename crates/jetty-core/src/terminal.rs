@@ -251,10 +251,6 @@ fn scroll_csi(digits: &[u8], fin: u8) -> Option<IsolatedSeq> {
     }
 }
 
-/// [`Scan::Decset`] bit: the sequence named mode 9 (X10 mouse reporting).
-const DECSET_X10: u8 = 1;
-/// [`Scan::Decset`] bit: the sequence named mode 1015 (urxvt mouse encoding).
-const DECSET_URXVT: u8 = 2;
 /// [`Scan::Decset`] bit: the sequence named mode 2031 (color-scheme reports).
 const DECSET_2031: u8 = 4;
 /// [`Scan::Decset`] bit: the sequence has more than one parameter (so it is not
@@ -264,8 +260,6 @@ const DECSET_MULTI: u8 = 0x80;
 /// The [`Scan::Decset`] bit for private mode `n` (0 for every other mode).
 fn decset_bit(n: u16) -> u8 {
     match n {
-        9 => DECSET_X10,
-        1015 => DECSET_URXVT,
         2031 => DECSET_2031,
         _ => 0,
     }
@@ -789,13 +783,13 @@ enum Scan {
     /// decides where `feed` splits its slices.
     Csi { params: [u8; CSI_PARAMS_MAX], len: u8 },
     /// Inside a private-mode CSI (`ESC [ ?`), watching for DECSET/DECRST of the
-    /// modes alacritty does not track — the X10 (`9`) and urxvt (`1015`) mouse
-    /// modes and the color-scheme reports (`2031`) — and for the color-scheme
-    /// query `CSI ? 996 n`. `cur` is the parameter being read (saturating), `hit`
-    /// the modes named so far ([`DECSET_X10`] / [`DECSET_URXVT`] /
-    /// [`DECSET_2031`], plus [`DECSET_MULTI`] past a separator). Mirrors vte's
-    /// CSI states: C0, DEL and high bytes stay, ESC restarts, CAN/SUB and
-    /// anything that is not a plain `Pm h/l` / `Ps n` sequence end it.
+    /// color-scheme reports (`2031`, which a DECRQM earlier in the same read
+    /// must see unchanged) and for the color-scheme query `CSI ? 996 n`, which
+    /// vte drops. `cur` is the parameter being read (saturating), `hit` the
+    /// modes named so far ([`DECSET_2031`], plus [`DECSET_MULTI`] past a
+    /// separator). Mirrors vte's CSI states: C0, DEL and high bytes stay, ESC
+    /// restarts, CAN/SUB and anything that is not a plain `Pm h/l` / `Ps n`
+    /// sequence end it.
     Decset { cur: u16, hit: u8 },
     /// Inside `ESC ]`, matching the `133;` prefix byte by byte (`n` matched).
     Prefix { n: u8 },
@@ -1255,12 +1249,6 @@ pub struct Terminal {
     /// Payload bytes of the OSC being scanned (bounded by `osc_cap`). Persists
     /// across `feed` calls like `scan`.
     osc_len: u32,
-    /// DECSET 9 (X10 mouse reporting: button presses only) is on. alacritty
-    /// ignores this mode, so the scanner tracks it ([`Scan::Decset`]).
-    mouse_x10: bool,
-    /// DECSET 1015 (urxvt decimal mouse encoding) is on — tracked here for the
-    /// same reason.
-    mouse_urxvt: bool,
     /// The OSC payload cap in force: [`OSC_MAX_BYTES`], lowered only by tests so
     /// the vte differential fuzz reaches it cheaply.
     osc_cap: u32,
@@ -1509,8 +1497,6 @@ impl Terminal {
             kitty_seq: 0,
             image_work: IMAGE_WORK_MAX,
             osc_len: 0,
-            mouse_x10: false,
-            mouse_urxvt: false,
             osc_cap: OSC_MAX_BYTES,
             min_contrast: 1.0,
             color_reports,
@@ -1682,8 +1668,8 @@ impl Terminal {
         ] {
             self.term.unset_private_mode(PrivateMode::Named(mode));
         }
-        self.mouse_x10 = false;
-        self.mouse_urxvt = false;
+        self.vt.mouse_x10 = false;
+        self.vt.mouse_urxvt = false;
     }
 
     /// Drop what a program that EXITED left on, before another one starts in
@@ -1738,22 +1724,22 @@ impl Terminal {
     }
 
     /// Whether the app requested X10 mouse reporting (`\e[?9h`: button presses
-    /// only). alacritty does not track this mode; the feed scanner does.
+    /// only). alacritty does not track this mode; the VT handler does — as one
+    /// of the four tracking modes (see `handler.rs`).
     pub fn mouse_x10(&self) -> bool {
-        self.mouse_x10
+        self.vt.mouse_x10
     }
 
     /// Whether the app requested urxvt-style decimal mouse reports
-    /// (`\e[?1015h`). Tracked by the feed scanner, like [`Terminal::mouse_x10`].
+    /// (`\e[?1015h`). Tracked by the VT handler, like [`Terminal::mouse_x10`].
     pub fn mouse_urxvt(&self) -> bool {
-        self.mouse_urxvt
+        self.vt.mouse_urxvt
     }
 
     /// A private-mode CSI ending in `fin` at byte `i` (`h` set / `l` reset /
     /// `n` DSR) named the modes in `hit`; `last` is its last parameter. Applies
     /// what alacritty doesn't track and returns the new flush `start`:
     ///
-    /// * the X10 / urxvt mouse modes flip (no flush needed);
     /// * mode 2031 flips AFTER alacritty has caught up through this sequence, so
     ///   a DECRQM earlier in the same read is answered with the state it had
     ///   (the answer is rewritten in `EventProxy` from the shared flag);
@@ -1770,12 +1756,6 @@ impl Terminal {
             return i + 1;
         }
         let on = fin == b'h';
-        if hit & DECSET_X10 != 0 {
-            self.mouse_x10 = on;
-        }
-        if hit & DECSET_URXVT != 0 {
-            self.mouse_urxvt = on;
-        }
         if hit & DECSET_2031 != 0 {
             self.advance_slice(&bytes[start..=i]);
             self.apply_pending_sync();
@@ -1976,8 +1956,8 @@ impl Terminal {
                                 seq_start = i;
                                 Scan::Csi { params: [0; CSI_PARAMS_MAX], len: 0 }
                             }
-                            // A private-mode CSI: watch it for the mouse modes
-                            // alacritty ignores (the `?` is consumed here).
+                            // A private-mode CSI: watch it for the color-scheme
+                            // mode and query (the `?` is consumed here).
                             CsiPeek::Other if bytes.get(i + 1) == Some(&b'?') => {
                                 self.scan = Scan::Decset { cur: 0, hit: 0 };
                                 i += 2;
@@ -2007,16 +1987,14 @@ impl Terminal {
                             }
                         },
                         // `ESC c` (RIS) resets the screen AND scrollback — and
-                        // every terminal mode, including the two mouse modes,
-                        // the color-scheme reports and the keyboard flag stacks
-                        // mirrored here.
+                        // every terminal mode, including the color-scheme
+                        // reports and the keyboard flag stacks mirrored here
+                        // (the VT handler resets its own).
                         b'c' => {
                             let k = i + 1;
                             if self.has_anchors() {
                                 start = self.isolate(bytes, start, i, k, IsolatedSeq::Reset);
                             }
-                            self.mouse_x10 = false;
-                            self.mouse_urxvt = false;
                             self.color_reports.store(false, Ordering::Relaxed);
                             self.kbd_cleared();
                             // A reset terminal shows no program's progress.
@@ -2043,7 +2021,7 @@ impl Terminal {
                         }
                         // A private-mode CSI that outgrows the 5-byte window (a
                         // second parameter, a long number): keep reading it for
-                        // the mouse modes (an over-long first number names none).
+                        // mode 2031 (an over-long first number names none).
                         b';' if private => {
                             let hit = decset_bit(decset_param(&params[1..len as usize])) | DECSET_MULTI;
                             self.scan = Scan::Decset { cur: 0, hit };
@@ -4476,7 +4454,8 @@ impl Terminal {
     }
 
     /// Whether the running application has enabled mouse reporting (any of the
-    /// X10/normal/button-event/any-event mouse modes). When true, the app wants
+    /// normal/button-event/any-event mouse modes; X10 is
+    /// [`Terminal::mouse_x10`]). When true, the app wants
     /// to receive mouse events (clicks, wheel) over the PTY instead of the host
     /// handling them locally (scroll/panel).
     pub fn mouse_mode(&self) -> bool {
@@ -11293,7 +11272,7 @@ mod tests {
         }
     }
 
-    // ── scanner-tracked mouse modes (X10 9 / urxvt 1015) ──────────────────────
+    // ── handler-tracked mouse modes (X10 9 / urxvt 1015) ──────────────────────
 
     /// Feed `seq` split at EVERY byte boundary (and whole), with and without
     /// live anchors, and return the (x10, urxvt) flags each run ends with.
@@ -11328,14 +11307,15 @@ mod tests {
         all(b"\x1b[?1015h\x1b[?1015l", (false, false));
         all(b"\x1b[?9h\x1b[?1015h\x1bc", (false, false)); // RIS resets both
         // Not a DECSET of these modes: other modes, ANSI SM, other finals, an
-        // intermediate, an over-long number, a sub-parameter, a CAN abort.
+        // intermediate, an over-long number, a CAN abort.
         all(b"\x1b[?25l\x1b[?2004h", (false, false));
         all(b"\x1b[1015h", (false, false));
         all(b"\x1b[?1015m", (false, false));
         all(b"\x1b[?1015$h", (false, false));
         all(b"\x1b[?10150h", (false, false));
-        all(b"\x1b[?1015:1h", (false, false));
         all(b"\x1b[?10\x1815h", (false, false));
+        // vte names a parameter by its first sub-parameter, for every mode.
+        all(b"\x1b[?1015:1h", (false, true));
         // C0 controls inside the CSI are executed by vte without ending it.
         all(b"\x1b[?10\n15h", (false, true));
     }
@@ -11348,6 +11328,46 @@ mod tests {
         let snap = t.snapshot();
         let row: String = snap.cells.iter().take(6).map(|c| c.c).collect();
         assert_eq!(row, "abcdef", "the sequences still reach vte, nothing leaks as text");
+    }
+
+    #[test]
+    fn mouse_tracking_is_one_mode_as_in_xterm() {
+        // Setting any of 9 / 1000 / 1002 / 1003 replaces the others; resetting
+        // one of 1000 / 1002 / 1003 ends X10 too. A stale X10 kept reporting
+        // clicks to the shell after a program's `\e[?1000l`.
+        let modes = |seq: &[u8]| {
+            let mut t = Terminal::new(20, 3);
+            t.feed(seq);
+            (t.mouse_x10(), t.mouse_mode())
+        };
+        assert_eq!(modes(b"\x1b[?9h\x1b[?1000h"), (false, true), "1000 replaces X10");
+        assert_eq!(modes(b"\x1b[?9h\x1b[?1000h\x1b[?1000l"), (false, false), "and its reset ends it all");
+        assert_eq!(modes(b"\x1b[?1000h\x1b[?9h"), (true, false), "X10 replaces 1000");
+        assert_eq!(modes(b"\x1b[?1003h\x1b[?9h"), (true, false), "and 1003");
+        assert_eq!(modes(b"\x1b[?9h\x1b[?1002l"), (false, false), "a tracking reset ends X10");
+        assert_eq!(modes(b"\x1b[?1002h\x1b[?9h\x1b[?9l"), (false, false));
+        let mut t = Terminal::new(20, 3);
+        t.feed(b"\x1b[?1003h\x1b[?9h");
+        assert!(!t.mouse_drag() && !t.mouse_motion());
+    }
+
+    #[test]
+    fn decrqm_reports_the_x10_and_urxvt_modes() {
+        // alacritty answered both as "not recognized" (`;0$y`).
+        let mut t = Terminal::new(20, 3);
+        t.feed(b"\x1b[?9$p\x1b[?1015$p");
+        assert_eq!(t.drain_pty_writes(), b"\x1b[?9;2$y\x1b[?1015;2$y");
+        t.feed(b"\x1b[?9;1015h\x1b[?9$p\x1b[?1015$p");
+        assert_eq!(t.drain_pty_writes(), b"\x1b[?9;1$y\x1b[?1015;1$y");
+    }
+
+    #[test]
+    fn a_mouse_mode_set_in_a_synchronized_update_applies_with_it() {
+        let mut t = Terminal::new(20, 3);
+        t.feed(b"\x1b[?2026h\x1b[?9h\x1b[?1015h");
+        assert!(!t.mouse_x10() && !t.mouse_urxvt(), "still buffered");
+        t.feed(b"\x1b[?2026l");
+        assert!(t.mouse_x10() && t.mouse_urxvt());
     }
 
     // ── mode getters for the input layer (kitty keyboard / focus / mouse) ────

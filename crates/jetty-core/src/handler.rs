@@ -24,6 +24,10 @@
 //!   1048 (save / restore the cursor) work.
 //! * DECSCNM (`CSI ? 5 h`, the reverse-video screen vim's visual bell
 //!   flashes) is tracked here and drawn by the snapshot; alacritty ignored it.
+//! * The X10 (9) and urxvt (1015) mouse modes, which alacritty ignores, are
+//!   tracked here and answer DECRQM. Mouse tracking is ONE mode, as in xterm:
+//!   setting 9 / 1000 / 1002 / 1003 replaces the others, resetting one of
+//!   1000 / 1002 / 1003 ends X10 too.
 //! * OSC 4 / 10 / 11 / 12 queries answer with the color a program set (pywal,
 //!   base16-shell) instead of the theme's, so the background a program
 //!   detects (neovim, bat, delta) is the one on screen.
@@ -77,13 +81,24 @@ pub(crate) struct VtState {
     /// visual bell flashes (terminfo `flash`). alacritty ignores the mode; the
     /// snapshot swaps the colors.
     pub(crate) reverse: bool,
+    /// DECSET 9: X10 mouse reporting (button presses only).
+    pub(crate) mouse_x10: bool,
+    /// DECSET 1015: urxvt decimal mouse encoding.
+    pub(crate) mouse_urxvt: bool,
 }
 
 impl VtState {
     pub(crate) fn new(rows: usize) -> VtState {
-        VtState { region: (0, rows as i32), reverse: false }
+        VtState { region: (0, rows as i32), reverse: false, mouse_x10: false, mouse_urxvt: false }
     }
 }
+
+/// The mouse-tracking modes alacritty knows (1000 / 1002 / 1003).
+const TRACKING: [NamedPrivateMode; 3] = [
+    NamedPrivateMode::ReportMouseClicks,
+    NamedPrivateMode::ReportCellMouseMotion,
+    NamedPrivateMode::ReportAllMouseMotion,
+];
 
 /// alacritty's `Term` as JeTTY's vte handler: the same memory, so vte's
 /// performer reaches `Term` through the one pointer it already holds.
@@ -356,6 +371,17 @@ impl<T: EventListener> Handler for Vt<T> {
                     self.0.swap_alt();
                 }
             }
+            PrivateMode::Unknown(9) => {
+                for m in TRACKING {
+                    Handler::unset_private_mode(&mut self.0, PrivateMode::Named(m));
+                }
+                set_state(VtState { mouse_x10: true, ..state() });
+            }
+            PrivateMode::Unknown(1015) => set_state(VtState { mouse_urxvt: true, ..state() }),
+            PrivateMode::Named(m) if TRACKING.contains(&m) => {
+                set_state(VtState { mouse_x10: false, ..state() });
+                Handler::set_private_mode(&mut self.0, mode);
+            }
             _ => {
                 Handler::set_private_mode(&mut self.0, mode);
                 if mode == PrivateMode::Named(NamedPrivateMode::ColumnMode) {
@@ -374,6 +400,12 @@ impl<T: EventListener> Handler for Vt<T> {
                     self.0.swap_alt();
                 }
             }
+            PrivateMode::Unknown(9) => set_state(VtState { mouse_x10: false, ..state() }),
+            PrivateMode::Unknown(1015) => set_state(VtState { mouse_urxvt: false, ..state() }),
+            PrivateMode::Named(m) if TRACKING.contains(&m) => {
+                set_state(VtState { mouse_x10: false, ..state() });
+                Handler::unset_private_mode(&mut self.0, mode);
+            }
             _ => {
                 Handler::unset_private_mode(&mut self.0, mode);
                 if mode == PrivateMode::Named(NamedPrivateMode::ColumnMode) {
@@ -387,6 +419,8 @@ impl<T: EventListener> Handler for Vt<T> {
         let on = match mode {
             PrivateMode::Unknown(5) => Some(state().reverse),
             PrivateMode::Unknown(47 | 1047) => Some(self.0.mode().contains(TermMode::ALT_SCREEN)),
+            PrivateMode::Unknown(9) => Some(state().mouse_x10),
+            PrivateMode::Unknown(1015) => Some(state().mouse_urxvt),
             _ => None,
         };
         match on {
