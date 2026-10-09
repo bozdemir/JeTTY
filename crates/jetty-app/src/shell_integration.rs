@@ -191,11 +191,16 @@ const DIR_VAR: &str = "JETTY_SHELL_INTEGRATION_DIR";
 /// What every JeTTY shell needs for its opt-in line: `$JETTY_SHELL_INTEGRATION_DIR`,
 /// naming this run's snippets — written now unless they are there already
 /// ([`install_in`]), so one that went missing comes back with the next tab.
-/// Under `$XDG_RUNTIME_DIR` (a per-user tmpfs), else the user's cache dir —
-/// never the shared temp dir. Empty when they could not be written: the line
-/// then does nothing.
+/// Under `$XDG_RUNTIME_DIR` (a per-user tmpfs), else the `jetty` dir of the
+/// user's cache (macOS) — never the shared temp dir. Empty when they could
+/// not be written: the line then does nothing.
 pub fn shell_env() -> Vec<(String, String)> {
-    let root = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()).map(PathBuf::from).or_else(dirs::cache_dir);
+    let root = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()).map(PathBuf::from).or_else(|| {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = dirs::cache_dir()?.join("jetty");
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).ok()?;
+        Some(dir)
+    });
     root.and_then(|root| install_in(&root))
         .and_then(|dir| dir.to_str().map(str::to_string))
         .map(|dir| vec![(DIR_VAR.to_string(), dir)])
