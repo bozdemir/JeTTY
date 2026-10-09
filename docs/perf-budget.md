@@ -15,11 +15,26 @@ cargo run --release -p jetty-app --bin jetty-bench
 # CI / no-GPU subset (never constructs wgpu): throughput + snapshot +
 # pipeline_1byte_cpu on a fixed baseline grid. This is what the CI perf-report runs.
 JETTY_BENCH_CPU_ONLY=1 target/release/jetty-bench
+#   JETTY_BENCH_GRID=240x70 picks the grid.
+
+# One section only, for quick interleaved A/B runs of two builds:
+JETTY_BENCH_ONLY=gpu_init target/release/jetty-bench  # instance/adapter/device split,
+                                                       # mapped driver libs, RSS
+JETTY_BENCH_ONLY=frames   target/release/jetty-bench  # per-frame table + scene + chrome
+JETTY_BENCH_ONLY=backdrop target/release/jetty-bench
+#   JETTY_BENCH_NO_VK_FILTER=1: GPU init without the startup Vulkan driver filter.
 
 # Live metrics on the running app: exec→first-frame cold start, input latency
 # (keypress→glyph, percentiles), and idle RSS. Zero cost unless the flag is set.
 JETTY_PERF_LOG=1 target/release/jetty
 ```
+
+`jetty-bench` runs on a counting global allocator: the frame tables print
+allocations and KB per frame next to the CPU time (the hot path should allocate
+next to nothing; every render pass + submit costs ~65 allocations in wgpu). The
+throughput test feeds 8 KiB chunks — the PTY reader's read size, so the live
+drain's shape (4 / 8 / 64 KiB chunks measure 154 / 151 / 146 MB/s on a quiet
+machine: smaller chunks stay in cache).
 
 `JETTY_PERF_LOG=1` prints (to stderr):
 - `cold-start … = N ms` once, at the first presented frame. On Linux this is a
@@ -62,13 +77,13 @@ Konsole 23.08.5, GNOME Terminal / VTE 0.76.
 | Metric | Market reference (fastest class) | Jetty **target** (gate) | Jetty **current** (measured) | Status |
 |---|---|---|---|---|
 | **Frame render** (offscreen, ~199×57 @ 1920×1200, 16px) | 60 Hz = 16.7 ms; 144 Hz = 6.9 ms/frame | ≤ **6.9 ms** (144 Hz-ready); hard ≤ 16.7 ms | **~1.1–1.8 ms** offscreen (this build: cpu ~0.5–0.8 + gpu ~0.6–1.0). Live app is vsync-capped (`PresentMode::Fifo`) | ✅ meets 144 Hz |
-| **Idle CPU** | ~0 % (event-driven terminals) | **0 %** when nothing changes | ~0 % (damage-driven redraw) | ✅ |
-| **Per-frame CPU** (snapshot, ~11k cells; grid computed from cell metrics) | n/a | ≤ **1 ms** | **~0.08 ms** (0.072–0.087) | ✅ ~12× under |
-| **Throughput** (parse+grid, colored VT) | alacritty class: very high; VTE/Konsole: lower | ≥ **150 MB/s**; stretch ≥ 300 | **~118 MB/s** (median; 105–137 observed) — ⚠ **the old "154" is not reproducible** (see correction note) | ⚠ **below target** — investigate before re-asserting ≥150 |
-| **Pipeline compute** (`pipeline_1byte_cpu`: feed 1 byte → snapshot, CPU only) — **NOT input latency** | n/a | informational | p50 **~0.07 ms** (min ~0.068, p99 ~0.09; n=2000). Excludes PTY write + shell-echo round-trip + reader-thread wake + winit + compositor/display | — informational proxy |
-| **Cold start** (process exec → first frame) | foot ~40–60 ms; alacritty ~100–300 ms | < **150 ms**; stretch < 80 ms | `gpu_init` **warm ~85–94 ms / cold ~278 ms** (adapter+device only — a *subcomponent*; `text_init` warm ~24–36 / cold ~750 ms overlaps on a worker thread). End-to-end **exec→first-frame now instrumented** (`JETTY_PERF_LOG=1`, `/proc`-based on Linux, incl. pre-`main`) | ✅ subcomponent meets; end-to-end instrumented (read live) |
+| **Idle CPU** | ~0 % (event-driven terminals) | **0 %** when nothing changes | **0 wakeups / 10 s**, shown, hidden or behind another window (until 2026-10-09 the X11 hotkey thread polled at 20 Hz — see §"Performance pass") | ✅ |
+| **Per-frame CPU** (snapshot, ~11k cells; grid computed from cell metrics) | n/a | ≤ **1 ms** | **~0.037 ms** at 199×57, 0.051 ms at 240×70, 0.18 ms at 480×135 (2026-10-09; was 0.076 / 0.109 / 0.41) | ✅ ~27× under |
+| **Throughput** (parse+grid, colored VT) | alacritty class: very high; VTE/Konsole: lower | ≥ **150 MB/s**; stretch ≥ 300 | **~146–150 MB/s** quiet machine, 8 KiB chunks as the live drain feeds (the same build fed 64 KiB chunks: ~141). Unchanged parser cost — see the correction note | ⚠ at the target, not above it |
+| **Pipeline compute** (`pipeline_1byte_cpu`: feed 1 byte → snapshot, CPU only) — **NOT input latency** | n/a | informational | p50 **~0.035 ms** at 199×57 (2026-10-09; was ~0.075). Excludes PTY write + shell-echo round-trip + reader-thread wake + winit + compositor/display | — informational proxy |
+| **Cold start** (process exec → first frame) | foot ~40–60 ms; alacritty ~100–300 ms | < **150 ms**; stretch < 80 ms | `gpu_init` **~20 ms** quiet machine (2026-10-09, startup Vulkan driver filter; every installed driver: ~74 ms) — adapter+device only, a *subcomponent*; `text_init` warm ~24–36 ms overlaps on a worker thread. End-to-end **exec→first-frame instrumented** (`JETTY_PERF_LOG=1`, `/proc`-based on Linux, incl. pre-`main`) | ✅ subcomponent meets; end-to-end instrumented (read live) |
 | **Input latency** (keypress → glyph) | foot ≈ 1 frame; the latency leader | ≤ **1 frame** added (< 5 ms beyond display) | **instrumented** (`JETTY_PERF_LOG=1`): app-side `keypress→frame-ready` (no vsync) + `keypress→pre-present` (vsync-throttled), quiescent-prompt, percentiles + refresh rate. Not the bench proxy above | ✅ instrumented (read live) |
-| **Idle RSS** | alacritty ~30–50 MB; foot lower | < **80 MB** | **instrumented** (`JETTY_PERF_LOG=1` → `idle RSS … MB`, via `sysinfo`; RSS incl. shared pages, not PSS) | ✅ instrumented (read live) |
+| **Idle RSS** | alacritty ~30–50 MB; foot lower | < **80 MB** | **instrumented** (`JETTY_PERF_LOG=1` → `idle RSS … MB`, via `sysinfo`; RSS incl. shared pages, not PSS). The startup driver filter keeps ~90 MB of unused Vulkan drivers out of it on a hybrid laptop (`jetty-bench` right after the GPU block: 106 → 15 MiB) | ✅ instrumented (read live) |
 | **Binary size** | — | informational | 15 MB (release) | — |
 
 > **⚠ Throughput correction (v0.17).** Earlier revisions of this file claimed
@@ -78,6 +93,12 @@ Konsole 23.08.5, GNOME Terminal / VTE 0.76.
 > measurement basis, or an error; it is corrected here rather than re-published. The
 > ≥150 MB/s target is retained but **currently unmet on this binary** (OPEN — see the
 > TODO list). No unverified figure is shipped.
+>
+> **2026-10-09:** on a quiet machine the same parser measures **~141 MB/s** with
+> 64 KiB chunks (the visuals-v2 round-robin agrees: 141/142) and **~150 MB/s** with
+> the 8 KiB chunks the live drain actually feeds — the bench now uses those. The
+> parser's own cost did not change; the ~118 above was measured under load. 150 is
+> reached, not beaten: the target stays open as a "match alacritty" item.
 
 ### Visuals v2 vs v0.26.1 (2026-10-09)
 
@@ -110,6 +131,109 @@ per frame).
 > compile runs slower (the CPU and iGPU share one power budget). Compare GPU numbers
 > only in a round-robin of many binaries over several rounds, never from one pair.
 
+### Performance pass (2026-10-09, after v0.27.0)
+
+Measured against the shared `main` of the day (v0.27.0 + that day's fixes), same
+machine; A/B runs interleaved, medians.
+
+**Idle wakeups and summon latency.** `global-hotkey`'s X11 backend serviced its
+key grab with a loop that polled the X connection and slept 50 ms: **20 wakeups a
+second** for the life of the process, shown or hidden, and 0–50 ms added to every
+F9. Linux/BSD now grab the key in `jetty_platform::hotkey` on a thread that
+blocks on its own X connection (same grab: NumLock/CapsLock combinations, XKB
+detectable auto-repeat, a taken key reported). Nested X server (Xvfb + KWin,
+lavapipe), the owner's CRT config, F9 by XTEST → the window's Map/UnmapNotify:
+
+| | before | after |
+|---|---|---|
+| idle wakeups (10 s, shown / hidden / Settings focused) | 199 | **0** |
+| F9 → hidden, p50 (min–max) | 45.7 ms (3.4–49.2) | **3.1 ms** (0.9–5.5) |
+| F9 → shown, p50 | 23.6 ms | **10.8 ms** |
+
+(The X server itself delivers a grabbed key in ~0.4 ms there.)
+
+**Cold start: the Vulkan loader initialized every installed driver.** Creating a
+Vulkan instance makes the loader `dlopen` and initialize every ICD to ask for its
+extensions and devices. On this laptop that is Intel ANV (the one used), NVIDIA's
+driver (~50 ms of device enumeration on its own), lavapipe and RADV (both pull in
+the 138 MB libLLVM), nouveau, asahi, virtio, gfxstream, hasvk — and JeTTY kept
+`/dev/nvidia*` open and ~90 MB of those libraries resident for its whole life, all
+to pick the integrated GPU. `jetty_render::vk_loader` sets the loader's standard
+`VK_LOADER_DRIVERS_DISABLE` for the **first instance only**, decided from the
+kernel's view of the GPUs (`/sys/class/drm` render nodes, `/sys/module/nvidia`):
+
+- a Mesa / NVIDIA driver whose kernel driver is absent cannot have a device —
+  skipped (AMDVLK, ARM drivers and anything unknown are never skipped);
+- lavapipe only wins when no hardware adapter can present — skipped while a real
+  GPU's kernel driver is present;
+- NVIDIA under the default low-power preference while an integrated-capable GPU
+  (i915/xe/amdgpu/asahi) is present — wgpu then picks the integrated one.
+
+It is a first attempt, never a different pick: unless the adapter it yields is
+provably the unfiltered choice (integrated when NVIDIA was skipped; hardware when
+lavapipe was; any adapter on a loader older than 1.3.234, which ignores the
+variable), the instance is created again unfiltered — e.g. an iGPU that cannot
+present (Xvfb/VNC without DRI3) costs one extra cheap attempt. Off when the user
+steers drivers or GPUs (`VK_ICD_FILENAMES`, `VK_DRIVER_FILES`, `VK_ADD_DRIVER_FILES`,
+`VK_LOADER_DRIVERS_SELECT/DISABLE`, `DRI_PRIME`, `MESA_VK_DEVICE_SELECT`,
+`__NV_PRIME_RENDER_OFFLOAD`, `WGPU_BACKEND`; `JETTY_GPU=high` keeps NVIDIA). The
+variable is set in `run()` while the process has one thread, released right after
+the first instance (overwritten with "", which the loader reads as no filter — a
+pointer store, never an environment shift under other threads), and removed from
+every shell's environment (`jetty_core::hide_from_shells`): the first shell spawns
+while it is still set, and the user's own Vulkan programs must see every GPU.
+
+`JETTY_BENCH_ONLY=gpu_init`, 10 interleaved rounds, quiet machine:
+
+| | every driver | filter |
+|---|---|---|
+| gpu_init (instance + adapter + device) | 74.2 ms (instance 58.3) | **20.3 ms** (instance 3.7) |
+| process RSS right after the GPU block | 106.4 MiB (file-backed 91.8) | **15.3 MiB** (12.5) |
+| shared libraries mapped | 49 (338 MiB on disk) | **26** (31 MiB) |
+
+Not changed: an instance-creation hook (`wgpu-hal`'s `init_with_callback`) can't do
+this — wgpu enumerates instance extensions (which loads every driver) before the
+callback runs; `VK_LUNARG_direct_driver_loading` would mean JeTTY loading driver
+libraries itself. GPU-loss recovery and every later window build unfiltered, as
+before.
+
+**Frame CPU.**
+
+- *Snapshot* (every frame): one `&[Cell]` slice per row instead of a per-cell
+  ring-buffer index through `display_iter`, a one-entry color memo for fg and bg,
+  cells pushed in order (no blank pre-fill), the plain cell skipping the attribute
+  ladder. Output identical — the previous implementation is kept in the tests as
+  the reference and a randomized test (160 screens × 40 steps) compares every
+  field. CPU-only bench, `main` vs this pass, 6 interleaved rounds:
+
+  | grid | snapshot | pipeline_1byte p50 |
+  |---|---|---|
+  | 199×57 | 0.076 → **0.037 ms** | 0.075 → **0.035 ms** |
+  | 240×70 | 0.109 → **0.051 ms** | 0.107 → **0.050 ms** |
+  | 480×135 (4K) | 0.411 → **0.179 ms** | 0.404 → **0.171 ms** |
+
+  Whole grid frames (`frames` table: snapshot + render_to, CPU ms; full-bench
+  round-robin `main` vs this pass, 3 rounds, quiet machine): 240×70 static
+  0.246 → **0.170**, typing 0.509 → **0.434**, scroll 0.542 → **0.433**, tui
+  1.044 → **0.766**, boxtype 0.268 → **0.192**; 120×40 static 0.085 → **0.063**,
+  boxtype 0.112 → **0.094**, typing / scroll / tui within noise (−4 / +4 / +8 %:
+  tenths of a ms at that size).
+
+- *Window chrome* (every frame: tab bar + status HUD; the bench's `chrome` line
+  draws the main window's 4-tab bar and HUD exactly as the app does). Each label
+  was re-shaped (Advanced shaping, font fallback) every frame, and the chrome was
+  five render passes + submits. Labels are now shaped once and cached by content
+  (`OverlayCache`: per family, bounded, never evicting the current pass), and the
+  bar + strip draw in ONE pass (`TextLayer::render_chrome`; pixel-identical — an
+  ignored GPU test compares readbacks, and the live main / detached / bottom-bar
+  windows match):
+
+  | chrome per frame | CPU | allocations |
+  |---|---|---|
+  | v0.27.0 | 0.239 ms | 596 |
+  | label cache | 0.137 ms | 306 |
+  | label cache + one pass | **0.047 ms** | **102** |
+
 ## Where we lead vs. match vs. must improve
 
 - **Lead (architecture already gives us the edge):**
@@ -121,12 +245,14 @@ per frame).
     **instrumented live** (`JETTY_PERF_LOG=1`) rather than only asserted — two
     honestly-labelled numbers (app-compute-to-frame-ready, and to-pre-present with
     the vsync-acquire wait), sampled at a quiescent prompt, with percentiles.
-  - *Per-frame CPU* — snapshot is ~80 µs; render is GPU-bound.
+  - *Per-frame CPU* — snapshot is ~37 µs (199×57); the window chrome ~50 µs in one
+    pass; render is GPU-bound.
 - **Match:**
   - *Throughput / frame time* — we use alacritty_terminal's parser, so raw
     parse speed tracks alacritty; render at ~1.1–1.8 ms/full-frame clears 144 Hz.
     Both already beat VTE-based Konsole/GNOME Terminal on this machine. (Throughput
-    currently measures ~118 MB/s — below the ≥150 target; see the correction note.)
+    measures ~146–150 MB/s at the live drain's 8 KiB chunks — at the ≥150 target, not
+    above it; see the correction note.)
 - **Fixed (was the one red metric):**
   - *Cold start* — gpu_init went **224 ms → ~85 ms warm** by restricting the wgpu
     instance to the **Vulkan backend** (the default probed every backend), the
@@ -134,8 +260,10 @@ per frame).
     PTY fork now run on worker threads** that overlap the remaining device
     acquisition, and **global-hotkey registration moved off the main thread** on
     Linux (macOS must register it on the main thread — a cheap Carbon call there);
-    `[profile.release] lto = "thin"` trims runtime. `gpu_init` measures warm
-    ~85–94 ms (cold ~278 ms, first run of a cold cache). The **end-to-end
+    `[profile.release] lto = "thin"` trims runtime. `gpu_init` measured warm
+    ~85–94 ms (cold ~278 ms, first run of a cold cache) — and **~20 ms** since the
+    startup Vulkan driver filter (2026-10-09: the loader no longer initializes
+    NVIDIA, lavapipe, RADV, … to pick the iGPU; see §"Performance pass"). The **end-to-end
     exec→first-frame** number (which the gpu_init figure is only a subcomponent of)
     is now instrumented via `JETTY_PERF_LOG=1` — a genuine `/proc`-based exec delta
     on Linux that includes pre-`main` loader time.
@@ -148,9 +276,9 @@ These are enforced by review and by running the bench before a release — **not
 a failing CI job** (CI only reports; see rule 6).
 
 1. `jetty-bench` render ≤ 6.9 ms/frame and snapshot ≤ 1 ms/frame on the baseline.
-2. Throughput ≥ 150 MB/s. *(Currently unmet on this binary — measures ~118; see the
-   correction note. Treated as an OPEN investigation, not a silently-passed gate.)*
-3. Idle redraw stays damage-driven (no unconditional per-tick `request_redraw`); the only permitted idle wake is the perf-HUD one-shot `WaitUntil`, which must fire at most once per activity burst.
+2. Throughput ≥ 150 MB/s. *(~146–150 at the live 8 KiB chunk size on a quiet
+   machine since 2026-10-09 — at the floor, not above it; see the correction note.)*
+3. Idle redraw stays damage-driven (no unconditional per-tick `request_redraw`); the only permitted idle wake is the perf-HUD one-shot `WaitUntil`, which must fire at most once per activity burst. **No thread polls either**: every helper thread blocks in the kernel (PTY reader, hotkey grab, IPC, config watcher, portal) — check with per-thread context switches over 10 s idle (shown, hidden, unfocused), not just the main loop.
 4. Nothing added to the keystroke → PTY → render path that isn't strictly needed.
    The `JETTY_PERF_LOG=1` instrumentation obeys this: when the flag is unset the
    per-byte drain path is byte-identical and the present path pays one
@@ -209,7 +337,7 @@ Now instrumented (v0.17 — read live with `JETTY_PERF_LOG=1`, unit-tested in
   pre-`main`); the one-shot line prints at the first present.
 
 Still genuinely unmeasured (TODO):
-- **Throughput vs. the ≥150 target**: currently ~118 MB/s — resolve the 154
-  discrepancy (regression? basis? error?) before re-asserting the claim.
+- **Throughput vs. the ≥150 target**: ~146–150 MB/s at the live chunk size
+  (2026-10-09) — at the floor; beating it means work inside alacritty's parser.
 - **vs. market**: same `cat 50MB` / `time seq` workload through Jetty vs. Konsole
   vs. GNOME Terminal, wall-clock compared.
