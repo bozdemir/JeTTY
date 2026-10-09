@@ -363,8 +363,9 @@ const FALLBACK_ROWS: usize = 24;
 // last column / p10k's right-aligned prompt at some window widths). See
 // `App::gutter_px_at` and `DetachedWindow::fit_grid_dims`.
 
-/// Maximum bytes of PTY output fed into one tab's terminal per drain pass. Under
-/// an output flood (`yes`, `cat huge.log`) the PTY can produce faster than the VT
+/// Maximum bytes of PTY output fed into one ON-SCREEN tab's terminal per drain
+/// pass (the main window's active tab, a detached window's tab). Under an
+/// output flood (`yes`, `cat huge.log`) the PTY can produce faster than the VT
 /// parser consumes; draining to empty in one go would never return to the winit
 /// loop (no redraws, no keyboard — the user could not even Ctrl+C the flood).
 /// The drain stops after this many bytes and `about_to_wait` re-arms the tab's
@@ -372,6 +373,56 @@ const FALLBACK_ROWS: usize = 24;
 /// iteration — after pending input events. The backlog itself is bounded by the
 /// PTY read queue (the reader blocks and the child with it), not by this.
 const PTY_DRAIN_BUDGET: usize = 2 * 1024 * 1024;
+
+/// Bytes the main window's BACKGROUND tabs may feed, all of them together, per
+/// event-loop iteration (`App::bg_drain_left`, refilled by `about_to_wait`)
+/// while the active tab is not flooding itself (see `drain_pass`). Each
+/// flooding background tab used to take a full `PTY_DRAIN_BUDGET` on the
+/// Wake path and again on every frame's drain — ~13 ms of parsing apiece, twice
+/// per iteration, in front of the active tab's keystroke echo. A quarter MiB
+/// parses in ~1.7 ms, so a key waits that long at most behind every background
+/// flood together, and a background flood keeps its throughput: an iteration
+/// that paints nothing turns around in ~20 µs and drains the next quarter.
+const BG_DRAIN_BUDGET: usize = 256 * 1024;
+
+/// One main-window drain pass, scheduled (`App::drain_pty`). `drain(i, budget)`
+/// feeds tab `i` at most about `budget` bytes (whole chunks: it may overshoot
+/// by one) and returns how many it fed; every tab is visited exactly once, so
+/// each one's exit, bell and title are still checked when it gets no bytes.
+/// The ACTIVE tab goes first, with the full `PTY_DRAIN_BUDGET` — what the user
+/// is looking at and typing into never waits behind a background flood. The
+/// background tabs then share what is left of `bg_left` this iteration, in
+/// round-robin order from `next`: the tab that uses up the budget makes the
+/// next pass start after it, so several floods take turns. While the active
+/// tab floods itself, they share as much as it just fed instead: a key typed
+/// there waits behind its own flood anyway, and each paced frame still
+/// carries a fair share of every flood (fewer bytes per frame would cost
+/// throughput). Returns the bytes the active tab fed.
+fn drain_pass(
+    tabs: usize,
+    active: usize,
+    next: &mut usize,
+    bg_left: &mut usize,
+    mut drain: impl FnMut(usize, usize) -> usize,
+) -> usize {
+    if active >= tabs {
+        return 0;
+    }
+    let active_fed = drain(active, PTY_DRAIN_BUDGET);
+    if active_fed as u64 >= FLOOD_PACE_BYTES {
+        *bg_left = (*bg_left).max(active_fed);
+    }
+    let start = *next % tabs;
+    for i in (start..tabs).chain(0..start).filter(|&i| i != active) {
+        let budget = (*bg_left).min(PTY_DRAIN_BUDGET);
+        let fed = drain(i, budget);
+        if budget > 0 && fed >= budget {
+            *next = i + 1;
+        }
+        *bg_left = bg_left.saturating_sub(fed);
+    }
+    active_fed
+}
 
 
 /// A tab's STABLE identity for its whole life (main window ↔ detached window
@@ -1193,6 +1244,11 @@ pub struct App {
     /// A flood paint deferred to the next refresh (`pace_paint`); serviced by
     /// `about_to_wait` as a single WaitUntil wake.
     paced_paint_at: Option<std::time::Instant>,
+    /// What the background tabs may still feed this event-loop iteration
+    /// (`BG_DRAIN_BUDGET`, refilled by `about_to_wait`), and the tab their
+    /// round-robin starts at in the next drain pass (`drain_pass`).
+    bg_drain_left: usize,
+    bg_drain_next: usize,
     /// Window corner radius in logical px, clamped [0, 24]. 0 = square corners.
     corner_radius: f32,
     /// Inner grid padding in LOGICAL px (`padding_x` / `padding_y` config
@@ -1801,9 +1857,9 @@ pub struct App {
     trail: jetty_render::TrailModel,
     trail_layer: Option<jetty_render::CursorTrailLayer>,
     trail_wake: Option<std::time::Instant>,
-    /// When the main window's tabs last drained a flood (≥ `FLOOD_PACE_BYTES`
-    /// in one Wake): a cursor jump right after is output, not the user — no
-    /// trail for it.
+    /// When the main window's ACTIVE tab last drained a flood (≥
+    /// `FLOOD_PACE_BYTES` in one Wake): a cursor jump right after is output, not
+    /// the user — no trail for it. A background tab's flood never stamps it.
     flood_at: Option<std::time::Instant>,
     /// The visual bell playing in the main window (start, kind) — a bounded
     /// animation like `caret_anim` (`BELL_SECS`), at most one per
@@ -2222,6 +2278,8 @@ impl App {
             last_present_at: None,
             frame_interval: refresh_interval(None),
             paced_paint_at: None,
+            bg_drain_left: BG_DRAIN_BUDGET,
+            bg_drain_next: 0,
             corner_radius: 10.0,
             // Replaced by the config's values in `new` below.
             padding_x: 0.0,
@@ -8561,20 +8619,26 @@ impl App {
     }
 
 
-    /// Drain pending PTY output for EVERY tab into its terminal and flush each
-    /// tab's query replies back to its own PTY. Background tabs must keep draining
-    /// so their shells never block on a full pipe.
+    /// Drain pending PTY output into the main window's tabs and flush each tab's
+    /// query replies back to its own PTY. With `background` (the Wake path) every
+    /// tab is drained — the active one first, the background ones sharing this
+    /// iteration's `BG_DRAIN_BUDGET` (`drain_pass`) — so their shells never
+    /// block on a full pipe; without it (the paint path) only the active tab:
+    /// a frame shows nothing of the others, and whatever they still have queued
+    /// gets the next iteration's Wake (`rearm_pty_wakes`).
     ///
-    /// Returns `(active_had_data, chrome_changed, exited)` where
+    /// Returns `(active_had_data, active_bytes, chrome_changed, exited)` where
     /// `active_had_data` is true if the ACTIVE tab consumed bytes (so the caller
-    /// redraws), `chrome_changed` is true if the tab bar needs a repaint — an
+    /// redraws), `active_bytes` is how many it fed (flood pacing: a background
+    /// flood is no reason to defer the active tab's echo), `chrome_changed` is
+    /// true if the tab bar needs a repaint — an
     /// INACTIVE tab's activity indicator transitioned, or ANY tab's title was
     /// changed by an OSC 0/2 (a background tab whose indicator is already lit
     /// yields no activity transition, yet its new title must still reach the
     /// tab bar / OS title — F1/F14) — and `exited` is the list of tab indices
     /// whose child exited this tick (caller closes them after, to avoid
     /// mutating `tabs` while iterating).
-    fn drain_pty(&mut self) -> (bool, bool, Vec<usize>) {
+    fn drain_pty(&mut self, background: bool) -> (bool, u64, bool, Vec<usize>) {
         let mut active_had_data = false;
         let mut chrome_changed = false;
         let mut exited: Vec<usize> = Vec::new();
@@ -8599,8 +8663,12 @@ impl App {
         // The ACTIVE tab rang the bell (BEL) this drain: the visual bell and
         // `glitch_on_bell`, after the loop.
         let mut active_bell = false;
-        for (i, tab) in self.tabs.iter_mut().enumerate() {
-            let (had, title_changed, notice) = Self::drain_one_tab(tab, &mut vt_read, title_mode);
+        let (active, n) = (self.active, self.tabs.len());
+        let tabs = &mut self.tabs;
+        let mut drain_tab = |i: usize, budget: usize| -> usize {
+            let tab = &mut tabs[i];
+            let read_before = vt_read;
+            let (had, title_changed, notice) = Self::drain_one_tab(tab, budget, &mut vt_read, title_mode);
             chrome_changed |= title_changed;
             if let Some(n) = notice {
                 runsel_notices.push(n);
@@ -8610,28 +8678,35 @@ impl App {
             // sticky (never downgraded by later output); Output only lights a
             // clean tab. Rides the existing event-driven drain — zero idle work.
             let rang = tab.terminal.take_bell();
-            active_bell |= rang && i == self.active;
-            if i != self.active {
+            if i != active {
                 let new = next_activity(tab.meta.activity, had, rang, suppress_output);
                 if new != tab.meta.activity {
                     tab.meta.activity = new;
                     chrome_changed = true;
                 }
             }
-            if i == self.active && had {
+            if i == active && had {
                 active_had_data = true;
             }
-            if i == self.active && rang {
+            if i == active && rang {
                 active_bell = true;
             }
             if tab.terminal.child_exited() || tab.pty.child_exited() {
                 if Self::revive_failed_start(tab) {
-                    active_had_data |= i == self.active;
+                    active_had_data |= i == active;
                 } else {
                     exited.push(i);
                 }
             }
-        }
+            (vt_read - read_before) as usize
+        };
+        let active_bytes = if background {
+            drain_pass(n, active, &mut self.bg_drain_next, &mut self.bg_drain_left, &mut drain_tab)
+        } else if active < n {
+            drain_tab(active, PTY_DRAIN_BUDGET)
+        } else {
+            0
+        };
         self.vt_bytes += vt_read;
         if active_bell && self.fx.glitch_on_bell && !self.motion_reduced() {
             self.trigger_main_glitch();
@@ -8643,7 +8718,7 @@ impl App {
         if active_bell {
             self.ring_main_bell();
         }
-        (active_had_data, chrome_changed, exited)
+        (active_had_data, active_bytes as u64, chrome_changed, exited)
     }
 
     /// The main window's active tab rang the bell: play the visual bell
@@ -8832,14 +8907,16 @@ impl App {
     /// surfaces it via `show_status_pill` (a pill needs `&mut self`).
     fn drain_one_tab(
         tab: &mut Tab,
+        budget: usize,
         vt_read: &mut u64,
         title_mode: crate::tabmeta::TabTitleMode,
     ) -> (bool, bool, Option<crate::runsel::Notice>) {
-        // Feed at most PTY_DRAIN_BUDGET bytes this pass so a flood can't starve
-        // the event loop (see the const's doc). Whatever remains is scheduled
+        // Feed at most `budget` bytes this pass (`PTY_DRAIN_BUDGET` for a tab on
+        // screen; a background tab's share of `BG_DRAIN_BUDGET`, possibly 0) so a
+        // flood can't starve the event loop. Whatever remains is scheduled
         // for the next loop iteration by `rearm_pty_wakes` in `about_to_wait`.
         let terminal = &mut tab.terminal;
-        let fed = tab.pty.drain_output(PTY_DRAIN_BUDGET, |chunk| terminal.feed(chunk));
+        let fed = tab.pty.drain_output(budget, |chunk| terminal.feed(chunk));
         *vt_read += fed as u64;
         let mut had = fed > 0;
         // Flush any query replies (DSR/DA, etc.) this tab produced back to its
@@ -12318,7 +12395,7 @@ impl App {
             // is no longer owed (mirrors the main window's RedrawRequested).
             dw.key_paint_due = None;
             let mut vt_read: u64 = 0;
-            let (had, _, notice) = Self::drain_one_tab(&mut dw.tab, &mut vt_read, title_mode);
+            let (had, _, notice) = Self::drain_one_tab(&mut dw.tab, PTY_DRAIN_BUDGET, &mut vt_read, title_mode);
             let (_, rang) = Self::after_detached_drain(dw, had, vt_read);
             self.vt_bytes += vt_read;
             (notice, rang)
@@ -13318,7 +13395,9 @@ impl ApplicationHandler<AppEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // PTY output left queued by this iteration's drains is scheduled for the
         // next one (and idle tabs re-armed). First, so no early return skips it.
+        // The next iteration's background tabs get a fresh shared budget.
         self.rearm_pty_wakes();
+        self.bg_drain_left = BG_DRAIN_BUDGET;
         // DECSET 1004 focus reports (and the releases of keys held as a window
         // lost the keyboard) for whatever this event batch changed (OS focus,
         // summon/hide, a tab switch) — one pass, every window.
@@ -14430,9 +14509,10 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, ev: AppEvent) {
         match ev {
             AppEvent::Wake => {
-                let vt_before = self.vt_bytes;
-                let (had_data, chrome_changed, exited) = self.drain_pty();
-                let main_flood = self.vt_bytes - vt_before >= FLOOD_PACE_BYTES;
+                let (had_data, active_bytes, chrome_changed, exited) = self.drain_pty(true);
+                // A flood is the ACTIVE tab's: a background tab's flood must not
+                // pace the active tab's echo nor hold back its cursor trail.
+                let main_flood = active_bytes >= FLOOD_PACE_BYTES;
                 if main_flood {
                     self.flood_at = Some(std::time::Instant::now());
                 }
@@ -14511,7 +14591,7 @@ impl ApplicationHandler<AppEvent> for App {
                 for (i, dw) in self.detached.iter_mut().enumerate() {
                     let read_before = vt_read;
                     let (had, title_changed, notice) =
-                        Self::drain_one_tab(&mut dw.tab, &mut vt_read, title_mode);
+                        Self::drain_one_tab(&mut dw.tab, PTY_DRAIN_BUDGET, &mut vt_read, title_mode);
                     // Stale search, flood pacing, the OS title (synced even when
                     // occluded: a minimized window's taskbar entry must update)
                     // and the bell — shared with the render path's drain.
@@ -16242,11 +16322,15 @@ impl ApplicationHandler<AppEvent> for App {
                     self.ensure_summon_fx();
                     self.summon_anim = Some(std::time::Instant::now());
                 }
-                // Drain every tab so background shells keep running; close any
-                // whose child exited as part of the output we just drained.
+                // Drain the ACTIVE tab — what this frame shows — and close it if
+                // its child exited as part of the output we just drained. The
+                // background tabs drain on the Wake path, which every iteration
+                // that leaves output queued gets (`rearm_pty_wakes`): draining
+                // them here too put up to a `PTY_DRAIN_BUDGET` per flooding tab
+                // in front of every frame, the echo's included.
                 // (chrome changes are picked up by this same frame's
                 // tabs_meta()/tab_activity snapshot below, so the flag is moot here.)
-                let (had, _chrome_changed, exited) = self.drain_pty();
+                let (had, _active_bytes, _chrome_changed, exited) = self.drain_pty(false);
                 // Input-latency echo signal (JETTY_PERF_LOG only): if this drain
                 // consumed active-tab output, refresh the quiescent clock and mark
                 // any armed keystroke's echo as seen. Gated on `perf.on`.
@@ -21538,6 +21622,132 @@ mod window_mode_tests {
         for n in names {
             assert!(n.chars().count() <= 11, "cycler label too long: {n:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod drain_pass_tests {
+    //! The main window's drain scheduling (`drain_pass`): the active tab first
+    //! and in full, the background tabs sharing one budget per iteration.
+    use super::{drain_pass, BG_DRAIN_BUDGET, FLOOD_PACE_BYTES, PTY_DRAIN_BUDGET};
+
+    /// A queue that never runs dry (a `yes` / `cat` flood).
+    const FLOOD: usize = usize::MAX / 2;
+    const CHUNK: usize = 8 * 1024;
+
+    /// One drain pass over the tabs' queued bytes, fed in whole 8 KiB chunks
+    /// until the budget is met (`PtySession::drain_output`'s shape). Returns
+    /// the active tab's bytes, what each tab fed, and the visit order.
+    fn pass(queues: &mut [usize], active: usize, next: &mut usize, left: &mut usize) -> (usize, Vec<usize>, Vec<usize>) {
+        let mut fed = vec![0; queues.len()];
+        let mut order = Vec::new();
+        let active_fed = drain_pass(queues.len(), active, next, left, |i, budget| {
+            order.push(i);
+            let mut f = 0;
+            while f < budget && queues[i] > 0 {
+                let c = CHUNK.min(queues[i]);
+                queues[i] -= c;
+                f += c;
+            }
+            fed[i] += f;
+            f
+        });
+        (active_fed, fed, order)
+    }
+
+    #[test]
+    fn the_active_tab_drains_first_and_in_full_behind_background_floods() {
+        let mut q = vec![FLOOD, 320 * 1024, FLOOD, FLOOD];
+        let (mut next, mut left) = (0, BG_DRAIN_BUDGET);
+        let (active_fed, fed, order) = pass(&mut q, 1, &mut next, &mut left);
+        assert_eq!(order[0], 1, "the active tab is drained before any background tab");
+        assert_eq!(active_fed, 320 * 1024);
+        let mut visited = order.clone();
+        visited.sort_unstable();
+        assert_eq!(visited, [0, 1, 2, 3], "every tab is visited once (exit / bell / title checks)");
+        let background: usize = fed.iter().enumerate().filter(|&(i, _)| i != 1).map(|(_, f)| f).sum();
+        assert_eq!(background, 320 * 1024, "three background floods share the active tab's amount");
+    }
+
+    #[test]
+    fn behind_an_idle_active_tab_background_floods_share_one_small_budget() {
+        let mut q = vec![FLOOD, 0, FLOOD, FLOOD];
+        let (mut next, mut left) = (0, BG_DRAIN_BUDGET);
+        let (active_fed, fed, _) = pass(&mut q, 1, &mut next, &mut left);
+        assert_eq!(active_fed, 0);
+        assert_eq!(fed.iter().sum::<usize>(), BG_DRAIN_BUDGET, "a keystroke waits ~1.7 ms at most");
+    }
+
+    #[test]
+    fn a_flooding_active_tab_takes_its_full_budget_and_the_background_as_much() {
+        let mut q = vec![FLOOD, FLOOD, FLOOD];
+        let (mut next, mut left) = (0, BG_DRAIN_BUDGET);
+        let (active_fed, fed, _) = pass(&mut q, 0, &mut next, &mut left);
+        assert_eq!(active_fed, PTY_DRAIN_BUDGET);
+        assert_eq!(fed[1] + fed[2], PTY_DRAIN_BUDGET, "however many background floods");
+    }
+
+    #[test]
+    fn a_background_flood_is_not_the_active_tabs_flood() {
+        // The active tab echoes a keystroke while a background tab floods: the
+        // pass reports the echo's bytes, so the echo is neither paced nor
+        // taken for a flood that blocks the cursor trail.
+        let mut q = vec![3, FLOOD];
+        let (mut next, mut left) = (0, BG_DRAIN_BUDGET);
+        let (active_fed, fed, _) = pass(&mut q, 0, &mut next, &mut left);
+        assert_eq!(active_fed, 3);
+        assert!((active_fed as u64) < FLOOD_PACE_BYTES);
+        assert!(fed[1] >= BG_DRAIN_BUDGET, "the background flood still drained");
+    }
+
+    #[test]
+    fn a_second_wake_in_the_same_iteration_leaves_the_background_alone() {
+        // The echo's own Wake arrives while the iteration's background share is
+        // spent: the active tab drains in full, the background waits for the
+        // next iteration (about_to_wait refills `left`).
+        let mut q = vec![FLOOD, 0];
+        let (mut next, mut left) = (0, BG_DRAIN_BUDGET);
+        pass(&mut q, 1, &mut next, &mut left);
+        assert_eq!(left, 0);
+        q[1] = 5;
+        let (active_fed, fed, _) = pass(&mut q, 1, &mut next, &mut left);
+        assert_eq!(active_fed, 5);
+        assert_eq!(fed[0], 0);
+    }
+
+    #[test]
+    fn background_floods_take_turns() {
+        // Three flooding background tabs over many iterations: each gets the
+        // same share, whichever index it has.
+        let mut q = vec![0, FLOOD, FLOOD, FLOOD];
+        let mut total = [0usize; 4];
+        let mut next = 0;
+        for _ in 0..30 {
+            let mut left = BG_DRAIN_BUDGET;
+            let (_, fed, _) = pass(&mut q, 0, &mut next, &mut left);
+            for (t, f) in total.iter_mut().zip(fed) {
+                *t += f;
+            }
+        }
+        for (i, &t) in total.iter().enumerate().skip(1) {
+            assert_eq!(t, 10 * BG_DRAIN_BUDGET, "tab {i} got {t}");
+        }
+    }
+
+    #[test]
+    fn a_quiet_background_tab_leaves_its_share_to_a_flooding_one() {
+        let mut q = vec![0, 10 * 1024, FLOOD];
+        let (mut next, mut left) = (1, BG_DRAIN_BUDGET);
+        let (_, fed, _) = pass(&mut q, 0, &mut next, &mut left);
+        assert_eq!(fed[1], 10 * 1024, "the quiet tab drained to empty");
+        assert!(fed[2] >= BG_DRAIN_BUDGET - 10 * 1024, "the flood took the rest: {}", fed[2]);
+    }
+
+    #[test]
+    fn no_tabs_or_a_stale_active_index_drains_nothing() {
+        let (mut next, mut left) = (0, BG_DRAIN_BUDGET);
+        assert_eq!(drain_pass(0, 0, &mut next, &mut left, |_, _| unreachable!()), 0);
+        assert_eq!(drain_pass(2, 2, &mut next, &mut left, |_, _| unreachable!()), 0);
     }
 }
 
