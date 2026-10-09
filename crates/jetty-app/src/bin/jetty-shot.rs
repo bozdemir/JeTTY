@@ -557,17 +557,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    eprintln!(
-        "jetty-shot: GPU adapter = {} ({:?})",
-        adapter.get_info().name,
-        adapter.get_info().backend
-    );
+    let info = adapter.get_info();
+    let driver = if info.driver_info.is_empty() { String::new() } else { format!(", {}", info.driver_info) };
+    eprintln!("jetty-shot: GPU adapter = {} ({:?}{driver})", info.name, info.backend);
 
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("jetty-shot-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            // What the live app requests (`GpuContext::new`): a downlevel GL / GLES
+            // 3.0 adapter sits below `Limits::default()` and refused the device.
+            required_limits: adapter.limits(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
             ..Default::default()

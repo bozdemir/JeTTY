@@ -295,11 +295,15 @@ impl GpuContext {
         use std::sync::Once;
         static LOG_ADAPTER: Once = Once::new();
         LOG_ADAPTER.call_once(|| {
-            eprintln!(
-                "jetty: GPU adapter = {} ({:?})",
-                adapter.get_info().name,
-                adapter.get_info().backend
-            );
+            let info = adapter.get_info();
+            // The driver string — on GL the context version ("OpenGL ES 3.2 Mesa
+            // …"), what a GL-only machine's bug report needs most.
+            let driver = if info.driver_info.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", info.driver_info)
+            };
+            eprintln!("jetty: GPU adapter = {} ({:?}{driver})", info.name, info.backend);
         });
         let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("jetty-device"),
