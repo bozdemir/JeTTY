@@ -25,8 +25,8 @@ pub use snapshot::{
     GRAPHEME_MAX_MARKS, SHAPE_MASK, VisibleImage,
 };
 pub use terminal::{
-    CommandCompletion, LinkHit, Osc52Target, Progress, ProgressState, Terminal, ViewSpot, OSC52_MAX_BYTES,
-    SEARCH_MAX_MATCHES, SEARCH_MAX_QUERY, WIDE_SPACER,
+    osc52_load_reply, CommandCompletion, LinkHit, Osc52Target, Progress, ProgressState, Terminal, ViewSpot,
+    OSC52_MAX_BYTES, SEARCH_MAX_MATCHES, SEARCH_MAX_QUERY, WIDE_SPACER,
 };
 pub use theme::Theme;
 pub use theme::{builtins, set_registry, theme_at, theme_count, theme_index, theme_list};

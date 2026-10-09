@@ -40,13 +40,15 @@ fn text_area_px(cells: u32, cell: f32) -> u16 {
 }
 
 /// The ONE place the alacritty `Config` is built. `Term::set_options` replaces the
-/// whole config, so `new` and every runtime rebuild (scrollback, OSC 52, kitty
-/// keyboard, default cursor shape) must go through here or a non-default field
-/// would silently revert.
-fn term_config(scrollback: usize, osc52: Osc52, kitty_keyboard: bool, cursor: CursorShape) -> Config {
+/// whole config, so `new` and every runtime rebuild (scrollback, kitty keyboard,
+/// default cursor shape) must go through here or a non-default field would
+/// silently revert. OSC 52 is always `CopyPaste` for alacritty: whether a
+/// program may READ a selection is decided in `EventProxy`, which answers a
+/// denied read itself (alacritty would answer nothing).
+fn term_config(scrollback: usize, kitty_keyboard: bool, cursor: CursorShape) -> Config {
     Config {
         scrolling_history: scrollback,
-        osc52,
+        osc52: Osc52::CopyPaste,
         kitty_keyboard,
         default_cursor_style: CursorStyle { shape: cursor, blinking: false },
         ..Default::default()
@@ -360,6 +362,22 @@ fn peek_isolated_csi(rest: &[u8]) -> CsiPeek {
 /// when `osc52_allow_paste` is enabled.
 pub const OSC52_MAX_BYTES: usize = 100 * 1024;
 
+/// The answer to an OSC 52 read (`ESC ] 52 ; c ; ?`): the selection's `text`
+/// through alacritty's formatter, capped at [`OSC52_MAX_BYTES`] — or, with
+/// nothing readable (an empty or non-text selection, a clipboard error), an
+/// EMPTY selection. Never no answer: nvim's OSC 52 paste waited 10 s for one.
+pub fn osc52_load_reply(text: Option<String>, fmt: &(dyn Fn(&str) -> String + Send + Sync)) -> String {
+    let mut text = text.unwrap_or_default();
+    if text.len() > OSC52_MAX_BYTES {
+        let mut cut = OSC52_MAX_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    fmt(&text)
+}
+
 /// Formatter supplied by alacritty with an OSC 52 PASTE (load) request: given the
 /// clipboard text it returns the full `\e]52;…\a` reply to write back to the PTY.
 /// Matches alacritty's `Event::ClipboardLoad` payload type exactly.
@@ -445,14 +463,16 @@ struct EventProxy {
     /// the common no-copy case (lock-free — zero idle cost).
     clipboard_dirty: Arc<AtomicBool>,
     /// Pending OSC 52 clipboard-PASTE (load) requests: the reply formatter alacritty
-    /// supplied, one per selection. Only ever set when `osc52` mode permits paste
-    /// (OnlyPaste/CopyPaste), i.e. only when the user opted into
-    /// `osc52_allow_paste`. Drained by the app via [`Terminal::take_clipboard_loads`],
-    /// which reads each selection, formats, and writes the replies to the PTY. Off
-    /// by default (the secure default).
+    /// supplied, one per selection. Only ever set while `osc52_paste` is on, i.e.
+    /// only when the user opted into `osc52_allow_paste`. Drained by the app via
+    /// [`Terminal::take_clipboard_loads`], which reads each selection, formats, and
+    /// writes the replies to the PTY. Off by default (the secure default).
     clipboard_load: Osc52Pending<ClipboardLoadFmt>,
     /// Cheap "a clipboard-paste is pending" flag (mirrors `clipboard_dirty`).
     clipboard_load_dirty: Arc<AtomicBool>,
+    /// Programs may READ a selection with OSC 52 (`osc52_allow_paste`), shared
+    /// with the owning `Terminal` ([`Terminal::set_osc52_allow_paste`]).
+    osc52_paste: Arc<AtomicBool>,
     /// DEC mode 2031 state, shared with the owning `Terminal`'s scanner (see
     /// `Terminal::color_reports`): alacritty answers `CSI ? 2031 $ p` as "not
     /// recognized", and neovim only enables the mode after a set/reset answer,
@@ -574,13 +594,19 @@ impl EventListener for EventProxy {
                 }
             }
             // OSC 52 PASTE (load): the app running in the PTY asked to READ the
-            // system clipboard. alacritty only emits this when `osc52` permits paste
-            // (OnlyPaste/CopyPaste) — never under the default OnlyCopy — so it is
-            // inert unless the user set `osc52_allow_paste = true`. Stash the reply
-            // formatter; the app reads the clipboard, caps + formats, writes to PTY.
+            // system clipboard. Allowed only when the user set
+            // `osc52_allow_paste = true`: stash the reply formatter; the app reads
+            // the clipboard, caps + formats, writes to PTY. Denied (the default),
+            // it is answered at once with an EMPTY selection, in order with the
+            // other replies — nothing leaks, and a program waiting for the
+            // answer (nvim's OSC 52 paste: 10 s a paste) gets one.
             Event::ClipboardLoad(ty, formatter) => {
-                push_osc52(&self.clipboard_load, Osc52Target::of(ty), formatter);
-                self.clipboard_load_dirty.store(true, Ordering::Release);
+                if self.osc52_paste.load(Ordering::Relaxed) {
+                    push_osc52(&self.clipboard_load, Osc52Target::of(ty), formatter);
+                    self.clipboard_load_dirty.store(true, Ordering::Release);
+                } else {
+                    let _ = self.tx.send(formatter("").into_bytes());
+                }
             }
             // Wakeup / MouseCursorDirty and the rest are intentionally ignored.
             _ => {}
@@ -1024,14 +1050,14 @@ pub struct Terminal {
     clipboard_dirty: Arc<AtomicBool>,
     /// Pending OSC 52 clipboard-paste reply formatters + flag, shared with the
     /// `EventProxy`; consumed by [`Terminal::take_clipboard_loads`]. Inert unless
-    /// `osc52_mode` permits paste.
+    /// `osc52_paste` is on.
     clipboard_load: Osc52Pending<ClipboardLoadFmt>,
     clipboard_load_dirty: Arc<AtomicBool>,
-    /// The OSC 52 mode this terminal was built with. Stored so `set_scrollback_lines`
-    /// (which rebuilds the alacritty `Config`) preserves it instead of silently
-    /// reverting an enabled paste back to the default `OnlyCopy`. Toggled by
+    /// Programs may read a selection with OSC 52 (off by default), shared with
+    /// the `EventProxy`, which answers a denied read itself. Kept out of the
+    /// alacritty `Config`, so no config rebuild can revert it. Toggled by
     /// [`Terminal::set_osc52_allow_paste`].
-    osc52_mode: Osc52,
+    osc52_paste: Arc<AtomicBool>,
     /// Whether alacritty's kitty keyboard protocol support (`CSI ? u` query,
     /// `CSI > u` push / `CSI < u` pop) is enabled. Off by default: an app that
     /// pushes kitty flags expects kitty-encoded keys, so this must only be turned
@@ -1353,14 +1379,13 @@ impl Terminal {
         let rows = rows.max(1);
         let size = Size { cols, lines: rows };
         let scrollback_limit = 10_000;
-        // Default to write-only OSC 52 (alacritty's secure default): remote copy is
-        // accepted, remote paste is denied. `set_osc52_allow_paste` flips this to
-        // CopyPaste when the user opts in. Both `new` and `set_scrollback_lines`
-        // build the Config with THIS value so a scrollback change never reverts it.
-        let osc52_mode = Osc52::OnlyCopy;
+        // Write-only OSC 52 by default: remote copy is accepted, remote paste is
+        // denied (answered empty). `set_osc52_allow_paste` lets reads through when
+        // the user opts in.
+        let osc52_paste = Arc::new(AtomicBool::new(false));
         let kitty_keyboard = false;
         let default_cursor = CursorShape::Block;
-        let config = term_config(scrollback_limit, osc52_mode, kitty_keyboard, default_cursor);
+        let config = term_config(scrollback_limit, kitty_keyboard, default_cursor);
         let (tx, pty_write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         // Clone the sender for the synchronous scanner path (Kitty graphics
         // OK/error replies flow out through the same drain as async proxy replies).
@@ -1413,6 +1438,7 @@ impl Terminal {
             clipboard_dirty: Arc::clone(&clipboard_dirty),
             clipboard_load: Arc::clone(&clipboard_load),
             clipboard_load_dirty: Arc::clone(&clipboard_load_dirty),
+            osc52_paste: Arc::clone(&osc52_paste),
             color_reports: Arc::clone(&color_reports),
         };
         let term = Term::new(config, &size, proxy);
@@ -1434,7 +1460,7 @@ impl Terminal {
             clipboard_dirty,
             clipboard_load,
             clipboard_load_dirty,
-            osc52_mode,
+            osc52_paste,
             kitty_keyboard,
             bold_is_bright: false,
             default_cursor,
@@ -1551,10 +1577,10 @@ impl Terminal {
 
     /// Take the pending OSC 52 clipboard-PASTE reply formatters: at most one per
     /// selection, in arrival order. Empty in the common case (a lock-free flag
-    /// check). Only ever non-empty when the terminal was built/toggled to permit
-    /// paste (`osc52_allow_paste`), so the default (write-only) build never yields
-    /// one. The app reads the named selection, caps it, calls the formatter, and
-    /// writes the reply to the PTY — one reply per request.
+    /// check). Only ever non-empty while paste is permitted
+    /// (`osc52_allow_paste`): a denied read is answered empty by the terminal
+    /// itself. The app reads the named selection and writes
+    /// [`osc52_load_reply`] to the PTY — one reply per request.
     pub fn take_clipboard_loads(&mut self) -> Vec<(Osc52Target, ClipboardLoadFmt)> {
         if !self.clipboard_load_dirty.swap(false, Ordering::Acquire) {
             return Vec::new();
@@ -1584,17 +1610,16 @@ impl Terminal {
     /// Enable or disable OSC 52 clipboard PASTE (remote READ of the local clipboard).
     /// Copy (write) is always permitted. Paste is a SECURITY trade-off (a remote host
     /// / stray output can exfiltrate the clipboard), so it is OFF by default; the
-    /// `osc52_allow_paste` config key opts in. Rebuilds the alacritty `Config`
-    /// preserving the current scrollback limit. Idempotent-ish (re-applies set_options
-    /// even when unchanged), so callers may invoke it unconditionally at tab spawn.
+    /// `osc52_allow_paste` config key opts in. A denied read is answered with an
+    /// empty selection. Idempotent, so callers may invoke it unconditionally at
+    /// tab spawn.
     pub fn set_osc52_allow_paste(&mut self, allow: bool) {
-        self.osc52_mode = if allow { Osc52::CopyPaste } else { Osc52::OnlyCopy };
-        self.term.set_options(self.config());
+        self.osc52_paste.store(allow, Ordering::Relaxed);
     }
 
     /// The alacritty `Config` for this terminal's current settings.
     fn config(&self) -> Config {
-        term_config(self.scrollback_limit, self.osc52_mode, self.kitty_keyboard, self.default_cursor)
+        term_config(self.scrollback_limit, self.kitty_keyboard, self.default_cursor)
     }
 
     /// The cursor shape programs reset to (`CSI 0 SP q`) and a fresh screen
@@ -1642,8 +1667,8 @@ impl Terminal {
             // A protocol toggle is alacritty's only way to clear BOTH screens'
             // stacks (`set_options`; the re-emitted title is a no-op app-side).
             let cursor = self.default_cursor;
-            self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, false, cursor));
-            self.term.set_options(term_config(self.scrollback_limit, self.osc52_mode, true, cursor));
+            self.term.set_options(term_config(self.scrollback_limit, false, cursor));
+            self.term.set_options(term_config(self.scrollback_limit, true, cursor));
         }
         self.kbd_cleared();
         for mode in [
@@ -1841,10 +1866,7 @@ impl Terminal {
     ///   value equals what's already displayed (the app's apply path is a
     ///   no-op on unchanged titles, and manual renames are flagged app-side).
     pub fn set_scrollback_lines(&mut self, lines: usize) {
-        // Preserve the OSC 52 mode: `..Default::default()` would reset `osc52` to
-        // OnlyCopy, silently reverting an enabled `osc52_allow_paste` on every
-        // scrollback change (amendment O2). Carry the stored mode through.
-        self.term.set_options(term_config(lines, self.osc52_mode, self.kitty_keyboard, self.default_cursor));
+        self.term.set_options(term_config(lines, self.kitty_keyboard, self.default_cursor));
         self.scrollback_limit = lines;
         // A shrink freed trimmed history rows, so stored search-match Points
         // can reference lines that no longer exist (wrong counter, Enter/F3
@@ -9532,11 +9554,35 @@ mod tests {
 
     #[test]
     fn osc52_paste_denied_by_default() {
-        // Default build is write-only (OnlyCopy): a paste query `\e]52;c;?\a` is
-        // denied at the alacritty layer, so no load request ever reaches us.
+        // Default build is write-only: a paste query `\e]52;c;?\a` never reaches
+        // the clipboard — and is answered with an empty selection, at once and in
+        // order with the other replies (unanswered, nvim waited 10 s a paste).
         let mut t = Terminal::new(20, 5);
         t.feed(b"\x1b]52;c;?\x07");
         assert!(t.take_clipboard_loads().is_empty(), "paste is off by default");
+        assert_eq!(t.drain_pty_writes(), b"\x1b]52;c;\x07");
+        t.feed(b"\x1b]52;p;?\x1b\\\x1b[c");
+        let da1 = String::from_utf8_lossy(crate::handler::DA1_REPLY);
+        assert_eq!(String::from_utf8_lossy(&t.drain_pty_writes()), format!("\x1b]52;p;\x1b\\{da1}"));
+        // Turned off again, a read is answered empty again.
+        t.set_osc52_allow_paste(true);
+        t.set_osc52_allow_paste(false);
+        t.feed(b"\x1b]52;c;?\x07");
+        assert!(t.take_clipboard_loads().is_empty());
+        assert_eq!(t.drain_pty_writes(), b"\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn an_osc52_read_is_answered_even_with_nothing_to_read() {
+        // A selection that is empty, not text, or unreadable answers empty;
+        // a huge one is capped on a char boundary.
+        let fmt = |s: &str| format!("<{s}>");
+        assert_eq!(osc52_load_reply(None, &fmt), "<>");
+        assert_eq!(osc52_load_reply(Some("hi".into()), &fmt), "<hi>");
+        let big = "é".repeat(OSC52_MAX_BYTES); // 2 bytes each
+        let reply = osc52_load_reply(Some(big), &fmt);
+        assert_eq!(reply.len(), OSC52_MAX_BYTES + 2);
+        assert!(reply.ends_with("é>"));
     }
 
     #[test]
@@ -9572,13 +9618,17 @@ mod tests {
 
     #[test]
     fn osc52_scrollback_change_preserves_paste_mode() {
-        // Regression (amendment O2): changing scrollback rebuilds the alacritty
-        // Config and must NOT revert an enabled paste back to OnlyCopy.
+        // Regression (amendment O2): changing scrollback (or the keyboard
+        // protocol) rebuilds the alacritty Config and must NOT revert an enabled
+        // paste.
         let mut t = Terminal::new(20, 5);
         t.set_osc52_allow_paste(true);
         t.set_scrollback_lines(500);
+        t.set_kitty_keyboard(true);
+        t.reset_input_modes();
         t.feed(b"\x1b]52;c;?\x07");
         assert_eq!(t.take_clipboard_loads().len(), 1, "paste survives a scrollback change");
+        assert!(t.drain_pty_writes().is_empty(), "answered by the app, from the clipboard");
     }
 
     // ─────────────────────────── SIXEL DCS scanner + placement ───────────────

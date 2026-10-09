@@ -120,7 +120,7 @@ Names of fonts and themes are matched in any letter case, and a theme by its id
 | `shell` | `""` | The shell to run. `""` = `$SHELL`, then your login shell, then `/bin/bash`; or an absolute path such as `"/usr/bin/fish"`. Applies to new tabs. |
 | `scrollback_lines` | `10000` | History kept per tab, in lines, `100`–`100000`. |
 | `kitty_keyboard` | `true` | Offer the kitty keyboard protocol to programs that ask for it (unambiguous keys: Ctrl+I ≠ Tab, key releases). `false` turns it off in every tab. |
-| `osc52_allow_paste` | `false` | Let programs — a remote host over SSH too — READ your clipboard with OSC 52. Copying through OSC 52 always works; reading is off because it can leak whatever is on the clipboard. |
+| `osc52_allow_paste` | `false` | Let programs — a remote host over SSH too — READ your clipboard with OSC 52. Copying through OSC 52 always works; reading is off because it can leak whatever is on the clipboard. A program that asks anyway gets an empty clipboard back, so it never hangs waiting for an answer (nvim's OSC 52 paste waited 10 s). |
 | `copy_on_select` | `"primary"` | Where a finished mouse selection is copied: `"primary"` (the X11/Wayland selection a middle click pastes), `"clipboard"`, `"both"` or `"off"`. Without a primary selection (macOS) `"primary"` means the clipboard. |
 | `run_selection` | `true` | "Run the selection in a new tab" (menu, `Ctrl+Shift+Enter`, palette, copy mode). `false` turns every way of doing it off. |
 | `macos_option_as_alt` | `"none"` | macOS: which Option key acts as Alt/Meta instead of typing characters — `"none"`, `"left"`, `"right"` or `"both"`. Ignored elsewhere. |

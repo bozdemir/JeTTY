@@ -8989,23 +8989,19 @@ impl App {
             }
         }
         // OSC 52 PASTE (load): a program asked to READ a selection. Only ever
-        // present when the user enabled `osc52_allow_paste` (else alacritty denies it
-        // and no request reaches us). Read the selection, CAP the reply length, format
-        // via alacritty's supplied formatter, and write it back to the PTY — one
-        // reply per request (a `c;?` + `p;?` pair gets two).
+        // present when the user enabled `osc52_allow_paste` (else the terminal
+        // answers it empty itself). Read the selection and write the capped,
+        // formatted answer back to the PTY — one reply per request (a `c;?` +
+        // `p;?` pair gets two), an empty one when nothing is readable (an image,
+        // an empty clipboard, an error): a program waits for the answer.
         for (target, fmt) in tab.terminal.take_clipboard_loads() {
             let text = match target {
                 jetty_core::Osc52Target::Primary => crate::clipboard::get_primary(),
                 jetty_core::Osc52Target::Clipboard => crate::clipboard::get(),
             };
-            if let Some(mut text) = text {
-                if text.len() > jetty_core::OSC52_MAX_BYTES {
-                    text.truncate(floor_char_boundary(&text, jetty_core::OSC52_MAX_BYTES));
-                }
-                let reply = fmt(&text);
-                tab.pty.send_reply(reply.as_bytes());
-                had = true;
-            }
+            let reply = jetty_core::osc52_load_reply(text, &*fmt);
+            tab.pty.send_reply(reply.as_bytes());
+            had = true;
         }
         // Run-selection pending inject: poll readiness against the bytes just
         // fed (prompt mark + bracketed paste) and fire/drop. The ONLY new
@@ -18378,20 +18374,6 @@ fn apply_option_as_alt(window: &winit::window::Window, option_as_alt: input::Opt
 fn apply_option_as_alt(_window: &winit::window::Window, _option_as_alt: input::OptionAsAlt) {}
 
 
-/// Largest byte index `<= max` that is a char boundary of `s` (a stable stand-in for
-/// the unstable `str::floor_char_boundary`). Used to cap an OSC 52 paste reply
-/// without splitting a multibyte char, which would make `String::truncate` panic.
-fn floor_char_boundary(s: &str, max: usize) -> usize {
-    if s.len() <= max {
-        return s.len();
-    }
-    let mut b = max;
-    while b > 0 && !s.is_char_boundary(b) {
-        b -= 1;
-    }
-    b
-}
-
 /// The warning for a chosen theme that isn't in the registry (`shown` is the
 /// display name of the fallback on screen).
 /// The `minimum_contrast` steps the palette cycles through: off, 3:1 (WCAG
@@ -20974,7 +20956,7 @@ mod scheduler_tests {
 
 #[cfg(test)]
 mod hot_reload_tests {
-    use super::{floor_char_boundary, sanitize_notice, theme_missing_warning};
+    use super::{sanitize_notice, theme_missing_warning};
     use crate::config::hash_str as hash_config_str;
 
     /// The self-write guard: a reload is IGNORED iff the on-disk content hashes to
@@ -21006,21 +20988,6 @@ mod hot_reload_tests {
         assert!(!s.chars().any(|c| c.is_control()), "{s:?}");
         assert!(s.contains("]52;c;AAA"), "printable text is kept: {s:?}");
         assert!(theme_missing_warning("mine", "Catppuccin Mocha").contains("\"mine\""));
-    }
-
-    #[test]
-    fn osc52_reply_cap_never_splits_a_char() {
-        // The paste-reply cap must land on a char boundary so String::truncate can't
-        // panic on a multibyte char straddling the cap.
-        let s = "a£b€c"; // '£' is 2 bytes, '€' is 3 bytes
-        for max in 0..=s.len() + 2 {
-            let b = floor_char_boundary(s, max);
-            assert!(b <= s.len());
-            assert!(s.is_char_boundary(b), "cap {max} landed mid-char at {b}");
-        }
-        // A cap at/after the end returns the full length.
-        assert_eq!(floor_char_boundary(s, s.len()), s.len());
-        assert_eq!(floor_char_boundary(s, s.len() + 10), s.len());
     }
 
     /// Which config keys apply LIVE on hot-reload vs require a RESTART. Mirrors
