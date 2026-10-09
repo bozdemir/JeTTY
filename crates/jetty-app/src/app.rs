@@ -7244,8 +7244,13 @@ impl App {
     /// shell or rc file — gets the next shell candidate instead of closing
     /// (with the last tab, the whole app used to vanish without a word). The
     /// dead shell's last output (its error) stays on screen above the notice.
-    /// True when the tab lives on (see `PtySession::respawn_after_failed_start`).
+    /// A tab whose shell already showed a prompt (OSC 133) did start: whatever
+    /// ended it was the user's. True when the tab lives on (see
+    /// `PtySession::respawn_after_failed_start`).
     fn revive_failed_start(tab: &mut Tab) -> bool {
+        if tab.terminal.prompt_count() > 0 {
+            return false;
+        }
         let Some(Ok(pty)) = tab.pty.respawn_after_failed_start() else { return false };
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
         while std::time::Instant::now() < deadline {

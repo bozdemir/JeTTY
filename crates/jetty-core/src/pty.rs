@@ -201,14 +201,16 @@ struct SpawnPlan {
 
 /// How soon after starting an unsuccessful exit means "this shell could not
 /// start" (a broken shell or rc file) rather than the user leaving it. A full
-/// oh-my-zsh + powerlevel10k start takes ~0.2 s; a user's own `exit 1` (or ^C
-/// then ^D) within this window of a new tab is not a realistic case.
+/// oh-my-zsh + powerlevel10k start takes ~0.2 s; a user's own `exit 1` within
+/// this window of a new tab is not a realistic case.
 const FAILED_START_WINDOW: Duration = Duration::from_secs(2);
 
-/// Whether a shell that ended `success`fully or not after running for `lived`
-/// failed to start (see [`FAILED_START_WINDOW`]).
-fn failed_start(success: bool, lived: Duration) -> bool {
-    !success && lived < FAILED_START_WINDOW
+/// Whether a shell that ended with `status` after running for `lived` failed
+/// to start (see [`FAILED_START_WINDOW`]). 130 never does: zsh and bash both
+/// leave with it on ^C then ^D at a fresh prompt — the user closing the tab.
+fn failed_start(status: &portable_pty::ExitStatus, lived: Duration) -> bool {
+    let interrupted = status.signal().is_none() && status.exit_code() == 130;
+    !status.success() && !interrupted && lived < FAILED_START_WINDOW
 }
 
 /// `Write` adapter handed to the app: forwards buffers to the PTY writer
@@ -1127,7 +1129,7 @@ impl PtySession {
     /// last words, usually the error.
     pub fn respawn_after_failed_start(&self) -> Option<std::io::Result<PtySession>> {
         let (status, ended) = self.ended.lock().ok()?.clone()?;
-        if !failed_start(status.success(), ended.duration_since(self.started)) {
+        if !failed_start(&status, ended.duration_since(self.started)) {
             return None;
         }
         let next = self.launched + 1;
@@ -1515,12 +1517,17 @@ mod tests {
 
     #[test]
     fn only_an_unsuccessful_exit_right_after_starting_is_a_failed_start() {
+        use portable_pty::ExitStatus;
         let ms = Duration::from_millis;
-        assert!(failed_start(false, ms(150)), "a broken rc file: dies within ~0.2 s");
-        assert!(failed_start(false, FAILED_START_WINDOW - ms(1)));
-        assert!(!failed_start(true, ms(150)), "`exit` / Ctrl+D at once: the user closed it");
-        assert!(!failed_start(false, FAILED_START_WINDOW), "a later failure is the user's own `exit 1`");
-        assert!(!failed_start(false, Duration::from_secs(3600)));
+        let code = ExitStatus::with_exit_code;
+        assert!(failed_start(&code(1), ms(150)), "a broken rc file: dies within ~0.2 s");
+        assert!(failed_start(&code(127), FAILED_START_WINDOW - ms(1)));
+        assert!(failed_start(&ExitStatus::with_signal("Segmentation fault"), ms(10)), "a crash");
+        assert!(!failed_start(&code(0), ms(150)), "`exit` / Ctrl+D at once: the user closed it");
+        // zsh and bash both leave with 130 on ^C then ^D at a fresh prompt.
+        assert!(!failed_start(&code(130), ms(300)), "^C ^D: the user closed it");
+        assert!(!failed_start(&code(1), FAILED_START_WINDOW), "a later failure is the user's own `exit 1`");
+        assert!(!failed_start(&code(1), Duration::from_secs(3600)));
     }
 
     #[test]
