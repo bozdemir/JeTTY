@@ -5613,9 +5613,12 @@ impl App {
                 Surface::Detached(p) => self.reattach_tab(p, event_loop),
             },
             C::OpenSettings => {
-                // Open (never toggle-closed): don't dismiss an already-open panel.
+                // Open (never toggle-closed): an already-open panel — perhaps
+                // behind the terminal — comes forward, as a deep link's does.
                 if self.settings_window.is_none() {
                     self.toggle_settings_window(event_loop);
+                } else if let Some(w) = &self.settings_window {
+                    w.focus_window();
                 }
             }
             C::ApplyLook(i) => {
