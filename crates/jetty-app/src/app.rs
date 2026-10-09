@@ -4214,8 +4214,10 @@ impl App {
             })
             .unwrap_or((0, 0));
         let spawn_cwd = cwd.clone();
-        // COLORFGBG: the dark/light hint of the theme on screen.
-        let env = colorfgbg_env(&self.active_theme);
+        // COLORFGBG: the dark/light hint of the theme on screen; and where the
+        // shell-integration line finds its snippet.
+        let mut env = colorfgbg_env(&self.active_theme);
+        env.extend(crate::shell_integration::shell_env());
         let pty = match PtySession::spawn_with_env(cols as u16, rows as u16, px_w, px_h, shell, cwd, env, move || {
             let _ = proxy_wake.send_event(AppEvent::Wake);
         }) {
@@ -13292,6 +13294,9 @@ impl ApplicationHandler<AppEvent> for App {
         let shell = self.opt_shell();
         let first_shell_env = self.first_shell_env();
         let pty_handle = std::thread::spawn(move || {
+            // The shell-integration snippets are written here, off the main thread.
+            let mut env = first_shell_env.resolve();
+            env.extend(crate::shell_integration::shell_env());
             // Provisional grid at startup: the real text-area pixel size is set by
             // the immediate resize once the cell metrics are known (see below).
             PtySession::spawn_with_env(
@@ -13301,7 +13306,7 @@ impl ApplicationHandler<AppEvent> for App {
                 0,
                 shell,
                 None,
-                first_shell_env.resolve(),
+                env,
                 move || {
                     let _ = proxy_wake.send_event(AppEvent::Wake);
                 },

@@ -389,10 +389,13 @@ pub fn run() {
                      Settings: Ctrl+, or Ctrl+Shift+O · Command palette: Ctrl+Shift+P\n\
                      Config: {config} (another dir: set JETTY_CONFIG_DIR)\n\
                      Shell integration (prompt marks, Ctrl+Shift+Z/X jump, Run & Notify). Add to your rc file:\n\
-                     \x20 zsh:  [[ -n \"${{JETTY-}}\" ]] && source <(\"${{JETTY_BIN:-jetty}}\" --print-shell-integration zsh)\n\
-                     \x20 bash: [[ -n \"${{JETTY-}}\" ]] && source <(\"${{JETTY_BIN:-jetty}}\" --print-shell-integration bash)\n\
-                     \x20 fish: set -q JETTY; and \"$JETTY_BIN\" --print-shell-integration fish | source",
+                     \x20 zsh:  {zsh}\n\
+                     \x20 bash: {bash}\n\
+                     \x20 fish: {fish}",
                     config = config::Config::config_path().display(),
+                    zsh = shell_integration::ZSH_LINE,
+                    bash = shell_integration::BASH_LINE,
+                    fish = shell_integration::FISH_LINE,
                 );
                 std::process::exit(0);
             }

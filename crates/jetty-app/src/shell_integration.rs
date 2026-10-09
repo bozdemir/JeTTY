@@ -1,12 +1,16 @@
-//! OSC 133 shell-integration snippets emitted by
+//! OSC 133 shell-integration snippets: written for each run as files the
+//! user's rc line sources (`jetty.zsh`, `jetty.bash`, `jetty.fish` in
+//! `$JETTY_SHELL_INTEGRATION_DIR` — see [`shell_env`]), and printed by
 //! `jetty --print-shell-integration <zsh|bash|fish>`.
 //!
 //! JeTTY NEVER edits the user's dotfiles. The user opts in with ONE guarded line
-//! they add themselves (printed in `--help` and at the top of each snippet),
-//! which sources the snippet ONLY under JeTTY and produces no output in other
-//! terminals or when the binary is missing (instant-prompt safe). The line runs
-//! `$JETTY_BIN` — the absolute path JeTTY exports to its shells — so it also works
-//! for AppImage / tarball installs where `jetty` is not on `PATH`.
+//! they add themselves ([`ZSH_LINE`], [`BASH_LINE`], [`FISH_LINE`] — shown by
+//! `--help`, the README and at the top of each snippet), which sources the
+//! snippet ONLY under JeTTY and produces no output in other terminals or when
+//! the file is missing (instant-prompt safe). A file, not the old
+//! `source <(jetty --print-shell-integration …)`: no process starts with each
+//! shell — an AppImage mounted itself for every new tab — and bash 3.2 (macOS),
+//! whose `source` reads nothing from a pipe, works too. The old line still does.
 //!
 //! Marks emitted: OSC 133 `A` (prompt), `C` (command start), `D;<exit>` (done),
 //! and — zsh only — `B` (input start), from `zle-line-init`, which runs once the
@@ -17,6 +21,18 @@
 //! KNOWN LIMITATION (tmux/screen): OSC 133 emitted inside a multiplexer reaches
 //! the multiplexer, not JeTTY, unless passthrough is configured, and
 //! `$JETTY`/`$TERM_PROGRAM` may be stale inside it.
+
+use std::path::{Path, PathBuf};
+
+/// The rc-file line that opts zsh in (end of `~/.zshrc`; see the module doc).
+pub const ZSH_LINE: &str =
+    r#"[[ -r "${JETTY_SHELL_INTEGRATION_DIR-}/jetty.zsh" ]] && source "$JETTY_SHELL_INTEGRATION_DIR/jetty.zsh""#;
+/// The rc-file line that opts bash in (end of `~/.bashrc`).
+pub const BASH_LINE: &str =
+    r#"[[ -r "${JETTY_SHELL_INTEGRATION_DIR-}/jetty.bash" ]] && source "$JETTY_SHELL_INTEGRATION_DIR/jetty.bash""#;
+/// The line that opts fish in (`~/.config/fish/config.fish`).
+pub const FISH_LINE: &str =
+    r#"test -r "$JETTY_SHELL_INTEGRATION_DIR/jetty.fish"; and source "$JETTY_SHELL_INTEGRATION_DIR/jetty.fish""#;
 
 /// zsh snippet — powerlevel10k-safe.
 ///
@@ -34,7 +50,7 @@ pub const ZSH: &str = r#"# JeTTY zsh shell integration — OSC 133 semantic prom
 # (prompt marks + failed-command markers + Ctrl+Shift+Z/X prompt jump)
 #
 # Opt in from the END of ~/.zshrc with (guarded; silent in other terminals):
-#   [[ -n "${JETTY-}" ]] && source <("${JETTY_BIN:-jetty}" --print-shell-integration zsh 2>/dev/null)
+#   [[ -r "${JETTY_SHELL_INTEGRATION_DIR-}/jetty.zsh" ]] && source "$JETTY_SHELL_INTEGRATION_DIR/jetty.zsh"
 #
 # powerlevel10k: p10k emits the marks itself, in step with its transient prompt;
 # this turns them on (POWERLEVEL9K_TERM_SHELL_INTEGRATION=true) unless your
@@ -95,7 +111,7 @@ fi
 /// Safe under `set -u` (every variable read has a default).
 pub const BASH: &str = r#"# JeTTY bash shell integration — OSC 133 semantic prompts.
 # Opt in from the END of ~/.bashrc with (guarded; silent in other terminals):
-#   [[ -n "${JETTY-}" ]] && source <("${JETTY_BIN:-jetty}" --print-shell-integration bash 2>/dev/null)
+#   [[ -r "${JETTY_SHELL_INTEGRATION_DIR-}/jetty.bash" ]] && source "$JETTY_SHELL_INTEGRATION_DIR/jetty.bash"
 #
 # A (prompt) and D (exit) come from PROMPT_COMMAND, C (command start) from PS0
 # (bash >= 4.4); no DEBUG trap is installed — fully non-destructive.
@@ -137,7 +153,7 @@ fi
 /// fish snippet — native events; captures `$status` first in fish_postexec.
 pub const FISH: &str = r#"# JeTTY fish shell integration — OSC 133 semantic prompts.
 # Opt in from ~/.config/fish/config.fish with (guarded; silent elsewhere):
-#   test -n "$JETTY"; and test -n "$JETTY_BIN"; and "$JETTY_BIN" --print-shell-integration fish | source
+#   test -r "$JETTY_SHELL_INTEGRATION_DIR/jetty.fish"; and source "$JETTY_SHELL_INTEGRATION_DIR/jetty.fish"
 if status is-interactive; and set -q JETTY
     function _jetty_prompt --on-event fish_prompt
         printf '\033]133;A\007'
@@ -160,6 +176,72 @@ pub fn snippet_for(shell: &str) -> Option<&'static str> {
         "fish" => Some(FISH),
         _ => None,
     }
+}
+
+/// The variable naming the directory of this run's snippets ([`shell_env`]).
+const DIR_VAR: &str = "JETTY_SHELL_INTEGRATION_DIR";
+
+/// What every JeTTY shell needs for its opt-in line: `$JETTY_SHELL_INTEGRATION_DIR`,
+/// naming this run's snippets — written now unless they are there already
+/// ([`install_in`]), so one that went missing comes back with the next tab.
+/// Under `$XDG_RUNTIME_DIR` (a per-user tmpfs), else the user's cache dir —
+/// never the shared temp dir. Empty when they could not be written: the line
+/// then does nothing.
+pub fn shell_env() -> Vec<(String, String)> {
+    let root = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()).map(PathBuf::from).or_else(dirs::cache_dir);
+    root.and_then(|root| install_in(&root))
+        .and_then(|dir| dir.to_str().map(str::to_string))
+        .map(|dir| vec![(DIR_VAR.to_string(), dir)])
+        .unwrap_or_default()
+}
+
+/// Write the three snippets into `<root>/jetty-shell-<id>/` (0700) unless they
+/// are there, and return that directory. `<id>` hashes their content, so two
+/// JeTTYs at once (another config dir, another version) never source each
+/// other's. `None` when `root` is writable by other users — a snippet planted
+/// there would run in every shell — or a file could not be written. Each file
+/// is renamed into place whole: a starting shell never reads half of one.
+fn install_in(root: &Path) -> Option<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Temp names unique within this process too: the first shell's worker
+    // thread and a new tab may install at once.
+    static TMP: AtomicUsize = AtomicUsize::new(0);
+    let meta = std::fs::metadata(root).ok()?;
+    if !meta.is_dir() || meta.mode() & 0o022 != 0 {
+        return None;
+    }
+    let files = [("jetty.zsh", ZSH), ("jetty.bash", BASH), ("jetty.fish", FISH)];
+    let id = files
+        .iter()
+        .flat_map(|(_, text)| text.bytes().chain([0]))
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    let dir = root.join(format!("jetty-shell-{id:016x}"));
+    if files.iter().all(|(name, _)| dir.join(name).is_file()) {
+        return Some(dir);
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    for (name, text) in files {
+        let tmp = dir.join(format!(".{name}.{}.{}", std::process::id(), TMP.fetch_add(1, Ordering::Relaxed)));
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(text.as_bytes()))
+            .and_then(|()| std::fs::rename(&tmp, dir.join(name)));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+    }
+    Some(dir)
 }
 
 #[cfg(test)]
@@ -216,7 +298,7 @@ mod tests {
     /// at most). `None` when none of `shells` is installed.
     #[cfg(unix)]
     fn run_snippet_in_pty(shells: &[&str], args: &[&str], term: &str, snippet: &str, script: &str) -> Option<String> {
-        run_in_pty(shells, args, term, snippet, script, true)
+        run_in_pty(shells, args, term, snippet, script, true, &[])
     }
 
     /// [`run_snippet_in_pty`], but the snippet is the scratch HOME's rc file
@@ -224,11 +306,20 @@ mod tests {
     /// as in real use — so `args` must not suppress rc files.
     #[cfg(unix)]
     fn run_rc_in_pty(shells: &[&str], args: &[&str], term: &str, snippet: &str, script: &str) -> Option<String> {
-        run_in_pty(shells, args, term, snippet, script, false)
+        run_in_pty(shells, args, term, snippet, script, false, &[])
     }
 
+    /// `env` is exported to the shell on top of the scratch environment.
     #[cfg(unix)]
-    fn run_in_pty(shells: &[&str], args: &[&str], term: &str, snippet: &str, script: &str, typed: bool) -> Option<String> {
+    fn run_in_pty(
+        shells: &[&str],
+        args: &[&str],
+        term: &str,
+        snippet: &str,
+        script: &str,
+        typed: bool,
+        env: &[(&str, &str)],
+    ) -> Option<String> {
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         use std::io::{Read, Write};
         // Tests run in parallel: one scratch dir per call.
@@ -259,6 +350,9 @@ mod tests {
         cmd.env("TERM", term);
         cmd.env("JETTY", "test");
         cmd.env("PS1", "$ ");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
         cmd.cwd(&dir);
         let mut child = pair.slave.spawn_command(cmd).expect("spawn shell");
         drop(pair.slave);
@@ -502,12 +596,79 @@ mod tests {
     }
 
     #[test]
-    fn opt_in_lines_use_jetty_bin() {
-        // AppImage / tarball installs have no `jetty` on PATH; JeTTY exports
-        // $JETTY_BIN to its shells, so every opt-in line must prefer it.
-        assert!(ZSH.contains(r#""${JETTY_BIN:-jetty}" --print-shell-integration zsh"#));
-        assert!(BASH.contains(r#""${JETTY_BIN:-jetty}" --print-shell-integration bash"#));
-        assert!(FISH.contains(r#""$JETTY_BIN" --print-shell-integration fish"#));
+    fn one_opt_in_line_per_shell_everywhere() {
+        // The same line in each snippet's header, `--help` (printed from these
+        // consts) and the README: they used to drift apart — the `--help` lines
+        // lacked `2>/dev/null` and printed an error at every shell start once
+        // $JETTY_BIN went stale.
+        for (snippet, line) in [(ZSH, ZSH_LINE), (BASH, BASH_LINE), (FISH, FISH_LINE)] {
+            assert!(snippet.contains(&format!("#   {line}\n")), "the snippet's header shows {line}");
+        }
+        let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md")).expect("README.md");
+        for line in [ZSH_LINE, BASH_LINE, FISH_LINE] {
+            assert!(readme.contains(&format!("`{line}`")), "README shows {line}");
+        }
+    }
+
+    /// A fresh directory only we can write, like `$XDG_RUNTIME_DIR`.
+    #[cfg(unix)]
+    fn private_root(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("jetty-si-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_snippets_are_written_once_into_a_private_dir() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = private_root("install");
+        let dir = install_in(&root).expect("installed");
+        assert!(dir.starts_with(&root));
+        assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700, "only we can read or replace them");
+        for (name, text) in [("jetty.zsh", ZSH), ("jetty.bash", BASH), ("jetty.fish", FISH)] {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), text, "{name}");
+        }
+        // The next tab finds them; one that went missing comes back.
+        assert_eq!(install_in(&root), Some(dir.clone()));
+        std::fs::remove_file(dir.join("jetty.bash")).unwrap();
+        assert_eq!(install_in(&root), Some(dir.clone()));
+        assert_eq!(std::fs::read_to_string(dir.join("jetty.bash")).unwrap(), BASH);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "no temp file left behind");
+        // A root other users can write (a shared temp dir): never — a snippet
+        // planted there would run in every shell.
+        let shared = private_root("shared");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(install_in(&shared), None);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&shared);
+    }
+
+    /// The opt-in line, loaded from the rc file as in real use, sources the
+    /// snippet JeTTY wrote for this run — a file: no process per shell, and
+    /// bash 3.2 sources it too (its `source` read nothing from `<(…)`). Without
+    /// `$JETTY_SHELL_INTEGRATION_DIR` (another terminal) it does nothing, silently.
+    #[cfg(unix)]
+    #[test]
+    fn the_rc_line_sources_this_runs_snippet_and_is_silent_elsewhere() {
+        let root = private_root("rc-line");
+        let dir = install_in(&root).expect("installed");
+        let dir = dir.to_str().unwrap();
+        let shells = [(BASHES, &["--noprofile", "-i"][..], "dumb", BASH_LINE), (ZSHES, &["-i"][..], "xterm-256color", ZSH_LINE)];
+        for (shells, args, term, line) in shells {
+            let Some(text) = run_in_pty(shells, args, term, line, "false\nexit\n", false, &[(DIR_VAR, dir)]) else {
+                eprintln!("no {line:?} shell — skipped");
+                continue;
+            };
+            assert!(text.contains("\x1b]133;D;1\x07"), "{line}: the snippet ran:\n{text:?}");
+            let text = run_in_pty(shells, args, term, line, "false\nexit\n", false, &[]).unwrap();
+            assert!(!text.contains("\x1b]133;"), "{line}: no marks elsewhere:\n{text:?}");
+            assert!(!text.contains("jetty."), "{line}: and no error about the file:\n{text:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

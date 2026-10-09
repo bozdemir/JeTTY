@@ -616,6 +616,9 @@ const INHERITED_ENV_DENYLIST: &[&str] = &[
     // The launching terminal's dark/light hint: JeTTY sets its own from the
     // theme on screen (`PtySession::spawn_with_env`).
     "COLORFGBG",
+    // Another JeTTY's shell-integration snippets (this one was started from
+    // its shell): the app exports this run's own, when it could write them.
+    "JETTY_SHELL_INTEGRATION_DIR",
 ];
 
 /// `(variable, marker)`: git hooks a VS Code / Cursor terminal sets — its
@@ -1012,8 +1015,10 @@ impl PtySession {
             cmd.env("SHELL_SESSIONS_DISABLE", "1");
             // Shell-integration handshake (OSC 133). Advertise JeTTY so an opt-in
             // rc snippet can activate ONLY under JeTTY and feature-detect it, and
-            // hand the shell an absolute path to this exe so the snippet needs no
-            // PATH lookup: `source <($JETTY_BIN --print-shell-integration zsh)`.
+            // hand the shell an absolute path to this exe, to run it with no
+            // PATH lookup (the older opt-in line runs
+            // `$JETTY_BIN --print-shell-integration zsh`). The app adds where
+            // this run's snippets are (`$JETTY_SHELL_INTEGRATION_DIR`).
             let ver = advertised_version();
             cmd.env("TERM_PROGRAM", "jetty");
             cmd.env("TERM_PROGRAM_VERSION", &ver);
