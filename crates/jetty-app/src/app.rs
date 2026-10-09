@@ -7832,6 +7832,7 @@ impl App {
         // bar, inside the padding and the scrollbar gutter.
         let (w, h) = (gpu.config.width as f32, gpu.config.height as f32);
         let (cols, rows) = self.main_grid_dims_at(w, h, self.chrome_metrics().dpi, cw, ch);
+        let active_before = self.tabs.get(self.active).map(|t| (t.terminal.cols(), t.terminal.rows()));
         // Reflow every tab so background sessions stay in sync with the window.
         for tab in &mut self.tabs {
             tab.terminal.resize(cols, rows);
@@ -7844,6 +7845,12 @@ impl App {
                 (cols as f32 * cw).min(65535.0) as u16,
                 (rows as f32 * ch).min(65535.0) as u16,
             );
+        }
+        // Copy-mode's cursor and anchor are old-grid coordinates.
+        if let (Some(before), Some(cm), Some(tab)) =
+            (active_before, self.ov.copy_mode.as_mut(), self.tabs.get_mut(self.active))
+        {
+            crate::copymode::after_resize(cm, &mut tab.terminal, before);
         }
         // Every background shell just got a SIGWINCH from US: their prompt
         // repaints are self-inflicted, not "unseen output" — arm the activity
@@ -11273,7 +11280,11 @@ impl ApplicationHandler<AppEvent> for App {
                     dw.reflow_pending_at = None;
                     let (cw, ch) = dw.text.cell_size();
                     let (cols, rows) = dw.fit_grid_dims(ui_font, show_hud, gutter, padding);
+                    let before = (dw.tab.terminal.cols(), dw.tab.terminal.rows());
                     dw.tab.terminal.resize(cols, rows);
+                    if let Some(cm) = dw.ov.copy_mode.as_mut() {
+                        crate::copymode::after_resize(cm, &mut dw.tab.terminal, before);
+                    }
                     dw.tab.terminal.set_cell_px(cw, ch);
                     dw.tab.pty.resize(
                         cols as u16,

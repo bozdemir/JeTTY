@@ -139,6 +139,22 @@ pub fn leave(cm: &CopyMode, term: &mut jetty_core::Terminal) {
     term.scroll_to_offset(cm.entry_offset);
 }
 
+/// The grid under copy-mode was just resized from `before` = `(cols, rows)`.
+/// When its size changed the text reflowed, so an active selection's anchor no
+/// longer names the same text: drop the selection (back to moving the cursor)
+/// and keep the cursor inside the new grid. A same-size resize is a no-op.
+pub fn after_resize(cm: &mut CopyMode, term: &mut jetty_core::Terminal, before: (usize, usize)) {
+    if (term.cols(), term.rows()) == before {
+        return;
+    }
+    cm.row = cm.row.min(term.rows().saturating_sub(1));
+    cm.col = cm.col.min(term.cols().saturating_sub(1));
+    if cm.selecting {
+        cm.selecting = false;
+        term.selection_clear();
+    }
+}
+
 /// The result of a motion: the new cursor cell + a scroll request.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MotionOut {
@@ -522,6 +538,35 @@ mod tests {
         t.selection_start_block_abs(top, 2, a_left);
         t.selection_update_abs(top + 1, 2, c_left);
         assert_eq!(t.selection_text().as_deref(), Some("c\nc"));
+    }
+
+    #[test]
+    fn a_resize_keeps_the_cursor_inside_and_drops_a_stale_selection() {
+        // Shrinking the window under copy-mode left the cursor outside the new
+        // grid (drawn off-screen) and the anchor naming other text after the
+        // reflow, so the next motion selected the wrong lines.
+        let mut t = jetty_core::Terminal::new(20, 10);
+        for i in 0..30 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let mut m = CopyMode::new(9, 15);
+        assert!(m.select(SelKind::Chars, t.viewport_line_to_buffer(9)));
+        t.selection_start(9, 15, true);
+        t.selection_update(9, 15, false);
+        let before = (t.cols(), t.rows());
+        t.resize(10, 4);
+        after_resize(&mut m, &mut t, before);
+        assert_eq!((m.row, m.col), (3, 9), "clamped into the 10×4 grid");
+        assert!(!m.selecting, "back to moving the cursor");
+        assert_eq!(t.selection_text(), None);
+        // A same-size reflow (a font change that kept the grid) changes nothing.
+        let mut m = CopyMode::new(1, 2);
+        assert!(m.select(SelKind::Lines, t.viewport_line_to_buffer(1)));
+        t.selection_start_lines(1);
+        let same = (t.cols(), t.rows());
+        after_resize(&mut m, &mut t, same);
+        assert!(m.selecting);
+        assert!(t.selection_text().is_some());
     }
 
     #[test]
