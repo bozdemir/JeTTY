@@ -1871,6 +1871,11 @@ impl Terminal {
                             start = self.kitty_kbd_csi(bytes, start, i, marker, n, odd);
                             self.scan = Scan::Ground;
                         }
+                        // XTVERSION (`CSI > q`, `CSI > 0 q`), which vte drops.
+                        b'q' if marker == b'>' && n == 0 && seps == 0 && !odd => {
+                            start = self.xtversion(bytes, start, i);
+                            self.scan = Scan::Ground;
+                        }
                         // Any other final byte (`CSI > 4 ; 2 m`, `CSI > c`, …).
                         0x40..=0x7e => self.scan = Scan::Ground,
                         // ESC restarts, CAN/SUB abort (vte's "anywhere" rules).
@@ -2486,6 +2491,23 @@ impl Terminal {
             _ => {}
         }
         i
+    }
+
+    /// Answer XTVERSION (`CSI > q`, final byte at `bytes[i]`) with the
+    /// terminal's name and version — `DCS > | JeTTY(0.27.0) ST` — so programs
+    /// (tmux, notcurses, yazi…) can tell which terminal they run in; vte drops
+    /// the query. Caught up first (a synchronized update applied) so the reply
+    /// keeps its place among alacritty's own. Returns the new `start`.
+    #[cold]
+    #[inline(never)]
+    fn xtversion(&mut self, bytes: &[u8], start: usize, i: usize) -> usize {
+        self.advance_slice(&bytes[start..=i]);
+        if self.sync_deadline().is_some() {
+            self.flush_sync();
+        }
+        let reply = format!("\x1bP>|JeTTY({})\x1b\\", crate::pty::advertised_version());
+        let _ = self.reply_tx.send(reply.into_bytes());
+        i + 1
     }
 
     /// alacritty just cleared BOTH kitty keyboard stacks (RIS, a protocol toggle).
@@ -7281,6 +7303,30 @@ mod tests {
             t.feed(format!("new {i}\r\n").as_bytes());
         }
         assert_eq!(t.snapshot().row_text(0), before, "viewport content did not move");
+    }
+
+    #[test]
+    fn xtversion_names_the_terminal() {
+        let name = format!("\x1bP>|JeTTY({})\x1b\\", crate::pty::advertised_version());
+        let da1 = String::from_utf8_lossy(crate::handler::DA1_REPLY).into_owned();
+        let reply = |seq: &[u8], cut: usize| {
+            let mut t = Terminal::new(20, 3);
+            t.feed(&seq[..cut]);
+            t.feed(&seq[cut..]);
+            String::from_utf8_lossy(&t.drain_pty_writes()).into_owned()
+        };
+        // Answered at any feed split, in order after a DA1 earlier in the read
+        // (also when both sit in a synchronized update vte is still buffering).
+        for seq in [&b"\x1b[>q"[..], b"\x1b[>0q", b"\x1b[c\x1b[>q", b"\x1b[?2026h\x1b[c\x1b[>q"] {
+            let want = if seq.ends_with(b"[>q") && seq.len() > 4 { format!("{da1}{name}") } else { name.clone() };
+            for cut in 0..=seq.len() {
+                assert_eq!(reply(seq, cut), want, "{:?} cut at {cut}", String::from_utf8_lossy(seq));
+            }
+        }
+        // Other `CSI > … q` forms are not XTVERSION.
+        for seq in [&b"\x1b[>1q"[..], b"\x1b[>0;1q", b"\x1b[>$q", b"\x1b[>c"] {
+            assert!(!reply(seq, 0).contains("JeTTY"), "{:?}", String::from_utf8_lossy(seq));
+        }
     }
 
     #[test]

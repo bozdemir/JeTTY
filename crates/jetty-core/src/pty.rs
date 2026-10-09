@@ -18,7 +18,7 @@ pub fn set_advertised_version(version: &str) {
 }
 
 /// The advertised version, defaulting to the crate version when unset.
-fn advertised_version() -> String {
+pub(crate) fn advertised_version() -> String {
     ADVERTISED_VERSION
         .get()
         .cloned()
