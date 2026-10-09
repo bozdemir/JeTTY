@@ -929,7 +929,8 @@ pub struct TextLayer {
     /// screens of rows (LRU) so scrolling back and forth keeps hitting.
     row_cache: Vec<ShapedRow>,
     /// `shape_gen` the row cache was built under; a mismatch (font family/size,
-    /// resize) drops every cached row.
+    /// routing) drops every cached row. A window resize keeps them: rows never
+    /// wrap, and the prepare check compares the window size.
     row_cache_gen: u64,
     /// Bumped once per frame that re-prepares the grid (row-cache LRU clock).
     frame_no: u64,
@@ -996,8 +997,8 @@ pub struct TextLayer {
     /// bound (F25). Chars visible in the current frame are never evicted.
     fallback_order: std::collections::VecDeque<char>,
     /// Monotonic counter bumped whenever a change invalidates shaped grid content
-    /// (font family, font size, resize): it drops the row cache and forces the next
-    /// frame to re-prepare even when the grid text/colors are unchanged.
+    /// (font family, font size, routing): it drops the row cache and forces the
+    /// next frame to re-prepare even when the grid text/colors are unchanged.
     shape_gen: u64,
     /// Cached underline/strikethrough quads (placed at the grid origin) and the
     /// key they were built for: `(grid_decoration_key, cell_w bits, cell_h bits,
@@ -1037,6 +1038,9 @@ pub struct TextLayer {
     custom_scratch: Vec<CustomGlyph>,
     /// The (empty) buffer of the text area that carries the built-in glyphs.
     empty_buffer: Buffer,
+    /// Grid rows shaped so far (tests assert what a frame re-shapes).
+    #[cfg(test)]
+    rows_shaped: usize,
 }
 
 impl TextLayer {
@@ -1206,6 +1210,8 @@ impl TextLayer {
             underline,
             custom_scratch: Vec::new(),
             empty_buffer: Buffer::new_empty(metrics),
+            #[cfg(test)]
+            rows_shaped: 0,
         }
     }
 
@@ -1573,14 +1579,6 @@ impl TextLayer {
     /// glyphs, under the cursor).
     pub fn decoration_rects(&self) -> &[crate::quad::Rect] {
         &self.deco_rects
-    }
-
-    pub fn resize(&mut self, gpu: &GpuContext) {
-        // Rows never wrap (no width bound) and the viewport is updated per frame,
-        // so nothing here depends on the new size; the bump just guarantees the
-        // next frame re-prepares from freshly shaped rows.
-        self.shape_gen = self.shape_gen.wrapping_add(1);
-        let _ = gpu;
     }
 
     /// How the primary terminal font must render `c` in a cell of style `shape`
@@ -2106,6 +2104,10 @@ impl TextLayer {
         row.last_used = frame;
         self.text_scratch = text;
         self.cell_ranges_scratch = runs;
+        #[cfg(test)]
+        {
+            self.rows_shaped += 1;
+        }
     }
 
     /// Shape each DISTINCT overdraw char once into a cached buffer with
@@ -3379,13 +3381,9 @@ mod tests {
         eprintln!("{checked} monospace families aligned in all four styles");
     }
 
-    /// GPU: `render_chrome` (quads + mono labels + titles in ONE pass) draws
-    /// exactly the pixels of the pass-per-layer sequence it replaces — the main
-    /// window's tab bar + status strip. `#[ignore]`: needs a GPU adapter (the
-    /// low-power one). Run: `cargo test -p jetty-render chrome_in_one -- --ignored`.
-    #[test]
-    #[ignore]
-    fn chrome_in_one_pass_matches_a_pass_per_layer() {
+    /// A device on the low-power adapter, for the GPU tests — `#[ignore]`d, as
+    /// they need an adapter. Run: `cargo test -p jetty-render -- --ignored`.
+    fn test_device() -> (wgpu::Device, wgpu::Queue) {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -3396,8 +3394,38 @@ mod tests {
             force_fallback_adapter: false,
         }))
         .expect("adapter");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device")
+    }
+
+    /// GPU: a window resize (a border drag delivers one per frame, while the
+    /// grid reflow is debounced) re-prepares the glyphs for the new size but
+    /// re-shapes no row: rows never wrap, so their shaped buffers stay valid.
+    #[test]
+    #[ignore]
+    fn a_window_resize_reprepares_without_reshaping_a_row() {
+        let (device, queue) = test_device();
+        let mut text = TextLayer::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb, 16.0);
+        let snap = plain_grid(80, 24);
+        let origin = crate::GridOrigin::new(0.0, 0.0);
+        text.prepare_grid(&device, &queue, 800, 600, &snap, origin, &GridPaint::default()).unwrap();
+        let shaped = text.rows_shaped;
+        assert!(shaped > 0);
+        for (w, h) in [(812, 600), (830, 640), (800, 600)] {
+            text.prepare_grid(&device, &queue, w, h, &snap, origin, &GridPaint::default()).unwrap();
+            let size = text.prepared.as_ref().map(|p| (p.width, p.height));
+            assert_eq!(size, Some((w, h)), "prepared for the new size");
+        }
+        assert_eq!(text.rows_shaped, shaped, "a resize re-shaped rows");
+    }
+
+    /// GPU: `render_chrome` (quads + mono labels + titles in ONE pass) draws
+    /// exactly the pixels of the pass-per-layer sequence it replaces — the main
+    /// window's tab bar + status strip. `#[ignore]`: needs a GPU adapter (the
+    /// low-power one). Run: `cargo test -p jetty-render chrome_in_one -- --ignored`.
+    #[test]
+    #[ignore]
+    fn chrome_in_one_pass_matches_a_pass_per_layer() {
+        let (device, queue) = test_device();
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let (w, h) = (640u32, 200u32);
         let cm = crate::ChromeMetrics::new(1.0, crate::UI_FONT_BASE);

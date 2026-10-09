@@ -11179,8 +11179,6 @@ impl App {
             WindowEvent::Resized(size) => {
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 dw.gpu.resize(size.width, size.height);
-                dw.text.resize(&dw.gpu);
-                dw.chrome_text.resize(&dw.gpu);
                 // Same stale-cache rule as the main window: the context menu's
                 // hit rects were clamped against the old size — close it.
                 dw.menu_open = None;
@@ -12760,9 +12758,6 @@ impl App {
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.settings_gpu {
                     gpu.resize(size.width, size.height);
-                }
-                if let (Some(gpu), Some(text)) = (&self.settings_gpu, &mut self.settings_text) {
-                    text.resize(gpu);
                 }
                 self.request_settings_paint();
             }
@@ -14348,9 +14343,6 @@ impl ApplicationHandler<AppEvent> for App {
                 self.top_flush_dirty = true;
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
-                }
-                if let (Some(gpu), Some(text)) = (&self.gpu, &mut self.text) {
-                    text.resize(gpu);
                 }
                 // A resize invalidates the menus' cached absolute hit rects
                 // (built at open against the OLD window size) — close them so
