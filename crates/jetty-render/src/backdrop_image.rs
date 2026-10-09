@@ -162,9 +162,82 @@ fn check_dims(w: u32, h: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Decode PNG or JPEG bytes into straight RGBA8. Dimensions are checked from
-/// the header before the frame buffer is allocated.
+/// Decode PNG or JPEG bytes into straight RGBA8, upright: a photo's EXIF
+/// orientation (a phone stores portrait shots turned) is applied. Dimensions
+/// are checked from the header before the frame buffer is allocated.
 pub fn decode_bytes(data: &[u8]) -> Result<RawImage, String> {
+    decode_stored(data).map(|(raw, o)| orient(raw, o))
+}
+
+/// The EXIF Orientation (tag 0x0112) of a TIFF-structured EXIF block — what a
+/// JPEG's APP1 "Exif" segment and a PNG's eXIf chunk carry (a leading
+/// "Exif\0\0" is skipped): 1..=8, 1 = as stored. `None` when absent or
+/// malformed. Reads IFD0 only; every access is bounds-checked (the bytes come
+/// from an untrusted file).
+pub fn exif_orientation(exif: &[u8]) -> Option<u8> {
+    let tiff = exif.strip_prefix(b"Exif\0\0").unwrap_or(exif);
+    let le = match tiff.get(..4)? {
+        [b'I', b'I', 42, 0] => true,
+        [b'M', b'M', 0, 42] => false,
+        _ => return None,
+    };
+    let bytes = |at: usize, n: usize| tiff.get(at..at.checked_add(n)?);
+    let u16_at = |at: usize| -> Option<u16> {
+        let b: [u8; 2] = bytes(at, 2)?.try_into().ok()?;
+        Some(if le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) })
+    };
+    let u32_at = |at: usize| -> Option<u32> {
+        let b: [u8; 4] = bytes(at, 4)?.try_into().ok()?;
+        Some(if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+    };
+    let ifd = usize::try_from(u32_at(4)?).ok()?;
+    for i in 0..usize::from(u16_at(ifd)?) {
+        let entry = ifd.checked_add(2 + i * 12)?;
+        if u16_at(entry)? != 0x0112 {
+            continue;
+        }
+        // One SHORT: the value sits in the first two bytes of the value field.
+        if u16_at(entry + 2)? != 3 {
+            return None;
+        }
+        return u8::try_from(u16_at(entry + 8)?).ok().filter(|o| (1..=8).contains(o));
+    }
+    None
+}
+
+/// `raw` turned upright for EXIF orientation `o`: 2 / 4 mirror it, 3 turns it
+/// 180°, 6 / 8 turn it 90° clockwise / counter-clockwise, 5 / 7 transpose it
+/// across either diagonal (5..=8 swap width and height). Any other value — and
+/// a buffer that does not match its size — leaves it as stored.
+pub fn orient(raw: RawImage, o: u8) -> RawImage {
+    let (w, h) = (raw.w as usize, raw.h as usize);
+    if !(2..=8).contains(&o) || raw.rgba.len() != w * h * 4 {
+        return raw;
+    }
+    let (ow, oh) = if o >= 5 { (h, w) } else { (w, h) };
+    let mut out = vec![0u8; raw.rgba.len()];
+    for y in 0..oh {
+        for x in 0..ow {
+            // The stored pixel shown at (x, y).
+            let (sx, sy) = match o {
+                2 => (w - 1 - x, y),
+                3 => (w - 1 - x, h - 1 - y),
+                4 => (x, h - 1 - y),
+                5 => (y, x),
+                6 => (y, h - 1 - x),
+                7 => (w - 1 - y, h - 1 - x),
+                _ => (w - 1 - y, x),
+            };
+            let (s, d) = ((sy * w + sx) * 4, (y * ow + x) * 4);
+            out[d..d + 4].copy_from_slice(&raw.rgba[s..s + 4]);
+        }
+    }
+    RawImage { w: ow as u32, h: oh as u32, rgba: out }
+}
+
+/// Decode PNG or JPEG bytes into straight RGBA8 in the file's STORED
+/// orientation, plus the EXIF orientation that shows it upright (1 = none).
+fn decode_stored(data: &[u8]) -> Result<(RawImage, u8), String> {
     match sniff(data) {
         Some(ImageKind::Png) => decode_png(data),
         Some(ImageKind::Jpeg) => decode_jpeg(data),
@@ -182,7 +255,7 @@ fn decode_error(kind: &str, detail: &str) -> String {
     format!("bad {kind} ({d})")
 }
 
-fn decode_png(data: &[u8]) -> Result<RawImage, String> {
+fn decode_png(data: &[u8]) -> Result<(RawImage, u8), String> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     decoder.set_limits(png::Limits { bytes: PNG_LIMIT_BYTES });
@@ -230,10 +303,12 @@ fn decode_png(data: &[u8]) -> Result<RawImage, String> {
         // Indexed is expanded by EXPAND; anything else is unexpected.
         _ => return Err("unsupported PNG color type".into()),
     }
-    Ok(RawImage { w, h, rgba })
+    // An eXIf chunk (before the image data) may say how to show it.
+    let orientation = reader.info().exif_metadata.as_deref().and_then(exif_orientation).unwrap_or(1);
+    Ok((RawImage { w, h, rgba }, orientation))
 }
 
-fn decode_jpeg(data: &[u8]) -> Result<RawImage, String> {
+fn decode_jpeg(data: &[u8]) -> Result<(RawImage, u8), String> {
     use zune_jpeg::zune_core::bytestream::ZCursor;
     use zune_jpeg::zune_core::colorspace::ColorSpace;
     use zune_jpeg::zune_core::options::DecoderOptions;
@@ -246,12 +321,15 @@ fn decode_jpeg(data: &[u8]) -> Result<RawImage, String> {
     let info = decoder.info().ok_or("bad JPEG (no header)")?;
     let (w, h) = (info.width as u32, info.height as u32);
     check_dims(w, h)?;
+    // A camera / phone photo's APP1 EXIF says how to show it (portrait shots
+    // are stored turned).
+    let orientation = decoder.exif().and_then(|e| exif_orientation(e)).unwrap_or(1);
     let pixels = decoder.decode().map_err(|e| decode_error("JPEG", &format!("{e:?}")))?;
     let px = w as usize * h as usize;
     if pixels.len() != px * 4 {
         return Err("bad JPEG (unexpected output size)".into());
     }
-    Ok(RawImage { w, h, rgba: pixels })
+    Ok((RawImage { w, h, rgba: pixels }, orientation))
 }
 
 // ── Premultiply / resample / blur ────────────────────────────────────────────
@@ -494,17 +572,30 @@ pub fn blur_radius(blur: f32) -> u32 {
     (blur.clamp(0.0, 1.0) * 24.0).round() as u32
 }
 
-/// Turn a decoded frame into an upload-ready [`DecodedImage`]: premultiply,
-/// downscale to cover `max_w`×`max_h`, optionally blur (at ¼ size), build the
-/// mips and measure the luminance percentiles.
-pub fn prepare(mut raw: RawImage, max_w: u32, max_h: u32, blur: f32) -> DecodedImage {
+/// Turn a decoded (upright) frame into an upload-ready [`DecodedImage`]:
+/// premultiply, downscale to cover `max_w`×`max_h`, optionally blur (at ¼
+/// size), build the mips and measure the luminance percentiles.
+pub fn prepare(raw: RawImage, max_w: u32, max_h: u32, blur: f32) -> DecodedImage {
+    prepare_oriented((raw, 1), max_w, max_h, blur)
+}
+
+/// [`prepare`] for a frame in its stored orientation plus the EXIF
+/// orientation that shows it upright: laid out upright, but downscaled while
+/// still stored and turned afterwards — the turn copies the small image, never
+/// the full-size decode.
+fn prepare_oriented((mut raw, orientation): (RawImage, u8), max_w: u32, max_h: u32, blur: f32) -> DecodedImage {
     premultiply(&mut raw);
-    let (lw, lh) = layout_size(raw.w, raw.h, max_w, max_h);
-    let mut level0 = if (lw, lh) == (raw.w, raw.h) {
-        MipLevel { w: raw.w, h: raw.h, rgba: raw.rgba }
+    let turned = (5..=8).contains(&orientation);
+    let (ow, oh) = if turned { (raw.h, raw.w) } else { (raw.w, raw.h) };
+    let (lw, lh) = layout_size(ow, oh, max_w, max_h);
+    let (sw, sh) = if turned { (lh, lw) } else { (lw, lh) };
+    let stored = if (sw, sh) == (raw.w, raw.h) {
+        raw
     } else {
-        MipLevel { w: lw, h: lh, rgba: resize_area(&raw.rgba, raw.w, raw.h, lw, lh) }
+        RawImage { w: sw, h: sh, rgba: resize_area(&raw.rgba, raw.w, raw.h, sw, sh) }
     };
+    let up = orient(stored, orientation);
+    let mut level0 = MipLevel { w: up.w, h: up.h, rgba: up.rgba };
     let radius = blur_radius(blur);
     let blurred = radius > 0;
     if blurred {
@@ -531,7 +622,7 @@ pub fn load(path: &Path, max_w: u32, max_h: u32, blur: f32) -> Result<DecodedIma
         return Err(format!("the file is larger than {} MB", MAX_FILE_BYTES / (1024 * 1024)));
     }
     let data = std::fs::read(path).map_err(|e| format!("cannot read it ({e})"))?;
-    std::panic::catch_unwind(move || decode_bytes(&data).map(|raw| prepare(raw, max_w, max_h, blur)))
+    std::panic::catch_unwind(move || decode_stored(&data).map(|d| prepare_oriented(d, max_w, max_h, blur)))
         .unwrap_or_else(|_| Err("the decoder failed on this file".into()))
 }
 
@@ -582,6 +673,112 @@ mod tests {
         assert!(px(2, 4)[0] > 200 && px(2, 4)[2] < 60, "{:?}", px(2, 4));
         assert!(px(13, 4)[2] > 200 && px(13, 4)[0] < 60, "{:?}", px(13, 4));
         assert!(raw.rgba.chunks_exact(4).all(|p| p[3] == 255));
+    }
+
+    /// The 16×8 red|blue picture as a phone stores it: pixels turned 90° CCW
+    /// (8×16) and EXIF Orientation 6 ("rotate 90° CW to display").
+    const JPEG_16X8_EXIF6: &[u8] = include_bytes!("../tests/fixtures/backdrop-16x8-exif6.jpg");
+
+    /// A minimal TIFF block (either byte order) whose IFD0 holds an unrelated
+    /// tag, then Orientation `o`.
+    fn exif_tiff(o: u16, big_endian: bool) -> Vec<u8> {
+        let u16b = |v: u16| if big_endian { v.to_be_bytes() } else { v.to_le_bytes() };
+        let u32b = |v: u32| if big_endian { v.to_be_bytes() } else { v.to_le_bytes() };
+        let mut t = Vec::new();
+        t.extend_from_slice(if big_endian { b"MM" } else { b"II" });
+        t.extend_from_slice(&u16b(42));
+        t.extend_from_slice(&u32b(8)); // IFD0 right after the header
+        t.extend_from_slice(&u16b(2)); // two entries: an unrelated tag, then Orientation
+        t.extend_from_slice(&u16b(0x010F)); // Make (ASCII) — skipped
+        t.extend_from_slice(&u16b(2));
+        t.extend_from_slice(&u32b(4));
+        t.extend_from_slice(b"abc\0");
+        t.extend_from_slice(&u16b(0x0112));
+        t.extend_from_slice(&u16b(3)); // SHORT
+        t.extend_from_slice(&u32b(1));
+        t.extend_from_slice(&u16b(o));
+        t.extend_from_slice(&[0, 0]);
+        t.extend_from_slice(&u32b(0)); // no next IFD
+        t
+    }
+
+    #[test]
+    fn exif_orientation_is_read_from_either_byte_order() {
+        for o in 1..=8u16 {
+            assert_eq!(exif_orientation(&exif_tiff(o, false)), Some(o as u8));
+            assert_eq!(exif_orientation(&exif_tiff(o, true)), Some(o as u8));
+        }
+        // A PNG eXIf written with the JPEG APP1 "Exif\0\0" prefix still reads.
+        let mut prefixed = b"Exif\0\0".to_vec();
+        prefixed.extend(exif_tiff(6, false));
+        assert_eq!(exif_orientation(&prefixed), Some(6));
+        // Out of range, truncated, garbage, empty: no orientation (and no panic).
+        assert_eq!(exif_orientation(&exif_tiff(9, false)), None);
+        assert_eq!(exif_orientation(&exif_tiff(0, true)), None);
+        let t = exif_tiff(6, false);
+        for cut in 0..t.len() {
+            let _ = exif_orientation(&t[..cut]);
+        }
+        assert_eq!(exif_orientation(&t[..20]), None);
+        assert_eq!(exif_orientation(b"II*\0\xff\xff\xff\xff"), None, "IFD offset past the end");
+        assert_eq!(exif_orientation(&[]), None);
+    }
+
+    #[test]
+    fn every_exif_orientation_turns_the_picture_upright() {
+        // Stored 3×2:  a b c / d e f  (one byte per pixel tells them apart).
+        let stored = || RawImage { w: 3, h: 2, rgba: (0..6u8).flat_map(|v| [b'a' + v, 0, 0, 255]).collect() };
+        let shown = |r: &RawImage| -> (u32, u32, String) {
+            (r.w, r.h, r.rgba.chunks_exact(4).map(|p| p[0] as char).collect())
+        };
+        for (o, want) in [
+            (1, (3, 2, "abcdef")),
+            (2, (3, 2, "cbafed")),
+            (3, (3, 2, "fedcba")),
+            (4, (3, 2, "defabc")),
+            (5, (2, 3, "adbecf")),
+            (6, (2, 3, "daebfc")),
+            (7, (2, 3, "fcebda")),
+            (8, (2, 3, "cfbead")),
+            (0, (3, 2, "abcdef")),
+            (42, (3, 2, "abcdef")),
+        ] {
+            assert_eq!(shown(&orient(stored(), o)), (want.0, want.1, want.2.to_string()), "orientation {o}");
+        }
+    }
+
+    #[test]
+    fn an_exif_rotated_jpeg_decodes_upright() {
+        let raw = decode_bytes(JPEG_16X8_EXIF6).unwrap();
+        assert_eq!((raw.w, raw.h), (16, 8), "a phone photo is shown the way it was taken");
+        let px = |x: usize, y: usize| &raw.rgba[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4];
+        assert!(px(2, 4)[0] > 200 && px(2, 4)[2] < 60, "red on the left: {:?}", px(2, 4));
+        assert!(px(13, 4)[2] > 200 && px(13, 4)[0] < 60, "blue on the right: {:?}", px(13, 4));
+        // …and through the whole load path (downscale first, then turned).
+        let img = prepare_oriented(decode_stored(JPEG_16X8_EXIF6).unwrap(), 4, 4, 0.0);
+        assert_eq!((img.layout_w, img.layout_h), (8, 4), "covers 4×4 in the upright aspect");
+        let l0 = &img.mips[0];
+        assert_eq!((l0.w, l0.h), (8, 4));
+        assert!(l0.rgba[(2 * 8) * 4] > 200 && l0.rgba[(2 * 8 + 7) * 4 + 2] > 200, "red left, blue right");
+    }
+
+    #[test]
+    fn a_png_exif_chunk_orients_it_too() {
+        // A 2×1 red|blue picture stored turned 90° CCW (1×2: blue over red)
+        // with an eXIf chunk saying "rotate 90° CW" (6): shown red|blue again.
+        let mut png = png_bytes(1, 2, &[0, 0, 255, 255, 255, 0, 0, 255]);
+        let tiff = exif_tiff(6, true);
+        let mut chunk = (tiff.len() as u32).to_be_bytes().to_vec();
+        chunk.extend_from_slice(b"eXIf");
+        chunk.extend_from_slice(&tiff);
+        let crc = crc32(&chunk[4..]);
+        chunk.extend_from_slice(&crc.to_be_bytes());
+        // After the 8-byte signature and the 25-byte IHDR chunk.
+        png.splice(33..33, chunk);
+        let raw = decode_bytes(&png).unwrap();
+        assert_eq!((raw.w, raw.h), (2, 1));
+        assert_eq!(&raw.rgba[..4], &[255, 0, 0, 255], "red on the left");
+        assert_eq!(&raw.rgba[4..], &[0, 0, 255, 255], "blue on the right");
     }
 
     #[test]
