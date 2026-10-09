@@ -26,17 +26,22 @@ pub const NO_GPU_HELP: &str = "jetty: no graphics driver can draw the window —
 or OpenGL 3.3 / OpenGL ES 3.0 through EGL. Install your GPU's Vulkan driver or Mesa's \
 EGL/OpenGL drivers, then start JeTTY again.";
 
-/// The descriptor of an instance [`GpuContext::new`] creates for `backends`. Only
-/// an instance with the GL backend carries the platform display
-/// ([`set_platform_display`]) — GL presents through it; Vulkan never reads it, so
-/// the Vulkan-first instance stays exactly as it was.
-fn instance_descriptor(backends: wgpu::Backends) -> wgpu::InstanceDescriptor {
+/// The descriptor of an instance JeTTY creates for `backends` ([`GpuContext::new`];
+/// jetty-shot and jetty-bench use it too, so they measure and draw on the same
+/// device setup). Only an instance with the GL backend carries the platform
+/// display ([`set_platform_display`]) — GL presents through it; Vulkan never reads
+/// it. wgpu's indirect-call validation is off: JeTTY issues no indirect draws or
+/// dispatches, and that validation (on by default in release builds) compiled two
+/// compute pipelines into every device creation — ~2 ms of cold start on Vulkan
+/// (Intel iGPU, lavapipe), ~3.5 ms on GL (llvmpipe).
+pub fn instance_descriptor(backends: wgpu::Backends) -> wgpu::InstanceDescriptor {
     let display = if backends.contains(wgpu::Backends::GL) {
         PLATFORM_DISPLAY.get().map(|d| Box::new(Arc::clone(d)) as Box<dyn WgpuHasDisplayHandle>)
     } else {
         None
     };
-    wgpu::InstanceDescriptor { backends, display, ..wgpu::InstanceDescriptor::new_without_display_handle() }
+    let flags = wgpu::InstanceFlags::default() - wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL;
+    wgpu::InstanceDescriptor { backends, display, flags, ..wgpu::InstanceDescriptor::new_without_display_handle() }
 }
 
 /// The GPU objects every JeTTY window shares: ONE wgpu instance, adapter, device
@@ -626,6 +631,21 @@ mod tests {
         assert!(instance_descriptor(Backends::VULKAN).display.is_none(), "the Vulkan path is unchanged");
         assert!(instance_descriptor(Backends::all()).display.is_some(), "GL presents through the display");
         assert!(instance_descriptor(Backends::GL).display.is_some());
+    }
+
+    /// JeTTY issues no indirect draws or dispatches: wgpu's indirect-call
+    /// validation (on by default in release builds) only compiled two compute
+    /// pipelines into every device creation — ~2 ms of cold start on Vulkan,
+    /// ~3.5 ms on GL.
+    #[test]
+    fn no_instance_pays_for_indirect_call_validation() {
+        for backends in [Backends::VULKAN, Backends::all()] {
+            let flags = instance_descriptor(backends).flags;
+            assert!(!flags.contains(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL), "{backends:?}");
+            // Everything else stays as wgpu's build-type default.
+            assert_eq!(flags | wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL,
+                wgpu::InstanceFlags::default() | wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+        }
     }
 
     /// OpenGL ES 3.0 without EXT_color_buffer_float cannot render to

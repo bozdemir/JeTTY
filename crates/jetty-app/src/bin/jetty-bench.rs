@@ -109,10 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok("high") | Ok("discrete") | Ok("dgpu") => wgpu::PowerPreference::HighPerformance,
         _ => wgpu::PowerPreference::LowPower,
     };
-    let mut instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
+    let mut instance = wgpu::Instance::new(jetty_render::instance_descriptor(wgpu::Backends::VULKAN));
     let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: power,
         compatible_surface: None,
@@ -120,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })) {
         Ok(a) => a,
         Err(_) => {
-            instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            instance = wgpu::Instance::new(jetty_render::instance_descriptor(wgpu::Backends::all()));
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: power,
                 compatible_surface: None,
