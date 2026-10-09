@@ -40,8 +40,8 @@ git clone https://github.com/bozdemir/JeTTY.git && cd JeTTY
 # Debug build (faster compile, some perf loss)
 cargo build
 
-# Release build — always use this before manual testing (the user runs the
-# release binary directly; debug builds are noticeably slower)
+# Release build — always use this before manual testing (debug builds are
+# noticeably slower)
 cargo build --release --bin jetty
 ./target/release/jetty
 
@@ -129,13 +129,13 @@ will be asked to fix it before merge.
 
 2. **No desktop-environment-specific code.** No KDE/GNOME/compositor-specific
    libraries, detection, or behaviour branches. Everything must work on any
-   X11 or Wayland compositor (and macOS). See project memory for the history
-   of why this rule exists.
+   X11 or Wayland compositor (and macOS).
 
 3. **Whole-codebase chrome theming.** Every UI surface (panel, menus, tab bar,
    welcome overlay, confirm dialogs, help overlay) must re-skin with the active
-   theme. If you add a new surface, derive its colours from `theme.bg`/`theme.fg`
-   the same way `panel.rs` and `help.rs` do — never hardcode a colour.
+   theme. If you add a new surface, take its colours from the shared
+   `UiPalette` (`UiPalette::cached(theme)`, as `panel.rs`, `help.rs` and
+   `confirm.rs` do) — never hardcode a colour.
 
 ## Pull request steps
 
