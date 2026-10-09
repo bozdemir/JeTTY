@@ -6635,11 +6635,13 @@ impl App {
     /// Drop the transient state that belonged to the previously active tab once
     /// a DIFFERENT tab is active (after `set_active_tab`, or a removal path whose
     /// active tab was the one removed): hint chips and the copy-mode cursor are
-    /// anchored on the old grid, an in-progress selection drag and a fractional
-    /// wheel remainder were that tab's, and the cached Ctrl+hover underline must
-    /// be recomputed against the new grid — Ctrl+Tab keeps Ctrl held (no
-    /// ModifiersChanged) and the hovered CELL is unchanged, so without the forced
-    /// recompute tab 1's underline ghosts over tab 2's text (F12).
+    /// anchored on the old grid, the menus were opened over it (the terminal
+    /// menu's rows act on the active tab, grayed for the old one's selection),
+    /// an in-progress selection drag and a fractional wheel remainder were that
+    /// tab's, and the cached Ctrl+hover underline must be recomputed against
+    /// the new grid — Ctrl+Tab keeps Ctrl held (no ModifiersChanged) and the
+    /// hovered CELL is unchanged, so without the forced recompute tab 1's
+    /// underline ghosts over tab 2's text (F12).
     fn entered_new_active_tab(&mut self) {
         // Smart titles refresh on a tab switch too (the user looks at it now).
         let mode = self.tab_title_mode;
@@ -6651,6 +6653,11 @@ impl App {
         }
         self.ov.hint_mode = None;
         self.ov.copy_mode = None;
+        // A menu still open here was opened over the old tab (its shell
+        // exited under it, a reattach, a detached window's tab command): its
+        // Copy would copy the new tab's selection, Clear and Close Tab would
+        // hit the new tab.
+        self.dismiss_menus();
         // A selection drag, scrollbar drag, or button the outgoing tab's program
         // saw pressed can't be released into the new tab.
         self.reset_main_pointer();
