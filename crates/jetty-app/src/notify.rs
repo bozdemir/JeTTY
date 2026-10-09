@@ -33,9 +33,6 @@ pub enum NotifyMsg {
         summary: String,
         /// Notification body — the command's last output line (may be empty).
         body: String,
-        /// A failed command: raises urgency to `Critical` (freedesktop) so the
-        /// daemon surfaces it prominently.
-        critical: bool,
     },
 }
 
@@ -61,8 +58,8 @@ impl Notifier {
     /// Queue a notification. NEVER blocks the caller (the UI thread): on a full
     /// queue or a dead worker the message is simply dropped — the winit urgency
     /// hint has already informed the user, so a lost toast is harmless.
-    pub fn fire(&self, summary: String, body: String, critical: bool) {
-        match self.tx.try_send(NotifyMsg::Fire { summary, body, critical }) {
+    pub fn fire(&self, summary: String, body: String) {
+        match self.tx.try_send(NotifyMsg::Fire { summary, body }) {
             // Sent, queue full (drop), or worker gone (drop) — all non-fatal.
             Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
         }
@@ -87,7 +84,7 @@ pub fn spawn_notifier() -> Notifier {
         .name("jetty-notify".into())
         .spawn(move || {
             for msg in rx {
-                let NotifyMsg::Fire { summary, body, critical } = msg;
+                let NotifyMsg::Fire { summary, body } = msg;
                 // Shed rather than spawn once too many deliveries are already
                 // stranded (pathological non-replying daemon) — bounds threads.
                 if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT_SENDS {
@@ -98,7 +95,7 @@ pub fn spawn_notifier() -> Notifier {
                 let _ = std::thread::Builder::new()
                     .name("jetty-notify-send".into())
                     .spawn(move || {
-                        show(&summary, &body, critical);
+                        show(&summary, &body);
                         inflight.fetch_sub(1, Ordering::Relaxed);
                     });
             }
@@ -144,7 +141,7 @@ fn body_is_markup() -> bool {
 
 /// Linux/BSD: full freedesktop toast via the pure-Rust zbus backend.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn show(summary: &str, body: &str, critical: bool) {
+fn show(summary: &str, body: &str) {
     use notify_rust::{Hint, Notification, Urgency};
     // The summary is plain text by spec; only the body may be parsed as markup.
     let body = if body_is_markup() { escape_markup(body) } else { std::borrow::Cow::Borrowed(body) };
@@ -153,13 +150,16 @@ fn show(summary: &str, body: &str, critical: bool) {
     // own method-call timeout unwedges it and the bounded queue sheds load
     // meanwhile. Errors (no daemon) are swallowed. Timeout stays the default
     // (`Timeout::Default`) so the DAEMON owns the expiry — a fire-and-hide ping
-    // never leaves a sticky bubble (amendments §5c).
+    // never leaves a sticky bubble (amendments §5c). That is also why a FAILED
+    // command stays `Normal`: the spec says a `Critical` notification never
+    // expires (Plasma, GNOME, dunst keep it until dismissed) and it breaks
+    // through Do Not Disturb. The summary already reads "failed (exit N)".
     let _ = Notification::new()
         .appname("JeTTY")
         .summary(summary)
         .body(&body)
         .icon("jetty")
-        .hint(Hint::Urgency(if critical { Urgency::Critical } else { Urgency::Normal }))
+        .hint(Hint::Urgency(Urgency::Normal))
         .show();
 }
 
@@ -168,7 +168,7 @@ fn show(summary: &str, body: &str, critical: bool) {
 /// attributed anyway, and full macOS toasts need a `.app` bundle (future). The
 /// guaranteed macOS signal is the winit dock-bounce urgency fired by `app.rs`.
 #[cfg(not(all(unix, not(target_os = "macos"))))]
-fn show(_summary: &str, _body: &str, _critical: bool) {}
+fn show(_summary: &str, _body: &str) {}
 
 /// Short floor for FAILURE notifications that carry a KNOWN duration: an instant
 /// typo (`cd /nope`, exit 1, sub-second) stays silent even when you're not
@@ -328,13 +328,13 @@ mod tests {
         drop(rx);
         let n = Notifier { tx };
         for i in 0..1000 {
-            n.fire(format!("t{i}"), String::new(), i % 2 == 0);
+            n.fire(format!("t{i}"), String::new());
         }
         // Queue full: live but never-drained receiver → overflow is dropped, no block.
         let (tx, _rx) = sync_channel::<NotifyMsg>(NOTIFY_QUEUE_BOUND);
         let n = Notifier { tx };
         for i in 0..1000 {
-            n.fire(format!("t{i}"), String::new(), false);
+            n.fire(format!("t{i}"), String::new());
         }
     }
 
@@ -347,12 +347,10 @@ mod tests {
         n.fire(
             "Tab 2 · cargo — finished · 1m 12s".to_string(),
             "Compiling jetty-app v0.15.0".to_string(),
-            false,
         );
         n.fire(
             "Tab 3 · make — failed (exit 2) · 8s".to_string(),
             "make: *** [all] Error 2".to_string(),
-            true,
         );
         // Give the worker time to complete the blocking D-Bus round trip.
         std::thread::sleep(Duration::from_millis(800));

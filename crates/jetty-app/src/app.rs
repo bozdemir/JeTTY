@@ -7828,7 +7828,7 @@ impl App {
         self.notify_last_at.insert(key, std::time::Instant::now());
         let failed = matches!(c.exit_code, Some(code) if code != 0);
         let (summary, body) = build_notification_text(&self.main_tab_label(tab), &c, failed);
-        self.notifier.fire(summary, body, failed);
+        self.notifier.fire(summary, body);
         // Taskbar/dock urgency baseline — the guaranteed macOS signal (dock bounce)
         // and a cross-DE hint on Linux even where no notification daemon runs.
         // Skipped while the window holds focus (a BACKGROUND tab of a focused
@@ -7868,7 +7868,7 @@ impl App {
         let failed = matches!(c.exit_code, Some(code) if code != 0);
         let label = format!("{} (detached)", self.detached[pos].tab.title);
         let (summary, body) = build_notification_text(&label, &c, failed);
-        self.notifier.fire(summary, body, failed);
+        self.notifier.fire(summary, body);
         self.detached[pos]
             .window
             .request_user_attention(Some(attention_for(failed)));
