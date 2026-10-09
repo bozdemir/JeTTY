@@ -4469,14 +4469,7 @@ impl App {
         if pos >= self.detached.len() {
             return;
         }
-        // This window's overlays go away with it: close its search (dropping
-        // the tab's compiled regex + matches, which the main window's closed bar
-        // would otherwise carry into every reflow) and its copy-mode selection.
-        let s = Surface::Detached(pos);
-        self.search_close(s);
-        if self.ov_of(s).is_some_and(|o| o.copy_mode.is_some()) {
-            self.cancel_copy_mode(s);
-        }
+        self.close_detached_overlays(pos);
         // Leave OS fullscreen while the window still exists: dropping a
         // fullscreen window leaks macOS's app-scoped presentation options (an
         // auto-hidden Dock + menu bar for the rest of the session).
@@ -4530,6 +4523,20 @@ impl App {
         self.update_link_hover(true);
         // `dw` drops here: detached window + GPU surface are closed/destroyed.
         self.request_main_paint();
+    }
+
+    /// Detached window `pos`'s overlays go away with it (a reattach, its shell
+    /// exiting): its palette — a live theme preview there would otherwise stay
+    /// on every window — its search (dropping the tab's compiled regex +
+    /// matches, which the main window's closed bar would otherwise carry into
+    /// every reflow) and its copy-mode selection.
+    fn close_detached_overlays(&mut self, pos: usize) {
+        let s = Surface::Detached(pos);
+        self.close_palette(s);
+        self.search_close(s);
+        if self.ov_of(s).is_some_and(|o| o.copy_mode.is_some()) {
+            self.cancel_copy_mode(s);
+        }
     }
 
     /// Open the tab context menu for `tab` at `(x, y)` with `labels` (the main
@@ -13557,6 +13564,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // harmlessly by `PtySession::Drop`.
                 for i in exited_detached.into_iter().rev() {
                     if i < self.detached.len() {
+                        // Its overlays go first (a live palette theme preview
+                        // must not outlive the window), as in `reattach_tab`.
+                        self.close_detached_overlays(i);
                         // Same reason as `reattach_tab`: never DROP a fullscreen
                         // window (macOS presentation-options leak).
                         self.exit_detached_fullscreen_bare(i);
