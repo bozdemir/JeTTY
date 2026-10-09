@@ -14,14 +14,22 @@
 //! time-varying color and width and a SOFT inner edge (`soft` > 0: solid
 //! over the outer part of the band, then a smooth fade inward — a glow rather
 //! than a line); the focus ring itself is `soft = 0`.
+//!
+//! During a Dropdown slide the window shape moves (the corner mask's
+//! `apply_slid`): the `_slid` entry points move the ring with it, so its
+//! bottom edge and corners ride the strip's moving edge.
 
 const RING_SHADER: &str = r#"
-// Two 16-byte rows + the color row (48 bytes, std140-aligned):
-// {size.xy, width, soft} {r_tl, r_tr, r_bl, r_br} {color rgba (sRGB, straight)}.
+// Four 16-byte rows (64 bytes, std140-aligned): {size.xy, width, soft}
+// {r_tl, r_tr, r_bl, r_br} {color rgba (sRGB, straight)} {offset_y, pad}.
 // soft = 0: a crisp ring `width` px deep (the focus ring); soft in (0, 1]: solid
 // over the outer (1 - soft) of the band, then a smooth fade to nothing at
-// `width` (the bell rim / command pulse glow).
-struct Params { size: vec2<f32>, width: f32, soft: f32, radii: vec4<f32>, color: vec4<f32> };
+// `width` (the bell rim / command pulse glow). offset_y moves the window shape
+// down (the Dropdown slide, ≤ 0), exactly like the corner mask's.
+struct Params {
+    size: vec2<f32>, width: f32, soft: f32, radii: vec4<f32>, color: vec4<f32>,
+    offset_y: f32, _p0: f32, _p1: f32, _p2: f32,
+};
 @group(0) @binding(0) var<uniform> params: Params;
 
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
@@ -51,7 +59,8 @@ fn s2l(c: f32) -> f32 { if (c <= 0.04045) { return c / 12.92; } return pow((c + 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let hsize = params.size * 0.5;
-    let d = sd_round_rect_per(in.uv - hsize, hsize, params.radii.x, params.radii.y, params.radii.z, params.radii.w);
+    let p = in.uv - vec2(0.0, params.offset_y) - hsize;
+    let d = sd_round_rect_per(p, hsize, params.radii.x, params.radii.y, params.radii.z, params.radii.w);
     // Inside the window shape (the mask's own edge feather) …
     let shape = 1.0 - smoothstep(-0.75, 0.75, d);
     // … and within `width` px of its edge (a 1 px feather on the inner side,
@@ -66,7 +75,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// The ring's uniform, laid out exactly like the WGSL `Params` (48 bytes).
+/// The ring's uniform, laid out exactly like the WGSL `Params` (64 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RingUniform {
@@ -82,6 +91,10 @@ pub struct RingUniform {
     pub radii: [f32; 4],
     /// Ring color, sRGB 0..1 with straight alpha. (offset 32)
     pub color: [f32; 4],
+    /// The window shape's vertical offset in physical px (≤ 0 while a
+    /// Dropdown slides in; the corner mask's `offset_y`). (offset 48)
+    pub offset_y: f32,
+    pub _pad: [f32; 3],
 }
 
 /// Ring width in physical px for a window at `dpi`: 1.5 logical px — crisp at
@@ -178,7 +191,26 @@ impl FocusRing {
         ring_w: f32,
         color: [u8; 4],
     ) {
-        self.apply_soft(device, queue, view, width, height, radii, ring_w, color, 0.0);
+        self.apply_soft_slid(device, queue, view, width, height, radii, ring_w, color, 0.0, 0.0);
+    }
+
+    /// [`FocusRing::apply`] around the window shape moved down by `offset_y`
+    /// physical px — the Dropdown slide (≤ 0; the corner mask's
+    /// `apply_slid`): the ring follows the strip's moving bottom edge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_slid(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        radii: [f32; 4],
+        ring_w: f32,
+        color: [u8; 4],
+        offset_y: f32,
+    ) {
+        self.apply_soft_slid(device, queue, view, width, height, radii, ring_w, color, 0.0, offset_y);
     }
 
     /// [`FocusRing::apply`] as a soft glow: solid over the outer `1 − soft` of
@@ -198,16 +230,38 @@ impl FocusRing {
         color: [u8; 4],
         soft: f32,
     ) {
+        self.apply_soft_slid(device, queue, view, width, height, radii, ring_w, color, soft, 0.0);
+    }
+
+    /// [`FocusRing::apply_soft`] around the window shape moved down by
+    /// `offset_y` physical px (the Dropdown slide; see [`FocusRing::apply_slid`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_soft_slid(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        radii: [f32; 4],
+        ring_w: f32,
+        color: [u8; 4],
+        soft: f32,
+        offset_y: f32,
+    ) {
         if width == 0 || height == 0 || ring_w <= 0.0 || color[3] == 0 {
             return;
         }
         let radii = clamp_radii(width, height, radii);
+        let offset_y = if offset_y.is_finite() { offset_y } else { 0.0 };
         let u = RingUniform {
             size: [width as f32, height as f32],
             width: ring_w,
             soft: if soft.is_finite() { soft.clamp(0.0, 1.0) } else { 0.0 },
             radii,
             color: color.map(|c| c as f32 / 255.0),
+            offset_y,
+            _pad: [0.0; 3],
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
         let mut encoder =
@@ -228,7 +282,7 @@ impl FocusRing {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            for [x, y, w, h] in ring_regions(width, height, radii, ring_w) {
+            for [x, y, w, h] in draw_regions(width, height, radii, ring_w, offset_y) {
                 pass.set_scissor_rect(x, y, w, h);
                 pass.draw(0..3, 0..1);
             }
@@ -274,14 +328,33 @@ pub(crate) fn ring_regions(width: u32, height: u32, radii: [f32; 4], ring_w: f32
     out
 }
 
+/// The scissor rects one draw uses: [`ring_regions`] for the window's resting
+/// shape; while the shape is moved (`offset_y` ≠ 0, the ~150 ms of a Dropdown
+/// slide) its edges can be anywhere, so the whole target once — the shader's
+/// coverage is exactly 0 off the band, which the "over" blend leaves untouched.
+pub(crate) fn draw_regions(width: u32, height: u32, radii: [f32; 4], ring_w: f32, offset_y: f32) -> Vec<[u32; 4]> {
+    if offset_y != 0.0 && offset_y.is_finite() && width > 0 && height > 0 {
+        vec![[0, 0, width, height]]
+    } else {
+        ring_regions(width, height, radii, ring_w)
+    }
+}
+
 /// CPU mirror of the ring shader's coverage at pixel `(x, y)` of a `w`×`h`
 /// target (pixel centres, like the GPU): 1.0 on the ring, 0.0 away from the
 /// edges, antialiased at both rims. Used by the unit tests to pin the geometry
 /// and the scissor regions.
 pub fn ring_coverage(x: f32, y: f32, w: f32, h: f32, radii: [f32; 4], ring_w: f32) -> f32 {
+    ring_coverage_slid(x, y, w, h, radii, ring_w, 0.0)
+}
+
+/// [`ring_coverage`] around the window shape moved down by `offset_y` (the
+/// Dropdown slide) — the CPU mirror of [`FocusRing::apply_slid`].
+#[allow(clippy::too_many_arguments)]
+pub fn ring_coverage_slid(x: f32, y: f32, w: f32, h: f32, radii: [f32; 4], ring_w: f32, offset_y: f32) -> f32 {
     let [r_tl, r_tr, r_bl, r_br] = radii;
     let (hw, hh) = (w / 2.0, h / 2.0);
-    let (px, py) = ((x + 0.5) - hw, (y + 0.5) - hh);
+    let (px, py) = ((x + 0.5) - hw, (y + 0.5) - offset_y - hh);
     let r_top = if px > 0.0 { r_tr } else { r_tl };
     let r_bot = if px > 0.0 { r_br } else { r_bl };
     let r = if py > 0.0 { r_bot } else { r_top };
@@ -311,14 +384,22 @@ mod tests {
     #[test]
     fn ring_uniform_layout_matches_the_wgsl_params() {
         use std::mem::{align_of, offset_of, size_of};
-        assert_eq!(size_of::<RingUniform>(), 48);
+        assert_eq!(size_of::<RingUniform>(), 64);
         assert_eq!(offset_of!(RingUniform, size), 0);
         assert_eq!(offset_of!(RingUniform, width), 8);
         assert_eq!(offset_of!(RingUniform, soft), 12);
         assert_eq!(offset_of!(RingUniform, radii), 16);
         assert_eq!(offset_of!(RingUniform, color), 32);
+        assert_eq!(offset_of!(RingUniform, offset_y), 48);
         assert_eq!(size_of::<RingUniform>() % align_of::<RingUniform>(), 0);
         assert_eq!(size_of::<RingUniform>() % 16, 0, "std140 rows");
+        // naga agrees on the WGSL side.
+        let module = naga::front::wgsl::parse_str(RING_SHADER).unwrap();
+        let (_, ty) = module.types.iter().find(|(_, t)| t.name.as_deref() == Some("Params")).expect("Params");
+        let naga::TypeInner::Struct { members, span } = &ty.inner else { panic!("Params is a struct") };
+        assert_eq!(*span, 64);
+        let off = |n: &str| members.iter().find(|m| m.name.as_deref() == Some(n)).map(|m| m.offset);
+        assert_eq!((off("radii"), off("color"), off("offset_y")), (Some(16), Some(32), Some(48)));
     }
 
     #[test]
@@ -392,6 +473,35 @@ mod tests {
         let mid = soft_band(6.75, 10.0, 0.65);
         assert!(mid > 0.3 && mid < 0.7, "fading: {mid}");
         assert_eq!(soft_band(10.0, 10.0, 0.65), 0.0, "nothing at the width");
+    }
+
+    /// Mid Dropdown slide the window SHAPE is moved up by `offset_y` (the
+    /// corner mask cuts it at the moving bottom edge): the ring — and the bell
+    /// rim / command pulse drawn by the same pass — hugs that moved shape, its
+    /// bottom edge and rounded bottom corners on the moving edge, nothing below.
+    #[test]
+    fn a_slid_ring_hugs_the_moving_bottom_edge() {
+        let (w, h, rw) = (200.0, 120.0, 2.0);
+        let radii = [0.0, 0.0, 16.0, 16.0]; // top-flush Dropdown
+        let slid = |x: f32, y: f32| ring_coverage_slid(x, y, w, h, radii, rw, -60.0);
+        assert!(slid(100.0, 59.0) > 0.5, "the bottom edge rides the slide");
+        assert!(slid(0.0, 30.0) > 0.5 && slid(199.0, 30.0) > 0.5, "the sides, inside the strip");
+        for (x, y) in [(100.0, 119.0), (0.0, 100.0), (199.0, 80.0), (100.0, 61.0)] {
+            assert_eq!(slid(x, y), 0.0, "({x},{y}) is below the moving edge: nothing there");
+        }
+        // The rounded bottom-left corner at the moved edge: on its arc, not past it.
+        let a = 16.0 - 16.0 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(slid(a, 60.0 - a - 1.0) > 0.3, "corner arc pixel");
+        assert!(slid(0.0, 59.0) < 0.01, "outside the rounded corner");
+        // Offset 0 is exactly the static ring.
+        for (x, y) in [(0.0, 0.0), (100.0, 119.0), (3.0, 110.0), (100.0, 60.0)] {
+            assert_eq!(ring_coverage_slid(x, y, w, h, radii, rw, 0.0), ring_coverage(x, y, w, h, radii, rw));
+        }
+        // The shader applies the same offset, and a slid frame draws the whole
+        // target (the moving edge can be anywhere) — still exactly once per pixel.
+        assert!(RING_SHADER.contains("in.uv - vec2(0.0, params.offset_y)"));
+        assert_eq!(draw_regions(200, 120, radii, rw, -60.0), vec![[0, 0, 200, 120]]);
+        assert_eq!(draw_regions(200, 120, radii, rw, 0.0), ring_regions(200, 120, radii, rw));
     }
 
     #[test]

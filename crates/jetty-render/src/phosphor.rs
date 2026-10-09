@@ -2,23 +2,31 @@
 //! scanline reveals the interior while a neon accent rim hugs the window's
 //! rounded-rect border (corners light first) and a bright scan line sweeps down.
 //!
-//! Two fullscreen-triangle passes share one 32-byte uniform
-//! `{ w, h, radius, t, ar, ag, ab, _pad }` (8 scalars = 32 bytes; no vec3 so the
-//! Rust buffer layout matches exactly):
+//! Two fullscreen-triangle passes share one 48-byte uniform ([`PhosphorUniform`],
+//! scalars only — no vec3 — so the Rust layout matches the WGSL `P` exactly):
 //!   Pass A (multiply-dst, src=Zero/dst=Src): the unlit area is darkened to ~10%
 //!     and brightens to full behind a descending reveal line.
 //!   Pass B (additive, src=One/dst=One): a neon accent rim just inside the
 //!     rounded-rect edge (corner-staggered) plus a bright moving scan line. Gated
 //!     by a sin envelope so it is 0 at t=0 and t=1 (no residue).
 //!
+//! The rounded rect is the window's real shape: separate top / bottom corner
+//! radii (a top-flush Dropdown keeps its top corners square) and the shape's
+//! vertical offset during the Dropdown slide (the corner mask's `offset_y`), so
+//! the rim, the scan line and the wipe ride the sliding strip instead of
+//! lighting the full window rect over the desktop below it.
+//!
 //! Self-contained: our own wgpu/WGSL, reusing the rounded-rect SDF from mask.rs.
 //! No offscreen texture, no desktop-environment / compositor / OS-specific code.
 
 const PHOSPHOR_SHADER: &str = r#"
-// 32-byte uniform (8 scalars). Avoid vec3<f32> so the host buffer layout is exact.
+// 48-byte uniform (12 scalars). Avoid vec3<f32> so the host buffer layout is exact.
+// radius = the BOTTOM corners, radius_top = the top ones; offset_y moves the
+// window shape down (the Dropdown slide, <= 0).
 struct P {
     w: f32, h: f32, radius: f32, t: f32,
-    ar: f32, ag: f32, ab: f32, _pad: f32,
+    ar: f32, ag: f32, ab: f32, offset_y: f32,
+    radius_top: f32, _p0: f32, _p1: f32, _p2: f32,
 };
 @group(0) @binding(0) var<uniform> p: P;
 
@@ -40,18 +48,25 @@ fn sd_round_rect(pt: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0, 0.0))) - r;
 }
 
+// The fragment's height in the window shape, 0..1 top to bottom (it moves by
+// p.offset_y during the Dropdown slide).
+fn shape_v(uv_y: f32) -> f32 {
+    return (uv_y * p.h - p.offset_y) / p.h;
+}
+
 // Pass A: descending scanline reveal (multiply the destination by brightness).
 @fragment
 fn fs_reveal(in: VsOut) -> @location(0) vec4<f32> {
     let t = clamp(p.t, 0.0, 1.0);
     let scan_y = smoothstep(0.15, 1.0, t);
+    let vy = shape_v(in.uv.y);
     // 1 ABOVE the descending line (already revealed — the beam has passed it),
-    // 0 below (still dark). uv.y grows downward, so "above" is uv.y < scan_y.
+    // 0 below (still dark). vy grows downward, so "above" is vy < scan_y.
     // The `1.0 -` is load-bearing: bf44be9 swapped the smoothstep edges into
     // ascending order (edge0 > edge1 is undefined in WGSL) but dropped the
     // inversion, which played the reveal upside down (the window ~90% dark,
     // then popping in at t = 1). `phosphor_reveal_wipe` mirrors this line.
-    let wipe = 1.0 - smoothstep(scan_y - 0.02, scan_y + 0.05, in.uv.y);
+    let wipe = 1.0 - smoothstep(scan_y - 0.02, scan_y + 0.05, vy);
     let b = mix(0.10, 1.0, wipe);
     return vec4<f32>(b, b, b, b);
 }
@@ -61,8 +76,8 @@ fn fs_reveal(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_glow(in: VsOut) -> @location(0) vec4<f32> {
     let t = clamp(p.t, 0.0, 1.0);
     let hsize = vec2<f32>(p.w, p.h) * 0.5;
-    let pos = vec2<f32>(in.uv.x * p.w, in.uv.y * p.h) - hsize;
-    let d = sd_round_rect(pos, hsize, p.radius);
+    let pos = vec2<f32>(in.uv.x * p.w, in.uv.y * p.h - p.offset_y) - hsize;
+    let d = sd_round_rect(pos, hsize, select(p.radius_top, p.radius, pos.y > 0.0));
     // Thin band just inside the edge.
     let rim = smoothstep(-5.0, -2.0, d) * (1.0 - smoothstep(-2.0, 0.5, d));
     // Corner-stagger: corners light first as t rises.
@@ -71,7 +86,7 @@ fn fs_glow(in: VsOut) -> @location(0) vec4<f32> {
     let scan_y = smoothstep(0.15, 1.0, t);
     // Fix: smoothstep(0.05, 0.0, …) had edge0 > edge1 (spec-undefined).
     // Rewrite as 1.0 - smoothstep(0.0, 0.05, …) which is equivalent and well-defined.
-    let scan = 1.0 - smoothstep(0.0, 0.05, abs(in.uv.y - scan_y));
+    let scan = 1.0 - smoothstep(0.0, 0.05, abs(shape_v(in.uv.y) - scan_y));
     // Ignite envelope: 0 at t=0 and t=1 → no residue.
     let ignite = sin(t * 3.14159265);
     // Gate glow contribution by the rounded-rect SDF coverage so the additive
@@ -82,6 +97,25 @@ fn fs_glow(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(accent * g, g * 0.6);
 }
 "#;
+
+/// The pass's uniform, laid out exactly like the WGSL `P` (48 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PhosphorUniform {
+    /// Target size in physical px. (offset 0)
+    pub size: [f32; 2],
+    /// Bottom corner radius in physical px. (offset 8)
+    pub radius: f32,
+    /// Progress 0..1. (offset 12)
+    pub t: f32,
+    /// Accent RGB 0..1. (offset 16)
+    pub accent: [f32; 3],
+    /// The window shape's vertical offset (≤ 0 during the Dropdown slide). (offset 28)
+    pub offset_y: f32,
+    /// Top corner radius in physical px (0 for a top-flush Dropdown). (offset 32)
+    pub radius_top: f32,
+    pub _pad: [f32; 3],
+}
 
 pub struct PhosphorIgnition {
     reveal_pipeline: wgpu::RenderPipeline,
@@ -99,7 +133,7 @@ impl PhosphorIgnition {
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("phosphor-uniform"),
-            size: 32,
+            size: std::mem::size_of::<PhosphorUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -194,17 +228,40 @@ impl PhosphorIgnition {
         t: f32,
         accent: [f32; 3],
     ) {
-        let params: [f32; 8] = [
-            width as f32,
-            height as f32,
-            radius.max(0.0),
+        self.apply_slid(device, queue, view, width, height, [radius, radius], 0.0, t, accent);
+    }
+
+    /// [`Self::apply`] on the window's real shape: `radii` = (top, bottom)
+    /// corner radii in physical px (top 0 while a Dropdown is top-flush) and
+    /// the shape moved down by `offset_y` physical px (≤ 0 during the Dropdown
+    /// slide — the corner mask's `apply_slid`). The rim, scan line and wipe
+    /// ride the sliding strip; nothing lights outside it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_slid(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        radii: [f32; 2],
+        offset_y: f32,
+        t: f32,
+        accent: [f32; 3],
+    ) {
+        // Each radius at most half the smaller side (the corner mask's clamp).
+        let max_r = width.min(height) as f32 / 2.0;
+        let r = |v: f32| if v.is_finite() { v.clamp(0.0, max_r) } else { 0.0 };
+        let u = PhosphorUniform {
+            size: [width as f32, height as f32],
+            radius: r(radii[1]),
             t,
-            accent[0],
-            accent[1],
-            accent[2],
-            0.0,
-        ];
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&params));
+            accent,
+            offset_y: if offset_y.is_finite() { offset_y } else { 0.0 },
+            radius_top: r(radii[0]),
+            _pad: [0.0; 3],
+        };
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("phosphor-encoder"),
@@ -242,14 +299,80 @@ mod tests {
     /// and progress `t` — the reveal's direction, pinned by tests (the shader
     /// itself needs a GPU; jetty-shot's `JETTY_SHOT_PHOSPHOR_T` renders it).
     fn phosphor_reveal_brightness(uv_y: f32, t: f32) -> f32 {
-        fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
-            let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-            t * t * (3.0 - 2.0 * t)
-        }
         let t = t.clamp(0.0, 1.0);
         let scan_y = smoothstep(0.15, 1.0, t);
         let wipe = 1.0 - smoothstep(scan_y - 0.02, scan_y + 0.05, uv_y);
         0.10 + (1.0 - 0.10) * wipe
+    }
+
+    fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// The wipe at window pixel row `y_px` of an `h`-tall window whose shape
+    /// is moved by `offset_y` (`shape_v` in the shader).
+    fn phosphor_reveal_brightness_slid(y_px: f32, h: f32, offset_y: f32, t: f32) -> f32 {
+        phosphor_reveal_brightness((y_px - offset_y) / h, t)
+    }
+
+    /// CPU mirror of `fs_glow`'s rim × shape coverage at pixel `(x, y)` (its
+    /// centre, like the GPU) — the time-independent part of the glow.
+    fn phosphor_glow_coverage(x: f32, y: f32, w: f32, h: f32, r_top: f32, r_bottom: f32, offset_y: f32) -> f32 {
+        let (px, py) = (x + 0.5 - w / 2.0, y + 0.5 - offset_y - h / 2.0);
+        let r = if py > 0.0 { r_bottom } else { r_top };
+        let (qx, qy) = (px.abs() - w / 2.0 + r, py.abs() - h / 2.0 + r);
+        let d = qx.max(qy).min(0.0) + (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() - r;
+        let rim = smoothstep(-5.0, -2.0, d) * (1.0 - smoothstep(-2.0, 0.5, d));
+        rim * (-d).clamp(0.0, 1.0)
+    }
+
+    /// The uniform: 48 bytes, the WGSL `P` byte for byte.
+    #[test]
+    fn phosphor_uniform_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<PhosphorUniform>(), 48);
+        assert_eq!(offset_of!(PhosphorUniform, radius), 8);
+        assert_eq!(offset_of!(PhosphorUniform, t), 12);
+        assert_eq!(offset_of!(PhosphorUniform, accent), 16);
+        assert_eq!(offset_of!(PhosphorUniform, offset_y), 28);
+        assert_eq!(offset_of!(PhosphorUniform, radius_top), 32);
+        let module = naga::front::wgsl::parse_str(PHOSPHOR_SHADER).unwrap();
+        let (_, ty) = module.types.iter().find(|(_, t)| t.name.as_deref() == Some("P")).expect("P");
+        let naga::TypeInner::Struct { members, span } = &ty.inner else { panic!("P is a struct") };
+        assert_eq!(*span, 48);
+        let off = |n: &str| members.iter().find(|m| m.name.as_deref() == Some(n)).map(|m| m.offset);
+        assert_eq!((off("offset_y"), off("radius_top")), (Some(28), Some(32)));
+    }
+
+    /// Mid Dropdown slide the window shape is moved up by `offset_y`: the
+    /// accent rim and scan line light only that moved shape (they were drawn
+    /// around the full window, floating over the desktop below the sliding
+    /// strip), and a top-flush window's square top corners get a square rim.
+    #[test]
+    fn the_glow_rides_the_dropdown_slide() {
+        let (w, h) = (400.0, 200.0);
+        let cov = |x: f32, y: f32, o: f32| phosphor_glow_coverage(x, y, w, h, 0.0, 16.0, o);
+        // Static: the bottom rim sits just inside the window's bottom edge.
+        assert!(cov(200.0, 197.0, 0.0) > 0.9);
+        // Slid up 120 px: nothing below the moving edge (y = 80)…
+        for (x, y) in [(200.0, 197.0), (2.0, 150.0), (397.0, 120.0), (200.0, 81.0)] {
+            assert_eq!(cov(x, y, -120.0), 0.0, "({x},{y}) is below the moving edge");
+        }
+        // …the rim runs along it instead.
+        assert!(cov(200.0, 77.0, -120.0) > 0.9);
+        // Top-flush (r_top = 0): the rim reaches into the square top corners.
+        assert!(phosphor_glow_coverage(2.0, 2.0, w, h, 0.0, 16.0, 0.0) > 0.9);
+        assert_eq!(phosphor_glow_coverage(2.0, 2.0, w, h, 16.0, 16.0, 0.0), 0.0, "rounded: outside the arc");
+        // The reveal wipe rides the slide too: a content row is lit the same.
+        for t in [0.3, 0.6] {
+            for row in [10.0, 60.0, 150.0] {
+                let still = phosphor_reveal_brightness(row / h, t);
+                let slid = phosphor_reveal_brightness_slid(row - 120.0, h, -120.0, t);
+                assert!((still - slid).abs() < 1e-5, "t={t} row {row}: {still} vs {slid}");
+            }
+        }
+        assert!(PHOSPHOR_SHADER.contains("p.offset_y"));
     }
 
     #[test]
@@ -264,8 +387,7 @@ mod tests {
     fn the_shader_keeps_the_inverted_wipe() {
         // The regression line itself: without the `1.0 -` the reveal plays upside
         // down (bf44be9).
-        assert!(PHOSPHOR_SHADER
-            .contains("let wipe = 1.0 - smoothstep(scan_y - 0.02, scan_y + 0.05, in.uv.y);"));
+        assert!(PHOSPHOR_SHADER.contains("let wipe = 1.0 - smoothstep(scan_y - 0.02, scan_y + 0.05, vy);"));
     }
 
     #[test]

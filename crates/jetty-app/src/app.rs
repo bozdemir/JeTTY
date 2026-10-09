@@ -14963,7 +14963,7 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(ring) = focus_ring {
                         let r_top = if top_flush { 0.0 } else { corner_radius_px };
                         for spec in &edge.rims {
-                            ring.apply_soft(
+                            ring.apply_soft_slid(
                                 &gpu.device,
                                 &gpu.queue,
                                 scene_view,
@@ -14973,6 +14973,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 spec.band * scale,
                                 spec.rgba(),
                                 crate::motion::RIM_SOFTNESS,
+                                slide_y_offset,
                             );
                         }
                     }
@@ -15045,12 +15046,12 @@ impl ApplicationHandler<AppEvent> for App {
                     // the pass runs UNDER the summon (`crt_under`), when it keeps
                     // owning the corners.
                     // Window border / focus ring: on the window's own shape (the
-                    // mask's radii), BEFORE the mask so its outer edge is feathered
-                    // like the content's; under CRT it lands in the offscreen and
-                    // is bent with the scene.
+                    // mask's radii, and its Dropdown slide), BEFORE the mask so
+                    // its outer edge is feathered like the content's; under CRT
+                    // it lands in the offscreen and is bent with the scene.
                     if let (Some(ring), Some(c)) = (focus_ring, ring_color) {
                         let r_top = if top_flush { 0.0 } else { corner_radius_px };
-                        ring.apply(
+                        ring.apply_slid(
                             &gpu.device,
                             &gpu.queue,
                             scene_view,
@@ -15059,6 +15060,7 @@ impl ApplicationHandler<AppEvent> for App {
                             [r_top, r_top, corner_radius_px, corner_radius_px],
                             jetty_render::ring_width_px(scale),
                             [c[0], c[1], c[2], 255],
+                            slide_y_offset,
                         );
                     }
                     // During a Dropdown slide the mask moves with the content
@@ -15154,10 +15156,12 @@ impl ApplicationHandler<AppEvent> for App {
                                     }
                                 }
                                 SummonEffect::Phosphor => {
+                                    // On the window's real shape: square top
+                                    // corners when top-flush, riding the slide.
                                     if let Some(ph) = phosphor {
-                                        ph.apply(
+                                        ph.apply_slid(
                                             &gpu.device, &gpu.queue, scene_view, width, height,
-                                            corner_radius_px, t, summon_accent,
+                                            [r_top, corner_radius_px], slide_y_offset, t, summon_accent,
                                         );
                                     }
                                 }
