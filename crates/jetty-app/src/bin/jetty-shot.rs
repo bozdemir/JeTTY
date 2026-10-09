@@ -558,7 +558,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let info = adapter.get_info();
     let driver = if info.driver_info.is_empty() { String::new() } else { format!(", {}", info.driver_info) };
-    eprintln!("jetty-shot: GPU adapter = {} ({:?}{driver})", info.name, info.backend);
+    let backend = jetty_render::backend_display_name(info.backend);
+    eprintln!("jetty-shot: GPU adapter = {} ({backend}{driver})", info.name);
 
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -1769,7 +1770,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let splash = jetty_render::build_welcome_overlay(
                 shot_origin.top + prompt_rows as f32 * wch,
                 env!("CARGO_PKG_VERSION"),
-                "Vulkan",
+                jetty_render::backend_display_name(adapter.get_info().backend),
                 &jetty_app::default_welcome_tip(),
                 terminal.theme(),
                 wcw,

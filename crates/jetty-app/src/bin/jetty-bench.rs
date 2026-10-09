@@ -202,7 +202,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cpu_ms = cpu_accum * 1000.0 / n_frames as f64;
     let gpu_ms = (frame_ms - cpu_ms).max(0.0);
 
-    println!("=== Jetty perf bench ({} {:?}) ===", adapter.get_info().name, adapter.get_info().backend);
+    println!(
+        "=== Jetty perf bench ({} {}) ===",
+        adapter.get_info().name,
+        jetty_render::backend_display_name(adapter.get_info().backend)
+    );
     println!("grid          {cols}x{rows} cells (cell {cw:.1}x{ch:.1}px) @ {width}x{height}");
     println!("gpu_init      {gpu_init_ms:6.1} ms    (adapter + device acquisition)");
     println!("text_init     {text_init_ms:6.1} ms    (font system + atlas)");

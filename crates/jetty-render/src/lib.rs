@@ -38,8 +38,8 @@ pub use chrome::{
     CHROME_ADVANCE, MAX_LABEL_CHARS, OVERLAY_SCALE, PILL_H_BASE, STATUS_H_BASE, UI_FONT_BASE,
 };
 pub use gpu::{
-    instance_descriptor, set_platform_display, AcquireError, GpuContext, GpuShared, WgpuHasDisplayHandle,
-    NO_GPU_HELP,
+    backend_display_name, instance_descriptor, set_platform_display, AcquireError, GpuContext, GpuShared,
+    WgpuHasDisplayHandle, NO_GPU_HELP,
 };
 pub use text::{GridPaint, TextLayer};
 pub use colors::{

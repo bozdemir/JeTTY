@@ -56,6 +56,19 @@ fn backend_attempts(pinned: Option<wgpu::Backends>) -> [Option<wgpu::Backends>; 
     }
 }
 
+/// The backend's name as users know it — the welcome splash's "Render" row, the
+/// startup log, jetty-shot and jetty-bench (wgpu's enum spells GL "Gl").
+pub fn backend_display_name(backend: wgpu::Backend) -> &'static str {
+    match backend {
+        wgpu::Backend::Vulkan => "Vulkan",
+        wgpu::Backend::Gl => "OpenGL",
+        wgpu::Backend::Metal => "Metal",
+        wgpu::Backend::Dx12 => "DirectX 12",
+        wgpu::Backend::BrowserWebGpu => "WebGPU",
+        wgpu::Backend::Noop => "none",
+    }
+}
+
 /// The GPU objects every JeTTY window shares: ONE wgpu instance, adapter, device
 /// and queue. Acquiring them is the dominant GPU cost (~70–90 ms of adapter
 /// enumeration + device creation on the reference machine); a second window —
@@ -229,7 +242,8 @@ pub struct GpuContext {
     pub config: wgpu::SurfaceConfiguration,
     pub format: wgpu::TextureFormat,
     /// Human-readable wgpu backend name captured at adapter selection, e.g.
-    /// "Vulkan", "Metal", "Gl". Used by the Welcome overlay "Render" row.
+    /// "Vulkan", "OpenGL", "Metal" ([`backend_display_name`]). Used by the Welcome
+    /// overlay "Render" row.
     pub backend_name: String,
     /// Whether the frame clear should premultiply the theme bg by its alpha, to
     /// match how the window system composites the surface (true for
@@ -324,7 +338,8 @@ impl GpuContext {
             } else {
                 format!(", {}", info.driver_info)
             };
-            eprintln!("jetty: GPU adapter = {} ({:?}{driver})", info.name, info.backend);
+            let backend = backend_display_name(info.backend);
+            eprintln!("jetty: GPU adapter = {} ({backend}{driver})", info.name);
         });
         let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("jetty-device"),
@@ -367,7 +382,7 @@ impl GpuContext {
 
         let shared = Arc::new(GpuShared {
             backend: adapter.get_info().backend,
-            backend_name: format!("{:?}", adapter.get_info().backend),
+            backend_name: backend_display_name(adapter.get_info().backend).to_string(),
             cpu: adapter.get_info().device_type == wgpu::DeviceType::Cpu,
             max_dim: device.limits().max_texture_dimension_2d,
             instance,
@@ -647,6 +662,17 @@ mod tests {
         assert!(instance_descriptor(Backends::VULKAN).display.is_none(), "the Vulkan path is unchanged");
         assert!(instance_descriptor(Backends::all()).display.is_some(), "GL presents through the display");
         assert!(instance_descriptor(Backends::GL).display.is_some());
+    }
+
+    /// The backend as users know it: the welcome splash read "wgpu · Gl".
+    #[test]
+    fn backends_carry_their_user_facing_names() {
+        use super::backend_display_name;
+        assert_eq!(backend_display_name(Backend::Vulkan), "Vulkan");
+        assert_eq!(backend_display_name(Backend::Gl), "OpenGL");
+        assert_eq!(backend_display_name(Backend::Metal), "Metal");
+        assert_eq!(backend_display_name(Backend::Dx12), "DirectX 12");
+        assert_eq!(backend_display_name(Backend::BrowserWebGpu), "WebGPU");
     }
 
     /// Vulkan alone first, then every backend; `WGPU_BACKEND` (`gl`, `vulkan`, …)
