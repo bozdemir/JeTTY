@@ -210,6 +210,27 @@ fn icon_in(appdir: Option<std::ffi::OsString>) -> String {
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 fn show(_summary: &str, _body: &str) {}
 
+/// A startup failure that ends JeTTY (no GPU, no shell, no window), as a
+/// desktop notification — only when stderr reaches no one (a desktop or login
+/// launch), where JeTTY would otherwise just never appear. Waits up to 2 s for
+/// the delivery (the process exits next; a daemon that never replies can't
+/// hold it).
+pub fn fatal(summary: &str, body: &str) {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        return;
+    }
+    let (summary, body) = (summary.to_string(), body.to_string());
+    let (done, wait) = std::sync::mpsc::channel();
+    let sent = std::thread::Builder::new().name("jetty-notify-fatal".into()).spawn(move || {
+        show(&summary, &body);
+        let _ = done.send(());
+    });
+    if sent.is_ok() {
+        let _ = wait.recv_timeout(Duration::from_secs(2));
+    }
+}
+
 /// Short floor for FAILURE notifications that carry a KNOWN duration: an instant
 /// typo (`cd /nope`, exit 1, sub-second) stays silent even when you're not
 /// looking, while a failure whose duration is UNKNOWN (plain bash) or that ran

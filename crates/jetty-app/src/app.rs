@@ -13549,6 +13549,7 @@ impl ApplicationHandler<AppEvent> for App {
             Ok(window) => window,
             Err(e) => {
                 eprintln!("jetty: could not create the window: {e}");
+                crate::notify::fatal("JeTTY could not start", &format!("It could not create its window: {e}"));
                 drop(pty_handle.join());
                 self.startup_failed = true;
                 event_loop.exit();
@@ -13621,6 +13622,8 @@ impl ApplicationHandler<AppEvent> for App {
             // it unpainted, and this instance holding the single-instance socket
             // would swallow every later launch: say why and exit non-zero.
             eprintln!("{}", jetty_render::NO_GPU_HELP);
+            let help = jetty_render::NO_GPU_HELP.strip_prefix("jetty: ").unwrap_or(jetty_render::NO_GPU_HELP);
+            crate::notify::fatal("JeTTY could not start", help);
             drop(pty_handle.join());
             self.startup_failed = true;
             event_loop.exit();
@@ -13771,6 +13774,13 @@ impl ApplicationHandler<AppEvent> for App {
                     "jetty: no shell could be started: {e}\n\
                      jetty: set `shell` in {} (or $SHELL) to an installed shell, e.g. /bin/bash",
                     crate::config::Config::config_path().display()
+                );
+                crate::notify::fatal(
+                    "JeTTY could not start",
+                    &format!(
+                        "No shell could be started ({e}). Set `shell` in {} to an installed shell, e.g. /bin/bash.",
+                        crate::config::Config::config_path().display()
+                    ),
                 );
                 self.startup_failed = true;
                 event_loop.exit();

@@ -928,15 +928,15 @@ impl KeyMap {
         }
     }
 
-    /// Whether `claim` may take a slot `existing` (another action) holds; a
-    /// user chord that may not is reported as a conflict.
-    fn may_take(&mut self, claim: Claim, slot: impl FnOnce() -> String, action: BindableAction) -> bool {
+    /// Whether `claim` may take a slot `holder` (another action) holds; a
+    /// user chord that may not is reported as a conflict naming the holder.
+    fn may_take(&mut self, claim: Claim, slot: impl FnOnce() -> String, action: BindableAction, holder: &str) -> bool {
         match claim {
             Claim::Force => true,
             Claim::Default => false,
             Claim::User => {
                 self.warnings.push(format!(
-                    "keybinding conflict on {}: {} is ignored (already bound)",
+                    "keybinding conflict on {}: {holder} has it — {} is ignored there",
                     slot(),
                     action.name(),
                 ));
@@ -983,7 +983,7 @@ impl KeyMap {
 
     fn put_named(&mut self, action: BindableAction, m: Mods, named: NamedKey, ka: &KeyAction, claim: Claim) {
         if let Some(existing) = self.named.get(&(m, named)) {
-            if existing == ka || !self.may_take(claim, || pretty_slot_named(m, named), action) {
+            if existing == ka || !self.may_take(claim, || pretty_slot_named(m, named), action, action_name(existing)) {
                 return;
             }
         }
@@ -992,7 +992,7 @@ impl KeyMap {
 
     fn put_phys_fallback(&mut self, action: BindableAction, m: Mods, code: KeyCode, ka: &KeyAction, claim: Claim) {
         if let Some(existing) = self.phys_fallback.get(&(m, code)) {
-            if existing == ka || !self.may_take(claim, || pretty_slot_phys(m, code), action) {
+            if existing == ka || !self.may_take(claim, || pretty_slot_phys(m, code), action, action_name(existing)) {
                 return;
             }
         }
@@ -1002,7 +1002,7 @@ impl KeyMap {
     fn put_phys(&mut self, action: BindableAction, m: Mods, code: KeyCode, ka: &KeyAction, claim: Claim) {
         if let Some(existing) = self.physical.get(&(m, code)) {
             // Same action already there, or another one that keeps the slot.
-            if existing == ka || !self.may_take(claim, || pretty_slot_phys(m, code), action) {
+            if existing == ka || !self.may_take(claim, || pretty_slot_phys(m, code), action, action_name(existing)) {
                 return;
             }
         }
@@ -1014,8 +1014,9 @@ impl KeyMap {
                     if claim == Claim::Default {
                         return;
                     }
+                    let other = action_name(other);
                     self.warnings.push(format!(
-                        "keybinding for {} shadows a logical binding on the same chord",
+                        "keybinding for {} and {other} land on one key (on a US layout) — bind one of them elsewhere",
                         action.name()
                     ));
                 }
@@ -1026,7 +1027,8 @@ impl KeyMap {
 
     fn put_logical(&mut self, action: BindableAction, m: Mods, ch: SmolStr, ka: &KeyAction, claim: Claim) {
         if let Some(existing) = self.logical.get(&(m, ch.clone())) {
-            if existing == ka || !self.may_take(claim, || format!("{}+'{}'", pretty_mods(m), ch), action) {
+            let holder = action_name(existing);
+            if existing == ka || !self.may_take(claim, || format!("{}+'{}'", pretty_mods(m), ch), action, holder) {
                 return;
             }
         }
@@ -1038,8 +1040,9 @@ impl KeyMap {
                     if claim == Claim::Default {
                         return;
                     }
+                    let other = action_name(other);
                     self.warnings.push(format!(
-                        "keybinding for {} shadows a physical binding on the same chord",
+                        "keybinding for {} and {other} land on one key (on a US layout) — bind one of them elsewhere",
                         action.name()
                     ));
                 }
@@ -1102,6 +1105,12 @@ fn smol_lower(s: &SmolStr) -> SmolStr {
         return s.clone();
     }
     SmolStr::new(s.to_lowercase())
+}
+
+/// The `[keys]` name of the action `ka` dispatches, for warnings that name the
+/// other side of a clash.
+fn action_name(ka: &KeyAction) -> &'static str {
+    BindableAction::ALL.iter().find(|a| a.key_action() == *ka).map_or("another action", |a| a.name())
 }
 
 /// Would this user chord shadow a needed terminal control byte or lock out
@@ -1707,6 +1716,12 @@ mod tests {
             b.close_tab = Some(ChordSpec::One("Ctrl+Shift+G".to_string()));
         });
         assert!(km.warnings().iter().any(|w| w.contains("conflict")));
+        // The warning names the action that holds the chord.
+        assert!(
+            km.warnings().iter().any(|w| w.contains("new_tab has it — close_tab is ignored there")),
+            "{:?}",
+            km.warnings()
+        );
         // new_tab is earlier in ALL → it wins the slot.
         let a = km.lookup(Mods::new(true, true, false, false), PhysicalKey::Code(KeyCode::KeyG), &ch("G"));
         assert_eq!(a, Some(KeyAction::NewTab));
@@ -1761,7 +1776,7 @@ mod tests {
             b.font_down = Some(ChordSpec::One("Ctrl+Shift+Slash".to_string()));
         });
         assert!(
-            km.warnings().iter().any(|w| w.contains("conflict") || w.contains("shadows")),
+            km.warnings().iter().any(|w| w.contains("conflict") || w.contains("land on one key")),
             "{:?}",
             km.warnings()
         );
