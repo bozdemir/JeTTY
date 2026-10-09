@@ -23,6 +23,10 @@ JETTY_BENCH_ONLY=gpu_init target/release/jetty-bench  # instance/adapter/device 
 JETTY_BENCH_ONLY=frames   target/release/jetty-bench  # per-frame table + scene + chrome
 JETTY_BENCH_ONLY=backdrop target/release/jetty-bench
 #   JETTY_BENCH_NO_VK_FILTER=1: GPU init without the startup Vulkan driver filter.
+JETTY_BENCH_ONLY=first_frame target/release/jetty-bench  # cold start's text layers +
+                                                          # first-frame effect pipelines
+#   JETTY_BENCH_FIRST_FRAME=serial: the pre-0.30 order. One measurement per process
+#   (the driver caches pipelines in memory): alternate many runs of each.
 
 # Live metrics on the running app: exec→first-frame cold start, input latency
 # (keypress→glyph, percentiles), and idle RSS. Zero cost unless the flag is set.

@@ -3547,40 +3547,24 @@ impl App {
     /// changes — instead of all of them at startup.
     fn ensure_summon_fx(&mut self) {
         let Some(g) = &self.gpu else { return };
-        let (device, format) = (&g.device, g.format);
-        match self.summon_plan().0 {
-            SummonEffect::None => {}
-            SummonEffect::Bayer => {
-                if self.bayer_reveal.is_none() {
-                    self.bayer_reveal = Some(jetty_render::BayerReveal::new(device, format));
-                }
-            }
-            SummonEffect::Phosphor => {
-                if self.phosphor.is_none() {
-                    self.phosphor = Some(jetty_render::PhosphorIgnition::new(device, format));
-                }
-            }
-            SummonEffect::Liquid => {
-                if self.liquid.is_none() {
-                    self.liquid = Some(jetty_render::LiquidDrop::new(device, format));
-                }
-            }
-            SummonEffect::Focus => {
-                if self.focus.is_none() {
-                    self.focus = Some(jetty_render::FocusPull::new(device, format));
-                }
-            }
-            SummonEffect::Pop | SummonEffect::Glide | SummonEffect::Fade => {
-                if self.transform.is_none() {
-                    self.transform = Some(jetty_render::SummonTransform::new(device, format));
-                }
+        let effect = self.summon_plan().0;
+        let built = match effect {
+            SummonEffect::None => true,
+            SummonEffect::Bayer => self.bayer_reveal.is_some(),
+            SummonEffect::Phosphor => self.phosphor.is_some(),
+            SummonEffect::Liquid => self.liquid.is_some(),
+            SummonEffect::Focus => self.focus.is_some(),
+            SummonEffect::Pop | SummonEffect::Glide | SummonEffect::Fade => self.transform.is_some(),
+        };
+        if !built {
+            if let Some(pass) = SummonPass::build(&g.device, g.format, effect) {
+                self.adopt_summon_pass(pass);
             }
         }
         // The passes of effects no longer selected go: their pipelines, and a
         // Tier-B pass's cached bind group, which would keep the scene texture
         // alive. A Tier-B effect swapped for one that samples nothing drops
         // that texture too (unless the post pass still renders into it).
-        let effect = self.summon_plan().0;
         if effect != SummonEffect::Bayer {
             self.bayer_reveal = None;
         }
@@ -3597,6 +3581,17 @@ impl App {
             self.transform = None;
         }
         self.release_post_targets(self.crt_key);
+    }
+
+    /// Hold a built summon reveal pass where its effect's frames look for it.
+    fn adopt_summon_pass(&mut self, pass: SummonPass) {
+        match pass {
+            SummonPass::Bayer(p) => self.bayer_reveal = Some(p),
+            SummonPass::Phosphor(p) => self.phosphor = Some(p),
+            SummonPass::Liquid(p) => self.liquid = Some(p),
+            SummonPass::Focus(p) => self.focus = Some(p),
+            SummonPass::Transform(p) => self.transform = Some(p),
+        }
     }
 
     /// Set `reduce_motion` (hot-reload, Settings, palette).
@@ -13649,6 +13644,14 @@ impl ApplicationHandler<AppEvent> for App {
             event_loop.exit();
             return;
         }
+        // The first frame's effect pipelines compile on a worker while this
+        // thread builds the text layers below (`FirstFramePasses`).
+        let first_passes = gpu.as_ref().map(|g| {
+            let (device, format) = (g.device.clone(), g.format);
+            let effect = self.summon_plan().0;
+            let post = crate::motion::post_key(&self.fx, self.motion_reduced());
+            std::thread::spawn(move || FirstFramePasses::build(&device, format, effect, post))
+        });
         // GPU is ready — join the font worker (its ~20ms load happened in
         // parallel with the GPU block above, so this join is typically free).
         let (font_system, mono_families) = font_handle.join().expect("font worker panicked");
@@ -13756,6 +13759,14 @@ impl ApplicationHandler<AppEvent> for App {
             self.chrome_text = Some(chrome);
         }
 
+        // Frame 1 finds these built: `ensure_summon_fx` and `sync_main_post`
+        // (which records the prepared variant) compile nothing then.
+        if let Some(passes) = first_passes.and_then(|h| h.join().ok()) {
+            if let Some(pass) = passes.summon {
+                self.adopt_summon_pass(pass);
+            }
+            self.crt = passes.crt;
+        }
         self.window = Some(window);
         self.refresh_frame_interval();
         self.gpu = gpu;
@@ -17300,6 +17311,59 @@ fn summon_plan(effect: SummonEffect, reduced: bool) -> (SummonEffect, f32) {
         (SummonEffect::Fade, crate::motion::REDUCED_SUMMON_SECS)
     } else {
         (effect, effect.duration())
+    }
+}
+
+/// One summon reveal effect's GPU pass (`App::ensure_summon_fx`).
+enum SummonPass {
+    Bayer(jetty_render::BayerReveal),
+    Phosphor(jetty_render::PhosphorIgnition),
+    Liquid(jetty_render::LiquidDrop),
+    Focus(jetty_render::FocusPull),
+    Transform(jetty_render::SummonTransform),
+}
+
+impl SummonPass {
+    /// Compile `effect`'s pass (`None` for no reveal).
+    fn build(device: &wgpu::Device, format: wgpu::TextureFormat, effect: SummonEffect) -> Option<Self> {
+        Some(match effect {
+            SummonEffect::None => return None,
+            SummonEffect::Bayer => SummonPass::Bayer(jetty_render::BayerReveal::new(device, format)),
+            SummonEffect::Phosphor => SummonPass::Phosphor(jetty_render::PhosphorIgnition::new(device, format)),
+            SummonEffect::Liquid => SummonPass::Liquid(jetty_render::LiquidDrop::new(device, format)),
+            SummonEffect::Focus => SummonPass::Focus(jetty_render::FocusPull::new(device, format)),
+            SummonEffect::Pop | SummonEffect::Glide | SummonEffect::Fade => {
+                SummonPass::Transform(jetty_render::SummonTransform::new(device, format))
+            }
+        })
+    }
+}
+
+/// The first frame's effect pipelines, compiled on a worker thread while
+/// `resumed` builds the text layers (`wgpu::Device` is Send + Sync): the
+/// summon reveal the first open plays, and the CRT post pass's variant when it
+/// is on. Frame 1 used to compile both on the cold start's critical path,
+/// right after the GPU block.
+struct FirstFramePasses {
+    summon: Option<SummonPass>,
+    /// Built with `post`'s variant prepared; `App::sync_main_post` adopts it.
+    crt: Option<jetty_render::Crt>,
+}
+
+impl FirstFramePasses {
+    fn build(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        effect: SummonEffect,
+        post: Option<jetty_render::CrtKey>,
+    ) -> Self {
+        let summon = SummonPass::build(device, format, effect);
+        let crt = post.map(|key| {
+            let crt = jetty_render::Crt::new(device, format);
+            crt.prepare(device, key);
+            crt
+        });
+        FirstFramePasses { summon, crt }
     }
 }
 

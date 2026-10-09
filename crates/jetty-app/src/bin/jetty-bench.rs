@@ -225,6 +225,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if only.as_deref() == Some("frames") {
         return bench_frames(&device, &queue, format, font_size);
     }
+    // `JETTY_BENCH_ONLY=first_frame`: the cold start's text layers and first-frame
+    // effect pipelines, serial or overlapped (one measurement per process).
+    if only.as_deref() == Some("first_frame") {
+        return bench_first_frame(&device, &queue, format, font_size);
+    }
 
     // Split as the app pays it: the font-DB scan overlaps GPU init on a worker
     // thread, the layer (atlas, pipelines, font loads) is built on the UI thread
@@ -362,6 +367,65 @@ fn print_gpu_init(adapter: &wgpu::Adapter, instance_ms: f64, adapter_ms: f64, to
             }
         }
     }
+}
+
+/// The cold start's critical path after the GPU block (`JETTY_BENCH_ONLY=
+/// first_frame`): the two text layers `resumed` builds (from an already-loaded
+/// font database, as there), and the first frame's effect pipelines — the
+/// default summon pass (Phosphor) and the Retro CRT preset's post-pass variant —
+/// compiled after them on this thread (`JETTY_BENCH_FIRST_FRAME=serial`: what
+/// frame 1 did) or on a worker while they build (the default, `overlap`: what
+/// `resumed` does). ONE measurement per process — a second build would hit the
+/// driver's in-memory pipeline cache — so compare many runs of each, with and
+/// without `MESA_SHADER_CACHE_DISABLE=true` (a cold on-disk shader cache).
+fn bench_first_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    font_size: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jetty_app::effects::{self, EffectsConfig};
+    let overlap = std::env::var("JETTY_BENCH_FIRST_FRAME").map_or(true, |v| v != "serial");
+    let mut fx = EffectsConfig::default();
+    if let Some(p) = effects::effect_presets().iter().find(|p| p.id == "retro_crt") {
+        p.patch.apply_to(&mut fx);
+    }
+    let key = effects::crt_settings(&fx).key();
+    // The pipelines frame 1 needs, and how long they took (ms).
+    fn effect_pipelines(device: &wgpu::Device, format: wgpu::TextureFormat, key: jetty_render::CrtKey) -> f64 {
+        let t = Instant::now();
+        let _phosphor = jetty_render::PhosphorIgnition::new(device, format);
+        let crt = jetty_render::Crt::new(device, format);
+        crt.prepare(device, key);
+        t.elapsed().as_secs_f64() * 1000.0
+    }
+    let fonts = TextLayer::build_font_system();
+    let t0 = Instant::now();
+    let worker = overlap.then(|| {
+        let device = device.clone();
+        std::thread::spawn(move || effect_pipelines(&device, format, key))
+    });
+    let grid = TextLayer::new_with_family_and_fonts(device, queue, format, font_size, "MesloLGS NF", fonts);
+    let chrome_fonts = grid.clone_font_system();
+    let _chrome = TextLayer::new_with_family_and_fonts(
+        device,
+        queue,
+        format,
+        jetty_render::UI_FONT_BASE,
+        "MesloLGS NF",
+        chrome_fonts,
+    );
+    let text_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let fx_ms = match worker {
+        Some(h) => h.join().map_err(|_| "effect worker panicked")?,
+        None => effect_pipelines(device, format, key),
+    };
+    let wall = t0.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "first_frame   {}: {wall:6.1} ms (text layers {text_ms:5.1} ms, effect pipelines {fx_ms:5.1} ms)",
+        if overlap { "overlap" } else { "serial " }
+    );
+    Ok(())
 }
 
 /// The CRT post pass (`jetty_render::Crt`, the app's own settings path) on a
