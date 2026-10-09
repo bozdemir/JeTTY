@@ -6413,6 +6413,25 @@ mod tests {
         assert_eq!(t.take_title_update(), None, "coalesced into one update");
     }
 
+    #[test]
+    fn the_title_stack_holds_clipped_titles() {
+        // alacritty kept an OSC 0/2 title whole (up to the 1 MiB OSC cap) and
+        // cloned it on every `CSI 22 t`, 4096 deep: ~1 MB of output pinned
+        // ~4 GiB per tab. Titles are clipped on the way in (JeTTY shows 256
+        // chars), so the stack holds at most 4096 × 1 KiB.
+        let mut t = Terminal::new(20, 5);
+        t.feed(format!("\x1b]2;{}\x07", "中".repeat(5462)).as_bytes()); // 16 KiB
+        t.feed(&b"\x1b[22t".repeat(4096));
+        t.feed(b"\x1b]2;short\x07");
+        for _ in 0..3 {
+            t.feed(b"\x1b[23t");
+            let popped = t.title_update.lock().unwrap().clone().flatten().unwrap();
+            assert!(popped.len() <= crate::handler::TITLE_MAX_BYTES, "a {}-byte title", popped.len());
+            assert_eq!(popped, "中".repeat(341), "clipped on a char boundary");
+        }
+        assert_eq!(t.take_title_update(), Some(Some("中".repeat(256))), "the title shown is the same");
+    }
+
     // ── OSC 9;4 progress ──────────────────────────────────────────────────────
 
     fn prog(state: ProgressState, value: Option<u8>) -> Option<Progress> {

@@ -28,6 +28,9 @@
 //!   base16-shell) instead of the theme's, so the background a program
 //!   detects (neovim, bat, delta) is the one on screen.
 //! * DA1 reports sixel graphics, so lsix, chafa, notcurses and tmux use them.
+//! * OSC 0 / 2 titles are clipped to [`TITLE_MAX_BYTES`]: alacritty kept the
+//!   whole payload and cloned it on every title-stack push (`CSI 22 t`, 4096
+//!   deep), so ~1 MB of output could pin ~4 GiB per tab.
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
@@ -43,6 +46,11 @@ use alacritty_terminal::vte::ansi::{
 use std::cell::Cell;
 use std::ptr::NonNull;
 use std::sync::mpsc::Sender;
+
+/// Most bytes of a title `Term` keeps. JeTTY shows at most 256 chars (≤ 1 KiB
+/// of UTF-8); alacritty stores the whole OSC 0 / 2 payload — up to the 1 MiB
+/// OSC cap — and clones it on every title-stack push (`CSI 22 t`, 4096 deep).
+pub(crate) const TITLE_MAX_BYTES: usize = 1024;
 
 /// The primary device attributes JeTTY reports: a VT220-class terminal (62)
 /// with sixel graphics (4) and ANSI color (22). alacritty answers a bare VT102
@@ -193,7 +201,6 @@ macro_rules! forward {
 
 impl<T: EventListener> Handler for Vt<T> {
     forward! {
-        fn set_title(&mut self, title: Option<String>);
         fn set_cursor_style(&mut self, style: Option<CursorStyle>);
         fn set_cursor_shape(&mut self, shape: CursorShape);
         fn input(&mut self, c: char);
@@ -250,6 +257,20 @@ impl<T: EventListener> Handler for Vt<T> {
     fn linefeed(&mut self) {
         Handler::linefeed(&mut self.0);
         self.0.grid_mut().cursor.input_needs_wrap = false;
+    }
+
+    fn set_title(&mut self, title: Option<String>) {
+        let title = title.map(|mut t| {
+            if t.len() > TITLE_MAX_BYTES {
+                let mut end = TITLE_MAX_BYTES;
+                while !t.is_char_boundary(end) {
+                    end -= 1;
+                }
+                t.truncate(end);
+            }
+            t
+        });
+        Handler::set_title(&mut self.0, title);
     }
 
     fn reverse_index(&mut self) {
