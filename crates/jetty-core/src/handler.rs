@@ -5,12 +5,20 @@
 //! into `Term` (whose `input` stays out of line, as in alacritty).
 //!
 //! The corrections:
+//! * DCH (`CSI Ps P`) with a count past the end of the line erased the cells
+//!   LEFT of the cursor too; the count is clamped to the cells that remain.
+//! * DCH / ICH / ECH / EL / ED through half of a wide char erase all of it (as
+//!   xterm, VTE and kitty do): an orphaned first half drew its glyph over the
+//!   next cell, an orphaned second half put the drawn cursor a cell off.
 //! * OSC 4 / 10 / 11 / 12 queries answer with the color a program set (pywal,
 //!   base16-shell) instead of the theme's, so the background a program
 //!   detects (neovim, bat, delta) is the one on screen.
 //! * DA1 reports sixel graphics, so lsix, chafa, notcurses and tmux use them.
 
 use alacritty_terminal::event::EventListener;
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::Column;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::cursor_icon::CursorIcon;
 use alacritty_terminal::vte::ansi::{
@@ -37,6 +45,28 @@ impl<T: EventListener> Vt<'_, T> {
     fn send(&self, bytes: Vec<u8>) {
         let _ = self.reply.send(bytes);
     }
+
+    fn column(&self) -> usize {
+        self.term.grid().cursor.point.column.0
+    }
+
+    /// Erase the wide char straddling the boundary just left of column `col`
+    /// on the cursor row (`col` = its second half), both halves, before an edit
+    /// that splits it: an orphaned first half drew its glyph over the next
+    /// cell, an orphaned second half put the drawn cursor a cell off.
+    fn split_wide_at(&mut self, col: usize) {
+        if col == 0 || col >= self.term.columns() {
+            return;
+        }
+        let line = self.term.grid().cursor.point.line;
+        let row = &mut self.term.grid_mut()[line];
+        if row[Column(col)].flags.contains(Flags::WIDE_CHAR_SPACER) {
+            row[Column(col)].flags.remove(Flags::WIDE_CHAR_SPACER);
+            if row[Column(col - 1)].flags.contains(Flags::WIDE_CHAR) {
+                row[Column(col - 1)].clear_wide();
+            }
+        }
+    }
 }
 
 /// Forward `Handler` methods to `Term` unchanged.
@@ -60,7 +90,6 @@ impl<T: EventListener> Handler for Vt<'_, T> {
         fn goto(&mut self, line: i32, col: usize);
         fn goto_line(&mut self, line: i32);
         fn goto_col(&mut self, col: usize);
-        fn insert_blank(&mut self, count: usize);
         fn move_up(&mut self, lines: usize);
         fn move_down(&mut self, lines: usize);
         fn device_status(&mut self, arg: usize);
@@ -80,14 +109,10 @@ impl<T: EventListener> Handler for Vt<'_, T> {
         fn scroll_down(&mut self, lines: usize);
         fn insert_blank_lines(&mut self, lines: usize);
         fn delete_lines(&mut self, lines: usize);
-        fn erase_chars(&mut self, count: usize);
-        fn delete_chars(&mut self, count: usize);
         fn move_backward_tabs(&mut self, count: u16);
         fn move_forward_tabs(&mut self, count: u16);
         fn save_cursor_position(&mut self);
         fn restore_cursor_position(&mut self);
-        fn clear_line(&mut self, mode: LineClearMode);
-        fn clear_screen(&mut self, mode: ClearMode);
         fn clear_tabs(&mut self, mode: TabulationClearMode);
         fn set_tabs(&mut self, interval: u16);
         fn reset_state(&mut self);
@@ -124,6 +149,53 @@ impl<T: EventListener> Handler for Vt<'_, T> {
         fn set_scp(&mut self, char_path: ScpCharPath, update_mode: ScpUpdateMode);
     }
 
+    fn delete_chars(&mut self, count: usize) {
+        let x = self.column();
+        let count = count.min(self.term.columns() - x);
+        self.split_wide_at(x);
+        self.split_wide_at(x + count);
+        Handler::delete_chars(&mut *self.term, count);
+    }
+
+    fn insert_blank(&mut self, count: usize) {
+        let (x, cols) = (self.column(), self.term.columns());
+        let count = count.min(cols - x);
+        self.split_wide_at(x);
+        // The cells from `cols - count` on are pushed off the end of the line.
+        if cols - count > x {
+            self.split_wide_at(cols - count);
+        }
+        Handler::insert_blank(&mut *self.term, count);
+    }
+
+    fn erase_chars(&mut self, count: usize) {
+        let x = self.column();
+        self.split_wide_at(x);
+        self.split_wide_at(x.saturating_add(count));
+        Handler::erase_chars(&mut *self.term, count);
+    }
+
+    fn clear_line(&mut self, mode: LineClearMode) {
+        let x = self.column();
+        match mode {
+            // `Term` clears nothing to the right while a wrap is pending.
+            LineClearMode::Right if !self.term.grid().cursor.input_needs_wrap => self.split_wide_at(x),
+            LineClearMode::Left => self.split_wide_at(x + 1),
+            _ => {}
+        }
+        Handler::clear_line(&mut *self.term, mode);
+    }
+
+    fn clear_screen(&mut self, mode: ClearMode) {
+        let x = self.column();
+        match mode {
+            ClearMode::Below => self.split_wide_at(x),
+            ClearMode::Above => self.split_wide_at(x + 1),
+            _ => {}
+        }
+        Handler::clear_screen(&mut *self.term, mode);
+    }
+
     fn identify_terminal(&mut self, intermediate: Option<char>) {
         match intermediate {
             None => self.send(DA1_REPLY.to_vec()),
@@ -148,8 +220,7 @@ mod tests {
     use super::*;
     use crate::Terminal;
     use alacritty_terminal::event::Event;
-    use alacritty_terminal::grid::Dimensions;
-    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::index::Line;
     use alacritty_terminal::term::cell::Cell;
     use alacritty_terminal::term::test::TermSize;
     use alacritty_terminal::term::{Config, TermMode};
@@ -164,6 +235,43 @@ mod tests {
         let s = t.snapshot();
         let text = (0..rows).map(|r| s.row_text(r)).collect();
         (text, (s.cursor_row, s.cursor_col), String::from_utf8_lossy(&t.drain_pty_writes()).into_owned())
+    }
+
+    #[test]
+    fn dch_past_the_end_of_the_line_keeps_the_cells_left_of_the_cursor() {
+        for n in [3, 5, 99, 65535] {
+            let (rows, cursor, _) = run(10, 1, &format!("0123456789\x1b[1;9H\x1b[{n}P"));
+            assert_eq!((rows[0].as_str(), cursor), ("01234567  ", (0, 8)), "DCH {n}");
+        }
+        let (rows, _, _) = run(10, 1, "0123456789\x1b[1;4H\x1b[3P");
+        assert_eq!(rows[0], "0126789   ", "a DCH inside the line is unchanged");
+    }
+
+    #[test]
+    fn editing_through_half_a_wide_char_erases_all_of_it() {
+        // xterm, VTE and kitty never leave half a wide char behind. An orphaned
+        // first half drew its glyph over the next cell; an orphaned second half
+        // put the drawn cursor a cell off (in column 0: a debug panic, and the
+        // cursor drawn in the last column in release).
+        let cases = [
+            ("ab中cd\x1b[1;4H\x1b[P", "ab cd ", (0, 3)),
+            ("中x\x1b[1;1H\x1b[P", " x    ", (0, 0)),
+            ("ab中cd\x1b[1;4H\x1b[@", "ab   c", (0, 3)),
+            ("abcd中\x1b[1;1H\x1b[@", " abcd ", (0, 0)),
+            ("中x\x1b[1;1H\x1b[X\x1b[1;2H", "  x   ", (0, 1)),
+            ("a中x\x1b[1;3H\x1b[X", "a  x  ", (0, 2)),
+            ("a中x\x1b[1;3H\x1b[K", "a     ", (0, 2)),
+            ("中x\x1b[1;1H\x1b[1K\x1b[1;2H", "  x   ", (0, 1)),
+            ("a中x\x1b[1;3H\x1b[J", "a     ", (0, 2)),
+            ("中x\x1b[1;1H\x1b[1J\x1b[1;2H", "  x   ", (0, 1)),
+        ];
+        for (seq, row, cursor) in cases {
+            let (rows, at, _) = run(6, 2, seq);
+            assert_eq!((rows[0].as_str(), at), (row, cursor), "{seq:?}");
+        }
+        // Whole wide chars are untouched by edits that do not split them.
+        let (rows, _, _) = run(6, 1, "中文x\x1b[1;3H\x1b[2P");
+        assert_eq!(rows[0], "中 x   ");
     }
 
     #[test]

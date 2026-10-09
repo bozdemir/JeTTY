@@ -3620,14 +3620,35 @@ impl Terminal {
         self.after_vte(alt_before, alt_after, h0, h1, d0);
     }
 
+    /// The grid cell the cursor is drawn on: its own — or, on the right half of
+    /// a wide glyph, the glyph's first cell. Only a REAL glyph counts:
+    /// alacritty's renderable cursor steps left off any right half, which put
+    /// the cursor a cell off on an orphaned half (DCH / ECH / EL through a wide
+    /// char leave one) and underflowed in column 0 (a debug panic; release drew
+    /// the cursor in the last column).
+    fn cursor_cell(&self) -> Point {
+        let grid = self.term.grid();
+        let mut p = grid.cursor.point;
+        if p.column.0 > 0
+            && grid[p].flags.contains(Flags::WIDE_CHAR_SPACER)
+            && grid[p.line][p.column - 1].flags.contains(Flags::WIDE_CHAR)
+        {
+            p.column -= 1;
+        }
+        p
+    }
+
     pub fn snapshot(&self) -> GridSnapshot {
         let (rows, cols) = (self.rows, self.cols);
         // Filled in row-major order below (every cell is pushed exactly once), so
         // there is no blank pre-fill for the loop to overwrite.
         let mut cells: Vec<CellSnapshot> = Vec::with_capacity(rows * cols);
         let mut graphemes = Vec::new();
-        let content = self.term.renderable_content();
-        let display_offset = content.display_offset;
+        // The grid is read directly, not through `Term::renderable_content`:
+        // that also computes the selection range (done once, below) and a
+        // cursor that underflows on an orphaned wide-char half (`cursor_cell`).
+        let grid = self.term.grid();
+        let display_offset = grid.display_offset();
         // Dynamic OSC 4/10/11/12 palette overrides (pywal, base16 hooks, etc.)
         // are stored in the Term's color table; consult it so redefined colors
         // actually change on screen, falling back to the static theme.
@@ -3644,7 +3665,6 @@ impl Terminal {
         // snapshot (theme and override table are fixed while it runs).
         let mut fg_memo = ColorMemo::new(&self.theme, colors);
         let mut bg_memo = ColorMemo::new(&self.theme, colors);
-        let grid = self.term.grid();
         // The visible rows, one slice per row: viewport row `r` is grid line
         // `r - display_offset` (negative = history) — the mapping
         // `point_to_viewport` inverts. Walking each row's cells as a slice costs
@@ -3794,9 +3814,9 @@ impl Terminal {
         // Viewport rows the grid doesn't have (never expected): blank.
         cells.resize(rows * cols, CellSnapshot::default());
 
-        // Mark selected cells: the selection range (terminal coordinates) that
-        // `renderable_content` already resolved, over the viewport rows.
-        if let Some(range) = content.selection {
+        // Mark selected cells: the selection range (terminal coordinates),
+        // resolved once, over the viewport rows.
+        if let Some(range) = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term)) {
             for vp_row in 0..self.rows {
                 let term_point = viewport_to_point(display_offset, Point::new(vp_row, Column(0)));
                 let term_line = term_point.line;
@@ -3830,21 +3850,22 @@ impl Terminal {
         // visible viewport (point_to_viewport → None, or a row past the last
         // visible line); in that case the cursor has scrolled off-screen and must
         // be hidden so it does not paint over scrollback content.
-        let cursor_vp = point_to_viewport(display_offset, content.cursor.point);
+        let cursor_vp = point_to_viewport(display_offset, self.cursor_cell());
         let cursor_in_view = cursor_vp.map(|p| p.line < self.rows).unwrap_or(false);
         let (cursor_row, cursor_col) = cursor_vp
             .map(|p| (p.line.min(self.rows.saturating_sub(1)), p.column.0.min(self.cols.saturating_sub(1))))
             .unwrap_or((0, 0));
 
-        // Apps hide the cursor with DECTCEM (`\e[?25l`); alacritty then reports
-        // the renderable cursor shape as `CursorShape::Hidden`. Treat that as not
-        // visible. Also hide the cursor when it has scrolled out of the viewport.
-        let cursor_visible = content.cursor.shape != CursorShape::Hidden && cursor_in_view;
+        // Apps hide the cursor with DECTCEM (`\e[?25l`). Also hide the cursor
+        // when it has scrolled out of the viewport.
+        let shown = self.term.mode().contains(TermMode::SHOW_CURSOR);
+        let cursor_visible = shown && cursor_in_view;
 
         // Renderable cursor SHAPE (DECSCUSR `CSI Ps SP q`): 1/2 block, 3/4
-        // underline, 5/6 beam. Hidden is folded into `cursor_visible` above, so
-        // it maps to the Block default (never drawn while invisible).
-        let cursor_shape = match content.cursor.shape {
+        // underline, 5/6 beam (the user's default until a program sets one). A
+        // hidden cursor reports the Block default (never drawn while invisible).
+        let cursor_shape = match self.term.cursor_style().shape {
+            _ if !shown => CursorShapeSnap::Block,
             CursorShape::Underline => CursorShapeSnap::Underline,
             CursorShape::Beam => CursorShapeSnap::Beam,
             CursorShape::HollowBlock => CursorShapeSnap::HollowBlock,
@@ -3854,7 +3875,6 @@ impl Terminal {
         // Scrollbar data: display_offset is how many lines we're scrolled up
         // (0 = at bottom). history_size() is the number of lines in the scrollback
         // buffer (total_lines - screen_lines), which is the maximum scroll offset.
-        let grid = self.term.grid();
         let scroll_offset = grid.display_offset();
         let scroll_max = grid.history_size();
 
@@ -4589,9 +4609,9 @@ impl Terminal {
     /// can see neighbouring rows (BLOCKING 4). Keystroke-rate only.
     pub fn viewport_rows_chars(&self) -> Vec<Vec<char>> {
         let mut rows = vec![vec![' '; self.cols]; self.rows];
-        let content = self.term.renderable_content();
-        let display_offset = content.display_offset;
-        for item in content.display_iter {
+        let grid = self.term.grid();
+        let display_offset = grid.display_offset();
+        for item in grid.display_iter() {
             if let Some(vp) = point_to_viewport(display_offset, item.point) {
                 if vp.line < self.rows && vp.column.0 < self.cols {
                     let cell = item.cell;
@@ -7203,6 +7223,27 @@ mod tests {
     }
 
     #[test]
+    fn the_cursor_on_an_orphaned_wide_char_half_is_drawn_where_it_is() {
+        // A wide char's second half with no first half before it (column 0, or
+        // left by an edit through a wide char). alacritty's renderable cursor
+        // stepped left off ANY second half: a cell off, and in column 0 an
+        // underflow — a panic in debug builds, the cursor drawn in the LAST
+        // column in release.
+        let mut t = Terminal::new(6, 2);
+        t.feed(b"ab");
+        for col in [0, 1] {
+            t.term.grid_mut()[Line(0)][Column(col)].flags.insert(Flags::WIDE_CHAR_SPACER);
+            t.feed(format!("\x1b[1;{}H", col + 1).as_bytes());
+            let s = t.snapshot();
+            assert_eq!((s.cursor_row, s.cursor_col), (0, col));
+            assert_eq!(t.viewport_rows_chars()[0][col], WIDE_SPACER);
+        }
+        // On a real wide char's second half the cursor still covers the glyph.
+        t.feed("\x1b[2;1Hx中\x1b[2;3H".as_bytes());
+        assert_eq!(t.snapshot().cursor_col, 1);
+    }
+
+    #[test]
     fn region_scrolls_while_scrolled_back_leave_the_view_alone() {
         // Scrolling a region below a fixed top row (DECSTBM top margin > 1) or
         // deleting lines below the top row pushes nothing into history, yet
@@ -9522,7 +9563,10 @@ mod tests {
         }
         let seeds: u64 = std::env::var("JETTY_FUZZ_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
         for seed in 1..=seeds {
-            fuzz_terminal(seed.wrapping_mul(0xd1b5_4a32_d192_ed03), 600);
+            let seed = seed.wrapping_mul(0xd1b5_4a32_d192_ed03);
+            // Name the seed even when the panic comes from inside alacritty.
+            let run = std::panic::catch_unwind(|| fuzz_terminal(seed, 600));
+            assert!(run.is_ok(), "fuzz seed {seed:#x} panicked (replay: JETTY_FUZZ_SEED={seed:#x})");
         }
     }
 }
