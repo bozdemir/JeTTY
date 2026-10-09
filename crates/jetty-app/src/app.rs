@@ -9293,25 +9293,25 @@ impl App {
     /// expanded, scrolled near the top and highlighted until the next input.
     /// A section's master switch and the theme gallery reveal their section.
     fn reveal_setting(&mut self, id: &'static str) {
-        use crate::settings_ui::{find, section, Kind};
+        use crate::settings_ui::{find, link_target, stop_of, stops, tab_items};
         let Some(d) = find(id) else { return };
-        let header = matches!(d.kind, Kind::Gallery) || section(d.section).is_some_and(|s| s.master == Some(id));
-        let target = if header { d.section } else { id };
+        let cfg = self.settings_snapshot();
+        // A control the config hides lands on the row that reveals it.
+        let Some((tab, target)) = link_target(id, &cfg) else { return };
         self.gallery.keep();
         self.reset_armed = false;
-        self.settings_tab = d.tab;
+        self.settings_tab = tab;
         self.settings_collapsed.retain(|s| *s != d.section);
         self.settings_focus = Some(target);
         // …and the keyboard focus on it: the arrows adjust it right away.
         self.settings_kb = {
-            use crate::settings_ui::{stop_of, stops, tab_items};
-            let cfg = self.settings_snapshot();
-            stop_of(&stops(&tab_items(d.tab, &cfg, &self.settings_ctx())), id)
+            let st = stops(&tab_items(tab, &cfg, &self.settings_ctx()));
+            stop_of(&st, id).or_else(|| stop_of(&st, target))
         };
         let margin = 12.0 * self.settings_metrics().overlay_u();
         if let Some(pv) = self.settings_view_now() {
             if let Some((top, _)) = pv.geom.anchor(target) {
-                self.settings_scroll[d.tab] = (top - margin).clamp(0.0, pv.geom.max_scroll);
+                self.settings_scroll[tab] = (top - margin).clamp(0.0, pv.geom.max_scroll);
             }
         }
         if let Some(w) = &self.settings_window {

@@ -1948,6 +1948,26 @@ pub struct DeepLink {
     pub id: CtlId,
 }
 
+/// Where a deep link to control `id` lands in config `cfg`: `(tab, the row
+/// or section it highlights)`. A section's master switch and the gallery
+/// highlight their section; a control `cfg` hides (the backdrop's Image row
+/// while the backdrop is off) lands on the first row of its section that
+/// shows — the one that reveals it (the backdrop mode).
+pub fn link_target(id: &str, cfg: &Config) -> Option<(usize, &'static str)> {
+    let d = find(id)?;
+    let sec = section(d.section);
+    let master = sec.and_then(|s| s.master);
+    if matches!(d.kind, Kind::Gallery) || master == Some(d.id) {
+        return Some((d.tab, d.section));
+    }
+    let shows = |o: &Desc| o.visible.is_none_or(|v| v(cfg));
+    if shows(d) {
+        return Some((d.tab, d.id));
+    }
+    let first = DESCS.iter().find(|o| o.section == d.section && Some(o.id) != master && o.is_setting() && shows(o));
+    Some((d.tab, first.map_or(d.section, |o| o.id)))
+}
+
 /// Palette deep links, one per setting.
 pub fn deep_links() -> Vec<DeepLink> {
     DESCS
@@ -2939,6 +2959,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every deep link lands on a row or section the panel SHOWS, in every
+    /// config — so it can scroll there and highlight it. A control the
+    /// config hides (the backdrop's Image row while the backdrop is off)
+    /// used to land on nothing: the tab opened, nothing scrolled, nothing lit.
+    #[test]
+    fn every_deep_link_lands_on_a_shown_row() {
+        let (mono, ui) = fonts();
+        let x = ctx(&mono, &ui);
+        let mut configs = revealing_configs();
+        configs.push(Config::default());
+        for c in &configs {
+            for link in deep_links() {
+                let (tab, target) = link_target(link.id, c).expect("a known control");
+                let shown = tab_items(tab, c, &x).iter().any(|it| match it {
+                    PanelItem::Section { id, .. } => *id == target,
+                    PanelItem::Row(r) => r.id == target,
+                    _ => false,
+                });
+                assert!(shown, "{} (backdrop {:?}) lands on {target:?}, which is hidden", link.title, c.backdrop.mode);
+            }
+        }
+        // The hidden control lands on the row that reveals it.
+        let off = Config::default();
+        assert_eq!(link_target("backdrop.image", &off), Some((LOOK, "backdrop.mode")));
+        let image = with_backdrop("image", &[]);
+        assert_eq!(link_target("backdrop.image", &image), Some((LOOK, "backdrop.image")));
     }
 
     #[test]

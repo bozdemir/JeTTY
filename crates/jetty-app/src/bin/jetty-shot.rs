@@ -1300,11 +1300,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // section for a master switch or the gallery) and keyboard-focused
             // (ringed) — like App::reveal_setting.
             let linked = var("JETTY_SHOT_PANEL_FOCUS").and_then(|id| sui::find(&id));
-            let focus: Option<&'static str> = linked.map(|d| {
-                tab = d.tab;
-                let header = matches!(d.kind, sui::Kind::Gallery)
-                    || sui::section(d.section).is_some_and(|s| s.master == Some(d.id));
-                if header { d.section } else { d.id }
+            let focus: Option<&'static str> = linked.and_then(|d| sui::link_target(d.id, cfg)).map(|(t, target)| {
+                tab = t;
+                target
             });
             let filter = match var("JETTY_SHOT_PANEL_FILTER").as_deref() {
                 Some("dark") => jetty_render::ThemeFilter::Dark,
@@ -1378,7 +1376,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             inp.hover = hover;
             inp.focus = focus;
             inp.focus_part = linked
-                .and_then(|d| sui::stop_of(&sui::stops(&items), d.id))
+                .and_then(|d| {
+                    let st = sui::stops(&items);
+                    sui::stop_of(&st, d.id).or_else(|| focus.and_then(|t| sui::stop_of(&st, t)))
+                })
                 .and_then(|s| sui::focus_ring(s, &items, theme_idx));
             inp.ui_font_size = ui_font_size;
             inp.reset = reset;
