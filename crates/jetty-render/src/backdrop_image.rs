@@ -621,6 +621,38 @@ fn prepare_oriented((mut raw, orientation): (RawImage, u8), max_w: u32, max_h: u
 /// panics (a decoder panic is caught). The `Err` is a short reason for the
 /// user ("not a PNG or JPEG file", "4000×9000 is too large …").
 pub fn load(path: &Path, max_w: u32, max_h: u32, blur: f32) -> Result<DecodedImage, String> {
+    let data = read_checked(path)?;
+    std::panic::catch_unwind(move || decode_stored(&data).map(|d| prepare_oriented(d, max_w, max_h, blur)))
+        .unwrap_or_else(|_| Err("the decoder failed on this file".into()))
+}
+
+/// What [`load`] would refuse `path` for, found without decoding it — the
+/// file's size, its magic bytes and the dimensions in its header — for `jetty
+/// --check-config`. `Ok` when it should load.
+pub fn check(path: &Path) -> Result<(), String> {
+    use zune_jpeg::zune_core::bytestream::ZCursor;
+    let data = read_checked(path)?;
+    let (w, h) = std::panic::catch_unwind(|| match sniff(&data) {
+        Some(ImageKind::Png) => {
+            let reader = png::Decoder::new(std::io::Cursor::new(&data[..]))
+                .read_info()
+                .map_err(|e| decode_error("PNG", &e.to_string()))?;
+            Ok((reader.info().width, reader.info().height))
+        }
+        Some(ImageKind::Jpeg) => {
+            let mut decoder = zune_jpeg::JpegDecoder::new(ZCursor::new(&data[..]));
+            decoder.decode_headers().map_err(|e| decode_error("JPEG", &format!("{e:?}")))?;
+            let info = decoder.info().ok_or("bad JPEG (no header)")?;
+            Ok((u32::from(info.width), u32::from(info.height)))
+        }
+        None => Err("not a PNG or JPEG file".to_string()),
+    })
+    .unwrap_or_else(|_| Err("the decoder failed on this file".into()))?;
+    check_dims(w, h)
+}
+
+/// `path`'s bytes, when it is a file no larger than [`MAX_FILE_BYTES`].
+fn read_checked(path: &Path) -> Result<Vec<u8>, String> {
     let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => "file not found".to_string(),
         _ => format!("cannot read it ({e})"),
@@ -631,9 +663,7 @@ pub fn load(path: &Path, max_w: u32, max_h: u32, blur: f32) -> Result<DecodedIma
     if meta.len() > MAX_FILE_BYTES {
         return Err(format!("the file is larger than {} MB", MAX_FILE_BYTES / (1024 * 1024)));
     }
-    let data = std::fs::read(path).map_err(|e| format!("cannot read it ({e})"))?;
-    std::panic::catch_unwind(move || decode_stored(&data).map(|d| prepare_oriented(d, max_w, max_h, blur)))
-        .unwrap_or_else(|_| Err("the decoder failed on this file".into()))
+    std::fs::read(path).map_err(|e| format!("cannot read it ({e})"))
 }
 
 #[cfg(test)]
@@ -655,6 +685,28 @@ mod tests {
 
     /// A 16×8 baseline JPEG (PIL, quality 95): left half red, right half blue.
     const JPEG_16X8: &[u8] = include_bytes!("../tests/fixtures/backdrop-16x8.jpg");
+
+    #[test]
+    fn a_file_is_checked_without_decoding_it() {
+        // `jetty --check-config` says what `load` would, from the header only.
+        let dir = std::env::temp_dir().join(format!("jetty-backdrop-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        assert_eq!(check(&file("ok.png", &png_bytes(2, 2, &[9; 16]))), Ok(()));
+        assert_eq!(check(&file("ok.jpg", JPEG_16X8)), Ok(()));
+        assert_eq!(check(&dir.join("gone.png")), Err("file not found".to_string()));
+        assert_eq!(check(&file("x.gif", b"GIF89a....")), Err("not a PNG or JPEG file".to_string()));
+        // Too wide: refused from the header.
+        let wide = png_bytes(9000, 1, &vec![0; 9000 * 4]);
+        assert_eq!(check(&file("wide.png", &wide)), Err("9000×1 is too large (max 8192×8192)".to_string()));
+        assert!(check(&dir).is_err(), "a folder is not an image");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sniff_by_magic_not_extension() {

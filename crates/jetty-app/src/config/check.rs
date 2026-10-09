@@ -660,8 +660,9 @@ pub(crate) fn pick_ui_font_family(want: &str, families: impl FnOnce() -> Vec<Str
 
 /// Every problem the config tree at `dir` has, worded as JeTTY reports them:
 /// config.toml's (read as at startup, but never copied aside), the theme
-/// files', a theme or font name that finds nothing, a summon hotkey that does
-/// not parse, rejected keybindings and a hot reload that cannot watch the tree
+/// files', a theme or font name that finds nothing, a backdrop image that will
+/// not load, a `shell` that is not executable, a summon hotkey that does not
+/// parse, rejected keybindings and a hot reload that cannot watch the tree
 /// (inotify's limits). `fonts` lists the installed families: `(monospace,
 /// every other)`. Rebuilds the theme registry from `dir`.
 pub(crate) fn problems_in(dir: &std::path::Path, fonts: impl FnOnce() -> (Vec<String>, Vec<String>)) -> Vec<String> {
@@ -691,8 +692,30 @@ pub(crate) fn problems_in(dir: &std::path::Path, fonts: impl FnOnce() -> (Vec<St
     out.extend(crate::themes::rebuild_registry_from(&dir.join("themes")));
     for (key, name) in [("theme", &cfg.theme), ("light_theme", &cfg.light_theme)] {
         if !(key == "light_theme" && name.is_empty()) && jetty_core::theme_index(name).is_none() {
-            out.push(format!("{key} {name:?} not found{}", crate::themes::name_hint(name)));
+            let unused = key == "light_theme" && !cfg.follow_system_theme;
+            let note = if unused { " (only used with follow_system_theme)" } else { "" };
+            out.push(format!("{key} {name:?} not found{note}{}", crate::themes::name_hint(name)));
         }
+    }
+    // What is only used later — a backdrop image when it is decoded, the shell
+    // when a tab starts — is checked now too.
+    if jetty_render::BackdropMode::parse(&cfg.backdrop.mode) == jetty_render::BackdropMode::Image {
+        match cfg.backdrop.image_path(dir) {
+            None => out.push(
+                "backdrop.mode is \"image\" but no backdrop.image is set — the gradient shows instead".to_string(),
+            ),
+            Some(path) => {
+                if let Err(e) = jetty_render::backdrop_image::check(&path) {
+                    out.push(format!("backdrop.image {:?}: {e} — the gradient shows instead", cfg.backdrop.image));
+                }
+            }
+        }
+    }
+    if !cfg.shell.trim().is_empty() && !is_executable(cfg.shell.trim()) {
+        out.push(format!(
+            "shell {:?} is not an executable file — tabs start $SHELL, or your login shell, instead",
+            cfg.shell
+        ));
     }
     let (mono, others) = fonts();
     out.extend(pick_font_family(&cfg.font_family, &mono, || others.clone()).warning);
@@ -705,6 +728,17 @@ pub(crate) fn problems_in(dir: &std::path::Path, fonts: impl FnOnce() -> (Vec<St
         out.extend(crate::watch::probe(dir));
     }
     out
+}
+
+/// Whether `shell` names an executable file: a path, or a name found on
+/// `$PATH`, as starting it looks it up.
+fn is_executable(shell: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let runs = |p: &std::path::Path| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    if shell.contains('/') {
+        return runs(std::path::Path::new(shell));
+    }
+    std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| runs(&d.join(shell))))
 }
 
 /// The installed font families, `(monospace, every other)` — what the font
@@ -924,6 +958,44 @@ mod tests {
         std::fs::write(dir.join("config.toml"), "theme = \"nord\"\n").unwrap();
         std::fs::remove_file(dir.join("themes").join("bad.toml")).unwrap();
         assert_eq!(problems_in(&dir, fonts), Vec::<String>::new());
+        jetty_core::set_registry(Vec::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_also_checks_what_is_only_used_later() {
+        // A backdrop image or a shell that does not work only showed up once
+        // used (a notice after the decode, a tab on another shell), and the
+        // light theme was reported as if it mattered without
+        // follow_system_theme.
+        let dir = std::env::temp_dir().join(format!("jetty-check-later-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("backgrounds")).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "shell = \"/nonexistent/fsh\"\nlight_theme = \"nosuch\"\n[backdrop]\nmode = \"image\"\nimage = \"gone.png\"\n",
+        )
+        .unwrap();
+        let fonts = || (Vec::new(), Vec::new());
+        let all = problems_in(&dir, fonts).join("\n");
+        for want in [
+            "backdrop.image \"gone.png\": file not found — the gradient shows instead",
+            "shell \"/nonexistent/fsh\" is not an executable file",
+            "light_theme \"nosuch\" not found (only used with follow_system_theme)",
+        ] {
+            assert!(all.contains(want), "{want:?} missing from:\n{all}");
+        }
+        // A shell named for $PATH and an image that loads: nothing to say.
+        std::fs::write(
+            dir.join("backgrounds").join("ok.jpg"),
+            include_bytes!("../../../jetty-render/tests/fixtures/backdrop-16x8.jpg"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("config.toml"), "shell = \"sh\"\n[backdrop]\nmode = \"image\"\nimage = \"ok.jpg\"\n").unwrap();
+        assert_eq!(problems_in(&dir, fonts), Vec::<String>::new());
+        // Image mode with no image named.
+        std::fs::write(dir.join("config.toml"), "[backdrop]\nmode = \"image\"\n").unwrap();
+        assert_eq!(problems_in(&dir, fonts), ["backdrop.mode is \"image\" but no backdrop.image is set — the gradient shows instead"]);
         jetty_core::set_registry(Vec::new());
         let _ = std::fs::remove_dir_all(&dir);
     }
