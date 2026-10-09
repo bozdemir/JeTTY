@@ -13836,6 +13836,17 @@ impl ApplicationHandler<AppEvent> for App {
                 {
                     return;
                 }
+                // Middle-click on a TAB asks to close it (the browser idiom) —
+                // the same confirmation as its "×" and Ctrl+Shift+W.
+                if let Some((w, h)) = self.gpu.as_ref().map(|g| (g.config.width, g.config.height)) {
+                    let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
+                    if let Some(i) = self.main_tab_at(w, self.tabbar_y(h as f32), cx, cy) {
+                        self.commit_rename();
+                        self.confirm_close = self.tabs.get(i).map(|t| t.id);
+                        self.request_main_paint();
+                        return;
+                    }
+                }
                 if !self.main_grid_geom().contains_y(self.cursor.1 as f32) {
                     return;
                 }
