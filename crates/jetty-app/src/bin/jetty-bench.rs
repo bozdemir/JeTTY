@@ -19,10 +19,49 @@
 /// instance/adapter/device. This is what CI runs: it avoids GPU-availability and
 /// software-rasterizer timing variance on shared runners (NOT because the GPU bench
 /// "crashes" there — it simply removes GPU-dependent numbers from the report).
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use jetty_app::perf::{env_enabled, percentile};
 use jetty_render::TextLayer;
+
+/// The system allocator, counting every allocation (and its bytes) so the frame
+/// tables can report what each frame allocates — the hot path should allocate
+/// next to nothing. Two relaxed atomic adds per allocation: no measurable cost.
+struct CountingAlloc;
+
+static ALLOCS: AtomicU64 = AtomicU64::new(0);
+static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+
+// SAFETY: every call is forwarded unchanged to the system allocator.
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAlloc = CountingAlloc;
+
+/// `(allocations, bytes)` so far.
+fn alloc_counts() -> (u64, u64) {
+    (ALLOCS.load(Ordering::Relaxed), ALLOC_BYTES.load(Ordering::Relaxed))
+}
 
 /// The typical colored prompt+output line fed for the throughput test.
 const VT_LINE: &[u8] = b"\x1b[1;32muser@host\x1b[0m:\x1b[34m~/src/jetty\x1b[0m$ \x1b[33mcargo build\x1b[0m --release --workspace   \x1b[2m# building 4 crates\x1b[0m\r\n";
@@ -36,9 +75,11 @@ fn make_payload(target: usize) -> Vec<u8> {
     payload
 }
 
-/// Feed `payload` into `term` in 64 KiB chunks (matches the live PTY drain shape).
+/// Feed `payload` into `term` in 8 KiB chunks — the PTY reader's read size, so
+/// the live drain's chunk shape (measured: 4 / 8 / 64 KiB chunks feed within
+/// noise of each other).
 fn feed_chunked(term: &mut jetty_core::Terminal, payload: &[u8]) {
-    let chunk = 65536;
+    let chunk = 8192;
     let mut i = 0;
     while i < payload.len() {
         let end = (i + chunk).min(payload.len());
@@ -507,23 +548,30 @@ fn bench_frames(
             let n = 300usize;
             let mut cpu = Vec::with_capacity(n);
             let (mut total, mut snap_total) = (0.0f64, 0.0f64);
+            let (mut allocs, mut alloc_bytes) = (0u64, 0u64);
             for k in 0..n {
                 step(&mut term, k);
                 let t = Instant::now();
+                let (a0, b0) = alloc_counts();
                 let snap = term.snapshot();
                 snap_total += t.elapsed().as_secs_f64() * 1000.0;
                 text.render_to(device, queue, &view, width, height, &snap, true, 0.0)?;
+                drop(snap);
+                let (a1, b1) = alloc_counts();
                 cpu.push(t.elapsed().as_secs_f32() * 1000.0);
+                (allocs, alloc_bytes) = (allocs + a1 - a0, alloc_bytes + b1 - b0);
                 device.poll(wgpu::PollType::wait_indefinitely())?;
                 total += t.elapsed().as_secs_f64() * 1000.0;
             }
             let mean = cpu.iter().sum::<f32>() / n as f32;
             cpu.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             println!(
-                "  {cols:3}x{rows:<3} {label:<7} cpu {mean:7.3} ms (snapshot {:5.3}) | total {:7.3} ms | p99 cpu {:7.3} ms",
+                "  {cols:3}x{rows:<3} {label:<7} cpu {mean:7.3} ms (snapshot {:5.3}) | total {:7.3} ms | p99 cpu {:7.3} ms | {:5.1} allocs {:6.1} KB/frame",
                 snap_total / n as f64,
                 total / n as f64,
-                percentile(&cpu, 99.0)
+                percentile(&cpu, 99.0),
+                allocs as f64 / n as f64,
+                alloc_bytes as f64 / n as f64 / 1024.0
             );
             Ok(())
         };
@@ -644,6 +692,7 @@ fn bench_scene_passes(
         bd.prepare(device, queue, &s, term.theme(), &frame).then_some(bd)
     });
     let (mut two, mut one) = (Vec::new(), Vec::new());
+    let (mut two_allocs, mut one_allocs) = (0u64, 0u64);
     for k in 0..600usize {
         if k % 100 == 99 {
             term.feed(b"\r\n$ ");
@@ -651,6 +700,7 @@ fn bench_scene_passes(
             term.feed(&[b"abcdefghijklmnopqrstuvwxyz"[k % 26]]);
         }
         let t = Instant::now();
+        let a0 = alloc_counts().0;
         let snap = term.snapshot();
         let bg = jetty_render::cell_bg_rects(&snap, cw, ch, 0.0, [60, 80, 120]);
         let clear = jetty_render::default_bg_clear(&snap, true);
@@ -658,6 +708,7 @@ fn bench_scene_passes(
             quad.render_clear(device, queue, &view, width, height, &bg, clear);
             text.render_to(device, queue, &view, width, height, &snap, false, 0.0)?;
             two.push(t.elapsed().as_secs_f32() * 1000.0);
+            two_allocs += alloc_counts().0 - a0;
         } else {
             let n = quad.upload(device, queue, width, height, &bg);
             let ready = text
@@ -689,14 +740,17 @@ fn bench_scene_passes(
             queue.submit(Some(encoder.finish()));
             text.end_grid_frame();
             one.push(t.elapsed().as_secs_f32() * 1000.0);
+            one_allocs += alloc_counts().0 - a0;
         }
         device.poll(wgpu::PollType::wait_indefinitely())?;
     }
     let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
     println!(
-        "scene         {cols}x{rows} typing, bg quads + glyphs: 2 passes/submits cpu {:.3} ms | 1 pass/submit cpu {:.3} ms{}",
+        "scene         {cols}x{rows} typing, bg quads + glyphs: 2 passes/submits cpu {:.3} ms ({:.0} allocs) | 1 pass/submit cpu {:.3} ms ({:.0} allocs){}",
         mean(&two),
+        two_allocs as f64 / two.len() as f64,
         mean(&one),
+        one_allocs as f64 / one.len() as f64,
         if backdrop.is_some() { " (1-pass incl. backdrop)" } else { "" }
     );
     Ok(())
