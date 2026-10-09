@@ -265,47 +265,57 @@ fn decode_png(data: &[u8]) -> Result<(RawImage, u8), String> {
         check_dims(info.width, info.height)?;
     }
     let size = reader.output_buffer_size().ok_or("bad PNG (frame size)")?;
-    // Defensive: never more than 8 bytes per pixel after EXPAND | STRIP_16.
-    let (iw, ih) = (reader.info().width as u64, reader.info().height as u64);
-    if size as u64 > iw * ih * 8 {
+    // Defensive: never more than 4 bytes per pixel after EXPAND | STRIP_16
+    // (8-bit RGBA at most).
+    let (iw, ih) = (reader.info().width as usize, reader.info().height as usize);
+    let full = iw * ih * 4;
+    if size > full {
         return Err("bad PNG (frame size)".into());
     }
-    let mut buf = vec![0u8; size];
+    // ONE buffer, allocated at the final RGBA size: the frame decodes into its
+    // front and is widened to RGBA in place — never a second full-size copy
+    // (an 8192² RGB wallpaper peaked at ~470 MB with one).
+    let mut buf = Vec::with_capacity(full);
+    buf.resize(size, 0u8);
     let frame = reader.next_frame(&mut buf).map_err(|e| decode_error("PNG", &e.to_string()))?;
     let (w, h) = (frame.width, frame.height);
     check_dims(w, h)?;
     let px = w as usize * h as usize;
-    let mut rgba = vec![0u8; px * 4];
-    let need = |n: usize| if buf.len() < px * n { Err("bad PNG (short frame)".to_string()) } else { Ok(()) };
-    match frame.color_type {
-        png::ColorType::Rgba => {
-            need(4)?;
-            rgba.copy_from_slice(&buf[..px * 4]);
-        }
-        png::ColorType::Rgb => {
-            need(3)?;
-            for (o, i) in rgba.chunks_exact_mut(4).zip(buf.chunks_exact(3)) {
-                o.copy_from_slice(&[i[0], i[1], i[2], 255]);
-            }
-        }
-        png::ColorType::GrayscaleAlpha => {
-            need(2)?;
-            for (o, i) in rgba.chunks_exact_mut(4).zip(buf.chunks_exact(2)) {
-                o.copy_from_slice(&[i[0], i[0], i[0], i[1]]);
-            }
-        }
-        png::ColorType::Grayscale => {
-            need(1)?;
-            for (o, &g) in rgba.chunks_exact_mut(4).zip(buf.iter()) {
-                o.copy_from_slice(&[g, g, g, 255]);
-            }
-        }
+    let n = match frame.color_type {
+        png::ColorType::Rgba => 4,
+        png::ColorType::Rgb => 3,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Grayscale => 1,
         // Indexed is expanded by EXPAND; anything else is unexpected.
         _ => return Err("unsupported PNG color type".into()),
+    };
+    if buf.len() < px * n || px * 4 > full {
+        return Err("bad PNG (short frame)".into());
     }
+    let rgba = widen_to_rgba(buf, px, n);
     // An eXIf chunk (before the image data) may say how to show it.
     let orientation = reader.info().exif_metadata.as_deref().and_then(exif_orientation).unwrap_or(1);
     Ok((RawImage { w, h, rgba }, orientation))
+}
+
+/// `buf`'s first `px` pixels of `n` bytes each (RGBA 4, RGB 3, gray + alpha
+/// 2, gray 1) widened IN PLACE to `px` straight RGBA8 pixels. Back to front:
+/// pixel i's RGBA lands at `4i ≥ n·i`, past every source byte still unread.
+fn widen_to_rgba(mut buf: Vec<u8>, px: usize, n: usize) -> Vec<u8> {
+    buf.resize(px * 4, 0);
+    if n == 4 {
+        return buf;
+    }
+    for i in (0..px).rev() {
+        let s = i * n;
+        let p = match n {
+            3 => [buf[s], buf[s + 1], buf[s + 2], 255],
+            2 => [buf[s], buf[s], buf[s], buf[s + 1]],
+            _ => [buf[s], buf[s], buf[s], 255],
+        };
+        buf[i * 4..i * 4 + 4].copy_from_slice(&p);
+    }
+    buf
 }
 
 fn decode_jpeg(data: &[u8]) -> Result<(RawImage, u8), String> {
@@ -653,6 +663,63 @@ mod tests {
         assert_eq!(sniff(b"GIF89a"), None);
         assert_eq!(sniff(&[]), None);
         assert!(decode_bytes(b"hello world").unwrap_err().contains("not a PNG or JPEG"));
+    }
+
+    /// Encode `data` as an in-memory PNG of `color` / `depth` (with `palette`
+    /// for indexed images).
+    fn png_of(w: u32, h: u32, color: png::ColorType, depth: png::BitDepth, data: &[u8], palette: Option<&[u8]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut e = png::Encoder::new(&mut out, w, h);
+            e.set_color(color);
+            e.set_depth(depth);
+            if let Some(p) = palette {
+                e.set_palette(p.to_vec());
+            }
+            let mut wr = e.write_header().unwrap();
+            wr.write_image_data(data).unwrap();
+        }
+        out
+    }
+
+    /// Every PNG flavor decodes to the same straight RGBA8: RGB, gray, gray +
+    /// alpha, indexed (with and without transparency), 16-bit.
+    #[test]
+    fn every_png_color_type_decodes_to_rgba() {
+        use png::{BitDepth, ColorType};
+        let rgb: Vec<u8> = (0..3 * 3 * 2).map(|i| (i * 13) as u8).collect();
+        let raw = decode_bytes(&png_of(3, 2, ColorType::Rgb, BitDepth::Eight, &rgb, None)).unwrap();
+        let want: Vec<u8> = rgb.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+        assert_eq!((raw.w, raw.h, raw.rgba), (3, 2, want));
+
+        let gray = [0u8, 64, 128, 255, 7, 99];
+        let raw = decode_bytes(&png_of(2, 3, ColorType::Grayscale, BitDepth::Eight, &gray, None)).unwrap();
+        let want: Vec<u8> = gray.iter().flat_map(|&g| [g, g, g, 255]).collect();
+        assert_eq!(raw.rgba, want);
+
+        let ga = [10u8, 0, 20, 50, 30, 128, 40, 255];
+        let raw = decode_bytes(&png_of(4, 1, ColorType::GrayscaleAlpha, BitDepth::Eight, &ga, None)).unwrap();
+        let want: Vec<u8> = ga.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect();
+        assert_eq!(raw.rgba, want);
+
+        let palette = [255u8, 0, 0, 0, 255, 0, 0, 0, 255];
+        let idx = [0u8, 1, 2, 1];
+        let raw = decode_bytes(&png_of(2, 2, ColorType::Indexed, BitDepth::Eight, &idx, Some(&palette))).unwrap();
+        assert_eq!(raw.rgba, [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 0, 255, 0, 255]);
+
+        // 16-bit RGB: the high byte of each sample survives (STRIP_16).
+        let rgb16: Vec<u8> = [0x1234u16, 0xABCD, 0xFF00, 0x0102, 0x8000, 0x7FFF]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        let raw = decode_bytes(&png_of(2, 1, ColorType::Rgb, BitDepth::Sixteen, &rgb16, None)).unwrap();
+        assert_eq!(raw.rgba, [0x12, 0xAB, 0xFF, 255, 0x01, 0x80, 0x7F, 255]);
+        // A wide odd-sized RGB image (in-place expansion across many rows).
+        let (w, h) = (37u32, 23u32);
+        let big: Vec<u8> = (0..w * h * 3).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+        let raw = decode_bytes(&png_of(w, h, ColorType::Rgb, BitDepth::Eight, &big, None)).unwrap();
+        let want: Vec<u8> = big.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+        assert!(raw.rgba == want, "a 37×23 RGB image survives the expansion");
     }
 
     #[test]
