@@ -693,6 +693,24 @@ fn summon_reopens(by: SummonBy, main_focused: bool, hide: jetty_platform::HideKi
     by == SummonBy::User && !main_focused && hide == jetty_platform::HideKind::Close
 }
 
+/// Whether a press on the main window JeTTY took for minimized (its ─ button
+/// sets `main_occluded`) shows it is on screen after all: on Wayland, where the
+/// minimize is only a request — tiling compositors (sway, river, Hyprland)
+/// ignore it, and the window kept the focus while JeTTY stopped painting it. A
+/// minimized window gets neither keys nor clicks. X11 keeps its own signals.
+fn press_unminimizes(occluded: bool, pressed: bool, hide: jetty_platform::HideKind) -> bool {
+    occluded && pressed && hide == jetty_platform::HideKind::Close
+}
+
+/// Whether `event` is a key or button press.
+fn is_press(event: &WindowEvent) -> bool {
+    match event {
+        WindowEvent::KeyboardInput { event, .. } => event.state == ElementState::Pressed,
+        WindowEvent::MouseInput { state, .. } => *state == ElementState::Pressed,
+        _ => false,
+    }
+}
+
 /// The inner size, in logical px, a main window closed by a hide is built
 /// again with: its size at its scale — or, hidden while fullscreen, the
 /// windowed size kept on the way in (the fullscreen exit is asynchronous, so
@@ -14550,6 +14568,18 @@ impl ApplicationHandler<AppEvent> for App {
         if self.tabs.is_empty() {
             return;
         }
+        // Wayland: a key or a click on the window its ─ button minimized means
+        // the compositor ignored the minimize (tiling ones do) — it is on
+        // screen, so it paints again instead of staying frozen. (One bool on
+        // every other event.)
+        if self.main_occluded
+            && self.window.as_deref().is_some_and(|w| {
+                press_unminimizes(self.main_occluded, is_press(&event), jetty_platform::hide_kind(w))
+            })
+        {
+            self.main_occluded = false;
+            self.request_main_paint();
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.confirm_quit = true;
@@ -20209,9 +20239,9 @@ mod scheduler_tests {
     //! the loop at 0-CPU idle (or makes it wake) is a pure function tested here.
     use super::{
         anim_expired, autohide_due, caret_drives_frames, focus_ask, main_finish_actions, main_tab_watched,
-        next_acquire_retry, parked_size, perf_idle_decision, summon_reopens, toggle_action, AutohideDue, FocusAsk,
-        IdleHud, SummonBy, ToggleAction, AUTOHIDE_GRACE_MS, AUTOHIDE_GRAB_FAST_FOR, AUTOHIDE_GRAB_SLOW_RECHECK,
-        FOCUS_CHURN_GRACE, KEY_ECHO_GRACE, RAISE_RETRY_WINDOW,
+        next_acquire_retry, parked_size, perf_idle_decision, press_unminimizes, summon_reopens, toggle_action,
+        AutohideDue, FocusAsk, IdleHud, SummonBy, ToggleAction, AUTOHIDE_GRACE_MS, AUTOHIDE_GRAB_FAST_FOR,
+        AUTOHIDE_GRAB_SLOW_RECHECK, FOCUS_CHURN_GRACE, KEY_ECHO_GRACE, RAISE_RETRY_WINDOW,
     };
     use std::time::{Duration, Instant};
 
@@ -20285,6 +20315,20 @@ mod scheduler_tests {
         assert!(!summon_reopens(SummonBy::App, false, HideKind::Close));
         // X11 / macOS raise the window they have.
         assert!(!summon_reopens(SummonBy::User, false, HideKind::Unmap));
+    }
+
+    #[test]
+    fn a_press_on_a_window_a_tiling_compositor_never_minimized_paints_it_again() {
+        use jetty_platform::HideKind;
+        // Wayland: ─ asked for a minimize that sway ignores — the window stays
+        // on screen, focused, and a key or click reaches it: it is shown.
+        assert!(press_unminimizes(true, true, HideKind::Close));
+        // Nothing to undo, or no press (a pointer motion during a real
+        // minimize's animation proves nothing).
+        assert!(!press_unminimizes(false, true, HideKind::Close));
+        assert!(!press_unminimizes(true, false, HideKind::Close));
+        // X11 learns of a restore from the window manager.
+        assert!(!press_unminimizes(true, true, HideKind::Unmap));
     }
 
     #[test]
