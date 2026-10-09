@@ -172,8 +172,11 @@ kernel's view of the GPUs (`/sys/class/drm` render nodes, `/sys/module/nvidia`):
 It is a first attempt, never a different pick: unless the adapter it yields is
 provably the unfiltered choice (integrated when NVIDIA was skipped; hardware when
 lavapipe was; any adapter on a loader older than 1.3.234, which ignores the
-variable), the instance is created again unfiltered — e.g. an iGPU that cannot
-present (Xvfb/VNC without DRI3) costs one extra cheap attempt. Off when the user
+variable), the instance is created again unfiltered. The one configuration that
+pays for it: an X server without DRI3 (Xvfb, VNC, Xpra), where the hardware GPU
+cannot present and lavapipe must — the filtered attempt finds nothing and the
+retry adds ~10–20 ms (nested Xvfb with the Intel, RADV and lavapipe drivers
+visible: exec→first-frame 150 → 170 ms, 10 ms resolution). Off when the user
 steers drivers or GPUs (`VK_ICD_FILENAMES`, `VK_DRIVER_FILES`, `VK_ADD_DRIVER_FILES`,
 `VK_LOADER_DRIVERS_SELECT/DISABLE`, `DRI_PRIME`, `MESA_VK_DEVICE_SELECT`,
 `__NV_PRIME_RENDER_OFFLOAD`, `WGPU_BACKEND`; `JETTY_GPU=high` keeps NVIDIA). The
