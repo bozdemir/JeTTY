@@ -4620,8 +4620,9 @@ impl App {
             (snap.rows.saturating_sub(1), 0)
         };
         term.selection_clear();
+        let entry_offset = term.scroll_offset();
         if let Some(ov) = self.ov_of_mut(s) {
-            ov.copy_mode = Some(crate::copymode::CopyMode::new(row, col));
+            ov.copy_mode = Some(crate::copymode::CopyMode { entry_offset, ..crate::copymode::CopyMode::new(row, col) });
         }
         self.paint_surface(s);
     }
@@ -4635,10 +4636,13 @@ impl App {
     }
 
     /// Clear window `s`'s selection and leave copy-mode (Esc, the copy-mode
-    /// chord, and every "done" path).
+    /// chord, and every "done" path), the view back where copy-mode began.
     fn cancel_copy_mode(&mut self, s: Surface) {
-        if let Some(term) = self.term_of_mut(s) {
-            term.selection_clear();
+        if let Some((ov, term)) = self.ov_term_mut(s) {
+            match ov.copy_mode {
+                Some(cm) => crate::copymode::leave(&cm, term),
+                None => term.selection_clear(),
+            }
         }
         self.exit_copy_mode(s);
     }
@@ -4690,6 +4694,13 @@ impl App {
                 // selection and the mode — not a clear-and-exit surprise.
                 let selecting = self.ov_of(s).and_then(|o| o.copy_mode).is_some_and(|cm| cm.selecting);
                 if self.run_selection_enabled && selecting {
+                    // Put the SOURCE tab's view back first: the run makes the
+                    // new tab the main window's active one.
+                    if let Some((ov, term)) = self.ov_term_mut(s) {
+                        if let Some(cm) = ov.copy_mode {
+                            term.scroll_to_offset(cm.entry_offset);
+                        }
+                    }
                     // run_selection_in_new_tab captures + clears the SOURCE
                     // selection BEFORE switching to the new tab; the extra
                     // clear covers the empty-selection no-op path so the exit

@@ -52,13 +52,17 @@ pub struct CopyMode {
     /// selecting extends into scrollback instead of sliding the whole selection.
     pub anchor_line: i32,
     pub anchor_col: usize,
+    /// The view's scroll offset when copy-mode was entered. Motions scroll
+    /// freely; leaving ([`leave`]) puts the view back here — the live bottom,
+    /// usually — the way tmux / WezTerm copy-modes return to the prompt.
+    pub entry_offset: usize,
 }
 
 impl CopyMode {
     pub fn new(row: usize, col: usize) -> Self {
         // `anchor_line` is unused until `begin_select` captures a real one
         // (guarded by `selecting`), so 0 is a safe placeholder here.
-        CopyMode { row, col, selecting: false, line_mode: false, anchor_line: 0, anchor_col: col }
+        CopyMode { row, col, selecting: false, line_mode: false, anchor_line: 0, anchor_col: col, entry_offset: 0 }
     }
 
     /// Begin (or restart) a selection anchored at the current cursor cell.
@@ -70,6 +74,13 @@ impl CopyMode {
         self.anchor_line = anchor_line;
         self.anchor_col = self.col;
     }
+}
+
+/// Leave copy-mode on `term` (Esc, the chord, `y`/Enter, `r`): drop the
+/// selection and put the view back where copy-mode was entered.
+pub fn leave(cm: &CopyMode, term: &mut jetty_core::Terminal) {
+    term.selection_clear();
+    term.scroll_to_offset(cm.entry_offset);
 }
 
 /// The result of a motion: the new cursor cell + a scroll request.
@@ -413,6 +424,29 @@ mod tests {
         assert_eq!(snap_to_char(&v, 0, 6), 5);
         assert_eq!(snap_to_char(&v, 0, 5), 5);
         assert_eq!(snap_to_char(&v, 0, 9), 9);
+    }
+
+    #[test]
+    fn leaving_puts_the_view_back_where_copy_mode_began() {
+        // Copy-mode motions scroll the view (`k` at the top row, Ctrl+u, `g`);
+        // Esc / `y` left it deep in history instead of back at the prompt.
+        let mut t = jetty_core::Terminal::new(20, 5);
+        for i in 0..100 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let cm = CopyMode { entry_offset: t.scroll_offset(), ..CopyMode::new(4, 0) };
+        t.scroll_lines(40);
+        t.selection_start(0, 0, true);
+        t.selection_update(1, 5, false);
+        leave(&cm, &mut t);
+        assert_eq!(t.scroll_offset(), 0, "back at the live bottom");
+        assert_eq!(t.selection_text(), None, "the selection is dropped");
+        // Entered while reading history: back to that spot, not the bottom.
+        t.scroll_lines(30);
+        let cm = CopyMode { entry_offset: t.scroll_offset(), ..CopyMode::new(0, 0) };
+        t.scroll_lines(25);
+        leave(&cm, &mut t);
+        assert_eq!(t.scroll_offset(), 30);
     }
 
     #[test]
