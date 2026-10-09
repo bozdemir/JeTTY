@@ -171,13 +171,36 @@ fn show(summary: &str, body: &str) {
     // command stays `Normal`: the spec says a `Critical` notification never
     // expires (Plasma, GNOME, dunst keep it until dismissed) and it breaks
     // through Do Not Disturb. The summary already reads "failed (exit N)".
+    // `desktop-entry` ties the toast to jetty.desktop: the desktop's per-app
+    // notification settings and grouping then apply to JeTTY.
     let _ = Notification::new()
         .appname("JeTTY")
         .summary(summary)
         .body(&body)
-        .icon("jetty")
+        .icon(notification_icon())
+        .hint(Hint::DesktopEntry("jetty".into()))
         .hint(Hint::Urgency(Urgency::Normal))
         .show();
+}
+
+/// The toast's icon (read once): the installed `jetty` icon theme name — or,
+/// run from an AppImage, whose icon is usually not installed, the file inside
+/// it (its mount lives as long as JeTTY).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn notification_icon() -> &'static str {
+    static ICON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ICON.get_or_init(|| icon_in(std::env::var_os("APPDIR")))
+}
+
+/// [`notification_icon`] for the AppImage dir `appdir`: its icon when it holds
+/// one (another AppImage's `$APPDIR`, inherited from its terminal, does not).
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn icon_in(appdir: Option<std::ffi::OsString>) -> String {
+    appdir
+        .filter(|d| !d.is_empty())
+        .map(|d| std::path::Path::new(&d).join("usr/share/icons/hicolor/256x256/apps/jetty.png"))
+        .filter(|icon| icon.is_file())
+        .map_or_else(|| "jetty".to_string(), |icon| icon.display().to_string())
 }
 
 /// macOS (and any non-freedesktop platform): no-op. `notify-rust` is not a
@@ -353,6 +376,19 @@ mod tests {
         for i in 0..1000 {
             n.fire(format!("t{i}"), String::new());
         }
+    }
+
+    #[test]
+    fn an_appimage_toast_carries_the_icon_inside_it() {
+        assert_eq!(icon_in(None), "jetty", "installed: the icon theme's");
+        assert_eq!(icon_in(Some("".into())), "jetty");
+        let appdir = std::env::temp_dir().join(format!("jetty-notify-icon-{}", std::process::id()));
+        assert_eq!(icon_in(Some(appdir.clone().into())), "jetty", "another AppImage's $APPDIR: no icon of ours");
+        let icon = appdir.join("usr/share/icons/hicolor/256x256/apps/jetty.png");
+        std::fs::create_dir_all(icon.parent().unwrap()).unwrap();
+        std::fs::write(&icon, b"png").unwrap();
+        assert_eq!(icon_in(Some(appdir.clone().into())), icon.display().to_string());
+        let _ = std::fs::remove_dir_all(&appdir);
     }
 
     #[test]
