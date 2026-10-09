@@ -12,9 +12,10 @@
 //!   TOML at all loads defaults in memory, is copied aside (`config.toml.bad-<ts>`,
 //!   never moved — a symlinked config stays linked) and is never written until fixed.
 //! * **Saving** edits the file IN PLACE (`toml_edit`): only keys whose value changed
-//!   are touched, so comments, formatting, key order and unknown keys survive. Saves
-//!   are debounced and written by a background thread, which re-reads the file first
-//!   so a concurrent external edit is merged, never clobbered.
+//!   are touched, so comments, formatting, key order and unknown keys survive; a
+//!   new file holds only the changed keys. Saves are debounced and written by a
+//!   background thread, which re-reads the file first so a concurrent external
+//!   edit is merged, never clobbered.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1486,6 +1487,18 @@ pub(crate) fn real_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
+/// The notice for a config.toml at `path` a reload found gone — deleted, or a
+/// symlink whose target went away: the settings in use stay.
+pub(crate) fn missing_notice(path: &Path) -> String {
+    match symlink_target(path) {
+        Some(target) => format!(
+            "config.toml links to {}, which does not exist — keeping the settings in use",
+            target.display()
+        ),
+        None => "config.toml was deleted — keeping the settings in use (a restart loads the defaults)".to_string(),
+    }
+}
+
 /// `launch_at_login` as config text `s` itself sets it: `None` when the text is
 /// not TOML or the key is missing or not a bool (see [`Loaded::launch_at_login`]).
 pub(crate) fn explicit_launch_at_login(s: &str) -> Option<bool> {
@@ -1853,7 +1866,7 @@ struct SyncShared {
 }
 
 enum WriterMsg {
-    Write { changes: Vec<Change>, full: Box<Config> },
+    Write(Vec<Change>),
     Barrier(std::sync::mpsc::Sender<()>),
 }
 
@@ -1932,15 +1945,12 @@ impl Persister {
             return;
         }
         let changes = std::mem::take(&mut self.pending);
-        let full = Box::new(self.synced.clone());
         lock(&self.shared).inflight += 1;
-        let sent = self.writer().is_some_and(|tx| {
-            tx.send(WriterMsg::Write { changes: changes.clone(), full: full.clone() }).is_ok()
-        });
+        let sent = self.writer().is_some_and(|tx| tx.send(WriterMsg::Write(changes.clone())).is_ok());
         if !sent {
             // No writer thread (spawn failed): write synchronously rather than lose
             // the change.
-            if let Err(e) = write_changes(&self.path, &changes, &full, &self.shared) {
+            if let Err(e) = write_changes(&self.path, &changes, &self.shared) {
                 eprintln!("jetty: {}", sanitize_notice(&e));
             }
             lock(&self.shared).inflight -= 1;
@@ -1997,6 +2007,30 @@ impl Persister {
         lock(&self.shared).known = Some(hash);
     }
 
+    /// Whether config.toml as a reload just read it (`text`) may be a write in
+    /// progress, to look at again before applying: empty, or gone, where it was
+    /// not when JeTTY last saw it — an in-place writer between its truncate and
+    /// its write, a sync tool between its delete and its write. Applied as read,
+    /// the empty file is every default at once (each tab's history trimmed to
+    /// the default scrollback).
+    pub(crate) fn unsettled(&self, text: &std::io::Result<String>) -> bool {
+        let known = lock(&self.shared).known;
+        match text {
+            Ok(s) => s.trim().is_empty() && known != Some(hash_str(s)),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound && known.is_some(),
+        }
+    }
+
+    /// A reload found config.toml gone (and still gone when it looked again).
+    /// The settings in use stay — a restart loads the defaults — and the next
+    /// settings change makes a new file of only that change, as its own write.
+    /// Whether this is news (the file was there when last seen).
+    pub(crate) fn note_missing(&mut self) -> bool {
+        let mut s = lock(&self.shared);
+        s.external_pending = false;
+        s.known.take().is_some()
+    }
+
     /// Copy the current config aside to `config.toml.bak-<secs>` after flushing
     /// pending saves (so the backup is of what the user has). `Ok(None)` when
     /// there is no file to back up.
@@ -2019,8 +2053,8 @@ impl Persister {
                 .spawn(move || {
                     for msg in rx {
                         match msg {
-                            WriterMsg::Write { changes, full } => {
-                                if let Err(e) = write_changes(&path, &changes, &full, &shared) {
+                            WriterMsg::Write(changes) => {
+                                if let Err(e) = write_changes(&path, &changes, &shared) {
                                     eprintln!("jetty: {}", sanitize_notice(&e));
                                     notice(e);
                                 }
@@ -2042,18 +2076,14 @@ impl Persister {
     }
 }
 
-/// Write `changes` into `path` in place (or `full` when there is no file yet),
-/// atomically. Refuses — returning a user-facing message — when the existing file
-/// is not valid TOML: it would have to be replaced wholesale, losing the user's
-/// text. Records the written hash as our own, unless the file changed externally
-/// since we last saw it (then the hot-reload must re-apply the merged result).
-fn write_changes(
-    path: &Path,
-    changes: &[Change],
-    full: &Config,
-    shared: &Mutex<SyncShared>,
-) -> Result<(), String> {
-    write_changes_racing(path, changes, full, shared, &mut || {})
+/// Write `changes` into `path` in place (into a new file when there is none
+/// yet), atomically. Refuses — returning a user-facing message — when the
+/// existing file is not valid TOML: it would have to be replaced wholesale,
+/// losing the user's text. Records the written hash as our own, unless the file
+/// changed externally since we last saw it (then the hot-reload must re-apply
+/// the merged result).
+fn write_changes(path: &Path, changes: &[Change], shared: &Mutex<SyncShared>) -> Result<(), String> {
+    write_changes_racing(path, changes, shared, &mut || {})
 }
 
 /// How many times a save re-merges because an editor saved `config.toml` while
@@ -2068,7 +2098,6 @@ const SAVE_ATTEMPTS: usize = 5;
 fn write_changes_racing(
     path: &Path,
     changes: &[Change],
-    full: &Config,
     shared: &Mutex<SyncShared>,
     race: &mut dyn FnMut(),
 ) -> Result<(), String> {
@@ -2083,7 +2112,7 @@ fn write_changes_racing(
                 real_path(path).display()
             ));
         }
-        let new_text = merged_text(before.as_deref(), changes, full)?;
+        let new_text = merged_text(before.as_deref(), changes)?;
         if before.as_deref() == Some(new_text.as_str()) {
             return Ok(()); // nothing to change on disk
         }
@@ -2133,12 +2162,28 @@ fn read_config_text(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
-/// `before` (the file's text, `None` = no file) with `changes` applied in place
-/// — or, without a file, every setting of `full`.
-fn merged_text(before: Option<&str>, changes: &[Change], full: &Config) -> Result<String, String> {
+/// The comment a config.toml JeTTY creates starts with: the file holds only
+/// what was changed, and this says where the rest is described.
+const NEW_FILE_HEADER: &str = "\
+# JeTTY settings. A key left out has its default; every key, its default and
+# what it does: https://github.com/bozdemir/JeTTY/blob/main/docs/configuration.md
+# `jetty --check-config` lists any problems with this file.
+";
+
+/// `before` (the file's text, `None` = no file) with `changes` applied in place.
+/// Without a file, a new one holds only `changes` (under [`NEW_FILE_HEADER`]):
+/// writing every setting froze each default in it — a later release's better
+/// default never reached anyone who had touched Settings once — and, after
+/// the user deleted the file to start over, wrote every old setting back.
+fn merged_text(before: Option<&str>, changes: &[Change]) -> Result<String, String> {
     Ok(match before {
-        // No file yet: write every setting, so the file documents them all.
-        None => toml::to_string_pretty(full).map_err(|e| format!("could not serialize settings: {e}"))?,
+        None => {
+            let mut doc = toml_edit::DocumentMut::new();
+            for c in changes {
+                apply_change(&mut doc, c);
+            }
+            format!("{NEW_FILE_HEADER}\n{doc}")
+        }
         Some(text) => {
             let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
                 let at = e.span().map(|s| format!("{}: ", line_col(text, s.start))).unwrap_or_default();
@@ -3545,7 +3590,7 @@ caret_glow_enabled = true\n";
             }
             raced += 1;
         };
-        write_changes_racing(&path, &changes, &cfg, &shared, &mut editor).unwrap();
+        write_changes_racing(&path, &changes, &shared, &mut editor).unwrap();
         let out = std::fs::read_to_string(&path).unwrap();
         assert!(out.contains("theme = \"dracula\""), "the editor's save survives: {out}");
         assert!(out.contains("opacity = 0.8"), "{out}");
@@ -3560,7 +3605,7 @@ caret_glow_enabled = true\n";
             flip += 1;
             std::fs::write(&path, format!("theme = \"edit{flip}\"\n")).unwrap();
         };
-        let err = write_changes_racing(&path, &changes, &cfg, &shared, &mut changing).unwrap_err();
+        let err = write_changes_racing(&path, &changes, &shared, &mut changing).unwrap_err();
         assert!(err.contains("kept changing"), "{err}");
         assert!(std::fs::read_to_string(&path).unwrap().starts_with("theme = \"edit"), "untouched");
         let leftovers = std::fs::read_dir(&dir)
@@ -3619,16 +3664,68 @@ caret_glow_enabled = true\n";
     }
 
     #[test]
-    fn first_save_without_a_file_writes_every_setting() {
+    fn first_save_without_a_file_writes_only_what_changed() {
+        // It wrote every setting: ~90 defaults frozen into the file, so a later
+        // release's better default never reached anyone who touched Settings
+        // once — and "only the keys that changed" was not true.
         let dir = tmp_dir("fresh");
         let path = dir.join("sub").join("config.toml");
         let (mut p, mut cfg, _) = persister_for(&path);
         cfg.theme = "nord".to_string();
+        cfg.effects.crt_enabled = true;
         p.record(&cfg, Instant::now());
         p.flush_and_wait(Duration::from_secs(5));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(NEW_FILE_HEADER), "{text}");
+        assert!(text.contains("docs/configuration.md") && text.contains("jetty --check-config"), "{text}");
+        assert!(text.contains("theme = \"nord\"") && text.contains("[effects]\ncrt_enabled = true"), "{text}");
+        assert!(!text.contains("opacity") && !text.contains("font_size"), "no default is pinned: {text}");
         let back = Config::load_from(&path);
         assert!(back.warnings.is_empty(), "{:?}", back.warnings);
         assert_eq!(back.cfg, cfg);
+        assert!(p.is_self_write(hash_str(&text)), "its echo is skipped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_config_deleted_while_running_is_recreated_with_only_the_next_change() {
+        // Deleting config.toml to start over: the next settings change wrote
+        // every setting back — the reset silently undone.
+        let dir = tmp_dir("deleted");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "theme = \"nord\"\nopacity = 0.8\nfont_size = 13.0\n").unwrap();
+        let (mut p, mut cfg, _) = persister_for(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(p.unsettled(&std::fs::read_to_string(&path)), "gone where it was not: look again");
+        assert!(p.note_missing(), "news");
+        assert!(!p.unsettled(&std::fs::read_to_string(&path)) && !p.note_missing(), "once");
+        cfg.font_size = 14.0;
+        p.record(&cfg, Instant::now());
+        assert!(p.flush_and_wait(Duration::from_secs(5)));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("font_size = 14.0"), "{text}");
+        assert!(!text.contains("nord") && !text.contains("opacity"), "the reset holds: {text}");
+        assert!(p.is_self_write(hash_str(&text)), "the settings in use stay: its echo is skipped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_emptied_config_is_looked_at_again_before_it_applies() {
+        // An in-place writer between its truncate and its write: applied as
+        // read, the empty file is every default at once — each tab's history
+        // trimmed to the default scrollback, then grown back too late.
+        let dir = tmp_dir("emptied");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "scrollback_lines = 50000\n").unwrap();
+        let (mut p, cfg, _) = persister_for(&path);
+        let read = |s: &str| -> std::io::Result<String> { Ok(s.to_string()) };
+        assert!(p.unsettled(&read("")) && p.unsettled(&read(" \n")));
+        assert!(!p.unsettled(&read("scrollback_lines = 50000\n")) && !p.unsettled(&read("theme = \"nord\"\n")));
+        // An empty file that was already seen (applied) is settled.
+        p.note_reloaded(cfg, hash_str(""));
+        assert!(!p.unsettled(&read("")));
+        // Unreadable for another reason: nothing to wait for.
+        assert!(!p.unsettled(&Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

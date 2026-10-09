@@ -41,6 +41,10 @@ change.
 - **Your formatting stays.** Settings changes rewrite only the keys that changed:
   comments, order and keys JeTTY does not know survive. A symlinked file
   (dotfiles) is written through the link; a read-only one is never replaced.
+  Without a config file, the first change creates one holding just that change
+  — every other key keeps its default, including defaults a later release
+  improves. Deleting the file while JeTTY runs keeps the settings in use until
+  a restart (which loads the defaults); a change made meanwhile is saved alone.
 
 Names of fonts and themes are matched in any letter case, and a theme by its id
 (`solarized_light`) or the name Settings shows (`"Solarized Light"`).

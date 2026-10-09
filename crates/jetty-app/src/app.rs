@@ -1291,6 +1291,9 @@ pub struct App {
     /// `ConfigChanged` event (coalescing an editor's write/rename/chmod burst); the
     /// reload runs once from `about_to_wait` when the deadline passes, then clears.
     pending_reload_at: Option<std::time::Instant>,
+    /// A reload found config.toml emptied or gone and looks again before acting
+    /// on it (see [`crate::config::Persister::unsettled`]).
+    config_recheck: bool,
     // ── Run & Notify (v0.15) runtime mirrors of the persisted config keys ──────
     /// Notify (toast + taskbar/dock urgency) when a command finishes while JeTTY
     /// is hidden/unfocused. Mirrors `Config.notify_on_command_finish`; the whole
@@ -2072,6 +2075,7 @@ impl App {
             start_hidden: false,
             startup_failed: false,
             pending_reload_at: None,
+            config_recheck: false,
             // Run & Notify: overridden by config below; safe defaults here.
             notify_on_finish: true,
             notify_min_seconds: 10,
@@ -2955,6 +2959,9 @@ impl App {
     ///   last write is skipped (self-write echo). `self.reloading` disables
     ///   `persist()` for the whole apply, so no live key can write config.toml back
     ///   (amendment H2 — loop-free by construction).
+    /// * A file found emptied or gone is looked at again shortly before anything
+    ///   happens: a writer may be between its truncate (or delete) and its write.
+    ///   One still gone then is reported; the settings in use stay.
     fn reload_config_and_themes(&mut self) {
         if self.persister.borrow().busy() {
             self.persister.borrow_mut().flush();
@@ -2962,6 +2969,14 @@ impl App {
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(60));
             return;
         }
+        let config_path = crate::config::Config::config_path();
+        let text = std::fs::read_to_string(&config_path);
+        if self.persister.borrow().unsettled(&text) && !self.config_recheck {
+            self.config_recheck = true;
+            self.pending_reload_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+            return;
+        }
+        self.config_recheck = false;
         self.reloading = true;
         let mut warnings = Vec::new();
 
@@ -2972,13 +2987,13 @@ impl App {
         let mut config_read = false;
 
         // (B) Config — per-key, hash-guarded.
-        if let Ok(s) = std::fs::read_to_string(crate::config::Config::config_path()) {
-            let h = crate::config::hash_str(&s);
+        if let Ok(s) = &text {
+            let h = crate::config::hash_str(s);
             // Skip our own write echoing back through the watcher.
             if !self.persister.borrow().is_self_write(h) {
                 config_read = true;
                 let live = self.settings_snapshot();
-                match crate::config::Config::parse_with_base(&s, &live, "keeping the current value") {
+                match crate::config::Config::parse_with_base(s, &live, "keeping the current value") {
                     Ok((mut cfg, problems)) => {
                         warnings.extend(problems);
                         // Only an EDIT of launch_at_login adds or removes the
@@ -2986,7 +3001,7 @@ impl App {
                         // removed, a typo) or still says what it said (a stale
                         // `false` beside an entry the app mirrors) keeps the
                         // live value.
-                        let explicit = crate::config::explicit_launch_at_login(&s);
+                        let explicit = crate::config::explicit_launch_at_login(s);
                         cfg.launch_at_login = reloaded_launch_at_login(
                             explicit,
                             self.launch_at_login_in_file,
@@ -3020,6 +3035,19 @@ impl App {
                         self.persister.borrow_mut().note_seen(h);
                     }
                 }
+            }
+        }
+        // Gone (still, after a second look): said once. The next settings change
+        // writes a new file of only that change — it wrote every setting back,
+        // undoing the reset the user deleted the file for.
+        if let Err(e) = &text {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warnings.push(format!(
+                    "could not read {}: {e} — keeping the current settings",
+                    config_path.display()
+                ));
+            } else if self.persister.borrow_mut().note_missing() {
+                warnings.push(crate::config::missing_notice(&config_path));
             }
         }
 
