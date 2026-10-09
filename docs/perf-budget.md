@@ -237,6 +237,17 @@ before.
   | label cache | 0.137 ms | 306 |
   | label cache + one pass | **0.047 ms** | **102** |
 
+  The scrollbar / decoration / cursor rects that followed in a pass of their own
+  (every frame with the default `scrollbar = "always"` once there is scrollback)
+  now ride that same pass: a typical main-window frame is three submits — grid,
+  chrome, corner mask — where v0.27.0 recorded seven.
+
+**Memory per scrollback line (measured, not changed).** alacritty_terminal stores
+every history row at full width, 24 B per cell: a 120-column tab's default 10 000
+lines take **+28 MiB**, a 240-column one **+55 MiB** (~2.9 / 5.8 KiB per line),
+per tab. The largest steady-state memory item once tabs fill their scrollback;
+shrinking it means a different history representation inside the grid.
+
 ## Where we lead vs. match vs. must improve
 
 - **Lead (architecture already gives us the edge):**
