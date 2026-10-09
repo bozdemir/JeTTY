@@ -8269,8 +8269,11 @@ impl App {
             let Some(chunk) = tab.pty.recv_output_timeout(std::time::Duration::from_millis(20)) else { break };
             tab.terminal.feed(&chunk);
         }
-        // Replies to the dead shell's queries must not reach its successor.
+        // Replies to the dead shell's queries must not reach its successor,
+        // nor the modes it left on (the alternate screen, kitty keys, mouse
+        // reporting… of a tmux its rc file exec'd).
         let _ = tab.terminal.drain_pty_writes();
+        tab.terminal.reset_after_exit();
         for notice in pty.startup_notices() {
             tab.terminal.feed_notice(notice);
         }

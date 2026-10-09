@@ -1505,6 +1505,20 @@ impl Terminal {
         self.mouse_urxvt = false;
     }
 
+    /// Drop what a program that EXITED left on, before another one starts in
+    /// this terminal (a shell that died right after starting hands over to the
+    /// next): its unfinished synchronized update (flushed: its last words show),
+    /// the alternate screen, and the keyboard / mouse / paste modes
+    /// ([`Terminal::reset_input_modes`]) — a tmux that an rc file exec'd leaves
+    /// all of them. The next program may never reset them itself.
+    pub fn reset_after_exit(&mut self) {
+        self.flush_sync();
+        if self.alt_screen() {
+            self.feed(b"\x1b[?1049l");
+        }
+        self.reset_input_modes();
+    }
+
     /// The kitty keyboard protocol flags the running app has currently pushed,
     /// as the protocol's bit values: 1 disambiguate escape codes, 2 report event
     /// types, 4 report alternate keys, 8 report all keys as escape codes, 16
@@ -9964,6 +9978,27 @@ mod tests {
         assert_eq!(t.snapshot().row_text(0).trim_end(), "keep me");
         t.feed(b"\x1b[?u");
         assert_eq!(t.drain_pty_writes(), b"\x1b[?0u", "the protocol is still on");
+    }
+
+    #[test]
+    fn reset_after_exit_drops_what_a_dead_program_left_on() {
+        // An rc file exec'd tmux, which died mid-frame: a synchronized update
+        // still open, the alternate screen, kitty keys, mouse and paste modes.
+        let mut t = kitty_term();
+        t.feed(b"$ zsh\r\n");
+        t.feed(b"\x1b[?1049h\x1b[>1u\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?2026hhalf a frame");
+        t.reset_after_exit();
+        assert!(t.sync_deadline().is_none(), "the update is over");
+        assert!(!t.alt_screen(), "back on the primary screen");
+        assert_eq!(t.kitty_keyboard_flags(), 0, "Ctrl+C is ^C again");
+        assert!(!t.mouse_mode() && !t.sgr_mouse() && !t.bracketed_paste());
+        assert_eq!(t.snapshot().row_text(0).trim_end(), "$ zsh", "the primary screen as it was");
+        // Nothing to drop: the screen is left alone.
+        let mut plain = kitty_term();
+        plain.feed(b"keep\r\nme");
+        plain.reset_after_exit();
+        assert_eq!(plain.snapshot().row_text(1).trim_end(), "me");
+        assert_eq!(plain.snapshot().cursor_col, 2, "the cursor stays");
     }
 
     #[test]
