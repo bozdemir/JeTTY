@@ -203,7 +203,7 @@ JeTTY renders through **Vulkan** when a Vulkan driver is installed, and otherwis
 | `Ctrl+,` · `Ctrl+Shift+O` | Settings | `toggle_settings` |
 | `Ctrl+Shift+P` | Command palette | `open_palette` |
 | `Ctrl+Shift+T` | New tab (in the current tab's directory) | `new_tab` |
-| `Ctrl+Shift+W` | Close tab (with confirm) | `close_tab` |
+| `Ctrl+Shift+W` | Close tab (with confirm; the last one quits JeTTY) | `close_tab` |
 | `Ctrl+Shift+D` | Detach the tab into its own window / reattach | `detach_tab` |
 | `Ctrl+Tab` | Next tab | `next_tab` |
 | `Ctrl+Shift+Tab` | Previous tab | `prev_tab` |
@@ -226,7 +226,7 @@ JeTTY renders through **Vulkan** when a Vulkan driver is installed, and otherwis
 | — (command palette: "Previous theme") | Previous theme | `prev_theme` |
 <!-- keybindings:end -->
 
-Mouse: **left-drag** selects (double-click a word, triple-click a line); **Shift+drag** selects even over programs that track the mouse (vim, htop, tmux, Claude Code) — those programs get the clicks otherwise, right and middle buttons included, and **Shift+right-click** opens JeTTY's menu there; the **wheel** scrolls the scrollback or goes to such a program (a pager on the alternate screen gets arrow keys), while **Shift+wheel** — or the wheel over the scrollbar or the status strip — always scrolls JeTTY's own scrollback; **right-click** opens the Copy / Paste / Run in New Tab / Select All / Clear / Close Tab menu; **middle-click** pastes the primary selection; **Ctrl+click** opens a link; a file **dropped** on the terminal types its quoted path (X11 and macOS — winit has no Wayland drag-and-drop yet). Tabs: drag one along the bar to reorder it, off the bar to detach it (drop it back on the bar to reattach), right-click a tab for Detach / Rename / Color / Close, double-click to rename, middle-click to close, scroll the wheel over the bar to switch. `Ctrl+D` exits the shell.
+Mouse: **left-drag** selects (double-click a word, triple-click a line); **Shift+drag** selects even over programs that track the mouse (vim, htop, tmux, Claude Code) — those programs get the clicks otherwise, right and middle buttons included, and **Shift+right-click** opens JeTTY's menu there; the **wheel** scrolls the scrollback or goes to such a program (a pager on the alternate screen gets arrow keys), while **Shift+wheel** — or the wheel over the scrollbar or the status strip — always scrolls JeTTY's own scrollback; **right-click** opens the Copy / Paste / Run in New Tab / Select All / Clear / Close Tab menu; **middle-click** pastes the primary selection; **Ctrl+click** opens a link; a file **dropped** on the terminal types its quoted path (X11 and macOS — winit has no Wayland drag-and-drop yet). Tabs: drag one along the bar to reorder it, off the bar to detach it (drop it back on the bar to reattach), right-click a tab for Detach / Rename / Color / Close, double-click to rename, middle-click to close, scroll the wheel over the bar to switch. `Ctrl+D` exits the shell. Closing the last tab (or exiting its shell) quits JeTTY, summon hotkey included.
 
 Menus work from the keyboard too: the **Menu** key opens the right-click menu at the text cursor, and in any menu the arrows (or `Home` / `End`) move, `Enter` picks, `→` / `←` open and leave a tab's Color list, and `Esc` (or **Menu** again) closes it. An open menu holds the keyboard the way native menus do — any other key closes it and then does its usual job, so typing on after a stray **Menu** press loses nothing and runs nothing.
 

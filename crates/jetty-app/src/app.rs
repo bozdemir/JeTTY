@@ -2535,7 +2535,7 @@ impl App {
                 Some(key) => format!("{key} (configurable) — Summon / hide window"),
                 None => "Compositor shortcut — Summon / hide window   (bind it to jetty --toggle)".to_string(),
             },
-            "Ctrl+D — Close shell (EOF)".to_string(),
+            "Ctrl+D — Close shell (EOF)   (in the last tab: quits JeTTY)".to_string(),
             "Esc — Close this help".to_string(),
         ]
     }
@@ -4334,6 +4334,12 @@ impl App {
         // The tab bar gained an entry either way (active or background).
         self.request_main_paint();
         Some(self.tabs.len() - 1)
+    }
+
+    /// Would closing a main-window tab quit JeTTY — it is the last tab and no
+    /// detached window would be pulled back in its place (see `close_tab`)?
+    fn closing_tab_quits(&self) -> bool {
+        self.tabs.len() == 1 && self.detached.is_empty()
     }
 
     /// Close tab `i` (its PtySession Drop kills the child). Fix up `active`. If
@@ -14551,11 +14557,12 @@ impl ApplicationHandler<AppEvent> for App {
                     let cy = self.cursor.1 as f32;
                     let target = self.tab_index(id);
                     let title = target.map(|i| self.tabs[i].title.clone()).unwrap_or_default();
+                    let quits = self.closing_tab_quits();
                     let theme = self.current_theme();
                     let cm = self.chrome_metrics();
                     let mut fallback = mono_fallback(cm);
                     let popup = jetty_render::build_confirm_close(
-                        w, h, &title, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
+                        w, h, &title, quits, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
                     );
                     if input::point_in(&popup.close_rect, cx, cy) {
                         self.confirm_close = None;
@@ -15767,10 +15774,10 @@ impl ApplicationHandler<AppEvent> for App {
                     .map(|g| g.backend_name.clone())
                     .unwrap_or_else(|| "?".to_string());
                 let confirm_quit = self.confirm_quit;
-                let confirm_close: Option<String> = self
+                let confirm_close: Option<(String, bool)> = self
                     .confirm_close
                     .and_then(|id| self.tab_index(id))
-                    .map(|i| self.tabs[i].title.clone());
+                    .map(|i| (self.tabs[i].title.clone(), self.closing_tab_quits()));
                 let rename_state: Option<(usize, String)> =
                     self.rename_ref().map(|(i, buf)| (i, buf.to_string()));
                 // Corner-mask inputs captured before the mutable render borrows.
@@ -16569,9 +16576,9 @@ impl ApplicationHandler<AppEvent> for App {
                                 &gpu.device, &gpu.queue, scene_view, width, height, &popup.labels,
                             );
                         }
-                    } else if let Some(title) = &confirm_close {
+                    } else if let Some((title, quits)) = &confirm_close {
                         let popup = jetty_render::build_confirm_close(
-                            width, height, title, &theme, &mut *chrome_text, cm,
+                            width, height, title, *quits, &theme, &mut *chrome_text, cm,
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &popup.quads);
                         if !popup.labels.is_empty() {

@@ -173,17 +173,26 @@ fn wrap_lines(m: &mut dyn ChromeMeasure, s: &str, max_w: f32, max_lines: usize) 
     lines
 }
 
-/// Confirmation popup asking whether to close the tab titled `title`.
+/// The close-tab prompt when the tab is the last one: closing it quits JeTTY —
+/// the summon hotkey with it — so it asks the way the quit dialog does.
+pub const CLOSE_LAST_TAB_PROMPT: &str = "Close the last tab and quit JeTTY?";
+
+/// Confirmation popup asking whether to close the tab titled `title` — or,
+/// when it is the last tab (`quits`), whether to close it and quit JeTTY.
 ///
 /// `m` / `cm` are forwarded to `build_confirm`; see its docs.
 pub fn build_confirm_close(
     win_w: u32,
     win_h: u32,
     title: &str,
+    quits: bool,
     theme: &jetty_core::Theme,
     m: &mut dyn ChromeMeasure,
     cm: ChromeMetrics,
 ) -> ConfirmPopup {
+    if quits {
+        return build_confirm(win_w, win_h, CLOSE_LAST_TAB_PROMPT, theme, m, cm);
+    }
     // Clip first: the title is program-controlled (OSC 0/2) and may be huge.
     let (title, _) = crate::chrome::clip_head(title);
     let shown_title: String = if title.chars().count() > 28 {
@@ -215,7 +224,7 @@ mod tests {
 
     #[test]
     fn popup_is_centered_and_has_buttons() {
-        let p = build_confirm_close(1000, 700, "Tab 1", &theme(), &mut mono(), CM);
+        let p = build_confirm_close(1000, 700, "Tab 1", false, &theme(), &mut mono(), CM);
         assert!(p.panel.x >= 0.0 && p.panel.y >= 0.0);
         assert!(p.panel.x + p.panel.w <= 1000.0 + 0.5);
         // Close button sits left of Cancel.
@@ -225,9 +234,20 @@ mod tests {
     }
 
     #[test]
+    fn closing_the_last_tab_asks_to_quit() {
+        // Closing the last tab quits JeTTY (and its summon hotkey): a plain
+        // "Close tab?" hid that. The prompt says it, whole.
+        let p = build_confirm_close(1000, 700, "zsh", true, &theme(), &mut mono(), CM);
+        assert_eq!(p.labels[0].0, CLOSE_LAST_TAB_PROMPT);
+        assert!(CLOSE_LAST_TAB_PROMPT.contains("quit JeTTY"));
+        let other = build_confirm_close(1000, 700, "zsh", false, &theme(), &mut mono(), CM);
+        assert_eq!(other.labels[0].0, "Close tab \"zsh\"?");
+    }
+
+    #[test]
     fn long_title_is_truncated() {
         let long = "a".repeat(80);
-        let p = build_confirm_close(1000, 700, &long, &theme(), &mut mono(), CM);
+        let p = build_confirm_close(1000, 700, &long, false, &theme(), &mut mono(), CM);
         let prompt = &p.labels[0].0;
         assert!(prompt.contains('…'), "long title should be truncated: {prompt}");
         assert!(p.panel.x + p.panel.w <= 1000.0 + 0.5);

@@ -45,7 +45,7 @@ pub const HELP_ROWS: &[&str] = &[
     "",
     "## Other",
     "F9 (configurable) — Summon / hide window",
-    "Ctrl+D — Close shell (EOF)",
+    "Ctrl+D — Close shell (EOF)   (in the last tab: quits JeTTY)",
     "Esc — Close this help",
 ];
 

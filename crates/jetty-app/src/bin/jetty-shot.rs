@@ -1867,10 +1867,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("jetty-shot: JETTY_SHOT_WELCOME rendered welcome splash");
         }
 
-        // JETTY_SHOT_CONFIRM — render the "Close this tab?" confirmation popup.
+        // JETTY_SHOT_CONFIRM — render the "Close this tab?" confirmation popup
+        // (`=last`: the last tab's, which asks to quit JeTTY).
         if env_flag("JETTY_SHOT_CONFIRM") {
+            let quits = std::env::var("JETTY_SHOT_CONFIRM").is_ok_and(|v| v == "last");
             let popup = jetty_render::build_confirm_close(
-                width, height, &sample_tab_title(2), terminal.theme(), &mut chrome_text, cm,
+                width, height, &sample_tab_title(2), quits, terminal.theme(), &mut chrome_text, cm,
             );
             rects.extend(popup.quads);
             chrome_labels.extend(popup.labels);
