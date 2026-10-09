@@ -8537,7 +8537,7 @@ impl App {
             return;
         }
         // 1. Capture everything from the SOURCE tab.
-        let (text, cwd, wait_for_mark, notify_window) = match source {
+        let (text, hides_text, cwd, wait_for_mark, notify_window) = match source {
             SelSource::Main => {
                 if self.tabs.is_empty() {
                     return;
@@ -8545,6 +8545,7 @@ impl App {
                 let t = &self.tabs[self.active];
                 (
                     t.terminal.selection_text(),
+                    t.terminal.selection_hides_text(),
                     t.pty.cwd(),
                     t.terminal.prompt_count() > 0,
                     self.window.as_ref().map(|w| w.id()),
@@ -8554,6 +8555,7 @@ impl App {
                 let Some(dw) = self.detached.get(i) else { return };
                 (
                     dw.tab.terminal.selection_text(),
+                    dw.tab.terminal.selection_hides_text(),
                     dw.tab.pty.cwd(),
                     dw.tab.terminal.prompt_count() > 0,
                     Some(dw.window.id()),
@@ -8561,7 +8563,8 @@ impl App {
             }
         };
         let Some(raw) = text else { return };
-        let (text, run) = match crate::runsel::classify(crate::runsel::prepare(&raw)) {
+        let plan = crate::runsel::classify(crate::runsel::prepare(&raw));
+        let (text, run) = match crate::runsel::stage_if_hidden(plan, hides_text) {
             crate::runsel::Plan::Empty => return,
             crate::runsel::Plan::Run(t) => (t, true),
             crate::runsel::Plan::Type(t) => (t, false),
@@ -8599,6 +8602,7 @@ impl App {
             created: std::time::Instant::now(),
             wait_for_mark,
             notify_window,
+            hides_text,
         });
         // Wake the `about_to_wait` deadline fold (one bool; false when unused).
         self.runsel_active = true;
@@ -9103,10 +9107,10 @@ impl App {
                     verdict == Verdict::Fire,
                 )
                 .unwrap_or(false);
-                // Type mode landed staged (multiline / truncated): say so — the
-                // user's Enter is the run confirmation.
+                // Type mode landed staged (multiline / truncated / hidden
+                // text): say so — the user's Enter is the run confirmation.
                 let notice = (wrote && !p.run).then_some(runsel::Notice {
-                    msg: runsel::MSG_STAGED,
+                    msg: if p.hides_text { runsel::MSG_HIDDEN } else { runsel::MSG_STAGED },
                     window: p.notify_window,
                 });
                 (wrote, notice)
