@@ -188,6 +188,13 @@ pub(crate) fn reorder_slot(x: f32, tab_rects: &[Rect], from: usize) -> Option<us
     crate::detached::reorder_target(x, tab_rects).filter(|&to| to != from)
 }
 
+/// `drag` while its tab is among `live`: a tab drag outlives any OTHER tab's
+/// removal (a background shell exiting dropped it mid-tear, leaving the
+/// grabbing pointer stuck).
+pub(crate) fn drag_still_open(drag: Option<TabDrag>, live: &[TabId]) -> Option<TabDrag> {
+    drag.filter(|d| live.contains(&d.tab))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +344,15 @@ mod tests {
         // Back on the strip, already past the slop: it follows the pointer.
         assert_eq!(drag.moved(160.0, false, REORDER_SLOP), DragMove { tear_changed: true, reorder: true });
         assert!(!drag.tearing);
+    }
+
+    #[test]
+    fn a_tab_drag_outlives_another_tabs_removal() {
+        // A background tab's shell exiting mid-drag used to drop the drag (the
+        // release then did nothing and a tear-out's grabbing pointer stuck).
+        let drag = Some(TabDrag::new(TabId(2), 0.0));
+        assert_eq!(drag_still_open(drag, &[TabId(1), TabId(2)]), drag);
+        assert_eq!(drag_still_open(drag, &[TabId(1), TabId(3)]), None, "its own tab went: it ends");
+        assert_eq!(drag_still_open(None, &[TabId(1)]), None);
     }
 }

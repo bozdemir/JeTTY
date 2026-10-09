@@ -4175,6 +4175,16 @@ impl App {
         }
     }
 
+    /// Drop a held tab drag whose release can't come (the focus left) or must
+    /// not act (its tab is gone): a tear-out's grabbing pointer goes with it.
+    fn end_tab_drag(&mut self) {
+        if self.tab_drag.take().is_some_and(|d| d.tearing) {
+            if let Some(win) = &self.window {
+                win.set_cursor(self.desired_cursor(self.resize_cursor));
+            }
+        }
+    }
+
     /// The wheel over the tab strip: step through the tabs. Inert while a
     /// popup, a menu, an inline rename or a tab drag owns the strip.
     fn wheel_tabs(&mut self, delta: MouseScrollDelta) {
@@ -4352,13 +4362,6 @@ impl App {
         // selection is reset.
         self.drop_stale_tab_refs();
         self.selecting = false;
-        // The tab menu / a held tab drag are anchored on the old layout; it
-        // just changed under them, so drop both (transient, cheap to reopen).
-        self.tab_menu = None;
-        self.tab_menu_hover = None;
-        self.tab_menu_rects.clear();
-        self.tab_menu_labels.clear();
-        self.tab_drag = None;
         if active_removed {
             // A different tab is now active: drop the closed tab's hint/copy
             // mode, wheel remainder and hover (the same reset every switch does).
@@ -4415,15 +4418,6 @@ impl App {
             self.active -= 1;
         }
         self.drop_stale_tab_refs();
-        // The tab menu / a held tab drag hold raw indices; the layout just
-        // changed under them, so drop both — same invariant as `close_tab` /
-        // `close_exited_tabs` (a stale index would rename/close/tear the
-        // WRONG tab after Ctrl+Shift+D with the menu open).
-        self.tab_menu = None;
-        self.tab_menu_hover = None;
-        self.tab_menu_rects.clear();
-        self.tab_menu_labels.clear();
-        self.tab_drag = None;
         // A selection drag in progress belonged to the tab that just left; without
         // clearing this, every later CursorMoved would stretch the NOW-active
         // tab's stale selection and the release would clobber the clipboard with
@@ -5242,6 +5236,21 @@ impl App {
         self.confirm_close = still_open(self.confirm_close, &live);
         if self.renaming.is_none() {
             self.rename_buf.clear();
+        }
+        // The tab menu and a held tab drag name their tab by id too: another
+        // tab's removal leaves them be (a background shell exiting closed the
+        // menu under the pointer and dropped a drag mid-tear, its grabbing
+        // pointer stuck) — unless it took the menu's "Detach" row with it.
+        let menu_gone = self.tab_menu.is_some_and(|(_, _, id)| !live.contains(&id))
+            || (!crate::detached::can_detach(live.len()) && self.tab_menu_labels.contains(&"Detach"));
+        if menu_gone {
+            self.tab_menu = None;
+            self.tab_menu_hover = None;
+            self.tab_menu_rects.clear();
+            self.tab_menu_labels.clear();
+        }
+        if crate::tabstrip::drag_still_open(self.tab_drag, &live).is_none() {
+            self.end_tab_drag();
         }
         // Ids are never reused, so a gone tab's notification throttle is dead
         // weight — drop it.
@@ -9006,13 +9015,6 @@ impl App {
             self.rename_buf.clear();
         }
         self.selecting = false;
-        // Same index-invalidation as `close_tab`: drop the transient tab menu /
-        // held tab drag now that the tab layout changed under them.
-        self.tab_menu = None;
-        self.tab_menu_hover = None;
-        self.tab_menu_rects.clear();
-        self.tab_menu_labels.clear();
-        self.tab_drag = None;
         if active_removed {
             // A different tab is active now (same reset as a tab switch).
             self.entered_new_active_tab();
@@ -14232,11 +14234,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.dismiss_surface_menus(Surface::Main);
                 // A held tab drag can never see its release once focus is gone —
                 // clear it (and its grabbing cursor) so it doesn't resume stuck.
-                if self.tab_drag.take().is_some() {
-                    if let Some(win) = &self.window {
-                        win.set_cursor(winit::window::CursorIcon::Default);
-                    }
-                }
+                self.end_tab_drag();
                 // A link underline can't clear itself while unfocused (the
                 // modifier release is delivered elsewhere) — drop it now.
                 self.link_hover_cell = None;
