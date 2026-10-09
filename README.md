@@ -142,7 +142,7 @@ cargo build --release
 ./target/release/jetty
 ```
 
-Renders through **Metal**. Summon with **F9** — on Mac keyboards where the function-row keys default to media actions, press `fn`+`F9` so the OS delivers F9. You can also bind `jetty --toggle` to a shortcut via a launcher (the first press launches JeTTY; each subsequent press toggles the running instance via the single-instance socket). A locally built binary is not quarantined, so there's no Gatekeeper prompt. *(Prebuilt `.app` / `.dmg` are on the [roadmap](#-roadmap).)*
+Renders through **Metal**. Summon with **F9** — on Mac keyboards where the function-row keys default to media actions, press `fn`+`F9` so the OS delivers F9. You can also bind `jetty --toggle` to a shortcut via a launcher (the first press launches JeTTY; each subsequent press toggles the running instance via the single-instance socket). A locally built binary is not quarantined, so there's no Gatekeeper prompt. *(There are no prebuilt `.app` / `.dmg` builds.)*
 
 ### 🍎 macOS (.app bundle with Dock icon)
 
@@ -182,7 +182,7 @@ git clone https://github.com/bozdemir/JeTTY.git && cd JeTTY
 cargo build --release && ./target/release/jetty
 ```
 
-> Prebuilt artifacts (`.deb`, AppImage, tarball, checksums) are published by CI when a `v*` tag is pushed — **Linux x86_64 today; macOS prebuilt builds are on the roadmap.** Until then, macOS users build from source (above).
+> Prebuilt artifacts (`.deb`, AppImage, tarball, checksums) are published by CI when a `v*` tag is pushed — **Linux x86_64 only**; macOS users build from source (above).
 
 ### Graphics drivers
 
@@ -287,7 +287,7 @@ Great places to jump in right now:
 - Multi-monitor awareness & per-monitor dropdown placement
 - More summon effects / themes / visual polish
 - Faster cold start
-- Packaging (PPA, AUR, Flatpak research), docs
+- Docs
 
 **How to get involved:** open an [issue](https://github.com/bozdemir/JeTTY/issues) or discussion, or send a pull request. New to the code? The [architecture](#-architecture) section is a good place to start.
 
@@ -295,7 +295,6 @@ Great places to jump in right now:
 
 - Native Wayland global shortcut via the XDG GlobalShortcuts portal
 - Multi-monitor awareness
-- Launchpad PPA (`apt install jetty`) + AUR package
 - Faster cold start
 - More summon effects and themes
 
