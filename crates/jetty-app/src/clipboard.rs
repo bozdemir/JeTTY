@@ -1,34 +1,66 @@
-/// Thin wrapper around `arboard::Clipboard`.
+/// The system clipboard: CLIPBOARD (explicit Copy/Paste) and, on X11/Wayland,
+/// PRIMARY (the select-to-copy, middle-click-to-paste convention).
 ///
-/// IMPORTANT (X11): the clipboard contents are served by the *owning process*
-/// for as long as its `Clipboard` instance stays alive. A fresh `Clipboard`
-/// created per call and dropped at the end of `set()` would relinquish the X11
-/// selection immediately, so pasting into another app yields nothing. We
-/// therefore keep ONE long-lived `Clipboard` for the whole process (a
-/// `thread_local`, since all clipboard access happens on the UI thread) so the
-/// copied text keeps being served while Jetty runs.
+/// * A native Wayland session (JeTTY's windows are Wayland clients): a
+///   data-device client on winit's own `wl_display` — smithay-clipboard, the
+///   core `wl_data_device` and `zwp_primary_selection` protocols on a worker
+///   thread with its own event queue (see [`init`]). The XWayland route arboard
+///   takes sees nothing a native Wayland app copied: KWin and wlroots hand a
+///   Wayland-owned selection to X11 clients only while an X11 window has the
+///   focus, so a paste got nothing, or JeTTY's own stale copy. arboard's
+///   `wayland-data-control` backend is deliberately NOT enabled either — it
+///   serves a copy by forking the process, and a fork of JeTTY would inherit
+///   every PTY master fd (shells would not see their tab close).
+/// * X11, macOS: `arboard::Clipboard`.
 ///
-/// Two selections: CLIPBOARD (explicit Copy/Paste) and, on X11/Wayland, PRIMARY
-/// (the select-to-copy, middle-click-to-paste convention). On Wayland the
-/// X11 path is used through XWayland, which bridges both selections to native
-/// apps; arboard's `wayland-data-control` backend is deliberately NOT enabled —
-/// it serves a copy by forking the process, and a fork of JeTTY would inherit
-/// every PTY master fd (shells would not see their tab close).
+/// IMPORTANT: the clipboard contents are served by the *owning process* for as
+/// long as its clipboard object stays alive. A fresh one created per call and
+/// dropped at the end of `set()` would relinquish the selection immediately, so
+/// pasting into another app yields nothing. We therefore keep ONE long-lived
+/// clipboard for the whole process (a `thread_local`, since all clipboard
+/// access happens on the UI thread) so the copied text keeps being served
+/// while JeTTY runs.
 use std::cell::RefCell;
 
 use arboard::Clipboard;
 
-thread_local! {
+/// Which selection an operation is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Selection {
+    /// Explicit Copy / Paste.
+    Clipboard,
+    /// What a middle click pastes. Platforms without one (macOS, Windows) use
+    /// the clipboard instead, which is their own copy-on-select convention.
+    Primary,
+}
+
+/// The UI thread's clipboard connections.
+#[derive(Default)]
+struct Selections {
+    /// A native Wayland session's clipboard ([`init`]); `None` elsewhere.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
+    wayland: Option<wayland::Clipboard>,
     /// Opened on first use. `None` while no clipboard is available (e.g. a
     /// headless session) — every operation then degrades to a silent no-op,
     /// and the next one tries to open it again: one failed open (a display
     /// that was not up yet) never disables copy and paste for the session.
-    static CLIPBOARD: RefCell<Option<Clipboard>> = const { RefCell::new(None) };
+    arboard: Option<Clipboard>,
 }
 
-/// Run `f` on the clipboard, opening it first when it is not open yet.
-fn with_clipboard<R>(f: impl FnOnce(&mut Clipboard) -> Option<R>) -> Option<R> {
-    CLIPBOARD.with(|cell| f(open_lazily(&mut cell.borrow_mut(), || Clipboard::new().ok())?))
+thread_local! {
+    static SELECTIONS: RefCell<Selections> = RefCell::default();
+}
+
+/// Connect to a native Wayland session's clipboard, on the connection of
+/// winit's event loop (`display`). Elsewhere arboard opens on first use.
+pub fn init(display: winit::event_loop::OwnedDisplayHandle) {
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
+    if let Some(native) = wayland::Native::connect(display) {
+        let clipboard = wayland::Clipboard::spawn(native, wayland::READ_TIMEOUT);
+        SELECTIONS.with(|cell| cell.borrow_mut().wayland = clipboard);
+    }
+    #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")))))]
+    let _ = display;
 }
 
 /// The value in `slot`, created by `open` while there is none: a failed open
@@ -40,15 +72,61 @@ fn open_lazily<T>(slot: &mut Option<T>, open: impl FnOnce() -> Option<T>) -> Opt
     slot.as_mut()
 }
 
+/// Make `text` the `sel` selection. Errors are silently discarded.
+fn store(sel: Selection, text: &str) {
+    SELECTIONS.with(|cell| {
+        let s = &mut *cell.borrow_mut();
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
+        if let Some(w) = &s.wayland {
+            w.store(sel, text.to_owned());
+            return;
+        }
+        let Some(cb) = open_lazily(&mut s.arboard, || Clipboard::new().ok()) else { return };
+        let _ = match sel {
+            Selection::Clipboard => cb.set_text(text.to_owned()),
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
+            Selection::Primary => {
+                use arboard::{LinuxClipboardKind, SetExtLinux};
+                cb.set().clipboard(LinuxClipboardKind::Primary).text(text.to_owned())
+            }
+            #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")))))]
+            Selection::Primary => cb.set_text(text.to_owned()),
+        };
+    });
+}
+
+/// The text of the `sel` selection: `None` on error or when it holds no text.
+fn load(sel: Selection) -> Option<String> {
+    SELECTIONS.with(|cell| {
+        let s = &mut *cell.borrow_mut();
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
+        if let Some(w) = &mut s.wayland {
+            return w.load(sel);
+        }
+        let cb = open_lazily(&mut s.arboard, || Clipboard::new().ok())?;
+        match sel {
+            Selection::Clipboard => cb.get_text(),
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
+            Selection::Primary => {
+                use arboard::{GetExtLinux, LinuxClipboardKind};
+                cb.get().clipboard(LinuxClipboardKind::Primary).text()
+            }
+            #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")))))]
+            Selection::Primary => cb.get_text(),
+        }
+        .ok()
+    })
+}
+
 /// Write `text` to the system clipboard. Errors are silently discarded.
 pub fn set(text: &str) {
-    with_clipboard(|cb| cb.set_text(text.to_owned()).ok());
+    store(Selection::Clipboard, text);
 }
 
 /// Read a `String` from the system clipboard. Returns `None` on error or when
 /// the clipboard contains no text.
 pub fn get() -> Option<String> {
-    with_clipboard(|cb| cb.get_text().ok())
+    load(Selection::Clipboard)
 }
 
 /// Write `text` to the PRIMARY selection — the copy-on-select target, pasted
@@ -56,26 +134,143 @@ pub fn get() -> Option<String> {
 /// primary selection (macOS, Windows) use the clipboard instead, which is their
 /// own copy-on-select convention.
 pub fn set_primary(text: &str) {
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
-    {
-        use arboard::{LinuxClipboardKind, SetExtLinux};
-        with_clipboard(|cb| cb.set().clipboard(LinuxClipboardKind::Primary).text(text.to_owned()).ok());
-    }
-    #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")))))]
-    set(text);
+    store(Selection::Primary, text);
 }
 
 /// Read the PRIMARY selection (what a middle click pastes): the text most
 /// recently selected in any app. Falls back to the clipboard where there is no
 /// primary selection (see [`set_primary`]).
 pub fn get_primary() -> Option<String> {
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
-    {
-        use arboard::{GetExtLinux, LinuxClipboardKind};
-        with_clipboard(|cb| cb.get().clipboard(LinuxClipboardKind::Primary).text().ok())
+    load(Selection::Primary)
+}
+
+/// The native Wayland clipboard: smithay-clipboard's data-device client on
+/// winit's own `wl_display`, driven from a thread of its own so that a paste
+/// waits at most [`READ_TIMEOUT`]. smithay-clipboard's read blocks until the app
+/// that owns the selection has sent all of it, and a frozen app never does —
+/// that froze every JeTTY window until the app came back or died.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
+mod wayland {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::Selection;
+
+    /// How long a paste waits for the owner of the selection to send it — the
+    /// same 4 s arboard's X11 read gives the owner to start.
+    pub const READ_TIMEOUT: Duration = Duration::from_secs(4);
+
+    /// What the clipboard thread drives: smithay-clipboard ([`Native`]), or a
+    /// stand-in in the tests.
+    pub trait Backend {
+        fn store(&self, sel: Selection, text: String);
+        fn load(&self, sel: Selection) -> Option<String>;
     }
-    #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")))))]
-    get()
+
+    enum Request {
+        Store(Selection, String),
+        Load(Selection),
+    }
+
+    /// The UI thread's end of the clipboard thread.
+    pub struct Clipboard {
+        requests: mpsc::Sender<Request>,
+        replies: mpsc::Receiver<Option<String>>,
+        timeout: Duration,
+        /// A read gave up waiting and still runs on the clipboard thread: until
+        /// its (late) reply arrives, reads give up at once instead of queueing
+        /// behind it, and that reply is dropped — never pasted by a later read.
+        stalled: bool,
+    }
+
+    impl Clipboard {
+        /// Serve `backend` from a thread of its own (it ends with this end), a
+        /// read waiting at most `timeout`. `None` when no thread can start.
+        pub fn spawn<B: Backend + Send + 'static>(backend: B, timeout: Duration) -> Option<Self> {
+            let (requests, rx) = mpsc::channel();
+            let (tx, replies) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("jetty-clipboard".into())
+                .spawn(move || {
+                    for request in rx {
+                        match request {
+                            Request::Store(sel, text) => backend.store(sel, text),
+                            Request::Load(sel) => {
+                                if tx.send(backend.load(sel)).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .ok()?;
+            Some(Clipboard { requests, replies, timeout, stalled: false })
+        }
+
+        /// Make `text` the `sel` selection. Never waits.
+        pub fn store(&self, sel: Selection, text: String) {
+            let _ = self.requests.send(Request::Store(sel, text));
+        }
+
+        /// The text of the `sel` selection: `None` when there is none, it is
+        /// not text, or its owner did not send it in time.
+        pub fn load(&mut self, sel: Selection) -> Option<String> {
+            if self.stalled {
+                self.replies.try_recv().ok()?;
+                self.stalled = false;
+            }
+            self.requests.send(Request::Load(sel)).ok()?;
+            match self.replies.recv_timeout(self.timeout) {
+                Ok(text) => text,
+                Err(_) => {
+                    self.stalled = true;
+                    None
+                }
+            }
+        }
+    }
+
+    /// smithay-clipboard and the display its worker runs on, dropped in that
+    /// order (fields drop in declaration order).
+    pub struct Native {
+        clipboard: smithay_clipboard::Clipboard,
+        /// Keeps winit's `wl_display` connected while `clipboard` uses it.
+        _display: winit::event_loop::OwnedDisplayHandle,
+    }
+
+    impl Native {
+        /// The clipboard of `display` when it is a Wayland display; `None` on
+        /// X11 (arboard serves that).
+        pub fn connect(display: winit::event_loop::OwnedDisplayHandle) -> Option<Self> {
+            use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+            let ptr = match display.display_handle().ok()?.as_raw() {
+                RawDisplayHandle::Wayland(h) => h.display.as_ptr(),
+                _ => return None,
+            };
+            // SAFETY: `ptr` is the live `wl_display` of winit's connection, and
+            // `_display` holds that connection for as long as `clipboard` (and
+            // its worker thread, joined when it drops) lives.
+            let clipboard = unsafe { smithay_clipboard::Clipboard::new(ptr) };
+            Some(Native { clipboard, _display: display })
+        }
+    }
+
+    impl Backend for Native {
+        fn store(&self, sel: Selection, text: String) {
+            match sel {
+                Selection::Clipboard => self.clipboard.store(text),
+                Selection::Primary => self.clipboard.store_primary(text),
+            }
+        }
+
+        fn load(&self, sel: Selection) -> Option<String> {
+            match sel {
+                Selection::Clipboard => self.clipboard.load(),
+                Selection::Primary => self.clipboard.load_primary(),
+            }
+            .ok()
+        }
+    }
 }
 
 /// Where a finished mouse selection is copied (config key `copy_on_select`):
@@ -200,6 +395,65 @@ mod open_tests {
         assert_eq!(open_lazily(&mut slot, || { tries += 1; Some(7) }).copied(), Some(7), "the next use opens it");
         assert_eq!(open_lazily(&mut slot, || { tries += 1; Some(8) }).copied(), Some(7), "and keeps it");
         assert_eq!(tries, 2, "an open clipboard is never reopened");
+    }
+}
+
+#[cfg(all(test, unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
+mod wayland_tests {
+    use super::wayland::{Backend, Clipboard};
+    use super::Selection;
+    use std::sync::{mpsc, Mutex};
+    use std::time::Duration;
+
+    /// A stand-in for the app that owns the selection (no real clipboard is
+    /// touched): copies land in `stored`, and every read waits for its answer
+    /// on `answers` — a frozen app never sends one.
+    struct Owner {
+        stored: mpsc::Sender<(Selection, String)>,
+        asked: mpsc::Sender<Selection>,
+        answers: Mutex<mpsc::Receiver<Option<String>>>,
+    }
+
+    impl Backend for Owner {
+        fn store(&self, sel: Selection, text: String) {
+            let _ = self.stored.send((sel, text));
+        }
+
+        fn load(&self, sel: Selection) -> Option<String> {
+            let _ = self.asked.send(sel);
+            self.answers.lock().unwrap().recv().ok().flatten()
+        }
+    }
+
+    #[test]
+    fn a_paste_never_waits_on_a_frozen_owner_past_the_timeout() {
+        let (stored_tx, stored) = mpsc::channel();
+        let (asked_tx, asked) = mpsc::channel();
+        let (answer, answers) = mpsc::channel();
+        let owner = Owner { stored: stored_tx, asked: asked_tx, answers: Mutex::new(answers) };
+        let mut cb = Clipboard::spawn(owner, Duration::from_millis(500)).unwrap();
+        let wait = Duration::from_secs(10);
+
+        // An owner that answers: the paste gets its text.
+        answer.send(Some("one".into())).unwrap();
+        assert_eq!(cb.load(Selection::Clipboard).as_deref(), Some("one"));
+        assert_eq!(asked.recv_timeout(wait), Ok(Selection::Clipboard));
+
+        // A frozen one: the paste gives up after the timeout…
+        assert_eq!(cb.load(Selection::Primary), None);
+        assert_eq!(asked.recv_timeout(wait), Ok(Selection::Primary));
+        // …and while that read still hangs, the next one gives up at once
+        // instead of queueing behind it.
+        assert_eq!(cb.load(Selection::Clipboard), None);
+        // A copy still goes through, once the hung read is over.
+        cb.store(Selection::Clipboard, "copied".into());
+
+        // The owner comes back: its late answer is dropped, never pasted.
+        answer.send(Some("late".into())).unwrap();
+        assert_eq!(stored.recv_timeout(wait), Ok((Selection::Clipboard, "copied".to_string())));
+        assert!(asked.try_recv().is_err(), "no read was queued behind the hung one");
+        answer.send(Some("two".into())).unwrap();
+        assert_eq!(cb.load(Selection::Clipboard).as_deref(), Some("two"));
     }
 }
 

@@ -14,7 +14,7 @@ png = "0.18.1"
 # Text-only clipboard: the default `image-data` feature pulled in the `image`
 # crate (and a second `png`) for an API JeTTY never calls. NOT
 # `wayland-data-control` either: that backend forks the process to serve a copy
-# (see clipboard.rs) — XWayland bridges both selections instead.
+# (see clipboard.rs) — a native Wayland session uses smithay-clipboard instead.
 arboard = { version = "3.6.1", default-features = false }
 global-hotkey = "0.8.0"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -55,6 +55,12 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 # X11 keysym names for the summon-hotkey grab (`x11_hotkey`). Already in the
 # tree via global-hotkey and winit — no new crate.
 xkeysym = "0.2"
+# The native Wayland clipboard (clipboard.rs): the core wl_data_device and
+# primary-selection protocols on winit's own wl_display, served by a worker
+# thread — no fork. Its toolkit, calloop and wayland crates are winit's own.
+# Pinned: 0.7.3 is the same code on smithay-client-toolkit 0.20, which would
+# build a second toolkit next to winit's 0.19.
+smithay-clipboard = "=0.7.2"
 
 [dev-dependencies]
 # Tests drive the shell-integration snippets in a REAL shell on a PTY (bash -u).

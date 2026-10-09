@@ -13109,6 +13109,8 @@ impl ApplicationHandler<AppEvent> for App {
         }
         // Without Vulkan, wgpu's GL backend presents through the display connection.
         jetty_render::set_platform_display(event_loop.owned_display_handle());
+        // A native Wayland session's clipboard is served on that connection too.
+        crate::clipboard::init(event_loop.owned_display_handle());
         // Cold-start parallelism: the FontSystem (~20ms) and the initial PTY
         // fork/exec are both GPU-independent and Send, so kick them off NOW on
         // worker threads. They run fully overlapped with build_window +
