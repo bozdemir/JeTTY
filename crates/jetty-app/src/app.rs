@@ -7136,7 +7136,7 @@ impl App {
             // close, reattach) for free.
             let active_title =
                 self.tabs.get(self.active).map(|t| t.title.as_str()).unwrap_or("JeTTY");
-            let desired = format!("{active_title} — JeTTY");
+            let desired = crate::detached::os_window_title(active_title);
             if desired != self.applied_main_os_title {
                 if let Some(w) = &self.window {
                     w.set_title(&desired);

@@ -318,6 +318,12 @@ pub fn menu_hint(km: &crate::keymap::KeyMap, label: &str) -> String {
     menu_action(label).map(|a| km.menu_hint(a)).unwrap_or_default()
 }
 
+/// The OS title (taskbar, Alt+Tab) of a JeTTY window showing `tab_title` —
+/// the main window's active tab and a detached window's tab alike.
+pub(crate) fn os_window_title(tab_title: &str) -> String {
+    format!("{tab_title} — JeTTY")
+}
+
 /// True if `last_focused` is one of the live detached-window ids, i.e. focus
 /// moved from the main window into one of the app's OWN detached windows. The
 /// main window's Yakuake-style auto-hide must be suppressed in that case (the
@@ -446,8 +452,8 @@ pub(crate) struct DetachedWindow {
     pub reflow_pending_at: Option<std::time::Instant>,
     /// The single terminal session owned by this detached window.
     pub tab: Tab,
-    /// Last string passed to `window.set_title`, so `sync_os_title` is a no-op
-    /// string compare unless the tab's title really changed.
+    /// The tab title the OS title was last set from, so `sync_os_title` is a
+    /// no-op string compare unless the tab's title really changed.
     pub applied_os_title: String,
     /// Last known cursor position inside THIS window (physical px).
     pub cursor: (f64, f64),
@@ -583,7 +589,7 @@ impl DetachedWindow {
         // Title the OS window from the tab (mirrors how the tab bar displays it).
         let window = match jetty_platform::build_window(
             event_loop,
-            &tab.title,
+            &os_window_title(&tab.title),
             (w_logical, h_logical),
         ) {
             Ok(w) => w,
@@ -767,13 +773,14 @@ impl DetachedWindow {
     }
 
     /// Keep the OS window title (title bar / taskbar) in sync with the tab's
-    /// display title. Called after each PTY drain — a no-op string compare
-    /// unless the title actually changed, so it adds nothing to the idle path.
-    /// Deliberately NOT gated on occlusion: a minimized window's taskbar entry
-    /// must stay correct too.
+    /// display title — "<title> — JeTTY", as the main window's. Called after
+    /// each PTY drain — a no-op string compare (against the tab title last
+    /// applied) unless the title actually changed, so it adds nothing to the
+    /// idle path. Deliberately NOT gated on occlusion: a minimized window's
+    /// taskbar entry must stay correct too.
     pub(crate) fn sync_os_title(&mut self) {
         if self.tab.title != self.applied_os_title {
-            self.window.set_title(&self.tab.title);
+            self.window.set_title(&os_window_title(&self.tab.title));
             self.applied_os_title = self.tab.title.clone();
         }
     }
@@ -1146,6 +1153,13 @@ mod tests {
         }
         assert_eq!(menu_hint(&km, "Rename"), "");
         assert!(menu_action("Rename").is_none());
+    }
+
+    #[test]
+    fn every_window_is_named_jetty_in_the_taskbar() {
+        // The main window's OS title always ended in " — JeTTY"; a detached
+        // window's was the bare tab title.
+        assert_eq!(os_window_title("htop"), "htop — JeTTY");
     }
 
     #[test]
