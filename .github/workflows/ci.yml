@@ -10,17 +10,24 @@ on:
 permissions:
   contents: read
 
+# Third-party actions are pinned to a commit (the tag it was taken from in the
+# comment beside it), as in release.yml: a moved tag can't change what runs.
+
 jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: System build deps
         run: |
@@ -35,6 +42,78 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # The release builds and tests on Ubuntu 22.04 (its glibc is the binary's
+  # floor — see release.yml): run those tests on every push, so an older
+  # system's failure shows up here instead of on the tag.
+  build-test-22-04:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # The auto key doesn't include the runner image; never restore objects
+          # built against another glibc.
+          key: ubuntu-22.04
+
+      - name: System build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libvulkan-dev libwayland-dev libxkbcommon-dev \
+            libx11-dev libxcb1-dev libfontconfig1-dev libgl1-mesa-dev
+
+      - name: Test
+        run: cargo test --workspace
+
+  # Gates that need no test run: the paint chokepoint (the idle-CPU rule —
+  # every producer paint goes through a per-surface choke), clippy at zero
+  # warnings, and the desktop entry + AppStream metadata the packages ship.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Paint chokepoint
+        run: bash scripts/check-paint-choke.sh
+
+      - name: Install Rust (+ clippy)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: lint
+
+      - name: System build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libvulkan-dev libwayland-dev libxkbcommon-dev \
+            libx11-dev libxcb1-dev libfontconfig1-dev libgl1-mesa-dev \
+            desktop-file-utils appstream
+
+      - name: Clippy (no warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Desktop entry and AppStream metadata
+        run: |
+          desktop-file-validate assets/jetty.desktop
+          appstreamcli validate --no-net assets/io.github.bozdemir.jetty.metainfo.xml
+
   # macOS compile check, run from Linux: type-checks every `cfg(target_os =
   # "macos")` path (global hotkey on the main thread, the LaunchAgent, Cmd
   # chords, …) without a Mac runner, so a break shows up here instead of on the
@@ -43,20 +122,49 @@ jobs:
   macos-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust (+ aarch64-apple-darwin)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: macos-check
 
       - name: Check (aarch64-apple-darwin)
         run: cargo check --workspace --all-targets --target aarch64-apple-darwin
+
+  # On a real Mac, the tests of what a compile check can't see: the config
+  # watcher on FSEvents, temp paths under /var that are really /private/var,
+  # the macOS config directory, theme loading. Non-blocking until it has run
+  # green on GitHub's Mac runners (it was added without one to try it on).
+  macos-test:
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: macos-test
+
+      - name: Test (config, watcher, themes)
+        run: |
+          cargo test -p jetty-app --lib -- watch:: config:: themes::
 
   # Informational perf REPORT (never fails the build). It runs the CPU-only
   # bench and prints the numbers so we can watch the runner's real distribution.
@@ -69,13 +177,17 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Same build deps as build-test. These are orthogonal to the CPU-only runtime
       # path (which never touches wgpu); kept so the release-profile bench binary
