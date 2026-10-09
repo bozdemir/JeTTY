@@ -286,15 +286,18 @@ pub(crate) enum Press {
 }
 
 /// A press of `button` that the window's chrome did not take. `link_mod` is
-/// whether the link modifier (Ctrl; Cmd too on macOS) is held.
+/// whether the link modifier (Ctrl; Cmd too on macOS) is held. Only a press on
+/// the grid band counts: one on the status strip below it (the perf HUD) is
+/// chrome, and clamping it onto the last row clicked htop's F9 Kill / F10 Quit
+/// bar or tmux's status line.
 pub(crate) fn press(g: &mut Grid, button: MouseButton, link_mod: bool, now: Instant) -> Press {
     let Some(btn) = MouseBtn::from_winit(button) else { return Press::Ignored };
-    if !g.geom.usable() {
+    if !g.geom.usable() || !g.geom.contains_y(g.pointer.1 as f32) {
         return Press::Ignored;
     }
     let shift = g.mods.shift_key();
     // A link-modifier click on a link opens it (Shift still forces a selection).
-    if btn == MouseBtn::Left && link_mod && !shift && g.geom.contains_y(g.pointer.1 as f32) {
+    if btn == MouseBtn::Left && link_mod && !shift {
         let (line, col, _) = g.select_cell();
         if let Some(hit) = g.term.link_at(line, col) {
             return Press::OpenLink(hit.uri);
@@ -614,6 +617,30 @@ mod tests {
         // A release whose press never went to the program is not reported.
         let (r, bytes) = w.at(2.0, 1.0, NONE, |g| release(g, MouseButton::Right));
         assert_eq!((r, bytes.as_str()), (Release::Ignored, ""));
+    }
+
+    #[test]
+    fn presses_on_the_status_strip_below_the_grid_band_do_nothing() {
+        // GEOM's band ends at y = 70 (4 rows); the status strip (perf HUD) sits
+        // below it. A press there used to be clamped onto the LAST row: a click
+        // on the HUD reached htop's function-key bar (F9 Kill / F10 Quit) or
+        // tmux's status line, and started a selection on a plain prompt.
+        for setup in [&b"\x1b[?1000h\x1b[?1006h"[..], b"\x1b[?1003h", b""] {
+            let mut w = Win::new(setup);
+            for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right, MouseButton::Back] {
+                let (p, bytes) = w.at(3.0, 4.2, NONE, |g| press(g, button, false, t0()));
+                assert_eq!((p, bytes.as_str()), (Press::Ignored, ""), "{button:?} after {setup:?}");
+                assert!(!w.selecting);
+                // No phantom release either: the press was never the program's.
+                let (r, bytes) = w.at(3.0, 4.2, NONE, |g| release(g, button));
+                assert_eq!(bytes, "", "{button:?} release after {setup:?}");
+                assert_ne!(r, Release::Copy(String::new()));
+            }
+        }
+        // The last row itself (just above the band's end) still reports.
+        let mut w = Win::new(SGR_CLICKS);
+        let (p, bytes) = w.at(3.0, 3.6, NONE, |g| press(g, MouseButton::Left, false, t0()));
+        assert_eq!((p, bytes.as_str()), (Press::Reported, "\x1b[<0;4;4M"));
     }
 
     #[test]
