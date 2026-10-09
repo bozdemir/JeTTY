@@ -1297,8 +1297,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|v| v.split(',').filter_map(|id| sui::section(id.trim()).map(|s| s.id)).collect())
                 .unwrap_or_default();
             // A deep link: the control's tab, scrolled to it, highlighted (its
-            // section for a master switch or the gallery) — like App::reveal_setting.
-            let focus: Option<&'static str> = var("JETTY_SHOT_PANEL_FOCUS").and_then(|id| sui::find(&id)).map(|d| {
+            // section for a master switch or the gallery) and keyboard-focused
+            // (ringed) — like App::reveal_setting.
+            let linked = var("JETTY_SHOT_PANEL_FOCUS").and_then(|id| sui::find(&id));
+            let focus: Option<&'static str> = linked.map(|d| {
                 tab = d.tab;
                 let header = matches!(d.kind, sui::Kind::Gallery)
                     || sui::section(d.section).is_some_and(|s| s.master == Some(d.id));
@@ -1375,6 +1377,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             inp.filter = filter;
             inp.hover = hover;
             inp.focus = focus;
+            inp.focus_part = linked
+                .and_then(|d| sui::stop_of(&sui::stops(&items), d.id))
+                .and_then(|s| sui::focus_ring(s, &items, theme_idx));
             inp.ui_font_size = ui_font_size;
             inp.reset = reset;
             inp.footer_hint = footer;

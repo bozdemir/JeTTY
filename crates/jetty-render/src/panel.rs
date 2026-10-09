@@ -248,8 +248,13 @@ pub struct PanelInput<'a> {
     /// The part under the mouse (gallery cards, filter chips, section headers,
     /// the footer button and the scroll thumb highlight).
     pub hover: Option<PanelHit>,
-    /// A deep-linked control or section id, highlighted until the next input.
+    /// A deep-linked or keyboard-focused control or section id: its row band
+    /// is highlighted.
     pub focus: Option<&'static str>,
+    /// The part the keyboard focus is on (a switch, a chip, a slider's
+    /// `Track` — ringed at its knob —, a list's selected `Row`, a gallery
+    /// card): ringed in the accent.
+    pub focus_part: Option<PanelHit>,
     /// The TRUE UI font size (logical pt) — sizes the specimen line.
     pub ui_font_size: f32,
     pub reset: ResetState,
@@ -281,6 +286,7 @@ impl<'a> PanelInput<'a> {
             filter: ThemeFilter::All,
             hover: None,
             focus: None,
+            focus_part: None,
             ui_font_size: 16.0,
             reset: ResetState::Ready,
             footer_hint: "",
@@ -571,6 +577,11 @@ fn area(x: f32, y: f32, w: f32, h: f32) -> Rect {
     Rect::new(x, y, w, h, [0, 0, 0, 0])
 }
 
+/// A part's visible outline (a focus ring's shape): position, size, radius.
+fn shape(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Rect {
+    Rect::rounded(x, y, w, h, [0, 0, 0, 0], radius)
+}
+
 /// What the content builder collects (content space: y = 0 at the top).
 #[derive(Default)]
 struct Out {
@@ -594,6 +605,8 @@ struct Lay<'m> {
     c: Colors,
     hover: Option<PanelHit>,
     focus: Option<&'static str>,
+    /// The keyboard-focused part (ringed).
+    ring: Option<PanelHit>,
     /// The specimen's line height in logical px.
     spec_line: f32,
     theme_idx: usize,
@@ -624,6 +637,26 @@ impl Lay<'_> {
 
     fn hit(&mut self, r: Rect, h: PanelHit) {
         self.out.hits.push((r, h));
+    }
+
+    /// The keyboard-focus ring around part `hit` at `r` (its visible shape,
+    /// radius included), when `hit` is the focused part: an accent outline
+    /// with a gap in `gap`, the color behind the part — so it reads around an
+    /// accent-filled part too. Draw it BEFORE the part, which covers the
+    /// middle.
+    fn ring(&mut self, hit: PanelHit, r: Rect, gap: [u8; 4]) {
+        if self.ring != Some(hit) {
+            return;
+        }
+        let accent = self.c.accent;
+        self.quad(Rect::rounded(r.x - 4.0, r.y - 4.0, r.w + 8.0, r.h + 8.0, accent, r.radius + 4.0));
+        self.quad(Rect::rounded(r.x - 2.0, r.y - 2.0, r.w + 4.0, r.h + 4.0, gap, r.radius + 2.0));
+    }
+
+    /// The color behind the parts of row / section `id`: its focus band, or
+    /// the surface.
+    fn under(&self, id: &str) -> [u8; 4] {
+        if self.focus == Some(id) { self.c.focus } else { self.c.surface }
     }
 
     fn right(&self) -> f32 {
@@ -703,8 +736,11 @@ impl Lay<'_> {
             self.quad(Rect::new(rx, hy + 14.0, rend - rx, 1.0, c.hair));
         }
         if let Some((mid, on)) = master {
-            let track = self.switch(x0 + cw - SW_W, hy + 2.0, on, RowState::Normal);
-            self.hit(track, PanelHit::Ctl { id: mid, part: CtlPart::Switch });
+            let hit = PanelHit::Ctl { id: mid, part: CtlPart::Switch };
+            let sx = x0 + cw - SW_W;
+            self.ring(hit, shape(sx, hy + 2.0, SW_W, SW_H, SW_H / 2.0), self.under(id));
+            let track = self.switch(sx, hy + 2.0, on, RowState::Normal);
+            self.hit(track, hit);
         }
         // After the switch, so the switch wins where they meet.
         self.hit(area(x0 - 8.0, hy - 3.0, cw + 16.0 - sw_room, SECTION_H + 6.0), PanelHit::Section(id));
@@ -829,18 +865,23 @@ impl Lay<'_> {
         self.quad(faded(Rect::rounded(x0, y + 30.0, cw, 4.0, c.track, 2.0), st));
         let fill_w = (frac * (cw - 16.0) + 8.0).clamp(4.0, cw);
         self.quad(faded(Rect::rounded(x0, y + 30.0, fill_w, 4.0, c.accent_fill, 2.0), st));
-        self.quad(faded(Rect::rounded(x0 + frac * (cw - 16.0), y + 24.0, 16.0, 16.0, c.accent, 8.0), st));
+        let kx = x0 + frac * (cw - 16.0);
+        let hit = PanelHit::Ctl { id: row.id, part: CtlPart::Track };
+        self.ring(hit, shape(kx, y + 24.0, 16.0, 16.0, 8.0), self.under(row.id));
+        self.quad(faded(Rect::rounded(kx, y + 24.0, 16.0, 16.0, c.accent, 8.0), st));
         if self.live(row) {
-            self.hit(area(x0, y + 20.0, cw, 24.0), PanelHit::Ctl { id: row.id, part: CtlPart::Track });
+            self.hit(area(x0, y + 20.0, cw, 24.0), hit);
         }
     }
 
     fn toggle(&mut self, y: f32, row: &CtlRow, on: bool) {
         let x = self.right() - SW_W;
         self.row_label(row, y + LABEL_DY, x);
+        let hit = PanelHit::Ctl { id: row.id, part: CtlPart::Switch };
+        self.ring(hit, shape(x, y + 2.0, SW_W, SW_H, SW_H / 2.0), self.under(row.id));
         let track = self.switch(x, y + 2.0, on, row.state);
         if self.live(row) {
-            self.hit(track, PanelHit::Ctl { id: row.id, part: CtlPart::Switch });
+            self.hit(track, hit);
         }
     }
 
@@ -873,6 +914,8 @@ impl Lay<'_> {
             (w, y)
         };
         let x = self.right() - cyc_w;
+        let banded = self.under(row.id);
+        self.ring(PanelHit::Ctl { id: row.id, part: CtlPart::Next }, shape(x, y, cyc_w, CTL_H, R_CTL), banded);
         self.quad(faded(Rect::rounded(x, y, cyc_w, CTL_H, c.ctl, R_CTL), st));
         self.seg_line(x + CYC_SEG, y, st);
         self.seg_line(x + cyc_w - CYC_SEG, y, st);
@@ -907,7 +950,10 @@ impl Lay<'_> {
         if !stacked {
             self.row_label(row, y + LABEL_DY, rx);
         }
+        let (id, banded) = (row.id, self.under(row.id));
+        self.ring(PanelHit::Ctl { id, part: CtlPart::Reset }, shape(rx, y, RESET_W, CTL_H, R_CTL), banded);
         self.quad(faded(Rect::rounded(rx, y, RESET_W, CTL_H, c.ctl, R_CTL), st));
+        self.ring(PanelHit::Ctl { id, part: CtlPart::Plus }, shape(x, y, step_w, CTL_H, R_CTL), banded);
         self.quad(faded(Rect::rounded(x, y, step_w, CTL_H, c.ctl, R_CTL), st));
         self.seg_line(x + STEP_SEG, y, st);
         self.seg_line(x + step_w - STEP_SEG, y, st);
@@ -951,9 +997,12 @@ impl Lay<'_> {
             self.quad(faded(Rect::rounded(x, y + 30.0, track_w, 4.0, c.track, 2.0), st));
             let fill_w = (f * (track_w - 14.0) + 7.0).clamp(4.0, track_w);
             self.quad(faded(Rect::rounded(x, y + 30.0, fill_w, 4.0, c.accent_fill, 2.0), st));
-            self.quad(faded(Rect::rounded(x + f * (track_w - 14.0), y + 25.0, 14.0, 14.0, c.accent, 7.0), st));
+            let kx = x + f * (track_w - 14.0);
+            let hit = PanelHit::Ctl { id: row.id, part: CtlPart::Channel(i as u8) };
+            self.ring(hit, shape(kx, y + 25.0, 14.0, 14.0, 7.0), self.under(row.id));
+            self.quad(faded(Rect::rounded(kx, y + 25.0, 14.0, 14.0, c.accent, 7.0), st));
             if self.live(row) {
-                self.hit(area(x, y + 20.0, track_w, 24.0), PanelHit::Ctl { id: row.id, part: CtlPart::Channel(i as u8) });
+                self.hit(area(x, y + 20.0, track_w, 24.0), hit);
             }
         }
     }
@@ -978,10 +1027,12 @@ impl Lay<'_> {
             y
         };
         let x_start = self.right() - total;
+        let banded = self.under(row.id);
         for (i, (t, on)) in chips[..n].iter().enumerate() {
             let x = x_start + i as f32 * (w + 8.0);
             let fill = if *on { c.accent } else { c.ctl };
             let r = Rect::rounded(x, y + 2.0, w, CHIP_H, fill, CHIP_H / 2.0);
+            self.ring(PanelHit::Ctl { id: row.id, part: CtlPart::Chip(i as u8) }, r, banded);
             self.quad(faded(r, st));
             let tc = if *on { c.ui.on_accent } else { c.label(st) };
             let shown = self.fit(t, w - 8.0);
@@ -1022,12 +1073,14 @@ impl Lay<'_> {
         self.row_label(row, y, self.right() - status_w);
         let sc = c.label(st);
         self.label(status, self.right() - status_w, y, sc);
+        let under = self.under(row.id);
         for (line, items) in self.chip_flow_lines(chips).into_iter().enumerate() {
             let cy = y + 24.0 + line as f32 * (CHIP_H + CHIP_FLOW_GAP);
             for (i, dx, w) in items {
                 let (t, on) = &chips[i];
                 let x = self.x0 + dx;
                 let r = Rect::rounded(x, cy, w, CHIP_H, if *on { c.accent } else { c.ctl }, CHIP_H / 2.0);
+                self.ring(PanelHit::Ctl { id: row.id, part: CtlPart::Chip(i.min(255) as u8) }, r, under);
                 self.quad(faded(r, st));
                 let shown = self.fit(t, w - 8.0);
                 let tx = x + ((w - self.tw(&shown)) * 0.5).max(0.0);
@@ -1084,6 +1137,7 @@ impl Lay<'_> {
             let abs = offset + i;
             let sel = selected == Some(abs);
             let r = Rect::rounded(rx, ry, rw, LIST_ROW_H, c.row_sel, 5.0);
+            self.ring(PanelHit::Ctl { id: row.id, part: CtlPart::Row(abs) }, r, c.well);
             if sel {
                 self.quad(faded(r, st));
                 self.quad(faded(Rect::rounded(rx, ry + 3.0, 3.0, LIST_ROW_H - 6.0, c.accent, 1.5), st));
@@ -1160,6 +1214,9 @@ impl Lay<'_> {
         let h = GAL_CARD_H;
         let selected = idx == self.theme_idx;
         let hovered = self.hover == Some(PanelHit::GalleryCard(idx));
+        // Focused: a ring around the whole tile, its name included.
+        let tile = shape(cx - 3.0, cy - 3.0, w + 6.0, h + GAL_CAPTION_H + 3.0, 11.0);
+        self.ring(PanelHit::GalleryCard(idx), tile, c.surface);
         if selected {
             self.quad(Rect::rounded(cx - 3.0, cy - 3.0, w + 6.0, h + 6.0, c.accent, 11.0));
             self.quad(Rect::rounded(cx - 1.0, cy - 1.0, w + 2.0, h + 2.0, c.surface, 9.0));
@@ -1304,6 +1361,7 @@ pub fn build_panel(inp: &PanelInput, m: &mut dyn ChromeMeasure) -> PanelView {
         c,
         hover: inp.hover,
         focus: inp.focus,
+        ring: inp.focus_part,
         spec_line,
         theme_idx: inp.theme_idx,
         filter: inp.filter,
@@ -1810,6 +1868,47 @@ mod tests {
         assert!((s - (148.0f32).min(g.max_scroll)).abs() < 0.5, "{s}");
         // Never past the end.
         assert!(g.scroll_to_reveal(1.0e6, 1.0e6 + 10.0, 8.0) <= g.max_scroll);
+    }
+
+    /// The keyboard-focused part gets a ring — an accent outline around its
+    /// visible shape, under the part — and nothing else changes; a slider's
+    /// ring circles its knob.
+    #[test]
+    fn the_focused_part_is_ringed() {
+        let items = sample_items();
+        let theme = jetty_core::Theme::by_name("catppuccin_mocha");
+        let plain = view_with(&items, 420, 3000, 1.0, 16.0, 0.0);
+        let accent = UiPalette::cached(&theme).accent;
+        for (hit, ring_w) in [
+            (PanelHit::Ctl { id: "chips", part: CtlPart::Chip(1) }, None),
+            (PanelHit::Ctl { id: "toggle", part: CtlPart::Switch }, Some(SW_W)),
+            (PanelHit::Ctl { id: "slider", part: CtlPart::Track }, Some(16.0)),
+            (PanelHit::Ctl { id: "stepper", part: CtlPart::Reset }, Some(RESET_W)),
+            (PanelHit::Ctl { id: "presets", part: CtlPart::Chip(3) }, None),
+            (PanelHit::Ctl { id: "list", part: CtlPart::Row(1) }, None),
+            (PanelHit::Ctl { id: "master", part: CtlPart::Switch }, Some(SW_W)),
+        ] {
+            let mut inp = PanelInput::new(420, 3000, &theme, ChromeMetrics::DEFAULT, &items);
+            inp.focus_part = Some(hit);
+            let v = build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK * ChromeMetrics::DEFAULT.overlay_u()));
+            assert_eq!(v.content_quads.len(), plain.content_quads.len() + 2, "{hit:?}: a ring and its gap");
+            let key = |q: &Rect| (q.x.to_bits(), q.y.to_bits(), q.w.to_bits(), q.h.to_bits(), q.color);
+            let before: Vec<_> = plain.content_quads.iter().map(key).collect();
+            let ring = v.content_quads.iter().find(|q| !before.contains(&key(q)) && q.color[..3] == accent);
+            let ring = ring.unwrap_or_else(|| panic!("{hit:?}: no accent ring"));
+            let r = plain.geom.rect_of(hit).unwrap();
+            if let Some(w) = ring_w {
+                let u = ChromeMetrics::DEFAULT.overlay_u();
+                assert!((ring.w - (w + 8.0) * u).abs() < 0.01, "{hit:?}: the ring hugs the part ({})", ring.w);
+            } else {
+                assert!(ring.x < r.x && ring.x + ring.w > r.x + r.w, "{hit:?}: the ring encloses the part: ring {} {} {} {} part {} {} {} {}", ring.x, ring.y, ring.w, ring.h, r.x, r.y, r.w, r.h);
+            }
+            assert_eq!(v.content_labels, plain.content_labels, "{hit:?}: the text is untouched");
+        }
+        // A part that is not drawn rings nothing.
+        let mut inp = PanelInput::new(420, 3000, &theme, ChromeMetrics::DEFAULT, &items);
+        inp.focus_part = Some(PanelHit::Ctl { id: "nope", part: CtlPart::Switch });
+        assert_eq!(build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK * ChromeMetrics::DEFAULT.overlay_u())).content_quads.len(), plain.content_quads.len());
     }
 
     /// The stepper's value always shows whole, clear of the "-" / "+"

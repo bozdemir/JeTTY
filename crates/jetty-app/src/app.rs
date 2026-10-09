@@ -1047,6 +1047,8 @@ pub struct App {
     ctl_drag: Option<CtlDrag>,
     /// Wheel travel toward the next row of the Settings list under the pointer.
     settings_list_wheel: input::ScrollAccumulator,
+    /// The Settings keyboard focus (Tab / Shift+Tab; see `settings_ui::nav`).
+    settings_kb: Option<crate::settings_ui::Stop>,
     /// The Settings scrollbar thumb is being dragged: where it was grabbed
     /// (pointer y − thumb top, physical px).
     settings_scroll_grab: Option<f32>,
@@ -1906,6 +1908,7 @@ impl App {
             settings_collapsed: Vec::new(),
             ctl_drag: None,
             settings_list_wheel: input::ScrollAccumulator::new(),
+            settings_kb: None,
             settings_scroll_grab: None,
             settings_hover: None,
             settings_focus: None,
@@ -8689,6 +8692,7 @@ impl App {
         self.gallery.keep();
         self.settings_hover = None;
         self.settings_focus = None;
+        self.settings_kb = None;
         self.reset_armed = false;
         self.settings_geom = None;
         if self.debug {
@@ -8744,7 +8748,9 @@ impl App {
         inp.theme_idx = self.theme_idx;
         inp.filter = self.gallery_filter;
         inp.hover = self.settings_hover;
-        inp.focus = self.settings_focus;
+        // A deep link's band, else the keyboard focus (its band and ring).
+        inp.focus = self.settings_focus.or(self.settings_kb.and_then(|s| s.band()));
+        inp.focus_part = self.settings_kb.and_then(|s| crate::settings_ui::focus_ring(s, &items, self.theme_idx));
         inp.ui_font_size = self.ui_font_logical;
         inp.reset = reset;
         inp.footer_hint = footer;
@@ -9084,13 +9090,32 @@ impl App {
     ///   theme it started from; else closes Settings.
     /// * Enter: keeps the theme the gallery shows (ends the session).
     /// * Ctrl+Tab / Ctrl+Shift+Tab: next / previous tab.
+    /// * Tab / Shift+Tab: the keyboard focus, and with a control focused the
+    ///   arrows, Home/End, Space and Enter work it (`settings_nav`).
     /// * Look tab: arrows / Home / End move through the gallery (live).
     /// * Other tabs: arrows, Page Up/Down, Home/End scroll.
-    fn settings_key(&mut self, key: &winit::keyboard::Key) {
-        use crate::settings_ui::{GalleryKey as G, LOOK};
+    fn settings_key(&mut self, key: &winit::keyboard::Key, repeat: bool) {
+        use crate::settings_ui::{GalleryKey as G, NavKey, LOOK};
         use winit::keyboard::{Key, NamedKey as N};
         let Key::Named(k) = key else { return };
         self.settings_focus = None;
+        let nav = match *k {
+            N::Tab if self.settings_mods.control_key() => None,
+            N::Tab if self.settings_mods.shift_key() => Some(NavKey::BackTab),
+            N::Tab => Some(NavKey::Tab),
+            N::ArrowUp => Some(NavKey::Up),
+            N::ArrowDown => Some(NavKey::Down),
+            N::ArrowLeft => Some(NavKey::Left),
+            N::ArrowRight => Some(NavKey::Right),
+            N::Home => Some(NavKey::Home),
+            N::End => Some(NavKey::End),
+            N::Space | N::Enter => Some(NavKey::Activate),
+            _ => None,
+        };
+        if nav.is_some_and(|n| self.settings_nav(n, repeat)) {
+            self.request_settings_paint();
+            return;
+        }
         let tab = self.settings_tab.min(jetty_render::N_TABS - 1);
         let line = 40.0 * self.settings_metrics().overlay_u();
         let page = self.settings_geom.as_ref().map_or(300.0, |g| g.viewport_h() * 0.9);
@@ -9118,6 +9143,7 @@ impl App {
                 let n = jetty_render::N_TABS;
                 self.gallery.keep();
                 self.reset_armed = false;
+                self.settings_kb = None;
                 self.settings_tab = if self.settings_mods.shift_key() { (tab + n - 1) % n } else { (tab + 1) % n };
             }
             N::ArrowLeft if gallery => self.gallery_key(G::Left),
@@ -9138,6 +9164,89 @@ impl App {
             _ => return,
         }
         self.request_settings_paint();
+    }
+
+    /// A focus key in Settings (see `settings_ui::nav`): moves the keyboard
+    /// focus or works the focused control exactly as a click would. Whether
+    /// it was handled (else the legacy keys run: scroll, gallery, Esc).
+    fn settings_nav(&mut self, key: crate::settings_ui::NavKey, repeat: bool) -> bool {
+        use crate::settings_ui::{self as sui, Kind, ListSrc, Nav, Stop};
+        let cfg = self.settings_snapshot();
+        let tab = self.settings_tab.min(jetty_render::N_TABS - 1);
+        let nav = {
+            let ctx = self.settings_ctx();
+            let stops = sui::stops(&sui::tab_items(tab, &cfg, &ctx));
+            sui::nav(&stops, self.settings_kb, key, self.settings_mods.shift_key(), &cfg, &ctx)
+        };
+        match nav {
+            Nav::Pass => return false,
+            Nav::Focus(s) => {
+                // Leaving the gallery keeps the theme it shows.
+                if self.settings_kb == Some(Stop::Gallery) && s != Stop::Gallery {
+                    self.gallery.keep();
+                }
+                self.settings_kb = Some(s);
+            }
+            Nav::Press(id, part) => self.settings_ctl_press(id, part),
+            Nav::Set(id, v) => {
+                // A release-applied slider (the dropdown size re-docks the
+                // window) moves per press, never per auto-repeat.
+                if let Some(d) = sui::find(id).filter(|d| !repeat || sui::live(d)) {
+                    if self.apply_settings_change(|c| (d.set)(c, v)) {
+                        self.persist();
+                    }
+                }
+            }
+            Nav::ListStep(id, n) => {
+                let Some(d) = sui::find(id) else { return true };
+                let Some(i) = sui::list_step(d, n, &cfg, &self.settings_ctx()) else { return true };
+                self.settings_ctl_press(id, jetty_render::CtlPart::Row(i));
+                if let Kind::List { src, rows } = d.kind {
+                    let (len, off) = match src {
+                        ListSrc::Mono => (self.font_families.len(), &mut self.font_scroll_offset),
+                        ListSrc::Ui => (self.ui_font_families.len(), &mut self.ui_font_scroll_offset),
+                    };
+                    *off = sui::list_offset_keeping(*off, i, rows, len);
+                }
+            }
+            Nav::Fold(id) => {
+                if let Some(i) = self.settings_collapsed.iter().position(|s| *s == id) {
+                    self.settings_collapsed.remove(i);
+                } else {
+                    self.settings_collapsed.push(id);
+                }
+            }
+            Nav::Gallery(g) => self.gallery_key(g),
+        }
+        self.reveal_settings_kb();
+        true
+    }
+
+    /// Scroll the keyboard-focused stop into view.
+    fn reveal_settings_kb(&mut self) {
+        use crate::settings_ui::Stop;
+        use jetty_render::PanelHit;
+        let Some(stop) = self.settings_kb else { return };
+        let Some(pv) = self.settings_view_now() else { return };
+        let g = &pv.geom;
+        // Its row / section; else (the gallery, a section's master switch)
+        // the part itself.
+        let part_span = |h: PanelHit| {
+            g.rect_of(h).map(|r| {
+                let top = r.y - g.content_top + g.scroll;
+                (top, top + r.h)
+            })
+        };
+        let span = stop.band().and_then(|b| g.anchor(b)).or_else(|| match stop {
+            Stop::Gallery => part_span(PanelHit::GalleryCard(self.theme_idx)),
+            Stop::Part(id, part) => part_span(PanelHit::Ctl { id, part }),
+            _ => None,
+        });
+        if let Some((top, bottom)) = span {
+            let margin = 12.0 * self.settings_metrics().overlay_u();
+            let tab = self.settings_tab.min(jetty_render::N_TABS - 1);
+            self.settings_scroll[tab] = g.scroll_to_reveal(top, bottom, margin);
+        }
     }
 
     /// A file dropped on the Settings window: a PNG / JPEG becomes the
@@ -9177,6 +9286,12 @@ impl App {
         self.settings_tab = d.tab;
         self.settings_collapsed.retain(|s| *s != d.section);
         self.settings_focus = Some(target);
+        // …and the keyboard focus on it: the arrows adjust it right away.
+        self.settings_kb = {
+            use crate::settings_ui::{stop_of, stops, tab_items};
+            let cfg = self.settings_snapshot();
+            stop_of(&stops(&tab_items(d.tab, &cfg, &self.settings_ctx())), id)
+        };
         let margin = 12.0 * self.settings_metrics().overlay_u();
         if let Some(pv) = self.settings_view_now() {
             if let Some((top, _)) = pv.geom.anchor(target) {
@@ -10983,9 +11098,10 @@ impl App {
         geom: &jetty_render::PanelGeom,
     ) {
         use input::MouseAction as A;
-        // Any press ends a deep-link highlight, and disarms "Reset tab" unless
-        // it IS the second click on it.
+        // Any press ends a deep-link highlight and the keyboard focus, and
+        // disarms "Reset tab" unless it IS the second click on it.
         self.settings_focus = None;
+        self.settings_kb = None;
         if action != A::ResetTab {
             self.reset_armed = false;
         }
@@ -11108,7 +11224,7 @@ impl App {
                 if is_synthetic {
                     return;
                 }
-                self.settings_key(&event.logical_key);
+                self.settings_key(&event.logical_key, event.repeat);
             }
             WindowEvent::DroppedFile(path) => {
                 self.settings_drop_image(path);

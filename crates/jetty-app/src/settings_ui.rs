@@ -29,7 +29,7 @@
 //! Sections listed in [`SECTIONS`] without any control yet are hook points for
 //! upcoming settings: they stay hidden until a `Desc` names them.
 
-use jetty_render::{CtlId, CtlPart, CtlRow, CtlShow, PanelItem, RowState, TAB_NAMES};
+use jetty_render::{CtlId, CtlPart, CtlRow, CtlShow, PanelHit, PanelItem, RowState, TAB_NAMES};
 
 use crate::config::Config;
 
@@ -2025,6 +2025,278 @@ impl GallerySession {
     }
 }
 
+// ── Keyboard focus ────────────────────────────────────────────────────────────
+
+/// A keyboard focus stop on a Settings tab. Tab / Shift+Tab walk a tab's
+/// stops in display order; the focused one is ringed and takes the keys
+/// (see [`nav`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// A section header: Space / Enter fold it, Left / Right close / open it.
+    Section(&'static str),
+    /// One part of a control: a slider (`Track`), a switch, a cycler
+    /// (`Next`), a stepper (`Plus`) or its `Reset`, an RGB channel, a chip.
+    Part(CtlId, CtlPart),
+    /// A list: Up / Down move its selection.
+    List(CtlId),
+    /// The theme gallery: the arrows browse it.
+    Gallery,
+}
+
+impl Stop {
+    /// The row or section id whose band highlights this stop.
+    pub fn band(self) -> Option<&'static str> {
+        match self {
+            Stop::Section(id) | Stop::Part(id, _) | Stop::List(id) => Some(id),
+            Stop::Gallery => None,
+        }
+    }
+}
+
+/// The focus stops of a tab's content, in display order: each section
+/// header (then its master switch) and every part of every live control.
+/// Disabled rows are skipped; the specimen is not a control.
+pub fn stops(items: &[PanelItem]) -> Vec<Stop> {
+    let mut v = Vec::new();
+    for it in items {
+        match it {
+            PanelItem::Section { id, master, .. } => {
+                v.push(Stop::Section(id));
+                if let Some((m, _)) = master {
+                    v.push(Stop::Part(m, CtlPart::Switch));
+                }
+            }
+            PanelItem::Row(r) if r.state != RowState::Disabled => {
+                let part = |p| Stop::Part(r.id, p);
+                match &r.show {
+                    CtlShow::Slider { .. } => v.push(part(CtlPart::Track)),
+                    CtlShow::Toggle(_) => v.push(part(CtlPart::Switch)),
+                    CtlShow::Cycler(_) => v.push(part(CtlPart::Next)),
+                    CtlShow::Stepper(_) => v.extend([part(CtlPart::Plus), part(CtlPart::Reset)]),
+                    CtlShow::Rgb(_) => v.extend((0..3).map(|i| part(CtlPart::Channel(i)))),
+                    // As many chips as the panel draws (8 in a chip row).
+                    CtlShow::Chips(c) => v.extend((0..c.len().min(8)).map(|i| part(CtlPart::Chip(i as u8)))),
+                    CtlShow::ChipFlow { chips: c, .. } => {
+                        v.extend((0..c.len().min(256)).map(|i| part(CtlPart::Chip(i as u8))))
+                    }
+                    CtlShow::List { .. } => v.push(Stop::List(r.id)),
+                }
+            }
+            PanelItem::Gallery => v.push(Stop::Gallery),
+            _ => {}
+        }
+    }
+    v
+}
+
+/// A key the Settings focus model reads (the app maps Space and Enter both
+/// to `Activate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavKey {
+    Tab,
+    BackTab,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    Activate,
+}
+
+/// What a focus key does (see [`nav`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Nav {
+    /// Move the focus there and scroll it into view.
+    Focus(Stop),
+    /// Press a control part, exactly as a click does.
+    Press(CtlId, CtlPart),
+    /// Set a control (a slider or RGB channel moved by the keys).
+    Set(CtlId, Val),
+    /// Move a list's selection by this many rows.
+    ListStep(CtlId, i32),
+    /// Fold or unfold a section.
+    Fold(&'static str),
+    /// Browse the theme gallery.
+    Gallery(GalleryKey),
+    /// Not the focus model's key: the caller's own handling.
+    Pass,
+}
+
+/// The keys of the Settings focus model. Tab / Shift+Tab walk `stops`
+/// (wrapping; from no focus, the first / last). With a stop focused every
+/// nav key acts on it — never falling through to the gallery or the scroll —
+/// except Enter on the gallery (which keeps the browsed theme):
+///
+/// * Up / Down: the previous / next stop (a list moves its selection, the
+///   gallery browses); Home / End: the first / last stop.
+/// * Left / Right: a slider or RGB channel moves (`fine`: Shift, a smaller
+///   step); Home / End take it to an end. A cycler steps back / on, a
+///   stepper down / up; chips move along their row; a section closes / opens.
+/// * Space / Enter: a switch flips, a cycler steps on, a chip is pressed, a
+///   Reset resets, a section folds.
+///
+/// Without focus only Tab is read (`Pass` otherwise), so the legacy keys —
+/// the scroll, the gallery arrows — are untouched.
+pub fn nav(stops: &[Stop], focus: Option<Stop>, key: NavKey, fine: bool, cfg: &Config, ctx: &Ctx) -> Nav {
+    let focus = focus.filter(|f| stops.contains(f));
+    let at = focus.and_then(|f| stops.iter().position(|s| *s == f));
+    let n = stops.len();
+    if n == 0 {
+        return Nav::Pass;
+    }
+    if matches!(key, NavKey::Tab | NavKey::BackTab) {
+        let i = match at {
+            Some(i) if key == NavKey::Tab => (i + 1) % n,
+            Some(i) => (i + n - 1) % n,
+            None if key == NavKey::Tab => 0,
+            None => n - 1,
+        };
+        return Nav::Focus(stops[i]);
+    }
+    let (Some(f), Some(i)) = (focus, at) else { return Nav::Pass };
+    let step = |d: isize| Nav::Focus(stops[(i as isize + d).clamp(0, n as isize - 1) as usize]);
+    let dir = match key {
+        NavKey::Left | NavKey::Home => -1.0,
+        _ => 1.0,
+    };
+    let to_end = matches!(key, NavKey::Home | NavKey::End);
+    match (f, key) {
+        (Stop::Gallery, NavKey::Activate) => Nav::Pass,
+        (Stop::Gallery, k) => Nav::Gallery(match k {
+            NavKey::Up => GalleryKey::Up,
+            NavKey::Down => GalleryKey::Down,
+            NavKey::Left => GalleryKey::Left,
+            NavKey::Right => GalleryKey::Right,
+            NavKey::Home => GalleryKey::Home,
+            _ => GalleryKey::End,
+        }),
+        (Stop::List(id), NavKey::Up) => Nav::ListStep(id, -1),
+        (Stop::List(id), NavKey::Down) => Nav::ListStep(id, 1),
+        (_, NavKey::Up) => step(-1),
+        (_, NavKey::Down) => step(1),
+        (Stop::Part(id, p @ (CtlPart::Track | CtlPart::Channel(_))), NavKey::Left | NavKey::Right | NavKey::Home | NavKey::End) => {
+            match find(id).and_then(|d| nudge(d, p, &(d.get)(cfg), dir, fine, to_end)) {
+                Some(v) => Nav::Set(id, v),
+                None => Nav::Focus(f),
+            }
+        }
+        (_, NavKey::Home) => Nav::Focus(stops[0]),
+        (_, NavKey::End) => Nav::Focus(stops[n - 1]),
+        (Stop::Section(id), NavKey::Activate) => Nav::Fold(id),
+        (Stop::Section(id), NavKey::Left) if !ctx.collapsed.contains(&id) => Nav::Fold(id),
+        (Stop::Section(id), NavKey::Right) if ctx.collapsed.contains(&id) => Nav::Fold(id),
+        (Stop::Part(id, CtlPart::Next), NavKey::Left) => Nav::Press(id, CtlPart::Prev),
+        (Stop::Part(id, CtlPart::Next), NavKey::Right | NavKey::Activate) => Nav::Press(id, CtlPart::Next),
+        (Stop::Part(id, CtlPart::Plus), NavKey::Left) => Nav::Press(id, CtlPart::Minus),
+        (Stop::Part(id, CtlPart::Plus), NavKey::Right) => Nav::Press(id, CtlPart::Plus),
+        (Stop::Part(id, p @ (CtlPart::Switch | CtlPart::Reset | CtlPart::Chip(_))), NavKey::Activate) => {
+            Nav::Press(id, p)
+        }
+        (Stop::Part(id, CtlPart::Chip(c)), NavKey::Left | NavKey::Right) => {
+            let to = if key == NavKey::Left { c.checked_sub(1) } else { c.checked_add(1) };
+            match to.map(|c| Stop::Part(id, CtlPart::Chip(c))).filter(|s| stops.contains(s)) {
+                Some(s) => Nav::Focus(s),
+                None => Nav::Focus(f),
+            }
+        }
+        // Any other nav key on a focused stop does nothing — it must not
+        // reach the legacy keys (a Left on a switch browsing the gallery).
+        _ => Nav::Focus(f),
+    }
+}
+
+/// The value a slider (`Track`) or RGB channel moves to on an arrow key:
+/// `dir` ±1 by a twentieth of the range (`fine`: a hundredth; a channel by
+/// 1/16, `fine` 1/255) — a slider at least until its readout changes — or
+/// to its end (`to_end`). Snapped to the slider's step and clamped; `None`
+/// for any other control.
+pub fn nudge(d: &Desc, part: CtlPart, cur: &Val, dir: f32, fine: bool, to_end: bool) -> Option<Val> {
+    match (&d.kind, part) {
+        (Kind::Slider { min, max, step, fmt, .. }, CtlPart::Track) => {
+            let (min, max, step) = (*min, *max, *step);
+            let snap = |v: f32| {
+                let v = if step > 0.0 { min + ((v - min) / step).round() * step } else { v };
+                v.clamp(min, max)
+            };
+            if to_end {
+                return Some(Val::F(if dir < 0.0 { min } else { max }));
+            }
+            let unit = (max - min) / if fine { 100.0 } else { 20.0 };
+            let unit = if step > 0.0 { unit.max(step) } else { unit };
+            let shown = fmt(cur.f());
+            let mut v = snap(cur.f());
+            for _ in 0..100 {
+                let next = snap(v + dir * unit);
+                if next == v {
+                    break;
+                }
+                v = next;
+                if fmt(v) != shown {
+                    break;
+                }
+            }
+            Some(Val::F(v))
+        }
+        (Kind::Rgb, CtlPart::Channel(i)) if i < 3 => {
+            let mut c = cur.rgb();
+            let ch = &mut c[i as usize];
+            *ch = if to_end {
+                if dir < 0.0 { 0.0 } else { 1.0 }
+            } else {
+                (*ch + dir * if fine { 1.0 / 255.0 } else { 1.0 / 16.0 }).clamp(0.0, 1.0)
+            };
+            Some(Val::Rgb(c))
+        }
+        _ => None,
+    }
+}
+
+/// The row of list control `d` that is `n` rows from the one selected now
+/// (clamped to the list), or `None` for an empty list / not a list.
+pub fn list_step(d: &Desc, n: i32, cfg: &Config, ctx: &Ctx) -> Option<usize> {
+    let Kind::List { src, .. } = d.kind else { return None };
+    let (items, _, shown) = list_src(src, ctx);
+    let last = items.len().checked_sub(1)?;
+    let cur = list_selected(src, items, (d.get)(cfg).s(), shown).unwrap_or(0);
+    Some((cur as i64 + n as i64).clamp(0, last as i64) as usize)
+}
+
+/// The part the panel rings for focus `stop` (`PanelInput::focus_part`): the
+/// part itself, a list's selected row, the gallery's shown card (`theme_idx`);
+/// a section shows only its band.
+pub fn focus_ring(stop: Stop, items: &[PanelItem], theme_idx: usize) -> Option<PanelHit> {
+    match stop {
+        Stop::Section(_) => None,
+        Stop::Part(id, part) => Some(PanelHit::Ctl { id, part }),
+        Stop::List(id) => items.iter().find_map(|it| match it {
+            PanelItem::Row(CtlRow { id: rid, show: CtlShow::List { selected: Some(s), .. }, .. }) if *rid == id => {
+                Some(PanelHit::Ctl { id, part: CtlPart::Row(*s) })
+            }
+            _ => None,
+        }),
+        Stop::Gallery => Some(PanelHit::GalleryCard(theme_idx)),
+    }
+}
+
+/// Control `id`'s first focus stop among `stops` — where a deep link puts
+/// the keyboard focus (`None` for an inert control).
+pub fn stop_of(stops: &[Stop], id: &str) -> Option<Stop> {
+    stops.iter().copied().find(|s| match s {
+        Stop::Part(sid, _) | Stop::List(sid) => *sid == id,
+        Stop::Gallery => find(id).is_some_and(|d| matches!(d.kind, Kind::Gallery)),
+        Stop::Section(_) => false,
+    })
+}
+
+/// The first visible row of a `rows`-row list (`len` items, first visible
+/// `offset`) after selecting row `i`: unchanged when `i` is in view, else
+/// moved just enough to show it.
+pub fn list_offset_keeping(offset: usize, i: usize, rows: usize, len: usize) -> usize {
+    let o = if i < offset { i } else if i >= offset + rows { i + 1 - rows } else { offset };
+    o.min(len.saturating_sub(rows))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2684,5 +2956,169 @@ mod tests {
         assert!(s.keep(), "Enter ends a running session");
         assert!(!s.keep(), "…and is a no-op without one");
         assert_eq!(s.restore(), None);
+    }
+
+    /// Every tab's stops: in display order, each one something the panel
+    /// draws and the mouse could press (so the ring has a part to circle and
+    /// a key does what a click does), disabled rows skipped.
+    #[test]
+    fn every_live_control_part_is_a_focus_stop_in_display_order() {
+        let (mono, ui) = fonts();
+        let x = ctx(&mono, &ui);
+        let theme = jetty_core::Theme::by_name("catppuccin_mocha");
+        for c in revealing_configs() {
+            for tab in 0..N_TABS {
+                let items = tab_items(tab, &c, &x);
+                let s = stops(&items);
+                assert!(!s.is_empty(), "tab {tab}");
+                let mut inp = PanelInput::new(420, 60_000, &theme, ChromeMetrics::DEFAULT, &items);
+                inp.active_tab = tab;
+                let v = build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK));
+                let g = &v.geom;
+                let mut last_top = f32::NEG_INFINITY;
+                for stop in &s {
+                    let hit = match *stop {
+                        Stop::Section(id) => Some(PanelHit::Section(id)),
+                        Stop::Part(id, part) => Some(PanelHit::Ctl { id, part }),
+                        Stop::List(_) | Stop::Gallery => None,
+                    };
+                    if let Some(h) = hit {
+                        assert!(g.rect_of(h).is_some(), "tab {tab}: {stop:?} is not drawn");
+                    }
+                    if let Some((top, _)) = stop.band().and_then(|b| g.anchor(b)) {
+                        assert!(top >= last_top, "tab {tab}: {stop:?} out of display order");
+                        last_top = top;
+                    }
+                }
+            }
+        }
+        // Dropdown sliders are inert outside Dropdown mode: no stop.
+        let s = stops(&tab_items(WINDOW, &Config::default(), &x));
+        assert!(!s.contains(&Stop::Part("dropdown_height_pct", CtlPart::Track)));
+        assert!(s.contains(&Stop::Part("window_mode", CtlPart::Next)));
+        assert!(stops(&tab_items(LOOK, &Config::default(), &x)).contains(&Stop::Gallery));
+    }
+
+    #[test]
+    fn tab_walks_the_stops_and_wraps() {
+        let (mono, ui) = fonts();
+        let x = ctx(&mono, &ui);
+        let c = Config::default();
+        let s = stops(&tab_items(SHELL, &c, &x));
+        let go = |f: Option<Stop>, k: NavKey| nav(&s, f, k, false, &c, &x);
+        assert_eq!(go(None, NavKey::Tab), Nav::Focus(s[0]), "first Tab: the first stop");
+        assert_eq!(go(None, NavKey::BackTab), Nav::Focus(s[s.len() - 1]));
+        assert_eq!(go(Some(s[0]), NavKey::Tab), Nav::Focus(s[1]));
+        assert_eq!(go(Some(s[s.len() - 1]), NavKey::Tab), Nav::Focus(s[0]), "wraps — nothing traps focus");
+        assert_eq!(go(Some(s[0]), NavKey::BackTab), Nav::Focus(s[s.len() - 1]));
+        // Up / Down walk too, without wrapping; Home / End jump.
+        assert_eq!(go(Some(s[1]), NavKey::Up), Nav::Focus(s[0]));
+        assert_eq!(go(Some(s[0]), NavKey::Up), Nav::Focus(s[0]));
+        assert_eq!(go(Some(s[1]), NavKey::End), Nav::Focus(s[s.len() - 1]));
+        assert_eq!(go(Some(s[2]), NavKey::Home), Nav::Focus(s[0]));
+        // A focus that is no longer on the tab counts as none.
+        let gone = Stop::Part("opacity", CtlPart::Track);
+        assert_eq!(go(Some(gone), NavKey::Tab), Nav::Focus(s[0]));
+        // Without focus only Tab is ours: the legacy keys keep working.
+        for k in [NavKey::Up, NavKey::Down, NavKey::Left, NavKey::Right, NavKey::Home, NavKey::End, NavKey::Activate] {
+            assert_eq!(go(None, k), Nav::Pass, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn focused_controls_take_their_keys() {
+        let (mono, ui) = fonts();
+        let x = ctx(&mono, &ui);
+        let c = Config::default();
+        let all: Vec<Stop> = (0..N_TABS).flat_map(|t| stops(&tab_items(t, &c, &x))).collect();
+        let go = |f: Stop, k: NavKey| nav(&all, Some(f), k, false, &c, &x);
+        let sw = Stop::Part("launch_at_login", CtlPart::Switch);
+        assert_eq!(go(sw, NavKey::Activate), Nav::Press("launch_at_login", CtlPart::Switch));
+        assert_eq!(go(sw, NavKey::Left), Nav::Focus(sw), "an arrow on a switch never reaches the gallery");
+        let cyc = Stop::Part("window_mode", CtlPart::Next);
+        assert_eq!(go(cyc, NavKey::Right), Nav::Press("window_mode", CtlPart::Next));
+        assert_eq!(go(cyc, NavKey::Activate), Nav::Press("window_mode", CtlPart::Next));
+        assert_eq!(go(cyc, NavKey::Left), Nav::Press("window_mode", CtlPart::Prev));
+        let step = Stop::Part("font_size", CtlPart::Plus);
+        assert_eq!(go(step, NavKey::Left), Nav::Press("font_size", CtlPart::Minus));
+        assert_eq!(go(step, NavKey::Right), Nav::Press("font_size", CtlPart::Plus));
+        let reset = Stop::Part("font_size", CtlPart::Reset);
+        assert_eq!(go(reset, NavKey::Activate), Nav::Press("font_size", CtlPart::Reset));
+        // Chips move along their row and press on Space / Enter.
+        let chip = |i| Stop::Part("effects.crt_animate", CtlPart::Chip(i));
+        assert_eq!(go(chip(0), NavKey::Right), Nav::Focus(chip(1)));
+        assert_eq!(go(chip(2), NavKey::Right), Nav::Focus(chip(2)), "the row's end");
+        assert_eq!(go(chip(0), NavKey::Left), Nav::Focus(chip(0)));
+        assert_eq!(go(chip(1), NavKey::Activate), Nav::Press("effects.crt_animate", CtlPart::Chip(1)));
+        // Sections fold.
+        let sec = Stop::Section("shell.startup");
+        assert_eq!(go(sec, NavKey::Activate), Nav::Fold("shell.startup"));
+        assert_eq!(go(sec, NavKey::Left), Nav::Fold("shell.startup"), "Left closes an open section");
+        assert_eq!(go(sec, NavKey::Right), Nav::Focus(sec), "Right on an open one: nothing");
+        // Lists move their selection; the gallery browses; Enter on it keeps.
+        assert_eq!(go(Stop::List("font_family"), NavKey::Down), Nav::ListStep("font_family", 1));
+        assert_eq!(go(Stop::List("font_family"), NavKey::Up), Nav::ListStep("font_family", -1));
+        assert_eq!(go(Stop::Gallery, NavKey::Right), Nav::Gallery(GalleryKey::Right));
+        assert_eq!(go(Stop::Gallery, NavKey::End), Nav::Gallery(GalleryKey::End));
+        assert_eq!(go(Stop::Gallery, NavKey::Activate), Nav::Pass);
+        // Sliders and channels move, change their readout, and reach both ends.
+        let op = Stop::Part("opacity", CtlPart::Track);
+        assert_eq!(go(op, NavKey::Left), Nav::Set("opacity", Val::F(0.955)));
+        assert_eq!(go(op, NavKey::Home), Nav::Set("opacity", Val::F(0.1)));
+        assert_eq!(nav(&all, Some(op), NavKey::Left, true, &c, &x), Nav::Set("opacity", Val::F(0.991)), "Shift: fine");
+        let flash = Stop::Part("effects.caret_flash_color", CtlPart::Channel(0));
+        let Nav::Set(_, Val::Rgb(v)) = go(flash, NavKey::Left) else { panic!("channel") };
+        assert!((v[0] - (c.effects.caret_flash_color[0] - 1.0 / 16.0).max(0.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn slider_keys_always_change_the_readout_and_respect_the_step() {
+        let radius = find("corner_radius").unwrap();
+        // A hundredth of 0–24 px (0.24) does not change "10px": keep going.
+        let Some(Val::F(v)) = nudge(radius, CtlPart::Track, &Val::F(10.0), 1.0, true, false) else { panic!() };
+        assert_eq!(fmt_px(v), "11px");
+        let angle = find("backdrop.angle").unwrap();
+        let Some(Val::F(v)) = nudge(angle, CtlPart::Track, &Val::F(90.0), -1.0, false, false) else { panic!() };
+        assert_eq!(v, 72.0, "a twentieth of 360°, on the 1° grid");
+        let Some(Val::F(v)) = nudge(angle, CtlPart::Track, &Val::F(0.0), -1.0, false, false) else { panic!() };
+        assert_eq!(v, 0.0, "clamped at the end");
+        assert_eq!(nudge(radius, CtlPart::Next, &Val::F(1.0), 1.0, false, false), None);
+    }
+
+    #[test]
+    fn deep_links_and_the_ring_find_their_stop() {
+        let (mono, ui) = fonts();
+        let x = ctx(&mono, &ui);
+        let c = Config { font_family: "Hack".into(), ..Config::default() };
+        let items = tab_items(FONTS, &c, &x);
+        let s = stops(&items);
+        assert_eq!(stop_of(&s, "font_size"), Some(Stop::Part("font_size", CtlPart::Plus)));
+        assert_eq!(stop_of(&s, "font_family"), Some(Stop::List("font_family")));
+        let ring = focus_ring(Stop::List("font_family"), &items, 0);
+        assert_eq!(ring, Some(PanelHit::Ctl { id: "font_family", part: CtlPart::Row(2) }), "the selected family");
+        let look = tab_items(LOOK, &c, &x);
+        assert_eq!(stop_of(&stops(&look), "theme"), Some(Stop::Gallery));
+        assert_eq!(focus_ring(Stop::Gallery, &look, 7), Some(PanelHit::GalleryCard(7)));
+        assert_eq!(focus_ring(Stop::Section("look.theme"), &look, 7), None, "a section: its band only");
+        // A master switch's link focuses the switch; an inert control has no stop.
+        let shell = stops(&tab_items(SHELL, &c, &x));
+        let master = Stop::Part("notify_on_command_finish", CtlPart::Switch);
+        assert_eq!(stop_of(&shell, "notify_on_command_finish"), Some(master));
+        assert_eq!(stop_of(&stops(&tab_items(WINDOW, &c, &x)), "dropdown_height_pct"), None);
+    }
+
+    #[test]
+    fn list_keys_select_the_next_family_and_keep_it_in_view() {
+        let (mono, ui) = fonts();
+        let x = ctx(&mono, &ui);
+        let d = find("font_family").unwrap();
+        let c = Config { font_family: "Hack".into(), ..Config::default() };
+        assert_eq!(list_step(d, 1, &c, &x), Some(3));
+        assert_eq!(list_step(d, -100, &c, &x), Some(0));
+        assert_eq!(list_step(d, 100, &c, &x), Some(mono.len() - 1));
+        assert_eq!(list_offset_keeping(0, 6, 5, 7), 2);
+        assert_eq!(list_offset_keeping(2, 1, 5, 7), 1);
+        assert_eq!(list_offset_keeping(1, 3, 5, 7), 1);
+        assert_eq!(list_offset_keeping(0, 0, 5, 3), 0, "a list shorter than its rows");
     }
 }
