@@ -25,17 +25,19 @@ fn advertised_version() -> String {
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
-/// Hard ceiling on bytes queued to a session's writer thread but not yet
-/// written to the fd. Normal use never approaches this: the writer thread
-/// drains the channel at fd speed, so `queued` sits near zero. It only fills
-/// when the child stops reading its stdin AND something keeps producing output
-/// — the classic case being a `yes $'\e[6n'` / hostile-content query flood
-/// where the terminal auto-answers every CPR/DA into the queue while the
-/// blocked child never drains the ~4 KiB kernel tty buffer. The old unbounded
-/// channel grew by GBs/min until the OOM killer took the whole app (F13). We
-/// bound it at 64 MiB — far above any realistic keystroke burst or single
-/// paste, so legitimate writes are never dropped, yet low enough that a
+/// Ceiling on bytes queued to a session's writer thread but not yet written to
+/// the fd, past which the terminal's REPLIES are dropped
+/// ([`PtySession::send_reply`]). Normal use never approaches this: the writer
+/// thread drains the channel at fd speed, so `queued` sits near zero. It only
+/// fills when the child stops reading its stdin AND keeps asking — the classic
+/// case being a `yes $'\e[6n'` / hostile-content query flood where the terminal
+/// auto-answers every CPR/DA into the queue while the blocked child never
+/// drains the ~4 KiB kernel tty buffer. The old unbounded channel grew by
+/// GBs/min until the OOM killer took the whole app (F13); at 64 MiB a
 /// pathological reply loop caps in a few seconds instead of exhausting RAM.
+/// The USER's input ([`PtySession::writer`]: keys, pastes) is never dropped:
+/// it is bounded by what they type or paste, and a paste past this cap used to
+/// vanish whole, without a word.
 const PTY_WRITE_QUEUE_CAP: usize = 64 * 1024 * 1024;
 
 /// Bytes per PTY read — the most one queued output chunk can hold.
@@ -223,6 +225,9 @@ struct ChannelWriter {
     tx: Sender<Vec<u8>>,
     /// Shared byte counter (see [`PtySession::write_queued`]).
     queued: Arc<AtomicUsize>,
+    /// Drop writes past [`PTY_WRITE_QUEUE_CAP`] — for the terminal's replies
+    /// only ([`PtySession::send_reply`]); the user's input is never dropped.
+    capped: bool,
 }
 
 impl Write for ChannelWriter {
@@ -230,14 +235,13 @@ impl Write for ChannelWriter {
         if buf.is_empty() {
             return Ok(0);
         }
-        // Bound the queue: once more than PTY_WRITE_QUEUE_CAP bytes are pending
-        // (the child has stopped reading and something is flooding the queue),
-        // drop this buffer rather than grow toward OOM. We report it as fully
-        // written so a hostile query-reply loop can't turn into an error storm
-        // either; normal writes never reach the cap. This keeps the never-block
-        // guarantee for legitimate writes while making the flood self-limiting.
+        // Bound the queue against a reply flood: once more than
+        // PTY_WRITE_QUEUE_CAP bytes are pending (the child has stopped reading
+        // and keeps asking), drop the reply rather than grow toward OOM. We
+        // report it as fully written so a hostile query-reply loop can't turn
+        // into an error storm either.
         let queued = self.queued.load(Ordering::Relaxed);
-        if queued.saturating_add(buf.len()) > PTY_WRITE_QUEUE_CAP {
+        if self.capped && queued.saturating_add(buf.len()) > PTY_WRITE_QUEUE_CAP {
             return Ok(buf.len());
         }
         self.queued.fetch_add(buf.len(), Ordering::Relaxed);
@@ -1242,7 +1246,9 @@ impl PtySession {
         }
     }
 
-    /// Returns a writer for the PTY (send keystrokes to the shell).
+    /// Returns a writer for the user's input to the PTY: keystrokes, pastes,
+    /// mouse and focus reports. Never dropped, whatever their size — the
+    /// terminal's own replies go through [`PtySession::send_reply`] instead.
     ///
     /// The returned writer NEVER blocks the caller: bytes are queued to the
     /// session's dedicated writer thread (which owns the blocking fd), so the
@@ -1251,10 +1257,20 @@ impl PtySession {
     /// no-op (the writer thread flushes each chunk). May be called any number
     /// of times.
     pub fn writer(&self) -> Box<dyn Write + Send> {
-        Box::new(ChannelWriter {
-            tx: self.write_tx.clone(),
-            queued: Arc::clone(&self.write_queued),
-        })
+        Box::new(self.channel_writer(false))
+    }
+
+    /// Queue the terminal's REPLIES to the program's queries (DSR/DA, OSC
+    /// color and clipboard reads, mode reports) — like [`PtySession::writer`],
+    /// in order with it, but dropped once [`PTY_WRITE_QUEUE_CAP`] bytes are
+    /// waiting: a program that floods queries without reading its input
+    /// cannot grow the queue without bound (F13).
+    pub fn send_reply(&self, bytes: &[u8]) {
+        let _ = self.channel_writer(true).write_all(bytes);
+    }
+
+    fn channel_writer(&self, capped: bool) -> ChannelWriter {
+        ChannelWriter { tx: self.write_tx.clone(), queued: Arc::clone(&self.write_queued), capped }
     }
 
     pub fn resize(&self, cols: u16, rows: u16, px_w: u16, px_h: u16) {
@@ -1323,7 +1339,7 @@ mod tests {
     }
 
     fn mk_writer(tx: Sender<Vec<u8>>) -> ChannelWriter {
-        ChannelWriter { tx, queued: Arc::new(AtomicUsize::new(0)) }
+        ChannelWriter { tx, queued: Arc::new(AtomicUsize::new(0)), capped: false }
     }
 
     /// A reader-side half (sender + shared state + wake that counts into a
@@ -1584,6 +1600,23 @@ mod tests {
     }
 
     #[test]
+    fn only_replies_are_dropped_past_the_cap_never_the_users_input() {
+        // A child that stopped reading has filled the queue to the cap. Its
+        // further query replies are dropped (F13); the user's paste — however
+        // big — and keys still queue, in order.
+        let (tx, rx) = channel::<Vec<u8>>();
+        let queued = Arc::new(AtomicUsize::new(PTY_WRITE_QUEUE_CAP));
+        let mut reply = ChannelWriter { tx: tx.clone(), queued: Arc::clone(&queued), capped: true };
+        let mut input = ChannelWriter { tx, queued: Arc::clone(&queued), capped: false };
+        reply.write_all(b"\x1b[1;1R").unwrap();
+        input.write_all(&vec![b'p'; PTY_WRITE_QUEUE_CAP + 1]).unwrap();
+        input.write_all(b"\x03").unwrap();
+        reply.write_all(b"\x1b[?62c").unwrap();
+        let got: Vec<usize> = rx.try_iter().map(|c| c.len()).collect();
+        assert_eq!(got, vec![PTY_WRITE_QUEUE_CAP + 1, 1], "the paste and the key, nothing else");
+    }
+
+    #[test]
     fn channel_writer_drops_past_cap_without_blocking_or_erroring() {
         // Regression (F13): once the queue exceeds PTY_WRITE_QUEUE_CAP (the
         // child stopped reading and a reply flood keeps producing), further
@@ -1591,7 +1624,7 @@ mod tests {
         // erroring — so memory stays bounded instead of growing to OOM.
         let (tx, rx) = channel::<Vec<u8>>();
         let queued = Arc::new(AtomicUsize::new(0));
-        let mut w = ChannelWriter { tx, queued: Arc::clone(&queued) };
+        let mut w = ChannelWriter { tx, queued: Arc::clone(&queued), capped: true };
         // Nothing consumes `rx`, so `queued` only ever grows here.
         let chunk = vec![b'q'; 1 << 20]; // 1 MiB per write
         let mut sent = 0usize;
@@ -1643,8 +1676,8 @@ mod tests {
         // ordered queue (per-session ordering is what the terminal relies on).
         let (tx, rx) = channel::<Vec<u8>>();
         let queued = Arc::new(AtomicUsize::new(0));
-        let mut a = ChannelWriter { tx: tx.clone(), queued: Arc::clone(&queued) };
-        let mut b = ChannelWriter { tx, queued };
+        let mut a = ChannelWriter { tx: tx.clone(), queued: Arc::clone(&queued), capped: false };
+        let mut b = ChannelWriter { tx, queued, capped: false };
         a.write_all(b"1").unwrap();
         b.write_all(b"2").unwrap();
         a.write_all(b"3").unwrap();

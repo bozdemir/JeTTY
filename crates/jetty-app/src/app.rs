@@ -7283,11 +7283,11 @@ impl App {
         *vt_read += fed as u64;
         let mut had = fed > 0;
         // Flush any query replies (DSR/DA, etc.) this tab produced back to its
-        // own PTY so the shell's startup probes succeed.
+        // own PTY so the shell's startup probes succeed (capped: a reply flood
+        // from a program that does not read can't grow the queue).
         let replies = tab.terminal.drain_pty_writes();
         if !replies.is_empty() {
-            let _ = tab.writer.write_all(&replies);
-            let _ = tab.writer.flush();
+            tab.pty.send_reply(&replies);
             had = true;
         }
         // Apply any pending shell-set title (OSC 0/2). Event-driven: rides this
@@ -7346,8 +7346,7 @@ impl App {
                     text.truncate(floor_char_boundary(&text, jetty_core::OSC52_MAX_BYTES));
                 }
                 let reply = fmt(&text);
-                let _ = tab.writer.write_all(reply.as_bytes());
-                let _ = tab.writer.flush();
+                tab.pty.send_reply(reply.as_bytes());
                 had = true;
             }
         }
@@ -16246,8 +16245,7 @@ fn random_other(n: usize, avoid: usize, r: u64) -> usize {
 fn write_replies(tab: &mut Tab) {
     let replies = tab.terminal.drain_pty_writes();
     if !replies.is_empty() {
-        let _ = tab.writer.write_all(&replies);
-        let _ = tab.writer.flush();
+        tab.pty.send_reply(&replies);
     }
 }
 

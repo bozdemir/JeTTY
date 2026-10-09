@@ -342,3 +342,32 @@ fn a_clean_exit_is_not_a_failed_start() {
     assert!(wait_exited(&pty), "premise: the shell exits");
     assert!(pty.respawn_after_failed_start().is_none(), "status 0: the tab just closes");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_paste_past_the_reply_cap_still_arrives_whole() {
+    // The 64 MiB queue cap exists for query-REPLY floods (a program that keeps
+    // asking without reading its input); it also swallowed any paste past it
+    // — nothing reached the program and nothing said so.
+    const N: usize = 64 * 1024 * 1024 + 4096;
+    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    {
+        use std::io::Write;
+        // The echoed command line shows `READ''Y`; only the output says READY.
+        pty.writer().write_all(format!("stty raw -echo; echo READ''Y; head -c {N} | wc -c\n").as_bytes()).unwrap();
+    }
+    assert!(read_until(&pty, "READY").contains("READY"), "premise: raw reader ready");
+    {
+        use std::io::Write;
+        pty.writer().write_all(&vec![b'x'; N]).unwrap();
+    }
+    let want = N.to_string();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut seen = String::new();
+    while Instant::now() < deadline && !seen.contains(&want) {
+        if let Some(chunk) = pty.recv_output_timeout(Duration::from_millis(200)) {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+    assert!(seen.contains(&want), "the program must receive all {N} bytes; it printed {seen:?}");
+}
