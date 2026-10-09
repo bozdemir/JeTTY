@@ -5101,8 +5101,8 @@ impl Terminal {
     /// edge extends its WRAPLINE walk BEYOND the viewport (capped at
     /// [`crate::url::MAX_WRAP_WALK`]) so its `text` is the COMPLETE token even
     /// though the label anchors on the visible portion. Identical on-screen
-    /// tokens dedup to one entry; the total is capped so the label alphabet stays
-    /// short. Like `link_at`, spans are recomputed from a fresh grid every call —
+    /// tokens dedup to one entry (the bottom-most); the total is capped — at
+    /// the NEWEST tokens — so the label alphabet stays short. Like `link_at`, spans are recomputed from a fresh grid every call —
     /// never store the returned viewport coords across grid changes.
     pub fn hint_tokens(&self) -> Vec<HintToken> {
         const TOKEN_CAP: usize = 100;
@@ -5140,14 +5140,18 @@ impl Terminal {
             }
         }
 
+        // Logical lines BOTTOM-UP, each one's tokens right to left: the cap keeps
+        // the NEWEST tokens — the rows next to the prompt, the usual target —
+        // and a duplicate is labelled where it last appears. Handed back in
+        // reading order, so labels still go top-down.
         let mut tokens: Vec<HintToken> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut gs = scan_start;
-        while gs <= scan_end {
+        let mut ge = scan_end;
+        'lines: while ge >= scan_start {
             // Group consecutive WRAPLINE rows into one logical line.
-            let mut ge = gs;
-            while ge < scan_end && wrapped(ge) {
-                ge += 1;
+            let mut gs = ge;
+            while gs > scan_start && wrapped(gs - 1) {
+                gs -= 1;
             }
             // Assemble the group's chars: exactly `cols` per row so char index i
             // maps back to cell (gs + i/cols, i % cols); wide spacers → ' '.
@@ -5164,7 +5168,7 @@ impl Terminal {
                     });
                 }
             }
-            for (s, e, kind) in crate::hints::scan_line(&chars) {
+            for (s, e, kind) in crate::hints::scan_line(&chars).into_iter().rev() {
                 // Map to VISIBLE viewport spans first (a fully off-screen token
                 // — wrapped entirely above/below — is dropped).
                 let mut spans: Vec<(usize, usize, usize)> = Vec::new();
@@ -5191,11 +5195,12 @@ impl Terminal {
                 }
                 tokens.push(HintToken { text, kind, spans });
                 if tokens.len() >= TOKEN_CAP {
-                    return tokens;
+                    break 'lines;
                 }
             }
-            gs = ge + 1;
+            ge = gs - 1;
         }
+        tokens.reverse();
         tokens
     }
 
@@ -9566,6 +9571,27 @@ mod tests {
         t.feed(b"https://x.io/a\r\nhttps://x.io/a\r\n");
         let toks = t.hint_tokens();
         assert_eq!(toks.iter().filter(|h| h.text == "https://x.io/a").count(), 1);
+    }
+
+    #[test]
+    fn hint_tokens_keep_the_newest_when_capped() {
+        // More tokens on screen than the cap (a tall window of `git log`
+        // hashes): the cap kept the 100 top-most, so the newest rows next to
+        // the prompt — the usual target — got no label. A duplicate is
+        // labelled where it last appears, and labels still go in reading order.
+        let mut t = Terminal::new(40, 130);
+        for i in 0..120 {
+            t.feed(format!("deadbeef{i:04}\r\n").as_bytes());
+        }
+        t.feed(b"/tmp/dup\r\n...\r\n/tmp/dup");
+        let toks = t.hint_tokens();
+        assert_eq!(toks.len(), 100);
+        let texts: Vec<&str> = toks.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts[0], "deadbeef0021", "the oldest kept: {texts:?}");
+        assert_eq!(texts[98], "deadbeef0119");
+        assert_eq!(texts[99], "/tmp/dup");
+        assert_eq!(toks[99].spans, vec![(122, 0, 7)], "the duplicate on the last row");
+        assert!(toks.windows(2).all(|w| w[0].spans[0] < w[1].spans[0]), "reading order");
     }
 
     #[test]
