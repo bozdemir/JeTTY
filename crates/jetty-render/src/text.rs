@@ -191,6 +191,36 @@ fn probe_route(
         .unwrap_or(CellRoute::Inline)
 }
 
+/// Whether the face a cell of style `shape` is shaped with maps every char of
+/// `text`: shaped like the row (`Shaping::Basic`, no fallback), a char that face
+/// lacks is glyph 0.
+fn face_covers(
+    font_system: &mut FontSystem,
+    probe: &mut Buffer,
+    family: &str,
+    weights: FaceWeights,
+    text: &str,
+    shape: u8,
+) -> bool {
+    probe.set_text(font_system, text, &face_attrs(family, weights, shape), Shaping::Basic, None);
+    probe.layout_runs().flat_map(|run| run.glyphs.iter()).all(|g| g.glyph_id != 0)
+}
+
+/// The style an overdraw char or a cluster of a `shape` cell is shaped in: the
+/// cell's own when its face has every char (a bold NFD `é`, a bold CJK glyph of
+/// a font that has CJK); else regular when the REGULAR face has them all (the
+/// box drawing MesloLGS NF Bold lacks stays in the family instead of coming
+/// from another font's bold); else the cell's style again, and font fallback
+/// looks for a face of that style elsewhere (a bold CJK fallback).
+fn overdraw_shape(font_system: &mut FontSystem, probe: &mut Buffer, style: &OverdrawStyle, text: &str, shape: u8) -> u8 {
+    let mut covers = |shape| face_covers(font_system, probe, &style.family, style.weights, text, shape);
+    if shape == 0 || covers(shape) || !covers(0) {
+        shape
+    } else {
+        0
+    }
+}
+
 /// A shaped overdraw glyph (a fallback char, a grapheme cluster or a color
 /// emoji) and the x offset that centres it in its cells (0 except for emoji).
 struct OverdrawGlyph {
@@ -291,12 +321,12 @@ struct PreparedGrid {
     rows: usize,
     cols: usize,
     keys: Vec<u64>,
-    fallback: Vec<(f32, f32, char, [u8; 3])>,
+    fallback: Vec<OverdrawCell>,
     /// `(x, y, index into clusters, fg, half)` per cluster-drawn cell.
     graphemes: Vec<GraphemeCell>,
-    /// The distinct (clamped) clusters those cells draw — bounded by
-    /// `GRAPHEME_GLYPH_CAP` × `MAX_CLUSTER_BYTES`.
-    clusters: Vec<Box<str>>,
+    /// The distinct (clamped) clusters those cells draw, each with its cells'
+    /// style — bounded by `GRAPHEME_GLYPH_CAP` × `MAX_CLUSTER_BYTES`.
+    clusters: Vec<(Box<str>, u8)>,
     /// The built-in glyph cells (their row keys hold a blank).
     builtin: Vec<BuiltinCell>,
 }
@@ -305,6 +335,10 @@ struct PreparedGrid {
 /// `half` = a color emoji squeezed into ONE cell (a narrow base + VS16 with a
 /// non-blank neighbour), drawn at half scale; otherwise an emoji spans two cells.
 type GraphemeCell = (f32, f32, u32, [u8; 3], bool);
+
+/// One overdraw cell: `(x, y, char, BOLD|ITALIC bits, fg)`. The char is drawn in
+/// its cell's style — a color emoji in none (one buffer for every style).
+type OverdrawCell = (f32, f32, char, u8, [u8; 3]);
 
 /// The default terminal font. Matches the user's Konsole profile: MesloLGS NF
 /// — a Nerd Font, so the zsh prompt's powerline/icon glyphs render correctly.
@@ -476,96 +510,107 @@ fn evict_fifo_cache<K: std::hash::Hash + Eq, V, S: std::hash::BuildHasher>(
     visible: impl Fn(&K) -> bool,
     cap: usize,
 ) {
+    let len = map.len();
+    evict_fifo(order, len, visible, cap, |k| {
+        map.remove(k);
+    });
+}
+
+/// [`evict_fifo_cache`] for any store: `order` lists the key of each of its
+/// `len` entries, and `remove` drops one.
+fn evict_fifo<K>(
+    order: &mut std::collections::VecDeque<K>,
+    mut len: usize,
+    visible: impl Fn(&K) -> bool,
+    cap: usize,
+    mut remove: impl FnMut(&K),
+) {
     let mut scanned = 0usize;
     let cap_scan = order.len();
-    while map.len() > cap && scanned < cap_scan {
+    while len > cap && scanned < cap_scan {
         let Some(old) = order.pop_front() else { break };
         scanned += 1;
         if visible(&old) {
             order.push_back(old);
         } else {
-            map.remove(&old);
+            remove(&old);
+            len -= 1;
         }
     }
 }
 
-/// Shaped grapheme-cluster buffers, keyed by the (clamped) cluster. Bounded in
-/// entries (`GRAPHEME_GLYPH_CAP`, FIFO, never evicting a cluster drawn this
-/// frame — and a frame draws at most that many distinct clusters) and per entry
-/// (a key is at most `MAX_CLUSTER_BYTES`, its buffer at most
-/// `MAX_CLUSTER_MARKS + 1` chars), so its memory is bounded no matter what a
-/// program prints. Generic over the cached value only so the bounds are testable
-/// without a font; the renderer caches shaped [`OverdrawGlyph`]s.
+/// Shaped grapheme-cluster buffers, keyed by the (clamped) cluster and its
+/// cells' style (a map per `BOLD|ITALIC` value). Bounded in entries
+/// (`GRAPHEME_GLYPH_CAP`, FIFO, never evicting a cluster drawn this frame — and
+/// a frame draws at most that many distinct clusters) and per entry (a key is
+/// at most `MAX_CLUSTER_BYTES`, its buffer at most `MAX_CLUSTER_MARKS + 1`
+/// chars), so its memory is bounded no matter what a program prints. Generic
+/// over the cached value only so the bounds are testable without a font; the
+/// renderer caches shaped [`OverdrawGlyph`]s.
 struct ClusterGlyphCache<V = OverdrawGlyph> {
-    map: FxHashMap<Box<str>, V>,
-    order: std::collections::VecDeque<Box<str>>,
+    maps: [FxHashMap<Box<str>, V>; 4],
+    order: std::collections::VecDeque<(Box<str>, u8)>,
 }
 
 impl<V> Default for ClusterGlyphCache<V> {
     fn default() -> Self {
-        Self { map: FxHashMap::default(), order: std::collections::VecDeque::new() }
+        Self { maps: Default::default(), order: std::collections::VecDeque::new() }
     }
 }
 
 impl<V> ClusterGlyphCache<V> {
-    /// Build (`make`) every cluster of this frame not cached yet, then evict down
-    /// to the cap, keeping this frame's clusters.
-    fn ensure_with(&mut self, clusters: &[&str], mut make: impl FnMut(&str) -> V) {
-        for &cluster in clusters {
+    /// Build (`make`) every `(cluster, style)` of this frame not cached yet, then
+    /// evict down to the cap, keeping this frame's clusters.
+    fn ensure_with(&mut self, clusters: &[(&str, u8)], mut make: impl FnMut(&str, u8) -> V) {
+        for &(cluster, shape) in clusters {
             debug_assert!(cluster.len() <= MAX_CLUSTER_BYTES, "clusters are clamped before caching");
-            if !self.map.contains_key(cluster) {
-                let v = make(cluster);
-                self.map.insert(Box::from(cluster), v);
-                self.order.push_back(Box::from(cluster));
+            let shape = shape & jetty_core::SHAPE_MASK;
+            let map = &mut self.maps[shape as usize];
+            if !map.contains_key(cluster) {
+                map.insert(Box::from(cluster), make(cluster, shape));
+                self.order.push_back((Box::from(cluster), shape));
             }
         }
-        if self.map.len() > GRAPHEME_GLYPH_CAP {
-            let drawn: rustc_hash::FxHashSet<&str> = clusters.iter().copied().collect();
-            evict_fifo_cache(&mut self.map, &mut self.order, |k| drawn.contains(&**k), GRAPHEME_GLYPH_CAP);
+        if self.len() > GRAPHEME_GLYPH_CAP {
+            let drawn: rustc_hash::FxHashSet<(&str, u8)> = clusters.iter().copied().collect();
+            let (len, maps) = (self.len(), &mut self.maps);
+            let visible = |(k, s): &(Box<str>, u8)| drawn.contains(&(&**k, *s));
+            evict_fifo(&mut self.order, len, visible, GRAPHEME_GLYPH_CAP, |(k, s)| {
+                maps[*s as usize].remove(k);
+            });
         }
+    }
+
+    fn len(&self) -> usize {
+        self.maps.iter().map(|m| m.len()).sum()
     }
 
     /// Bytes held by the keys (each stored twice: map + FIFO order).
     #[cfg(test)]
     fn key_bytes(&self) -> usize {
-        self.map.keys().map(|k| k.len()).sum::<usize>() + self.order.iter().map(|k| k.len()).sum::<usize>()
+        let keys = self.maps.iter().flat_map(|m| m.keys());
+        keys.map(|k| k.len()).sum::<usize>() + self.order.iter().map(|(k, _)| k.len()).sum::<usize>()
     }
 
-    fn get(&self, cluster: &str) -> Option<&V> {
-        self.map.get(cluster)
+    fn get(&self, cluster: &str, shape: u8) -> Option<&V> {
+        self.maps[(shape & jetty_core::SHAPE_MASK) as usize].get(cluster)
     }
 
     fn clear(&mut self) {
-        self.map.clear();
+        for map in &mut self.maps {
+            map.clear();
+        }
         self.order.clear();
     }
 }
 
-impl ClusterGlyphCache<OverdrawGlyph> {
-    /// Shape every cluster of this frame not cached yet (`Shaping::Advanced`, so
-    /// font fallback supplies marks/emoji the primary font lacks). With an emoji
-    /// family, emoji clusters (`emoji::is_emoji_cluster`) are shaped in it, sized to
-    /// two cells.
-    fn ensure(&mut self, font_system: &mut FontSystem, style: &OverdrawStyle, clusters: &[&str]) {
-        let attrs = style.attrs();
-        self.ensure_with(clusters, |cluster| match &style.emoji_family {
-            Some(fam) if emoji::is_emoji_cluster(cluster) => style.shape_emoji(font_system, fam, cluster),
-            _ => {
-                let mut buffer = Buffer::new(font_system, style.metrics);
-                buffer.set_size(font_system, None, None);
-                buffer.set_text(font_system, cluster, &attrs, Shaping::Advanced, None);
-                OverdrawGlyph { buffer, dx: 0.0 }
-            }
-        });
-    }
-}
-
-/// What the overdraw / cluster / emoji buffers are shaped with: the grid font (at
-/// its regular weight) and metrics, the cell box an emoji is fitted into, and the
-/// emoji family (`None` when `color_emoji` is off or no emoji font is installed).
+/// What the overdraw / cluster / emoji buffers are shaped with: the grid font
+/// (its `FaceWeights`, so a bold cell's glyph comes from the bold face) and
+/// metrics, the cell box an emoji is fitted into, and the emoji family (`None`
+/// when `color_emoji` is off or no emoji font is installed).
 struct OverdrawStyle {
     family: Arc<str>,
-    weight: Weight,
+    weights: FaceWeights,
     emoji_family: Option<Arc<str>>,
     metrics: Metrics,
     cell_w: f32,
@@ -573,9 +618,15 @@ struct OverdrawStyle {
 }
 
 impl OverdrawStyle {
-    /// The attrs an overdraw char or cluster is shaped with (font fallback on).
-    fn attrs(&self) -> Attrs<'_> {
-        Attrs::new().family(Family::Name(&self.family)).weight(self.weight)
+    /// Shape an overdraw char or cluster in style `shape` (`BOLD|ITALIC` bits —
+    /// see [`overdraw_shape`]) with font fallback (`Shaping::Advanced`), so the
+    /// marks and glyphs the grid font lacks come from another font.
+    fn shape_text(&self, font_system: &mut FontSystem, text: &str, shape: u8) -> OverdrawGlyph {
+        let mut buffer = Buffer::new(font_system, self.metrics);
+        buffer.set_size(font_system, None, None);
+        let attrs = face_attrs(&self.family, self.weights, shape);
+        buffer.set_text(font_system, text, &attrs, Shaping::Advanced, None);
+        OverdrawGlyph { buffer, dx: 0.0 }
     }
 
     /// Shape `text` in the emoji family, scaled so the emoji fills its two-cell
@@ -712,7 +763,7 @@ impl OverlayCache {
 struct PackScratch {
     keys: Vec<u64>,
     row_hashes: Vec<u64>,
-    fallback: Vec<(f32, f32, char, [u8; 3])>,
+    fallback: Vec<OverdrawCell>,
     graphemes: Vec<GraphemeCell>,
     builtin: Vec<BuiltinCell>,
     order: Vec<usize>,
@@ -726,15 +777,15 @@ struct PackedGrid<'a> {
     keys: Vec<u64>,
     /// Per-row content hash; 0 = all-blank row (nothing to shape or draw).
     row_hashes: Vec<u64>,
-    /// `(x, y, char, fg)` per overdraw cell (glyph missing from the primary font,
-    /// double-width, or a color emoji).
-    fallback: Vec<(f32, f32, char, [u8; 3])>,
+    /// One entry per overdraw cell (glyph missing from the primary font,
+    /// double-width, or a color emoji — see [`OverdrawCell`]).
+    fallback: Vec<OverdrawCell>,
     /// One entry per cell drawn from its grapheme cluster (see [`GraphemeCell`]).
     graphemes: Vec<GraphemeCell>,
-    /// The DISTINCT clusters drawn this frame, each clamped by `clamp_cluster`; at
-    /// most `GRAPHEME_GLYPH_CAP` of them, `GRAPHEME_FRAME_CHARS` chars across all
-    /// cells.
-    clusters: Vec<&'a str>,
+    /// The DISTINCT `(cluster, style)` pairs drawn this frame, each cluster
+    /// clamped by `clamp_cluster`; at most `GRAPHEME_GLYPH_CAP` of them,
+    /// `GRAPHEME_FRAME_CHARS` chars across all cells.
+    clusters: Vec<(&'a str, u8)>,
     /// Cells drawn as built-in glyphs (their row keys hold a blank, so a change of
     /// box/braille glyph alone never re-shapes a row).
     builtin: Vec<BuiltinCell>,
@@ -793,8 +844,8 @@ fn pack_grid<'a>(
     }
     let g_pos = |i: usize| (paint.graphemes[i].0, paint.graphemes[i].1);
     let mut g_next = 0usize;
-    let mut clusters: Vec<&'a str> = Vec::new();
-    let mut cluster_index: FxHashMap<&'a str, u32> = FxHashMap::default();
+    let mut clusters: Vec<(&'a str, u8)> = Vec::new();
+    let mut cluster_index: FxHashMap<(&'a str, u8), u32> = FxHashMap::default();
     let mut cluster_chars = 0usize;
     let mut sel_memo: Option<([u8; 3], [u8; 3])> = None;
     // Recolor spans, walked with a cursor alongside the cell loop like the
@@ -844,14 +895,18 @@ fn pack_grid<'a>(
             let mut drawn_as_cluster = false;
             if g_next < order.len() && g_pos(order[g_next]) == (row, col) {
                 let (cluster, n) = clamp_cluster(paint.graphemes[order[g_next]].2);
+                // Drawn in the cell's style — a color emoji in none (its font
+                // has no bold or italic: one buffer for every style).
+                let is_emoji = color_emoji && emoji::is_emoji_cluster(cluster);
+                let key = (cluster, if is_emoji { 0 } else { cell.shape_bits() });
                 let ci = if n == 0 || cluster_chars + n > GRAPHEME_FRAME_CHARS {
                     None
-                } else if let Some(&ci) = cluster_index.get(cluster) {
+                } else if let Some(&ci) = cluster_index.get(&key) {
                     Some(ci)
                 } else if clusters.len() < GRAPHEME_GLYPH_CAP {
                     let ci = clusters.len() as u32;
-                    clusters.push(cluster);
-                    cluster_index.insert(cluster, ci);
+                    clusters.push(key);
+                    cluster_index.insert(key, ci);
                     Some(ci)
                 } else {
                     None
@@ -861,9 +916,8 @@ fn pack_grid<'a>(
                     // An emoji on a NARROW base (`❤️`: VS16 does not widen the
                     // cell) spans two cells only when its right neighbour is blank;
                     // otherwise it is squeezed into its own cell.
-                    let half = color_emoji
+                    let half = is_emoji
                         && ch.width().unwrap_or(1) < 2
-                        && emoji::is_emoji_cluster(clusters[ci as usize])
                         && (col + 1 >= cols || snapshot.cell(row, col + 1).c != ' ');
                     graphemes.push((col as f32 * cell_w, row as f32 * cell_h, ci, fg, half));
                     ch = ' ';
@@ -875,13 +929,15 @@ fn pack_grid<'a>(
                 // primary font always lays them out inline.
                 match route(ch, cell.shape_bits()) {
                     CellRoute::Inline => {}
-                    CellRoute::Overdraw | CellRoute::Emoji => {
+                    route @ (CellRoute::Overdraw | CellRoute::Emoji) => {
                         // A glyph the primary font lacks (tofu under Shaping::Basic,
                         // no fallback), draws double-width (a CJK glyph advances ~2
                         // cells and would shift the rest of the row) or a color
                         // emoji: blank it here so the row stays on the grid,
-                        // overdraw the real glyph on top, aligned.
-                        fallback.push((col as f32 * cell_w, row as f32 * cell_h, ch, fg));
+                        // overdraw the real glyph on top, aligned — in the cell's
+                        // style (a color emoji has none).
+                        let shape = if route == CellRoute::Emoji { 0 } else { cell.shape_bits() };
+                        fallback.push((col as f32 * cell_w, row as f32 * cell_h, ch, shape, fg));
                         ch = ' ';
                     }
                     CellRoute::Builtin(slot) => {
@@ -984,18 +1040,18 @@ pub struct TextLayer {
     /// Scratch buffer used only to probe glyph coverage/advance (shape one char,
     /// inspect the resulting glyph id and width). Reused across frames.
     coverage_buffer: Buffer,
-    /// Shaped single-glyph buffers for the overdraw path, keyed by char so a char
-    /// repeated across the grid shares one shaped buffer and an unchanged frame
-    /// re-shapes nothing. Shaped with `Shaping::Advanced` so cosmic-text's font
-    /// fallback supplies a glyph the primary font lacks (or the primary font's own
-    /// double-width glyph). Cleared on `set_font_family`/`set_font_size` (glyphs are
-    /// per family + size).
-    fallback_glyphs: FxHashMap<char, OverdrawGlyph>,
+    /// Shaped single-glyph buffers for the overdraw path, keyed by char and cell
+    /// style (`route_key`) so a char repeated across the grid shares one shaped
+    /// buffer and an unchanged frame re-shapes nothing. Shaped with
+    /// `Shaping::Advanced` so cosmic-text's font fallback supplies a glyph the
+    /// primary font lacks (or the primary font's own double-width glyph). Cleared
+    /// on `set_font_family`/`set_font_size` (glyphs are per family + size).
+    fallback_glyphs: FxHashMap<u32, OverdrawGlyph>,
     /// Insertion order of `fallback_glyphs` keys, used to evict the oldest
     /// entries once the cache exceeds `FALLBACK_GLYPH_CAP` so a session scrolling
     /// through a large CJK/emoji corpus can't accumulate shaped buffers without
     /// bound (F25). Chars visible in the current frame are never evicted.
-    fallback_order: std::collections::VecDeque<char>,
+    fallback_order: std::collections::VecDeque<u32>,
     /// Monotonic counter bumped whenever a change invalidates shaped grid content
     /// (font family, font size, routing): it drops the row cache and forces the
     /// next frame to re-prepare even when the grid text/colors are unchanged.
@@ -1807,7 +1863,7 @@ impl TextLayer {
                 && p.graphemes == packed.graphemes
                 && p.builtin == packed.builtin
                 && p.clusters.len() == packed.clusters.len()
-                && p.clusters.iter().zip(&packed.clusters).all(|(a, b)| **a == **b)
+                && p.clusters.iter().zip(&packed.clusters).all(|((a, sa), (b, sb))| **a == **b && sa == sb)
         });
 
         let mut result = Ok(());
@@ -1873,8 +1929,8 @@ impl TextLayer {
             // Overdraws and clusters: drawn ON TOP of their blanked cells, at the
             // exact cell origin, in this same prepare() — so they never shift a
             // neighbor.
-            for &(x, y, c, rgb) in packed.fallback.iter() {
-                if let Some(g) = self.fallback_glyphs.get(&c) {
+            for &(x, y, c, shape, rgb) in packed.fallback.iter() {
+                if let Some(g) = self.fallback_glyphs.get(&route_key(c, shape)) {
                     areas.push(TextArea {
                         buffer: &g.buffer,
                         left: x + left_offset + g.dx,
@@ -1887,7 +1943,8 @@ impl TextLayer {
                 }
             }
             for &(x, y, ci, rgb, half) in packed.graphemes.iter() {
-                if let Some(g) = self.clusters.get(packed.clusters[ci as usize]) {
+                let (cluster, shape) = packed.clusters[ci as usize];
+                if let Some(g) = self.clusters.get(cluster, shape) {
                     // A half-scale emoji keeps its centre: half the offset into its
                     // one cell, and a quarter cell down (its line box is halved).
                     let (scale, dx, dy) = if half { (0.5, g.dx * 0.5, cell_h * 0.25) } else { (1.0, g.dx, 0.0) };
@@ -1953,7 +2010,7 @@ impl TextLayer {
                 p.graphemes.extend_from_slice(&packed.graphemes);
                 std::mem::swap(&mut p.builtin, &mut packed.builtin);
                 p.clusters.clear();
-                p.clusters.extend(packed.clusters.iter().map(|&c| Box::from(c)));
+                p.clusters.extend(packed.clusters.iter().map(|&(c, s)| (Box::from(c), s)));
                 self.prepared = Some(p);
             }
             result = prepared;
@@ -2118,32 +2175,29 @@ impl TextLayer {
     /// on family/size change), so a char repeated across the grid — e.g.
     /// full-screen CJK — shapes only once. Usually both lists are empty and this
     /// does nothing.
-    fn ensure_overdraw_buffers(&mut self, fallback_cells: &[(f32, f32, char, [u8; 3])], clusters: &[&str]) {
+    fn ensure_overdraw_buffers(&mut self, fallback_cells: &[OverdrawCell], clusters: &[(&str, u8)]) {
         if fallback_cells.is_empty() && clusters.is_empty() {
             return;
         }
         let style = self.overdraw_style();
+        let (fs, probe) = (&mut self.font_system, &mut self.coverage_buffer);
         if !fallback_cells.is_empty() {
-            let attrs = style.attrs();
-            for (_x, _y, c, _rgb) in fallback_cells {
-                if !self.fallback_glyphs.contains_key(c) {
+            for &(_x, _y, c, shape, _rgb) in fallback_cells {
+                let key = route_key(c, shape);
+                if let std::collections::hash_map::Entry::Vacant(slot) = self.fallback_glyphs.entry(key) {
                     let mut tmp = [0u8; 4];
                     let text = c.encode_utf8(&mut tmp);
                     let glyph = match &style.emoji_family {
                         // Routed as a color emoji (see `classify`): its own font,
                         // fitted to its two cells.
-                        Some(fam) if is_color_emoji_char(*c) => {
-                            style.shape_emoji(&mut self.font_system, fam, text)
-                        }
+                        Some(fam) if is_color_emoji_char(c) => style.shape_emoji(fs, fam, text),
                         _ => {
-                            let mut buffer = Buffer::new(&mut self.font_system, style.metrics);
-                            buffer.set_size(&mut self.font_system, None, None);
-                            buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
-                            OverdrawGlyph { buffer, dx: 0.0 }
+                            let shape = overdraw_shape(fs, probe, &style, text, shape);
+                            style.shape_text(fs, text, shape)
                         }
                     };
-                    self.fallback_glyphs.insert(*c, glyph);
-                    self.fallback_order.push_back(*c);
+                    slot.insert(glyph);
+                    self.fallback_order.push_back(key);
                 }
             }
             // Evict the oldest cached buffers once the cache exceeds its cap, so a
@@ -2152,12 +2206,22 @@ impl TextLayer {
             // cap sits well above any single frame's distinct count, so this only
             // trims long-past entries and runs only when over cap.
             if self.fallback_glyphs.len() > FALLBACK_GLYPH_CAP {
-                let drawn: rustc_hash::FxHashSet<char> = fallback_cells.iter().map(|(_, _, c, _)| *c).collect();
-                evict_fifo_cache(&mut self.fallback_glyphs, &mut self.fallback_order, |c| drawn.contains(c), FALLBACK_GLYPH_CAP);
+                let drawn: rustc_hash::FxHashSet<u32> =
+                    fallback_cells.iter().map(|&(_, _, c, shape, _)| route_key(c, shape)).collect();
+                evict_fifo_cache(&mut self.fallback_glyphs, &mut self.fallback_order, |k| drawn.contains(k), FALLBACK_GLYPH_CAP);
             }
         }
         if !clusters.is_empty() {
-            self.clusters.ensure(&mut self.font_system, &style, clusters);
+            // Font fallback supplies the marks / emoji the grid font lacks. With an
+            // emoji family, emoji clusters (`emoji::is_emoji_cluster`) are shaped
+            // in it, sized to two cells.
+            self.clusters.ensure_with(clusters, |cluster, shape| match &style.emoji_family {
+                Some(fam) if emoji::is_emoji_cluster(cluster) => style.shape_emoji(fs, fam, cluster),
+                _ => {
+                    let shape = overdraw_shape(fs, probe, &style, cluster, shape);
+                    style.shape_text(fs, cluster, shape)
+                }
+            });
         }
     }
 
@@ -2165,7 +2229,7 @@ impl TextLayer {
     fn overdraw_style(&mut self) -> OverdrawStyle {
         OverdrawStyle {
             family: Arc::clone(&self.font_family),
-            weight: self.face_weights.of(0),
+            weights: self.face_weights,
             emoji_family: self.active_emoji_family(),
             metrics: self.metrics,
             cell_w: self.cell_w,
@@ -2686,13 +2750,13 @@ mod tests {
         let elapsed = t.elapsed();
 
         assert!(packed.clusters.len() <= GRAPHEME_GLYPH_CAP, "{} distinct clusters", packed.clusters.len());
-        for c in &packed.clusters {
+        for (c, _) in &packed.clusters {
             assert!(c.len() <= MAX_CLUSTER_BYTES && c.chars().count() <= 1 + MAX_CLUSTER_MARKS);
         }
         let drawn_chars: usize = packed
             .graphemes
             .iter()
-            .map(|&(_, _, ci, _, _)| packed.clusters[ci as usize].chars().count())
+            .map(|&(_, _, ci, _, _)| packed.clusters[ci as usize].0.chars().count())
             .sum();
         assert!(drawn_chars <= GRAPHEME_FRAME_CHARS, "{drawn_chars} cluster chars drawn");
         assert!(!packed.graphemes.is_empty(), "clusters within budget are still drawn");
@@ -2888,6 +2952,94 @@ mod tests {
     }
 
     #[test]
+    fn overdraw_and_cluster_cells_keep_their_style() {
+        // Bold / italic cells drawn from the overdraw (中) or from their cluster
+        // (NFD é) carry their style, and a color emoji carries none.
+        let bold = jetty_core::attr::BOLD;
+        let italic = jetty_core::attr::ITALIC;
+        let mut g = text_grid("中é😀éé", 8);
+        g.cells[0].attrs = bold;
+        g.cells[4].attrs = bold | jetty_core::attr::STRIKE;
+        g.cells[5].attrs = italic;
+        let mut route = |c: char, s: u8| if c == '中' { CellRoute::Overdraw } else { test_route(c, s) };
+        let overrides = [(0usize, 2usize, "e\u{301}"), (0, 5, "e\u{301}"), (0, 6, "e\u{301}"), (0, 7, "\u{2764}\u{FE0F}")];
+        g.cells[7].attrs = bold;
+        let paint = GridPaint { graphemes: &overrides, ..Default::default() };
+        let packed = pack_grid(&g, &paint, 10.0, 20.0, &mut route, true, PackScratch::default());
+        let over: Vec<(char, u8)> = packed.fallback.iter().map(|f| (f.2, f.3)).collect();
+        assert_eq!(over, vec![('中', bold), ('😀', 0)]);
+        // Three cells of "é": regular, italic and regular again (one entry), and
+        // the bold ❤️ draws in no style.
+        let drawn: Vec<(&str, u8)> =
+            packed.graphemes.iter().map(|&(_, _, ci, _, _)| packed.clusters[ci as usize]).collect();
+        assert_eq!(drawn, vec![("e\u{301}", 0), ("e\u{301}", italic), ("e\u{301}", 0), ("\u{2764}\u{FE0F}", 0)]);
+        assert_eq!(packed.clusters.len(), 3);
+        // Strike never splits a cluster's entry (only BOLD|ITALIC shape it).
+        g.cells[6].attrs = jetty_core::attr::STRIKE;
+        let again = pack_grid(&g, &paint, 10.0, 20.0, &mut route, true, PackScratch::default());
+        assert_eq!(again.clusters, packed.clusters);
+    }
+
+    /// The overdraw style of `family` at 16 px (cell measured like the grid's).
+    fn overdraw_style_for(fs: &mut FontSystem, family: &str) -> OverdrawStyle {
+        let metrics = layer_metrics(16.0, LINE_HEIGHT_DEFAULT);
+        let weights = resolve_face_weights(fs, family, wght_axis_range);
+        let cell_w = measure_advance_family(fs, metrics, family, weights.of(0));
+        OverdrawStyle { family: Arc::from(family), weights, emoji_family: None, metrics, cell_w, cell_h: metrics.line_height }
+    }
+
+    /// The faces `(family, weight, italic)` the glyphs of `g` were shaped from.
+    fn glyph_faces(fs: &FontSystem, g: &OverdrawGlyph) -> Vec<(String, u16, bool)> {
+        let faces = g.buffer.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| g.font_id));
+        faces
+            .filter_map(|id| fs.db().face(id))
+            .map(|f| (f.families[0].0.clone(), f.weight.0, f.style == Style::Italic))
+            .collect()
+    }
+
+    #[test]
+    fn a_styled_overdraw_glyph_comes_from_the_cells_face() {
+        // Regression: clusters (NFD text) and overdraw chars were shaped regular
+        // and upright whatever their cell's style — a bold "Café" drew its é
+        // regular. Needs MesloLGS NF (real Bold / Italic faces that have the
+        // combining marks) — skipped without it.
+        let mut fs = TextLayer::build_font_system();
+        let fam = "MesloLGS NF";
+        if !fs.db().faces().any(|f| f.families.iter().any(|(n, _)| n == fam) && f.weight.0 == 700) {
+            return;
+        }
+        let style = overdraw_style_for(&mut fs, fam);
+        let mut probe = Buffer::new(&mut fs, style.metrics);
+        let (bold, italic) = (jetty_core::attr::BOLD, jetty_core::attr::ITALIC);
+        let mut shaped = |fs: &mut FontSystem, text: &str, shape: u8| {
+            let shape = overdraw_shape(fs, &mut probe, &style, text, shape);
+            let g = style.shape_text(fs, text, shape);
+            glyph_faces(fs, &g)
+        };
+        // Every glyph (harfrust may compose the pair into one) from that face.
+        let mut from = |fs: &mut FontSystem, text: &str, shape: u8, weight: u16, italic: bool| {
+            let faces = shaped(fs, text, shape);
+            assert!(!faces.is_empty() && faces.iter().all(|f| *f == (fam.to_string(), weight, italic)), "{text:?} {shape}: {faces:?}");
+        };
+        from(&mut fs, "e\u{301}", 0, 400, false);
+        from(&mut fs, "e\u{301}", bold, 700, false);
+        from(&mut fs, "i\u{308}", italic, 400, true);
+        from(&mut fs, "s\u{327}", bold | italic, 700, true);
+        // A char the bold face lacks but the regular face has (box drawing in
+        // MesloLGS NF Bold) stays in the family, regular — never another font's
+        // bold.
+        let faces = shaped(&mut fs, "─", bold);
+        assert!(faces.iter().all(|f| f.0 == fam), "{faces:?}");
+        // A char no face of the family has (CJK): font fallback in the cell's
+        // style — a bold face of the fallback font when it has one.
+        let faces = shaped(&mut fs, "中", bold);
+        let (family, weight, _) = faces.first().cloned().expect("a glyph");
+        assert_ne!(family, fam);
+        let fallback_has_bold = fs.db().faces().any(|f| f.families[0].0 == family && f.weight.0 >= 600);
+        assert!(!fallback_has_bold || weight >= 600, "{faces:?}");
+    }
+
+    #[test]
     fn underlines_follow_the_text_not_the_cell_edge() {
         // Measured from the font: the stroke just under the baseline, the line
         // box bottom near the cell bottom at the default line height, and the
@@ -2965,13 +3117,16 @@ mod tests {
         for frame in 0..6 {
             let raw: Vec<String> =
                 (0..GRAPHEME_GLYPH_CAP).map(|i| zalgo('z', frame * GRAPHEME_GLYPH_CAP + i, 5_000)).collect();
-            let clusters: Vec<&str> = raw.iter().map(|s| clamp_cluster(s).0).collect();
-            cache.ensure_with(&clusters, |c| c.chars().count());
-            assert!(cache.map.values().all(|&n| n <= 1 + MAX_CLUSTER_MARKS), "each entry shapes ≤ the cap");
-            assert!(cache.map.len() <= GRAPHEME_GLYPH_CAP, "frame {frame}: {} entries", cache.map.len());
-            assert_eq!(cache.map.len(), cache.order.len(), "map and FIFO stay in sync");
+            // Every style: each (cluster, style) pair is an entry of its own.
+            let clusters: Vec<(&str, u8)> =
+                raw.iter().enumerate().map(|(i, s)| (clamp_cluster(s).0, (i % 4) as u8)).collect();
+            cache.ensure_with(&clusters, |c, _| c.chars().count());
+            let values = || cache.maps.iter().flat_map(|m| m.values());
+            assert!(values().all(|&n| n <= 1 + MAX_CLUSTER_MARKS), "each entry shapes ≤ the cap");
+            assert!(cache.len() <= GRAPHEME_GLYPH_CAP, "frame {frame}: {} entries", cache.len());
+            assert_eq!(cache.len(), cache.order.len(), "maps and FIFO stay in sync");
             assert!(cache.key_bytes() <= 2 * GRAPHEME_GLYPH_CAP * MAX_CLUSTER_BYTES);
-            assert!(clusters.iter().all(|c| cache.get(c).is_some()), "this frame's clusters are all served");
+            assert!(clusters.iter().all(|&(c, s)| cache.get(c, s).is_some()), "this frame's clusters are all served");
         }
     }
 
