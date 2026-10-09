@@ -655,6 +655,12 @@ impl DetachedWindow {
         // Focus the new window so it receives keyboard events immediately.
         window.focus_window();
         window.request_redraw();
+        // Focused only once the platform says so: its Focused(true) — the window
+        // manager focusing it on map — sets it. Assumed `true`, a window the WM
+        // never focused (focus-stealing prevention) counted as watched for good:
+        // F9 hid instead of raising, its commands' notifications were skipped,
+        // its program got a focus-in.
+        let focused = window.has_focus();
 
         Ok(Self {
             window,
@@ -685,9 +691,7 @@ impl DetachedWindow {
             last_present_at: None,
             paced_paint_at: None,
             frame_interval: None,
-            // A freshly-detached window is created focused (the WM focuses it on
-            // map); its Focused events keep this current thereafter.
-            focused: true,
+            focused,
             fullscreen: false,
             reflow_pending_at: None,
             // build_window above already titled the OS window from tab.title.

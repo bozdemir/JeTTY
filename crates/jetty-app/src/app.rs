@@ -1092,10 +1092,11 @@ pub struct App {
     /// Focused(false) BEFORE the settings Focused(true) (the last_focused_window
     /// check alone loses that race).
     switching_to_settings: bool,
-    /// Set while focus is moving to one of OUR detached windows (on detach, and
-    /// while a detached window holds focus). Consumed by the main window's
-    /// Focused(false) to suppress auto-hide so detaching a tab does not hide the
-    /// main window — mirrors `switching_to_settings` for the Settings window.
+    /// Set while one of OUR detached windows holds focus. Consumed by the main
+    /// window's Focused(false) to suppress auto-hide when focus moves between
+    /// JeTTY's windows — mirrors `switching_to_settings` for the Settings
+    /// window. (A detach sets nothing ahead: the deferred auto-hide covers the
+    /// new window's late Focused(true).)
     switching_to_detached: bool,
     /// When `Some`, a focus-loss auto-hide of the main window is SCHEDULED for
     /// this instant (`AUTOHIDE_GRACE_MS` after the Focused(false)). Cancelled by
@@ -4609,11 +4610,12 @@ impl App {
         );
 
         // Focus is about to move to the new detached window, which makes the main
-        // window receive Focused(false). Flag it so the auto-hide there does NOT
-        // fire (the user is staying inside Jetty) — mirrors the Settings path.
-        // Some platforms deliver the main Focused(false) BEFORE the detached
-        // Focused(true), so set this now, before the window is created.
-        self.switching_to_detached = true;
+        // window receive Focused(false). No latch for it: that only SCHEDULES the
+        // auto-hide (`AUTOHIDE_GRACE_MS`), and the new window's Focused(true)
+        // cancels it, whichever comes first. A latch set here stayed set
+        // whenever the window manager did not focus the new window (focus-
+        // stealing prevention), and the next real focus loss then never hid
+        // the terminal.
 
         // Build the detached window with the same font settings as the main
         // window. On GPU/window init failure the constructor hands the tab back
@@ -4651,7 +4653,6 @@ impl App {
                 let at = idx.min(self.tabs.len());
                 self.tabs.insert(at, tab);
                 self.active = prev_active.min(self.tabs.len().saturating_sub(1));
-                self.switching_to_detached = false;
                 self.request_main_paint();
                 return;
             }
@@ -14780,10 +14781,9 @@ impl ApplicationHandler<AppEvent> for App {
                 self.main_occluded = false;
                 // A scheduled auto-hide is void: focus is back on us.
                 self.pending_autohide_at = None;
-                // Any pending "switching to a sibling window" latch is over too.
-                // Without this, a detach whose new window the WM never focused
-                // (focus-stealing prevention) would leave switching_to_detached
-                // stuck true and silently disable auto-hide.
+                // Any pending "switching to a sibling window" latch is over too:
+                // one left set (its window's focus loss never reported) would
+                // silently disable auto-hide.
                 self.switching_to_detached = false;
                 self.switching_to_settings = false;
                 // Clear any taskbar/dock urgency we raised on a command-finish
