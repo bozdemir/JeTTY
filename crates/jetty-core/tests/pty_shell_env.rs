@@ -4,9 +4,13 @@
 //! `$SHELL` in this process (one file = one process).
 #![cfg(target_os = "linux")]
 
+// Every shell here is `/bin/sh` in a scratch home — see `common`.
+mod common;
+
 use std::io::Write;
 use std::time::{Duration, Instant};
 
+use common::{spawn_sh, spawn_shell};
 use jetty_core::PtySession;
 
 fn read_until(pty: &PtySession, needle: &str) -> String {
@@ -40,7 +44,7 @@ fn shell_var(pty: &PtySession) -> String {
 fn shell_names_the_shell_that_runs() {
     // The login shell JeTTY was started with.
     std::env::set_var("SHELL", "/bin/bash");
-    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    let pty = spawn_sh(None);
     assert_eq!(shell_var(&pty), "/bin/sh", "`shell = \"/bin/sh\"`: $SHELL follows it");
 
     // Not a shell — e.g. a multiplexer, which would start itself in every
@@ -51,7 +55,7 @@ fn shell_names_the_shell_that_runs() {
     std::fs::write(&screen, "#!/bin/sh\nexec /bin/sh\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&screen, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let pty = PtySession::spawn(80, 24, 0, 0, Some(screen.display().to_string()), None, || {}).expect("spawn");
+    let pty = spawn_shell(&screen.display().to_string(), None, Vec::new()).expect("spawn");
     assert_eq!(shell_var(&pty), "/bin/bash", "a non-shell program leaves $SHELL alone");
     let _ = std::fs::remove_dir_all(&dir);
 }

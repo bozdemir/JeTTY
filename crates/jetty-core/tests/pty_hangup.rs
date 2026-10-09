@@ -3,7 +3,10 @@
 // (a freed pty index is reused by the next openpty).
 #![cfg(target_os = "linux")]
 
-use jetty_core::PtySession;
+// Every shell here is `/bin/sh` in a scratch home — see `common`.
+mod common;
+
+use common::spawn_sh;
 use std::time::{Duration, Instant};
 
 /// How many of this process's fds are a pty master for `/dev/pts/<index>`.
@@ -37,7 +40,7 @@ fn dropping_a_session_closes_every_master_fd_even_when_the_tty_stays_silent() {
     let before = threads();
     let pidfile = std::env::temp_dir().join(format!("jetty-pty-hangup-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
-    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    let pty = spawn_sh(None);
     {
         use std::io::Write;
         let mut w = pty.writer();

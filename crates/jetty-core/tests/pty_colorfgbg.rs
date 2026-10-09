@@ -2,8 +2,12 @@
 //! the terminal JeTTY itself was started from.
 #![cfg(unix)]
 
+// Every shell here is `/bin/sh` in a scratch home — see `common`.
+mod common;
+
 use std::time::{Duration, Instant};
 
+use common::{spawn_sh, spawn_shell, SH};
 use jetty_core::PtySession;
 
 fn read_until(pty: &PtySession, needle: &str) -> String {
@@ -39,20 +43,10 @@ fn shell_colorfgbg(pty: &PtySession) -> String {
 fn colorfgbg_is_jettys_own() {
     // This test binary's environment is its own (one file = one process).
     std::env::set_var("COLORFGBG", "7;0");
-    let plain = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    let plain = spawn_sh(None);
     assert_eq!(shell_colorfgbg(&plain), "unset", "the launching terminal's value must not leak");
 
     let light = jetty_core::contrast::colorfgbg([0xfd, 0xf6, 0xe3]);
-    let pty = PtySession::spawn_with_env(
-        80,
-        24,
-        0,
-        0,
-        Some("/bin/sh".into()),
-        None,
-        vec![("COLORFGBG".into(), light.into())],
-        || {},
-    )
-    .expect("spawn");
+    let pty = spawn_shell(SH, None, vec![("COLORFGBG".into(), light.into())]).expect("spawn");
     assert_eq!(shell_colorfgbg(&pty), "0;15");
 }

@@ -1,11 +1,13 @@
-// Test PTY echoing. Run with SHELL=/bin/cat if the default shell does not echo:
-//   SHELL=/bin/cat cargo test -p jetty-core --test pty
+// Every shell here is `/bin/sh` in a scratch home — see `common`.
+mod common;
+
+use common::{spawn_sh, spawn_shell, SH};
 use jetty_core::PtySession;
 use std::time::{Duration, Instant};
 
 #[test]
 fn pty_echoes_written_bytes() {
-    let pty = PtySession::spawn(80, 24, 0, 0, None, None, || {}).expect("spawn");
+    let pty = spawn_sh(None);
     {
         let mut w = pty.writer();
         // cooked PTY echoes typed input back; send a line.
@@ -31,7 +33,7 @@ fn child_exit_is_detected() {
     // When the shell exits (Ctrl+D / `exit`), the reader thread sees EOF on the
     // PTY master and must flag it so the app can close the window instead of
     // freezing on a dead shell. Drive that path by telling the shell to exit.
-    let pty = PtySession::spawn(80, 24, 0, 0, None, None, || {}).expect("spawn");
+    let pty = spawn_sh(None);
     {
         let mut w = pty.writer();
         use std::io::Write;
@@ -68,8 +70,7 @@ fn spawn_inherits_cwd() {
     let dir = unique_temp_dir("inherit");
     // macOS /tmp is a symlink to /private/tmp; compare canonicalized paths.
     let canon = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
-    let pty =
-        PtySession::spawn(80, 24, 0, 0, None, Some(dir.clone()), || {}).expect("spawn with cwd");
+    let pty = spawn_sh(Some(dir.clone()));
 
     // The spawned shell must report the requested cwd via PtySession::cwd().
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -113,8 +114,7 @@ fn spawn_with_vanished_cwd_falls_back() {
     let dir = unique_temp_dir("vanished");
     std::fs::remove_dir(&dir).expect("remove temp dir");
     // A vanished cwd must degrade to the default spawn dir, not fail the tab.
-    let pty =
-        PtySession::spawn(80, 24, 0, 0, None, Some(dir.clone()), || {}).expect("spawn must succeed");
+    let pty = spawn_shell(SH, Some(dir.clone()), Vec::new()).expect("spawn must succeed");
     std::thread::sleep(Duration::from_millis(300));
     while pty.try_recv_output().is_some() {}
     assert!(!pty.child_exited(), "shell died after spawn with a vanished cwd");
@@ -144,11 +144,10 @@ fn is_root() -> bool {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn spawn_without_cwd_starts_in_home() {
-    // No requested cwd → home (portable-pty's default), whatever directory the
-    // app itself was started from.
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
-    let Ok(home) = std::fs::canonicalize(home) else { return };
-    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    // No requested cwd → home (portable-pty's default: the shell's `$HOME`, here
+    // the scratch one), whatever directory the app itself was started from.
+    let home = std::fs::canonicalize(common::scratch_home()).expect("canonicalize the scratch home");
+    let pty = spawn_sh(None);
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut cwd = None;
     while Instant::now() < deadline {
@@ -176,7 +175,7 @@ fn unenterable_inherited_cwd_falls_back_with_a_notice() {
     // one): ESC/BEL/C1 that would write the clipboard and query the terminal.
     let dir = unique_temp_dir("locked\x1b]52;c;aGk=\x07\u{9b}6n\x1b[c");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let res = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), Some(dir.clone()), || {});
+    let res = spawn_shell(SH, Some(dir.clone()), Vec::new());
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let _ = std::fs::remove_dir(&dir);
     let pty = res.expect("spawn must fall back instead of failing the tab");
@@ -202,6 +201,25 @@ fn unenterable_inherited_cwd_falls_back_with_a_notice() {
 
 #[cfg(unix)]
 #[test]
+fn test_shells_never_read_the_developers_startup_files() {
+    // `common`'s guard: an interactive `sh` runs the file `$ENV` names (a macOS
+    // login `sh` also `~/.profile`) — the developer's, in their environment.
+    let rc = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("pty-developer-env.sh");
+    std::fs::write(&rc, "echo DEVELOPER-RC-RAN\n").unwrap();
+    std::env::set_var("ENV", &rc);
+    let pty = spawn_sh(None);
+    {
+        use std::io::Write;
+        pty.writer().write_all(b"echo \"HOME=[$HOME]\"; echo RC-DONE\n").unwrap();
+    }
+    let out = read_until(&pty, "\nRC-DONE");
+    assert!(!out.contains("DEVELOPER-RC-RAN"), "the shell ran the developer's $ENV file:\n{out}");
+    let home = common::scratch_home().display().to_string();
+    assert!(out.contains(&format!("HOME=[{home}]")), "the shell's home is the scratch one:\n{out}");
+}
+
+#[cfg(unix)]
+#[test]
 fn launch_environment_identity_does_not_leak_into_shells() {
     // Activation tokens, the AppImage runtime and another terminal's identity in
     // JeTTY's own environment must not reach its shells. (Process env is shared
@@ -216,7 +234,7 @@ fn launch_environment_identity_does_not_leak_into_shells() {
     ] {
         std::env::set_var(k, v);
     }
-    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    let pty = spawn_sh(None);
     {
         use std::io::Write;
         let mut w = pty.writer();
@@ -239,7 +257,7 @@ fn variables_jetty_set_for_itself_stay_out_of_shells() {
     std::env::set_var("JETTY_TEST_HIDDEN_FROM_SHELLS", "*nvidia_icd*");
     std::env::set_var("JETTY_TEST_PASSED_TO_SHELLS", "kept");
     jetty_core::hide_from_shells("JETTY_TEST_HIDDEN_FROM_SHELLS");
-    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    let pty = spawn_sh(None);
     {
         use std::io::Write;
         let mut w = pty.writer();
@@ -255,7 +273,7 @@ fn variables_jetty_set_for_itself_stay_out_of_shells() {
 
 #[test]
 fn cwd_none_after_exit() {
-    let pty = PtySession::spawn(80, 24, 0, 0, None, None, || {}).expect("spawn");
+    let pty = spawn_sh(None);
     {
         let mut w = pty.writer();
         use std::io::Write;
@@ -284,8 +302,7 @@ fn title_cwd_and_foreground_name_follow_the_shell() {
     // its name is reported.
     let dir = unique_temp_dir("title");
     let canon = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
-    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".to_string()), Some(dir.clone()), || {})
-        .expect("spawn sh");
+    let pty = spawn_sh(Some(dir.clone()));
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut cwd_ok = false;
     while Instant::now() < deadline {
@@ -339,8 +356,10 @@ fn wait_exited(pty: &PtySession) -> bool {
 fn a_shell_that_dies_right_after_starting_hands_over_to_the_next_one() {
     // `shell = "/bin/false"` — or a zsh whose rc file exits 1 — spawns fine,
     // then dies at once, and the app used to vanish with its last tab. The
-    // next candidate takes over in the same terminal, saying why.
-    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/false".into()), None, || {}).expect("spawn");
+    // next candidate takes over in the same terminal, saying why. That is
+    // `$SHELL`: `sh` here, never the developer's own shell.
+    std::env::set_var("SHELL", SH);
+    let pty = spawn_shell("/bin/false", None, Vec::new()).expect("spawn");
     assert!(wait_exited(&pty), "premise: /bin/false exits");
     let next = pty.respawn_after_failed_start().expect("a failed start").expect("the next shell spawns");
     let notices = next.startup_notices();
@@ -359,7 +378,7 @@ fn a_shell_that_dies_right_after_starting_hands_over_to_the_next_one() {
 #[test]
 fn a_clean_exit_is_not_a_failed_start() {
     // `exit` / Ctrl+D at once is the user closing the tab, not a broken shell.
-    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    let pty = spawn_sh(None);
     {
         use std::io::Write;
         pty.writer().write_all(b"exit\n").unwrap();
@@ -375,7 +394,7 @@ fn a_paste_past_the_reply_cap_still_arrives_whole() {
     // asking without reading its input); it also swallowed any paste past it
     // — nothing reached the program and nothing said so.
     const N: usize = 64 * 1024 * 1024 + 4096;
-    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    let pty = spawn_sh(None);
     {
         use std::io::Write;
         // The echoed command line shows `READ''Y`; only the output says READY.
