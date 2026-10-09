@@ -23,13 +23,26 @@ use crate::config::BackdropConfig;
 /// Fallback monitor size for the decode downscale when no monitor is known.
 pub(crate) const FALLBACK_MONITOR: (u32, u32) = (3840, 2160);
 
+/// The size the image is decoded to cover ([`ImageKey::max`]): the largest
+/// width and the largest height among the connected `monitors` (physical px),
+/// so one texture serves every screen — a window dragged to a bigger monitor,
+/// or a detached window on one, never shows an upscaled (blurred) image.
+/// [`FALLBACK_MONITOR`] when none is known.
+pub(crate) fn cover_size(monitors: impl IntoIterator<Item = (u32, u32)>) -> (u32, u32) {
+    monitors
+        .into_iter()
+        .filter(|&(w, h)| w > 0 && h > 0)
+        .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)))
+        .unwrap_or(FALLBACK_MONITOR)
+}
+
 /// What a decode was asked for — any change re-decodes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImageKey {
     pub path: PathBuf,
     /// `blur` in thousandths (the decode bakes the blur in).
     pub blur_q: u16,
-    /// The monitor size the image is downscaled to cover.
+    /// The size the image is downscaled to cover ([`cover_size`]).
     pub max: (u32, u32),
     /// The file's size and modification time when asked (`None`: unreadable):
     /// new contents at the same path — a fixed broken file, a replaced
@@ -169,8 +182,9 @@ impl BackdropState {
     /// same image is already shown / loading / decoded / known broken. One
     /// decode at a time: a request made while one is in flight (a slider being
     /// dragged) waits — the app re-syncs when the decode lands, so only the
-    /// latest request is decoded next. `max` (the monitor size, an X11
-    /// round-trip) is only asked for when an image is wanted.
+    /// latest request is decoded next. `max` (the size to cover:
+    /// [`cover_size`] of the monitors) is only asked for when an image is
+    /// wanted.
     pub fn sync_image(
         &mut self,
         config_dir: &Path,
@@ -364,6 +378,20 @@ mod tests {
             2,
             0.0,
         ))
+    }
+
+    /// One decode covers every connected monitor: a 1080p laptop panel next
+    /// to a 4K screen decodes for 4K (the window may be dragged there), a
+    /// portrait screen adds its height.
+    #[test]
+    fn the_decode_covers_the_largest_monitor() {
+        assert_eq!(cover_size([(1920, 1080), (3840, 2160)]), (3840, 2160));
+        assert_eq!(cover_size([(3840, 2160), (1920, 1080)]), (3840, 2160));
+        assert_eq!(cover_size([(2560, 1440), (1080, 1920)]), (2560, 1920));
+        assert_eq!(cover_size([(1920, 1200)]), (1920, 1200));
+        // Nothing known (or only empty sizes): the fallback.
+        assert_eq!(cover_size([]), FALLBACK_MONITOR);
+        assert_eq!(cover_size([(0, 0)]), FALLBACK_MONITOR);
     }
 
     #[test]

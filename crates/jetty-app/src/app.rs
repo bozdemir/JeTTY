@@ -3709,19 +3709,17 @@ impl App {
     }
 
     /// Bring the backdrop image in line with `[backdrop]`: start a decode on a
-    /// worker thread for a newly named file (scaled to cover the window's
-    /// monitor), drop the texture when no image is wanted. Cheap no-op when
-    /// nothing changed — called on startup (`resumed`), reload, a settings
-    /// change and a GPU rebuild.
+    /// worker thread for a newly named file (scaled to cover the largest
+    /// connected monitor), drop the texture when no image is wanted. Cheap
+    /// no-op when nothing changed — called on startup (`resumed`), reload, a
+    /// settings change, a GPU rebuild, and when the window moves (a monitor
+    /// plugged in since is then covered too).
     fn sync_backdrop_image(&mut self) {
         let window = self.window.clone();
         let max = move || {
-            window
-                .as_ref()
-                .and_then(|w| w.current_monitor())
-                .map(|m| (m.size().width, m.size().height))
-                .filter(|&(w, h)| w > 0 && h > 0)
-                .unwrap_or(crate::backdrop::FALLBACK_MONITOR)
+            crate::backdrop::cover_size(
+                window.iter().flat_map(|w| w.available_monitors()).map(|m| (m.size().width, m.size().height)),
+            )
         };
         // First show a decode that landed (also one that arrived while no GPU
         // existed — startup race, a device rebuild), then start whatever the
@@ -14141,6 +14139,9 @@ impl ApplicationHandler<AppEvent> for App {
                 self.top_flush_dirty = true;
                 // The window may now be on a monitor with another refresh rate.
                 self.refresh_frame_interval();
+                // …or on a bigger one plugged in since the backdrop image was
+                // decoded (a no-op unless the monitors changed).
+                self.sync_backdrop_image();
             }
             WindowEvent::Resized(size) => {
                 self.top_flush_dirty = true;
@@ -14197,6 +14198,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // grid against the real surface size.
                 self.top_flush_dirty = true;
                 self.refresh_frame_interval();
+                // A monitor change: the backdrop image may need a bigger decode.
+                self.sync_backdrop_image();
                 let scale = scale_factor as f32;
                 // Re-scale the font IN-PLACE (reusing the FontSystem) rather than
                 // rebuilding the TextLayers — a DPI change must not rescan
