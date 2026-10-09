@@ -287,8 +287,9 @@ enum LockAttempt {
     /// The lock file exists but another (live) process holds the lock.
     Held,
     /// The lock file could not even be opened/created (stale `XDG_RUNTIME_DIR`
-    /// pointing at a removed path, a read-only or foreign-owned dir). This is a
-    /// permanent error for this launch — there is nothing to wait for.
+    /// pointing at a removed path, a read-only or foreign-owned dir), or the
+    /// filesystem can't lock it (ENOLCK). This is a permanent error for this
+    /// launch — there is nothing to wait for.
     Unavailable,
 }
 
@@ -305,9 +306,20 @@ fn try_acquire_primary_lock(lock_path: &str) -> LockAttempt {
         // spin the full 2 s retry loop before the first window appeared (F34).
         Err(_) => return LockAttempt::Unavailable,
     };
-    match f.try_lock() {
+    let locked = f.try_lock();
+    lock_outcome(f, locked)
+}
+
+/// What `try_lock` on the lock file `f` came to. Only contention means a live
+/// peer holds it: a real error (ENOLCK on an NFS home without lockd, say — the
+/// lock lives under ~/.cache/jetty when `XDG_RUNTIME_DIR` is unset) never
+/// clears, so it degrades to the lockless bind at once like an open() failure,
+/// instead of spinning the 2 s loop and refusing to start with no instance.
+fn lock_outcome(f: std::fs::File, locked: Result<(), std::fs::TryLockError>) -> LockAttempt {
+    match locked {
         Ok(()) => LockAttempt::Acquired(f),
-        Err(_) => LockAttempt::Held,
+        Err(std::fs::TryLockError::WouldBlock) => LockAttempt::Held,
+        Err(std::fs::TryLockError::Error(_)) => LockAttempt::Unavailable,
     }
 }
 
@@ -658,6 +670,24 @@ mod primary_lock_tests {
         let path = tmp_lock_path("leftover");
         std::fs::write(&path, b"").unwrap();
         assert!(matches!(try_acquire_primary_lock(&path), LockAttempt::Acquired(_)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn only_contention_counts_as_held() {
+        use super::lock_outcome;
+        use std::fs::TryLockError;
+        let path = tmp_lock_path("outcome");
+        let file = || std::fs::File::create(&path).unwrap();
+        assert!(matches!(lock_outcome(file(), Ok(())), LockAttempt::Acquired(_)));
+        assert!(matches!(lock_outcome(file(), Err(TryLockError::WouldBlock)), LockAttempt::Held));
+        // ENOLCK (an NFS home without lockd) is no live peer: waiting can't
+        // help, so it degrades at once instead of refusing to start 2 s later.
+        let enolck = std::io::Error::from_raw_os_error(37);
+        assert!(matches!(
+            lock_outcome(file(), Err(TryLockError::Error(enolck))),
+            LockAttempt::Unavailable
+        ));
         let _ = std::fs::remove_file(&path);
     }
 
