@@ -1,7 +1,8 @@
 //! Config checks that turn silent fallbacks into warnings a user can act on:
 //! unknown keys and invalid values with the closest valid spelling ("did you
 //! mean …?"), enum-like strings checked against the parsers the app reads them
-//! with (any letter case is accepted), and numbers outside their range.
+//! with (any letter case is accepted), numbers outside their range, and font
+//! families that are not installed.
 //!
 //! Each check takes its knowledge from the code it guards, so none of it can
 //! drift from what JeTTY accepts: the key lists come from the config structs
@@ -566,6 +567,86 @@ pub(super) fn range_warnings(
     }
 }
 
+// ── Font families ────────────────────────────────────────────────────────────
+
+/// The family a window renders with for a configured one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FontPick {
+    /// What to render with: the configured family in its installed spelling,
+    /// or a fallback when it is not installed.
+    pub shown: String,
+    /// Why the configured family is not what is shown, for the user.
+    pub warning: Option<String>,
+}
+
+/// `want` in its installed spelling, matched case-insensitively.
+fn installed<'a>(want: &str, families: &'a [String]) -> Option<&'a String> {
+    families.iter().find(|f| *f == want).or_else(|| families.iter().find(|f| f.eq_ignore_ascii_case(want.trim())))
+}
+
+/// The installed family closest to `want`: its abbreviation (`JetBrains
+/// Mono` → `JetBrainsMono Nerd Font`, the shortest such), else a near spelling.
+fn similar_family<'a>(want: &str, families: &'a [String]) -> Option<&'a str> {
+    let w = squash(want);
+    if w.len() >= 3 {
+        let prefixed = families.iter().filter(|f| squash(f).starts_with(&w)).min_by_key(|f| f.len());
+        if let Some(f) = prefixed {
+            return Some(f);
+        }
+    }
+    let refs: Vec<&str> = families.iter().map(String::as_str).collect();
+    closest(want, &refs)
+}
+
+/// `font_family = want` against the installed fonts: `mono`, the monospace
+/// families (what Settings lists), and — asked only when `want` is not one of
+/// them — `others`, every other installed family (an installed font is the
+/// user's choice and is used). A family that is not installed at all — or an
+/// empty name — falls back to "MesloLGS NF" when that is installed, else the
+/// first monospace family: rendering with the missing name would leave the
+/// grid to the font engine's own fallback, which need not be monospace at
+/// all. Names match in any letter case and are shown in their installed
+/// spelling. With nothing installed to compare with, `want` stays.
+pub(crate) fn pick_font_family(want: &str, mono: &[String], others: impl FnOnce() -> Vec<String>) -> FontPick {
+    if let Some(f) = installed(want, mono) {
+        return FontPick { shown: f.clone(), warning: None };
+    }
+    if mono.is_empty() {
+        return FontPick { shown: want.to_string(), warning: None };
+    }
+    let others = others();
+    if let Some(f) = installed(want, &others) {
+        return FontPick { shown: f.clone(), warning: None };
+    }
+    let fallback = installed(super::default_font_family().as_str(), mono).unwrap_or(&mono[0]).clone();
+    let warning = (!want.trim().is_empty()).then(|| {
+        let hint = similar_family(want, mono).map(|f| format!(" — did you mean {f:?}?")).unwrap_or_default();
+        format!("font_family {want:?} is not installed{hint} — showing {fallback:?} until it is")
+    });
+    FontPick { shown: fallback, warning }
+}
+
+/// `ui_font_family = want`: `""` is the platform sans; an installed family —
+/// of any kind, a monospace chrome is a choice too — is used in its installed
+/// spelling; one that is not installed falls back to the sans, with a warning.
+pub(crate) fn pick_ui_font_family(want: &str, families: impl FnOnce() -> Vec<String>) -> FontPick {
+    if want.trim().is_empty() {
+        return FontPick { shown: String::new(), warning: None };
+    }
+    let families = families();
+    if let Some(f) = installed(want, &families) {
+        return FontPick { shown: f.clone(), warning: None };
+    }
+    if families.is_empty() {
+        return FontPick { shown: want.to_string(), warning: None };
+    }
+    let hint = similar_family(want, &families).map(|f| format!(" — did you mean {f:?}?")).unwrap_or_default();
+    FontPick {
+        shown: String::new(),
+        warning: Some(format!("ui_font_family {want:?} is not installed{hint} — showing the system sans until it is")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,5 +738,47 @@ mod tests {
         assert_eq!(variant_hint(msg), " — did you mean `amber`?");
         assert_eq!(variant_hint("unknown variant `zzzz`, expected one of `off`, `amber`"), "");
         assert_eq!(variant_hint("invalid type: string, expected f32"), "");
+    }
+
+    fn fams(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_font_that_is_not_installed_falls_back_visibly() {
+        let mono = fams(&["DejaVu Sans Mono", "JetBrainsMono Nerd Font", "JetBrainsMono Nerd Font Mono", "MesloLGS NF"]);
+        let none = Vec::new;
+        // Installed: used as is, or in its installed spelling.
+        assert_eq!(pick_font_family("MesloLGS NF", &mono, none), FontPick { shown: "MesloLGS NF".into(), warning: None });
+        assert_eq!(pick_font_family("meslolgs nf", &mono, none).shown, "MesloLGS NF");
+        // An installed font that is not monospace is still the user's choice.
+        let p = pick_font_family("Inter", &mono, || fams(&["Inter", "Noto Sans"]));
+        assert_eq!(p, FontPick { shown: "Inter".into(), warning: None });
+        // Missing: the default family, with a warning naming the close one.
+        let p = pick_font_family("JetBrains Mono", &mono, none);
+        assert_eq!(p.shown, "MesloLGS NF");
+        let w = p.warning.unwrap();
+        assert!(w.contains("\"JetBrains Mono\" is not installed"), "{w}");
+        assert!(w.contains("did you mean \"JetBrainsMono Nerd Font\"?"), "{w}");
+        assert!(w.contains("showing \"MesloLGS NF\""), "{w}");
+        // Without MesloLGS NF, the first monospace family.
+        let p = pick_font_family("MesloLGS NF", &fams(&["DejaVu Sans Mono", "Hack"]), none);
+        assert_eq!(p.shown, "DejaVu Sans Mono");
+        assert!(p.warning.unwrap().contains("not installed"));
+        // An empty name is the fallback, silently; nothing to compare with keeps it.
+        assert_eq!(pick_font_family("", &mono, none), FontPick { shown: "MesloLGS NF".into(), warning: None });
+        assert_eq!(pick_font_family("X", &[], none).shown, "X");
+    }
+
+    #[test]
+    fn a_ui_font_that_is_not_installed_falls_back_to_the_sans() {
+        let all = || fams(&["Inter", "Noto Sans", "JetBrains Mono"]);
+        assert_eq!(pick_ui_font_family("", all), FontPick { shown: String::new(), warning: None });
+        assert_eq!(pick_ui_font_family("inter", all).shown, "Inter");
+        assert_eq!(pick_ui_font_family("JetBrains Mono", all).shown, "JetBrains Mono", "a mono chrome is a choice");
+        let p = pick_ui_font_family("Interr", all);
+        assert_eq!(p.shown, "");
+        let w = p.warning.unwrap();
+        assert!(w.contains("\"Interr\" is not installed — did you mean \"Inter\"?"), "{w}");
     }
 }

@@ -2930,7 +2930,7 @@ impl App {
         // Compared with the CHOSEN family: a missing one shows a fallback, which
         // an unrelated reload must not flip back to the missing name.
         if cfg.font_family != self.font_family_chosen {
-            self.set_font_family(cfg.font_family.clone());
+            warnings.extend(self.set_font_family(cfg.font_family.clone()));
         }
         // UI (chrome) font size / family.
         let ufs = cfg.ui_font_size.clamp(UI_FONT_MIN, UI_FONT_MAX);
@@ -2938,7 +2938,7 @@ impl App {
             self.set_ui_font_size(ufs);
         }
         if cfg.ui_font_family != self.ui_font_family_chosen {
-            self.set_ui_font_family(cfg.ui_font_family.clone());
+            warnings.extend(self.set_ui_font_family(cfg.ui_font_family.clone()));
         }
         // Corner radius.
         let cr = cfg.corner_radius.clamp(0.0, 24.0);
@@ -7919,11 +7919,19 @@ impl App {
         self.mark_dirty_all();
     }
 
-    /// Change the font family at runtime. Updates `font_family`, tells the
-    /// TextLayer to remeasure, then reflows and requests a redraw.
-    fn set_font_family(&mut self, name: String) {
-        self.font_family_chosen = name.clone();
-        self.font_family = name;
+    /// Change the font family at runtime. `name` is the user's choice (what is
+    /// saved); the grid shows it — or, when it is not installed, the fallback
+    /// `check::pick_font_family` names, reported in the returned warning (an
+    /// unvalidated name left the grid to the font engine's fallback, often not
+    /// monospace). Tells the TextLayer to remeasure, then reflows and requests a
+    /// redraw.
+    fn set_font_family(&mut self, name: String) -> Option<String> {
+        let text = self.text.as_ref();
+        let pick = crate::config::check::pick_font_family(&name, &self.font_families, || {
+            text.map(TextLayer::proportional_families).unwrap_or_default()
+        });
+        self.font_family_chosen = name;
+        self.font_family = pick.shown;
         if let Some(text) = &mut self.text {
             text.set_font_family(&self.font_family);
         }
@@ -7943,6 +7951,7 @@ impl App {
         self.reflow();
         self.persist();
         self.mark_dirty_all();
+        pick.warning
     }
 
     /// Change the UI (chrome) font SIZE at runtime, clamped [10, 28]. Resizes the
@@ -8003,13 +8012,18 @@ impl App {
     }
 
     /// Change the UI (chrome) font FAMILY at runtime. `""` selects the platform
-    /// proportional sans. Swaps the chrome + settings layers' `ui_family` via the
-    /// no-rescan `set_ui_family` (the chrome FontSystem already holds every
-    /// installed family). Does NOT reflow the grid/PTY (chrome family is
-    /// orthogonal to cols/rows), so the hot/idle paths are untouched.
-    fn set_ui_font_family(&mut self, name: String) {
-        self.ui_font_family_chosen = name.clone();
-        self.ui_font_family = name;
+    /// proportional sans, and so does a family that is not installed (shown
+    /// only; `name` is kept and saved) — reported in the returned warning. Swaps
+    /// the chrome + settings layers' `ui_family` via the no-rescan
+    /// `set_ui_family` (the chrome FontSystem already holds every installed
+    /// family). Does NOT reflow the grid/PTY (chrome family is orthogonal to
+    /// cols/rows), so the hot/idle paths are untouched.
+    fn set_ui_font_family(&mut self, name: String) -> Option<String> {
+        let pick = crate::config::check::pick_ui_font_family(&name, || {
+            self.ui_font_families.iter().skip(1).chain(&self.font_families).cloned().collect()
+        });
+        self.ui_font_family_chosen = name;
+        self.ui_font_family = pick.shown;
         let fam = if self.ui_font_family.is_empty() {
             None
         } else {
@@ -8036,6 +8050,7 @@ impl App {
         self.resize_settings_to_fit();
         self.render_settings_window();
         self.request_settings_paint();
+        pick.warning
     }
 
     /// Perform the Yakuake-style focus-loss auto-hide of the main window.
@@ -12002,6 +12017,24 @@ impl ApplicationHandler<AppEvent> for App {
                 &g.device, &g.queue, g.format, self.font_logical * scale, &self.font_family,
                 font_system,
             );
+            // The configured family must be installed — a missing one (the
+            // default "MesloLGS NF" on a machine without it, a dotfiles config
+            // from another machine) left the grid to the font engine's own
+            // fallback, which need not be monospace. Shown only: the chosen
+            // family is kept (and saved) for when it is installed again.
+            self.font_families = text.monospace_families();
+            eprintln!("jetty: found {} monospace families", self.font_families.len());
+            let pick = crate::config::check::pick_font_family(&self.font_family, &self.font_families, || {
+                text.proportional_families()
+            });
+            if pick.shown != self.font_family {
+                text.set_font_family(&pick.shown);
+                self.font_family = pick.shown;
+            }
+            if let Some(w) = pick.warning {
+                eprintln!("jetty: {w}");
+                self.startup_warnings.push(w);
+            }
             text.set_line_height(self.line_height);
             let (cw, ch) = text.cell_size();
             // Derive the grid from the physical pixel size and the physical cell
@@ -12014,35 +12047,6 @@ impl ApplicationHandler<AppEvent> for App {
         } else {
             (None, None, FALLBACK_COLS, FALLBACK_ROWS)
         };
-        // Populate the cached font family list from the new TextLayer.
-        if let Some(ref t) = text {
-            self.font_families = t.monospace_families();
-            eprintln!("jetty: found {} monospace families", self.font_families.len());
-
-            // Validate the persisted font family: if it's empty or no longer
-            // present among the enumerated monospace families (e.g. the user
-            // uninstalled it), fall back to the default ("MesloLGS NF" when
-            // available, otherwise the first family) and log the substitution.
-            let valid = !self.font_family.is_empty()
-                && self.font_families.iter().any(|f| f == &self.font_family);
-            if !valid {
-                let fallback = if self.font_families.iter().any(|f| f == "MesloLGS NF") {
-                    "MesloLGS NF".to_string()
-                } else {
-                    self.font_families.first().cloned().unwrap_or_default()
-                };
-                if !fallback.is_empty() {
-                    eprintln!(
-                        "jetty: configured font family {:?} not found; falling back to {:?}",
-                        self.font_family, fallback
-                    );
-                    // Shown only: `font_family_chosen` (what is saved) keeps the
-                    // user's choice for when the font is installed again.
-                    self.font_family = fallback;
-                }
-            }
-        }
-
         // Build the rounded-corner mask (final fullscreen pass) for the borderless
         // main window, using the same surface format as the rest of the pipeline.
         if let Some(ref g) = gpu {
@@ -12090,18 +12094,17 @@ impl ApplicationHandler<AppEvent> for App {
                 "jetty: found {} proportional UI families",
                 self.ui_font_families.len().saturating_sub(1)
             );
-            // Validate the persisted UI family: a non-empty family that is no
-            // longer installed falls back to "" (platform sans) so a removed font
-            // never leaves blank chrome.
-            if !self.ui_font_family.is_empty()
-                && !self.ui_font_families.iter().any(|f| f == &self.ui_font_family)
-            {
-                eprintln!(
-                    "jetty: configured UI font {:?} not found; falling back to system sans",
-                    self.ui_font_family
-                );
-                // Shown only — `ui_font_family_chosen` keeps (and saves) the choice.
-                self.ui_font_family.clear();
+            // Validate the persisted UI family: a non-empty family that is not
+            // installed falls back to "" (platform sans) so a removed font never
+            // leaves blank chrome — and says so. Shown only:
+            // `ui_font_family_chosen` keeps (and saves) the choice.
+            let pick = crate::config::check::pick_ui_font_family(&self.ui_font_family, || {
+                self.ui_font_families[1..].iter().chain(&self.font_families).cloned().collect()
+            });
+            self.ui_font_family = pick.shown;
+            if let Some(w) = pick.warning {
+                eprintln!("jetty: {w}");
+                self.startup_warnings.push(w);
             }
             // Apply the (validated) UI family to the chrome layer (no rescan).
             chrome.set_ui_family(if self.ui_font_family.is_empty() {

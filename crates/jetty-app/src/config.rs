@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 /// Checks that make problems visible: unknown keys and invalid values with the
-/// closest valid spelling, enum values read by the app's own parsers, ranges.
+/// closest valid spelling, enum values read by the app's own parsers, ranges,
+/// fonts that are not installed.
 pub(crate) mod check;
 
 /// The persisted user settings. Field names are the TOML keys.
