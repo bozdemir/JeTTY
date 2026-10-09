@@ -161,7 +161,9 @@ pub fn build_command_palette(
     let shown_query = fit_tail(m, query, query_budget, false);
 
     let input_text = if query.is_empty() {
-        format!("{PROMPT}Type a command…")
+        // The placeholder fits the same budget: in a narrow box it ran into
+        // the counter.
+        format!("{PROMPT}{}", fit_head(m, "Type a command…", query_budget, false))
     } else {
         format!("{PROMPT}{shown_query}")
     };
@@ -474,6 +476,21 @@ mod tests {
         let p = build_command_palette(100, 700, &theme(), &mut mono(), CM, "", &rows, 1, 0);
         assert!(!p.labels.iter().any(|l| l.0 == "⇧⌃D"), "no room: no hint");
         assert!(p.labels.iter().any(|l| l.0.starts_with('D')), "the title keeps the row");
+    }
+
+    /// The empty query's placeholder fits before the counter in a narrow box
+    /// (it was drawn whole and ran into "218 results").
+    #[test]
+    fn the_placeholder_never_runs_into_the_counter() {
+        let titles = vec!["New tab".to_string()];
+        let rows = sample_rows(&titles, 0);
+        for w in [240u32, 300, 450, 1000] {
+            let p = build_command_palette(w, 700, &theme(), &mut mono(), CM, "", &rows, 218, 0);
+            let input = p.labels.iter().find(|l| l.0.starts_with("> ")).expect("input label");
+            let counter = p.labels.iter().find(|l| l.0 == "218 results").expect("counter");
+            let input_right = input.1 + mono().text_w(&input.0);
+            assert!(input_right <= counter.1, "{w}: placeholder {:?} ends at {input_right} > {}", input.0, counter.1);
+        }
     }
 
     #[test]
