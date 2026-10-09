@@ -2447,6 +2447,7 @@ fn shot_bar_opts() -> jetty_render::TabBarOpts {
         opaque: !env_flag("JETTY_SHOT_TAB_BAR_OPACITY"),
         progress: std::env::var("JETTY_SHOT_PROGRESS_BAR").map(|v| v != "0").unwrap_or(true),
         bottom: false,
+        first: 0,
     }
 }
 

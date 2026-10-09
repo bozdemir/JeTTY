@@ -250,6 +250,10 @@ pub struct TabBarOpts {
     /// The bar sits at the window BOTTOM: marks that face the grid (the
     /// underline, the progress hairline) move to the bar's top edge.
     pub bottom: bool,
+    /// The first tab drawn when they don't all fit — the last layout's
+    /// [`TabBar::first`], so the strip stays put until the active tab must
+    /// come into view ([`overflow_start`]). 0 = the head.
+    pub first: usize,
 }
 
 impl Default for TabBarOpts {
@@ -261,6 +265,7 @@ impl Default for TabBarOpts {
             opaque: true,
             progress: true,
             bottom: false,
+            first: 0,
         }
     }
 }
@@ -303,6 +308,21 @@ pub struct TabBar {
     pub max_rect: Rect,
     /// Hit-test rect for the close "✕" window control (rightmost).
     pub close_rect: Rect,
+    /// The first tab drawn (0 while they all fit): pass it back as
+    /// [`TabBarOpts::first`] so the next layout keeps the strip where it is.
+    pub first: usize,
+}
+
+/// Where the drawn window over `len` tabs starts when only `drawn` fit: at
+/// `first` — the last layout's — while the `active` tab is inside it, else
+/// the nearest start that brings it in (a browser's "ensure visible").
+/// Derived from the active tab alone, the window moved whenever a click
+/// activated a drawn tab left of the drawn width: the strip jumped under the
+/// pointer, and the drag that press armed reordered the tab.
+pub fn overflow_start(first: usize, active: usize, drawn: usize, len: usize) -> usize {
+    let lo = (active + 1).saturating_sub(drawn);
+    let hi = active.min(len.saturating_sub(drawn));
+    first.clamp(lo, hi.max(lo))
 }
 
 /// Build the tab bar across the top of the window at the design baseline (1×,
@@ -896,18 +916,14 @@ pub fn build_tab_bar_styled(
     let drawn = tabs.len().min(max_visible);
     let overflow = tabs.len().saturating_sub(drawn);
 
-    // Window the drawn range around the ACTIVE tab so it is ALWAYS visible — the
-    // overflow window is not fixed to the head of the list. If the active index is
-    // beyond the head window, slide the window so the active tab sits at its right
-    // edge. Hit-rects stay index-aligned with ABSOLUTE tab indices (tabs outside
-    // the window get an offscreen sentinel) because the app maps a clicked rect's
-    // position straight to a tab index.
+    // Window the drawn range so the ACTIVE tab is ALWAYS visible — the overflow
+    // window is not fixed to the head of the list: it stays where the last
+    // layout had it (`opts.first`) and slides only as far as brings the active
+    // tab in (`overflow_start`). Hit-rects stay index-aligned with ABSOLUTE tab
+    // indices (tabs outside the window get an offscreen sentinel) because the
+    // app maps a clicked rect's position straight to a tab index.
     let active_idx = tabs.iter().position(|(_, a)| *a).unwrap_or(0);
-    let start = if active_idx >= drawn {
-        (active_idx + 1 - drawn).min(tabs.len().saturating_sub(drawn))
-    } else {
-        0
-    };
+    let start = overflow_start(opts.first, active_idx, drawn, tabs.len());
 
     let title_pad = cm.px(sm.title_pad); // left inset of the title inside a tab
 
@@ -1088,7 +1104,7 @@ pub fn build_tab_bar_styled(
 
     TabBar {
         quads, labels, title_labels, tab_rects, close_rects, plus_rect,
-        help_rect, settings_rect, min_rect, max_rect, close_rect,
+        help_rect, settings_rect, min_rect, max_rect, close_rect, first: start,
     }
 }
 
@@ -1303,6 +1319,39 @@ mod tests {
         // A head tab that scrolled out of the window is parked offscreen so it
         // can't be clicked to a wrong index.
         assert!(bar.tab_rects[0].x < 0.0, "scrolled-out head tab should be offscreen");
+    }
+
+    #[test]
+    fn the_overflow_window_moves_only_to_bring_the_active_tab_into_view() {
+        // 15 tabs, 12 drawn: the active last tab puts the window at 3..15.
+        assert_eq!(overflow_start(0, 14, 12, 15), 3);
+        // Clicking the leftmost drawn tab (3) keeps the window — deriving it
+        // from the active tab alone jumped it to 0..12 under the pointer.
+        assert_eq!(overflow_start(3, 3, 12, 15), 3);
+        assert_eq!(overflow_start(3, 9, 12, 15), 3);
+        // An active tab outside the window scrolls it just enough.
+        assert_eq!(overflow_start(3, 1, 12, 15), 1);
+        assert_eq!(overflow_start(0, 13, 12, 15), 2);
+        // A start past the last full window, or tabs that all fit: clamped.
+        assert_eq!(overflow_start(9, 14, 12, 15), 3);
+        assert_eq!(overflow_start(4, 2, 5, 5), 0);
+        assert_eq!(overflow_start(0, 0, 1, 1), 0);
+    }
+
+    #[test]
+    fn an_overflowed_strip_stays_put_when_a_drawn_tab_is_activated() {
+        // 1000 px Pill at 1×: 12 of 15 tabs are drawn.
+        let tabs = |active: usize| -> Vec<(String, bool)> { (0..15).map(|i| (format!("{i}"), i == active)).collect() };
+        let at_end = styled(1000, &tabs(14), &[], &TabBarOpts::default());
+        assert_eq!(at_end.first, 3, "the window ends at the active last tab");
+        assert!(at_end.tab_rects[2].w == 0.0 && at_end.tab_rects[3].w > 0.0);
+        // Tab 3 (leftmost drawn) becomes active: with the window passed back
+        // it stays where it was drawn, so the press's tab is still under it.
+        let clicked = styled(1000, &tabs(3), &[], &TabBarOpts { first: at_end.first, ..TabBarOpts::default() });
+        assert_eq!(clicked.first, 3);
+        assert!(same_rect(&clicked.tab_rects[3], &at_end.tab_rects[3]));
+        // The default (no window kept) is the head, as before.
+        assert_eq!(styled(1000, &tabs(3), &[], &TabBarOpts::default()).first, 0);
     }
 
     #[test]

@@ -1473,10 +1473,10 @@ pub struct App {
     renaming: Option<TabId>,
     /// The edit buffer for the in-progress rename (committed/discarded on Enter/Esc).
     rename_buf: String,
-    /// Time, physical-pixel position and target of the last left press on the
-    /// top strip, used to detect double-clicks (window maximize / enter-rename)
-    /// — `None` after a press on a window control, "+" or a close "×".
-    last_strip_click: Option<(std::time::Instant, f32, f32, StripTarget)>,
+    /// The last left press on the top strip, to detect double-clicks (window
+    /// maximize / enter-rename) — `None` after a press on a window control,
+    /// "+" or a close "×" (`tabstrip::press`).
+    last_strip_click: Option<crate::tabstrip::StripClick>,
     /// The resize cursor currently applied to the main window. Cached so we only
     /// call `set_cursor` when the zone actually changes (the borderless window
     /// draws its own resize edges).
@@ -1596,7 +1596,7 @@ pub struct App {
     /// strip by more than `detached::TEAR_THRESHOLD_PX` vertically; releasing
     /// while tearing detaches that tab at the drop position. Cleared on release
     /// and on focus loss (same discipline as `selecting`/`dragging_scrollbar`).
-    tab_drag: Option<TabDrag>,
+    tab_drag: Option<crate::tabstrip::TabDrag>,
     /// When `Some((x, y, tab))`, the TAB context menu (Detach / Rename /
     /// Close Tab) is open at this physical-pixel anchor for that tab.
     /// Mutually exclusive with `context_menu` (the terminal Copy/Paste menu).
@@ -1627,6 +1627,10 @@ pub struct App {
     /// The main-window tab under the pointer (hover lift, hover "×"). Updated
     /// on CursorMoved only when it changes — one repaint per change.
     tab_hover: Option<usize>,
+    /// The main strip's overflow window: the first tab its last layout drew
+    /// (`TabBar::first`), passed back so activating a drawn tab never moves
+    /// the strip under the pointer (`jetty_render::overflow_start`).
+    tab_first: usize,
     /// Whether the pointer is over the main window: `cursor` is its last
     /// position there. False from a CursorLeft (and a hide or focus loss: a
     /// summon finds the pointer anywhere) until it moves over the window
@@ -1682,15 +1686,6 @@ pub struct App {
 }
 
 
-
-/// A left-button drag that began on tab `tab` in the main tab bar. `tearing`
-/// flips true once the cursor moves > `TEAR_THRESHOLD_PX` vertically out of the
-/// strip (and back false if it returns), so a plain click still selects.
-#[derive(Debug, Clone, Copy)]
-struct TabDrag {
-    tab: TabId,
-    tearing: bool,
-}
 
 /// Which resize zone (if any) the cursor is over on a borderless window (the
 /// main window and every detached window share this).
@@ -2264,6 +2259,7 @@ impl App {
             tab_title_mode: crate::tabmeta::TabTitleMode::Osc,
             tab_hover: None,
             main_pointer_in: false,
+            tab_first: 0,
             tab_wheel: crate::tabmeta::TabWheel::default(),
             main_dpi_size: None,
             focus_ring: None,
@@ -4171,7 +4167,7 @@ impl App {
             return;
         };
         let rects = self.main_bar_geometry(w, None).tab_rects;
-        let Some(to) = crate::detached::reorder_target(cx, &rects).filter(|&to| to != from) else { return };
+        let Some(to) = crate::tabstrip::reorder_slot(cx, &rects, from) else { return };
         if crate::detached::move_item(&mut self.tabs, from, to) {
             self.active = crate::detached::index_after_move(self.active, from, to);
             self.tab_hover = None;
@@ -6480,6 +6476,7 @@ impl App {
             opaque: !self.tab_bar_opacity,
             progress: self.progress_bar,
             bottom: self.tab_bar_bottom,
+            first: self.tab_first,
         }
     }
 
@@ -7165,6 +7162,22 @@ impl App {
         self.update_link_hover(true);
         // The track comes from the live surface; the size args are vestigial.
         let _ = (w, h);
+    }
+
+    /// The strip's ▢ (and a double-click on empty strip): maximize / restore
+    /// the main window. While FULLSCREEN it unambiguously means "give me my
+    /// window back": leave fullscreen ONLY — never `set_maximized`, which on a
+    /// fullscreen X11 window is a no-op or a stuck half-state. Maximize and
+    /// fullscreen stay orthogonal booleans, so maximize → F11 → ▢ hands back a
+    /// MAXIMIZED window (the exit skips the geometry restore while
+    /// `is_maximized()`, because a position set on a maximized X11 window is
+    /// ignored or half-applied); a second ▢ then normalises it (amendment I-F).
+    fn toggle_main_maximized(&mut self) {
+        if self.main_fullscreen {
+            self.set_main_fullscreen(false);
+        } else if let Some(win) = &self.window {
+            win.set_maximized(!win.is_maximized());
+        }
     }
 
     /// Enter / leave OS fullscreen on the MAIN window — the single chokepoint.
@@ -14393,21 +14406,21 @@ impl ApplicationHandler<AppEvent> for App {
                         cm.bar_h(),
                         cm.px(crate::detached::TEAR_THRESHOLD_PX),
                     ) && crate::detached::can_detach(self.tabs.len());
-                    if let Some(drag) = self.tab_drag.as_mut() {
-                        if drag.tearing != now_tearing {
-                            drag.tearing = now_tearing;
-                            if let Some(win) = &self.window {
-                                win.set_cursor(if now_tearing {
-                                    winit::window::CursorIcon::Grabbing
-                                } else {
-                                    winit::window::CursorIcon::Default
-                                });
-                            }
+                    let slop = cm.dpx(crate::tabstrip::REORDER_SLOP);
+                    let step = self.tab_drag.as_mut().map(|d| d.moved(position.x as f32, now_tearing, slop));
+                    if step.is_some_and(|s| s.tear_changed) {
+                        if let Some(win) = &self.window {
+                            win.set_cursor(if now_tearing {
+                                winit::window::CursorIcon::Grabbing
+                            } else {
+                                winit::window::CursorIcon::Default
+                            });
                         }
                     }
-                    // Held along the strip instead: the tab follows the pointer
-                    // into the slot under it (live reordering).
-                    if !now_tearing {
+                    // Held along the strip instead (past a click's jitter): the
+                    // tab follows the pointer into the slot under it (live
+                    // reordering).
+                    if step.is_some_and(|s| s.reorder) {
                         self.drag_reorder_tab(position.x as f32);
                     }
                 }
@@ -14611,13 +14624,6 @@ impl ApplicationHandler<AppEvent> for App {
                 // drag, and double-click-maximize — all BEFORE terminal selection.
                 let bar_y = self.tabbar_y(h as f32);
                 if cy >= bar_y && cy < bar_y + self.bar_h() {
-                    // A double-click is two quick presses on the same target
-                    // (`strip_double_click`). Taken here: a press on a window
-                    // control, "+" or a close "×" leaves none to complete.
-                    let now = std::time::Instant::now();
-                    let last_click = self.last_strip_click.take();
-                    let slop = self.chrome_metrics().dpx(5.0);
-
                     // The drawn bar's hit geometry: same style (compact tabs are
                     // narrower), no perf reservation (the HUD lives in the status
                     // strip — a phantom reservation once shrank the hit tabs, F19)
@@ -14625,129 +14631,79 @@ impl ApplicationHandler<AppEvent> for App {
                     // HERE (`tab_close_button`: a hidden "×" never closes). Shifted
                     // to the bar's actual position (bottom mode).
                     let bar = self.main_bar_hit_geometry(w, bar_y, cx, cy);
-
-                    // Window controls take priority (rightmost region).
-                    if input::point_in(&bar.help_rect, cx, cy) {
+                    let ids: Vec<TabId> = self.tabs.iter().map(|t| t.id).collect();
+                    let slop = self.chrome_metrics().dpx(crate::tabstrip::DOUBLE_CLICK_SLOP);
+                    let now = std::time::Instant::now();
+                    use crate::tabstrip::StripPress;
+                    match crate::tabstrip::press(&bar, &ids, self.renaming, &mut self.last_strip_click, now, cx, cy, slop) {
                         // Toggle the in-window Help overlay. Opening it closes the
                         // context menu so the two overlays are mutually exclusive.
-                        self.toggle_help(Surface::Main);
-                        return;
-                    }
-                    if input::point_in(&bar.settings_rect, cx, cy) {
+                        StripPress::Control(jetty_render::CtrlHover::Help) => self.toggle_help(Surface::Main),
                         // Same as Ctrl+Shift+P: open/close the Settings window.
-                        self.toggle_settings_window(event_loop);
-                        return;
-                    }
-                    if input::point_in(&bar.close_rect, cx, cy) {
+                        StripPress::Control(jetty_render::CtrlHover::Settings) => {
+                            self.toggle_settings_window(event_loop)
+                        }
                         // Confirm before quitting the whole app (closes every tab).
-                        self.confirm_quit = true;
-                        self.request_main_paint();
-                        return;
-                    }
-                    if input::point_in(&bar.max_rect, cx, cy) {
-                        // ▢ while FULLSCREEN unambiguously means "give me my window
-                        // back": leave fullscreen ONLY — never `set_maximized`, which
-                        // on a fullscreen X11 window is a no-op or a stuck half-state.
-                        // Maximize and fullscreen stay orthogonal booleans, so
-                        // maximize → F11 → ▢ hands back a MAXIMIZED window (the exit
-                        // skips the geometry restore while `is_maximized()`, because a
-                        // position set on a maximized X11 window is ignored or
-                        // half-applied); a second ▢ then normalises it (amendment I-F).
-                        if self.main_fullscreen {
-                            self.set_main_fullscreen(false);
-                        } else if let Some(win) = &self.window {
-                            win.set_maximized(!win.is_maximized());
+                        StripPress::Control(jetty_render::CtrlHover::Close) => {
+                            self.confirm_quit = true;
+                            self.request_main_paint();
                         }
-                        return;
-                    }
-                    if input::point_in(&bar.min_rect, cx, cy) {
-                        if let Some(win) = &self.window {
-                            win.set_minimized(true);
+                        StripPress::Control(jetty_render::CtrlHover::Max) => self.toggle_main_maximized(),
+                        StripPress::Control(jetty_render::CtrlHover::Min) => {
+                            if let Some(win) = &self.window {
+                                win.set_minimized(true);
+                            }
+                            // Some WMs don't send Occluded on iconify — mark it here
+                            // too so animations stop immediately (F17). Restoring the
+                            // window delivers Focused/Occluded(false), which clears it.
+                            self.main_occluded = true;
                         }
-                        // Some WMs don't send Occluded on iconify — mark it here
-                        // too so animations stop immediately (F17). Restoring the
-                        // window delivers Focused/Occluded(false), which clears it.
-                        self.main_occluded = true;
-                        return;
-                    }
-
-                    // A click anywhere on the strip commits an in-progress rename
-                    // unless it lands on the tab being renamed (handled below).
-                    let renaming_id = self.renaming;
-
-                    // Close buttons take priority over the tab body they sit on.
-                    if let Some(i) = bar
-                        .close_rects
-                        .iter()
-                        .position(|r| input::point_in(r, cx, cy))
-                    {
-                        self.commit_rename();
-                        // Ask before closing instead of closing immediately.
-                        self.confirm_close = self.tabs.get(i).map(|t| t.id);
-                        self.request_main_paint();
-                        return;
-                    }
-                    if input::point_in(&bar.plus_rect, cx, cy) {
-                        self.commit_rename();
-                        self.new_tab();
-                        return;
-                    }
-                    if let Some(i) = bar
-                        .tab_rects
-                        .iter()
-                        .position(|r| input::point_in(r, cx, cy))
-                    {
-                        // Double-click on a tab → enter inline rename. But a
-                        // double-click on the tab ALREADY being renamed must not
-                        // reset the in-progress edit buffer (it would discard the
-                        // user's typing); leave the rename untouched.
-                        let tab_id = self.tabs[i].id;
-                        let target = StripTarget::Tab(tab_id);
-                        let is_double = strip_double_click(last_click, now, cx, cy, target, slop);
-                        if is_double && self.renaming != Some(tab_id) {
+                        StripPress::Control(jetty_render::CtrlHover::None) | StripPress::Nothing => {}
+                        StripPress::CloseTab(i) => {
+                            self.commit_rename();
+                            // Ask before closing instead of closing immediately.
+                            self.confirm_close = self.tabs.get(i).map(|t| t.id);
+                            self.request_main_paint();
+                        }
+                        StripPress::NewTab => {
+                            self.commit_rename();
+                            self.new_tab();
+                        }
+                        // Double-click on a tab → inline rename (the first click
+                        // committed any other one).
+                        StripPress::Rename(i) => {
                             self.take_keyboard(Surface::Main, Layer::Rename);
-                            self.renaming = Some(tab_id);
+                            self.renaming = Some(self.tabs[i].id);
                             self.rename_buf = self.tabs[i].title.clone();
                             self.request_main_paint();
-                            return;
                         }
-                        if is_double {
-                            // Already renaming this tab: swallow the click without
-                            // disturbing the buffer.
-                            return;
+                        StripPress::Hold(i) => {
+                            // A click on a different tab commits any rename.
+                            let tab_id = self.tabs[i].id;
+                            if self.renaming != Some(tab_id) {
+                                self.commit_rename();
+                            }
+                            // Select immediately (a plain click), and HOLD the tab:
+                            // along the strip it follows the pointer (reorder); if
+                            // the pointer leaves the strip by more than
+                            // TEAR_THRESHOLD_PX before release, the drag becomes a
+                            // tear-out and the release detaches this tab.
+                            self.select_tab(i);
+                            self.tab_drag = Some(crate::tabstrip::TabDrag::new(tab_id, cx));
                         }
-                        self.last_strip_click = Some((now, cx, cy, target));
-                        // Single click on a different tab commits any rename.
-                        if renaming_id != Some(tab_id) {
+                        // Empty strip space: commit any rename, then either maximize
+                        // (double-click) or start an OS window move (single press).
+                        StripPress::Empty { double } => {
                             self.commit_rename();
-                        }
-                        // Select immediately (a plain click), and ARM the
-                        // drag-out gesture: if the cursor leaves the strip by
-                        // more than TEAR_THRESHOLD_PX before release, the drag
-                        // becomes a tear-out and the release detaches this tab.
-                        self.select_tab(i);
-                        self.tab_drag = Some(TabDrag { tab: tab_id, tearing: false });
-                        return;
-                    }
-
-                    // Empty strip space: commit any rename, then either maximize
-                    // (double-click) or start an OS window move (single press).
-                    self.commit_rename();
-                    if strip_double_click(last_click, now, cx, cy, StripTarget::Empty, slop) {
-                        // Same rule as the ▢ button above (amendment I-F).
-                        if self.main_fullscreen {
-                            self.set_main_fullscreen(false);
-                        } else if let Some(win) = &self.window {
-                            win.set_maximized(!win.is_maximized());
-                        }
-                        return;
-                    }
-                    self.last_strip_click = Some((now, cx, cy, StripTarget::Empty));
-                    if !self.main_fullscreen {
-                        // Dragging a fullscreen window leaves it in a broken
-                        // half-state on X11 — the move gesture is inert.
-                        if let Some(win) = &self.window {
-                            let _ = win.drag_window();
+                            if double {
+                                self.toggle_main_maximized();
+                            } else if !self.main_fullscreen {
+                                // Dragging a fullscreen window leaves it in a broken
+                                // half-state on X11 — the move gesture is inert.
+                                if let Some(win) = &self.window {
+                                    let _ = win.drag_window();
+                                }
+                            }
                         }
                     }
                     return;
@@ -16122,6 +16078,9 @@ impl ApplicationHandler<AppEvent> for App {
                     width, &tabs_meta, &theme, rename_ref, ctrl_hover, None, &mut *chrome_text, cm,
                     &tab_deco, &bar_opts,
                 );
+                // Where the strip's overflow window landed: kept for the next
+                // layout and every hit test until then.
+                self.tab_first = bar.first;
                 // Translate the bar quads + labels to its actual y (bottom mode)
                 // PLUS the dropdown slide so it moves with the content.
                 let bar_offset = bar_y + slide_y_offset;
@@ -17341,39 +17300,6 @@ fn trail_step(
 /// rule for every id-holding piece of UI state.
 fn still_open(r: Option<TabId>, live: &[TabId]) -> Option<TabId> {
     r.filter(|id| live.contains(id))
-}
-
-/// What a left press on the main window's tab strip landed on: a double-click
-/// is two quick presses on the SAME one ([`strip_double_click`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StripTarget {
-    /// A tab's body (a double-click renames it).
-    Tab(TabId),
-    /// Empty strip space (a double-click maximizes).
-    Empty,
-}
-
-/// Whether a strip press on `target` at `(x, y)` completes a double-click with
-/// the `last` one: within ~400 ms and `slop` px (5 logical), on the same
-/// target. A quick second click on "+" lands on the tab the first one opened
-/// (its cell covers the old "+"); renaming that tab swallowed the next command
-/// typed into its title.
-fn strip_double_click(
-    last: Option<(std::time::Instant, f32, f32, StripTarget)>,
-    now: std::time::Instant,
-    x: f32,
-    y: f32,
-    target: StripTarget,
-    slop: f32,
-) -> bool {
-    matches!(
-        last,
-        Some((t, px, py, was))
-            if was == target
-                && now.duration_since(t) <= std::time::Duration::from_millis(400)
-                && (x - px).abs() <= slop
-                && (y - py).abs() <= slop
-    )
 }
 
 /// Shared input core (v0.23 Task 9 / amendment I5): a keystroke (or IME commit)
@@ -18790,34 +18716,6 @@ mod default_title_tests {
         assert_eq!(TabId(1).default_title(), "Tab 1");
         let titles: std::collections::HashSet<String> = (1..=50).map(|n| TabId(n).default_title()).collect();
         assert_eq!(titles.len(), 50);
-    }
-}
-
-#[cfg(test)]
-mod strip_double_click_tests {
-    use super::{strip_double_click, StripTarget, TabId};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn a_double_click_is_two_quick_presses_on_the_same_target() {
-        let t = Instant::now();
-        let ms = |n| t + Duration::from_millis(n);
-        let tab = |n| StripTarget::Tab(TabId(n));
-        let last = Some((t, 100.0, 10.0, tab(1)));
-        assert!(strip_double_click(last, ms(300), 103.0, 12.0, tab(1), 5.0));
-        assert!(!strip_double_click(last, ms(401), 100.0, 10.0, tab(1), 5.0), "too slow");
-        assert!(!strip_double_click(last, ms(100), 106.0, 10.0, tab(1), 5.0), "too far");
-        // The slop is logical: 6 px is near enough at 2× (10 px of slop).
-        assert!(strip_double_click(last, ms(100), 106.0, 10.0, tab(1), 10.0));
-        // Another target under the same spot: a tab that slid in, the strip.
-        assert!(!strip_double_click(last, ms(100), 100.0, 10.0, tab(2), 5.0));
-        assert!(!strip_double_click(last, ms(100), 100.0, 10.0, StripTarget::Empty, 5.0));
-        let empty = Some((t, 100.0, 10.0, StripTarget::Empty));
-        assert!(strip_double_click(empty, ms(100), 100.0, 10.0, StripTarget::Empty, 5.0));
-        assert!(!strip_double_click(empty, ms(100), 100.0, 10.0, tab(1), 5.0));
-        // A press on "+" leaves no click to complete: the tab it opened, whose
-        // cell now covers the old "+", is not renamed by the second click.
-        assert!(!strip_double_click(None, ms(100), 100.0, 10.0, tab(3), 5.0));
     }
 }
 

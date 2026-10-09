@@ -28,6 +28,7 @@ mod runsel;
 pub mod palette;
 mod shell_integration;
 mod tabmeta;
+mod tabstrip;
 /// Settings controls as data (the panel's descriptor table). Public so the
 /// `jetty-shot` self-test builds the SAME panel content the app shows.
 pub mod settings_ui;
