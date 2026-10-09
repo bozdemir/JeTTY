@@ -81,6 +81,35 @@ pub enum KeyAction {
     None,
 }
 
+impl KeyAction {
+    /// Whether auto-repeat — the chord held down — runs the action again. The
+    /// actions that STEP repeat, like a held arrow key: scrolling, the prompt /
+    /// tab / theme steppers, font size and opacity (and typed bytes, of
+    /// course). Every other command opens, closes, toggles or sets something
+    /// — Settings, the palette and the other overlays, the Menu key, F11,
+    /// detach, a new tab, run-selection, copy and paste — and runs once per
+    /// press: a held F11 flipped fullscreen at the repeat rate, a held
+    /// Ctrl+Shift+D detached tab after tab.
+    pub fn repeats(&self) -> bool {
+        matches!(
+            self,
+            KeyAction::ScrollPageUp
+                | KeyAction::ScrollPageDown
+                | KeyAction::PrevPrompt
+                | KeyAction::NextPrompt
+                | KeyAction::NextTab
+                | KeyAction::PrevTab
+                | KeyAction::NextTheme
+                | KeyAction::PrevTheme
+                | KeyAction::FontUp
+                | KeyAction::FontDown
+                | KeyAction::OpacityUp
+                | KeyAction::OpacityDown
+                | KeyAction::Send(_)
+        )
+    }
+}
+
 // ── Key event model (one path for the main AND detached windows) ─────────────
 
 /// Kitty keyboard protocol progressive-enhancement flags (`CSI = flags u`,
@@ -343,9 +372,11 @@ pub fn chord_action(keymap: &KeyMap, ev: &KeyInput<'_>, opts: &KeyOptions) -> Op
 /// Resolution order:
 /// 1. Releases → only the kitty protocol's event-type reporting wants them.
 /// 2. Escape + panel open → ClosePanel (overlay logic, not a keybinding).
-/// 3. [`chord_action`] → the discrete app-command chords. Unmodified Page keys
-///    bound to host scrolling yield to the program on the alternate screen (it
-///    has no scrollback).
+/// 3. [`chord_action`] → the discrete app-command chords. A chord's
+///    auto-repeat runs only the actions that step ([`KeyAction::repeats`]);
+///    any other's repeats go nowhere. Unmodified Page keys bound to host
+///    scrolling yield to the program on the alternate screen (it has no
+///    scrollback).
 /// 4. macOS Cmd swallow: an unmapped bare Cmd chord is never sent to the PTY.
 /// 5. Kitty keyboard protocol, when the program enabled it.
 /// 6. Legacy: macOS Option-compose text, dead-key text, then the xterm
@@ -372,6 +403,11 @@ pub fn decide_key_event(
     }
 
     if let Some(action) = chord_action(keymap, ev, opts) {
+        // The press ran it; a one-shot action's repeats reach nothing — not
+        // the program either, which never saw the press.
+        if ev.kind == KeyEventKind::Repeat && !action.repeats() {
+            return KeyAction::None;
+        }
         // `[keys] scroll_page_up = ["Shift+PageUp", "PageUp"]` restores the
         // pre-v0.26 plain-PageUp scrolling; like then, the bare key still
         // reaches pagers/editors on the alternate screen.
@@ -3855,6 +3891,54 @@ mod tests {
         let t = Key::Character("T".into());
         let ev = KeyInput { kind: KeyEventKind::Release, ..kev(KeyCode::KeyT, &t, None, ctrl_shift()) };
         assert_eq!(decide(&ev, KeyModes::default(), KeyOptions::default()), KeyAction::None);
+    }
+
+    #[test]
+    fn a_held_chord_repeats_only_the_actions_that_step() {
+        let held = |code: KeyCode, key: &Key, mods: KeyMods, modes: KeyModes| {
+            let press = decide(&kev(code, key, None, mods), modes, KeyOptions::default());
+            let ev = KeyInput { kind: KeyEventKind::Repeat, ..kev(code, key, None, mods) };
+            (press, decide(&ev, modes, KeyOptions::default()))
+        };
+        let legacy = KeyModes::default();
+        let kitty = KeyModes { kitty_flags: KITTY_DISAMBIGUATE | KITTY_REPORT_EVENT_TYPES, ..legacy };
+        let ctrl = KeyMods { ctrl: true, ..KeyMods::default() };
+        let shift = KeyMods { shift: true, ..KeyMods::default() };
+        let c = |s: &str| Key::Character(s.into());
+        // One-shot: a held F11 flipped fullscreen at the repeat rate, a held
+        // Ctrl+Shift+D detached tab after tab. The press acts; each repeat goes
+        // nowhere — not to a kitty-protocol program either, which never saw
+        // the press.
+        for (code, key, mods, want) in [
+            (KeyCode::F11, Key::Named(NamedKey::F11), KeyMods::default(), KeyAction::ToggleFullscreen),
+            (KeyCode::KeyD, c("D"), ctrl_shift(), KeyAction::DetachTab),
+            (KeyCode::Comma, c(","), ctrl, KeyAction::TogglePanel),
+            (KeyCode::ContextMenu, Key::Named(NamedKey::ContextMenu), KeyMods::default(), KeyAction::ContextMenu),
+            (KeyCode::KeyP, c("P"), ctrl_shift(), KeyAction::OpenPalette),
+            (KeyCode::KeyF, c("F"), ctrl_shift(), KeyAction::SearchToggle),
+            (KeyCode::KeyT, c("T"), ctrl_shift(), KeyAction::NewTab),
+            (KeyCode::Enter, Key::Named(NamedKey::Enter), ctrl_shift(), KeyAction::RunSelection),
+            (KeyCode::KeyV, c("V"), ctrl_shift(), KeyAction::Paste),
+            (KeyCode::Digit2, c("2"), ctrl, KeyAction::SelectTab(1)),
+        ] {
+            for modes in [legacy, kitty] {
+                assert_eq!(held(code, &key, mods, modes), (want.clone(), KeyAction::None), "{want:?}");
+            }
+        }
+        // Steppers keep stepping while held.
+        for (code, key, mods, want) in [
+            (KeyCode::Equal, c("="), ctrl, KeyAction::FontUp),
+            (KeyCode::Minus, c("-"), ctrl, KeyAction::FontDown),
+            (KeyCode::PageUp, Key::Named(NamedKey::PageUp), shift, KeyAction::ScrollPageUp),
+            (KeyCode::Tab, Key::Named(NamedKey::Tab), ctrl, KeyAction::NextTab),
+            (KeyCode::KeyZ, c("Z"), ctrl_shift(), KeyAction::PrevPrompt),
+            (KeyCode::Equal, c("="), KeyMods { alt: true, ..ctrl }, KeyAction::OpacityUp),
+        ] {
+            assert_eq!(held(code, &key, mods, legacy), (want.clone(), want.clone()), "{want:?}");
+        }
+        // Typing repeats, of course.
+        assert_eq!(held(KeyCode::KeyA, &c("a"), KeyMods::default(), legacy).1, KeyAction::Send(b"a".to_vec()));
+        assert_eq!(held(KeyCode::KeyC, &c("c"), ctrl, legacy).1, KeyAction::Send(vec![0x03]));
     }
 
     // ── kitty keyboard protocol (byte-exact vs kitty's key_encoding.c) ──────

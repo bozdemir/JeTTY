@@ -5707,7 +5707,9 @@ impl App {
     /// narrow the label prefix, Esc cancels, Backspace pops, its chord toggles
     /// closed, everything else swallowed); then copy-mode. Chords are routed
     /// through the keymap so a remapped binding toggles closed consistently
-    /// (amendment 4). Returns whether the key was consumed.
+    /// (amendment 4) — on a fresh press only: the auto-repeat of the chord
+    /// that opened the overlay is swallowed, not a flicker shut and open.
+    /// Returns whether the key was consumed.
     fn overlay_key_modal(
         &mut self,
         s: Surface,
@@ -5725,7 +5727,9 @@ impl App {
         let chord = self.chord(event);
         if palette {
             if chord == Some(input::KeyAction::OpenPalette) {
-                self.close_palette(s);
+                if !event.repeat {
+                    self.close_palette(s);
+                }
                 return true;
             }
             match &event.logical_key {
@@ -5770,14 +5774,18 @@ impl App {
         }
         if hint {
             if chord == Some(input::KeyAction::HintMode) {
-                self.exit_hint_mode(s);
+                if !event.repeat {
+                    self.exit_hint_mode(s);
+                }
                 return true;
             }
             self.hint_mode_key(s, event.physical_key, &event.logical_key);
             return true;
         }
         if chord == Some(input::KeyAction::CopyMode) {
-            self.cancel_copy_mode(s);
+            if !event.repeat {
+                self.cancel_copy_mode(s);
+            }
             return true;
         }
         self.copy_mode_key(s, event.physical_key, &event.logical_key, ctrl);
@@ -5792,7 +5800,8 @@ impl App {
     /// keys edit the query incrementally; Enter/F3 step older, Shift+Enter /
     /// Shift+F3 newer; Backspace pops; Esc / its chord close and CLEAR (no query
     /// retention); the Paste chord pastes into the query; every other Ctrl/Cmd
-    /// chord is swallowed (alacritty-style). Returns whether the key was
+    /// chord is swallowed (alacritty-style). The two chords act once per press,
+    /// like everywhere (`KeyAction::repeats`). Returns whether the key was
     /// consumed.
     fn overlay_key_bars(&mut self, s: Surface, event: &winit::event::KeyEvent) -> bool {
         use winit::keyboard::{Key, NamedKey};
@@ -5840,7 +5849,9 @@ impl App {
         let sup = self.modifiers.super_key();
         let chord_action = self.chord(event);
         if chord_action == Some(input::KeyAction::SearchToggle) {
-            self.search_close(s);
+            if !event.repeat {
+                self.search_close(s);
+            }
             return true;
         }
         match &event.logical_key {
@@ -5866,8 +5877,10 @@ impl App {
             }
             _ => {
                 if chord_action == Some(input::KeyAction::Paste) {
-                    if let Some(text) = clipboard::get() {
-                        self.search_extend_query(s, &text);
+                    if !event.repeat {
+                        if let Some(text) = clipboard::get() {
+                            self.search_extend_query(s, &text);
+                        }
                     }
                 } else if ctrl || sup {
                     // Swallow other Ctrl/Cmd chords while the bar is open.

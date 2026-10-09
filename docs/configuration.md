@@ -227,6 +227,9 @@ parsed is reported and ignored; the rest still apply. Terminal control bytes —
 `Ctrl` with a letter, `Space`, `[`, `\`, `]` or `/` (`Ctrl+C`, `Ctrl+T` …) —
 cannot be taken over: add `Shift` or `Alt`. An action none of whose chords can
 be used keeps its default.
+Holding a chord repeats only the actions that step — scrolling, the prompt,
+tab and theme steppers, font size and opacity; every other one (`F11`,
+Settings, the palette, detach, copy, paste …) runs once per press.
 The command palette's **Reset keybindings** clears the table (after saving a
 `config.toml.bak-<time>` copy).
 
