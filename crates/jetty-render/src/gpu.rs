@@ -44,6 +44,7 @@ pub struct GpuShared {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    backend: wgpu::Backend,
     backend_name: String,
     /// The adapter is a CPU (software) rasterizer, e.g. lavapipe/llvmpipe:
     /// every frame costs real CPU, so animations pace slower.
@@ -53,6 +54,30 @@ pub struct GpuShared {
     /// Set by the device-lost callback on a genuine loss (driver reset, GPU
     /// hang, suspend) — see [`GpuContext::is_lost`].
     lost: Arc<AtomicBool>,
+}
+
+/// The surface's composite alpha mode from what it offers, transparency first:
+/// PreMultiplied → PostMultiplied → Opaque → Auto.
+fn pick_alpha_mode(offered: &[wgpu::CompositeAlphaMode]) -> wgpu::CompositeAlphaMode {
+    use wgpu::CompositeAlphaMode as M;
+    [M::PreMultiplied, M::PostMultiplied, M::Opaque]
+        .into_iter()
+        .find(|m| offered.contains(m))
+        .unwrap_or(M::Auto)
+}
+
+/// Whether the frame's color must be premultiplied by its alpha
+/// ([`GpuContext::premultiply_clear`]): for a PreMultiplied surface;
+/// PostMultiplied (Metal) and a truly Opaque surface want straight color.
+///
+/// wgpu's GL backend is the exception: it offers only `Opaque` yet never forces
+/// alpha to 1, so the frame's alpha reaches the compositor through JeTTY's ARGB
+/// window (X11) or ARGB buffer (Wayland) — read as PREMULTIPLIED there, exactly
+/// like the Vulkan surface on the same window. A straight frame on GL composited
+/// translucent themes brighter than on Vulkan.
+fn premultiplied_frame(alpha_mode: wgpu::CompositeAlphaMode, backend: wgpu::Backend) -> bool {
+    alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied
+        || (cfg!(all(unix, not(target_vendor = "apple"))) && backend == wgpu::Backend::Gl)
 }
 
 /// Why [`GpuContext::acquire_frame`] skipped a frame
@@ -82,8 +107,9 @@ pub struct GpuContext {
     /// "Vulkan", "Metal", "Gl". Used by the Welcome overlay "Render" row.
     pub backend_name: String,
     /// Whether the frame clear should premultiply the theme bg by its alpha, to
-    /// match the chosen surface `alpha_mode` (true for PreMultiplied, false for
-    /// PostMultiplied/Opaque). See `default_bg_clear`.
+    /// match how the window system composites the surface (true for
+    /// PreMultiplied and for GL on X11/Wayland, false for PostMultiplied/Opaque).
+    /// See `premultiplied_frame` and `default_bg_clear`.
     pub premultiply_clear: bool,
     /// Max 2D texture dimension the device enforces. Surface `width`/`height` are
     /// clamped to this so `Surface::configure` never fails validation on very large
@@ -209,6 +235,7 @@ impl GpuContext {
         });
 
         let shared = Arc::new(GpuShared {
+            backend: adapter.get_info().backend,
             backend_name: format!("{:?}", adapter.get_info().backend),
             cpu: adapter.get_info().device_type == wgpu::DeviceType::Cpu,
             max_dim: device.limits().max_texture_dimension_2d,
@@ -294,19 +321,8 @@ impl GpuContext {
         // `premultiply_clear`: premultiply the bg ONLY for PreMultiplied. Feeding a
         // premultiplied clear to PostMultiplied is what made transparent themes
         // "too dark" before — fixed by using a straight clear in that mode.
-        // Order: PreMultiplied → PostMultiplied → Opaque → Auto.
-        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
-            wgpu::CompositeAlphaMode::PreMultiplied
-        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
-            wgpu::CompositeAlphaMode::PostMultiplied
-        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
-            wgpu::CompositeAlphaMode::Opaque
-        } else {
-            wgpu::CompositeAlphaMode::Auto
-        };
-        // The frame clear premultiplies the theme bg by its alpha ONLY for a
-        // PreMultiplied surface; PostMultiplied/Opaque want straight rgb.
-        let premultiply_clear = alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+        let alpha_mode = pick_alpha_mode(&caps.alpha_modes);
+        let premultiply_clear = premultiplied_frame(alpha_mode, shared.backend);
 
         let max_dim = shared.max_dim;
         let config = wgpu::SurfaceConfiguration {
@@ -476,9 +492,9 @@ impl GpuContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{instance_descriptor, set_platform_display};
+    use super::{instance_descriptor, pick_alpha_mode, premultiplied_frame, set_platform_display};
     use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle, RawDisplayHandle, XlibDisplayHandle};
-    use wgpu::Backends;
+    use wgpu::{Backend, Backends, CompositeAlphaMode as M};
 
     /// Stands in for winit's `OwnedDisplayHandle` (no X connection is opened).
     #[derive(Debug)]
@@ -500,5 +516,35 @@ mod tests {
         assert!(instance_descriptor(Backends::VULKAN).display.is_none(), "the Vulkan path is unchanged");
         assert!(instance_descriptor(Backends::all()).display.is_some(), "GL presents through the display");
         assert!(instance_descriptor(Backends::GL).display.is_some());
+    }
+
+    #[test]
+    fn the_alpha_mode_prefers_transparency() {
+        // Vulkan on X11/Wayland, Metal, wgpu-GL, an adapter that offers nothing.
+        assert_eq!(pick_alpha_mode(&[M::Opaque, M::PreMultiplied, M::Inherit]), M::PreMultiplied);
+        assert_eq!(pick_alpha_mode(&[M::Opaque, M::PostMultiplied]), M::PostMultiplied);
+        assert_eq!(pick_alpha_mode(&[M::Opaque]), M::Opaque);
+        assert_eq!(pick_alpha_mode(&[]), M::Auto);
+    }
+
+    #[test]
+    fn the_frame_is_premultiplied_where_the_window_system_reads_it_so() {
+        assert!(premultiplied_frame(M::PreMultiplied, Backend::Vulkan));
+        // Metal composites straight color itself.
+        assert!(!premultiplied_frame(M::PostMultiplied, Backend::Metal));
+        // A truly opaque Vulkan surface ignores alpha: straight color, no darkening.
+        assert!(!premultiplied_frame(M::Opaque, Backend::Vulkan));
+    }
+
+    /// wgpu's GL backend offers only `Opaque` but never forces alpha to 1: the
+    /// framebuffer's alpha reaches the compositor through JeTTY's ARGB window
+    /// (X11) / ARGB buffer (Wayland), whose convention is premultiplied. A
+    /// straight frame there composited translucent themes brighter than Vulkan
+    /// did (measured: opacity 0.5 wrote 30,30,46 @127 on GL vs 19,19,31 @127 on
+    /// Vulkan into the same window).
+    #[test]
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    fn gl_frames_are_premultiplied_for_the_compositor() {
+        assert!(premultiplied_frame(M::Opaque, Backend::Gl));
     }
 }
