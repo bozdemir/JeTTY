@@ -1,4 +1,4 @@
-use crate::handler::Vt;
+use crate::handler::{Vt, VtState};
 use crate::hints::HintToken;
 use crate::kitty::KittyCmd;
 use crate::snapshot::{
@@ -1151,6 +1151,9 @@ pub struct Terminal {
     kbd_depth: [u16; 2],
     /// The keyboard state the running command started from; `None` outside one.
     kbd_window: Option<KbdWindow>,
+    /// What the xterm-conformance corrections over alacritty's `Handler`
+    /// remember (the scroll region mirror) — see `handler.rs`.
+    vt: VtState,
     /// Test-only: every byte handed to vte, in order (the differential fuzz
     /// replays it through a model of vte's state machine).
     #[cfg(test)]
@@ -1323,6 +1326,7 @@ impl Terminal {
             color_reports,
             kbd_depth: [0, 0],
             kbd_window: None,
+            vt: VtState::new(rows),
             #[cfg(test)]
             vte_log: None,
         }
@@ -2576,7 +2580,7 @@ impl Terminal {
         if let Some(log) = self.vte_log.as_mut() {
             log.extend_from_slice(s);
         }
-        self.parser.advance(&mut Vt { term: &mut self.term, reply: &self.reply_tx }, s);
+        self.parser.advance(&mut Vt { term: &mut self.term, st: &mut self.vt, reply: &self.reply_tx }, s);
         let alt_after = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h1 = self.term.grid().history_size();
         self.after_vte(alt_before, alt_after, h0, h1, d0);
@@ -3614,7 +3618,7 @@ impl Terminal {
         let alt_before = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h0 = self.term.grid().history_size();
         let d0 = self.term.grid().display_offset();
-        self.parser.stop_sync(&mut Vt { term: &mut self.term, reply: &self.reply_tx });
+        self.parser.stop_sync(&mut Vt { term: &mut self.term, st: &mut self.vt, reply: &self.reply_tx });
         let alt_after = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h1 = self.term.grid().history_size();
         self.after_vte(alt_before, alt_after, h0, h1, d0);
@@ -4063,6 +4067,8 @@ impl Terminal {
         // existing lines, preserves scrollback, and adjusts the cursor position.
         let new_size = Size { cols, lines: rows };
         self.term.resize(new_size);
+        // `Term::resize` resets the scroll region to the whole screen.
+        self.vt = VtState::new(rows);
         // p10k / starship prompt-scatter fix. alacritty's reflow rewraps a
         // full-width, absolute-positioned prompt into stray fragments (its
         // right-aligned segment lands on a wrapped row), and on GROW pulls

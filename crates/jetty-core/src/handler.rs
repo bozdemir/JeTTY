@@ -10,6 +10,16 @@
 //! * DCH / ICH / ECH / EL / ED through half of a wide char erase all of it (as
 //!   xterm, VTE and kitty do): an orphaned first half drew its glyph over the
 //!   next cell, an orphaned second half put the drawn cursor a cell off.
+//! * LF / VT / FF / IND / RI left a pending autowrap armed, so the next
+//!   character wrapped a line too low instead of landing in the last column.
+//! * CUU / CUD (and CNL / CPL / VPR) stop at the scroll margins when the
+//!   cursor is inside them; under origin mode (DECOM) CUU / CUD / CNL / CPL /
+//!   CHA / HPA / VPR no longer jump below the region (alacritty added the top
+//!   margin to an absolute row), and CPR reports the row relative to it.
+//! * DECSTBM with its top margin below the screen is ignored, as in xterm
+//!   (alacritty kept an empty region, and output stopped scrolling).
+//! * Modes 47 / 1047 (the alternate screen without 1049's cursor save) and
+//!   1048 (save / restore the cursor) work.
 //! * OSC 4 / 10 / 11 / 12 queries answer with the color a program set (pywal,
 //!   base16-shell) instead of the theme's, so the background a program
 //!   detects (neovim, bat, delta) is the one on screen.
@@ -19,12 +29,12 @@ use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Column;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::Term;
+use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::cursor_icon::CursorIcon;
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
-    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, PrivateMode, Rgb, ScpCharPath, ScpUpdateMode,
-    StandardCharset, TabulationClearMode,
+    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedPrivateMode, PrivateMode, Rgb,
+    ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
 };
 use std::sync::mpsc::Sender;
 
@@ -33,9 +43,25 @@ use std::sync::mpsc::Sender;
 /// (`CSI ? 6 c`), which tells sixel-probing programs there are no images.
 pub(crate) const DA1_REPLY: &[u8] = b"\x1b[?62;4;22c";
 
+/// What the corrections remember between calls (owned by `Terminal`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VtState {
+    /// Mirror of alacritty's private scroll region: `[top, bottom)` in screen
+    /// lines. Kept in step at every change: DECSTBM, RIS, DECCOLM and a resize
+    /// (`Terminal::resize` resets it, as `Term::resize` does).
+    pub(crate) region: (i32, i32),
+}
+
+impl VtState {
+    pub(crate) fn new(rows: usize) -> VtState {
+        VtState { region: (0, rows as i32) }
+    }
+}
+
 /// `Term` plus what its corrections need, for one `advance` call.
 pub(crate) struct Vt<'a, T> {
     pub(crate) term: &'a mut Term<T>,
+    pub(crate) st: &'a mut VtState,
     /// The PTY reply channel `Term`'s own answers go through, so an answer
     /// written here keeps its place among them.
     pub(crate) reply: &'a Sender<Vec<u8>>,
@@ -48,6 +74,39 @@ impl<T: EventListener> Vt<'_, T> {
 
     fn column(&self) -> usize {
         self.term.grid().cursor.point.column.0
+    }
+
+    fn origin(&self) -> bool {
+        self.term.mode().contains(TermMode::ORIGIN)
+    }
+
+    /// Move to the ABSOLUTE screen line `line` (`Term::goto` reads its line
+    /// relative to the top margin under DECOM, and clamps it to the region).
+    fn goto_abs(&mut self, line: i32, col: usize) {
+        let top = if self.origin() { self.st.region.0 } else { 0 };
+        Handler::goto(&mut *self.term, line - top, col);
+    }
+
+    /// CUU's target row: `n` up, stopping at the top margin when the cursor is
+    /// at or below it (xterm's `CursorUp`).
+    fn up_target(&self, n: usize) -> i32 {
+        let line = self.term.grid().cursor.point.line.0;
+        let top = self.st.region.0;
+        let floor = if line >= top { top } else { 0 };
+        line.saturating_sub(n.min(u16::MAX as usize) as i32).max(floor)
+    }
+
+    /// CUD's target row: `n` down, stopping at the bottom margin when the
+    /// cursor is at or above it (xterm's `CursorDown`).
+    fn down_target(&self, n: usize) -> i32 {
+        let line = self.term.grid().cursor.point.line.0;
+        let bottom = self.st.region.1 - 1;
+        let ceil = if line <= bottom { bottom } else { self.term.screen_lines() as i32 - 1 };
+        line.saturating_add(n.min(u16::MAX as usize) as i32).min(ceil)
+    }
+
+    fn full_region(&mut self) {
+        self.st.region = (0, self.term.screen_lines() as i32);
     }
 
     /// Erase the wide char straddling the boundary just left of column `col`
@@ -89,18 +148,11 @@ impl<T: EventListener> Handler for Vt<'_, T> {
         fn input(&mut self, c: char);
         fn goto(&mut self, line: i32, col: usize);
         fn goto_line(&mut self, line: i32);
-        fn goto_col(&mut self, col: usize);
-        fn move_up(&mut self, lines: usize);
-        fn move_down(&mut self, lines: usize);
-        fn device_status(&mut self, arg: usize);
         fn move_forward(&mut self, cols: usize);
         fn move_backward(&mut self, cols: usize);
-        fn move_down_and_cr(&mut self, lines: usize);
-        fn move_up_and_cr(&mut self, lines: usize);
         fn put_tab(&mut self, count: u16);
         fn backspace(&mut self);
         fn carriage_return(&mut self);
-        fn linefeed(&mut self);
         fn bell(&mut self);
         fn substitute(&mut self);
         fn newline(&mut self);
@@ -115,16 +167,10 @@ impl<T: EventListener> Handler for Vt<'_, T> {
         fn restore_cursor_position(&mut self);
         fn clear_tabs(&mut self, mode: TabulationClearMode);
         fn set_tabs(&mut self, interval: u16);
-        fn reset_state(&mut self);
-        fn reverse_index(&mut self);
         fn terminal_attribute(&mut self, attr: Attr);
         fn set_mode(&mut self, mode: Mode);
         fn unset_mode(&mut self, mode: Mode);
         fn report_mode(&mut self, mode: Mode);
-        fn set_private_mode(&mut self, mode: PrivateMode);
-        fn unset_private_mode(&mut self, mode: PrivateMode);
-        fn report_private_mode(&mut self, mode: PrivateMode);
-        fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>);
         fn set_keypad_application_mode(&mut self);
         fn unset_keypad_application_mode(&mut self);
         fn set_active_charset(&mut self, index: CharsetIndex);
@@ -147,6 +193,112 @@ impl<T: EventListener> Handler for Vt<'_, T> {
         fn set_modify_other_keys(&mut self, mode: ModifyOtherKeys);
         fn report_modify_other_keys(&mut self);
         fn set_scp(&mut self, char_path: ScpCharPath, update_mode: ScpUpdateMode);
+    }
+
+    #[inline(always)]
+    fn linefeed(&mut self) {
+        Handler::linefeed(&mut *self.term);
+        self.term.grid_mut().cursor.input_needs_wrap = false;
+    }
+
+    fn reverse_index(&mut self) {
+        Handler::reverse_index(&mut *self.term);
+        self.term.grid_mut().cursor.input_needs_wrap = false;
+    }
+
+    fn move_up(&mut self, lines: usize) {
+        let (line, col) = (self.up_target(lines), self.column());
+        self.goto_abs(line, col);
+    }
+
+    fn move_down(&mut self, lines: usize) {
+        let (line, col) = (self.down_target(lines), self.column());
+        self.goto_abs(line, col);
+    }
+
+    fn move_up_and_cr(&mut self, lines: usize) {
+        let line = self.up_target(lines);
+        self.goto_abs(line, 0);
+    }
+
+    fn move_down_and_cr(&mut self, lines: usize) {
+        let line = self.down_target(lines);
+        self.goto_abs(line, 0);
+    }
+
+    fn goto_col(&mut self, col: usize) {
+        let line = self.term.grid().cursor.point.line.0;
+        self.goto_abs(line, col);
+    }
+
+    fn device_status(&mut self, arg: usize) {
+        if arg == 6 && self.origin() {
+            let p = self.term.grid().cursor.point;
+            let line = p.line.0 - self.st.region.0 + 1;
+            self.send(format!("\x1b[{line};{}R", p.column.0 + 1).into_bytes());
+        } else {
+            Handler::device_status(&mut *self.term, arg);
+        }
+    }
+
+    fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
+        let lines = self.term.screen_lines();
+        let top = top.max(1);
+        let bottom = bottom.map_or(lines, |b| b.min(lines));
+        if top >= bottom {
+            return; // xterm ignores a region that is empty once clamped to the screen
+        }
+        Handler::set_scrolling_region(&mut *self.term, top, Some(bottom));
+        self.st.region = (top as i32 - 1, bottom as i32);
+    }
+
+    fn reset_state(&mut self) {
+        Handler::reset_state(&mut *self.term);
+        self.full_region();
+    }
+
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        match mode {
+            PrivateMode::Unknown(1048) => Handler::save_cursor_position(&mut *self.term),
+            PrivateMode::Unknown(47 | 1047) => {
+                if !self.term.mode().contains(TermMode::ALT_SCREEN) {
+                    self.term.swap_alt();
+                }
+            }
+            _ => {
+                Handler::set_private_mode(&mut *self.term, mode);
+                if mode == PrivateMode::Named(NamedPrivateMode::ColumnMode) {
+                    self.full_region(); // DECCOLM resets the margins
+                }
+            }
+        }
+    }
+
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        match mode {
+            PrivateMode::Unknown(1048) => Handler::restore_cursor_position(&mut *self.term),
+            PrivateMode::Unknown(47 | 1047) => {
+                if self.term.mode().contains(TermMode::ALT_SCREEN) {
+                    self.term.swap_alt();
+                }
+            }
+            _ => {
+                Handler::unset_private_mode(&mut *self.term, mode);
+                if mode == PrivateMode::Named(NamedPrivateMode::ColumnMode) {
+                    self.full_region();
+                }
+            }
+        }
+    }
+
+    fn report_private_mode(&mut self, mode: PrivateMode) {
+        match mode {
+            PrivateMode::Unknown(n @ (47 | 1047)) => {
+                let state = if self.term.mode().contains(TermMode::ALT_SCREEN) { 1 } else { 2 };
+                self.send(format!("\x1b[?{n};{state}$y").into_bytes());
+            }
+            _ => Handler::report_private_mode(&mut *self.term, mode),
+        }
     }
 
     fn delete_chars(&mut self, count: usize) {
@@ -275,6 +427,124 @@ mod tests {
     }
 
     #[test]
+    fn line_feeds_and_reverse_index_cancel_a_pending_wrap() {
+        // After a full line the cursor waits in the last column for a wrap. LF,
+        // VT, FF and IND (and RI, upward) move it a line and cancel the wrap: the
+        // next character lands in the last column of that line (xterm, VTE,
+        // kitty) — it used to wrap and land a line further down, in column 0.
+        for seq in ["abcde\n*", "abcde\x0b*", "abcde\x0c*", "abcde\x1bD*"] {
+            let (rows, cursor, _) = run(5, 3, seq);
+            assert_eq!(rows, ["abcde", "    *", "     "], "{seq:?}");
+            assert_eq!(cursor, (1, 4), "{seq:?}: wrap pending again after the `*`");
+        }
+        let (rows, _, _) = run(5, 3, "\x1b[2;1Habcde\x1bM*");
+        assert_eq!(rows, ["    *", "abcde", "     "], "RI");
+        // The usual CR LF, and NEL, still start the next line in column 0.
+        for seq in ["abcde\r\n*", "abcde\x1bE*"] {
+            assert_eq!(run(5, 3, seq).0, ["abcde", "*    ", "     "], "{seq:?}");
+        }
+    }
+
+    #[test]
+    fn cursor_up_and_down_stop_at_the_scroll_margins() {
+        // Region rows 5–10 (1-based). From inside it CUU / CUD / CPL / CNL / VPR
+        // stop at its edges; from outside they run to the screen's.
+        let cases = [
+            ("\x1b[7;3H\x1b[20A", (4, 2)),
+            ("\x1b[7;3H\x1b[20B", (9, 2)),
+            ("\x1b[7;3H\x1b[20F", (4, 0)),
+            ("\x1b[7;3H\x1b[20E", (9, 0)),
+            ("\x1b[7;3H\x1b[20e", (9, 2)),
+            ("\x1b[3;3H\x1b[20A", (0, 2)),
+            ("\x1b[3;3H\x1b[20B", (9, 2)),
+            ("\x1b[11;3H\x1b[20B", (11, 2)),
+            ("\x1b[11;3H\x1b[20A", (4, 2)),
+            ("\x1b[7;3H\x1b[A", (5, 2)),
+        ];
+        for (moves, want) in cases {
+            let (_, cursor, _) = run(10, 12, &format!("\x1b[5;10r{moves}"));
+            assert_eq!(cursor, want, "{moves:?}");
+        }
+    }
+
+    #[test]
+    fn relative_moves_under_origin_mode_stay_in_the_region() {
+        // DECOM with region rows 5–10: CUP is relative to row 5. alacritty added
+        // the top margin AGAIN to the absolute row for CUU / CUD / CNL / CPL /
+        // CHA / HPA / VPR, sending the cursor down to the bottom margin.
+        let cases = [
+            ("\x1b[3;1H\x1b[A", (5, 0)),
+            ("\x1b[3;1H\x1b[B", (7, 0)),
+            ("\x1b[3;3H\x1b[E", (7, 0)),
+            ("\x1b[3;3H\x1b[F", (5, 0)),
+            ("\x1b[3;1H\x1b[5G", (6, 4)),
+            ("\x1b[3;1H\x1b[5`", (6, 4)),
+            ("\x1b[3;1H\x1b[e", (7, 0)),
+            ("\x1b[3;1H\x1b[9A", (4, 0)),
+            ("\x1b[3;1H\x1b[9B", (9, 0)),
+            ("\x1b[2;3H\x1b[3d", (6, 2)),
+        ];
+        for (moves, want) in cases {
+            let (_, cursor, _) = run(10, 12, &format!("\x1b[5;10r\x1b[?6h{moves}"));
+            assert_eq!(cursor, want, "{moves:?}");
+        }
+    }
+
+    #[test]
+    fn cursor_position_report_is_relative_to_the_origin() {
+        let (_, _, reply) = run(10, 12, "\x1b[5;10r\x1b[?6h\x1b[3;4H\x1b[6n");
+        assert_eq!(reply, "\x1b[3;4R");
+        let (_, _, reply) = run(10, 12, "\x1b[5;10r\x1b[7;4H\x1b[6n");
+        assert_eq!(reply, "\x1b[7;4R", "without DECOM: absolute");
+    }
+
+    #[test]
+    fn a_scroll_region_starting_below_the_screen_is_ignored() {
+        // xterm ignores DECSTBM unless bottom > top once clamped to the screen.
+        // alacritty set an EMPTY region past the last row: from then on output
+        // at the bottom stopped scrolling and overwrote the last line.
+        let mut seq = String::from("\x1b[30;40r");
+        for i in 0..10 {
+            seq.push_str(&format!("line{i}\r\n"));
+        }
+        let (rows, cursor, _) = run(8, 5, &seq);
+        assert_eq!(rows, ["line6   ", "line7   ", "line8   ", "line9   ", "        "]);
+        assert_eq!(cursor, (4, 0));
+        // A valid region still homes the cursor; one clamped to the screen works.
+        let (_, cursor, _) = run(8, 5, "\x1b[3;3Hx\x1b[2;99r");
+        assert_eq!(cursor, (0, 0));
+    }
+
+    #[test]
+    fn the_region_mirror_follows_resets_and_resizes() {
+        // RIS, DECCOLM and a resize put the region back to the whole screen.
+        for reset in ["\x1bc", "\x1b[?3l", "\x1b[?3h"] {
+            let (_, cursor, _) = run(10, 12, &format!("\x1b[5;10r{reset}\x1b[7;3H\x1b[20A"));
+            assert_eq!(cursor, (0, 2), "{reset:?}");
+        }
+        let mut t = Terminal::new(10, 12);
+        t.feed(b"\x1b[5;10r");
+        t.resize(10, 14);
+        t.feed(b"\x1b[7;3H\x1b[20B");
+        let s = t.snapshot();
+        assert_eq!((s.cursor_row, s.cursor_col), (13, 2));
+    }
+
+    #[test]
+    fn modes_47_and_1047_switch_screens_and_1048_saves_the_cursor() {
+        for mode in ["47", "1047"] {
+            let (rows, _, reply) =
+                run(10, 3, &format!("main\x1b[?{mode}halt\x1b[?{mode}$p\x1b[?{mode}l*\x1b[?{mode}$p"));
+            assert_eq!(rows[0], "main*     ", "{mode}: the main screen is back");
+            assert_eq!(reply, format!("\x1b[?{mode};1$y\x1b[?{mode};2$y"));
+            let (rows, _, _) = run(10, 3, &format!("main\x1b[?{mode}hALT"));
+            assert_eq!(rows[0], "    ALT   ", "{mode}: on the alternate screen");
+        }
+        let (rows, cursor, _) = run(10, 1, "ab\x1b[?1048hxyz\x1b[?1048l*");
+        assert_eq!((rows[0].as_str(), cursor), ("ab*yz     ", (0, 3)));
+    }
+
+    #[test]
     fn color_queries_report_colors_a_program_set() {
         let (_, _, reply) = run(10, 1, "\x1b]11;#102030\x07\x1b]11;?\x07");
         assert_eq!(reply, "\x1b]11;rgb:1010/2020/3030\x07");
@@ -365,10 +635,11 @@ mod tests {
         let mut a = Term::new(config(), &size, rec_a.clone());
         let mut b = Term::new(config(), &size, rec_b.clone());
         let (mut pa, mut pb) = (Processor::<StdSyncHandler>::new(), Processor::<StdSyncHandler>::new());
+        let mut st = VtState::new(6);
         let (tx, _rx) = std::sync::mpsc::channel();
         for piece in pieces {
             pa.advance(&mut a, piece.as_bytes());
-            pb.advance(&mut Vt { term: &mut b, reply: &tx }, piece.as_bytes());
+            pb.advance(&mut Vt { term: &mut b, st: &mut st, reply: &tx }, piece.as_bytes());
             assert_eq!(state(&a), state(&b), "after {piece:?}");
             assert_eq!(*rec_a.0.borrow(), *rec_b.0.borrow(), "events after {piece:?}");
         }
