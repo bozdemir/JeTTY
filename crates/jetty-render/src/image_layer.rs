@@ -84,6 +84,27 @@ pub struct ImageDraw<'a> {
     pub opacity: f32,
 }
 
+/// Upload a `w`×`h` image's tightly packed RGBA into `texture`.
+fn write_rgba(queue: &wgpu::Queue, texture: &wgpu::Texture, w: u32, h: u32, rgba: &[u8]) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            // Tight rows; write_texture (unlike a buffer copy) needs no
+            // 256-byte alignment.
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+}
+
 /// Where a visible image draws ([`ImageDraw::dst`], physical px) in a grid
 /// whose cell (0, 0) is at `origin`: snapped to whole pixels, so a native-size
 /// image maps each texel onto one pixel. Most columns start at a fractional x
@@ -110,7 +131,6 @@ pub fn image_scissor_x(origin: GridOrigin, cols: usize, cell_w: f32, width: u32)
 
 /// A cached GPU texture for one image id.
 struct Cached {
-    #[allow(dead_code)]
     texture: wgpu::Texture,
     #[allow(dead_code)]
     view: wgpu::TextureView,
@@ -123,6 +143,34 @@ struct Cached {
 
 /// VRAM budget for cached image textures (per window). LRU-evicted past this.
 const IMAGE_VRAM_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// Of it, what textures not drawn this frame may keep. A video (mpv
+/// --vo=kitty, chafa --animate) sends a new image every frame, and its old
+/// frames stayed resident up to the whole budget — on an integrated GPU, in
+/// system RAM. Enough for images scrolled briefly out of view to come back
+/// without a re-upload.
+const IMAGE_VRAM_IDLE: u64 = 32 * 1024 * 1024;
+
+/// The textures to evict, least recently drawn first, from `(id, last drawn
+/// frame, bytes)`: never one drawn in `frame`; idle ones while all of them
+/// (`total` bytes) exceed [`IMAGE_VRAM_BUDGET`] or the idle ones exceed
+/// [`IMAGE_VRAM_IDLE`].
+fn evictions(textures: impl Iterator<Item = (u64, u64, u64)>, frame: u64, total: u64) -> Vec<u64> {
+    let mut idle: Vec<(u64, u64, u64)> = textures.filter(|&(_, last, _)| last < frame).collect();
+    idle.sort_unstable_by_key(|&(id, last, _)| (last, id));
+    let mut idle_bytes: u64 = idle.iter().map(|&(_, _, bytes)| bytes).sum();
+    let mut total = total;
+    let mut out = Vec::new();
+    for (id, _, bytes) in idle {
+        if total <= IMAGE_VRAM_BUDGET && idle_bytes <= IMAGE_VRAM_IDLE {
+            break;
+        }
+        total = total.saturating_sub(bytes);
+        idle_bytes -= bytes;
+        out.push(id);
+    }
+    out
+}
 
 pub struct ImageLayer {
     pipeline: wgpu::RenderPipeline,
@@ -297,6 +345,15 @@ impl ImageLayer {
             self.vram_bytes = self.vram_bytes.saturating_sub(c.bytes);
             self.textures.remove(&id);
         }
+        // A texture of this size not drawn this frame — a video's previous
+        // frame — is written over instead of allocating one per frame.
+        let idle = self.textures.iter().find(|(_, c)| c.last_frame < self.frame && c.w == w && c.h == h);
+        if let Some(mut c) = idle.map(|(&k, _)| k).and_then(|k| self.textures.remove(&k)) {
+            write_rgba(queue, &c.texture, w, h, rgba);
+            c.last_frame = self.frame;
+            self.textures.insert(id, c);
+            return true;
+        }
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("image-texture"),
@@ -308,23 +365,7 @@ impl ImageLayer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                // Tight rows; write_texture (unlike a buffer copy) needs no
-                // 256-byte alignment.
-                bytes_per_row: Some(w * 4),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
+        write_rgba(queue, &texture, w, h, rgba);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("image-tex-bg"),
@@ -457,23 +498,11 @@ impl ImageLayer {
     }
 
     /// Evict least-recently-used textures NOT touched this frame until under the
-    /// VRAM budget. Never touches this frame's visible set (`last_frame == frame`).
+    /// VRAM budget and the idle cap ([`evictions`]). Never touches this frame's
+    /// visible set (`last_frame == frame`).
     fn evict_over_budget(&mut self) {
-        if self.vram_bytes <= IMAGE_VRAM_BUDGET {
-            return;
-        }
-        // Collect evictable ids (older than this frame), oldest first.
-        let mut candidates: Vec<(u64, u64)> = self
-            .textures
-            .iter()
-            .filter(|(_, c)| c.last_frame < self.frame)
-            .map(|(&id, c)| (c.last_frame, id))
-            .collect();
-        candidates.sort_unstable();
-        for (_, id) in candidates {
-            if self.vram_bytes <= IMAGE_VRAM_BUDGET {
-                break;
-            }
+        let textures = self.textures.iter().map(|(&id, c)| (id, c.last_frame, c.bytes));
+        for id in evictions(textures, self.frame, self.vram_bytes) {
             if let Some(c) = self.textures.remove(&id) {
                 self.vram_bytes = self.vram_bytes.saturating_sub(c.bytes);
             }
@@ -484,6 +513,23 @@ impl ImageLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_textures_are_capped_and_the_drawn_ones_kept() {
+        const MB: u64 = 1024 * 1024;
+        // A video's frames: 8 MB each, one drawn per frame. Only the idle cap's
+        // worth of old frames stays, the oldest go first.
+        let frames: Vec<(u64, u64, u64)> = (0..10).map(|k| (k, k, 8 * MB)).collect();
+        assert_eq!(evictions(frames.iter().copied(), 9, 80 * MB), [0, 1, 2, 3, 4], "32 MB of idle frames stay");
+        // Under both limits nothing goes.
+        assert!(evictions(frames[..4].iter().copied(), 3, 32 * MB).is_empty());
+        // Over the budget, idle textures go even under the idle cap — never a
+        // drawn one.
+        let big = [(1, 5, 20 * MB), (2, 4, 10 * MB), (3, 9, 250 * MB)];
+        assert_eq!(evictions(big.iter().copied(), 9, 280 * MB), [2, 1]);
+        let drawn = [(1, 9, 200 * MB), (2, 9, 100 * MB)];
+        assert!(evictions(drawn.iter().copied(), 9, 300 * MB).is_empty(), "this frame's images stay");
+    }
 
     #[test]
     fn images_draw_on_whole_pixels_and_are_cut_at_the_grids_edge() {
