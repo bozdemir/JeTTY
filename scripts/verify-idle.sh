@@ -43,9 +43,15 @@ SHOTBIN=./target/release/jetty-shot
 LOG="$SB/jetty.log"                    # the nested jetty's stdout + stderr
 PNGDIR="$SB/verify"
 OCC_SECONDS="${OCC_SECONDS:-6}"   # pidstat window for the occluded/hidden states
-CPU_SOFT_MAX="${CPU_SOFT_MAX:-5.0}"   # soft %CPU ceiling for occluded-with-output
-                                       # (draining a `yes` flood is not literally 0;
-                                       # the HARD signal is the frozen frame counter)
+# Soft %CPU ceiling (percent of one core) while hidden/occluded WITH a flooding
+# shell. The flood is still drained at full speed — the shell must never block —
+# and that is two threads at most (the UI thread parsing, the PTY reader), so
+# drain-only work stays under 200% (measured ~150%). Rendering on top of it — a
+# frame pipeline that runs without presenting, which the frame counter cannot
+# see — pushes past it: lavapipe renders on every core. The HARD signal is the
+# frozen frame counter. (Until v0.30 this read pidstat's CPU-core column, so a
+# 5% ceiling could pass.)
+CPU_SOFT_MAX="${CPU_SOFT_MAX:-200}"
 FAILS=0
 
 note()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -197,7 +203,7 @@ else
 fi
 info "occluded-with-output max CPU = ${cmax:-?}% (soft ceiling ${CPU_SOFT_MAX}%)"
 awk -v c="${cmax:-0}" -v m="$CPU_SOFT_MAX" 'BEGIN{exit !(c+0>m+0)}' \
-  && fail "occluded CPU ${cmax}% exceeds ${CPU_SOFT_MAX}% (investigate drain cost)" \
+  && fail "occluded CPU ${cmax}% exceeds ${CPU_SOFT_MAX}% (more than the drain: is it rendering?)" \
   || pass "occluded CPU within soft ceiling"
 xdo windowmap "$WID" 2>/dev/null; focus
 keyk ctrl+c; sleep 0.2; typek "kill %1 2>/dev/null"; enter; keyk ctrl+c; sleep 0.3
