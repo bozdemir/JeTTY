@@ -7910,6 +7910,7 @@ impl App {
     /// rest (cancel a staged inject, jump to the prompt) from `runsel::paste_into`.
     /// Returns whether the view jumped (the caller repaints that window).
     fn paste_to_tab(tab: &mut Tab, text: &str) -> bool {
+        tab.pty.note_user_input();
         crate::runsel::paste_into(&mut tab.terminal, &mut tab.pending_inject, &mut tab.writer, text)
     }
 
@@ -8243,8 +8244,9 @@ impl App {
     /// shell or rc file — gets the next shell candidate instead of closing
     /// (with the last tab, the whole app used to vanish without a word). The
     /// dead shell's last output (its error) stays on screen above the notice.
-    /// A tab whose shell already showed a prompt (OSC 133) did start: whatever
-    /// ended it was the user's. True when the tab lives on (see
+    /// A tab whose shell already showed a prompt (OSC 133), or that the user
+    /// typed into (`PtySession::note_user_input`), did start: whatever ended
+    /// it was the user's. True when the tab lives on (see
     /// `PtySession::respawn_after_failed_start`).
     fn revive_failed_start(tab: &mut Tab) -> bool {
         if tab.terminal.prompt_count() > 0 {
@@ -8441,6 +8443,7 @@ impl App {
         let p = tab.pending_inject.take().expect("checked Some above");
         match verdict {
             Verdict::Fire | Verdict::FireUnbracketed => {
+                tab.pty.note_user_input();
                 let wrote = runsel::fire_pending(
                     &mut tab.writer,
                     &p.text,
@@ -17260,6 +17263,9 @@ fn write_key_to_pty(
         // irrelevant vs the PTY write (viewport offset and the PTY writer are
         // independent).
         tab.terminal.scroll_to_bottom();
+        // Whatever ends this shell now is the user's (Ctrl+D, `exit`), never
+        // a failed start that swaps in the next shell.
+        tab.pty.note_user_input();
     }
     let _ = tab.writer.write_all(bytes);
     let _ = tab.writer.flush();

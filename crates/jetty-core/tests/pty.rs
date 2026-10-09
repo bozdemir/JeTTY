@@ -386,6 +386,31 @@ fn a_shell_that_dies_right_after_starting_hands_over_to_the_next_one() {
 
 #[cfg(unix)]
 #[test]
+fn ctrl_d_after_a_failed_command_is_the_user_leaving() {
+    // A shell leaves with its last command's status: Ctrl+D (or `exit`) right
+    // after a failed command — or at the first prompt of an rc file whose last
+    // line failed — ends a brand-new tab with status 1 within the failed-start
+    // window. Typed by the user, that closes the tab: it used to swap in the
+    // next shell with "exited with status 1 right after starting".
+    std::env::set_var("SHELL", SH);
+    let end_after_a_failure = |typed: bool| {
+        let mut pty = spawn_sh(None);
+        {
+            use std::io::Write;
+            pty.writer().write_all(b"false\n\x04").unwrap();
+        }
+        if typed {
+            pty.note_user_input();
+        }
+        assert!(wait_exited(&pty), "premise: the shell exits");
+        pty.respawn_after_failed_start().map(|next| next.is_ok())
+    };
+    assert_eq!(end_after_a_failure(false), Some(true), "premise: unsuccessful, inside the window");
+    assert_eq!(end_after_a_failure(true), None, "the user's Ctrl+D just closes the tab");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_clean_exit_is_not_a_failed_start() {
     // `exit` / Ctrl+D at once is the user closing the tab, not a broken shell.
     let pty = spawn_sh(None);

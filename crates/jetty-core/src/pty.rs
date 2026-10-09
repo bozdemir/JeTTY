@@ -190,6 +190,9 @@ pub struct PtySession {
     /// BEFORE `exited`, so a caller that saw `child_exited` can read it).
     started: Instant,
     ended: Arc<Mutex<Option<(portable_pty::ExitStatus, Instant)>>>,
+    /// The user typed or pasted into the shell ([`PtySession::note_user_input`]):
+    /// whatever ended it was theirs, never a failed start.
+    user_input: bool,
 }
 
 /// The shell candidates (most preferred first), start directory and extra
@@ -1248,6 +1251,7 @@ impl PtySession {
             wake,
             started,
             ended,
+            user_input: false,
         })
     }
 
@@ -1272,11 +1276,15 @@ impl PtySession {
     /// candidate on a fresh PTY of the same size, start directory, environment
     /// and wake, whose [`PtySession::startup_notices`] say what happened — so a
     /// tab (and with the last tab, the whole app) does not just vanish.
-    /// `None` when the shell is alive, ended cleanly or later, or was the last
-    /// candidate; `Some(Err)` when no further candidate could be spawned.
-    /// Drain this session's remaining output first: it is the dead shell's
-    /// last words, usually the error.
+    /// `None` when the shell is alive, ended cleanly or later, was typed into
+    /// ([`PtySession::note_user_input`]), or was the last candidate;
+    /// `Some(Err)` when no further candidate could be spawned. Drain this
+    /// session's remaining output first: it is the dead shell's last words,
+    /// usually the error.
     pub fn respawn_after_failed_start(&self) -> Option<std::io::Result<PtySession>> {
+        if self.user_input {
+            return None;
+        }
         let (status, ended) = self.ended.lock().ok()?.clone()?;
         if !failed_start(&status, ended.duration_since(self.started)) {
             return None;
@@ -1297,6 +1305,16 @@ impl PtySession {
             session.startup_notices.insert(0, notice);
             session
         }))
+    }
+
+    /// Record that the user typed, pasted or ran a command in this shell (the
+    /// app's key, paste and run-selection paths — not the terminal's own
+    /// reports). A shell exits with the status of its last command, so Ctrl+D
+    /// or `exit` right after a failed one (or after an rc file whose last line
+    /// failed) ends a brand-new shell unsuccessfully: that is the user leaving,
+    /// never a failed start ([`PtySession::respawn_after_failed_start`]).
+    pub fn note_user_input(&mut self) {
+        self.user_input = true;
     }
 
     /// Feed queued output to `f`, oldest chunk first, until the queue is empty or
