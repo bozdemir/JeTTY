@@ -21,3 +21,10 @@ miniz_oxide = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# macOS only: the system locale a shell gets when JeTTY.app was started without
+# one (`pty::system_locale`). Already in the tree via wgpu and arboard, NSLocale
+# included — no new crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSLocale", "NSString"] }

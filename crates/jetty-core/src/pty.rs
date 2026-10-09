@@ -605,6 +605,73 @@ pub fn hide_from_shells(var: &'static str) {
     }
 }
 
+/// The locale variable a shell gets when the environment JeTTY hands it names
+/// none (`var` looks one up): `LANG` = the system's language and region
+/// (`system`, e.g. `tr_TR`) in UTF-8 when that locale is `installed`, else
+/// `LC_CTYPE=UTF-8` — UTF-8 text, C conventions for the rest (alacritty's and
+/// iTerm2's fallback). `None` while any of `LC_ALL`, `LC_CTYPE`, `LANG` is set
+/// and non-empty: a locale the user chose is never overridden.
+///
+/// macOS needs it: launchd starts JeTTY.app — Dock, Finder, Spotlight, the
+/// login item — with no locale, and ~/.zprofile rarely sets one, since
+/// Terminal.app and iTerm2 export it for their shells. The shell then ran in
+/// the C locale: typed `ş` showed as `<C5><9F>` in zsh, `ls` printed `??` for
+/// UTF-8 names, vim and less read UTF-8 files as Latin-1.
+#[cfg(any(test, target_os = "macos"))]
+fn shell_locale(
+    var: impl Fn(&str) -> Option<String>,
+    system: Option<&str>,
+    installed: impl Fn(&str) -> bool,
+) -> Option<(&'static str, String)> {
+    let set = |key: &str| var(key).is_some_and(|v| !v.is_empty());
+    if ["LC_ALL", "LC_CTYPE", "LANG"].into_iter().any(set) {
+        return None;
+    }
+    match system.map(|s| format!("{s}.UTF-8")) {
+        Some(lang) if installed(&lang) => Some(("LANG", lang)),
+        _ => Some(("LC_CTYPE", "UTF-8".to_string())),
+    }
+}
+
+/// Whether the C library has the locale `name` (`tr_TR.UTF-8`) — every
+/// category of it: a shell's `setlocale(LC_ALL, "")` fails as a whole on a
+/// partial one.
+#[cfg(any(test, target_os = "macos"))]
+fn locale_installed(name: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // SAFETY: `name` is a valid C string; a non-null result is a new locale
+    // object, freed right away.
+    unsafe {
+        let locale = libc::newlocale(libc::LC_ALL_MASK, name.as_ptr(), std::ptr::null_mut());
+        if locale.is_null() {
+            return false;
+        }
+        libc::freelocale(locale);
+    }
+    true
+}
+
+/// The language and region the user picked in System Settings, as a locale
+/// name without its codeset (`tr_TR`); read once.
+#[cfg(target_os = "macos")]
+fn system_locale() -> Option<&'static str> {
+    static LOCALE: OnceLock<Option<String>> = OnceLock::new();
+    LOCALE
+        .get_or_init(|| {
+            objc2::rc::autoreleasepool(|_| {
+                let locale = objc2_foundation::NSLocale::currentLocale();
+                let language = locale.languageCode().to_string();
+                // Deprecated for `regionCode`, which needs macOS 13.
+                #[allow(deprecated)]
+                let region = locale.countryCode()?.to_string();
+                Some(format!("{language}_{region}"))
+            })
+        })
+        .as_deref()
+}
+
 /// The path a shell should use to re-invoke JeTTY (`$JETTY_BIN`).
 fn jetty_bin_path() -> Option<std::ffi::OsString> {
     self_exe().map(|s| s.path.into_os_string())
@@ -902,6 +969,16 @@ impl PtySession {
                 cmd.env("JETTY_BIN", exe);
             }
             for (key, value) in env {
+                cmd.env(key, value);
+            }
+            // A shell started from JeTTY.app gets no locale from launchd: the
+            // system's, in UTF-8, unless one is set (`shell_locale`).
+            #[cfg(target_os = "macos")]
+            if let Some((key, value)) = shell_locale(
+                |key| cmd.get_env(key).map(|v| v.to_string_lossy().into_owned()),
+                system_locale(),
+                locale_installed,
+            ) {
                 cmd.env(key, value);
             }
             // An explicit cwd (inherited from the requesting tab) wins.
@@ -1304,6 +1381,39 @@ impl PtySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shell_with_no_locale_gets_the_systems_in_utf8() {
+        let unset = |_: &str| None;
+        let installed = |l: &str| l == "tr_TR.UTF-8";
+        // JeTTY.app started by launchd (Dock, Finder, the login item): no LANG,
+        // LC_ALL or LC_CTYPE. The system's language and region, in UTF-8.
+        assert_eq!(shell_locale(unset, Some("tr_TR"), installed), Some(("LANG", "tr_TR.UTF-8".into())));
+        // A language/region pair with no installed locale (English in Turkey),
+        // or none known: UTF-8 text, C conventions for the rest.
+        assert_eq!(shell_locale(unset, Some("en_TR"), installed), Some(("LC_CTYPE", "UTF-8".into())));
+        assert_eq!(shell_locale(unset, None, installed), Some(("LC_CTYPE", "UTF-8".into())));
+        // An empty value is no locale either.
+        let empty_lang = |k: &str| (k == "LANG").then(String::new);
+        assert_eq!(shell_locale(empty_lang, Some("tr_TR"), installed), Some(("LANG", "tr_TR.UTF-8".into())));
+    }
+
+    #[test]
+    fn a_locale_the_user_set_is_never_overridden() {
+        let installed = |_: &str| true;
+        for var in ["LC_ALL", "LC_CTYPE", "LANG"] {
+            let set = |k: &str| (k == var).then(|| "de_DE.UTF-8".to_string());
+            assert_eq!(shell_locale(set, Some("tr_TR"), installed), None, "{var}");
+        }
+    }
+
+    #[test]
+    fn locale_installed_asks_the_c_library() {
+        assert!(locale_installed("C"));
+        assert!(locale_installed("POSIX"));
+        assert!(!locale_installed("xx_NOWHERE.UTF-8"));
+        assert!(!locale_installed("nul\0inside"));
+    }
 
     #[test]
     fn appimage_is_trusted_only_from_inside_the_appimage() {
