@@ -1,11 +1,12 @@
 //! The application as a whole, apart from its windows. Only macOS has such a
-//! thing: AppKit keeps an ACTIVE application separate from its key window, and
-//! hides and un-hides applications. Everywhere else these are no-ops.
+//! thing: AppKit keeps an ACTIVE application separate from its key window,
+//! hides and un-hides applications, and the Dock talks to the application, not
+//! to a window. Everywhere else these are no-ops.
 //!
 //! Is this a violation of the no-platform-specific-code rule? No, for the same
 //! reasons as `set_window_fullscreen`'s macOS branch: per-OS, not per-desktop,
-//! and only documented APIs — winit's own `ActiveEventLoopExtMacOS` and AppKit's
-//! `NSApplication`.
+//! and only documented APIs — winit's own `ActiveEventLoopExtMacOS`, AppKit's
+//! `NSApplication`, Foundation's `NSAppleEventManager`.
 
 use winit::event_loop::ActiveEventLoop;
 
@@ -38,12 +39,38 @@ pub fn unhide_application() {
     macos::unhide_application();
 }
 
+/// Call `on_reopen` whenever macOS asks the running JeTTY to "reopen": a click
+/// on its Dock icon, `open -a JeTTY`, a launch from Spotlight, Launchpad or
+/// Finder. LaunchServices sends the running process the `kAEReopenApplication`
+/// Apple event instead of starting a second one, so the single-instance socket
+/// never hears of it, and winit (0.30) neither handles the event nor lets an
+/// app set its own `NSApplicationDelegate` (its own must stay installed) — a
+/// click on the Dock icon of a hidden JeTTY only activated it, with no window.
+/// This installs a handler for that one event with `NSAppleEventManager`.
+///
+/// Call once the application has finished launching (from `resumed`): AppKit
+/// installs its own handler while launching, and the later one wins. The
+/// callback runs on the main thread, inside the event loop. A no-op off macOS.
+pub fn on_reopen(on_reopen: impl Fn() + 'static) {
+    #[cfg(target_os = "macos")]
+    macos::on_reopen(Box::new(on_reopen));
+    #[cfg(not(target_os = "macos"))]
+    let _ = on_reopen;
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
-    use objc2::MainThreadMarker;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, NSObject};
+    use objc2::{class, define_class, msg_send, sel, DefinedClass, MainThreadMarker};
     use objc2_app_kit::NSApplication;
     use winit::event_loop::ActiveEventLoop;
     use winit::platform::macos::ActiveEventLoopExtMacOS;
+
+    /// `kCoreEventClass` and `kAEReopenApplication`: the four-character codes
+    /// ('aevt', 'rapp') of the reopen Apple event.
+    const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
+    const REOPEN_APPLICATION: u32 = u32::from_be_bytes(*b"rapp");
 
     pub(super) fn hide_application(event_loop: &ActiveEventLoop) {
         let Some(mtm) = MainThreadMarker::new() else {
@@ -62,5 +89,56 @@ mod macos {
         if app.isHidden() {
             app.unhideWithoutActivation();
         }
+    }
+
+    struct Reopen {
+        run: Box<dyn Fn()>,
+    }
+
+    define_class!(
+        // SAFETY: NSObject has no subclassing requirements, and
+        // `ReopenHandler` does not implement Drop.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = objc2::MainThreadOnly]
+        #[ivars = Reopen]
+        struct ReopenHandler;
+
+        impl ReopenHandler {
+            // SAFETY: an NSAppleEventManager handler's signature —
+            // `-(void)handle:(NSAppleEventDescriptor *)event
+            // withReplyEvent:(NSAppleEventDescriptor *)reply`, both taken as
+            // nullable so a nil descriptor can never become a reference.
+            #[unsafe(method(handleReopen:withReplyEvent:))]
+            fn handle_reopen(&self, _event: Option<&AnyObject>, _reply: Option<&AnyObject>) {
+                (self.ivars().run)();
+            }
+        }
+    );
+
+    pub(super) fn on_reopen(run: Box<dyn Fn()>) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let handler = mtm.alloc::<ReopenHandler>().set_ivars(Reopen { run });
+        // SAFETY: NSObject's designated initializer.
+        let handler: Retained<ReopenHandler> = unsafe { msg_send![super(handler), init] };
+        // SAFETY: the documented `+[NSAppleEventManager sharedAppleEventManager]`
+        // and `-setEventHandler:andSelector:forEventClass:andEventID:` (the
+        // class and id are 32-bit four-character codes); the selector is the
+        // handler method defined above, with the signature it requires.
+        unsafe {
+            let manager: Retained<AnyObject> =
+                msg_send![class!(NSAppleEventManager), sharedAppleEventManager];
+            let _: () = msg_send![
+                &*manager,
+                setEventHandler: &*handler,
+                andSelector: sel!(handleReopen:withReplyEvent:),
+                forEventClass: CORE_EVENT_CLASS,
+                andEventID: REOPEN_APPLICATION,
+            ];
+        }
+        // NSAppleEventManager does not retain its handlers: this one lives as
+        // long as the process.
+        std::mem::forget(handler);
     }
 }

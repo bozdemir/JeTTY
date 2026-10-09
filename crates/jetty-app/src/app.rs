@@ -19,6 +19,9 @@ pub enum AppEvent {
     ToggleVisibility,
     /// `jetty --show` / `--hide` — set window visibility explicitly.
     SetVisible(bool),
+    /// macOS asked the running JeTTY to reopen: a click on its Dock icon,
+    /// `open -a JeTTY`, Spotlight (`jetty_platform::on_reopen`).
+    Reopen,
     /// A watched config/theme file changed (from the `notify` watcher). Debounced
     /// and applied from `about_to_wait`; carries no payload (the reload re-reads).
     ConfigChanged,
@@ -13150,6 +13153,13 @@ impl ApplicationHandler<AppEvent> for App {
         if self.hotkey_manager.is_none() {
             self.start_summon_hotkey();
         }
+        // macOS: a click on the Dock icon (or `open -a JeTTY`, Spotlight) while
+        // JeTTY runs only activated it — a hidden terminal stayed hidden. Show
+        // it. Installed here, after AppKit's own handler; a no-op elsewhere.
+        let proxy = self.proxy.clone();
+        jetty_platform::on_reopen(move || {
+            let _ = proxy.send_event(AppEvent::Reopen);
+        });
 
         // NO periodic heartbeat: every wake source is an event — PTY data/EOF
         // (reader thread), shell exit (waiter thread), F9 (hotkey thread), IPC,
@@ -13357,6 +13367,15 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::SetVisible(want) => {
                 self.set_visibility(want, event_loop);
+            }
+            AppEvent::Reopen => {
+                // Shown and raised like `jetty --show`, never hidden. A minimized
+                // window comes back too, as AppKit's own reopen handling (which
+                // JeTTY's handler replaces) brought it back.
+                if let Some(w) = &self.window {
+                    w.set_minimized(false);
+                }
+                self.set_visibility(true, event_loop);
             }
             AppEvent::ConfigChanged => {
                 // Debounce an editor's write/rename/chmod burst: schedule ONE reload

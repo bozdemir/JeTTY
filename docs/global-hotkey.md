@@ -97,7 +97,9 @@ as on Wayland.
 Hiding the terminal (F9, `jetty --hide`) while no other JeTTY window is open
 hides the whole application, as Cmd+H does, so the keyboard goes back to the app
 you came from instead of staying with a JeTTY that has no window. A hidden start
-(`jetty --background`, the login item) does not take the keyboard either.
+(`jetty --background`, the login item) does not take the keyboard either. A click
+on JeTTY's Dock icon, `open -a JeTTY` or a launch from Spotlight or Finder while
+it runs brings the terminal back, like `jetty --show`.
 
 ## Notes
 

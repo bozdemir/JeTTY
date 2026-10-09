@@ -147,7 +147,7 @@ sh scripts/make-macos-app.sh      # builds JeTTY.app with the Dock/Finder icon
 open JeTTY.app                     # run the bundle, NOT ./target/release/jetty
 ```
 
-> **Note:** the bare binary cannot show a Dock icon on macOS (winit limitation); the `.app` bundle is required. If the icon appears stale in the Dock, run `killall Dock` once to flush the icon cache.
+> **Note:** the bare binary cannot show a Dock icon on macOS (winit limitation); the `.app` bundle is required. If the icon appears stale in the Dock, run `killall Dock` once to flush the icon cache. While JeTTY runs, a click on its Dock icon (or `open -a JeTTY`) brings a hidden terminal back.
 
 ### 🐧 Linux — one-line installer (prebuilt, no toolchain)
 
