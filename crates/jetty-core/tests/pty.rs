@@ -309,7 +309,9 @@ fn title_cwd_and_foreground_name_follow_the_shell() {
     while Instant::now() < deadline {
         while pty.try_recv_output().is_some() {}
         name = pty.foreground_name();
-        if name.is_some() {
+        // Between fork and exec the new job is still a copy of `sh` (already in
+        // the foreground on a slow runner): wait for the exec.
+        if name.as_deref() == Some("sleep") {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
