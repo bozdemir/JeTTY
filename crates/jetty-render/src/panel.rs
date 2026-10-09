@@ -440,10 +440,21 @@ const SW_H: f32 = 24.0;
 /// Cycler `< value >`.
 const CYC_W: f32 = 210.0;
 const CYC_SEG: f32 = 32.0;
-/// Stepper `- value +` and its Reset button.
+/// Stepper `- value +` and its Reset button. The stepper grows past STEP_W
+/// when its value needs it, keeping VAL_PAD clear of each separator.
 const STEP_W: f32 = 116.0;
 const STEP_SEG: f32 = 36.0;
 const RESET_W: f32 = 64.0;
+const VAL_PAD: f32 = 8.0;
+/// A cycler, stepper or chip row whose control would leave its label less
+/// than this (or the label's own width, if shorter) drops the control onto
+/// a line of its own below the label — a narrow Settings window — adding
+/// STACK_DY to the row.
+const LABEL_MIN_W: f32 = 96.0;
+const STACK_DY: f32 = 24.0;
+/// The tab strip's narrowest padding (each side of a name) before the
+/// longest names are ellipsized.
+const TAB_PAD_MIN: f32 = 3.0;
 /// Chips.
 const CHIP_W_MIN: f32 = 72.0;
 const CHIP_H: f32 = 24.0;
@@ -706,6 +717,8 @@ impl Lay<'_> {
     }
 
     fn row(&mut self, y: f32, row: &CtlRow) -> f32 {
+        let stacked = self.stacks(row);
+        let dy = if stacked { STACK_DY } else { 0.0 };
         let h = match &row.show {
             CtlShow::Slider { .. } => SLIDER_PITCH,
             CtlShow::Rgb(_) => RGB_PITCH,
@@ -714,7 +727,7 @@ impl Lay<'_> {
                 let lines = self.chip_flow_lines(chips).len().max(1) as f32;
                 24.0 + lines * (CHIP_H + CHIP_FLOW_GAP) + 8.0
             }
-            _ => ROW_PITCH,
+            _ => ROW_PITCH + dy,
         } + if row.hint.is_some() { HINT_H } else { 0.0 };
         if self.focus == Some(row.id) {
             let fc = self.c.focus;
@@ -723,10 +736,10 @@ impl Lay<'_> {
         match &row.show {
             CtlShow::Slider { frac, text } => self.slider(y, row, *frac, text),
             CtlShow::Toggle(on) => self.toggle(y, row, *on),
-            CtlShow::Cycler(v) => self.cycler(y, row, v),
-            CtlShow::Stepper(v) => self.stepper(y, row, v),
+            CtlShow::Cycler(v) => self.cycler(y, row, v, stacked),
+            CtlShow::Stepper(v) => self.stepper(y, row, v, stacked),
             CtlShow::Rgb(v) => self.rgb(y, row, *v),
-            CtlShow::Chips(chips) => self.chips(y, row, chips),
+            CtlShow::Chips(chips) => self.chips(y, row, chips, stacked),
             CtlShow::ChipFlow { chips, status } => self.chip_flow(y, row, chips, status),
             CtlShow::List { items, offset, total, selected, rows } => {
                 self.list(y, row, items, *offset, *total, *selected, *rows)
@@ -741,7 +754,7 @@ impl Lay<'_> {
                     let lines = self.chip_flow_lines(chips).len().max(1) as f32;
                     y + 24.0 + lines * (CHIP_H + CHIP_FLOW_GAP) + 2.0
                 }
-                _ => y + CTL_H + 5.0,
+                _ => y + dy + CTL_H + 5.0,
             };
             let s = self.fit(hint, self.cw);
             let col = self.c.ui.text_hint;
@@ -756,6 +769,45 @@ impl Lay<'_> {
         let s = self.fit(&row.label, ctl_x - 12.0 - self.x0);
         let col = self.c.label(row.state);
         self.label(s, self.x0, y, col);
+    }
+
+    /// A row label on a line of its own (a stacked row): the full width.
+    fn row_label_above(&mut self, row: &CtlRow, y: f32) {
+        let ctl_x = self.right() + 12.0;
+        self.row_label(row, y, ctl_x);
+    }
+
+    /// Whether `row`'s control drops onto a line below its label: beside it,
+    /// the label would keep less than `LABEL_MIN_W` (or its own width, when
+    /// that is shorter) — only in a narrow window. Sliders, RGB rows, chip
+    /// flows and lists always put their control under the label; a toggle
+    /// always fits beside it.
+    fn stacks(&mut self, row: &CtlRow) -> bool {
+        let ctl_w = match &row.show {
+            CtlShow::Cycler(_) => CYC_W,
+            CtlShow::Stepper(v) => RESET_W + 8.0 + self.stepper_w(v),
+            CtlShow::Chips(chips) => self.chips_w(chips).1,
+            _ => return false,
+        };
+        let need = self.tw(&row.label).min(LABEL_MIN_W);
+        self.cw - ctl_w - 12.0 < need
+    }
+
+    /// A stepper wide enough for `value` with VAL_PAD clear of each separator
+    /// (never narrower than STEP_W).
+    fn stepper_w(&mut self, value: &str) -> f32 {
+        (self.tw(value) + 2.0 * (STEP_SEG + VAL_PAD)).max(STEP_W)
+    }
+
+    /// A chip row's chip width (every chip as wide as the widest label
+    /// needs) and the row's total width.
+    fn chips_w(&mut self, chips: &[(String, bool)]) -> (f32, f32) {
+        let n = chips.len().min(8);
+        let mut w = CHIP_W_MIN;
+        for (t, _) in &chips[..n] {
+            w = w.max(self.tw(t) + 16.0);
+        }
+        (w, n as f32 * w + n.saturating_sub(1) as f32 * 8.0)
     }
 
     fn live(&self, row: &CtlRow) -> bool {
@@ -800,16 +852,24 @@ impl Lay<'_> {
         self.quad(faded(Rect::new(x, y + 7.0, 1.0, CTL_H - 14.0, col), state));
     }
 
-    fn cycler(&mut self, y: f32, row: &CtlRow, value: &str) {
+    fn cycler(&mut self, y: f32, row: &CtlRow, value: &str, stacked: bool) {
         let c = self.c;
         let st = row.state;
-        // CYC_W wide, grown to fit a long value (a theme name) as far as the
-        // label beside it leaves room — short values keep the common width.
-        let label_w = self.tw(&row.label);
-        let want = self.tw(value) + 2.0 * CYC_SEG + 16.0;
-        let cyc_w = want.min(self.cw - label_w - 12.0).max(CYC_W);
+        let (cyc_w, y) = if stacked {
+            // Under its label: the full content width.
+            self.row_label_above(row, y);
+            (self.cw, y + STACK_DY)
+        } else {
+            // CYC_W wide, grown to fit a long value (a theme name) as far as
+            // the label beside it leaves room — short values keep the common
+            // width.
+            let label_w = self.tw(&row.label);
+            let want = self.tw(value) + 2.0 * CYC_SEG + 16.0;
+            let w = want.min(self.cw - label_w - 12.0).max(CYC_W);
+            self.row_label(row, y + LABEL_DY, self.right() - w);
+            (w, y)
+        };
         let x = self.right() - cyc_w;
-        self.row_label(row, y + LABEL_DY, x);
         self.quad(faded(Rect::rounded(x, y, cyc_w, CTL_H, c.ctl, R_CTL), st));
         self.seg_line(x + CYC_SEG, y, st);
         self.seg_line(x + cyc_w - CYC_SEG, y, st);
@@ -827,29 +887,40 @@ impl Lay<'_> {
         }
     }
 
-    fn stepper(&mut self, y: f32, row: &CtlRow, value: &str) {
+    fn stepper(&mut self, y: f32, row: &CtlRow, value: &str, stacked: bool) {
         let c = self.c;
         let st = row.state;
-        let x = self.right() - STEP_W;
+        let natural = self.stepper_w(value);
+        let (step_w, y) = if stacked {
+            // Under its label, right-aligned like the one-line row; squeezed
+            // (the value ellipsized) only when even the full width is short.
+            self.row_label_above(row, y);
+            (natural.min(self.cw - RESET_W - 8.0).max(2.0 * STEP_SEG + 8.0), y + STACK_DY)
+        } else {
+            (natural, y)
+        };
+        let x = self.right() - step_w;
         let rx = x - 8.0 - RESET_W;
-        self.row_label(row, y + LABEL_DY, rx);
+        if !stacked {
+            self.row_label(row, y + LABEL_DY, rx);
+        }
         self.quad(faded(Rect::rounded(rx, y, RESET_W, CTL_H, c.ctl, R_CTL), st));
-        self.quad(faded(Rect::rounded(x, y, STEP_W, CTL_H, c.ctl, R_CTL), st));
+        self.quad(faded(Rect::rounded(x, y, step_w, CTL_H, c.ctl, R_CTL), st));
         self.seg_line(x + STEP_SEG, y, st);
-        self.seg_line(x + STEP_W - STEP_SEG, y, st);
-        let vw = STEP_W - 2.0 * STEP_SEG;
-        let shown = self.fit(value, vw - 4.0);
+        self.seg_line(x + step_w - STEP_SEG, y, st);
+        let vw = step_w - 2.0 * STEP_SEG;
+        let shown = self.fit(value, vw - VAL_PAD);
         let sx = x + STEP_SEG + ((vw - self.tw(&shown)) * 0.5).max(0.0);
         self.label(shown, sx, y + LABEL_DY, c.value(st));
         let gc = c.label(st);
         self.seg_glyph("-", x, STEP_SEG, y + LABEL_DY, gc);
-        self.seg_glyph("+", x + STEP_W - STEP_SEG, STEP_SEG, y + LABEL_DY, gc);
+        self.seg_glyph("+", x + step_w - STEP_SEG, STEP_SEG, y + LABEL_DY, gc);
         let reset = self.fit("Reset", RESET_W - 8.0);
         self.seg_glyph(&reset, rx, RESET_W, y + LABEL_DY, gc);
         if self.live(row) {
             let id = row.id;
             self.hit(area(x, y, STEP_SEG, CTL_H), PanelHit::Ctl { id, part: CtlPart::Minus });
-            self.hit(area(x + STEP_W - STEP_SEG, y, STEP_SEG, CTL_H), PanelHit::Ctl { id, part: CtlPart::Plus });
+            self.hit(area(x + step_w - STEP_SEG, y, STEP_SEG, CTL_H), PanelHit::Ctl { id, part: CtlPart::Plus });
             self.hit(area(rx, y, RESET_W, CTL_H), PanelHit::Ctl { id, part: CtlPart::Reset });
         }
     }
@@ -884,17 +955,26 @@ impl Lay<'_> {
         }
     }
 
-    fn chips(&mut self, y: f32, row: &CtlRow, chips: &[(String, bool)]) {
+    fn chips(&mut self, y: f32, row: &CtlRow, chips: &[(String, bool)], stacked: bool) {
         let c = self.c;
         let st = row.state;
         let n = chips.len().min(8);
-        let mut w = CHIP_W_MIN;
-        for (t, _) in &chips[..n] {
-            w = w.max(self.tw(t) + 16.0);
-        }
-        let total = n as f32 * w + n.saturating_sub(1) as f32 * 8.0;
+        let (mut w, mut total) = self.chips_w(chips);
+        let y = if stacked {
+            // Under the label, right-aligned; narrowed (labels ellipsized)
+            // only when even the full width is short.
+            self.row_label_above(row, y);
+            if total > self.cw && n > 0 {
+                w = ((self.cw - (n - 1) as f32 * 8.0) / n as f32).max(1.0);
+                total = self.cw;
+            }
+            y + STACK_DY
+        } else {
+            let x_start = self.right() - total;
+            self.row_label(row, y + LABEL_DY, x_start);
+            y
+        };
         let x_start = self.right() - total;
-        self.row_label(row, y + LABEL_DY, x_start);
         for (i, (t, on)) in chips[..n].iter().enumerate() {
             let x = x_start + i as f32 * (w + 8.0);
             let fill = if *on { c.accent } else { c.ctl };
@@ -932,10 +1012,13 @@ impl Lay<'_> {
     fn chip_flow(&mut self, y: f32, row: &CtlRow, chips: &[(String, bool)], status: &str) {
         let c = self.c;
         let st = row.state;
-        let status_w = self.tw(status);
+        // The readout takes at most half the line, so a long one ("Green
+        // Phosphor") never crowds the label out in a narrow window.
+        let status = self.fit(status, self.cw * 0.5);
+        let status_w = self.tw(&status);
         self.row_label(row, y, self.right() - status_w);
         let sc = c.label(st);
-        self.label(status.to_string(), self.right() - status_w, y, sc);
+        self.label(status, self.right() - status_w, y, sc);
         for (line, items) in self.chip_flow_lines(chips).into_iter().enumerate() {
             let cy = y + 24.0 + line as f32 * (CHIP_H + CHIP_FLOW_GAP);
             for (i, dx, w) in items {
@@ -1015,18 +1098,23 @@ impl Lay<'_> {
     fn gallery(&mut self, y: f32) -> f32 {
         let c = self.c;
         let (x0, cw) = (self.x0, self.cw);
-        let mut x = x0;
+        // The filter chips, wrapping onto a second line in a narrow window.
+        let (mut x, mut cy) = (x0, y);
         for f in ThemeFilter::ALL {
             let t = f.label();
-            let w = (self.tw(t) + 24.0).max(52.0);
+            let w = (self.tw(t) + 24.0).max(52.0).min(cw);
+            if x > x0 && x + w > x0 + cw {
+                (x, cy) = (x0, cy + CHIP_H + CHIP_FLOW_GAP);
+            }
             let on = f == self.filter;
             let hov = self.hover == Some(PanelHit::GalleryFilter(f));
             let fill = if on { c.accent } else if hov { c.ctl_hi } else { c.ctl };
-            let r = Rect::rounded(x, y + 2.0, w, CHIP_H, fill, CHIP_H / 2.0);
+            let r = Rect::rounded(x, cy + 2.0, w, CHIP_H, fill, CHIP_H / 2.0);
             self.quad(r);
             let tc = if on { c.ui.on_accent } else { c.ui.text_dim };
-            let tx = x + (w - self.tw(t)) * 0.5;
-            self.label(t.to_string(), tx, y + 6.0, tc);
+            let shown = self.fit(t, w - 8.0);
+            let tx = x + ((w - self.tw(&shown)) * 0.5).max(0.0);
+            self.label(shown, tx, cy + 6.0, tc);
             self.hit(r, PanelHit::GalleryFilter(f));
             x += w + 6.0;
         }
@@ -1038,9 +1126,9 @@ impl Lay<'_> {
         let count = if n == 1 { "1 theme".to_string() } else { format!("{n} themes") };
         let count_w = self.tw(&count);
         if x0 + cw - count_w > x + 8.0 {
-            self.label(count, x0 + cw - count_w, y + 6.0, c.ui.text_hint);
+            self.label(count, x0 + cw - count_w, cy + 6.0, c.ui.text_hint);
         }
-        let mut h = GAL_CHIPS_H;
+        let mut h = cy - y + GAL_CHIPS_H;
         if themes.is_empty() {
             let msg = match self.filter {
                 ThemeFilter::Mine => "No themes of your own yet: add .toml files to themes/",
@@ -1123,6 +1211,56 @@ pub fn track_knob(part: CtlPart) -> f32 {
 /// Height of a list's inset card showing `rows` rows.
 fn list_card_h(rows: usize) -> f32 {
     2.0 * LIST_PAD + rows as f32 * LIST_ROW_H + rows.saturating_sub(1) as f32 * LIST_ROW_GAP
+}
+
+/// The tab strip's layout (logical px): the names as shown, their widths,
+/// the padding each side of a name, and the first cell's x.
+struct TabStrip {
+    names: [String; N_TABS],
+    widths: [f32; N_TABS],
+    pad: f32,
+    x: f32,
+}
+
+/// Lay the tab strip out in the column `[px, px + pw]` whose content starts at
+/// `x0` (`cw` wide). Roomy: the classic layout, the first name aligned with the
+/// content. Narrower (the Settings window can be sized down to 200 px): the
+/// cells spread across the whole column, then the longest names are
+/// ellipsized until every tab fits — a tab must never fall off the window.
+fn tab_strip(m: &mut dyn ChromeMeasure, u: f32, x0: f32, cw: f32, px: f32, pw: f32) -> TabStrip {
+    let n = N_TABS as f32;
+    let mut widths = TAB_NAMES.map(|t| m.text_w(t) / u);
+    let total: f32 = widths.iter().sum();
+    let right = px + pw - 4.0;
+    let pad = ((cw - total) / (2.0 * n)).clamp(4.0, 14.0);
+    if x0 - pad + total + 2.0 * n * pad <= right {
+        return TabStrip { names: TAB_NAMES.map(String::from), widths, pad, x: x0 - pad };
+    }
+    let left = px + 4.0;
+    let room = right - left;
+    let pad = ((room - total) / (2.0 * n)).min(4.0);
+    if pad >= TAB_PAD_MIN {
+        return TabStrip { names: TAB_NAMES.map(String::from), widths, pad, x: left };
+    }
+    // The widest names give way first: one cap `c` with Σ min(w, c) = budget.
+    let budget = (room - 2.0 * n * TAB_PAD_MIN).max(0.0);
+    let mut sorted = widths;
+    sorted.sort_by(f32::total_cmp);
+    let (mut rest, mut cap) = (budget, f32::INFINITY);
+    for (i, w) in sorted.iter().enumerate() {
+        let k = (N_TABS - i) as f32;
+        if w * k > rest {
+            cap = rest / k;
+            break;
+        }
+        rest -= w;
+    }
+    let names = TAB_NAMES.map(|t| fit_head(m, t, cap * u, false));
+    for (w, s) in widths.iter_mut().zip(&names) {
+        *w = m.text_w(s) / u;
+    }
+    let pad = ((room - widths.iter().sum::<f32>()) / (2.0 * n)).clamp(0.0, TAB_PAD_MIN);
+    TabStrip { names, widths, pad, x: left }
 }
 
 /// Build the Settings panel for one frame. `m` measures labels exactly as the
@@ -1208,19 +1346,15 @@ pub fn build_panel(inp: &PanelInput, m: &mut dyn ChromeMeasure) -> PanelView {
 
     // Tab strip: leading-aligned cells sized to their measured labels, on a
     // full-width hairline; the active tab carries an accent underline.
-    let mut names_w = [0.0f32; N_TABS];
-    for (i, n) in TAB_NAMES.iter().enumerate() {
-        names_w[i] = m.text_w(n) / u;
-    }
-    let total_w: f32 = names_w.iter().sum();
-    let tab_pad = ((cw - total_w) / (2 * N_TABS) as f32).clamp(4.0, 14.0);
+    let strip = tab_strip(m, u, x0, cw, px, pw);
+    let (names_w, tab_pad) = (strip.widths, strip.pad);
     let mut tab_rects = [Rect::default(); N_TABS];
-    let mut tx = x0 - tab_pad;
-    for (i, r) in tab_rects.iter_mut().enumerate() {
+    let mut tx = strip.x;
+    for (i, (r, name)) in tab_rects.iter_mut().zip(strip.names).enumerate() {
         let w = names_w[i] + 2.0 * tab_pad;
         *r = area(tx, py + 44.0, w, 32.0);
         let col = if i == active_tab { c.ui.text } else { c.ui.text_dim };
-        labels.push((TAB_NAMES[i].to_string(), tx + tab_pad, py + 52.0, col));
+        labels.push((name, tx + tab_pad, py + 52.0, col));
         tx += w;
     }
     quads.push(Rect::new(0.0, py + 75.0, sw, 1.0, c.hair));
@@ -1673,5 +1807,117 @@ mod tests {
         assert!((s - (148.0f32).min(g.max_scroll)).abs() < 0.5, "{s}");
         // Never past the end.
         assert!(g.scroll_to_reveal(1.0e6, 1.0e6 + 10.0, 8.0) <= g.max_scroll);
+    }
+
+    /// The stepper's value always shows whole, clear of the "-" / "+"
+    /// separators — at fractional scales the real font's hinted advance is
+    /// wider than the design estimate ("16pt" came out as "16…" at 1.25× and
+    /// 1.5×, and touched both separator lines at 1× and 2×).
+    #[test]
+    fn stepper_value_is_never_cut_or_crowded() {
+        let items = vec![row("font_size", "Font size", CtlShow::Stepper("16pt".into()))];
+        // (DPI, UI font, the chrome font's advance as the GPU layer measures it:
+        // the design advance, or a hinted one rounded up to whole px.)
+        for (dpi, font, adv) in [(1.0, 16.0, 9.6328), (1.25, 14.0, 11.0), (1.5, 13.0, 12.0), (2.0, 16.0, 19.27)] {
+            let cm = ChromeMetrics::new(dpi, font);
+            let u = cm.overlay_u();
+            let (w, h) = ((PANEL_W * u).ceil() as u32, (PANEL_H * u).ceil() as u32);
+            let theme = jetty_core::Theme::by_name("catppuccin_mocha");
+            let inp = PanelInput::new(w, h, &theme, cm, &items);
+            let mut m = MonoMeasure(adv);
+            let v = build_panel(&inp, &mut m);
+            let g = &v.geom;
+            let minus = g.rect_of(PanelHit::Ctl { id: "font_size", part: CtlPart::Minus }).unwrap();
+            let plus = g.rect_of(PanelHit::Ctl { id: "font_size", part: CtlPart::Plus }).unwrap();
+            let value = v.content_labels.iter().find(|l| l.0.starts_with("16")).expect("value label");
+            assert_eq!(value.0, "16pt", "{dpi}×/{font}pt: the value was cut");
+            let (l, r) = (value.1, value.1 + m.text_w(&value.0));
+            let gap = 4.0 * u;
+            assert!(l >= minus.x + minus.w + gap - 0.01, "{dpi}×/{font}pt: value crowds the '-' separator");
+            assert!(r <= plus.x - gap + 0.01, "{dpi}×/{font}pt: value crowds the '+' separator");
+        }
+    }
+
+    /// The tab strip fits any Settings window the user can size (the window's
+    /// floor is 200 logical px): every tab stays reachable, no label runs
+    /// past the window, and a name that cannot fit is ellipsized. At the
+    /// design width every name shows whole, as before.
+    #[test]
+    fn tab_strip_fits_any_window_width() {
+        for (dpi, font) in [(1.0, 16.0), (2.0, 16.0), (1.0, 13.0), (1.0, 17.0)] {
+            let cm = ChromeMetrics::new(dpi, font);
+            let adv = CHAR_W_FALLBACK * cm.overlay_u();
+            for lw in (200..=720).step_by(10) {
+                let sw = (lw as f32 * dpi) as u32;
+                let v = view_with(&[], sw, (PANEL_H * dpi) as u32, dpi, font, 0.0);
+                let g = &v.geom;
+                let mut prev = f32::NEG_INFINITY;
+                for (i, r) in g.tab_rects.iter().enumerate() {
+                    assert!(r.w > 0.0 && r.x >= -0.01 && r.x + r.w <= sw as f32 + 0.01, "{lw}px: tab {i} outside");
+                    assert!(r.x + 0.01 >= prev, "{lw}px: tab {i} overlaps");
+                    assert_eq!(g.hit_at(r.x + r.w / 2.0, r.y + r.h / 2.0), Some(PanelHit::Tab(i)), "{lw}px: tab {i}");
+                    prev = r.x + r.w;
+                    let l = v.labels.iter().find(|l| (l.2 - r.y - 8.0 * cm.overlay_u()).abs() < 0.5 && l.1 >= r.x - 0.01 && l.1 < r.x + r.w)
+                        .unwrap_or_else(|| panic!("{lw}px: tab {i} has no label"));
+                    assert!(l.0 == TAB_NAMES[i] || l.0.ends_with('…'), "{lw}px: {:?} cut without an ellipsis", l.0);
+                    let end = l.1 + l.0.chars().count() as f32 * adv;
+                    assert!(end <= r.x + r.w + 0.5 && end <= sw as f32, "{lw}px: {:?} runs past its tab", l.0);
+                }
+            }
+            // The design width keeps every name whole.
+            let u = cm.overlay_u();
+            let v = view_with(&[], (PANEL_W * u) as u32, (PANEL_H * u) as u32, dpi, font, 0.0);
+            for n in TAB_NAMES {
+                assert!(v.labels.iter().any(|l| l.0 == n), "{dpi}×/{font}pt: {n} cut at the design width");
+            }
+        }
+    }
+
+    /// In a narrow window no row label runs into its control: a control that
+    /// leaves its label too little room drops below the label (as sliders
+    /// always do), and every control stays inside the content column. (A
+    /// 300-px window drew "A…" under the first Animate chip; at 240 px the
+    /// chips ran off the window and every cycler covered its label.)
+    #[test]
+    fn narrow_rows_stack_instead_of_overlapping() {
+        let mut items = sample_items();
+        items.push(row(
+            "anim",
+            "Animate",
+            CtlShow::Chips(vec![("Roll".into(), true), ("Flicker".into(), false), ("Jitter".into(), false)]),
+        ));
+        items.push(row("shape", "Shape", CtlShow::Cycler("Block".into())));
+        for (dpi, font) in [(1.0, 16.0), (2.0, 16.0), (1.0, 13.0)] {
+            let cm = ChromeMetrics::new(dpi, font);
+            let u = cm.overlay_u();
+            let adv = CHAR_W_FALLBACK * u;
+            for lw in (200..=440).step_by(20) {
+                let sw = (lw as f32 * dpi) as u32;
+                let v = view_with(&items, sw, 40_000, dpi, font, 0.0);
+                let g = &v.geom;
+                let (x0, right) = (g.panel.x + PAD * u, g.panel.x + g.panel.w - PAD * u);
+                let ctl: Vec<&Rect> =
+                    g.hits.iter().filter(|(_, h)| matches!(h, PanelHit::Ctl { .. })).map(|(r, _)| r).collect();
+                for r in &ctl {
+                    assert!(r.x >= x0 - 0.5 && r.x + r.w <= right + 0.5, "{lw}px {dpi}×: a control leaves the column");
+                }
+                for (t, lx, ly, _) in &v.content_labels {
+                    let (l, r) = (*lx, lx + t.chars().count() as f32 * adv);
+                    assert!(r <= right + 0.5, "{lw}px {dpi}×: {t:?} past the column");
+                    // The label's ink band (not its whole line box).
+                    let (top, bot) = (ly + 4.0 * u, ly + 16.0 * u);
+                    for c in ctl.iter().filter(|c| c.y < bot && c.y + c.h > top) {
+                        let inside = l >= c.x - 0.5 && r <= c.x + c.w + 0.5;
+                        let apart = r <= c.x + 0.5 || l >= c.x + c.w - 0.5;
+                        assert!(inside || apart, "{lw}px {dpi}×: {t:?} runs into a control at x={:.0}", c.x);
+                    }
+                }
+            }
+        }
+        // The design width keeps the one-line rows (nothing stacks).
+        let wide = view_with(&items, 420, 40_000, 1.0, 16.0, 0.0);
+        let cyc = wide.geom.rect_of(PanelHit::Ctl { id: "shape", part: CtlPart::Prev }).unwrap();
+        let lab = wide.content_labels.iter().find(|l| l.0 == "Shape").unwrap();
+        assert!((cyc.y - lab.2).abs() < 8.0, "a roomy cycler stays beside its label");
     }
 }

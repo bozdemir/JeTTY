@@ -2547,6 +2547,54 @@ mod tests {
         }
     }
 
+    /// Every tab in a NARROW Settings window (the user can size it down to
+    /// 200 logical px): every tab strip cell stays on screen, no label runs
+    /// past the column, every control stays inside it, and no text runs into
+    /// a control on its line (a row label, a status readout).
+    #[test]
+    fn every_tab_fits_a_narrow_window() {
+        let (mono, ui) = fonts();
+        let x = ctx(&mono, &ui);
+        let theme = jetty_core::Theme::by_name("gruvbox_light");
+        for base in revealing_configs() {
+            let c = Config { shell: "/usr/local/bin/a-shell-with-a-long-name".into(), ..base };
+            for (scale, font) in [(1.0, 16.0), (2.0, 13.0)] {
+                let cm = ChromeMetrics::new(scale, font);
+                let u = cm.overlay_u();
+                let adv = CHAR_W_FALLBACK * u;
+                for lw in [200.0, 240.0, 300.0, 360.0] {
+                    let w = (lw * scale) as u32;
+                    for tab in 0..N_TABS {
+                        let items = tab_items(tab, &c, &x);
+                        let mut inp = PanelInput::new(w, 60_000, &theme, cm, &items);
+                        inp.active_tab = tab;
+                        let v = build_panel(&inp, &mut MonoMeasure(adv));
+                        let g = &v.geom;
+                        for r in &g.tab_rects {
+                            assert!(r.x >= -0.5 && r.x + r.w <= w as f32 + 0.5, "{lw}px tab {tab}: a tab is off screen");
+                        }
+                        let (x0, right) = (g.panel.x + 20.0 * u, g.panel.x + g.panel.w - 20.0 * u);
+                        let ctl: Vec<_> =
+                            g.hits.iter().filter(|(_, h)| matches!(h, PanelHit::Ctl { .. })).map(|(r, _)| *r).collect();
+                        for r in &ctl {
+                            assert!(r.x >= x0 - 0.5 && r.x + r.w <= right + 0.5, "{lw}px tab {tab}: a control leaves the column");
+                        }
+                        for (t, lx, ly, _) in &v.content_labels {
+                            let (l, r) = (*lx, lx + t.chars().count() as f32 * adv);
+                            assert!(r <= right + 0.5, "{lw}px tab {tab}: {t:?} past the column");
+                            let (top, bot) = (ly + 4.0 * u, ly + 16.0 * u);
+                            for cr in ctl.iter().filter(|cr| cr.y < bot && cr.y + cr.h > top) {
+                                let inside = l >= cr.x - 0.5 && r <= cr.x + cr.w + 0.5;
+                                let apart = r <= cr.x + 0.5 || l >= cr.x + cr.w - 0.5;
+                                assert!(inside || apart, "{lw}px {scale}× tab {tab}: {t:?} runs into a control");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Every control label and section title renders WHOLE (never ellipsized)
     /// with the widest realistic chrome font — the monospace default — so a
     /// new control's label must fit its row, not just get cut to fit.
