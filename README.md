@@ -123,7 +123,7 @@
 
 ## 🚀 Install
 
-JeTTY runs on **Linux** (X11 / Wayland, Vulkan) and **macOS** (Metal). Building from source needs only the Rust toolchain and works on both.
+JeTTY runs on **Linux** (X11 / Wayland — Vulkan, or OpenGL where there is no Vulkan driver) and **macOS** (Metal). Building from source needs only the Rust toolchain and works on both.
 
 ### 🍎 macOS — build from source
 
@@ -176,6 +176,10 @@ cargo build --release && ./target/release/jetty
 ```
 
 > Prebuilt artifacts (`.deb`, AppImage, tarball, checksums) are published by CI when a `v*` tag is pushed — **Linux x86_64 today; macOS prebuilt builds are on the roadmap.** Until then, macOS users build from source (above).
+
+### Graphics drivers
+
+JeTTY renders through **Vulkan** when a Vulkan driver is installed, and otherwise through **OpenGL 3.3 / OpenGL ES 3.0** (EGL) — so VMs, older GPUs and software rendering (Mesa llvmpipe) work too, effects included. The startup log names what it picked (`jetty: GPU adapter = …`). If a Vulkan driver misbehaves, `WGPU_BACKEND=gl jetty` forces OpenGL. With neither available, JeTTY says what it needs and exits with status 1.
 
 ### Global summon hotkey
 
