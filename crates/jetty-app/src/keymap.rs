@@ -743,7 +743,8 @@ impl KeyMap {
     /// Compile a keymap from user `[keys]` bindings layered over the defaults.
     /// Non-panicking: an invalid chord string is dropped with a warning; a
     /// control-byte-shadowing or no-modifier-printable bind is rejected with a
-    /// warning; `open_palette` is re-inserted if the user locked it out.
+    /// warning (an action left with none of its chords keeps its default);
+    /// `open_palette` is re-inserted if the user locked it out.
     ///
     /// The user's chords go in first, then the defaults of the actions left
     /// alone — so a remap onto ANOTHER action's default chord takes it whichever
@@ -762,24 +763,26 @@ impl KeyMap {
             warnings: Vec::new(),
         };
 
-        let mut by_action: Vec<(BindableAction, Vec<Chord>)> = Vec::with_capacity(BindableAction::ALL.len());
+        // `None`: the action keeps its defaults (no `[keys]` entry, or one
+        // naming no chord that can be used) — they go in after every user chord.
+        let mut user: Vec<(BindableAction, Option<Vec<Chord>>)> = Vec::with_capacity(BindableAction::ALL.len());
         for action in BindableAction::ALL {
-            let chords = match action.user_spec(bindings) {
-                Some(spec) => km.parse_user_chords(action, spec),
-                None => Vec::new(),
-            };
-            for ch in &chords {
+            let chords = action.user_spec(bindings).as_ref().and_then(|spec| km.parse_user_chords(action, spec));
+            for ch in chords.iter().flatten() {
                 km.add_chord(action, ch, Claim::User);
             }
-            by_action.push((action, chords));
+            user.push((action, chords));
         }
-        for (action, chords) in &mut by_action {
-            if action.user_spec(bindings).is_none() {
-                *chords = action.default_chords();
-                for ch in chords.iter() {
-                    km.add_chord(*action, ch, Claim::Default);
+        let mut by_action: Vec<(BindableAction, Vec<Chord>)> = Vec::with_capacity(user.len());
+        for (action, chords) in user {
+            let chords = chords.unwrap_or_else(|| {
+                let defaults = action.default_chords();
+                for ch in &defaults {
+                    km.add_chord(action, ch, Claim::Default);
                 }
-            }
+                defaults
+            });
+            by_action.push((action, chords));
         }
 
         // Reserved: `open_palette` must stay reachable (it reaches every command,
@@ -1020,13 +1023,18 @@ impl KeyMap {
 
     /// Parse a user `[keys]` value into accepted chords (invalid / unsafe chords
     /// are dropped with a warning; `""`/`[]` yields no chords → explicitly unbound).
-    fn parse_user_chords(&mut self, action: BindableAction, spec: &ChordSpec) -> Vec<Chord> {
+    /// `None` when it names chords but none of them can be used: the action
+    /// keeps its default, and the last warning says so — `new_tab = "Ctrl+T"`
+    /// (a control byte) used to leave New tab with no shortcut at all.
+    fn parse_user_chords(&mut self, action: BindableAction, spec: &ChordSpec) -> Option<Vec<Chord>> {
         let mut out = Vec::new();
+        let mut named = false;
         for raw in spec.chords() {
             let s = raw.trim();
             if s.is_empty() {
                 continue; // "" = explicitly unbound
             }
+            named = true;
             match parse_chord(s) {
                 Ok(chord) => {
                     if let Some(reason) = chord_reject_reason(&chord) {
@@ -1048,7 +1056,14 @@ impl KeyMap {
                 )),
             }
         }
-        out
+        if named && out.is_empty() {
+            // Every chord it named was reported, the last one just now.
+            if let Some(last) = self.warnings.last_mut() {
+                last.push_str(&format!(" — {} keeps its default", action.name()));
+            }
+            return None;
+        }
+        Some(out)
     }
 }
 
@@ -1542,6 +1557,36 @@ mod tests {
         // Ctrl+C still produces the SIGINT byte (not NewTab).
         let a = km.lookup(Mods::new(true, false, false, false), PhysicalKey::Code(KeyCode::KeyC), &ch("c"));
         assert_eq!(a, None, "Ctrl+C must remain unmapped → passes to PTY");
+    }
+
+    #[test]
+    fn a_binding_none_of_whose_chords_can_be_used_keeps_the_default() {
+        // README's own example, `new_tab = "Ctrl+T"`, was rejected (a control
+        // byte) and ALSO left New tab without its default: no shortcut at all.
+        let defaults = KeyMap::defaults().pretty_chords(BindableAction::NewTab);
+        let one = |s: &str| Some(ChordSpec::One(s.to_string()));
+        let many = |v: &[&str]| Some(ChordSpec::Many(v.iter().map(|s| s.to_string()).collect()));
+        for spec in [one("Ctrl+T"), one("Ctrl+Bogus"), many(&["Ctrl+T", "Hyper+N", "T"])] {
+            let km = km_with(|b| b.new_tab = spec.clone());
+            assert_eq!(km.pretty_chords(BindableAction::NewTab), defaults, "{spec:?}");
+            let kept: Vec<_> = km.warnings().iter().filter(|w| w.ends_with("new_tab keeps its default")).collect();
+            assert_eq!(kept.len(), 1, "{spec:?}: said once, on the last problem: {:?}", km.warnings());
+            let cs = Mods::new(true, true, false, false);
+            assert_eq!(km.lookup(cs, PhysicalKey::Code(KeyCode::KeyT), &ch("T")), Some(KeyAction::NewTab));
+        }
+        let km = km_with(|b| b.new_tab = one("Ctrl+T"));
+        let ctrl = Mods::new(true, false, false, false);
+        assert_eq!(km.lookup(ctrl, PhysicalKey::Code(KeyCode::KeyT), &ch("t")), None, "Ctrl+T stays the shell's");
+        // One usable chord replaces the default; the rejected one is reported.
+        let km = km_with(|b| b.new_tab = many(&["Ctrl+T", "Ctrl+Shift+N"]));
+        assert_eq!(km.pretty_chords(BindableAction::NewTab), ["Ctrl+Shift+N"]);
+        assert!(km.warnings().iter().all(|w| !w.contains("keeps its default")), "{:?}", km.warnings());
+        // `""` / `[]` still unbind, silently.
+        for spec in [one(""), many(&[]), many(&["", " "])] {
+            let km = km_with(|b| b.new_tab = spec.clone());
+            assert!(km.pretty_chords(BindableAction::NewTab).is_empty(), "{spec:?}");
+            assert!(km.warnings().is_empty(), "{spec:?}: {:?}", km.warnings());
+        }
     }
 
     #[test]
