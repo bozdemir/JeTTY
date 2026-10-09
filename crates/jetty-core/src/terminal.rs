@@ -1,4 +1,4 @@
-use crate::handler::{Vt, VtState};
+use crate::handler::VtState;
 use crate::hints::HintToken;
 use crate::kitty::KittyCmd;
 use crate::snapshot::{
@@ -2615,7 +2615,8 @@ impl Terminal {
         if let Some(log) = self.vte_log.as_mut() {
             log.extend_from_slice(s);
         }
-        self.parser.advance(&mut Vt { term: &mut self.term, st: &mut self.vt, reply: &self.reply_tx }, s);
+        let parser = &mut self.parser;
+        crate::handler::parse(&mut self.term, &mut self.vt, &self.reply_tx, |vt| parser.advance(vt, s));
         let alt_after = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h1 = self.term.grid().history_size();
         self.after_vte(alt_before, alt_after, h0, h1, d0);
@@ -3653,7 +3654,8 @@ impl Terminal {
         let alt_before = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h0 = self.term.grid().history_size();
         let d0 = self.term.grid().display_offset();
-        self.parser.stop_sync(&mut Vt { term: &mut self.term, st: &mut self.vt, reply: &self.reply_tx });
+        let parser = &mut self.parser;
+        crate::handler::parse(&mut self.term, &mut self.vt, &self.reply_tx, |vt| parser.stop_sync(vt));
         let alt_after = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h1 = self.term.grid().history_size();
         self.after_vte(alt_before, alt_after, h0, h1, d0);

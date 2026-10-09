@@ -1,8 +1,10 @@
 //! The vte [`Handler`] JeTTY parses into: alacritty_terminal 0.26's `Term`,
 //! with the places where it departs from xterm (VTE and kitty agree with xterm
 //! on all of them) corrected on the way through. Every other call is forwarded
-//! untouched and `#[inline(always)]`, so vte's performer still calls straight
-//! into `Term` (whose `input` stays out of line, as in alacritty).
+//! untouched and `#[inline(always)]`, and [`Vt`] is `Term` itself (a
+//! transparent newtype), so vte's performer still calls straight into `Term`
+//! (whose `input` stays out of line, as in alacritty) — a wrapper HOLDING
+//! `&mut Term` cost a pointer hop per character, 1–4% of parse throughput.
 //!
 //! The corrections:
 //! * DCH (`CSI Ps P`) with a count past the end of the line erased the cells
@@ -38,6 +40,8 @@ use alacritty_terminal::vte::ansi::{
     KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedPrivateMode, PrivateMode, Rgb,
     ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
 };
+use std::cell::Cell;
+use std::ptr::NonNull;
 use std::sync::mpsc::Sender;
 
 /// The primary device attributes JeTTY reports: a VT220-class terminal (62)
@@ -64,40 +68,81 @@ impl VtState {
     }
 }
 
-/// `Term` plus what its corrections need, for one `advance` call.
-pub(crate) struct Vt<'a, T> {
-    pub(crate) term: &'a mut Term<T>,
-    pub(crate) st: &'a mut VtState,
-    /// The PTY reply channel `Term`'s own answers go through, so an answer
-    /// written here keeps its place among them.
-    pub(crate) reply: &'a Sender<Vec<u8>>,
+/// alacritty's `Term` as JeTTY's vte handler: the same memory, so vte's
+/// performer reaches `Term` through the one pointer it already holds.
+#[repr(transparent)]
+pub(crate) struct Vt<T>(Term<T>);
+
+/// The terminal's [`VtState`] and its PTY reply channel, while a parse runs.
+type Context = Option<(VtState, NonNull<Sender<Vec<u8>>>)>;
+
+thread_local! {
+    /// What the corrections need besides the `Term`, published by [`parse`]
+    /// for the length of one parse: the terminal's [`VtState`] (copied in and
+    /// back out) and its PTY reply channel. Only the rare corrected sequences
+    /// read it — never the per-character path.
+    static CTX: Cell<Context> = const { Cell::new(None) };
 }
 
-impl<T: EventListener> Vt<'_, T> {
+/// Run one parse — `f`, a `Processor::advance` or `stop_sync` — with `term`
+/// as the handler, the corrections seeing `st` (updated in place) and sending
+/// their answers through `reply`: the PTY reply channel `Term`'s own answers
+/// go through, so one written here keeps its place among them.
+pub(crate) fn parse<T, R>(
+    term: &mut Term<T>,
+    st: &mut VtState,
+    reply: &Sender<Vec<u8>>,
+    f: impl FnOnce(&mut Vt<T>) -> R,
+) -> R {
+    CTX.with(|c| c.set(Some((*st, NonNull::from(reply)))));
+    // SAFETY: `Vt<T>` is `#[repr(transparent)]` over `Term<T>` (same layout);
+    // the exclusive borrow of `term` carries over to the result.
+    let vt = unsafe { &mut *(term as *mut Term<T>).cast::<Vt<T>>() };
+    let r = f(vt);
+    if let Some((after, _)) = CTX.with(|c| c.take()) {
+        *st = after;
+    }
+    r
+}
+
+/// The corrections' state, as [`parse`] published it.
+fn state() -> VtState {
+    CTX.with(|c| c.get()).map(|(st, _)| st).expect("a handler call outside `parse`")
+}
+
+fn set_state(st: VtState) {
+    CTX.with(|c| c.set(c.get().map(|(_, reply)| (st, reply))));
+}
+
+impl<T: EventListener> Vt<T> {
     fn send(&self, bytes: Vec<u8>) {
-        let _ = self.reply.send(bytes);
+        if let Some((_, reply)) = CTX.with(|c| c.get()) {
+            // SAFETY: `parse` published a borrow it holds for the whole parse,
+            // and every handler call happens inside a parse.
+            let _ = unsafe { reply.as_ref() }.send(bytes);
+        }
     }
 
     fn column(&self) -> usize {
-        self.term.grid().cursor.point.column.0
+        self.0.grid().cursor.point.column.0
     }
 
     fn origin(&self) -> bool {
-        self.term.mode().contains(TermMode::ORIGIN)
+        self.0.mode().contains(TermMode::ORIGIN)
     }
 
     /// Move to the ABSOLUTE screen line `line` (`Term::goto` reads its line
     /// relative to the top margin under DECOM, and clamps it to the region).
     fn goto_abs(&mut self, line: i32, col: usize) {
-        let top = if self.origin() { self.st.region.0 } else { 0 };
-        Handler::goto(&mut *self.term, line - top, col);
+        let top = if self.origin() { state().region.0 } else { 0 };
+        Handler::goto(&mut self.0, line - top, col);
     }
 
     /// CUU's target row: `n` up, stopping at the top margin when the cursor is
     /// at or below it (xterm's `CursorUp`).
     fn up_target(&self, n: usize) -> i32 {
-        let line = self.term.grid().cursor.point.line.0;
-        let top = self.st.region.0;
+        let line = self.0.grid().cursor.point.line.0;
+        let top = state().region.0;
         let floor = if line >= top { top } else { 0 };
         line.saturating_sub(n.min(u16::MAX as usize) as i32).max(floor)
     }
@@ -105,14 +150,14 @@ impl<T: EventListener> Vt<'_, T> {
     /// CUD's target row: `n` down, stopping at the bottom margin when the
     /// cursor is at or above it (xterm's `CursorDown`).
     fn down_target(&self, n: usize) -> i32 {
-        let line = self.term.grid().cursor.point.line.0;
-        let bottom = self.st.region.1 - 1;
-        let ceil = if line <= bottom { bottom } else { self.term.screen_lines() as i32 - 1 };
+        let line = self.0.grid().cursor.point.line.0;
+        let bottom = state().region.1 - 1;
+        let ceil = if line <= bottom { bottom } else { self.0.screen_lines() as i32 - 1 };
         line.saturating_add(n.min(u16::MAX as usize) as i32).min(ceil)
     }
 
     fn full_region(&mut self) {
-        self.st.region = (0, self.term.screen_lines() as i32);
+        set_state(VtState { region: (0, self.0.screen_lines() as i32), ..state() });
     }
 
     /// Erase the wide char straddling the boundary just left of column `col`
@@ -120,11 +165,11 @@ impl<T: EventListener> Vt<'_, T> {
     /// that splits it: an orphaned first half drew its glyph over the next
     /// cell, an orphaned second half put the drawn cursor a cell off.
     fn split_wide_at(&mut self, col: usize) {
-        if col == 0 || col >= self.term.columns() {
+        if col == 0 || col >= self.0.columns() {
             return;
         }
-        let line = self.term.grid().cursor.point.line;
-        let row = &mut self.term.grid_mut()[line];
+        let line = self.0.grid().cursor.point.line;
+        let row = &mut self.0.grid_mut()[line];
         if row[Column(col)].flags.contains(Flags::WIDE_CHAR_SPACER) {
             row[Column(col)].flags.remove(Flags::WIDE_CHAR_SPACER);
             if row[Column(col - 1)].flags.contains(Flags::WIDE_CHAR) {
@@ -140,13 +185,13 @@ macro_rules! forward {
         $(
             #[inline(always)]
             fn $name(&mut self $(, $arg: $ty)*) {
-                Handler::$name(&mut *self.term $(, $arg)*)
+                Handler::$name(&mut self.0 $(, $arg)*)
             }
         )*
     };
 }
 
-impl<T: EventListener> Handler for Vt<'_, T> {
+impl<T: EventListener> Handler for Vt<T> {
     forward! {
         fn set_title(&mut self, title: Option<String>);
         fn set_cursor_style(&mut self, style: Option<CursorStyle>);
@@ -203,13 +248,13 @@ impl<T: EventListener> Handler for Vt<'_, T> {
 
     #[inline(always)]
     fn linefeed(&mut self) {
-        Handler::linefeed(&mut *self.term);
-        self.term.grid_mut().cursor.input_needs_wrap = false;
+        Handler::linefeed(&mut self.0);
+        self.0.grid_mut().cursor.input_needs_wrap = false;
     }
 
     fn reverse_index(&mut self) {
-        Handler::reverse_index(&mut *self.term);
-        self.term.grid_mut().cursor.input_needs_wrap = false;
+        Handler::reverse_index(&mut self.0);
+        self.0.grid_mut().cursor.input_needs_wrap = false;
     }
 
     fn move_up(&mut self, lines: usize) {
@@ -233,47 +278,47 @@ impl<T: EventListener> Handler for Vt<'_, T> {
     }
 
     fn goto_col(&mut self, col: usize) {
-        let line = self.term.grid().cursor.point.line.0;
+        let line = self.0.grid().cursor.point.line.0;
         self.goto_abs(line, col);
     }
 
     fn device_status(&mut self, arg: usize) {
         if arg == 6 && self.origin() {
-            let p = self.term.grid().cursor.point;
-            let line = p.line.0 - self.st.region.0 + 1;
+            let p = self.0.grid().cursor.point;
+            let line = p.line.0 - state().region.0 + 1;
             self.send(format!("\x1b[{line};{}R", p.column.0 + 1).into_bytes());
         } else {
-            Handler::device_status(&mut *self.term, arg);
+            Handler::device_status(&mut self.0, arg);
         }
     }
 
     fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
-        let lines = self.term.screen_lines();
+        let lines = self.0.screen_lines();
         let top = top.max(1);
         let bottom = bottom.map_or(lines, |b| b.min(lines));
         if top >= bottom {
             return; // xterm ignores a region that is empty once clamped to the screen
         }
-        Handler::set_scrolling_region(&mut *self.term, top, Some(bottom));
-        self.st.region = (top as i32 - 1, bottom as i32);
+        Handler::set_scrolling_region(&mut self.0, top, Some(bottom));
+        set_state(VtState { region: (top as i32 - 1, bottom as i32), ..state() });
     }
 
     fn reset_state(&mut self) {
-        Handler::reset_state(&mut *self.term);
-        *self.st = VtState::new(self.term.screen_lines());
+        Handler::reset_state(&mut self.0);
+        set_state(VtState::new(self.0.screen_lines()));
     }
 
     fn set_private_mode(&mut self, mode: PrivateMode) {
         match mode {
-            PrivateMode::Unknown(5) => self.st.reverse = true,
-            PrivateMode::Unknown(1048) => Handler::save_cursor_position(&mut *self.term),
+            PrivateMode::Unknown(5) => set_state(VtState { reverse: true, ..state() }),
+            PrivateMode::Unknown(1048) => Handler::save_cursor_position(&mut self.0),
             PrivateMode::Unknown(47 | 1047) => {
-                if !self.term.mode().contains(TermMode::ALT_SCREEN) {
-                    self.term.swap_alt();
+                if !self.0.mode().contains(TermMode::ALT_SCREEN) {
+                    self.0.swap_alt();
                 }
             }
             _ => {
-                Handler::set_private_mode(&mut *self.term, mode);
+                Handler::set_private_mode(&mut self.0, mode);
                 if mode == PrivateMode::Named(NamedPrivateMode::ColumnMode) {
                     self.full_region(); // DECCOLM resets the margins
                 }
@@ -283,15 +328,15 @@ impl<T: EventListener> Handler for Vt<'_, T> {
 
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         match mode {
-            PrivateMode::Unknown(5) => self.st.reverse = false,
-            PrivateMode::Unknown(1048) => Handler::restore_cursor_position(&mut *self.term),
+            PrivateMode::Unknown(5) => set_state(VtState { reverse: false, ..state() }),
+            PrivateMode::Unknown(1048) => Handler::restore_cursor_position(&mut self.0),
             PrivateMode::Unknown(47 | 1047) => {
-                if self.term.mode().contains(TermMode::ALT_SCREEN) {
-                    self.term.swap_alt();
+                if self.0.mode().contains(TermMode::ALT_SCREEN) {
+                    self.0.swap_alt();
                 }
             }
             _ => {
-                Handler::unset_private_mode(&mut *self.term, mode);
+                Handler::unset_private_mode(&mut self.0, mode);
                 if mode == PrivateMode::Named(NamedPrivateMode::ColumnMode) {
                     self.full_region();
                 }
@@ -301,8 +346,8 @@ impl<T: EventListener> Handler for Vt<'_, T> {
 
     fn report_private_mode(&mut self, mode: PrivateMode) {
         let on = match mode {
-            PrivateMode::Unknown(5) => Some(self.st.reverse),
-            PrivateMode::Unknown(47 | 1047) => Some(self.term.mode().contains(TermMode::ALT_SCREEN)),
+            PrivateMode::Unknown(5) => Some(state().reverse),
+            PrivateMode::Unknown(47 | 1047) => Some(self.0.mode().contains(TermMode::ALT_SCREEN)),
             _ => None,
         };
         match on {
@@ -310,45 +355,45 @@ impl<T: EventListener> Handler for Vt<'_, T> {
                 let state = if on { 1 } else { 2 };
                 self.send(format!("\x1b[?{};{state}$y", mode.raw()).into_bytes());
             }
-            None => Handler::report_private_mode(&mut *self.term, mode),
+            None => Handler::report_private_mode(&mut self.0, mode),
         }
     }
 
     fn delete_chars(&mut self, count: usize) {
         let x = self.column();
-        let count = count.min(self.term.columns() - x);
+        let count = count.min(self.0.columns() - x);
         self.split_wide_at(x);
         self.split_wide_at(x + count);
-        Handler::delete_chars(&mut *self.term, count);
+        Handler::delete_chars(&mut self.0, count);
     }
 
     fn insert_blank(&mut self, count: usize) {
-        let (x, cols) = (self.column(), self.term.columns());
+        let (x, cols) = (self.column(), self.0.columns());
         let count = count.min(cols - x);
         self.split_wide_at(x);
         // The cells from `cols - count` on are pushed off the end of the line.
         if cols - count > x {
             self.split_wide_at(cols - count);
         }
-        Handler::insert_blank(&mut *self.term, count);
+        Handler::insert_blank(&mut self.0, count);
     }
 
     fn erase_chars(&mut self, count: usize) {
         let x = self.column();
         self.split_wide_at(x);
         self.split_wide_at(x.saturating_add(count));
-        Handler::erase_chars(&mut *self.term, count);
+        Handler::erase_chars(&mut self.0, count);
     }
 
     fn clear_line(&mut self, mode: LineClearMode) {
         let x = self.column();
         match mode {
             // `Term` clears nothing to the right while a wrap is pending.
-            LineClearMode::Right if !self.term.grid().cursor.input_needs_wrap => self.split_wide_at(x),
+            LineClearMode::Right if !self.0.grid().cursor.input_needs_wrap => self.split_wide_at(x),
             LineClearMode::Left => self.split_wide_at(x + 1),
             _ => {}
         }
-        Handler::clear_line(&mut *self.term, mode);
+        Handler::clear_line(&mut self.0, mode);
     }
 
     fn clear_screen(&mut self, mode: ClearMode) {
@@ -358,24 +403,24 @@ impl<T: EventListener> Handler for Vt<'_, T> {
             ClearMode::Above => self.split_wide_at(x + 1),
             _ => {}
         }
-        Handler::clear_screen(&mut *self.term, mode);
+        Handler::clear_screen(&mut self.0, mode);
     }
 
     fn identify_terminal(&mut self, intermediate: Option<char>) {
         match intermediate {
             None => self.send(DA1_REPLY.to_vec()),
-            _ => Handler::identify_terminal(&mut *self.term, intermediate),
+            _ => Handler::identify_terminal(&mut self.0, intermediate),
         }
     }
 
     fn dynamic_color_sequence(&mut self, prefix: String, index: usize, terminator: &str) {
         // A color a program set (OSC 4 / 10 / 11 / 12) wins over the theme's,
         // which `Term` would ask the event listener for. Same reply format.
-        match self.term.colors()[index] {
+        match self.0.colors()[index] {
             Some(Rgb { r, g, b }) => self.send(
                 format!("\x1b]{prefix};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}{terminator}").into_bytes(),
             ),
-            None => Handler::dynamic_color_sequence(&mut *self.term, prefix, index, terminator),
+            None => Handler::dynamic_color_sequence(&mut self.0, prefix, index, terminator),
         }
     }
 }
@@ -595,7 +640,7 @@ mod tests {
 
     type State = (Vec<Cell>, String, TermMode, Vec<Option<Rgb>>, CursorStyle);
 
-    fn state(term: &Term<Recorder>) -> State {
+    fn observe(term: &Term<Recorder>) -> State {
         let grid = term.grid();
         let mut cells = Vec::new();
         for l in grid.topmost_line().0..=grid.bottommost_line().0 {
@@ -652,8 +697,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         for piece in pieces {
             pa.advance(&mut a, piece.as_bytes());
-            pb.advance(&mut Vt { term: &mut b, st: &mut st, reply: &tx }, piece.as_bytes());
-            assert_eq!(state(&a), state(&b), "after {piece:?}");
+            parse(&mut b, &mut st, &tx, |vt| pb.advance(vt, piece.as_bytes()));
+            assert_eq!(observe(&a), observe(&b), "after {piece:?}");
             assert_eq!(*rec_a.0.borrow(), *rec_b.0.borrow(), "events after {piece:?}");
         }
         assert!(rec_a.0.borrow().len() > 20, "the corpus produced events");
