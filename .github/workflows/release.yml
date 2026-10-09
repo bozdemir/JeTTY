@@ -39,7 +39,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libvulkan-dev libwayland-dev libxkbcommon-dev \
             libx11-dev libxcb1-dev libfontconfig1-dev libgl1-mesa-dev \
-            desktop-file-utils
+            desktop-file-utils \
+            libxkbcommon-x11-0 libxcursor1 libxi6
 
       # Never ship a tag whose tests fail.
       - name: Test
@@ -95,8 +96,18 @@ jobs:
           # `Icon=jetty` entry expects (linuxdeploy otherwise names it after the
           # source file "jetty-256" → "Could not find suitable icon for Icon
           # entry: jetty" and the AppImage step fails).
+          # The libraries JeTTY dlopen()s that a minimal system may lack —
+          # xkbcommon-x11 missing made winit panic at startup in the AppImage
+          # catalog's test VM. linuxdeploy bundles them (and their deps, minus
+          # its excludelist: libX11, libxcb, EGL/GL stay the host's) next to
+          # the binary, whose RUNPATH ($ORIGIN/../lib) dlopen() searches first.
+          L=/usr/lib/x86_64-linux-gnu
           ./linuxdeploy --appdir AppDir \
             --executable target/release/jetty \
+            --library "$L/libxkbcommon.so.0" \
+            --library "$L/libxkbcommon-x11.so.0" \
+            --library "$L/libXcursor.so.1" \
+            --library "$L/libXi.so.6" \
             --desktop-file assets/jetty.desktop \
             --icon-file assets/icons/jetty-256.png \
             --icon-filename jetty \

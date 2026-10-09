@@ -30,7 +30,11 @@ maintainer = "Burak Ozdemir <bozdemir@gmail.com>"
 copyright = "2026, Burak Ozdemir"
 license-file = ["LICENSE", "0"]
 extended-description = "JeTTY is a GPU-rendered terminal emulator that drops into the center of your screen (or slides down Yakuake-style) on a global hotkey. Desktop-environment-independent: X11 and Wayland, KDE / GNOME / any compositor."
-depends = "$auto, libvulkan1, libxkbcommon0, fontconfig"
+# What JeTTY dlopen()s at run time ($auto only sees what it links: libc):
+# X11 + keyboard + cursor always; Wayland and EGL (the OpenGL fallback)
+# only where used. libxkbcommon-x11-0 missing = a panic at startup on X11.
+depends = "$auto, libvulkan1, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libx11-xcb1, libxcursor1, libxi6, fontconfig"
+recommends = "libwayland-client0, libwayland-egl1, libegl1"
 section = "utils"
 priority = "optional"
 assets = [

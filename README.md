@@ -155,7 +155,7 @@ open JeTTY.app                     # run the bundle, NOT ./target/release/jetty
 curl -fsSL https://raw.githubusercontent.com/bozdemir/JeTTY/main/install.sh | sh
 ```
 
-Installs to `~/.local/bin` by default. The script verifies the published `SHA256SUMS.txt` checksum before installing. For a system-wide install:
+Installs to `~/.local/bin` by default. The script verifies the published `SHA256SUMS.txt` checksum before installing. The binary loads the desktop's own X11 / Wayland libraries at run time; a minimal Debian / Ubuntu system may need `sudo apt install libvulkan1 libxkbcommon-x11-0 libxcursor1 libxi6` (the `.deb` pulls these in, and the AppImage carries the keyboard and cursor ones). For a system-wide install:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bozdemir/JeTTY/main/install.sh | JETTY_PREFIX=/usr/local sudo -E sh
