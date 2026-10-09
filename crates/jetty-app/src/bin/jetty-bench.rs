@@ -556,9 +556,8 @@ fn bench_frames(
                 let snap = term.snapshot();
                 snap_total += t.elapsed().as_secs_f64() * 1000.0;
                 text.render_to(device, queue, &view, width, height, &snap, true, 0.0)?;
-                drop(snap);
-                let (a1, b1) = alloc_counts();
                 cpu.push(t.elapsed().as_secs_f32() * 1000.0);
+                let (a1, b1) = alloc_counts();
                 (allocs, alloc_bytes) = (allocs + a1 - a0, alloc_bytes + b1 - b0);
                 device.poll(wgpu::PollType::wait_indefinitely())?;
                 total += t.elapsed().as_secs_f64() * 1000.0;
@@ -604,7 +603,8 @@ fn bench_frames(
             }
         })?;
     }
-    bench_scene_passes(device, queue, format, font_size)
+    bench_scene_passes(device, queue, format, font_size)?;
+    bench_chrome(device, queue, format)
 }
 
 /// One full redraw of a btop-like screen: `╭─…─╮`, rows of `│` + a braille graph
@@ -650,6 +650,91 @@ fn box_setup(term: &mut jetty_core::Terminal, cols: usize, rows: usize) {
     s.push('╯');
     s.push_str("\x1b[2;3H");
     term.feed(s.as_bytes());
+}
+
+/// The window chrome the app draws on EVERY frame — the tab bar (4 tabs: quads,
+/// monospace labels, sans titles) and the bottom status strip with the perf HUD —
+/// built and drawn exactly as the main window does (each layer its own pass and
+/// submit), at 1920×1200. The HUD text changes every frame, the titles don't.
+fn bench_chrome(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (width, height) = (1920u32, 1200u32);
+    let cm = jetty_render::ChromeMetrics::new(1.0, jetty_render::UI_FONT_BASE);
+    let mut chrome = TextLayer::new_with_family(device, queue, format, jetty_render::UI_FONT_BASE, "MesloLGS NF");
+    let mut quad = jetty_render::QuadLayer::new(device, format);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("bench-chrome-tex"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let theme = jetty_core::Theme::by_name("catppuccin_mocha");
+    let tabs: Vec<(String, bool)> = ["burak@omen: ~/src/jetty", "cargo build --release", "nvim src/main.rs", "htop"]
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.to_string(), i == 0))
+        .collect();
+    let deco = vec![jetty_render::TabDeco::default(); tabs.len()];
+    let opts = jetty_render::TabBarOpts::default();
+    let status_h = cm.status_h();
+    let n = 300usize;
+    let mut cpu = Vec::with_capacity(n);
+    let mut allocs = 0u64;
+    for k in 0..n + 20 {
+        let hud = format!("⚡ {:.1} ms · {} fps · {}% CPU · 0 MB/s", 16.0 + (k % 7) as f32 * 0.1, 60 - k % 3, k % 5);
+        let t = Instant::now();
+        let a0 = alloc_counts().0;
+        let bar = jetty_render::build_tab_bar_styled(
+            width,
+            &tabs,
+            &theme,
+            None,
+            jetty_render::CtrlHover::None,
+            None,
+            &mut chrome,
+            cm,
+            &deco,
+            &opts,
+        );
+        quad.render(device, queue, &view, width, height, &bar.quads);
+        let _ = chrome.render_overlays(device, queue, &view, width, height, &bar.labels);
+        let _ = chrome.render_overlays_sans(device, queue, &view, width, height, &bar.title_labels);
+        let strip = jetty_render::build_status_strip(
+            width,
+            height as f32 - status_h,
+            status_h,
+            Some(&hud),
+            &theme,
+            &mut chrome,
+            cm,
+        );
+        quad.render(device, queue, &view, width, height, &[strip.quad]);
+        if let Some(label) = strip.label {
+            let _ = chrome.render_overlays(device, queue, &view, width, height, &[label]);
+        }
+        // The first frames shape and cache; measure the steady state.
+        if k >= 20 {
+            cpu.push(t.elapsed().as_secs_f32() * 1000.0);
+            allocs += alloc_counts().0 - a0;
+        }
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+    }
+    let mean = cpu.iter().sum::<f32>() / n as f32;
+    cpu.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    println!(
+        "chrome        tab bar (4 tabs) + status HUD, {width}x{height}: cpu {mean:.3} ms (p50 {:.3}) | {:.0} allocs/frame",
+        percentile(&cpu, 50.0),
+        allocs as f64 / n as f64
+    );
+    Ok(())
 }
 
 /// The app's whole grid scene per frame — cell-background quads + glyphs, typing —

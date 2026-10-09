@@ -484,6 +484,95 @@ impl OverdrawStyle {
     }
 }
 
+/// Entries per family in [`OverlayCache`] before it evicts: far above the
+/// distinct labels of any one frame (a tab bar is ~20, the Settings panel a few
+/// hundred), and each entry is bounded (`MAX_LABEL_CHARS`).
+const OVERLAY_CACHE_CAP: usize = 512;
+/// Once over the cap, entries not drawn by the last this-many overlay passes go.
+const OVERLAY_CACHE_KEEP_PASSES: u64 = 32;
+
+/// Shaped chrome-label buffers (`render_overlays*`), cached by content per
+/// family — `[mono, title]` — so a label that is the same as last frame (tab
+/// titles, ×, +, the window controls, menu rows) is never shaped again. Every
+/// cached buffer is shaped at the layer's current metrics: a family or size
+/// change clears the cache (`clear_measure_caches`).
+#[derive(Default)]
+struct OverlayCache {
+    maps: [FxHashMap<Box<str>, OverlayEntry>; 2],
+    /// Counts overlay passes (`next_frame`): the LRU clock.
+    pass: u64,
+}
+
+struct OverlayEntry {
+    buffer: Buffer,
+    /// The layout height the buffer was sized for (the target's height).
+    height: u32,
+    /// [`OverlayCache::pass`] of the last pass that drew it.
+    last_used: u64,
+}
+
+impl OverlayCache {
+    /// Start an overlay pass; returns its clock value.
+    fn next_frame(&mut self) -> u64 {
+        self.pass = self.pass.wrapping_add(1);
+        self.pass
+    }
+
+    /// Make sure `text` (in the `title` family) has a buffer — `make` shapes a
+    /// new one on a miss — sized for `height`, and stamp it used by `pass`.
+    fn ensure(
+        &mut self,
+        title: bool,
+        text: &str,
+        height: u32,
+        pass: u64,
+        font_system: &mut FontSystem,
+        make: impl FnOnce(&mut FontSystem) -> Buffer,
+    ) {
+        let map = &mut self.maps[title as usize];
+        match map.get_mut(text) {
+            Some(e) => {
+                if e.height != height {
+                    e.buffer.set_size(font_system, None, Some(height as f32));
+                    e.height = height;
+                }
+                e.last_used = pass;
+            }
+            None => {
+                map.insert(Box::from(text), OverlayEntry { buffer: make(font_system), height, last_used: pass });
+            }
+        }
+    }
+
+    fn get(&self, title: bool, text: &str) -> Option<&Buffer> {
+        self.maps[title as usize].get(text).map(|e| &e.buffer)
+    }
+
+    /// Over the cap: drop what the last [`OVERLAY_CACHE_KEEP_PASSES`] passes
+    /// didn't draw — and, should that not be enough, all but this pass's labels.
+    fn evict(&mut self, pass: u64) {
+        for map in &mut self.maps {
+            if map.len() > OVERLAY_CACHE_CAP {
+                map.retain(|_, e| e.last_used.wrapping_add(OVERLAY_CACHE_KEEP_PASSES) >= pass);
+            }
+            if map.len() > OVERLAY_CACHE_CAP {
+                map.retain(|_, e| e.last_used == pass);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        for map in &mut self.maps {
+            map.clear();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.maps.iter().map(|m| m.len()).sum()
+    }
+}
+
 /// Scratch vectors for [`pack_grid`], reused frame to frame so the frame path
 /// does not reallocate.
 #[derive(Default)]
@@ -712,8 +801,8 @@ pub struct TextLayer {
     line_height: f32,
     cell_w: f32,
     cell_h: f32,
-    /// Growable pool of glyphon Buffers reused across frames for overlay labels.
-    overlay_buffers: Vec<Buffer>,
+    /// Shaped overlay-label buffers, cached by content (see `OverlayCache`).
+    overlays: OverlayCache,
     /// Current font family name (runtime-settable via `set_font_family`).
     /// `Arc<str>` so per-frame span building can share it without cloning the
     /// string (the family name is captured by every cell's `Attrs`).
@@ -903,7 +992,7 @@ impl TextLayer {
             line_height: LINE_HEIGHT_DEFAULT,
             cell_w,
             cell_h,
-            overlay_buffers: Vec::new(),
+            overlays: OverlayCache::default(),
             font_family: Arc::from(family),
             // Chrome defaults to the platform proportional sans, matching the
             // pre-feature look (sans tab titles); the app overrides this from
@@ -1158,7 +1247,7 @@ impl TextLayer {
         // The shape-gen bump drops every cached grid row too, so rows are rebuilt
         // at the new metrics with the new cell width as their monospace snap
         // (keeps bold/italic aligned after a font-size / DPI change). On a chrome
-        // layer the grid rows are never built — chrome renders via overlay_buffers.
+        // layer the grid rows are never built — chrome renders via `overlays`.
         self.fallback_glyphs.clear();
         self.fallback_order.clear();
         self.clusters.clear();
@@ -1187,7 +1276,8 @@ impl TextLayer {
         self.line_height
     }
 
-    /// Drop every cached chrome measurement (family or size changed).
+    /// Drop every cached chrome measurement and shaped label (family or size
+    /// changed).
     fn clear_measure_caches(&mut self) {
         for c in &mut self.measure_cache {
             c.clear();
@@ -1195,6 +1285,7 @@ impl TextLayer {
         for c in &mut self.xs_cache {
             c.clear();
         }
+        self.overlays.clear();
     }
 
     /// Shape `s` as chrome (`title` = tab-title family) into the scratch buffer
@@ -1892,13 +1983,6 @@ impl TextLayer {
             return Ok(());
         }
 
-        // Ensure we have enough buffers in the pool.
-        while self.overlay_buffers.len() < labels.len() {
-            let mut buf = Buffer::new(&mut self.font_system, self.metrics);
-            buf.set_size(&mut self.font_system, None, Some(height as f32));
-            self.overlay_buffers.push(buf);
-        }
-
         let (clip_top, clip_bottom) = clip_y.unwrap_or((0, height as i32));
         let win_bounds = TextBounds {
             left: 0,
@@ -1907,46 +1991,53 @@ impl TextLayer {
             bottom: clip_bottom,
         };
 
-        // First pass: set text content (requires &mut font_system, so can't borrow
-        // bufs as &T simultaneously). Clone the chrome family + mono fallback +
-        // metrics out of self so the `Family::Name` borrow doesn't conflict with
-        // the &mut font_system.
+        // First pass: a shaped buffer per DISTINCT label (shaping needs
+        // &mut font_system, so the buffers can't be borrowed as &T yet). The
+        // buffers are cached by content (`OverlayCache`): chrome is mostly the
+        // same strings every frame — tab titles, ×, +, the window controls — and
+        // re-shaping each one per frame (Advanced shaping with font fallback)
+        // was most of the chrome's CPU. Clone the chrome family + mono fallback
+        // out of self so the `Family::Name` borrow doesn't conflict with the
+        // &mut font_system.
         let ui_family = self.ui_family.clone();
         let mono_fallback = self.font_family.clone();
         let metrics = self.metrics;
-        for (i, (text, _x, _y, _rgb)) in labels.iter().enumerate() {
-            let buf = &mut self.overlay_buffers[i];
-            // POOLED buffers are reused across frames and retain whatever metrics
-            // they were created with. After a UI-font SIZE change the pool still
-            // holds buffers at the OLD size, so the first frames would render
-            // stale-size glyphs. Push the current metrics into every buffer each
-            // frame so a size change takes effect immediately (one-liner, easy to
-            // miss). Cheap: set_metrics is a no-op when the metrics are unchanged.
-            buf.set_metrics(&mut self.font_system, metrics);
-            buf.set_size(&mut self.font_system, None, Some(height as f32));
-            // A `Named` UI family unifies ALL chrome onto it; the `Sans` default
-            // keeps today's split (titles → sans, rest → mono Nerd Font) so the
-            // default look — including symbol glyphs — is byte-identical.
-            let attrs = Attrs::new().family(ui_family.as_family(is_title, &mono_fallback));
-            // Shaping::Advanced: chrome text now carries user/shell-controlled
-            // strings (OSC tab titles, search queries, rename buffers), so it
-            // needs cosmic-text's font fallback — under Basic every glyph the
-            // chrome family lacks (emoji, CJK, symbols on a custom UI font)
-            // rendered as a tofu box. Chrome is proportional overlay text with
-            // no grid-alignment constraint, and overlays only shape on rendered
-            // frames (idle draws nothing), so Advanced is safe here. Clipped to
-            // MAX_LABEL_CHARS: labels can carry program-controlled text (a
-            // multi-MB OSC title), and shaping that whole per frame is a DoS —
-            // nothing past the clip could be visible anyway.
+        let frame = self.overlays.next_frame();
+        for (text, _x, _y, _rgb) in labels {
+            // Clipped to MAX_LABEL_CHARS: labels can carry program-controlled text
+            // (a multi-MB OSC title), and shaping that whole per frame is a DoS —
+            // nothing past the clip could be visible anyway. It also bounds every
+            // cached key.
             let (text, _) = crate::chrome::clip_head(text);
-            buf.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
+            let font_system = &mut self.font_system;
+            self.overlays.ensure(is_title, text, height, frame, font_system, |font_system| {
+                let mut buf = Buffer::new(font_system, metrics);
+                buf.set_size(font_system, None, Some(height as f32));
+                // A `Named` UI family unifies ALL chrome onto it; the `Sans` default
+                // keeps today's split (titles → sans, rest → mono Nerd Font) so the
+                // default look — including symbol glyphs — is byte-identical.
+                let attrs = Attrs::new().family(ui_family.as_family(is_title, &mono_fallback));
+                // Shaping::Advanced: chrome text carries user/shell-controlled
+                // strings (OSC tab titles, search queries, rename buffers), so it
+                // needs cosmic-text's font fallback — under Basic every glyph the
+                // chrome family lacks (emoji, CJK, symbols on a custom UI font)
+                // rendered as a tofu box. Chrome is proportional overlay text with
+                // no grid-alignment constraint, so Advanced is safe here.
+                buf.set_text(font_system, text, &attrs, Shaping::Advanced, None);
+                buf
+            });
         }
+        // Keep the cache bounded; never evicts a label drawn this frame.
+        self.overlays.evict(frame);
 
-        // Second pass: build TextAreas with shared refs (no mutation of font_system needed).
+        // Second pass: build TextAreas with shared refs (no mutation of font_system
+        // needed). Repeated labels (a "×" per tab) share one buffer.
         let mut areas: Vec<TextArea> = Vec::with_capacity(labels.len());
-        for (i, (_text, x, y, rgb)) in labels.iter().enumerate() {
+        for (text, x, y, rgb) in labels {
+            let (text, _) = crate::chrome::clip_head(text);
+            let Some(buffer) = self.overlays.get(is_title, text) else { continue };
             areas.push(TextArea {
-                buffer: &self.overlay_buffers[i],
+                buffer,
                 left: *x,
                 top: *y,
                 scale: 1.0,
@@ -2638,6 +2729,60 @@ mod tests {
     /// A monospace family to shape with: the default terminal font when it is
     /// installed, else any monospace face (CI runners lack MesloLGS NF); `None`
     /// on a machine without one (the shaping tests then have nothing to test).
+    #[test]
+    fn overlay_labels_are_shaped_once_and_reused_per_family() {
+        let mut fs = TextLayer::build_font_system();
+        let mut cache = OverlayCache::default();
+        let mut shaped = 0;
+        for _frame in 0..10 {
+            let pass = cache.next_frame();
+            for text in ["✕", "+", "burak@omen: ~", "✕", "✕"] {
+                cache.ensure(false, text, 800, pass, &mut fs, |fs| {
+                    shaped += 1;
+                    Buffer::new(fs, Metrics::new(16.0, 21.0))
+                });
+            }
+            // A tab title is the TITLE family: its own entry even for equal text.
+            cache.ensure(true, "burak@omen: ~", 800, pass, &mut fs, |fs| {
+                shaped += 1;
+                Buffer::new(fs, Metrics::new(16.0, 21.0))
+            });
+            cache.evict(pass);
+        }
+        assert_eq!(shaped, 4, "three distinct mono labels + one title, shaped once over ten frames");
+        assert!(cache.get(false, "✕").is_some() && cache.get(true, "burak@omen: ~").is_some());
+        assert!(cache.get(true, "✕").is_none(), "families are not mixed");
+        cache.clear();
+        assert_eq!(cache.len(), 0, "a family/size change drops every shaped label");
+    }
+
+    #[test]
+    fn overlay_cache_stays_bounded_under_ever_new_labels_and_keeps_the_current_pass() {
+        // A HUD whose text changes every frame, or a program rewriting a tab title
+        // per frame: every pass brings new labels. The cache must stay bounded and
+        // still hold every label of the pass being drawn.
+        let mut fs = TextLayer::build_font_system();
+        let mut cache = OverlayCache::default();
+        for frame in 0..(OVERLAY_CACHE_CAP * 3) {
+            let pass = cache.next_frame();
+            let labels: Vec<String> = (0..3).map(|i| format!("⚡ {frame}.{i} ms")).collect();
+            for l in &labels {
+                cache.ensure(false, l, 600, pass, &mut fs, |fs| Buffer::new(fs, Metrics::new(16.0, 21.0)));
+            }
+            cache.evict(pass);
+            assert!(cache.len() <= OVERLAY_CACHE_CAP + 3, "pass {frame}: {} entries", cache.len());
+            assert!(labels.iter().all(|l| cache.get(false, l).is_some()), "pass {frame} lost a label it draws");
+        }
+        // Even one pass with more distinct labels than the cap keeps them all.
+        let pass = cache.next_frame();
+        let many: Vec<String> = (0..OVERLAY_CACHE_CAP + 50).map(|i| format!("row {i}")).collect();
+        for l in &many {
+            cache.ensure(false, l, 600, pass, &mut fs, |fs| Buffer::new(fs, Metrics::new(16.0, 21.0)));
+        }
+        cache.evict(pass);
+        assert!(many.iter().all(|l| cache.get(false, l).is_some()));
+    }
+
     fn mono_family(fs: &FontSystem) -> Option<String> {
         let faces = || fs.db().faces();
         if faces().any(|f| f.families.iter().any(|(n, _)| n == FONT_FAMILY_DEFAULT)) {
