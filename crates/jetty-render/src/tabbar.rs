@@ -778,9 +778,11 @@ fn paint_tab_body(
 /// the title family), so title truncation, the rename caret and the HUD
 /// reservation are right for any UI font. `cm` sizes the whole strip. The hit
 /// geometry (tab/close/plus/control rects) depends only on `width`, the tab
-/// count, `cm`, the style (only [`TabStyle::Compact`] differs) and — for the
-/// close rects — which "×" are shown ([`CloseButton`] + `opts.hover`); never on
-/// text or `deco`, so a hit-test rebuild may pass any measurer and no deco.
+/// count, `cm`, the style (only [`TabStyle::Compact`] differs — and
+/// [`TabStyle::Powerline`] in a window too narrow for one minimum-width tab)
+/// and — for the close rects — which "×" are shown ([`CloseButton`] +
+/// `opts.hover`); never on text or `deco`, so a hit-test rebuild may pass any
+/// measurer and no deco.
 ///
 /// Inactive tabs with activity get a small themed badge in the title gutter
 /// and a hidden (overflowed) tab's strongest activity tints the "+N" hint.
@@ -866,6 +868,22 @@ pub fn build_tab_bar_styled(
     // Ideal width per tab, clamped to [MIN, default]. Use the full default when
     // there's room; shrink toward MIN as tabs are added.
     let tab_w = (tabs_avail_w / n_tabs).clamp(tab_w_min, tab_w_max).min(tab_w_max);
+    // The narrowest windows (the 200 px minimum width at 1×) cannot hold even
+    // one minimum-width tab left of the controls. The one tab drawn then
+    // shrinks to the room there is (the "+" is not drawn either) and drops
+    // its "×" — Ctrl+Shift+W and the tab menu still close it — instead of
+    // running under the "?" with its "×" on top of the "?" glyph. (A powerline
+    // chevron's tip reaches past its cell: that overhang is kept clear too.)
+    let tip = match opts.style {
+        TabStyle::Powerline => {
+            let body_h = (h - cm.px(sm.vpad) * 2.0).max(1.0);
+            ((body_h * POWERLINE_DEPTH).round() - cm.px(POWERLINE_GAP)).max(0.0) * 0.5
+        }
+        _ => 0.0,
+    };
+    let room = (tab_area_x - left - tip).max(0.0);
+    let cramped = tab_w > room;
+    let tab_w = tab_w.min(room);
     // How many tabs actually fit at `tab_w` (at least 1 so the active tab shows).
     // When they don't all fit, room is kept for the "+N" hint after the "+":
     // it carries the hidden tabs' badges (a failure must never be invisible),
@@ -903,7 +921,8 @@ pub fn build_tab_bar_styled(
         TabStyle::Powerline => (((h - cm.px(sm.vpad) * 2.0).max(1.0)) * POWERLINE_DEPTH).round(),
         _ => 0.0,
     };
-    let title_max_w = (tab_w - close_w - title_pad - content_lead - cm.px(8.0)).max(0.0);
+    let close_room = if cramped { 0.0 } else { close_w };
+    let title_max_w = (tab_w - close_room - title_pad - content_lead - cm.px(8.0)).max(0.0);
 
     // Hit-rects are index-aligned to ABSOLUTE tab indices; off-window tabs get an
     // offscreen sentinel (0-width, far left) so a click can never match them.
@@ -925,7 +944,9 @@ pub fn build_tab_bar_styled(
         let lead = paint_tab_body(&mut quads, opts.style, sm, cm, &cell, h, &colors, i == start, opts.bottom);
 
         let title_x = x + title_pad + lead;
-        let close_x = x + tab_w - close_w - cm.px(4.0);
+        // Without a "×" (cramped) its slot is the tab's right pad, where the
+        // progress bar then ends (like the detached bar's lone tab).
+        let close_x = if cramped { x + tab_w - cm.px(6.0) } else { x + tab_w - close_w - cm.px(4.0) };
         if being_renamed {
             // Live edit buffer + trailing caret, front-truncated so the caret stays.
             let buf = match renaming { Some((_, b)) => b, None => "" };
@@ -943,7 +964,7 @@ pub fn build_tab_bar_styled(
         // Close "×" (recessive on inactive tabs) — only where the mode shows it;
         // a hidden one is not clickable (its rect stays offscreen). Kept while
         // renaming so indices stay aligned, but never drawn over the edit box.
-        if opts.close_button.shows(is_on, hovered) {
+        if opts.close_button.shows(is_on, hovered) && !cramped {
             if !being_renamed {
                 labels.push(("×".to_string(), close_x + cm.px(4.0), label_y, colors.close));
             }
@@ -2161,6 +2182,44 @@ mod tests {
                             q.y,
                             q.h
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_narrowest_window_keeps_its_tab_clear_of_the_controls() {
+        // The window's minimum width (200 logical px) at 1× and 2×, and just
+        // above it: one minimum-width tab no longer fits left of the five
+        // window controls. It used to be drawn at that minimum anyway — its
+        // pill under "?" and its "×" on top of the "?" glyph.
+        let deco = [TabDeco { activity: TabActivity::Bell, ..Default::default() }; 3];
+        for style in TabStyle::ALL {
+            for (w, cm) in [(200u32, CM), (240, CM), (400, ChromeMetrics::new(2.0, 16.0))] {
+                for n in [1usize, 3] {
+                    let tabs: Vec<(String, bool)> = (0..n).map(|i| (format!("Tab {i}"), i == 0)).collect();
+                    let mut m = MonoMeasure(CHROME_CHAR_W * cm.u);
+                    let o = TabBarOpts { style, ..TabBarOpts::default() };
+                    let bar = build_tab_bar_styled(w, &tabs, &theme(), None, CtrlHover::None, None, &mut m, cm, &deco, &o);
+                    let what = format!("{style:?} {w}px@{}x, {n} tab(s)", cm.dpi);
+                    let controls_left = bar.help_rect.x;
+                    // The active tab is still there, and readable.
+                    assert!(bar.tab_rects[0].w > 0.0 && !bar.title_labels.is_empty(), "{what}: no tab");
+                    for r in bar.tab_rects.iter().chain(&bar.close_rects).filter(|r| r.x > -1.0) {
+                        assert!(r.x + r.w <= controls_left + 0.5, "{what}: hit rect under the controls");
+                    }
+                    // Nothing drawn for the tabs (bodies, badges, titles, "×",
+                    // "+") reaches the controls: only the bar background and the
+                    // controls' own glyphs may.
+                    for q in bar.quads.iter().filter(|q| q.w < w as f32) {
+                        assert!(q.x + q.w <= controls_left + 0.5, "{what}: quad x={} w={} under the controls", q.x, q.w);
+                    }
+                    for l in &bar.title_labels {
+                        assert!(l.1 + m.title_w(&l.0) <= controls_left + 0.5, "{what}: title {:?} under the controls", l.0);
+                    }
+                    for l in bar.labels.iter().filter(|l| l.1 < controls_left) {
+                        assert!(l.1 + m.text_w(&l.0) <= controls_left + 0.5, "{what}: {:?} under the controls", l.0);
                     }
                 }
             }
