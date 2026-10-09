@@ -502,6 +502,20 @@ fn wheel_notches(delta: MouseScrollDelta, geom: GridGeom) -> (f32, f32) {
     }
 }
 
+/// macOS turns Shift + a classic (notched) wheel into a HORIZONTAL scroll,
+/// system-wide: Shift+wheel — the escape to JeTTY's scrollback — arrived as
+/// `LineDelta(±n, 0)` there and scrolled nothing. On `macos`, a held Shift
+/// reads such a delta back as the vertical one it was (an OS convention, so
+/// keyed on the OS alone).
+fn shift_wheel_delta(delta: MouseScrollDelta, shift: bool, macos: bool) -> MouseScrollDelta {
+    match delta {
+        MouseScrollDelta::LineDelta(x, y) if macos && shift && y == 0.0 && x != 0.0 => {
+            MouseScrollDelta::LineDelta(0.0, x)
+        }
+        d => d,
+    }
+}
+
 /// One wheel event. `vertical` is the window's line accumulator;
 /// `over_scrollbar` keeps the wheel on the host scrollback (the scrollbar is
 /// JeTTY's), and so does the status strip below the grid band (chrome too:
@@ -541,6 +555,7 @@ pub(crate) fn wheel(
     // report remainder carry into a later program report.
     g.mouse.vnotches.reset();
     g.mouse.hnotches.reset();
+    let delta = shift_wheel_delta(delta, shift, cfg!(target_os = "macos"));
     let lines = vertical.add(input::wheel_lines(delta, g.geom.cell_h));
     if lines == 0 {
         return Wheel::None;
@@ -877,6 +892,32 @@ mod tests {
         assert_eq!(w.at(0.0, 0.0, NONE, |g| wheel(g, line(0.0, 2.0), false, &mut acc)).1, "\x1b[<64;1;1M".repeat(2));
         let fling = w.at(0.0, 0.0, NONE, |g| wheel(g, line(0.0, -40.0), false, &mut acc)).1;
         assert_eq!(fling, "\x1b[<65;1;1M".repeat(WHEEL_MAX_REPORTS as usize));
+    }
+
+    #[test]
+    fn macos_shift_wheel_reads_back_as_the_vertical_scroll_it_was() {
+        // macOS hands Shift + a notched wheel over as a horizontal delta, so
+        // the Shift+wheel escape to the scrollback scrolled nothing there.
+        use MouseScrollDelta::LineDelta;
+        assert_eq!(shift_wheel_delta(LineDelta(1.0, 0.0), true, true), LineDelta(0.0, 1.0));
+        assert_eq!(shift_wheel_delta(LineDelta(-2.0, 0.0), true, true), LineDelta(0.0, -2.0));
+        // Elsewhere, without Shift, with a vertical part or from a touchpad:
+        // untouched.
+        let px = MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(30.0, 0.0));
+        for (d, shift, macos) in
+            [(LineDelta(1.0, 0.0), true, false), (LineDelta(1.0, 0.0), false, true), (LineDelta(1.0, 0.5), true, true)]
+                .into_iter()
+                .chain([(px, true, true), (LineDelta(0.0, 1.0), true, true)])
+        {
+            assert_eq!(shift_wheel_delta(d, shift, macos), d, "{d:?} shift={shift} macos={macos}");
+        }
+        // Through the wheel: on macOS it scrolls the scrollback like a vertical
+        // Shift+wheel; elsewhere a horizontal one has nothing to scroll there.
+        let mut w = with_history(b"\x1b[?1000h\x1b[?1006h");
+        let mut acc = ScrollAccumulator::new();
+        let (_, bytes) = w.at(0.0, 0.0, ModifiersState::SHIFT, |g| wheel(g, LineDelta(1.0, 0.0), false, &mut acc));
+        assert_eq!(bytes, "");
+        assert_eq!(w.term.scroll_offset(), if cfg!(target_os = "macos") { 3 } else { 0 });
     }
 
     #[test]
