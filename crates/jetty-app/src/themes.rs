@@ -7,8 +7,11 @@
 //! parsed data + the registry.
 //!
 //! Never panics: a malformed file (bad TOML, bad hex, wrong palette length, missing
-//! a required field) is skipped and reported (the app shows the warning); the other
-//! themes still load. `read_dir` order is unspecified, so files are SORTED before
+//! a required field) is reported — with the line and column, or the key of the bad
+//! value — and skipped, or, when an earlier version of it loaded in this session,
+//! that version is kept (a theme on screen survives a typo mid-edit); the other
+//! themes still load. A key close to a real one (`selection_backgrond`) is
+//! reported too. `read_dir` order is unspecified, so files are SORTED before
 //! loading, making "duplicate user name → last wins" deterministic.
 //!
 //! ## Schema (`~/.config/jetty/themes/<id>.toml`)
@@ -84,18 +87,48 @@ struct AnsiTable {
 }
 
 impl AnsiTable {
-    fn to_rows(&self) -> Result<[[u8; 3]; 8], String> {
+    /// The 8 colors; `table` (`normal` / `bright`) names a bad one's key.
+    fn to_rows(&self, table: &str) -> Result<[[u8; 3]; 8], String> {
+        let c = |name: &str, v: &str| hex(&format!("{table}.{name}"), v);
         Ok([
-            parse_hex(&self.black)?,
-            parse_hex(&self.red)?,
-            parse_hex(&self.green)?,
-            parse_hex(&self.yellow)?,
-            parse_hex(&self.blue)?,
-            parse_hex(&self.magenta)?,
-            parse_hex(&self.cyan)?,
-            parse_hex(&self.white)?,
+            c("black", &self.black)?,
+            c("red", &self.red)?,
+            c("green", &self.green)?,
+            c("yellow", &self.yellow)?,
+            c("blue", &self.blue)?,
+            c("magenta", &self.magenta)?,
+            c("cyan", &self.cyan)?,
+            c("white", &self.white)?,
         ])
     }
+}
+
+/// Every key a theme file may set: what [`ThemeToml`] reads, its aliases, and
+/// `opacity` (accepted and ignored — opacity is a global setting).
+const KNOWN_KEYS: &[&str] = &[
+    "name",
+    "display_name",
+    "background",
+    "bg",
+    "foreground",
+    "fg",
+    "cursor",
+    "cursor_text",
+    "selection_foreground",
+    "selection_fg",
+    "selection_background",
+    "selection_bg",
+    "selection",
+    "accent",
+    "palette",
+    "normal",
+    "bright",
+    "opacity",
+];
+
+/// [`parse_hex`] for the theme key `key`, which a bad value's error names.
+fn hex(key: &str, value: &str) -> Result<[u8; 3], String> {
+    parse_hex(value).map_err(|e| format!("`{key}`: {e}"))
 }
 
 /// Parse a hex color (`#rrggbb`, `#rgb`, `rrggbb`, or `rgb`) to `[r, g, b]`.
@@ -150,16 +183,16 @@ fn theme_from_toml(t: ThemeToml, stem: &str) -> Result<jetty_core::Theme, String
     }
     let display_name = t.display_name.unwrap_or_else(|| title_case(&name));
 
-    let bg3 = parse_hex(t.background.as_deref().ok_or("missing `background`")?)?;
-    let fg = parse_hex(t.foreground.as_deref().ok_or("missing `foreground`")?)?;
-    let cursor = parse_hex(t.cursor.as_deref().ok_or("missing `cursor`")?)?;
-    let cursor_text = t.cursor_text.as_deref().map(parse_hex).transpose()?;
-    let selection_fg = t.selection_foreground.as_deref().map(parse_hex).transpose()?;
-    let accent = t.accent.as_deref().map(parse_hex).transpose()?;
+    let bg3 = hex("background", t.background.as_deref().ok_or("missing `background`")?)?;
+    let fg = hex("foreground", t.foreground.as_deref().ok_or("missing `foreground`")?)?;
+    let cursor = hex("cursor", t.cursor.as_deref().ok_or("missing `cursor`")?)?;
+    let cursor_text = t.cursor_text.as_deref().map(|v| hex("cursor_text", v)).transpose()?;
+    let selection_fg = t.selection_foreground.as_deref().map(|v| hex("selection_foreground", v)).transpose()?;
+    let accent = t.accent.as_deref().map(|v| hex("accent", v)).transpose()?;
     // `selection_background` wins; the older plain-color `selection` is lenient
     // (it used to be ignored, so a bad value there must not drop the theme now).
     let selection_bg = match (t.selection_background.as_deref(), &t.selection) {
-        (Some(s), _) => Some(parse_hex(s)?),
+        (Some(s), _) => Some(hex("selection_background", s)?),
         (None, Some(toml::Value::String(s))) => parse_hex(s).ok(),
         _ => None,
     };
@@ -171,13 +204,13 @@ fn theme_from_toml(t: ThemeToml, stem: &str) -> Result<jetty_core::Theme, String
             return Err(format!("`palette` must have exactly 16 colors (got {})", list.len()));
         }
         let mut p = [[0u8; 3]; 16];
-        for (i, hex) in list.iter().enumerate() {
-            p[i] = parse_hex(hex)?;
+        for (i, value) in list.iter().enumerate() {
+            p[i] = hex(&format!("palette[{i}]"), value)?;
         }
         p
     } else if let (Some(normal), Some(bright)) = (t.normal.as_ref(), t.bright.as_ref()) {
-        let n = normal.to_rows()?;
-        let b = bright.to_rows()?;
+        let n = normal.to_rows("normal")?;
+        let b = bright.to_rows("bright")?;
         let mut p = [[0u8; 3]; 16];
         p[..8].copy_from_slice(&n);
         p[8..].copy_from_slice(&b);
@@ -202,12 +235,47 @@ fn theme_from_toml(t: ThemeToml, stem: &str) -> Result<jetty_core::Theme, String
     })
 }
 
+/// The last version of each user theme file that loaded, by path. A save that
+/// does not load — a typo mid-edit in the theme on screen — keeps this one,
+/// with a warning, instead of dropping the theme (the whole terminal used to
+/// flash to the fallback theme until the next good save). A deleted file is
+/// forgotten.
+static LAST_GOOD: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, jetty_core::Theme>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Read and convert one theme file. `Err` says why it cannot be used, with the
+/// line and column of a TOML error and the key of a bad value. Keys that are
+/// close to a real key (a typo: `selection_backgrond`) are reported in
+/// `warnings`; other unknown keys (`author`) are accepted silently.
+fn load_theme_file(
+    path: &std::path::Path,
+    stem: &str,
+    file: &str,
+    warnings: &mut Vec<String>,
+) -> Result<jetty_core::Theme, String> {
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let parsed: ThemeToml =
+        toml::from_str(&content).map_err(|e| crate::config::describe_toml_error(&e, &content))?;
+    if let Ok(table) = toml::from_str::<toml::Table>(&content) {
+        for key in table.keys().filter(|k| !KNOWN_KEYS.contains(&k.as_str())) {
+            if let Some(near) = crate::config::check::closest(key, KNOWN_KEYS) {
+                warnings.push(format!(
+                    "theme file themes/{file}: unknown key `{key}` is ignored — did you mean `{near}`?"
+                ));
+            }
+        }
+    }
+    theme_from_toml(parsed, stem)
+}
+
 /// Read `<dir>/*.toml` (the user themes dir) into a `Vec<Theme>`, plus a warning
-/// per problem. Never panics: a malformed file is skipped (and reported); a missing
-/// directory yields `[]`. Files are sorted by path so duplicate names resolve
-/// deterministically (last wins).
+/// per problem. Never panics: a malformed file is skipped (and reported) — or,
+/// when an earlier version of it loaded in this session, that version is kept
+/// (see [`LAST_GOOD`]); a missing directory yields `[]`. Files are sorted by
+/// path so duplicate names resolve deterministically (last wins).
 pub fn load_user_themes_from(dir: &std::path::Path) -> (Vec<jetty_core::Theme>, Vec<String>) {
     let mut warnings = Vec::new();
+    let mut last_good = LAST_GOOD.lock().unwrap_or_else(|p| p.into_inner());
     let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
@@ -218,9 +286,14 @@ pub fn load_user_themes_from(dir: &std::path::Path) -> (Vec<jetty_core::Theme>, 
                     && !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(".tmp."))
             })
             .collect(),
-        Err(_) => return (Vec::new(), warnings), // no themes dir → no user themes
+        Err(_) => {
+            // No themes dir → no user themes (and none to keep).
+            last_good.retain(|p, _| p.parent() != Some(dir));
+            return (Vec::new(), warnings);
+        }
     };
     files.sort(); // deterministic load order (read_dir order is unspecified)
+    last_good.retain(|p, _| p.parent() != Some(dir) || files.contains(p));
 
     let mut out: Vec<jetty_core::Theme> = Vec::new();
     for path in files {
@@ -230,34 +303,30 @@ pub fn load_user_themes_from(dir: &std::path::Path) -> (Vec<jetty_core::Theme>, 
             .unwrap_or("theme")
             .to_string();
         let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                warnings.push(format!("theme file themes/{file} skipped: {e}"));
-                continue;
-            }
-        };
-        let parsed: ThemeToml = match toml::from_str(&content) {
-            Ok(t) => t,
-            Err(e) => {
-                warnings.push(format!("theme file themes/{file} skipped: {}", e.message().trim()));
-                continue;
-            }
-        };
-        match theme_from_toml(parsed, &stem) {
+        let theme = match load_theme_file(&path, &stem, &file, &mut warnings) {
             Ok(theme) => {
-                // Duplicate user name → last wins (drop the earlier one), reported.
-                if let Some(pos) = out.iter().position(|t| t.name == theme.name) {
-                    warnings.push(format!(
-                        "two theme files are named {:?} — themes/{file} wins",
-                        theme.name
-                    ));
-                    out.remove(pos);
-                }
-                out.push(theme);
+                last_good.insert(path.clone(), theme.clone());
+                theme
             }
-            Err(e) => warnings.push(format!("theme file themes/{file} skipped: {e}")),
+            Err(e) => match last_good.get(&path) {
+                Some(kept) => {
+                    warnings.push(format!(
+                        "theme file themes/{file}: {e} — keeping the last version that loaded"
+                    ));
+                    kept.clone()
+                }
+                None => {
+                    warnings.push(format!("theme file themes/{file} skipped: {e}"));
+                    continue;
+                }
+            },
+        };
+        // Duplicate user name → last wins (drop the earlier one), reported.
+        if let Some(pos) = out.iter().position(|t| t.name == theme.name) {
+            warnings.push(format!("two theme files are named {:?} — themes/{file} wins", theme.name));
+            out.remove(pos);
         }
+        out.push(theme);
     }
     (out, warnings)
 }
@@ -591,6 +660,88 @@ palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606"
         let (none, w) = load_user_themes_from(&dir.join("nope"));
         assert!(none.is_empty() && w.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn theme_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("jetty-themes-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn theme_text(bg: &str) -> String {
+        format!("name = \"mine\"\nbackground = \"{bg}\"\nforeground = \"#eeeeee\"\ncursor = \"#ffffff\"\n{PAL16}\n")
+    }
+
+    #[test]
+    fn a_theme_file_broken_mid_edit_keeps_its_last_good_version() {
+        // Saving a theme that is in use with a typo (an editor that saves on
+        // every pause) dropped it from the registry: the whole terminal flashed
+        // to the fallback theme until the next good save.
+        let dir = theme_dir("last-good");
+        let path = dir.join("mine.toml");
+        std::fs::write(&path, theme_text("#401010")).unwrap();
+        let (themes, w) = load_user_themes_from(&dir);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(themes[0].bg, [0x40, 0x10, 0x10, 255]);
+        std::fs::write(&path, theme_text("#40101")).unwrap();
+        let (themes, w) = load_user_themes_from(&dir);
+        assert_eq!(themes.len(), 1, "the last version that loaded stays");
+        assert_eq!((themes[0].name.as_ref(), themes[0].bg), ("mine", [0x40, 0x10, 0x10, 255]));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("themes/mine.toml") && w[0].contains("keeping the last version that loaded"), "{w:?}");
+        assert!(w[0].contains("`background`"), "names the key: {w:?}");
+        // Fixed: the new version.
+        std::fs::write(&path, theme_text("#102030")).unwrap();
+        let (themes, w) = load_user_themes_from(&dir);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(themes[0].bg, [0x10, 0x20, 0x30, 255]);
+        // Deleted: gone (that is deliberate) — and not resurrected by a broken
+        // file of the same name later.
+        std::fs::remove_file(&path).unwrap();
+        assert!(load_user_themes_from(&dir).0.is_empty());
+        std::fs::write(&path, theme_text("#nothex")).unwrap();
+        let (themes, w) = load_user_themes_from(&dir);
+        assert!(themes.is_empty());
+        assert!(w[0].contains("skipped"), "{w:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn theme_errors_say_where() {
+        let dir = theme_dir("where");
+        std::fs::write(dir.join("a.toml"), "background = \"#101010\nforeground = \"#eeeeee\"\n").unwrap();
+        std::fs::write(dir.join("b.toml"), theme_text("#101010").replace("\"#030303\"", "\"#03030\"")).unwrap();
+        std::fs::write(dir.join("c.toml"), theme_text("#101010").replace("palette = [", "palette = [1, ")).unwrap();
+        let (_, w) = load_user_themes_from(&dir);
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w[0].starts_with("theme file themes/a.toml skipped: line 1, column"), "{w:?}");
+        assert!(w[1].contains("`palette[3]`: bad hex color \"#03030\""), "{w:?}");
+        assert!(w[2].contains("line 5, column"), "a wrong type has a place too: {w:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_misspelled_theme_key_is_reported_and_the_theme_still_loads() {
+        let dir = theme_dir("typo");
+        let text = theme_text("#101010") + "selection_backgrond = \"#334455\"\nauthor = \"me\"\n";
+        std::fs::write(dir.join("mine.toml"), text).unwrap();
+        let (themes, w) = load_user_themes_from(&dir);
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].selection_bg, None, "the misspelled key does nothing");
+        // Only a key close to a real one is worth a warning (`author` is not).
+        assert_eq!(
+            w,
+            ["theme file themes/mine.toml: unknown key `selection_backgrond` is ignored — did you mean `selection_background`?"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_known_theme_keys_cover_the_file_format() {
+        for f in crate::config::check::fields_of::<ThemeToml>() {
+            assert!(KNOWN_KEYS.contains(f), "{f} is read but not listed");
+        }
     }
 
     #[test]
