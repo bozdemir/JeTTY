@@ -373,7 +373,7 @@ pub fn filter(registry: &[PaletteEntry], query: &str) -> Vec<PaletteHit> {
             .map(|e| PaletteHit { title: e.title.clone(), indices: Vec::new(), cmd: e.cmd.clone() })
             .collect();
     }
-    let mut scored: Vec<(i32, bool, usize, PaletteHit)> = Vec::new();
+    let mut scored: Vec<(i32, bool, u8, usize, PaletteHit)> = Vec::new();
     for (i, e) in registry.iter().enumerate() {
         let title_m = fuzzy_match(query, &e.title);
         let kw_m = fuzzy_match(query, e.keywords);
@@ -384,18 +384,51 @@ pub fn filter(registry: &[PaletteEntry], query: &str) -> Vec<PaletteHit> {
         };
         // Whether the TITLE carries the best score (keywords are secondary).
         let by_title = t == Some(best);
+        let tier = if by_title { title_tier(query, &e.title) } else { 2 };
         // Highlight indices come ONLY from the title match.
         let indices = title_m.map(|m| m.indices).unwrap_or_default();
-        scored.push((best, by_title, i, PaletteHit { title: e.title.clone(), indices, cmd: e.cmd.clone() }));
+        scored.push((best, by_title, tier, i, PaletteHit { title: e.title.clone(), indices, cmd: e.cmd.clone() }));
     }
     // A title match first, a keyword-only one after ("bloom" finds "Settings ›
-    // Effects › Bloom" before an action that merely lists the word); among
-    // title matches a command you can run before a deep link to its Settings
-    // control ("built-in glyphs" toggles them); then score desc; then registry
-    // order (stable on the index). A plain key, so the order is total.
+    // Effects › Bloom" before an action that merely lists the word). Among
+    // title matches: the whole title typed, then titles whose words start
+    // with the typed words, then scattered letters ("fit" is the Fit control,
+    // not f…i…t across "follow system light"); within a tier a command you
+    // can run before a deep link to its Settings control ("built-in glyphs"
+    // toggles them); then score desc; then registry order (stable on the
+    // index). A plain key, so the order is total.
     let link = |h: &PaletteHit| matches!(h.cmd, PaletteCmd::SettingsAt(_));
-    scored.sort_by_key(|(score, by_title, i, hit)| (!*by_title, *by_title && link(hit), std::cmp::Reverse(*score), *i));
-    scored.into_iter().map(|(_, _, _, hit)| hit).collect()
+    scored.sort_by_key(|(score, by_title, tier, i, hit)| {
+        (!*by_title, *tier, *by_title && link(hit), std::cmp::Reverse(*score), *i)
+    });
+    scored.into_iter().map(|(_, _, _, _, hit)| hit).collect()
+}
+
+/// How well a title that fuzzy-matched `query` matches it, best first: 0 —
+/// the whole title typed (case-insensitive); 1 — every typed word starts a
+/// title word, in order ("tab col" → "Tab color: Red", "built-in glyphs" →
+/// "Toggle built-in box & braille glyphs"); 2 — anything else the fuzzy
+/// matcher accepts. Words split at anything not alphanumeric.
+fn title_tier(query: &str, title: &str) -> u8 {
+    let q = query.trim();
+    if q.to_lowercase() == title.to_lowercase() {
+        return 0;
+    }
+    let words = |s: &str| -> Vec<String> {
+        s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect()
+    };
+    let (qw, tw) = (words(q), words(title));
+    if qw.is_empty() {
+        return 2;
+    }
+    let mut next = 0;
+    for w in &qw {
+        match tw[next..].iter().position(|t| t.starts_with(w.as_str())) {
+            Some(k) => next += k + 1,
+            None => return 2,
+        }
+    }
+    1
 }
 
 #[cfg(test)]
@@ -639,4 +672,49 @@ mod tests {
         let r = reg();
         assert!(filter(&r, "zzqxq").is_empty());
     }
+
+    /// Typing a row's whole title finds THAT row first — "Settings › Fonts ›
+    /// Font" used to rank its longer neighbour "… › Font size" above it (the
+    /// scorer only rewards matched characters, so a longer title ties).
+    #[test]
+    fn an_exact_title_ranks_first() {
+        let mut r = reg();
+        r.extend(backdrop_entries(&["wall.jpg".to_string()]));
+        for e in &r {
+            for q in [e.title.clone(), e.title.to_lowercase()] {
+                assert_eq!(filter(&r, &q)[0].title, e.title, "typing {q:?}");
+            }
+        }
+    }
+
+    /// A title whose words START with the typed words beats one that only
+    /// scatters the letters: "fit" is the backdrop's Fit control, not "Toggle
+    /// follow system light/dark theme" (f…i…t), which used to rank first
+    /// because any runnable command outranked every Settings link.
+    #[test]
+    fn a_word_match_beats_scattered_letters() {
+        let r = reg();
+        for (q, cmd) in [
+            ("fit", PaletteCmd::SettingsAt("backdrop.fit")),
+            ("tint", PaletteCmd::SettingsAt("effects.crt_scanline_tint")),
+            ("trail", PaletteCmd::ToggleCursorTrail),
+        ] {
+            assert_eq!(filter(&r, q)[0].cmd, cmd, "top hit for {q:?}");
+        }
+        // Commands still lead their own Settings links on an equal match…
+        let trail = filter(&r, "trail");
+        assert_eq!(trail[1].cmd, PaletteCmd::SettingsAt("cursor.trail"), "{:?}", trail[1].title);
+        // …and "shape" lists the cursor command, then both Shape controls,
+        // before the pattern whose letters merely spell it out.
+        let shape: Vec<PaletteCmd> = filter(&r, "shape").into_iter().take(3).map(|h| h.cmd).collect();
+        assert_eq!(
+            shape,
+            [
+                PaletteCmd::CycleCursorShape,
+                PaletteCmd::SettingsAt("backdrop.shape"),
+                PaletteCmd::SettingsAt("cursor.shape"),
+            ]
+        );
+    }
 }
+
