@@ -11023,7 +11023,8 @@ impl App {
                 if let Some(dw) = self.detached.get_mut(pos) {
                     dw.pointer_in = false;
                     let gutter = std::mem::take(&mut dw.scrollbar_hover) && dw.tab.terminal.scroll_max() > 0;
-                    if std::mem::take(&mut dw.close_hover) || gutter {
+                    let control = std::mem::replace(&mut dw.ctrl_hover, jetty_render::CtrlHover::None);
+                    if control != jetty_render::CtrlHover::None || gutter {
                         dw.request_paint();
                     }
                 }
@@ -11139,10 +11140,16 @@ impl App {
                             },
                         );
                     }
-                    // --- Close ✕ hover highlight ---
-                    let hover = input::point_in(&jetty_render::detached_close_rect(w, cm), cx, cy);
-                    if hover != dw.close_hover {
-                        dw.close_hover = hover;
+                    // --- Close ✕ / help ? hover highlight ---
+                    let hover = if input::point_in(&jetty_render::detached_close_rect(w, cm), cx, cy) {
+                        jetty_render::CtrlHover::Close
+                    } else if input::point_in(&jetty_render::detached_help_rect(w, cm), cx, cy) {
+                        jetty_render::CtrlHover::Help
+                    } else {
+                        jetty_render::CtrlHover::None
+                    };
+                    if hover != dw.ctrl_hover {
+                        dw.ctrl_hover = hover;
                         dw.request_paint();
                     }
                 }
@@ -11847,7 +11854,7 @@ impl App {
             );
         }
         let preedit_ui = if preedit_hidden { None } else { dw.ime_preedit.clone() };
-        let close_hover = dw.close_hover;
+        let ctrl_hover = dw.ctrl_hover;
         let menu_open = dw.menu_open;
         let menu_hover = dw.menu_hover;
         let menu_disabled = dw.menu_disabled.clone();
@@ -12122,7 +12129,7 @@ impl App {
             // same pass, over the chrome's quads.
             |quad, device, queue, view, w, h, grid_rects| {
                 let bar = jetty_render::build_detached_bar_styled(
-                    w, &title, &theme, close_hover, &mut *chrome_text, cm, &tab_deco, &bar_opts,
+                    w, &title, &theme, ctrl_hover, &mut *chrome_text, cm, &tab_deco, &bar_opts,
                 );
                 let (mut quads, mut labels) = (bar.quads, bar.labels);
                 if status_h > 0.0 {

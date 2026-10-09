@@ -1161,23 +1161,24 @@ pub fn build_detached_bar(
     width: u32,
     title: &str,
     theme: &Theme,
-    close_hover: bool,
+    hover: CtrlHover,
     m: &mut dyn ChromeMeasure,
     cm: ChromeMetrics,
 ) -> DetachedBar {
-    build_detached_bar_styled(width, title, theme, close_hover, m, cm, &TabDeco::default(), &TabBarOpts::default())
+    build_detached_bar_styled(width, title, theme, hover, m, cm, &TabDeco::default(), &TabBarOpts::default())
 }
 
 /// Build the top bar of a DETACHED window: bar background, the tab title as the
 /// window's (always active) tab in `opts.style` with its color and progress,
-/// and the close "✕" at the right (danger highlight when `close_hover`). `m` /
+/// and the help "?" and close "✕" at the right (`hover` highlights one as the
+/// main bar's controls are: an accent tint, the danger fill for "✕"). `m` /
 /// `cm` as in [`build_tab_bar_styled`]. The detached bar is always at the top.
 #[allow(clippy::too_many_arguments)]
 pub fn build_detached_bar_styled(
     width: u32,
     title: &str,
     theme: &Theme,
-    close_hover: bool,
+    hover: CtrlHover,
     m: &mut dyn ChromeMeasure,
     cm: ChromeMetrics,
     deco: &TabDeco,
@@ -1222,13 +1223,19 @@ pub fn build_detached_bar_styled(
     // Close "✕" at the right — danger hover background with a readable glyph
     // (identical treatment to the main window's close control).
     let close_rect = detached_close_rect(width, cm);
+    let close_hover = hover == CtrlHover::Close;
     if close_hover {
         quads.push(Rect { x: close_rect.x, y: 0.0, w: close_rect.w, h, color: rgba(ui.danger), ..Default::default() });
     }
     let close_fg = if close_hover { ui.on_danger } else { ui.text };
     labels.push(("✕".to_string(), close_rect.x + cm.px(8.0), cm.px(LABEL_Y), close_fg));
-    // Help "?" left of it (same glyph offset as the main bar's help control).
+    // Help "?" left of it (same glyph offset and hover tint as the main bar's
+    // help control).
     let help_rect = detached_help_rect(width, cm);
+    if hover == CtrlHover::Help {
+        let tint = rgba(mix(ui.bg, ui.accent, 0.22));
+        quads.push(Rect { x: help_rect.x, y: 0.0, w: help_rect.w, h, color: tint, ..Default::default() });
+    }
     labels.push(("?".to_string(), help_rect.x + cm.px(9.0), cm.px(LABEL_Y), ui.text));
 
     DetachedBar { quads, labels, title_labels, close_rect, help_rect }
@@ -1504,7 +1511,7 @@ mod tests {
 
     #[test]
     fn detached_bar_close_parked_at_right() {
-        let bar = build_detached_bar(1000, "Tab 2", &theme(), false, &mut mono(), CM);
+        let bar = build_detached_bar(1000, "Tab 2", &theme(), CtrlHover::None, &mut mono(), CM);
         // The ✕ occupies the rightmost control cell, inset by STRIP_PAD.
         assert!((bar.close_rect.x + bar.close_rect.w - (1000.0 - STRIP_PAD)).abs() < 0.01);
         assert!((bar.close_rect.w - CTRL_W_BASE).abs() < 0.01);
@@ -1518,7 +1525,7 @@ mod tests {
 
     #[test]
     fn detached_bar_shows_title_pill() {
-        let bar = build_detached_bar(1000, "Build logs", &theme(), false, &mut mono(), CM);
+        let bar = build_detached_bar(1000, "Build logs", &theme(), CtrlHover::None, &mut mono(), CM);
         // Title present in the sans title labels.
         assert!(bar.title_labels.iter().any(|l| l.0 == "Build logs"));
         // Bar bg + pill are both emitted (≥ 2 quads).
@@ -1527,7 +1534,7 @@ mod tests {
 
     #[test]
     fn detached_bar_close_hover_paints_theme_red() {
-        let hot = build_detached_bar(1000, "Tab 2", &theme(), true, &mut mono(), CM);
+        let hot = build_detached_bar(1000, "Tab 2", &theme(), CtrlHover::Close, &mut mono(), CM);
         let ui = UiPalette::from_theme(&theme());
         let red = ui.danger;
         assert!(hot.quads.iter().any(|q| q.color == [red[0], red[1], red[2], 255]));
@@ -1536,9 +1543,29 @@ mod tests {
     }
 
     #[test]
+    fn detached_bar_help_hover_tints_its_cell_like_the_main_bars() {
+        // The detached "?" had no hover feedback at all.
+        let ui = UiPalette::from_theme(&theme());
+        let tint = {
+            let c = mix(ui.bg, ui.accent, 0.22);
+            [c[0], c[1], c[2], 255]
+        };
+        let hot = build_detached_bar(1000, "Tab 2", &theme(), CtrlHover::Help, &mut mono(), CM);
+        let cell = detached_help_rect(1000, CM);
+        assert!(hot.quads.iter().any(|q| q.color == tint && q.x == cell.x && q.w == cell.w));
+        assert!(!hot.quads.iter().any(|q| q.color == [ui.danger[0], ui.danger[1], ui.danger[2], 255]));
+        // The main bar's help hover is the same tint.
+        let tabs = [("Tab 1".to_string(), true)];
+        let main = build_tab_bar_ex(1000, &tabs, &theme(), None, CtrlHover::Help, None, &mut mono(), CM, &[]);
+        assert!(main.quads.iter().any(|q| q.color == tint));
+        let cold = build_detached_bar(1000, "Tab 2", &theme(), CtrlHover::None, &mut mono(), CM);
+        assert!(!cold.quads.iter().any(|q| q.color == tint));
+    }
+
+    #[test]
     fn detached_bar_long_title_truncates_with_ellipsis() {
         let long = "a very long detached tab title that cannot fit";
-        let bar = build_detached_bar(1000, long, &theme(), false, &mut mono(), CM);
+        let bar = build_detached_bar(1000, long, &theme(), CtrlHover::None, &mut mono(), CM);
         let label = &bar.title_labels[0].0;
         assert!(label.ends_with('…'), "expected truncation, got {label:?}");
     }
@@ -1787,7 +1814,7 @@ mod tests {
         let r = detached_close_rect(2000, hi);
         assert!((r.x + r.w - (2000.0 - 2.0 * STRIP_PAD)).abs() < 0.01);
         assert_eq!(r.h, 72.0);
-        let bar = build_detached_bar(2000, "Tab", &theme(), false, &mut MonoMeasure(19.2), hi);
+        let bar = build_detached_bar(2000, "Tab", &theme(), CtrlHover::None, &mut MonoMeasure(19.2), hi);
         assert_eq!(bar.close_rect.x, r.x);
         // The help "?" sits one control cell left of the ✕, at the same scale.
         let help = detached_help_rect(2000, hi);
@@ -1800,7 +1827,8 @@ mod tests {
     fn detached_title_pill_never_runs_under_the_controls() {
         let cm = ChromeMetrics::new(1.0, 16.0);
         // Narrow window: the pill is clamped to end before the help control.
-        let bar = build_detached_bar(260, "a very long tab title indeed", &theme(), false, &mut MonoMeasure(9.6), cm);
+        let title = "a very long tab title indeed";
+        let bar = build_detached_bar(260, title, &theme(), CtrlHover::None, &mut MonoMeasure(9.6), cm);
         let help = detached_help_rect(260, cm);
         let pill = &bar.quads[1];
         assert!(pill.x + pill.w <= help.x + 0.01, "pill ends at {} past help x {}", pill.x + pill.w, help.x);
@@ -2149,7 +2177,7 @@ mod tests {
             1000,
             "T",
             &theme(),
-            false,
+            CtrlHover::None,
             &mut mono(),
             CM,
             &TabDeco::default(),
@@ -2181,7 +2209,7 @@ mod tests {
             let x = bar.labels.iter().find(|l| l.0 == "✕").unwrap();
             let c = crate::contrast_ratio(x.3, ui.danger);
             assert!(c >= 4.5, "{}: ✕ on red {c:.2}", t.name);
-            let d = build_detached_bar(800, "T", &t, true, &mut mono(), CM);
+            let d = build_detached_bar(800, "T", &t, CtrlHover::Close, &mut mono(), CM);
             let dx = d.labels.iter().find(|l| l.0 == "✕").unwrap();
             assert!(crate::contrast_ratio(dx.3, ui.danger) >= 4.5, "{}: detached ✕", t.name);
             for l in bar.title_labels.iter().chain(bar.labels.iter().filter(|l| l.0 != "✕")) {

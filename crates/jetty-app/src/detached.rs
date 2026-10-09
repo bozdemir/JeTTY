@@ -491,8 +491,9 @@ pub(crate) struct DetachedWindow {
     /// rows), reset at every open: the pointer moves the highlight only when
     /// it crosses rows (`menunav::pointer_hover`).
     pub menu_pointer_row: Option<usize>,
-    /// Whether the cursor is over the close ✕ (drives the red hover highlight).
-    pub close_hover: bool,
+    /// The bar control under the pointer — the close "✕" (its red hover) or
+    /// the help "?" (an accent tint, as in the main bar).
+    pub ctrl_hover: jetty_render::CtrlHover,
     /// Time + position of the last left press on the top bar, for the
     /// double-click → maximize toggle (mirrors `App::last_strip_click`).
     pub last_bar_click: Option<(std::time::Instant, f32, f32)>,
@@ -695,7 +696,7 @@ impl DetachedWindow {
             menu_disabled: Vec::new(),
             menu_hover: None,
             menu_pointer_row: None,
-            close_hover: false,
+            ctrl_hover: jetty_render::CtrlHover::None,
             last_bar_click: None,
             occluded: false,
             scroll_accum: crate::input::ScrollAccumulator::new(),

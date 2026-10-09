@@ -1817,7 +1817,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let opts = jetty_render::TabBarOpts { bottom: false, ..shot_bar_opts() };
             let bar = jetty_render::build_detached_bar_styled(
-                width, &title, terminal.theme(), close_hover, &mut chrome_text, cm, &deco, &opts,
+                width,
+                &title,
+                terminal.theme(),
+                if close_hover { jetty_render::CtrlHover::Close } else { jetty_render::CtrlHover::None },
+                &mut chrome_text,
+                cm,
+                &deco,
+                &opts,
             );
             // The app draws the bar mid-scene, UNDER this window's overlays (its
             // help / palette dim layers cover it): put its quads first.
