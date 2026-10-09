@@ -831,6 +831,10 @@ pub struct App {
     /// Global summon hotkey string (e.g. "F9", "F12", "Ctrl+Shift+F12"). Parsed
     /// by `global_hotkey`'s own `HotKey::from_str`. Default "F9".
     summon_hotkey: String,
+    /// The `summon_hotkey` the global grab was registered with (once, at the
+    /// first window): an edit of the key takes effect only after a restart,
+    /// and a reload says so — unless it names this one again.
+    summon_hotkey_registered: Option<String>,
     /// Shell to launch (the `shell` config key). Empty = auto-detect
     /// ($SHELL → passwd → /bin/bash); a path forces that shell.
     shell: String,
@@ -1838,6 +1842,7 @@ impl App {
             launch_at_login: false,
             launch_at_login_in_file: None,
             summon_hotkey: "F9".to_string(),
+            summon_hotkey_registered: None,
             shell: String::new(),
             top_flush_pos: false,
             top_flush_dirty: true,
@@ -2613,6 +2618,7 @@ impl App {
         use std::str::FromStr;
         let proxy = self.proxy.clone();
         let spec = self.summon_hotkey.clone();
+        self.summon_hotkey_registered = Some(spec.clone());
         // global_hotkey's own parser ("F9", "F12", "Ctrl+Shift+F12").
         let hotkey = match global_hotkey::hotkey::HotKey::from_str(&spec) {
             Ok(h) => h,
@@ -3090,7 +3096,13 @@ impl App {
         // round-trips the user's external edit instead of clobbering it with the
         // stale startup value. Its live EFFECT stays restart-only (the summon grab
         // is registered once at startup) — but the on-disk value must survive an
-        // external edit + a subsequent unrelated Settings change.
+        // external edit + a subsequent unrelated Settings change. Said once, so
+        // the new key not working yet is no mystery.
+        warnings.extend(summon_hotkey_restart_note(
+            &cfg.summon_hotkey,
+            &self.summon_hotkey,
+            self.summon_hotkey_registered.as_deref(),
+        ));
         self.summon_hotkey = cfg.summon_hotkey.clone();
         self.cfg_show_welcome = cfg.show_welcome;
         // shell: mirror so new tabs spawned after the reload use the edited shell.
@@ -16089,6 +16101,14 @@ impl FirstShellEnv {
     }
 }
 
+/// The notice for a reloaded `summon_hotkey = new` (the global grab is
+/// registered once, so it applies after a restart): `Some` when `new` differs
+/// from the live value (said once) and from the key `registered`.
+fn summon_hotkey_restart_note(new: &str, live: &str, registered: Option<&str>) -> Option<String> {
+    let registered = registered.filter(|r| *r != new && new != live)?;
+    Some(format!("summon_hotkey = {new:?} takes effect after a restart — {registered:?} summons JeTTY until then"))
+}
+
 fn theme_missing_warning(name: &str, shown: &str) -> String {
     format!(
         "theme {name:?} not found (missing or invalid theme file?){} — showing \
@@ -17240,6 +17260,24 @@ mod desktop_exec_arg_tests {
         assert_eq!(out, expected);
         // The invalid single-backslash `\$` escape must NOT appear.
         assert!(out.contains("\\\\$"), "literal $ must be doubly escaped");
+    }
+}
+
+#[cfg(test)]
+mod summon_hotkey_note_tests {
+    use super::summon_hotkey_restart_note as note;
+
+    #[test]
+    fn an_edited_summon_hotkey_says_it_needs_a_restart_once() {
+        // F9 is registered; the file now says F12: say so.
+        let n = note("F12", "F9", Some("F9")).expect("a notice");
+        assert!(n.contains("\"F12\" takes effect after a restart") && n.contains("\"F9\" summons"), "{n}");
+        // The next reload (live already mirrors F12): quiet.
+        assert_eq!(note("F12", "F12", Some("F9")), None);
+        // Back to the registered key: nothing to restart for.
+        assert_eq!(note("F9", "F12", Some("F9")), None);
+        // No grab registered yet (no window): nothing to say.
+        assert_eq!(note("F12", "F9", None), None);
     }
 }
 
