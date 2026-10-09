@@ -94,6 +94,11 @@ background thread, where it could silently never fire). If the grab fails, Jetty
 says so in the window; binding `jetty --toggle` to a shortcut via a launcher works
 as on Wayland.
 
+Hiding the terminal (F9, `jetty --hide`) while no other JeTTY window is open
+hides the whole application, as Cmd+H does, so the keyboard goes back to the app
+you came from instead of staying with a JeTTY that has no window. A hidden start
+(`jetty --background`, the login item) does not take the keyboard either.
+
 ## Notes
 
 - The PTY (shell) keeps running while the window is hidden — nothing is killed.

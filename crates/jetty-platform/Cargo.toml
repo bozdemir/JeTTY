@@ -14,3 +14,10 @@ png = "0.18.1"
 # new crate.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 x11rb = { version = "0.13", features = ["xkb"] }
+
+# macOS only: the application-level half of hiding and showing JeTTY
+# (`application`). Already in the tree via arboard, global-hotkey and wgpu — no
+# new crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder"] }

@@ -516,7 +516,17 @@ pub fn run() {
         jetty_core::hide_from_shells(jetty_render::vk_loader::FILTER_VAR);
     }
 
-    let event_loop = EventLoop::<AppEvent>::with_user_event().build().expect("event loop");
+    let mut builder = EventLoop::<AppEvent>::with_user_event();
+    // macOS: winit activates the application as it launches. A hidden start
+    // (`--background`, the login item) has no window to take the keyboard, so
+    // JeTTY sat frontmost with nothing to type into — the keys of the app in
+    // front went nowhere. Activate only when no other app is active.
+    #[cfg(target_os = "macos")]
+    if cmd == "background" {
+        use winit::platform::macos::EventLoopBuilderExtMacOS;
+        builder.with_activate_ignoring_other_apps(false);
+    }
+    let event_loop = builder.build().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 

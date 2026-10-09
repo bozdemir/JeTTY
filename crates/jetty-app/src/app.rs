@@ -8948,7 +8948,7 @@ impl App {
         self.set_visibility_by(want, SummonBy::User, event_loop);
     }
 
-    fn set_visibility_by(&mut self, want: bool, by: SummonBy, _event_loop: &ActiveEventLoop) {
+    fn set_visibility_by(&mut self, want: bool, by: SummonBy, event_loop: &ActiveEventLoop) {
         let ask_focus = |win: &Window| match focus_ask(by) {
             FocusAsk::Activate => jetty_platform::activate_window(win),
             FocusAsk::Request => win.focus_window(),
@@ -8963,6 +8963,10 @@ impl App {
                 // later if the WM's FocusIn didn't beat the deadline (F31).
                 self.pending_autohide_at = None;
                 if let Some(win) = &self.window {
+                    // macOS: Cmd+H hid the whole application while the window
+                    // still counts as shown — un-hide it, or the focus request
+                    // below finds no visible window and does nothing.
+                    jetty_platform::unhide_application();
                     // F9's raise, `--show`, a detached window's command on the main
                     // one: ask the WM the way a taskbar click does — a plain
                     // `focus_window()` was refused by KWin's focus-stealing
@@ -9005,6 +9009,10 @@ impl App {
         }
         if let Some(win) = &self.window {
             if self.visible {
+                // macOS: the hide below may have hidden the whole application,
+                // whose windows then stay off screen — un-hide it first (without
+                // activating: `ask_focus` does that, as before).
+                jetty_platform::unhide_application();
                 match mode {
                     WindowMode::Center => {
                         win.set_visible(true);
@@ -9144,6 +9152,14 @@ impl App {
                 self.summon_pending = false;
                 // Unmapped — or minimized on Wayland, which cannot unmap.
                 jetty_platform::hide_window(win);
+                // macOS keeps the app active with no window: typed keys went
+                // nowhere until the user clicked the app they came from. With no
+                // other JeTTY window open, hide the application so AppKit hands
+                // the keyboard back (a no-op elsewhere). Not on the focus-loss
+                // auto-hide: focus has already gone somewhere then.
+                if self.settings_window.is_none() && self.detached.is_empty() {
+                    jetty_platform::hide_application(event_loop);
+                }
                 // Save a still-debounced settings change now (non-blocking).
                 self.persister.borrow_mut().flush();
                 // The matching button-release never arrives once hidden — end
