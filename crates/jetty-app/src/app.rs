@@ -14571,7 +14571,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // --- Inline tab rename captures all keys ---
                 // While renaming, keys edit the title buffer and never reach the
                 // PTY: printable chars append, Backspace pops, Enter commits,
-                // Escape cancels. Return early so nothing leaks to the shell.
+                // Escape cancels, the Paste chord pastes a line, and any other
+                // Ctrl / Cmd chord is swallowed. Return early so nothing leaks
+                // to the shell.
                 if self.renaming.is_some() {
                     use winit::keyboard::{Key, NamedKey};
                     match &event.logical_key {
@@ -14590,6 +14592,18 @@ impl ApplicationHandler<AppEvent> for App {
                             self.rename_buf.pop();
                             self.request_main_paint();
                         }
+                        // A chord types no letter (winit's text leaves Ctrl
+                        // out: Ctrl+Shift+V typed "V"), as in the palette and
+                        // the search bar.
+                        _ if self.chord(&event) == Some(input::KeyAction::Paste) => {
+                            if !event.repeat {
+                                if let Some(text) = clipboard::get() {
+                                    crate::tabmeta::paste_into_title(&mut self.rename_buf, &text);
+                                    self.request_main_paint();
+                                }
+                            }
+                        }
+                        _ if self.modifiers.control_key() || self.modifiers.super_key() => {}
                         _ => {
                             // Append any printable text the key produced.
                             if let Some(t) = &event.text {

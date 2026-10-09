@@ -230,6 +230,24 @@ pub(crate) fn smart_title(running: Option<&str>, cwd: Option<&Path>, home: Optio
     }
 }
 
+/// Most bytes a paste grows a tab's rename buffer to: the 1 KiB a program's
+/// OSC 0/2 title is clipped to. A title is one short line, and the whole of it
+/// becomes the window's title too.
+pub(crate) const RENAME_PASTE_MAX: usize = 1024;
+
+/// Paste `clip` into a tab's rename buffer: its first non-blank line, control
+/// characters dropped, the buffer stopping at [`RENAME_PASTE_MAX`] bytes (on a
+/// character boundary).
+pub(crate) fn paste_into_title(buf: &mut String, clip: &str) {
+    let line = clip.trim_start().lines().next().unwrap_or("");
+    for c in line.chars().filter(|c| !c.is_control()) {
+        if buf.len() + c.len_utf8() > RENAME_PASTE_MAX {
+            break;
+        }
+        buf.push(c);
+    }
+}
+
 /// The mouse wheel over the tab strip flips through the tabs instead of
 /// scrolling the grid below it: one notch (3 lines) per tab — a touchpad's
 /// fractional deltas accumulate to the same — wheel up / left = the previous
@@ -307,6 +325,24 @@ mod tests {
             assert_eq!(TabTitleMode::from_config(m.to_config()), m);
         }
         assert_eq!(TabTitleMode::from_config("bogus"), Osc);
+    }
+
+    #[test]
+    fn a_paste_renames_with_one_clean_line() {
+        let pasted = |buf: &str, clip: &str| {
+            let mut b = buf.to_string();
+            paste_into_title(&mut b, clip);
+            b
+        };
+        assert_eq!(pasted("build ", "logs\nmore\n"), "build logs", "the first line only");
+        assert_eq!(pasted("", "\n\n  api server\r\nx"), "api server", "its first non-blank line");
+        assert_eq!(pasted("a", "\x1b[31mred\x07\tx"), "a[31mredx", "no control character gets in");
+        assert_eq!(pasted("t", ""), "t");
+        // A huge one-line clipboard stops at the cap, on a character boundary.
+        let long = pasted("", &"ş".repeat(4096));
+        assert!(long.len() <= RENAME_PASTE_MAX && long.len() > RENAME_PASTE_MAX - 2, "{}", long.len());
+        assert!(long.chars().all(|c| c == 'ş'));
+        assert_eq!(pasted(&long, "more"), long, "a full buffer takes no more");
     }
 
     #[test]
