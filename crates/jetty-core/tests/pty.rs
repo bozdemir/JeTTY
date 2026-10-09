@@ -424,6 +424,34 @@ fn a_clean_exit_is_not_a_failed_start() {
 
 #[cfg(unix)]
 #[test]
+fn a_shell_slow_to_hang_up_gets_to_finish() {
+    // Closing a tab SIGHUPs its shell. One that takes its time to leave — bash
+    // writing a big HISTFILE, zsh's exit hooks — was SIGKILLed after 300 ms,
+    // mid-save.
+    let saved = common::scratch_home().join(format!("hangup-saved-{}", std::process::id()));
+    let _ = std::fs::remove_file(&saved);
+    let pty = spawn_sh(None);
+    {
+        use std::io::Write;
+        // Not the interactive `sh` itself: dash runs a trap only once its
+        // prompt reads another line. The shell becomes one that handles the
+        // hangup in 0.6 s.
+        let leave = format!("sleep 0.6; echo saved > {}; exit", saved.display());
+        let shell = format!("exec sh -c 'trap \"{leave}\" HUP; echo TRAP\"\"PED; while :; do sleep 0.1; done'\n");
+        pty.writer().write_all(shell.as_bytes()).unwrap();
+    }
+    assert!(read_until(&pty, "TRAPPED").contains("TRAPPED"), "premise: the trap is set");
+    drop(pty);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !saved.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(saved.exists(), "the shell was killed before it finished");
+    let _ = std::fs::remove_file(&saved);
+}
+
+#[cfg(unix)]
+#[test]
 fn ctrl_c_reaches_a_program_still_reading_a_huge_paste() {
     // A program that reads its input slowly (~5 KB/s, an editor typing a
     // paste in) and an 8 MiB paste: half an hour of it. The user's Ctrl+C

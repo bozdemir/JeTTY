@@ -300,6 +300,12 @@ struct SpawnPlan {
 /// this window of a new tab is not a realistic case.
 const FAILED_START_WINDOW: Duration = Duration::from_secs(2);
 
+/// How long a closed tab's shell has to leave after its SIGHUP before it is
+/// SIGKILLed (`Drop`). A shell that handles the hangup slowly — bash rewriting
+/// a large `HISTFILE` (on NFS), zsh's exit hooks, a history sync — must get to
+/// finish: 300 ms used to kill it mid-save and lose that session's history.
+const HANGUP_GRACE: Duration = Duration::from_secs(2);
+
 /// Whether a shell that ended with `status` after running for `lived` failed
 /// to start (see [`FAILED_START_WINDOW`]). 130 never does: zsh and bash both
 /// leave with it on ^C then ^D at a fresh prompt — the user closing the tab.
@@ -392,9 +398,9 @@ impl Drop for PtySession {
         }
         let _ = self.killer.kill();
         // Stage 2: if the shell IGNORES SIGHUP (`trap '' HUP`) and is still
-        // unreaped after a grace period, escalate to an uncatchable SIGKILL so it
-        // can't leak forever (portable-pty's cloned killer only sends SIGHUP, so
-        // we restore the escalation the owning `Child::kill` used to provide).
+        // unreaped after `HANGUP_GRACE`, escalate to an uncatchable SIGKILL so
+        // it can't leak forever (portable-pty's cloned killer only sends SIGHUP,
+        // so we restore the escalation the owning `Child::kill` used to provide).
         // Guarded by `exited` — which the waiter sets only AFTER it reaps — so we
         // never signal a PID that was reaped and possibly recycled. Detached
         // thread so Drop never blocks.
@@ -402,7 +408,7 @@ impl Drop for PtySession {
         if let Some(pid) = self.pid {
             let exited = Arc::clone(&self.exited);
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::thread::sleep(HANGUP_GRACE);
                 if !exited.load(Ordering::SeqCst) {
                     unsafe {
                         libc::kill(pid as i32, libc::SIGKILL);
