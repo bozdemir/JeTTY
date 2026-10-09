@@ -8768,8 +8768,10 @@ impl App {
         // Save a still-debounced settings change now (non-blocking).
         self.persister.borrow_mut().flush();
         // The matching button-release never arrives once hidden — end the
-        // pointer gestures so none resumes stuck on the next summon.
+        // pointer gestures so none resumes stuck on the next summon — and
+        // close the menus: a summon never brings one back.
         self.reset_main_pointer();
+        self.dismiss_menus();
         // Clear the remaining self-drive terms whose ONLY expiry point is inside
         // RedrawRequested — which a hidden (orderOut) window never receives on
         // macOS — so they can't pin about_to_wait in Poll and spin 100% CPU while
@@ -9056,10 +9058,11 @@ impl App {
                 // Save a still-debounced settings change now (non-blocking).
                 self.persister.borrow_mut().flush();
                 // The matching button-release never arrives once hidden — end
-                // the pointer gestures so none resumes stuck on the next summon
-                // (mirrors autohide_main_window; the F9/IPC hide path reaches
-                // here too).
+                // the pointer gestures so none resumes stuck on the next summon,
+                // and close the menus (mirrors autohide_main_window; the F9/IPC
+                // hide path reaches here too, `--hide` without a focus loss).
                 self.reset_main_pointer();
+                self.dismiss_menus();
                 // Clear the self-drive terms whose only expiry is in
                 // RedrawRequested (never delivered to a hidden macOS window) so
                 // they don't pin Poll and spin 100% CPU while hidden (F18).
@@ -10951,12 +10954,13 @@ impl App {
                 // If focus left mid-interaction, the matching release/click may
                 // never arrive — clear the per-window drag/menu state so nothing
                 // resumes stuck (same discipline as the main window's auto-hide).
+                // The menu goes with a repaint: nothing else may paint this
+                // window for a while, and its last frame would keep showing a
+                // dead menu that the arrows and Enter no longer reach.
+                self.dismiss_surface_menus(Surface::Detached(pos));
                 if let Some(dw) = self.detached.get_mut(pos) {
                     dw.bar_drag = None;
                     dw.bar_drag_start = None;
-                    dw.menu_open = None;
-                    dw.menu_hover = None;
-                    dw.menu_rects.clear();
                     dw.last_bar_click = None;
                     // A selection/press drag can't see its release once focus is
                     // gone — clear it so it doesn't resume stuck (F14).
@@ -13454,6 +13458,10 @@ impl ApplicationHandler<AppEvent> for App {
                 // and the edge auto-scroll can't see their release once focus is
                 // gone — end them so nothing resumes stuck (detached parity, F14).
                 self.reset_main_pointer();
+                // A menu closes with the focus, like a native one (detached
+                // parity): left open, its highlighted row would take the first
+                // Space / Enter typed after the next summon.
+                self.dismiss_surface_menus(Surface::Main);
                 // A held tab drag can never see its release once focus is gone —
                 // clear it (and its grabbing cursor) so it doesn't resume stuck.
                 if self.tab_drag.take().is_some() {
