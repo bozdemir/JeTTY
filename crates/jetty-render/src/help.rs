@@ -426,7 +426,7 @@ mod tests {
         // description add a second, key/desc column label).
         assert_eq!(h.labels[0].0, "Keyboard Shortcuts");
         let non_spacer = HELP_ROWS.iter().filter(|r| !r.is_empty()).count();
-        assert!(h.labels.len() >= non_spacer + 1);
+        assert!(h.labels.len() > non_spacer);
     }
 
     #[test]

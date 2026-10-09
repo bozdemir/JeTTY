@@ -19058,9 +19058,7 @@ mod fullscreen_helper_tests {
             assert!(live.contains("Ctrl+") && live.contains("Cmd+"), "{live:?}");
         }
         assert!(
-            jetty_render::HELP_ROWS
-                .iter()
-                .any(|r| *r == "F11 — Fullscreen (whole monitor)"),
+            jetty_render::HELP_ROWS.contains(&"F11 — Fullscreen (whole monitor)"),
             "static HELP_ROWS mirror is missing the fullscreen row"
         );
         // It lives in the window/appearance section (the first `## ` block).
@@ -19118,7 +19116,7 @@ mod fullscreen_helper_tests {
         assert!(live.contains("Ctrl+Shift+Enter"), "{live:?}");
         assert!(live.contains(" — "), "sectioned 'KEY — desc' shape: {live:?}");
         assert!(
-            jetty_render::HELP_ROWS.iter().any(|r| *r == live.as_str()),
+            jetty_render::HELP_ROWS.contains(&live.as_str()),
             "static HELP_ROWS mirror out of sync with the live row: {live:?}"
         );
         let idx = rows.iter().position(|r| r == live).unwrap();
