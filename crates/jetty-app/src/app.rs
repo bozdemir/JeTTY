@@ -1388,9 +1388,10 @@ pub struct App {
     renaming: Option<TabId>,
     /// The edit buffer for the in-progress rename (committed/discarded on Enter/Esc).
     rename_buf: String,
-    /// Time + physical-pixel position of the last left press on the top strip,
-    /// used to detect double-clicks (window maximize / enter-rename).
-    last_strip_click: Option<(std::time::Instant, f32, f32)>,
+    /// Time, physical-pixel position and target of the last left press on the
+    /// top strip, used to detect double-clicks (window maximize / enter-rename)
+    /// — `None` after a press on a window control, "+" or a close "×".
+    last_strip_click: Option<(std::time::Instant, f32, f32, StripTarget)>,
     /// The resize cursor currently applied to the main window. Cached so we only
     /// call `set_cursor` when the zone actually changes (the borderless window
     /// draws its own resize edges).
@@ -13891,16 +13892,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // drag, and double-click-maximize — all BEFORE terminal selection.
                 let bar_y = self.tabbar_y(h as f32);
                 if cy >= bar_y && cy < bar_y + self.bar_h() {
-                    // Detect a double-click on the strip (within ~400ms and ~5px).
+                    // A double-click is two quick presses on the same target
+                    // (`strip_double_click`). Taken here: a press on a window
+                    // control, "+" or a close "×" leaves none to complete.
                     let now = std::time::Instant::now();
-                    let is_double = matches!(
-                        self.last_strip_click,
-                        Some((t, px, py))
-                            if now.duration_since(t) <= std::time::Duration::from_millis(400)
-                                && (cx - px).abs() <= 5.0
-                                && (cy - py).abs() <= 5.0
-                    );
-                    self.last_strip_click = Some((now, cx, cy));
+                    let last_click = self.last_strip_click.take();
 
                     // The drawn bar's hit geometry: same style (compact tabs are
                     // narrower), no perf reservation (the HUD lives in the status
@@ -13986,19 +13982,20 @@ impl ApplicationHandler<AppEvent> for App {
                         // reset the in-progress edit buffer (it would discard the
                         // user's typing); leave the rename untouched.
                         let tab_id = self.tabs[i].id;
+                        let target = StripTarget::Tab(tab_id);
+                        let is_double = strip_double_click(last_click, now, cx, cy, target);
                         if is_double && self.renaming != Some(tab_id) {
                             self.renaming = Some(tab_id);
                             self.rename_buf = self.tabs[i].title.clone();
-                            self.last_strip_click = None;
                             self.request_main_paint();
                             return;
                         }
                         if is_double {
                             // Already renaming this tab: swallow the click without
                             // disturbing the buffer.
-                            self.last_strip_click = None;
                             return;
                         }
+                        self.last_strip_click = Some((now, cx, cy, target));
                         // Single click on a different tab commits any rename.
                         if renaming_id != Some(tab_id) {
                             self.commit_rename();
@@ -14015,15 +14012,17 @@ impl ApplicationHandler<AppEvent> for App {
                     // Empty strip space: commit any rename, then either maximize
                     // (double-click) or start an OS window move (single press).
                     self.commit_rename();
-                    if is_double {
-                        self.last_strip_click = None;
+                    if strip_double_click(last_click, now, cx, cy, StripTarget::Empty) {
                         // Same rule as the ▢ button above (amendment I-F).
                         if self.main_fullscreen {
                             self.set_main_fullscreen(false);
                         } else if let Some(win) = &self.window {
                             win.set_maximized(!win.is_maximized());
                         }
-                    } else if !self.main_fullscreen {
+                        return;
+                    }
+                    self.last_strip_click = Some((now, cx, cy, StripTarget::Empty));
+                    if !self.main_fullscreen {
                         // Dragging a fullscreen window leaves it in a broken
                         // half-state on X11 — the move gesture is inert.
                         if let Some(win) = &self.window {
@@ -16607,6 +16606,37 @@ fn still_open(r: Option<TabId>, live: &[TabId]) -> Option<TabId> {
     r.filter(|id| live.contains(id))
 }
 
+/// What a left press on the main window's tab strip landed on: a double-click
+/// is two quick presses on the SAME one ([`strip_double_click`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripTarget {
+    /// A tab's body (a double-click renames it).
+    Tab(TabId),
+    /// Empty strip space (a double-click maximizes).
+    Empty,
+}
+
+/// Whether a strip press on `target` at `(x, y)` completes a double-click with
+/// the `last` one: within ~400 ms and ~5 px, on the same target. A quick second
+/// click on "+" lands on the tab the first one opened (its cell covers the old
+/// "+"); renaming that tab swallowed the next command typed into its title.
+fn strip_double_click(
+    last: Option<(std::time::Instant, f32, f32, StripTarget)>,
+    now: std::time::Instant,
+    x: f32,
+    y: f32,
+    target: StripTarget,
+) -> bool {
+    matches!(
+        last,
+        Some((t, px, py, was))
+            if was == target
+                && now.duration_since(t) <= std::time::Duration::from_millis(400)
+                && (x - px).abs() <= 5.0
+                && (y - py).abs() <= 5.0
+    )
+}
+
 /// Shared input core (v0.23 Task 9 / amendment I5): a keystroke (or IME commit)
 /// that was NOT consumed by any chrome/overlay → snap the viewport to the live
 /// bottom and write the decoded bytes to this tab's PTY. Deliberately SMALL —
@@ -17889,6 +17919,32 @@ mod stable_tab_id_tests {
         let confirm = Some(TabId(2));
         assert_eq!(still_open(confirm, &[TabId(1), TabId(3)]), None);
         assert_eq!(still_open(None, &[TabId(1)]), None);
+    }
+}
+
+#[cfg(test)]
+mod strip_double_click_tests {
+    use super::{strip_double_click, StripTarget, TabId};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_double_click_is_two_quick_presses_on_the_same_target() {
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        let tab = |n| StripTarget::Tab(TabId(n));
+        let last = Some((t, 100.0, 10.0, tab(1)));
+        assert!(strip_double_click(last, ms(300), 103.0, 12.0, tab(1)));
+        assert!(!strip_double_click(last, ms(401), 100.0, 10.0, tab(1)), "too slow");
+        assert!(!strip_double_click(last, ms(100), 106.0, 10.0, tab(1)), "too far");
+        // Another target under the same spot: a tab that slid in, the strip.
+        assert!(!strip_double_click(last, ms(100), 100.0, 10.0, tab(2)));
+        assert!(!strip_double_click(last, ms(100), 100.0, 10.0, StripTarget::Empty));
+        let empty = Some((t, 100.0, 10.0, StripTarget::Empty));
+        assert!(strip_double_click(empty, ms(100), 100.0, 10.0, StripTarget::Empty));
+        assert!(!strip_double_click(empty, ms(100), 100.0, 10.0, tab(1)));
+        // A press on "+" leaves no click to complete: the tab it opened, whose
+        // cell now covers the old "+", is not renamed by the second click.
+        assert!(!strip_double_click(None, ms(100), 100.0, 10.0, tab(3)));
     }
 }
 
