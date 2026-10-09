@@ -1,3 +1,4 @@
+pub mod hotkey;
 mod window;
 pub use window::{
     activate_window, build_fixed_window, build_window, build_window_with_visibility, dpi_change_size,

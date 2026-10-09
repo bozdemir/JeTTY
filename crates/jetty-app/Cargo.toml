@@ -52,6 +52,9 @@ notify-rust = { version = "4", default-features = false, features = ["z"] }
 # async-io executor); `blocking-api` adds only its blocking wrappers (no new
 # crate). One watcher thread blocks on the bus: zero idle CPU. See appearance.rs.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+# X11 keysym names for the summon-hotkey grab (`x11_hotkey`). Already in the
+# tree via global-hotkey and winit — no new crate.
+xkeysym = "0.2"
 
 [dev-dependencies]
 # Tests drive the shell-integration snippets in a REAL shell on a PTY (bash -u).

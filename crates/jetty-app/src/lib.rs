@@ -26,6 +26,9 @@ mod tabmeta;
 /// `jetty-shot` self-test builds the SAME panel content the app shows.
 pub mod settings_ui;
 mod watch;
+/// The X11 summon-hotkey grab (Linux/BSD), event-driven — no polling thread.
+#[cfg(all(unix, not(target_os = "macos")))]
+mod x11_hotkey;
 /// User theme loading + registry rebuild. Public so the `jetty-shot` self-test
 /// binary can seed user themes before resolving `JETTY_THEME`.
 pub mod themes;

@@ -2712,24 +2712,23 @@ impl App {
                 Err(e) => report_hotkey_failure(&proxy, &spec, &e.to_string()),
             }
         }
-        // Linux/BSD: off the main thread — GlobalHotKeyManager::register() blocks on
-        // a worker that opens a 2nd X11 connection + xkb round-trips ending in a
-        // 50 ms sleep, which used to delay the first redraw. The press events go
-        // through the async proxy either way, so moving it changes only WHERE it
-        // blocks. The manager is kept alive inside the forwarding loop.
+        // Linux/BSD: our own X11 grab (`x11_hotkey`) on a thread that BLOCKS on its
+        // X connection — global-hotkey's processor polled it every 50 ms (20
+        // wakeups/s forever, 0–50 ms added to every summon). Off the main thread
+        // so the grab's round-trips never delay the first redraw.
         #[cfg(not(target_os = "macos"))]
         {
             self.hotkey_manager = Some(());
             std::thread::spawn(move || {
-                let manager = match global_hotkey::GlobalHotKeyManager::new() {
-                    Ok(m) => m,
-                    Err(e) => return report_hotkey_failure(&proxy, &spec, &e.to_string()),
-                };
-                if let Err(e) = manager.register(hotkey) {
-                    return report_hotkey_failure(&proxy, &spec, &e.to_string());
-                }
-                forward_hotkey_presses(&proxy);
-                drop(manager);
+                crate::x11_hotkey::run(
+                    hotkey,
+                    |r| {
+                        if let Err(e) = r {
+                            report_hotkey_failure(&proxy, &spec, &e);
+                        }
+                    },
+                    || proxy.send_event(AppEvent::ToggleVisibility).is_ok(),
+                );
             });
         }
     }
@@ -16583,7 +16582,9 @@ fn sanitize_notice(s: &str) -> String {
 }
 
 /// Forward global summon-hotkey presses to the event loop (blocks for the
-/// process lifetime on the hotkey receiver).
+/// process lifetime on the hotkey receiver). macOS only: Linux/BSD grab the key
+/// themselves (`x11_hotkey`).
+#[cfg(target_os = "macos")]
 fn forward_hotkey_presses(proxy: &EventLoopProxy<AppEvent>) {
     let rx = global_hotkey::GlobalHotKeyEvent::receiver();
     while let Ok(ev) = rx.recv() {

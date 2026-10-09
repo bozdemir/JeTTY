@@ -8,7 +8,9 @@ winit = "0.30"
 raw-window-handle = "0.6"
 png = "0.18.1"
 
-# X11 only: the user-request raise (`activate_window`). Already in the tree via
-# winit, arboard and global-hotkey — no new crate.
+# X11 only: the user-request raise (`activate_window`) and the summon-hotkey
+# grab (`hotkey`, which needs the XKB extension for detectable auto-repeat).
+# Already in the tree via winit, arboard and global-hotkey, `xkb` included — no
+# new crate.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["xkb"] }
