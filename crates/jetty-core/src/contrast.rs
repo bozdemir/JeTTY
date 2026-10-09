@@ -36,6 +36,7 @@ fn ratio_of(la: f32, lb: f32) -> f32 {
 }
 
 /// WCAG contrast ratio between two sRGB colors (1.0 ..= 21.0).
+#[inline]
 pub fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
     ratio_of(relative_luminance(a), relative_luminance(b))
 }

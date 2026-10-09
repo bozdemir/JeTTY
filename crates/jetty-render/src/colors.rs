@@ -1,7 +1,10 @@
 //! Theme-derived colors for the grid's selection highlight and block cursor,
 //! shared by the live app and `jetty-shot` so the two can never drift.
 
-use std::sync::OnceLock;
+/// The WCAG math is jetty-core's — the same that `minimum_contrast` pushes
+/// text with — so a selected glyph, the cursor and the grid can never disagree
+/// about what reads.
+pub use jetty_core::contrast::{contrast_ratio, relative_luminance};
 
 /// A selected glyph whose own color contrasts LESS than this with the selection
 /// highlight is redrawn in the readable fallback color. Deliberately below WCAG's
@@ -107,33 +110,6 @@ fn more_contrasting(against: [u8; 3], a: [u8; 3], b: [u8; 3]) -> [u8; 3] {
     } else {
         a
     }
-}
-
-/// sRGB channel → linear light, as a 256-entry table (the contrast math runs per
-/// selected cell, so no `powf` on the frame path).
-fn srgb_lut() -> &'static [f32; 256] {
-    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut t = [0.0f32; 256];
-        for (i, v) in t.iter_mut().enumerate() {
-            let s = i as f32 / 255.0;
-            *v = if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) };
-        }
-        t
-    })
-}
-
-/// WCAG relative luminance of an sRGB color.
-pub fn relative_luminance(c: [u8; 3]) -> f32 {
-    let l = srgb_lut();
-    0.2126 * l[c[0] as usize] + 0.7152 * l[c[1] as usize] + 0.0722 * l[c[2] as usize]
-}
-
-/// WCAG contrast ratio between two sRGB colors (1.0 ..= 21.0).
-pub fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
-    let (la, lb) = (relative_luminance(a), relative_luminance(b));
-    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
-    (hi + 0.05) / (lo + 0.05)
 }
 
 #[cfg(test)]
