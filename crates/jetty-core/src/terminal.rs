@@ -8653,6 +8653,34 @@ mod tests {
     }
 
     #[test]
+    fn replies_keep_their_order_inside_a_synchronized_update() {
+        // vte answers what it buffers in an update only when the update is
+        // applied; what the scanner answers itself (XTVERSION, the color
+        // scheme, kitty graphics) applies it first. Programs read a DA1 reply
+        // as their "end of probe" sentinel, so every answer must keep its
+        // place — at any read split.
+        let da1 = String::from_utf8_lossy(crate::handler::DA1_REPLY).into_owned();
+        let xtv = format!("\x1bP>|JeTTY({})\x1b\\", crate::pty::advertised_version());
+        let t0 = Terminal::new(20, 3);
+        let scheme = String::from_utf8_lossy(color_scheme_report(t0.theme_rgb_bg())).into_owned();
+        let query = format!("\x1b_Ga=q,i=7,f=32,s=1,v=1;{}\x1b\\", b64(&[9u8, 9, 9, 255]));
+        let cases = [
+            ("\x1b[c\x1b[>q\x1b[c\x1b[?996n\x1b[5n".to_string(), format!("{da1}{xtv}{da1}{scheme}\x1b[0n")),
+            (format!("\x1b[c{query}\x1b[c"), format!("{da1}\x1b_Gi=7;OK\x1b\\{da1}")),
+        ];
+        for (body, want) in cases {
+            let seq = format!("\x1b[?2026h{body}\x1b[?2026l");
+            let seq = seq.as_bytes();
+            for cut in 0..=seq.len() {
+                let mut t = Terminal::new(20, 3);
+                t.feed(&seq[..cut]);
+                t.feed(&seq[cut..]);
+                assert_eq!(String::from_utf8_lossy(&t.drain_pty_writes()), want, "cut at {cut}");
+            }
+        }
+    }
+
+    #[test]
     fn xtversion_names_the_terminal() {
         let name = format!("\x1bP>|JeTTY({})\x1b\\", crate::pty::advertised_version());
         let da1 = String::from_utf8_lossy(crate::handler::DA1_REPLY).into_owned();
@@ -12074,6 +12102,10 @@ mod tests {
         assert!(t.image_work <= IMAGE_WORK_MAX, "{ctx}: image-work bank");
         assert!(t.kbd_depth.iter().all(|&d| d <= KBD_STACK_MAX), "{ctx}: kbd depth {:?}", t.kbd_depth);
         assert!(t.marks.len() <= MAX_MARKS, "{ctx}: marks");
+        // A mark binds at the cursor and only ever moves up from there (an
+        // update, a scroll or a clear never leaves one below the screen).
+        let bottom = t.abs_top + t.rows as i64;
+        assert!(t.marks.iter().all(|m| m.prompt < bottom), "{ctx}: a mark below the screen");
         assert!(t.completed.len() <= MAX_PENDING_COMPLETIONS, "{ctx}: completions");
         assert!(t.placements.len() <= MAX_PLACEMENTS && t.alt_placements.len() <= MAX_PLACEMENTS, "{ctx}: placements");
         let live: u64 = t.placements.iter().map(|p| p.image.rgba.len() as u64).sum();
