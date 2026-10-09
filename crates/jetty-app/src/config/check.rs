@@ -462,7 +462,8 @@ pub(super) fn check_choices(
 }
 
 /// " — did you mean `x`?" for serde's "unknown variant `y`, expected one of
-/// `a`, `b`" (a strict enum such as `effects.crt_phosphor`), else "".
+/// `a`, `b`" (an enum such as `effects.crt_phosphor`, which names its
+/// values), else "".
 pub(super) fn variant_hint(msg: &str) -> String {
     let Some(rest) = msg.strip_prefix("unknown variant `") else { return String::new() };
     let Some((got, rest)) = rest.split_once('`') else { return String::new() };

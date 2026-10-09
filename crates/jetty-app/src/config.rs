@@ -789,9 +789,10 @@ pub struct EffectsConfig {
     #[serde(default = "ef_false")] pub animate_unfocused: bool,
 }
 
-/// The CRT phosphor color mode (`crt_phosphor`). Unknown values fall back to
-/// "off" with a warning (the per-key config loader).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// The CRT phosphor color mode (`crt_phosphor`), read in any letter case.
+/// Unknown values fall back to "off" with a warning (the per-key config
+/// loader).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PhosphorMode {
     #[default]
@@ -829,6 +830,9 @@ impl PhosphorMode {
         }
     }
 
+    /// Every mode's config value, in [`PhosphorMode::ALL`] order.
+    const NAMES: [&'static str; 7] = ["off", "amber", "green", "white", "blue", "paper", "custom"];
+
     /// The mode named `name` (its config value, case-insensitive).
     pub fn from_name(name: &str) -> Option<PhosphorMode> {
         Self::ALL.into_iter().find(|m| m.display_name().eq_ignore_ascii_case(name.trim()))
@@ -854,6 +858,16 @@ impl PhosphorMode {
             PhosphorMode::Paper => (hex(0x101010), hex(0xF2F2EC)),
             PhosphorMode::Custom => (custom.map(|v| finite_or(v, 1.0).clamp(0.0, 1.0)), [0.0; 3]),
         })
+    }
+}
+
+impl<'de> Deserialize<'de> for PhosphorMode {
+    /// A config value in any letter case (`"Amber"`, like every enum-like key);
+    /// anything else is serde's "unknown variant", which the loader reports
+    /// with the closest value.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        PhosphorMode::from_name(&s).ok_or_else(|| serde::de::Error::unknown_variant(&s, &PhosphorMode::NAMES))
     }
 }
 
@@ -3645,6 +3659,15 @@ caret_glow_enabled = true\n";
         assert!(w.is_empty(), "{w:?}");
         assert_eq!((c.visual_bell.as_str(), c.reduce_motion.as_str()), ("off", "on"));
         assert_eq!(c.cursor.shape, "beam");
+        // The phosphor too: `"Amber"` was invalid ("did you mean `amber`?").
+        let (c, w) = parse("[effects]\ncrt_phosphor = \"Amber\"\n");
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.effects.crt_phosphor, PhosphorMode::Amber);
+        assert_eq!(parse("[effects]\ncrt_phosphor = \" PAPER \"\n").0.effects.crt_phosphor, PhosphorMode::Paper);
+        // The values an unknown word is told about are the ones it writes.
+        for (m, name) in PhosphorMode::ALL.into_iter().zip(PhosphorMode::NAMES) {
+            assert_eq!(toml::Value::try_from(m).unwrap().as_str(), Some(name));
+        }
     }
 
     #[test]
