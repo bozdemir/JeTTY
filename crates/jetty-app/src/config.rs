@@ -1990,6 +1990,15 @@ fn write_changes_racing(
 ) -> Result<(), String> {
     for _ in 0..SAVE_ATTEMPTS {
         let before = read_config_text(path)?;
+        // A config.toml without write permission (`chmod a-w`) is the user's
+        // way of saying "leave it as it is" — but the atomic rename below needs
+        // only a writable folder and would replace it anyway.
+        if before.is_some() && std::fs::metadata(path).is_ok_and(|m| m.permissions().readonly()) {
+            return Err(format!(
+                "{} is read-only — settings changes are not saved (make it writable to save them)",
+                real_path(path).display()
+            ));
+        }
         let new_text = merged_text(before.as_deref(), changes, full)?;
         if before.as_deref() == Some(new_text.as_str()) {
             return Ok(()); // nothing to change on disk
@@ -3477,6 +3486,35 @@ caret_glow_enabled = true\n";
         let n = notices.lock().unwrap();
         assert_eq!(n.len(), 1, "{n:?}");
         assert!(n[0].contains("line 2") && n[0].contains("not saved"), "{n:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_config_is_never_replaced() {
+        // `chmod a-w config.toml` says "do not change this file" — but the atomic
+        // save renames a new file over it, which needs only a writable folder, so
+        // every settings change silently replaced the locked file anyway.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("readonly");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "theme = \"nord\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let (mut p, mut cfg, notices) = persister_for(&path);
+        cfg.opacity = 0.5;
+        p.record(&cfg, Instant::now());
+        assert!(p.flush_and_wait(Duration::from_secs(5)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theme = \"nord\"\n", "untouched");
+        let n = notices.lock().unwrap().clone();
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert!(n[0].contains("read-only") && n[0].contains("not saved"), "{n:?}");
+        // Writable again: the next change is saved.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        cfg.font_size = 18.0;
+        p.record(&cfg, Instant::now());
+        assert!(p.flush_and_wait(Duration::from_secs(5)));
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("font_size = 18.0"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
