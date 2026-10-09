@@ -9777,6 +9777,7 @@ impl App {
             font_offset: self.font_scroll_offset,
             ui_font_offset: self.ui_font_scroll_offset,
             backdrop_images: &self.backdrop_images,
+            file_drops: self.window.as_ref().is_none_or(|w| crate::gridmouse::file_drops_arrive(w)),
             shown_theme: &self.active_theme.name,
             collapsed: &self.settings_collapsed,
             drag: self.ctl_drag.as_ref().and_then(|d| d.pending.as_ref().map(|v| (d.id, v))),

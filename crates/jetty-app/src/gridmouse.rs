@@ -549,6 +549,14 @@ pub(crate) fn dropped_path_text(path: &std::path::Path) -> String {
     out
 }
 
+/// Whether files dropped on `window` reach JeTTY (`WindowEvent::DroppedFile`):
+/// on X11, macOS and Windows. winit 0.30 has no Wayland drag-and-drop, so a
+/// native Wayland window never sees a drop — nothing may promise one there.
+pub(crate) fn file_drops_arrive(window: &winit::window::Window) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    !matches!(window.window_handle().map(|h| h.as_raw()), Ok(RawWindowHandle::Wayland(_)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

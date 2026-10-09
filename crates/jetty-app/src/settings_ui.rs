@@ -94,6 +94,9 @@ pub struct Ctx<'a> {
     /// The image files in `<config dir>/backgrounds/` (the backdrop picker),
     /// listed when Settings opens — never per frame.
     pub backdrop_images: &'a [String],
+    /// Files dropped on the Settings window arrive (X11, macOS); a native
+    /// Wayland window gets none, and no hint may offer a drop there.
+    pub file_drops: bool,
     /// The theme on screen (its id) — what a look's theme is compared with
     /// (the light slot may be showing).
     pub shown_theme: &'a str,
@@ -117,6 +120,7 @@ impl Ctx<'_> {
             font_offset: 0,
             ui_font_offset: 0,
             backdrop_images: &[],
+            file_drops: true,
             shown_theme: "",
             collapsed: &[],
             drag: None,
@@ -439,6 +443,11 @@ fn bd_moves(c: &Config) -> bool {
     bd_mode(c, "gradient") || bd_mode(c, "pattern") || bd_mode(c, "theme")
 }
 
+/// The backdrop image row's hint where a file dropped on Settings arrives —
+/// and where none does (`Ctx::file_drops`, see [`row_hint`]).
+const IMAGE_HINT: &str = "From backgrounds/, or drop a file here";
+const IMAGE_HINT_NO_DROP: &str = "From backgrounds/ in the config folder";
+
 fn fmt_deg(v: f32) -> String {
     format!("{}°", v.round() as i32)
 }
@@ -575,7 +584,7 @@ pub static DESCS: &[Desc] = &[
         },
         get: get_s!(backdrop.image),
         set: set_s!(backdrop.image),
-        hint: Some("From backgrounds/, or drop a file here"),
+        hint: Some(IMAGE_HINT),
         visible: Some(|c| bd_mode(c, "image")),
         ..Desc::DEFAULT
     },
@@ -1817,7 +1826,16 @@ fn row_for(d: &Desc, cfg: &Config, ctx: &Ctx, master_off: bool) -> PanelItem {
     if master_off && state == RowState::Normal {
         state = RowState::Dimmed;
     }
-    PanelItem::Row(CtlRow { id: d.id, label: d.label.to_string(), show, state, hint: d.hint.map(str::to_string) })
+    PanelItem::Row(CtlRow { id: d.id, label: d.label.to_string(), show, state, hint: row_hint(d, ctx).map(str::to_string) })
+}
+
+/// The hint under `d` here: no drop is offered where dropped files never
+/// arrive (Wayland).
+fn row_hint(d: &Desc, ctx: &Ctx) -> Option<&'static str> {
+    match d.hint {
+        Some(IMAGE_HINT) if !ctx.file_drops => Some(IMAGE_HINT_NO_DROP),
+        hint => hint,
+    }
 }
 
 /// The content of settings tab `tab`: its sections (hook sections with no
@@ -2648,6 +2666,21 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn the_image_row_offers_a_drop_only_where_drops_arrive() {
+        let cfg = with_backdrop("image", &[]);
+        let hint = |file_drops| {
+            tab_items(LOOK, &cfg, &Ctx { file_drops, ..Ctx::empty() }).into_iter().find_map(|it| match it {
+                PanelItem::Row(r) if r.id == "backdrop.image" => r.hint,
+                _ => None,
+            })
+        };
+        // X11, macOS: a file dropped on Settings sets the image.
+        assert_eq!(hint(true).as_deref(), Some("From backgrounds/, or drop a file here"));
+        // Wayland: winit delivers no drop, so none is offered.
+        assert_eq!(hint(false).as_deref(), Some("From backgrounds/ in the config folder"));
     }
 
     #[test]
