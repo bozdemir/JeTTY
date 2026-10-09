@@ -242,10 +242,13 @@ fn overdraw_shape(font_system: &mut FontSystem, probe: &mut Buffer, style: &Over
 }
 
 /// A shaped overdraw glyph (a fallback char, a grapheme cluster or a color
-/// emoji) and the x offset that centres it in its cells (0 except for emoji).
+/// emoji) and where it goes from its cell's origin: `dx` centres it in its
+/// cells (an emoji, or a glyph narrower than them), `dy` puts a text glyph on
+/// the row's baseline (an emoji stays centred in the line).
 struct OverdrawGlyph {
     buffer: Buffer,
     dx: f32,
+    dy: f32,
 }
 
 /// Extra per-frame inputs for [`TextLayer::render_grid`]. `Default` is the plain
@@ -627,8 +630,9 @@ impl<V> ClusterGlyphCache<V> {
 
 /// What the overdraw / cluster / emoji buffers are shaped with: the grid font
 /// (its `FaceWeights`, so a bold cell's glyph comes from the bold face) and
-/// metrics, the cell box an emoji is fitted into, and the emoji family (`None`
-/// when `color_emoji` is off or no emoji font is installed).
+/// metrics, the cell box an emoji is fitted into, the row's baseline, and the
+/// emoji family (`None` when `color_emoji` is off or no emoji font is
+/// installed).
 struct OverdrawStyle {
     family: Arc<str>,
     weights: FaceWeights,
@@ -636,18 +640,36 @@ struct OverdrawStyle {
     metrics: Metrics,
     cell_w: f32,
     cell_h: f32,
+    /// A grid row's baseline below its top (`measure_baseline`).
+    baseline: f32,
 }
 
 impl OverdrawStyle {
     /// Shape an overdraw char or cluster in style `shape` (`BOLD|ITALIC` bits —
     /// see [`overdraw_shape`]) with font fallback (`Shaping::Advanced`), so the
     /// marks and glyphs the grid font lacks come from another font.
+    ///
+    /// cosmic-text centres a line's glyph box — the ascent and descent of the
+    /// fonts on it — in the line height, so a glyph from a font with other
+    /// metrics (CJK, symbols) sat on a baseline of its own: `dy` moves it onto
+    /// the row's, in whole pixels like glyphon's baselines. A glyph narrower
+    /// than its cells (one, or two for a wide char) is centred in them; a wider
+    /// or zero-width one keeps the cell's origin.
     fn shape_text(&self, font_system: &mut FontSystem, text: &str, shape: u8) -> OverdrawGlyph {
         let mut buffer = Buffer::new(font_system, self.metrics);
         buffer.set_size(font_system, None, None);
         let attrs = face_attrs(&self.family, self.weights, shape);
         buffer.set_text(font_system, text, &attrs, Shaping::Advanced, None);
-        OverdrawGlyph { buffer, dx: 0.0 }
+        let (mut dx, mut dy) = (0.0, 0.0);
+        if let Some(run) = buffer.layout_runs().next() {
+            let cells = text.chars().next().and_then(|c| c.width()).unwrap_or(1).max(1);
+            let span = cells as f32 * self.cell_w;
+            if run.line_w > 0.0 && run.line_w < span {
+                dx = (span - run.line_w) / 2.0;
+            }
+            dy = self.baseline.round() - (run.line_y - run.line_top).round();
+        }
+        OverdrawGlyph { buffer, dx, dy }
     }
 
     /// Shape `text` in the emoji family, scaled so the emoji fills its two-cell
@@ -669,7 +691,7 @@ impl OverdrawStyle {
             buffer.set_metrics(font_system, metrics);
             dx = ((box_w - advance(&buffer)) / 2.0).max(0.0);
         }
-        OverdrawGlyph { buffer, dx }
+        OverdrawGlyph { buffer, dx, dy: 0.0 }
     }
 }
 
@@ -1111,6 +1133,9 @@ pub struct TextLayer {
     /// Where a row's underlines go, measured from the grid font (see
     /// `measure_underline`).
     underline: crate::quad::UnderlineGeom,
+    /// A grid row's baseline below its top, measured from the grid font
+    /// (`measure_baseline`): glyphs overdrawn from other fonts are moved onto it.
+    baseline: f32,
     /// Per-frame scratch: the built-in glyphs handed to glyphon.
     custom_scratch: Vec<CustomGlyph>,
     /// The (empty) buffer of the text area that carries the built-in glyphs.
@@ -1240,6 +1265,7 @@ impl TextLayer {
         let regular = face_weights.of(0);
         let cell_w = measure_advance_family(&mut font_system, metrics, family, regular);
         let underline = measure_underline(&mut font_system, metrics, family, regular);
+        let baseline = measure_baseline(&mut font_system, metrics, family, regular);
         let cell_h = line_height;
 
         Self {
@@ -1285,6 +1311,7 @@ impl TextLayer {
             emoji_family: None,
             builtin_light: builtin::light_thickness(metrics.font_size),
             underline,
+            baseline,
             custom_scratch: Vec::new(),
             empty_buffer: Buffer::new_empty(metrics),
             #[cfg(test)]
@@ -1302,11 +1329,13 @@ impl TextLayer {
         self.underline
     }
 
-    /// Re-measure `underline` (font family / size / line height changed) and
-    /// drop the cached decoration quads built with the old one.
+    /// Re-measure `underline` and `baseline` (font family / size / line height
+    /// changed) and drop the cached decoration quads built with the old one.
     fn refresh_underline(&mut self) {
         let fam = Arc::clone(&self.font_family);
-        self.underline = measure_underline(&mut self.font_system, self.metrics, &fam, self.face_weights.of(0));
+        let regular = self.face_weights.of(0);
+        self.underline = measure_underline(&mut self.font_system, self.metrics, &fam, regular);
+        self.baseline = measure_baseline(&mut self.font_system, self.metrics, &fam, regular);
         self.deco_cache_key = None;
     }
 
@@ -1956,7 +1985,7 @@ impl TextLayer {
                     areas.push(TextArea {
                         buffer: &g.buffer,
                         left: x + left_offset + g.dx,
-                        top: y + top_offset,
+                        top: y + top_offset + g.dy,
                         scale: 1.0,
                         bounds: win_bounds,
                         default_color: Color::rgb(rgb[0], rgb[1], rgb[2]),
@@ -1969,7 +1998,7 @@ impl TextLayer {
                 if let Some(g) = self.clusters.get(cluster, shape) {
                     // A half-scale emoji keeps its centre: half the offset into its
                     // one cell, and a quarter cell down (its line box is halved).
-                    let (scale, dx, dy) = if half { (0.5, g.dx * 0.5, cell_h * 0.25) } else { (1.0, g.dx, 0.0) };
+                    let (scale, dx, dy) = if half { (0.5, g.dx * 0.5, cell_h * 0.25) } else { (1.0, g.dx, g.dy) };
                     areas.push(TextArea {
                         buffer: &g.buffer,
                         left: x + left_offset + dx,
@@ -2257,6 +2286,7 @@ impl TextLayer {
             metrics: self.metrics,
             cell_w: self.cell_w,
             cell_h: self.cell_h,
+            baseline: self.baseline,
         }
     }
 
@@ -2674,6 +2704,16 @@ fn measure_underline(
     crate::quad::UnderlineGeom { top, bottom, thickness }
 }
 
+/// A grid row's baseline below the row's top for `family` at `metrics`: where
+/// cosmic-text puts it for a row of the family's glyphs (their ascent and
+/// descent centred in the line height).
+fn measure_baseline(font_system: &mut FontSystem, metrics: Metrics, family: &str, weight: Weight) -> f32 {
+    let mut b = Buffer::new(font_system, metrics);
+    b.set_size(font_system, None, Some(metrics.line_height));
+    b.set_text(font_system, "M", &Attrs::new().family(Family::Name(family)).weight(weight), Shaping::Basic, None);
+    b.layout_runs().next().map_or(metrics.line_height * 0.8, |r| r.line_y - r.line_top)
+}
+
 /// The cell width: the advance of 'M' in `family` at `weight` (the grid family's
 /// regular `FaceWeights`, so the cell comes from the family's own face).
 fn measure_advance_family(font_system: &mut FontSystem, metrics: Metrics, family: &str, weight: Weight) -> f32 {
@@ -3008,7 +3048,9 @@ mod tests {
         let metrics = layer_metrics(16.0, LINE_HEIGHT_DEFAULT);
         let weights = resolve_face_weights(fs, family, wght_axis_range);
         let cell_w = measure_advance_family(fs, metrics, family, weights.of(0));
-        OverdrawStyle { family: Arc::from(family), weights, emoji_family: None, metrics, cell_w, cell_h: metrics.line_height }
+        let baseline = measure_baseline(fs, metrics, family, weights.of(0));
+        let cell_h = metrics.line_height;
+        OverdrawStyle { family: Arc::from(family), weights, emoji_family: None, metrics, cell_w, cell_h, baseline }
     }
 
     /// The faces `(family, weight, italic)` the glyphs of `g` were shaped from.
@@ -3060,6 +3102,40 @@ mod tests {
         assert_ne!(family, fam);
         let fallback_has_bold = fs.db().faces().any(|f| f.families[0].0 == family && f.weight.0 >= 600);
         assert!(!fallback_has_bold || weight >= 600, "{faces:?}");
+    }
+
+    #[test]
+    fn overdrawn_glyphs_sit_on_the_rows_baseline_centred_in_their_cells() {
+        // Regression: a glyph from another font sat on that font's own baseline
+        // (Noto Sans CJK 1.4 px below MesloLGS NF at 16 px, FreeSans symbols
+        // above it), flush left in its cells. Now its baseline is the row's, and
+        // one narrower than its cells is centred in them; a glyph of the grid
+        // font itself (an NFD é) does not move. Skipped without a monospace font.
+        let mut fs = TextLayer::build_font_system();
+        let Some(fam) = mono_family(&fs) else { return };
+        let style = overdraw_style_for(&mut fs, &fam);
+        for text in ["中", "한", "\u{23F5}", "\u{23FA}", "\u{2714}", "e\u{301}", "\u{0E01}\u{0E34}"] {
+            let g = style.shape_text(&mut fs, text, 0);
+            let Some(run) = g.buffer.layout_runs().next() else { continue };
+            let baseline = (run.line_y - run.line_top).round() + g.dy;
+            assert_eq!(baseline, style.baseline.round(), "{text:?} is on the row's baseline");
+            let cells = text.chars().next().and_then(|c| c.width()).unwrap_or(1).max(1);
+            let span = cells as f32 * style.cell_w;
+            let want = if run.line_w > 0.0 && run.line_w < span { (span - run.line_w) / 2.0 } else { 0.0 };
+            assert_eq!(g.dx, want, "{text:?}: {} wide in {span}", run.line_w);
+            let own = run.glyphs.iter().all(|gl| fs.db().face(gl.font_id).is_some_and(|f| f.families[0].0 == fam));
+            if own {
+                assert_eq!((g.dx, g.dy), (0.0, 0.0), "{text:?}: the grid font's own glyph stays put");
+            }
+        }
+        // The CJK fallback really sat elsewhere (when it is installed).
+        let cjk = style.shape_text(&mut fs, "中", 0);
+        let from_cjk_font = cjk.buffer.layout_runs().flat_map(|r| r.glyphs.iter()).any(|g| {
+            fs.db().face(g.font_id).is_some_and(|f| f.families[0].0.contains("CJK"))
+        });
+        if from_cjk_font && fam == FONT_FAMILY_DEFAULT {
+            assert!(cjk.dy != 0.0 && cjk.dx > 0.0, "dy {} dx {}", cjk.dy, cjk.dx);
+        }
     }
 
     #[test]
