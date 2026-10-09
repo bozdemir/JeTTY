@@ -3578,7 +3578,10 @@ impl Terminal {
     }
 
     pub fn snapshot(&self) -> GridSnapshot {
-        let mut cells = vec![CellSnapshot::default(); self.cols * self.rows];
+        let (rows, cols) = (self.rows, self.cols);
+        // Filled in row-major order below (every cell is pushed exactly once), so
+        // there is no blank pre-fill for the loop to overwrite.
+        let mut cells: Vec<CellSnapshot> = Vec::with_capacity(rows * cols);
         let mut graphemes = Vec::new();
         let content = self.term.renderable_content();
         let display_offset = content.display_offset;
@@ -3592,148 +3595,165 @@ impl Terminal {
             let bg = [self.theme.bg[0], self.theme.bg[1], self.theme.bg[2]];
             crate::contrast::ContrastMemo::new(self.min_contrast, self.theme.fg, bg)
         });
-
-        // Iterate over all visible cells. Each item has point in terminal coordinates
-        // (line 0 = top of current viewport when display_offset=0; negative = history).
-        // point_to_viewport converts to display row: viewport_line = point.line.0 + display_offset.
-        for item in content.display_iter {
-            if let Some(vp) = point_to_viewport(display_offset, item.point) {
-                let row = vp.line;
-                let col = vp.column.0;
-                if row < self.rows && col < self.cols {
-                    let cell = item.cell;
-                    // `bold_is_bright`: a bold cell's normal ANSI foreground (0–7)
-                    // takes its bright twin (8–15) before it is resolved.
-                    let fg_color = if self.bold_is_bright && cell.flags.contains(Flags::BOLD) {
-                        bright_for_bold(cell.fg)
+        // Color resolution memo: neighbouring cells overwhelmingly share their
+        // colors (a run of text, a background band), so the last palette color →
+        // RGB pair is remembered for fg and for bg. `resolve_rgb` is pure for one
+        // snapshot (theme and override table are fixed while it runs).
+        let mut fg_memo = ColorMemo::new(&self.theme, colors);
+        let mut bg_memo = ColorMemo::new(&self.theme, colors);
+        let grid = self.term.grid();
+        // The visible rows, one slice per row: viewport row `r` is grid line
+        // `r - display_offset` (negative = history) — the mapping
+        // `point_to_viewport` inverts. Walking each row's cells as a slice costs
+        // one ring-buffer lookup per ROW (a per-cell `display_iter` paid it per
+        // cell) and lets the cell loop run without per-cell index math.
+        let visible = rows.min(grid.screen_lines());
+        for row in 0..visible {
+            let line = Line(row as i32 - display_offset as i32);
+            let row_cells = &grid[line][..];
+            let row_start = cells.len();
+            for (col, cell) in row_cells.iter().take(cols).enumerate() {
+                // The common cell — no SGR attribute, no marks / underline color /
+                // link (`extra`), `minimum_contrast` off — is exactly its char and
+                // two colors: everything below would leave it unchanged.
+                if cell.flags.is_empty() && cell.extra.is_none() && mc_memo.is_none() {
+                    let fg = fg_memo.get(cell.fg);
+                    let bg = bg_memo.get(cell.bg);
+                    cells.push(CellSnapshot { c: cell.c, fg, bg, uline: fg, attrs: 0, selected: false });
+                    continue;
+                }
+                // `bold_is_bright`: a bold cell's normal ANSI foreground (0–7)
+                // takes its bright twin (8–15) before it is resolved.
+                let fg_color = if self.bold_is_bright && cell.flags.contains(Flags::BOLD) {
+                    bright_for_bold(cell.fg)
+                } else {
+                    cell.fg
+                };
+                let mut fg = fg_memo.get(fg_color);
+                let mut bg = bg_memo.get(cell.bg);
+                // Reverse video (`\e[7m`, also used by selections and `ls`
+                // highlights): swap fg/bg after resolving to RGB so the cell
+                // renders inverted once backgrounds are painted.
+                if cell.flags.contains(Flags::INVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                // SGR 2 (dim): alacritty sets Flags::DIM but leaves fg as a
+                // named color resolving to full brightness, so dim text would
+                // be indistinguishable from normal. Pull the foreground a third
+                // of the way toward the cell's background (`faint`) — less
+                // contrast on dark AND light themes. Done after INVERSE so the
+                // dimmed channel is whichever ends up fg.
+                if cell.flags.contains(Flags::DIM) {
+                    fg = faint(fg, bg);
+                }
+                // SGR 8 (conceal): the glyph must not be readable (password
+                // echoes, secret-masking TUIs). Paint the foreground with the
+                // cell's background so the character is invisible while its
+                // background/layout are preserved. Done after INVERSE/DIM so it
+                // wins over whatever ended up as fg.
+                if cell.flags.contains(Flags::HIDDEN) {
+                    fg = bg;
+                } else if let Some(memo) = mc_memo.as_mut() {
+                    // `minimum_contrast` (off = one predictable branch): the
+                    // FINAL fg is pushed to the ratio against the final bg —
+                    // even a palette color that equals the background
+                    // (solarized_dark's 8: invisible zsh autosuggestions).
+                    // Concealed text (above) stays invisible; powerline, block
+                    // and sextant glyphs keep their colors (they draw shapes).
+                    // A blank draws no glyph: skipped (the common cell).
+                    if cell.c != ' ' && !crate::contrast::min_contrast_exempt(cell.c) {
+                        fg = memo.get(fg, bg);
+                    }
+                }
+                // A double-width glyph occupies two grid cells: the WIDE_CHAR
+                // cell holds the actual char, and the following
+                // WIDE_CHAR_SPACER cell is a placeholder. alacritty stores a
+                // space (or stale char) in the spacer; the wide glyph from the
+                // preceding cell already visually spans both columns via the
+                // font, so we force the spacer to a blank to keep columns
+                // aligned (preserving the spacer's own bg).
+                // Combining marks / zero-width chars (NFD accents, VS16, ZWJ)
+                // live in the cell's `zerowidth()` extra storage, separate from
+                // `cell.c`. The per-cell `CellSnapshot` stays `Copy` (base char
+                // only); cells that carry marks are listed SPARSELY in
+                // `graphemes` (base + marks, capped) for the renderer to compose
+                // — an empty `Vec`, no allocation, on the common path.
+                let spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+                let c = if spacer { ' ' } else { cell.c };
+                // (`extra` also holds hyperlinks / underline colors: skip empty.)
+                if let Some(marks) = cell.zerowidth().filter(|m| !spacer && !m.is_empty()) {
+                    graphemes.push(CellGrapheme { row, col, text: grapheme_text(cell.c, marks) });
+                }
+                // Pack the SGR text attributes we render (bold/italic/strike +
+                // underline style). BLINK (SGR 5/6) is intentionally NOT here:
+                // alacritty_terminal 0.26 drops the blink bit at the VT engine
+                // and a blink timer would fight ~0% idle (same non-goal as
+                // ligatures). DIM_BOLD contains the BOLD bit, so a dim+bold cell
+                // reads as bold via `contains(BOLD)`.
+                let flags = cell.flags;
+                let mut attrs = 0u8;
+                if flags.contains(Flags::BOLD) {
+                    attrs |= attr::BOLD;
+                }
+                if flags.contains(Flags::ITALIC) {
+                    attrs |= attr::ITALIC;
+                }
+                if flags.contains(Flags::STRIKEOUT) {
+                    attrs |= attr::STRIKE;
+                }
+                // Underline style: most cells have none, so gate the five style
+                // tests behind a single ALL_UNDERLINES check. Priority ladder
+                // matches how the styles are mutually exclusive in the SGR model
+                // (the most specific colon-subparam form wins).
+                if flags.intersects(Flags::ALL_UNDERLINES) {
+                    let ul = if flags.contains(Flags::UNDERCURL) {
+                        attr::UL_UNDERCURL
+                    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+                        attr::UL_DOTTED
+                    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+                        attr::UL_DASHED
+                    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+                        attr::UL_DOUBLE
                     } else {
-                        cell.fg
+                        attr::UL_SINGLE
                     };
-                    let mut fg = resolve_rgb(&self.theme, colors, fg_color);
-                    let mut bg = resolve_rgb(&self.theme, colors, cell.bg);
-                    // Reverse video (`\e[7m`, also used by selections and `ls`
-                    // highlights): swap fg/bg after resolving to RGB so the cell
-                    // renders inverted once backgrounds are painted.
-                    if cell.flags.contains(Flags::INVERSE) {
-                        std::mem::swap(&mut fg, &mut bg);
+                    attrs |= ul << attr::UL_SHIFT;
+                }
+                // Underline color: SGR 58 (per-cell, stored in CellExtra) when
+                // set, otherwise the FINAL resolved fg (post INVERSE/DIM/HIDDEN)
+                // — so a reverse-video underline uses the swapped fg, and a
+                // HIDDEN (conceal) cell whose fg==bg draws an invisible underline.
+                // Deliberate: the underline tracks the visible glyph color. Gate
+                // the underline_color() lookup behind the underline flag: it is
+                // never read without an underline, so most cells skip it (SPEED).
+                let mut uline = fg;
+                if flags.intersects(Flags::ALL_UNDERLINES) {
+                    if let Some(c) = cell.underline_color() {
+                        uline = resolve_rgb(&self.theme, colors, c);
                     }
-                    // SGR 2 (dim): alacritty sets Flags::DIM but leaves fg as a
-                    // named color resolving to full brightness, so dim text would
-                    // be indistinguishable from normal. Pull the foreground a third
-                    // of the way toward the cell's background (`faint`) — less
-                    // contrast on dark AND light themes. Done after INVERSE so the
-                    // dimmed channel is whichever ends up fg.
-                    if cell.flags.contains(Flags::DIM) {
-                        fg = faint(fg, bg);
-                    }
-                    // SGR 8 (conceal): the glyph must not be readable (password
-                    // echoes, secret-masking TUIs). Paint the foreground with the
-                    // cell's background so the character is invisible while its
-                    // background/layout are preserved. Done after INVERSE/DIM so it
-                    // wins over whatever ended up as fg.
-                    if cell.flags.contains(Flags::HIDDEN) {
-                        fg = bg;
-                    } else if let Some(memo) = mc_memo.as_mut() {
-                        // `minimum_contrast` (off = one predictable branch): the
-                        // FINAL fg is pushed to the ratio against the final bg —
-                        // even a palette color that equals the background
-                        // (solarized_dark's 8: invisible zsh autosuggestions).
-                        // Concealed text (above) stays invisible; powerline, block
-                        // and sextant glyphs keep their colors (they draw shapes).
-                        // A blank draws no glyph: skipped (the common cell).
-                        if cell.c != ' ' && !crate::contrast::min_contrast_exempt(cell.c) {
-                            fg = memo.get(fg, bg);
-                        }
-                    }
-                    // A double-width glyph occupies two grid cells: the WIDE_CHAR
-                    // cell holds the actual char, and the following
-                    // WIDE_CHAR_SPACER cell is a placeholder. alacritty stores a
-                    // space (or stale char) in the spacer; the wide glyph from the
-                    // preceding cell already visually spans both columns via the
-                    // font, so we force the spacer to a blank to keep columns
-                    // aligned (preserving the spacer's own bg).
-                    // Combining marks / zero-width chars (NFD accents, VS16, ZWJ)
-                    // live in the cell's `zerowidth()` extra storage, separate from
-                    // `cell.c`. The per-cell `CellSnapshot` stays `Copy` (base char
-                    // only); cells that carry marks are listed SPARSELY in
-                    // `graphemes` (base + marks, capped) for the renderer to compose
-                    // — an empty `Vec`, no allocation, on the common path.
-                    let spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
-                    let c = if spacer { ' ' } else { cell.c };
-                    // (`extra` also holds hyperlinks / underline colors: skip empty.)
-                    if let Some(marks) = cell.zerowidth().filter(|m| !spacer && !m.is_empty()) {
-                        graphemes.push(CellGrapheme { row, col, text: grapheme_text(cell.c, marks) });
-                    }
-                    // Pack the SGR text attributes we render (bold/italic/strike +
-                    // underline style). BLINK (SGR 5/6) is intentionally NOT here:
-                    // alacritty_terminal 0.26 drops the blink bit at the VT engine
-                    // and a blink timer would fight ~0% idle (same non-goal as
-                    // ligatures). DIM_BOLD contains the BOLD bit, so a dim+bold cell
-                    // reads as bold via `contains(BOLD)`.
-                    let flags = cell.flags;
-                    let mut attrs = 0u8;
-                    if flags.contains(Flags::BOLD) {
-                        attrs |= attr::BOLD;
-                    }
-                    if flags.contains(Flags::ITALIC) {
-                        attrs |= attr::ITALIC;
-                    }
-                    if flags.contains(Flags::STRIKEOUT) {
-                        attrs |= attr::STRIKE;
-                    }
-                    // Underline style: most cells have none, so gate the five style
-                    // tests behind a single ALL_UNDERLINES check. Priority ladder
-                    // matches how the styles are mutually exclusive in the SGR model
-                    // (the most specific colon-subparam form wins).
-                    if flags.intersects(Flags::ALL_UNDERLINES) {
-                        let ul = if flags.contains(Flags::UNDERCURL) {
-                            attr::UL_UNDERCURL
-                        } else if flags.contains(Flags::DOTTED_UNDERLINE) {
-                            attr::UL_DOTTED
-                        } else if flags.contains(Flags::DASHED_UNDERLINE) {
-                            attr::UL_DASHED
-                        } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
-                            attr::UL_DOUBLE
-                        } else {
-                            attr::UL_SINGLE
-                        };
-                        attrs |= ul << attr::UL_SHIFT;
-                    }
-                    // Underline color: SGR 58 (per-cell, stored in CellExtra) when
-                    // set, otherwise the FINAL resolved fg (post INVERSE/DIM/HIDDEN)
-                    // — so a reverse-video underline uses the swapped fg, and a
-                    // HIDDEN (conceal) cell whose fg==bg draws an invisible underline.
-                    // Deliberate: the underline tracks the visible glyph color. Gate
-                    // the underline_color() lookup behind the underline flag: it is
-                    // never read without an underline, so most cells skip it (SPEED).
-                    let mut uline = fg;
-                    if flags.intersects(Flags::ALL_UNDERLINES) {
-                        if let Some(c) = cell.underline_color() {
-                            uline = resolve_rgb(&self.theme, colors, c);
-                        }
-                    }
-                    // WIDE_CHAR_SPACER: inherit the preceding base cell's attrs+uline
-                    // so an underline/strike/bold spans the FULL width of a CJK glyph
-                    // rather than only its left half. display_iter yields the base
-                    // cell (col-1) before the spacer, so it is already stored. The
-                    // spacer keeps its own bg (painted above) and blank char.
-                    if flags.contains(Flags::WIDE_CHAR_SPACER) && col > 0 {
-                        let base = &cells[row * self.cols + col - 1];
+                }
+                // WIDE_CHAR_SPACER: inherit the preceding base cell's attrs+uline
+                // so an underline/strike/bold spans the FULL width of a CJK glyph
+                // rather than only its left half. The base cell (col-1) was pushed
+                // just before the spacer. The spacer keeps its own bg (painted
+                // above) and blank char.
+                if spacer && col > 0 {
+                    if let Some(base) = cells.last() {
                         attrs = base.attrs;
                         uline = base.uline;
                     }
-                    cells[row * self.cols + col] =
-                        CellSnapshot { c, fg, bg, uline, attrs, selected: false };
                 }
+                cells.push(CellSnapshot { c, fg, bg, uline, attrs, selected: false });
             }
+            // A row shorter than the grid (never expected): blank the rest.
+            cells.resize(row_start + cols, CellSnapshot::default());
         }
+        // Viewport rows the grid doesn't have (never expected): blank.
+        cells.resize(rows * cols, CellSnapshot::default());
 
-        // Mark selected cells. Compute the selection range once (in terminal
-        // coordinates) and iterate over viewport rows to mark covered cells.
-        let sel_range = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term));
-        if let Some(range) = sel_range {
-            let grid = self.term.grid();
-            let display_offset = grid.display_offset();
+        // Mark selected cells: the selection range (terminal coordinates) that
+        // `renderable_content` already resolved, over the viewport rows.
+        if let Some(range) = content.selection {
             for vp_row in 0..self.rows {
                 let term_point = viewport_to_point(display_offset, Point::new(vp_row, Column(0)));
                 let term_line = term_point.line;
@@ -4888,6 +4908,33 @@ fn bright_for_bold(color: alacritty_terminal::vte::ansi::Color) -> alacritty_ter
     }
 }
 
+/// A one-entry [`resolve_rgb`] cache for one snapshot pass: neighbouring cells
+/// overwhelmingly repeat the previous cell's fg (and bg), so the last color →
+/// RGB pair answers most lookups with one compare.
+struct ColorMemo<'a> {
+    theme: &'a Theme,
+    colors: &'a Colors,
+    last: Option<(alacritty_terminal::vte::ansi::Color, [u8; 3])>,
+}
+
+impl<'a> ColorMemo<'a> {
+    fn new(theme: &'a Theme, colors: &'a Colors) -> Self {
+        ColorMemo { theme, colors, last: None }
+    }
+
+    #[inline]
+    fn get(&mut self, color: alacritty_terminal::vte::ansi::Color) -> [u8; 3] {
+        if let Some((c, rgb)) = self.last {
+            if c == color {
+                return rgb;
+            }
+        }
+        let rgb = resolve_rgb(self.theme, self.colors, color);
+        self.last = Some((color, rgb));
+        rgb
+    }
+}
+
 fn resolve_rgb(theme: &Theme, colors: &Colors, color: alacritty_terminal::vte::ansi::Color) -> [u8; 3] {
     use alacritty_terminal::vte::ansi::{Color, NamedColor};
     // Indexed and named colors map onto slots in the override table (Indexed(i)
@@ -4932,6 +4979,341 @@ fn resolve_rgb(theme: &Theme, colors: &Colors, color: alacritty_terminal::vte::a
 mod tests {
     use super::*;
     use crate::snapshot::{attr, CursorShapeSnap};
+
+    /// The snapshot as it was built before the row-slice walk: every cell through
+    /// `display_iter`, colors resolved per cell, a blank pre-fill. Kept as the
+    /// reference `Terminal::snapshot` must reproduce exactly.
+    fn reference_snapshot(t: &Terminal) -> GridSnapshot {
+        let mut cells = vec![CellSnapshot::default(); t.cols * t.rows];
+        let mut graphemes = Vec::new();
+        let content = t.term.renderable_content();
+        let display_offset = content.display_offset;
+        // Dynamic OSC 4/10/11/12 palette overrides (pywal, base16 hooks, etc.)
+        // are stored in the Term's color table; consult it so redefined colors
+        // actually change on screen, falling back to the static theme.
+        let colors = t.term.colors();
+        // `minimum_contrast` memo, seeded with the default text/background pair
+        // (most cells); `None` while the feature is off.
+        let mut mc_memo = (t.min_contrast > 1.0).then(|| {
+            let bg = [t.theme.bg[0], t.theme.bg[1], t.theme.bg[2]];
+            crate::contrast::ContrastMemo::new(t.min_contrast, t.theme.fg, bg)
+        });
+
+        // Iterate over all visible cells. Each item has point in terminal coordinates
+        // (line 0 = top of current viewport when display_offset=0; negative = history).
+        // point_to_viewport converts to display row: viewport_line = point.line.0 + display_offset.
+        for item in content.display_iter {
+            if let Some(vp) = point_to_viewport(display_offset, item.point) {
+                let row = vp.line;
+                let col = vp.column.0;
+                if row < t.rows && col < t.cols {
+                    let cell = item.cell;
+                    // `bold_is_bright`: a bold cell's normal ANSI foreground (0–7)
+                    // takes its bright twin (8–15) before it is resolved.
+                    let fg_color = if t.bold_is_bright && cell.flags.contains(Flags::BOLD) {
+                        bright_for_bold(cell.fg)
+                    } else {
+                        cell.fg
+                    };
+                    let mut fg = resolve_rgb(&t.theme, colors, fg_color);
+                    let mut bg = resolve_rgb(&t.theme, colors, cell.bg);
+                    // Reverse video (`\e[7m`, also used by selections and `ls`
+                    // highlights): swap fg/bg after resolving to RGB so the cell
+                    // renders inverted once backgrounds are painted.
+                    if cell.flags.contains(Flags::INVERSE) {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+                    // SGR 2 (dim): alacritty sets Flags::DIM but leaves fg as a
+                    // named color resolving to full brightness, so dim text would
+                    // be indistinguishable from normal. Pull the foreground a third
+                    // of the way toward the cell's background (`faint`) — less
+                    // contrast on dark AND light themes. Done after INVERSE so the
+                    // dimmed channel is whichever ends up fg.
+                    if cell.flags.contains(Flags::DIM) {
+                        fg = faint(fg, bg);
+                    }
+                    // SGR 8 (conceal): the glyph must not be readable (password
+                    // echoes, secret-masking TUIs). Paint the foreground with the
+                    // cell's background so the character is invisible while its
+                    // background/layout are preserved. Done after INVERSE/DIM so it
+                    // wins over whatever ended up as fg.
+                    if cell.flags.contains(Flags::HIDDEN) {
+                        fg = bg;
+                    } else if let Some(memo) = mc_memo.as_mut() {
+                        // `minimum_contrast` (off = one predictable branch): the
+                        // FINAL fg is pushed to the ratio against the final bg —
+                        // even a palette color that equals the background
+                        // (solarized_dark's 8: invisible zsh autosuggestions).
+                        // Concealed text (above) stays invisible; powerline, block
+                        // and sextant glyphs keep their colors (they draw shapes).
+                        // A blank draws no glyph: skipped (the common cell).
+                        if cell.c != ' ' && !crate::contrast::min_contrast_exempt(cell.c) {
+                            fg = memo.get(fg, bg);
+                        }
+                    }
+                    // A double-width glyph occupies two grid cells: the WIDE_CHAR
+                    // cell holds the actual char, and the following
+                    // WIDE_CHAR_SPACER cell is a placeholder. alacritty stores a
+                    // space (or stale char) in the spacer; the wide glyph from the
+                    // preceding cell already visually spans both columns via the
+                    // font, so we force the spacer to a blank to keep columns
+                    // aligned (preserving the spacer's own bg).
+                    // Combining marks / zero-width chars (NFD accents, VS16, ZWJ)
+                    // live in the cell's `zerowidth()` extra storage, separate from
+                    // `cell.c`. The per-cell `CellSnapshot` stays `Copy` (base char
+                    // only); cells that carry marks are listed SPARSELY in
+                    // `graphemes` (base + marks, capped) for the renderer to compose
+                    // — an empty `Vec`, no allocation, on the common path.
+                    let spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+                    let c = if spacer { ' ' } else { cell.c };
+                    // (`extra` also holds hyperlinks / underline colors: skip empty.)
+                    if let Some(marks) = cell.zerowidth().filter(|m| !spacer && !m.is_empty()) {
+                        graphemes.push(CellGrapheme { row, col, text: grapheme_text(cell.c, marks) });
+                    }
+                    // Pack the SGR text attributes we render (bold/italic/strike +
+                    // underline style). BLINK (SGR 5/6) is intentionally NOT here:
+                    // alacritty_terminal 0.26 drops the blink bit at the VT engine
+                    // and a blink timer would fight ~0% idle (same non-goal as
+                    // ligatures). DIM_BOLD contains the BOLD bit, so a dim+bold cell
+                    // reads as bold via `contains(BOLD)`.
+                    let flags = cell.flags;
+                    let mut attrs = 0u8;
+                    if flags.contains(Flags::BOLD) {
+                        attrs |= attr::BOLD;
+                    }
+                    if flags.contains(Flags::ITALIC) {
+                        attrs |= attr::ITALIC;
+                    }
+                    if flags.contains(Flags::STRIKEOUT) {
+                        attrs |= attr::STRIKE;
+                    }
+                    // Underline style: most cells have none, so gate the five style
+                    // tests behind a single ALL_UNDERLINES check. Priority ladder
+                    // matches how the styles are mutually exclusive in the SGR model
+                    // (the most specific colon-subparam form wins).
+                    if flags.intersects(Flags::ALL_UNDERLINES) {
+                        let ul = if flags.contains(Flags::UNDERCURL) {
+                            attr::UL_UNDERCURL
+                        } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+                            attr::UL_DOTTED
+                        } else if flags.contains(Flags::DASHED_UNDERLINE) {
+                            attr::UL_DASHED
+                        } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+                            attr::UL_DOUBLE
+                        } else {
+                            attr::UL_SINGLE
+                        };
+                        attrs |= ul << attr::UL_SHIFT;
+                    }
+                    // Underline color: SGR 58 (per-cell, stored in CellExtra) when
+                    // set, otherwise the FINAL resolved fg (post INVERSE/DIM/HIDDEN)
+                    // — so a reverse-video underline uses the swapped fg, and a
+                    // HIDDEN (conceal) cell whose fg==bg draws an invisible underline.
+                    // Deliberate: the underline tracks the visible glyph color. Gate
+                    // the underline_color() lookup behind the underline flag: it is
+                    // never read without an underline, so most cells skip it (SPEED).
+                    let mut uline = fg;
+                    if flags.intersects(Flags::ALL_UNDERLINES) {
+                        if let Some(c) = cell.underline_color() {
+                            uline = resolve_rgb(&t.theme, colors, c);
+                        }
+                    }
+                    // WIDE_CHAR_SPACER: inherit the preceding base cell's attrs+uline
+                    // so an underline/strike/bold spans the FULL width of a CJK glyph
+                    // rather than only its left half. display_iter yields the base
+                    // cell (col-1) before the spacer, so it is already stored. The
+                    // spacer keeps its own bg (painted above) and blank char.
+                    if flags.contains(Flags::WIDE_CHAR_SPACER) && col > 0 {
+                        let base = &cells[row * t.cols + col - 1];
+                        attrs = base.attrs;
+                        uline = base.uline;
+                    }
+                    cells[row * t.cols + col] =
+                        CellSnapshot { c, fg, bg, uline, attrs, selected: false };
+                }
+            }
+        }
+
+        // Mark selected cells. Compute the selection range once (in terminal
+        // coordinates) and iterate over viewport rows to mark covered cells.
+        let sel_range = t.term.selection.as_ref().and_then(|s| s.to_range(&t.term));
+        if let Some(range) = sel_range {
+            let grid = t.term.grid();
+            let display_offset = grid.display_offset();
+            for vp_row in 0..t.rows {
+                let term_point = viewport_to_point(display_offset, Point::new(vp_row, Column(0)));
+                let term_line = term_point.line;
+                // Skip rows outside the selection's line range.
+                if term_line < range.start.line || term_line > range.end.line {
+                    continue;
+                }
+                let row = &grid[term_line];
+                let base = vp_row * t.cols;
+                for col in 0..t.cols {
+                    let pt = Point::new(term_line, Column(col));
+                    if range.contains(pt) {
+                        cells[base + col].selected = true;
+                        // A wide glyph spans its cell and the spacer after it:
+                        // highlight both halves.
+                        let flags = row[Column(col)].flags;
+                        if flags.contains(Flags::WIDE_CHAR) && col + 1 < t.cols {
+                            cells[base + col + 1].selected = true;
+                        } else if flags.contains(Flags::WIDE_CHAR_SPACER) && col > 0 {
+                            cells[base + col - 1].selected = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cursor point is in terminal coordinates; convert to viewport (display)
+        // row using the SAME display-offset mapping as the cells above. When the
+        // user scrolls up into history the cursor's grid point maps OUTSIDE the
+        // visible viewport (point_to_viewport → None, or a row past the last
+        // visible line); in that case the cursor has scrolled off-screen and must
+        // be hidden so it does not paint over scrollback content.
+        let cursor_vp = point_to_viewport(display_offset, content.cursor.point);
+        let cursor_in_view = cursor_vp.map(|p| p.line < t.rows).unwrap_or(false);
+        let (cursor_row, cursor_col) = cursor_vp
+            .map(|p| (p.line.min(t.rows.saturating_sub(1)), p.column.0.min(t.cols.saturating_sub(1))))
+            .unwrap_or((0, 0));
+
+        // Apps hide the cursor with DECTCEM (`\e[?25l`); alacritty then reports
+        // the renderable cursor shape as `CursorShape::Hidden`. Treat that as not
+        // visible. Also hide the cursor when it has scrolled out of the viewport.
+        let cursor_visible = content.cursor.shape != CursorShape::Hidden && cursor_in_view;
+
+        // Renderable cursor SHAPE (DECSCUSR `CSI Ps SP q`): 1/2 block, 3/4
+        // underline, 5/6 beam. Hidden is folded into `cursor_visible` above, so
+        // it maps to the Block default (never drawn while invisible).
+        let cursor_shape = match content.cursor.shape {
+            CursorShape::Underline => CursorShapeSnap::Underline,
+            CursorShape::Beam => CursorShapeSnap::Beam,
+            CursorShape::HollowBlock => CursorShapeSnap::HollowBlock,
+            CursorShape::Block | CursorShape::Hidden => CursorShapeSnap::Block,
+        };
+
+        // Scrollbar data: display_offset is how many lines we're scrolled up
+        // (0 = at bottom). history_size() is the number of lines in the scrollback
+        // buffer (total_lines - screen_lines), which is the maximum scroll offset.
+        let grid = t.term.grid();
+        let scroll_offset = grid.display_offset();
+        let scroll_max = grid.history_size();
+
+        // Honor OSC 11 (background) / OSC 12 (cursor) dynamic overrides, keeping
+        // the theme's background alpha; fall back to the theme when unset.
+        let bg_rgba = match colors[257] {
+            Some(rgb) => [rgb.r, rgb.g, rgb.b, t.theme.bg[3]],
+            None => t.theme.bg,
+        };
+        let cursor_rgb = match colors[258] {
+            Some(rgb) => [rgb.r, rgb.g, rgb.b],
+            None => t.theme.cursor,
+        };
+
+        GridSnapshot {
+            cols: t.cols,
+            rows: t.rows,
+            cells,
+            cursor_row,
+            cursor_col,
+            cursor_visible,
+            bg_rgba,
+            cursor_rgb,
+            scroll_offset,
+            scroll_max,
+            cursor_shape,
+            graphemes,
+        }
+    }
+
+    /// `snapshot` (row slices, memoized colors, the plain-cell fast path) must be
+    /// field-for-field the reference snapshot on every screen: random text (wide,
+    /// combining, emoji, box/braille), every SGR attribute and color form,
+    /// underline colors, cursor moves and erases, the alternate screen, palette
+    /// and OSC 10/11/12 overrides, resizes, scrollback views, selections, themes,
+    /// `bold_is_bright` and `minimum_contrast`.
+    #[test]
+    fn snapshot_matches_the_display_iter_reference_on_random_screens() {
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rnd = move |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        const TEXT: &[&str] = &[
+            "a", "Z", "0", " ", " ", "-", "~", "漢", "字", "テ", "👍", "😀", "e\u{301}", "a\u{308}\u{301}",
+            "❤\u{fe0f}", "👩\u{200d}💻", "─", "│", "╭", "⠿", "█", "▄", "\t", "\u{e0b0}",
+        ];
+        const SGR: &[&str] = &[
+            "0", "1", "2", "3", "4", "4:2", "4:3", "4:4", "4:5", "7", "8", "9", "21", "22", "23", "24", "27", "28",
+            "29", "31", "37", "39", "42", "47", "49", "92", "105", "38;5;208", "48;5;17", "38;2;10;200;30",
+            "48;2;250;250;250", "58;5;196", "58;2;0;255;255", "59", "1;4;7", "2;8",
+        ];
+        let mut checked = 0;
+        for case in 0..160 {
+            let (mut cols, mut rows) = (2 + rnd(70) as usize, 1 + rnd(24) as usize);
+            let mut t = Terminal::new(cols, rows);
+            if case % 3 == 0 {
+                t.set_theme(crate::theme::theme_at(rnd(crate::theme::theme_count() as u64) as usize));
+            }
+            for _ in 0..40 {
+                let mut out = String::new();
+                for _ in 0..rnd(40) {
+                    match rnd(12) {
+                        0..=4 => out.push_str(TEXT[rnd(TEXT.len() as u64) as usize]),
+                        5 | 6 => out.push_str(&format!("\x1b[{}m", SGR[rnd(SGR.len() as u64) as usize])),
+                        7 => out.push_str("\r\n"),
+                        8 => out.push_str(&format!("\x1b[{};{}H", 1 + rnd(rows as u64 + 2), 1 + rnd(cols as u64 + 2))),
+                        9 => out.push_str(["\x1b[K", "\x1b[1K", "\x1b[J", "\x1b[2L", "\x1b[3P", "\x1b[2@"][rnd(6) as usize]),
+                        10 => out.push_str(
+                            [
+                                "\x1b[?1049h", "\x1b[?1049l", "\x1b[?25l", "\x1b[?25h", "\x1b[5 q", "\x1b[3 q",
+                                "\x1b]4;1;rgb:ff/00/80\x07", "\x1b]10;rgb:10/20/30\x07", "\x1b]11;rgb:f0/f0/e0\x07",
+                                "\x1b]12;rgb:00/ff/00\x07", "\x1b]104\x07", "\x1b]110\x07", "\x1b]111\x07",
+                            ][rnd(13) as usize],
+                        ),
+                        _ => out.push_str(&"x".repeat(rnd(cols as u64 * 2) as usize)),
+                    }
+                }
+                t.feed(out.as_bytes());
+                match rnd(10) {
+                    0 => {
+                        cols = 2 + rnd(70) as usize;
+                        rows = 1 + rnd(24) as usize;
+                        t.resize(cols, rows);
+                    }
+                    1 => t.scroll_lines(rnd(40) as i32 - 10),
+                    2 => {
+                        t.selection_start(rnd(rows as u64) as usize, rnd(cols as u64) as usize, rnd(2) == 0);
+                        t.selection_update(rnd(rows as u64) as usize, rnd(cols as u64) as usize, rnd(2) == 0);
+                    }
+                    3 => t.selection_clear(),
+                    4 => t.set_bold_is_bright(rnd(2) == 0),
+                    5 => t.set_minimum_contrast(if rnd(2) == 0 { 1.0 } else { 4.5 }),
+                    _ => {}
+                }
+                let (got, want) = (t.snapshot(), reference_snapshot(&t));
+                let ctx = format!("case {case}, {cols}x{rows}");
+                assert_eq!((got.cols, got.rows), (want.cols, want.rows), "{ctx}");
+                for (i, (g, w)) in got.cells.iter().zip(&want.cells).enumerate() {
+                    assert_eq!(g, w, "{ctx}: cell row {} col {}", i / got.cols, i % got.cols);
+                }
+                assert_eq!(got.cells.len(), want.cells.len(), "{ctx}");
+                assert_eq!(got.graphemes, want.graphemes, "{ctx}");
+                assert_eq!(
+                    (got.cursor_row, got.cursor_col, got.cursor_visible, got.cursor_shape),
+                    (want.cursor_row, want.cursor_col, want.cursor_visible, want.cursor_shape),
+                    "{ctx}"
+                );
+                assert_eq!((got.bg_rgba, got.cursor_rgb), (want.bg_rgba, want.cursor_rgb), "{ctx}");
+                assert_eq!((got.scroll_offset, got.scroll_max), (want.scroll_offset, want.scroll_max), "{ctx}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 160 * 40);
+    }
 
     /// `prune_marks`' O(pruned) fast path must keep EXACTLY the marks a full
     /// rescan keeps, in the same order — under mostly-ascending binds with
