@@ -4443,15 +4443,19 @@ impl Terminal {
         // one line per row. As in alacritty, a row ending in a placeholder
         // takes its wrapped wide char along on the last row, and on the others
         // when the block does not start in column 0.
+        // A corner on the right half of the last column moves the rectangle's
+        // left edge PAST it (alacritty's range_block does not wrap it): no
+        // column is selected then — and indexing one panicked.
+        let empty = range.start.column.0 >= self.cols || range.start.column > range.end.column;
         let mut text = String::new();
         for line in range.start.line.0..=range.end.line.0 {
             let line = Line(line);
             let wrapped = line == range.end.line || range.start.column.0 != 0;
-            let row = self.text_between(
-                Point::new(line, range.start.column),
-                Point::new(line, range.end.column),
-                wrapped,
-            );
+            let row = if empty {
+                String::new()
+            } else {
+                self.text_between(Point::new(line, range.start.column), Point::new(line, range.end.column), wrapped)
+            };
             text += row.trim_end();
             if line != range.end.line {
                 text.push('\n');
@@ -7431,6 +7435,11 @@ mod tests {
         let mut t = Terminal::new(5, 3);
         t.feed("abcd中e".as_bytes());
         assert_eq!(block(&mut t, (0, 1), (0, 4)).as_deref(), Some("bcd中"), "on the top row");
+        // A corner on the right half of the last column selects no column (the
+        // rectangle's left edge lands past it): empty rows, not a panic.
+        t.selection_start_block_abs(0, 4, false);
+        t.selection_update_abs(1, 4, true);
+        assert_eq!(t.selection_text().as_deref(), Some("\n"));
     }
 
     #[test]
@@ -9746,6 +9755,19 @@ mod tests {
                 }
                 8 => t.reset_input_modes(),
                 9 => t.selection_start_semantic(r.below(t.rows), r.below(t.cols)),
+                10 => {
+                    // Copy mode's block (Ctrl+V) and line selections, anchored in
+                    // the buffer.
+                    let line = t.viewport_line_to_buffer(r.below(t.rows));
+                    if r.chance(2) {
+                        t.selection_start_block_abs(line, r.below(t.cols), r.chance(2));
+                    } else {
+                        t.selection_start_lines_abs(line);
+                    }
+                    let line = t.viewport_line_to_buffer(r.below(t.rows));
+                    t.selection_update_abs(line, r.below(t.cols), r.chance(2));
+                    let _ = t.selection_text();
+                }
                 _ => {}
             }
             let _ = t.drain_pty_writes();
