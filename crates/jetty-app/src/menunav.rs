@@ -1,14 +1,16 @@
 //! Keyboard navigation for the custom-drawn menus — the terminal context menu,
 //! the tab menu (and its "Color ▸" list) and a detached window's menu.
 //!
-//! The logic lives here — PURE and testable off `App`. [`classify`] turns a key
-//! press into a [`MenuKey`]; [`step`] says what that key does to an open menu,
-//! moving the highlight over the ENABLED rows ([`next_enabled`],
-//! [`prev_enabled`], [`first_enabled`], [`last_enabled`]: wrapping, grayed rows
-//! skipped). The app owns the menus: it writes the highlight into the menu's
-//! hover index — the one the pointer drives too, whenever it crosses rows
-//! ([`pointer_hover`]) — and runs a row through the very method a click on that
-//! row runs.
+//! The logic lives here — PURE and testable off `App`. An open menu is
+//! keyboard-modal, like a native one: [`classify`] sorts every key press into
+//! the menu's own keys ([`MenuKey`], Escape), a modifier alone, and any other
+//! key — which closes the menu before it takes its usual path. [`step`] says
+//! what a menu key does to an open menu, moving the highlight over the ENABLED
+//! rows ([`next_enabled`], [`prev_enabled`], [`first_enabled`],
+//! [`last_enabled`]: wrapping, grayed rows skipped). The app owns the menus: it
+//! writes the highlight into the menu's hover index — the one the pointer
+//! drives too, whenever it crosses rows ([`pointer_hover`]) — and runs a row
+//! through the very method a click on that row runs.
 
 use winit::keyboard::{Key, NamedKey};
 
@@ -46,18 +48,43 @@ pub enum MenuStep {
     Back,
 }
 
-/// Classify a key PRESS for an open menu: `None` when the menu leaves the key
-/// alone, so it takes today's path (Escape still closes the menu, anything
-/// else reaches the shell). A key with Ctrl, Alt or Super held is never the
-/// menu's — those are chords (Ctrl+Shift+C copies with a menu open); Shift
-/// changes nothing. Keypad Enter and the keypad's arrows / Home / End (NumLock
-/// off) arrive as the same named keys as the main block's.
-pub fn classify(logical: &Key, mods: Mods) -> Option<MenuKey> {
-    if mods.ctrl || mods.alt || mods.super_ {
-        return None;
+/// What a key PRESS means to an open menu (see [`classify`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MenuPress {
+    /// One of the menu's keys: it drives the menu and goes no further.
+    Key(MenuKey),
+    /// Escape: it closes the menu and goes no further.
+    Close,
+    /// A modifier alone (Shift, Ctrl, Alt, AltGr, Super, a lock key): the menu
+    /// stays open — it may start Shift+Down, or a chord — and the key takes
+    /// its usual path.
+    Modifier,
+    /// Any other key, a chord included: it closes the menu, then takes its
+    /// usual path — a letter reaches the shell, Ctrl+Tab switches tabs.
+    Other,
+}
+
+/// Classify a key PRESS for an open menu. A menu is keyboard-modal, like a
+/// native one: its keys (the arrows, Home / End, Enter / Space, Escape) are
+/// its own, and every other key closes it on its way, so typing after an
+/// accidental Menu press loses nothing and runs nothing — the next Space is
+/// the shell's, not a press on the highlighted row. A key with Ctrl, Alt or
+/// Super held is a chord (`Other`) — save Escape, which closes the menu
+/// whatever is held; Shift changes nothing. Keypad Enter and the keypad's
+/// arrows / Home / End (NumLock off) arrive as the same named keys as the
+/// main block's.
+pub fn classify(logical: &Key, mods: Mods) -> MenuPress {
+    let Key::Named(named) = logical else { return MenuPress::Other };
+    if crate::input::is_modifier_key(logical) {
+        return MenuPress::Modifier;
     }
-    let Key::Named(named) = logical else { return None };
-    Some(match named {
+    if *named == NamedKey::Escape {
+        return MenuPress::Close;
+    }
+    if mods.ctrl || mods.alt || mods.super_ {
+        return MenuPress::Other;
+    }
+    MenuPress::Key(match named {
         NamedKey::ArrowUp => MenuKey::Prev,
         NamedKey::ArrowDown => MenuKey::Next,
         NamedKey::Home => MenuKey::First,
@@ -65,15 +92,15 @@ pub fn classify(logical: &Key, mods: Mods) -> Option<MenuKey> {
         NamedKey::Enter | NamedKey::Space => MenuKey::Activate,
         NamedKey::ArrowRight => MenuKey::Open,
         NamedKey::ArrowLeft => MenuKey::Back,
-        _ => return None,
+        _ => return MenuPress::Other,
     })
 }
 
 /// The step `key` takes on an open menu of `rows` rows, `disabled` of them
 /// grayed and `hover` highlighted. The moves always land (on an enabled row,
 /// or nowhere when there is none); Enter / Space / Right need a highlighted
-/// row and are `None` without one — the key then keeps today's path (Enter
-/// and Space reach the shell). Whether Right / Left mean anything in THIS
+/// row and are `None` without one — the menu keeps the key and nothing
+/// happens, as in a native menu. Whether Right / Left mean anything in THIS
 /// menu (a row with a submenu, a submenu to back out of) is the caller's to
 /// decide.
 pub fn step(key: MenuKey, hover: Option<usize>, rows: usize, disabled: &[usize]) -> Option<MenuStep> {
@@ -180,40 +207,85 @@ mod tests {
             (NamedKey::ArrowLeft, MenuKey::Back),
         ];
         for (k, want) in cases {
-            assert_eq!(classify(&named(k), NONE), Some(want), "{k:?}");
+            assert_eq!(classify(&named(k), NONE), MenuPress::Key(want), "{k:?}");
             // Shift changes nothing (Shift+Space, Shift+Down still navigate).
             let shift = Mods { shift: true, ..NONE };
-            assert_eq!(classify(&named(k), shift), Some(want), "Shift+{k:?}");
+            assert_eq!(classify(&named(k), shift), MenuPress::Key(want), "Shift+{k:?}");
         }
     }
 
     #[test]
-    fn chords_and_every_other_key_are_not_the_menus() {
-        // Ctrl / Alt / Super make it a chord: it takes today's path (a keymap
-        // action, or the shell), never the menu.
+    fn chords_and_every_other_key_close_the_menu_on_their_way() {
+        // Ctrl / Alt / Super make it a chord: the menu closes and the chord
+        // takes its usual path (a keymap action, or the shell).
         for m in [
             Mods { ctrl: true, ..NONE },
             Mods { alt: true, ..NONE },
             Mods { super_: true, ..NONE },
             Mods { ctrl: true, shift: true, ..NONE },
         ] {
-            for k in [NamedKey::ArrowDown, NamedKey::Enter, NamedKey::Space, NamedKey::Home] {
-                assert_eq!(classify(&named(k), m), None, "{m:?}+{k:?}");
+            for k in [NamedKey::ArrowDown, NamedKey::Enter, NamedKey::Space, NamedKey::Home, NamedKey::Tab] {
+                assert_eq!(classify(&named(k), m), MenuPress::Other, "{m:?}+{k:?}");
             }
         }
-        // Escape keeps its own (today's) path; letters, Tab, Page keys and the
-        // Menu key itself are not navigation.
+        // Letters, digits, Tab, Page keys, Backspace, F-keys and the Menu key
+        // itself (its toggle closes the menu) are not the menu's either.
         for k in [
-            named(NamedKey::Escape),
             named(NamedKey::Tab),
             named(NamedKey::PageDown),
             named(NamedKey::Backspace),
+            named(NamedKey::Delete),
+            named(NamedKey::F5),
             named(NamedKey::ContextMenu),
             Key::Character("j".into()),
+            Key::Character("1".into()),
             Key::Character(" ".into()),
+            Key::Character("@".into()),
         ] {
-            assert_eq!(classify(&k, NONE), None, "{k:?}");
+            assert_eq!(classify(&k, NONE), MenuPress::Other, "{k:?}");
         }
+    }
+
+    #[test]
+    fn escape_closes_the_menu_whatever_is_held() {
+        for m in [NONE, Mods { shift: true, ..NONE }, Mods { ctrl: true, ..NONE }, Mods { alt: true, ..NONE }] {
+            assert_eq!(classify(&named(NamedKey::Escape), m), MenuPress::Close, "{m:?}");
+        }
+    }
+
+    #[test]
+    fn a_modifier_alone_leaves_the_menu_open() {
+        // Pressing Ctrl on its way to Ctrl+Tab, or Shift to Shift+Down, must
+        // not close the menu — the held modifier is already in `mods` then.
+        let cases = [
+            (NamedKey::Shift, Mods { shift: true, ..NONE }),
+            (NamedKey::Control, Mods { ctrl: true, ..NONE }),
+            (NamedKey::Alt, Mods { alt: true, ..NONE }),
+            (NamedKey::AltGraph, NONE),
+            (NamedKey::Super, Mods { super_: true, ..NONE }),
+            (NamedKey::Meta, NONE),
+            (NamedKey::CapsLock, NONE),
+            (NamedKey::NumLock, NONE),
+        ];
+        for (k, m) in cases {
+            assert_eq!(classify(&named(k), m), MenuPress::Modifier, "{k:?}");
+            assert_eq!(classify(&named(k), NONE), MenuPress::Modifier, "{k:?} (state not yet updated)");
+        }
+    }
+
+    #[test]
+    fn typing_after_an_accidental_menu_press_runs_nothing() {
+        // The Menu key opened the terminal menu on its first enabled row:
+        // Paste (Copy and Run in New Tab are grayed without a selection).
+        let disabled = [0, 2];
+        assert_eq!(first_enabled(6, &disabled), Some(1));
+        // `git commit -m x`: the `g` is not the menu's — it closes the menu
+        // and reaches the shell, so the Space after `git` never meets it.
+        assert_eq!(classify(&Key::Character("g".into()), NONE), MenuPress::Other);
+        // Only a Space or Enter pressed while the menu is still open runs the
+        // highlighted row — the one the menu draws highlighted.
+        assert_eq!(classify(&named(NamedKey::Space), NONE), MenuPress::Key(MenuKey::Activate));
+        assert_eq!(step(MenuKey::Activate, Some(1), 6, &disabled), Some(MenuStep::Run(1)));
     }
 
     #[test]
@@ -282,7 +354,7 @@ mod tests {
         // With a row highlighted they act on it …
         assert_eq!(step(MenuKey::Activate, Some(3), 6, &[]), Some(MenuStep::Run(3)));
         assert_eq!(step(MenuKey::Open, Some(2), 4, &[]), Some(MenuStep::Open(2)));
-        // … with none, the key is not the menu's (Enter / Space reach the shell).
+        // … with none they do nothing (the menu keeps the key).
         assert_eq!(step(MenuKey::Activate, None, 6, &[]), None);
         assert_eq!(step(MenuKey::Open, None, 4, &[]), None);
         // A highlight can never sit on a grayed row; if one did, it runs nothing.

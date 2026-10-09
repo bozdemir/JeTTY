@@ -1018,6 +1018,32 @@ pub fn key_to_bytes(key: &Key) -> Option<Vec<u8>> {
     }
 }
 
+/// Whether `logical` is a modifier key on its own (Shift, Ctrl, Alt, AltGr,
+/// Super, the lock keys, …): sent to the PTY only under the kitty "report all
+/// keys" flag, and never a reason to close an open menu.
+pub fn is_modifier_key(logical: &Key) -> bool {
+    use NamedKey as N;
+    matches!(
+        logical,
+        Key::Named(
+            N::Shift
+                | N::Control
+                | N::Alt
+                | N::AltGraph
+                | N::Super
+                | N::Meta
+                | N::Hyper
+                | N::CapsLock
+                | N::NumLock
+                | N::ScrollLock
+                | N::Fn
+                | N::FnLock
+                | N::Symbol
+                | N::SymbolLock
+        )
+    )
+}
+
 /// Accumulates fractional scroll deltas (in LINES) across wheel events.
 ///
 /// Slow two-finger touchpad scrolling arrives as many sub-line deltas

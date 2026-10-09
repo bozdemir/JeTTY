@@ -340,7 +340,7 @@ fn env_flag(k: &str) -> bool {
 /// (up / down / home / end) moves the highlight through the app's own
 /// `menunav` — the logic its key handler runs. Without it: `fallback`.
 fn shot_menu_hover(rows: usize, disabled: &[usize], fallback: Option<usize>) -> Option<usize> {
-    use jetty_app::menunav::{self, MenuStep};
+    use jetty_app::menunav::{self, MenuPress, MenuStep};
     use winit::keyboard::{Key, NamedKey};
     let Ok(keys) = std::env::var("JETTY_SHOT_MENU_KEYS") else { return fallback };
     let mut hover = menunav::first_enabled(rows, disabled);
@@ -355,8 +355,10 @@ fn shot_menu_hover(rows: usize, disabled: &[usize], fallback: Option<usize>) -> 
                 continue;
             }
         };
-        let key = menunav::classify(&Key::Named(named), jetty_app::keymap::Mods::default());
-        if let Some(MenuStep::Highlight(h)) = key.and_then(|k| menunav::step(k, hover, rows, disabled)) {
+        let MenuPress::Key(key) = menunav::classify(&Key::Named(named), jetty_app::keymap::Mods::default()) else {
+            continue;
+        };
+        if let Some(MenuStep::Highlight(h)) = menunav::step(key, hover, rows, disabled) {
             hover = h;
         }
     }

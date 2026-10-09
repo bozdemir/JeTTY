@@ -223,7 +223,7 @@ JeTTY renders through **Vulkan** when a Vulkan driver is installed, and otherwis
 
 Mouse: **left-drag** selects (double-click a word, triple-click a line); **Shift+drag** selects even over programs that track the mouse (vim, htop, tmux, Claude Code) — those programs get the clicks otherwise, right and middle buttons included, and **Shift+right-click** opens JeTTY's menu there; **right-click** opens the Copy / Paste / Run in New Tab / Select All / Clear / Close Tab menu; **middle-click** pastes the primary selection; **Ctrl+click** opens a link. Tabs: drag one along the bar to reorder it, off the bar to detach it (drop it back on the bar to reattach), right-click a tab for Detach / Rename / Color / Close, double-click to rename, middle-click to close, scroll the wheel over the bar to switch. `Ctrl+D` exits the shell.
 
-Menus work from the keyboard too: the **Menu** key opens the right-click menu at the text cursor, and in any menu the arrows (or `Home` / `End`) move, `Enter` picks, `→` / `←` open and leave a tab's Color list, and `Esc` closes it.
+Menus work from the keyboard too: the **Menu** key opens the right-click menu at the text cursor, and in any menu the arrows (or `Home` / `End`) move, `Enter` picks, `→` / `←` open and leave a tab's Color list, and `Esc` (or **Menu** again) closes it. An open menu holds the keyboard the way native menus do — any other key closes it and then does its usual job, so typing on after a stray **Menu** press loses nothing and runs nothing.
 
 *The theme is picked in Settings (`Ctrl+,`) or the command palette — there is no theme shortcut.*
 

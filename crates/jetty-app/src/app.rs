@@ -4770,25 +4770,19 @@ impl App {
         Some(crate::menunav::cursor_anchor(row, col, cell, origin, menu_h, win_h as f32))
     }
 
-    /// The Menu key (`[keys] context_menu`) in window `s`: close the menu that
-    /// is open there, else open the context menu at the text cursor.
-    fn toggle_menu_at_cursor(&mut self, s: Surface) {
-        let open = match s {
+    /// Whether window `s` has a menu open (main: the terminal or the tab menu).
+    fn menu_open(&self, s: Surface) -> bool {
+        match s {
             Surface::Main => self.context_menu.is_some() || self.tab_menu.is_some(),
             Surface::Detached(p) => self.detached.get(p).is_some_and(|d| d.menu_open.is_some()),
-        };
-        if open {
-            self.dismiss_surface_menus(s);
-            self.paint_surface(s);
-        } else {
-            self.open_menu_at_cursor(s);
         }
     }
 
     /// Open window `s`'s context menu at its text cursor with the first
     /// enabled row highlighted, so the arrows and Enter work at once — the
     /// Menu key and the palette's "Open context menu". Under the right-click's
-    /// modal gates (`menu_blocked`).
+    /// modal gates (`menu_blocked`). (With a menu open, the Menu key never
+    /// gets here: that menu takes it and closes — `menu_key`.)
     fn open_menu_at_cursor(&mut self, s: Surface) {
         if self.menu_blocked(s) {
             return;
@@ -4812,18 +4806,45 @@ impl App {
         }
     }
 
-    /// The keys an open menu of window `s` takes (`crate::menunav`): Up / Down
-    /// move the highlight over the enabled rows (wrapping), Home / End jump to
-    /// the first / last of them, and Enter / Space run the highlighted row
-    /// through the click's own method; in the tab menu Right opens "Color ▸"'s
-    /// list and Left goes back from it. Returns whether the key was consumed —
-    /// never for a chord (Ctrl / Alt / Super held) nor Enter / Space with
-    /// nothing highlighted: those keep today's path, like every other key.
+    /// A key press while window `s` has a menu open. The menu is
+    /// keyboard-modal (`crate::menunav::classify`): Up / Down move the
+    /// highlight over the enabled rows (wrapping), Home / End jump to the
+    /// first / last of them, Enter / Space run the highlighted row through the
+    /// click's own method, in the tab menu Right opens "Color ▸"'s list and
+    /// Left goes back from it, and Escape closes the menu — those keys go no
+    /// further, even where they have nothing to do (Enter with no row
+    /// highlighted). Any other key, a chord included, closes the menu and
+    /// takes its usual path — save the Menu key (`[keys] context_menu`), whose
+    /// toggle IS that close. A modifier alone leaves the menu open. Returns
+    /// whether the key was consumed (`false` with no menu open).
     fn menu_key(&mut self, s: Surface, event: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) -> bool {
-        use crate::menunav::{self, MenuStep};
+        use crate::menunav::{self, MenuPress, MenuStep};
+        if !self.menu_open(s) {
+            return false;
+        }
         let m = self.modifiers;
         let mods = crate::keymap::Mods::new(m.control_key(), m.shift_key(), m.alt_key(), m.super_key());
-        let Some(key) = menunav::classify(&event.logical_key, mods) else { return false };
+        let key = match menunav::classify(&event.logical_key, mods) {
+            MenuPress::Key(key) => key,
+            MenuPress::Close => {
+                self.dismiss_surface_menus(s);
+                return true;
+            }
+            MenuPress::Modifier => return false,
+            MenuPress::Other => {
+                let chord = self.keymap.lookup(mods, event.physical_key, &event.logical_key);
+                if chord == Some(input::KeyAction::ContextMenu) {
+                    // The Menu key's toggle — on a fresh press only: held
+                    // down, its auto-repeat must not flicker the menu.
+                    if !event.repeat {
+                        self.dismiss_surface_menus(s);
+                    }
+                    return true;
+                }
+                self.dismiss_surface_menus(s);
+                return false;
+            }
+        };
         match s {
             Surface::Main if self.context_menu.is_some() => {
                 let rows = jetty_render::MENU_ITEMS.len();
@@ -4835,18 +4856,13 @@ impl App {
                         }
                     }
                     Some(MenuStep::Run(i)) => self.run_context_menu_row(Some(i)),
-                    // No submenus here: Right / Left keep today's path.
-                    _ => return false,
+                    // No submenus here, or no row highlighted: nothing to do.
+                    _ => {}
                 }
-                true
             }
-            Surface::Main if self.tab_menu.is_some() => self.tab_menu_key(key, event_loop),
-            Surface::Main => false,
+            Surface::Main => self.tab_menu_key(key, event_loop),
             Surface::Detached(p) => {
-                let Some(dw) = self.detached.get_mut(p) else { return false };
-                if dw.menu_open.is_none() {
-                    return false;
-                }
+                let Some(dw) = self.detached.get_mut(p) else { return true };
                 let rows = crate::detached::DETACHED_MENU_ITEMS.len();
                 match menunav::step(key, dw.menu_hover, rows, &dw.menu_disabled) {
                     Some(MenuStep::Highlight(h)) => {
@@ -4856,18 +4872,18 @@ impl App {
                         }
                     }
                     Some(MenuStep::Run(i)) => self.run_detached_menu_row(p, Some(i), event_loop),
-                    _ => return false,
+                    _ => {}
                 }
-                true
             }
         }
+        true
     }
 
-    /// [`App::menu_key`] for the open tab menu (no grayed rows): "Color ▸"
-    /// opens the color list in place on Enter / Space or Right, with its first
-    /// row highlighted; Left in the color list goes back to the tab menu with
-    /// "Color ▸" highlighted.
-    fn tab_menu_key(&mut self, key: crate::menunav::MenuKey, event_loop: &ActiveEventLoop) -> bool {
+    /// [`App::menu_key`]'s menu keys for the open tab menu (no grayed rows):
+    /// "Color ▸" opens the color list in place on Enter / Space or Right, with
+    /// its first row highlighted; Left in the color list goes back to the tab
+    /// menu with "Color ▸" highlighted. Right / Left elsewhere do nothing.
+    fn tab_menu_key(&mut self, key: crate::menunav::MenuKey, event_loop: &ActiveEventLoop) {
         use crate::menunav::{self, MenuStep};
         let run = match menunav::step(key, self.tab_menu_hover, self.tab_menu_labels.len(), &[]) {
             Some(MenuStep::Highlight(h)) => {
@@ -4875,19 +4891,19 @@ impl App {
                     self.tab_menu_hover = h;
                     self.request_main_paint();
                 }
-                return true;
+                return;
             }
             Some(MenuStep::Run(i)) => i,
             Some(MenuStep::Open(i)) if self.tab_menu_labels.get(i) == Some(&crate::detached::TAB_MENU_COLOR) => i,
             Some(MenuStep::Back) if crate::detached::is_tab_color_list(&self.tab_menu_labels) => {
-                let Some((x, y, tab)) = self.tab_menu else { return false };
+                let Some((x, y, tab)) = self.tab_menu else { return };
                 let labels = crate::detached::tab_menu_items(crate::detached::can_detach(self.tabs.len()));
                 let color_row = labels.iter().position(|&l| l == crate::detached::TAB_MENU_COLOR);
                 self.open_tab_menu(x, y, tab, labels);
                 self.tab_menu_hover = color_row;
-                return true;
+                return;
             }
-            _ => return false,
+            _ => return,
         };
         self.run_tab_menu_row(Some(run), event_loop);
         // "Color ▸" re-opened the menu in place as the color list: the
@@ -4895,7 +4911,6 @@ impl App {
         if self.tab_menu.is_some() {
             self.tab_menu_hover = menunav::first_enabled(self.tab_menu_labels.len(), &[]);
         }
-        true
     }
 
     /// Drop the long-lived tab references (rename box, close confirmation)
@@ -4979,8 +4994,13 @@ impl App {
         }
     }
 
-    /// Close window `s`'s context menu(s) (an overlay taking over the window).
+    /// Close window `s`'s context menu(s) — an overlay taking over the window,
+    /// a key that is not the menu's, a focus loss — and repaint the window
+    /// when one was open: its last frame would keep showing a dead menu.
     fn dismiss_surface_menus(&mut self, s: Surface) {
+        if !self.menu_open(s) {
+            return;
+        }
         match s {
             Surface::Main => self.dismiss_menus(),
             Surface::Detached(p) => {
@@ -4992,6 +5012,7 @@ impl App {
                 }
             }
         }
+        self.paint_surface(s);
     }
 
     /// The run-selection source for window `s`.
@@ -10010,16 +10031,16 @@ impl App {
                 if is_synthetic {
                     return;
                 }
-                // --- THIS window's overlays own the keyboard first, in the main
-                // window's order: command palette, hint mode, copy-mode, then the
-                // help (Esc + scroll keys) and the scrollback-search bar ---
+                // --- THIS window's open menu first (keyboard-modal, as in the
+                // main window: its keys drive it, any other key closes it on its
+                // way on), then its overlays, in the main window's order: command
+                // palette, hint mode, copy-mode, then the help (Esc + scroll
+                // keys) and the scrollback-search bar ---
                 let s = Surface::Detached(pos);
-                if self.overlay_key_modal(s, &event, event_loop) || self.overlay_key_bars(s, &event) {
-                    return;
-                }
-                // --- Then THIS window's open menu takes its navigation keys
-                // (arrows, Home / End, Enter / Space on the highlighted row) ---
-                if self.menu_key(s, &event, event_loop) {
+                if self.menu_key(s, &event, event_loop)
+                    || self.overlay_key_modal(s, &event, event_loop)
+                    || self.overlay_key_bars(s, &event)
+                {
                     return;
                 }
                 // The SAME key decision as the main window (`decide_window_key`),
@@ -10146,10 +10167,10 @@ impl App {
                         self.cycle_theme(if action == input::KeyAction::NextTheme { 1 } else { -1 });
                         return;
                     }
-                    // The Menu key: THIS window's menu at its text cursor (or
-                    // close the one that is open).
+                    // The Menu key: THIS window's menu at its text cursor (an
+                    // open one took the key above and closed).
                     input::KeyAction::ContextMenu => {
-                        self.toggle_menu_at_cursor(s);
+                        self.open_menu_at_cursor(s);
                         return;
                     }
                     _ => {}
@@ -10222,21 +10243,12 @@ impl App {
                         dw.request_paint();
                     }
                     input::KeyAction::Send(bytes) => {
-                        // Escape closes this window's context menu (if open)
-                        // before anything reaches the PTY — mirrors the main window.
-                        if is_escape_key(&event) && dw.menu_open.is_some() {
-                            dw.menu_open = None;
-                            dw.menu_hover = None;
-                            dw.menu_rects.clear();
-                            dw.menu_disabled.clear();
-                            dw.request_paint();
-                            return;
-                        }
                         // Snap this window's view to the live bottom (else typing
                         // while scrolled up goes blind, F30) then write to the PTY
                         // — the shared input core, same as the main Send arm
                         // (v0.23 Task 9).
-                        write_key_to_pty(&mut dw.tab, &bytes, Some(event.physical_key), !is_modifier_key(&event));
+                        let modifier = input::is_modifier_key(&event.logical_key);
+                        write_key_to_pty(&mut dw.tab, &bytes, Some(event.physical_key), !modifier);
                         // No paint here — the echo paints (same rule and fallback
                         // deadline as the main window's Send arm).
                         let now = std::time::Instant::now();
@@ -10292,9 +10304,11 @@ impl App {
                     }
                 }
                 if !text.is_empty() {
-                    // This window's overlays take the commit first (palette /
+                    // It closes an open menu on its way (as in the main window),
+                    // then this window's overlays take the commit (palette /
                     // search queries; hint/copy-mode drop it) — the main
                     // window's modal priority.
+                    self.dismiss_surface_menus(Surface::Detached(pos));
                     if self.overlay_ime_commit(Surface::Detached(pos), &text) {
                         return;
                     }
@@ -14393,6 +14407,15 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     return;
                 }
+                // --- An open context / tab menu is keyboard-modal: it takes
+                // its keys — arrows, Home / End, Enter / Space on the
+                // highlighted row, Right / Left into and out of the tab menu's
+                // color list, Escape — and any other key closes it on its way
+                // to the overlays below or the shell. Ahead of them: the menu
+                // is drawn over them. Shared with the detached windows ---
+                if self.menu_key(Surface::Main, &event, event_loop) {
+                    return;
+                }
                 // --- The window's modal overlays own the keyboard: command
                 // palette, then hint mode, then copy-mode (shared with the
                 // detached windows) ---
@@ -14415,13 +14438,6 @@ impl ApplicationHandler<AppEvent> for App {
                 // --- Help (Esc + its scroll keys) and the scrollback-search bar
                 // (every key while open), shared with the detached windows ---
                 if self.overlay_key_bars(Surface::Main, &event) {
-                    return;
-                }
-                // --- An open context / tab menu takes its navigation keys:
-                // arrows, Home / End, Enter / Space on the highlighted row (and
-                // Right / Left into and out of the tab menu's color list).
-                // Shared with the detached windows ---
-                if self.menu_key(Surface::Main, &event, event_loop) {
                     return;
                 }
                 let ctrl = self.modifiers.control_key();
@@ -14628,25 +14644,10 @@ impl ApplicationHandler<AppEvent> for App {
                     input::KeyAction::NextTheme => self.cycle_theme(1),
                     input::KeyAction::PrevTheme => self.cycle_theme(-1),
                     // The Menu key (`[keys] context_menu`): the terminal context
-                    // menu at the text cursor, first enabled row highlighted —
-                    // or, with a menu open, close it.
-                    input::KeyAction::ContextMenu => self.toggle_menu_at_cursor(Surface::Main),
+                    // menu at the text cursor, first enabled row highlighted (an
+                    // open menu took the key above and closed).
+                    input::KeyAction::ContextMenu => self.open_menu_at_cursor(Surface::Main),
                     input::KeyAction::Send(bytes) => {
-                        // Escape closes an open context/tab menu before forwarding to PTY.
-                        // Decided on the KEY, not the encoded bytes: under the kitty
-                        // keyboard protocol Esc encodes as `CSI 27 u`, not 0x1b.
-                        if is_escape_key(&event)
-                            && (self.context_menu.is_some() || self.tab_menu.is_some())
-                        {
-                            self.context_menu = None;
-                            self.menu_hover = None;
-                            self.tab_menu = None;
-                            self.tab_menu_hover = None;
-                            self.tab_menu_rects.clear();
-                            self.tab_menu_labels.clear();
-                            self.request_main_paint();
-                            return;
-                        }
                         // Esc also dismisses the welcome splash (but still reaches PTY).
                         // Any real Send to the PTY also dismisses the welcome splash.
                         if self.welcome_open {
@@ -14655,7 +14656,8 @@ impl ApplicationHandler<AppEvent> for App {
                         // Any real keystroke jumps back to the bottom so the user
                         // sees their input, then writes to the PTY (shared input
                         // core, v0.23 Task 9).
-                        write_key_to_pty(self.active_tab_mut(), &bytes, Some(event.physical_key), !is_modifier_key(&event));
+                        let modifier = input::is_modifier_key(&event.logical_key);
+                        write_key_to_pty(self.active_tab_mut(), &bytes, Some(event.physical_key), !modifier);
                         // Input-latency START stamp (JETTY_PERF_LOG only): record the
                         // keystroke instant so the frame that reflects its echo can
                         // measure keypress→glyph. Gated on `perf.on` (a bool read once
@@ -14731,6 +14733,9 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.confirm_quit || self.confirm_close.is_some() {
                     return;
                 }
+                // Typed text closes an open menu on its way, like any key that
+                // is not the menu's (`menu_key`).
+                self.dismiss_surface_menus(Surface::Main);
                 // Hint mode / copy-mode own the keyboard: DROP the commit so a CJK
                 // IME (which routes even Latin letters through Ime::Commit rather
                 // than KeyboardInput) cannot leak typed text to the shell behind
@@ -16593,40 +16598,6 @@ fn write_key_to_pty(
     if let Some(key) = pressed {
         tab.input.note_press(key);
     }
-}
-
-/// Whether `event` is a modifier key on its own (Shift, Ctrl, Alt, Super, the
-/// lock keys, …) — sent to the PTY only under the kitty "report all keys" flag.
-fn is_modifier_key(event: &winit::event::KeyEvent) -> bool {
-    use winit::keyboard::{Key, NamedKey as N};
-    matches!(
-        event.logical_key,
-        Key::Named(
-            N::Shift
-                | N::Control
-                | N::Alt
-                | N::AltGraph
-                | N::Super
-                | N::Meta
-                | N::Hyper
-                | N::CapsLock
-                | N::NumLock
-                | N::ScrollLock
-                | N::Fn
-                | N::FnLock
-                | N::Symbol
-                | N::SymbolLock
-        )
-    )
-}
-
-/// Whether `event` is the Escape key itself — independent of how the active
-/// keyboard protocol encodes it (legacy `0x1b`, kitty `CSI 27 u`).
-fn is_escape_key(event: &winit::event::KeyEvent) -> bool {
-    matches!(
-        event.logical_key,
-        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
-    )
 }
 
 /// The shared decision half of the main and detached key paths: one winit key
