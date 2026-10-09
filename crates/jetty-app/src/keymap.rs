@@ -573,10 +573,10 @@ impl BindableAction {
             NextTheme | PrevTheme => Vec::new(),
             // The bare Menu key — the PC keyboard's own "context menu" key,
             // and the second default (after F11) bound without a modifier,
-            // which `chord_reject_reason` permits for it. The legacy encoders
-            // send nothing for it, so the shell loses nothing; a program on
-            // the kitty keyboard protocol loses its `CSI 57363 u` (the opt-out
-            // is `[keys] context_menu = ""`, as with F11). EXACT, like F11.
+            // which `chord_reject_reason` permits for it. A program loses
+            // xterm's `CSI 29 ~` for it (the VT220's Do key), or its
+            // `CSI 57363 u` on the kitty keyboard protocol (the opt-out is
+            // `[keys] context_menu = ""`, as with F11). EXACT, like F11.
             // Matched by the key the LAYOUT calls Menu (`KeyMatch::Named`), so
             // `compose:menu` keeps that key composing. Apple keyboards have no
             // Menu key (winit maps none on macOS): the palette's "Open context

@@ -273,14 +273,14 @@ fn enter_sends_cr() {
 
 #[test]
 fn unknown_key_returns_none() {
-    // F13 has no xterm mapping (we encode F1–F12); a genuinely unmapped key
-    // must still produce no bytes. (F12 is now mapped — see function_keys test.)
+    // Print Screen has no xterm mapping; a genuinely unmapped key must still
+    // produce no bytes. (F1–F24 are all mapped — see the function_keys test.)
     let action = dk(
         false,
         false,
         false,
-        phys(KeyCode::F13),
-        &Key::Named(NamedKey::F13),
+        phys(KeyCode::PrintScreen),
+        &Key::Named(NamedKey::PrintScreen),
         false,
         false,
         false,
@@ -747,11 +747,26 @@ fn function_keys_send_xterm_sequences() {
         (NamedKey::F4, b"\x1bOS"),
         (NamedKey::F5, b"\x1b[15~"),
         (NamedKey::F12, b"\x1b[24~"),
+        // xterm's decfuncvalue (an Apple keyboard's F13–F19, a remapper's F-keys).
+        (NamedKey::F13, b"\x1b[25~"),
+        (NamedKey::F14, b"\x1b[26~"),
+        (NamedKey::F15, b"\x1b[28~"),
+        (NamedKey::F16, b"\x1b[29~"),
+        (NamedKey::F17, b"\x1b[31~"),
+        (NamedKey::F18, b"\x1b[32~"),
+        (NamedKey::F19, b"\x1b[33~"),
+        (NamedKey::F20, b"\x1b[34~"),
+        (NamedKey::F21, b"\x1b[42~"),
+        (NamedKey::F24, b"\x1b[45~"),
     ];
     for (k, want) in cases {
         let a = dk(false, false, false, phys(KeyCode::F1), &named(*k), false, false, false);
         assert_eq!(a, send(want), "key {:?}", k);
     }
+    // Modified: the xterm parameter (Shift = 2, Alt = 3, Ctrl = 5) — no double ESC.
+    assert_eq!(dk(false, true, false, phys(KeyCode::F13), &named(NamedKey::F13), false, false, false), send(b"\x1b[25;2~"));
+    assert_eq!(dk(false, false, true, phys(KeyCode::F19), &named(NamedKey::F19), false, false, false), send(b"\x1b[33;3~"));
+    assert_eq!(dk(true, false, false, phys(KeyCode::F24), &named(NamedKey::F24), false, false, false), send(b"\x1b[45;5~"));
 }
 
 #[test]

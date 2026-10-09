@@ -671,6 +671,16 @@ fn encode_legacy(
     logical: &Key,
     modes: &KeyModes,
 ) -> Option<Vec<u8>> {
+    // An F13–F18 key the layout left unnamed is that F-key (`unnamed_fkey`).
+    let named;
+    let logical = match unnamed_fkey(logical, physical) {
+        Some(f) => {
+            named = Key::Named(f);
+            &named
+        }
+        None => logical,
+    };
+
     // PageUp / PageDown always reach the program: `\e[5~`/`\e[6~`, with the
     // xterm modifier parameter when modified (`\e[5;m~`; vim :tabnext on
     // Ctrl+PageDown, tmux `bind -n C-PgUp`). Host scrolling is the keymap's
@@ -780,10 +790,14 @@ fn encode_legacy(
             }
             _ => {}
         }
+        if kp_begin(physical, logical) {
+            return Some(format!("\x1b[1;{m}E").into_bytes());
+        }
         // Modified function keys: F1–F4 use the CSI-1 letter form (`\e[1;{m}P..S`),
-        // F5–F12 the CSI tilde form (`\e[{n};{m}~`). Without these any modified
-        // F-key collapses to the unmodified sequence (Shift+F5 → plain `\e[15~`),
-        // and Alt+F-key would get a double-ESC from the Meta fallback below.
+        // F5–F24 and Menu the CSI tilde form (`\e[{n};{m}~`). Without these any
+        // modified F-key collapses to the unmodified sequence (Shift+F5 → plain
+        // `\e[15~`), and Alt+F-key would get a double-ESC from the Meta fallback
+        // below.
         let fkey_final = match logical {
             Key::Named(NamedKey::F1) => Some('P'),
             Key::Named(NamedKey::F2) => Some('Q'),
@@ -794,18 +808,7 @@ fn encode_legacy(
         if let Some(fin) = fkey_final {
             return Some(format!("\x1b[1;{m}{fin}").into_bytes());
         }
-        let fkey_num = match logical {
-            Key::Named(NamedKey::F5) => Some(15),
-            Key::Named(NamedKey::F6) => Some(17),
-            Key::Named(NamedKey::F7) => Some(18),
-            Key::Named(NamedKey::F8) => Some(19),
-            Key::Named(NamedKey::F9) => Some(20),
-            Key::Named(NamedKey::F10) => Some(21),
-            Key::Named(NamedKey::F11) => Some(23),
-            Key::Named(NamedKey::F12) => Some(24),
-            _ => None,
-        };
-        if let Some(n) = fkey_num {
+        if let Some(n) = tilde_key_number(logical) {
             return Some(format!("\x1b[{n};{m}~").into_bytes());
         }
         if shift && !ctrl && !alt && matches!(logical, Key::Named(NamedKey::Tab)) {
@@ -817,6 +820,11 @@ fn encode_legacy(
     // the arrows AND Home/End use SS3 (`\eOA`, `\eOH`, `\eOF`) — exactly
     // terminfo's kcuu1/khome/kend, which shells read after `smkx` (oh-my-zsh
     // binds Home/End to `$terminfo[khome]`/`[kend]` ONLY). Normal mode keeps CSI.
+    // NumLock-off keypad 5 (`KP_Begin`) is one of xterm's cursor keys too:
+    // `\e[E` / `\eOE` (terminfo's kb2).
+    if kp_begin(physical, logical) {
+        return Some(if modes.app_cursor { b"\x1bOE".to_vec() } else { b"\x1b[E".to_vec() });
+    }
     if let Some(bytes) = cursor_key_bytes(logical, modes.app_cursor) {
         if alt {
             let mut out = Vec::with_capacity(bytes.len() + 1);
@@ -1047,24 +1055,75 @@ pub fn key_to_bytes(key: &Key) -> Option<Vec<u8>> {
         Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
         Key::Named(NamedKey::Delete) => Some(b"\x1b[3~".to_vec()),
         Key::Named(NamedKey::Insert) => Some(b"\x1b[2~".to_vec()),
-        // Function row. F1–F4 use the SS3 (`\eOP`..`\eOS`) form; F5–F12 the CSI
-        // tilde form. (F9 is normally consumed by the global summon hotkey before
-        // it reaches here; this is the fallback when no global grab is active.)
+        // Function row. F1–F4 use the SS3 (`\eOP`..`\eOS`) form; F5–F24 (and
+        // Menu) the CSI tilde form (`tilde_key_number`). (F9 is normally
+        // consumed by the global summon hotkey before it reaches here; this is
+        // the fallback when no global grab is active.)
         Key::Named(NamedKey::F1) => Some(b"\x1bOP".to_vec()),
         Key::Named(NamedKey::F2) => Some(b"\x1bOQ".to_vec()),
         Key::Named(NamedKey::F3) => Some(b"\x1bOR".to_vec()),
         Key::Named(NamedKey::F4) => Some(b"\x1bOS".to_vec()),
-        Key::Named(NamedKey::F5) => Some(b"\x1b[15~".to_vec()),
-        Key::Named(NamedKey::F6) => Some(b"\x1b[17~".to_vec()),
-        Key::Named(NamedKey::F7) => Some(b"\x1b[18~".to_vec()),
-        Key::Named(NamedKey::F8) => Some(b"\x1b[19~".to_vec()),
-        Key::Named(NamedKey::F9) => Some(b"\x1b[20~".to_vec()),
-        Key::Named(NamedKey::F10) => Some(b"\x1b[21~".to_vec()),
-        Key::Named(NamedKey::F11) => Some(b"\x1b[23~".to_vec()),
-        Key::Named(NamedKey::F12) => Some(b"\x1b[24~".to_vec()),
         Key::Character(s) => Some(s.as_bytes().to_vec()),
-        _ => None,
+        _ => tilde_key_number(key).map(|n| format!("\x1b[{n}~").into_bytes()),
     }
+}
+
+/// The xterm `CSI n ~` number of F5–F24 and the Menu key (xterm's
+/// `decfuncvalue`): F13–F20 are the VT220's 25, 26, 28, 29 and 31–34 — 28 is
+/// its Help key and 29 its Do key, which xterm sends for Menu — and from F21
+/// they run on from 42.
+fn tilde_key_number(key: &Key) -> Option<u8> {
+    use NamedKey as N;
+    let Key::Named(named) = key else { return None };
+    Some(match named {
+        N::F5 => 15,
+        N::F6 => 17,
+        N::F7 => 18,
+        N::F8 => 19,
+        N::F9 => 20,
+        N::F10 => 21,
+        N::F11 => 23,
+        N::F12 => 24,
+        N::F13 => 25,
+        N::F14 => 26,
+        N::F15 => 28,
+        N::F16 | N::ContextMenu => 29,
+        N::F17 => 31,
+        N::F18 => 32,
+        N::F19 => 33,
+        N::F20 => 34,
+        N::F21 => 42,
+        N::F22 => 43,
+        N::F23 => 44,
+        N::F24 => 45,
+        _ => return None,
+    })
+}
+
+/// F13–F18 for a key the layout left unnamed at those positions: xkb's evdev
+/// rules call them `XF86Tools` and `XF86Launch5`…`9`, which winit doesn't
+/// name, so Apple's F13–F18 and a keyd / QMK remap to them sent nothing. F19
+/// and F24 arrive named; F20–F23 are laptop keys by udev convention (mic
+/// mute, touchpad toggle / on / off) and stay silent.
+fn unnamed_fkey(logical: &Key, physical: PhysicalKey) -> Option<NamedKey> {
+    if !matches!(logical, Key::Unidentified(_)) {
+        return None;
+    }
+    Some(match physical {
+        PhysicalKey::Code(KeyCode::F13) => NamedKey::F13,
+        PhysicalKey::Code(KeyCode::F14) => NamedKey::F14,
+        PhysicalKey::Code(KeyCode::F15) => NamedKey::F15,
+        PhysicalKey::Code(KeyCode::F16) => NamedKey::F16,
+        PhysicalKey::Code(KeyCode::F17) => NamedKey::F17,
+        PhysicalKey::Code(KeyCode::F18) => NamedKey::F18,
+        _ => return None,
+    })
+}
+
+/// NumLock-off keypad 5: xkb's `KP_Begin`, which winit leaves unnamed (with
+/// NumLock on, the key types its digit).
+fn kp_begin(physical: PhysicalKey, logical: &Key) -> bool {
+    physical == PhysicalKey::Code(KeyCode::Numpad5) && matches!(logical, Key::Unidentified(_))
 }
 
 /// Whether `logical` is a modifier key on its own (Shift, Ctrl, Alt, AltGr,
@@ -1406,8 +1465,9 @@ fn functional_key(ev: &KeyInput<'_>) -> Option<FKey> {
             return Some(k);
         }
     }
-    let Key::Named(named) = ev.logical else {
-        return None;
+    let named = match ev.logical {
+        Key::Named(named) => *named,
+        _ => unnamed_fkey(ev.logical, ev.physical)?,
     };
     let right = ev.location == KeyLocation::Right;
     let side = |left: u32| if right { left + 6 } else { left };
@@ -2378,7 +2438,8 @@ mod tests {
             assert_eq!(decide(&ev, modes, KeyOptions::default()), KeyAction::ContextMenu);
         }
         // `[keys] context_menu = ""` hands the key back: a kitty program gets
-        // `CSI 57363 u`, a legacy shell nothing — exactly as before the binding.
+        // `CSI 57363 u`, a legacy one xterm's `CSI 29 ~` (Menu is the VT220's Do
+        // key there) — it used to get nothing.
         let b = crate::config::KeyBindings {
             context_menu: Some(crate::config::ChordSpec::One(String::new())),
             ..Default::default()
@@ -2388,11 +2449,14 @@ mod tests {
             decide_key_event(&km, &ev, &kitty, &KeyOptions::default(), false),
             KeyAction::Send(b"\x1b[57363u".to_vec())
         );
-        assert_eq!(decide_key_event(&km, &ev, &KeyModes::default(), &KeyOptions::default(), false), KeyAction::None);
-        // The default chord is EXACT: Shift+Menu is not the menu (and, legacy,
-        // sends nothing).
+        assert_eq!(
+            decide_key_event(&km, &ev, &KeyModes::default(), &KeyOptions::default(), false),
+            KeyAction::Send(b"\x1b[29~".to_vec())
+        );
+        // The default chord is EXACT: Shift+Menu is not the menu (it reaches the
+        // program as xterm's `CSI 29 ; 2 ~`).
         let shifted = kev(KeyCode::ContextMenu, &menu, None, KeyMods { shift: true, ..KeyMods::default() });
-        assert_eq!(decide(&shifted, KeyModes::default(), KeyOptions::default()), KeyAction::None);
+        assert_eq!(decide(&shifted, KeyModes::default(), KeyOptions::default()), KeyAction::Send(b"\x1b[29;2~".to_vec()));
     }
 
     #[test]
@@ -3679,6 +3743,43 @@ mod tests {
         // NumLock off: keypad 7 is Home and follows DECCKM like the main key.
         assert_eq!(decide(&kev(KeyCode::Numpad7, &home, None, KeyMods::default()), smkx, KeyOptions::default()), KeyAction::Send(b"\x1bOH".to_vec()));
         assert_eq!(decide(&kev(KeyCode::Numpad7, &home, None, KeyMods::default()), KeyModes::default(), KeyOptions::default()), KeyAction::Send(b"\x1b[H".to_vec()));
+    }
+
+    #[test]
+    fn numlock_off_keypad_5_is_xterms_begin_key() {
+        // xkb's KP_Begin, which winit leaves Unidentified: it sent nothing.
+        let begin = Key::Unidentified(winit::keyboard::NativeKey::Xkb(0xff9d));
+        let smkx = KeyModes { app_cursor: true, ..KeyModes::default() };
+        let ev = kev(KeyCode::Numpad5, &begin, None, KeyMods::default());
+        assert_eq!(decide(&ev, KeyModes::default(), KeyOptions::default()), KeyAction::Send(b"\x1b[E".to_vec()));
+        assert_eq!(decide(&ev, smkx, KeyOptions::default()), KeyAction::Send(b"\x1bOE".to_vec()));
+        let shifted = kev(KeyCode::Numpad5, &begin, None, KeyMods { shift: true, ..KeyMods::default() });
+        assert_eq!(decide(&shifted, smkx, KeyOptions::default()), KeyAction::Send(b"\x1b[1;2E".to_vec()));
+        // NumLock on: the digit.
+        let five = Key::Character("5".into());
+        assert_eq!(decide(&kev(KeyCode::Numpad5, &five, Some("5"), KeyMods::default()), KeyModes::default(), KeyOptions::default()), KeyAction::Send(b"5".to_vec()));
+        // An unnamed key elsewhere still sends nothing.
+        let other = kev(KeyCode::Numpad6, &begin, None, KeyMods::default());
+        assert_eq!(decide(&other, KeyModes::default(), KeyOptions::default()), KeyAction::None);
+    }
+
+    #[test]
+    fn f13_to_f18_the_layout_left_unnamed_are_those_f_keys() {
+        // xkb's evdev rules call F13 `XF86Tools` and F14–F18 `XF86Launch5`…`9`,
+        // which winit doesn't name: an Apple keyboard's F13–F18 or a keyd / QMK
+        // remap to them sent nothing in either protocol.
+        let tools = Key::Unidentified(winit::keyboard::NativeKey::Xkb(0x1008_ff81));
+        let ev = kev(KeyCode::F13, &tools, None, KeyMods::default());
+        let kitty = KeyModes { kitty_flags: KITTY_DISAMBIGUATE, ..KeyModes::default() };
+        assert_eq!(decide(&ev, KeyModes::default(), KeyOptions::default()), KeyAction::Send(b"\x1b[25~".to_vec()));
+        assert_eq!(decide(&ev, kitty, KeyOptions::default()), KeyAction::Send(b"\x1b[57376u".to_vec()));
+        let ctrl = kev(KeyCode::F18, &tools, None, KeyMods { ctrl: true, ..KeyMods::default() });
+        assert_eq!(decide(&ctrl, KeyModes::default(), KeyOptions::default()), KeyAction::Send(b"\x1b[32;5~".to_vec()));
+        // F20–F23 are laptop keys by udev convention (mic mute, touchpad
+        // toggle / on / off): left unnamed they stay silent.
+        let touchpad = kev(KeyCode::F21, &tools, None, KeyMods::default());
+        assert_eq!(decide(&touchpad, KeyModes::default(), KeyOptions::default()), KeyAction::None);
+        assert_eq!(decide(&touchpad, kitty, KeyOptions::default()), KeyAction::None);
     }
 
     // ── layouts: chords follow the key LABEL ──────────────────────────────────
