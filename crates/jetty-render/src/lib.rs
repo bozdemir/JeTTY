@@ -83,7 +83,7 @@ pub use tabbar::{
     CtrlHover, DetachedBar, TabActivity, TabBar, TabBarOpts, TabDeco, TabStyle, CONTROLS_W, STRIP_PAD,
     TABBAR_H, TAB_COLORS,
 };
-pub use welcome::{build_welcome_overlay, WelcomeOverlay};
+pub use welcome::{build_welcome_overlay, welcome_tip, WelcomeOverlay};
 pub use search_bar::{
     build_search_bar, search_current_fg, search_hit_rects, search_recolor_spans, SearchBar,
 };

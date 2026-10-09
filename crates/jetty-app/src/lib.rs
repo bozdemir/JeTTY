@@ -67,6 +67,18 @@ pub fn copy_mode_block_sides(anchor_col: usize, cursor_col: usize) -> (bool, boo
     copymode::block_sides(anchor_col, cursor_col)
 }
 
+/// The welcome splash's tip line for keymap `km`: the command palette's
+/// first chord as bound (the help overlay's form).
+pub fn welcome_tip(km: &keymap::KeyMap) -> String {
+    let chord = km.pretty_chords(keymap::BindableAction::OpenPalette).into_iter().next().unwrap_or_default();
+    jetty_render::welcome_tip(&chord)
+}
+
+/// [`welcome_tip`] under the DEFAULT keymap (for `jetty-shot`).
+pub fn default_welcome_tip() -> String {
+    welcome_tip(&keymap::KeyMap::defaults())
+}
+
 /// The tab context menu's rows (for `jetty-shot`'s JETTY_SHOT_TAB_MENU).
 pub fn shot_tab_menu_items(can_detach: bool) -> Vec<&'static str> {
     detached::tab_menu_items(can_detach)

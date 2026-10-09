@@ -1759,11 +1759,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Below the prompt, as in the app (the cursor row + 1).
             let prompt_rows = snap.cursor_row.min(snap.rows.saturating_sub(1)) + 1;
             let splash = jetty_render::build_welcome_overlay(
-                width,
-                height,
                 shot_origin.top + prompt_rows as f32 * wch,
                 env!("CARGO_PKG_VERSION"),
                 "Vulkan",
+                &jetty_app::default_welcome_tip(),
                 terminal.theme(),
                 wcw,
                 wch,

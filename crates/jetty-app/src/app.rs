@@ -14525,6 +14525,8 @@ impl ApplicationHandler<AppEvent> for App {
                 } else {
                     Vec::new()
                 };
+                // The welcome splash's tip names the palette chord as bound.
+                let welcome_tip = if welcome_open { crate::welcome_tip(&self.keymap) } else { String::new() };
                 let tab_menu_hints: Vec<String> = if tab_menu.is_some() {
                     tab_menu_labels
                         .iter()
@@ -14987,11 +14989,10 @@ impl ApplicationHandler<AppEvent> for App {
                         // types on. It follows the cursor until the first key.
                         let prompt_rows = snap.cursor_row.min(snap.rows.saturating_sub(1)) + 1;
                         let mut splash = jetty_render::build_welcome_overlay(
-                            width,
-                            height,
                             origin.top + slide_y_offset + prompt_rows as f32 * welcome_ch,
                             env!("CARGO_PKG_VERSION"),
                             &gpu_backend_name,
+                            &welcome_tip,
                             &theme,
                             welcome_cw,
                             welcome_ch,
