@@ -4500,70 +4500,42 @@ impl App {
         // monitor info is available, use the raw position; on Wayland
         // set_outer_position is a no-op (accepted degradation, no DE code).
         //
-        // MIXED-DPI (F9): `drop_global` is main-window-scale physical px (main
-        // outer_position + cursor), but each monitor's position()/size() is in
-        // ITS OWN scale's physical px — on a mixed-DPI macOS setup those spaces
-        // are not comparable, so the containment test picked the wrong monitor and
-        // the clamp pinned the window off the drop point. Do the whole
-        // containment+clamp in scale-INDEPENDENT LOGICAL points (a single unified
-        // desktop space on both macOS and X11) and set a LogicalPosition, so winit
-        // maps it back per the target display. At a uniform scale (X11) this is a
-        // no-op, so the working path is unchanged.
+        // MIXED-DPI (F9): `drop_global` is the main window's outer position +
+        // the cursor, in its physical px, and each monitor's position()/size()
+        // is in ITS OWN scale's px. The containment and clamp run in the one
+        // space the desktop shares (`detached::desktop_unit_scale`): points on
+        // macOS — set as a LogicalPosition, which winit maps back per display —
+        // and pixels on X11 / Windows, whose root window / virtual screen IS one
+        // pixel space (a monitor's own "logical" rect sat outside it at mixed
+        // DPI, and a drop on the 2× monitor landed on the 1× one). At one
+        // uniform scale both are the same placement.
         if let Some((gx, gy)) = drop_global {
-            let main_scale = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0);
-            // Drop point and window size in logical points.
-            let drop_lx = gx / main_scale;
-            let drop_ly = gy / main_scale;
-            let dw_scale = dw.window.scale_factor();
-            let ws = dw.window.outer_size();
-            let win_lw = ws.width as f64 / dw_scale;
-            let win_lh = ws.height as f64 / dw_scale;
-            // A monitor's logical rect = its physical rect / its OWN scale.
-            let mon_logical = |m: &winit::monitor::MonitorHandle| {
-                let p = m.position();
-                let s = m.size();
-                let sc = m.scale_factor();
-                (p.x as f64 / sc, p.y as f64 / sc, s.width as f64 / sc, s.height as f64 / sc)
-            };
-            let contains = |m: &winit::monitor::MonitorHandle| {
-                let (mx, my, mw, mh) = mon_logical(m);
-                drop_lx >= mx && drop_lx < mx + mw && drop_ly >= my && drop_ly < my + mh
-            };
-            let target = dw
-                .window
-                .available_monitors()
-                .find(contains)
-                .or_else(|| {
-                    dw.window.available_monitors().min_by(|a, b| {
-                        let d = |m: &winit::monitor::MonitorHandle| {
-                            let (mx, my, mw, mh) = mon_logical(m);
-                            let cx = mx + mw / 2.0;
-                            let cy = my + mh / 2.0;
-                            (drop_lx - cx).powi(2) + (drop_ly - cy).powi(2)
-                        };
-                        d(a).total_cmp(&d(b))
-                    })
+            let macos = cfg!(target_os = "macos");
+            let unit = |scale: f64| crate::detached::desktop_unit_scale(scale, macos);
+            let main_unit = unit(self.window.as_ref().map_or(1.0, |w| w.scale_factor()));
+            let (dw_unit, ws) = (unit(dw.window.scale_factor()), dw.window.outer_size());
+            let mut monitors: Vec<winit::monitor::MonitorHandle> = dw.window.available_monitors().collect();
+            if monitors.is_empty() {
+                monitors.extend(dw.window.current_monitor());
+            }
+            let rects: Vec<(f64, f64, f64, f64)> = monitors
+                .iter()
+                .map(|m| {
+                    let (p, sz, u) = (m.position(), m.size(), unit(m.scale_factor()));
+                    (p.x as f64 / u, p.y as f64 / u, sz.width as f64 / u, sz.height as f64 / u)
                 })
-                .or_else(|| dw.window.current_monitor());
-            let (lx, ly) = match target {
-                Some(mon) => {
-                    let (mx, my, mw, mh) = mon_logical(&mon);
-                    // Clamp the top-left (in logical points) so the whole window
-                    // stays on the target monitor. Sub-pixel logical placement is
-                    // irrelevant, so round to integers and reuse clamp_pos.
-                    let (cx, cy) = crate::detached::clamp_pos(
-                        drop_lx.round() as i32,
-                        drop_ly.round() as i32,
-                        win_lw.round() as u32,
-                        win_lh.round() as u32,
-                        (mx.round() as i32, my.round() as i32, mw.round() as u32, mh.round() as u32),
-                    );
-                    (cx as f64, cy as f64)
-                }
-                None => (drop_lx, drop_ly),
+                .collect();
+            let (x, y) = crate::detached::drop_position(
+                (gx / main_unit, gy / main_unit),
+                (ws.width as f64 / dw_unit, ws.height as f64 / dw_unit),
+                &rects,
+            );
+            let at: winit::dpi::Position = if macos {
+                winit::dpi::LogicalPosition::new(x, y).into()
+            } else {
+                winit::dpi::PhysicalPosition::new(x.round() as i32, y.round() as i32).into()
             };
-            dw.window
-                .set_outer_position(winit::dpi::LogicalPosition::new(lx, ly));
+            dw.window.set_outer_position(at);
         }
 
         // Reflow the moved tab to the detached window's grid: the client area
@@ -11421,21 +11393,20 @@ impl App {
                 if let Some((gx, gy)) = drop_global {
                     if self.visible {
                         // Convert the detached-window release point and the main
-                        // window's outer rect BOTH into scale-independent LOGICAL
-                        // points before the band test, so a drop from a
-                        // different-DPI monitor lands correctly (F9). At a uniform
-                        // scale this is identity, so the X11 path is unchanged.
-                        let dw_scale = self
-                            .detached
-                            .get(pos)
-                            .map(|d| d.window.scale_factor())
-                            .unwrap_or(1.0);
+                        // window's outer rect BOTH into the one space the desktop
+                        // shares (`detached::desktop_unit_scale`: points on macOS,
+                        // pixels on X11 / Windows) before the band test, so a drop
+                        // from a different-DPI monitor lands correctly (F9). At a
+                        // uniform scale both are the same test.
+                        let macos = cfg!(target_os = "macos");
+                        let unit = |scale: f64| crate::detached::desktop_unit_scale(scale, macos);
+                        let dw_scale = unit(self.detached.get(pos).map(|d| d.window.scale_factor()).unwrap_or(1.0));
                         // The main window's chrome bands, in ITS physical px.
                         let (main_bar_h, main_status_h) = (self.bar_h() as f64, self.status_h() as f64);
                         if let (Some(win), Some(gpu)) = (&self.window, &self.gpu) {
                             if let Ok(mp) = win.outer_position() {
-                                let main_scale = win.scale_factor();
-                                // EVERY input in logical points — including the
+                                let main_scale = unit(win.scale_factor());
+                                // EVERY input in that space — including the
                                 // bar/strip heights, which used to be passed in
                                 // physical px (a too-high, half-overlapping band
                                 // on a 2× display).

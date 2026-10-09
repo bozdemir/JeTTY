@@ -96,9 +96,10 @@ pub fn index_after_move(i: usize, from: usize, to: usize) -> usize {
 /// position; `main_w/main_h` its surface size.
 ///
 /// All coordinates must be in ONE consistent unit space. The caller passes
-/// scale-independent LOGICAL points so a drop from a detached window on a
-/// DIFFERENT-DPI monitor is tested against the main window's band in the same
-/// units (mixing per-window physical scales made the band test miss — F9).
+/// the space the whole desktop shares ([`desktop_unit_scale`]) so a drop from a
+/// detached window on a DIFFERENT-DPI monitor is tested against the main
+/// window's band in the same units (mixing per-window scales made the band
+/// test miss — F9).
 #[allow(clippy::too_many_arguments)]
 pub fn main_tabbar_contains(
     gx: f64,
@@ -122,6 +123,41 @@ pub fn main_tabbar_contains(
         0.0
     };
     ly >= bar_y && ly < bar_y + tabbar_h
+}
+
+/// The scale that maps a window's or monitor's physical px into the ONE unit
+/// space every desktop coordinate shares: macOS lays its displays out in
+/// points (logical), so there it is that window's / monitor's own scale; X11's
+/// root window and Windows' virtual screen are laid out in pixels, where a
+/// monitor's own "logical" rect is not part of any shared space at mixed DPI —
+/// 1 there. Only the OS decides this, never the desktop environment.
+pub fn desktop_unit_scale(scale: f64, macos: bool) -> f64 {
+    if macos && scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+/// Where a torn-off tab's window goes: its top-left at the `drop` point, kept
+/// on the monitor that contains it (else the nearest) — `win` its size and
+/// `monitors` their `(x, y, w, h)` rects, all in the desktop's one unit space
+/// ([`desktop_unit_scale`]). With no monitor known, the drop point itself.
+pub fn drop_position(drop: (f64, f64), win: (f64, f64), monitors: &[(f64, f64, f64, f64)]) -> (f64, f64) {
+    let (dx, dy) = drop;
+    let contains = |m: &&(f64, f64, f64, f64)| dx >= m.0 && dx < m.0 + m.2 && dy >= m.1 && dy < m.1 + m.3;
+    let dist = |m: &(f64, f64, f64, f64)| (dx - (m.0 + m.2 / 2.0)).powi(2) + (dy - (m.1 + m.3 / 2.0)).powi(2);
+    let target = monitors.iter().find(contains).or_else(|| monitors.iter().min_by(|a, b| dist(a).total_cmp(&dist(b))));
+    let Some(&(mx, my, mw, mh)) = target else { return drop };
+    // Sub-pixel placement is irrelevant: whole units through `clamp_pos`.
+    let (x, y) = clamp_pos(
+        dx.round() as i32,
+        dy.round() as i32,
+        win.0.round() as u32,
+        win.1.round() as u32,
+        (mx.round() as i32, my.round() as i32, mw.round() as u32, mh.round() as u32),
+    );
+    (x as f64, y as f64)
 }
 
 /// Clamp a window top-left `(x, y)` so a `win_w`×`win_h` window stays inside
@@ -958,6 +994,27 @@ mod tests {
     }
 
     // ── on-screen clamp for the drop-placed window ──────────────────────────
+
+    #[test]
+    fn a_torn_off_tab_lands_where_it_was_dropped_at_mixed_dpi() {
+        // X11, monitor A 1920 px at 1×, monitor B at x = 1920, 3840 px at 2×
+        // (per-monitor scales from RandR, no Xft.dpi). Root coordinates are
+        // one PIXEL space: a drop at x = 3000 is on B. Each monitor's own
+        // logical rect (B: 960..2880) is not part of any shared space — there
+        // the drop matched no monitor and the window ended up on A.
+        let x11 = |px: f64, sc: f64| px / desktop_unit_scale(sc, false);
+        let mons = [(x11(0.0, 1.0), 0.0, x11(1920.0, 1.0), 1080.0), (x11(1920.0, 2.0), 0.0, x11(3840.0, 2.0), 2160.0)];
+        assert_eq!(drop_position((3000.0, 500.0), (1600.0, 1000.0), &mons), (3000.0, 500.0));
+        // Near B's right edge: kept on B, never pushed back onto A.
+        assert_eq!(drop_position((5500.0, 500.0), (1600.0, 1000.0), &mons), (5760.0 - 1600.0, 500.0));
+        // macOS lays displays out in points: each rect / its own scale.
+        let mac = |pt: f64, sc: f64| pt / desktop_unit_scale(sc, true);
+        let mons = [(0.0, 0.0, mac(2880.0, 2.0), mac(1800.0, 2.0)), (mac(2880.0, 2.0), 0.0, 1920.0, 1080.0)];
+        assert_eq!(drop_position((2000.0, 300.0), (800.0, 500.0), &mons), (2000.0, 300.0));
+        // Off every monitor: the nearest one; none known: the drop point.
+        assert_eq!(drop_position((-300.0, 200.0), (800.0, 500.0), &mons), (0.0, 200.0));
+        assert_eq!(drop_position((-300.0, 200.0), (800.0, 500.0), &[]), (-300.0, 200.0));
+    }
 
     #[test]
     fn clamp_pos_keeps_window_on_the_monitor() {
