@@ -348,20 +348,24 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         col = phosphor_map(col / a) * a;
     }
 
-    // --- 3) Scanlines (output space), tinted by p.tint.rgb. The static beam is
-    // 1 on even rows, 0 on odd ones (sin((y + 0.5)·π)); roll advances its phase. ---
+    // --- 3) Scanlines (output space), tinted by p.tint.rgb, one per DPI-scaled
+    // cell row (2× shows the 1× look, magnified — not lines half its size that
+    // read as a flat dimming). The static beam is 1 on even rows, 0 on odd ones
+    // (sin((row + 0.5)·π)); roll advances its phase. ---
     if (FEAT_SCAN) {
-        var beam = select(0.0, 1.0, (pix.y & 1u) == 0u);
+        let row = floor(in.pos.y / max(x.fx.y, 1.0));
+        var beam = select(0.0, 1.0, (u32(row) & 1u) == 0u);
         if (FEAT_ANIM && roll_on) {
-            beam = 0.5 + 0.5 * sin(in.uv.y * res.y * PI + p.time * ROLL_SPEED);
+            beam = 0.5 + 0.5 * sin((row + 0.5) * PI + p.time * ROLL_SPEED);
         }
         let darken = p.scanline * beam;
         col = col * ((1.0 - darken) * mix(vec3(1.0, 1.0, 1.0), p.tint.rgb, darken));
     }
 
-    // --- 4) Shadow-mask / aperture grille: vertical RGB stripes per column. ---
+    // --- 4) Shadow-mask / aperture grille: vertical RGB stripes per (DPI-scaled)
+    // column. ---
     if (FEAT_MASK) {
-        let idx = pix.x % 3u;
+        let idx = u32(in.pos.x / max(x.fx.y, 1.0)) % 3u;
         let triad = vec3(
             select(0.0, 1.0, idx == 0u),
             select(0.0, 1.0, idx == 1u),
@@ -1539,6 +1543,111 @@ mod tests {
         let p = CrtParams::build(&s, &frame());
         assert_eq!(p.ext.fg[3], bloom_blur(0.3).0);
         assert_eq!(p.ext.paper[3], 0.3, "the radius rides in paper.w");
+    }
+
+    /// The CRT pass over a white 64×48 scene at `dpi_scale`, read back as
+    /// RGBA8 (sRGB) rows. Needs a GPU adapter (the `#[ignore]` tests).
+    fn crt_white_frame(s: &CrtSettings, dpi_scale: f32) -> Vec<[u8; 4]> {
+        let (w, h) = (64u32, 48u32);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let tex = |label| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        let (src, dst) = (tex("src"), tex("dst"));
+        let src_view = src.create_view(&Default::default());
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &src_view,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        queue.submit(Some(enc.finish()));
+        let crt = Crt::new(&device, format);
+        let p = CrtParams::build(
+            s,
+            &CrtFrame { width: w, height: h, corner_radius: 0.0, corner_radius_top: 0.0, dpi_scale, ..frame() },
+        );
+        crt.prepare(&device, p.key);
+        crt.apply(&device, &queue, &dst.create_view(&Default::default()), &src_view, &p);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (w * h * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            dst.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: None },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let bytes = buf.slice(..).get_mapped_range().to_vec();
+        bytes.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+    }
+
+    /// Scanlines and the shadow mask are sized in DPI-scaled cells, like the
+    /// grain and the dither: at 2× a scanline is two physical rows and a mask
+    /// stripe two columns — the 1× look, magnified. Per physical pixel they
+    /// were half that size and read as a flat dimming. Run with:
+    ///   cargo test -p jetty-render crt_patterns_follow_the_dpi -- --ignored
+    #[test]
+    #[ignore]
+    fn crt_patterns_follow_the_dpi() {
+        let scan = CrtSettings { scanline: 1.0, ..CrtSettings::PASSTHROUGH };
+        let lit = |px: [u8; 4]| px[0] > 128;
+        for (dpi, period) in [(1.0, 1usize), (2.0, 2)] {
+            let img = crt_white_frame(&scan, dpi);
+            // The beam darkens the even lines.
+            let rows: Vec<bool> = (0..8).map(|y| lit(img[y * 64 + 32])).collect();
+            let want: Vec<bool> = (0..8).map(|y| (y / period) % 2 == 1).collect();
+            assert_eq!(rows, want, "scanline rows at {dpi}×");
+        }
+        let mask = CrtSettings { mask: 1.0, ..CrtSettings::PASSTHROUGH };
+        for (dpi, period) in [(1.0, 1usize), (2.0, 2)] {
+            let img = crt_white_frame(&mask, dpi);
+            // The one full channel of each column: its triad stripe.
+            let stripe: Vec<usize> =
+                (0..12).map(|x| (0..3).max_by_key(|&c| img[20 * 64 + x][c]).unwrap()).collect();
+            let want: Vec<usize> = (0..12).map(|x| (x / period) % 3).collect();
+            assert_eq!(stripe, want, "mask stripes at {dpi}×");
+        }
     }
 
     /// Smoke-test `Crt` on a real device: prepare a few variants (incl. bloom)
