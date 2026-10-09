@@ -7,6 +7,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.28.0] — 2026-10-09
+
+**The fix-and-polish release.** Ten parallel reviews of the whole codebase —
+renderer, terminal emulation, shell, input, config, Settings, performance,
+selection, windows and the v0.27 visuals — found and fixed about sixty bugs,
+including a crash that v0.27.0 has. JeTTY now also runs on machines without
+Vulkan, F9 is faster and always takes the keyboard focus, and every frame costs
+less CPU.
+
+### Added
+- **Runs without Vulkan:** on machines with no Vulkan driver (VMs, older GPUs,
+  software rendering) JeTTY draws through OpenGL 3.3 / OpenGL ES 3.0, on X11 and
+  Wayland — it used to open an unpainted window. Where the only Vulkan driver is
+  a software one (lavapipe) but the GPU has an OpenGL driver, JeTTY uses the GPU.
+  `WGPU_BACKEND=gl` forces OpenGL, e.g. around a broken Vulkan driver.
+- **Settings from the keyboard:** Tab / Shift+Tab move through every control,
+  arrows adjust, Space / Enter toggle or press; palette links leave the focus on
+  their control.
+- **Tabs:** drag a tab along the bar to reorder it, scroll the mouse wheel over
+  the bar to switch tabs, middle-click a tab to close it.
+- **Copy-mode `Ctrl+V`** selects a rectangle; `v` / `V` / `Ctrl+V` switch kinds
+  keeping the anchor.
+- Double-clicking a URL selects the whole URL.
+- Ctrl-hovering a hyperlink whose text hides its real address shows where a
+  click would go.
+- `jetty --check-config` lists every config and theme problem; a configuration
+  reference, `docs/configuration.md`, covers every key (checked against the code
+  by a test).
+- Terminal: programs that ask which terminal this is (`CSI > q`: tmux,
+  notcurses, yazi…) are told `JeTTY(<version>)`; reverse-video screen mode
+  (`CSI ? 5 h` — vim's `visualbell`, terminfo `flash`); sixel support is
+  reported to programs that probe for it (lsix, tmux 3.4+); modes 47 / 1047 /
+  1048.
+- powerlevel10k: the integration line turns on p10k's own prompt marks — no
+  need to edit `~/.p10k.zsh` (a setting there is respected).
+- Picking the same backdrop image again reloads it if the file changed.
+
+### Changed
+- **Faster F9:** the summon hotkey no longer wakes JeTTY 20 times a second, and
+  F9 shows / hides the window up to 50 ms sooner (hide: 46 → 3 ms).
+- **Faster start, less memory on multi-GPU laptops:** JeTTY no longer loads
+  Vulkan drivers for GPUs it won't use (GPU setup 74 → 20 ms, ~90 MB less memory;
+  the NVIDIA GPU is left alone under the default low-power pick), and wgpu no
+  longer compiles unused validation shaders (~2 ms).
+- **Cheaper frames:** the terminal snapshot costs about half as much, and the tab
+  bar, status bar and cursor/scrollbar layer draw in one pass (a 240×70 typing
+  frame: 0.51 → 0.43 ms CPU). Large PNG backdrops load with about half the
+  memory.
+- `$SHELL` inside JeTTY names the shell JeTTY runs, so tmux, `vim :sh` and
+  `sudo -s` open the same shell.
+- Config values are read in any letter case (`tab_style = "Underline"`); unknown
+  or misspelled keys, values, theme and font names are reported with the closest
+  valid spelling (an unknown value no longer resets the live setting on reload);
+  out-of-range numbers are reported; TOML errors give line and column. Themes can
+  be named the way Settings shows them (`"Solarized Light"`).
+- The command palette ranks a command's exact name first, then whole-word
+  matches, then scattered letters.
+- Release builds' `jetty --version` names their commit instead of "dev".
+- The welcome screen's tip points at the command palette shortcut.
+
+### Fixed
+- **Crashes and hangs:** JeTTY could crash when a program scrolled a region
+  below a fixed top line while you were scrolled back (v0.27.0 too), and the view
+  drifted up a line per scroll. A new tab from a directory on a dead network
+  mount froze JeTTY. A shell that dies right after starting (a broken `~/.zshrc`)
+  closed JeTTY — its error now stays on screen and the next available shell
+  opens. With no usable GPU, or no shell at all, JeTTY ran invisibly or exited
+  "successfully" — it now says what to fix and exits with status 1.
+- **F9 and windows:** under KWin, F9 could bring JeTTY to the front while your
+  typing still went to the previous window. Changing the display scale and back
+  shrank windows (to 379×213 in a corner). On Wayland, hiding left a frozen
+  window on screen. At the minimum window width the tab ran under the window
+  controls.
+- **Keyboard and mouse:** Ctrl with punctuation on non-US layouts sent the US
+  key's control code — Ctrl+; on Turkish-Q and Ctrl+# on German sent SIGQUIT to
+  the running program. A click on the status strip clicked the program's bottom
+  row (htop's F9 Kill / F10 Quit). A `[keys]` binding couldn't take another
+  action's default shortcut depending on declaration order. F13–F24 showed as
+  "Unknown".
+- **Shell integration:** Enter on an empty prompt after a failed command marked
+  that prompt failed (powerlevel10k, bash); bash users' own `PROMPT_COMMAND`
+  hooks always saw success. Pastes over 64 MiB vanished.
+- **Terminal emulation:** color queries (OSC 4/10/11/12) reported the theme's
+  colors after a program set its own (neovim, bat, delta picked the wrong
+  background); deleting characters past the line end erased text left of the
+  cursor; editing through half of a wide character left the other half behind;
+  copying a row whose wide character wrapped pasted a wrong character; cursor
+  motion at the margins and after a full line now follows xterm; replies inside
+  a synchronized update keep their order.
+- **Rendering:** translucent themes on OpenGL; CRT, the CRT Looks and the aurora
+  backdrop went black on GPUs that can't render half-float textures; a GPU error
+  repeating every frame flooded the log. Animated backdrops redrew the whole
+  background on every frame while typing; phone photos showed sideways (EXIF);
+  in Dropdown mode the Phosphor glow, window border, bell rim and command pulse
+  drew outside the sliding window; turning CRT off freed none of its GPU memory
+  (~10 MB). A `font_family` that isn't installed rendered the grid in a
+  proportional font — JeTTY now falls back to a monospace one.
+- **Selection, search, copy-mode:** a search with thousands of matches jumped
+  far up into history; a selected wide character was highlighted on one half;
+  copy-mode treated wide characters as two cells, hid the cursor under its pill,
+  left the view in history on exit and lost the cursor on resize; pasting while
+  scrolled back didn't jump to the prompt; Run in New Tab kept the border of an
+  indented box; hint mode split quoted paths and UUIDs.
+- **Config and themes:** a theme file broken mid-edit flipped the terminal to the
+  default theme (the last good version stays now); Settings could replace a
+  read-only `config.toml`; editing `summon_hotkey` while running did nothing
+  visible (it now says it needs a restart).
+- **Settings, palette, help:** the font-size steppers cut their value at 1.25×
+  and 1.5×; a narrow Settings window overlapped its controls and hid tabs; the
+  theme gallery showed 46 themes under 38 names; palette links to a control
+  hidden in the current mode landed on nothing; touchpad scrolling in the palette
+  and font lists raced or stalled; "Open Settings…" didn't bring an open Settings
+  window forward; the help overlay's dividers struck through its headings; the
+  welcome splash didn't scale on HiDPI.
+
 ## [0.27.0] — 2026-10-09
 
 **Visuals v2.** One-click Looks, new themes, a background layer, a faster and
