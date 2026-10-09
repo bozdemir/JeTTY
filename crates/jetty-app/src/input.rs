@@ -487,34 +487,61 @@ pub fn decide_key(
 /// observed (DECSET 1004 focus reporting).
 #[derive(Debug, Default)]
 pub struct TabInputState {
-    /// Physical keys whose press reached this tab's PTY and are not released
-    /// yet. A handful at most; bounded so a release lost to a window teardown
-    /// can never grow it.
-    keys_down: Vec<PhysicalKey>,
+    /// Keys whose press reached this tab's PTY and are not released yet. A
+    /// handful at most; bounded so a release lost to a window teardown can
+    /// never grow it.
+    keys_down: Vec<HeldKey>,
     /// Focus state at the last observation (`None` before the first): a report
     /// is due only on a CHANGE, never when the app merely enables the mode.
     focus_seen: Option<bool>,
+}
+
+/// A key whose press a tab was sent, kept with what its release is encoded
+/// from — for the release JeTTY sends itself when the platform never does
+/// (focus left the window with the key down; see [`TabInputState::take_held`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeldKey {
+    pub physical: PhysicalKey,
+    /// The press's [`KeyInput`] fields of the same names.
+    pub logical: Key,
+    pub key_without_modifiers: Key,
+    pub location: KeyLocation,
+}
+
+impl HeldKey {
+    /// This key's release, sent while `mods` are held.
+    pub fn release(&self, mods: KeyMods) -> KeyInput<'_> {
+        KeyInput {
+            physical: self.physical,
+            logical: &self.logical,
+            key_without_modifiers: &self.key_without_modifiers,
+            text: None,
+            location: self.location,
+            kind: KeyEventKind::Release,
+            mods,
+        }
+    }
 }
 
 impl TabInputState {
     /// Most keys a tab tracks as held; the oldest is forgotten past this.
     pub const MAX_KEYS_DOWN: usize = 16;
 
-    /// A press (not an auto-repeat) of `physical` was written to this tab's PTY.
-    pub fn note_press(&mut self, physical: PhysicalKey) {
-        if self.keys_down.contains(&physical) {
+    /// A press (or an auto-repeat) of `key` was written to this tab's PTY.
+    pub fn note_press(&mut self, key: HeldKey) {
+        if self.holds(key.physical) {
             return;
         }
         if self.keys_down.len() == Self::MAX_KEYS_DOWN {
             self.keys_down.remove(0);
         }
-        self.keys_down.push(physical);
+        self.keys_down.push(key);
     }
 
     /// `physical` was released. True when this tab saw its press — the release
     /// belongs to it — and forgets the key.
     pub fn take_release(&mut self, physical: PhysicalKey) -> bool {
-        match self.keys_down.iter().position(|k| *k == physical) {
+        match self.keys_down.iter().position(|k| k.physical == physical) {
             Some(i) => {
                 self.keys_down.remove(i);
                 true
@@ -525,7 +552,15 @@ impl TabInputState {
 
     /// Whether this tab saw a press of `physical` that wasn't released yet.
     pub fn holds(&self, physical: PhysicalKey) -> bool {
-        self.keys_down.contains(&physical)
+        self.keys_down.iter().any(|k| k.physical == physical)
+    }
+
+    /// Every key still held, oldest first, now forgotten: the window lost the
+    /// keyboard with them down, and the releases are owed now. X11 sends them
+    /// itself before the focus loss (and `take_release` takes those first);
+    /// Wayland and macOS never do.
+    pub fn take_held(&mut self) -> Vec<HeldKey> {
+        std::mem::take(&mut self.keys_down)
     }
 
     /// Observe whether this tab is the focused one, returning the report due:
@@ -564,12 +599,18 @@ mod tab_input_tests {
     const A: PhysicalKey = PhysicalKey::Code(KeyCode::KeyA);
     const B: PhysicalKey = PhysicalKey::Code(KeyCode::KeyB);
 
+    /// The press of `physical`, typing `text`.
+    fn key(physical: PhysicalKey, text: &str) -> HeldKey {
+        let logical = Key::Character(text.into());
+        HeldKey { physical, key_without_modifiers: logical.clone(), logical, location: KeyLocation::Standard }
+    }
+
     #[test]
     fn releases_go_only_to_the_tab_that_saw_the_press() {
         let mut s = TabInputState::default();
         assert!(!s.take_release(A), "a release with no press (e.g. the summon key) is not ours");
-        s.note_press(A);
-        s.note_press(A); // auto-repeat / duplicate: still one entry
+        s.note_press(key(A, "a"));
+        s.note_press(key(A, "a")); // auto-repeat / duplicate: still one entry
         assert!(s.holds(A));
         assert!(s.take_release(A));
         assert!(!s.take_release(A), "exactly one release per press");
@@ -585,12 +626,36 @@ mod tab_input_tests {
             KeyCode::KeyK, KeyCode::KeyL, KeyCode::KeyM, KeyCode::KeyN, KeyCode::KeyO,
             KeyCode::KeyP, KeyCode::KeyQ, KeyCode::KeyR,
         ] {
-            s.note_press(PhysicalKey::Code(c));
+            s.note_press(key(PhysicalKey::Code(c), "x"));
         }
         assert_eq!(s.keys_down.len(), TabInputState::MAX_KEYS_DOWN);
         assert!(!s.holds(A), "the oldest is forgotten first");
         assert!(!s.holds(B));
         assert!(s.holds(PhysicalKey::Code(KeyCode::KeyR)));
+    }
+
+    #[test]
+    fn keys_still_held_when_the_focus_leaves_are_released_once() {
+        let mut s = TabInputState::default();
+        s.note_press(key(A, "a"));
+        s.note_press(key(B, "b"));
+        // X11 sends its own releases before the focus loss: those come first…
+        assert!(s.take_release(B));
+        // …and only what is left is still owed, oldest first, exactly once.
+        let held = s.take_held();
+        assert_eq!(held, vec![key(A, "a")]);
+        assert!(s.take_held().is_empty());
+        assert!(!s.take_release(A), "the real release that comes later sends nothing more");
+        // The release sent is the one the key would have had: `CSI 97;1:3u`
+        // with kitty event types on, nothing without them.
+        let decide = |flags| {
+            let modes = KeyModes { kitty_flags: flags, ..KeyModes::default() };
+            let ev = held[0].release(KeyMods::default());
+            decide_key_event(&KeyMap::defaults(), &ev, &modes, &KeyOptions::default(), false)
+        };
+        assert_eq!(decide(KITTY_DISAMBIGUATE | KITTY_REPORT_EVENT_TYPES), KeyAction::Send(b"\x1b[97;1:3u".to_vec()));
+        assert_eq!(decide(KITTY_DISAMBIGUATE), KeyAction::None);
+        assert_eq!(decide(0), KeyAction::None);
     }
 
     #[test]

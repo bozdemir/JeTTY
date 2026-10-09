@@ -8153,13 +8153,23 @@ impl App {
     /// `CSI O` + `CSI I` pair. Called from `about_to_wait` after every event
     /// batch, so no focus/visibility/tab-switch path needs its own hook; it only
     /// reads a mode bit per tab when nothing changed.
+    /// The tabs of a window without the keyboard (unfocused, or hidden) also
+    /// get the releases of keys they still hold (`release_held_keys`) — before
+    /// their `CSI O`, the order of X11's own synthetic releases.
     fn sync_focus_reports(&mut self) {
         let main_focused = self.visible && self.main_focused;
         let active = self.active;
+        let (keymap, mods, opt) = (&self.keymap, self.key_modifiers, self.macos_option_as_alt);
         for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if !main_focused {
+                release_held_keys(keymap, tab, &mods, opt);
+            }
             report_focus(tab, main_focused && i == active);
         }
         for dw in &mut self.detached {
+            if !dw.focused {
+                release_held_keys(keymap, &mut dw.tab, &mods, opt);
+            }
             report_focus(&mut dw.tab, dw.focused);
         }
     }
@@ -10644,7 +10654,7 @@ impl App {
                         // — the shared input core, same as the main Send arm
                         // (v0.23 Task 9).
                         let modifier = input::is_modifier_key(&event.logical_key);
-                        write_key_to_pty(&mut dw.tab, &bytes, Some(event.physical_key), !modifier);
+                        write_key_to_pty(&mut dw.tab, &bytes, Some(&event), !modifier);
                         // No paint here — the echo paints (same rule and fallback
                         // deadline as the main window's Send arm).
                         let now = std::time::Instant::now();
@@ -10666,8 +10676,9 @@ impl App {
             }
             // Key RELEASE: owed to this window's tab only if it was sent the
             // press (kitty keyboard protocol event types; a no-op otherwise).
-            // Synthetic releases (keys still held when focus leaves) are
-            // forwarded too, so a program never sees a key stuck down.
+            // X11's synthetic releases (keys still held when focus leaves) are
+            // forwarded too; elsewhere `release_held_keys` sends those, so a
+            // program never sees a key stuck down.
             WindowEvent::KeyboardInput { event, .. } => {
                 let (keymap, mods, opt) = (&self.keymap, self.key_modifiers, self.macos_option_as_alt);
                 if let Some(dw) = self.detached.get_mut(pos) {
@@ -12454,8 +12465,9 @@ impl ApplicationHandler<AppEvent> for App {
         // PTY output left queued by this iteration's drains is scheduled for the
         // next one (and idle tabs re-armed). First, so no early return skips it.
         self.rearm_pty_wakes();
-        // DECSET 1004 focus reports for whatever this event batch changed
-        // (OS focus, summon/hide, a tab switch) — one pass, every window.
+        // DECSET 1004 focus reports (and the releases of keys held as a window
+        // lost the keyboard) for whatever this event batch changed (OS focus,
+        // summon/hide, a tab switch) — one pass, every window.
         self.sync_focus_reports();
         // Input-latency percentile emit (JETTY_PERF_LOG only): runs HERE, off the
         // timed present path, so printing a batch never stalls the frame it measured
@@ -15139,7 +15151,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // sees their input, then writes to the PTY (shared input
                         // core, v0.23 Task 9).
                         let modifier = input::is_modifier_key(&event.logical_key);
-                        write_key_to_pty(self.active_tab_mut(), &bytes, Some(event.physical_key), !modifier);
+                        write_key_to_pty(self.active_tab_mut(), &bytes, Some(&event), !modifier);
                         // Input-latency START stamp (JETTY_PERF_LOG only): record the
                         // keystroke instant so the frame that reflects its echo can
                         // measure keypress→glyph. Gated on `perf.on` (a bool read once
@@ -15169,14 +15181,16 @@ impl ApplicationHandler<AppEvent> for App {
                     input::KeyAction::None => {}
                 }
             }
-            // Key RELEASE: owed only to the main-window tab that was sent the
+            // Key RELEASE: owed only to the main-window tabs that were sent the
             // press (kitty keyboard protocol event types; a no-op otherwise) —
-            // even if the user switched tabs meanwhile. Synthetic releases
-            // (keys still held when focus leaves) are forwarded too, so a
+            // even if the user switched tabs meanwhile, and to each of them
+            // when its auto-repeats went on in the tab switched to. X11's
+            // synthetic releases (keys still held when focus leaves) are
+            // forwarded too; elsewhere `release_held_keys` sends those, so a
             // program never sees a key stuck down.
             WindowEvent::KeyboardInput { event, .. } => {
                 let (keymap, mods, opt) = (&self.keymap, self.key_modifiers, self.macos_option_as_alt);
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.input.holds(event.physical_key)) {
+                for tab in &mut self.tabs {
                     write_key_release(keymap, tab, &event, &mods, opt);
                 }
             }
@@ -17073,16 +17087,17 @@ fn strip_double_click(
 /// main-only), the perf keystroke stamp, welcome-splash dismissal, and every
 /// modal/menu short-circuit stay in the per-window callers.
 ///
-/// `pressed` is the physical key when `bytes` encode a key PRESS (not an IME
+/// `pressed` is the key event when `bytes` encode a key PRESS (not an IME
 /// commit): the tab then owes that key's release to the program
-/// (`write_key_release`). `typing` is false for a lone modifier key, which only
-/// reaches the PTY as a kitty "report all keys" event: it is not the user
-/// typing, so it neither snaps the view nor cancels a staged inject (a
-/// Shift+drag selection in the scrollback must not jump to the bottom).
+/// (`write_key_release`, or `release_held_keys` when the focus leaves first).
+/// `typing` is false for a lone modifier key, which only reaches the PTY as a
+/// kitty "report all keys" event: it is not the user typing, so it neither
+/// snaps the view nor cancels a staged inject (a Shift+drag selection in the
+/// scrollback must not jump to the bottom).
 fn write_key_to_pty(
     tab: &mut Tab,
     bytes: &[u8],
-    pressed: Option<winit::keyboard::PhysicalKey>,
+    pressed: Option<&winit::event::KeyEvent>,
     typing: bool,
 ) {
     if typing {
@@ -17101,8 +17116,14 @@ fn write_key_to_pty(
     }
     let _ = tab.writer.write_all(bytes);
     let _ = tab.writer.flush();
-    if let Some(key) = pressed {
-        tab.input.note_press(key);
+    if let Some(event) = pressed.filter(|e| !tab.input.holds(e.physical_key)) {
+        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+        tab.input.note_press(input::HeldKey {
+            physical: event.physical_key,
+            logical: event.logical_key.clone(),
+            key_without_modifiers: event.key_without_modifiers(),
+            location: event.location,
+        });
     }
 }
 
@@ -17123,6 +17144,17 @@ fn decide_window_key(
     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
     let base = event.key_without_modifiers();
     let ev = key_input(event, &base, mods);
+    decide_tab_key(keymap, &ev, terminal, option_as_alt)
+}
+
+/// One key event (a winit one, or a release JeTTY sends itself) → its action,
+/// decided against the modes of the tab it goes to (see `decide_window_key`).
+fn decide_tab_key(
+    keymap: &crate::keymap::KeyMap,
+    ev: &input::KeyInput<'_>,
+    terminal: &Terminal,
+    option_as_alt: input::OptionAsAlt,
+) -> input::KeyAction {
     let modes = input::KeyModes {
         app_cursor: terminal.app_cursor_keys(),
         // DECKPAM changes no byte (NumLock overrides it — see `KeyModes`).
@@ -17130,7 +17162,7 @@ fn decide_window_key(
         alt_screen: terminal.alt_screen(),
         kitty_flags: terminal.kitty_keyboard_flags(),
     };
-    input::decide_key_event(keymap, &ev, &modes, &input::KeyOptions::native(option_as_alt), false)
+    input::decide_key_event(keymap, ev, &modes, &input::KeyOptions::native(option_as_alt), false)
 }
 
 /// One winit key event as the key encoder's [`input::KeyInput`]; `base` is
@@ -17170,6 +17202,29 @@ fn write_key_release(
     {
         let _ = tab.writer.write_all(&bytes);
         let _ = tab.writer.flush();
+    }
+}
+
+/// The releases of every key `tab` still holds, now that its window lost the
+/// keyboard (focus moved away, or the window hid) — `write_key_release`'s
+/// twin for the release that never comes. X11 reports releases for held keys
+/// itself, before the focus loss, so nothing is left here; Wayland and macOS
+/// report none, and a program with kitty event types (flag 2) believed the
+/// key was down until it was pressed and released in JeTTY again.
+fn release_held_keys(
+    keymap: &crate::keymap::KeyMap,
+    tab: &mut Tab,
+    mods: &winit::event::Modifiers,
+    option_as_alt: input::OptionAsAlt,
+) {
+    let mods = input::KeyMods::from_winit(mods);
+    for key in tab.input.take_held() {
+        if let input::KeyAction::Send(bytes) =
+            decide_tab_key(keymap, &key.release(mods), &tab.terminal, option_as_alt)
+        {
+            let _ = tab.writer.write_all(&bytes);
+            let _ = tab.writer.flush();
+        }
     }
 }
 
