@@ -132,10 +132,15 @@ fn match_ipv4(chars: &[char], i: usize, limit: usize) -> Option<usize> {
 }
 
 /// A git-style hex hash: 7–40 chars of `[0-9a-f]` (at least one letter, to avoid
-/// labelling plain long numbers), boundary-delimited. Returns the end, or `None`.
+/// labelling plain long numbers), boundary-delimited — or a whole UUID
+/// (`8-4-4-4-12` hex digits, either case), whose first group alone would
+/// otherwise pass for a hash. Returns the end, or `None`.
 fn match_hash(chars: &[char], i: usize, limit: usize) -> Option<usize> {
     if i > 0 && chars[i - 1].is_ascii_alphanumeric() {
         return None;
+    }
+    if let Some(e) = match_uuid(chars, i, limit) {
+        return Some(e);
     }
     let mut e = i;
     while e < limit {
@@ -161,14 +166,42 @@ fn match_hash(chars: &[char], i: usize, limit: usize) -> Option<usize> {
     Some(e)
 }
 
+/// A UUID (`8-4-4-4-12` hex digits, either case) starting at `i`, not followed
+/// by another alphanumeric. Returns the end, or `None`.
+fn match_uuid(chars: &[char], i: usize, limit: usize) -> Option<usize> {
+    let mut pos = i;
+    for (g, len) in [8usize, 4, 4, 4, 12].into_iter().enumerate() {
+        if g > 0 {
+            if pos >= limit || chars[pos] != '-' {
+                return None;
+            }
+            pos += 1;
+        }
+        if pos + len > limit || !chars[pos..pos + len].iter().all(char::is_ascii_hexdigit) {
+            return None;
+        }
+        pos += len;
+    }
+    if pos < limit && chars[pos].is_ascii_alphanumeric() {
+        return None;
+    }
+    Some(pos)
+}
+
+/// Longest quoted path the scanner looks for (chars between the quotes):
+/// bounds the closing-quote search, run at every opening quote.
+const MAX_QUOTED_PATH: usize = 256;
+
 fn is_path_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~' | '+' | '@' | '%')
 }
 
 /// A conservative file path: a run of path-safe chars that CONTAINS a `/`
-/// (absolute, relative, or `~/`), optionally with a trailing `:line[:col]`
-/// (grep/compiler output). Start must be a natural boundary. Returns the end,
-/// or `None`.
+/// (absolute, relative, or `~/`) and a name (an alphanumeric — `//`, `./` and
+/// `../` alone are no path), optionally with a trailing `:line[:col]`
+/// (grep/compiler output). Start must be a natural boundary. A path right
+/// after a quote may run to the closing quote, spaces included (Python's
+/// `File "/a b/c.py"`, `ls`'s `'/tmp/a b'`). Returns the end, or `None`.
 fn match_path(chars: &[char], i: usize, limit: usize) -> Option<usize> {
     if i > 0 {
         let p = chars[i - 1];
@@ -176,6 +209,11 @@ fn match_path(chars: &[char], i: usize, limit: usize) -> Option<usize> {
             || matches!(p, '(' | '[' | '{' | '<' | '"' | '\'' | '=' | ',' | ':');
         if !ok {
             return None;
+        }
+        if matches!(p, '"' | '\'') {
+            if let Some(e) = match_quoted_path(chars, i, limit, p) {
+                return Some(e);
+            }
         }
     }
     if i >= limit || !is_path_char(chars[i]) {
@@ -205,10 +243,27 @@ fn match_path(chars: &[char], i: usize, limit: usize) -> Option<usize> {
     if e <= i + 1 {
         return None;
     }
-    if !chars[i..e].contains(&'/') {
+    if !chars[i..e].contains(&'/') || !chars[i..e].iter().any(char::is_ascii_alphanumeric) {
         return None;
     }
     Some(e)
+}
+
+/// The path inside quotes `quote…quote` whose content starts at `i`: up to the
+/// closing quote (at most [`MAX_QUOTED_PATH`] chars on), when the content holds
+/// a space — a path without one the plain rule matches already — a `/`, a
+/// name, and nothing but path chars and spaces. Returns the content's end (the
+/// closing quote's index), or `None`.
+fn match_quoted_path(chars: &[char], i: usize, limit: usize, quote: char) -> Option<usize> {
+    let end = limit.min(i + MAX_QUOTED_PATH + 1);
+    let k = (i..end).find(|&k| chars[k] == quote)?;
+    let body = &chars[i..k];
+    let ok = body.first().is_some_and(|&c| is_path_char(c))
+        && body.contains(&' ')
+        && body.contains(&'/')
+        && body.iter().any(char::is_ascii_alphanumeric)
+        && body.iter().all(|&c| c == ' ' || is_path_char(c));
+    ok.then_some(k)
 }
 
 /// Assign short labels to `n` tokens. `n ≤ 26` → single home-row chars in scan
@@ -301,6 +356,46 @@ mod tests {
         assert!(scan("README.md is here").iter().all(|(_, k)| *k != TokenKind::Path));
         // Trailing punctuation trimmed.
         assert_eq!(scan("(see /etc/hosts)"), vec![("/etc/hosts".to_string(), TokenKind::Path)]);
+    }
+
+    #[test]
+    fn quoted_paths_keep_their_spaces() {
+        // Python tracebacks and `ls` quote a path that has a space in it; the
+        // scanner cut it at the space into two wrong tokens.
+        assert_eq!(
+            scan("  File \"/home/u/my project/app.py\", line 3"),
+            vec![("/home/u/my project/app.py".to_string(), TokenKind::Path)]
+        );
+        assert_eq!(
+            scan("ls: cannot access '/tmp/no such': No such file"),
+            vec![("/tmp/no such".to_string(), TokenKind::Path)]
+        );
+        // A quoted phrase without a slash is no path; an unterminated quote
+        // falls back to the plain rule.
+        assert!(scan("say \"hello world\" now").is_empty());
+        assert_eq!(scan("open '/tmp/a b"), vec![("/tmp/a".to_string(), TokenKind::Path)]);
+        // Quoted paths without spaces are unchanged.
+        assert_eq!(scan("'/etc/hosts'"), vec![("/etc/hosts".to_string(), TokenKind::Path)]);
+    }
+
+    #[test]
+    fn a_uuid_is_one_token() {
+        // Its first group alone used to come out as a git hash.
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(scan(&format!("id {id} ok")), vec![(id.to_string(), TokenKind::Hash)]);
+        let up = "550E8400-E29B-41D4-A716-446655440000";
+        assert_eq!(scan(&format!("ID={up}")), vec![(up.to_string(), TokenKind::Hash)]);
+        // Not quite a UUID: the hash rule as before.
+        assert_eq!(scan("550e8400-e29b ok"), vec![("550e8400".to_string(), TokenKind::Hash)]);
+    }
+
+    #[test]
+    fn a_run_of_slashes_and_dots_is_no_path() {
+        // `//` comments and a bare `https://` labelled a useless "//" token.
+        assert!(scan("x = 1; // note").is_empty());
+        assert!(scan("go ../ and ./ then //").is_empty());
+        assert!(scan("see https:// there").is_empty());
+        assert_eq!(scan("cd ../src"), vec![("../src".to_string(), TokenKind::Path)]);
     }
 
     #[test]
