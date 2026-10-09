@@ -8,8 +8,12 @@ reported in the window — not only on stderr.
 
 ## X11
 
-On X11, Jetty automatically registers a system-wide grab of the summon key at
-startup using the `global-hotkey` crate. No configuration is needed.
+On X11, Jetty grabs the summon key on the root window at startup — its own
+passive key grab (`jetty_platform::hotkey`, over x11rb) on a thread that sleeps
+in the kernel until the key is pressed: no polling, no idle wakeups. Every
+NumLock / CapsLock combination is grabbed too, a held key fires once, and a key
+another program already grabs is reported in the window. No configuration is
+needed.
 
 Key names are `global-hotkey`'s (`F12`, `KeyT`, `Digit1`, `Backquote`, `Space`
 …). A letter is the key your layout labels with it; the digit row and the
@@ -29,11 +33,12 @@ F9 does what you'd expect from the window's state:
   for one — lets it through. If the window manager still refuses (Wayland
   without an activation token), the next press within 1.5 s hides it.
 
-On summon the window is placed according to `window_mode` — re-centred on the
-current monitor (Center), re-docked to the top strip (Dropdown), or expanded to
-cover the whole monitor (Fullscreen) — then takes keyboard focus and replays the
-reveal effect. (Jetty launches visible — unless started with `--background` —
-so the first F9 press after startup hides it.)
+On summon the window is placed according to `window_mode` — centred the first
+time, then back where you left it as long as that spot is on a connected monitor
+(Center), re-docked to the top strip (Dropdown), or expanded to cover the whole
+monitor (Fullscreen) — then takes keyboard focus and replays the reveal effect.
+(Jetty launches visible — unless started with `--background` — so the first F9
+press after startup hides it.)
 
 In Fullscreen mode the OS fullscreen state is dropped on every hide and
 re-applied on every summon: it is never held while the window is hidden. That is
@@ -55,7 +60,15 @@ exits immediately — no window, no GUI work. (`jetty --background`, used by
 "Launch at login", starts Jetty hidden and does nothing if it already runs.)
 
 This is a generic, compositor-independent path — no portal, no
-desktop-environment-specific code, works on every compositor.
+desktop-environment-specific code, works on every compositor. Once hidden, the
+window comes back only through that binding (or `jetty --show`, or launching
+JeTTY again from the app menu, which forwards a toggle): a Wayland app cannot
+listen for a key it doesn't have focus for.
+
+JeTTY's X11 grab still reaches XWayland in a Wayland session, so `summon_hotkey`
+fires only while an X11 (XWayland) window has focus — which looks like a flaky
+hotkey. Bind `jetty --toggle` to the same key in the compositor instead; JeTTY
+doesn't report the grab as a problem there.
 
 ### KDE Plasma (Wayland)
 
@@ -122,7 +135,9 @@ it runs brings the terminal back, like `jetty --show`.
 - A newer JeTTY launched while an older one runs (an updated AppImage next to
   the old file, an upgraded package) toggles the running one, which then says
   how to switch; an AppImage also moves Launch at login to itself.
-- The built-in global grab uses the `global-hotkey` crate, which supports a
-  system-wide grab on X11, macOS, and Windows. On Wayland the crate cannot
-  register a grab, which is why the compositor-binding + IPC fallback is required
-  there. (Jetty targets Linux and macOS; Windows is untested.)
+- The built-in grab is JeTTY's own on X11 (`jetty_platform::hotkey`) and the
+  `global-hotkey` crate's Carbon hotkey on macOS; `summon_hotkey` uses that
+  crate's syntax on both, with the modifiers `Ctrl`, `Shift`, `Alt` / `Option`
+  and `Super` / `Cmd` (unlike `[keys]`, no `Opt`, `Win` or `Meta`). Wayland has
+  no global grab for apps, which is why the compositor binding + IPC path is
+  required there. (Jetty runs on Linux and macOS; it does not build on Windows.)
