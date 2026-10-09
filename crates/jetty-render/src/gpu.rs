@@ -44,6 +44,18 @@ pub fn instance_descriptor(backends: wgpu::Backends) -> wgpu::InstanceDescriptor
     wgpu::InstanceDescriptor { backends, display, flags, ..wgpu::InstanceDescriptor::new_without_display_handle() }
 }
 
+/// The backends of the instances [`GpuContext::new`] tries, in order. Unset
+/// `WGPU_BACKEND` (`pinned`): Vulkan alone first — its cold start skips EGL —
+/// then every backend. wgpu's own `WGPU_BACKEND` (`gl`, `vulkan`, …) pins them:
+/// the way around a broken Vulkan driver, and how the GL path runs on any machine.
+/// A value naming no backend is ignored.
+fn backend_attempts(pinned: Option<wgpu::Backends>) -> [Option<wgpu::Backends>; 2] {
+    match pinned.filter(|b| !b.is_empty()) {
+        Some(backends) => [Some(backends), None],
+        None => [Some(wgpu::Backends::VULKAN), Some(wgpu::Backends::all())],
+    }
+}
+
 /// The GPU objects every JeTTY window shares: ONE wgpu instance, adapter, device
 /// and queue. Acquiring them is the dominant GPU cost (~70–90 ms of adapter
 /// enumeration + device creation on the reference machine); a second window —
@@ -281,19 +293,23 @@ impl GpuContext {
             })).map_err(|e| format!("no compatible adapter: {e}"))?;
             Ok((instance, surface, adapter))
         };
-        // Vulkan is tried first; on non-Vulkan systems its failure is expected, so
-        // only the all-backends fallback's error is surfaced. That error names the
-        // step that actually failed (surface creation vs adapter request) instead of
-        // always reporting "no adapter".
-        let (instance, surface, adapter) = match make_instance_surface_adapter(wgpu::Backends::VULKAN) {
+        // Vulkan is tried first (`backend_attempts`); on non-Vulkan systems its
+        // failure is expected, so only the last attempt's error is surfaced. That
+        // error names the step that actually failed (surface creation vs adapter
+        // request) instead of always reporting "no adapter".
+        let mut picked = Err(String::new());
+        for backends in backend_attempts(wgpu::Backends::from_env()).into_iter().flatten() {
+            picked = make_instance_surface_adapter(backends);
+            if picked.is_ok() {
+                break;
+            }
+        }
+        let (instance, surface, adapter) = match picked {
             Ok(t) => t,
-            Err(_) => match make_instance_surface_adapter(wgpu::Backends::all()) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("jetty: GPU init failed ({e})");
-                    return None;
-                }
-            },
+            Err(e) => {
+                eprintln!("jetty: GPU init failed ({e})");
+                return None;
+            }
         };
         // Log the adapter ONCE per process (a window that cannot share the device
         // falls back to this path again — no need to reprint).
@@ -631,6 +647,21 @@ mod tests {
         assert!(instance_descriptor(Backends::VULKAN).display.is_none(), "the Vulkan path is unchanged");
         assert!(instance_descriptor(Backends::all()).display.is_some(), "GL presents through the display");
         assert!(instance_descriptor(Backends::GL).display.is_some());
+    }
+
+    /// Vulkan alone first, then every backend; `WGPU_BACKEND` (`gl`, `vulkan`, …)
+    /// pins them — the way around a broken Vulkan driver.
+    #[test]
+    fn wgpu_backend_pins_the_backends_tried() {
+        use super::backend_attempts;
+        let default = [Some(Backends::VULKAN), Some(Backends::all())];
+        assert_eq!(backend_attempts(None), default);
+        assert_eq!(backend_attempts(Some(Backends::GL)), [Some(Backends::GL), None]);
+        assert_eq!(backend_attempts(Some(Backends::VULKAN)), [Some(Backends::VULKAN), None]);
+        // An unknown value parses to no backend: ignored, not a GPU-less start.
+        assert_eq!(backend_attempts(Some(Backends::empty())), default);
+        assert_eq!(backend_attempts(Some(Backends::from_comma_list("foo"))), default);
+        assert_eq!(backend_attempts(Some(Backends::from_comma_list("gl"))), [Some(Backends::GL), None]);
     }
 
     /// JeTTY issues no indirect draws or dispatches: wgpu's indirect-call
