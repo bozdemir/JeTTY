@@ -69,6 +69,75 @@ pub fn backend_display_name(backend: wgpu::Backend) -> &'static str {
     }
 }
 
+/// GL renderer names of software rasterizers. GL reports no device type: wgpu
+/// guesses it from the renderer string and only knows llvmpipe, SwiftShader and
+/// "Mesa offscreen" as CPU — softpipe (Mesa without LLVM) or swrast came out
+/// "Other", like a real GPU.
+const SOFTWARE_GL: [&str; 5] = ["llvmpipe", "softpipe", "swrast", "swiftshader", "mesa offscreen"];
+
+/// Whether `info` is a software (CPU) rasterizer: lavapipe, llvmpipe, softpipe,
+/// SwiftShader. Vulkan's device type says so; a GL adapter is also matched by
+/// its renderer name ([`SOFTWARE_GL`]).
+fn is_software(info: &wgpu::AdapterInfo) -> bool {
+    info.device_type == wgpu::DeviceType::Cpu
+        || (info.backend == wgpu::Backend::Gl && {
+            let name = info.name.to_lowercase();
+            SOFTWARE_GL.iter().any(|s| name.contains(s))
+        })
+}
+
+/// Whether [`GpuContext::new`] looks at GL after its first pick: only when that
+/// pick is a software Vulkan adapter — lavapipe on a machine whose GPU has no
+/// Vulkan driver (an older GPU, a VM with virgl, WSL's d3d12) — and `WGPU_BACKEND`
+/// did not pin the backends. A hardware Vulkan adapter never pays for the probe.
+fn wants_gl_probe(first: &wgpu::AdapterInfo, pinned: bool) -> bool {
+    !pinned && first.backend == wgpu::Backend::Vulkan && first.device_type == wgpu::DeviceType::Cpu
+}
+
+/// A GL adapter as [`prefers_gl`] weighs it: wgpu's info, and whether its driver
+/// offers compute shaders (`DownlevelFlags::COMPUTE_SHADERS`).
+struct GlCandidate {
+    info: wgpu::AdapterInfo,
+    compute_shaders: bool,
+}
+
+impl GlCandidate {
+    fn of(adapter: &wgpu::Adapter) -> Self {
+        let flags = adapter.get_downlevel_capabilities().flags;
+        Self { info: adapter.get_info(), compute_shaders: flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS) }
+    }
+}
+
+/// The desktop GL version a GL adapter reports in `driver_info` ("3.3 (Core
+/// Profile) Mesa …" → (3, 3), "4.6.0 NVIDIA …" → (4, 6)); `None` for OpenGL ES
+/// ("OpenGL ES 3.0 …"), whose compute shaders come with GLSL ES 3.10.
+fn desktop_gl_version(driver_info: &str) -> Option<(u32, u32)> {
+    let mut parts = driver_info.split_whitespace().next()?.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// wgpu 29's GL backend puts the texture bindings into the shader whenever the
+/// driver offers compute shaders, but naga writes them only for GLSL 4.20+ /
+/// GLSL ES 3.10+. On a desktop GL 3.3–4.1 driver that advertises
+/// `GL_ARB_compute_shader` — Mesa's softpipe does — every texture is then
+/// sampled from unit 0: no text, a blank CRT frame.
+fn gl_textures_misbound(gl: &GlCandidate) -> bool {
+    gl.info.backend == wgpu::Backend::Gl
+        && gl.compute_shaders
+        && desktop_gl_version(&gl.info.driver_info).is_some_and(|v| v < (4, 2))
+}
+
+/// Whether the GL adapter `gl` (looked for because `first` is software Vulkan)
+/// replaces it: only a hardware one that draws correctly does
+/// ([`gl_textures_misbound`]). A software GL renderer, or no GL adapter, keeps
+/// the Vulkan one — CPU Vulkan presents fine.
+fn prefers_gl(first: &wgpu::AdapterInfo, gl: Option<&GlCandidate>) -> bool {
+    is_software(first)
+        && gl.is_some_and(|g| {
+            g.info.backend == wgpu::Backend::Gl && !is_software(&g.info) && !gl_textures_misbound(g)
+        })
+}
+
 /// The GPU objects every JeTTY window shares: ONE wgpu instance, adapter, device
 /// and queue. Acquiring them is the dominant GPU cost (~70–90 ms of adapter
 /// enumeration + device creation on the reference machine); a second window —
@@ -311,11 +380,30 @@ impl GpuContext {
         // failure is expected, so only the last attempt's error is surfaced. That
         // error names the step that actually failed (surface creation vs adapter
         // request) instead of always reporting "no adapter".
+        let pinned = wgpu::Backends::from_env().filter(|b| !b.is_empty());
         let mut picked = Err(String::new());
-        for backends in backend_attempts(wgpu::Backends::from_env()).into_iter().flatten() {
+        for backends in backend_attempts(pinned).into_iter().flatten() {
             picked = make_instance_surface_adapter(backends);
             if picked.is_ok() {
                 break;
+            }
+        }
+        // Software Vulkan (lavapipe) on a machine whose GPU has only a GL driver:
+        // draw on that GPU through GL instead (`wants_gl_probe`, `prefers_gl`).
+        // A hardware Vulkan pick skips this — no EGL, no added cold-start cost.
+        if let Ok((_, _, first)) = &picked {
+            let first = first.get_info();
+            if wants_gl_probe(&first, pinned.is_some()) {
+                if let Ok(gl) = make_instance_surface_adapter(wgpu::Backends::GL) {
+                    if prefers_gl(&first, Some(&GlCandidate::of(&gl.2))) {
+                        eprintln!(
+                            "jetty: Vulkan offers only a software renderer here ({}); drawing on the GPU \
+                             through OpenGL",
+                            first.name
+                        );
+                        picked = Ok(gl);
+                    }
+                }
             }
         }
         let (instance, surface, adapter) = match picked {
@@ -340,6 +428,14 @@ impl GpuContext {
             };
             let backend = backend_display_name(info.backend);
             eprintln!("jetty: GPU adapter = {} ({backend}{driver})", info.name);
+            // No other adapter was left to take: say why text may not draw.
+            if info.backend == wgpu::Backend::Gl && gl_textures_misbound(&GlCandidate::of(&adapter)) {
+                eprintln!(
+                    "jetty: this OpenGL driver offers compute shaders without GLSL 4.20; wgpu 29 then \
+                     samples every texture from one unit, so text and effects may not draw. A Vulkan \
+                     driver (Mesa's lavapipe works) avoids it."
+                );
+            }
         });
         let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("jetty-device"),
@@ -383,7 +479,7 @@ impl GpuContext {
         let shared = Arc::new(GpuShared {
             backend: adapter.get_info().backend,
             backend_name: backend_display_name(adapter.get_info().backend).to_string(),
-            cpu: adapter.get_info().device_type == wgpu::DeviceType::Cpu,
+            cpu: is_software(&adapter.get_info()),
             max_dim: device.limits().max_texture_dimension_2d,
             instance,
             adapter,
@@ -511,8 +607,9 @@ impl GpuContext {
     }
 
     /// Whether the adapter is a CPU (software) rasterizer — lavapipe/llvmpipe,
-    /// WARP — from its reported device type: every frame then costs real CPU,
-    /// so continuous effect animations pace at a lower rate.
+    /// softpipe, WARP — from its device type (and, on GL, its renderer name:
+    /// `is_software`): every frame then costs real CPU, so continuous effect
+    /// animations pace at a lower rate.
     pub fn is_cpu_adapter(&self) -> bool {
         self.shared.cpu
     }
@@ -664,6 +761,23 @@ mod tests {
         assert!(instance_descriptor(Backends::GL).display.is_some());
     }
 
+    /// An adapter as wgpu reports it (only the fields the choice reads matter).
+    fn adapter(name: &str, backend: Backend, device_type: wgpu::DeviceType) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: name.to_string(),
+            vendor: 0,
+            device: 0,
+            device_type,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend,
+            subgroup_min_size: 0,
+            subgroup_max_size: 0,
+            transient_saves_memory: false,
+        }
+    }
+
     /// The backend as users know it: the welcome splash read "wgpu · Gl".
     #[test]
     fn backends_carry_their_user_facing_names() {
@@ -673,6 +787,98 @@ mod tests {
         assert_eq!(backend_display_name(Backend::Metal), "Metal");
         assert_eq!(backend_display_name(Backend::Dx12), "DirectX 12");
         assert_eq!(backend_display_name(Backend::BrowserWebGpu), "WebGPU");
+    }
+
+    /// Software rasterizers, whatever device type wgpu inferred: GL has none, and
+    /// wgpu's renderer-string guess calls softpipe "Other".
+    #[test]
+    fn software_rasterizers_are_recognized_on_every_backend() {
+        use super::is_software;
+        use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, Other, VirtualGpu};
+        assert!(is_software(&adapter("llvmpipe (LLVM 15.0.7, 256 bits)", Backend::Vulkan, Cpu)));
+        assert!(is_software(&adapter("llvmpipe (LLVM 15.0.7, 256 bits)", Backend::Gl, Cpu)));
+        assert!(is_software(&adapter("softpipe", Backend::Gl, Other)));
+        assert!(is_software(&adapter("Gallium 0.4 on SWRAST", Backend::Gl, Other)));
+        assert!(is_software(&adapter("zink Vulkan 1.3(llvmpipe (LLVM 15.0.7, 256 bits))", Backend::Gl, Other)));
+        assert!(!is_software(&adapter("Mesa Intel(R) HD Graphics 3000 (SNB GT2)", Backend::Gl, IntegratedGpu)));
+        assert!(!is_software(&adapter("AMD Radeon HD 6450 (CAICOS, DRM 2.50.0)", Backend::Gl, Other)));
+        assert!(!is_software(&adapter("virgl (NVIDIA GeForce RTX 3060)", Backend::Gl, Other)));
+        assert!(!is_software(&adapter("NVIDIA GeForce RTX 3060", Backend::Vulkan, DiscreteGpu)));
+        assert!(!is_software(&adapter("Virtio-GPU Venus", Backend::Vulkan, VirtualGpu)));
+    }
+
+    /// A hardware Vulkan adapter takes today's path — no GL probe, no added cost;
+    /// only software Vulkan (lavapipe) looks at GL, and `WGPU_BACKEND` wins.
+    #[test]
+    fn only_software_vulkan_probes_gl() {
+        use super::wants_gl_probe;
+        use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, Other};
+        let lavapipe = adapter("llvmpipe (LLVM 15.0.7, 256 bits)", Backend::Vulkan, Cpu);
+        assert!(wants_gl_probe(&lavapipe, false));
+        assert!(!wants_gl_probe(&lavapipe, true), "WGPU_BACKEND pins the backends");
+        assert!(!wants_gl_probe(&adapter("Intel(R) Graphics (ARL)", Backend::Vulkan, IntegratedGpu), false));
+        assert!(!wants_gl_probe(&adapter("NVIDIA GeForce RTX 3060", Backend::Vulkan, DiscreteGpu), false));
+        // No Vulkan at all: the pick is already GL (or Metal), nothing to compare.
+        assert!(!wants_gl_probe(&adapter("llvmpipe (LLVM 15.0.7, 256 bits)", Backend::Gl, Cpu), false));
+        assert!(!wants_gl_probe(&adapter("AMD Radeon HD 6450", Backend::Gl, Other), false));
+    }
+
+    /// A GL adapter as the choice sees it.
+    fn gl(name: &str, device_type: wgpu::DeviceType, version: &str, compute_shaders: bool) -> super::GlCandidate {
+        let mut info = adapter(name, Backend::Gl, device_type);
+        info.driver_info = version.to_string();
+        super::GlCandidate { info, compute_shaders }
+    }
+
+    /// Software Vulkan gives way only to a hardware GL adapter that draws
+    /// correctly; a software GL renderer (llvmpipe, softpipe), a driver wgpu
+    /// misbinds, or none keeps it — CPU Vulkan presents fine.
+    #[test]
+    fn hardware_gl_beats_software_vulkan_and_nothing_else_does() {
+        use super::prefers_gl;
+        use wgpu::DeviceType::{Cpu, IntegratedGpu, Other};
+        let lavapipe = adapter("llvmpipe (LLVM 15.0.7, 256 bits)", Backend::Vulkan, Cpu);
+        let mesa = |v: &str| format!("{v} (Core Profile) Mesa 22.0.1");
+        let intel_gl = gl("Mesa Intel(R) HD Graphics 3000 (SNB GT2)", IntegratedGpu, &mesa("3.3"), false);
+        let radeon_gl = gl("AMD Radeon HD 6450 (CAICOS, DRM 2.50.0)", Other, &mesa("4.5"), true);
+        let virgl = gl("virgl (NVIDIA GeForce RTX 3060)", Other, "4.3 (Core Profile) Mesa 22.0.1", true);
+        let gles = gl("Mali-G52 (Panfrost)", IntegratedGpu, "OpenGL ES 3.1 Mesa 22.0.1", true);
+        assert!(prefers_gl(&lavapipe, Some(&intel_gl)));
+        assert!(prefers_gl(&lavapipe, Some(&radeon_gl)));
+        assert!(prefers_gl(&lavapipe, Some(&virgl)));
+        assert!(prefers_gl(&lavapipe, Some(&gles)));
+        let llvmpipe_gl = gl("llvmpipe (LLVM 15.0.7, 256 bits)", Cpu, "4.5 (Core Profile) Mesa 22.0.1", true);
+        assert!(!prefers_gl(&lavapipe, Some(&llvmpipe_gl)));
+        let softpipe = gl("softpipe", Other, "3.3 (Core Profile) Mesa 22.0.1", true);
+        assert!(!prefers_gl(&lavapipe, Some(&softpipe)));
+        // Hardware, but GL 3.3 advertising compute: wgpu would sample every
+        // texture from one unit — lavapipe keeps drawing text.
+        let misbound = gl("NV98", Other, "3.3 (Core Profile) Mesa 22.0.1", true);
+        assert!(!prefers_gl(&lavapipe, Some(&misbound)));
+        assert!(!prefers_gl(&lavapipe, None));
+        // A hardware first pick is never traded away.
+        let arc = adapter("Intel(R) Graphics (ARL)", Backend::Vulkan, IntegratedGpu);
+        assert!(!prefers_gl(&arc, Some(&radeon_gl)));
+    }
+
+    /// wgpu 29 binds textures in the shader when the driver offers compute
+    /// shaders, but naga writes those bindings only for GLSL 4.20+ / ES 3.10+.
+    #[test]
+    fn misbound_gl_textures_are_detected() {
+        use super::{desktop_gl_version, gl_textures_misbound};
+        use wgpu::DeviceType::{Cpu, Other};
+        assert_eq!(desktop_gl_version("3.3 (Core Profile) Mesa 26.0.8-1ubuntu0.3"), Some((3, 3)));
+        assert_eq!(desktop_gl_version("4.6.0 NVIDIA 595.99.02"), Some((4, 6)));
+        assert_eq!(desktop_gl_version("OpenGL ES 3.0 Mesa 26.0.8"), None);
+        assert_eq!(desktop_gl_version(""), None);
+        // Mesa's softpipe: GL 3.3 core + GL_ARB_compute_shader (seen live: no text).
+        assert!(gl_textures_misbound(&gl("softpipe", Other, "3.3 (Core Profile) Mesa 26.0.8", true)));
+        assert!(gl_textures_misbound(&gl("NV98", Other, "4.1 (Core Profile) Mesa 22.0.1", true)));
+        assert!(!gl_textures_misbound(&gl("NV98", Other, "3.3 (Core Profile) Mesa 22.0.1", false)));
+        assert!(!gl_textures_misbound(&gl("llvmpipe", Cpu, "4.5 (Core Profile) Mesa 26.0.8", true)));
+        assert!(!gl_textures_misbound(&gl("NV98", Other, "4.2 (Core Profile) Mesa 22.0.1", true)));
+        assert!(!gl_textures_misbound(&gl("Mali", Other, "OpenGL ES 3.0 Mesa 26.0.8", false)));
+        assert!(!gl_textures_misbound(&gl("Mali", Other, "OpenGL ES 3.1 Mesa 26.0.8", true)));
     }
 
     /// Vulkan alone first, then every backend; `WGPU_BACKEND` (`gl`, `vulkan`, …)

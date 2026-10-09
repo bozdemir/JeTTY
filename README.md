@@ -179,7 +179,7 @@ cargo build --release && ./target/release/jetty
 
 ### Graphics drivers
 
-JeTTY renders through **Vulkan** when a Vulkan driver is installed, and otherwise through **OpenGL 3.3 / OpenGL ES 3.0** (EGL) — so VMs, older GPUs and software rendering (Mesa llvmpipe) work too, effects included. The startup log names what it picked (`jetty: GPU adapter = …`). If a Vulkan driver misbehaves, `WGPU_BACKEND=gl jetty` forces OpenGL. With neither available, JeTTY says what it needs and exits with status 1.
+JeTTY renders through **Vulkan** when a Vulkan driver is installed, and otherwise through **OpenGL 3.3 / OpenGL ES 3.0** (EGL) — so VMs, older GPUs and software rendering (Mesa llvmpipe) work too, effects included. When the only Vulkan driver is a software one (Mesa's lavapipe) but the GPU has an OpenGL driver — an older GPU, a VM with virgl, WSL — JeTTY draws on the GPU through OpenGL; if OpenGL is software too, it stays on Vulkan. The startup log names what it picked (`jetty: GPU adapter = …`). If a Vulkan driver misbehaves, `WGPU_BACKEND=gl jetty` forces OpenGL (`WGPU_BACKEND=vulkan` forces Vulkan; either overrides the choice above). With neither available, JeTTY says what it needs and exits with status 1.
 
 ### Global summon hotkey
 
