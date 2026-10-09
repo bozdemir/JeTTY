@@ -1152,7 +1152,8 @@ pub struct Terminal {
     /// The keyboard state the running command started from; `None` outside one.
     kbd_window: Option<KbdWindow>,
     /// What the xterm-conformance corrections over alacritty's `Handler`
-    /// remember (the scroll region mirror) — see `handler.rs`.
+    /// remember (the scroll region mirror, the DECSCNM reverse-video screen) —
+    /// see `handler.rs`.
     vt: VtState,
     /// Test-only: every byte handed to vte, in order (the differential fuzz
     /// replays it through a model of vte's state machine).
