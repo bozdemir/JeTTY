@@ -140,7 +140,9 @@
 ///                    JETTY_SHOT_PANEL_HOVER=<theme name>|reset|filter:<f>|section:<id>,
 ///                    JETTY_SHOT_PANEL_COLLAPSE=<section id,...>,
 ///                    JETTY_SHOT_PANEL_FOCUS=<control id> (a deep link: its tab,
-///                    scrolled to it, highlighted), JETTY_SHOT_PANEL_RESET=
+///                    scrolled to it, highlighted, its first part keyboard-
+///                    focused and ringed; a control the config hides lands
+///                    on the row that reveals it), JETTY_SHOT_PANEL_RESET=
 ///                    armed|ready|disabled, JETTY_SHOT_PANEL_BACKDROP=<mode>, JETTY_SHOT_PANEL_PRESET=<id> (an effects
 ///                    preset on the panel config only), JETTY_SHOT_PANEL_SESSION=1 (a gallery
 ///                    browsing session's footer hint).
