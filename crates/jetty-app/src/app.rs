@@ -584,6 +584,41 @@ fn toggle_action(
     }
 }
 
+/// Who asked for a summon — which decides how hard the window may ask the
+/// window manager for keyboard focus ([`focus_ask`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummonBy {
+    /// F9, `jetty --toggle` / `--show`, a command typed in a detached window:
+    /// the user wants the terminal in front, now.
+    User,
+    /// JeTTY on its own: the opt-in auto-summon when a command finishes, a
+    /// detached shell adopted after the last main tab's shell exited.
+    App,
+}
+
+/// How a summon asks for focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusAsk {
+    /// As a taskbar click does (`jetty_platform::activate_window`).
+    Activate,
+    /// winit's plain application request, which the WM may refuse.
+    Request,
+}
+
+/// A USER summon activates the window the way the F9 raise does: winit's
+/// `focus_window()` (EWMH source 1) was refused by KWin's focus-stealing
+/// prevention whenever another window had been used since the terminal last
+/// had focus, so F9 mapped the terminal on top while the keyboard stayed with
+/// the other app — typed keys went there — and only a second F9 (the raise)
+/// focused it. JeTTY's OWN summons keep the plain request: an automatic event
+/// must never steal focus.
+fn focus_ask(by: SummonBy) -> FocusAsk {
+    match by {
+        SummonBy::User => FocusAsk::Activate,
+        SummonBy::App => FocusAsk::Request,
+    }
+}
+
 /// Retry state for a frame whose swapchain acquire failed (`acquire_frame()` →
 /// `None`: Outdated, Lost, Timeout, Occluded, Validation). Without it a failed
 /// acquire on the LAST damage-driven frame left the screen stale until some
@@ -4178,6 +4213,12 @@ impl App {
     /// still owned the tab would reap the shell. The window/GPU surface still
     /// gets torn down correctly when `dw` drops at the end of this function.
     fn reattach_tab(&mut self, pos: usize, event_loop: &ActiveEventLoop) {
+        self.reattach_tab_by(pos, SummonBy::User, event_loop);
+    }
+
+    /// [`Self::reattach_tab`], naming who asked: a hidden main window is
+    /// summoned for the tab, and only a USER reattach may take focus for it.
+    fn reattach_tab_by(&mut self, pos: usize, by: SummonBy, event_loop: &ActiveEventLoop) {
         if pos >= self.detached.len() {
             return;
         }
@@ -4234,7 +4275,7 @@ impl App {
         // parked in an invisible window, looking dead until the next F9 (F15). The
         // drag-to-reattach path only runs while visible, so this is a no-op there.
         if !self.visible {
-            self.set_visibility(true, event_loop);
+            self.set_visibility_by(true, by, event_loop);
         }
 
         // The reattached tab is now the active one under the pointer:
@@ -7591,7 +7632,7 @@ impl App {
         // the pre-loop snapshot (so no sibling completion is suppressed).
         if let Some(tab) = summon_target {
             self.select_tab(tab);
-            self.set_visibility(true, event_loop);
+            self.set_visibility_by(true, SummonBy::App, event_loop);
         }
         for i in 0..self.detached.len() {
             let completions = self.detached[i].tab.terminal.take_completions();
@@ -7847,7 +7888,7 @@ impl App {
                 event_loop.exit();
                 return false;
             }
-            self.reattach_tab(0, event_loop);
+            self.reattach_tab_by(0, SummonBy::App, event_loop);
         }
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
@@ -8226,7 +8267,17 @@ impl App {
         }
     }
 
-    fn set_visibility(&mut self, want: bool, _event_loop: &ActiveEventLoop) {
+    /// Show / hide the main window at the USER's request (F9, `jetty --toggle`,
+    /// `--show` / `--hide`, a command typed in a detached window).
+    fn set_visibility(&mut self, want: bool, event_loop: &ActiveEventLoop) {
+        self.set_visibility_by(want, SummonBy::User, event_loop);
+    }
+
+    fn set_visibility_by(&mut self, want: bool, by: SummonBy, _event_loop: &ActiveEventLoop) {
+        let ask_focus = |win: &Window| match focus_ask(by) {
+            FocusAsk::Activate => jetty_platform::activate_window(win),
+            FocusAsk::Request => win.focus_window(),
+        };
         // A redundant `--show` (already visible) just raises/focuses; a redundant
         // `--hide` (already hidden) is a no-op.
         if want == self.visible {
@@ -8237,13 +8288,12 @@ impl App {
                 // later if the WM's FocusIn didn't beat the deadline (F31).
                 self.pending_autohide_at = None;
                 if let Some(win) = &self.window {
-                    // Every caller that gets here is the user asking for this
-                    // window (F9's raise, `--show`, a detached window's command on
-                    // the main one; the auto-summon only runs while hidden), so ask
-                    // the WM the way a taskbar click does — a plain
+                    // F9's raise, `--show`, a detached window's command on the main
+                    // one: ask the WM the way a taskbar click does — a plain
                     // `focus_window()` was refused by KWin's focus-stealing
-                    // prevention and F9 left the window behind.
-                    jetty_platform::activate_window(win);
+                    // prevention and F9 left the window behind. (JeTTY's own
+                    // summons only run while hidden, so never reach here.)
+                    ask_focus(win);
                     self.request_main_paint();
                 }
             }
@@ -8380,7 +8430,9 @@ impl App {
                 );
                 self.reflow_pending_at = pending;
                 self.reflow_deferred_by_hide = deferred;
-                win.focus_window();
+                // The map above was already flushed, so the WM handles it before
+                // this request.
+                ask_focus(win);
                 // Crystallize/reveal on every summon (F9 show), mirroring first open.
                 // Start the clock on the FIRST real frame (summon_pending), not here:
                 // on macOS the window can take a beat to present, which would
@@ -17966,11 +18018,25 @@ mod scheduler_tests {
     //! The window itself can't run under `cargo test`, so every rule that keeps
     //! the loop at 0-CPU idle (or makes it wake) is a pure function tested here.
     use super::{
-        anim_expired, caret_drives_frames, main_tab_watched, next_acquire_retry,
-        perf_idle_decision, toggle_action, IdleHud, ToggleAction, FOCUS_CHURN_GRACE,
-        KEY_ECHO_GRACE, RAISE_RETRY_WINDOW,
+        anim_expired, caret_drives_frames, focus_ask, main_tab_watched, next_acquire_retry,
+        perf_idle_decision, toggle_action, FocusAsk, IdleHud, SummonBy, ToggleAction,
+        FOCUS_CHURN_GRACE, KEY_ECHO_GRACE, RAISE_RETRY_WINDOW,
     };
     use std::time::{Duration, Instant};
+
+    // ── how a summon asks for focus ──────────────────────────────────────────
+
+    #[test]
+    fn a_user_summon_asks_for_focus_like_a_taskbar_click() {
+        // F9 / `jetty --toggle` / `--show` from HIDDEN: winit's focus_window()
+        // (EWMH source 1) was refused by KWin's focus-stealing prevention once
+        // another window had been used — the terminal mapped on top with the
+        // keys still going to the other app. Ask as the raise does (source 2).
+        assert_eq!(focus_ask(SummonBy::User), FocusAsk::Activate);
+        // JeTTY's own summons (a finished command, an adopted detached shell)
+        // never force focus: the WM may refuse them.
+        assert_eq!(focus_ask(SummonBy::App), FocusAsk::Request);
+    }
 
     // ── idle HUD one-shot (the hidden-window 100% CPU spin) ──────────────────
 
