@@ -1859,6 +1859,22 @@ fn hint_base_letter(
     None
 }
 
+/// The label letter a key pressed in hint mode types, or `None`:
+/// [`hint_base_letter`], save that a Ctrl or Super (Cmd) chord is never a
+/// letter — xkb's logical key ignores Ctrl, so Ctrl+Shift+F read as "f" (and
+/// a reflexive Cmd+C as "c"), and an exact label match copied that token over
+/// the clipboard. Alt stays the open modifier (read at completion).
+fn hint_key_letter(
+    mods: winit::keyboard::ModifiersState,
+    physical: winit::keyboard::PhysicalKey,
+    logical: &winit::keyboard::Key,
+) -> Option<char> {
+    if mods.control_key() || mods.super_key() {
+        return None;
+    }
+    hint_base_letter(physical, logical)
+}
+
 /// Map a physical letter key (KeyA..KeyZ) to its lowercase QWERTY char.
 fn keycode_letter(code: winit::keyboard::KeyCode) -> Option<char> {
     use winit::keyboard::KeyCode::*;
@@ -5376,7 +5392,8 @@ impl App {
     /// the typed prefix (matched against the BASE ASCII letter, independent of
     /// Alt/compose — BLOCKING 5); an exact label match COPIES the token (default)
     /// or, for a URL with Alt held at completion, OPENS it. Esc cancels;
-    /// Backspace pops; every other key is swallowed.
+    /// Backspace pops; every other key — a Ctrl / Cmd chord included — is
+    /// swallowed.
     fn hint_mode_key(
         &mut self,
         s: Surface,
@@ -5398,8 +5415,8 @@ impl App {
             }
             _ => {}
         }
-        let Some(ch) = hint_base_letter(physical, logical) else {
-            return; // non-letter key: swallow
+        let Some(ch) = hint_key_letter(self.modifiers, physical, logical) else {
+            return; // non-letter key or a chord: swallow
         };
         enum Outcome {
             Fire(jetty_core::HintToken),
@@ -18147,6 +18164,32 @@ fn is_printable_keystroke(bytes: &[u8]) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod hint_key_tests {
+    use super::hint_key_letter;
+    use winit::keyboard::{Key, KeyCode, ModifiersState as M, PhysicalKey};
+
+    fn letter(mods: M, code: KeyCode, text: &str) -> Option<char> {
+        hint_key_letter(mods, PhysicalKey::Code(code), &Key::Character(text.into()))
+    }
+
+    /// A chord is never a label: with 4–26 tokens on screen each label is a
+    /// single letter, so Ctrl+Shift+F (the search chord) used to copy the
+    /// "f" token over the clipboard and exit, and a reflexive Cmd+C the "c"
+    /// one.
+    #[test]
+    fn a_ctrl_or_cmd_chord_never_picks_a_label() {
+        assert_eq!(letter(M::CONTROL | M::SHIFT, KeyCode::KeyF, "F"), None);
+        assert_eq!(letter(M::CONTROL, KeyCode::KeyD, "d"), None);
+        assert_eq!(letter(M::SUPER, KeyCode::KeyC, "c"), None);
+        // Plain and Shifted letters narrow; Alt (the open modifier) too, even
+        // where Option-compose mangled the text.
+        assert_eq!(letter(M::empty(), KeyCode::KeyF, "f"), Some('f'));
+        assert_eq!(letter(M::SHIFT, KeyCode::KeyF, "F"), Some('f'));
+        assert_eq!(letter(M::ALT, KeyCode::KeyF, "ƒ"), Some('f'));
+    }
 }
 
 #[cfg(test)]
