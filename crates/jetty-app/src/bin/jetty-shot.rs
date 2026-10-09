@@ -82,7 +82,8 @@
 ///   JETTY_SHOT_LINK_HOVER — "row,col" (0-based viewport cell): print
 ///                    `link_at(row,col)` to stderr (URL under that cell, OSC 8
 ///                    or plain text) and draw the app's themed Ctrl+hover
-///                    underline for the hit.
+///                    underline for the hit — plus the target pill when it is
+///                    an OSC 8 link whose text is not its target.
 ///   JETTY_SHOT_OSC133 — "1" feeds a scripted OSC 133 A/C/D;<exit> sequence (a
 ///                    FAILED command, a passing one, then another failed one)
 ///                    after the input, so the PNG shows the themed left-edge
@@ -1811,6 +1812,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rects.push(pill.quad);
                 chrome_labels.push(pill.label);
             }
+        }
+        // JETTY_SHOT_LINK_HOVER on an OSC 8 link whose text is not its target:
+        // the app's target pill (Pass 4c''), where the toast pill sits.
+        if let Some(hit) = link_hit.as_ref().filter(|h| h.hidden_target) {
+            let pill = jetty_render::build_toast_pill(
+                width,
+                height as f32 - shot_status_h - shot_bottom_bar_h - cm.px(14.0),
+                0.0,
+                &hit.uri,
+                terminal.theme(),
+                &mut chrome_text,
+                cm,
+            );
+            rects.push(pill.quad);
+            chrome_labels.push(pill.label);
         }
 
         quad.render(&device, &queue, &view, width, height, &rects);

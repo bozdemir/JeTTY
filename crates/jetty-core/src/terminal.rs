@@ -1173,6 +1173,10 @@ pub struct LinkHit {
     /// Viewport underline spans: `(row, col_start, col_end)` inclusive,
     /// clipped to the visible grid.
     pub spans: Vec<(usize, usize, usize)>,
+    /// An OSC 8 hyperlink whose visible text is not its target: the text can
+    /// name any address (or none), so the app shows `uri` before a click
+    /// opens it. Never set for a plain-text URL — that text IS the target.
+    pub hidden_target: bool,
 }
 
 impl Terminal {
@@ -4260,13 +4264,18 @@ impl Terminal {
         // them; id-less links share one generated id per OSC run).
         if let Some(link) = grid[pt].hyperlink() {
             let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+            // The text the link wears on screen, to tell whether it shows
+            // its target.
+            let mut text = String::new();
             for vp_row in 0..self.rows {
                 let line = viewport_to_point(display_offset, Point::new(vp_row, Column(0))).line;
                 for c in 0..self.cols {
-                    let same = grid[Point::new(line, Column(c))]
-                        .hyperlink()
-                        .is_some_and(|h| h.id() == link.id());
+                    let cell = &grid[Point::new(line, Column(c))];
+                    let same = cell.hyperlink().is_some_and(|h| h.id() == link.id());
                     if same {
+                        if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                            text.push(cell.c);
+                        }
                         match spans.last_mut() {
                             Some(s) if s.0 == vp_row && s.2 + 1 == c => s.2 = c,
                             _ => spans.push((vp_row, c, c)),
@@ -4274,7 +4283,9 @@ impl Terminal {
                     }
                 }
             }
-            return Some(LinkHit { uri: link.uri().to_string(), spans });
+            let uri = link.uri().to_string();
+            let hidden_target = text.trim() != uri;
+            return Some(LinkHit { uri, spans, hidden_target });
         }
 
         // Plain-text branch: the URL in the logical line around the cell.
@@ -4294,7 +4305,7 @@ impl Terminal {
                 }
             }
         }
-        Some(LinkHit { uri, spans })
+        Some(LinkHit { uri, spans, hidden_target: false })
     }
 
     /// The plain-text URL covering buffer point `pt`, as `(first row of its
@@ -5360,6 +5371,28 @@ mod tests {
             assert!(!snap2.cell(0, col).selected,
                 "cell (0, {col}) should not be selected after clear");
         }
+    }
+
+    #[test]
+    fn link_at_flags_an_osc8_target_its_text_does_not_show() {
+        // An OSC 8 link's text can claim any address: `cat` of a crafted file
+        // shows "https://github.com" and a Ctrl+click opens something else.
+        let mut t = Terminal::new(60, 5);
+        t.feed(
+            b"\x1b]8;;https://evil.example/x\x1b\\https://github.com\x1b]8;;\x1b\\ \
+              \x1b]8;;https://a.io/\x1b\\https://a.io/\x1b]8;;\x1b\\ https://plain.io/x",
+        );
+        let h = t.link_at(0, 2).expect("the disguised link");
+        assert_eq!(h.uri, "https://evil.example/x");
+        assert!(h.hidden_target, "its text names another address");
+        let h = t.link_at(0, 20).expect("an honest OSC 8 link");
+        assert_eq!(h.uri, "https://a.io/");
+        assert!(!h.hidden_target, "its text IS its target");
+        let h = t.link_at(0, 36).expect("a plain-text URL");
+        assert!(!h.hidden_target, "plain text is always its own target");
+        // `ls --hyperlink`: the file name links to a file:// URI.
+        t.feed(b"\r\n\x1b]8;;file://host/home/u/Cargo.toml\x1b\\Cargo.toml\x1b]8;;\x1b\\");
+        assert!(t.link_at(1, 3).expect("file link").hidden_target);
     }
 
     #[test]

@@ -1624,6 +1624,14 @@ fn link_modifier_held(m: &winit::keyboard::ModifiersState) -> bool {
     m.control_key() || (cfg!(target_os = "macos") && m.super_key())
 }
 
+/// The target to preview for a Ctrl+hovered link: an OSC 8 hyperlink whose
+/// text is not its target (`LinkHit::hidden_target`) shows where a click would
+/// really go. `None` without the link modifier, or for a link that shows its
+/// own address (a plain-text URL).
+fn link_target_preview(m: &winit::keyboard::ModifiersState, hover: Option<&jetty_core::LinkHit>) -> Option<String> {
+    hover.filter(|h| h.hidden_target && link_modifier_held(m)).map(|h| h.uri.clone())
+}
+
 /// Write bytes produced for a tab's program (mouse reports, wheel arrows) to
 /// its PTY. Nothing to write is free.
 fn write_pty_bytes(writer: &mut dyn Write, bytes: &[u8]) {
@@ -10371,6 +10379,8 @@ impl App {
             } else {
                 None
             };
+        // Where a hovered OSC 8 link really goes, when its text doesn't say.
+        let link_target = link_target_preview(&self.modifiers, dw.link_hover.as_ref());
         let theme = self.current_theme();
         let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
         // Menu hints from the LIVE keymap (only built while the menu is open).
@@ -10673,6 +10683,19 @@ impl App {
             let stack = if shift_hint_show { cm.pill_h() + cm.px(8.0) } else { 0.0 };
             let pill = jetty_render::build_toast_pill(
                 width, pill_bottom - stack, 0.0, msg, &theme, &mut *chrome_text, cm,
+            );
+            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill.quad]);
+            let _ = chrome_text.render_overlays(
+                &gpu.device, &gpu.queue, scene_view, width, height, &[pill.label],
+            );
+        }
+        // Pass 5b'': a Ctrl+hovered OSC 8 link's real target (the main window's
+        // Pass 4c'' twin), stacked above the pills that are live.
+        if let Some(target) = &link_target {
+            let live = shift_hint_show as u8 + status_pill_msg.is_some() as u8;
+            let stack = f32::from(live) * (cm.pill_h() + cm.px(8.0));
+            let pill = jetty_render::build_toast_pill(
+                width, pill_bottom - stack, 0.0, target, &theme, &mut *chrome_text, cm,
             );
             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill.quad]);
             let _ = chrome_text.render_overlays(
@@ -14474,6 +14497,8 @@ impl ApplicationHandler<AppEvent> for App {
                     } else {
                         None
                     };
+                // Where a hovered OSC 8 link really goes, when its text doesn't say.
+                let link_target = link_target_preview(&self.modifiers, self.link_hover.as_ref());
                 // Theme accent for the reveal glow (captured before the mutable
                 // gpu/text/quad borrow below).
                 // UiPalette's accent: a theme file's `accent` applies, and a
@@ -14774,6 +14799,21 @@ impl ApplicationHandler<AppEvent> for App {
                         let stack = if shift_hint_show { cm.pill_h() + cm.px(8.0) } else { 0.0 };
                         let pill = jetty_render::build_toast_pill(
                             width, pill_bottom - stack, slide_y_offset, msg,
+                            &theme, &mut *chrome_text, cm,
+                        );
+                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill.quad]);
+                        let _ = chrome_text.render_overlays(
+                            &gpu.device, &gpu.queue, scene_view, width, height, &[pill.label],
+                        );
+                    }
+                    // Pass 4c'': Ctrl+hover over an OSC 8 link whose text is
+                    // not its target — the pill shows where a click would go
+                    // (a browser's status bar), stacked above the live pills.
+                    if let Some(target) = &link_target {
+                        let live = shift_hint_show as u8 + status_pill_msg.is_some() as u8;
+                        let stack = f32::from(live) * (cm.pill_h() + cm.px(8.0));
+                        let pill = jetty_render::build_toast_pill(
+                            width, pill_bottom - stack, slide_y_offset, target,
                             &theme, &mut *chrome_text, cm,
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &[pill.quad]);
@@ -17479,6 +17519,22 @@ mod url_open_tests {
         // Scheme must be a PREFIX, and multibyte text can't panic the check.
         assert!(!url_scheme_allowed("xhttps://example.com"));
         assert!(!url_scheme_allowed("héllo→"));
+    }
+
+    #[test]
+    fn the_target_pill_shows_only_a_hidden_osc8_target_under_ctrl() {
+        use super::link_target_preview;
+        use winit::keyboard::ModifiersState;
+        let hit = |hidden_target| jetty_core::LinkHit {
+            uri: "https://evil.example/x".into(),
+            spans: vec![(0, 0, 4)],
+            hidden_target,
+        };
+        let ctrl = ModifiersState::CONTROL;
+        assert_eq!(link_target_preview(&ctrl, Some(&hit(true))).as_deref(), Some("https://evil.example/x"));
+        assert_eq!(link_target_preview(&ctrl, Some(&hit(false))), None, "text = target: nothing to add");
+        assert_eq!(link_target_preview(&ModifiersState::empty(), Some(&hit(true))), None, "no Ctrl: no hover");
+        assert_eq!(link_target_preview(&ctrl, None), None);
     }
 }
 
