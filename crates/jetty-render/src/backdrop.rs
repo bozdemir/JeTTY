@@ -1449,9 +1449,6 @@ struct Target {
 /// stores. A frame only copies it (`fs_composite`).
 const CACHE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-/// The aurora's half-resolution noise layer (filterable, no banding in it).
-const NOISE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-
 /// An animated look re-bakes at most this often (≤ 30 fps).
 const BAKE_MIN_INTERVAL: f32 = 1.0 / 30.0;
 
@@ -1550,6 +1547,10 @@ pub struct Backdrop {
     image_bind: Option<(Arc<GpuImage>, bool, wgpu::BindGroup)>,
     cache: Option<Target>,
     noise: Option<Target>,
+    /// The aurora noise layer's format, chosen on its first use: half-float, or
+    /// 8-bit sRGB where the GPU cannot render half-float
+    /// (`gpu::effect_target_format`).
+    noise_format: Option<wgpu::TextureFormat>,
     /// What the cache holds (see [`BakeStamp`]).
     baked: Option<BakeStamp>,
     last_comp: Option<BackdropUniform>,
@@ -1658,6 +1659,7 @@ impl Backdrop {
             image_bind: None,
             cache: None,
             noise: None,
+            noise_format: None,
             baked: None,
             last_comp: None,
             bakes: 0,
@@ -1809,11 +1811,12 @@ impl Backdrop {
         }
         if variant == Variant::Baked {
             let nsize = (size.0.div_ceil(2), size.1.div_ceil(2));
+            let format = *self.noise_format.get_or_insert_with(|| crate::gpu::effect_target_format(device));
             if self.noise.as_ref().is_none_or(|n| n.size != nsize) {
-                self.noise = Some(self.target(device, "backdrop-noise", nsize, NOISE_FORMAT));
+                self.noise = Some(self.target(device, "backdrop-noise", nsize, format));
             }
             if self.noise_pipeline.is_none() {
-                self.noise_pipeline = Some(self.pipeline(device, "fs_aurora_bake", false, NOISE_FORMAT));
+                self.noise_pipeline = Some(self.pipeline(device, "fs_aurora_bake", false, format));
             }
         }
         let group1 = match variant {

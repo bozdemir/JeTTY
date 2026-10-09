@@ -15,7 +15,8 @@
 //! jitter or glitch the scene is read with ONE `textureLoad` per pixel (the
 //! sample position is the pixel itself). Bloom runs at quarter resolution — a
 //! bright-pass downsample (4×4 texels → 1, four bilinear taps) into small
-//! `Rgba16Float` textures owned by this pass, blurred (separable 9-tap Gaussian,
+//! `Rgba16Float` textures owned by this pass (8-bit sRGB on a GPU that cannot
+//! render half-float — `gpu::effect_target_format`), blurred (separable 9-tap Gaussian,
 //! twice) only when `crt_bloom_radius` > 0 — and the composite adds it with one
 //! bilinear tap plus the pixel's own bright-pass (the old in-shader bloom read
 //! 13 full-res taps).
@@ -84,9 +85,6 @@ pub const BLOOM_STEP_MAX: f32 = 2.0;
 /// glitch tear pattern) advance at: the time is quantized to this clock, so a
 /// faster repaint (typing) never makes grain or a glitch strobe faster.
 pub const ANIM_SEED_FPS: f64 = 30.0;
-
-/// Texture format of the quarter-resolution bloom targets.
-const BLOOM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Pieces shared by the main and the bloom shader modules: the extension
 /// uniform (binding 3), the phosphor remap, the fullscreen-triangle vertex
@@ -886,6 +884,9 @@ struct CrtGpu {
 
 pub struct Crt {
     format: wgpu::TextureFormat,
+    /// Format of the quarter-resolution bloom targets: half-float, or 8-bit sRGB
+    /// where the GPU cannot render half-float (`gpu::effect_target_format`).
+    bloom_format: wgpu::TextureFormat,
     uniform_buf: wgpu::Buffer,
     ext_buf: wgpu::Buffer,
     bgl: wgpu::BindGroupLayout,
@@ -963,9 +964,11 @@ impl Crt {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
-        let dummy_view = Self::target(device, (1, 1), "crt-bloom-placeholder");
+        let bloom_format = crate::gpu::effect_target_format(device);
+        let dummy_view = Self::target(device, bloom_format, (1, 1), "crt-bloom-placeholder");
         Self {
             format,
+            bloom_format,
             uniform_buf,
             ext_buf,
             bgl,
@@ -977,7 +980,12 @@ impl Crt {
     }
 
     /// A quarter-res bloom render target (sampled by the next pass).
-    fn target(device: &wgpu::Device, (w, h): (u32, u32), label: &str) -> wgpu::TextureView {
+    fn target(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        (w, h): (u32, u32),
+        label: &str,
+    ) -> wgpu::TextureView {
         device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -985,7 +993,7 @@ impl Crt {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: BLOOM_FORMAT,
+                format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             })
@@ -1090,15 +1098,15 @@ impl Crt {
             if g.down[phos as usize].is_none() {
                 let c = [("FEAT_PHOS", if phos { 1.0 } else { 0.0 })];
                 g.down[phos as usize] =
-                    Some(Self::pipeline(device, "crt-bloom-down", layout, module, "fs_down", BLOOM_FORMAT, &c));
+                    Some(Self::pipeline(device, "crt-bloom-down", layout, module, "fs_down", self.bloom_format, &c));
             }
             if g.blur.is_none() {
                 let h = Self::pipeline(
-                    device, "crt-bloom-blur-h", layout, module, "fs_blur", BLOOM_FORMAT,
+                    device, "crt-bloom-blur-h", layout, module, "fs_blur", self.bloom_format,
                     &[("BLUR_VERTICAL", 0.0)],
                 );
                 let v = Self::pipeline(
-                    device, "crt-bloom-blur-v", layout, module, "fs_blur", BLOOM_FORMAT,
+                    device, "crt-bloom-blur-v", layout, module, "fs_blur", self.bloom_format,
                     &[("BLUR_VERTICAL", 1.0)],
                 );
                 g.blur = Some((h, v));
@@ -1119,8 +1127,8 @@ impl Crt {
         if g.targets.as_ref().is_some_and(|t| t.size == q) {
             return;
         }
-        let a = Self::target(device, q, "crt-bloom-a");
-        let b = Self::target(device, q, "crt-bloom-b");
+        let a = Self::target(device, self.bloom_format, q, "crt-bloom-a");
+        let b = Self::target(device, self.bloom_format, q, "crt-bloom-b");
         let bind = |src: &wgpu::TextureView, label: &str| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),

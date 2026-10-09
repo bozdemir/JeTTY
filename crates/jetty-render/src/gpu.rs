@@ -86,6 +86,61 @@ fn premultiplied_frame(alpha_mode: wgpu::CompositeAlphaMode, backend: wgpu::Back
         || (cfg!(all(unix, not(target_vendor = "apple"))) && backend == wgpu::Backend::Gl)
 }
 
+/// The format of the render targets an effect keeps between its passes — the
+/// CRT bloom chain, the aurora backdrop's noise layer: `Rgba16Float`, unless the
+/// device cannot render to it. That is OpenGL ES 3.0 without
+/// `EXT_color_buffer_(half_)float` (older GPUs): there every frame with CRT on
+/// failed validation and the window went black. They fall back to
+/// `Rgba8UnormSrgb`, whose sRGB encoding keeps the dark end of a glow free of
+/// visible banding; what those targets hold is non-negative and at most ~1, so
+/// nothing clips. Vulkan, Metal and DX12 always render to `Rgba16Float`: only a
+/// GL device is probed (a 1×1 texture, once per effect it builds).
+pub(crate) fn effect_target_format(device: &wgpu::Device) -> wgpu::TextureFormat {
+    let backend = device.adapter_info().backend;
+    let half_float_renders =
+        backend != wgpu::Backend::Gl || renders_to(device, wgpu::TextureFormat::Rgba16Float);
+    let format = effect_format(backend, half_float_renders);
+    if format != wgpu::TextureFormat::Rgba16Float {
+        use std::sync::Once;
+        static LOG: Once = Once::new();
+        LOG.call_once(|| {
+            eprintln!(
+                "jetty: this GPU cannot render to half-float textures (OpenGL ES without \
+                 EXT_color_buffer_float); CRT bloom and the aurora backdrop use 8-bit buffers"
+            );
+        });
+    }
+    format
+}
+
+/// [`effect_target_format`]'s decision.
+fn effect_format(backend: wgpu::Backend, half_float_renders: bool) -> wgpu::TextureFormat {
+    if backend != wgpu::Backend::Gl || half_float_renders {
+        wgpu::TextureFormat::Rgba16Float
+    } else {
+        wgpu::TextureFormat::Rgba8UnormSrgb
+    }
+}
+
+/// Whether `device` accepts a `format` texture as a render target (wgpu's GL
+/// backend decides per driver): a 1×1 probe inside a validation error scope.
+fn renders_to(device: &wgpu::Device, format: wgpu::TextureFormat) -> bool {
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let probe = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("render-target-probe"),
+        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let failed = pollster::block_on(scope.pop()).is_some();
+    probe.destroy();
+    !failed
+}
+
 /// Why [`GpuContext::acquire_frame`] skipped a frame
 /// ([`GpuContext::last_acquire_error`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,6 +577,21 @@ mod tests {
         assert!(instance_descriptor(Backends::VULKAN).display.is_none(), "the Vulkan path is unchanged");
         assert!(instance_descriptor(Backends::all()).display.is_some(), "GL presents through the display");
         assert!(instance_descriptor(Backends::GL).display.is_some());
+    }
+
+    /// OpenGL ES 3.0 without EXT_color_buffer_float cannot render to
+    /// `Rgba16Float`: the CRT bloom chain and the aurora's noise layer go 8-bit
+    /// sRGB there instead of failing every frame (a black window with CRT on).
+    #[test]
+    fn effect_targets_fall_back_to_8_bit_only_where_half_float_cannot_render() {
+        use super::effect_format;
+        use wgpu::TextureFormat::{Rgba16Float, Rgba8UnormSrgb};
+        assert_eq!(effect_format(Backend::Vulkan, true), Rgba16Float);
+        assert_eq!(effect_format(Backend::Metal, true), Rgba16Float);
+        assert_eq!(effect_format(Backend::Gl, true), Rgba16Float, "a capable GL driver keeps half-float");
+        assert_eq!(effect_format(Backend::Gl, false), Rgba8UnormSrgb);
+        // Only GL is ever probed; any other backend renders half-float.
+        assert_eq!(effect_format(Backend::Vulkan, false), Rgba16Float);
     }
 
     #[test]
