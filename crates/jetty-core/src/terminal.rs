@@ -8,7 +8,7 @@ use crate::snapshot::{
 use crate::theme::Theme;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
+use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
@@ -1053,11 +1053,19 @@ pub struct Terminal {
     /// query is empty or failed to compile — both render as "0/0").
     search_regex: Option<RegexSearch>,
     /// All matches across history+viewport, topmost→bottommost, capped at
-    /// [`SEARCH_MAX_MATCHES`]. Match `Point`s go stale as scrollback rotates;
-    /// the app calls [`Terminal::search_refresh`] (throttled) on output.
-    search_matches: Vec<Match>,
+    /// [`SEARCH_MAX_MATCHES`], on the absolute line scale: they stay on their
+    /// text while output scrolls. New output is matched by
+    /// [`Terminal::search_refresh`], which the app calls (throttled) on output.
+    search_matches: Vec<SearchMatch>,
     /// Index into `search_matches` of the CURRENT match (the counter's "n").
     search_current: usize,
+    /// What `search_matches` was collected from — `None` until a query
+    /// collects. What lets [`Terminal::search_refresh`] re-read only the lines
+    /// that can have changed since.
+    search_scan: Option<SearchScan>,
+    /// Bumped on every switch between the primary and the alternate screen:
+    /// stored search matches belong to the screen they were collected on.
+    screen_switches: u64,
     /// While a double-click selection that began on a plain-text URL is live:
     /// `true` when the selection's START is that URL's first cell, `false` when
     /// its END is the URL's last cell (the drag went left of it). The URL is
@@ -1244,6 +1252,10 @@ pub struct Terminal {
     /// replays it through a model of vte's state machine).
     #[cfg(test)]
     vte_log: Option<Vec<u8>>,
+    /// The search match cap ([`Terminal::search_cap`]), lowered by tests to
+    /// reach it.
+    #[cfg(test)]
+    search_cap: usize,
 }
 
 /// What [`Terminal::viewport_rows_chars`] puts in a wide char's spacer cell
@@ -1257,6 +1269,41 @@ pub const SEARCH_MAX_QUERY: usize = 256;
 /// kept (see `Terminal::search_collect`); the counter shows "5000+" when this
 /// cap is hit.
 pub const SEARCH_MAX_MATCHES: usize = 5000;
+
+/// A cell on the absolute line scale `abs_top` keeps for marks and images:
+/// unlike a grid `Point` it names the same text while output scrolls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AbsPoint {
+    line: i64,
+    col: usize,
+}
+
+/// A scrollback-search match: its first and last cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SearchMatch {
+    start: AbsPoint,
+    end: AbsPoint,
+}
+
+/// What the stored search matches were collected from (see
+/// [`Terminal::search_collect`]).
+#[derive(Clone, Copy, Debug)]
+struct SearchScan {
+    /// `abs_top` then: the lines from there down were on the screen and may
+    /// have been rewritten since; the ones above were history, which never
+    /// changes.
+    abs_top: i64,
+    /// The absolute line of the topmost row in the buffer then.
+    top: i64,
+    /// `anchor_epoch` then: a change means `abs_top` lost count (or a reflow
+    /// re-anchored it), so the stored lines name other text.
+    epoch: u64,
+    /// `screen_switches` then: the matches belong to that screen.
+    screens: u64,
+    /// The collect stopped at [`SEARCH_MAX_MATCHES`]: the lines above its
+    /// topmost match were never read.
+    capped: bool,
+}
 
 /// A link found under the pointer by [`Terminal::link_at`]: the target URI
 /// plus where to underline it in the viewport.
@@ -1370,6 +1417,8 @@ impl Terminal {
             search_regex: None,
             search_matches: Vec::new(),
             search_current: 0,
+            search_scan: None,
+            screen_switches: 0,
             url_select: None,
             abs_top: 0,
             scrollback_limit,
@@ -1417,6 +1466,8 @@ impl Terminal {
             vt: VtState::new(rows),
             #[cfg(test)]
             vte_log: None,
+            #[cfg(test)]
+            search_cap: SEARCH_MAX_MATCHES,
         }
     }
 
@@ -2543,10 +2594,12 @@ impl Terminal {
         // the whole update in one piece, where these would not run alone: a
         // toggle would freeze `abs_top` over the primary lines after it, ED 3's
         // shrink would hide the scroll before it, ED 2's prune would run before
-        // the erase. Apply the update first (the frame tears at most once, as
-        // for a mark or image inside a sync). SU / DL only scroll, which the
-        // replay counts like any line feed, and RIS drops every anchor anyway.
-        if !matches!(kind, IsolatedSeq::ScrollUp { .. } | IsolatedSeq::Reset) {
+        // the erase, RIS would drop the anchors (bump the epoch) before the
+        // reset it stands for — a search collected in between would trust
+        // `abs_top` across it. Apply the update first (the frame tears at most
+        // once, as for a mark or image inside a sync). SU / DL only scroll,
+        // which the replay counts like any line feed.
+        if !matches!(kind, IsolatedSeq::ScrollUp { .. }) {
             self.apply_pending_sync();
         }
         let seq = &bytes[s0..k];
@@ -2701,10 +2754,11 @@ impl Terminal {
     }
 
     /// Whether any row-anchored state exists — the only time the scanner pays to
-    /// isolate history-rewriting sequences (see [`IsolatedSeq`]).
+    /// isolate history-rewriting sequences (see [`IsolatedSeq`]). An active
+    /// search counts: its matches sit on the absolute line scale.
     #[inline(always)]
     fn has_anchors(&self) -> bool {
-        !self.marks.is_empty() || !self.placements.is_empty()
+        !self.marks.is_empty() || !self.placements.is_empty() || self.search_regex.is_some()
     }
 
     /// Apply what an isolated sequence (just advanced in its own sub-slice) means
@@ -2941,6 +2995,7 @@ impl Terminal {
             self.reset_kitty_chunks();
             self.clear_alt_placements();
             self.forget_alt_images();
+            self.screen_switches = self.screen_switches.wrapping_add(1);
         }
         // Back on (or still on) the primary screen with its view scrolled back.
         if !alt_after && (d0 != 0 || alt_before) {
@@ -4490,9 +4545,6 @@ impl Terminal {
             self.term.clear_screen(ClearMode::All);
             self.term.clear_screen(ClearMode::Saved);
         }
-        // Reflow moved every line; stored search-match Points are stale now.
-        // Cheap no-op when no search is active.
-        self.search_refresh();
         // A reflow REWRAPS logical lines: a mark's physical row genuinely moves by
         // an amount unrelated to any scroll, so its stored absolute line no longer
         // points at its prompt. `Term::resize` also changes `history_size()`
@@ -4527,6 +4579,9 @@ impl Terminal {
                 self.prune_placements(self.term.grid().history_size());
             }
         }
+        // Reflow moved every line (the epoch bump above tells the search):
+        // re-collect the whole grid. Cheap no-op when no search is active.
+        self.search_refresh();
     }
 
     /// Before a reflow: tag column 0 of every primary-screen image's anchor
@@ -5225,9 +5280,17 @@ impl Terminal {
     /// Returns `(current 1-based, total)`, `(0, 0)` when there is no match
     /// (empty query, failed compile, or genuinely nothing found).
     pub fn search_set_query(&mut self, query: &str) -> (usize, usize) {
+        // A search starting now makes the matches an anchor: a synchronized
+        // update still buffering bytes the scanner saw without one (an ED 3 or
+        // RIS not isolated, a shrink its replay would hide from `abs_top`)
+        // is applied first.
+        if self.search_regex.is_none() && !query.is_empty() {
+            self.apply_pending_sync();
+        }
         self.search_query = query.chars().take(SEARCH_MAX_QUERY).collect();
         self.search_regex = None;
         self.search_matches.clear();
+        self.search_scan = None;
         self.search_current = 0;
         if self.search_query.is_empty() {
             return (0, 0);
@@ -5246,11 +5309,11 @@ impl Terminal {
         // Current = the last match starting at or above the viewport bottom
         // (matches are topmost→bottommost); fall back to the last one.
         let display_offset = self.term.grid().display_offset();
-        let bottom_line = self.rows as i32 - 1 - display_offset as i32;
+        let bottom_line = self.abs_top + self.rows as i64 - 1 - display_offset as i64;
         self.search_current = self
             .search_matches
             .iter()
-            .rposition(|m| m.start().line.0 <= bottom_line)
+            .rposition(|m| m.start.line <= bottom_line)
             .unwrap_or(self.search_matches.len() - 1);
         self.search_scroll_to_current();
         (self.search_current + 1, self.search_matches.len())
@@ -5261,6 +5324,7 @@ impl Terminal {
         self.search_query.clear();
         self.search_regex = None;
         self.search_matches.clear();
+        self.search_scan = None;
         self.search_current = 0;
     }
 
@@ -5302,25 +5366,30 @@ impl Terminal {
         }
     }
 
-    /// Recompute matches with the existing query — called (throttled) after
-    /// new PTY output and after a resize, because stored match `Point`s go
-    /// stale when scrollback rotates or the grid reflows. Keeps the current
-    /// index pointed at the nearest surviving match; never scrolls (streaming
-    /// output must not fight the user's viewport).
+    /// Bring the matches up to date with the existing query — called
+    /// (throttled) after new PTY output, and after a resize or a scrollback
+    /// change. Only what can have changed is re-read (see
+    /// [`Terminal::search_collect`]). The current match stays the one it was
+    /// while it survives (else the nearest newer one; after a reflow, the one
+    /// as far from the bottom); never scrolls (streaming output must not fight
+    /// the user's viewport).
     pub fn search_refresh(&mut self) {
         if self.search_regex.is_none() {
             return;
         }
-        let old_start: Option<Point> =
-            self.search_matches.get(self.search_current).map(|m| *m.start());
+        let current = self.search_matches.get(self.search_current).copied();
+        let from_bottom = self.search_matches.len().saturating_sub(self.search_current + 1);
+        // The stored lines still name the same text unless a reflow or a lost
+        // scroll count re-anchored them.
+        let same_lines = self.search_scan.is_some_and(|s| s.epoch == self.anchor_epoch);
         self.search_collect();
-        self.search_current = match (old_start, self.search_matches.len()) {
-            (_, 0) => 0,
-            (None, len) => len - 1,
-            (Some(p), len) => self
-                .search_matches
-                .partition_point(|m| *m.start() < p)
-                .min(len - 1),
+        let len = self.search_matches.len();
+        self.search_current = match current {
+            _ if len == 0 => 0,
+            None => len - 1,
+            Some(m) if same_lines => self.search_matches.partition_point(|n| n.start < m.start).min(len - 1),
+            // A reflow keeps the matches in order, it only moves them.
+            Some(_) => len.saturating_sub(from_bottom + 1),
         };
     }
 
@@ -5328,88 +5397,163 @@ impl Terminal {
     /// wrapped matches, with the current match flagged. O(visible hits) via a
     /// binary search over the (ordered) match list — cheap per redraw.
     pub fn search_viewport_hits(&self) -> Vec<SearchHit> {
-        if self.search_matches.is_empty() {
+        // Lines a reflow or a lost scroll count re-anchored, or the other
+        // screen's, name other text: nothing is lit until the re-collect.
+        let stale = self
+            .search_scan
+            .is_some_and(|s| s.epoch != self.anchor_epoch || s.screens != self.screen_switches);
+        if self.search_matches.is_empty() || stale {
             return Vec::new();
         }
-        let display_offset = self.term.grid().display_offset();
-        let top_line = -(display_offset as i32);
-        let bottom_line = self.rows as i32 - 1 - display_offset as i32;
+        // The absolute lines the viewport shows.
+        let top = self.abs_top - self.term.grid().display_offset() as i64;
+        let bottom = top + self.rows as i64 - 1;
         // Matches are disjoint and ordered, so end-lines are monotonic too.
-        let first = self
-            .search_matches
-            .partition_point(|m| m.end().line.0 < top_line);
+        let first = self.search_matches.partition_point(|m| m.end.line < top);
         let mut hits = Vec::new();
         for (i, m) in self.search_matches.iter().enumerate().skip(first) {
-            let (s, e) = (*m.start(), *m.end());
-            if s.line.0 > bottom_line {
+            if m.start.line > bottom {
                 break;
             }
-            for line in s.line.0..=e.line.0 {
-                let col_start = if line == s.line.0 { s.column.0 } else { 0 };
-                let col_end = if line == e.line.0 {
-                    e.column.0
-                } else {
-                    self.cols.saturating_sub(1)
-                };
-                if let Some(vp) =
-                    point_to_viewport(display_offset, Point::new(Line(line), Column(col_start)))
-                {
-                    if vp.line < self.rows {
-                        hits.push(SearchHit {
-                            row: vp.line,
-                            col_start,
-                            col_end,
-                            is_current: i == self.search_current,
-                        });
-                    }
-                }
+            for line in m.start.line.max(top)..=m.end.line.min(bottom) {
+                let col_start = if line == m.start.line { m.start.col } else { 0 };
+                let col_end = if line == m.end.line { m.end.col } else { self.cols.saturating_sub(1) };
+                hits.push(SearchHit {
+                    row: (line - top) as usize,
+                    col_start,
+                    col_end,
+                    is_current: i == self.search_current,
+                });
             }
         }
         hits
     }
 
-    /// Re-collect `search_matches` from the whole grid with the compiled
-    /// regex (stored topmost→bottommost, capped at [`SEARCH_MAX_MATCHES`]).
+    /// Bring `search_matches` up to date with the grid and the compiled regex
+    /// (stored topmost→bottommost, capped at [`SEARCH_MAX_MATCHES`]).
     ///
     /// Collected BOTTOM-UP, so a query with more matches than the cap keeps
     /// the most RECENT ones — the screen the search starts from — and drops
     /// the oldest history. (Top-down, the cap kept the oldest: the visible
     /// output had no matches and the view jumped far up into history.) The
     /// early stop at the cap keeps a one-letter query in a huge scrollback as
-    /// cheap as before.
+    /// cheap as before. Each logical line is read on its own (a match spans
+    /// soft-wrapped rows, never a hard line break — see [`collect_lines`]).
+    ///
+    /// After the first collect only what can have changed is read again.
+    /// History never changes, so that is the lines that were on the screen
+    /// then or arrived since (the zone), from the start of the logical line
+    /// the old screen top belongs to — and, when rows scrolled out of the top
+    /// since, the buffer's first logical line (the head): a wide char that
+    /// wrapped onto it matched from the spacer the lost row ended in. The
+    /// matches in between are kept. A capped collect reads on above its
+    /// topmost match when the re-read lines came up short. That is exactly
+    /// the list a full re-collect finds (`search_incremental_equals_a_full_scan`),
+    /// at the cost of the new output instead of the whole history. The whole
+    /// grid is read again after a reflow or a lost scroll count (the anchor
+    /// epoch), after a screen switch, and on the alt screen (no history).
     fn search_collect(&mut self) {
-        self.search_matches.clear();
+        let max = self.search_cap();
         let Some(regex) = self.search_regex.as_mut() else {
+            self.search_matches.clear();
+            self.search_scan = None;
             return;
         };
-        let grid = self.term.grid();
-        let start = Point::new(grid.bottommost_line(), grid.last_column());
-        let end = Point::new(grid.topmost_line(), Column(0));
-        // A leftward scan resumes inside the match it just found, so a
-        // self-overlapping literal (`==` in `====`) also yields overlapping
-        // matches: keep only those that end before the last kept one starts.
-        let mut floor: Option<Point> = None;
-        let mut prev: Option<Point> = None;
-        for m in RegexIter::new(start, end, Direction::Left, &self.term, regex) {
-            // Each step resumes one cell left of the match it just found; past
-            // a wide char in the buffer's top-left corner alacritty wraps around
-            // to the bottom and finds every match again, endlessly (the skip
-            // below never reaches the cap): a match that does not start further
-            // left than the one before it means the scan wrapped.
-            if prev.is_some_and(|p| *m.start() >= p) {
-                break;
+        let term = &self.term;
+        let grid = term.grid();
+        let abs_top = self.abs_top;
+        // The absolute lines of the buffer's first and last row.
+        let top = abs_top - grid.history_size() as i64;
+        let bottom = abs_top + grid.bottommost_line().0 as i64;
+        let last_col = grid.last_column();
+        let grid_line = |abs: i64| Line((abs - abs_top) as i32);
+        let wrapped = |abs: i64| grid[grid_line(abs)][last_col].flags.contains(Flags::WRAPLINE);
+        let to_point = |p: AbsPoint| Point::new(grid_line(p.line), Column(p.col));
+        let to_abs = |p: Point| AbsPoint { line: abs_top + p.line.0 as i64, col: p.column.0 };
+        let to_match = |m: &Match| SearchMatch { start: to_abs(*m.start()), end: to_abs(*m.end()) };
+        // The first row of the logical line through row `abs`.
+        let line_start = |mut abs: i64| {
+            while abs > top && wrapped(abs - 1) {
+                abs -= 1;
             }
-            prev = Some(*m.start());
-            if floor.is_some_and(|f| *m.end() >= f) {
-                continue;
+            abs
+        };
+        let alt = term.mode().contains(TermMode::ALT_SCREEN);
+        let prev = self
+            .search_scan
+            .filter(|p| !alt && p.epoch == self.anchor_epoch && p.screens == self.screen_switches);
+        // The zone starts at the old screen top's logical line — for a full
+        // collect, at the top of the buffer.
+        let seam = prev.map_or(top, |p| line_start(p.abs_top.clamp(top, abs_top)));
+        let mut found = Vec::new();
+        collect_lines(term, regex, grid_line(seam), grid_line(bottom), &mut found, max);
+        let old = std::mem::take(&mut self.search_matches);
+        let mut matches = Vec::with_capacity(old.len().max(found.len()));
+        if let Some(p) = prev.filter(|_| found.len() < max) {
+            // The head, `top..=head_end` — none (`top - 1`) unless rows
+            // scrolled out of the top since and it lies above the zone.
+            let mut head_end = top - 1;
+            if top > p.top && seam > top {
+                head_end = top;
+                while head_end + 1 < seam && wrapped(head_end) {
+                    head_end += 1;
+                }
             }
-            floor = Some(*m.start());
-            self.search_matches.push(m);
-            if self.search_matches.len() >= SEARCH_MAX_MATCHES {
-                break;
+            // Kept: the old matches between the head and the zone.
+            let lo = old.partition_point(|m| m.start.line <= head_end);
+            let hi = old.partition_point(|m| m.end.line < seam).max(lo);
+            let kept = &old[lo..hi];
+            let room = max - found.len();
+            if kept.len() < room {
+                // What a full collect reads above the kept matches.
+                let cap = room - kept.len();
+                let mut more = Vec::new();
+                match old.first() {
+                    // That collect stopped at the cap on this match: the rest
+                    // of its line from the cell after it, then the lines above.
+                    Some(m) if p.capped && m.start.line > head_end && m.end.line < seam => {
+                        let start = line_start(m.start.line);
+                        let first = Point::new(grid_line(start), Column(0));
+                        let end = term.expand_wide(to_point(m.end), Direction::Left);
+                        if end > first {
+                            let from = end.sub(term, Boundary::None, 1);
+                            collect_left(term, regex, from, first, Some(to_point(m.start)), &mut more, cap);
+                        }
+                        if start > top {
+                            collect_lines(term, regex, grid_line(top), grid_line(start - 1), &mut more, cap);
+                        }
+                    }
+                    // It read nothing above the zone.
+                    Some(m) if p.capped && m.start.line >= seam => {
+                        if seam > top {
+                            collect_lines(term, regex, grid_line(top), grid_line(seam - 1), &mut more, cap);
+                        }
+                    }
+                    // It read every line below the head: the head.
+                    _ => {
+                        if head_end >= top {
+                            collect_lines(term, regex, grid_line(top), grid_line(head_end), &mut more, cap);
+                        }
+                    }
+                }
+                matches.extend(more.iter().rev().map(to_match));
             }
+            matches.extend_from_slice(&kept[kept.len().saturating_sub(room)..]);
         }
-        self.search_matches.reverse();
+        matches.extend(found.iter().rev().map(to_match));
+        let capped = matches.len() >= max;
+        self.search_matches = matches;
+        let (epoch, screens) = (self.anchor_epoch, self.screen_switches);
+        self.search_scan = Some(SearchScan { abs_top, top, epoch, screens, capped });
+    }
+
+    /// The most matches a search keeps: [`SEARCH_MAX_MATCHES`] (tests lower
+    /// it to reach it).
+    fn search_cap(&self) -> usize {
+        #[cfg(test)]
+        return self.search_cap;
+        #[cfg(not(test))]
+        SEARCH_MAX_MATCHES
     }
 
     /// Scroll so the current match is visible: no-op when it already is,
@@ -5418,18 +5562,83 @@ impl Terminal {
         let Some(m) = self.search_matches.get(self.search_current) else {
             return;
         };
-        let start = *m.start();
-        let display_offset = self.term.grid().display_offset();
-        if let Some(vp) = point_to_viewport(display_offset, start) {
-            if vp.line < self.rows {
-                return;
-            }
+        // Its grid line, and the viewport row that shows it now.
+        let line = m.start.line - self.abs_top;
+        let row = line + self.term.grid().display_offset() as i64;
+        if (0..self.rows as i64).contains(&row) {
+            return;
         }
         // Desired offset centers the match: viewport row rows/2 shows term
         // line (rows/2 - offset), so offset = rows/2 - match_line.
-        let max = self.scroll_max() as i32;
-        let target = (self.rows as i32 / 2 - start.line.0).clamp(0, max);
+        let max = self.scroll_max() as i64;
+        let target = (self.rows as i64 / 2 - line).clamp(0, max);
         self.scroll_to_offset(target as usize);
+    }
+}
+
+/// Collect `regex`'s matches in the logical lines of grid rows `first..=last`
+/// (`first` starts one, `last` ends one) into `out`, bottom-up, until it
+/// holds `cap`. Each line is read on its own: alacritty's one scan of the
+/// whole buffer missed a hard line break right after a wide char in the last
+/// columns (a match then ran across it), and ended for good at a match it
+/// failed to confirm there, leaving every older line unsearched.
+fn collect_lines<T>(
+    term: &Term<T>,
+    regex: &mut RegexSearch,
+    first: Line,
+    last: Line,
+    out: &mut Vec<Match>,
+    cap: usize,
+) {
+    let last_col = term.last_column();
+    let mut end = last;
+    while end >= first && out.len() < cap {
+        let mut start = end;
+        while start > first && term.grid()[start - 1i32][last_col].flags.contains(Flags::WRAPLINE) {
+            start -= 1i32;
+        }
+        collect_left(term, regex, Point::new(end, last_col), Point::new(start, Column(0)), None, out, cap);
+        end = start - 1i32;
+    }
+}
+
+/// Collect `regex`'s matches leftward from `from` down to `to` (inclusive)
+/// into `out`, bottom-up, until it holds `cap`. `last` is the start of the
+/// match the scan resumes after, if any. A leftward scan resumes inside the
+/// match it just found, so a self-overlapping literal (`==` in `====`) also
+/// yields overlapping matches: only those that end before the last kept one
+/// starts are kept.
+fn collect_left<T>(
+    term: &Term<T>,
+    regex: &mut RegexSearch,
+    from: Point,
+    to: Point,
+    last: Option<Point>,
+    out: &mut Vec<Match>,
+    cap: usize,
+) {
+    let mut floor = last;
+    let mut prev = last;
+    for m in RegexIter::new(from, to, Direction::Left, term, regex) {
+        // A match that does not start further left than the one before it
+        // means the scan wrapped around the buffer.
+        if prev.is_some_and(|p| *m.start() >= p) {
+            break;
+        }
+        prev = Some(*m.start());
+        if floor.is_none_or(|f| *m.end() < f) {
+            floor = Some(*m.start());
+            out.push(m.clone());
+            if out.len() >= cap {
+                break;
+            }
+        }
+        // The next step resumes one cell left of this match's (wide) end:
+        // from `to` that is above it — past a wide char in the buffer's
+        // top-left corner, around to its bottom, finding every match again.
+        if term.expand_wide(*m.end(), Direction::Left) <= to {
+            break;
+        }
     }
 }
 
@@ -7265,6 +7474,174 @@ mod tests {
             t.search_viewport_hits().iter().map(|h| (h.col_start, h.col_end)).collect();
         assert_eq!(cols, vec![(0, 1), (2, 3)]);
         assert_eq!(t.search_set_query("aa").1, 1);
+    }
+
+    #[test]
+    fn search_reads_past_a_wide_char_ending_a_row() {
+        // `a中` filling a 3-column row right before a hard line break: alacritty
+        // finds it leftward but cannot confirm it, and its one scan of the whole
+        // buffer ended right there — every older match went unfound.
+        let mut t = Terminal::new(3, 4);
+        t.feed("xa中b\r\n\r\na中\r\nz".as_bytes());
+        assert_eq!(t.search_set_query("a中").1, 1, "the wrapped one, above the row it cannot confirm");
+        let hits = t.search_viewport_hits();
+        assert_eq!(hits.len(), 2, "one match over two rows: {hits:?}");
+        assert_eq!((hits[0].row, hits[0].col_start), (0, 1));
+    }
+
+    #[test]
+    fn search_current_match_stays_on_its_text_while_output_scrolls() {
+        // 20×5: "err A" in history, "err B" on screen. Enter (older) makes A
+        // current and scrolls to it; three lines of output must leave A
+        // current. The refresh used to look it up by its pre-scroll grid
+        // point and land on B — the next Enter then re-selected A without
+        // moving, as if it did nothing.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"err A\r\n1\r\n2\r\n3\r\n4\r\n5\r\nerr B\r\n");
+        assert_eq!(t.search_set_query("err"), (2, 2));
+        assert_eq!(t.search_nav(true), (1, 2));
+        let offset = t.scroll_offset();
+        assert!(offset > 0, "A is in history: the view moved to it");
+        t.feed(b"x\r\ny\r\nz\r\n");
+        t.search_refresh();
+        assert_eq!(t.search_counter(), (1, 2), "A is still the current match");
+        assert_eq!(t.scroll_offset(), offset + 3, "the view stays on A");
+        let hits = t.search_viewport_hits();
+        assert!(hits.iter().any(|h| h.is_current), "A is lit as current where it is: {hits:?}");
+        // New matches below keep the old one current, and the counter honest.
+        t.feed(b"err C\r\nerr D\r\n");
+        t.search_refresh();
+        assert_eq!(t.search_counter(), (1, 4));
+        assert_eq!(t.search_nav(false), (2, 4), "Shift+Enter steps to the next newer one, B");
+    }
+
+    #[test]
+    fn search_current_match_survives_a_reflow() {
+        let mut t = Terminal::new(30, 6);
+        for i in 0..40 {
+            t.feed(format!("line {i} needle\r\n").as_bytes());
+        }
+        let (_, total) = t.search_set_query("needle");
+        for _ in 0..5 {
+            t.search_nav(true);
+        }
+        let (cur, _) = t.search_counter();
+        t.resize(20, 9);
+        assert_eq!(t.search_counter(), (cur, total), "the same match, counted from the bottom");
+    }
+
+    /// The matches a full re-collect finds on `t`'s grid right now; the
+    /// incremental state is left as it was.
+    fn full_search_matches(t: &mut Terminal) -> Vec<SearchMatch> {
+        let (kept, scan) = (t.search_matches.clone(), t.search_scan);
+        t.search_scan = None;
+        t.search_collect();
+        t.search_scan = scan;
+        std::mem::replace(&mut t.search_matches, kept)
+    }
+
+    /// Output that keeps matching the queries of [`search_equivalence`]: runs
+    /// of `a` / `b` / `=`, wide `中`, and line breaks — or a sequence that
+    /// rewrites what is on the screen or moves it into history.
+    fn search_fuzz_token(r: &mut Rng, out: &mut Vec<u8>) {
+        match r.below(12) {
+            0..=6 => {
+                for _ in 0..1 + r.below(30) {
+                    let piece: &[u8] = r.pick(&[&b"a"[..], b"a", b"b", b"=", b" ", "中".as_bytes(), b"\r\n", b"ab"]);
+                    out.extend_from_slice(piece);
+                }
+            }
+            7 => out.extend_from_slice(format!("\x1b[{};{}H", 1 + r.below(14), 1 + r.below(34)).as_bytes()),
+            8 => out.extend_from_slice(r.pick(&[
+                &b"\x1b[K"[..], b"\x1b[1K", b"\x1b[J", b"\x1b[2J", b"\x1b[3J", b"\x1b[2L", b"\x1b[M",
+                b"\x1b[3S", b"\x1b[T", b"\x1bM", b"\x1b[3@", b"\x1b[2P", b"\x1b#8",
+            ])),
+            9 => out.extend_from_slice(format!("\x1b[{};{}r", r.below(8), r.below(16)).as_bytes()),
+            10 => out.extend_from_slice(r.pick(&[
+                &b"\x1b[?1049h"[..], b"\x1b[?1049l", b"\x1b[?2026h", b"\x1b[?2026l", b"\x1bc",
+            ])),
+            _ => fuzz_token(r, out),
+        }
+    }
+
+    /// Drive one terminal with a search open through `steps` random outputs
+    /// and app calls, checking after every refresh that the incremental match
+    /// list equals a full re-collect. Returns how many refreshes hit the cap.
+    fn search_equivalence(seed: u64, steps: usize) -> usize {
+        let mut r = Rng(seed | 1);
+        let mut t = Terminal::new(2 + r.below(34), 1 + r.below(14));
+        t.set_scrollback_lines(r.pick(&[0usize, 3, 40, 300, 3000]));
+        t.search_cap = r.pick(&[1usize, 4, 30, 300, SEARCH_MAX_MATCHES]);
+        if r.chance(3) {
+            t.feed(b"\x1b]133;A\x07$ \x1b]133;C\x07"); // a live mark as well
+        }
+        let queries = ["a", "aa", "ab", "==", "中", "a中", "ba", "A"];
+        t.search_set_query(r.pick(&queries));
+        let mut capped = 0;
+        let mut buf = Vec::new();
+        for step in 0..steps {
+            buf.clear();
+            for _ in 0..1 + r.below(10) {
+                search_fuzz_token(&mut r, &mut buf);
+            }
+            let mut i = 0;
+            while i < buf.len() {
+                let end = (i + 1 + r.below(200)).min(buf.len());
+                t.feed(&buf[i..end]);
+                i = end;
+            }
+            match r.below(30) {
+                0 => t.resize(2 + r.below(34), 1 + r.below(14)),
+                1 => t.set_scrollback_lines(r.pick(&[0usize, 3, 40, 300, 3000])),
+                2 => t.flush_sync(),
+                3 => t.scroll_lines(r.below(40) as i32 - 20),
+                4 => {
+                    t.search_set_query(r.pick(&queries));
+                }
+                _ => {}
+            }
+            if r.chance(4) {
+                continue; // several outputs between two refreshes
+            }
+            t.search_refresh();
+            capped += usize::from(t.search_matches.len() == t.search_cap);
+            let full = full_search_matches(&mut t);
+            assert!(
+                t.search_matches == full,
+                "seed {seed:#x} step {step} ({:?}): {} incremental vs {} full matches",
+                t.search_query,
+                t.search_matches.len(),
+                full.len()
+            );
+            let (cur, total) = t.search_counter();
+            assert!(cur <= total && (total == 0) == (cur == 0), "seed {seed:#x} step {step}: counter {cur}/{total}");
+        }
+        capped
+    }
+
+    /// An incremental refresh must find exactly what a full re-collect finds,
+    /// whatever the output did since the last one: text dense in (wrapped,
+    /// wide, self-overlapping) matches, screen rewrites, scroll regions, the
+    /// alt screen, RIS, synchronized updates, resizes and scrollback changes,
+    /// with the history below and at its cap, and the match cap hit.
+    #[test]
+    fn search_incremental_equals_a_full_scan() {
+        let capped: usize = (1..=120u64).map(|s| search_equivalence(s.wrapping_mul(0x9e37_79b9_7f4a_7c15), 160)).sum();
+        assert!(capped > 100, "the match cap must be exercised ({capped})");
+    }
+
+    /// The long run: `cargo test -p jetty-core --release -- --ignored
+    /// search_incremental_long`. `JETTY_FUZZ_SEED=0x…` replays one seed.
+    #[test]
+    #[ignore]
+    fn search_incremental_long() {
+        if let Some(seed) = std::env::var("JETTY_FUZZ_SEED").ok().and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()) {
+            search_equivalence(seed, 600);
+            return;
+        }
+        for seed in 1..=5000u64 {
+            search_equivalence(seed.wrapping_mul(0xd1b5_4a32_d192_ed03), 600);
+        }
     }
 
     #[test]
