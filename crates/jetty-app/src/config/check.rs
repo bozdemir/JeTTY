@@ -96,7 +96,7 @@ pub(crate) fn closest<'a>(word: &str, candidates: &[&'a str]) -> Option<&'a str>
         .flatten()
         // …the same key name in another table (`cursor.opacity`)…
         .or_else(|| unique(&|c| c.contains('.') != word.contains('.') && leaf(c) == leaf(word)))
-        // …or a unique abbreviation (`drop`, `scrollback`).
+        // …or a unique abbreviation (`drop`).
         .or_else(|| unique(&|c| w.len() >= 3 && squash(c).starts_with(&w)))
 }
 
@@ -417,7 +417,10 @@ pub(super) fn check_choices(
     warnings: &mut Vec<String>,
     invalid: &mut Vec<Vec<String>>,
 ) {
-    let mut fixed: Option<toml::Table> = None;
+    // `cfg` as a table (made once, on the first enum-like key the file sets),
+    // turned back into `cfg` only when a value was fixed.
+    let mut table: Option<toml::Table> = None;
+    let mut changed = false;
     let mut base_t: Option<toml::Table> = None;
     for c in choices() {
         let path: Vec<String> = c.path.iter().map(|s| s.to_string()).collect();
@@ -425,11 +428,12 @@ pub(super) fn check_choices(
             continue;
         }
         let Some(toml::Value::String(raw)) = get_path(user, &path) else { continue };
-        let t = fixed.get_or_insert_with(|| to_table(cfg));
+        let t = table.get_or_insert_with(|| to_table(cfg));
         match (c.canon)(raw) {
             Some(canon) => {
                 if get_path(t, &path).and_then(toml::Value::as_str) != Some(canon) {
                     set_path(t, &path, toml::Value::String(canon.to_string()));
+                    changed = true;
                 }
             }
             None => {
@@ -444,12 +448,13 @@ pub(super) fn check_choices(
                 let b = base_t.get_or_insert_with(|| to_table(base));
                 if let Some(v) = get_path(b, &path) {
                     set_path(t, &path, v.clone());
+                    changed = true;
                 }
                 invalid.push(path);
             }
         }
     }
-    if let Some(t) = fixed {
+    if let (true, Some(t)) = (changed, table) {
         if let Ok(c) = toml::Value::Table(t).try_into::<Config>() {
             *cfg = c;
         }
