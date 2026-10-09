@@ -662,6 +662,17 @@ enum SummonBy {
     App,
 }
 
+/// Why the main window hides — what [`App::hide_main_window`] does
+/// differently for each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HideCause {
+    /// F9, `jetty --hide`, a command typed in a detached window: JeTTY may
+    /// still be the active application, with no window left to type into.
+    User,
+    /// The focus-loss auto-hide: the focus has already gone to another app.
+    FocusLoss,
+}
+
 /// How a summon asks for focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusAsk {
@@ -969,12 +980,13 @@ pub struct App {
     /// Dropdown mode.
     ///
     /// INVARIANT (rule F0): `!main_fullscreen` whenever `!visible`. The OS
-    /// fullscreen state is never held while the window is hidden — both hide
-    /// paths leave fullscreen BEFORE `set_visible(false)` and the summon path
-    /// re-enters it AFTER `set_visible(true)`. That is what makes the enter a
-    /// genuine `None → Some` transition winit's X11 backend cannot dedupe away,
-    /// keeps `set_simple_fullscreen` off an unmapped (screen-less) macOS window,
-    /// and stops an ad-hoc F11 leaking across a hide/summon round-trip.
+    /// fullscreen state is never held while the window is hidden — the hide
+    /// (`hide_main_window`) leaves fullscreen BEFORE `set_visible(false)` and
+    /// the summon path re-enters it AFTER `set_visible(true)`. That is what
+    /// makes the enter a genuine `None → Some` transition winit's X11 backend
+    /// cannot dedupe away, keeps `set_simple_fullscreen` off an unmapped
+    /// (screen-less) macOS window, and stops an ad-hoc F11 leaking across a
+    /// hide/summon round-trip.
     ///
     /// KNOWN LIMITATION — a WM-initiated fullscreen change DESYNCS this mirror.
     /// There is no winit event for "the WM took the window in or out of
@@ -1181,7 +1193,7 @@ pub struct App {
     /// presses coalesce into a single PTY SIGWINCH (avoids stacked p10k prompts).
     reflow_pending_at: Option<std::time::Instant>,
     /// Set when a HIDE dropped a still-pending `reflow_pending_at` deadline, so
-    /// the next summon re-arms it once (see the hide legs).
+    /// the next summon re-arms it once (see `hide_main_window`).
     ///
     /// Rule F0 exits OS fullscreen while the window is still MAPPED, so a hide
     /// from Fullscreen mode shrinks the frame monitor→windowed and the resulting
@@ -7654,9 +7666,9 @@ impl App {
     /// Rule F0: leave OS fullscreen while the window is still MAPPED, with NO
     /// geometry restore and no repaint. Returns whether we were fullscreen.
     ///
-    /// Used by both hide paths — `set_visibility(false)` and
-    /// `autohide_main_window` — immediately BEFORE `set_visible(false)`, and
-    /// before the window is dropped (app exit). Keeping the OS state out of the
+    /// Used by the hide (`hide_main_window`, for F9 and the focus-loss
+    /// auto-hide alike) immediately BEFORE `set_visible(false)`, and before
+    /// the window is dropped (app exit). Keeping the OS state out of the
     /// hidden period is what makes the next summon's enter a genuine
     /// `None → Some` transition, keeps macOS's simple fullscreen off a screen-less
     /// window, and stops an ad-hoc F11 leaking across a hide/summon round-trip.
@@ -9593,36 +9605,60 @@ impl App {
     /// Perform the Yakuake-style focus-loss auto-hide of the main window.
     /// Called from `about_to_wait` when the `pending_autohide_at` grace period
     /// elapsed without any JeTTY window regaining focus (see the field docs).
-    fn autohide_main_window(&mut self) {
-        if !self.visible {
-            return;
+    fn autohide_main_window(&mut self, event_loop: &ActiveEventLoop) {
+        if self.visible {
+            self.hide_main_window(HideCause::FocusLoss, event_loop);
         }
+    }
+
+    /// Take the main window off screen — the ONE hide, for F9 / `--hide` / a
+    /// detached window's command and the focus-loss auto-hide alike. The two
+    /// used to carry every reset below twice, and the copies had drifted apart;
+    /// what differs by `cause` is spelled out in one place.
+    fn hide_main_window(&mut self, cause: HideCause, event_loop: &ActiveEventLoop) {
+        self.visible = false;
+        // A hide supersedes any scheduled auto-hide.
+        self.pending_autohide_at = None;
         // Rule F0: drop the OS fullscreen state while the window is still MAPPED,
         // BEFORE `set_visible(false)` below.
         let was_fullscreen = self.exit_main_fullscreen_bare();
         if let Some(win) = &self.window {
-            // Never overwrite `last_pos` when we were fullscreen: `outer_position()`
-            // on a fullscreen (or just-exited) window reports the monitor origin,
-            // which would poison the user's remembered spot to the screen corner —
-            // and `set_main_fullscreen(true)` already saved the real pre-fullscreen
+            // Remember the current spot so the next Center summon restores it
+            // (Dropdown re-docks, so it saves nothing). Never when we were
+            // fullscreen: `outer_position()` on a fullscreen (or just-exited)
+            // window reports the monitor origin, which would poison the user's
+            // remembered spot to the screen corner — and
+            // `set_main_fullscreen(true)` already saved the real pre-fullscreen
             // position on the way in.
             if self.window_mode == WindowMode::Center && !was_fullscreen {
                 self.last_pos = win.outer_position().ok();
             }
-            self.slide_anim = None;
-            // Also stop a mid-flight summon animation: its only expiry point is
-            // inside the acquire_frame success path, which a hidden surface may
-            // never reach — a stuck summon_anim would pin the loop in Poll.
-            self.summon_anim = None;
-            self.summon_pending = false;
             // Unmapped — or, on Wayland, closed at the end of this hide.
             jetty_platform::hide_window(win);
         }
-        self.visible = false;
-        // Stamp the auto-hide: if this FocusOut was the summon hotkey's own key
-        // grab and the hotkey event is merely late, that toggle must not re-show
-        // the window (see `toggle_action`).
-        self.autohidden_at = Some(std::time::Instant::now());
+        match cause {
+            // macOS keeps the app active with no window: typed keys went
+            // nowhere until the user clicked the app they came from. With no
+            // other JeTTY window open, hide the application so AppKit hands the
+            // keyboard back (a no-op elsewhere).
+            HideCause::User => {
+                if self.settings_window.is_none() && self.detached.is_empty() {
+                    jetty_platform::hide_application(event_loop);
+                }
+            }
+            // Stamp the auto-hide: if this FocusOut was the summon hotkey's own
+            // key grab and the hotkey event is merely late, that toggle must not
+            // re-show the window (see `toggle_action`). The focus has already
+            // gone somewhere else: no application hide.
+            HideCause::FocusLoss => self.autohidden_at = Some(std::time::Instant::now()),
+        }
+        // A slide or summon reveal in flight: their only expiry point is inside
+        // the acquire_frame success path, which a hidden surface may never reach
+        // (Occluded/Timeout) — a stuck one would pin the loop in Poll (busy loop)
+        // for as long as the window stays hidden.
+        self.slide_anim = None;
+        self.summon_anim = None;
+        self.summon_pending = false;
         // Save a still-debounced settings change now (non-blocking).
         self.persister.borrow_mut().flush();
         // The matching button-release never arrives once hidden — end the
@@ -9661,7 +9697,7 @@ impl App {
     }
 
     /// Drop every paint owed to the main window that only makes sense while it
-    /// is on screen — shared by both hide paths. Each one is re-armed by the
+    /// is on screen — part of `hide_main_window`. Each one is re-armed by the
     /// first frame after the next summon, so nothing is lost; leaving them armed
     /// while hidden made `about_to_wait` request redraws for an unmapped window.
     fn disarm_hidden_paints(&mut self) {
@@ -9877,35 +9913,32 @@ impl App {
             }
             return;
         }
+        // The hide: one routine, shared with the focus-loss auto-hide.
+        if !want {
+            self.hide_main_window(HideCause::User, event_loop);
+            return;
+        }
         // Test hook (`debug_lose_gpu`): this summon finds the device lost.
-        if want && self.debug_lose_gpu {
+        if self.debug_lose_gpu {
             if let Some(g) = &self.gpu {
                 g.debug_lose_device();
             }
         }
         // Test hook (`debug_lose_surface`): this summon finds the surface gone.
-        if want && self.debug_lose_surface {
+        if self.debug_lose_surface {
             if let Some(g) = &mut self.gpu {
                 g.release_surface();
             }
         }
-        self.visible = want;
-        // An explicit visibility change supersedes any scheduled auto-hide.
+        self.visible = true;
+        // A summon supersedes any scheduled auto-hide.
         self.pending_autohide_at = None;
         let mode = self.window_mode;
-        // Rule F0: on the HIDE leg, drop the OS fullscreen state while the window is
-        // still MAPPED (before `set_visible(false)` below). Computed here, ahead of
-        // the `&self.window` borrow, because it needs `&mut self`.
-        let was_fullscreen = if self.visible {
-            false
-        } else {
-            self.exit_main_fullscreen_bare()
-        };
         // A summon into Fullscreen mode enters fullscreen INLINE below (rule F0
         // wants `set_visible(true)` first), bypassing `set_main_fullscreen` — so
         // the single-fullscreen-window rule is applied here instead, ahead of the
         // `&self.window` borrow that follows.
-        if self.visible && mode == WindowMode::Fullscreen {
+        if mode == WindowMode::Fullscreen {
             // Same two sibling-window rules as `set_main_fullscreen(true)`, applied
             // here because the summon enters fullscreen INLINE below (rule F0 wants
             // `set_visible(true)` first) — and both need `&mut self`, so they must
@@ -9921,201 +9954,138 @@ impl App {
         // Wayland: the hide closed the window — build it again. The compositor
         // focuses it as a new window (with the launcher's token where it wants
         // one), so it needs no focus request below. Unbuildable: stay hidden.
-        let reopened = self.visible && self.unpark_main_window(by, event_loop);
-        if self.visible && self.window.is_none() {
+        let reopened = self.unpark_main_window(by, event_loop);
+        if self.window.is_none() {
             self.visible = false;
             return;
         }
         if let Some(win) = &self.window {
-            if self.visible {
-                // macOS: the hide below may have hidden the whole application,
-                // whose windows then stay off screen — un-hide it first (without
-                // activating: `ask_focus` does that, as before).
-                jetty_platform::unhide_application();
-                match mode {
-                    WindowMode::Center => {
-                        win.set_visible(true);
-                        // Re-summon at the spot the user left it; first → center.
-                        // X11/KWin ignores a position issued before the window is
-                        // mapped, so re-assert it on the next few post-map redraws
-                        // (mirrors pending_dock_frames) or the saved spot is lost.
-                        match self.last_pos {
-                            // Only restore a saved position that still lands on a
-                            // connected monitor. If the monitor was unplugged while
-                            // hidden, the verbatim restore (plus the 5-frame
-                            // re-assertion) would map the window off-screen and
-                            // fight any WM rescue — center on a live monitor
-                            // instead and forget the stale spot (F32).
-                            Some(pos) if pos_on_some_monitor(win, pos) => {
-                                win.set_outer_position(pos);
-                                self.pending_center_pos = Some(pos);
-                                self.pending_center_frames = 5;
-                            }
-                            _ => {
-                                center_window(win);
-                                self.pending_center_pos = None;
-                                self.pending_center_frames = 0;
-                                self.last_pos = None;
-                            }
+            // macOS: a hide may have hidden the whole application, whose
+            // windows then stay off screen — un-hide it first (without
+            // activating: `ask_focus` does that, as before).
+            jetty_platform::unhide_application();
+            match mode {
+                WindowMode::Center => {
+                    win.set_visible(true);
+                    // Re-summon at the spot the user left it; first → center.
+                    // X11/KWin ignores a position issued before the window is
+                    // mapped, so re-assert it on the next few post-map redraws
+                    // (mirrors pending_dock_frames) or the saved spot is lost.
+                    match self.last_pos {
+                        // Only restore a saved position that still lands on a
+                        // connected monitor. If the monitor was unplugged while
+                        // hidden, the verbatim restore (plus the 5-frame
+                        // re-assertion) would map the window off-screen and
+                        // fight any WM rescue — center on a live monitor
+                        // instead and forget the stale spot (F32).
+                        Some(pos) if pos_on_some_monitor(win, pos) => {
+                            win.set_outer_position(pos);
+                            self.pending_center_pos = Some(pos);
+                            self.pending_center_frames = 5;
+                        }
+                        _ => {
+                            center_window(win);
+                            self.pending_center_pos = None;
+                            self.pending_center_frames = 0;
+                            self.last_pos = None;
                         }
                     }
-                    WindowMode::Dropdown => {
-                        // Show FIRST so the window is mapped, THEN dock: on X11 a
-                        // dock issued before the window is realized is ignored by
-                        // the WM (the window lands centered). pending_dock_frames
-                        // re-asserts the top-strip geometry on the next few
-                        // post-map redraws so it actually docks to the top.
-                        win.set_visible(true);
-                        dock_window_top(win, self.dropdown_width_pct, self.dropdown_height_pct);
-                        self.pending_dock_frames = 5;
-                        // Arm the render-side slide-down (not with reduced
-                        // motion: the window simply appears, docked).
-                        if !self.motion_reduced() {
-                            self.slide_anim = Some(std::time::Instant::now());
-                        }
-                    }
-                    WindowMode::Fullscreen => {
-                        // Show FIRST so the window is mapped: X11 resolves
-                        // `Borderless(None)` from the window frame and macOS's
-                        // simple fullscreen `expect`s a screen, neither of which an
-                        // unmapped window has (rule F0). Because the hide leg exited
-                        // fullscreen, this is always a genuine `None → Some`
-                        // transition — winit's X11 `set_fullscreen_inner` early-
-                        // returns when the requested state equals the cached one, so
-                        // holding the state across a hide would silently lose the WM
-                        // state and make the summon a no-op.
-                        //
-                        // HONESTLY, on X11 this enter is still DEFERRED: `set_visible`
-                        // leaves winit's visibility at `YesWait` until a
-                        // `VisibilityNotify` arrives, so `set_fullscreen_inner` stores
-                        // the request in `desired_fullscreen` and replays it post-map.
-                        // The window therefore maps at its WINDOWED geometry and
-                        // expands a moment later — a brief windowed→fullscreen flash
-                        // on every summon. Harmless (the deferral returns before the
-                        // cached state is assigned, so the replay is still a genuine
-                        // `None → Some`, and `main_fullscreen` is already true so the
-                        // corners are flat for those frames), but the blueprint's
-                        // "nothing is deferred here" claim was simply wrong.
-                        win.set_visible(true);
-                        // Same capture as `set_main_fullscreen(true)` — this inline
-                        // enter used to bypass it, which left an F11 escape (and a
-                        // Settings switch back to Center) with no position AND no
-                        // size to restore, so the exit centred from the stale
-                        // monitor-sized `outer_size()` and landed in the corner.
-                        capture_pre_fullscreen(
-                            win,
-                            mode,
-                            &mut self.last_pos,
-                            &mut self.last_windowed_size,
-                        );
-                        self.main_fullscreen = true;
-                        jetty_platform::set_window_fullscreen(win, true);
-                        // NO Center/Dropdown geometry, NO dock/center counters, NO
-                        // slide: the summon reveal effect (`summon_pending` below) is
-                        // this mode's appearance animation, and it is
-                        // resolution-independent.
-                        self.pending_center_pos = None;
-                        self.pending_center_frames = 0;
-                        self.pending_dock_frames = 0;
+                }
+                WindowMode::Dropdown => {
+                    // Show FIRST so the window is mapped, THEN dock: on X11 a
+                    // dock issued before the window is realized is ignored by
+                    // the WM (the window lands centered). pending_dock_frames
+                    // re-asserts the top-strip geometry on the next few
+                    // post-map redraws so it actually docks to the top.
+                    win.set_visible(true);
+                    dock_window_top(win, self.dropdown_width_pct, self.dropdown_height_pct);
+                    self.pending_dock_frames = 5;
+                    // Arm the render-side slide-down (not with reduced
+                    // motion: the window simply appears, docked).
+                    if !self.motion_reduced() {
+                        self.slide_anim = Some(std::time::Instant::now());
                     }
                 }
-                // Pay back a reflow the hide leg dropped (see
-                // `reflow_deferred_by_hide`) at THIS geometry. When the summon's own
-                // geometry change produces a `Resized`, that overwrites this
-                // deadline with its own — so a summon always costs exactly one
-                // debounced reflow, never two and never zero.
-                let (pending, deferred) = reflow_terms_on_summon(
-                    self.reflow_pending_at,
-                    self.reflow_deferred_by_hide,
-                    std::time::Instant::now()
-                        + std::time::Duration::from_millis(REFLOW_DEBOUNCE_MS),
-                );
-                self.reflow_pending_at = pending;
-                self.reflow_deferred_by_hide = deferred;
-                // The map above was already flushed, so the WM handles it before
-                // this request.
-                if !reopened {
-                    ask_focus(win);
+                WindowMode::Fullscreen => {
+                    // Show FIRST so the window is mapped: X11 resolves
+                    // `Borderless(None)` from the window frame and macOS's
+                    // simple fullscreen `expect`s a screen, neither of which an
+                    // unmapped window has (rule F0). Because the hide exited
+                    // fullscreen, this is always a genuine `None → Some`
+                    // transition — winit's X11 `set_fullscreen_inner` early-
+                    // returns when the requested state equals the cached one, so
+                    // holding the state across a hide would silently lose the WM
+                    // state and make the summon a no-op.
+                    //
+                    // HONESTLY, on X11 this enter is still DEFERRED: `set_visible`
+                    // leaves winit's visibility at `YesWait` until a
+                    // `VisibilityNotify` arrives, so `set_fullscreen_inner` stores
+                    // the request in `desired_fullscreen` and replays it post-map.
+                    // The window therefore maps at its WINDOWED geometry and
+                    // expands a moment later — a brief windowed→fullscreen flash
+                    // on every summon. Harmless (the deferral returns before the
+                    // cached state is assigned, so the replay is still a genuine
+                    // `None → Some`, and `main_fullscreen` is already true so the
+                    // corners are flat for those frames), but the blueprint's
+                    // "nothing is deferred here" claim was simply wrong.
+                    win.set_visible(true);
+                    // Same capture as `set_main_fullscreen(true)` — this inline
+                    // enter used to bypass it, which left an F11 escape (and a
+                    // Settings switch back to Center) with no position AND no
+                    // size to restore, so the exit centred from the stale
+                    // monitor-sized `outer_size()` and landed in the corner.
+                    capture_pre_fullscreen(
+                        win,
+                        mode,
+                        &mut self.last_pos,
+                        &mut self.last_windowed_size,
+                    );
+                    self.main_fullscreen = true;
+                    jetty_platform::set_window_fullscreen(win, true);
+                    // NO Center/Dropdown geometry, NO dock/center counters, NO
+                    // slide: the summon reveal effect (`summon_pending` below) is
+                    // this mode's appearance animation, and it is
+                    // resolution-independent.
+                    self.pending_center_pos = None;
+                    self.pending_center_frames = 0;
+                    self.pending_dock_frames = 0;
                 }
-                // Crystallize/reveal on every summon (F9 show), mirroring first open.
-                // Start the clock on the FIRST real frame (summon_pending), not here:
-                // on macOS the window can take a beat to present, which would
-                // otherwise let the whole effect elapse unseen (effectless).
-                self.summon_pending = true;
-                self.summon_settle_until =
-                    Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
-                // The summon may have placed the window anywhere: re-derive the
-                // Dropdown top-flush once; a fresh show is not a "raise", and any
-                // earlier auto-hide no longer matters.
-                self.top_flush_dirty = true;
-                self.raise_attempt_at = None;
-                self.autohidden_at = None;
-                self.request_main_paint();
-                if let Some((msg, ms)) = self.deferred_notice.take() {
-                    self.show_notice_pill(msg, ms);
-                }
-            } else {
-                // Remember the current spot before hiding so the next Center
-                // summon restores it. Dropdown re-docks, so last_pos is unused.
-                // Skipped when we just left fullscreen: `outer_position()` reports
-                // the monitor origin there, and the real pre-fullscreen spot was
-                // already saved on the way IN (see `set_main_fullscreen`).
-                if mode == WindowMode::Center && !was_fullscreen {
-                    self.last_pos = win.outer_position().ok();
-                }
-                self.slide_anim = None;
-                // Expire a mid-flight summon animation as well: its only other
-                // expiry point is inside the acquire_frame success path, which a
-                // hidden surface may never reach (Occluded/Timeout) — a stuck
-                // summon_anim would pin about_to_wait in Poll (busy loop) for as
-                // long as the window stays hidden.
-                self.summon_anim = None;
-                self.summon_pending = false;
-                // Unmapped — or, on Wayland, closed at the end of this hide.
-                jetty_platform::hide_window(win);
-                // macOS keeps the app active with no window: typed keys went
-                // nowhere until the user clicked the app they came from. With no
-                // other JeTTY window open, hide the application so AppKit hands
-                // the keyboard back (a no-op elsewhere). Not on the focus-loss
-                // auto-hide: focus has already gone somewhere then.
-                if self.settings_window.is_none() && self.detached.is_empty() {
-                    jetty_platform::hide_application(event_loop);
-                }
-                // Save a still-debounced settings change now (non-blocking).
-                self.persister.borrow_mut().flush();
-                // The matching button-release never arrives once hidden — end
-                // the pointer gestures so none resumes stuck on the next summon,
-                // and close the menus (mirrors autohide_main_window; the F9/IPC
-                // hide path reaches here too, `--hide` without a focus loss).
-                self.reset_main_pointer();
-                self.dismiss_menus();
-                // Clear the self-drive terms whose only expiry is in
-                // RedrawRequested (never delivered to a hidden macOS window) so
-                // they don't pin Poll and spin 100% CPU while hidden (F18).
-                self.caret_anim = None;
-                self.glitch.cancel();
-                self.trail.reset();
-                self.trail_wake = None;
-                self.bell_anim = None;
-                self.pulse_anim = None;
-                self.pending_dock_frames = 0;
-                self.pending_center_frames = 0;
-                // Paints owed to a now-invisible window (idle HUD, keystroke
-                // fallback, acquire retry, a pending raise) — same as the
-                // focus-loss hide path.
-                self.disarm_hidden_paints();
-                // …and the debounced reflow (see `reflow_deferred_by_hide`): rule
-                // F0 leaves fullscreen while still mapped just above, so the
-                // deadline may be live — and it would fire 250 ms later, hidden.
-                let (pending, deferred) =
-                    reflow_terms_on_hide(self.reflow_pending_at, self.reflow_deferred_by_hide);
-                self.reflow_pending_at = pending;
-                self.reflow_deferred_by_hide = deferred;
             }
-        }
-        // Wayland: the hidden window is closed, not kept.
-        if !self.visible {
-            self.park_main_window(was_fullscreen);
+            // Pay back a reflow the hide dropped (see
+            // `reflow_deferred_by_hide`) at THIS geometry. When the summon's own
+            // geometry change produces a `Resized`, that overwrites this
+            // deadline with its own — so a summon always costs exactly one
+            // debounced reflow, never two and never zero.
+            let (pending, deferred) = reflow_terms_on_summon(
+                self.reflow_pending_at,
+                self.reflow_deferred_by_hide,
+                std::time::Instant::now()
+                    + std::time::Duration::from_millis(REFLOW_DEBOUNCE_MS),
+            );
+            self.reflow_pending_at = pending;
+            self.reflow_deferred_by_hide = deferred;
+            // The WM sees the map above before this request: winit's own goes
+            // out behind it, `activate_window` waits for winit's connection.
+            if !reopened {
+                ask_focus(win);
+            }
+            // Crystallize/reveal on every summon (F9 show), mirroring first open.
+            // Start the clock on the FIRST real frame (summon_pending), not here:
+            // on macOS the window can take a beat to present, which would
+            // otherwise let the whole effect elapse unseen (effectless).
+            self.summon_pending = true;
+            self.summon_settle_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+            // The summon may have placed the window anywhere: re-derive the
+            // Dropdown top-flush once; a fresh show is not a "raise", and any
+            // earlier auto-hide no longer matters.
+            self.top_flush_dirty = true;
+            self.raise_attempt_at = None;
+            self.autohidden_at = None;
+            self.request_main_paint();
+            if let Some((msg, ms)) = self.deferred_notice.take() {
+                self.show_notice_pill(msg, ms);
+            }
         }
     }
 
@@ -13326,7 +13296,7 @@ impl ApplicationHandler<AppEvent> for App {
             if self.visible {
                 let now = std::time::Instant::now();
                 match autohide_due(self.focus_still_on_jetty(), self.focus_lost_at, now) {
-                    AutohideDue::Hide => self.autohide_main_window(),
+                    AutohideDue::Hide => self.autohide_main_window(event_loop),
                     AutohideDue::RecheckAt(d) => self.pending_autohide_at = Some(d),
                 }
             }
@@ -19021,9 +18991,9 @@ const REFLOW_DEBOUNCE_MS: u64 = 250;
 /// behind: NEVER a live deadline (a reflow that fires while hidden SIGWINCHes
 /// every shell to a grid the user cannot see), but remember that one was owed.
 ///
-/// Pure so "the hide legs clear the deadline" is a unit test. Both hide paths —
-/// `set_visibility(false)` and `autohide_main_window` — go through it, alongside
-/// the other deferred terms they already zero.
+/// Pure so "a hide clears the deadline" is a unit test. `hide_main_window`
+/// goes through it — for F9 and the focus-loss auto-hide alike — alongside the
+/// other deferred terms it zeroes.
 fn reflow_terms_on_hide(
     pending: Option<std::time::Instant>,
     deferred: bool,
