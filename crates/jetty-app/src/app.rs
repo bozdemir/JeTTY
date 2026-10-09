@@ -622,10 +622,19 @@ const FOCUS_CHURN_GRACE: std::time::Duration = std::time::Duration::from_millis(
 /// stays hidden (`Hide` on a hidden window is a no-op): that FocusOut was this
 /// very press's grab, and the auto-hide merely beat a slow hotkey event to it —
 /// the user asked to hide, so re-showing it would flash the window back up.
+///
+/// A window summoned a moment ago — before `settle_until`, the summon's settle
+/// window — counts as in front too: its focus is on its way (the window
+/// manager's FocusIn lags the map), and the focus loss on record is the one
+/// from before the hide, so a second press then RAISED a window the user had
+/// just decided to hide again.
+// A pure decision over every input it weighs; the arguments are the state.
+#[allow(clippy::too_many_arguments)]
 fn toggle_action(
     visible: bool,
     focused: bool,
     occluded: bool,
+    settle_until: Option<std::time::Instant>,
     focus_lost_at: Option<std::time::Instant>,
     autohidden_at: Option<std::time::Instant>,
     last_raise: Option<std::time::Instant>,
@@ -641,7 +650,8 @@ fn toggle_action(
             ToggleAction::Show
         };
     }
-    if (focused || within_churn(focus_lost_at)) && !occluded {
+    let settling = settle_until.is_some_and(|t| now < t);
+    if (focused || settling || within_churn(focus_lost_at)) && !occluded {
         return ToggleAction::Hide;
     }
     match last_raise {
@@ -9894,6 +9904,7 @@ impl App {
             self.visible,
             jetty_focused,
             self.main_occluded,
+            self.summon_settle_until,
             self.focus_lost_at,
             self.autohidden_at,
             self.raise_attempt_at,
@@ -20548,19 +20559,19 @@ mod scheduler_tests {
     }
 
     // ── F9 / launcher toggle ─────────────────────────────────────────────────
-    // Argument order: visible, focused, occluded, focus_lost_at, autohidden_at,
-    // last_raise, now.
+    // Argument order: visible, focused, occluded, settle_until, focus_lost_at,
+    // autohidden_at, last_raise, now.
 
     #[test]
     fn toggle_shows_a_hidden_window_and_hides_a_watched_one() {
         let now = Instant::now();
-        assert_eq!(toggle_action(false, false, false, None, None, None, now), ToggleAction::Show);
+        assert_eq!(toggle_action(false, false, false, None, None, None, None, now), ToggleAction::Show);
         assert_eq!(
-            toggle_action(false, true, true, Some(now), None, Some(now), now),
+            toggle_action(false, true, true, None, Some(now), None, Some(now), now),
             ToggleAction::Show,
             "a hidden window shows unless an auto-hide just raced this press"
         );
-        assert_eq!(toggle_action(true, true, false, None, None, None, now), ToggleAction::Hide);
+        assert_eq!(toggle_action(true, true, false, None, None, None, None, now), ToggleAction::Hide);
     }
 
     #[test]
@@ -20570,14 +20581,14 @@ mod scheduler_tests {
         // Genuinely unfocused for 2 s (clicked elsewhere, focus_autohide = false):
         // raise, not hide.
         assert_eq!(
-            toggle_action(true, false, false, long_ago, None, None, now),
+            toggle_action(true, false, false, None, long_ago, None, None, now),
             ToggleAction::Raise
         );
         // Covered by other windows / minimized: raise, even if it kept focus…
-        assert_eq!(toggle_action(true, true, true, None, None, None, now), ToggleAction::Raise);
+        assert_eq!(toggle_action(true, true, true, None, None, None, None, now), ToggleAction::Raise);
         // …and even inside the churn grace (occlusion is not grab churn).
         let churn = Some(now - Duration::from_millis(30));
-        assert_eq!(toggle_action(true, false, true, churn, None, None, now), ToggleAction::Raise);
+        assert_eq!(toggle_action(true, false, true, None, churn, None, None, now), ToggleAction::Raise);
     }
 
     /// The X11 grab-churn sequences measured in Xvfb (global-hotkey F9 via
@@ -20589,31 +20600,31 @@ mod scheduler_tests {
         // 30 ms tap: Focused(false) → hotkey +20.7 ms (FocusIn at +30 ms, after).
         let at = t_focus_out + Duration::from_millis(21);
         assert_eq!(
-            toggle_action(true, false, false, Some(t_focus_out), None, None, at),
+            toggle_action(true, false, false, None, Some(t_focus_out), None, None, at),
             ToggleAction::Hide,
             "FocusOut→toggle within 50 ms is the grab, not a real focus loss"
         );
         // 400 ms hold: Focused(false) → hotkey +29 ms (FocusIn only at +400 ms).
         let at = t_focus_out + Duration::from_millis(29);
         assert_eq!(
-            toggle_action(true, false, false, Some(t_focus_out), None, None, at),
+            toggle_action(true, false, false, None, Some(t_focus_out), None, None, at),
             ToggleAction::Hide
         );
         // A very short tap whose FocusIn beat the hotkey event: plainly focused.
         assert_eq!(
-            toggle_action(true, true, false, None, None, None, at),
+            toggle_action(true, true, false, None, None, None, None, at),
             ToggleAction::Hide
         );
         // A loaded loop delivering the hotkey late is still covered…
         let at = t_focus_out + FOCUS_CHURN_GRACE - Duration::from_millis(1);
         assert_eq!(
-            toggle_action(true, false, false, Some(t_focus_out), None, None, at),
+            toggle_action(true, false, false, None, Some(t_focus_out), None, None, at),
             ToggleAction::Hide
         );
         // …while a focus loss older than the grace is a genuine one → raise.
         let at = t_focus_out + FOCUS_CHURN_GRACE;
         assert_eq!(
-            toggle_action(true, false, false, Some(t_focus_out), None, None, at),
+            toggle_action(true, false, false, None, Some(t_focus_out), None, None, at),
             ToggleAction::Raise
         );
     }
@@ -20626,15 +20637,42 @@ mod scheduler_tests {
         let t_autohide = Instant::now();
         let at = t_autohide + Duration::from_millis(40);
         assert_eq!(
-            toggle_action(false, false, false, None, Some(t_autohide), None, at),
+            toggle_action(false, false, false, None, None, Some(t_autohide), None, at),
             ToggleAction::Hide,
             "Hide on a hidden window is a no-op: it stays hidden"
         );
         // A press well after an auto-hide is a real summon.
         let at = t_autohide + Duration::from_secs(2);
         assert_eq!(
-            toggle_action(false, false, false, None, Some(t_autohide), None, at),
+            toggle_action(false, false, false, None, None, Some(t_autohide), None, at),
             ToggleAction::Show
+        );
+    }
+
+    #[test]
+    fn toggle_hides_a_window_summoned_a_moment_ago() {
+        // F9, then F9 again before the window manager's FocusIn: the window is
+        // shown but not focused yet, and the focus loss on record is the one
+        // from before the hide — the second press must hide it (the user changed
+        // their mind), not count it as "behind other windows" and raise it.
+        let t0 = Instant::now();
+        let before_the_hide = Some(t0 - Duration::from_secs(10));
+        let settle = Some(t0 + Duration::from_millis(300));
+        let at = t0 + Duration::from_millis(80);
+        assert_eq!(
+            toggle_action(true, false, false, settle, before_the_hide, None, None, at),
+            ToggleAction::Hide
+        );
+        // Once the settle window is over an unfocused window is behind others.
+        let later = t0 + Duration::from_millis(300);
+        assert_eq!(
+            toggle_action(true, false, false, settle, before_the_hide, None, None, later),
+            ToggleAction::Raise
+        );
+        // Occlusion still wins: a covered window is raised.
+        assert_eq!(
+            toggle_action(true, false, true, settle, before_the_hide, None, None, at),
+            ToggleAction::Raise
         );
     }
 
@@ -20646,13 +20684,13 @@ mod scheduler_tests {
         // window hides instead of raising forever…
         let soon = t0 + RAISE_RETRY_WINDOW - Duration::from_millis(1);
         assert_eq!(
-            toggle_action(true, false, false, unfocused, None, Some(t0), soon),
+            toggle_action(true, false, false, None, unfocused, None, Some(t0), soon),
             ToggleAction::Hide
         );
         // …but a much later press is a fresh intent → raise again.
         let later = t0 + RAISE_RETRY_WINDOW;
         assert_eq!(
-            toggle_action(true, false, false, unfocused, None, Some(t0), later),
+            toggle_action(true, false, false, None, unfocused, None, Some(t0), later),
             ToggleAction::Raise
         );
     }
