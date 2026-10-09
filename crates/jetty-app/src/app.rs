@@ -7922,7 +7922,8 @@ impl App {
     /// Returns whether the view jumped (the caller repaints that window).
     fn paste_to_tab(tab: &mut Tab, text: &str) -> bool {
         tab.pty.note_user_input();
-        crate::runsel::paste_into(&mut tab.terminal, &mut tab.pending_inject, &mut tab.writer, text)
+        // The paste writer: a Ctrl+C pressed before it is all written cuts it.
+        crate::runsel::paste_into(&mut tab.terminal, &mut tab.pending_inject, &mut tab.pty.paste_writer(), text)
     }
 
     /// Run the current selection in a NEW tab — the browser's "open link in a
@@ -17296,8 +17297,9 @@ fn write_key_to_pty(
         // independent).
         tab.terminal.scroll_to_bottom();
         // Whatever ends this shell now is the user's (Ctrl+D, `exit`), never
-        // a failed start that swaps in the next shell.
-        tab.pty.note_user_input();
+        // a failed start that swaps in the next shell; and a Ctrl+C cuts short
+        // a paste still being written ahead of it.
+        tab.pty.note_key(bytes);
     }
     let _ = tab.writer.write_all(bytes);
     let _ = tab.writer.flush();

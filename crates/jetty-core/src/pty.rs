@@ -1,6 +1,6 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -25,20 +25,107 @@ pub(crate) fn advertised_version() -> String {
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
-/// Ceiling on bytes queued to a session's writer thread but not yet written to
-/// the fd, past which the terminal's REPLIES are dropped
+/// Ceiling on REPLY bytes queued to a session's writer thread but not yet
+/// written to the fd, past which further replies are dropped
 /// ([`PtySession::send_reply`]). Normal use never approaches this: the writer
-/// thread drains the channel at fd speed, so `queued` sits near zero. It only
+/// thread drains the channel at fd speed, so the count sits near zero. It only
 /// fills when the child stops reading its stdin AND keeps asking — the classic
 /// case being a `yes $'\e[6n'` / hostile-content query flood where the terminal
 /// auto-answers every CPR/DA into the queue while the blocked child never
 /// drains the ~4 KiB kernel tty buffer. The old unbounded channel grew by
 /// GBs/min until the OOM killer took the whole app (F13); at 64 MiB a
 /// pathological reply loop caps in a few seconds instead of exhausting RAM.
-/// The USER's input ([`PtySession::writer`]: keys, pastes) is never dropped:
+/// The USER's input ([`PtySession::writer`]: keys, pastes) is never dropped —
 /// it is bounded by what they type or paste, and a paste past this cap used to
-/// vanish whole, without a word.
+/// vanish whole, without a word — nor counted: a paste of 64 MiB+ still being
+/// written used to make every reply (DA, CPR, OSC 11) be dropped meanwhile.
 const PTY_WRITE_QUEUE_CAP: usize = 64 * 1024 * 1024;
+
+/// Bytes of a paste written between two checks for the user's Ctrl+C
+/// ([`PtySession::note_key`]): about what the kernel's tty buffer holds, so the
+/// interrupt reaches a program at most one piece after it was pressed.
+const PASTE_PIECE: usize = 4 * 1024;
+
+/// One write queued for a session's writer thread ([`write_chunks`]).
+enum WriteChunk {
+    /// The user's keys, mouse and focus reports, run-selection injections:
+    /// always written whole.
+    Input(Vec<u8>),
+    /// A paste, queued when the user's Ctrl+C count was `interrupts`: cut
+    /// short at its next [`PASTE_PIECE`] once they press another.
+    Paste { bytes: Vec<u8>, interrupts: u64 },
+    /// The terminal's reply to a query, counted against [`PTY_WRITE_QUEUE_CAP`].
+    Reply(Vec<u8>),
+}
+
+/// What a [`ChannelWriter`] queues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteKind {
+    Input,
+    Paste,
+    Reply,
+}
+
+/// The writer thread's loop: write each queued chunk to `out` in order until
+/// the session is gone or a write fails (the child exited). `replies` counts
+/// the reply bytes still queued; `interrupts` the user's Ctrl+C presses.
+fn write_chunks(rx: Receiver<WriteChunk>, out: &mut impl Write, replies: &AtomicUsize, interrupts: &AtomicU64) {
+    for chunk in rx {
+        let written = match chunk {
+            WriteChunk::Input(bytes) => out.write_all(&bytes).is_ok(),
+            WriteChunk::Reply(bytes) => {
+                let ok = out.write_all(&bytes).is_ok();
+                // Release the reservation as soon as the bytes leave the
+                // queue, whether or not the write succeeded (a failure ends
+                // the loop).
+                replies.fetch_sub(bytes.len(), Ordering::Relaxed);
+                ok
+            }
+            WriteChunk::Paste { bytes, interrupts: queued_at } => {
+                write_paste(out, &bytes, || interrupts.load(Ordering::SeqCst) != queued_at)
+            }
+        };
+        if !written {
+            break;
+        }
+        let _ = out.flush();
+    }
+}
+
+/// Write a paste to `out` in [`PASTE_PIECE`]s, stopping before the next one
+/// once `interrupted()`: the rest is dropped and the Ctrl+C queued behind it
+/// goes out next — not after megabytes of a paste the program reads slowly
+/// (an editor typing it in). A bracketed paste cut short still ends with its
+/// `ESC[201~` (completed, when the piece boundary split it), so the program
+/// leaves paste mode before the interrupt. `false` when a write failed.
+fn write_paste(out: &mut impl Write, bytes: &[u8], interrupted: impl Fn() -> bool) -> bool {
+    const END: &[u8] = b"\x1b[201~";
+    let mut written = 0;
+    while written < bytes.len() {
+        if interrupted() {
+            let rest = &bytes[written..];
+            // Pastes are sanitized: their only ESC are the markers, so one
+            // that starts with `ESC[200~` ends with `ESC[201~`.
+            if written > 0 && bytes.starts_with(b"\x1b[200~") {
+                let end = if rest.len() <= END.len() { rest } else { END };
+                return out.write_all(end).is_ok();
+            }
+            return true;
+        }
+        let piece = &bytes[written..bytes.len().min(written + PASTE_PIECE)];
+        if out.write_all(piece).is_err() {
+            return false;
+        }
+        written += piece.len();
+    }
+    true
+}
+
+/// Whether `key` — the bytes of a key press — is Ctrl+C: ETX, or the kitty
+/// keyboard protocol's `CSI 99;5u` (fish 4 and TUIs that ask for it).
+fn is_interrupt(key: &[u8]) -> bool {
+    key == b"\x03" || key == b"\x1b[99;5u"
+}
 
 /// Bytes per PTY read — the most one queued output chunk can hold.
 const PTY_READ_CHUNK: usize = 8 * 1024;
@@ -167,12 +254,15 @@ pub struct PtySession {
     /// performs the actual fd writes. Kept on the session so `writer()` can be
     /// called any number of times; the thread exits (dropping the Write half)
     /// once every sender clone is gone or a write fails (child exited → EIO).
-    write_tx: Sender<Vec<u8>>,
-    /// Bytes currently queued to the writer thread but not yet written to the
-    /// fd. Shared with every [`ChannelWriter`] so writes past
+    write_tx: Sender<WriteChunk>,
+    /// REPLY bytes currently queued to the writer thread but not yet written
+    /// to the fd. Shared with every [`ChannelWriter`] so replies past
     /// [`PTY_WRITE_QUEUE_CAP`] are dropped instead of growing the queue to OOM
-    /// (F13). The writer thread decrements it as it drains each chunk.
-    write_queued: Arc<AtomicUsize>,
+    /// (F13). The writer thread decrements it as it drains each reply.
+    replies_queued: Arc<AtomicUsize>,
+    /// The user's Ctrl+C presses ([`PtySession::note_key`]), shared with the
+    /// writer thread: a paste queued before the latest one is cut short.
+    interrupts: Arc<AtomicU64>,
     /// One-line notices to surface in the terminal when `spawn` had to fall
     /// back: the configured shell override could not be launched (F2), and/or
     /// the requested start directory could not be entered. Empty when the
@@ -225,12 +315,14 @@ fn failed_start(status: &portable_pty::ExitStatus, lived: Duration) -> bool {
 /// write ordering is preserved: one channel, one consumer thread. `flush()` is
 /// a no-op — the writer thread flushes after every chunk.
 struct ChannelWriter {
-    tx: Sender<Vec<u8>>,
-    /// Shared byte counter (see [`PtySession::write_queued`]).
-    queued: Arc<AtomicUsize>,
-    /// Drop writes past [`PTY_WRITE_QUEUE_CAP`] — for the terminal's replies
-    /// only ([`PtySession::send_reply`]); the user's input is never dropped.
-    capped: bool,
+    tx: Sender<WriteChunk>,
+    /// Shared reply byte counter (see [`PtySession::replies_queued`]).
+    replies: Arc<AtomicUsize>,
+    /// The session's Ctrl+C count, stamped on each paste.
+    interrupts: Arc<AtomicU64>,
+    /// What this writer queues. Only replies ([`PtySession::send_reply`]) are
+    /// dropped past [`PTY_WRITE_QUEUE_CAP`]; the user's input never is.
+    kind: WriteKind,
 }
 
 impl Write for ChannelWriter {
@@ -238,20 +330,31 @@ impl Write for ChannelWriter {
         if buf.is_empty() {
             return Ok(0);
         }
-        // Bound the queue against a reply flood: once more than
-        // PTY_WRITE_QUEUE_CAP bytes are pending (the child has stopped reading
-        // and keeps asking), drop the reply rather than grow toward OOM. We
-        // report it as fully written so a hostile query-reply loop can't turn
-        // into an error storm either.
-        let queued = self.queued.load(Ordering::Relaxed);
-        if self.capped && queued.saturating_add(buf.len()) > PTY_WRITE_QUEUE_CAP {
-            return Ok(buf.len());
-        }
-        self.queued.fetch_add(buf.len(), Ordering::Relaxed);
-        self.tx.send(buf.to_vec()).map_err(|_| {
-            // Roll back the reservation; the consumer is gone so nothing will
-            // decrement it otherwise.
-            self.queued.fetch_sub(buf.len(), Ordering::Relaxed);
+        let chunk = match self.kind {
+            WriteKind::Input => WriteChunk::Input(buf.to_vec()),
+            WriteKind::Paste => {
+                WriteChunk::Paste { bytes: buf.to_vec(), interrupts: self.interrupts.load(Ordering::SeqCst) }
+            }
+            WriteKind::Reply => {
+                // Bound the queue against a reply flood: once more than
+                // PTY_WRITE_QUEUE_CAP reply bytes are pending (the child has
+                // stopped reading and keeps asking), drop the reply rather than
+                // grow toward OOM. We report it as fully written so a hostile
+                // query-reply loop can't turn into an error storm either.
+                let queued = self.replies.load(Ordering::Relaxed);
+                if queued.saturating_add(buf.len()) > PTY_WRITE_QUEUE_CAP {
+                    return Ok(buf.len());
+                }
+                self.replies.fetch_add(buf.len(), Ordering::Relaxed);
+                WriteChunk::Reply(buf.to_vec())
+            }
+        };
+        self.tx.send(chunk).map_err(|_| {
+            // Roll back a reply's reservation; the consumer is gone so nothing
+            // will decrement it otherwise.
+            if self.kind == WriteKind::Reply {
+                self.replies.fetch_sub(buf.len(), Ordering::Relaxed);
+            }
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "pty writer thread closed",
@@ -1132,22 +1235,11 @@ impl PtySession {
                 return Err(std::io::Error::other(e.to_string()));
             }
         };
-        let (write_tx, write_rx) = channel::<Vec<u8>>();
-        let write_queued = Arc::new(AtomicUsize::new(0));
-        let write_queued_thread = Arc::clone(&write_queued);
-        std::thread::spawn(move || {
-            while let Ok(chunk) = write_rx.recv() {
-                let n = chunk.len();
-                let write_ok = pty_writer.write_all(&chunk).is_ok();
-                // Release the reservation as soon as the bytes leave the queue,
-                // whether or not the fd write succeeded (a failure ends the loop).
-                write_queued_thread.fetch_sub(n, Ordering::Relaxed);
-                if !write_ok {
-                    break;
-                }
-                let _ = pty_writer.flush();
-            }
-        });
+        let (write_tx, write_rx) = channel::<WriteChunk>();
+        let replies_queued = Arc::new(AtomicUsize::new(0));
+        let interrupts = Arc::new(AtomicU64::new(0));
+        let (replies_thread, interrupts_thread) = (Arc::clone(&replies_queued), Arc::clone(&interrupts));
+        std::thread::spawn(move || write_chunks(write_rx, &mut pty_writer, &replies_thread, &interrupts_thread));
 
         // The reader's own handle on the master. Linux: a dup we poll together
         // with a shutdown pipe (see `_reader_stop`); elsewhere portable-pty's
@@ -1249,7 +1341,8 @@ impl PtySession {
             killer,
             pid,
             write_tx,
-            write_queued,
+            replies_queued,
+            interrupts,
             startup_notices,
             plan,
             launched,
@@ -1414,9 +1507,10 @@ impl PtySession {
         }
     }
 
-    /// Returns a writer for the user's input to the PTY: keystrokes, pastes,
-    /// mouse and focus reports. Never dropped, whatever their size — the
-    /// terminal's own replies go through [`PtySession::send_reply`] instead.
+    /// Returns a writer for the user's input to the PTY: keystrokes, mouse and
+    /// focus reports, injected commands. Never dropped, whatever their size —
+    /// pastes go through [`PtySession::paste_writer`], the terminal's own
+    /// replies through [`PtySession::send_reply`].
     ///
     /// The returned writer NEVER blocks the caller: bytes are queued to the
     /// session's dedicated writer thread (which owns the blocking fd), so the
@@ -1425,20 +1519,45 @@ impl PtySession {
     /// no-op (the writer thread flushes each chunk). May be called any number
     /// of times.
     pub fn writer(&self) -> Box<dyn Write + Send> {
-        Box::new(self.channel_writer(false))
+        Box::new(self.channel_writer(WriteKind::Input))
+    }
+
+    /// A writer for the user's pastes — like [`PtySession::writer`], in order
+    /// with it, but each write (one whole paste) is cut short when the user
+    /// presses Ctrl+C before it was all written ([`PtySession::note_key`]).
+    pub fn paste_writer(&self) -> Box<dyn Write + Send> {
+        Box::new(self.channel_writer(WriteKind::Paste))
+    }
+
+    /// The user pressed a key that sends `key` (bytes the app is about to
+    /// write): their input ([`PtySession::note_user_input`]) — and when it is
+    /// Ctrl+C, the pastes queued before it stop at their next piece (a
+    /// bracketed one still gets its end marker), so the interrupt reaches the
+    /// program now: it used to wait behind every byte of a multi-MB paste the
+    /// program reads slowly, the tab looking frozen. Nothing else is dropped.
+    pub fn note_key(&mut self, key: &[u8]) {
+        self.note_user_input();
+        if is_interrupt(key) {
+            self.interrupts.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// Queue the terminal's REPLIES to the program's queries (DSR/DA, OSC
     /// color and clipboard reads, mode reports) — like [`PtySession::writer`],
-    /// in order with it, but dropped once [`PTY_WRITE_QUEUE_CAP`] bytes are
-    /// waiting: a program that floods queries without reading its input
+    /// in order with it, but dropped once [`PTY_WRITE_QUEUE_CAP`] reply bytes
+    /// are waiting: a program that floods queries without reading its input
     /// cannot grow the queue without bound (F13).
     pub fn send_reply(&self, bytes: &[u8]) {
-        let _ = self.channel_writer(true).write_all(bytes);
+        let _ = self.channel_writer(WriteKind::Reply).write_all(bytes);
     }
 
-    fn channel_writer(&self, capped: bool) -> ChannelWriter {
-        ChannelWriter { tx: self.write_tx.clone(), queued: Arc::clone(&self.write_queued), capped }
+    fn channel_writer(&self, kind: WriteKind) -> ChannelWriter {
+        ChannelWriter {
+            tx: self.write_tx.clone(),
+            replies: Arc::clone(&self.replies_queued),
+            interrupts: Arc::clone(&self.interrupts),
+            kind,
+        }
     }
 
     pub fn resize(&self, cols: u16, rows: u16, px_w: u16, px_h: u16) {
@@ -1550,8 +1669,19 @@ mod tests {
         );
     }
 
-    fn mk_writer(tx: Sender<Vec<u8>>) -> ChannelWriter {
-        ChannelWriter { tx, queued: Arc::new(AtomicUsize::new(0)), capped: false }
+    fn mk_writer(tx: Sender<WriteChunk>) -> ChannelWriter {
+        writer_of(WriteKind::Input, tx, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn writer_of(kind: WriteKind, tx: Sender<WriteChunk>, replies: Arc<AtomicUsize>) -> ChannelWriter {
+        ChannelWriter { tx, replies, interrupts: Arc::new(AtomicU64::new(0)), kind }
+    }
+
+    /// A queued chunk's bytes, whatever its kind.
+    fn bytes_of(chunk: WriteChunk) -> Vec<u8> {
+        match chunk {
+            WriteChunk::Input(b) | WriteChunk::Reply(b) | WriteChunk::Paste { bytes: b, .. } => b,
+        }
     }
 
     /// A reader-side half (sender + shared state + wake that counts into a
@@ -1799,13 +1929,13 @@ mod tests {
     fn channel_writer_preserves_order() {
         // The bracketed-paste triple (prefix, payload, suffix) must arrive at
         // the writer thread in exactly the order it was written.
-        let (tx, rx) = channel::<Vec<u8>>();
+        let (tx, rx) = channel::<WriteChunk>();
         let mut w = mk_writer(tx);
         w.write_all(b"\x1b[200~").unwrap();
         w.write_all(b"hello").unwrap();
         w.write_all(b"\x1b[201~").unwrap();
         w.flush().unwrap();
-        let got: Vec<Vec<u8>> = rx.try_iter().collect();
+        let got: Vec<Vec<u8>> = rx.try_iter().map(bytes_of).collect();
         assert_eq!(
             got,
             vec![b"\x1b[200~".to_vec(), b"hello".to_vec(), b"\x1b[201~".to_vec()],
@@ -1817,28 +1947,124 @@ mod tests {
         // The unbounded channel queues arbitrarily large pastes even when
         // nothing consumes them yet (the C14 freeze scenario): write returns
         // immediately with the full length.
-        let (tx, rx) = channel::<Vec<u8>>();
+        let (tx, rx) = channel::<WriteChunk>();
         let mut w = mk_writer(tx);
         let big = vec![b'x'; 1 << 20]; // 1 MiB, far beyond the ~64KB kernel buffer
         assert_eq!(w.write(&big).unwrap(), big.len());
-        assert_eq!(rx.try_recv().unwrap().len(), 1 << 20);
+        assert_eq!(bytes_of(rx.try_recv().unwrap()).len(), 1 << 20);
     }
 
     #[test]
     fn only_replies_are_dropped_past_the_cap_never_the_users_input() {
-        // A child that stopped reading has filled the queue to the cap. Its
-        // further query replies are dropped (F13); the user's paste — however
-        // big — and keys still queue, in order.
-        let (tx, rx) = channel::<Vec<u8>>();
-        let queued = Arc::new(AtomicUsize::new(PTY_WRITE_QUEUE_CAP));
-        let mut reply = ChannelWriter { tx: tx.clone(), queued: Arc::clone(&queued), capped: true };
-        let mut input = ChannelWriter { tx, queued: Arc::clone(&queued), capped: false };
+        // A child that stopped reading has filled the queue to the cap with
+        // replies. Its further query replies are dropped (F13); the user's
+        // paste — however big — and keys still queue, in order.
+        let (tx, rx) = channel::<WriteChunk>();
+        let replies = Arc::new(AtomicUsize::new(PTY_WRITE_QUEUE_CAP));
+        let mut reply = writer_of(WriteKind::Reply, tx.clone(), Arc::clone(&replies));
+        let mut paste = writer_of(WriteKind::Paste, tx.clone(), Arc::clone(&replies));
+        let mut input = writer_of(WriteKind::Input, tx, Arc::clone(&replies));
         reply.write_all(b"\x1b[1;1R").unwrap();
-        input.write_all(&vec![b'p'; PTY_WRITE_QUEUE_CAP + 1]).unwrap();
+        paste.write_all(&vec![b'p'; PTY_WRITE_QUEUE_CAP + 1]).unwrap();
         input.write_all(b"\x03").unwrap();
         reply.write_all(b"\x1b[?62c").unwrap();
-        let got: Vec<usize> = rx.try_iter().map(|c| c.len()).collect();
+        let got: Vec<usize> = rx.try_iter().map(|c| bytes_of(c).len()).collect();
         assert_eq!(got, vec![PTY_WRITE_QUEUE_CAP + 1, 1], "the paste and the key, nothing else");
+    }
+
+    #[test]
+    fn a_paste_in_the_queue_never_gets_the_replies_dropped() {
+        // Only replies count against the cap: a 64 MiB+ paste still being
+        // written used to make JeTTY drop every reply (DA, CPR, OSC 11).
+        let (tx, rx) = channel::<WriteChunk>();
+        let replies = Arc::new(AtomicUsize::new(0));
+        writer_of(WriteKind::Paste, tx.clone(), Arc::clone(&replies))
+            .write_all(&vec![b'p'; PTY_WRITE_QUEUE_CAP + 1])
+            .unwrap();
+        writer_of(WriteKind::Reply, tx, Arc::clone(&replies)).write_all(b"\x1b[?62c").unwrap();
+        assert_eq!(rx.try_iter().count(), 2, "the reply queued behind the paste");
+        assert_eq!(replies.load(Ordering::Relaxed), 6, "only the reply is counted");
+    }
+
+    /// A program reading its input: whatever reaches it, and the user pressing
+    /// Ctrl+C (`interrupts` + 1) once `after` bytes of it arrived.
+    struct Reader<'a> {
+        got: Vec<u8>,
+        after: usize,
+        interrupts: &'a AtomicU64,
+    }
+
+    impl Write for Reader<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let before = self.got.len();
+            self.got.extend_from_slice(buf);
+            if before < self.after && self.got.len() >= self.after {
+                self.interrupts.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ctrl_c_cuts_the_paste_ahead_of_it_and_nothing_else() {
+        // A 1 MiB bracketed paste the program reads slowly; the user presses
+        // Ctrl+C once the first piece is in. The rest of it — and a paste
+        // queued before the ^C — is dropped, the paste mode still closed; the
+        // ^C, and the keys and the paste after it, arrive whole.
+        let interrupts = AtomicU64::new(0);
+        let replies = AtomicUsize::new(0);
+        let (tx, rx) = channel::<WriteChunk>();
+        let paste = [&b"\x1b[200~"[..], &vec![b'x'; 1 << 20], b"\x1b[201~"].concat();
+        tx.send(WriteChunk::Paste { bytes: paste, interrupts: 0 }).unwrap();
+        tx.send(WriteChunk::Paste { bytes: b"queued too".to_vec(), interrupts: 0 }).unwrap();
+        tx.send(WriteChunk::Input(b"\x03".to_vec())).unwrap();
+        tx.send(WriteChunk::Input(b"ls\r".to_vec())).unwrap();
+        tx.send(WriteChunk::Paste { bytes: b"pasted after".to_vec(), interrupts: 1 }).unwrap();
+        drop(tx);
+        let mut reader = Reader { got: Vec::new(), after: 1, interrupts: &interrupts };
+        write_chunks(rx, &mut reader, &replies, &interrupts);
+        let want = [&b"\x1b[200~"[..], &vec![b'x'; PASTE_PIECE - 6], b"\x1b[201~\x03ls\rpasted after"].concat();
+        assert_eq!(reader.got, want);
+    }
+
+    #[test]
+    fn a_cut_paste_ends_its_paste_mode_exactly_once() {
+        let end = b"\x1b[201~";
+        // Cut where only part of the end marker is left: it is completed, not
+        // doubled. An unbracketed paste gets no marker; one cut before its
+        // first byte is dropped whole.
+        let bracketed = [&b"\x1b[200~"[..], &vec![b'y'; PASTE_PIECE - 8], end].concat();
+        let mut out = Vec::new();
+        let calls = std::cell::Cell::new(0);
+        assert!(write_paste(&mut out, &bracketed, || {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        }));
+        assert_eq!(out, bracketed, "the piece boundary split the marker: completed");
+        let mut out = Vec::new();
+        let plain = vec![b'z'; PASTE_PIECE * 3];
+        let calls = std::cell::Cell::new(0);
+        assert!(write_paste(&mut out, &plain, || {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        }));
+        assert_eq!(out.len(), PASTE_PIECE, "one piece, no marker");
+        let mut out = Vec::new();
+        assert!(write_paste(&mut out, &bracketed, || true));
+        assert!(out.is_empty(), "nothing written, nothing to close");
+    }
+
+    #[test]
+    fn only_ctrl_c_interrupts() {
+        assert!(is_interrupt(b"\x03"));
+        assert!(is_interrupt(b"\x1b[99;5u"), "the kitty keyboard protocol's Ctrl+C");
+        for key in [&b"c"[..], b"\x1b", b"\x04", b"\x03\x03", b"\x1b[99u"] {
+            assert!(!is_interrupt(key), "{key:?}");
+        }
     }
 
     #[test]
@@ -1847,9 +2073,9 @@ mod tests {
         // child stopped reading and a reply flood keeps producing), further
         // writes are DROPPED — reported as written, never blocking, never
         // erroring — so memory stays bounded instead of growing to OOM.
-        let (tx, rx) = channel::<Vec<u8>>();
+        let (tx, rx) = channel::<WriteChunk>();
         let queued = Arc::new(AtomicUsize::new(0));
-        let mut w = ChannelWriter { tx, queued: Arc::clone(&queued), capped: true };
+        let mut w = writer_of(WriteKind::Reply, tx, Arc::clone(&queued));
         // Nothing consumes `rx`, so `queued` only ever grows here.
         let chunk = vec![b'q'; 1 << 20]; // 1 MiB per write
         let mut sent = 0usize;
@@ -1872,7 +2098,7 @@ mod tests {
             queued.load(Ordering::Relaxed)
         );
         // And the messages that were enqueued sum to <= the cap.
-        let total: usize = rx.try_iter().map(|v| v.len()).sum();
+        let total: usize = rx.try_iter().map(|c| bytes_of(c).len()).sum();
         assert!(total <= PTY_WRITE_QUEUE_CAP, "enqueued bytes exceeded cap");
     }
 
@@ -1880,7 +2106,7 @@ mod tests {
     fn channel_writer_errors_after_writer_thread_exit() {
         // Once the consuming side is gone (writer thread exited), writes fail
         // with BrokenPipe instead of panicking or silently vanishing.
-        let (tx, rx) = channel::<Vec<u8>>();
+        let (tx, rx) = channel::<WriteChunk>();
         drop(rx);
         let mut w = mk_writer(tx);
         let err = w.write_all(b"x").unwrap_err();
@@ -1889,7 +2115,7 @@ mod tests {
 
     #[test]
     fn channel_writer_empty_write_sends_nothing() {
-        let (tx, rx) = channel::<Vec<u8>>();
+        let (tx, rx) = channel::<WriteChunk>();
         let mut w = mk_writer(tx);
         assert_eq!(w.write(b"").unwrap(), 0);
         assert!(rx.try_recv().is_err(), "no message for a zero-length write");
@@ -1899,14 +2125,13 @@ mod tests {
     fn multiple_writers_share_one_queue() {
         // writer() may now be called more than once; all clones feed the same
         // ordered queue (per-session ordering is what the terminal relies on).
-        let (tx, rx) = channel::<Vec<u8>>();
-        let queued = Arc::new(AtomicUsize::new(0));
-        let mut a = ChannelWriter { tx: tx.clone(), queued: Arc::clone(&queued), capped: false };
-        let mut b = ChannelWriter { tx, queued, capped: false };
+        let (tx, rx) = channel::<WriteChunk>();
+        let mut a = mk_writer(tx.clone());
+        let mut b = mk_writer(tx);
         a.write_all(b"1").unwrap();
         b.write_all(b"2").unwrap();
         a.write_all(b"3").unwrap();
-        let got: Vec<Vec<u8>> = rx.try_iter().collect();
+        let got: Vec<Vec<u8>> = rx.try_iter().map(bytes_of).collect();
         assert_eq!(got, vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
     }
 }

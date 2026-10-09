@@ -424,6 +424,30 @@ fn a_clean_exit_is_not_a_failed_start() {
 
 #[cfg(unix)]
 #[test]
+fn ctrl_c_reaches_a_program_still_reading_a_huge_paste() {
+    // A program that reads its input slowly (~5 KB/s, an editor typing a
+    // paste in) and an 8 MiB paste: half an hour of it. The user's Ctrl+C
+    // used to wait behind all of it, the tab looking frozen.
+    let mut pty = spawn_sh(None);
+    {
+        use std::io::Write;
+        let slow = "echo READ''Y; sh -c 'while :; do head -c 100 >/dev/null; sleep 0.02; done'\n";
+        pty.writer().write_all(slow.as_bytes()).unwrap();
+    }
+    assert!(read_until(&pty, "READY").contains("READY"), "premise: the slow reader runs");
+    {
+        use std::io::Write;
+        pty.paste_writer().write_all(&b"x\n".repeat(4 << 20)).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        pty.note_key(b"\x03");
+        pty.writer().write_all(b"\x03").unwrap();
+        pty.writer().write_all(b"echo ALI''VE\n").unwrap();
+    }
+    assert!(read_until(&pty, "ALIVE").contains("ALIVE"), "the interrupt got through");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_paste_past_the_reply_cap_still_arrives_whole() {
     // The 64 MiB queue cap exists for query-REPLY floods (a program that keeps
     // asking without reading its input); it also swallowed any paste past it
