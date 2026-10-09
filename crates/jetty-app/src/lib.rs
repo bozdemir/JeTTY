@@ -535,6 +535,9 @@ pub fn run() {
     // remove-stale-on-bind logic at the start of the next launch. Only unlink
     // the socket if it is still the one WE bound.
     remove_socket_if_ours(&sock_path, bound_ident);
+    if app.startup_failed() {
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]

@@ -37,7 +37,7 @@ pub use chrome::{
     clip_head, clip_tail, fit_head, fit_tail, ChromeMeasure, ChromeMetrics, MonoMeasure,
     CHROME_ADVANCE, MAX_LABEL_CHARS, OVERLAY_SCALE, PILL_H_BASE, STATUS_H_BASE, UI_FONT_BASE,
 };
-pub use gpu::{set_platform_display, AcquireError, GpuContext, GpuShared, WgpuHasDisplayHandle};
+pub use gpu::{set_platform_display, AcquireError, GpuContext, GpuShared, WgpuHasDisplayHandle, NO_GPU_HELP};
 pub use text::{GridPaint, TextLayer};
 pub use colors::{
     caret_flash_target, contrast_ratio, cursor_text_color, is_light_bg, relative_luminance, selection_bg,

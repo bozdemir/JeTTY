@@ -20,6 +20,12 @@ pub fn set_platform_display(display: impl WgpuHasDisplayHandle) {
     let _ = PLATFORM_DISPLAY.set(Arc::new(display));
 }
 
+/// What JeTTY tells the user when no GPU path at all (no Vulkan, no OpenGL
+/// through EGL) can draw its window — it then exits instead of sitting invisible.
+pub const NO_GPU_HELP: &str = "jetty: no graphics driver can draw the window — JeTTY needs Vulkan, \
+or OpenGL 3.3 / OpenGL ES 3.0 through EGL. Install your GPU's Vulkan driver or Mesa's \
+EGL/OpenGL drivers, then start JeTTY again.";
+
 /// The descriptor of an instance [`GpuContext::new`] creates for `backends`. Only
 /// an instance with the GL backend carries the platform display
 /// ([`set_platform_display`]) — GL presents through it; Vulkan never reads it, so
@@ -177,7 +183,7 @@ impl GpuContext {
             Err(_) => match make_instance_surface_adapter(wgpu::Backends::all()) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("jetty: GPU init failed ({e}); running without rendering");
+                    eprintln!("jetty: GPU init failed ({e})");
                     return None;
                 }
             },
@@ -208,7 +214,7 @@ impl GpuContext {
         })) {
             Ok(dq) => dq,
             Err(e) => {
-                eprintln!("jetty: GPU init failed (device: {e}); running without rendering");
+                eprintln!("jetty: GPU init failed (device: {e})");
                 return None;
             }
         };

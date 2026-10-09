@@ -1185,6 +1185,9 @@ pub struct App {
     /// Start hidden (`jetty --background`, used by the login autostart entry): the
     /// window is created unmapped and the first summon shows it.
     start_hidden: bool,
+    /// No GPU could draw the main window at startup: the loop exits and `run`
+    /// exits with status 1 ([`App::startup_failed`]).
+    startup_failed: bool,
     /// When `Some`, a debounced config/theme reload is due at this instant. Set by a
     /// `ConfigChanged` event (coalescing an editor's write/rename/chmod burst); the
     /// reload runs once from `about_to_wait` when the deadline passes, then clears.
@@ -1946,6 +1949,7 @@ impl App {
             shown_warnings: theme_warnings,
             reset_keys_armed_until: None,
             start_hidden: false,
+            startup_failed: false,
             pending_reload_at: None,
             // Run & Notify: overridden by config below; safe defaults here.
             notify_on_finish: true,
@@ -2192,6 +2196,12 @@ impl App {
     /// first summon shows it. Call before the event loop runs.
     pub fn set_start_hidden(&mut self, hidden: bool) {
         self.start_hidden = hidden;
+    }
+
+    /// Whether startup failed for good (no GPU could draw the main window) —
+    /// read by `run` after the event loop returns, for the exit status.
+    pub fn startup_failed(&self) -> bool {
+        self.startup_failed
     }
 
     /// Build the Help overlay rows from the CURRENT keymap (so a remap is
@@ -12019,6 +12029,16 @@ impl ApplicationHandler<AppEvent> for App {
         // font size by scale to get the physical font size so glyphs are sharp.
         let scale = window.scale_factor() as f32;
         let gpu = GpuContext::new(window.clone(), size.width, size.height);
+        if gpu.is_none() {
+            // Neither Vulkan nor OpenGL can draw the window. Staying would leave
+            // it unpainted, and this instance holding the single-instance socket
+            // would swallow every later launch: say why and exit non-zero.
+            eprintln!("{}", jetty_render::NO_GPU_HELP);
+            drop(pty_handle.join());
+            self.startup_failed = true;
+            event_loop.exit();
+            return;
+        }
         // GPU is ready — join the font worker (its ~20ms load happened in
         // parallel with the GPU block above, so this join is typically free).
         let font_system = font_handle.join().expect("font worker panicked");
