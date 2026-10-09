@@ -7662,10 +7662,12 @@ impl App {
 
     /// Recompute (or clear) the Ctrl+hover link state of detached window
     /// `pos` — the detached mirror of [`App::update_link_hover`], using that
-    /// window's own cursor/geometry (grid origin = its top bar, its own modal =
-    /// the context menu).
+    /// window's own cursor/geometry (grid origin = its top bar) and the same
+    /// modal predicate (`pointer_modal`: its menu, help, palette, hint mode —
+    /// each swallows the Ctrl+click the hover would offer).
     fn update_detached_link_hover(&mut self, pos: usize, force: bool) {
         let held = link_modifier_held(&self.modifiers);
+        let modal_open = self.pointer_modal(Surface::Detached(pos));
         let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
         let Some(dw) = self.detached.get_mut(pos) else { return };
         let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
@@ -7674,7 +7676,7 @@ impl App {
             && !dw.selecting
             && !dw.dragging_scrollbar
             && dw.bar_drag.is_none()
-            && dw.menu_open.is_none()
+            && !modal_open
             && geom.cell_w > 0.0
             && geom.cell_h > 0.0
             && geom.contains_y(cy);
