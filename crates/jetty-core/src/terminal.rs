@@ -2311,12 +2311,14 @@ impl Terminal {
     /// exceeds [`Terminal::piece_budget`] lines.
     fn advance_slice(&mut self, s: &[u8]) {
         // Exact scroll accounting only matters while something is anchored to a
-        // row. Without anchors the slice goes through whole, exactly as before
-        // (history may pin at the cap; `abs_top` then under-counts, which nothing
-        // reads — a mark bound later is relative to whatever `abs_top` is then).
-        // Keeping history below the cap costs alacritty ~1 ns per scrolled line,
-        // so floods past the last anchor run at full speed.
-        if !self.has_anchors() {
+        // row, or while the view is scrolled back (its offset is re-derived from
+        // the lines that really entered history, `keep_view_on_content`).
+        // Otherwise the slice goes through whole, exactly as before (history may
+        // pin at the cap; `abs_top` then under-counts, which nothing reads — a
+        // mark bound later is relative to whatever `abs_top` is then). Keeping
+        // history below the cap costs alacritty ~1 ns per scrolled line, so
+        // floods past the last anchor run at full speed.
+        if !self.has_anchors() && self.term.grid().display_offset() == 0 {
             self.advance_piece(s, None);
             return;
         }
@@ -2568,6 +2570,7 @@ impl Terminal {
             self.make_room(lines);
         }
         let h0 = self.term.grid().history_size();
+        let d0 = self.term.grid().display_offset();
         #[cfg(test)]
         if let Some(log) = self.vte_log.as_mut() {
             log.extend_from_slice(s);
@@ -2575,7 +2578,7 @@ impl Terminal {
         self.parser.advance(&mut self.term, s);
         let alt_after = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h1 = self.term.grid().history_size();
-        self.after_vte(alt_before, alt_after, h0, h1);
+        self.after_vte(alt_before, alt_after, h0, h1, d0);
     }
 
     /// Fold a `history_size` delta into `abs_top`, honoring the alt screen.
@@ -2601,6 +2604,35 @@ impl Terminal {
             }
         } else {
             self.on_history_shrunk(h1);
+        }
+    }
+
+    /// Keep a scrolled-back view on the lines it showed. alacritty 0.26 bumps the
+    /// display offset on EVERY scroll while the view is scrolled back — also when
+    /// a region below a fixed top row scrolls (DECSTBM top margin > 1) or lines
+    /// below the top row are deleted, which push nothing into history: the view
+    /// drifted up a line per scroll, and once past the top of the history the
+    /// next snapshot indexed outside the grid (a panic). Re-derive the offset
+    /// from the lines that really entered history since `before` = (offset,
+    /// history size) — exact, as sub-slices are bounded while the view is
+    /// scrolled back. Where that count is lost (`None`: the primary screen came
+    /// back from the alt screen mid-slice; a history pinned at the cap by an
+    /// unbounded sync replay) the offset is only kept inside the history.
+    #[cold]
+    #[inline(never)]
+    fn keep_view_on_content(&mut self, before: Option<(usize, usize)>, h1: usize) {
+        let d1 = self.term.grid().display_offset();
+        // Back at the bottom — put there by ED 3 or RIS: nothing to keep.
+        if d1 == 0 {
+            return;
+        }
+        let want = match before {
+            Some((d0, h0)) if h1 < self.scrollback_limit => d0 + h1.saturating_sub(h0),
+            _ => d1,
+        }
+        .min(h1);
+        if want != d1 {
+            self.term.scroll_display(Scroll::Delta(want as i32 - d1 as i32));
         }
     }
 
@@ -2710,14 +2742,19 @@ impl Terminal {
         self.alt_placement_bytes = 0;
     }
 
-    /// Bookkeeping after vte consumed bytes (a sub-slice or a sync flush).
-    fn after_vte(&mut self, alt_before: bool, alt_after: bool, h0: usize, h1: usize) {
+    /// Bookkeeping after vte consumed bytes (a sub-slice or a sync flush); `h0` /
+    /// `d0` are the history size and display offset before it.
+    fn after_vte(&mut self, alt_before: bool, alt_after: bool, h0: usize, h1: usize, d0: usize) {
         if alt_before != alt_after {
             // A full-screen TUI took over (or left) mid-transfer: a partial Kitty
             // chunk accumulation lost its context (M5), and alt-screen images
             // belong to the screen that just went away.
             self.reset_kitty_chunks();
             self.clear_alt_placements();
+        }
+        // Back on (or still on) the primary screen with its view scrolled back.
+        if !alt_after && (d0 != 0 || alt_before) {
+            self.keep_view_on_content((!alt_before).then_some((d0, h0)), h1);
         }
         self.track_abs_top(alt_before, alt_after, h0, h1);
         if alt_after && !self.alt_placements.is_empty() {
@@ -2774,6 +2811,7 @@ impl Terminal {
         if reserve {
             let epoch = self.anchor_epoch;
             let h0 = self.term.grid().history_size();
+            let d0 = self.term.grid().display_offset();
             if sixel {
                 self.term.carriage_return();
             }
@@ -2782,6 +2820,9 @@ impl Terminal {
                 self.term.linefeed();
             }
             let h1 = self.term.grid().history_size();
+            if d0 != 0 {
+                self.keep_view_on_content(Some((d0, h0)), h1);
+            }
             self.track_abs_top(false, false, h0, h1);
             if self.anchor_epoch != epoch {
                 return;
@@ -3571,10 +3612,11 @@ impl Terminal {
         // `advance_slice` does (a sync block that scrolled must advance abs_top).
         let alt_before = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h0 = self.term.grid().history_size();
+        let d0 = self.term.grid().display_offset();
         self.parser.stop_sync(&mut self.term);
         let alt_after = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h1 = self.term.grid().history_size();
-        self.after_vte(alt_before, alt_after, h0, h1);
+        self.after_vte(alt_before, alt_after, h0, h1, d0);
     }
 
     pub fn snapshot(&self) -> GridSnapshot {
@@ -7157,6 +7199,81 @@ mod tests {
             t.feed(format!("new {i}\r\n").as_bytes());
         }
         assert_eq!(t.snapshot().row_text(0), before, "viewport content did not move");
+    }
+
+    #[test]
+    fn region_scrolls_while_scrolled_back_leave_the_view_alone() {
+        // Scrolling a region below a fixed top row (DECSTBM top margin > 1) or
+        // deleting lines below the top row pushes nothing into history, yet
+        // alacritty 0.26 bumped the display offset on every such scroll while the
+        // view was scrolled back: the view drifted up a line per scroll, and once
+        // past the top of the history the next snapshot indexed outside the grid
+        // (a panic, release builds too). LF / IND / SU / DL / an autowrap.
+        let scrolls: [&[u8]; 5] = [
+            b"\x1b[2;5r\x1b[5;1H\n",
+            b"\x1b[2;5r\x1b[5;1H\x1bD",
+            b"\x1b[2;5r\x1b[S",
+            b"\x1b[r\x1b[3;1H\x1b[M",
+            b"\x1b[2;5r\x1b[5;1Hxxxxxxxxxxx",
+        ];
+        for scroll in scrolls {
+            let mut t = Terminal::new(10, 5);
+            for i in 0..20 {
+                t.feed(format!("line{i}\r\n").as_bytes());
+            }
+            t.scroll_lines(3);
+            let view: Vec<String> = (0..2).map(|r| t.snapshot().row_text(r)).collect();
+            for _ in 0..3000 {
+                t.feed(scroll);
+            }
+            let what = String::from_utf8_lossy(scroll);
+            assert_eq!(t.scroll_offset(), 3, "{what:?}: the view drifted");
+            let now: Vec<String> = (0..2).map(|r| t.snapshot().row_text(r)).collect();
+            assert_eq!(now, view, "{what:?}: the history rows on screen changed");
+        }
+        // Leaving the alt screen in the same write as the region scrolls: the
+        // count is lost there, but the view stays inside the history.
+        let mut t = Terminal::new(10, 5);
+        for i in 0..20 {
+            t.feed(format!("line{i}\r\n").as_bytes());
+        }
+        t.scroll_lines(3);
+        t.feed(b"\x1b[?1049h");
+        let mut burst = b"\x1b[?1049l\x1b[2;5r\x1b[5;1H".to_vec();
+        burst.extend_from_slice(&b"\n".repeat(3000));
+        t.feed(&burst);
+        assert!(t.scroll_offset() <= t.scroll_max(), "{} > {}", t.scroll_offset(), t.scroll_max());
+        let _ = t.snapshot();
+    }
+
+    #[test]
+    fn output_that_fills_history_while_scrolled_back_keeps_the_view_on_its_lines() {
+        // A full-screen scroll DOES push lines into history: the view follows
+        // its content up (also with a bottom status line, apt-style), in one
+        // write or many, until that content falls off the top of the history.
+        for (region, bottom) in [("", 5), ("\x1b[1;4r", 4)] {
+            let mut t = Terminal::new(10, 5);
+            t.set_scrollback_lines(100);
+            for i in 0..50 {
+                t.feed(format!("line{i}\r\n").as_bytes());
+            }
+            t.feed(region.as_bytes());
+            t.scroll_lines(10);
+            let view = t.snapshot().row_text(0);
+            let mut burst = String::new();
+            for i in 0..30 {
+                burst.push_str(&format!("\x1b[{bottom};1Hnew{i}\n"));
+            }
+            t.feed(burst.as_bytes());
+            for i in 0..20 {
+                t.feed(format!("\x1b[{bottom};1Hmore{i}\n").as_bytes());
+            }
+            assert_eq!(t.scroll_offset(), 60, "{region:?}: the view follows its lines");
+            assert_eq!(t.snapshot().row_text(0), view, "{region:?}");
+            t.feed(format!("\x1b[{bottom};1H\n").repeat(500).as_bytes());
+            assert!(t.scroll_offset() <= t.scroll_max(), "{region:?}: inside the history");
+            let _ = t.snapshot();
+        }
     }
 
     #[test]
