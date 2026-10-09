@@ -2873,14 +2873,34 @@ impl App {
 
     /// Show `msg` in the main window's status pill for `ms` milliseconds.
     fn show_notice_pill(&mut self, msg: String, ms: u64) {
+        self.show_notice_pill_in(Surface::Main, msg, ms);
+    }
+
+    /// [`Self::show_notice_pill`] in window `s` — the one a command ran in
+    /// (falling back to the main window when it is gone). Shown in the main
+    /// window instead, a detached window's feedback went unseen there or
+    /// waited for its next summon: "run Reset keybindings again to confirm"
+    /// appeared minutes after the reset it warned about.
+    fn show_notice_pill_in(&mut self, s: Surface, msg: String, ms: u64) {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        if let Surface::Detached(p) = s {
+            // A detached window is never hidden: nothing waits for a summon.
+            if let Some(id) = self.detached.get(p).map(|d| d.window.id()) {
+                let previous = self.status_pill.as_ref().map(|p| p.2).filter(|&p| p != id);
+                self.status_pill = Some((msg, until, id));
+                for w in std::iter::once(id).chain(previous) {
+                    self.request_window_paint(w);
+                }
+                return;
+            }
+        }
         if !self.visible {
             self.deferred_notice = Some((msg, ms));
             return;
         }
         let Some(id) = self.window.as_ref().map(|w| w.id()) else { return };
         let previous = self.status_pill.as_ref().map(|p| p.2).filter(|&p| p != id);
-        self.status_pill =
-            Some((msg, std::time::Instant::now() + std::time::Duration::from_millis(ms), id));
+        self.status_pill = Some((msg, until, id));
         self.request_main_paint();
         if let Some(w) = previous {
             self.request_window_paint(w);
@@ -5953,34 +5973,35 @@ impl App {
     /// Step the theme by `step` in registry order (wrapping) from the chosen
     /// one, pick and save it, and name it in a pill (a key binding gives no
     /// other feedback of which theme came up).
-    fn cycle_theme(&mut self, step: isize) {
+    fn cycle_theme(&mut self, s: Surface, step: isize) {
         self.end_theme_previews();
         let n = jetty_core::theme_count();
         if n == 0 {
             return;
         }
         let i = (self.theme_idx as isize + step).rem_euclid(n as isize) as usize;
-        self.pick_cycled_theme(i);
+        self.pick_cycled_theme(s, i);
     }
 
     /// Pick a random theme other than the chosen one (see [`cycle_theme`]).
-    fn random_theme(&mut self) {
+    fn random_theme(&mut self, s: Surface) {
         use std::hash::{BuildHasher, Hasher};
         self.end_theme_previews();
         // RandomState is randomly keyed per instance: no RNG crate needed.
         let mut h = std::collections::hash_map::RandomState::new().build_hasher();
         h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
         let i = random_other(jetty_core::theme_count(), self.theme_idx, h.finish());
-        self.pick_cycled_theme(i);
+        self.pick_cycled_theme(s, i);
     }
 
-    fn pick_cycled_theme(&mut self, i: usize) {
+    /// The pill names it in window `s`, where the key or command came from.
+    fn pick_cycled_theme(&mut self, s: Surface, i: usize) {
         self.pick_theme(i);
         self.persist();
         self.redraw_main_and_detached();
         self.request_settings_paint();
         let name = self.active_theme.display_name.to_string();
-        self.show_notice_pill(format!("Theme: {name}"), 1500);
+        self.show_notice_pill_in(s, format!("Theme: {name}"), 1500);
     }
 
     /// Keys owned by window `s`'s MODAL overlays, in priority order
@@ -6695,36 +6716,36 @@ impl App {
                 let next = crate::motion::CursorShapePref::parse(&self.cursor_cfg.shape).next();
                 let cfg = crate::config::CursorConfig { shape: next.as_str().to_string(), ..self.cursor_cfg.clone() };
                 self.set_cursor_config(&cfg);
-                self.show_notice_pill(format!("Cursor shape: {}", next.as_str().replace('_', " ")), 1800);
+                self.show_notice_pill_in(s, format!("Cursor shape: {}", next.as_str().replace('_', " ")), 1800);
             }
             C::ToggleCursorTrail => {
                 let cfg = crate::config::CursorConfig { trail: !self.cursor_cfg.trail, ..self.cursor_cfg.clone() };
                 self.set_cursor_config(&cfg);
                 let state = if self.cursor_cfg.trail { "on" } else { "off" };
-                self.show_notice_pill(format!("Cursor trail: {state}"), 1800);
+                self.show_notice_pill_in(s, format!("Cursor trail: {state}"), 1800);
             }
             C::CycleCursorGuide => {
                 let next = crate::motion::GuideMode::parse(&self.cursor_cfg.guide).next();
                 let cfg = crate::config::CursorConfig { guide: next.as_str().to_string(), ..self.cursor_cfg.clone() };
                 self.set_cursor_config(&cfg);
-                self.show_notice_pill(format!("Cursor guide: {}", next.as_str()), 1800);
+                self.show_notice_pill_in(s, format!("Cursor guide: {}", next.as_str()), 1800);
             }
             C::CycleReduceMotion => {
                 let next = self.reduce_motion.next();
                 self.set_reduce_motion(next);
-                self.show_notice_pill(format!("Reduce motion: {}", next.as_str()), 1800);
+                self.show_notice_pill_in(s, format!("Reduce motion: {}", next.as_str()), 1800);
             }
             C::CycleVisualBell => {
                 self.visual_bell = self.visual_bell.next();
                 self.persist();
                 self.mark_dirty_all();
-                self.show_notice_pill(format!("Visual bell: {}", self.visual_bell.as_str()), 1800);
+                self.show_notice_pill_in(s, format!("Visual bell: {}", self.visual_bell.as_str()), 1800);
             }
             C::CycleCommandPulse => {
                 self.command_pulse = self.command_pulse.next();
                 self.persist();
                 self.mark_dirty_all();
-                self.show_notice_pill(format!("Command pulse: {}", self.command_pulse.as_str()), 1800);
+                self.show_notice_pill_in(s, format!("Command pulse: {}", self.command_pulse.as_str()), 1800);
             }
             C::TogglePerfHud => self.toggle_perf_hud(),
             C::ToggleBuiltinGlyphs => {
@@ -6803,7 +6824,8 @@ impl App {
                 let now = std::time::Instant::now();
                 if self.reset_keys_armed_until.is_none_or(|t| now >= t) {
                     self.reset_keys_armed_until = Some(now + std::time::Duration::from_secs(6));
-                    self.show_notice_pill(
+                    self.show_notice_pill_in(
+                        s,
                         "Run \u{201c}Reset keybindings\u{201d} again within 6 s to confirm (a backup is saved first)"
                             .to_string(),
                         6000,
@@ -6834,7 +6856,7 @@ impl App {
                     ),
                     None => "Keybindings reset to defaults".to_string(),
                 };
-                self.show_notice_pill(msg, 6000);
+                self.show_notice_pill_in(s, msg, 6000);
             }
             // A crashed program's keyboard / mouse modes, dropped for the tab the
             // palette was opened over — the screen and scrollback stay.
@@ -6897,9 +6919,9 @@ impl App {
                     self.set_tab_color(id, color);
                 }
             }
-            C::NextTheme => self.cycle_theme(1),
-            C::PrevTheme => self.cycle_theme(-1),
-            C::RandomTheme => self.random_theme(),
+            C::NextTheme => self.cycle_theme(s, 1),
+            C::PrevTheme => self.cycle_theme(s, -1),
+            C::RandomTheme => self.random_theme(s),
             C::ToggleFollowSystemTheme => {
                 self.set_follow_system_theme(!self.follow_system_theme);
                 let msg = if !self.follow_system_theme {
@@ -6910,7 +6932,7 @@ impl App {
                 } else {
                     format!("Following the system light/dark theme: on — {}", self.active_theme.display_name)
                 };
-                self.show_notice_pill(msg, 2500);
+                self.show_notice_pill_in(s, msg, 2500);
             }
             C::CycleMinimumContrast => {
                 let next = next_minimum_contrast(self.minimum_contrast);
@@ -6920,7 +6942,7 @@ impl App {
                 } else {
                     format!("Minimum contrast: {next}:1")
                 };
-                self.show_notice_pill(msg, 1500);
+                self.show_notice_pill_in(s, msg, 1500);
             }
             // A theme by name: one that vanished (a themes/ reload) is a no-op.
             C::SetTheme(name) => {
@@ -10766,7 +10788,8 @@ impl App {
                     }
                     // The theme is app-wide: every window takes it.
                     input::KeyAction::NextTheme | input::KeyAction::PrevTheme => {
-                        self.cycle_theme(if action == input::KeyAction::NextTheme { 1 } else { -1 });
+                        let step = if action == input::KeyAction::NextTheme { 1 } else { -1 };
+                        self.cycle_theme(Surface::Detached(pos), step);
                         return;
                     }
                     // The Menu key: THIS window's menu at its text cursor (an
@@ -15407,8 +15430,8 @@ impl ApplicationHandler<AppEvent> for App {
                         self.set_main_fullscreen(!self.main_fullscreen);
                     }
                     // `[keys] next_theme` / `prev_theme` (no default chord).
-                    input::KeyAction::NextTheme => self.cycle_theme(1),
-                    input::KeyAction::PrevTheme => self.cycle_theme(-1),
+                    input::KeyAction::NextTheme => self.cycle_theme(Surface::Main, 1),
+                    input::KeyAction::PrevTheme => self.cycle_theme(Surface::Main, -1),
                     // The Menu key (`[keys] context_menu`): the terminal context
                     // menu at the text cursor, first enabled row highlighted (an
                     // open menu took the key above and closed).
