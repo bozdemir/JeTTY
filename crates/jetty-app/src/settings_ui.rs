@@ -977,7 +977,7 @@ pub static DESCS: &[Desc] = &[
         kind: Kind::Choice { options: |_| pairs(&[("off", "Off"), ("on", "On"), ("system", "System")]) },
         get: get_s!(reduce_motion),
         set: set_s!(reduce_motion),
-        hint: Some("System follows the desktop (Linux)"),
+        hint: Some("System follows the desktop"),
         ..Desc::DEFAULT
     },
     Desc {

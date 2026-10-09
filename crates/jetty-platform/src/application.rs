@@ -58,6 +58,19 @@ pub fn on_reopen(on_reopen: impl Fn() + 'static) {
     let _ = on_reopen;
 }
 
+/// Whether the user asked the system to reduce motion: on macOS System
+/// Settings › Accessibility › Display › Reduce motion (`NSWorkspace`'s
+/// `accessibilityDisplayShouldReduceMotion`), read now — cheap, but AppKit
+/// tells no one when it changes, so read it where it can have: when JeTTY
+/// gains focus. `None` elsewhere: Linux and BSD desktops report it through
+/// the settings portal, which the app watches.
+pub fn reduce_motion_requested() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    return Some(macos::reduce_motion_requested());
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use objc2::rc::Retained;
@@ -88,6 +101,16 @@ mod macos {
         let app = NSApplication::sharedApplication(mtm);
         if app.isHidden() {
             app.unhideWithoutActivation();
+        }
+    }
+
+    pub(super) fn reduce_motion_requested() -> bool {
+        // SAFETY: the documented `+[NSWorkspace sharedWorkspace]` (any thread)
+        // and its BOOL property `accessibilityDisplayShouldReduceMotion`
+        // (macOS 10.12+).
+        unsafe {
+            let workspace: Retained<AnyObject> = msg_send![class!(NSWorkspace), sharedWorkspace];
+            msg_send![&*workspace, accessibilityDisplayShouldReduceMotion]
         }
     }
 

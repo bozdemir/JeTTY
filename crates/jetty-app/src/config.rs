@@ -226,7 +226,8 @@ pub struct Config {
     pub cursor: CursorConfig,
     /// Calm the motion down: `"off"` (default), `"on"`, or `"system"` (follow
     /// the desktop's reduced-motion setting, via the freedesktop settings
-    /// portal / the macOS accessibility flag). While active the summon reveal
+    /// portal / the macOS accessibility flag, read when JeTTY gains focus).
+    /// While active the summon reveal
     /// becomes a short fade, the dropdown does not slide, CRT roll / flicker /
     /// jitter and the caret ripple stop, the cursor trail is off, and the
     /// visual bell is the rim.

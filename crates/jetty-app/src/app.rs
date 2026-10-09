@@ -3448,10 +3448,28 @@ impl App {
         }
         self.reduce_motion = mode;
         // "system" needs the desktop's setting: start the watcher (a no-op
-        // when it already runs or nothing wants it).
+        // when it already runs or nothing wants it) — macOS: read it.
         self.ensure_appearance_watcher();
+        self.read_system_reduced_motion();
         self.motion_changed();
         self.persist();
+    }
+
+    /// macOS: read the accessibility "Reduce motion" setting for `reduce_motion =
+    /// "system"` — at startup, when "system" is chosen, and whenever the terminal
+    /// gains focus (AppKit announces no change; System Settings was in front).
+    /// It never followed anything there. Elsewhere a no-op: the settings portal
+    /// reports the desktop's.
+    fn read_system_reduced_motion(&mut self) {
+        if self.reduce_motion != crate::motion::ReduceMotion::System {
+            return;
+        }
+        if let Some(reduced) = jetty_platform::reduce_motion_requested() {
+            self.apply_appearance(crate::appearance::Appearance {
+                reduced_motion: Some(reduced),
+                ..Default::default()
+            });
+        }
     }
 
     /// The desktop's reduced-motion setting changed (`apply_appearance`: the
@@ -12944,6 +12962,7 @@ impl ApplicationHandler<AppEvent> for App {
                 ..Default::default()
             });
         }
+        self.read_system_reduced_motion();
         self.take_first_appearance();
         let proxy_wake = self.proxy.clone();
         let shell = self.opt_shell();
@@ -13672,6 +13691,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.last_focused_window = Some(id);
                 self.main_focused = true;
                 self.focus_lost_at = None;
+                self.read_system_reduced_motion();
                 // A toggle-raise succeeded (or focus came back by itself): the
                 // next toggle should hide, not count as a refused raise. This is
                 // also the FocusIn that ends the summon hotkey's key grab (on

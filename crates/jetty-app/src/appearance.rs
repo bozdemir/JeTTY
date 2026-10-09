@@ -13,7 +13,9 @@
 //!   reported and JeTTY keeps `theme`.
 //! * **macOS** (and any platform where winit reports it): the system theme
 //!   (`ActiveEventLoop::system_theme` at startup, `WindowEvent::ThemeChanged`
-//!   after) — winit never reports either on X11/Wayland.
+//!   after) — winit never reports either on X11/Wayland. Reduced motion is
+//!   read from AppKit when the terminal gains focus
+//!   (`jetty_platform::reduce_motion_requested`).
 //!
 //! The D-Bus side is behind the small [`portal::Settings`] trait, so everything
 //! that decides something (value parsing, the `ReadOne` → `Read` fallback, no

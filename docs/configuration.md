@@ -108,7 +108,7 @@ Names of fonts and themes are matched in any letter case, and a theme by its id
 
 | Key | Default | What it does |
 |---|---|---|
-| `reduce_motion` | `"off"` | Calm the motion down: `"off"`, `"on"` or `"system"` (follow the desktop's reduced-motion setting). While active the summon reveal is a short fade, the dropdown does not slide, CRT roll, flicker and jitter stop, the cursor trail is off and the visual bell is the rim. |
+| `reduce_motion` | `"off"` | Calm the motion down: `"off"`, `"on"` or `"system"` (follow the desktop's reduced-motion setting: the settings portal on Linux and BSD, Accessibility › Display › Reduce motion on macOS — read when JeTTY gains focus). While active the summon reveal is a short fade, the dropdown does not slide, CRT roll, flicker and jitter stop, the cursor trail is off and the visual bell is the rim. |
 | `visual_bell` | `"off"` | The bell (BEL in the active tab) as a picture: `"off"`, `"flash"` (a 150 ms flash of the window) or `"rim"` (a glow along its edge). At most three a second; an unfocused window asks for attention instead. |
 | `command_pulse` | `"off"` | A pulse along the window edge when a command finishes (needs shell integration): `"off"`, `"failures"` (red, on a failed command) or `"all"` (also the accent when a long command succeeds). |
 
