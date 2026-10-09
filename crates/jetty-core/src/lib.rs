@@ -15,7 +15,7 @@ pub mod url;
 
 pub use fuzzy::{fuzzy_match, FuzzyMatch};
 pub use hints::{HintToken, TokenKind};
-pub use pty::{hide_from_shells, self_exe, set_advertised_version, PtySession, SelfExe};
+pub use pty::{hide_from_shells, self_exe, set_advertised_version, uninherited_env, PtySession, SelfExe};
 pub use sixel::{decode_sixel, InlineImage, SixelCaps, SixelImage, SIXEL_CAPS};
 pub use snapshot::{
     attr, CellGrapheme, CellSnapshot, CursorShapeSnap, GridSnapshot, SearchHit, GRAPHEME_MAX_BYTES,

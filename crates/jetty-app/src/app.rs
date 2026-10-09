@@ -1341,6 +1341,8 @@ pub struct App {
     /// The one-time "Shift+right-click opens JeTTY's menu" pill was shown (a
     /// right click now goes to a program that tracks the mouse).
     right_click_hint_shown: bool,
+    /// Links opened with a click, waiting for their activation token.
+    opener: crate::opener::Opener,
     /// Fractional wheel-scroll accumulator for the main window: slow touchpad
     /// deltas (sub-line PixelDelta/LineDelta) accumulate across events instead
     /// of being rounded to 0 and dropped. Reset on tab switch so one tab's
@@ -2141,6 +2143,7 @@ impl App {
             cursor: (0.0, 0.0),
             grid_mouse: crate::gridmouse::GridMouse::default(),
             right_click_hint_shown: false,
+            opener: crate::opener::Opener::default(),
             scroll_accum: input::ScrollAccumulator::new(),
             shift_hint_until: None,
             shift_hint_window: None,
@@ -5523,7 +5526,13 @@ impl App {
                 // decoupled from the label letter (BLOCKING 5). Alt = open ONLY
                 // for a URL; every other kind always copies.
                 if tok.kind == jetty_core::TokenKind::Url && self.modifiers.alt_key() {
-                    App::open_url(&tok.text);
+                    let window = match s {
+                        Surface::Main => self.window.as_deref(),
+                        Surface::Detached(p) => self.detached.get(p).map(|d| &*d.window),
+                    };
+                    if let Some(window) = window {
+                        Self::open_url(&mut self.opener, window, &tok.text);
+                    }
                 } else {
                     crate::clipboard::set(&tok.text);
                 }
@@ -7833,34 +7842,17 @@ impl App {
         }
     }
 
-    /// Open `url` with the platform opener (`open` on macOS, `xdg-open`
-    /// elsewhere — OS-level cfg only, never DE-specific), spawned fully
-    /// detached with all three stdio fds null. Restricted to the
+    /// Open `url` — a click (or a hint) in `window` — with the platform opener
+    /// (`open` on macOS, `xdg-open` elsewhere — OS-level cfg only, never
+    /// DE-specific): a clean environment and a fresh activation token for the
+    /// click (`crate::opener`), all three stdio fds null. Restricted to the
     /// http/https/file allowlist; a missing opener degrades to an stderr line.
-    fn open_url(url: &str) {
+    fn open_url(opener: &mut crate::opener::Opener, window: &Window, url: &str) {
         if !url_scheme_allowed(url) {
             eprintln!("jetty: refusing to open URL with disallowed scheme: {url}");
             return;
         }
-        #[cfg(target_os = "macos")]
-        let cmd = "open";
-        #[cfg(not(target_os = "macos"))]
-        let cmd = "xdg-open";
-        match std::process::Command::new(cmd)
-            .arg(url)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            // Reap the short-lived child off-thread so it never zombies.
-            Ok(mut child) => {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-            }
-            Err(e) => eprintln!("jetty: failed to spawn {cmd} for URL: {e}"),
-        }
+        opener.open(window, url);
     }
 
     /// Paste `text` to the ACTIVE tab's PTY, wrapping in bracketed-paste
@@ -11074,7 +11066,9 @@ impl App {
                             match with_detached_grid(dw, geom, self.modifiers, |g| {
                                 crate::gridmouse::press(g, MouseButton::Left, link_mod, now)
                             }) {
-                                crate::gridmouse::Press::OpenLink(uri) => Self::open_url(&uri),
+                                crate::gridmouse::Press::OpenLink(uri) => {
+                                    Self::open_url(&mut self.opener, &dw.window, &uri)
+                                }
                                 crate::gridmouse::Press::Selecting => dw.request_paint(),
                                 _ => {}
                             }
@@ -13728,6 +13722,12 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // The activation token a clicked link waits for — whichever window
+        // asked, even one closed since the click (`crate::opener`).
+        if let WindowEvent::ActivationTokenDone { serial, token } = event {
+            self.opener.token_done(serial, token);
+            return;
+        }
         // Route events to the settings window when they belong to it. Everything
         // else falls through to the main-terminal handling below.
         if self.settings_window.as_ref().is_some_and(|w| w.id() == id) {
@@ -14531,7 +14531,11 @@ impl ApplicationHandler<AppEvent> for App {
                         match self.with_main_grid(|g| {
                             crate::gridmouse::press(g, MouseButton::Left, link_mod, now)
                         }) {
-                            Some(crate::gridmouse::Press::OpenLink(uri)) => Self::open_url(&uri),
+                            Some(crate::gridmouse::Press::OpenLink(uri)) => {
+                                if let Some(window) = &self.window {
+                                    Self::open_url(&mut self.opener, window, &uri);
+                                }
+                            }
                             Some(crate::gridmouse::Press::Selecting) => self.request_main_paint(),
                             _ => {}
                         }

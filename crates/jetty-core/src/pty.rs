@@ -605,6 +605,14 @@ pub fn hide_from_shells(var: &'static str) {
     }
 }
 
+/// Every variable of JeTTY's own environment a program it starts must not
+/// inherit: the launch-environment denylist plus what JeTTY set for itself
+/// ([`hide_from_shells`]). Removed from the shells and from the URL opener.
+pub fn uninherited_env() -> Vec<&'static str> {
+    let hidden = HIDDEN_FROM_SHELLS.lock().unwrap_or_else(|e| e.into_inner());
+    INHERITED_ENV_DENYLIST.iter().copied().chain(hidden.iter().copied()).collect()
+}
+
 /// The locale variable a shell gets when the environment JeTTY hands it names
 /// none (`var` looks one up): `LANG` = the system's language and region
 /// (`system`, e.g. `tr_TR`) in UTF-8 when that locale is `installed`, else
@@ -929,10 +937,7 @@ impl PtySession {
             };
             #[cfg(not(target_os = "macos"))]
             let mut cmd = CommandBuilder::new(shell);
-            for key in INHERITED_ENV_DENYLIST {
-                cmd.env_remove(key);
-            }
-            for key in HIDDEN_FROM_SHELLS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            for key in uninherited_env() {
                 cmd.env_remove(key);
             }
             // `$SHELL` names the shell that runs here — the `shell` override or
@@ -1381,6 +1386,17 @@ impl PtySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_jetty_starts_inherits_none_of_its_launch_or_own_variables() {
+        hide_from_shells("JETTY_TEST_HIDDEN_VAR");
+        let vars = uninherited_env();
+        for var in ["DESKTOP_STARTUP_ID", "XDG_ACTIVATION_TOKEN", "APPIMAGE", "APPDIR", "ARGV0", "OWD", "TMUX"] {
+            assert!(vars.contains(&var), "{var} (the launch-environment denylist)");
+        }
+        assert!(vars.contains(&"JETTY_TEST_HIDDEN_VAR"), "a variable JeTTY set for itself");
+        assert!(!vars.contains(&"PATH") && !vars.contains(&"HOME"), "the rest is inherited");
+    }
 
     #[test]
     fn a_shell_with_no_locale_gets_the_systems_in_utf8() {

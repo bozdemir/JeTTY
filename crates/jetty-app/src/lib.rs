@@ -18,6 +18,9 @@ mod gridmouse;
 pub mod menunav;
 pub mod motion;
 mod notify;
+/// Opening links with the platform opener (clean environment, fresh
+/// activation token).
+mod opener;
 mod overlays;
 mod runsel;
 /// Command-palette action registry + fuzzy filter. Public so the `jetty-shot`
