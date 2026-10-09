@@ -62,6 +62,12 @@ xkeysym = "0.2"
 # build a second toolkit next to winit's 0.19.
 smithay-clipboard = "=0.7.2"
 
+[target.'cfg(unix)'.dependencies]
+# `gethostname` (a `file://` link on another machine is never opened locally)
+# and `getuid` (the IPC socket's directory must be ours). Already in the tree
+# via jetty-core — no new crate.
+libc = "0.2"
+
 [dev-dependencies]
 # Tests drive the shell-integration snippets in a REAL shell on a PTY (bash -u).
 # Already in the lockfile via jetty-core — no new download.

@@ -2197,6 +2197,44 @@ fn url_scheme_allowed(url: &str) -> bool {
         .any(|p| url.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p)))
 }
 
+/// What Ctrl+click / hint mode hands the platform opener for `url`: the URL
+/// itself, or for a `file://` URI the local file (`file:///path`) — only when
+/// it names no host, `localhost` or this machine (`hostname`). A file on
+/// another machine (`ls --hyperlink`, `rg --hyperlink-format`, `fd
+/// --hyperlink` over SSH print `file://devbox/…`) is refused with a pill: GLib
+/// (`gio open`) opened the LOCAL file of that name, plain xdg-open a path
+/// relative to JeTTY's directory, KIO a network share on a host the program
+/// output chose. `Err(None)`: a scheme outside the allowlist (no pill).
+fn link_open_target(url: &str, hostname: &str) -> Result<String, Option<String>> {
+    if !url_scheme_allowed(url) {
+        return Err(None);
+    }
+    let Some(rest) = url.get(..7).filter(|s| s.eq_ignore_ascii_case("file://")).map(|_| &url[7..]) else {
+        return Ok(url.to_string());
+    };
+    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let here = host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || (!hostname.is_empty() && host.eq_ignore_ascii_case(hostname));
+    if here {
+        return Ok(format!("file://{}", if path.is_empty() { "/" } else { path }));
+    }
+    let host = jetty_core::untrusted::display(host, 64).unwrap_or_default();
+    Err(Some(format!("Not opened: the file is on {host}, not on this machine")))
+}
+
+/// This machine's host name (`gethostname`), to tell a local `file://` link
+/// from one on another machine; empty when it can't be read.
+fn local_hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most `buf.len()` bytes into `buf`.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return String::new();
+    }
+    let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
 impl App {
     pub fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
         // Seed the theme registry (built-ins + user themes) BEFORE any theme
@@ -5954,13 +5992,7 @@ impl App {
                 // decoupled from the label letter (BLOCKING 5). Alt = open ONLY
                 // for a URL; every other kind always copies.
                 if tok.kind == jetty_core::TokenKind::Url && self.modifiers.alt_key() {
-                    let window = match s {
-                        Surface::Main => self.window.as_deref(),
-                        Surface::Detached(p) => self.detached.get(p).map(|d| &*d.window),
-                    };
-                    if let Some(window) = window {
-                        Self::open_url(&mut self.opener, window, &tok.text);
-                    }
+                    self.open_link(s, &tok.text);
                 } else {
                     crate::clipboard::set(&tok.text);
                 }
@@ -8478,17 +8510,38 @@ impl App {
         }
     }
 
+    /// Open a Ctrl+clicked or hinted link in window `s`; a refused `file://`
+    /// link on another machine says so in a pill there.
+    fn open_link(&mut self, s: Surface, url: &str) {
+        let window = match s {
+            Surface::Main => self.window.as_deref(),
+            Surface::Detached(p) => self.detached.get(p).map(|d| &*d.window),
+        };
+        let Some(window) = window else { return };
+        let id = window.id();
+        if let Err(msg) = Self::open_url(&mut self.opener, window, url) {
+            self.show_pill(msg, Some(id));
+        }
+    }
+
     /// Open `url` — a click (or a hint) in `window` — with the platform opener
     /// (`open` on macOS, `xdg-open` elsewhere — OS-level cfg only, never
     /// DE-specific): a clean environment and a fresh activation token for the
     /// click (`crate::opener`), all three stdio fds null. Restricted to the
-    /// http/https/file allowlist; a missing opener degrades to an stderr line.
-    fn open_url(opener: &mut crate::opener::Opener, window: &Window, url: &str) {
-        if !url_scheme_allowed(url) {
-            eprintln!("jetty: refusing to open URL with disallowed scheme: {url}");
-            return;
-        }
-        opener.open(window, url);
+    /// http/https/file allowlist and to this machine's files
+    /// ([`link_open_target`]); a missing opener degrades to an stderr line.
+    /// `Err` is a refusal to show.
+    fn open_url(opener: &mut crate::opener::Opener, window: &Window, url: &str) -> Result<(), String> {
+        let url = match link_open_target(url, &local_hostname()) {
+            Ok(url) => url,
+            Err(None) => {
+                eprintln!("jetty: refusing to open URL with disallowed scheme: {url}");
+                return Ok(());
+            }
+            Err(Some(msg)) => return Err(msg),
+        };
+        opener.open(window, &url);
+        Ok(())
     }
 
     /// Paste `text` to the ACTIVE tab's PTY, wrapping in bracketed-paste
@@ -8630,8 +8683,13 @@ impl App {
     }
 
     fn show_status_pill(&mut self, n: crate::runsel::Notice) {
-        let target = n
-            .window
+        self.show_pill(n.msg.to_string(), n.window);
+    }
+
+    /// Show `msg` in the status pill of `window` (the main window when `None`
+    /// or gone) — see [`App::show_status_pill`].
+    fn show_pill(&mut self, msg: String, window: Option<winit::window::WindowId>) {
+        let target = window
             .filter(|id| {
                 self.window.as_ref().is_some_and(|w| w.id() == *id)
                     || self.detached.iter().any(|d| d.window.id() == *id)
@@ -8641,8 +8699,7 @@ impl App {
         // A pill re-tagged to another window must disappear from the one that
         // showed it: pills paint only on show/expiry, so repaint that one too.
         let previous = self.status_pill.as_ref().map(|p| p.2).filter(|&p| p != id);
-        self.status_pill =
-            Some((n.msg.to_string(), std::time::Instant::now() + std::time::Duration::from_millis(4000), id));
+        self.status_pill = Some((msg, std::time::Instant::now() + std::time::Duration::from_millis(4000), id));
         for w in std::iter::once(id).chain(previous) {
             self.request_window_paint(w);
         }
@@ -11946,7 +12003,7 @@ impl App {
                                 crate::gridmouse::press(g, MouseButton::Left, link_mod, now)
                             }) {
                                 crate::gridmouse::Press::OpenLink(uri) => {
-                                    Self::open_url(&mut self.opener, &dw.window, &uri)
+                                    self.open_link(Surface::Detached(pos), &uri)
                                 }
                                 crate::gridmouse::Press::Selecting => dw.request_paint(),
                                 _ => {}
@@ -15555,11 +15612,7 @@ impl ApplicationHandler<AppEvent> for App {
                         match self.with_main_grid(|g| {
                             crate::gridmouse::press(g, MouseButton::Left, link_mod, now)
                         }) {
-                            Some(crate::gridmouse::Press::OpenLink(uri)) => {
-                                if let Some(window) = &self.window {
-                                    Self::open_url(&mut self.opener, window, &uri);
-                                }
-                            }
+                            Some(crate::gridmouse::Press::OpenLink(uri)) => self.open_link(Surface::Main, &uri),
                             Some(crate::gridmouse::Press::Selecting) => self.request_main_paint(),
                             _ => {}
                         }
@@ -20443,7 +20496,31 @@ mod summon_motion_tests {
 
 #[cfg(test)]
 mod url_open_tests {
-    use super::url_scheme_allowed;
+    use super::{link_open_target, url_scheme_allowed};
+
+    #[test]
+    fn a_file_link_opens_only_on_this_machine() {
+        let ok = |url: &str, want: &str| assert_eq!(link_open_target(url, "myhost"), Ok(want.to_string()), "{url}");
+        ok("file:///home/u/a.txt", "file:///home/u/a.txt");
+        ok("file://localhost/etc/hosts", "file:///etc/hosts");
+        ok("FILE://LocalHost/x", "file:///x");
+        ok("file://MyHost/home/u/a.txt", "file:///home/u/a.txt"); // `ls --hyperlink` here
+        ok("file://", "file:///");
+        ok("https://example.com/a", "https://example.com/a");
+        // `ls --hyperlink` / `rg` over ssh: never the LOCAL file of that name.
+        for url in ["file://devbox/home/u/notes.txt", "file://myhost.evil/x", "file://devbox"] {
+            let msg = link_open_target(url, "myhost").expect_err(url).expect("a pill");
+            assert!(msg.contains("devbox") || msg.contains("myhost.evil"), "{msg}");
+        }
+        // An unknown own name leaves only the local spellings.
+        assert!(link_open_target("file://myhost/x", "").is_err());
+        assert_eq!(link_open_target("file:///x", ""), Ok("file:///x".to_string()));
+        // A host name is untrusted text in the pill.
+        let msg = link_open_target("file://dev\u{202E}box/x", "myhost").unwrap_err().unwrap();
+        assert!(msg.contains("devbox"), "{msg}");
+        // Other schemes: refused without a pill, as before.
+        assert_eq!(link_open_target("mailto:me@example.com", "myhost"), Err(None));
+    }
 
     #[test]
     fn allows_http_https_file_case_insensitively() {

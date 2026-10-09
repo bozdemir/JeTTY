@@ -1198,6 +1198,7 @@ dependencies = [
  "jetty-core",
  "jetty-platform",
  "jetty-render",
+ "libc",
  "notify",
  "notify-rust",
  "png",
