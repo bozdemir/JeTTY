@@ -659,6 +659,14 @@ const RAISE_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_millis
 /// "unfocused" and RAISED it instead of hiding it. 300 ms covers a busy loop.
 const FOCUS_CHURN_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// Whether a terminal window draws differently once it loses focus — the
+/// `[cursor] unfocused` look (a hollow or no cursor) or a focus ring
+/// (`window_border`) — so that a focus change owes it a repaint. Every window
+/// renders its focus state as of its last frame; nothing else repaints it.
+fn focus_changes_look(unfocused: jetty_render::UnfocusedCursor, border: crate::tabmeta::WindowBorder) -> bool {
+    unfocused != jetty_render::UnfocusedCursor::Unchanged || border != crate::tabmeta::WindowBorder::None
+}
+
 /// Pure toggle decision. Hiding is right only when the user is LOOKING at the
 /// terminal (shown, focused, not occluded); "focused" includes a focus loss
 /// within [`FOCUS_CHURN_GRACE`] — the hotkey's own grab churn. A window that is
@@ -1151,6 +1159,11 @@ pub struct App {
     /// focused — on X11 the summon hotkey's own key grab produces exactly such a
     /// FocusOut just before the hotkey event arrives (see `toggle_action`).
     focus_lost_at: Option<std::time::Instant>,
+    /// The repaint a focus loss owes the focus-dependent look (the unfocused
+    /// cursor, the focus ring — `focus_changes_look`), at `focus_lost_at +
+    /// FOCUS_CHURN_GRACE`: the summon hotkey's own grab churn must not render a
+    /// frame in front of an F9 hide. A focus gain repaints at once and clears it.
+    focus_paint_at: Option<std::time::Instant>,
     /// When the focus-loss AUTO-hide last hid the main window; cleared on show.
     /// A toggle within `FOCUS_CHURN_GRACE` of it keeps the window hidden (the
     /// auto-hide beat a slow hotkey event to the same press).
@@ -2258,6 +2271,7 @@ impl App {
             main_attention: false,
             raise_attempt_at: None,
             focus_lost_at: None,
+            focus_paint_at: None,
             autohidden_at: None,
             switching_to_settings: false,
             switching_to_detached: false,
@@ -12191,10 +12205,12 @@ impl App {
                 self.last_focused_window = Some(self.detached[pos].window.id());
                 self.switching_to_detached = true;
                 self.detached[pos].focused = true;
+                self.detached[pos].focus_paint_at = None;
                 // Focus implies on-screen: clear any stale occluded flag in case
                 // the WM skipped Occluded(false) on restore (F17).
                 self.detached[pos].occluded = false;
-                if self.window_border != crate::tabmeta::WindowBorder::None {
+                // The focused cursor / ring (the main window's gain repaints too).
+                if focus_changes_look(self.cursor_spec.style.unfocused, self.window_border) {
                     self.detached[pos].request_paint();
                 }
                 // Clear a command-finish / bell urgency raised on THIS detached
@@ -12214,12 +12230,15 @@ impl App {
                 // for a switch-to-detached and the terminal hides as it should.
                 self.switching_to_detached = false;
                 self.detached[pos].focused = false;
-                if self.window_border != crate::tabmeta::WindowBorder::None {
-                    self.detached[pos].request_paint();
-                }
                 // F9 decides "hide vs raise" from JeTTY-wide focus: a focus loss
                 // this instant may be the summon hotkey's own grab churn.
-                self.focus_lost_at = Some(std::time::Instant::now());
+                let now = std::time::Instant::now();
+                self.focus_lost_at = Some(now);
+                // The unfocused look paints once the loss is real (as in the
+                // main window); a focus gain first cancels it.
+                if focus_changes_look(self.cursor_spec.style.unfocused, self.window_border) {
+                    self.detached[pos].focus_paint_at = Some(now + FOCUS_CHURN_GRACE);
+                }
                 if self.last_focused_window == Some(self.detached[pos].window.id()) {
                     self.last_focused_window = None;
                 }
@@ -13581,6 +13600,11 @@ impl ApplicationHandler<AppEvent> for App {
             self.key_paint_due = None;
             main_settled = true;
         }
+        // A real focus loss: the unfocused cursor / ring paints once.
+        if self.focus_paint_at.is_some_and(|d| now >= d) {
+            self.focus_paint_at = None;
+            main_settled = true;
+        }
         // An event-glitch burst that just ended owes one clean frame.
         if self.glitch.expire(now) {
             main_settled = true;
@@ -13629,6 +13653,10 @@ impl ApplicationHandler<AppEvent> for App {
             }
             if dw.key_paint_due.is_some_and(|d| now >= d) {
                 dw.key_paint_due = None;
+                settled = true;
+            }
+            if dw.focus_paint_at.is_some_and(|d| now >= d) {
+                dw.focus_paint_at = None;
                 settled = true;
             }
             if dw.glitch.expire(now) {
@@ -13998,6 +14026,11 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some(d) = self.key_paint_due {
             merge_wake(&mut wake_at, d);
         }
+        // A focus loss's deferred repaint (a due one was serviced above) — no
+        // wake for a hidden window: it repaints when it comes back.
+        if let Some(d) = self.focus_paint_at.filter(|_| main_visible) {
+            merge_wake(&mut wake_at, d);
+        }
         // The cursor trail's dwell (a due one was serviced above → future).
         if let Some(d) = self.trail_wake {
             merge_wake(&mut wake_at, d);
@@ -14012,6 +14045,9 @@ impl ApplicationHandler<AppEvent> for App {
         }
         for dw in &self.detached {
             if let Some(d) = dw.key_paint_due {
+                merge_wake(&mut wake_at, d);
+            }
+            if let Some(d) = dw.focus_paint_at.filter(|_| !dw.occluded) {
                 merge_wake(&mut wake_at, d);
             }
             if let Some(d) = dw.trail_wake {
@@ -14902,10 +14938,12 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::Focused(true) => {
-                // The main terminal window gained focus.
+                // The main terminal window gained focus. (Its paint below shows
+                // the focused cursor / ring; a pending focus-loss paint is moot.)
                 self.last_focused_window = Some(id);
                 self.main_focused = true;
                 self.focus_lost_at = None;
+                self.focus_paint_at = None;
                 self.read_system_reduced_motion();
                 // A toggle-raise succeeded (or focus came back by itself): the
                 // next toggle should hide, not count as a refused raise. This is
@@ -14939,15 +14977,17 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::Focused(false) => {
                 self.main_focused = false;
-                // The focus ring dims or goes (window_border); nothing else here
-                // repaints on a focus loss.
-                if self.window_border != crate::tabmeta::WindowBorder::None {
-                    self.request_main_paint();
-                }
                 // Stamped for the toggle's churn grace: on X11 pressing the
                 // summon hotkey itself sends this FocusOut (its key grab) just
                 // before the hotkey event — see `FOCUS_CHURN_GRACE`.
-                self.focus_lost_at = Some(std::time::Instant::now());
+                let now = std::time::Instant::now();
+                self.focus_lost_at = Some(now);
+                // The unfocused cursor / dimmed ring paints once the loss is
+                // real, never in front of an F9 hide (nothing else here
+                // repaints on a focus loss); a focus gain first cancels it.
+                if focus_changes_look(self.cursor_spec.style.unfocused, self.window_border) {
+                    self.focus_paint_at = Some(now + FOCUS_CHURN_GRACE);
+                }
                 // A selection / scrollbar drag, buttons the program saw pressed
                 // and the edge auto-scroll can't see their release once focus is
                 // gone — end them so nothing resumes stuck (detached parity, F14).
@@ -21622,6 +21662,25 @@ mod window_mode_tests {
         for n in names {
             assert!(n.chars().count() <= 11, "cycler label too long: {n:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod focus_look_tests {
+    use super::focus_changes_look;
+    use crate::tabmeta::WindowBorder;
+    use jetty_render::UnfocusedCursor;
+
+    #[test]
+    fn a_focus_change_repaints_whatever_draws_focus() {
+        // The defaults (hollow unfocused cursor, no ring) draw focus: the
+        // unfocused window's block must turn hollow, the focused one solid.
+        assert!(focus_changes_look(UnfocusedCursor::default(), WindowBorder::default()));
+        assert!(focus_changes_look(UnfocusedCursor::None, WindowBorder::None));
+        assert!(focus_changes_look(UnfocusedCursor::Unchanged, WindowBorder::Focus));
+        assert!(focus_changes_look(UnfocusedCursor::Unchanged, WindowBorder::Always));
+        // Nothing focus-dependent on screen: no frame for a focus change.
+        assert!(!focus_changes_look(UnfocusedCursor::Unchanged, WindowBorder::None));
     }
 }
 

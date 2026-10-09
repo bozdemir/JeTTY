@@ -450,6 +450,9 @@ pub(crate) struct DetachedWindow {
     /// Whether THIS detached window holds OS focus (from its Focused events).
     /// Drives the unfocused-hollow cursor, per-window like the main one.
     pub focused: bool,
+    /// The repaint THIS window's focus loss owes its focus-dependent look
+    /// (mirrors `App::focus_paint_at`).
+    pub focus_paint_at: Option<std::time::Instant>,
     /// Whether JeTTY asked for attention on THIS window since it last had
     /// focus — cleared on its next Focused(true), and only then (see
     /// `App::main_attention`).
@@ -696,6 +699,7 @@ impl DetachedWindow {
             paced_paint_at: None,
             frame_interval: None,
             focused,
+            focus_paint_at: None,
             attention: false,
             fullscreen: false,
             reflow_pending_at: None,
