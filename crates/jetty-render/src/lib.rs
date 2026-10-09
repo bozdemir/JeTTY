@@ -1,5 +1,6 @@
 mod chrome;
 mod colors;
+mod coverage;
 mod cursor;
 mod cursor_trail;
 mod gpu;

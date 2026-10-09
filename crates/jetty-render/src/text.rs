@@ -9,6 +9,7 @@ use glyphon::{
 };
 use jetty_core::{CellSnapshot, GridSnapshot};
 use rustc_hash::{FxHashMap, FxHasher};
+use std::borrow::Cow;
 use std::hash::Hasher;
 use std::sync::{Arc, OnceLock};
 use unicode_width::UnicodeWidthChar;
@@ -257,6 +258,50 @@ fn overdraw_shape(font_system: &mut FontSystem, probe: &mut Buffer, style: &Over
     }
 }
 
+/// Whether some installed font has every char of `text` (`coverage`; assumed
+/// until the coverage is built).
+fn drawable(text: &str) -> bool {
+    crate::coverage::get().is_none_or(|cov| text.chars().all(|c| cov.covers(c)))
+}
+
+/// Shape an overdraw char or cluster of a `shape` cell: in the emoji font when
+/// it is an `emoji` (fitted to its cells), else with font fallback in the face
+/// the row would use (`overdraw_shape`). One with a char no installed font has
+/// is shaped from the cell's own face alone — that face's glyphs and its
+/// `.notdef` box, which is what font fallback ends with after trying every
+/// installed face, one by one (~7 ms a char here).
+fn shape_overdraw(
+    font_system: &mut FontSystem,
+    probe: &mut Buffer,
+    style: &OverdrawStyle,
+    text: &str,
+    shape: u8,
+    emoji: bool,
+) -> OverdrawGlyph {
+    match &style.emoji_family {
+        Some(family) if emoji && drawable(text) => style.shape_emoji(font_system, family, text),
+        _ if !drawable(text) => style.shape_text(font_system, text, shape, Shaping::Basic),
+        _ => {
+            let shape = overdraw_shape(font_system, probe, style, text, shape);
+            style.shape_text(font_system, text, shape, Shaping::Advanced)
+        }
+    }
+}
+
+/// A chrome label to shape: `text`, with each char no installed font has
+/// (`coverage`) shown as U+FFFD — or `?` without that either. Chrome is shaped
+/// with font fallback, which tries every installed face for such a char, once
+/// per distinct label, and programs set their tab titles.
+fn drawable_label(text: &str) -> Cow<'_, str> {
+    let Some(cov) = crate::coverage::get() else { return Cow::Borrowed(text) };
+    let shown = |c: char| c.is_control() || cov.covers(c);
+    if text.chars().all(shown) {
+        return Cow::Borrowed(text);
+    }
+    let missing = if cov.covers('\u{FFFD}') { '\u{FFFD}' } else { '?' };
+    Cow::Owned(text.chars().map(|c| if shown(c) { c } else { missing }).collect())
+}
+
 /// A shaped overdraw glyph (a fallback char, a grapheme cluster or a color
 /// emoji) and where it goes from its cell's origin: `dx` centres it in its
 /// cells (an emoji, or a glyph narrower than them), `dy` puts a text glyph on
@@ -379,6 +424,12 @@ type GraphemeCell = (f32, f32, u32, [u8; 3], bool);
 /// its cell's style — a color emoji in none (one buffer for every style).
 type OverdrawCell = (f32, f32, char, u8, [u8; 3]);
 
+/// The char an overdraw cell holds for one whose char no installed font has
+/// (`CellRoute::Missing`): a noncharacter no font maps either, so it draws the
+/// cell face's `.notdef` box like any of them — one cached glyph per style
+/// however many different such chars a program prints.
+const MISSING_GLYPH: char = '\u{10FFFF}';
+
 /// The default terminal font. Matches the user's Konsole profile: MesloLGS NF
 /// — a Nerd Font, so the zsh prompt's powerline/icon glyphs render correctly.
 const FONT_FAMILY_DEFAULT: &str = "MesloLGS NF";
@@ -478,6 +529,10 @@ enum CellRoute {
     /// A color emoji (`color_emoji`): blank in the row, overdrawn from the emoji
     /// font, scaled and centred across its two cells.
     Emoji,
+    /// No installed font has the char (`coverage`): blank in the row, overdrawn
+    /// as its cell face's `.notdef` box — the same box for every such char, so
+    /// they share one overdraw glyph per style (`MISSING_GLYPH`).
+    Missing,
     /// A REGIONAL INDICATOR letter while color emoji are drawn. The VT engine
     /// gives each letter its own cell, so two in a row (counted from the start
     /// of a run of them) are one flag, drawn as one color emoji across both
@@ -667,8 +722,9 @@ struct OverdrawStyle {
 
 impl OverdrawStyle {
     /// Shape an overdraw char or cluster in style `shape` (`BOLD|ITALIC` bits —
-    /// see [`overdraw_shape`]) with font fallback (`Shaping::Advanced`), so the
-    /// marks and glyphs the grid font lacks come from another font.
+    /// see [`overdraw_shape`]) with `shaping`: font fallback (`Advanced`), so
+    /// the marks and glyphs the grid font lacks come from another font — or
+    /// none (`Basic`, see [`shape_overdraw`]).
     ///
     /// cosmic-text centres a line's glyph box — the ascent and descent of the
     /// fonts on it — in the line height, so a glyph from a font with other
@@ -676,11 +732,11 @@ impl OverdrawStyle {
     /// the row's, in whole pixels like glyphon's baselines. A glyph narrower
     /// than its cells (one, or two for a wide char) is centred in them; a wider
     /// or zero-width one keeps the cell's origin.
-    fn shape_text(&self, font_system: &mut FontSystem, text: &str, shape: u8) -> OverdrawGlyph {
+    fn shape_text(&self, font_system: &mut FontSystem, text: &str, shape: u8, shaping: Shaping) -> OverdrawGlyph {
         let mut buffer = Buffer::new(font_system, self.metrics);
         buffer.set_size(font_system, None, None);
         let attrs = face_attrs(&self.family, self.weights, shape);
-        buffer.set_text(font_system, text, &attrs, Shaping::Advanced, None);
+        buffer.set_text(font_system, text, &attrs, shaping, None);
         let (mut dx, mut dy) = (0.0, 0.0);
         if let Some(run) = buffer.layout_runs().next() {
             let cells = text.chars().next().and_then(|c| c.width()).unwrap_or(1).max(1);
@@ -1022,6 +1078,10 @@ fn pack_grid<'a>(
                         fallback.push((col as f32 * cell_w, row as f32 * cell_h, ch, shape, fg));
                         ch = ' ';
                     }
+                    CellRoute::Missing => {
+                        fallback.push((col as f32 * cell_w, row as f32 * cell_h, MISSING_GLYPH, cell.shape_bits(), fg));
+                        ch = ' ';
+                    }
                     CellRoute::Builtin(slot) => {
                         builtin.push((row as u16, col as u16, slot, fg));
                         ch = ' ';
@@ -1231,6 +1291,9 @@ impl TextLayer {
                 .db_mut()
                 .load_fonts_dir(format!("{home}/.local/share/fonts"));
         }
+        // Which chars any of these fonts has, read on a background thread while
+        // the files are still in the page cache (see `coverage`).
+        crate::coverage::start(font_system.db());
         font_system
     }
 
@@ -1701,6 +1764,9 @@ impl TextLayer {
         if s.is_empty() {
             return;
         }
+        // Shaped as drawn (`drawable_label` keeps the char count, so `out` still
+        // has a boundary per char of the label).
+        let s = drawable_label(s);
         let ui_family = self.ui_family.clone();
         let mono_fallback = self.font_family.clone();
         let metrics = self.metrics;
@@ -1708,7 +1774,7 @@ impl TextLayer {
         let buf = &mut self.measure_buffer;
         buf.set_metrics(&mut self.font_system, metrics);
         buf.set_size(&mut self.font_system, None, Some(metrics.line_height));
-        buf.set_text(&mut self.font_system, s, &attrs, Shaping::Advanced, None);
+        buf.set_text(&mut self.font_system, &s, &attrs, Shaping::Advanced, None);
         // Byte offset of each char boundary (the last one = len) → boundary x =
         // the x of the first glyph whose cluster starts at/after it, or the full
         // width past the last glyph. Chrome labels are single-line LTR runs.
@@ -1773,8 +1839,9 @@ impl TextLayer {
         route
     }
 
-    /// The uncached half of [`Self::route`]: built-in glyph, color emoji, or a
-    /// probe of the primary font's face for `shape`.
+    /// The uncached half of [`Self::route`]: built-in glyph, color emoji, flag
+    /// letter, a char no installed font has, or a probe of the primary font's
+    /// face for `shape`.
     fn classify(&mut self, c: char, shape: u8) -> CellRoute {
         if self.builtin_glyphs {
             if builtin::is_blank(c) {
@@ -1789,6 +1856,9 @@ impl TextLayer {
         }
         if is_regional_indicator(c) && self.active_emoji_family().is_some() {
             return CellRoute::Flag;
+        }
+        if crate::coverage::get().is_some_and(|cov| !cov.covers(c)) {
+            return CellRoute::Missing;
         }
         let fam = Arc::clone(&self.font_family);
         probe_route(&mut self.font_system, &mut self.coverage_buffer, &fam, self.face_weights, c, shape, self.cell_w)
@@ -2309,16 +2379,9 @@ impl TextLayer {
                 if let std::collections::hash_map::Entry::Vacant(slot) = self.fallback_glyphs.entry(key) {
                     let mut tmp = [0u8; 4];
                     let text = c.encode_utf8(&mut tmp);
-                    let glyph = match &style.emoji_family {
-                        // Routed as a color emoji (see `classify`): its own font,
-                        // fitted to its two cells.
-                        Some(fam) if is_color_emoji_char(c) => style.shape_emoji(fs, fam, text),
-                        _ => {
-                            let shape = overdraw_shape(fs, probe, &style, text, shape);
-                            style.shape_text(fs, text, shape)
-                        }
-                    };
-                    slot.insert(glyph);
+                    // Routed as a color emoji (see `classify`): its own font,
+                    // fitted to its two cells.
+                    slot.insert(shape_overdraw(fs, probe, &style, text, shape, is_color_emoji_char(c)));
                     self.fallback_order.push_back(key);
                 }
             }
@@ -2337,12 +2400,8 @@ impl TextLayer {
             // Font fallback supplies the marks / emoji the grid font lacks. With an
             // emoji family, emoji clusters (`emoji::is_emoji_cluster`) are shaped
             // in it, sized to two cells.
-            self.clusters.ensure_with(clusters, |cluster, shape| match &style.emoji_family {
-                Some(fam) if emoji::is_emoji_cluster(cluster) => style.shape_emoji(fs, fam, cluster),
-                _ => {
-                    let shape = overdraw_shape(fs, probe, &style, cluster, shape);
-                    style.shape_text(fs, cluster, shape)
-                }
+            self.clusters.ensure_with(clusters, |cluster, shape| {
+                shape_overdraw(fs, probe, &style, cluster, shape, emoji::is_emoji_cluster(cluster))
             });
         }
     }
@@ -2463,7 +2522,7 @@ impl TextLayer {
                     // the chrome family lacks (emoji, CJK, symbols on a custom UI
                     // font) rendered as a tofu box. Chrome is proportional overlay
                     // text with no grid-alignment constraint, so Advanced is safe.
-                    buf.set_text(font_system, text, &attrs, Shaping::Advanced, None);
+                    buf.set_text(font_system, &drawable_label(text), &attrs, Shaping::Advanced, None);
                     buf
                 });
             }
@@ -3184,7 +3243,7 @@ mod tests {
         let (bold, italic) = (jetty_core::attr::BOLD, jetty_core::attr::ITALIC);
         let mut shaped = |fs: &mut FontSystem, text: &str, shape: u8| {
             let shape = overdraw_shape(fs, &mut probe, &style, text, shape);
-            let g = style.shape_text(fs, text, shape);
+            let g = style.shape_text(fs, text, shape, Shaping::Advanced);
             glyph_faces(fs, &g)
         };
         // Every glyph (harfrust may compose the pair into one) from that face.
@@ -3221,7 +3280,7 @@ mod tests {
         let Some(fam) = mono_family(&fs) else { return };
         let style = overdraw_style_for(&mut fs, &fam);
         for text in ["中", "한", "\u{23F5}", "\u{23FA}", "\u{2714}", "e\u{301}", "\u{0E01}\u{0E34}"] {
-            let g = style.shape_text(&mut fs, text, 0);
+            let g = style.shape_text(&mut fs, text, 0, Shaping::Advanced);
             let Some(run) = g.buffer.layout_runs().next() else { continue };
             let baseline = (run.line_y - run.line_top).round() + g.dy;
             assert_eq!(baseline, style.baseline.round(), "{text:?} is on the row's baseline");
@@ -3235,13 +3294,97 @@ mod tests {
             }
         }
         // The CJK fallback really sat elsewhere (when it is installed).
-        let cjk = style.shape_text(&mut fs, "中", 0);
+        let cjk = style.shape_text(&mut fs, "中", 0, Shaping::Advanced);
         let from_cjk_font = cjk.buffer.layout_runs().flat_map(|r| r.glyphs.iter()).any(|g| {
             fs.db().face(g.font_id).is_some_and(|f| f.families[0].0.contains("CJK"))
         });
         if from_cjk_font && fam == FONT_FAMILY_DEFAULT {
             assert!(cjk.dy != 0.0 && cjk.dx > 0.0, "dy {} dx {}", cjk.dy, cjk.dx);
         }
+    }
+
+    /// The process's font coverage, waited for (the first font scan starts it on
+    /// a background thread).
+    fn wait_for_coverage() -> &'static crate::coverage::Coverage {
+        let _ = TextLayer::build_font_system();
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(cov) = crate::coverage::get() {
+                return cov;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(60), "no font coverage");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_char_no_font_has_is_drawn_without_trying_every_font() {
+        // Regression: each distinct char no installed font has (octant art,
+        // private-use icons, emoji newer than the font, a binary's garbage) sent
+        // cosmic-text's fallback through every installed face — ~7 ms a char
+        // here, ~240 ms for the first — and froze the window for seconds. Now
+        // the cell's own face draws its .notdef box, with no search.
+        let cov = wait_for_coverage();
+        let mut fs = TextLayer::build_font_system();
+        let Some(fam) = mono_family(&fs) else { return };
+        let style = overdraw_style_for(&mut fs, &fam);
+        let mut probe = Buffer::new(&mut fs, style.metrics);
+        let missing: Vec<char> =
+            (0xF0000..0xF1000).filter_map(char::from_u32).filter(|&c| !cov.covers(c)).take(300).collect();
+        if missing.len() < 300 {
+            return;
+        }
+        let t = std::time::Instant::now();
+        for (i, &c) in missing.iter().enumerate() {
+            let text = c.to_string();
+            let g = shape_overdraw(&mut fs, &mut probe, &style, &text, (i % 4) as u8, false);
+            let glyphs: Vec<(u16, String)> = g
+                .buffer
+                .layout_runs()
+                .flat_map(|r| r.glyphs.iter())
+                .map(|g| (g.glyph_id, fs.db().face(g.font_id).map(|f| f.families[0].0.clone()).unwrap_or_default()))
+                .collect();
+            assert_eq!(glyphs, vec![(0, fam.clone())], "U+{:04X}: the cell face's .notdef", c as u32);
+        }
+        let elapsed = t.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2), "300 missing chars took {elapsed:?}");
+        // The router sends every such char to one shared glyph: a char no font
+        // maps either, which draws the same box.
+        assert!(!cov.covers(MISSING_GLYPH));
+        let g = shape_overdraw(&mut fs, &mut probe, &style, &MISSING_GLYPH.to_string(), 0, false);
+        let ids: Vec<u16> = g.buffer.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| g.glyph_id)).collect();
+        assert_eq!(ids, vec![0]);
+        let mut g = text_grid("a\u{F0000}\u{F0001}\u{1CD00}b", 5);
+        g.cells[2].attrs = jetty_core::attr::BOLD;
+        let mut route = |c: char, s: u8| if cov.covers(c) { test_route(c, s) } else { CellRoute::Missing };
+        let packed = pack_grid(&g, &GridPaint::default(), 10.0, 20.0, &mut route, true, PackScratch::default());
+        let over: Vec<(char, u8)> = packed.fallback.iter().map(|f| (f.2, f.3)).collect();
+        let bold = jetty_core::attr::BOLD;
+        assert_eq!(over, vec![(MISSING_GLYPH, 0), (MISSING_GLYPH, bold), (MISSING_GLYPH, 0)]);
+        // A char some font has still comes from font fallback, a cluster with a
+        // missing mark from the cell's face.
+        let g = shape_overdraw(&mut fs, &mut probe, &style, "中", 0, false);
+        assert!(g.buffer.layout_runs().flat_map(|r| r.glyphs.iter()).all(|g| g.glyph_id != 0));
+        let g = shape_overdraw(&mut fs, &mut probe, &style, "a\u{F0000}", 0, false);
+        let ids: Vec<u16> = g.buffer.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| g.glyph_id)).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids[0] != 0 && ids[1] == 0, "{ids:?}");
+    }
+
+    #[test]
+    fn chrome_labels_show_a_char_no_font_has_as_a_replacement() {
+        // A tab title is shaped with font fallback too: once per distinct title
+        // (twice with its measurement), each char no font has cost a search of
+        // every installed face. It is shown as U+FFFD instead, one char for one,
+        // so the label's per-char boundaries still line up.
+        let cov = wait_for_coverage();
+        let Some(missing) = (0xF0000..0xF1000).filter_map(char::from_u32).find(|&c| !cov.covers(c)) else { return };
+        assert!(matches!(drawable_label("burak@omen: ~ 中 ✔"), Cow::Borrowed(_)));
+        let label = format!("a{missing}b\t");
+        let shown = drawable_label(&label);
+        let replacement = if cov.covers('\u{FFFD}') { '\u{FFFD}' } else { '?' };
+        assert_eq!(*shown, format!("a{replacement}b\t"));
+        assert_eq!(shown.chars().count(), label.chars().count());
     }
 
     #[test]
