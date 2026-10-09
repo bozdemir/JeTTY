@@ -92,6 +92,24 @@ fn the_996_reply_keeps_its_place_among_other_replies() {
 }
 
 #[test]
+fn the_996_reply_keeps_its_place_inside_a_synchronized_update() {
+    // vte BUFFERS a synchronized update (DEC 2026) until it ends or times out,
+    // so a DA1 sent before the query inside one is answered only then — the
+    // 996 reply, written by the scanner at once, used to overtake it.
+    at_every_split(b"\x1b[?2026h\x1b[c\x1b[?996n", |_, r, what| {
+        let r = String::from_utf8(r).unwrap();
+        let da = r.find("c").unwrap_or_else(|| panic!("{what}: no DA1 reply in {r:?}"));
+        let scheme = r.find("\x1b[?997;1n").unwrap_or_else(|| panic!("{what}: no 996 reply in {r:?}"));
+        assert!(da < scheme, "{what}: order {r:?}");
+    });
+    // Likewise a DECRQM 2031 buffered BEFORE the mode is set reports it unset.
+    at_every_split(b"\x1b[?2026h\x1b[?2031$p\x1b[?2031h\x1b[?2026l", |t, r, what| {
+        assert_eq!(String::from_utf8(r).unwrap(), "\x1b[?2031;2$y", "{what}");
+        assert!(t.color_reports(), "{what}");
+    });
+}
+
+#[test]
 fn mode_2031_is_tracked_at_any_split() {
     at_every_split(b"\x1b[?2031h", |t, _, what| assert!(t.color_reports(), "{what}"));
     at_every_split(b"\x1b[?1000;2031;1006h", |t, _, what| assert!(t.color_reports(), "{what}"));

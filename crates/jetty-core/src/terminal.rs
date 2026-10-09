@@ -1555,6 +1555,7 @@ impl Terminal {
                 return start;
             }
             self.advance_slice(&bytes[start..=i]);
+            self.apply_pending_sync();
             let _ = self.reply_tx.send(color_scheme_report(self.theme_rgb_bg()).to_vec());
             return i + 1;
         }
@@ -1567,10 +1568,23 @@ impl Terminal {
         }
         if hit & DECSET_2031 != 0 {
             self.advance_slice(&bytes[start..=i]);
+            self.apply_pending_sync();
             self.color_reports.store(on, Ordering::Relaxed);
             return i + 1;
         }
         start
+    }
+
+    /// vte BUFFERS a synchronized update (DEC 2026) until it ends or times out,
+    /// answering the queries in it only then. Before the scanner itself answers
+    /// one (or changes state a buffered query reads), apply the update, so that
+    /// answer keeps its place behind the earlier ones (a program using DA1 as
+    /// its end-of-probe sentinel would otherwise misread). The frame tears at
+    /// most once, as for a prompt mark inside an update.
+    fn apply_pending_sync(&mut self) {
+        if self.sync_deadline().is_some() {
+            self.flush_sync();
+        }
     }
 
     /// The theme background without its alpha (what dark/light is judged on).
@@ -2502,9 +2516,7 @@ impl Terminal {
     #[inline(never)]
     fn xtversion(&mut self, bytes: &[u8], start: usize, i: usize) -> usize {
         self.advance_slice(&bytes[start..=i]);
-        if self.sync_deadline().is_some() {
-            self.flush_sync();
-        }
+        self.apply_pending_sync();
         let reply = format!("\x1bP>|JeTTY({})\x1b\\", crate::pty::advertised_version());
         let _ = self.reply_tx.send(reply.into_bytes());
         i + 1
