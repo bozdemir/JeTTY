@@ -5773,6 +5773,21 @@ impl App {
         }
     }
 
+    /// End every window's live palette theme preview, showing the chosen theme
+    /// again. A theme choice made anywhere else — the Settings gallery, a theme
+    /// binding — steps from, records and saves the CHOSEN theme, never one a
+    /// palette merely previews (Esc in the gallery restored, and saved, the
+    /// previewed theme as the session's origin).
+    fn end_theme_previews(&mut self) {
+        let mut live = self.ov.end_theme_preview(false);
+        for d in &mut self.detached {
+            live |= d.ov.end_theme_preview(false);
+        }
+        if live {
+            self.reresolve_theme(false);
+        }
+    }
+
     /// Show theme `i` WITHOUT choosing it (palette preview): `theme_idx` only —
     /// the chosen names stay, nothing is saved. Every window repaints with it.
     fn preview_theme(&mut self, i: usize) {
@@ -5782,10 +5797,11 @@ impl App {
         }
     }
 
-    /// Step the theme by `step` in registry order (wrapping) from the one on
-    /// screen, pick and save it, and name it in a pill (a key binding gives no
+    /// Step the theme by `step` in registry order (wrapping) from the chosen
+    /// one, pick and save it, and name it in a pill (a key binding gives no
     /// other feedback of which theme came up).
     fn cycle_theme(&mut self, step: isize) {
+        self.end_theme_previews();
         let n = jetty_core::theme_count();
         if n == 0 {
             return;
@@ -5794,9 +5810,10 @@ impl App {
         self.pick_cycled_theme(i);
     }
 
-    /// Pick a random theme other than the one on screen (see [`cycle_theme`]).
+    /// Pick a random theme other than the chosen one (see [`cycle_theme`]).
     fn random_theme(&mut self) {
         use std::hash::{BuildHasher, Hasher};
+        self.end_theme_previews();
         // RandomState is randomly keyed per instance: no RNG crate needed.
         let mut h = std::collections::hash_map::RandomState::new().build_hasher();
         h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
@@ -10017,6 +10034,7 @@ impl App {
     /// Show theme `i` from the gallery (a click or an arrow key): applied live
     /// and saved; the browsing session remembers the theme it started from.
     fn gallery_pick(&mut self, i: usize) {
+        self.end_theme_previews();
         if i >= jetty_core::theme_count() || i == self.theme_idx {
             return;
         }
@@ -10028,6 +10046,7 @@ impl App {
     /// A gallery arrow / Home / End key: move to the next card of the filtered
     /// grid and keep it in view.
     fn gallery_key(&mut self, key: crate::settings_ui::GalleryKey) {
+        self.end_theme_previews();
         let order = jetty_render::gallery_order(self.gallery_filter);
         let Some(next) =
             crate::settings_ui::gallery_step(&order, jetty_render::GALLERY_COLS, self.theme_idx, key)
@@ -10088,6 +10107,7 @@ impl App {
                 if std::mem::take(&mut self.reset_armed) {
                     // Disarmed.
                 } else if let Some(o) = self.gallery.restore() {
+                    self.end_theme_previews();
                     if o != self.theme_idx && o < jetty_core::theme_count() {
                         self.pick_theme(o);
                         self.persist();
