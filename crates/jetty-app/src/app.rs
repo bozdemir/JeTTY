@@ -1038,6 +1038,13 @@ pub struct App {
     /// `AcquireRetry` schedule as the main/detached windows); `None` while its
     /// frames present normally or while it is closed.
     settings_acquire_retry: Option<AcquireRetry>,
+    /// The Settings window is fully covered or minimized
+    /// (`WindowEvent::Occluded(true)`): like a hidden main window it builds no
+    /// frame and drops its acquire retry until it is uncovered or focused — on
+    /// macOS every fan-out repaint of a covered Settings window started a retry
+    /// loop that rebuilt the whole panel once a second for as long as it stayed
+    /// covered.
+    settings_occluded: bool,
     /// After a GPU device loss whose rebuild failed (the driver still resetting),
     /// the next attempt is not before this instant — see `recover_lost_gpu`.
     gpu_rebuild_retry_at: Option<std::time::Instant>,
@@ -2042,6 +2049,7 @@ impl App {
             summon_settle_until: None,
             settings_paint_until: None,
             settings_acquire_retry: None,
+            settings_occluded: false,
             gpu_rebuild_retry_at: None,
             last_present_at: None,
             frame_interval: refresh_interval(None),
@@ -9543,11 +9551,17 @@ impl App {
         window.focus_window();
         window.request_redraw();
         self.settings_window = Some(window);
+        self.settings_occluded = false;
         // macOS: keep repainting under Poll for a short window so the surface
         // presents once macOS has displayed the new window (a single redraw on
-        // open is dropped, leaving it blank until clicked).
-        self.settings_paint_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
+        // open is dropped, leaving it blank until clicked). X11 and Wayland
+        // present the synchronous first frame below and repaint on the map's
+        // Expose / configure: there the loop only built ~36 needless panel
+        // frames per open.
+        if cfg!(target_os = "macos") {
+            self.settings_paint_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
+        }
         // …and draw the first frame SYNCHRONOUSLY now, before returning to the
         // event loop, so the window is never shown blank even for a frame.
         self.render_settings_window();
@@ -9757,6 +9771,7 @@ impl App {
         }
         self.switching_to_settings = false;
         self.settings_window = None;
+        self.settings_occluded = false;
         self.settings_gpu = None;
         self.settings_text = None;
         self.settings_specimen_text = None;
@@ -9841,8 +9856,13 @@ impl App {
         Some(self.settings_panel_view(w, h))
     }
 
-    /// Render the settings panel into the settings window's surface.
+    /// Render the settings panel into the settings window's surface — none
+    /// while it is covered or minimized (`settings_occluded`: no frame of it
+    /// shows; it repaints when uncovered).
     fn render_settings_window(&mut self) {
+        if self.settings_occluded {
+            return;
+        }
         let Some((width, height)) = self.settings_gpu.as_ref().map(|g| (g.config.width, g.config.height)) else {
             return;
         };
@@ -12226,6 +12246,15 @@ impl App {
                 self.request_main_paint();
             }
             WindowEvent::ThemeChanged(t) => self.system_theme_changed(t),
+            WindowEvent::Occluded(occluded) => {
+                // Fully covered or minimized (macOS; X11 without a compositor):
+                // no frame of it shows, so none is built or retried
+                // (`settings_occluded`). Uncovered, it repaints once.
+                self.settings_occluded = occluded;
+                if !occluded {
+                    self.request_settings_paint();
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.settings_gpu {
                     gpu.resize(size.width, size.height);
@@ -12307,6 +12336,9 @@ impl App {
                 self.settings_drop_image(path);
             }
             WindowEvent::Focused(true) => {
+                // Focus implies on-screen: clear a stale occluded flag in case
+                // the WM skipped Occluded(false) (as the main window does).
+                self.settings_occluded = false;
                 // Images added to backgrounds/ meanwhile show up in the picker.
                 self.backdrop_images = crate::backdrop::background_images(&crate::config::Config::dir());
                 // Record that OUR settings window now holds focus so the main
@@ -12774,7 +12806,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
         if let Some(r) = self.settings_acquire_retry {
-            if self.settings_window.is_none() {
+            if self.settings_window.is_none() || self.settings_occluded {
                 self.settings_acquire_retry = None;
             } else if now >= r.due {
                 self.settings_acquire_retry = Some(next_acquire_retry(Some(r), now));
@@ -12933,7 +12965,11 @@ impl ApplicationHandler<AppEvent> for App {
                 painted = true;
             }
         }
+        // The macOS first-paint window: only for a Settings window that can
+        // present (never a Poll spin with nothing to draw).
         let settings_pending = self.settings_window.is_some()
+            && self.settings_gpu.is_some()
+            && !self.settings_occluded
             && self
                 .settings_paint_until
                 .is_some_and(|d| std::time::Instant::now() < d);
