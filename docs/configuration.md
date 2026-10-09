@@ -59,7 +59,7 @@ Names of fonts and themes are matched in any letter case, and a theme by its id
 
 | Key | Default | What it does |
 |---|---|---|
-| `font_family` | `"MesloLGS NF"` | The terminal font: any installed family (Settings lists the monospace ones). One that is not installed shows "MesloLGS NF" — or the first monospace font, when that is missing too — and says so; the name you chose is kept for when it is installed. The default itself falls back without a notice. |
+| `font_family` | `"MesloLGS NF"` | The terminal font: any installed family (Settings lists the monospace ones). One that is not installed shows "MesloLGS NF" — or the first monospace font, when that is missing too — and says so; the name you chose is kept for when it is installed. The default itself falls back without a notice. Bold and italic always come from the family itself (a variable font's own bold weight; regular weight in a family with no bold), so they never shift a column. |
 | `font_size` | `16.0` | The terminal font size in points, `6`–`48`. `Ctrl+=` / `Ctrl+-` / `Ctrl+0` change it. |
 | `ui_font_family` | `""` | The font of the window chrome — tab titles, status bar, menus, Settings, dialogs. `""` is the system's sans-serif. |
 | `ui_font_size` | `16.0` | The chrome font size in points, `10`–`28`. |

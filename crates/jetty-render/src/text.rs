@@ -1,10 +1,11 @@
 use crate::colors::{contrast_ratio, SelectionPaint, SELECTION_MIN_CONTRAST};
 use crate::gpu::GpuContext;
 use crate::{builtin, emoji};
+use glyphon::fontdb::{Database, FaceInfo, Query, ID};
 use glyphon::{
     Attrs, Buffer, Cache, Color, ContentType, CustomGlyph, Family, FontSystem, Metrics, PrepareError,
-    RasterizeCustomGlyphRequest, RasterizedCustomGlyph, Resolution, Shaping, Style, SwashCache, TextArea,
-    TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+    RasterizeCustomGlyphRequest, RasterizedCustomGlyph, Resolution, Shaping, Stretch, Style, SwashCache,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
 use jetty_core::{CellSnapshot, GridSnapshot};
 use rustc_hash::{FxHashMap, FxHasher};
@@ -45,10 +46,97 @@ fn route_key(c: char, shape: u8) -> u32 {
 
 /// The attrs a grid cell of style `shape` (BOLD|ITALIC bits) is shaped with —
 /// shared by the row shaping and the coverage probe so both pick the same face.
-fn face_attrs(family: &str, shape: u8) -> Attrs<'_> {
-    let weight = if shape & jetty_core::attr::BOLD != 0 { Weight::BOLD } else { Weight::NORMAL };
+/// `weights` are the family's (see [`FaceWeights`]).
+fn face_attrs(family: &str, weights: FaceWeights, shape: u8) -> Attrs<'_> {
     let style = if shape & jetty_core::attr::ITALIC != 0 { Style::Italic } else { Style::Normal };
-    Attrs::new().family(Family::Name(family)).weight(weight).style(style)
+    Attrs::new().family(Family::Name(family)).weight(weights.of(shape)).style(style)
+}
+
+/// The weight each grid style (`BOLD|ITALIC` bits, the index) asks the font
+/// system for. cosmic-text shapes a run in its family only when one of the
+/// family's faces has EXACTLY that weight; any other run falls out of the family
+/// into the system fallback — a proportional sans, so every column after a bold
+/// run shifted. Resolved once per family by [`resolve_face_weights`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FaceWeights([Weight; 4]);
+
+impl FaceWeights {
+    /// Regular 400, bold 700: a family with real Regular and Bold faces.
+    const PLAIN: Self = Self([Weight::NORMAL, Weight::BOLD, Weight::NORMAL, Weight::BOLD]);
+
+    /// The weight a cell of style `shape` is shaped with.
+    #[inline]
+    fn of(self, shape: u8) -> Weight {
+        self.0[(shape & jetty_core::SHAPE_MASK) as usize]
+    }
+}
+
+/// Resolve `family`'s [`FaceWeights`]. For each style, from `PLAIN`'s weight:
+/// 1. the family has a face of that weight and style → keep it (MesloLGS NF,
+///    DejaVu Sans Mono: every family with real faces is unchanged);
+/// 2. the face fontdb matches is a variable font whose wght axis reaches the
+///    weight → add that face again AT the weight (clamped to the axis): cosmic-
+///    text then shapes it and swash rasterizes it at that wght — a real variable
+///    bold (Ubuntu Mono, Ubuntu Sans Mono);
+/// 3. the weight exists in the other style → keep it (cosmic-text slants it);
+/// 4. else the matched face's own weight: bold in a regular-only family (Noto
+///    Mono) draws regular, and the grid never shifts.
+///
+/// A family that is not installed keeps `PLAIN`. Scans the in-memory face list
+/// once; reads a font file only for a family that lacks a weight (its fvar).
+/// `wght_axis` is [`wght_axis_range`] (a seam for tests).
+fn resolve_face_weights(
+    font_system: &mut FontSystem,
+    family: &str,
+    wght_axis: impl Fn(&Database, ID) -> Option<(u16, u16)>,
+) -> FaceWeights {
+    let mut weights = FaceWeights::PLAIN;
+    let mut faces: Vec<(Weight, Style)> = font_system
+        .db()
+        .faces()
+        .filter(|f| f.families.iter().any(|(n, _)| n == family))
+        .map(|f| (f.weight, f.style))
+        .collect();
+    if faces.is_empty() {
+        return weights;
+    }
+    for (shape, weight) in weights.0.iter_mut().enumerate() {
+        let want = *weight;
+        let style = if shape as u8 & jetty_core::attr::ITALIC != 0 { Style::Italic } else { Style::Normal };
+        if faces.contains(&(want, style)) {
+            continue;
+        }
+        let db = font_system.db();
+        let query = Query { families: &[Family::Name(family)], weight: want, stretch: Stretch::Normal, style };
+        let Some(best) = db.query(&query).and_then(|id| db.face(id)) else { continue };
+        if let Some((lo, hi)) = wght_axis(db, best.id) {
+            let at = Weight(want.0.clamp(lo, hi));
+            if at != best.weight {
+                if !faces.contains(&(at, best.style)) {
+                    faces.push((at, best.style));
+                    let face = FaceInfo { weight: at, ..best.clone() };
+                    font_system.db_mut().push_face_info(face);
+                }
+                *weight = at;
+                continue;
+            }
+        }
+        if !faces.iter().any(|&(w, _)| w == want) {
+            *weight = best.weight;
+        }
+    }
+    weights
+}
+
+/// The wght axis range of face `id` when it is a variable font (its fvar table).
+fn wght_axis_range(db: &Database, id: ID) -> Option<(u16, u16)> {
+    use glyphon::cosmic_text::skrifa::{FontRef, MetadataProvider, Tag};
+    db.with_face_data(id, |data, index| {
+        let font = FontRef::from_index(data, index).ok()?;
+        let axis = font.axes().iter().find(|a| a.tag() == Tag::new(b"wght"))?;
+        let (lo, hi) = (axis.min_value().round() as u16, axis.max_value().round() as u16);
+        (lo <= hi).then_some((lo, hi))
+    })?
 }
 
 /// A char drawn as a color emoji (when an emoji font is installed and
@@ -66,10 +154,18 @@ fn is_color_emoji_char(c: char) -> bool {
 /// row if laid out inline. Both take the `Overdraw` route (blanked in the row,
 /// overdrawn at the exact cell origin from a buffer shaped with font fallback,
 /// which finds the regular face or another font that has it).
-fn probe_route(font_system: &mut FontSystem, probe: &mut Buffer, family: &str, c: char, shape: u8, cell_w: f32) -> CellRoute {
+fn probe_route(
+    font_system: &mut FontSystem,
+    probe: &mut Buffer,
+    family: &str,
+    weights: FaceWeights,
+    c: char,
+    shape: u8,
+    cell_w: f32,
+) -> CellRoute {
     let mut tmp = [0u8; 4];
     let s = c.encode_utf8(&mut tmp);
-    probe.set_text(font_system, s, &face_attrs(family, shape), Shaping::Basic, None);
+    probe.set_text(font_system, s, &face_attrs(family, weights, shape), Shaping::Basic, None);
     probe
         .layout_runs()
         .flat_map(|run| run.glyphs.iter())
@@ -436,7 +532,7 @@ impl ClusterGlyphCache<OverdrawGlyph> {
     /// family, emoji clusters (`emoji::is_emoji_cluster`) are shaped in it, sized to
     /// two cells.
     fn ensure(&mut self, font_system: &mut FontSystem, style: &OverdrawStyle, clusters: &[&str]) {
-        let attrs = Attrs::new().family(Family::Name(&style.family));
+        let attrs = style.attrs();
         self.ensure_with(clusters, |cluster| match &style.emoji_family {
             Some(fam) if emoji::is_emoji_cluster(cluster) => style.shape_emoji(font_system, fam, cluster),
             _ => {
@@ -449,11 +545,12 @@ impl ClusterGlyphCache<OverdrawGlyph> {
     }
 }
 
-/// What the overdraw / cluster / emoji buffers are shaped with: the grid font and
-/// metrics, the cell box an emoji is fitted into, and the emoji family (`None`
-/// when `color_emoji` is off or no emoji font is installed).
+/// What the overdraw / cluster / emoji buffers are shaped with: the grid font (at
+/// its regular weight) and metrics, the cell box an emoji is fitted into, and the
+/// emoji family (`None` when `color_emoji` is off or no emoji font is installed).
 struct OverdrawStyle {
     family: Arc<str>,
+    weight: Weight,
     emoji_family: Option<Arc<str>>,
     metrics: Metrics,
     cell_w: f32,
@@ -461,6 +558,11 @@ struct OverdrawStyle {
 }
 
 impl OverdrawStyle {
+    /// The attrs an overdraw char or cluster is shaped with (font fallback on).
+    fn attrs(&self) -> Attrs<'_> {
+        Attrs::new().family(Family::Name(&self.family)).weight(self.weight)
+    }
+
     /// Shape `text` in the emoji family, scaled so the emoji fills its two-cell
     /// box (emoji are about as tall as they are wide, so the box's smaller side
     /// bounds the advance) and centred in it. The line keeps the cell height, so
@@ -840,6 +942,9 @@ pub struct TextLayer {
     /// `Arc<str>` so per-frame span building can share it without cloning the
     /// string (the family name is captured by every cell's `Attrs`).
     font_family: Arc<str>,
+    /// The weight each grid style asks `font_family` for (see `FaceWeights`),
+    /// resolved with it.
+    face_weights: FaceWeights,
     /// Family the CHROME overlay pass renders in (tab titles, status bar, menu,
     /// panel, help/confirm/welcome). Independent of `font_family` (the terminal
     /// grid font). Defaults to `Sans` so the default chrome look is unchanged
@@ -1002,8 +1107,10 @@ impl TextLayer {
         measure_buffer.set_size(&mut font_system, None, None);
 
         // Measure a monospace cell by shaping a single 'M'.
-        let cell_w = measure_advance_family(&mut font_system, metrics, family);
-        let underline = measure_underline(&mut font_system, metrics, family);
+        let face_weights = resolve_face_weights(&mut font_system, family, wght_axis_range);
+        let regular = face_weights.of(0);
+        let cell_w = measure_advance_family(&mut font_system, metrics, family, regular);
+        let underline = measure_underline(&mut font_system, metrics, family, regular);
         let cell_h = line_height;
 
         Self {
@@ -1027,6 +1134,7 @@ impl TextLayer {
             cell_h,
             overlays: OverlayCache::default(),
             font_family: Arc::from(family),
+            face_weights,
             // Chrome defaults to the platform proportional sans, matching the
             // pre-feature look (sans tab titles); the app overrides this from
             // the persisted `ui_font_family` after construction.
@@ -1067,7 +1175,7 @@ impl TextLayer {
     /// drop the cached decoration quads built with the old one.
     fn refresh_underline(&mut self) {
         let fam = Arc::clone(&self.font_family);
-        self.underline = measure_underline(&mut self.font_system, self.metrics, &fam);
+        self.underline = measure_underline(&mut self.font_system, self.metrics, &fam, self.face_weights.of(0));
         self.deco_cache_key = None;
     }
 
@@ -1193,6 +1301,7 @@ impl TextLayer {
     /// The caller must call `reflow()` and `request_redraw()` after this.
     pub fn set_font_family(&mut self, name: &str) {
         self.font_family = Arc::from(name);
+        self.face_weights = resolve_face_weights(&mut self.font_system, name, wght_axis_range);
         // Routing is per-font: a glyph present/single-width in the old family may be
         // missing/double-width in the new one. Drop the caches so they re-probe, and
         // bump the shape generation so the grid re-shapes even if its text is unchanged.
@@ -1205,7 +1314,7 @@ impl TextLayer {
         // bold/italic run in the new family stays column-aligned.
         self.shape_gen = self.shape_gen.wrapping_add(1);
         // Re-measure cell width with the new family.
-        self.cell_w = measure_advance_family(&mut self.font_system, self.metrics, name);
+        self.cell_w = measure_advance_family(&mut self.font_system, self.metrics, name, self.face_weights.of(0));
         self.refresh_underline();
         // At the default UI family, non-title chrome renders in THIS family, so
         // every cached chrome width is stale.
@@ -1240,11 +1349,14 @@ impl TextLayer {
     /// user-chosen `Named` UI family measures that family's own advance.
     fn measure_chrome_advance(&mut self) -> f32 {
         match &self.ui_family {
-            ChromeFamily::Sans => {
-                measure_advance_family(&mut self.font_system, self.metrics, &Arc::clone(&self.font_family))
-            }
+            ChromeFamily::Sans => measure_advance_family(
+                &mut self.font_system,
+                self.metrics,
+                &Arc::clone(&self.font_family),
+                self.face_weights.of(0),
+            ),
             ChromeFamily::Named(n) => {
-                measure_advance_family(&mut self.font_system, self.metrics, &n.clone())
+                measure_advance_family(&mut self.font_system, self.metrics, &n.clone(), Weight::NORMAL)
             }
         }
     }
@@ -1433,7 +1545,7 @@ impl TextLayer {
             return CellRoute::Emoji;
         }
         let fam = Arc::clone(&self.font_family);
-        probe_route(&mut self.font_system, &mut self.coverage_buffer, &fam, c, shape, self.cell_w)
+        probe_route(&mut self.font_system, &mut self.coverage_buffer, &fam, self.face_weights, c, shape, self.cell_w)
     }
 
     /// Renders the terminal grid to an arbitrary TextureView (offscreen or on-screen).
@@ -1900,16 +2012,18 @@ impl TextLayer {
         // Clone the Arc (a refcount bump, not a string copy) so every span can
         // borrow the family name without re-borrowing self.
         let family = Arc::clone(&self.font_family);
-        let default_attrs = Attrs::new().family(Family::Name(&family));
+        let weights = self.face_weights;
+        let default_attrs = face_attrs(&family, weights, 0);
         let row = &mut self.row_cache[i];
         row.buffer.set_rich_text(
             &mut self.font_system,
             runs.iter().map(|&(s, e, color, shape)| {
                 // BOLD -> real Bold face, ITALIC -> real Italic face, under
-                // Shaping::Basic. Monospace alignment is guaranteed by the row's
-                // monospace snap (see `new_row_buffer`). A char that face lacks
-                // never gets here: `probe_route` sent it to the overdraw.
-                (&text[s..e], face_attrs(&family, shape).color(color))
+                // Shaping::Basic — at the weights the family has (`FaceWeights`),
+                // so no run leaves the family. Monospace alignment is guaranteed by
+                // the row's monospace snap (see `new_row_buffer`). A char that face
+                // lacks never gets here: `probe_route` sent it to the overdraw.
+                (&text[s..e], face_attrs(&family, weights, shape).color(color))
             }),
             &default_attrs,
             Shaping::Basic,
@@ -1937,7 +2051,7 @@ impl TextLayer {
         }
         let style = self.overdraw_style();
         if !fallback_cells.is_empty() {
-            let attrs = Attrs::new().family(Family::Name(&style.family));
+            let attrs = style.attrs();
             for (_x, _y, c, _rgb) in fallback_cells {
                 if !self.fallback_glyphs.contains_key(c) {
                     let mut tmp = [0u8; 4];
@@ -1978,6 +2092,7 @@ impl TextLayer {
     fn overdraw_style(&mut self) -> OverdrawStyle {
         OverdrawStyle {
             family: Arc::clone(&self.font_family),
+            weight: self.face_weights.of(0),
             emoji_family: self.active_emoji_family(),
             metrics: self.metrics,
             cell_w: self.cell_w,
@@ -2346,13 +2461,18 @@ fn pick_emoji_family<'a>(names: impl Iterator<Item = &'a str>) -> Option<String>
 /// * `top` — the font's underline position (the post table's offset of the
 ///   stroke's top below the baseline; a fifth of the descent without one),
 ///   rounded, at least a pixel under the baseline, the stroke above `bottom`.
-fn measure_underline(font_system: &mut FontSystem, metrics: Metrics, family: &str) -> crate::quad::UnderlineGeom {
+fn measure_underline(
+    font_system: &mut FontSystem,
+    metrics: Metrics,
+    family: &str,
+    weight: Weight,
+) -> crate::quad::UnderlineGeom {
     let lh = metrics.line_height;
     let px = metrics.font_size;
     let thickness = (px * 0.1).round().max(1.0);
     let mut b = Buffer::new(font_system, metrics);
     b.set_size(font_system, None, Some(lh));
-    b.set_text(font_system, "M", &Attrs::new().family(Family::Name(family)), Shaping::Basic, None);
+    b.set_text(font_system, "M", &Attrs::new().family(Family::Name(family)).weight(weight), Shaping::Basic, None);
     let probe = b.layout_runs().next().and_then(|r| r.glyphs.first().map(|g| (r.line_y - r.line_top, g.font_id, g.font_weight)));
     let descent = b.lines.first().and_then(|l| l.layout_opt()).and_then(|l| l.first()).map(|l| l.max_descent);
     let (Some((baseline, font_id, weight)), Some(descent)) = (probe, descent) else {
@@ -2371,9 +2491,11 @@ fn measure_underline(font_system: &mut FontSystem, metrics: Metrics, family: &st
     crate::quad::UnderlineGeom { top, bottom, thickness }
 }
 
-fn measure_advance_family(font_system: &mut FontSystem, metrics: Metrics, family: &str) -> f32 {
+/// The cell width: the advance of 'M' in `family` at `weight` (the grid family's
+/// regular `FaceWeights`, so the cell comes from the family's own face).
+fn measure_advance_family(font_system: &mut FontSystem, metrics: Metrics, family: &str, weight: Weight) -> f32 {
     let mut b = Buffer::new(font_system, metrics);
-    let attrs = Attrs::new().family(Family::Name(family));
+    let attrs = Attrs::new().family(Family::Name(family)).weight(weight);
     // Shaping::Basic avoids kerning so the advance width matches the terminal grid.
     b.set_text(font_system, "M", &attrs, Shaping::Basic, None);
     b.set_size(font_system, None, Some(metrics.line_height));
@@ -2650,17 +2772,20 @@ mod tests {
         let metrics = Metrics::new(16.0, 21.0);
         let mut probe = Buffer::new(&mut fs, metrics);
         probe.set_size(&mut fs, None, None);
-        let cell_w = measure_advance_family(&mut fs, metrics, "MesloLGS NF");
         let fam = "MesloLGS NF";
-        assert_eq!(probe_route(&mut fs, &mut probe, fam, 'a', 0, cell_w), CellRoute::Inline);
-        assert_eq!(probe_route(&mut fs, &mut probe, fam, 'é', jetty_core::attr::BOLD, cell_w), CellRoute::Inline);
-        let bold_box = probe_route(&mut fs, &mut probe, fam, '─', jetty_core::attr::BOLD, cell_w);
-        let regular_box = probe_route(&mut fs, &mut probe, fam, '─', 0, cell_w);
+        let weights = resolve_face_weights(&mut fs, fam, wght_axis_range);
+        assert_eq!(weights, FaceWeights::PLAIN, "real Regular / Bold / Italic / Bold Italic faces");
+        let cell_w = measure_advance_family(&mut fs, metrics, fam, weights.of(0));
+        assert_eq!(probe_route(&mut fs, &mut probe, fam, weights, 'a', 0, cell_w), CellRoute::Inline);
+        let bold = jetty_core::attr::BOLD;
+        assert_eq!(probe_route(&mut fs, &mut probe, fam, weights, 'é', bold, cell_w), CellRoute::Inline);
+        let bold_box = probe_route(&mut fs, &mut probe, fam, weights, '─', bold, cell_w);
+        let regular_box = probe_route(&mut fs, &mut probe, fam, weights, '─', 0, cell_w);
         assert_eq!(regular_box, CellRoute::Inline);
         // Whichever faces lack it, the styled cell never lays out a .notdef: a
         // face with the glyph inlines it, one without overdraws it.
         let bold_has_it = {
-            probe.set_text(&mut fs, "─", &face_attrs(fam, jetty_core::attr::BOLD), Shaping::Basic, None);
+            probe.set_text(&mut fs, "─", &face_attrs(fam, weights, bold), Shaping::Basic, None);
             probe.layout_runs().flat_map(|r| r.glyphs.iter()).next().is_some_and(|g| g.glyph_id != 0)
         };
         assert_eq!(bold_box, if bold_has_it { CellRoute::Inline } else { CellRoute::Overdraw });
@@ -2674,7 +2799,7 @@ mod tests {
         // monospace font (CI may lack MesloLGS NF) — skipped without one.
         let mut fs = TextLayer::build_font_system();
         let Some(fam) = mono_family(&fs) else { return };
-        let at = |fs: &mut FontSystem, lh: f32| measure_underline(fs, Metrics::new(16.0, lh), &fam);
+        let at = |fs: &mut FontSystem, lh: f32| measure_underline(fs, Metrics::new(16.0, lh), &fam, Weight::NORMAL);
         let d = at(&mut fs, 21.0);
         assert_eq!(d.thickness, 2.0, "round(0.1 × 16 px), the historical 2 px at 21 px rows");
         assert!(d.bottom > 18.0 && d.bottom <= 21.0, "{d:?}: the line box bottom, near the cell bottom");
@@ -2973,7 +3098,7 @@ mod tests {
         // 13 pt × 1.25, 15 pt × 1.5, 13 pt × 1.5, 11 pt × 1.75, and a whole size.
         for requested in [16.25f32, 22.5, 19.5, 19.25, 16.0] {
             let metrics = layer_metrics(rounded_font_px(requested), LINE_HEIGHT_DEFAULT);
-            let cell_w = measure_advance_family(&mut fs, metrics, &family);
+            let cell_w = measure_advance_family(&mut fs, metrics, &family, Weight::NORMAL);
             let xs = row_glyph_xs(&mut fs, &family, metrics, cell_w, &text);
             assert_eq!(xs.len(), 120, "{family} @ {requested}px");
             for (col, &x) in xs.iter().enumerate() {
@@ -2985,11 +3110,147 @@ mod tests {
         // at 22.5 px): an UNROUNDED size drifts off the grid.
         for (requested, sign) in [(16.25f32, -1.0f32), (22.5, 1.0)] {
             let metrics = layer_metrics(requested, LINE_HEIGHT_DEFAULT);
-            let cell_w = measure_advance_family(&mut fs, metrics, &family);
+            let cell_w = measure_advance_family(&mut fs, metrics, &family, Weight::NORMAL);
             let xs = row_glyph_xs(&mut fs, &family, metrics, cell_w, &text);
             let drift = xs[99] - 99.0 * cell_w;
             assert!(drift * sign > 5.0, "{family} @ {requested}px unrounded: col 99 drift {drift}");
         }
+    }
+
+    #[test]
+    fn face_weights_ask_only_for_weights_the_family_can_draw() {
+        // A synthetic database (no font files): the weight each style asks for,
+        // and the variable-font instances added. Faces named "…VF" stand in for
+        // variable fonts (their wght axis range), everything else is static.
+        use glyphon::fontdb::{Language, Source};
+        let mut db = Database::new();
+        let mut add = |family: &str, ps: &str, weight: u16, style: Style| {
+            db.push_face_info(FaceInfo {
+                id: ID::dummy(),
+                source: Source::Binary(Arc::new(Vec::<u8>::new())),
+                index: 0,
+                families: vec![(family.to_string(), Language::English_UnitedStates)],
+                post_script_name: ps.to_string(),
+                style,
+                weight: Weight(weight),
+                stretch: Stretch::Normal,
+                monospaced: true,
+            });
+        };
+        let (n, i) = (Style::Normal, Style::Italic);
+        for (ps, w, s) in [("Full", 400, n), ("Full-B", 700, n), ("Full-I", 400, i), ("Full-BI", 700, i)] {
+            add("Full", ps, w, s);
+        }
+        add("Regular Only", "RegularOnly", 400, n);
+        add("Variable", "UprightVF", 400, n);
+        add("Variable", "ItalicVF", 400, i);
+        add("Upright Variable", "UprightVF", 400, n);
+        add("Narrow Variable", "NarrowVF", 400, n);
+        add("Light Variable", "LightVF", 300, n);
+        add("Semi", "Semi", 400, n);
+        add("Semi", "Semi-SB", 600, n);
+        for (ps, w, s) in [("NoBI", 400, n), ("NoBI-B", 700, n), ("NoBI-I", 400, i)] {
+            add("No Bold Italic", ps, w, s);
+        }
+        add("Light Static", "LightStatic-L", 300, n);
+        add("Light Static", "LightStatic-B", 700, n);
+        let mut fs = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let wght = |db: &Database, id: ID| match db.face(id)?.post_script_name.as_str() {
+            "UprightVF" => Some((100, 700)),
+            "ItalicVF" => Some((400, 700)),
+            "NarrowVF" => Some((400, 600)),
+            "LightVF" => Some((300, 800)),
+            _ => None,
+        };
+        let faces = |fs: &FontSystem, family: &str| -> Vec<(u16, Style)> {
+            let mut v: Vec<_> =
+                fs.db().faces().filter(|f| f.families[0].0 == family).map(|f| (f.weight.0, f.style)).collect();
+            v.sort_by_key(|&(w, s)| (w, s == Style::Italic));
+            v
+        };
+        // `family` resolves to `want` ([regular, bold, italic, bold italic]) and
+        // holds the faces `after` — also when resolved again (another layer, a
+        // switch back to the font): nothing is added twice.
+        let mut check = |family: &str, want: [u16; 4], after: &[(u16, Style)]| {
+            for pass in ["", " again"] {
+                let got = resolve_face_weights(&mut fs, family, wght);
+                assert_eq!(got, FaceWeights(want.map(Weight)), "{family}{pass}");
+                assert_eq!(faces(&fs, family), after, "{family}{pass}");
+            }
+        };
+        // Real faces for every style: nothing changes (MesloLGS NF, DejaVu).
+        check("Full", [400, 700, 400, 700], &[(400, n), (400, i), (700, n), (700, i)]);
+        // Regular only (Noto Mono): bold draws regular, never another family.
+        check("Regular Only", [400, 400, 400, 400], &[(400, n)]);
+        // Variable upright + italic (Ubuntu Mono): real bold instances of both.
+        check("Variable", [400, 700, 400, 700], &[(400, n), (400, i), (700, n), (700, i)]);
+        // Variable upright only: bold italic slants the bold instance.
+        check("Upright Variable", [400, 700, 400, 700], &[(400, n), (700, n)]);
+        // An axis that stops short of 700: its heaviest instance.
+        check("Narrow Variable", [400, 600, 400, 600], &[(400, n), (600, n)]);
+        // A variable font indexed at Light: regular AND bold instances.
+        check("Light Variable", [400, 700, 400, 700], &[(300, n), (400, n), (700, n)]);
+        // Static SemiBold, no Bold: the nearest heavier face.
+        check("Semi", [400, 600, 400, 600], &[(400, n), (600, n)]);
+        // No Bold Italic face: the Bold face, slanted (as before).
+        check("No Bold Italic", [400, 700, 400, 700], &[(400, n), (400, i), (700, n)]);
+        // No 400 face: regular comes from the Light one, not a fallback font.
+        check("Light Static", [300, 700, 300, 700], &[(300, n), (700, n)]);
+        // Not installed: the plain weights (it falls back whole, as before).
+        check("Missing", [400, 700, 400, 700], &[]);
+        // The added instances are the variable font itself (same source, same
+        // name), so cosmic-text rasterizes them from it at their wght.
+        let added = fs.db().faces().find(|f| f.families[0].0 == "Variable" && f.weight.0 == 700 && f.style == i);
+        assert_eq!(added.map(|f| f.post_script_name.as_str()), Some("ItalicVF"));
+    }
+
+    #[test]
+    fn every_style_of_every_monospace_family_stays_in_the_family_and_on_the_grid() {
+        // Regression: cosmic-text shapes a run in its family only when a face of
+        // EXACTLY the requested weight exists. Ubuntu Mono and Ubuntu Sans Mono
+        // are variable fonts indexed once at 400 and Noto Mono has Regular only,
+        // so their bold runs were shaped in Noto Sans Bold — proportional: 'W'
+        // advanced 15 px in an 8.96 px cell and every column after it shifted.
+        // Every installed monospace family, in all four styles: each glyph from
+        // a face of the family, on its cell.
+        let mut fs = TextLayer::build_font_system();
+        let mut families: Vec<String> =
+            fs.db().faces().filter(|f| f.monospaced).filter_map(|f| f.families.first().map(|(n, _)| n.clone())).collect();
+        families.sort();
+        families.dedup();
+        let metrics = layer_metrics(16.0, LINE_HEIGHT_DEFAULT);
+        let mut checked = 0;
+        for family in &families {
+            let weights = resolve_face_weights(&mut fs, family, wght_axis_range);
+            let cell_w = measure_advance_family(&mut fs, metrics, family, weights.of(0));
+            // Each glyph's x and whether the family drew it (a real glyph from
+            // one of its faces).
+            let shaped = |fs: &mut FontSystem, shape: u8| -> Vec<(f32, bool)> {
+                let mut b = grid_row_buffer(fs, metrics, cell_w);
+                let attrs = face_attrs(family, weights, shape);
+                b.set_rich_text(fs, [("MWiMWi", attrs.clone())], &attrs, Shaping::Basic, None);
+                let glyphs: Vec<_> =
+                    b.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| (g.x, g.font_id, g.glyph_id))).collect();
+                let in_family = |id| fs.db().face(id).is_some_and(|f| f.families.iter().any(|(n, _)| n == family));
+                glyphs.into_iter().map(|(x, id, glyph)| (x, glyph != 0 && in_family(id))).collect()
+            };
+            // Not a text font (an emoji or symbol font flagged fixed-pitch): no
+            // Latin letters of its own to align.
+            if !shaped(&mut fs, 0).iter().all(|&(_, own)| own) {
+                continue;
+            }
+            for shape in 0..4u8 {
+                let glyphs = shaped(&mut fs, shape);
+                assert_eq!(glyphs.len(), 6, "{family} style {shape}");
+                for (col, &(x, own)) in glyphs.iter().enumerate() {
+                    assert!(own, "{family} style {shape}: col {col} shaped in another family");
+                    let want = col as f32 * cell_w;
+                    assert!((x - want).abs() < 0.01, "{family} style {shape}: col {col} at x {x}, cell at {want}");
+                }
+            }
+            checked += 1;
+        }
+        eprintln!("{checked} monospace families aligned in all four styles");
     }
 
     /// GPU: `render_chrome` (quads + mono labels + titles in ONE pass) draws
