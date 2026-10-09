@@ -10067,8 +10067,11 @@ impl App {
     fn settings_drag_to(&mut self, cx: f32) {
         let Some(drag) = self.ctl_drag.clone() else { return };
         let Some(d) = crate::settings_ui::find(drag.id) else { return };
-        let Some(pv) = self.settings_view_now() else { return };
-        let Some(r) = pv.geom.rect_of(jetty_render::PanelHit::Ctl { id: drag.id, part: drag.part }) else {
+        // The track as last painted: it holds still during a drag (building the
+        // whole panel on every mouse move only to find it doubled a drag's cost).
+        let hit = jetty_render::PanelHit::Ctl { id: drag.id, part: drag.part };
+        let painted = self.settings_geom.as_ref().and_then(|g| g.rect_of(hit));
+        let Some(r) = painted.or_else(|| self.settings_view_now().and_then(|pv| pv.geom.rect_of(hit))) else {
             return;
         };
         let knob = jetty_render::track_knob(drag.part) * self.settings_metrics().overlay_u();
