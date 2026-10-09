@@ -44,6 +44,8 @@
 ///                    (JETTY_SHOT_SCROLL) or with JETTY_SHOT_SCROLLBAR_HOVER=1
 ///                    (the pointer over the gutter).
 ///   JETTY_SHOT_TABBAR_N — number of sample tabs for JETTY_SHOT_TABBAR (default 3).
+///   JETTY_SHOT_TAB_TITLES — comma list of the sample tabs' titles (default
+///                    "Tab N"; an OSC 0/2 title in the input still wins for tab 1).
 ///   JETTY_SHOT_HELP_SCROLL — first help row for JETTY_SHOT_HELP when its rows
 ///                    overflow the window (large UI font / short window).
 ///   JETTY_SHOT_PILL="text" — draw the app's toast pill (run-selection status /
@@ -210,7 +212,8 @@
 ///
 /// If the terminal bg alpha < 255, the rendered image is composited over a
 /// checkerboard (alternating 16px squares of [40,40,40] and [90,90,90]) so
-/// transparency is visible in the output PNG.
+/// transparency is visible in the output PNG. JETTY_SHOT_UNDERLAY=none keeps
+/// the real alpha instead (a straight-alpha RGBA PNG).
 use std::fs::File;
 use std::io::BufWriter;
 
@@ -1595,11 +1598,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|s| s.parse().ok())
                 .map(|n: usize| n.clamp(1, 99))
                 .unwrap_or(3);
+            // JETTY_SHOT_TAB_TITLES — comma list of sample tab titles (empty or
+            // missing entries keep "Tab N"; tab 1's OSC title still wins).
+            let titles_env = std::env::var("JETTY_SHOT_TAB_TITLES").unwrap_or_default();
+            let titles: Vec<&str> = titles_env.split(',').map(str::trim).collect();
             let mut first_title = osc_title;
             let tabs: Vec<(String, bool)> = (0..n_tabs)
                 .map(|i| {
                     let t = if i == 0 { first_title.take() } else { None };
-                    (t.unwrap_or_else(|| format!("Tab {}", i + 1)), i == 0)
+                    let named = titles.get(i).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                    (t.or(named).unwrap_or_else(|| format!("Tab {}", i + 1)), i == 0)
                 })
                 .collect();
             // JETTY_SHOT_PERF — render the perf HUD ONLY when a human supplies
@@ -2235,7 +2243,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || std::env::var("JETTY_SHOT_LIQUID_T").is_ok()
         || std::env::var("JETTY_SHOT_FOCUS_T").is_ok()
         || std::env::var("JETTY_SHOT_TRANSFORM_T").is_ok();
-    let composited = if bg_alpha < 255 || corner_radius > 0.0 || summon_active || slide_t.is_some() {
+    // JETTY_SHOT_UNDERLAY=none keeps the frame's own alpha (straight, not
+    // premultiplied) instead of the checkerboard — for compositing the shot
+    // over something else, e.g. a desktop behind a summon frame.
+    let keep_alpha = std::env::var("JETTY_SHOT_UNDERLAY").is_ok_and(|v| v == "none");
+    let composited = if keep_alpha {
+        let mut out = tight;
+        for px in out.chunks_exact_mut(4) {
+            let a = px[3] as f32 / 255.0;
+            for c in &mut px[..3] {
+                *c = if a > 0.0 { (*c as f32 / a).min(255.0) as u8 } else { 0 };
+            }
+        }
+        out
+    } else if bg_alpha < 255 || corner_radius > 0.0 || summon_active || slide_t.is_some() {
         eprintln!("jetty-shot: compositing over checkerboard (bg alpha={})", bg_alpha);
         const TILE: u32 = 16;
         const DARK: [u8; 3] = [40, 40, 40];

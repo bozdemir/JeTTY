@@ -16,7 +16,11 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Collaborators wanted](https://img.shields.io/badge/collaborators-wanted-ff5c8a)
 
-<img src="assets/screenshots/hero.png" alt="JeTTY with tabs in the Catppuccin Mocha theme" width="820">
+<img src="assets/screenshots/hero.png" alt="JeTTY in its default look: Catppuccin Mocha, a powerlevel10k prompt, tabs with activity badges and a progress bar" width="820">
+
+<img src="assets/screenshots/look-neon-night.png" alt="The Neon Night look" width="268"> <img src="assets/screenshots/look-trinitron.png" alt="The Trinitron look" width="268"> <img src="assets/screenshots/look-amber-vt.png" alt="The Amber VT look" width="268">
+
+<sub>One click in Settings › Look: <b>Neon Night</b> · <b>Trinitron</b> · <b>Amber VT</b> — or Aurora, P1 Green, Paper and Clean. <a href="#-screenshots">More screenshots ↓</a></sub>
 
 </div>
 
@@ -78,21 +82,44 @@
 
 ## 📸 Screenshots
 
-| Catppuccin Mocha | Tokyo Night |
-|:---:|:---:|
-| <img src="assets/screenshots/catppuccin.png" width="400"> | <img src="assets/screenshots/tokyo-night.png" width="400"> |
-| **Gruvbox Dark** | **Dracula** |
-| <img src="assets/screenshots/gruvbox.png" width="400"> | <img src="assets/screenshots/dracula.png" width="400"> |
-| **Onyx** | **Settings — 46 themes, live previews** |
-| <img src="assets/screenshots/onyx.png" width="400"> | <img src="assets/screenshots/settings.png" width="400"> |
+<p align="center">
+  <img src="assets/screenshots/summon.webp" alt="JeTTY summoned onto a desktop with Phosphor Ignition: a bright scan line sweeps down and the window powers on behind it" width="820"><br>
+  <sub><b>Phosphor Ignition</b>, the default summon effect — shown at ⅓ speed; the real one takes 0.25 s.</sub>
+</p>
 
-| CRT effect (curvature · scanlines · bloom · vignette) | Summon effect (Phosphor Ignition) |
-|:---:|:---:|
-| <img src="assets/screenshots/crt.png" width="400"> | <img src="assets/screenshots/phosphor.png" width="400"> |
+**Looks** — one click sets the theme, effects, backdrop, summon effect and cursor together.
 
-| Live perf HUD | |
+| Neon Night | Aurora |
 |:---:|:---:|
-| <img src="assets/screenshots/perf-hud.png" width="400"> | |
+| <img src="assets/screenshots/look-neon-night.png" alt="Neon Night: Synthwave '84 with a neon glow over a synthwave sun and grid" width="400"> | <img src="assets/screenshots/look-aurora.png" alt="Aurora: Tokyo Night Storm over an aurora backdrop" width="400"> |
+| **Trinitron** | **Amber VT** |
+| <img src="assets/screenshots/look-trinitron.png" alt="Trinitron: Tokyo Night on a curved CRT with scanlines and a shadow mask" width="400"> | <img src="assets/screenshots/look-amber-vt.png" alt="Amber VT: an amber phosphor monitor" width="400"> |
+| **P1 Green** | **Paper** |
+| <img src="assets/screenshots/look-p1-green.png" alt="P1 Green: a green phosphor monitor" width="400"> | <img src="assets/screenshots/look-paper.png" alt="Paper: Flexoki Light on paper" width="400"> |
+
+**46 themes, 11 of them light** — exact community palettes; menus, pills and dialogs stay readable on every one.
+
+<img src="assets/screenshots/themes.png" alt="Sixteen of the built-in themes, each with code, the 16-color palette and a prompt" width="820">
+
+**Backdrops** — behind the text, rendered once and reused: patterns, gradients, or your own image.
+
+<img src="assets/screenshots/backdrops.png" alt="Backdrops: stars, a grid, a gradient and a frosted image" width="820">
+
+**Drawn by JeTTY itself** — box drawing, braille, blocks, shades, sextants and Powerline separators join without seams at any size; color emoji; every underline style.
+
+<img src="assets/screenshots/glyphs.png" alt="A btop-style panel with a braille graph and block bars, a tmux status line, underline styles and emoji" width="820">
+
+**Tabs** — five styles; badges for new output, a bell, and commands that finished or failed; OSC 9;4 progress.
+
+<img src="assets/screenshots/tabs.png" alt="The five tab styles: pill, underline, slant, powerline and compact" width="820">
+
+**Settings**
+
+| Look — Looks and the theme gallery | Effects — presets and the CRT pass |
+|:---:|:---:|
+| <img src="assets/screenshots/settings.png" alt="The Settings window's Look tab: one-click Looks and a gallery of live theme previews" width="400"> | <img src="assets/screenshots/settings-effects.png" alt="The Settings window's Effects tab: presets and the CRT sliders" width="400"> |
+
+<sub>Every image is a frame from JeTTY's own GPU renderer drawing a scripted session; <code>scripts/readme-shots/shoot.py</code> regenerates them all.</sub>
 
 ## 🚀 Install
 

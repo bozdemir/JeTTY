@@ -31,11 +31,15 @@
   </developer>
   <screenshots>
     <screenshot type="default">
-      <caption>A summoned JeTTY window</caption>
+      <caption>A summoned JeTTY window with tabs and a powerlevel10k prompt</caption>
       <image>https://raw.githubusercontent.com/bozdemir/JeTTY/main/assets/screenshots/hero.png</image>
     </screenshot>
     <screenshot>
-      <caption>The Settings window</caption>
+      <caption>The Neon Night look, one click away in Settings</caption>
+      <image>https://raw.githubusercontent.com/bozdemir/JeTTY/main/assets/screenshots/look-neon-night.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The Settings window: one-click Looks and the theme gallery</caption>
       <image>https://raw.githubusercontent.com/bozdemir/JeTTY/main/assets/screenshots/settings.png</image>
     </screenshot>
   </screenshots>
