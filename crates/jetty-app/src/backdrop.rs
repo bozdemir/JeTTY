@@ -83,6 +83,9 @@ pub(crate) struct BackdropState {
     /// stays up while a newer request decodes (no flash of the gradient while
     /// a slider is dragged); a failed request or leaving image mode drops it.
     shown: Option<(ImageKey, Arc<GpuImage>)>,
+    /// The image the latest [`Self::sync_image`] asked for (`None`: none). A
+    /// decode of any other key is superseded — a newer request waits behind it.
+    latest: Option<ImageKey>,
     /// Generation of the latest decode request: a stale result is dropped.
     gen: u64,
     /// The animation clock.
@@ -99,6 +102,7 @@ impl BackdropState {
             cfg,
             image: ImageSlot::None,
             shown: None,
+            latest: None,
             gen: 0,
             clock: Instant::now(),
             calm: false,
@@ -178,6 +182,7 @@ impl BackdropState {
         } else {
             None
         };
+        self.latest = wanted.clone();
         let Some(key) = wanted else {
             self.image = ImageSlot::None;
             self.shown = None;
@@ -195,10 +200,14 @@ impl BackdropState {
     }
 
     /// A decode finished. A stale generation, or one whose request was dropped
-    /// meanwhile (image mode left), is ignored. Returns the error to show the
-    /// user when this (current) decode failed — the gradient then shows. The
-    /// caller re-syncs afterwards (a request may have waited behind this one).
-    pub fn on_decoded(&mut self, gen: u64, result: Result<Arc<DecodedImage>, String>) -> Option<String> {
+    /// meanwhile (image mode left), is ignored. Returns the file and the error
+    /// to show the user when this decode failed ([`Self::failed`]). The caller
+    /// re-syncs afterwards (a request may have waited behind this one).
+    pub fn on_decoded(
+        &mut self,
+        gen: u64,
+        result: Result<Arc<DecodedImage>, String>,
+    ) -> Option<(PathBuf, String)> {
         if gen != self.gen {
             return None;
         }
@@ -211,17 +220,14 @@ impl BackdropState {
                 self.image = ImageSlot::Decoded(key, img);
                 None
             }
-            Err(e) => {
-                self.image = ImageSlot::Failed(key);
-                self.shown = None;
-                Some(e)
-            }
+            Err(e) => self.failed(key, e),
         }
     }
 
     /// Upload a decoded image to `device` (its CPU pixels are dropped then) and
-    /// show it. Returns an error to show when the device cannot hold it.
-    pub fn upload_pending(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<String> {
+    /// show it. Returns the file and the error to show when the device cannot
+    /// hold it ([`Self::failed`]).
+    pub fn upload_pending(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<(PathBuf, String)> {
         if !matches!(self.image, ImageSlot::Decoded(..)) {
             return None;
         }
@@ -233,12 +239,24 @@ impl BackdropState {
                 self.shown = Some((key, Arc::new(gpu)));
                 None
             }
-            None => {
-                self.image = ImageSlot::Failed(key);
-                self.shown = None;
-                Some("too large for this GPU".to_string())
-            }
+            None => self.failed(key, "too large for this GPU".to_string()),
         }
+    }
+
+    /// `key` cannot be shown (`why`). The latest request: it is not retried
+    /// until it changes, the gradient shows, and `(file, why)` is the notice.
+    /// A superseded one (a newer pick waits behind it — a broken file picked,
+    /// then another while it decoded) is moot: dropped silently, the image on
+    /// screen stays up, and the re-sync decodes the newer pick.
+    fn failed(&mut self, key: ImageKey, why: String) -> Option<(PathBuf, String)> {
+        if self.latest.as_ref() != Some(&key) {
+            self.image = ImageSlot::None;
+            return None;
+        }
+        let file = key.path.clone();
+        self.image = ImageSlot::Failed(key);
+        self.shown = None;
+        Some((file, why))
     }
 
     /// The image on the GPU, when there is one (windows on another device skip it).
@@ -385,7 +403,10 @@ mod tests {
         let mut s = BackdropState::new(image_cfg("/x/broken.jpg", 0.0));
         let mut gen = 0;
         s.sync_image(dir, || (800, 600), |g, _| gen = g);
-        assert_eq!(s.on_decoded(gen, Err("bad JPEG".into())), Some("bad JPEG".into()));
+        assert_eq!(
+            s.on_decoded(gen, Err("bad JPEG".into())),
+            Some((PathBuf::from("/x/broken.jpg"), "bad JPEG".into()))
+        );
         assert!(matches!(s.image, ImageSlot::Failed(_)));
         // Same settings: no new decode (the notice is not repeated forever).
         s.sync_image(dir, || (800, 600), |_, _| panic!("a known-broken image is not re-decoded"));
@@ -461,6 +482,40 @@ mod tests {
         s.sync_image(dir, || (800, 600), |_, _| panic!("no decode when off"));
         assert_eq!(s.on_decoded(spawned[1].0, Ok(tiny_image())), None);
         assert!(matches!(s.image, ImageSlot::None));
+    }
+
+    /// A broken file picked and then replaced by another pick while it still
+    /// decodes: its failure is moot. Nothing is reported (the notice named the
+    /// newer, fine file), it is not marked broken, and the newer pick — which
+    /// waited behind it — is decoded next.
+    #[test]
+    fn a_superseded_failure_is_dropped_silently() {
+        let dir = Path::new("/cfg");
+        let mut s = BackdropState::new(image_cfg("broken.png", 0.0));
+        let mut spawned = Vec::new();
+        s.sync_image(dir, || (800, 600), |g, k| spawned.push((g, k)));
+        // B is picked while A decodes: it waits.
+        s.set_config(image_cfg("fine.png", 0.0));
+        s.sync_image(dir, || (800, 600), |g, k| spawned.push((g, k)));
+        assert_eq!(spawned.len(), 1);
+        // A fails: no notice, not Failed(A).
+        assert_eq!(s.on_decoded(spawned[0].0, Err("bad PNG".into())), None);
+        assert!(matches!(s.image, ImageSlot::None), "{:?}", s.image);
+        // The re-sync decodes B.
+        s.sync_image(dir, || (800, 600), |g, k| spawned.push((g, k)));
+        assert_eq!(spawned.len(), 2);
+        assert_eq!(spawned[1].1.path, PathBuf::from("/cfg/backgrounds/fine.png"));
+        // B itself failing is reported, against B's own path.
+        let (path, why) = s.on_decoded(spawned[1].0, Err("bad JPEG".into())).expect("the current pick failed");
+        assert_eq!((path.as_path(), why.as_str()), (Path::new("/cfg/backgrounds/fine.png"), "bad JPEG"));
+        assert!(matches!(s.image, ImageSlot::Failed(_)));
+        // Any newer request supersedes: here a blur change made while another
+        // broken pick decodes.
+        s.set_config(image_cfg("other.png", 0.0));
+        s.sync_image(dir, || (800, 600), |g, k| spawned.push((g, k)));
+        s.set_config(image_cfg("fine.png", 0.25));
+        s.sync_image(dir, || (800, 600), |g, k| spawned.push((g, k)));
+        assert_eq!(s.on_decoded(spawned[2].0, Err("gone".into())), None);
     }
 
     #[test]
