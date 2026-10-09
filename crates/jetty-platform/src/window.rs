@@ -3,7 +3,7 @@ use winit::dpi::LogicalSize;
 use winit::error::OsError;
 use winit::event_loop::ActiveEventLoop;
 use winit::monitor::MonitorHandle;
-use winit::window::{Icon, Window};
+use winit::window::{Icon, Window, WindowAttributes};
 
 /// Decode the embedded JeTTY app icon into a winit `Icon` (shown in the
 /// taskbar / Alt-Tab / when minimized). The 256px RGBA PNG is baked into the
@@ -26,6 +26,28 @@ fn app_icon() -> Option<Icon> {
 pub const MIN_TERMINAL_SIZE: (f64, f64) = (200.0, 120.0);
 /// The smallest the Settings window may be, in logical px.
 pub const MIN_SETTINGS_SIZE: (f64, f64) = (200.0, 200.0);
+
+/// The name JeTTY's desktop entry is installed under (`assets/jetty.desktop`,
+/// whose `StartupWMClass` is the same word). Every window carries it as its
+/// Wayland app id and its X11 `WM_CLASS`, which is how a compositor or taskbar
+/// finds the entry — the icon, the pinned launcher the window belongs to.
+/// Without it Wayland windows had no app id at all, and X11 took the class
+/// from the binary's file name: `JeTTY-0.29.0-x86_64.AppImage` for the
+/// AppImage.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+pub const APP_ID: &str = "jetty";
+
+/// Give `attrs` JeTTY's [`APP_ID`]. winit keeps ONE name for both backends, so
+/// the Wayland call sets the X11 class too (`WM_CLASS` "jetty", "jetty").
+fn with_app_id(attrs: WindowAttributes) -> WindowAttributes {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use winit::platform::wayland::WindowAttributesExtWayland;
+        attrs.with_name(APP_ID, APP_ID)
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    attrs
+}
 
 /// Build the main window: a borderless (client-side decorations) window with
 /// our custom titlebar + the JeTTY app icon.
@@ -52,7 +74,7 @@ pub fn build_window_with_visibility(
     size: (u32, u32),
     visible: bool,
 ) -> Result<Arc<Window>, OsError> {
-    let attrs = Window::default_attributes()
+    let attrs = with_app_id(Window::default_attributes())
         .with_visible(visible)
         .with_title(title)
         .with_window_icon(app_icon())
@@ -80,7 +102,7 @@ pub fn build_fixed_window(
     title: &str,
     size: (u32, u32),
 ) -> Result<Arc<Window>, OsError> {
-    let attrs = Window::default_attributes()
+    let attrs = with_app_id(Window::default_attributes())
         .with_title(title)
         .with_window_icon(app_icon())
         .with_inner_size(LogicalSize::new(size.0, size.1))
@@ -555,6 +577,24 @@ mod dpi_tests {
         // Bogus scales fall back to 1.
         assert_eq!(dpi_physical((1000.0, 640.0), f64::NAN, MON, MIN), (1000, 640));
         assert_eq!(dpi_physical((1000.0, 640.0), 0.0, MON, MIN), (1000, 640));
+    }
+}
+
+#[cfg(test)]
+mod app_id_tests {
+    use super::APP_ID;
+
+    #[test]
+    fn the_app_id_is_the_desktop_entry_every_package_installs() {
+        // A Wayland compositor looks the window up as `<app id>.desktop`; an X11
+        // taskbar matches the entry's StartupWMClass against WM_CLASS.
+        let entry = include_str!("../../../assets/jetty.desktop");
+        assert!(entry.lines().any(|l| l == format!("StartupWMClass={APP_ID}")), "{entry}");
+        let file = format!("assets/{APP_ID}.desktop");
+        // The .deb, the AppImage and install.sh all install that file.
+        assert!(include_str!("../../../Cargo.toml").contains(&format!("[\"{file}\"")), "deb assets");
+        assert!(include_str!("../../../.github/workflows/release.yml").contains(&format!("--desktop-file {file}")), "AppImage");
+        assert!(include_str!("../../../install.sh").contains(&format!("applications/{APP_ID}.desktop")), "install.sh");
     }
 }
 
