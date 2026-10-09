@@ -884,6 +884,23 @@ impl ImagePlacement {
     }
 }
 
+/// One image in the Kitty registry ([`Terminal::kitty_images`]).
+#[derive(Debug)]
+struct StoredImage {
+    /// Its id: the `i=` it was sent with, or the one an `I=` transmit is given.
+    id: u32,
+    /// Its `I=` image number (0 = none).
+    number: u32,
+    /// Sent on the alternate screen. Each screen has images of its own, as in
+    /// kitty: a full-screen program's ids never meet the shell's.
+    alt: bool,
+    /// Its place among the transmits (`I=` names the newest with a number).
+    seq: u64,
+    /// Content id (the texture key) and pixels.
+    content: u64,
+    image: Arc<crate::sixel::InlineImage>,
+}
+
 /// One finished shell command, surfaced from an OSC 133 `D` mark. The tab index /
 /// window is attributed by `jetty-app` (it owns the tab→window mapping); this
 /// struct is per-terminal. Drained on the existing PTY-drain pass via
@@ -1139,13 +1156,15 @@ pub struct Terminal {
     chunk_meta: Option<KittyCmd>,
     /// Count of chunks accumulated so far (bounds an endless-`m=1` stream).
     chunk_count: u32,
-    /// Bounded transmit-then-put image registry: `(i=/I= key, content id,
-    /// decoded image)`. A later `a=p,i=N` displays without re-transmitting —
-    /// or re-hashing: the id is computed once, at transmit. LRU-evicted by
-    /// count and bytes ([`MAX_KITTY_STORED`] / [`MAX_KITTY_STORED_BYTES`]).
-    kitty_images: VecDeque<(u32, u64, Arc<crate::sixel::InlineImage>)>,
+    /// Bounded transmit-then-put image registry, least recently used first. A
+    /// later `a=p,i=N` displays without re-transmitting — or re-hashing: the
+    /// content id is computed once, at transmit. LRU-evicted by count and
+    /// bytes ([`MAX_KITTY_STORED`] / [`MAX_KITTY_STORED_BYTES`]).
+    kitty_images: VecDeque<StoredImage>,
     /// Running sum of `rgba.len()` across `kitty_images` (the registry byte budget).
     kitty_stored_bytes: u64,
+    /// Kitty transmits stored so far ([`StoredImage::seq`]).
+    kitty_seq: u64,
     /// The image-work bank: bytes images may still write (decoded RGBA,
     /// inflated payloads). Every byte fed earns [`IMAGE_WORK_PER_BYTE`], up to
     /// [`IMAGE_WORK_MAX`]; an image is paid for before it allocates, or dropped.
@@ -1349,6 +1368,7 @@ impl Terminal {
             chunk_count: 0,
             kitty_images: VecDeque::new(),
             kitty_stored_bytes: 0,
+            kitty_seq: 0,
             image_work: IMAGE_WORK_MAX,
             osc_len: 0,
             mouse_x10: false,
@@ -2838,6 +2858,17 @@ impl Terminal {
         self.alt_placement_bytes = 0;
     }
 
+    /// Drop the Kitty images stored on the ALT screen: they go with what it
+    /// showed, as kitty clears that screen's images on entering it.
+    fn forget_alt_images(&mut self) {
+        let mut freed = 0;
+        self.kitty_images.retain(|e| {
+            freed += if e.alt { e.image.rgba.len() as u64 } else { 0 };
+            !e.alt
+        });
+        self.kitty_stored_bytes = self.kitty_stored_bytes.saturating_sub(freed);
+    }
+
     /// Bookkeeping after vte consumed bytes (a sub-slice or a sync flush); `h0` /
     /// `d0` are the history size and display offset before it.
     fn after_vte(&mut self, alt_before: bool, alt_after: bool, h0: usize, h1: usize, d0: usize) {
@@ -2847,6 +2878,7 @@ impl Terminal {
             // belong to the screen that just went away.
             self.reset_kitty_chunks();
             self.clear_alt_placements();
+            self.forget_alt_images();
         }
         // Back on (or still on) the primary screen with its view scrolled back.
         if !alt_after && (d0 != 0 || alt_before) {
@@ -3407,17 +3439,22 @@ impl Terminal {
         // Single-shot: base64-decode the payload now (bounded), then dispatch.
         match crate::base64::decode_base64(payload, KITTY_RAW_BUDGET) {
             Some(raw) => self.handle_kitty_command(cmd, raw),
-            None => self.kitty_reply(&cmd, "EBADF"),
+            None => self.kitty_reply(&cmd, cmd.id, "EBADF"),
         }
     }
 
     /// Dispatch a finalized Kitty command with its RAW (base64-decoded) payload.
     /// `raw` is meaningful only for transmit/query; delete/put ignore it.
     fn handle_kitty_command(&mut self, cmd: KittyCmd, raw: Vec<u8>) {
+        if cmd.id != 0 && cmd.number != 0 {
+            // Naming an image both ways is an error (the spec).
+            self.kitty_reply(&cmd, cmd.id, "EINVAL");
+            return;
+        }
         if cmd.virtual_placement && matches!(cmd.action, b'T' | b'p') {
             // Unicode-placeholder (virtual) placements are not rendered: refuse,
             // so the client falls back instead of printing placeholder cells.
-            self.kitty_reply(&cmd, "ENOTSUPP");
+            self.kitty_reply(&cmd, cmd.id, "ENOTSUPP");
             return;
         }
         match cmd.action {
@@ -3435,13 +3472,13 @@ impl Terminal {
                 } else {
                     self.decode_kitty_image(&cmd, raw).map_or_else(|code| code, |_| "OK")
                 };
-                self.kitty_reply(&cmd, reply);
+                self.kitty_reply(&cmd, cmd.id, reply);
             }
             b't' | b'T' => {
                 // Only direct base64 transmission is supported (safety: an
                 // untrusted PTY must not make us open files / shm).
                 if cmd.medium != b'd' {
-                    self.kitty_reply(&cmd, "ENOTSUPP");
+                    self.kitty_reply(&cmd, cmd.id, "ENOTSUPP");
                     return;
                 }
                 // Transmit-only without an `i=`/`I=`: nothing could ever put or
@@ -3450,28 +3487,27 @@ impl Terminal {
                     return;
                 }
                 let params = [KITTY_TAG, cmd.format.into(), cmd.width, cmd.height, cmd.compressed.into()];
-                let id = crate::sixel::content_id(&params, &raw);
+                let content = crate::sixel::content_id(&params, &raw);
                 match self.decode_kitty_image(&cmd, raw) {
                     Ok(img) => {
                         let img = Arc::new(img);
-                        // Transmit: store in the registry if addressable.
-                        if cmd.addressable() {
-                            self.kitty_store(&cmd, id, img.clone());
-                        }
+                        // Transmit: store in the registry if addressable (an
+                        // `I=` image is given an id there).
+                        let id = if cmd.addressable() { self.kitty_store(&cmd, content, img.clone()) } else { 0 };
                         // Display on `a=T`.
                         let shown = match cmd.action {
-                            b'T' => self.place_inline_image(&img, id, &cmd),
+                            b'T' => self.place_inline_image(&img, content, id, &cmd),
                             _ => Ok(()),
                         };
-                        self.kitty_reply(&cmd, shown.err().unwrap_or("OK"));
+                        self.kitty_reply(&cmd, id, shown.err().unwrap_or("OK"));
                     }
-                    Err(code) => self.kitty_reply(&cmd, code),
+                    Err(code) => self.kitty_reply(&cmd, cmd.id, code),
                 }
             }
             // Empty `a=` (action 0) is a malformed command.
-            0 => self.kitty_reply(&cmd, "EINVAL"),
+            0 => self.kitty_reply(&cmd, cmd.id, "EINVAL"),
             // Animation (`a=a`/`a=f`) and any other action: documented non-goal.
-            _ => self.kitty_reply(&cmd, "ENOTSUPP"),
+            _ => self.kitty_reply(&cmd, cmd.id, "ENOTSUPP"),
         }
     }
 
@@ -3536,88 +3572,151 @@ impl Terminal {
         Ok(())
     }
 
-    /// Store a decoded image (and its content `id`) in the transmit-then-put
-    /// registry, replacing any existing entry with the same key and
-    /// LRU-evicting to stay within both caps.
-    fn kitty_store(&mut self, cmd: &KittyCmd, id: u64, img: Arc<crate::sixel::InlineImage>) {
-        let key = if cmd.id != 0 { cmd.id } else { cmd.number };
-        if key == 0 {
-            return;
-        }
-        // Replace an existing same-key entry (free its bytes).
-        if let Some(pos) = self.kitty_images.iter().position(|(k, ..)| *k == key) {
-            if let Some((_, _, old)) = self.kitty_images.remove(pos) {
-                self.kitty_stored_bytes =
-                    self.kitty_stored_bytes.saturating_sub(old.rgba.len() as u64);
-            }
-        }
-        self.kitty_stored_bytes = self.kitty_stored_bytes.saturating_add(img.rgba.len() as u64);
-        self.kitty_images.push_back((key, id, img));
-        while self.kitty_images.len() > MAX_KITTY_STORED
-            || self.kitty_stored_bytes > MAX_KITTY_STORED_BYTES
-        {
-            let Some((_, _, old)) = self.kitty_images.pop_front() else { break };
-            self.kitty_stored_bytes = self.kitty_stored_bytes.saturating_sub(old.rgba.len() as u64);
-        }
-    }
-
-    /// Display a previously-transmitted image (`a=p,i=N`/`I=N`) under the id it
-    /// was stored with — a put costs nothing per pixel. Unknown id ⇒ `ENOENT`
-    /// and no placement.
-    fn kitty_put(&mut self, cmd: &KittyCmd) {
-        let key = if cmd.id != 0 { cmd.id } else { cmd.number };
-        let found = self
-            .kitty_images
-            .iter()
-            .find(|(k, ..)| *k == key)
-            .map(|(_, id, img)| (*id, img.clone()));
-        match found {
-            Some((id, img)) => {
-                let shown = self.place_inline_image(&img, id, cmd);
-                self.kitty_reply(cmd, shown.err().unwrap_or("OK"));
-            }
-            None => self.kitty_reply(cmd, "ENOENT"),
-        }
-    }
-
-    /// Honor the common Kitty delete requests on BOTH screens' placements; refuse
-    /// the exotic ones as a safe no-op (amendment A6 / T9). Lowercase selectors
-    /// delete PLACEMENTS only; uppercase also frees stored image data.
-    fn kitty_delete(&mut self, cmd: &KittyCmd) {
-        let key = if cmd.id != 0 { cmd.id } else { cmd.number };
-        let hit = |p: &ImagePlacement| match cmd.delete {
-            // `a=d` with no selector, or d=a / d=A: every KITTY placement (never a
-            // sixel — a Kitty clear must not wipe another protocol's images, M2).
-            0 | b'a' | b'A' => p.is_kitty,
-            // d=i / d=I: the placements of that image id.
-            b'i' | b'I' => p.kitty_id == Some(key),
-            // Any other selector (by row/column/z/cursor): documented no-op.
-            _ => false,
+    /// Store a decoded image (and its `content` id) in the transmit-then-put
+    /// registry of the active screen and return its id: the `i=` it was sent
+    /// with, or a free one for an `I=` transmit — every such transmit is a new
+    /// image, its number naming the newest. Re-sending an `i=` replaces that
+    /// image and deletes its placements (the spec). LRU-evicts to stay within
+    /// both caps, images no placement shows first (as kitty frees them).
+    fn kitty_store(&mut self, cmd: &KittyCmd, content: u64, image: Arc<crate::sixel::InlineImage>) -> u32 {
+        let alt = self.alt_screen();
+        let id = if cmd.id != 0 {
+            self.drop_stored_image(alt, cmd.id);
+            self.delete_placements(|p| p.kitty_id == Some(cmd.id));
+            cmd.id
+        } else {
+            self.free_image_id(alt)
         };
-        retain_placements(&mut self.placements, &mut self.placement_bytes, |p| !hit(p));
-        retain_placements(&mut self.alt_placements, &mut self.alt_placement_bytes, |p| !hit(p));
-        match cmd.delete {
-            b'A' => {
-                self.kitty_images.clear();
-                self.kitty_stored_bytes = 0;
+        self.kitty_seq += 1;
+        self.kitty_stored_bytes += image.rgba.len() as u64;
+        self.kitty_images.push_back(StoredImage { id, number: cmd.number, alt, seq: self.kitty_seq, content, image });
+        while self.kitty_images.len() > MAX_KITTY_STORED || self.kitty_stored_bytes > MAX_KITTY_STORED_BYTES {
+            // Never the image just stored.
+            let older = self.kitty_images.len() - 1;
+            let unshown = self.kitty_images.iter().take(older).position(|e| !self.shows(e));
+            let Some(old) = self.kitty_images.remove(unshown.unwrap_or(0)) else { break };
+            self.kitty_stored_bytes = self.kitty_stored_bytes.saturating_sub(old.image.rgba.len() as u64);
+        }
+        id
+    }
+
+    /// Whether a placement on its screen shows stored image `e`.
+    fn shows(&self, e: &StoredImage) -> bool {
+        let list = if e.alt { &self.alt_placements } else { &self.placements };
+        list.iter().any(|p| p.kitty_id == Some(e.id))
+    }
+
+    /// The smallest image id nothing on that screen uses (kitty gives an `I=`
+    /// transmit the same), so a later `i=` names this image alone.
+    fn free_image_id(&self, alt: bool) -> u32 {
+        let list = if alt { &self.alt_placements } else { &self.placements };
+        let mut used: Vec<u32> = self.kitty_images.iter().filter(|e| e.alt == alt).map(|e| e.id).collect();
+        used.extend(list.iter().filter_map(|p| p.kitty_id));
+        used.sort_unstable();
+        let mut id = 1;
+        for u in used {
+            if u == id {
+                id += 1;
+            } else if u > id {
+                break;
             }
-            b'I' => {
-                if let Some(pos) = self.kitty_images.iter().position(|(k, ..)| *k == key) {
-                    if let Some((_, _, old)) = self.kitty_images.remove(pos) {
-                        self.kitty_stored_bytes =
-                            self.kitty_stored_bytes.saturating_sub(old.rgba.len() as u64);
-                    }
-                }
+        }
+        id
+    }
+
+    /// The registry index of the active screen's image `cmd` names: by `i=`,
+    /// or the newest with its `I=` number.
+    fn find_image(&self, cmd: &KittyCmd) -> Option<usize> {
+        let alt = self.alt_screen();
+        let mine = self.kitty_images.iter().enumerate().filter(|(_, e)| e.alt == alt);
+        if cmd.id != 0 {
+            mine.filter(|(_, e)| e.id == cmd.id).map(|(k, _)| k).next()
+        } else {
+            mine.filter(|(_, e)| cmd.number != 0 && e.number == cmd.number).max_by_key(|(_, e)| e.seq).map(|(k, _)| k)
+        }
+    }
+
+    /// Drop image `id` of that screen from the registry (its placements stay).
+    fn drop_stored_image(&mut self, alt: bool, id: u32) {
+        if let Some(pos) = self.kitty_images.iter().position(|e| e.alt == alt && e.id == id) {
+            if let Some(old) = self.kitty_images.remove(pos) {
+                self.kitty_stored_bytes = self.kitty_stored_bytes.saturating_sub(old.image.rgba.len() as u64);
             }
-            _ => {}
+        }
+    }
+
+    /// Drop the active screen's placements `hit` matches.
+    fn delete_placements(&mut self, hit: impl Fn(&ImagePlacement) -> bool) {
+        if self.alt_screen() {
+            retain_placements(&mut self.alt_placements, &mut self.alt_placement_bytes, |p| !hit(p));
+        } else {
+            retain_placements(&mut self.placements, &mut self.placement_bytes, |p| !hit(p));
+        }
+    }
+
+    /// Display a previously-transmitted image of the active screen (`a=p,i=N`,
+    /// or `I=N`: the newest with that number) under the content id it was
+    /// stored with — a put costs nothing per pixel — and mark it recently used.
+    /// Unknown ⇒ `ENOENT` and no placement.
+    fn kitty_put(&mut self, cmd: &KittyCmd) {
+        let Some(e) = self.find_image(cmd).and_then(|pos| self.kitty_images.remove(pos)) else {
+            self.kitty_reply(cmd, cmd.id, "ENOENT");
+            return;
+        };
+        let (id, content, img) = (e.id, e.content, e.image.clone());
+        self.kitty_images.push_back(e);
+        let shown = self.place_inline_image(&img, content, id, cmd);
+        self.kitty_reply(cmd, id, shown.err().unwrap_or("OK"));
+    }
+
+    /// `a=d`: delete the active screen's Kitty placements the `d=` selector
+    /// picks — each screen has its own, as in kitty, so a full-screen program
+    /// clearing its images never touches the shell's. `a` (the default): those
+    /// visible on screen, not the scrollback's; `i`: those of image `i=`; `n`:
+    /// of the newest image numbered `I=` — narrowed to one placement by `p=`.
+    /// An uppercase selector also frees the stored images it names that no
+    /// placement on the screen still shows. The other selectors (by cell, row,
+    /// column, z-index): documented no-op (amendment A6 / T9).
+    fn kitty_delete(&mut self, cmd: &KittyCmd) {
+        let alt = self.alt_screen();
+        let top = if alt { 0 } else { self.abs_top };
+        let selector = cmd.delete.to_ascii_lowercase();
+        // The image `i` / `n` names (0: none).
+        let id = match selector {
+            b'i' => cmd.id,
+            b'n' => self.find_image(&KittyCmd { id: 0, ..*cmd }).map_or(0, |pos| self.kitty_images[pos].id),
+            _ => 0,
+        };
+        self.delete_placements(|p| match selector {
+            // Never a sixel: a Kitty clear must not wipe another protocol's
+            // images (M2).
+            0 | b'a' => p.is_kitty && p.abs_line + p.rows as i64 > top,
+            b'i' | b'n' => {
+                id != 0 && p.kitty_id == Some(id) && (cmd.placement == 0 || p.kitty_placement == Some(cmd.placement))
+            }
+            _ => false,
+        });
+        if cmd.delete.is_ascii_uppercase() {
+            let freed: Vec<u32> = self
+                .kitty_images
+                .iter()
+                .filter(|e| e.alt == alt && (selector == b'a' || e.id == id) && !self.shows(e))
+                .map(|e| e.id)
+                .collect();
+            for id in freed {
+                self.drop_stored_image(alt, id);
+            }
         }
     }
 
     /// Enqueue a Kitty graphics OK/error reply on the PTY write-back channel,
     /// honoring the addressability + quiet rules (amendment A10):
     /// only reply when the command addresses an image (`i=`/`I=`), and never at
-    /// `q>=2`; `q>=1` suppresses OK but still reports errors.
-    fn kitty_reply(&mut self, cmd: &KittyCmd, msg: &str) {
+    /// `q>=2`; `q>=1` suppresses OK but still reports errors. Like kitty's, it
+    /// names the image — its `id` (the one an `I=` transmit was given), number
+    /// and placement. A synchronized update in flight is applied first, so the
+    /// reply keeps its place behind the answers vte holds in it.
+    fn kitty_reply(&mut self, cmd: &KittyCmd, id: u32, msg: &str) {
         // Reply only for addressable commands — prevents a tiny-APC flood from
         // amplifying 1:1 writes back to a non-reading PTY.
         if !cmd.addressable() {
@@ -3629,17 +3728,13 @@ impl Terminal {
         if cmd.quiet >= 1 && msg == "OK" {
             return;
         }
-        let mut out = Vec::with_capacity(16 + msg.len());
-        out.extend_from_slice(b"\x1b_G");
-        if cmd.id != 0 {
-            out.extend_from_slice(format!("i={}", cmd.id).as_bytes());
-        } else {
-            out.extend_from_slice(format!("I={}", cmd.number).as_bytes());
-        }
-        out.push(b';');
-        out.extend_from_slice(msg.as_bytes());
-        out.extend_from_slice(b"\x1b\\");
-        let _ = self.reply_tx.send(out);
+        self.apply_pending_sync();
+        let keys: Vec<String> = [("i", id), ("I", cmd.number), ("p", cmd.placement)]
+            .into_iter()
+            .filter(|&(_, v)| v != 0)
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        let _ = self.reply_tx.send(format!("\x1b_G{};{msg}\x1b\\", keys.join(",")).into_bytes());
     }
 
     /// The cell footprint (`cols`, `rows`) of a `width`×`height` px image and
@@ -3669,12 +3764,19 @@ impl Terminal {
         (cols.min(self.cols as f32) as u16, rows as u16, [x, y, w, h])
     }
 
-    /// Place a decoded Kitty image (content id `id`) at the cursor, moved left
-    /// to fit; `C=1` leaves the cursor (and the grid) untouched. Guards: a zero
-    /// cell metric drops it; an in-flight sync update is flushed first so the
-    /// cursor is where the app put it. `Err` is the reply: [`IMAGE_BUSY`] when
-    /// the image-work bank cannot pay for the rows it reserves.
-    fn place_inline_image(&mut self, img: &Arc<crate::sixel::InlineImage>, id: u64, cmd: &KittyCmd) -> Result<(), &'static str> {
+    /// Place a decoded Kitty image (content id `content`; registry id `id`, 0
+    /// for an anonymous one) at the cursor, moved left to fit; `C=1` leaves the
+    /// cursor (and the grid) untouched. Guards: a zero cell metric drops it; an
+    /// in-flight sync update is flushed first so the cursor is where the app
+    /// put it. `Err` is the reply: [`IMAGE_BUSY`] when the image-work bank
+    /// cannot pay for the rows it reserves.
+    fn place_inline_image(
+        &mut self,
+        img: &Arc<crate::sixel::InlineImage>,
+        content: u64,
+        id: u32,
+        cmd: &KittyCmd,
+    ) -> Result<(), &'static str> {
         if self.cell_px_w <= 0.0 || self.cell_px_h <= 0.0 {
             return Ok(());
         }
@@ -3682,16 +3784,15 @@ impl Terminal {
             self.flush_sync();
         }
         let (cols, rows, draw) = self.image_geometry(img.width, img.height, cmd.cols, cmd.rows);
-        let key = if cmd.id != 0 { cmd.id } else { cmd.number };
         let p = ImagePlacement {
-            id,
+            id: content,
             abs_line: 0,
             col: 0,
             cols,
             rows,
             draw,
             image: img.clone(),
-            kitty_id: (key != 0).then_some(key),
+            kitty_id: (id != 0).then_some(id),
             kitty_placement: (cmd.placement != 0).then_some(cmd.placement),
             is_kitty: true,
             marks_cells: false,
@@ -9220,8 +9321,8 @@ mod tests {
         assert!(took.as_millis() < 500, "1000 puts took {took:?}");
         assert_eq!(t.placements.len(), 1, "each put replaced the one it covers");
         let stored = &t.kitty_images[0];
-        assert!(Arc::ptr_eq(&t.placements[0].image, &stored.2), "the stored image, not a copy");
-        assert_eq!(t.placements[0].id, stored.1, "under the id it was stored with");
+        assert!(Arc::ptr_eq(&t.placements[0].image, &stored.image), "the stored image, not a copy");
+        assert_eq!(t.placements[0].id, stored.content, "under the id it was stored with");
     }
 
     #[test]
@@ -9266,6 +9367,126 @@ mod tests {
         t.feed(&apc("a=d,d=i,i=3"));
         assert_eq!(t.placements.len(), 1, "only id 3 removed");
         assert_eq!(t.placements[0].kitty_id, Some(8));
+    }
+
+    #[test]
+    fn a_kitty_delete_touches_only_its_own_screen() {
+        // mpv --vo=kitty sends `a=d` on the alternate screen, and again before
+        // it leaves it: every Kitty image of the shell went with it, and a
+        // `d=A` there freed the shell's stored images too. kitty keeps a set
+        // of images and placements per screen.
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&red_rgba_2x2(",i=1"));
+        t.feed(&apc(&format!("a=t,f=32,s=1,v=1,i=7;{}", b64(&[1, 2, 3, 255]))));
+        t.feed(b"\x1b[?1049h");
+        t.feed(&red_rgba_2x2(",i=1"));
+        t.feed(&apc("a=d"));
+        assert!(t.alt_placements.is_empty(), "the alternate screen's image is deleted");
+        t.feed(&apc("a=d,d=A"));
+        t.feed(b"\x1b[?1049l");
+        assert_eq!(t.placements.len(), 1, "the shell's image survives");
+        t.feed(&apc("a=p,i=7,C=1"));
+        assert_eq!(t.placements.len(), 2, "and so does the image it stored");
+    }
+
+    #[test]
+    fn a_kitty_clear_keeps_the_scrollback_and_p_picks_one_placement() {
+        // `kitten icat --clear` (`d=A`) deleted every Kitty image in the
+        // scrollback too; the spec deletes those visible on screen. And
+        // `d=i,i=N,p=P` deleted every placement of N.
+        let mut t = Terminal::new(20, 4);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&red_rgba_2x2(",i=1"));
+        t.feed(&b"\r\n".repeat(8)); // into the scrollback
+        t.feed(&red_rgba_2x2(",i=2"));
+        t.feed(&apc("a=d,d=A"));
+        assert_eq!(t.placements.len(), 1);
+        assert_eq!(t.placements[0].kitty_id, Some(1), "the scrolled-off image stays");
+        t.feed(&red_rgba_2x2(",i=3,p=1"));
+        t.feed(b"\r\n");
+        t.feed(&apc("a=p,i=3,p=2"));
+        t.feed(&apc("a=d,d=i,i=3,p=1"));
+        let left: Vec<_> = t.placements.iter().map(|p| (p.kitty_id, p.kitty_placement)).collect();
+        assert_eq!(left, [(Some(1), None), (Some(3), Some(2))], "only placement 1 of image 3");
+    }
+
+    #[test]
+    fn re_transmitting_an_image_deletes_its_placements() {
+        // The spec: "When re-transmitting image data for a specific id, the
+        // existing image and all its placements must be deleted." The old one
+        // stayed on screen as a ghost.
+        let mut t = Terminal::new(20, 8);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&red_rgba_2x2(",i=1"));
+        t.feed(b"\x1b[5;1H");
+        t.feed(&red_rgba_2x2(",i=1"));
+        assert_eq!(t.placements.len(), 1, "a=T again");
+        assert_eq!(t.placements[0].abs_line, 4);
+        t.feed(&apc(&format!("a=t,f=32,s=1,v=1,i=1;{}", b64(&[1, 2, 3, 255]))));
+        assert!(t.placements.is_empty(), "a=t again");
+    }
+
+    #[test]
+    fn kitty_replies_name_the_image_number_and_placement() {
+        // `a=T,I=13` answered `I=13;OK`: the spec's answer names the id the
+        // image got (`i=99,I=13;OK`), and kitty's adds the placement id. `i=`
+        // and `I=` shared one key space: `I=5` replaced image `i=5`.
+        let mut t = Terminal::new(20, 8);
+        t.set_cell_px(10.0, 10.0);
+        let reply = |t: &mut Terminal, keys: &str| {
+            t.feed(&red_rgba_2x2(keys));
+            String::from_utf8(t.drain_pty_writes()).unwrap()
+        };
+        assert_eq!(reply(&mut t, ",I=13"), "\x1b_Gi=1,I=13;OK\x1b\\", "the id it got");
+        assert_eq!(reply(&mut t, ",i=5,p=7"), "\x1b_Gi=5,p=7;OK\x1b\\");
+        assert_eq!(reply(&mut t, ",I=5"), "\x1b_Gi=2,I=5;OK\x1b\\", "a number is not an id");
+        assert_eq!(reply(&mut t, ",I=13"), "\x1b_Gi=3,I=13;OK\x1b\\", "a new image per transmit");
+        t.feed(&apc("a=p,I=13,p=4,C=1"));
+        assert_eq!(String::from_utf8(t.drain_pty_writes()).unwrap(), "\x1b_Gi=3,I=13,p=4;OK\x1b\\", "the newest");
+        assert_eq!(reply(&mut t, ",i=6,I=6"), "\x1b_Gi=6,I=6;EINVAL\x1b\\", "both is an error");
+        assert_eq!(t.placements.iter().filter(|p| p.kitty_id == Some(5)).count(), 1);
+        t.feed(&apc("a=d,d=n,I=13"));
+        assert!(t.placements.iter().all(|p| p.kitty_id != Some(3)), "d=n: the newest image numbered 13");
+        assert!(t.placements.iter().any(|p| p.kitty_id == Some(1)));
+    }
+
+    #[test]
+    fn the_kitty_registry_keeps_the_images_in_use() {
+        // A TUI re-puts an icon on every redraw while transmitting thumbnails:
+        // the registry evicted in transmit order, so the icon went first and
+        // its next (quiet) put showed nothing.
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        let px = b64(&[1u8, 2, 3, 255]);
+        let send = |t: &mut Terminal, id: usize| t.feed(&apc(&format!("a=t,f=32,s=1,v=1,i={id},q=2;{px}")));
+        send(&mut t, 1);
+        t.feed(&apc("a=p,i=1,C=1,q=2"));
+        for id in 2..=MAX_KITTY_STORED + 10 {
+            send(&mut t, id);
+        }
+        assert!(t.kitty_images.iter().any(|e| e.id == 1), "an image on screen is kept");
+        // Unshown, the least recently used one goes first.
+        t.feed(&apc("a=d,d=a"));
+        t.feed(&apc("a=p,i=1,C=1,q=2"));
+        t.feed(&apc("a=d,d=a"));
+        for id in 100..110 {
+            send(&mut t, id);
+        }
+        assert!(t.kitty_images.iter().any(|e| e.id == 1), "a recently put image is kept");
+        assert_eq!(t.kitty_images.len(), MAX_KITTY_STORED);
+    }
+
+    #[test]
+    fn kitty_replies_keep_their_place_in_a_synchronized_update() {
+        // vte holds the DA1 reply until the update ends; the Kitty reply
+        // jumped ahead of it.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[?2026h\x1b[c");
+        t.feed(&apc("a=q,i=1,s=1,v=1,f=24;AAAA"));
+        let replies = String::from_utf8(t.drain_pty_writes()).unwrap();
+        assert!(replies.starts_with("\x1b[?62;"), "DA1 first: {replies:?}");
+        assert!(replies.ends_with("\x1b_Gi=1;OK\x1b\\"), "{replies:?}");
     }
 
     #[test]
@@ -9654,7 +9875,7 @@ mod tests {
         assert_eq!(t.placements.len(), 1, "same image id + placement id replaces");
         assert_eq!(t.visible_images()[0].col, 299 % 10);
         t.feed(b"\x1b[3;1H");
-        t.feed(&red_rgba_2x2(",i=1,p=2"));
+        t.feed(&apc("a=p,i=1,p=2"));
         assert_eq!(t.placements.len(), 2, "another placement id is a second placement");
     }
 
@@ -10445,6 +10666,10 @@ mod tests {
         assert_eq!(live, t.placement_bytes, "{ctx}: placement byte counter");
         let live: u64 = t.alt_placements.iter().map(|p| p.image.rgba.len() as u64).sum();
         assert_eq!(live, t.alt_placement_bytes, "{ctx}: alt placement byte counter");
+        let stored: u64 = t.kitty_images.iter().map(|e| e.image.rgba.len() as u64).sum();
+        assert_eq!(stored, t.kitty_stored_bytes, "{ctx}: registry byte counter");
+        assert!(t.kitty_images.len() <= MAX_KITTY_STORED && stored <= MAX_KITTY_STORED_BYTES, "{ctx}: registry");
+        assert!(t.alt_screen() || t.kitty_images.iter().all(|e| !e.alt), "{ctx}: alternate-screen images outlive it");
         let snap = t.snapshot();
         assert_eq!(snap.cells.len(), t.rows * t.cols, "{ctx}: snapshot size");
         assert!(snap.cursor_row < t.rows && snap.cursor_col < t.cols, "{ctx}: snapshot cursor");
