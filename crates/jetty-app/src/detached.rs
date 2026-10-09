@@ -567,8 +567,10 @@ impl DetachedWindow {
     /// sizes (same values stored in `App::font_logical` and `App::ui_font_logical`).
     /// `font_family` is the terminal font family (same as `App::font_family`);
     /// `ui_font_family` the chrome family (`""` = platform sans, same as
-    /// `App::ui_font_family`). Both sizes are scaled by the new window's
-    /// `scale_factor` before being passed to `TextLayer`, matching `App::resumed`.
+    /// `App::ui_font_family`) and `chrome_family` the chrome's mono family at that
+    /// default (`App::chrome_font_family`). Both sizes are scaled by the new
+    /// window's `scale_factor` before being passed to `TextLayer`, matching
+    /// `App::resumed`.
     ///
     /// Returns `Err(tab)` — handing the `Tab` back intact — when the OS window
     /// or the GPU context cannot be created at runtime (both fail for real,
@@ -589,6 +591,7 @@ impl DetachedWindow {
         ui_font_logical: f32,
         font_family: &str,
         ui_font_family: &str,
+        chrome_family: &str,
         gpu_shared: Option<&Arc<jetty_render::GpuShared>>,
         font_source: Option<&TextLayer>,
     ) -> Result<Self, Tab> {
@@ -632,7 +635,7 @@ impl DetachedWindow {
         // Chrome layer — mirrors the chrome TextLayer built in `App::resumed`:
         // UI font at ui_font_logical × scale_factor, with the chrome family
         // applied via `set_ui_family` (no fontconfig rescan).
-        let mut chrome_text = TextLayer::for_gpu(&gpu, ui_font_logical * scale, font_family, fonts());
+        let mut chrome_text = TextLayer::for_gpu(&gpu, ui_font_logical * scale, chrome_family, fonts());
         chrome_text.set_ui_family(if ui_font_family.is_empty() {
             None
         } else {
@@ -750,7 +753,9 @@ impl DetachedWindow {
         let line_height = self.text.line_height();
         self.text = TextLayer::for_gpu(&gpu, font_logical * scale, font_family, grid_fonts);
         self.text.set_line_height(line_height);
-        let mut chrome_text = TextLayer::for_gpu(&gpu, ui_font_logical * scale, font_family, chrome_fonts);
+        // The chrome keeps its mono family (`App::chrome_font_family`).
+        let chrome_family = self.chrome_text.font_family().to_string();
+        let mut chrome_text = TextLayer::for_gpu(&gpu, ui_font_logical * scale, &chrome_family, chrome_fonts);
         chrome_text.set_ui_family(if ui_font_family.is_empty() { None } else { Some(ui_font_family) });
         self.chrome_text = chrome_text;
         self.quad = QuadLayer::for_gpu(&gpu);

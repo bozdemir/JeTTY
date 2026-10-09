@@ -1150,6 +1150,13 @@ pub struct App {
     /// help/confirm/welcome. SEPARATE from `font_family` (the terminal grid font).
     /// `""` = platform proportional sans (the default look).
     ui_font_family: String,
+    /// The monospace family every chrome and Settings layer draws its non-title
+    /// labels in at the default UI font (`ui_font_family` `""`): the terminal
+    /// font the main window's chrome was first built with, kept for the
+    /// session — so the chrome of every window (detached, Settings, rebuilt
+    /// after a GPU loss) matches it, and a terminal-font pick changes the grid
+    /// alone.
+    chrome_font_family: String,
     /// UI (chrome) font size in logical points, clamped [10, 28]. SEPARATE from
     /// `font_logical`; a change never reflows the grid (chrome size is orthogonal
     /// to cols/rows), so there is no p10k-scatter risk and no debounce.
@@ -2113,6 +2120,7 @@ impl App {
             // UI font defaults (overridden by config below): "" = platform sans,
             // 16pt = today's chrome size, so the default look is unchanged.
             ui_font_family: String::new(),
+            chrome_font_family: String::new(),
             ui_font_logical: UI_FONT_LOGICAL_DEFAULT,
             ui_font_families: Vec::new(),
             ui_font_scroll_offset: 0,
@@ -4498,6 +4506,7 @@ impl App {
             self.ui_font_logical,
             &self.font_family,
             &self.ui_font_family,
+            &self.chrome_font_family,
             gpu_shared.as_ref(),
             self.text.as_ref(),
         ) {
@@ -9365,11 +9374,12 @@ impl App {
         for pos in 0..self.detached.len() {
             self.update_detached_link_hover(pos, true);
         }
-        // The chrome is now DECOUPLED from the terminal font: it follows the
+        // The chrome is DECOUPLED from the terminal font: it follows the
         // separate `ui_font_family`/`ui_font_logical` (set via `set_ui_font_*`),
-        // NOT the terminal family. So a terminal-font change no longer touches
-        // chrome_text — leaving the chrome typeface stable while the grid font
-        // changes (and avoiding a chrome re-measure on every terminal-font pick).
+        // and at the default UI font its mono labels use `chrome_font_family`,
+        // fixed for the session. So a terminal-font change touches no chrome
+        // layer — the chrome typeface stays put in every window while the grid
+        // font changes (and no chrome re-measures on every terminal-font pick).
         self.persist();
         self.mark_dirty_all();
         pick.warning
@@ -9990,7 +10000,7 @@ impl App {
             // set_ui_family (no rescan). The true UI size is used only for the live
             // "Aa" specimen, drawn separately via chrome_text.
             let capped = self.ui_font_logical.clamp(PANEL_TEXT_MIN, PANEL_TEXT_MAX);
-            let mut text = TextLayer::for_gpu(&g, capped * scale, &self.font_family, fonts());
+            let mut text = TextLayer::for_gpu(&g, capped * scale, &self.chrome_font_family, fonts());
             let ui_fam = if self.ui_font_family.is_empty() {
                 None
             } else {
@@ -9999,7 +10009,7 @@ impl App {
             text.set_ui_family(ui_fam);
             // Dedicated TRUE-size specimen layer on the settings device for the
             // live "Aa" preview (the panel body text above is capped).
-            let mut specimen = TextLayer::for_gpu(&g, self.ui_font_logical * scale, &self.font_family, fonts());
+            let mut specimen = TextLayer::for_gpu(&g, self.ui_font_logical * scale, &self.chrome_font_family, fonts());
             specimen.set_ui_family(ui_fam);
             let quad = QuadLayer::for_gpu(&g);
             self.settings_text = Some(text);
@@ -10091,7 +10101,7 @@ impl App {
         let (grid_fonts, chrome_fonts) = (font_db(), font_db());
         let mut text = TextLayer::for_gpu(&gpu, self.font_logical * scale, &self.font_family, grid_fonts);
         text.set_line_height(self.line_height);
-        let mut chrome = TextLayer::for_gpu(&gpu, self.ui_font_logical * scale, &self.font_family, chrome_fonts);
+        let mut chrome = TextLayer::for_gpu(&gpu, self.ui_font_logical * scale, &self.chrome_font_family, chrome_fonts);
         chrome.set_ui_family(if self.ui_font_family.is_empty() {
             None
         } else {
@@ -13889,8 +13899,11 @@ impl ApplicationHandler<AppEvent> for App {
             // fontconfig scan here cost ~15–20ms on the main thread at EVERY cold
             // start, undoing the worker-thread overlap above.
             let fonts = text.as_ref().map_or_else(TextLayer::build_font_system, |t| t.clone_font_system());
+            if self.chrome_font_family.is_empty() {
+                self.chrome_font_family = self.font_family.clone();
+            }
             // (Its glyphon pipeline is the grid layer's: `TextLayer::for_gpu`.)
-            let mut chrome = TextLayer::for_gpu(g, self.ui_font_logical * scale, &self.font_family, fonts);
+            let mut chrome = TextLayer::for_gpu(g, self.ui_font_logical * scale, &self.chrome_font_family, fonts);
             // Populate the UI-font picker list: a synthetic "System Sans (default)"
             // row (→ "") first, then the installed proportional families.
             self.ui_font_families = std::iter::once("System Sans (default)".to_string())
