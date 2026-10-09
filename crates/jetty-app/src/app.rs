@@ -2955,8 +2955,11 @@ impl App {
         let config_path = crate::config::Config::config_path();
         let text = std::fs::read_to_string(&config_path);
         if self.persister.borrow().unsettled(&text) && !self.config_recheck {
+            // Half a second more (on top of the 200 ms debounce): a writer
+            // slower than that leaves an empty file that is all defaults —
+            // and a trimmed history does not grow back.
             self.config_recheck = true;
-            self.pending_reload_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+            self.pending_reload_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
             return;
         }
         self.config_recheck = false;
