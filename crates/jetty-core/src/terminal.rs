@@ -911,7 +911,8 @@ impl ImagePlacement {
     fn anchor_at(&mut self, col: usize, cols: usize) {
         let (col, cols) = (col.min(cols - 1) as u16, cols as u16);
         if self.is_kitty {
-            self.col = col.min(cols.saturating_sub(self.cols));
+            self.cols = self.cols.min(cols);
+            self.col = col.min(cols - self.cols);
         } else {
             self.col = col;
             self.cols = self.cols.min(cols - col);
@@ -4453,6 +4454,8 @@ impl Terminal {
         // below). Capture the idle-clean-prompt state NOW, before `term.resize`
         // clears the marks it depends on.
         let clean_prompt = self.at_clean_prompt();
+        // Primary-screen images ride the reflow on their rows.
+        let image_rows = self.tag_image_rows();
         self.cols = cols;
         self.rows = rows;
         // Publish the new geometry to the shared atomic BEFORE Term::resize so
@@ -4498,12 +4501,14 @@ impl Terminal {
         // next prompt re-marks) and re-establish a clean anchor so future marks and
         // pruning are exact again. Skip the re-anchor on the alt screen: its grid
         // has ~no history, so `history_size()` there would corrupt the primary
-        // `abs_top` (which is frozen for the alt session). Image placements
-        // anchor on the same (now-meaningless) reflowed rows, so they go too
-        // (correct-or-absent; a re-emit re-marks). The reserved blank rows remain
-        // — harmless — and the GPU textures simply stop being drawn (the
-        // ImageLayer's LRU reclaims their VRAM). Run & Notify state survives:
-        // a command running across the resize still yields its completion.
+        // `abs_top` (which is frozen for the alt session). Primary-screen images
+        // are carried over to the rows their anchor rows reflowed to (found by
+        // the tags set above) — or, where that cannot be told, go too
+        // (correct-or-absent). Alt-screen ones go: a TUI redraws on SIGWINCH.
+        // Run & Notify state survives: a command running across the resize
+        // still yields its completion.
+        let images = std::mem::take(&mut self.placements);
+        let moved = self.find_image_rows(image_rows.len());
         self.drop_anchors();
         self.clear_alt_placements();
         // A reflow also invalidates any in-progress Kitty chunk accumulation
@@ -4511,7 +4516,63 @@ impl Terminal {
         self.reset_kitty_chunks();
         if !self.term.mode().contains(TermMode::ALT_SCREEN) {
             self.abs_top = self.term.grid().history_size() as i64;
+            if let Some(moved) = moved {
+                for mut p in images {
+                    let Ok(k) = image_rows.binary_search(&p.abs_line) else { continue };
+                    p.abs_line = self.abs_top + i64::from(moved[k]);
+                    p.anchor_at(usize::from(p.col), cols);
+                    self.placement_bytes += p.image.rgba.len() as u64;
+                    self.placements.push_back(p);
+                }
+                self.prune_placements(self.term.grid().history_size());
+            }
         }
+    }
+
+    /// Before a reflow: tag column 0 of every primary-screen image's anchor
+    /// row with [`SIXEL_CELL`] (unused on the primary screen), so the rows can
+    /// be found where alacritty's reflow puts them — it never splits column 0
+    /// off a row, nor merges the line-fed rows an image reserves. Returns the
+    /// tagged rows' absolute lines, ascending; none on the alt screen, where
+    /// the primary grid is out of reach (its images go, correct-or-absent).
+    #[cold]
+    #[inline(never)]
+    fn tag_image_rows(&mut self) -> Vec<i64> {
+        if self.placements.is_empty() || self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return Vec::new();
+        }
+        let top = self.abs_top;
+        let grid = self.term.grid_mut();
+        let lines = i64::from(grid.topmost_line().0)..=i64::from(grid.bottommost_line().0);
+        let mut rows: Vec<i64> = self.placements.iter().map(|p| p.abs_line).filter(|a| lines.contains(&(a - top))).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        for &abs in &rows {
+            grid[Line((abs - top) as i32)][Column(0)].flags.insert(SIXEL_CELL);
+        }
+        rows
+    }
+
+    /// After the reflow: the grid lines of the `n` rows [`Terminal::tag_image_rows`]
+    /// tagged, top to bottom, untagging them. `None` unless all `n` are found:
+    /// rows the reflow dropped (history overflow, empty rows below the cursor,
+    /// a wipe) leave no way to tell which image went with them.
+    #[cold]
+    #[inline(never)]
+    fn find_image_rows(&mut self, n: usize) -> Option<Vec<i32>> {
+        if n == 0 {
+            return None;
+        }
+        let grid = self.term.grid_mut();
+        let mut found = Vec::with_capacity(n);
+        for l in grid.topmost_line().0..=grid.bottommost_line().0 {
+            let flags = &mut grid[Line(l)][Column(0)].flags;
+            if flags.contains(SIXEL_CELL) {
+                flags.remove(SIXEL_CELL);
+                found.push(l);
+            }
+        }
+        (found.len() == n).then_some(found)
     }
 
     /// Whether the shell child process has exited (or the terminal requested
@@ -8983,14 +9044,81 @@ mod tests {
         assert_eq!((t.placements[0].image.width, t.placements[0].image.height), (1000, 3600));
     }
 
+    /// The absolute line (anchor space) of the row — history or screen — whose
+    /// text starts with `marker`.
+    fn abs_line_of(t: &Terminal, marker: &str) -> Option<i64> {
+        let grid = t.term.grid();
+        (grid.topmost_line().0..=grid.bottommost_line().0).find_map(|l| {
+            let row = &grid[Line(l)];
+            let text: String = (0..marker.len().min(t.cols)).map(|c| row[Column(c)].c).collect();
+            (text == marker).then_some(t.abs_top + l as i64)
+        })
+    }
+
     #[test]
-    fn resize_clears_placements() {
-        let mut t = Terminal::new(20, 5);
+    fn images_keep_their_rows_across_a_resize() {
+        // A window resize, F11, a font zoom or a detach reflows the grid, and it
+        // dropped every image, leaving its blank rows behind. kitty, WezTerm
+        // and foot keep them; so does JeTTY now, each on its own row.
+        let mut t = Terminal::new(20, 8);
         t.set_cell_px(10.0, 10.0);
-        t.feed(&sixel(RED_1X6));
-        assert_eq!(t.placements.len(), 1);
-        t.resize(30, 8); // reflow invalidates anchors
-        assert!(t.placements.is_empty(), "reflow drops placements (correct-or-absent)");
+        t.feed(b"m0\r\n");
+        t.feed(&sixel(RED_1X12));
+        t.feed(b"m1 ");
+        t.feed(&red_rgba_2x2(",c=3,r=2"));
+        t.feed(b"\r\n");
+        for (cols, rows) in [(30, 10), (12, 5), (40, 3), (20, 8)] {
+            t.resize(cols, rows);
+            assert_eq!(t.placements.len(), 2, "{cols}x{rows}");
+            assert_eq!(t.placements[0].abs_line, abs_line_of(&t, "m0").unwrap() + 1, "{cols}x{rows}");
+            assert_eq!(t.placements[1].abs_line, abs_line_of(&t, "m1").unwrap(), "{cols}x{rows}");
+            assert_eq!(t.placements[1].col, 3);
+        }
+        // Wiped by the prompt-scatter fix (a resize at a clean prompt): gone.
+        t.feed(b"\x1b[2J\x1b[3J\x1b[H");
+        assert!(t.placements.is_empty());
+    }
+
+    #[test]
+    fn images_never_land_on_another_row_after_a_resize() {
+        // Random output — long lines that rewrap, images under marker lines, a
+        // small scrollback — through random resizes: every image left is right
+        // under its marker. One may be dropped (correct-or-absent), never moved.
+        let mut r = Rng(0x1234_5678_9abc_def1);
+        let (mut carried, mut dropped) = (0, 0);
+        for _ in 0..80 {
+            let mut t = Terminal::new(10 + r.below(30), 3 + r.below(10));
+            t.set_cell_px(10.0, 10.0);
+            t.set_scrollback_lines(r.pick(&[0usize, 4, 20, 1000]));
+            let mut k = 0;
+            for _ in 0..30 {
+                match r.below(5) {
+                    0 => {
+                        k += 1;
+                        t.feed(format!("m{k}:\r\n").as_bytes());
+                        t.feed(&red_rgba_2x2(&format!(",i={k},c=2,r={}", 1 + r.below(3))));
+                    }
+                    1 => {
+                        t.feed(&vec![b'x'; r.below(90)]);
+                        t.feed(b"\r\n");
+                    }
+                    2 | 3 => {
+                        let before = t.placements.len();
+                        t.resize(10 + r.below(30), 3 + r.below(10));
+                        carried += t.placements.len();
+                        dropped += before - t.placements.len();
+                    }
+                    _ => t.feed(b"\r\n"),
+                }
+                for p in &t.placements {
+                    let marker = format!("m{}:", p.kitty_id.unwrap());
+                    if let Some(line) = abs_line_of(&t, &marker) {
+                        assert_eq!(p.abs_line, line + 1, "image {marker} moved");
+                    }
+                }
+            }
+        }
+        assert!(carried > 4 * dropped, "most images ride a resize: {carried} carried, {dropped} dropped");
     }
 
     #[test]
