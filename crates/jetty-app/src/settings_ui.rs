@@ -2307,11 +2307,18 @@ pub fn nav(stops: &[Stop], focus: Option<Stop>, key: NavKey, fine: bool, cfg: &C
 /// `dir` ±1 by a twentieth of the range (`fine`: a hundredth; a channel by
 /// 1/16, `fine` 1/255) — a slider at least until its readout changes — or
 /// to its end (`to_end`). Snapped to the slider's step and clamped; `None`
-/// for any other control.
+/// for any other control, and for a slider already at (or past) the end
+/// `dir` points to: a config value beyond the slider's range never moves
+/// against the key — the other key enters the range at that end.
 pub fn nudge(d: &Desc, part: CtlPart, cur: &Val, dir: f32, fine: bool, to_end: bool) -> Option<Val> {
     match (&d.kind, part) {
         (Kind::Slider { min, max, step, fmt, .. }, CtlPart::Track) => {
             let (min, max, step) = (*min, *max, *step);
+            let cur = cur.f();
+            let at_end = if dir < 0.0 { cur <= min } else { cur >= max };
+            if at_end {
+                return None;
+            }
             let snap = |v: f32| {
                 let v = if step > 0.0 { min + ((v - min) / step).round() * step } else { v };
                 v.clamp(min, max)
@@ -2319,10 +2326,13 @@ pub fn nudge(d: &Desc, part: CtlPart, cur: &Val, dir: f32, fine: bool, to_end: b
             if to_end {
                 return Some(Val::F(if dir < 0.0 { min } else { max }));
             }
+            if !(min..=max).contains(&cur) {
+                return Some(Val::F(cur.clamp(min, max)));
+            }
             let unit = (max - min) / if fine { 100.0 } else { 20.0 };
             let unit = if step > 0.0 { unit.max(step) } else { unit };
-            let shown = fmt(cur.f());
-            let mut v = snap(cur.f());
+            let shown = fmt(cur);
+            let mut v = snap(cur);
             for _ in 0..100 {
                 let next = snap(v + dir * unit);
                 if next == v {
@@ -3256,9 +3266,37 @@ mod tests {
         let angle = find("backdrop.angle").unwrap();
         let Some(Val::F(v)) = nudge(angle, CtlPart::Track, &Val::F(90.0), -1.0, false, false) else { panic!() };
         assert_eq!(v, 72.0, "a twentieth of 360°, on the 1° grid");
-        let Some(Val::F(v)) = nudge(angle, CtlPart::Track, &Val::F(0.0), -1.0, false, false) else { panic!() };
-        assert_eq!(v, 0.0, "clamped at the end");
+        assert_eq!(nudge(angle, CtlPart::Track, &Val::F(0.0), -1.0, false, false), None, "nothing past the end");
         assert_eq!(nudge(radius, CtlPart::Next, &Val::F(1.0), 1.0, false, false), None);
+    }
+
+    #[test]
+    fn a_slider_key_never_moves_the_value_against_it() {
+        // A config value can lie past a slider's range (minimum_contrast 1–21 on
+        // a 1–7 slider, the cursor trail's 1000 ms / 40 cells on 600 / 10): →
+        // dropped it to the slider's max, and saved that.
+        let contrast = find("minimum_contrast").unwrap();
+        let at = |cur: f32, dir: f32, to_end: bool| nudge(contrast, CtlPart::Track, &Val::F(cur), dir, false, to_end);
+        assert_eq!(at(10.0, 1.0, false), None, "→ past the max: nothing moves");
+        assert_eq!(at(10.0, 1.0, true), None, "End past the max: nothing moves");
+        assert_eq!(at(10.0, -1.0, false), Some(Val::F(7.0)), "← enters the range at its max");
+        assert_eq!(at(10.0, -1.0, true), Some(Val::F(1.0)), "Home goes to the min");
+        // Every slider, from inside, at and past both ends of its range.
+        for d in DESCS {
+            let Kind::Slider { min, max, .. } = d.kind else { continue };
+            let span = max - min;
+            for cur in [min - span, min, min + 0.33 * span, max - 0.01 * span, max, max + span] {
+                for (dir, fine, to_end) in [(1.0, false, false), (-1.0, false, false), (1.0, true, false), (-1.0, true, false), (1.0, false, true), (-1.0, false, true)] {
+                    match nudge(d, CtlPart::Track, &Val::F(cur), dir, fine, to_end) {
+                        None => {}
+                        Some(Val::F(v)) => {
+                            assert!((v - cur) * dir > 0.0, "{}: {cur} → {v} against the key ({dir})", d.id)
+                        }
+                        Some(v) => panic!("{}: a slider moved to {v:?}", d.id),
+                    }
+                }
+            }
+        }
     }
 
     /// The gallery's filter chips and the footer's "Reset tab" are reachable
