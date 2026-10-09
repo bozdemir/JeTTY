@@ -75,6 +75,20 @@ pub(crate) fn tracking(term: &Terminal) -> MouseTracking {
     MouseTracking::from_modes(term.mouse_x10(), term.mouse_mode(), term.mouse_drag(), term.mouse_motion())
 }
 
+/// The tracking mode a NEW gesture — a press, the wheel, a hover — is routed
+/// by: `Off` while the view is scrolled back into history, which the program
+/// can't see. A click there reached fzf's Ctrl+R (a primary-screen tracker) as
+/// a click on whatever live row sat under the pointer, and the wheel went to
+/// fzf instead of bringing the view back down. JeTTY keeps the mouse until the
+/// view is live again; a press the program already holds still ends there.
+pub(crate) fn gesture_tracking(term: &Terminal) -> MouseTracking {
+    if term.scroll_offset() > 0 {
+        MouseTracking::Off
+    } else {
+        tracking(term)
+    }
+}
+
 /// The report encoding the terminal's program asked for.
 pub(crate) fn encoding(term: &Terminal) -> MouseEncoding {
     MouseEncoding::from_modes(term.mouse_utf8(), term.mouse_sgr(), term.mouse_urxvt())
@@ -197,11 +211,13 @@ impl Grid<'_> {
         (self.pointer.0 as f32, self.pointer.1 as f32)
     }
 
-    /// The 1-based cell under the pointer, clamped to the grid (report
-    /// coordinates).
+    /// The 1-based cell under the pointer, clamped to the grid, on the
+    /// program's live screen (report coordinates): scrolled back `n` lines,
+    /// viewport row `r` shows live row `r - n`, and history clamps to row 1.
     fn report_cell(&self) -> (usize, usize) {
         let (x, y) = self.pointer_f32();
-        self.geom.report_cell(x, y, self.term.cols(), self.term.rows())
+        let (col, row) = self.geom.report_cell(x, y, self.term.cols(), self.term.rows());
+        (col, row.saturating_sub(self.term.scroll_offset()).max(1))
     }
 
     /// The 0-based viewport cell under the pointer (clamped) and whether the
@@ -289,7 +305,8 @@ pub(crate) enum Press {
 /// whether the link modifier (Ctrl; Cmd too on macOS) is held. Only a press on
 /// the grid band counts: one on the status strip below it (the perf HUD) is
 /// chrome, and clamping it onto the last row clicked htop's F9 Kill / F10 Quit
-/// bar or tmux's status line.
+/// bar or tmux's status line. Scrolled back, the press is JeTTY's
+/// ([`gesture_tracking`]).
 pub(crate) fn press(g: &mut Grid, button: MouseButton, link_mod: bool, now: Instant) -> Press {
     let Some(btn) = MouseBtn::from_winit(button) else { return Press::Ignored };
     if !g.geom.usable() || !g.geom.contains_y(g.pointer.1 as f32) {
@@ -305,7 +322,7 @@ pub(crate) fn press(g: &mut Grid, button: MouseButton, link_mod: bool, now: Inst
     }
     let has_selection =
         btn == MouseBtn::Right && g.term.selection_text().is_some_and(|t| !t.is_empty());
-    match route_press(tracking(g.term), shift, btn, has_selection) {
+    match route_press(gesture_tracking(g.term), shift, btn, has_selection) {
         Route::Program => {
             if !g.report(Some(btn), MouseAct::Press) {
                 return Press::Ignored;
@@ -404,7 +421,8 @@ pub(crate) struct Motion {
 /// The pointer moved: extend a local selection drag (arming the edge
 /// auto-scroll while the pointer is past the grid's top or bottom), or report
 /// the motion to a program that tracks it — 1002 while one of its buttons is
-/// held, 1003 always — once per cell.
+/// held, 1003 always (but not over history, [`gesture_tracking`]) — once per
+/// cell.
 pub(crate) fn motion(g: &mut Grid, now: Instant) -> Motion {
     if !g.geom.usable() {
         return Motion::default();
@@ -417,6 +435,9 @@ pub(crate) fn motion(g: &mut Grid, now: Instant) -> Motion {
         g.mouse.autoscroll = autoscroll_lines(g.geom, rows, g.pointer.1 as f32)
             .map(|lines| AutoScroll { lines, next });
         return Motion { paint: true };
+    }
+    if g.mouse.held == 0 && gesture_tracking(g.term) == MouseTracking::Off {
+        return Motion::default();
     }
     let cell = g.report_cell();
     if g.mouse.last_cell != Some(cell) {
@@ -465,7 +486,8 @@ pub(crate) enum Wheel {
 /// One wheel event. `vertical` is the window's line accumulator;
 /// `over_scrollbar` keeps the wheel on the host scrollback (the scrollbar is
 /// JeTTY's). Shift also always scrolls the host scrollback — the escape hatch
-/// out of a mouse-grabbing program.
+/// out of a mouse-grabbing program — and so does a view scrolled back
+/// ([`gesture_tracking`]): the wheel brings it back down first.
 pub(crate) fn wheel(
     g: &mut Grid,
     delta: MouseScrollDelta,
@@ -474,7 +496,7 @@ pub(crate) fn wheel(
 ) -> Wheel {
     let lines = vertical.add(input::wheel_lines(delta, g.geom.cell_h));
     let cols = g.mouse.hwheel.add(input::wheel_columns(delta, g.geom.cell_w));
-    let tracking = tracking(g.term);
+    let tracking = gesture_tracking(g.term);
     let shift = g.mods.shift_key();
     let wheel_report = MouseReport::new(Some(MouseBtn::WheelUp), MouseAct::Press);
     if !shift && !over_scrollbar && input::mouse_reportable(tracking, &wheel_report) {
@@ -927,6 +949,65 @@ mod tests {
         w.at(1.0, -2.0, NONE, |g| motion(g, next));
         w.at(1.0, -2.0, NONE, |g| release(g, MouseButton::Left));
         assert_eq!(w.mouse.autoscroll_due(), None);
+    }
+
+    /// 20 lines of output and then `setup`: an 8×4 grid with history.
+    fn with_history(setup: &[u8]) -> Win {
+        let mut feed = Vec::new();
+        for i in 0..20 {
+            feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        feed.extend_from_slice(setup);
+        Win::new(&feed)
+    }
+
+    #[test]
+    fn scrolled_back_new_gestures_are_jettys_until_the_view_is_live() {
+        // fzf's Ctrl+R (`--height`) tracks the mouse on the PRIMARY screen. A
+        // click in the history view reached it as a click on the live row under
+        // the pointer — an unrelated entry, which a double click accepted — and
+        // the wheel went to fzf too, so the view never came back down.
+        let line = |n: f32| MouseScrollDelta::LineDelta(0.0, n);
+        let mut acc = ScrollAccumulator::new();
+        let mut w = with_history(b"\x1b[?1003h\x1b[?1006h");
+        w.term.scroll_lines(3);
+        let (p, bytes) = w.at(1.0, 1.0, NONE, |g| press(g, MouseButton::Left, false, t0()));
+        assert_eq!((p, bytes.as_str()), (Press::Selecting, ""), "a press selects");
+        assert_eq!(w.at(1.0, 1.0, NONE, |g| release(g, MouseButton::Left)).1, "");
+        assert_eq!(w.at(1.0, 1.0, NONE, |g| press(g, MouseButton::Right, false, t0())), (Press::Menu, String::new()));
+        assert_eq!(
+            w.at(1.0, 1.0, NONE, |g| press(g, MouseButton::Middle, false, t0())),
+            (Press::PastePrimary, String::new())
+        );
+        assert_eq!(w.at(1.0, 1.0, NONE, |g| press(g, MouseButton::Back, false, t0())), (Press::Ignored, String::new()));
+        assert_eq!(w.at(3.0, 2.0, NONE, |g| motion(g, t0())).1, "", "no hover reports over history");
+        // The wheel scrolls the view — up further, then down to the live screen.
+        let (r, bytes) = w.at(0.0, 0.0, NONE, |g| wheel(g, line(1.0), false, &mut acc));
+        assert_eq!((r, bytes.as_str()), (Wheel::Scrolled, ""));
+        assert_eq!(w.term.scroll_offset(), 6);
+        for _ in 0..2 {
+            assert_eq!(w.at(0.0, 0.0, NONE, |g| wheel(g, line(-1.0), false, &mut acc)), (Wheel::Scrolled, String::new()));
+        }
+        assert_eq!(w.term.scroll_offset(), 0);
+        // Live again: the program gets the wheel, the hover and the press.
+        assert_eq!(w.at(0.0, 0.0, NONE, |g| wheel(g, line(-1.0), false, &mut acc)).1, "\x1b[<65;1;1M");
+        assert_eq!(w.at(3.0, 2.0, NONE, |g| motion(g, t0())).1, "\x1b[<35;4;3M");
+        assert_eq!(w.at(3.0, 2.0, NONE, |g| press(g, MouseButton::Left, false, t0())).1, "\x1b[<0;4;3M");
+    }
+
+    #[test]
+    fn scrolled_back_a_held_press_ends_on_the_live_screens_rows() {
+        // A press the program already holds still gets its drag and release
+        // (it must never see a stuck button) — at the LIVE row under the
+        // pointer: scrolled back one line, viewport row 3 shows live row 2, and
+        // a pointer over history is row 1.
+        let mut w = with_history(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(w.at(2.0, 1.0, NONE, |g| press(g, MouseButton::Left, false, t0())).1, "\x1b[<0;3;2M");
+        w.term.scroll_lines(1);
+        assert_eq!(w.at(2.0, 3.0, NONE, |g| motion(g, t0())).1, "\x1b[<32;3;3M");
+        assert_eq!(w.at(2.0, 0.0, NONE, |g| motion(g, t0())).1, "\x1b[<32;3;1M");
+        let (r, bytes) = w.at(2.0, 3.0, NONE, |g| release(g, MouseButton::Left));
+        assert_eq!((r, bytes.as_str()), (Release::Program { dragged: true }, "\x1b[<0;3;3m"));
     }
 
     #[test]

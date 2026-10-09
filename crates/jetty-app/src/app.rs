@@ -4534,7 +4534,8 @@ impl App {
         // explanation. Surface the Shift+drag hint alongside the menu —
         // deliberately BYPASSING the 25s drag-cooldown: an explicit request
         // for the menu over dimmed rows is a direct question, not a nag.
-        let tracking = crate::gridmouse::tracking(&self.active_tab().terminal);
+        // (Scrolled back, a plain drag selects: no hint.)
+        let tracking = crate::gridmouse::gesture_tracking(&self.active_tab().terminal);
         if !has_sel && tracking != input::MouseTracking::Off {
             if let Some(id) = self.window.as_ref().map(|w| w.id()) {
                 arm_shift_hint(&mut self.shift_hint_until, &mut self.shift_hint_cooldown, id, true);
@@ -4587,7 +4588,7 @@ impl App {
         // The v0.25.1 teachable moment, as in the main window: a menu opened
         // over a mouse-grabbing program with nothing selected gets the
         // Shift+drag hint right away.
-        if !has_sel && crate::gridmouse::tracking(&dw.tab.terminal) != input::MouseTracking::Off {
+        if !has_sel && crate::gridmouse::gesture_tracking(&dw.tab.terminal) != input::MouseTracking::Off {
             let id = dw.window.id();
             arm_shift_hint(&mut self.shift_hint_until, &mut self.shift_hint_cooldown, id, true);
         }
