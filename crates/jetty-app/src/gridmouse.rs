@@ -42,7 +42,7 @@ pub(crate) struct GridGeom {
     pub cell_w: f32,
     pub cell_h: f32,
     /// The window's DPI scale (physical px per logical px): the edge
-    /// auto-scroll zones are logical sizes.
+    /// auto-scroll zones and the multi-click slop are logical sizes.
     pub scale: f32,
 }
 
@@ -367,8 +367,10 @@ pub(crate) fn press(g: &mut Grid, button: MouseButton, link_mod: bool, now: Inst
 /// double click by word, a triple click by line — and the drag that follows
 /// extends in that unit.
 fn start_selection(g: &mut Grid, now: Instant) {
+    // The click slop is in logical px (a touchpad's taps land a few apart).
     let (x, y) = g.pointer_f32();
-    let count = g.mouse.clicks.press(MouseButton::Left, now, x, y);
+    let s = if g.geom.scale > 0.0 { g.geom.scale } else { 1.0 };
+    let count = g.mouse.clicks.press(MouseButton::Left, now, x / s, y / s);
     let (line, col, left_half) = g.select_cell();
     g.term.selection_clear();
     match count {
@@ -645,13 +647,15 @@ mod tests {
         mouse: GridMouse,
         selecting: bool,
         out: Vec<u8>,
+        /// [`GEOM`] unless a test changes it.
+        geom: GridGeom,
     }
 
     impl Win {
         fn new(setup: &[u8]) -> Self {
             let mut term = Terminal::new(8, 4);
             term.feed(setup);
-            Win { term, mouse: GridMouse::default(), selecting: false, out: Vec::new() }
+            Win { term, mouse: GridMouse::default(), selecting: false, out: Vec::new(), geom: GEOM }
         }
 
         /// Run `f` with the pointer over 0-based cell (col, row) and `mods`;
@@ -669,7 +673,7 @@ mod tests {
                 term: &mut self.term,
                 mouse: &mut self.mouse,
                 selecting: &mut self.selecting,
-                geom: GEOM,
+                geom: self.geom,
                 pointer,
                 mods,
                 out: &mut self.out,
@@ -844,6 +848,23 @@ mod tests {
         assert_eq!(click(&mut w, t + Duration::from_millis(300)), Release::Copy("ab cde fg\n".into()));
         // Too slow: a new single click.
         assert_eq!(click(&mut w, t + Duration::from_secs(2)), Release::Cleared);
+    }
+
+    #[test]
+    fn the_multi_click_slop_is_logical_pixels() {
+        // Two presses 8 physical px apart: at 1× they are two single clicks,
+        // at 2× (4 logical px) a double click. The slop was 5 PHYSICAL px —
+        // 2.5 logical at 2×, less than a tap-to-click touchpad moves between
+        // taps, so double / triple clicks hardly ever selected a word or line.
+        for (scale, second) in [(1.0, Release::Cleared), (2.0, Release::Copy("cde".into()))] {
+            let mut w = Win::new(b"ab cde fg");
+            w.geom.scale = scale;
+            let t = Instant::now();
+            w.at(3.0, 0.0, NONE, |g| press(g, MouseButton::Left, false, t));
+            w.at(3.0, 0.0, NONE, |g| release(g, MouseButton::Left));
+            w.at(3.8, 0.0, NONE, |g| press(g, MouseButton::Left, false, t + Duration::from_millis(150)));
+            assert_eq!(w.at(3.8, 0.0, NONE, |g| release(g, MouseButton::Left)).0, second, "@{scale}×");
+        }
     }
 
     #[test]

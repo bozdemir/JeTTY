@@ -11126,8 +11126,8 @@ impl App {
                                     Some((t, px, py))
                                         if now.duration_since(t)
                                             <= std::time::Duration::from_millis(400)
-                                            && (cx - px).abs() <= 5.0
-                                            && (cy - py).abs() <= 5.0
+                                            && (cx - px).abs() <= cm.dpx(5.0)
+                                            && (cy - py).abs() <= cm.dpx(5.0)
                                 );
                                 dw.last_bar_click = Some((now, cx, cy));
                                 if is_double {
@@ -14531,6 +14531,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // control, "+" or a close "×" leaves none to complete.
                     let now = std::time::Instant::now();
                     let last_click = self.last_strip_click.take();
+                    let slop = self.chrome_metrics().dpx(5.0);
 
                     // The drawn bar's hit geometry: same style (compact tabs are
                     // narrower), no perf reservation (the HUD lives in the status
@@ -14617,7 +14618,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // user's typing); leave the rename untouched.
                         let tab_id = self.tabs[i].id;
                         let target = StripTarget::Tab(tab_id);
-                        let is_double = strip_double_click(last_click, now, cx, cy, target);
+                        let is_double = strip_double_click(last_click, now, cx, cy, target, slop);
                         if is_double && self.renaming != Some(tab_id) {
                             self.take_keyboard(Surface::Main, Layer::Rename);
                             self.renaming = Some(tab_id);
@@ -14647,7 +14648,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // Empty strip space: commit any rename, then either maximize
                     // (double-click) or start an OS window move (single press).
                     self.commit_rename();
-                    if strip_double_click(last_click, now, cx, cy, StripTarget::Empty) {
+                    if strip_double_click(last_click, now, cx, cy, StripTarget::Empty, slop) {
                         // Same rule as the ▢ button above (amendment I-F).
                         if self.main_fullscreen {
                             self.set_main_fullscreen(false);
@@ -17264,23 +17265,25 @@ enum StripTarget {
 }
 
 /// Whether a strip press on `target` at `(x, y)` completes a double-click with
-/// the `last` one: within ~400 ms and ~5 px, on the same target. A quick second
-/// click on "+" lands on the tab the first one opened (its cell covers the old
-/// "+"); renaming that tab swallowed the next command typed into its title.
+/// the `last` one: within ~400 ms and `slop` px (5 logical), on the same
+/// target. A quick second click on "+" lands on the tab the first one opened
+/// (its cell covers the old "+"); renaming that tab swallowed the next command
+/// typed into its title.
 fn strip_double_click(
     last: Option<(std::time::Instant, f32, f32, StripTarget)>,
     now: std::time::Instant,
     x: f32,
     y: f32,
     target: StripTarget,
+    slop: f32,
 ) -> bool {
     matches!(
         last,
         Some((t, px, py, was))
             if was == target
                 && now.duration_since(t) <= std::time::Duration::from_millis(400)
-                && (x - px).abs() <= 5.0
-                && (y - py).abs() <= 5.0
+                && (x - px).abs() <= slop
+                && (y - py).abs() <= slop
     )
 }
 
@@ -18697,18 +18700,20 @@ mod strip_double_click_tests {
         let ms = |n| t + Duration::from_millis(n);
         let tab = |n| StripTarget::Tab(TabId(n));
         let last = Some((t, 100.0, 10.0, tab(1)));
-        assert!(strip_double_click(last, ms(300), 103.0, 12.0, tab(1)));
-        assert!(!strip_double_click(last, ms(401), 100.0, 10.0, tab(1)), "too slow");
-        assert!(!strip_double_click(last, ms(100), 106.0, 10.0, tab(1)), "too far");
+        assert!(strip_double_click(last, ms(300), 103.0, 12.0, tab(1), 5.0));
+        assert!(!strip_double_click(last, ms(401), 100.0, 10.0, tab(1), 5.0), "too slow");
+        assert!(!strip_double_click(last, ms(100), 106.0, 10.0, tab(1), 5.0), "too far");
+        // The slop is logical: 6 px is near enough at 2× (10 px of slop).
+        assert!(strip_double_click(last, ms(100), 106.0, 10.0, tab(1), 10.0));
         // Another target under the same spot: a tab that slid in, the strip.
-        assert!(!strip_double_click(last, ms(100), 100.0, 10.0, tab(2)));
-        assert!(!strip_double_click(last, ms(100), 100.0, 10.0, StripTarget::Empty));
+        assert!(!strip_double_click(last, ms(100), 100.0, 10.0, tab(2), 5.0));
+        assert!(!strip_double_click(last, ms(100), 100.0, 10.0, StripTarget::Empty, 5.0));
         let empty = Some((t, 100.0, 10.0, StripTarget::Empty));
-        assert!(strip_double_click(empty, ms(100), 100.0, 10.0, StripTarget::Empty));
-        assert!(!strip_double_click(empty, ms(100), 100.0, 10.0, tab(1)));
+        assert!(strip_double_click(empty, ms(100), 100.0, 10.0, StripTarget::Empty, 5.0));
+        assert!(!strip_double_click(empty, ms(100), 100.0, 10.0, tab(1), 5.0));
         // A press on "+" leaves no click to complete: the tab it opened, whose
         // cell now covers the old "+", is not renamed by the second click.
-        assert!(!strip_double_click(None, ms(100), 100.0, 10.0, tab(3)));
+        assert!(!strip_double_click(None, ms(100), 100.0, 10.0, tab(3), 5.0));
     }
 }
 
