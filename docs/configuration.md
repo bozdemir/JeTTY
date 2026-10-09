@@ -10,7 +10,9 @@ it does.
 | macOS | `~/Library/Application Support/jetty/config.toml` | `~/Library/Application Support/jetty/themes/*.toml` |
 
 `JETTY_CONFIG_DIR=/some/dir` uses `/some/dir/config.toml` and `/some/dir/themes/`
-instead; `jetty --help` prints the path in use. Every key is optional: a key you
+instead (a relative path is taken from the directory JeTTY starts in, and `~/…`
+is your home folder even where no shell expands it); `jetty --help` prints the
+path in use. Every key is optional: a key you
 leave out has its default, so a config file only needs the lines you want to
 change.
 

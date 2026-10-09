@@ -1149,12 +1149,6 @@ pub struct Loaded {
 }
 
 impl Config {
-    /// Resolve the JeTTY config DIRECTORY: `$JETTY_CONFIG_DIR` when set (a whole
-    /// alternate config tree — e.g. to try a setup without touching your own),
-    /// else `<config_dir>/jetty` (`~/.config/jetty` on Linux, `~/Library/
-    /// Application Support/jetty` on macOS), falling back to `~/.config/jetty` when
-    /// the OS dir is unknown. It holds `config.toml` and `themes/`; the hot-reload
-    /// watcher and the theme loader both key off it.
     /// Whether `$JETTY_CONFIG_DIR` points JeTTY at an alternate config tree (a
     /// setup being tried out): what belongs to the user's REAL session — the
     /// login item — is then left alone.
@@ -1162,15 +1156,38 @@ impl Config {
         std::env::var_os("JETTY_CONFIG_DIR").is_some_and(|d| !d.is_empty())
     }
 
+    /// Resolve the JeTTY config DIRECTORY: `$JETTY_CONFIG_DIR` when set (a whole
+    /// alternate config tree — e.g. to try a setup without touching your own;
+    /// always absolute, see [`absolute_dir`]), else `<config_dir>/jetty`
+    /// (`~/.config/jetty` on Linux, `~/Library/Application Support/jetty` on
+    /// macOS), falling back to `~/.config/jetty` when the OS dir is unknown. It
+    /// holds `config.toml` and `themes/`; the hot-reload watcher and the theme
+    /// loader both key off it.
     pub(crate) fn dir() -> PathBuf {
         if let Some(d) = std::env::var_os("JETTY_CONFIG_DIR").filter(|d| !d.is_empty()) {
-            return PathBuf::from(d);
+            return absolute_dir(Path::new(&d));
         }
         let base = dirs::config_dir().unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             PathBuf::from(home).join(".config")
         });
         base.join("jetty")
+    }
+
+    /// Spell a relative (or `~`) `$JETTY_CONFIG_DIR` out as the absolute path
+    /// [`Config::dir`] makes of it, so everything downstream agrees on the
+    /// folder: the IPC socket's name (a hash of it) and the shells, which
+    /// inherit the variable — after a `cd`, a `jetty --toggle` run in one
+    /// resolved the relative path to another folder, another socket, and
+    /// started a second instance. Sets an environment variable: call it
+    /// once, first thing, while the process has one thread.
+    pub(crate) fn pin_dir_env() {
+        if let Some(d) = std::env::var_os("JETTY_CONFIG_DIR").filter(|d| !d.is_empty()) {
+            let abs = Self::dir();
+            if abs.as_os_str() != d {
+                std::env::set_var("JETTY_CONFIG_DIR", abs);
+            }
+        }
     }
 
     /// The config file path: `<dir>/config.toml`.
@@ -1419,6 +1436,22 @@ impl Config {
         self.notify_min_seconds = self.notify_min_seconds.clamp(1, 86_400);
         // Effects floats are sanitized by `EffectsConfig::clamped` (see sanitized()).
     }
+}
+
+/// The folder `$JETTY_CONFIG_DIR = d` names: `~` and `~/…` are under the home
+/// folder (a .desktop file's `Exec=env JETTY_CONFIG_DIR=~/x jetty` has no
+/// shell to expand them — a folder literally named `~` was created), and a
+/// relative path is made absolute against the current directory: the watcher
+/// reports absolute paths, which never matched a relative dir, so hot reload
+/// was dead.
+fn absolute_dir(d: &Path) -> PathBuf {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from).or_else(dirs::home_dir);
+    let d = match (d.strip_prefix("~"), home) {
+        (Ok(rest), Some(home)) if rest.as_os_str().is_empty() => home,
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => d.to_path_buf(),
+    };
+    std::path::absolute(&d).unwrap_or(d)
 }
 
 // ── Per-key parsing helpers ──────────────────────────────────────────────────
@@ -2309,6 +2342,22 @@ mod tests {
         assert!(c.kitty_keyboard, "the kitty keyboard protocol is on by default");
         let off: Config = toml::from_str("kitty_keyboard = false").unwrap();
         assert!(!off.kitty_keyboard);
+    }
+
+    #[test]
+    fn an_alternate_config_dir_is_made_absolute_and_tilde_is_home() {
+        // `JETTY_CONFIG_DIR=./try` (hot reload compared the watcher's absolute
+        // paths with it and never matched) or `~/try` from a .desktop file's
+        // `Exec=env …` (no shell expands it: a literal `~` folder was made).
+        let cwd = std::env::current_dir().unwrap();
+        let home = std::env::var_os("HOME").map(PathBuf::from).or_else(dirs::home_dir).unwrap();
+        assert_eq!(absolute_dir(Path::new("/x/jetty")), PathBuf::from("/x/jetty"));
+        assert_eq!(absolute_dir(Path::new("try/jetty")), cwd.join("try/jetty"));
+        assert_eq!(absolute_dir(Path::new("./try")), cwd.join("try"));
+        assert_eq!(absolute_dir(Path::new("~/try")), home.join("try"));
+        assert_eq!(absolute_dir(Path::new("~")), home);
+        // Only `~` itself is the home folder (`~user` needs a shell).
+        assert_eq!(absolute_dir(Path::new("~bob/x")), cwd.join("~bob/x"));
     }
 
     #[test]

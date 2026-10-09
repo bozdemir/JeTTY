@@ -331,6 +331,9 @@ pub fn run() {
     // Advertise the real release version to spawned shells (`$JETTY` /
     // `$TERM_PROGRAM_VERSION`); jetty-core alone only knows its placeholder.
     jetty_core::set_advertised_version(version);
+    // A relative `JETTY_CONFIG_DIR` becomes the absolute folder it names here,
+    // before the IPC socket is named after it and the shells inherit it.
+    config::Config::pin_dir_env();
 
     // `--print-shell-integration <zsh|bash|fish>`: emit the OSC 133 opt-in
     // snippet and exit, BEFORE any IPC/GUI. Safe arg parsing — no panic on a
