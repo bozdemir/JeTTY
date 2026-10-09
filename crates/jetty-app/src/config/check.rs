@@ -611,7 +611,9 @@ fn similar_family<'a>(want: &str, families: &'a [String]) -> Option<&'a str> {
 /// first monospace family: rendering with the missing name would leave the
 /// grid to the font engine's own fallback, which need not be monospace at
 /// all. Names match in any letter case and are shown in their installed
-/// spelling. With nothing installed to compare with, `want` stays.
+/// spelling. With nothing installed to compare with, `want` stays. The
+/// default family falls back silently: it is not the user's choice, and a
+/// fresh install without it would otherwise be told so on every launch.
 pub(crate) fn pick_font_family(want: &str, mono: &[String], others: impl FnOnce() -> Vec<String>) -> FontPick {
     if let Some(f) = installed(want, mono) {
         return FontPick { shown: f.clone(), warning: None };
@@ -624,7 +626,8 @@ pub(crate) fn pick_font_family(want: &str, mono: &[String], others: impl FnOnce(
         return FontPick { shown: f.clone(), warning: None };
     }
     let fallback = installed(super::default_font_family().as_str(), mono).unwrap_or(&mono[0]).clone();
-    let warning = (!want.trim().is_empty()).then(|| {
+    let chosen = !want.trim().is_empty() && !want.eq_ignore_ascii_case(super::default_font_family().as_str());
+    let warning = chosen.then(|| {
         let hint = similar_family(want, mono).map(|f| format!(" — did you mean {f:?}?")).unwrap_or_default();
         format!("font_family {want:?} is not installed{hint} — showing {fallback:?} until it is")
     });
@@ -941,8 +944,12 @@ mod tests {
         assert!(w.contains("\"JetBrains Mono\" is not installed"), "{w}");
         assert!(w.contains("did you mean \"JetBrainsMono Nerd Font\"?"), "{w}");
         assert!(w.contains("showing \"MesloLGS NF\""), "{w}");
-        // Without MesloLGS NF, the first monospace family.
+        // Without MesloLGS NF, the first monospace family — silently for the
+        // default, which the user never chose …
         let p = pick_font_family("MesloLGS NF", &fams(&["DejaVu Sans Mono", "Hack"]), none);
+        assert_eq!(p, FontPick { shown: "DejaVu Sans Mono".into(), warning: None });
+        // … and with a warning for a family the user picked.
+        let p = pick_font_family("Fira Code", &fams(&["DejaVu Sans Mono", "Hack"]), none);
         assert_eq!(p.shown, "DejaVu Sans Mono");
         assert!(p.warning.unwrap().contains("not installed"));
         // An empty name is the fallback, silently; nothing to compare with keeps it.

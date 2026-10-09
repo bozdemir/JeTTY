@@ -12036,6 +12036,7 @@ impl ApplicationHandler<AppEvent> for App {
                 text.proportional_families()
             });
             if pick.shown != self.font_family {
+                eprintln!("jetty: font {:?} is not installed — using {:?}", self.font_family, pick.shown);
                 text.set_font_family(&pick.shown);
                 self.font_family = pick.shown;
             }
