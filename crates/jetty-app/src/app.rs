@@ -1528,6 +1528,9 @@ pub struct App {
     tab_hover: Option<usize>,
     /// The wheel over the tab strip flips through the tabs (`tabmeta::TabWheel`).
     tab_wheel: crate::tabmeta::TabWheel,
+    /// The main window's size across scale-factor changes
+    /// (`jetty_platform::dpi_change_size`).
+    main_dpi_size: Option<jetty_platform::DpiSize>,
     /// The focus-ring pass on the MAIN device, built on the first frame that
     /// draws a ring (`window_border` on) — never in `resumed`.
     focus_ring: Option<jetty_render::FocusRing>,
@@ -2102,6 +2105,7 @@ impl App {
             tab_title_mode: crate::tabmeta::TabTitleMode::Osc,
             tab_hover: None,
             tab_wheel: crate::tabmeta::TabWheel::default(),
+            main_dpi_size: None,
             focus_ring: None,
             title_recheck_at: None,
             cursor_cfg: crate::config::CursorConfig::default(),
@@ -3809,6 +3813,46 @@ impl App {
         } else {
             0.0
         }
+    }
+
+    /// The main window's physical size after its scale factor changes to
+    /// `new_scale`. A shape derived from the monitor keeps its physical size —
+    /// the Dropdown strip, fullscreen, a maximized window — while any other
+    /// keeps its LOGICAL size inside the monitor (`jetty_platform::
+    /// dpi_change_size`, which also absorbs winit's repeated X11 event and a
+    /// window manager's clamp) and is centred again: a clamp may have pushed
+    /// it into the corner, and a saved position from the old scale no longer
+    /// names the same spot.
+    fn main_size_for_scale(&mut self, new_scale: f64) -> Option<winit::dpi::PhysicalSize<u32>> {
+        let win = self.window.clone()?;
+        let current = win.inner_size();
+        if self.main_fullscreen || win.is_maximized() || self.window_mode == WindowMode::Dropdown {
+            self.main_dpi_size = None;
+            return Some(current);
+        }
+        let monitor = jetty_platform::monitor_for_window(&win).map(|m| (m.size().width, m.size().height));
+        let d = jetty_platform::dpi_change_size(
+            (current.width, current.height),
+            win.scale_factor(),
+            new_scale,
+            self.main_dpi_size,
+            monitor,
+            jetty_platform::MIN_TERMINAL_SIZE,
+        );
+        self.main_dpi_size = Some(d);
+        let size = winit::dpi::PhysicalSize::new(d.requested.0, d.requested.1);
+        if size != current {
+            self.last_pos = None;
+            if self.visible {
+                // Re-asserted on the next frames like a summon's position: the
+                // move lands before the resize, while the window still has its
+                // old size, and a window manager keeping it on screen shifts it
+                // (KWin did: centred for 1000×640 while still 1728×972).
+                self.pending_center_pos = center_window_sized(&win, Some(size));
+                self.pending_center_frames = if self.pending_center_pos.is_some() { 5 } else { 0 };
+            }
+        }
+        Some(size)
     }
 
     /// Whether the pointer is over the main window's tab strip.
@@ -10586,7 +10630,7 @@ impl App {
                     _ => {}
                 }
             }
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+            WindowEvent::ScaleFactorChanged { scale_factor, mut inner_size_writer } => {
                 // Moved to a different-DPI monitor: re-scale the fonts in place
                 // (no fontconfig rescan) and arm the debounced reflow — the
                 // surface resize + grid reflow follow in the Resized event
@@ -10596,6 +10640,28 @@ impl App {
                 let font_logical = self.font_logical;
                 let ui_font_logical = self.ui_font_logical;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
+                // Its size at the new scale: the logical size kept inside the
+                // monitor, never winit's suggestion (applied twice on X11 — see
+                // `jetty_platform::dpi_change_size`); fullscreen / maximized
+                // keep the monitor-derived physical size.
+                let current = dw.window.inner_size();
+                let size = if dw.fullscreen || dw.window.is_maximized() {
+                    dw.dpi_size = None;
+                    current
+                } else {
+                    let monitor = jetty_platform::monitor_for_window(&dw.window).map(|m| (m.size().width, m.size().height));
+                    let d = jetty_platform::dpi_change_size(
+                        (current.width, current.height),
+                        dw.window.scale_factor(),
+                        scale_factor,
+                        dw.dpi_size,
+                        monitor,
+                        jetty_platform::MIN_TERMINAL_SIZE,
+                    );
+                    dw.dpi_size = Some(d);
+                    winit::dpi::PhysicalSize::new(d.requested.0, d.requested.1)
+                };
+                let _ = inner_size_writer.request_inner_size(size);
                 dw.text.set_font_size(font_logical * scale);
                 dw.chrome_text.set_font_size(ui_font_logical * scale);
                 dw.reflow_pending_at =
@@ -11323,7 +11389,20 @@ impl App {
                 }
                 self.request_settings_paint();
             }
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+            WindowEvent::ScaleFactorChanged { scale_factor, mut inner_size_writer } => {
+                // Its content-fitted logical size at the new scale, inside the
+                // monitor — never winit's `current × new/old` suggestion, which its
+                // X11 backend applies twice per change (`jetty_platform::
+                // dpi_change_size`).
+                let (lw, lh) = self.desired_settings_logical_size();
+                let monitor = self
+                    .settings_window
+                    .as_ref()
+                    .and_then(|w| jetty_platform::monitor_for_window(w))
+                    .map(|m| (m.size().width, m.size().height));
+                let (pw, ph) =
+                    jetty_platform::dpi_physical((f64::from(lw), f64::from(lh)), scale_factor, monitor, jetty_platform::MIN_SETTINGS_SIZE);
+                let _ = inner_size_writer.request_inner_size(winit::dpi::PhysicalSize::new(pw, ph));
                 let scale = scale_factor as f32;
                 // CAPPED UI size ([13,17] * scale): the panel body text stays within
                 // the fixed window. Re-scale in place (reusing the FontSystem) so a
@@ -12854,7 +12933,12 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 self.request_main_paint();
             }
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+            WindowEvent::ScaleFactorChanged { scale_factor, mut inner_size_writer } => {
+                // The window's size at the new scale: its logical size kept, not
+                // winit's suggestion (see `main_size_for_scale`).
+                if let Some(size) = self.main_size_for_scale(scale_factor) {
+                    let _ = inner_size_writer.request_inner_size(size);
+                }
                 // Fired when the window is moved between monitors with different DPI.
                 // Rebuild TextLayer with the new physical font size (logical * new
                 // scale). The surface has NOT resized yet — gpu.resize() only runs

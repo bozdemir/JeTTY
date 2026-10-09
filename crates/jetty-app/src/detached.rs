@@ -446,6 +446,9 @@ pub(crate) struct DetachedWindow {
     /// The hovered 0-based grid cell the cache above was computed for.
     /// Mirrors `App::link_hover_cell`.
     pub link_hover_cell: Option<(usize, usize)>,
+    /// This window's size across scale-factor changes (mirrors
+    /// `App::main_dpi_size`; see `jetty_platform::dpi_change_size`).
+    pub dpi_size: Option<jetty_platform::DpiSize>,
 }
 
 impl DetachedWindow {
@@ -614,6 +617,7 @@ impl DetachedWindow {
             bell_anim: None,
             bell_limit: crate::motion::RateLimit::default(),
             pulse_anim: None,
+            dpi_size: None,
         })
     }
 

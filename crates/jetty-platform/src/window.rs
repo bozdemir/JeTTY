@@ -22,6 +22,11 @@ fn app_icon() -> Option<Icon> {
     Icon::from_rgba(buf, info.width, info.height).ok()
 }
 
+/// The smallest a terminal window (main or detached) may be, in logical px.
+pub const MIN_TERMINAL_SIZE: (f64, f64) = (200.0, 120.0);
+/// The smallest the Settings window may be, in logical px.
+pub const MIN_SETTINGS_SIZE: (f64, f64) = (200.0, 200.0);
+
 /// Build the main window: a borderless (client-side decorations) window with
 /// our custom titlebar + the JeTTY app icon.
 ///
@@ -53,7 +58,7 @@ pub fn build_window_with_visibility(
         .with_window_icon(app_icon())
         .with_inner_size(LogicalSize::new(size.0, size.1))
         .with_resizable(true)
-        .with_min_inner_size(LogicalSize::new(200.0_f64, 120.0_f64))
+        .with_min_inner_size(LogicalSize::new(MIN_TERMINAL_SIZE.0, MIN_TERMINAL_SIZE.1))
         // Client-side decorations: drop the OS title bar/frame and draw our own
         // custom titlebar (min/max/close + drag) in the tab strip. Transparency
         // keeps the runtime opacity working and the rounded corners.
@@ -79,7 +84,7 @@ pub fn build_fixed_window(
         .with_title(title)
         .with_window_icon(app_icon())
         .with_inner_size(LogicalSize::new(size.0, size.1))
-        .with_min_inner_size(LogicalSize::new(200u32, 200u32))
+        .with_min_inner_size(LogicalSize::new(MIN_SETTINGS_SIZE.0, MIN_SETTINGS_SIZE.1))
         .with_resizable(true);
     event_loop.create_window(attrs).map(Arc::new)
 }
@@ -273,6 +278,74 @@ pub fn activate_window(win: &Window) {
     win.focus_window();
 }
 
+/// What a window keeps across scale-factor (DPI) changes: its size in LOGICAL
+/// px — the size the user chose — and the PHYSICAL size last requested for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DpiSize {
+    pub logical: (f64, f64),
+    pub requested: (u32, u32),
+}
+
+/// Most of the monitor a scale change may size a window to: the rest leaves
+/// room for panels, so the window manager has no reason to clamp the request
+/// (a clamp would lose the size the window comes back to).
+const DPI_MAX_MONITOR_FRACTION: f64 = 0.9;
+
+/// The size a window takes when its scale factor changes to `new_scale`,
+/// given its `current` physical size, the scale that size is at
+/// (`current_scale`: the window's own `scale_factor()` when the event arrives —
+/// on X11 still the old scale for the first event and the new one for the
+/// repeat, on Wayland and macOS already the new one) and what the previous
+/// change requested (`prev`).
+///
+/// The window keeps its LOGICAL size. That is `prev.logical` while the window
+/// still has the size `prev` requested — so neither a clamp nor a repeated
+/// event can erode it — and otherwise `current / current_scale` (the user
+/// resized it since). Why not winit's own suggestion (`current ×
+/// new/old`): its X11 backend delivers every Xft.dpi change twice — the second
+/// time from the next ConfigureNotify, with its cached monitor scale still the
+/// old one — so following it applied the factor twice; and a window manager
+/// clamping the scaled-up size to the screen lost the size on the way back.
+/// Live (Xvfb + KWin, 1× → 2.25× → 1×) a 1000×640 window ended at 379×213.
+///
+/// The physical size is [`dpi_physical`]: clamped inside `monitor` (physical
+/// px) and above `min_logical` at the new scale. Pure, so the whole sequence is
+/// a unit test.
+pub fn dpi_change_size(
+    current: (u32, u32),
+    current_scale: f64,
+    new_scale: f64,
+    prev: Option<DpiSize>,
+    monitor: Option<(u32, u32)>,
+    min_logical: (f64, f64),
+) -> DpiSize {
+    let old = sane_scale(current_scale);
+    let logical = match prev {
+        Some(p) if p.requested == current => p.logical,
+        _ => (f64::from(current.0) / old, f64::from(current.1) / old),
+    };
+    DpiSize { logical, requested: dpi_physical(logical, new_scale, monitor, min_logical) }
+}
+
+/// `logical` at `scale` in physical px, at most [`DPI_MAX_MONITOR_FRACTION`] of
+/// `monitor` and at least `min_logical` (also scaled).
+pub fn dpi_physical(logical: (f64, f64), scale: f64, monitor: Option<(u32, u32)>, min_logical: (f64, f64)) -> (u32, u32) {
+    let s = sane_scale(scale);
+    let fit = |len: f64, mon: Option<u32>, min: f64| {
+        let max = mon.map_or(f64::INFINITY, |m| (f64::from(m) * DPI_MAX_MONITOR_FRACTION).floor());
+        (len * s).min(max).max(min * s).round() as u32
+    };
+    (fit(logical.0, monitor.map(|m| m.0), min_logical.0), fit(logical.1, monitor.map(|m| m.1), min_logical.1))
+}
+
+fn sane_scale(s: f64) -> f64 {
+    if s.is_finite() && s > 0.0 {
+        s
+    } else {
+        1.0
+    }
+}
+
 /// What hiding a window does on its display server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HideKind {
@@ -360,6 +433,83 @@ mod x11 {
         // connection lingered). `check` also surfaces an X error (BadWindow).
         .check()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dpi_tests {
+    use super::{dpi_change_size, dpi_physical, DpiSize};
+
+    const MON: Option<(u32, u32)> = Some((1920, 1080));
+    const MIN: (f64, f64) = (200.0, 120.0);
+
+    /// One `ScaleFactorChanged`, then the window manager answering with the
+    /// size it really gives the window (`wm` clamps a request to the screen,
+    /// like KWin does).
+    fn change(
+        current_scale: f64,
+        new: f64,
+        current: (u32, u32),
+        prev: Option<DpiSize>,
+        wm: impl Fn((u32, u32)) -> (u32, u32),
+    ) -> (DpiSize, (u32, u32)) {
+        let d = dpi_change_size(current, current_scale, new, prev, MON, MIN);
+        (d, wm(d.requested))
+    }
+
+    #[test]
+    fn a_scale_change_and_back_restores_the_window_size() {
+        // The live repro (Xvfb + KWin, Xft.dpi 96 → 216 → 96): winit's X11
+        // backend sends every change TWICE (the second from the next
+        // ConfigureNotify, its cached monitor scale still the old one), each
+        // suggesting `current × new/old`. Followed blindly, with KWin clamping
+        // the 2.25× size to the screen in between, the 1000×640 window ended at
+        // 379×213 in the corner.
+        let screen = |(w, h): (u32, u32)| (w.min(1920), h.min(1080));
+        let (d1, size) = change(1.0, 2.25, (1000, 640), None, screen);
+        assert_eq!(d1.logical, (1000.0, 640.0));
+        assert!(size.0 <= 1920 && size.1 <= 1080, "stays on the screen: {size:?}");
+        // winit's duplicate (the window's scale already 2.25): nothing more.
+        let (d2, size2) = change(2.25, 2.25, size, Some(d1), screen);
+        assert_eq!((d2.requested, size2), (size, size), "no second scaling");
+        // Back to 1×: the size the user had, not the clamped one shrunk.
+        let (d3, size3) = change(2.25, 1.0, size2, Some(d2), screen);
+        assert_eq!(size3, (1000, 640));
+        let (_, size4) = change(1.0, 1.0, size3, Some(d3), screen);
+        assert_eq!(size4, (1000, 640), "the duplicate on the way back too");
+    }
+
+    #[test]
+    fn a_size_that_fits_keeps_its_logical_size_exactly() {
+        let big = Some((3840, 2160));
+        let d = dpi_change_size((800, 500), 1.0, 2.0, None, big, MIN);
+        assert_eq!(d.requested, (1600, 1000));
+        let back = dpi_change_size((1600, 1000), 2.0, 1.0, Some(d), big, MIN);
+        assert_eq!(back.requested, (800, 500));
+        // Wayland / macOS: the size is already at the new scale when the event
+        // comes — the logical size is the same, nothing is scaled twice.
+        let wl = dpi_change_size((1600, 1000), 2.0, 2.0, None, big, MIN);
+        assert_eq!((wl.logical, wl.requested), ((800.0, 500.0), (1600, 1000)));
+    }
+
+    #[test]
+    fn a_resize_by_the_user_between_changes_is_the_new_intent() {
+        let big = Some((3840, 2160));
+        let d = dpi_change_size((800, 500), 1.0, 2.0, None, big, MIN);
+        // The user dragged the window to 1400×900 at 2×: that is the size to keep.
+        let back = dpi_change_size((1400, 900), 2.0, 1.0, Some(d), big, MIN);
+        assert_eq!((back.logical, back.requested), ((700.0, 450.0), (700, 450)));
+    }
+
+    #[test]
+    fn the_physical_size_is_clamped_inside_the_monitor_and_above_the_minimum() {
+        // 90% of the monitor at most: room for panels, so the WM need not clamp.
+        assert_eq!(dpi_physical((1000.0, 640.0), 2.25, MON, MIN), (1728, 972));
+        assert_eq!(dpi_physical((1000.0, 640.0), 2.0, None, MIN), (2000, 1280), "no monitor: no clamp");
+        assert_eq!(dpi_physical((50.0, 40.0), 2.0, MON, MIN), (400, 240), "the min size scales too");
+        // Bogus scales fall back to 1.
+        assert_eq!(dpi_physical((1000.0, 640.0), f64::NAN, MON, MIN), (1000, 640));
+        assert_eq!(dpi_physical((1000.0, 640.0), 0.0, MON, MIN), (1000, 640));
     }
 }
 
