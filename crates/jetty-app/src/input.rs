@@ -646,9 +646,13 @@ fn encode_legacy(
     // Keyed on the LOGICAL character, not the physical position: physical codes
     // are hardware QWERTY positions, so keying letters on them sends the wrong
     // control code on Dvorak/AZERTY/QWERTZ — Ctrl at the key LABELED C must be
-    // 0x03, not TAB. Fall back to the physical position (ctrl_byte) only when the
-    // logical key is non-ASCII (Cyrillic/Greek/CJK) or Unidentified; ctrl_byte
-    // also owns the C0 symbol combos Ctrl+Space/[/\/] (NUL/ESC/FS/GS).
+    // 0x03, not TAB. A typed ASCII character decides ALONE ([`ctrl_char_byte`]:
+    // its C0 code, or nothing — then the character itself goes out below, as in
+    // xterm). Only a key that typed no ASCII character (Cyrillic/Greek/CJK, the
+    // Turkish ğ/ü/ı, a dead or Unidentified key, Space) falls back to its US
+    // position (ctrl_byte). Falling back for ASCII punctuation too sent the US
+    // key's byte at that spot: Ctrl+; on Turkish-Q and Ctrl+# on German were FS
+    // (0x1c, SIGQUIT), Ctrl+; on Dvorak SUB (0x1a, SIGTSTP).
     //
     // Applies REGARDLESS of shift: Ctrl+Shift+C == Ctrl+C for control purposes
     // (both → 0x03). The explicit Ctrl+Shift app shortcuts (C/V/T/W/…) are
@@ -656,42 +660,19 @@ fn encode_legacy(
     //
     // When Alt/Meta is also held, the control byte is ESC-prefixed (the classic
     // "Meta sends Escape" convention), e.g. Ctrl+Alt+b → ESC + 0x02.
-    //
-    // Symbol control bytes are keyed on the logical character too: "/"|"_" → 0x1f
-    // (US unit separator — readline/emacs undo; Ctrl+Shift+- produces "_"),
-    // "@" → 0x00 (NUL), "^" → 0x1e (RS), "?" → 0x7f (DEL). Physical Slash produces
-    // "-" on German layouts, which must keep falling through to the literal "-".
     if ctrl {
-        let logical_byte = match logical {
-            Key::Character(s) if s.chars().count() == 1 => {
-                let c = s.chars().next().unwrap();
-                if c.is_ascii_alphabetic() {
-                    Some(c.to_ascii_uppercase() as u8 - b'A' + 1)
-                } else {
-                    match c {
-                        '/' | '_' => Some(0x1f),
-                        '@' => Some(0x00),
-                        '^' => Some(0x1e),
-                        '?' => Some(0x7f),
-                        _ => None,
-                    }
-                }
-            }
-            _ => None,
+        let byte = match logical {
+            Key::Character(s) if s.is_ascii() => single_char(s).and_then(ctrl_char_byte),
+            _ => match physical {
+                PhysicalKey::Code(code) => ctrl_byte(code),
+                PhysicalKey::Unidentified(_) => None,
+            },
         };
-        if let Some(b) = logical_byte {
+        if let Some(b) = byte {
             if alt {
                 return Some(vec![0x1b, b]);
             }
             return Some(vec![b]);
-        }
-        if let PhysicalKey::Code(code) = physical {
-            if let Some(b) = ctrl_byte(code) {
-                if alt {
-                    return Some(vec![0x1b, b]);
-                }
-                return Some(vec![b]);
-            }
         }
     }
 
@@ -906,11 +887,31 @@ pub fn point_in(r: &jetty_render::Rect, x: f32, y: f32) -> bool {
     x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h
 }
 
+/// The control byte Ctrl turns a typed ASCII character into: letters → 1..=26
+/// (Ctrl+C = SIGINT, Ctrl+D = EOF, …), and the C0 symbols by xterm's Control
+/// rule (`@` NUL; `[` `{` ESC; `\` `|` FS; `]` `}` GS; `^` `~` RS; `_` US),
+/// plus `/` → US (readline / emacs undo, Ctrl+Shift+- produces `_` too) and
+/// `?` → DEL as kitty sends them. `None`: Ctrl doesn't change this character
+/// (`;` `#` `'` `.` digits `` ` `` …) — it is typed as is.
+fn ctrl_char_byte(c: char) -> Option<u8> {
+    Some(match c {
+        'a'..='z' | 'A'..='Z' => c.to_ascii_uppercase() as u8 - b'@',
+        '@' => 0x00,
+        '[' | '{' => 0x1b,
+        '\\' | '|' => 0x1c,
+        ']' | '}' => 0x1d,
+        '^' | '~' => 0x1e,
+        '_' | '/' => 0x1f,
+        '?' => 0x7f,
+        _ => return None,
+    })
+}
+
 /// Map a physical key to its Ctrl control byte: Ctrl+A=1 .. Ctrl+Z=26 (so
 /// Ctrl+C=3=SIGINT, Ctrl+D=4=EOF, Ctrl+Z=26, Ctrl+L=12=clear), plus the remaining
 /// C0 symbol combos: Ctrl+Space=0x00 (NUL), Ctrl+[=0x1b (ESC), Ctrl+\=0x1c (FS),
-/// Ctrl+]=0x1d (GS). Uses the physical key position, so it is independent of the
-/// keyboard layout.
+/// Ctrl+]=0x1d (GS). Uses the US key at that position — only for keys that typed
+/// no ASCII character (see `encode_legacy`).
 fn ctrl_byte(code: KeyCode) -> Option<u8> {
     use KeyCode::*;
     let n: u8 = match code {
@@ -2760,6 +2761,72 @@ mod tests {
             false, false, false,
         );
         assert_ne!(action, KeyAction::Send(vec![0x1f]));
+    }
+
+    #[test]
+    fn ctrl_symbols_follow_the_typed_character_not_the_us_key_position() {
+        // xkb ground truth (live on Xvfb, `setxkbmap tr` / `de` / `fr` /
+        // `us -variant dvorak`): the key's position and what it types there.
+        // A typed ASCII character decides alone — its C0 code when it has one
+        // (xterm's Control rule), else the character itself. The US key at that
+        // POSITION used to answer instead: Ctrl+; on Turkish-Q and Ctrl+# on
+        // German sent FS (0x1c, SIGQUIT), Ctrl+; on Dvorak SUB (0x1a, SIGTSTP).
+        let k = |ctrl_shift: bool, at: KeyCode, typed: &'static str| {
+            dk(true, ctrl_shift, false, make_physical(at), &make_logical_char(typed), false, false, false)
+        };
+        let send = |b: &[u8]| KeyAction::Send(b.to_vec());
+        for (shift, at, typed, want, layout) in [
+            // Turkish-Q: `,` / `;` at Backslash; AltGr symbols (AltGr isn't Alt).
+            (true, KeyCode::Backslash, ";", &b";"[..], "tr Ctrl+;"),
+            (false, KeyCode::BracketRight, "~", b"\x1e", "tr Ctrl+AltGr+ü (~)"),
+            (false, KeyCode::Minus, "\\", b"\x1c", "tr Ctrl+AltGr+* (\\)"),
+            (false, KeyCode::Equal, "|", b"\x1c", "tr Ctrl+AltGr+- (|)"),
+            // German QWERTZ: `#` / `'` at Backslash.
+            (false, KeyCode::Backslash, "#", b"#", "de Ctrl+#"),
+            (true, KeyCode::Backslash, "'", b"'", "de Ctrl+'"),
+            (false, KeyCode::Minus, "\\", b"\x1c", "de Ctrl+AltGr+ß (\\)"),
+            (false, KeyCode::BracketRight, "~", b"\x1e", "de Ctrl+AltGr++ (~)"),
+            // AZERTY: `*` at Backslash, `$` at BracketRight.
+            (false, KeyCode::Backslash, "*", b"*", "fr Ctrl+*"),
+            (false, KeyCode::BracketRight, "$", b"$", "fr Ctrl+$"),
+            // Dvorak: punctuation on US letter / bracket positions.
+            (false, KeyCode::KeyQ, "'", b"'", "dvorak Ctrl+'"),
+            (false, KeyCode::KeyE, ".", b".", "dvorak Ctrl+."),
+            (false, KeyCode::KeyZ, ";", b";", "dvorak Ctrl+;"),
+            (false, KeyCode::Minus, "[", b"\x1b", "dvorak Ctrl+["),
+            (false, KeyCode::Equal, "]", b"\x1d", "dvorak Ctrl+]"),
+            (true, KeyCode::Minus, "{", b"\x1b", "dvorak Ctrl+{"),
+            // US: the C0 symbols (and their shifted twins) keep their bytes.
+            (false, KeyCode::BracketLeft, "[", b"\x1b", "us Ctrl+["),
+            (false, KeyCode::Backslash, "\\", b"\x1c", "us Ctrl+\\"),
+            (false, KeyCode::BracketRight, "]", b"\x1d", "us Ctrl+]"),
+            (true, KeyCode::BracketLeft, "{", b"\x1b", "us Ctrl+{"),
+            (true, KeyCode::Backslash, "|", b"\x1c", "us Ctrl+|"),
+            (true, KeyCode::BracketRight, "}", b"\x1d", "us Ctrl+}"),
+            (true, KeyCode::Backquote, "~", b"\x1e", "us Ctrl+~"),
+            (false, KeyCode::Semicolon, ";", b";", "us Ctrl+;"),
+            (false, KeyCode::Backquote, "`", b"`", "us Ctrl+`"),
+            // Non-ASCII letters keep the US position (Turkish-Q ğ / ü / ı,
+            // German ü): the documented fallback for keys with no ASCII label.
+            (false, KeyCode::BracketLeft, "ğ", b"\x1b", "tr Ctrl+ğ"),
+            (false, KeyCode::BracketRight, "ü", b"\x1d", "tr Ctrl+ü"),
+            (false, KeyCode::KeyI, "ı", b"\x09", "tr Ctrl+ı"),
+            (false, KeyCode::Semicolon, "ş", "ş".as_bytes(), "tr Ctrl+ş"),
+            (false, KeyCode::BracketLeft, "ü", b"\x1b", "de Ctrl+ü"),
+        ] {
+            assert_eq!(k(shift, at, typed), send(want), "{layout}");
+        }
+        // With Alt the same byte is ESC-prefixed; a plain character too.
+        let ctrl_alt = |at: KeyCode, typed: &'static str| {
+            dk(true, false, true, make_physical(at), &make_logical_char(typed), false, false, false)
+        };
+        assert_eq!(ctrl_alt(KeyCode::KeyZ, ";"), send(b"\x1b;"), "dvorak Ctrl+Alt+;");
+        assert_eq!(ctrl_alt(KeyCode::Minus, "["), send(b"\x1b\x1b"), "dvorak Ctrl+Alt+[");
+        // Space has no character: its position still gives NUL.
+        assert_eq!(
+            dk(true, false, false, make_physical(KeyCode::Space), &Key::Named(NamedKey::Space), false, false, false),
+            send(b"\x00")
+        );
     }
 
     // ── Modified Home/End/Delete/Insert (C5) ────────────────────────────────
