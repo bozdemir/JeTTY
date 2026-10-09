@@ -867,6 +867,19 @@ impl ImagePlacement {
             && self.col >= other.col
             && self.col + self.cols <= other.col + other.cols
     }
+
+    /// Put the image's left edge at cursor column `col` of a `cols`-wide grid:
+    /// a sixel starts there and is cut at the grid's edge, as in xterm; a Kitty
+    /// image moves left to fit (A8).
+    fn anchor_at(&mut self, col: usize, cols: usize) {
+        let (col, cols) = (col.min(cols - 1) as u16, cols as u16);
+        if self.is_kitty {
+            self.col = col.min(cols.saturating_sub(self.cols));
+        } else {
+            self.col = col;
+            self.cols = self.cols.min(cols - col);
+        }
+    }
 }
 
 /// One finished shell command, surfaced from an OSC 133 `D` mark. The tab index /
@@ -2876,28 +2889,24 @@ impl Terminal {
     }
 
     /// Anchor `p` at the cursor on the PRIMARY screen. With `reserve`, the cursor
-    /// then moves down `p.rows` lines to column 0 (a sixel first returns to column
-    /// 0: `sixel`), scrolling as needed — through alacritty's `Handler`, never by
-    /// injecting bytes into a parser that may sit mid-sequence (e.g. in the
-    /// Escape state an ESC-ended DCS or APC leaves it in). Room for that scroll is
-    /// made first so it is counted exactly; an anchor reset on the way drops `p`.
+    /// then moves past it, scrolling as needed: below a sixel, under its left
+    /// edge (xterm); onto a Kitty image's last row, right of it (kitty — a wrap
+    /// pending at the edge). Through alacritty's `Handler`, never by injecting
+    /// bytes into a parser that may sit mid-sequence (e.g. in the Escape state
+    /// an ESC-ended DCS or APC leaves it in). Room for that scroll is made first
+    /// so it is counted exactly; an anchor reset on the way drops `p`.
     fn place_primary_at_cursor(&mut self, mut p: ImagePlacement, reserve: bool, sixel: bool) {
         use alacritty_terminal::vte::ansi::Handler;
         self.make_room(p.rows as usize + 1);
         let cur = self.term.grid().cursor.point;
         p.abs_line = self.abs_top + cur.line.0 as i64;
-        // A sixel starts at column 0 (the reserve's leading CR, like most sixel
-        // terminals); a Kitty image at the cursor column, clamped to fit (A8).
-        p.col = if sixel { 0 } else { (cur.column.0 as u16).min((self.cols as u16).saturating_sub(p.cols)) };
+        p.anchor_at(cur.column.0, self.cols);
         if reserve {
             let epoch = self.anchor_epoch;
             let h0 = self.term.grid().history_size();
             let d0 = self.term.grid().display_offset();
-            if sixel {
-                self.term.carriage_return();
-            }
-            for _ in 0..p.rows {
-                self.term.carriage_return();
+            let lines = if sixel { p.rows } else { p.rows.saturating_sub(1) };
+            for _ in 0..lines {
                 self.term.linefeed();
             }
             let h1 = self.term.grid().history_size();
@@ -2908,6 +2917,10 @@ impl Terminal {
             if self.anchor_epoch != epoch {
                 return;
             }
+            let col = usize::from(if sixel { p.col } else { p.col + p.cols });
+            let cursor = &mut self.term.grid_mut().cursor;
+            cursor.point.column = Column(col.min(self.cols - 1));
+            cursor.input_needs_wrap = col >= self.cols;
         }
         insert_placement(&mut self.placements, &mut self.placement_bytes, p);
         let history = self.term.grid().history_size();
@@ -2924,7 +2937,7 @@ impl Terminal {
         let (rows, cols) = (self.rows, self.cols);
         let cur = self.term.grid().cursor.point;
         p.abs_line = cur.line.0 as i64;
-        p.col = (cur.column.0 as u16).min((cols as u16).saturating_sub(p.cols));
+        p.anchor_at(cur.column.0, cols);
         let last_row = rows as i32 - 1;
         let grid = self.term.grid_mut();
         let target = if sixel {
@@ -3224,11 +3237,11 @@ impl Terminal {
     }
 
     /// Finish a sixel DCS at its terminator: decode the accumulated bytes and
-    /// place the image. PRIMARY screen: reserve its cell rows (the cursor moves
-    /// down, scrolling as needed, so `abs_top` tracks the image) anchored at
-    /// column 0 like most sixel terminals. ALT screen (TUI previews): anchor at
-    /// the cursor cell without scrolling; it lives until a covered cell is
-    /// written (see `check_alt_placements`).
+    /// place the image at the cursor, cut at the grid's edge, as xterm does.
+    /// PRIMARY screen: reserve its cell rows (the cursor moves below it,
+    /// scrolling as needed, so `abs_top` tracks the image). ALT screen (TUI
+    /// previews): no scrolling; it lives until a covered cell is written (see
+    /// `check_alt_placements`).
     ///
     /// Correct-or-absent guards (drop, touch nothing): a buffer overflow or a
     /// CAN/SUB-cancelled DCS (`sixel_overflow`), a zero cell metric, a decode
@@ -3617,10 +3630,10 @@ impl Terminal {
         let _ = self.reply_tx.send(out);
     }
 
-    /// Place a decoded Kitty image (content id `id`) at the cursor. Unlike a
-    /// sixel it anchors at the cursor COLUMN, and `C=1` leaves the cursor (and
-    /// the grid) untouched. Guards: a zero cell metric drops it; an in-flight
-    /// sync update is flushed first so the cursor is where the app put it.
+    /// Place a decoded Kitty image (content id `id`) at the cursor, moved left
+    /// to fit; `C=1` leaves the cursor (and the grid) untouched. Guards: a zero
+    /// cell metric drops it; an in-flight sync update is flushed first so the
+    /// cursor is where the app put it.
     fn place_inline_image(&mut self, img: &Arc<crate::sixel::InlineImage>, id: u64, cmd: &KittyCmd) {
         if self.cell_px_w <= 0.0 || self.cell_px_h <= 0.0 {
             return;
@@ -8940,6 +8953,55 @@ mod tests {
         t.feed(b"abc"); // cursor at column 3
         t.feed(&red_rgba_2x2(""));
         assert_eq!(t.placements[0].col, 3, "image anchors at the cursor column");
+    }
+
+    #[test]
+    fn a_sixel_starts_at_the_cursor_column_and_leaves_the_cursor_under_it() {
+        // `printf 'Plot: '; gnuplot` drew the plot over "Plot: " at column 0,
+        // and timg's grid (`CSI n C` before each image) stacked every image
+        // in column 0. xterm and WezTerm anchor a sixel at the cursor and
+        // put the cursor under the image's left edge.
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"Plot: ");
+        t.feed(&sixel(RED_1X12)); // 1 column, 2 rows
+        assert_eq!((t.placements[0].abs_line, t.placements[0].col), (0, 6));
+        let snap = t.snapshot();
+        assert_eq!((snap.cursor_row, snap.cursor_col), (2, 6), "under the image's left edge");
+        assert!(screen_has(&t, "Plot: "));
+        // Wider than the columns left: it stays at the cursor, cut at the edge.
+        t.feed(b"\x1b[5;18H");
+        t.feed(&sixel("#0;2;100;0;0#0!50~")); // 5 columns from column 17
+        let p = t.placements.back().unwrap();
+        assert_eq!((p.col, p.cols), (17, 3), "anchored at the cursor, clipped to the grid");
+        assert_eq!(t.snapshot().cursor_col, 17);
+    }
+
+    #[test]
+    fn a_kitty_image_leaves_the_cursor_right_of_its_last_row() {
+        // kitty moves the cursor right by the image's columns and down to its
+        // last row. icat and timg print a newline after an image, so JeTTY
+        // (column 0 BELOW the image) showed a blank row under every one, and
+        // timg's grid (up by the image's rows, then right) stepped down a row
+        // per column.
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"ab");
+        t.feed(&red_rgba_2x2(",c=3,r=2")); // 3×2 cells at (0, 2)
+        let snap = t.snapshot();
+        assert_eq!((snap.cursor_row, snap.cursor_col), (1, 5), "right of its last row");
+        t.feed(b"\r\n\x1b[2A\x1b[6C");
+        t.feed(&red_rgba_2x2(",c=3,r=2")); // timg's next grid column
+        assert_eq!(t.placements[1].abs_line, 0, "level with the first one");
+        // At the right edge the wrap is pending, as for text in the last column.
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"\x1b[1;18H");
+        t.feed(&red_rgba_2x2(",c=3,r=1"));
+        let snap = t.snapshot();
+        assert_eq!((snap.cursor_row, snap.cursor_col), (0, 19));
+        t.feed(b"x");
+        assert_eq!(t.snapshot().row_text(1).trim_end(), "x", "the next character wraps");
     }
 
 
