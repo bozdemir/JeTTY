@@ -8,40 +8,45 @@
 #   (b) a BLOCKING-2 regression — an occluded/hidden window that self-drives
 #       frames WHILE ITS SHELL PRODUCES OUTPUT (the idle battery is all
 #       idle-with-NO-output, so it would miss this).
-# This script drives a real `target/release/jetty` on the REAL X11 display,
-# samples `pidstat`, and — crucially — reads the `JETTY_FRAME_LOG=1` present
-# counter, whose behaviour is the crisp, drain-cost-independent signal:
+# This script drives a real `target/release/jetty` live on a NESTED display
+# (scripts/nested-live.sh: an invisible Xvfb with software Vulkan and its own
+# KWin, config dir, IPC socket and session bus — so it is safe next to the
+# JeTTY you are using: nothing here can reach it or your desktop), samples
+# `pidstat`, and — crucially — reads the `JETTY_FRAME_LOG=1` present counter,
+# whose behaviour is the crisp, drain-cost-independent signal:
 #   * a burst that ENDS must leave the counter advanced to the settled grid;
 #   * an occluded/hidden window with a flooding shell must present ZERO frames
 #     (counter FROZEN) — if occlusion gating regressed, the counter would climb.
 #
-# This CANNOT run in the agent sandbox (no X; MEMORY forbids Xvfb). It is a
-# SCRIPTED MANUAL gate the USER runs on their real machine BEFORE any push.
+# A SCRIPTED MANUAL gate: run it before a push that touches the paint paths.
 #
-# Requires (Linux/X11): xdotool, ffmpeg, pidstat (sysstat), a running WM on :0.
-# Optional: imagemagick `compare` for AA-tolerant PNG diffs (falls back to cmp).
+# Requires what scripts/nested-live.sh needs (Xvfb, xdotool, python3 with
+# python-xlib + Pillow, the lavapipe ICD), plus kwin_x11 (minimize needs a
+# window manager) and pidstat (sysstat). Optional: imagemagick `compare` for
+# AA-tolerant PNG diffs (falls back to cmp).
 #
 # Usage:
-#   scripts/verify-idle.sh                 # full battery
-#   HIDE_KEY="ctrl+grave" scripts/verify-idle.sh   # override the F9/summon hotkey
-#   OCC_SECONDS=10 scripts/verify-idle.sh  # longer occlusion CPU window
+#   scripts/verify-idle.sh                  # full battery, nested display :189
+#   DISPLAY_NUM=191 scripts/verify-idle.sh  # another nested display
+#   OCC_SECONDS=10 scripts/verify-idle.sh   # longer occlusion CPU window
 #
 # Exit 0 = all HARD assertions passed. Exit 1 = a regression was caught.
 
 set -u
 cd "$(dirname "$0")/.."
 
+export DISPLAY_NUM="${DISPLAY_NUM:-189}"
+NL=scripts/nested-live.sh
+SB="target/nested-live-$DISPLAY_NUM"   # nested-live's sandbox for this display
 APP=./target/release/jetty
 SHOTBIN=./target/release/jetty-shot
-LOG=/tmp/jetty-verify.log
-PNGDIR=/tmp/jetty-verify
-HIDE_KEY="${HIDE_KEY:-F9}"        # global summon/hide hotkey (override per config)
+LOG="$SB/jetty.log"                    # the nested jetty's stdout + stderr
+PNGDIR="$SB/verify"
 OCC_SECONDS="${OCC_SECONDS:-6}"   # pidstat window for the occluded/hidden states
 CPU_SOFT_MAX="${CPU_SOFT_MAX:-5.0}"   # soft %CPU ceiling for occluded-with-output
                                        # (draining a `yes` flood is not literally 0;
                                        # the HARD signal is the frozen frame counter)
 FAILS=0
-mkdir -p "$PNGDIR"; rm -f "$PNGDIR"/*.png "$LOG"
 
 note()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 pass()  { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
@@ -49,42 +54,43 @@ fail()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILS=$((FAILS+1)); }
 info()  { printf '       %s\n' "$*"; }
 
 # ---- preflight ----
-for t in xdotool ffmpeg pidstat; do
-  command -v "$t" >/dev/null || { echo "MISSING TOOL: $t (Linux/X11 gate)"; exit 2; }
+for t in Xvfb xdotool kwin_x11 pidstat; do
+  command -v "$t" >/dev/null || { echo "MISSING TOOL: $t"; exit 2; }
 done
 [ -x "$APP" ] || { echo "build first: cargo build --release --bin jetty"; exit 2; }
-if [ -z "${DISPLAY:-}" ]; then echo "no DISPLAY — run on the real X11 desktop"; exit 2; fi
+if [ -e "/tmp/.X11-unix/X$DISPLAY_NUM" ]; then
+  echo "display :$DISPLAY_NUM is in use — pick a free one with DISPLAY_NUM"; exit 2
+fi
 
-# ---- isolate the IPC socket (NEVER touch the user's JeTTY) ----
-# JeTTY is single-instance via a per-user socket under $XDG_RUNTIME_DIR. Reusing
-# it would either FORWARD our launch to a running JeTTY (the frame-logged test
-# instance never starts) or — if we killed that instance — kill the very
-# terminal running this script. Give the test instance a PRIVATE runtime dir so
-# it binds its OWN socket, fully independent; nothing to kill. (The X11 window is
-# unaffected by XDG_RUNTIME_DIR.) NOTE: still run this from a NON-JeTTY terminal
-# (a plain konsole/xterm or a TTY) — a summon window can swallow the xdotool
-# focus/keys this harness relies on.
-export XDG_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/jetty-verify.XXXXXX")"
-chmod 700 "$XDG_RUNTIME_DIR"
-
-# ---- launch jetty with the frame counter on ----
-JETTY_FRAME_LOG=1 SHELL=/usr/bin/zsh "$APP" >"$LOG" 2>&1 &
-PID=$!
-cleanup() { kill "$PID" 2>/dev/null; sleep 0.3; kill -9 "$PID" 2>/dev/null; rm -rf "$XDG_RUNTIME_DIR" 2>/dev/null; }
-trap cleanup EXIT
-sleep 3   # window map + shell init
-# Catch a genuine launch failure (crash / GPU init error). With the isolated
-# socket above the launch binds fresh, so an immediate exit means a real problem.
+# ---- the nested session (never the real display, never your JeTTY) ----
+# Default settings (the shortcuts below are the defaults) but no auto-hide on
+# focus loss — a minimized window would hide itself, and step 3 is about a
+# minimized one — plus the frame counter, zsh. nested-live.sh keeps its own
+# config dir, socket and bus, and its `stop` kills only what its `start`
+# launched.
+mkdir -p "$SB/config/jetty" "$PNGDIR"
+rm -f "$PNGDIR"/*.png "$SB/config/jetty/config.toml"
+echo 'focus_autohide = false' >"$SB/verify-config.toml"
+: >"$LOG"
+trap '"$NL" stop >/dev/null' EXIT
+JETTY_FRAME_LOG=1 SHELL=/usr/bin/zsh NESTED_WM=kwin NESTED_CONFIG="$SB/verify-config.toml" \
+  "$NL" start || { echo "ERROR: the nested session did not start"; tail -12 "$LOG"; exit 1; }
+PID=$(cat "$SB/jetty.pid")
+sleep 3   # shell init
+# Catch a genuine launch failure (crash / GPU init error).
 if ! kill -0 "$PID" 2>/dev/null; then
   echo "ERROR: the test instance exited immediately (crash or GPU init failure). Log:"
   tail -12 "$LOG"; exit 1
 fi
-if ! grep -q 'JETTY_FRAME' "$LOG" 2>/dev/null && ! grep -qi 'socket bound' "$LOG" 2>/dev/null; then
+if ! grep -q 'JETTY_FRAME' "$LOG" 2>/dev/null; then
   echo "WARNING: no frames logged yet after 3s — the frame counter may not be active."
   tail -6 "$LOG"
 fi
 
-WID=$(timeout 15 xdotool search --sync --name JeTTY 2>/dev/null | tail -1)
+# xdotool on the nested display only. Windows are found by the test
+# instance's pid — never by name, which a real JeTTY's windows share.
+xdo() { "$NL" x "$@"; }
+WID=$(timeout 15 "$NL" x search --sync --all --pid "$PID" --name JeTTY 2>/dev/null | tail -1)
 if [ -z "$WID" ]; then echo "ERROR: JeTTY window not found"; tail -8 "$LOG"; exit 1; fi
 
 # ---- helpers ----
@@ -97,15 +103,15 @@ frames_main() { local c; c=$(grep -c 'JETTY_FRAME .* main' "$LOG" 2>/dev/null); 
 # present by ANOTHER surface (e.g. a visible main window blinking its caret while
 # the DETACHED window is the one under test). Frame log = `JETTY_FRAME <n> <surface>`.
 frames_detached() { local c; c=$(grep -c 'JETTY_FRAME .* detached' "$LOG" 2>/dev/null); echo "${c:-0}"; }
-focus() { xdotool windowactivate --sync "$WID" 2>/dev/null; sleep 0.3; }
-is_focused() { [ "$(xdotool getactivewindow 2>/dev/null)" = "$WID" ]; }
-typek() { xdotool type --delay 40 -- "$1"; }
-keyk()  { xdotool key --clearmodifiers "$1"; }
-enter() { xdotool key Return; }
+focus() { xdo windowactivate --sync "$WID" 2>/dev/null; sleep 0.3; }
+is_focused() { [ "$(xdo getactivewindow 2>/dev/null)" = "$WID" ]; }
+typek() { xdo type --delay 40 -- "$1"; }
+keyk()  { xdo key --clearmodifiers "$1"; }
+enter() { xdo key Return; }
 shot() {  # shot <name> — grab ONLY the jetty window
-  eval "$(xdotool getwindowgeometry --shell "$WID" 2>/dev/null)"
-  ffmpeg -loglevel error -f x11grab -video_size "${WIDTH}x${HEIGHT}" \
-    -i ":0.0+${X},${Y}" -frames:v 1 -y "$PNGDIR/$1.png" 2>/dev/null
+  local WINDOW X Y WIDTH HEIGHT SCREEN
+  eval "$(xdo getwindowgeometry --shell "$WID" 2>/dev/null)"
+  "$NL" shot "$PNGDIR/$1.png" "$X" "$Y" "$WIDTH" "$HEIGHT" >/dev/null 2>&1
 }
 png_same() { # png_same a b -> 0 if visually identical
   if command -v compare >/dev/null; then
@@ -121,12 +127,12 @@ cpu_max() { pidstat -u -p "$PID" 1 "$1" 2>/dev/null \
   | sort -rn | head -1; }
 
 focus
-is_focused || { echo "ERROR: could not focus JeTTY (WID=$WID) — bail (no typing into other windows)"; exit 1; }
+is_focused || { echo "ERROR: could not focus JeTTY (WID=$WID)"; exit 1; }
 
 ########################################################################
 note "1. REPAINT-TRIGGER MATRIX (visible focused main window)"
 # Each trigger must advance the frame counter AND change the pixels.
-trigger() { # trigger <name> <action-fn>
+trigger() { # trigger <name> <command…>
   local name="$1"; shift
   local f0; f0=$(frames_main); shot "before_$name"
   "$@"; sleep 0.8
@@ -137,11 +143,17 @@ trigger() { # trigger <name> <action-fn>
     info "$name — pixels unchanged (frame-counter is the authority here)"
   else info "$name — pixels changed (expected)"; fi
 }
-trigger keystroke   bash -c 'xdotool type --delay 40 -- "echo hi"'
-trigger pty_output  bash -c 'xdotool key Return'                 # runs `echo hi`
-trigger ls_output   bash -c 'xdotool type -- "ls --color"; xdotool key Return'
-trigger resize      bash -c 'eval "$(xdotool getwindowgeometry --shell '"$WID"')"; xdotool windowsize '"$WID"' $((WIDTH-40)) $((HEIGHT-40))'
-trigger overlay     bash -c 'xdotool key ctrl+shift+p'           # command palette open
+ls_color() { typek "ls --color"; enter; }
+shrink() {
+  local WINDOW X Y WIDTH HEIGHT SCREEN
+  eval "$(xdo getwindowgeometry --shell "$WID" 2>/dev/null)"
+  xdo windowsize "$WID" $((WIDTH-40)) $((HEIGHT-40))
+}
+trigger keystroke   typek "echo hi"
+trigger pty_output  enter                       # runs `echo hi`
+trigger ls_output   ls_color
+trigger resize      shrink
+trigger overlay     keyk ctrl+shift+p           # command palette open
 keyk Escape; sleep 0.3
 
 ########################################################################
@@ -171,7 +183,7 @@ focus
 typek "yes > /dev/null &"; enter; sleep 0.2   # background flood, no screen output
 typek "yes"; enter                            # foreground flood TO the terminal
 sleep 1.0
-xdotool windowminimize "$WID"; sleep 1.2      # -> Occluded(true)/iconify path
+xdo windowminimize "$WID"; sleep 1.2          # -> Occluded(true)/iconify path
 f0=$(frames_main)
 info "sampling CPU for ${OCC_SECONDS}s while minimized + flooding..."
 cmax=$(cpu_max "$OCC_SECONDS")
@@ -185,14 +197,16 @@ info "occluded-with-output max CPU = ${cmax:-?}% (soft ceiling ${CPU_SOFT_MAX}%)
 awk -v c="${cmax:-0}" -v m="$CPU_SOFT_MAX" 'BEGIN{exit !(c+0>m+0)}' \
   && fail "occluded CPU ${cmax}% exceeds ${CPU_SOFT_MAX}% (investigate drain cost)" \
   || pass "occluded CPU within soft ceiling"
-xdotool windowmap "$WID" 2>/dev/null; xdotool windowactivate --sync "$WID" 2>/dev/null; sleep 0.5
+xdo windowmap "$WID" 2>/dev/null; focus
 keyk ctrl+c; sleep 0.2; typek "kill %1 2>/dev/null"; enter; keyk ctrl+c; sleep 0.3
 
 ########################################################################
-note "4. HIDDEN-WITH-OUTPUT (F9 off) — BLOCKING-2 catch"
+note "4. HIDDEN-WITH-OUTPUT (summon toggled off) — BLOCKING-2 catch"
+# Hidden over the test instance's own socket (`jetty --hide`): the window is
+# unmapped exactly as by the summon hotkey.
 focus
 typek "yes"; enter; sleep 1.0
-keyk "$HIDE_KEY"; sleep 1.2                    # global hide (window unmapped)
+"$NL" ctl --hide; sleep 1.2
 f0=$(frames_main)
 info "sampling CPU for ${OCC_SECONDS}s while hidden + flooding..."
 cmax=$(cpu_max "$OCC_SECONDS")
@@ -206,20 +220,21 @@ info "hidden-with-output max CPU = ${cmax:-?}%"
 awk -v c="${cmax:-0}" -v m="$CPU_SOFT_MAX" 'BEGIN{exit !(c+0>m+0)}' \
   && fail "hidden CPU ${cmax}% exceeds ${CPU_SOFT_MAX}%" \
   || pass "hidden CPU within soft ceiling"
-keyk "$HIDE_KEY"; sleep 0.8                     # re-summon
+"$NL" ctl --show; sleep 0.8                   # re-summon
 focus; keyk ctrl+c; sleep 0.3
 
 ########################################################################
 note "5. DETACHED OCCLUDED-WITH-OUTPUT — BLOCKING-2 catch (per-surface)"
 focus
+keyk ctrl+shift+t; sleep 1.5                    # detach needs >= 2 tabs
 keyk ctrl+shift+d; sleep 1.5                    # detach the active tab
-DWID=$(xdotool search --name JeTTY 2>/dev/null | grep -v "^$WID$" | tail -1)
-if [ -z "$DWID" ] || [ "$DWID" = "$WID" ]; then
-  info "SKIP: could not identify a detached window (detach needs >=2 tabs)."
+DWID=$(xdo search --onlyvisible --pid "$PID" 2>/dev/null | grep -vx "$WID" | tail -1)
+if [ -z "$DWID" ]; then
+  info "SKIP: could not identify a detached window."
 else
-  xdotool windowactivate --sync "$DWID" 2>/dev/null; sleep 0.4
-  xdotool type --delay 40 -- "yes"; xdotool key Return; sleep 1.0
-  xdotool windowminimize "$DWID"; sleep 1.2
+  xdo windowactivate --sync "$DWID" 2>/dev/null; sleep 0.4
+  xdo type --delay 40 -- "yes"; xdo key Return; sleep 1.0
+  xdo windowminimize "$DWID"; sleep 1.2
   f0=$(frames_detached)
   info "sampling CPU for ${OCC_SECONDS}s while detached window minimized + flooding..."
   cmax=$(cpu_max "$OCC_SECONDS")
@@ -230,8 +245,8 @@ else
     fail "occluded detached window SELF-DROVE $((f1-f0)) frames — 0%-idle regression"
   fi
   info "detached-occluded-with-output max CPU = ${cmax:-?}%"
-  xdotool windowmap "$DWID" 2>/dev/null; xdotool windowactivate --sync "$DWID" 2>/dev/null
-  xdotool key ctrl+c 2>/dev/null; sleep 0.3
+  xdo windowmap "$DWID" 2>/dev/null; xdo windowactivate --sync "$DWID" 2>/dev/null
+  xdo key ctrl+c 2>/dev/null; sleep 0.3
 fi
 
 ########################################################################
