@@ -57,6 +57,38 @@ pub fn tearing(cursor_y: f32, bar_y: f32, bar_h: f32, threshold: f32) -> bool {
     cursor_y < bar_y - threshold || cursor_y > bar_y + bar_h + threshold
 }
 
+/// The slot a tab dragged ALONG the strip (not tearing) points at: the index
+/// of the drawn tab rect spanning `cursor_x` — `None` before the first tab or
+/// past the last (over the "+"). A rect parked offscreen for an overflowed
+/// tab never matches.
+pub fn reorder_target(cursor_x: f32, tab_rects: &[jetty_render::Rect]) -> Option<usize> {
+    tab_rects.iter().position(|r| r.w > 0.0 && cursor_x >= r.x && cursor_x < r.x + r.w)
+}
+
+/// Move the element at `from` to index `to`, the ones between shifting over by
+/// one. `false` (and nothing moved) when either index is out of range.
+pub fn move_item<T>(v: &mut Vec<T>, from: usize, to: usize) -> bool {
+    if from >= v.len() || to >= v.len() {
+        return false;
+    }
+    let item = v.remove(from);
+    v.insert(to, item);
+    true
+}
+
+/// Where index `i` ends up after [`move_item`]`(from, to)`.
+pub fn index_after_move(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < i && i <= to {
+        i - 1
+    } else if to <= i && i < from {
+        i + 1
+    } else {
+        i
+    }
+}
+
 /// True when the GLOBAL cursor `(gx, gy)` lands inside the MAIN window's
 /// tab-bar strip: the band `tabbar_h` tall at the top of the main window, or —
 /// when `tab_bar_bottom` — just above the status strip at the bottom (the same
@@ -837,6 +869,46 @@ mod tests {
         assert!(!tearing(580.0, 578.0, 36.0, 24.0), "inside a bottom-mode strip");
         assert!(tearing(553.0, 578.0, 36.0, 24.0), "torn upward out of a bottom strip");
         assert!(!tearing(560.0, 578.0, 36.0, 24.0), "above bottom strip but within threshold");
+    }
+
+    // ── drag along the strip: reorder ────────────────────────────────────────
+
+    fn rect(x: f32, w: f32) -> jetty_render::Rect {
+        jetty_render::Rect::new(x, 0.0, w, 36.0, [0; 4])
+    }
+
+    #[test]
+    fn a_tab_dragged_along_the_strip_targets_the_slot_under_the_pointer() {
+        // Three 140px tabs from x 8; an overflowed one parked offscreen.
+        let parked = rect(-1.0e6, 0.0);
+        let rects = [rect(8.0, 140.0), rect(148.0, 140.0), rect(288.0, 140.0), parked];
+        assert_eq!(reorder_target(20.0, &rects), Some(0));
+        assert_eq!(reorder_target(148.0, &rects), Some(1), "a slot starts at its left edge");
+        assert_eq!(reorder_target(427.0, &rects), Some(2));
+        assert_eq!(reorder_target(500.0, &rects), None, "past the last tab (the \"+\")");
+        assert_eq!(reorder_target(2.0, &rects), None, "before the first");
+        assert_eq!(reorder_target(-1.0e6, &rects), None, "a parked rect never matches");
+    }
+
+    #[test]
+    fn moving_a_tab_shifts_the_others_and_keeps_every_index_on_its_tab() {
+        let mut v = vec!['a', 'b', 'c', 'd'];
+        assert!(move_item(&mut v, 0, 2));
+        assert_eq!(v, vec!['b', 'c', 'a', 'd']);
+        assert!(move_item(&mut v, 3, 1));
+        assert_eq!(v, vec!['b', 'd', 'c', 'a']);
+        assert!(!move_item(&mut v, 4, 0), "out of range: untouched");
+        assert!(!move_item(&mut v, 0, 9));
+        assert_eq!(v, vec!['b', 'd', 'c', 'a']);
+        // Every index follows its element.
+        let before = ['a', 'b', 'c', 'd', 'e'];
+        for (from, to) in [(0, 4), (4, 0), (1, 3), (3, 1), (2, 2)] {
+            let mut v = before.to_vec();
+            move_item(&mut v, from, to);
+            for (i, &c) in before.iter().enumerate() {
+                assert_eq!(v[index_after_move(i, from, to)], c, "{from}→{to}: {c}");
+            }
+        }
     }
 
     #[test]

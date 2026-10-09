@@ -3862,6 +3862,23 @@ impl App {
         y >= bar_y && y < bar_y + self.bar_h()
     }
 
+    /// A tab held along the strip: move it into the slot under the pointer at
+    /// `cx`, live — the tab bar's drag-to-reorder. Every long-lived tab
+    /// reference holds a `TabId`, so only the active index needs following.
+    fn drag_reorder_tab(&mut self, cx: f32) {
+        let Some(drag) = self.tab_drag else { return };
+        let (Some(w), Some(from)) = (self.gpu.as_ref().map(|g| g.config.width), self.tab_index(drag.tab)) else {
+            return;
+        };
+        let rects = self.main_bar_geometry(w, None).tab_rects;
+        let Some(to) = crate::detached::reorder_target(cx, &rects).filter(|&to| to != from) else { return };
+        if crate::detached::move_item(&mut self.tabs, from, to) {
+            self.active = crate::detached::index_after_move(self.active, from, to);
+            self.tab_hover = None;
+            self.request_main_paint();
+        }
+    }
+
     /// The wheel over the tab strip: step through the tabs. Inert while a
     /// popup, a menu, an inline rename or a tab drag owns the strip.
     fn wheel_tabs(&mut self, delta: MouseScrollDelta) {
@@ -13223,6 +13240,11 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                         }
                     }
+                    // Held along the strip instead: the tab follows the pointer
+                    // into the slot under it (live reordering).
+                    if !now_tearing {
+                        self.drag_reorder_tab(position.x as f32);
+                    }
                 }
                 // --- Tab context menu hover update (cached rects, like above) ---
                 if self.tab_menu.is_some() {
@@ -19015,8 +19037,9 @@ mod window_parity_tests {
             })
             .count();
         // close_tab (2) + detach_tab (2 fix-ups + 1 restore) + set_active_tab (1)
-        // + close_exited_tabs (2) + resumed (1).
-        assert_eq!(assigns, 9, "a new direct `self.active` assignment — use set_active_tab");
+        // + close_exited_tabs (2) + resumed (1) + drag_reorder_tab (1: the SAME
+        // tab re-indexed by a reorder — not a change, so its state must stay).
+        assert_eq!(assigns, 10, "a new direct `self.active` assignment — use set_active_tab");
     }
 
     #[test]
