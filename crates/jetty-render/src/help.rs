@@ -339,18 +339,28 @@ pub fn build_help_overlay(
         match *line {
             HelpLine::Spacer => {}
             HelpLine::Header(h) => {
-                labels.push((fit(m, h, content_w), px + pad_x, y, header_col));
-                // A thin, subtle accent rule under each header crisply separates
-                // the sections (drawn on the panel, beneath the row text).
-                let rule_y = (y + row_h * 0.9).round();
-                quads.push(Rect {
-                    x: px + pad_x,
-                    y: rule_y,
-                    w: (panel_w - pad_x * 2.0).max(0.0),
-                    h: (1.5 * vscale).max(1.0),
-                    color: [header_col[0], header_col[1], header_col[2], 70],
-                    ..Default::default()
-                });
+                let shown = fit(m, h, content_w);
+                let end = px + pad_x + m.text_w(&shown);
+                labels.push((shown, px + pad_x, y, header_col));
+                // A thin, subtle accent rule from the header's end to the
+                // content's right edge, through the header line (the Settings
+                // panel's section idiom), crisply separates the sections. It
+                // used to run UNDER the header at 90% of the row pitch — which
+                // shrinks to fit the window, putting the rule on the header's
+                // baseline (the default 1000×640 window) — while a rule beside
+                // the text can never touch it at any pitch.
+                let rx = end + 1.25 * char_w;
+                let rw = px + panel_w - pad_x - rx;
+                if rw > 2.0 * char_w {
+                    quads.push(Rect {
+                        x: rx,
+                        y: (y + cm.px(10.0)).round(),
+                        w: rw,
+                        h: (1.5 * vscale).max(1.0),
+                        color: [header_col[0], header_col[1], header_col[2], 70],
+                        ..Default::default()
+                    });
+                }
             }
             HelpLine::Item(key, desc) => {
                 labels.push((key.to_string(), px + pad_x, y, key_col));
@@ -606,6 +616,35 @@ mod tests {
         assert!(h.labels.iter().any(|l| l.0.ends_with('…')), "long descriptions are ellipsized");
         // Keys are never cut.
         assert!(h.labels.iter().any(|l| l.0 == "Ctrl+Tab / Ctrl+Shift+Tab"));
+    }
+
+    /// A section header's rule never runs through the header's text. It sat
+    /// at 90% of the row pitch — below the text at the ideal pitch, but the
+    /// pitch shrinks to fit the window, and in the default 1000×640 window
+    /// it ran along the header's baseline, striking through its letters.
+    #[test]
+    fn section_rules_never_cross_their_header() {
+        let rows = default_help_rows();
+        for cm in [CM, ChromeMetrics::new(2.0, 16.0), ChromeMetrics::new(1.0, 13.0)] {
+            let mut m = MonoMeasure(CHROME_ADVANCE * cm.u);
+            for (w, h) in [(1000u32, 640u32), (1000, 480), (700, 560), (1000, 760), (1600, 1200)] {
+                let (w, h) = ((w as f32 * cm.dpi) as u32, (h as f32 * cm.dpi) as u32);
+                let o = build_help_overlay(w, h, &theme(), &mut m, cm, &rows, 0);
+                let header = UiPalette::cached(&theme()).readable(theme().cursor, UiPalette::TEXT_FLOOR);
+                let rules: Vec<&Rect> = o.quads.iter().filter(|q| q.color[3] == 70).collect();
+                let headers: Vec<_> = o.labels.iter().filter(|l| l.3 == header).collect();
+                assert!(!headers.is_empty() && rules.len() == headers.len(), "{w}×{h}: one rule per header");
+                for (t, x, y, _) in headers {
+                    // The header's ink: cap tops to descenders of its line.
+                    let (l, r) = (*x, x + m.text_w(t));
+                    let (top, bot) = (y + cm.px(3.0), y + cm.px(19.0));
+                    for q in &rules {
+                        let apart = q.x >= r || q.x + q.w <= l || q.y >= bot || q.y + q.h <= top;
+                        assert!(apart, "{w}×{h} @{}: the rule crosses {t:?}", cm.u);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
