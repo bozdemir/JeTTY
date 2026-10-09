@@ -132,10 +132,10 @@ shell's rc file); without it nothing is ever notified.
 
 | Key | Default | What it does |
 |---|---|---|
-| `notify_on_command_finish` | `true` | A desktop notification (and taskbar urgency) when a command finishes while JeTTY is hidden or unfocused. |
+| `notify_on_command_finish` | `true` | A desktop notification (Linux; on macOS the Dock icon bounces instead) and taskbar urgency when a command finishes out of sight: JeTTY hidden or unfocused, or the command in a background tab. |
 | `notify_min_seconds` | `10` | Only commands that ran at least this long notify on success, `1`–`86400` seconds (a failure may notify sooner). |
 | `notify_only_on_failure` | `false` | Only notify about failed commands. |
-| `auto_summon_on_finish` | `false` | Bring JeTTY back (with the tab that finished) when a command finishes — only while it is hidden, never mid-typing. Follows `notify_only_on_failure`. |
+| `auto_summon_on_finish` | `false` | Bring JeTTY back (with the tab that finished) when a command finishes — only while it is hidden, never mid-typing. Follows `notify_min_seconds` and `notify_only_on_failure`; works with `notify_on_command_finish` off too. |
 
 ## The config file itself
 
