@@ -424,8 +424,9 @@ pub(crate) struct Motion {
 /// The pointer moved: extend a local selection drag (arming the edge
 /// auto-scroll while the pointer is past the grid's top or bottom), or report
 /// the motion to a program that tracks it — 1002 while one of its buttons is
-/// held, 1003 always (but not over history, [`gesture_tracking`]) — once per
-/// cell.
+/// held (wherever the pointer is: clamped to the grid), 1003 always but only
+/// over the grid band (not over chrome, nor over history,
+/// [`gesture_tracking`]) — once per cell.
 pub(crate) fn motion(g: &mut Grid, now: Instant) -> Motion {
     if !g.geom.usable() {
         return Motion::default();
@@ -439,7 +440,9 @@ pub(crate) fn motion(g: &mut Grid, now: Instant) -> Motion {
             .map(|lines| AutoScroll { lines, next });
         return Motion { paint: true };
     }
-    if g.mouse.held == 0 && gesture_tracking(g.term) == MouseTracking::Off {
+    if g.mouse.held == 0
+        && (gesture_tracking(g.term) == MouseTracking::Off || !g.geom.contains_y(g.pointer.1 as f32))
+    {
         return Motion::default();
     }
     let cell = g.report_cell();
@@ -501,15 +504,19 @@ fn wheel_notches(delta: MouseScrollDelta, geom: GridGeom) -> (f32, f32) {
 
 /// One wheel event. `vertical` is the window's line accumulator;
 /// `over_scrollbar` keeps the wheel on the host scrollback (the scrollbar is
-/// JeTTY's). Shift also always scrolls the host scrollback — the escape hatch
-/// out of a mouse-grabbing program — and so does a view scrolled back
-/// ([`gesture_tracking`]): the wheel brings it back down first.
+/// JeTTY's), and so does the status strip below the grid band (chrome too:
+/// clamped onto the last row, the wheel there hit tmux's status line, whose
+/// wheel bindings switch windows). Shift also always scrolls the host
+/// scrollback — the escape hatch out of a mouse-grabbing program — and so does
+/// a view scrolled back ([`gesture_tracking`]): the wheel brings it back down
+/// first.
 pub(crate) fn wheel(
     g: &mut Grid,
     delta: MouseScrollDelta,
     over_scrollbar: bool,
     vertical: &mut ScrollAccumulator,
 ) -> Wheel {
+    let over_scrollbar = over_scrollbar || !g.geom.contains_y(g.pointer.1 as f32);
     let tracking = gesture_tracking(g.term);
     let shift = g.mods.shift_key();
     let wheel_report = MouseReport::new(Some(MouseBtn::WheelUp), MouseAct::Press);
@@ -684,6 +691,32 @@ mod tests {
         let mut w = Win::new(SGR_CLICKS);
         let (p, bytes) = w.at(3.0, 3.6, NONE, |g| press(g, MouseButton::Left, false, t0()));
         assert_eq!((p, bytes.as_str()), (Press::Reported, "\x1b[<0;4;4M"));
+    }
+
+    #[test]
+    fn wheel_and_hover_over_the_status_strip_never_reach_the_program() {
+        // The wheel and a 1003 hover on the status strip (below GEOM's band,
+        // which ends at y = 70) were reported on the LAST row — tmux's status
+        // line, whose default wheel bindings switch windows. The strip is
+        // chrome, like the scrollbar: the wheel there is the host scrollback's.
+        let line = |n: f32| MouseScrollDelta::LineDelta(0.0, n);
+        let mut acc = ScrollAccumulator::new();
+        for setup in [&b"\x1b[?1003h\x1b[?1006h"[..], b"\x1b[?1049h\x1b[?1003h\x1b[?1006h"] {
+            let mut w = Win::new(setup);
+            let (r, bytes) = w.at(3.0, 4.2, NONE, |g| wheel(g, line(1.0), false, &mut acc));
+            assert_ne!(r, Wheel::Reported, "after {setup:?}");
+            assert_eq!(bytes, "", "no wheel report, no arrows after {setup:?}");
+            assert_eq!(w.at(3.0, 4.2, NONE, |g| motion(g, t0())).1, "", "no hover report after {setup:?}");
+            // The last row itself (just above the band's end) still gets both.
+            assert_eq!(w.at(3.0, 3.6, NONE, |g| wheel(g, line(1.0), false, &mut acc)).1, "\x1b[<64;4;4M");
+            assert_eq!(w.at(2.0, 3.6, NONE, |g| motion(g, t0())).1, "\x1b[<35;3;4M");
+        }
+        // A press the program holds still follows the pointer there, clamped
+        // onto the last row: it must see its drag through to the release.
+        let mut w = Win::new(b"\x1b[?1002h\x1b[?1006h");
+        w.at(3.0, 3.0, NONE, |g| press(g, MouseButton::Left, false, t0()));
+        assert_eq!(w.at(5.0, 4.2, NONE, |g| motion(g, t0())).1, "\x1b[<32;6;4M");
+        assert_eq!(w.at(5.0, 4.2, NONE, |g| release(g, MouseButton::Left)).1, "\x1b[<0;6;4m");
     }
 
     #[test]
