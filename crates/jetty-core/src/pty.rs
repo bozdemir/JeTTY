@@ -576,11 +576,36 @@ const INHERITED_ENV_DENYLIST: &[&str] = &[
     "GHOSTTY_RESOURCES_DIR",
     "GHOSTTY_BIN_DIR",
     "GHOSTTY_SHELL_FEATURES",
+    "XTERM_VERSION",
+    "XTERM_SHELL",
+    "XTERM_LOCALE",
+    "TERMINAL_EMULATOR",
+    // A VS Code / Cursor terminal's handles on that editor: its IPC sockets
+    // (`code` would open files in that window; git's prompts would pop up there,
+    // and fail once it quit) and its shell-integration handshake. Its git hooks
+    // themselves: `INHERITED_EDITOR_GIT_HOOKS`.
+    "VSCODE_GIT_IPC_HANDLE",
+    "VSCODE_GIT_ASKPASS_NODE",
+    "VSCODE_GIT_ASKPASS_MAIN",
+    "VSCODE_GIT_ASKPASS_EXTRA_ARGS",
+    "VSCODE_GIT_EDITOR_NODE",
+    "VSCODE_GIT_EDITOR_MAIN",
+    "VSCODE_GIT_EDITOR_EXTRA_ARGS",
+    "VSCODE_IPC_HOOK_CLI",
+    "VSCODE_INJECTION",
+    "VSCODE_NONCE",
+    // A Neovim `:terminal`'s server socket (nvr, flatten.nvim would open files
+    // in that Neovim).
+    "NVIM",
+    "NVIM_LISTEN_ADDRESS",
     // A multiplexer JeTTY was started under: JeTTY's shells are NOT inside it,
-    // so `tmux`/`screen` commands must not target the outer session.
+    // so `tmux`/`screen`/`zellij` commands must not target the outer session.
     "TMUX",
     "TMUX_PANE",
     "STY",
+    "ZELLIJ",
+    "ZELLIJ_SESSION_NAME",
+    "ZELLIJ_PANE_ID",
     // The launching terminal's size: stale for JeTTY's grid, and some programs
     // (e.g. Python's shutil.get_terminal_size) prefer these over TIOCGWINSZ.
     "COLUMNS",
@@ -589,6 +614,20 @@ const INHERITED_ENV_DENYLIST: &[&str] = &[
     // theme on screen (`PtySession::spawn_with_env`).
     "COLORFGBG",
 ];
+
+/// `(variable, marker)`: git hooks a VS Code / Cursor terminal sets — its
+/// askpass and commit-message editor, which call back into that editor (the
+/// prompt pops up there, and fails once it quit) — dropped like the denylist
+/// while the editor's `marker` is in JeTTY's environment too. A user's own
+/// `GIT_ASKPASS` / `GIT_EDITOR` comes without the marker and stays.
+const INHERITED_EDITOR_GIT_HOOKS: &[(&str, &str)] =
+    &[("GIT_ASKPASS", "VSCODE_GIT_ASKPASS_MAIN"), ("GIT_EDITOR", "VSCODE_GIT_EDITOR_MAIN")];
+
+/// The [`INHERITED_EDITOR_GIT_HOOKS`] to drop, given which variables JeTTY's
+/// own environment has (`set`).
+fn editor_git_hooks(set: impl Fn(&str) -> bool) -> impl Iterator<Item = &'static str> {
+    INHERITED_EDITOR_GIT_HOOKS.iter().filter(move |(_, marker)| set(marker)).map(|&(var, _)| var)
+}
 
 /// Variables JeTTY set in its OWN environment for its own use (see
 /// [`hide_from_shells`]); removed from every shell like the denylist above.
@@ -606,11 +645,17 @@ pub fn hide_from_shells(var: &'static str) {
 }
 
 /// Every variable of JeTTY's own environment a program it starts must not
-/// inherit: the launch-environment denylist plus what JeTTY set for itself
+/// inherit: the launch-environment denylist (with an editor's git hooks,
+/// [`INHERITED_EDITOR_GIT_HOOKS`]) plus what JeTTY set for itself
 /// ([`hide_from_shells`]). Removed from the shells and from the URL opener.
 pub fn uninherited_env() -> Vec<&'static str> {
     let hidden = HIDDEN_FROM_SHELLS.lock().unwrap_or_else(|e| e.into_inner());
-    INHERITED_ENV_DENYLIST.iter().copied().chain(hidden.iter().copied()).collect()
+    INHERITED_ENV_DENYLIST
+        .iter()
+        .copied()
+        .chain(editor_git_hooks(|key| std::env::var_os(key).is_some()))
+        .chain(hidden.iter().copied())
+        .collect()
 }
 
 /// The locale variable a shell gets when the environment JeTTY hands it names
@@ -1661,6 +1706,19 @@ mod tests {
         assert_eq!(answer_within(Duration::from_secs(5), || 42), Some(42), "a prompt answer comes through");
         let dir = std::env::temp_dir();
         assert_eq!(answer_within(CWD_STAT_TIMEOUT, move || dir.is_dir()), Some(true));
+    }
+
+    #[test]
+    fn an_editors_git_hooks_leave_only_with_the_editor() {
+        // Started from a VS Code / Cursor terminal: its askpass (and, with
+        // `git.terminalGitEditor`, its commit editor) call back into it.
+        let vscode = |k: &str| matches!(k, "GIT_ASKPASS" | "VSCODE_GIT_ASKPASS_MAIN" | "GIT_EDITOR");
+        assert_eq!(editor_git_hooks(vscode).collect::<Vec<_>>(), ["GIT_ASKPASS"]);
+        let editor = |k: &str| matches!(k, "GIT_EDITOR" | "VSCODE_GIT_EDITOR_MAIN");
+        assert_eq!(editor_git_hooks(editor).collect::<Vec<_>>(), ["GIT_EDITOR"]);
+        // The user's own askpass and editor stay.
+        let own = |k: &str| matches!(k, "GIT_ASKPASS" | "GIT_EDITOR");
+        assert_eq!(editor_git_hooks(own).count(), 0);
     }
 
     #[test]

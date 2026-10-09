@@ -222,16 +222,26 @@ fn test_shells_never_read_the_developers_startup_files() {
 #[test]
 fn launch_environment_identity_does_not_leak_into_shells() {
     // Activation tokens, the AppImage runtime and another terminal's identity in
-    // JeTTY's own environment must not reach its shells. (Process env is shared
-    // by the test binary's threads; these names are inert for other tests.)
-    for (k, v) in [
+    // JeTTY's own environment must not reach its shells — nor a VS Code
+    // terminal's git askpass and IPC sockets, a multiplexer's or a Neovim
+    // `:terminal`'s. (Process env is shared by the test binary's threads; these
+    // names are inert for other tests.)
+    let leaks = [
         ("XDG_ACTIVATION_TOKEN", "stale-token"),
         ("DESKTOP_STARTUP_ID", "stale-id"),
         ("KITTY_WINDOW_ID", "7"),
         ("TMUX", "/tmp/tmux-1/default,1,0"),
         ("WINDOWID", "12345"),
         ("OWD", "/somewhere"),
-    ] {
+        ("GIT_ASKPASS", "/opt/code/resources/app/extensions/git/dist/askpass.sh"),
+        ("VSCODE_GIT_ASKPASS_MAIN", "/opt/code/resources/app/extensions/git/dist/askpass-main.js"),
+        ("VSCODE_GIT_IPC_HANDLE", "/run/user/1000/vscode-git-1a2b3c.sock"),
+        ("VSCODE_IPC_HOOK_CLI", "/run/user/1000/vscode-ipc-4d5e.sock"),
+        ("ZELLIJ_SESSION_NAME", "main"),
+        ("NVIM", "/run/user/1000/nvim.123.0"),
+        ("XTERM_VERSION", "XTerm(390)"),
+    ];
+    for (k, v) in leaks {
         std::env::set_var(k, v);
     }
     let pty = spawn_sh(None);
@@ -241,8 +251,8 @@ fn launch_environment_identity_does_not_leak_into_shells() {
         w.write_all(b"env; echo ENV-DONE\n").unwrap();
     }
     let out = read_until(&pty, "\nENV-DONE");
-    for k in ["XDG_ACTIVATION_TOKEN=", "DESKTOP_STARTUP_ID=", "KITTY_WINDOW_ID=", "TMUX=", "WINDOWID=", "OWD="] {
-        assert!(!out.lines().any(|l| l.starts_with(k)), "{k} leaked into the shell:\n{out}");
+    for (k, _) in leaks {
+        assert!(!out.lines().any(|l| l.starts_with(&format!("{k}="))), "{k} leaked into the shell:\n{out}");
     }
     assert!(out.lines().any(|l| l.starts_with("JETTY_BIN=")), "JETTY_BIN missing:\n{out}");
     assert!(out.lines().any(|l| l.starts_with("TERM_PROGRAM=jetty")), "TERM_PROGRAM:\n{out}");
