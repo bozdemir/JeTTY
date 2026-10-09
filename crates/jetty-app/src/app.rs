@@ -3190,13 +3190,16 @@ impl App {
         self.shell = cfg.shell.clone();
         // Keybindings — LIVE (not restart-only). Recompile only when the `[keys]`
         // table actually changed (compare the compiled maps, so an unrelated reload
-        // skips the rebuild). No redraw needed; the next keypress uses the new map.
+        // skips the rebuild). No redraw needed — the next keypress uses the new
+        // map — unless a menu was open: its shortcut hints set the card's width,
+        // so it closes.
         if cfg.keys != self.keys {
             let new_km = crate::keymap::KeyMap::compile(&cfg.keys);
             warnings.extend(new_km.warnings().iter().map(|w| format!("[keys] {w}")));
             self.keys = cfg.keys.clone();
             self.keymap = new_km;
             self.help_rows = App::compute_help_rows(&self.keymap, &self.summon_hotkey);
+            self.dismiss_all_menus();
         }
     }
 
@@ -5013,6 +5016,18 @@ impl App {
             }
         }
         self.paint_surface(s);
+    }
+
+    /// Close every window's menus, repainting each window that had one open:
+    /// their hit rects were cached at open against the UI font, the DPI and
+    /// the `[keys]` hints of that moment, while the draw re-lays the menu out
+    /// every frame — after a change to any of them a click would hit-test rows
+    /// other than the ones drawn (the resize rule, `dismiss_menus`).
+    fn dismiss_all_menus(&mut self) {
+        self.dismiss_surface_menus(Surface::Main);
+        for p in 0..self.detached.len() {
+            self.dismiss_surface_menus(Surface::Detached(p));
+        }
     }
 
     /// The run-selection source for window `s`.
@@ -8652,6 +8667,8 @@ impl App {
     /// burst of steps — the p10k-scatter guard).
     fn set_ui_font_size(&mut self, new_logical: f32) {
         self.ui_font_logical = new_logical.clamp(UI_FONT_MIN, UI_FONT_MAX);
+        // The menus' rows grow or shrink with it.
+        self.dismiss_all_menus();
         let scale = self
             .window
             .as_ref()
@@ -8710,6 +8727,8 @@ impl App {
         });
         self.ui_font_family_chosen = name;
         self.ui_font_family = pick.shown;
+        // The menus' cards widen or narrow with it.
+        self.dismiss_all_menus();
         let fam = if self.ui_font_family.is_empty() {
             None
         } else {
@@ -11060,6 +11079,8 @@ impl App {
                 let scale = scale_factor as f32;
                 let font_logical = self.font_logical;
                 let ui_font_logical = self.ui_font_logical;
+                // Its menu was laid out at the old scale (as in the main window).
+                self.dismiss_surface_menus(Surface::Detached(pos));
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 // Its size at the new scale: the logical size kept inside the
                 // monitor, never winit's suggestion (applied twice on X11 — see
@@ -13384,6 +13405,9 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(t) = self.chrome_text.as_mut() {
                     t.set_font_size(self.ui_font_logical * scale);
                 }
+                // The menus were laid out at the old scale, and no Resized need
+                // follow to close them (a maximized window keeps its size).
+                self.dismiss_menus();
                 if self.visible {
                     self.reflow_pending_at =
                         Some(std::time::Instant::now() + std::time::Duration::from_millis(120));
