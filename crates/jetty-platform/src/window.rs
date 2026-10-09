@@ -495,19 +495,25 @@ fn hide_kind_for(handle: Option<&raw_window_handle::RawWindowHandle>) -> HideKin
 }
 
 /// Take `win` off screen (the summon hide, the focus-loss auto-hide) where the
-/// platform unmaps ([`HideKind::Unmap`]). A [`HideKind::Close`] window goes
-/// when the app drops it.
+/// platform unmaps ([`HideKind::Unmap`]) — on X11 also withdrawn from the
+/// window manager, which keeps no taskbar entry for it. A [`HideKind::Close`]
+/// window goes when the app drops it.
 pub fn hide_window(win: &Window) {
     win.set_visible(false);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    x11::withdraw(win);
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod x11 {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use std::sync::OnceLock;
+    use std::sync::Mutex;
     use winit::window::Window;
     use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt as _, EventMask};
+    use x11rb::errors::ReplyError;
+    use x11rb::protocol::xproto::{
+        Atom, ClientMessageEvent, ConnectionExt as _, EventMask, UnmapNotifyEvent, UNMAP_NOTIFY_EVENT,
+    };
     use x11rb::rust_connection::RustConnection;
 
     /// EWMH `_NET_ACTIVE_WINDOW` source indication for a request made on the
@@ -523,54 +529,108 @@ mod x11 {
         }
     }
 
-    /// Send `_NET_ACTIVE_WINDOW` (source 2) for `win` over a short-lived
-    /// connection of its own (a raise is rare: one hotkey press). `false` when
-    /// `win` is not an X11 window (Wayland) or the server can't be reached, so
-    /// the caller falls back to winit.
-    pub(super) fn request_activation(win: &Window) -> bool {
-        xid(win).is_some_and(|xid| send(xid).is_ok())
+    /// JeTTY's own connection for the few requests winit has no API for — the
+    /// activation, the withdraw, the focus question. Opened on the first one
+    /// and kept: each costs one round trip, where a connection per request
+    /// paid a socket, the Xauthority file and an atom lookup (0.5–3 ms) on
+    /// every F9 summon. The UI thread is its only user.
+    struct Helper {
+        conn: RustConnection,
+        root: u32,
+        net_active_window: Atom,
     }
 
-    /// [`super::holds_input_focus`]: GetInputFocus names one of `windows`. The
-    /// connection is opened on the first question and kept — unlike a raise,
-    /// a grab is asked about again while it lasts.
+    fn connect() -> Result<Helper, Box<dyn std::error::Error>> {
+        let (conn, screen) = x11rb::connect(None)?;
+        let root = conn.setup().roots.get(screen).ok_or("no X screen")?.root;
+        let net_active_window = conn.intern_atom(false, b"_NET_ACTIVE_WINDOW")?.reply()?.atom;
+        Ok(Helper { conn, root, net_active_window })
+    }
+
+    /// Run `request` on the kept connection, opening it first when there is
+    /// none. A connection that broke is dropped, so the next request opens a
+    /// new one. `None` when the server can't be reached or answered an error.
+    fn with_helper<T>(request: impl FnOnce(&Helper) -> Result<T, ReplyError>) -> Option<T> {
+        static HELPER: Mutex<Option<Helper>> = Mutex::new(None);
+        let mut slot = HELPER.lock().ok()?;
+        if slot.is_none() {
+            *slot = connect().ok();
+        }
+        let result = request(slot.as_ref()?);
+        if let Err(ReplyError::ConnectionError(_)) = result {
+            *slot = None;
+        }
+        result.ok()
+    }
+
+    /// A reply on winit's own connection: the server has then handled every
+    /// request winit sent before it — the map of a summon, the unmap of a hide
+    /// — so what JeTTY sends on its own connection next reaches the window
+    /// manager after them. Both are flushed but need not be processed yet, and
+    /// a window manager drops an activation for a window it has not been asked
+    /// to manage. Any request with a reply does; this one asks for the
+    /// window's position.
+    fn after_winit(win: &Window) {
+        let _ = win.inner_position();
+    }
+
+    /// Send `_NET_ACTIVE_WINDOW` (source 2) for `win`. `false` when `win` is
+    /// not an X11 window (Wayland) or the server can't be reached, so the
+    /// caller falls back to winit.
+    pub(super) fn request_activation(win: &Window) -> bool {
+        let Some(xid) = xid(win) else { return false };
+        after_winit(win);
+        with_helper(|h| {
+            // [source, timestamp (CurrentTime), requestor's active window (none), 0, 0]
+            let event = ClientMessageEvent::new(
+                32,
+                xid,
+                h.net_active_window,
+                [SOURCE_USER, x11rb::CURRENT_TIME, 0, 0, 0],
+            );
+            h.conn
+                .send_event(false, h.root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, event)?
+                // A round trip: it also surfaces an X error (BadWindow), and
+                // then the caller falls back to winit.
+                .check()
+        })
+        .is_some()
+    }
+
+    /// [`super::hide_window`]'s second half on X11 — ICCCM's withdraw: after
+    /// its own unmap a client sends the root a synthetic UnmapNotify for the
+    /// window, as Xlib's `XWithdrawWindow` does. It is the only word a window
+    /// manager gets when the window was not mapped any more: a window it had
+    /// MINIMIZED is unmapped already, so the client's unmap changes nothing.
+    /// Without it the focus-loss auto-hide of a minimized terminal left a
+    /// minimized taskbar entry behind, and a click on it showed the window for
+    /// an instant before winit unmapped it again — the window manager then let
+    /// go of it, and only the summon key brought it back. For a window that was
+    /// on screen it repeats what the real UnmapNotify already said.
+    pub(super) fn withdraw(win: &Window) {
+        let Some(xid) = xid(win) else { return };
+        after_winit(win);
+        with_helper(|h| {
+            let event = UnmapNotifyEvent {
+                response_type: UNMAP_NOTIFY_EVENT,
+                sequence: 0,
+                event: h.root,
+                window: xid,
+                from_configure: false,
+            };
+            h.conn
+                .send_event(false, h.root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, event)?
+                .check()
+        });
+    }
+
+    /// [`super::holds_input_focus`]: GetInputFocus names one of `windows`.
     pub(super) fn focus_on(windows: &[&Window]) -> bool {
-        static CONN: OnceLock<Option<RustConnection>> = OnceLock::new();
         let xids: Vec<u32> = windows.iter().filter_map(|w| xid(w)).collect();
         if xids.is_empty() {
             return false;
         }
-        let Some(conn) = CONN.get_or_init(|| x11rb::connect(None).ok().map(|(c, _)| c)) else {
-            return false;
-        };
-        conn.get_input_focus()
-            .ok()
-            .and_then(|cookie| cookie.reply().ok())
-            .is_some_and(|r| xids.contains(&r.focus))
-    }
-
-    fn send(xid: u32) -> Result<(), Box<dyn std::error::Error>> {
-        let (conn, screen) = x11rb::connect(None)?;
-        let root = conn.setup().roots.get(screen).ok_or("no X screen")?.root;
-        let atom = conn
-            .intern_atom(false, b"_NET_ACTIVE_WINDOW")?
-            .reply()?
-            .atom;
-        // [source, timestamp (CurrentTime), requestor's active window (none), 0, 0]
-        let event =
-            ClientMessageEvent::new(32, xid, atom, [SOURCE_USER, x11rb::CURRENT_TIME, 0, 0, 0]);
-        conn.send_event(
-            false,
-            root,
-            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-            event,
-        )?
-        // Round-trip before the connection closes: a request merely flushed and
-        // then followed by the close was dropped unprocessed by the server (on
-        // Xvfb no message reached the WM until the request was checked or the
-        // connection lingered). `check` also surfaces an X error (BadWindow).
-        .check()?;
-        Ok(())
+        with_helper(|h| Ok(h.conn.get_input_focus()?.reply()?.focus)).is_some_and(|focus| xids.contains(&focus))
     }
 }
 
