@@ -661,8 +661,9 @@ pub(crate) fn pick_ui_font_family(want: &str, families: impl FnOnce() -> Vec<Str
 /// Every problem the config tree at `dir` has, worded as JeTTY reports them:
 /// config.toml's (read as at startup, but never copied aside), the theme
 /// files', a theme or font name that finds nothing, a summon hotkey that does
-/// not parse and rejected keybindings. `fonts` lists the installed families:
-/// `(monospace, every other)`. Rebuilds the theme registry from `dir`.
+/// not parse, rejected keybindings and a hot reload that cannot watch the tree
+/// (inotify's limits). `fonts` lists the installed families: `(monospace,
+/// every other)`. Rebuilds the theme registry from `dir`.
 pub(crate) fn problems_in(dir: &std::path::Path, fonts: impl FnOnce() -> (Vec<String>, Vec<String>)) -> Vec<String> {
     use std::str::FromStr as _;
     let mut out = Vec::new();
@@ -700,6 +701,9 @@ pub(crate) fn problems_in(dir: &std::path::Path, fonts: impl FnOnce() -> (Vec<St
         out.push(format!("summon_hotkey {:?} is invalid ({e}) — F9 is used", cfg.summon_hotkey));
     }
     out.extend(crate::keymap::KeyMap::compile(&cfg.keys).warnings().iter().map(|w| format!("[keys] {w}")));
+    if cfg.hot_reload {
+        out.extend(crate::watch::probe(dir));
+    }
     out
 }
 

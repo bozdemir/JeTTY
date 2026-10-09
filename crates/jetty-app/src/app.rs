@@ -3029,9 +3029,9 @@ impl App {
         self.apply_theme();
 
         // (D) Keep watching a recreated config dir, a retargeted config symlink or a
-        // newly created themes/ dir.
+        // newly created themes/ dir — and say when a dir cannot be watched.
         if let Some(w) = self.config_watcher.as_mut() {
-            w.rearm();
+            warnings.extend(w.rearm());
         }
 
         self.reloading = false;
@@ -13236,14 +13236,26 @@ impl ApplicationHandler<AppEvent> for App {
         // Config/theme hot-reload watcher (unless disabled). OS-event-driven, so its
         // thread blocks in the kernel and adds ZERO idle CPU. The returned handle is
         // stored so it lives for the process lifetime (dropping it stops watching).
+        // When it cannot watch (inotify's limits, used up by IDEs and Electron
+        // apps), it says so: `hot_reload = true` doing nothing was a mystery.
         if self.hot_reload && self.config_watcher.is_none() {
             let proxy = self.proxy.clone();
-            self.config_watcher =
-                crate::watch::ConfigWatcher::spawn(crate::config::Config::dir(), move || {
-                    // Coalesced app-side (debounced in about_to_wait); a send error
-                    // just means the loop is gone (shutting down).
-                    let _ = proxy.send_event(AppEvent::ConfigChanged);
-                });
+            let spawned = crate::watch::ConfigWatcher::spawn(crate::config::Config::dir(), move || {
+                // Coalesced app-side (debounced in about_to_wait); a send error
+                // just means the loop is gone (shutting down).
+                let _ = proxy.send_event(AppEvent::ConfigChanged);
+            });
+            let problem = match spawned {
+                Ok((watcher, problem)) => {
+                    self.config_watcher = Some(watcher);
+                    problem
+                }
+                Err(e) => Some(e),
+            };
+            if let Some(p) = problem {
+                self.shown_warnings.push(p.clone());
+                self.show_config_warnings(&[p]);
+            }
         }
 
         self.request_main_paint();
