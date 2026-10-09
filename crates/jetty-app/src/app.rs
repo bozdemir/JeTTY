@@ -9772,7 +9772,12 @@ impl App {
     /// release never arrives) and the window closing all end drags here, so a
     /// live-applied value is never lost on the next start.
     fn end_settings_drags(&mut self) {
-        self.settings_scroll_grab = None;
+        // A released scrollbar thumb is drawn at rest again — also when the
+        // release lands off the thumb or outside the window (no hover change
+        // follows to repaint it).
+        if self.settings_scroll_grab.take().is_some() {
+            self.request_settings_paint();
+        }
         let Some((id, pending)) = settings_drag_end(self.ctl_drag.take()) else { return };
         if let (Some(v), Some(d)) = (pending, crate::settings_ui::find(id)) {
             self.apply_settings_change(|c| (d.set)(c, v));
