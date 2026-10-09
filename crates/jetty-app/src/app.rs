@@ -16477,10 +16477,12 @@ fn desktop_exec_arg(path: &str) -> String {
 
 /// Whether a hot-reload's `warnings` merely repeat what the user was already
 /// shown: nothing they did changed (the config was our own save's echo, no theme
-/// file changed) and the warnings are the very same. Then they are not shown
-/// again — every settings save used to re-pop a broken theme's warning.
+/// file changed) and every warning was shown before. Then they are not shown
+/// again — every settings save used to re-pop a broken theme's warning. (An
+/// echo never re-reads config.toml, so it re-derives only part of what a real
+/// edit showed: a subset is no news either.)
 fn is_reload_echo(config_read: bool, themes_changed: bool, warnings: &[String], shown: &[String]) -> bool {
-    !config_read && !themes_changed && warnings == shown
+    !config_read && !themes_changed && warnings.iter().all(|w| shown.contains(w))
 }
 
 /// Detect the login shells installed on the system, POSIX-style.
@@ -17294,6 +17296,12 @@ mod reload_warning_tests {
         let other = vec!["theme file themes/y.toml skipped: bad".to_string()];
         assert!(!is_reload_echo(false, false, &other, &w), "a new problem: show");
         assert!(is_reload_echo(false, false, &[], &[]), "nothing to show either way");
+        // config.toml has a problem too: the echo of a settings save does not
+        // re-read it, so it re-derives only the theme's warning — still nothing
+        // new, and the theme warning used to pop up again on every Settings click.
+        let both = vec![w[0].clone(), "unknown key `fontsize` is ignored".to_string()];
+        assert!(is_reload_echo(false, false, &w, &both), "a subset of what was shown: quiet");
+        assert!(!is_reload_echo(true, false, &w, &both), "but an edit of config.toml shows");
     }
 }
 
