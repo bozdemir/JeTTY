@@ -1189,8 +1189,9 @@ pub struct App {
     /// Start hidden (`jetty --background`, used by the login autostart entry): the
     /// window is created unmapped and the first summon shows it.
     start_hidden: bool,
-    /// No GPU could draw the main window at startup: the loop exits and `run`
-    /// exits with status 1 ([`App::startup_failed`]).
+    /// No GPU could draw the main window, or no shell could be started, at
+    /// startup: the loop exits and `run` exits with status 1
+    /// ([`App::startup_failed`]).
     startup_failed: bool,
     /// When `Some`, a debounced config/theme reload is due at this instant. Set by a
     /// `ConfigChanged` event (coalescing an editor's write/rename/chmod burst); the
@@ -2204,8 +2205,9 @@ impl App {
         self.start_hidden = hidden;
     }
 
-    /// Whether startup failed for good (no GPU could draw the main window) —
-    /// read by `run` after the event loop returns, for the exit status.
+    /// Whether startup failed for good (no GPU could draw the main window, or
+    /// no shell could be started) — read by `run` after the event loop
+    /// returns, for the exit status.
     pub fn startup_failed(&self) -> bool {
         self.startup_failed
     }
@@ -12368,7 +12370,15 @@ impl ApplicationHandler<AppEvent> for App {
         let pty = match pty_handle.join().expect("pty worker panicked") {
             Ok(pty) => pty,
             Err(e) => {
-                eprintln!("jetty: failed to spawn PTY: {e}");
+                // Every shell candidate failed (or no PTY could be opened): a
+                // window without a shell is useless, so say what to fix and
+                // exit non-zero (`run` reads `startup_failed`).
+                eprintln!(
+                    "jetty: no shell could be started: {e}\n\
+                     jetty: set `shell` in {} (or $SHELL) to an installed shell, e.g. /bin/bash",
+                    crate::config::Config::config_path().display()
+                );
+                self.startup_failed = true;
                 event_loop.exit();
                 return;
             }
