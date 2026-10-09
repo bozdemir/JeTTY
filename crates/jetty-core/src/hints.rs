@@ -198,7 +198,8 @@ fn is_path_char(c: char) -> bool {
 
 /// A conservative file path: a run of path-safe chars that CONTAINS a `/`
 /// (absolute, relative, or `~/`) and a name (an alphanumeric — `//`, `./` and
-/// `../` alone are no path), optionally with a trailing `:line[:col]`
+/// `../` alone are no path, nor is a `//TODO` comment marker), optionally with
+/// a trailing `:line[:col]`
 /// (grep/compiler output). Start must be a natural boundary. A path right
 /// after a quote may run to the closing quote, spaces included (Python's
 /// `File "/a b/c.py"`, `ls`'s `'/tmp/a b'`). Returns the end, or `None`.
@@ -246,7 +247,19 @@ fn match_path(chars: &[char], i: usize, limit: usize) -> Option<usize> {
     if !chars[i..e].contains(&'/') || !chars[i..e].iter().any(char::is_ascii_alphanumeric) {
         return None;
     }
+    if comment_marker(&chars[i..e]) {
+        return None;
+    }
     Some(e)
+}
+
+/// Whether a would-be path is a comment marker — `//TODO`, `///doc`: a run
+/// that starts with `//` and holds no `/` after its leading slashes (a
+/// protocol-relative URL or a network path, `//cdn.io/a.js`, names a
+/// directory).
+fn comment_marker(body: &[char]) -> bool {
+    let name = body.iter().position(|&c| c != '/').unwrap_or(body.len());
+    name >= 2 && !body[name..].contains(&'/')
 }
 
 /// The path inside quotes `quote…quote` whose content starts at `i`: up to the
@@ -262,7 +275,8 @@ fn match_quoted_path(chars: &[char], i: usize, limit: usize, quote: char) -> Opt
         && body.contains(&' ')
         && body.contains(&'/')
         && body.iter().any(char::is_ascii_alphanumeric)
-        && body.iter().all(|&c| c == ' ' || is_path_char(c));
+        && body.iter().all(|&c| c == ' ' || is_path_char(c))
+        && !comment_marker(body);
     ok.then_some(k)
 }
 
@@ -396,6 +410,17 @@ mod tests {
         assert!(scan("go ../ and ./ then //").is_empty());
         assert!(scan("see https:// there").is_empty());
         assert_eq!(scan("cd ../src"), vec![("../src".to_string(), TokenKind::Path)]);
+    }
+
+    #[test]
+    fn a_comment_marker_is_no_path() {
+        // `//TODO`, `///doc` and `//nolint:errcheck` are comments, not paths.
+        assert!(scan("x = 1; //TODO fix").is_empty());
+        assert!(scan("///doc comment").is_empty());
+        assert!(scan("f() //nolint:errcheck").is_empty());
+        // A protocol-relative URL or a network path names a directory.
+        assert_eq!(scan("src=//cdn.io/a.js"), vec![("//cdn.io/a.js".to_string(), TokenKind::Path)]);
+        assert_eq!(scan("at //server/share"), vec![("//server/share".to_string(), TokenKind::Path)]);
     }
 
     #[test]
