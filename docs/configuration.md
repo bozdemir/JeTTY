@@ -90,7 +90,7 @@ Names of fonts and themes are matched in any letter case, and a theme by its id
 | `summon_effect` | `"phosphor"` | How the window appears when summoned: `"none"`, `"bayer"`, `"phosphor"`, `"liquid"`, `"focus"`, `"pop"`, `"glide"` or `"fade"`. |
 | `summon_hotkey` | `"F9"` | The global hotkey that shows and hides JeTTY, e.g. `"F12"` or `"Ctrl+Shift+F12"`. Applies after a restart. On Wayland, bind `jetty --toggle` in your compositor instead. |
 | `focus_autohide` | `true` | Hide the window when it loses focus (drop-down terminal style). On X11 another program's keyboard grab — a held global shortcut, a window manager's move or resize, Alt+Tab while you choose — is not a focus loss: the window stays unless the focus ends up elsewhere. |
-| `launch_at_login` | `false` | Start JeTTY hidden at login (an XDG autostart entry on Linux, a LaunchAgent on macOS); press the summon hotkey and it is there. Starting JeTTY never removes the entry: set `false` (or use the Settings toggle) while JeTTY runs. Ignored with `JETTY_CONFIG_DIR`. |
+| `launch_at_login` | `false` | Start JeTTY hidden at login (an XDG autostart entry on Linux, a LaunchAgent on macOS); press the summon hotkey and it is there. Starting JeTTY never removes the entry: set `false` (or use the Settings toggle) while JeTTY runs. An entry switched off in the desktop's startup settings stays off (`Hidden=true` or `X-…-Autostart-enabled=false`). Ignored with `JETTY_CONFIG_DIR`. |
 
 ## Tabs and chrome
 

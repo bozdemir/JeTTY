@@ -17904,6 +17904,9 @@ fn set_launch_at_login(path: &std::path::Path, enabled: bool, program: &str) -> 
 /// Launch-at-login at STARTUP. Returns the app's state and a problem to show.
 ///
 /// * `JETTY_CONFIG_DIR` set (`alt_config_dir`): the file's value, untouched;
+/// * JeTTY's entry turned off in the desktop's own settings
+///   ([`autostart_entry_disabled`]): off, and the entry left as it is — that
+///   was the user switching it off, which a restart must not undo;
 /// * the config SETS `true`: the entry is (re)written ([`sync_launch_at_login`]);
 /// * otherwise nothing is removed at startup — the app MIRRORS the entry, so
 ///   Settings shows the truth: a config that does not set the key (no file, a
@@ -17920,11 +17923,27 @@ fn startup_launch_at_login(
     if alt_config_dir {
         return (cfg_value, None);
     }
+    let entry = std::fs::read_to_string(path).ok().filter(|c| is_jetty_autostart_entry(c));
+    if entry.as_deref().is_some_and(autostart_entry_disabled) {
+        return (false, None);
+    }
     if explicit == Some(true) {
         return (true, sync_launch_at_login(path, true, target).err());
     }
-    let ours = std::fs::read_to_string(path).is_ok_and(|c| is_jetty_autostart_entry(&c));
-    (ours, None)
+    (entry.is_some(), None)
+}
+
+/// Is this autostart entry switched off where it stands? Session-settings tools
+/// keep the file — still JeTTY's — and mark it: `Hidden=true` (the XDG autostart
+/// spec's "ignore this entry") or an `X-…-Autostart-enabled=false`.
+fn autostart_entry_disabled(content: &str) -> bool {
+    content.lines().filter_map(|l| l.split_once('=')).any(|(key, value)| {
+        let (key, value) = (key.trim(), value.trim());
+        (key == "Hidden" && value == "true")
+            || (key.starts_with("X-")
+                && key.to_ascii_lowercase().ends_with("-autostart-enabled")
+                && value == "false")
+    })
 }
 
 /// The `launch_at_login` a hot-reload applies: the file's value (`explicit`) —
@@ -19068,6 +19087,35 @@ mod autostart_tests {
         // An explicit `true` writes it.
         assert_eq!(startup_launch_at_login(&path, true, Some(true), false, &target(&exe)), (true, None));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), entry);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_entry_the_desktop_switched_off_stays_off() {
+        // The user unticked JeTTY in their session settings, which keeps the
+        // file and marks it. A restart with `launch_at_login = true` used to
+        // rewrite it enabled; now the app mirrors "off" and leaves it alone.
+        let dir = scratch("disabled");
+        let path = dir.join("autostart").join("jetty.desktop");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        let desktop = autostart_desktop_entry(&exe);
+        for off in [
+            desktop.clone() + "Hidden=true\n",
+            desktop.replace("X-GNOME-Autostart-enabled=true", "X-GNOME-Autostart-enabled=false"),
+            desktop.clone() + "X-MATE-Autostart-enabled=false\n",
+        ] {
+            std::fs::write(&path, &off).unwrap();
+            for explicit in [Some(true), Some(false), None] {
+                assert_eq!(startup_launch_at_login(&path, true, explicit, false, &target(&exe)), (false, None));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), off, "left as the desktop wrote it");
+            }
+            // Switching it back on in JeTTY rewrites it enabled.
+            set_launch_at_login(&path, true, &exe).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), autostart_entry_for(&exe));
+        }
+        // Its own `X-GNOME-Autostart-enabled=true` is not "off".
+        assert_eq!(startup_launch_at_login(&path, true, Some(true), false, &target(&exe)), (true, None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
