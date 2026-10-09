@@ -7604,13 +7604,16 @@ impl App {
         (w, h)
     }
 
-    /// Resize the open Settings window to fit the panel at the current UI font
-    /// (see [`Self::desired_settings_logical_size`]). No-op when Settings is
-    /// closed. Called after any UI-font size/family change so the window re-fits.
-    fn resize_settings_to_fit(&self) {
+    /// Grow the open Settings window to fit the panel at the current UI font
+    /// size (see [`Self::desired_settings_logical_size`]) — never shrink it: a
+    /// size the user dragged it to stays (the panel fills any size and
+    /// scrolls). No-op when Settings is closed or already fits.
+    fn grow_settings_to_fit(&self) {
         if let Some(win) = self.settings_window.as_ref() {
-            let (w, h) = self.desired_settings_logical_size();
-            let _ = win.request_inner_size(winit::dpi::LogicalSize::new(w, h));
+            let cur = win.inner_size().to_logical::<f64>(win.scale_factor());
+            if let Some((w, h)) = settings_grown_size((cur.width, cur.height), self.desired_settings_logical_size()) {
+                let _ = win.request_inner_size(winit::dpi::LogicalSize::new(w, h));
+            }
         }
     }
 
@@ -9058,9 +9061,10 @@ impl App {
         self.reflow_pending_at = Some(reflow_at);
         self.persist();
         self.request_main_paint();
-        // A different UI size grows/shrinks the panel — re-fit the window so the
-        // bottom rows are never clipped (then live-preview the change).
-        self.resize_settings_to_fit();
+        // A bigger UI size grows the panel — grow the window to fit it (a smaller
+        // one, or a window the user made bigger, keeps its size), then
+        // live-preview the change.
+        self.grow_settings_to_fit();
         // Live preview in the settings window (specimen + readout) if it's open.
         self.render_settings_window();
         self.request_settings_paint();
@@ -9103,8 +9107,9 @@ impl App {
         }
         self.persist();
         self.request_main_paint();
-        // A wider/narrower UI family changes the panel's scaled width — re-fit.
-        self.resize_settings_to_fit();
+        // The family leaves the panel's size alone (see
+        // `desired_settings_logical_size`), and so the window's: a size the user
+        // chose stays.
         self.render_settings_window();
         self.request_settings_paint();
         pick.warning
@@ -18305,6 +18310,18 @@ fn settings_drag_end(drag: Option<CtlDrag>) -> Option<(jetty_render::CtlId, Opti
     drag.map(|d| (d.id, d.pending))
 }
 
+/// The logical size the Settings window grows to from `cur` (its logical
+/// inner size) so the panel fits `want` (`App::desired_settings_logical_size`):
+/// each side only ever grows — a size the user dragged the window to is never
+/// taken back — and `None` when it already fits (within rounding).
+fn settings_grown_size(cur: (f64, f64), want: (u32, u32)) -> Option<(u32, u32)> {
+    let (w, h) = (f64::from(want.0), f64::from(want.1));
+    if cur.0 + 0.5 >= w && cur.1 + 0.5 >= h {
+        return None;
+    }
+    Some((cur.0.round().max(w) as u32, cur.1.round().max(h) as u32))
+}
+
 /// The wgpu clear color (linear) for an opaque sRGB color.
 fn srgb_clear(c: [u8; 3]) -> wgpu::Color {
     let lin = |v: u8| {
@@ -20136,7 +20153,7 @@ mod window_mode_tests {
 mod window_parity_tests {
     use super::{
         detach_logical_size, gpu_recovery_due, pace_paint, perf_hud_text, refresh_interval, settings_drag_end,
-        settings_fullscreen_exit, smooth_frame_ms, CtlDrag, FullscreenExit, PaintPacing,
+        settings_fullscreen_exit, settings_grown_size, smooth_frame_ms, CtlDrag, FullscreenExit, PaintPacing,
         GPU_REBUILD_RETRY,
     };
     use std::time::{Duration, Instant};
@@ -20256,6 +20273,19 @@ mod window_parity_tests {
         // The dropdown size applies on release (its change re-docks once).
         let dd = CtlDrag { id: "dropdown_height_pct", part: CtlPart::Track, pending: Some(Val::F(0.8)) };
         assert_eq!(settings_drag_end(Some(dd)), Some(("dropdown_height_pct", Some(Val::F(0.8)))));
+    }
+
+    #[test]
+    fn a_ui_font_change_grows_settings_but_never_shrinks_it() {
+        // A UI-font pick (or a step of its size) snapped a Settings window the
+        // user had enlarged back to the panel's design size every time.
+        assert_eq!(settings_grown_size((900.0, 1000.0), (424, 596)), None, "a bigger window stays");
+        assert_eq!(settings_grown_size((424.0, 596.0), (424, 596)), None);
+        assert_eq!(settings_grown_size((423.6, 595.7), (424, 596)), None, "rounding at a fractional scale");
+        // A bigger UI size outgrows the design size: the window grows to fit…
+        assert_eq!(settings_grown_size((424.0, 596.0), (450, 632)), Some((450, 632)));
+        // …on the short side only; the other keeps the user's size.
+        assert_eq!(settings_grown_size((900.0, 500.0), (450, 632)), Some((900, 632)));
     }
 
     #[test]
