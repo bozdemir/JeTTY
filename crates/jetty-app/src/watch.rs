@@ -60,7 +60,7 @@ impl Targets {
             .flatten()
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("toml"))
+            .filter(|p| crate::themes::is_theme_file(p))
             .filter_map(|p| linked(&p))
             .collect();
         real_themes.sort();
@@ -105,7 +105,8 @@ impl Targets {
     }
 
     /// Does a change to `p` warrant a reload? The real `config.toml` (or the file
-    /// it links to), `themes/*.toml`, and the config / themes dirs themselves
+    /// it links to), the theme files (`themes/*.toml`, see
+    /// [`crate::themes::is_theme_file`]), and the config / themes dirs themselves
     /// (created, removed, renamed). Never JeTTY's own atomic-save temp file
     /// (`.config.toml.tmp.<pid>`), its backups (`config.toml.bad-*`, `.bak-*`) or
     /// anything else in the watched dirs.
@@ -122,8 +123,7 @@ impl Targets {
         if self.real_config.as_deref() == Some(p) || self.real_themes.iter().any(|t| t == p) {
             return true;
         }
-        p.parent() == Some(self.themes_dir.as_path())
-            && p.extension().and_then(|x| x.to_str()) == Some("toml")
+        p.parent() == Some(self.themes_dir.as_path()) && crate::themes::is_theme_file(p)
     }
 }
 
@@ -223,6 +223,8 @@ mod tests {
         // preserved copies.
         assert!(!t.is_relevant(Path::new("/home/u/.config/jetty/config.toml.bad-1700000000")));
         assert!(!t.is_relevant(Path::new("/home/u/.config/jetty/config.toml.bak-1700000000")));
+        // Emacs's lock for a theme buffer being edited.
+        assert!(!t.is_relevant(Path::new("/home/u/.config/jetty/themes/.#mine.toml")));
         // a stray toml NOT under themes/, other apps' configs next door.
         assert!(!t.is_relevant(Path::new("/home/u/.config/jetty/other.toml")));
         assert!(!t.is_relevant(Path::new("/home/u/.config/kwinrc")));

@@ -268,6 +268,15 @@ fn load_theme_file(
     theme_from_toml(parsed, stem)
 }
 
+/// Whether `path` (in the themes dir) is a theme file: a `*.toml` — never an
+/// atomic-save temp file mid-write (`.tmp.`, an editor's or JeTTY's own) nor
+/// Emacs's lock for a buffer being edited (`.#mine.toml`, a dangling symlink).
+/// The loader, its fingerprint and the hot-reload watcher all ask this.
+pub(crate) fn is_theme_file(path: &std::path::Path) -> bool {
+    let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    path.extension().is_some_and(|x| x == "toml") && !name.contains(".tmp.") && !name.starts_with(".#")
+}
+
 /// Read `<dir>/*.toml` (the user themes dir) into a `Vec<Theme>`, plus a warning
 /// per problem. Never panics: a malformed file is skipped (and reported) — or,
 /// when an earlier version of it loaded in this session, that version is kept
@@ -277,15 +286,7 @@ pub fn load_user_themes_from(dir: &std::path::Path) -> (Vec<jetty_core::Theme>, 
     let mut warnings = Vec::new();
     let mut last_good = LAST_GOOD.lock().unwrap_or_else(|p| p.into_inner());
     let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            // `.tmp.` = an editor's / our own atomic-save temp file mid-write.
-            .filter(|p| {
-                p.extension().and_then(|x| x.to_str()) == Some("toml")
-                    && !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(".tmp."))
-            })
-            .collect(),
+        Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_theme_file(p)).collect(),
         Err(_) => {
             // No themes dir → no user themes (and none to keep).
             last_good.retain(|p, _| p.parent() != Some(dir));
@@ -331,18 +332,13 @@ pub fn load_user_themes_from(dir: &std::path::Path) -> (Vec<jetty_core::Theme>, 
     (out, warnings)
 }
 
-/// A fingerprint of the user theme files in `dir` (each `*.toml`'s name and
+/// A fingerprint of the user theme files in `dir` (each theme file's name and
 /// content): equal fingerprints mean no theme file changed — so a reload that is
 /// only the echo of JeTTY's own config save need not re-show theme warnings.
 pub fn fingerprint_of(dir: &std::path::Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("toml"))
-                .collect()
-        })
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| is_theme_file(p)).collect())
         .unwrap_or_default();
     files.sort();
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -415,6 +411,30 @@ mod tests {
         assert_eq!(fingerprint_of(&dir), fp, "non-theme files do not count");
         std::fs::write(dir.join("a.toml"), "still bad").unwrap();
         assert_ne!(fingerprint_of(&dir), fp, "an edit (even still broken) counts");
+        // What the loader skips does not count either: a save mid-write, and
+        // Emacs's lock for a buffer being edited.
+        let fp = fingerprint_of(&dir);
+        std::fs::write(dir.join(".a.toml.tmp.42.toml"), "half").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("me@host.4242:1700000000", dir.join(".#a.toml")).unwrap();
+        assert_eq!(fingerprint_of(&dir), fp, "temp and lock files are not themes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_emacs_lock_file_is_not_a_theme() {
+        // Emacs marks a modified buffer with a dangling symlink `.#<file>`:
+        // it was loaded as a theme, and "themes/.#mine.toml skipped: No such
+        // file or directory" popped up whenever a theme was being edited.
+        let dir = theme_dir("emacs-lock");
+        std::fs::write(dir.join("mine.toml"), theme_text("#101010")).unwrap();
+        std::os::unix::fs::symlink("me@host.4242:1700000000", dir.join(".#mine.toml")).unwrap();
+        let (themes, w) = load_user_themes_from(&dir);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(themes.len(), 1);
+        assert!(!is_theme_file(&dir.join(".#mine.toml")));
+        assert!(is_theme_file(&dir.join("mine.toml")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
