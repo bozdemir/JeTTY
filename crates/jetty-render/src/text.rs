@@ -2314,10 +2314,30 @@ impl TextLayer {
         quads: &[crate::quad::Rect],
         sets: &[(&[(String, f32, f32, [u8; 3])], bool)],
     ) -> Result<(), PrepareError> {
+        let no_tail: Option<fn(&mut wgpu::RenderPass<'_>)> = None;
+        self.render_chrome_then(device, queue, view, width, height, quad, quads, sets, no_tail)
+    }
+
+    /// [`Self::render_chrome`], with `tail`'s draws recorded last in the same
+    /// pass — the corner mask, on a frame that draws nothing after the chrome
+    /// (one pass and submit fewer).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn render_chrome_then(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        quad: &mut crate::quad::QuadLayer,
+        quads: &[crate::quad::Rect],
+        sets: &[(&[(String, f32, f32, [u8; 3])], bool)],
+        tail: Option<impl FnOnce(&mut wgpu::RenderPass<'_>)>,
+    ) -> Result<(), PrepareError> {
         let quad_count = quad.upload(device, queue, width, height, quads);
         let text = self.prepare_overlay_sets(device, queue, width, height, sets, None);
         let has_text = matches!(text, Ok(true));
-        if quad_count == 0 && !has_text {
+        if quad_count == 0 && !has_text && tail.is_none() {
             return text.map(|_| ());
         }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2328,6 +2348,9 @@ impl TextLayer {
             quad.draw_uploaded(&mut pass, quad_count);
             if has_text {
                 self.draw_prepared_overlays(&mut pass);
+            }
+            if let Some(tail) = tail {
+                tail(&mut pass);
             }
         }
         queue.submit(Some(encoder.finish()));

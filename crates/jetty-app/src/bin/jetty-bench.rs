@@ -688,7 +688,95 @@ fn bench_frames(
         })?;
     }
     bench_scene_passes(device, queue, format, font_size)?;
-    bench_chrome(device, queue, format)
+    bench_chrome(device, queue, format)?;
+    bench_corner_mask(device, queue, format)
+}
+
+/// The rounded-corner mask (radius 10, the default) after the chrome pass of a
+/// typing frame — the tab bar and the status HUD, as `bench_chrome` draws them
+/// — as a pass + submit of its own vs. recorded as the chrome pass's last draws
+/// (`render_chrome_then`), interleaved frame by frame at 1920×1200.
+fn bench_corner_mask(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (width, height) = (1920u32, 1200u32);
+    let cm = jetty_render::ChromeMetrics::new(1.0, jetty_render::UI_FONT_BASE);
+    let mut chrome = TextLayer::new_with_family(device, queue, format, jetty_render::UI_FONT_BASE, "MesloLGS NF");
+    let mut quad = jetty_render::QuadLayer::new(device, format);
+    let mask = jetty_render::CornerMask::new(device, format);
+    let view = device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("bench-mask-tex"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let theme = jetty_core::Theme::by_name("catppuccin_mocha");
+    let tabs: Vec<(String, bool)> =
+        ["~/src/jetty", "cargo build", "nvim"].iter().enumerate().map(|(i, t)| (t.to_string(), i == 0)).collect();
+    let deco = vec![jetty_render::TabDeco::default(); tabs.len()];
+    let opts = jetty_render::TabBarOpts::default();
+    let status_h = cm.status_h();
+    let radii = [10.0; 4];
+    let n = 300usize;
+    let mut cpu = [Vec::with_capacity(n), Vec::with_capacity(n)];
+    let mut allocs = [0u64; 2];
+    for k in 0..2 * n + 40 {
+        let folded = k % 2 == 1;
+        let hud = format!("⚡ {:.1} ms · {} fps · {}% CPU · 0 MB/s", 16.0 + (k % 7) as f32 * 0.1, 60 - k % 3, k % 5);
+        let t = Instant::now();
+        let a0 = alloc_counts().0;
+        let bar = jetty_render::build_tab_bar_styled(
+            width,
+            &tabs,
+            &theme,
+            None,
+            jetty_render::CtrlHover::None,
+            None,
+            &mut chrome,
+            cm,
+            &deco,
+            &opts,
+        );
+        let strip =
+            jetty_render::build_status_strip(width, height as f32 - status_h, status_h, Some(&hud), &theme, &mut chrome, cm);
+        let mut quads = bar.quads;
+        quads.push(strip.quad);
+        let mut labels = bar.labels;
+        labels.extend(strip.label);
+        let sets = [(&labels[..], false), (&bar.title_labels[..], true)];
+        if folded {
+            let tail = |pass: &mut wgpu::RenderPass<'_>| mask.record(queue, pass, width, height, radii, 0.0);
+            let _ = chrome.render_chrome_then(device, queue, &view, width, height, &mut quad, &quads, &sets, Some(tail));
+        } else {
+            let _ = chrome.render_chrome(device, queue, &view, width, height, &mut quad, &quads, &sets);
+            mask.apply(device, queue, &view, width, height, radii[0], radii[1], radii[2], radii[3]);
+        }
+        // The first frames shape and cache; measure the steady state.
+        if k >= 40 {
+            cpu[folded as usize].push(t.elapsed().as_secs_f32() * 1000.0);
+            allocs[folded as usize] += alloc_counts().0 - a0;
+        }
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+    }
+    for (variant, label) in ["own pass", "in the chrome pass"].iter().enumerate() {
+        let v = &mut cpu[variant];
+        let mean = v.iter().sum::<f32>() / v.len() as f32;
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        println!(
+            "corner mask   chrome + mask, {width}x{height}, {label:<18}: cpu {mean:.3} ms (p50 {:.3}) | {:.0} allocs/frame",
+            percentile(v, 50.0),
+            allocs[variant] as f64 / v.len() as f64
+        );
+    }
+    Ok(())
 }
 
 /// One full redraw of a btop-like screen: `╭─…─╮`, rows of `│` + a braille graph

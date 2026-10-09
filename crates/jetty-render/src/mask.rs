@@ -198,7 +198,6 @@ impl CornerMask {
         r_br: f32,
         offset_y: f32,
     ) {
-        let slid = offset_y != 0.0 && offset_y.is_finite();
         // All-flat corners ⇒ the pass would be a no-op multiply by 1.0: skip it
         // entirely (one fewer render pass + uniform write per frame). The app's
         // fullscreen corner suppression feeds radius 0.0 and so lands here — but
@@ -206,25 +205,9 @@ impl CornerMask {
         // scales with surface AREA, and a fullscreen surface is several times the
         // default window (see the CHANGELOG's honest cost note). Pinned by
         // `all_radii_flat`'s unit test.
-        if all_radii_flat(r_tl, r_tr, r_bl, r_br) && !slid {
+        if !Self::needed([r_tl, r_tr, r_bl, r_br], offset_y) {
             return;
         }
-        // Clamp each radius so it never exceeds half the smaller dimension.
-        let max_r = (width.min(height) as f32) / 2.0;
-        let c = |r: f32| r.min(max_r).max(0.0);
-        // Layout: [size.x, size.y, r_tl, r_tr, r_bl, r_br, offset_y, _pad] (32 bytes).
-        let params: [f32; 8] = [
-            width as f32,
-            height as f32,
-            c(r_tl),
-            c(r_tr),
-            c(r_bl),
-            c(r_br),
-            if slid { offset_y } else { 0.0 },
-            0.0,
-        ];
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&params));
-
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("corner-mask-encoder"),
         });
@@ -245,25 +228,58 @@ impl CornerMask {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            // Coverage is < 1 only near the rounded corners and on the outermost
-            // pixel row/column (the ~1px edge feather), so scissor the fullscreen
-            // triangle to just those regions instead of a read-modify-write blend
-            // over the WHOLE surface every frame. Pixels outside are multiplied by
-            // exactly 1.0 by the old full-screen pass, so the result is identical.
-            let regions = if slid {
-                // The moving edge can be anywhere: one full-target draw.
-                vec![[0, 0, width, height]]
-            } else {
-                mask_regions(width, height, [params[2], params[3], params[4], params[5]])
-            };
-            for [x, y, w, h] in regions {
-                pass.set_scissor_rect(x, y, w, h);
-                pass.draw(0..3, 0..1);
-            }
+            self.record(queue, &mut pass, width, height, [r_tl, r_tr, r_bl, r_br], offset_y);
         }
         queue.submit(Some(encoder.finish()));
+    }
+
+    /// Whether the mask changes any pixel: some corner is rounded, or the
+    /// shape is sliding (radii = tl, tr, bl, br).
+    pub fn needed(radii: [f32; 4], offset_y: f32) -> bool {
+        let [r_tl, r_tr, r_bl, r_br] = radii;
+        !all_radii_flat(r_tl, r_tr, r_bl, r_br) || (offset_y != 0.0 && offset_y.is_finite())
+    }
+
+    /// Record the mask's draws into `pass`, whose target is the frame being
+    /// masked: as the last draws of the frame's last pass (the chrome's, on a
+    /// frame that draws nothing after it), the mask costs no pass and submit of
+    /// its own. Same pixels as [`Self::apply_slid`]; call it only when
+    /// [`Self::needed`]. One mask per submit: the uniform is written now and
+    /// read when the pass's commands run.
+    pub fn record(
+        &self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'_>,
+        width: u32,
+        height: u32,
+        radii: [f32; 4],
+        offset_y: f32,
+    ) {
+        let slid = offset_y != 0.0 && offset_y.is_finite();
+        // Clamp each radius so it never exceeds half the smaller dimension.
+        let max_r = (width.min(height) as f32) / 2.0;
+        let [r_tl, r_tr, r_bl, r_br] = radii.map(|r| r.min(max_r).max(0.0));
+        // Layout: [size.x, size.y, r_tl, r_tr, r_bl, r_br, offset_y, _pad] (32 bytes).
+        let params: [f32; 8] =
+            [width as f32, height as f32, r_tl, r_tr, r_bl, r_br, if slid { offset_y } else { 0.0 }, 0.0];
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&params));
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        // Coverage is < 1 only near the rounded corners and on the outermost
+        // pixel row/column (the ~1px edge feather), so scissor the fullscreen
+        // triangle to just those regions instead of a read-modify-write blend
+        // over the WHOLE surface every frame. Pixels outside are multiplied by
+        // exactly 1.0 by the old full-screen pass, so the result is identical.
+        let regions = if slid {
+            // The moving edge can be anywhere: one full-target draw.
+            vec![[0, 0, width, height]]
+        } else {
+            mask_regions(width, height, [r_tl, r_tr, r_bl, r_br])
+        };
+        for [x, y, w, h] in regions {
+            pass.set_scissor_rect(x, y, w, h);
+            pass.draw(0..3, 0..1);
+        }
     }
 }
 
@@ -426,6 +442,96 @@ mod tests {
         all_radii_flat, mask_regions, rounded_rect_coverage, rounded_rect_coverage_per, rounded_rect_coverage_slid,
         MASK_SHADER,
     };
+
+    /// Recorded as the chrome pass's last draws (`TextLayer::render_chrome_then`),
+    /// the mask leaves exactly the pixels its own pass does — rounded, top-flush
+    /// and mid-slide. Needs a GPU adapter:
+    ///   cargo test -p jetty-render mask_in_the_chrome_pass -- --ignored
+    #[test]
+    #[ignore]
+    fn mask_in_the_chrome_pass_matches_its_own_pass() {
+        // 128 px: a row of 512 bytes, the copy alignment.
+        let (w, h) = (128u32, 64u32);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mask = super::CornerMask::new(&device, format);
+        let mut quad = crate::quad::QuadLayer::new(&device, format);
+        let mut text = crate::text::TextLayer::new_with_family(&device, &queue, format, 14.0, "monospace");
+        let quads = [
+            crate::quad::Rect::new(0.0, 0.0, w as f32, h as f32, [30, 30, 46, 255]),
+            crate::quad::Rect::new(0.0, 0.0, w as f32, 12.0, [137, 180, 250, 255]),
+        ];
+        let draw = |folded: bool, radii: [f32; 4], offset_y: f32, quad: &mut crate::quad::QuadLayer,
+                    text: &mut crate::text::TextLayer| {
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = target.create_view(&Default::default());
+            let label = [("chrome".to_string(), 4.0, 0.0, [205, 214, 244])];
+            let sets = [(&label[..], false)];
+            if folded {
+                let tail = |pass: &mut wgpu::RenderPass<'_>| mask.record(&queue, pass, w, h, radii, offset_y);
+                text.render_chrome_then(&device, &queue, &view, w, h, quad, &quads, &sets, Some(tail)).expect("chrome");
+            } else {
+                text.render_chrome(&device, &queue, &view, w, h, quad, &quads, &sets).expect("chrome");
+                mask.apply_slid(&device, &queue, &view, w, h, radii[0], radii[1], radii[2], radii[3], offset_y);
+            }
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (w * h * 4) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            enc.copy_texture_to_buffer(
+                target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: None },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            queue.submit(Some(enc.finish()));
+            buf.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+            device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+            let bytes = buf.slice(..).get_mapped_range().to_vec();
+            bytes
+        };
+        for (radii, offset_y) in [([10.0; 4], 0.0), ([0.0, 0.0, 10.0, 10.0], 0.0), ([0.0, 0.0, 10.0, 10.0], -20.0)] {
+            let own = draw(false, radii, offset_y, &mut quad, &mut text);
+            let folded = draw(true, radii, offset_y, &mut quad, &mut text);
+            assert_eq!(own.len(), folded.len());
+            assert!(own == folded, "radii {radii:?} offset {offset_y}: the folded mask differs");
+            // And the mask did run: the top-left corner pixel is transparent
+            // where that corner is rounded; a square one keeps the edge
+            // feather's ~0.93 (`mask_regions`).
+            if radii[0] > 0.0 {
+                assert_eq!(own[3], 0, "radii {radii:?}");
+            } else {
+                assert!(own[3] > 200, "radii {radii:?}: {}", own[3]);
+            }
+            let bottom = ((h - 1) * w * 4 + 3) as usize;
+            assert_eq!(own[bottom], 0, "the bottom-left corner is masked");
+        }
+    }
 
     #[test]
     fn mask_shader_validates_with_the_offset_field() {

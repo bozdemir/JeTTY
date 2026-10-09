@@ -12177,6 +12177,26 @@ impl App {
             copy_mode_active: copy_mode_ui.is_some(),
             copy_mode_ui,
         };
+        // The corner mask rides the chrome pass when nothing else draws before
+        // it (the main window's `mask_in_chrome`, which see): every draw between
+        // the chrome pass and the mask below must be listed here.
+        let drawn_after_chrome = shift_hint_show
+            || status_pill_msg.is_some()
+            || link_target.is_some()
+            || search_ui.is_some()
+            || hint_ui.is_some()
+            || preedit_ui.is_some()
+            || copy_mode_ui.is_some()
+            || menu_open.is_some()
+            || help_open
+            || palette_ui.is_some()
+            || edge.veil.is_some()
+            || (focus_ring.is_some() && (!edge.rims.is_empty() || ring_color.is_some()))
+            || (glow_look.is_some() && caret_fx.is_some() && caret_t.is_some());
+        let (r_tl, r_tr, r_bl, r_br) = crate::detached::corner_radii(corner_radius_px);
+        let mask_radii = [r_tl, r_tr, r_bl, r_br];
+        let mask_in_chrome =
+            !(drawn_after_chrome || crt_active) && jetty_render::CornerMask::needed(mask_radii, 0.0);
         render_grid_scene(
             gpu,
             text,
@@ -12210,7 +12230,10 @@ impl App {
                     labels.extend(strip.label);
                 }
                 quads.extend_from_slice(grid_rects);
-                let _ = chrome_text.render_chrome(
+                let mask_tail = mask_in_chrome.then_some(|pass: &mut wgpu::RenderPass<'_>| {
+                    corner_mask.record(queue, pass, w, h, mask_radii, 0.0)
+                });
+                let _ = chrome_text.render_chrome_then(
                     device,
                     queue,
                     view,
@@ -12219,6 +12242,7 @@ impl App {
                     quad,
                     &quads,
                     &[(&labels, false), (&bar.title_labels, true)],
+                    mask_tail,
                 );
             },
         );
@@ -12320,7 +12344,8 @@ impl App {
                 let _ = chrome_text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &pill.labels);
             }
         }
-        // Pass 6: the Reattach/Copy/Paste context menu on top of everything.
+        // Pass 6: the context menu (Reattach / Copy / Paste / Run in New Tab) on
+        // top of everything.
         if let Some((mx, my)) = menu_open {
             let items: Vec<(&str, &str)> = crate::detached::DETACHED_MENU_ITEMS
                 .iter()
@@ -12434,9 +12459,9 @@ impl App {
         // free-floating window, so ALL FOUR corners round (the main window's
         // Dropdown top-square nuance never applies here). Skipped while CRT is
         // active: the CRT pass owns the rounded corners then (exactly like the
-        // main window's mask/CRT interplay).
-        if !crt_active {
-            let (r_tl, r_tr, r_bl, r_br) = crate::detached::corner_radii(corner_radius_px);
+        // main window's mask/CRT interplay) — and when the chrome pass already
+        // recorded it (`mask_in_chrome`).
+        if !(crt_active || mask_in_chrome) {
             corner_mask.apply(
                 &gpu.device, &gpu.queue, scene_view, width, height, r_tl, r_tr, r_bl, r_br,
             );
@@ -16310,6 +16335,39 @@ impl ApplicationHandler<AppEvent> for App {
                             chrome_labels.extend(strip.label);
                         }
                     }
+                    // The corner mask (below) rides the chrome pass — then the
+                    // frame's last — when nothing else draws before it: one pass
+                    // and submit fewer on the typing frame. Every draw between
+                    // the chrome pass and the mask must be listed here, or it
+                    // lands over corners already masked.
+                    let drawn_after_chrome = shift_hint_show
+                        || status_pill_msg.is_some()
+                        || link_target.is_some()
+                        || search_ui.is_some()
+                        || hint_ui.is_some()
+                        || preedit_ui.is_some()
+                        || copy_mode_ui.is_some()
+                        || welcome_open
+                        || context_menu.is_some()
+                        || tab_menu.is_some()
+                        || help_open
+                        || confirm_quit
+                        || confirm_close.is_some()
+                        || palette_ui.is_some()
+                        || edge.veil.is_some()
+                        || (focus_ring.is_some() && (!edge.rims.is_empty() || ring_color.is_some()))
+                        || (glow_look.is_some() && caret_fx.is_some() && caret_t.is_some());
+                    let mask_radii = [
+                        if top_flush { 0.0 } else { corner_radius_px },
+                        if top_flush { 0.0 } else { corner_radius_px },
+                        corner_radius_px,
+                        corner_radius_px,
+                    ];
+                    // (The CRT pass owns the corners while it runs.)
+                    let mask_in_chrome = corner_mask.filter(|_| {
+                        !(drawn_after_chrome || crt_active || crt_under)
+                            && jetty_render::CornerMask::needed(mask_radii, slide_y_offset)
+                    });
                     render_grid_scene(
                         gpu,
                         text,
@@ -16331,7 +16389,12 @@ impl ApplicationHandler<AppEvent> for App {
                         // ride the same pass, over the chrome's quads.
                         |quad, device, queue, view, w, h, grid_rects| {
                             chrome_quads.extend_from_slice(grid_rects);
-                            let _ = chrome_text.render_chrome(
+                            let mask_tail = mask_in_chrome.map(|mask| {
+                                move |pass: &mut wgpu::RenderPass<'_>| {
+                                    mask.record(queue, pass, w, h, mask_radii, slide_y_offset)
+                                }
+                            });
+                            let _ = chrome_text.render_chrome_then(
                                 device,
                                 queue,
                                 view,
@@ -16340,6 +16403,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 quad,
                                 &chrome_quads,
                                 &[(&chrome_labels, false), (&bar.title_labels, true)],
+                                mask_tail,
                             );
                         },
                     );
@@ -16786,8 +16850,9 @@ impl ApplicationHandler<AppEvent> for App {
                     // (`slide_y_offset`): the window SHAPE slides in — its
                     // background and rounded bottom corners — instead of a
                     // full-height strip whose content alone moves.
+                    // (Already recorded in the chrome pass: `mask_in_chrome`.)
                     let r_top = if top_flush { 0.0 } else { corner_radius_px };
-                    if let (Some(mask), false) = (corner_mask, crt_active || crt_under) {
+                    if let (Some(mask), false) = (corner_mask, crt_active || crt_under || mask_in_chrome.is_some()) {
                         // Bottom corners always round to corner_radius_px; the top
                         // corners are zeroed when the window is top-flush (Dropdown).
                         mask.apply_slid(
