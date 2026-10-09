@@ -18,7 +18,7 @@ use alacritty_terminal::term::{
 };
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Processor, Rgb};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Pack `cols`/`rows` into a single `u32` (cols in the high 16 bits) so the
@@ -26,6 +26,17 @@ use std::sync::{Arc, Mutex};
 /// an `Arc<AtomicU32>` (alacritty exposes no public listener setter).
 fn pack_geom(cols: usize, rows: usize) -> u32 {
     ((cols.min(u16::MAX as usize) as u32) << 16) | (rows.min(u16::MAX as usize) as u32)
+}
+
+/// Pack the exact cell size (px) for the `EventProxy`, as `f32` bits.
+fn pack_cell_px(w: f32, h: f32) -> u64 {
+    (u64::from(w.to_bits()) << 32) | u64::from(h.to_bits())
+}
+
+/// The pixel length of `cells` cells of `cell` px, as the PTY is told it
+/// (TIOCGWINSZ — the app's `pty.resize` computes it the same way).
+fn text_area_px(cells: u32, cell: f32) -> u16 {
+    (cells as f32 * cell).min(65535.0) as u16
 }
 
 /// The ONE place the alacritty `Config` is built. `Term::set_options` replaces the
@@ -377,11 +388,11 @@ struct EventProxy {
     /// so `resize()` keeps these replies current after the proxy is moved into
     /// `Term` (alacritty has no public listener setter).
     geom: Arc<AtomicU32>,
-    /// Live cell pixel size (cell_w<<16 | cell_h, each rounded to u16), shared
-    /// with the owning `Terminal` so the `\e[14t` text-area-size reply reports the
-    /// REAL cell metrics (amendment A5). Image tools (chafa/timg/kitty) scale to
-    /// this; a wrong (hardcoded 8×16) value makes HiDPI images render undersized.
-    cell_px: Arc<AtomicU32>,
+    /// Live cell pixel size (exact, [`pack_cell_px`]), shared with the owning
+    /// `Terminal` so the `\e[14t` text-area-size reply reports the REAL cell
+    /// metrics (amendment A5). Image tools (chafa/timg/kitty) scale to this; a
+    /// wrong (hardcoded 8×16) value makes HiDPI images render undersized.
+    cell_px: Arc<AtomicU64>,
     /// Live theme used to answer OSC `ColorRequest` queries (OSC 10/11/12/4;n;?).
     /// Real apps (nvim/fzf/delta/tmux) probe OSC 11 to detect a dark/light
     /// background, so the reply must track runtime theme changes — not a copy
@@ -476,24 +487,23 @@ impl EventListener for EventProxy {
                 };
                 let _ = self.tx.send(bytes);
             }
-            // \e[14t (text area size in pixels) / \e[18t (size in cells). The
-            // formatter turns a WindowSize into the proper escape reply. Cell
-            // metrics are the REAL ones the app pushed via `set_cell_px` (image
-            // tools — chafa/timg/notcurses/viu — scale to them); 8×16 is only the
-            // fallback until the first push.
+            // \e[14t (text area size in pixels): the area the PTY is told
+            // (TIOCGWINSZ), from the REAL cell metrics the app pushed via
+            // `set_cell_px` (image tools — chafa/timg/notcurses/viu/lsix — scale
+            // to them); 8×16 is only the fallback until the first push. The
+            // formatter multiplies cells by a whole-pixel cell size, which
+            // over-reported the width by up to half a pixel per column (1800
+            // for 1720 px at 8.6 px cells: lsix's montage spilled past the
+            // grid), so it is handed the exact area as one cell.
             Event::TextAreaSizeRequest(fmt) => {
                 let g = self.geom.load(Ordering::Relaxed);
-                // Real cell px shared from the owning Terminal (A5); fall back to
-                // 8×16 only before the first `set_cell_px`. `\e[14t` reports the
-                // text area in PIXELS, so the reply size is cols*cell_w × rows*cell_h.
                 let cp = self.cell_px.load(Ordering::Relaxed);
-                let cell_width = (cp >> 16) as u16;
-                let cell_height = (cp & 0xFFFF) as u16;
+                let (cw, ch) = (f32::from_bits((cp >> 32) as u32), f32::from_bits(cp as u32));
                 let window_size = WindowSize {
-                    num_lines: (g & 0xFFFF) as u16,
-                    num_cols: (g >> 16) as u16,
-                    cell_width: if cell_width == 0 { 8 } else { cell_width },
-                    cell_height: if cell_height == 0 { 16 } else { cell_height },
+                    num_lines: 1,
+                    num_cols: 1,
+                    cell_width: text_area_px(g >> 16, cw),
+                    cell_height: text_area_px(g & 0xFFFF, ch),
                 };
                 let _ = self.tx.send(fmt(window_size).into_bytes());
             }
@@ -1134,9 +1144,9 @@ pub struct Terminal {
     /// exit and on resize. Bounded like `placements` (own budget).
     alt_placements: VecDeque<ImagePlacement>,
     alt_placement_bytes: u64,
-    /// Live cell pixel size shared with the `EventProxy` (cell_w<<16 | cell_h) so
+    /// Live cell pixel size shared with the `EventProxy` ([`pack_cell_px`]) so
     /// the `\e[14t` reply reports real metrics (A5). Updated by `set_cell_px`.
-    cell_px: Arc<AtomicU32>,
+    cell_px: Arc<AtomicU64>,
     /// A clone of the PTY write-back sender so the scanner (`&mut self`) can enqueue
     /// Kitty graphics OK/error replies onto the same `pty_write_rx` the app drains.
     reply_tx: std::sync::mpsc::Sender<Vec<u8>>,
@@ -1282,7 +1292,7 @@ impl Terminal {
         let child_exited = Arc::new(AtomicBool::new(false));
         let geom = Arc::new(AtomicU32::new(pack_geom(cols, rows)));
         // Default cell px = 8×16 (matches the pre-set_cell_px \e[14t fallback).
-        let cell_px = Arc::new(AtomicU32::new((8u32 << 16) | 16));
+        let cell_px = Arc::new(AtomicU64::new(pack_cell_px(8.0, 16.0)));
         let theme_shared = Arc::new(Mutex::new(theme.clone()));
         let title_update = Arc::new(Mutex::new(None));
         let title_dirty = Arc::new(AtomicBool::new(false));
@@ -3273,11 +3283,9 @@ impl Terminal {
         if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 {
             self.cell_px_w = w;
             self.cell_px_h = h;
-            // Publish the rounded metric to the shared atomic so the EventProxy's
-            // `\e[14t` reply reports real cell px (A5). Clamp into u16 each.
-            let cw = (w.round() as u32).clamp(1, u16::MAX as u32);
-            let ch = (h.round() as u32).clamp(1, u16::MAX as u32);
-            self.cell_px.store((cw << 16) | ch, Ordering::Relaxed);
+            // Publish the metric to the shared atomic so the EventProxy's
+            // `\e[14t` reply reports real cell px (A5).
+            self.cell_px.store(pack_cell_px(w, h), Ordering::Relaxed);
         }
     }
 
@@ -8765,6 +8773,20 @@ mod tests {
     // A red 1×6 column, and a red 1×12 (two bands).
     const RED_1X6: &str = "#0;2;100;0;0#0~";
     const RED_1X12: &str = "#0;2;100;0;0#0~-~";
+
+    #[test]
+    fn csi_14t_reports_the_text_area_the_pty_is_told() {
+        // With 8.6 px cells and 200 columns the PTY is told 1720 px wide, but
+        // `CSI 14 t` answered 200 × 9 = 1800: lsix sizes its montage from it,
+        // so a native-size montage spilled 80 px past the grid.
+        let mut t = Terminal::new(200, 50);
+        t.set_cell_px(8.6, 21.0);
+        t.feed(b"\x1b[14t");
+        assert_eq!(String::from_utf8(t.drain_pty_writes()).unwrap(), "\x1b[4;1050;1720t");
+        t.resize(100, 40);
+        t.feed(b"\x1b[14t");
+        assert_eq!(String::from_utf8(t.drain_pty_writes()).unwrap(), "\x1b[4;840;860t");
+    }
 
     #[test]
     fn sixel_records_placement_and_reserves_rows() {
