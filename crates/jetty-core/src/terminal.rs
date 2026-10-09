@@ -3153,9 +3153,13 @@ impl Terminal {
                 // Failed-command marker: bind to the most-recent still-open block
                 // (shells emit strictly A…B…C…D, so "most recent open" is correct
                 // even with gaps). Absent if anchors were dropped meanwhile.
+                let mut output_top = None;
                 if let Some(block) = self.marks.iter_mut().rev().find(|m| !m.finished) {
                     block.exit = exit;
                     block.finished = true;
+                    // Where its output starts: the C row, else the row after the
+                    // command line (an integration without C).
+                    output_top = Some(block.output.unwrap_or(block.input.unwrap_or(block.prompt) + 1));
                 }
                 // Run & Notify: emit a completion iff a command was open (a
                 // spurious lone D produces nothing). Independent of `marks`, so a
@@ -3164,7 +3168,7 @@ impl Terminal {
                     // `Some(elapsed)` iff a C was seen; `None` otherwise (an
                     // integration without C) → the completion reports unknown time.
                     let duration = cmd.started_at.map(|t| t.elapsed());
-                    let last_line = self.last_output_line();
+                    let last_line = self.last_output_line(output_top);
                     self.completed.push(CommandCompletion { exit_code: exit, duration, last_line });
                     // Bound undrained completions; drop the oldest on overflow.
                     if self.completed.len() > MAX_PENDING_COMPLETIONS {
@@ -4374,10 +4378,14 @@ impl Terminal {
     /// capped — the notification body. Called ONCE per command (at `D`), never on
     /// the per-byte path. Precmd emits `D` then `A`, so at `D` the cursor sits
     /// just below the command's final output; the bottom-most non-empty row
-    /// at/above it is that command's last output line. A wrapped long line
-    /// returns only its bottom physical row (acceptable). Only base `cell.c` is
-    /// read (same combining-mark limit as `snapshot`).
-    fn last_output_line(&self) -> String {
+    /// at/above it is that command's last output line. `output_top` (an absolute
+    /// row) is where that output starts: the prompt and command line above it
+    /// are not output, so a command that printed nothing (`sleep 30`) gets an
+    /// empty body, not the prompt. `None` (its marks were dropped) scans up
+    /// regardless. A wrapped long line returns only its bottom physical row
+    /// (acceptable). Only base `cell.c` is read (same combining-mark limit as
+    /// `snapshot`).
+    fn last_output_line(&self, output_top: Option<i64>) -> String {
         const MAX_SCAN_ROWS: i32 = 64; // bound the upward walk
         const MAX_CHARS: usize = 200;
         let grid = self.term.grid();
@@ -4388,7 +4396,10 @@ impl Terminal {
         let top = grid.topmost_line().0;
         let bottom = grid.bottommost_line().0;
         let cursor_line = grid.cursor.point.line.0.clamp(top, bottom);
-        let lo = (cursor_line - MAX_SCAN_ROWS).max(top);
+        let mut lo = (cursor_line - MAX_SCAN_ROWS).max(top);
+        if let Some(abs) = output_top {
+            lo = lo.max((abs - self.abs_top).clamp(i32::MIN.into(), i32::MAX.into()) as i32);
+        }
         for l in (lo..=cursor_line).rev() {
             let row = &grid[Line(l)];
             let mut s = String::new();
@@ -8326,6 +8337,29 @@ mod tests {
         let done = t.take_completions();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].last_line, "", "blank output region ⇒ empty body");
+    }
+
+    #[test]
+    fn completion_body_is_never_the_prompt_or_the_command_line() {
+        // A command that prints nothing (`sleep 30`, `cp -r`): the toast body
+        // used to be the nearest text above the cursor — the command line and
+        // the prompt, its private-use icons drawn as tofu. Its output region is
+        // blank: the body is empty. zsh / p10k shape, two-line prompt:
+        let mut t = Terminal::new(60, 8);
+        let prompt = "\x1b]133;A\x07~/proj \u{e0a0} main\r\n\u{276f} \x1b]133;B\x07";
+        t.feed(prompt.as_bytes());
+        t.feed(b"sleep 30\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert_eq!(t.take_completions()[0].last_line, "", "a silent command: empty body");
+        // A command's own output still is the body.
+        t.feed(prompt.as_bytes());
+        t.feed(b"ls\r\n\x1b]133;C\x07Cargo.toml\r\n\x1b]133;D;0\x07");
+        assert_eq!(t.take_completions()[0].last_line, "Cargo.toml");
+        // bash without a C mark (3.2 has no PS0): output starts below the
+        // command line.
+        t.feed(b"\x1b]133;A;redraw=0\x07$ sleep 1\r\n\x1b]133;D;0\x07");
+        assert_eq!(t.take_completions()[0].last_line, "");
+        t.feed(b"\x1b]133;A;redraw=0\x07$ date\r\nThu Oct  9\r\n\x1b]133;D;0\x07");
+        assert_eq!(t.take_completions()[0].last_line, "Thu Oct  9");
     }
 
     #[test]
