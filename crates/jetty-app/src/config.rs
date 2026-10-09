@@ -22,6 +22,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+/// Checks that make problems visible: unknown keys and invalid values with the
+/// closest valid spelling, enum values read by the app's own parsers, ranges.
+pub(crate) mod check;
+
 /// The persisted user settings. Field names are the TOML keys.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -1232,12 +1236,16 @@ impl Config {
     /// Parse config text key by key on top of `base`.
     ///
     /// `Err` only for a TOML syntax error (the whole document is unreadable). Valid
-    /// TOML always yields a config: each key with an invalid value is replaced by
-    /// `base`'s value — the defaults at startup, the live settings on a hot-reload —
-    /// and reported (`fallback` says which, e.g. "using the default"); unknown keys
-    /// are ignored with a warning. Generic over the struct: a new field needs no
-    /// code here. Takes the already-read content so the caller can hash and parse
-    /// the SAME bytes (no TOCTOU between the two).
+    /// TOML always yields a config: each key with an invalid value — a wrong type,
+    /// or an enum-like word the app does not know — is replaced by `base`'s value
+    /// (the defaults at startup, the live settings on a hot-reload) and reported
+    /// (`fallback` says which, e.g. "using the default"), with the closest valid
+    /// value when there is one; an enum-like word in another letter case reads as
+    /// meant; unknown keys are ignored with a warning naming the closest known
+    /// key; a number outside its range is clamped and reported. Generic over the
+    /// struct: a new field needs no code here (see [`check`]). Takes the
+    /// already-read content so the caller can hash and parse the SAME bytes (no
+    /// TOCTOU between the two).
     pub(crate) fn parse_with_base(
         s: &str,
         base: &Config,
@@ -1246,12 +1254,16 @@ impl Config {
         let user: toml::Table = toml::from_str(s).map_err(|e| describe_toml_error(&e, s))?;
         let mut warnings = Vec::new();
         let mut invalid: Vec<Vec<String>> = Vec::new();
-        let cfg = match toml::Value::Table(user.clone()).try_into::<Config>() {
+        let mut cfg = match toml::Value::Table(user.clone()).try_into::<Config>() {
             Ok(cfg) => cfg,
             Err(_) => Self::fallback_per_key(&user, base, fallback, &mut warnings, &mut invalid),
         };
-        unknown_key_warnings(&user, &cfg, &invalid, &mut warnings);
-        Ok((cfg.sanitized(), warnings))
+        check::check_choices(&user, &mut cfg, base, fallback, &mut warnings, &mut invalid);
+        check::unknown_keys(&user, &invalid, &mut warnings);
+        check::color_warnings(&user, &invalid, &mut warnings);
+        let clean = cfg.clone().sanitized();
+        check::range_warnings(&user, &cfg, &clean, &invalid, &mut warnings);
+        Ok((clean, warnings))
     }
 
     /// The slow path of [`Config::parse_with_base`]: probe every leaf of `user` on
@@ -1276,9 +1288,10 @@ impl Config {
             set_path(&mut probe, &path, value.clone());
             if let Err(e) = toml::Value::Table(probe).try_into::<Config>() {
                 warnings.push(format!(
-                    "`{} = {}` is invalid ({}) — {fallback}",
+                    "`{} = {}` is invalid{} ({}) — {fallback}",
                     path.join("."),
                     short_value(&value),
+                    check::variant_hint(e.message().trim()),
                     friendly_expected(e.message()),
                 ));
                 match get_path(&base_t, &path) {
@@ -1352,26 +1365,30 @@ impl Config {
         self
     }
 
-    /// Replace every non-finite float with its default. TOML 1.x allows a
-    /// literal `nan` and the toml crate deserializes it, while `f32::clamp`
-    /// PROPAGATES NaN — so a hand-edited `opacity = nan` sailed through every
-    /// load-time clamp (invisible window, collapsed grid, NaN shader uniforms)
-    /// and `save()` persisted it right back. Finite values pass through
-    /// untouched; the normal range clamps in `App::new` still apply after.
+    /// Replace every non-finite float with its default and clamp every number
+    /// into the range the app supports. TOML 1.x allows a literal `nan` and the
+    /// toml crate deserializes it, while `f32::clamp` PROPAGATES NaN — so a
+    /// hand-edited `opacity = nan` sailed through every load-time clamp
+    /// (invisible window, collapsed grid, NaN shader uniforms) and `save()`
+    /// persisted it right back. In-range values pass through untouched. These
+    /// are THE load-time ranges: a value outside one is reported
+    /// (`check::range_warnings` finds the range by probing this function).
     fn sanitize_floats(&mut self) {
         // NaN / ±inf → off; otherwise clamped to 1..=21.
         self.minimum_contrast = jetty_core::contrast::clamp_ratio(self.minimum_contrast);
-        self.opacity = finite_or(self.opacity, 1.0);
-        self.font_size = finite_or(self.font_size, 16.0);
-        self.ui_font_size = finite_or(self.ui_font_size, default_ui_font_size());
-        self.corner_radius = finite_or(self.corner_radius, 10.0);
+        // A visible floor: 0.0 would load an invisible window, which looks like
+        // a launch failure.
+        self.opacity = finite_or(self.opacity, 1.0).clamp(0.1, 1.0);
+        self.font_size = finite_or(self.font_size, 16.0).clamp(6.0, 48.0);
+        self.ui_font_size = finite_or(self.ui_font_size, default_ui_font_size()).clamp(10.0, 28.0);
+        self.corner_radius = finite_or(self.corner_radius, 10.0).clamp(0.0, 24.0);
         self.padding_x = finite_or(self.padding_x, default_padding_x()).clamp(0.0, jetty_render::PADDING_MAX);
         self.padding_y = finite_or(self.padding_y, default_padding_y()).clamp(0.0, jetty_render::PADDING_MAX);
         self.line_height = jetty_render::clamp_line_height(self.line_height);
         self.dropdown_height_pct =
-            finite_or(self.dropdown_height_pct, default_dropdown_height_pct());
+            finite_or(self.dropdown_height_pct, default_dropdown_height_pct()).clamp(0.25, 1.0);
         self.dropdown_width_pct =
-            finite_or(self.dropdown_width_pct, default_dropdown_width_pct());
+            finite_or(self.dropdown_width_pct, default_dropdown_width_pct()).clamp(0.2, 1.0);
         // Not a float, but this fn is the single sanitize entry point (the name
         // predates non-float sanitizing): keep hand-edited values verbatim, only
         // clamp to the supported range.
@@ -1502,29 +1519,6 @@ fn collect_leaves(
     }
 }
 
-/// Warn about every leaf the user wrote that the parsed config doesn't carry —
-/// i.e. a key serde silently ignored (a typo like `fontsize`, a stale key). Keys
-/// already reported as invalid are skipped. Found by round-tripping the parsed
-/// struct, so it needs no list of known keys.
-fn unknown_key_warnings(
-    user: &toml::Table,
-    cfg: &Config,
-    invalid: &[Vec<String>],
-    warnings: &mut Vec<String>,
-) {
-    let round = to_table(cfg);
-    let mut leaves = Vec::new();
-    collect_leaves(user, &toml::Table::new(), &mut Vec::new(), &mut leaves);
-    for (path, _) in leaves {
-        if invalid.iter().any(|p| path.starts_with(p)) {
-            continue;
-        }
-        if get_path(&round, &path).is_none() {
-            warnings.push(format!("unknown key `{}` is ignored", path.join(".")));
-        }
-    }
-}
-
 /// A short TOML rendering of a user value for a warning (long values elided).
 fn short_value(v: &toml::Value) -> String {
     let s = v.to_string();
@@ -1557,19 +1551,25 @@ fn friendly_expected(msg: &str) -> String {
     format!("expected {what}")
 }
 
-/// One-line description of a TOML syntax error: `line N: message`.
-fn describe_toml_error(e: &toml::de::Error, src: &str) -> String {
+/// One-line description of a TOML error in `src`: `line L, column C: message`.
+pub(crate) fn describe_toml_error(e: &toml::de::Error, src: &str) -> String {
     let msg = e.message().trim();
     match e.span() {
-        Some(span) => {
-            // Count newlines over BYTES: the span is a byte offset, and slicing the
-            // str there could split a multi-byte char.
-            let end = span.start.min(src.len());
-            let line = src.as_bytes()[..end].iter().filter(|&&b| b == b'\n').count() + 1;
-            format!("line {line}: {msg}")
-        }
+        Some(span) => format!("{}: {msg}", line_col(src, span.start)),
         None => msg.to_string(),
     }
+}
+
+/// `line L, column C` (1-based) of byte offset `at` in `src`. Counted over
+/// BYTES — the offset need not be a char boundary, and slicing the str there
+/// could split a multi-byte char — with the column in characters (a UTF-8
+/// continuation byte starts none).
+fn line_col(src: &str, at: usize) -> String {
+    let before = &src.as_bytes()[..at.min(src.len())];
+    let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+    let start = before.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let column = before[start..].iter().filter(|&&b| b & 0xC0 != 0x80).count() + 1;
+    format!("line {line}, column {column}")
 }
 
 /// Copy `path` (following a symlink: the CONTENT is copied, the link is left
@@ -2047,10 +2047,7 @@ fn merged_text(before: Option<&str>, changes: &[Change], full: &Config) -> Resul
         None => toml::to_string_pretty(full).map_err(|e| format!("could not serialize settings: {e}"))?,
         Some(text) => {
             let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
-                let line = e
-                    .span()
-                    .map(|s| text.as_bytes()[..s.start.min(text.len())].iter().filter(|&&b| b == b'\n').count() + 1);
-                let at = line.map(|l| format!("line {l}: ")).unwrap_or_default();
+                let at = e.span().map(|s| format!("{}: ", line_col(text, s.start))).unwrap_or_default();
                 format!(
                     "config.toml has a TOML syntax error ({at}{}) — settings changes are not saved until it is fixed",
                     e.message().trim()
@@ -2345,14 +2342,22 @@ mod tests {
         assert!((c.cursor.thickness - 0.12).abs() < 1e-6);
         assert_eq!((c.reduce_motion.as_str(), c.visual_bell.as_str()), ("off", "off"));
         assert_eq!(c.command_pulse, "off");
-        // Out-of-range numbers clamp; a partial table keeps the other defaults.
+        // Out-of-range numbers clamp (and say so); a partial table keeps the
+        // other defaults.
         let (c, w) = Config::parse_with_base(
             "[cursor]\nthickness = 3.0\ntrail_ms = 5\ntrail_threshold = 0\nshape = \"beam\"\n",
             &Config::default(),
             "x",
         )
         .unwrap();
-        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(
+            w,
+            [
+                "`cursor.thickness = 3.0` is out of range (0.04–0.5) — using 0.5",
+                "`cursor.trail_ms = 5` is out of range (60–1000) — using 60",
+                "`cursor.trail_threshold = 0` is out of range (1–40) — using 1",
+            ]
+        );
         assert_eq!(c.cursor.thickness, 0.5);
         assert_eq!((c.cursor.trail_ms, c.cursor.trail_threshold), (60, 1));
         assert_eq!((c.cursor.shape.as_str(), c.cursor.color.as_str()), ("beam", "theme"));
@@ -2693,7 +2698,6 @@ corner_radius = 8.0
             ("scrollbar = \"auto\"", ScrollbarMode::Auto),
             ("scrollbar = \"Never\"", ScrollbarMode::Never),
             ("scrollbar = \"off\"", ScrollbarMode::Never),
-            ("scrollbar = \"sometimes\"", ScrollbarMode::Always),
             ("scrollbar = false", ScrollbarMode::Never),
             ("scrollbar = true", ScrollbarMode::Always),
         ] {
@@ -2701,6 +2705,9 @@ corner_radius = 8.0
             assert_eq!(cfg.scrollbar, want, "{src}");
             assert!(warnings.is_empty(), "{src}: {warnings:?}");
         }
+        // An unknown word still reads as the default — and now says so.
+        let (cfg, warnings) = parse("scrollbar = \"sometimes\"\n");
+        assert_eq!((cfg.scrollbar, warnings.len()), (ScrollbarMode::Always, 1), "{warnings:?}");
         // A wrong type falls back with a warning, per key.
         let (cfg, warnings) = parse("scrollbar = 3\n");
         assert_eq!((cfg.scrollbar, warnings.len()), (ScrollbarMode::Always, 1));
@@ -2769,7 +2776,16 @@ corner_radius = 8.0
             "using the default",
         )
         .unwrap();
-        assert!(warnings.is_empty(), "{warnings:?}");
+        // Each clamp / skip is reported (the angle's wrap is no problem).
+        assert_eq!(
+            warnings,
+            [
+                "`backdrop.colors` entry \"bogus\" is not a color (\"#rrggbb\" or \"#rgb\") — skipped",
+                "`backdrop.blur = nan` is not a finite number — using 0",
+                "`backdrop.dim = -1.0` is out of range (0–1) — using 0",
+                "`backdrop.strength = 3.0` is out of range (0–1) — using 1",
+            ]
+        );
         let b = &cfg.backdrop;
         assert_eq!((b.mode.as_str(), b.pattern.as_str()), ("pattern", "aurora"));
         assert_eq!(b.strength, 1.0, "clamped to 0..1");
@@ -2781,11 +2797,12 @@ corner_radius = 8.0
         assert_eq!(s.mode, jetty_render::BackdropMode::Pattern);
         assert_eq!(s.pattern, jetty_render::BackdropPattern::Aurora);
         assert_eq!(s.colors, vec![[255, 0, 0], [0, 255, 0]], "unparseable colors are skipped");
-        // An unknown mode string is kept verbatim but reads as off.
-        let (cfg, _) =
+        // An unknown mode reads as off, as before — and is reported.
+        let (cfg, w) =
             Config::parse_with_base("[backdrop]\nmode = \"wallpaper\"\n", &Config::default(), "x").unwrap();
-        assert_eq!(cfg.backdrop.mode, "wallpaper");
         assert!(cfg.backdrop.settings().is_off());
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].starts_with("`backdrop.mode = \"wallpaper\"` is invalid"), "{w:?}");
     }
 
     #[test]
@@ -3552,6 +3569,143 @@ caret_glow_enabled = true\n";
         let mut paths: Vec<String> = d.iter().map(|c| c.path.join(".")).collect();
         paths.sort();
         assert_eq!(paths, vec!["effects.crt_bloom".to_string(), "opacity".to_string()]);
+    }
+
+    // ── values the app would silently read as something else ────────────────
+
+    fn parse(s: &str) -> (Config, Vec<String>) {
+        Config::parse_with_base(s, &Config::default(), "using the default").expect("valid TOML")
+    }
+
+    #[test]
+    fn enum_values_in_any_case_or_spelling_apply_as_meant() {
+        // The app's readers of these keys are exact-match: `"Underline"` drew the
+        // pill and `"Dropdown"` summoned centered — silently.
+        let (c, w) = parse(
+            "tab_style = \"Underline\"\nwindow_mode = \"Dropdown\"\nsummon_effect = \"FADE\"\n\
+             tab_bar_position = \"Bottom\"\nwindow_border = \" focus \"\nscrollbar = \"Never\"\n\
+             [cursor]\nshape = \"double-underline\"\nguide = \"Always\"\n[backdrop]\nmode = \"Theme\"\n",
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.tab_style, "underline");
+        assert_eq!(c.window_mode, "dropdown");
+        assert_eq!(c.summon_effect, "fade");
+        assert_eq!(c.tab_bar_position, "bottom");
+        assert_eq!(c.window_border, "focus");
+        assert_eq!(c.scrollbar, ScrollbarMode::Never);
+        assert_eq!((c.cursor.shape.as_str(), c.cursor.guide.as_str()), ("double_underline", "always"));
+        assert_eq!(c.backdrop.mode, "theme");
+        // Aliases a parser accepts read as their canonical value, warning-free.
+        let (c, w) = parse("visual_bell = \"none\"\nreduce_motion = \"yes\"\n[cursor]\nshape = \"bar\"\n");
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!((c.visual_bell.as_str(), c.reduce_motion.as_str()), ("off", "on"));
+        assert_eq!(c.cursor.shape, "beam");
+    }
+
+    #[test]
+    fn an_unknown_enum_value_is_reported_with_a_suggestion() {
+        let (c, w) = parse("window_mode = \"dropdwn\"\ntheme = \"nord\"\n");
+        assert_eq!(c.window_mode, "center", "the default, as before");
+        assert_eq!(c.theme, "nord", "the rest still applies");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].starts_with("`window_mode = \"dropdwn\"` is invalid — did you mean `dropdown`?"), "{w:?}");
+        assert!(w[0].contains("`center`, `dropdown`, `fullscreen`") && w[0].ends_with("using the default"), "{w:?}");
+        // Every enum-like key is checked (a few spot checks)…
+        for (src, key) in [
+            ("tab_style = \"pil\"", "tab_style"),
+            ("[cursor]\nshape = \"bean\"", "cursor.shape"),
+            ("[backdrop]\nfit = \"zoom\"", "backdrop.fit"),
+            ("copy_on_select = \"clipbaord\"", "copy_on_select"),
+            ("scrollbar = \"sometimes\"", "scrollbar"),
+        ] {
+            let (_, w) = parse(src);
+            assert_eq!(w.len(), 1, "{src}: {w:?}");
+            assert!(w[0].starts_with(&format!("`{key} = ")), "{src}: {w:?}");
+        }
+        // …and a strict enum (serde's own error) gets the suggestion too.
+        let (_, w) = parse("[effects]\ncrt_phosphor = \"ambr\"\n");
+        assert!(w[0].contains("did you mean `amber`?"), "{w:?}");
+    }
+
+    #[test]
+    fn a_reload_with_an_unknown_enum_value_keeps_the_live_value() {
+        // A typo used to switch the live setting to the default (centered window,
+        // pill tabs) instead of keeping it, unlike every other invalid value.
+        let live = Config { window_mode: "dropdown".into(), tab_style: "slant".into(), ..Config::default() };
+        let (c, w) =
+            Config::parse_with_base("window_mode = \"dropdwn\"\ntab_style = \"slant\"\n", &live, "keeping the current value")
+                .unwrap();
+        assert_eq!(c.window_mode, "dropdown");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].ends_with("keeping the current value"), "{w:?}");
+    }
+
+    #[test]
+    fn unknown_keys_name_the_closest_valid_key() {
+        let (_, w) = parse("fontsize = 18\n");
+        assert_eq!(w, ["unknown key `fontsize` is ignored — did you mean `font_size`?"]);
+        let (_, w) = parse("crt_enabled = true\n");
+        assert_eq!(w, ["unknown key `crt_enabled` is ignored — did you mean `crt_enabled` in `[effects]`?"]);
+        let (_, w) = parse("[cursor]\nopacity = 0.5\n");
+        assert_eq!(w, ["unknown key `cursor.opacity` is ignored — did you mean the top-level `opacity`?"]);
+        let (_, w) = parse("[keys]\nnew_tabb = \"Ctrl+T\"\n");
+        assert_eq!(w, ["unknown key `keys.new_tabb` is ignored — did you mean `keys.new_tab`?"]);
+        // A misspelled table is one warning, not one per key in it.
+        let (_, w) = parse("[efects]\ncrt_enabled = true\ncrt_bloom = 0.2\n");
+        assert_eq!(w, ["unknown table `[efects]` is ignored — did you mean `[effects]`?"]);
+        // Nothing close: just the key.
+        let (_, w) = parse("zzz = 1\n");
+        assert_eq!(w, ["unknown key `zzz` is ignored"]);
+    }
+
+    #[test]
+    fn numbers_outside_their_range_are_reported() {
+        let (c, w) = parse("opacity = 5.0\nfont_size = 100\nscrollback_lines = 50\n");
+        assert_eq!((c.opacity, c.font_size, c.scrollback_lines), (1.0, 48.0, 100));
+        assert_eq!(
+            w,
+            [
+                "`font_size = 100` is out of range (6–48) — using 48",
+                "`opacity = 5.0` is out of range (0.1–1) — using 1",
+                "`scrollback_lines = 50` is out of range (100–100000) — using 100",
+            ]
+        );
+        let (c, w) = parse("opacity = nan\n[cursor]\nthickness = 3.0\n");
+        assert_eq!((c.opacity, c.cursor.thickness), (1.0, 0.5));
+        assert_eq!(
+            w,
+            [
+                "`cursor.thickness = 3.0` is out of range (0.04–0.5) — using 0.5",
+                "`opacity = nan` is not a finite number — using 1",
+            ]
+        );
+        // A normalization is not a range: an angle of -90 simply is 270.
+        let (c, w) = parse("[backdrop]\nangle = -90.0\n");
+        assert_eq!(c.backdrop.angle, 270.0);
+        assert!(w.is_empty(), "{w:?}");
+        // In-range values (and the defaults) say nothing.
+        let (_, w) = parse("opacity = 0.1\nfont_size = 6\nui_font_size = 28\ndropdown_height_pct = 0.25\n");
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn backdrop_colors_that_are_not_colors_are_reported() {
+        let (c, w) = parse("[backdrop]\ncolors = [\"#ff0000\", \"bogus\", \"0f0\"]\n");
+        assert_eq!(c.backdrop.settings().colors, vec![[255, 0, 0], [0, 255, 0]]);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("\"bogus\"") && w[0].contains("backdrop.colors"), "{w:?}");
+        let (_, w) = parse("[backdrop]\ncolors = [\"#111\", \"#222\", \"#333\", \"#444\", \"#555\"]\n");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("first 4"), "{w:?}");
+    }
+
+    #[test]
+    fn syntax_errors_say_line_and_column() {
+        let err = Config::parse_with_base("theme = \"nord\"\nopacity = \n", &Config::default(), "x").unwrap_err();
+        assert!(err.starts_with("line 2, column 11:"), "{err}");
+        // Columns count characters, not bytes.
+        let err = Config::parse_with_base("theme = \"çay\" x\n", &Config::default(), "x").unwrap_err();
+        assert!(err.starts_with("line 1, column 15:"), "{err}");
     }
 
     #[test]

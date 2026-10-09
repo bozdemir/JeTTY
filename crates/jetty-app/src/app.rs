@@ -60,7 +60,7 @@ pub enum SummonEffect {
 
 impl SummonEffect {
     /// Cycle order for the ‹ / › settings buttons.
-    const ORDER: [SummonEffect; 8] = [
+    pub(crate) const ORDER: [SummonEffect; 8] = [
         SummonEffect::None,
         SummonEffect::Bayer,
         SummonEffect::Phosphor,
@@ -107,7 +107,7 @@ impl SummonEffect {
     }
 
     /// Config string ↔ enum.
-    fn from_config(s: &str) -> SummonEffect {
+    pub(crate) fn from_config(s: &str) -> SummonEffect {
         match s {
             "none" => SummonEffect::None,
             "phosphor" => SummonEffect::Phosphor,
@@ -121,7 +121,7 @@ impl SummonEffect {
         }
     }
 
-    fn to_config(self) -> &'static str {
+    pub(crate) fn to_config(self) -> &'static str {
         match self {
             SummonEffect::None => "none",
             SummonEffect::Bayer => "bayer",
@@ -220,7 +220,7 @@ pub enum WindowMode {
 }
 
 impl WindowMode {
-    const ORDER: [WindowMode; 3] =
+    pub(crate) const ORDER: [WindowMode; 3] =
         [WindowMode::Center, WindowMode::Dropdown, WindowMode::Fullscreen];
 
     fn display_name(self) -> &'static str {
@@ -234,7 +234,7 @@ impl WindowMode {
     /// Case-SENSITIVE, unknown ⇒ `Center` — unchanged, which is also what gives
     /// forward compatibility for free: an OLDER JeTTY reading
     /// `window_mode = "fullscreen"` falls into `_ => Center` and starts fine.
-    fn from_config(s: &str) -> WindowMode {
+    pub(crate) fn from_config(s: &str) -> WindowMode {
         match s {
             "dropdown" => WindowMode::Dropdown,
             "fullscreen" => WindowMode::Fullscreen,
@@ -242,7 +242,7 @@ impl WindowMode {
         }
     }
 
-    fn to_config(self) -> &'static str {
+    pub(crate) fn to_config(self) -> &'static str {
         match self {
             WindowMode::Center => "center",
             WindowMode::Dropdown => "dropdown",
