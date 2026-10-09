@@ -20,6 +20,18 @@ pub(crate) enum Surface {
     Detached(usize),
 }
 
+/// Rows a list moves for one wheel event, as a fraction to accumulate
+/// (positive = down, toward the end; winit's positive delta is up): a wheel
+/// notch — a `LineDelta` of 1, fractional on an X11 touchpad — is one row; a
+/// touchpad's `PixelDelta` (Wayland, macOS) is one row per `row_px`
+/// (physical) of travel.
+pub(crate) fn wheel_rows(delta: winit::event::MouseScrollDelta, row_px: f32) -> f32 {
+    match delta {
+        winit::event::MouseScrollDelta::LineDelta(_, y) => -y,
+        winit::event::MouseScrollDelta::PixelDelta(p) => -(p.y as f32) / row_px.max(1.0),
+    }
+}
+
 /// Owned command-palette draw data, captured before the render borrow:
 /// `(query, visible rows as (title, matched-char indices, selected), total,
 /// first_visible)`.
@@ -92,6 +104,8 @@ pub(crate) struct Overlays {
     /// `Theme: …` row (see [`Overlays::theme_preview_step`]). Ends by Enter on a
     /// theme row (kept) or any other close (the chosen theme comes back).
     pub theme_preview: bool,
+    /// Wheel travel toward the next palette row (see [`Overlays::palette_wheel`]).
+    pub palette_wheel_acc: crate::input::ScrollAccumulator,
     /// Active hint-mode state (primary screen only). `Some` while the labelled
     /// URL/path/hash/IPv4 chips are shown; the tokens are scanned ONCE on enter.
     pub hint_mode: Option<HintState>,
@@ -126,7 +140,20 @@ impl Overlays {
         self.palette_query.clear();
         self.palette_filtered = Vec::new();
         self.palette_registry = Vec::new();
+        self.palette_wheel_acc.reset();
         true
+    }
+
+    /// Move the palette selection for one wheel event: a notch is one row, a
+    /// touchpad one row per `row_px` (physical) of travel, accumulated across
+    /// events (see [`wheel_rows`]). Whether the selection moved.
+    pub fn palette_wheel(&mut self, delta: winit::event::MouseScrollDelta, row_px: f32) -> bool {
+        let n = self.palette_wheel_acc.add(wheel_rows(delta, row_px));
+        let before = self.palette_selected;
+        if n != 0 {
+            self.palette_move(n as isize);
+        }
+        self.palette_selected != before
     }
 
     /// Move the palette selection by `delta` rows (clamped), keeping it inside
@@ -383,6 +410,48 @@ mod tests {
         assert!(!ov.search_refresh_due(soon), "inside the throttle window");
         assert_eq!(ov.search_wake(), Some(t0 + SEARCH_REFRESH_INTERVAL), "one trailing wake");
         assert!(ov.search_refresh_due(t0 + SEARCH_REFRESH_INTERVAL));
+    }
+
+    /// The palette moves one row per wheel notch and one row per row of
+    /// touchpad travel. It used to step one row per EVENT: an X11 touchpad's
+    /// fractional `LineDelta`s rounded to 0 (a slow swipe never moved), and a
+    /// Wayland / macOS touchpad's stream of small `PixelDelta`s raced through
+    /// the list a row per event.
+    #[test]
+    fn the_palette_wheel_moves_by_travel_not_by_event() {
+        use winit::dpi::PhysicalPosition;
+        use winit::event::MouseScrollDelta::{LineDelta, PixelDelta};
+        let px = |y: f64| PixelDelta(PhysicalPosition::new(0.0, y));
+        let mut ov = Overlays { palette_open: true, palette_filtered: hits(40), ..Default::default() };
+        assert!(ov.palette_wheel(LineDelta(0.0, -1.0), 28.0), "a notch down");
+        assert_eq!(ov.palette_selected, 1);
+        for _ in 0..3 {
+            assert!(!ov.palette_wheel(LineDelta(0.0, -0.25), 28.0), "a quarter line: not yet");
+        }
+        assert!(ov.palette_wheel(LineDelta(0.0, -0.25), 28.0), "a whole line of X11 touchpad travel");
+        assert_eq!(ov.palette_selected, 2);
+        for _ in 0..3 {
+            assert!(!ov.palette_wheel(px(-7.0), 28.0), "7 px of a 28-px row: not yet");
+        }
+        assert!(ov.palette_wheel(px(-7.0), 28.0), "a whole row of pixel travel");
+        assert_eq!(ov.palette_selected, 3);
+        assert!(ov.palette_wheel(LineDelta(0.0, 2.0), 28.0), "two notches up");
+        assert_eq!(ov.palette_selected, 1);
+        // Closing drops a half-finished swipe.
+        ov.palette_wheel(px(-20.0), 28.0);
+        ov.close_palette();
+        let mut ov = Overlays { palette_open: true, palette_filtered: hits(40), ..ov };
+        assert!(!ov.palette_wheel(px(-10.0), 28.0), "no remainder carried into the next open");
+    }
+
+    #[test]
+    fn wheel_rows_follow_winit_signs() {
+        use winit::dpi::PhysicalPosition;
+        use winit::event::MouseScrollDelta::{LineDelta, PixelDelta};
+        assert_eq!(wheel_rows(LineDelta(0.0, 1.0), 20.0), -1.0, "wheel up: toward the top");
+        assert_eq!(wheel_rows(LineDelta(0.0, -3.0), 20.0), 3.0);
+        assert_eq!(wheel_rows(PixelDelta(PhysicalPosition::new(0.0, -50.0)), 20.0), 2.5);
+        assert_eq!(wheel_rows(PixelDelta(PhysicalPosition::new(0.0, 10.0)), 0.0), -10.0, "a zero pitch is 1 px");
     }
 
     #[test]

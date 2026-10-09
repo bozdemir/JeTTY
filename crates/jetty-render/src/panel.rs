@@ -470,6 +470,9 @@ const RGB_SWATCH_W: f32 = 30.0;
 const LIST_ROW_H: f32 = 24.0;
 const LIST_ROW_GAP: f32 = 2.0;
 const LIST_PAD: f32 = 5.0;
+/// A list's row pitch (logical px; × the panel's `overlay_u` for physical):
+/// how far a list scrolls per row, so touchpad travel maps to rows.
+pub const LIST_ROW_PITCH: f32 = LIST_ROW_H + LIST_ROW_GAP;
 
 /// Row pitches: single-line controls, sliders, RGB rows; a hint line adds
 /// HINT_H. Sections: header height and the gap above every header but the

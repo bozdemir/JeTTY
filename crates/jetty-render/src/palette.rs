@@ -7,6 +7,12 @@ use crate::Rect;
 /// builder's visible-slice assumption stay in lockstep.
 pub const MAX_PALETTE_ROWS: usize = 9;
 
+/// A palette row's pitch (physical px) for chrome metrics `cm` — before a
+/// short window squeezes it. The app converts touchpad travel to rows by it.
+pub fn palette_row_h(cm: ChromeMetrics) -> f32 {
+    (28.0 * cm.overlay_u()).max(16.0)
+}
+
 /// One result row handed to [`build_command_palette`]: a (possibly already
 /// tail/head-truncated) title, the matched CHARACTER indices into that title
 /// (for the accent highlight), and whether it is the selected row.
@@ -79,7 +85,7 @@ pub fn build_command_palette(
     let input_h = (34.0 * vscale).max(24.0);
     let div_h = 1.0;
     let n = rows.len();
-    let mut row_h = (28.0 * vscale).max(16.0);
+    let mut row_h = palette_row_h(cm);
 
     let avail_h = sh.max(0.0);
     let ideal_h = 2.0 * pad_v + input_h + div_h + n as f32 * row_h;

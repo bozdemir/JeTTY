@@ -1045,6 +1045,8 @@ pub struct App {
     settings_collapsed: Vec<&'static str>,
     /// The Settings control being dragged, if any.
     ctl_drag: Option<CtlDrag>,
+    /// Wheel travel toward the next row of the Settings list under the pointer.
+    settings_list_wheel: input::ScrollAccumulator,
     /// The Settings scrollbar thumb is being dragged: where it was grabbed
     /// (pointer y − thumb top, physical px).
     settings_scroll_grab: Option<f32>,
@@ -1903,6 +1905,7 @@ impl App {
             settings_scroll: [0.0; jetty_render::N_TABS],
             settings_collapsed: Vec::new(),
             ctl_drag: None,
+            settings_list_wheel: input::ScrollAccumulator::new(),
             settings_scroll_grab: None,
             settings_hover: None,
             settings_focus: None,
@@ -3715,14 +3718,10 @@ impl App {
             }
         }
         if self.ov_of(s).is_some_and(|o| o.palette_open) {
-            let step = match delta {
-                MouseScrollDelta::LineDelta(_, y) => -(y.round() as isize),
-                MouseScrollDelta::PixelDelta(p) => {
-                    if p.y > 0.0 { -1 } else if p.y < 0.0 { 1 } else { 0 }
-                }
-            };
-            if step != 0 {
-                self.palette_move(s, step);
+            // A row per notch or per row of touchpad travel (not per event).
+            let row_px = self.surface_layout(s).map_or(28.0, |(_, _, cm, _)| jetty_render::palette_row_h(cm));
+            if self.ov_of_mut(s).is_some_and(|o| o.palette_wheel(delta, row_px)) {
+                self.palette_preview_step(s, true);
                 self.paint_surface(s);
             }
             return true;
@@ -8992,9 +8991,12 @@ impl App {
         }
     }
 
-    /// The mouse wheel over Settings: a list under the pointer scrolls itself,
-    /// anything else scrolls the tab.
-    fn settings_wheel(&mut self, dy: f32) {
+    /// The mouse wheel over Settings: a list under the pointer scrolls itself
+    /// (a row per notch or per row of touchpad travel — not per event, which
+    /// raced through the font list on a touchpad), anything else scrolls the
+    /// tab.
+    fn settings_wheel(&mut self, delta: MouseScrollDelta) {
+        let u = self.settings_metrics().overlay_u();
         let (cx, cy) = (self.settings_cursor.0 as f32, self.settings_cursor.1 as f32);
         let over_list = self.settings_geom.as_ref().and_then(|g| {
             if cy < g.content_top || cy >= g.content_bottom {
@@ -9010,8 +9012,22 @@ impl App {
             })
         });
         match over_list.and_then(crate::settings_ui::find) {
-            Some(d) => self.scroll_list(d, if dy < 0.0 { -1 } else { 1 }),
-            None => self.scroll_settings_by(dy),
+            Some(d) => {
+                let rows = crate::overlays::wheel_rows(delta, jetty_render::LIST_ROW_PITCH * u);
+                let n = self.settings_list_wheel.add(rows);
+                if n != 0 {
+                    self.scroll_list(d, n);
+                }
+            }
+            None => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -y * 40.0 * u,
+                    MouseScrollDelta::PixelDelta(p) => -(p.y as f32),
+                };
+                if dy != 0.0 {
+                    self.scroll_settings_by(dy);
+                }
+            }
         }
     }
 
@@ -11085,15 +11101,7 @@ impl App {
                 let action = input::decide_mouse_press(Some(&pv.geom), None, cx, cy);
                 self.handle_settings_action(action, &pv.geom);
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -y * 40.0 * self.settings_metrics().overlay_u(),
-                    MouseScrollDelta::PixelDelta(p) => -(p.y as f32),
-                };
-                if dy != 0.0 {
-                    self.settings_wheel(dy);
-                }
-            }
+            WindowEvent::MouseWheel { delta, .. } => self.settings_wheel(delta),
             WindowEvent::KeyboardInput { event, is_synthetic, .. } if event.state.is_pressed() => {
                 // Ignore X11's synthetic focus-gain presses: an Escape held while
                 // the settings window takes focus must not instantly close it.

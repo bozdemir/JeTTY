@@ -59,7 +59,7 @@ pub use quad::{link_underline_rects_at, text_decoration_rects_at, Deco, Underlin
 pub use panel::{
     build_panel, gallery_order, is_user_theme, theme_is_light, track_knob, CtlId, CtlPart, CtlRow, CtlShow, Label,
     PanelGeom, PanelHit, PanelInput, PanelItem, PanelView, ResetState, RowState, ThemeFilter, CHAR_W_FALLBACK,
-    GALLERY_COLS, N_TABS, PANEL_H, PANEL_W, TAB_NAMES,
+    GALLERY_COLS, LIST_ROW_PITCH, N_TABS, PANEL_H, PANEL_W, TAB_NAMES,
 };
 pub use mask::{CornerMask, all_radii_flat, rounded_rect_coverage, rounded_rect_coverage_per, rounded_rect_coverage_slid};
 pub use reveal::{BayerReveal, bayer4, reveal_coverage};
@@ -89,7 +89,7 @@ pub use search_bar::{
 };
 pub use hints::{build_copy_pill, build_hint_overlay, copy_cursor_rects, CopyPill, CopySelect, HintOverlay, PillAvoid};
 pub use preedit::{build_preedit_overlay, PreeditOverlay, MAX_PREEDIT_CHARS};
-pub use palette::{build_command_palette, CommandPalette, PaletteRow, MAX_PALETTE_ROWS};
+pub use palette::{build_command_palette, palette_row_h, CommandPalette, PaletteRow, MAX_PALETTE_ROWS};
 pub use status::{build_status_strip, build_toast_pill, StatusStrip, ToastPill};
 pub use grid_geom::{failed_marker_x, grid_dims, padding_px, shift_labels_x, shift_x, GridOrigin, PADDING_MAX};
 pub use text::{clamp_line_height, LINE_HEIGHT_DEFAULT, LINE_HEIGHT_MAX, LINE_HEIGHT_MIN};
