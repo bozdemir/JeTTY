@@ -7101,7 +7101,11 @@ impl App {
                 active_bell = true;
             }
             if tab.terminal.child_exited() || tab.pty.child_exited() {
-                exited.push(i);
+                if Self::revive_failed_start(tab) {
+                    active_had_data |= i == self.active;
+                } else {
+                    exited.push(i);
+                }
             }
         }
         self.vt_bytes += vt_read;
@@ -7236,6 +7240,28 @@ impl App {
     /// Shared by `drain_pty` (per `self.tabs` entry) and the `AppEvent::Wake`
     /// handler's detached-window loop, so both paths drain identically.
     ///
+    /// A tab whose shell exited UNSUCCESSFULLY right after starting — a broken
+    /// shell or rc file — gets the next shell candidate instead of closing
+    /// (with the last tab, the whole app used to vanish without a word). The
+    /// dead shell's last output (its error) stays on screen above the notice.
+    /// True when the tab lives on (see `PtySession::respawn_after_failed_start`).
+    fn revive_failed_start(tab: &mut Tab) -> bool {
+        let Some(Ok(pty)) = tab.pty.respawn_after_failed_start() else { return false };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        while std::time::Instant::now() < deadline {
+            let Some(chunk) = tab.pty.recv_output_timeout(std::time::Duration::from_millis(20)) else { break };
+            tab.terminal.feed(&chunk);
+        }
+        // Replies to the dead shell's queries must not reach its successor.
+        let _ = tab.terminal.drain_pty_writes();
+        for notice in pty.startup_notices() {
+            tab.terminal.feed_notice(notice);
+        }
+        tab.writer = pty.writer();
+        tab.pty = pty;
+        true
+    }
+
     /// The third element is a run-selection feedback [`runsel::Notice`]
     /// (refusal/staged pill) — `None` on every normal pass; the caller
     /// surfaces it via `show_status_pill` (a pill needs `&mut self`).
@@ -12546,7 +12572,11 @@ impl ApplicationHandler<AppEvent> for App {
                     // case here: the app keeps running even if every detached window
                     // closes, so we never call `event_loop.exit()` for this.
                     if dw.tab.terminal.child_exited() || dw.tab.pty.child_exited() {
-                        exited_detached.push(i);
+                        if Self::revive_failed_start(&mut dw.tab) {
+                            dw.request_paint();
+                        } else {
+                            exited_detached.push(i);
+                        }
                     }
                 }
                 self.vt_bytes += vt_read;

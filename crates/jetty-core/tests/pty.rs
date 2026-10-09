@@ -295,3 +295,50 @@ fn title_cwd_and_foreground_name_follow_the_shell() {
     drop(pty);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Wait (≤ 5 s) for the session's shell to exit, draining its output.
+fn wait_exited(pty: &PtySession) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        while pty.try_recv_output().is_some() {}
+        if pty.child_exited() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+#[cfg(unix)]
+#[test]
+fn a_shell_that_dies_right_after_starting_hands_over_to_the_next_one() {
+    // `shell = "/bin/false"` — or a zsh whose rc file exits 1 — spawns fine,
+    // then dies at once, and the app used to vanish with its last tab. The
+    // next candidate takes over in the same terminal, saying why.
+    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/false".into()), None, || {}).expect("spawn");
+    assert!(wait_exited(&pty), "premise: /bin/false exits");
+    let next = pty.respawn_after_failed_start().expect("a failed start").expect("the next shell spawns");
+    let notices = next.startup_notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("\"/bin/false\"") && notices[0].contains("status 1"), "{notices:?}");
+    assert!(!next.child_exited(), "the fallback shell is alive");
+    {
+        use std::io::Write;
+        next.writer().write_all(b"echo REVIVED-$((40+2))\n").unwrap();
+    }
+    let out = read_until(&next, "REVIVED-42");
+    assert!(out.contains("REVIVED-42"), "the fallback shell runs commands: {out:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_clean_exit_is_not_a_failed_start() {
+    // `exit` / Ctrl+D at once is the user closing the tab, not a broken shell.
+    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    {
+        use std::io::Write;
+        pty.writer().write_all(b"exit\n").unwrap();
+    }
+    assert!(wait_exited(&pty), "premise: the shell exits");
+    assert!(pty.respawn_after_failed_start().is_none(), "status 0: the tab just closes");
+}

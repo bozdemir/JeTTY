@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The version JeTTY advertises to child shells via `TERM_PROGRAM_VERSION` and
 /// `JETTY`. The binary sets this once at startup (its real release version); the
@@ -177,6 +177,38 @@ pub struct PtySession {
     /// intended shell started where it was asked to. Plain text interpolating
     /// outside data (paths, OS errors) — show via `Terminal::feed_notice`.
     startup_notices: Vec<String>,
+    /// What the session was spawned from, and which candidate runs — kept so a
+    /// shell that dies right after starting can hand over to the next one
+    /// ([`PtySession::respawn_after_failed_start`]).
+    plan: SpawnPlan,
+    launched: usize,
+    /// The app's wake, shared with the reader/waiter threads (and a respawn).
+    wake: Wake,
+    /// When the shell started, and how and when it ended (the waiter sets this
+    /// BEFORE `exited`, so a caller that saw `child_exited` can read it).
+    started: Instant,
+    ended: Arc<Mutex<Option<(portable_pty::ExitStatus, Instant)>>>,
+}
+
+/// The shell candidates (most preferred first), start directory and extra
+/// environment a session was spawned from.
+#[derive(Clone)]
+struct SpawnPlan {
+    candidates: Vec<String>,
+    cwd: Option<std::path::PathBuf>,
+    env: Vec<(String, String)>,
+}
+
+/// How soon after starting an unsuccessful exit means "this shell could not
+/// start" (a broken shell or rc file) rather than the user leaving it. A full
+/// oh-my-zsh + powerlevel10k start takes ~0.2 s; a user's own `exit 1` (or ^C
+/// then ^D) within this window of a new tab is not a realistic case.
+const FAILED_START_WINDOW: Duration = Duration::from_secs(2);
+
+/// Whether a shell that ended `success`fully or not after running for `lived`
+/// failed to start (see [`FAILED_START_WINDOW`]).
+fn failed_start(success: bool, lived: Duration) -> bool {
+    !success && lived < FAILED_START_WINDOW
 }
 
 /// `Write` adapter handed to the app: forwards buffers to the PTY writer
@@ -240,7 +272,12 @@ impl Drop for PtySession {
         // dup closes too — then any disowned process still holding the slave sees
         // the hangup instead of pinning the reader in `read` forever. (On other
         // platforms the reader leaves only when the slave's last holder exits.)
-        // `kill()` on an already-exited child is ignored.
+        // A shell that already exited was REAPED by the waiter: its PID is free
+        // and may belong to another process by now — never signal it (the usual
+        // case: a tab closing because its shell exited).
+        if self.exited.load(Ordering::SeqCst) {
+            return;
+        }
         let _ = self.killer.kill();
         // Stage 2: if the shell IGNORES SIGHUP (`trap '' HUP`) and is still
         // unreaped after a grace period, escalate to an uncatchable SIGKILL so it
@@ -734,22 +771,43 @@ impl PtySession {
         env: Vec<(String, String)>,
         on_data: impl Fn() + Send + 'static,
     ) -> std::io::Result<PtySession> {
-        let pty_system = native_pty_system();
+        // The shell the caller explicitly requested (config `shell` override),
+        // remembered so we can tell whether the launch fell back to another one.
+        let requested = shell_override.clone().filter(|s| !s.is_empty());
+        // A vanished directory silently degrades to existing behavior;
+        // portable-pty re-guards (non-dir → home) at exec time.
+        let plan = SpawnPlan { candidates: shell_candidates(shell_override), cwd: cwd.filter(|d| d.is_dir()), env };
+        // Shared so the reader thread (coalesced output / EOF wakes), the waiter
+        // thread (exit wake) and `rearm_wake` can all drive it. `spawn`'s
+        // `on_data` is only `Send`, so it can't be cloned across threads
+        // directly; the `Mutex` makes it shareable.
+        let wake: Wake = Arc::new(Mutex::new(Box::new(on_data)));
         // Report the text-area pixel size (TIOCGWINSZ ws_xpixel/ws_ypixel) so
         // image tools that read it (as a fallback to the \e[14t reply) scale to
         // the real cell metrics. 0 = unknown (provisional spawn; a resize with the
         // real cell size follows).
-        let pair = pty_system
-            .openpty(PtySize { rows, cols, pixel_width: px_w, pixel_height: px_h })
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        // A vanished directory silently degrades to existing behavior;
-        // portable-pty re-guards (non-dir → home) at exec time.
-        let cwd = cwd.filter(|d| d.is_dir());
+        let size = PtySize { rows, cols, pixel_width: px_w, pixel_height: px_h };
+        let mut session = Self::spawn_plan(size, plan, 0, wake)?;
+        // If the user asked for a specific shell and we ended up on a different
+        // one, surface a one-line notice so the fallback is not silent.
+        match requested {
+            Some(req) if req != session.launched_shell() => session.startup_notices.insert(
+                0,
+                format!("jetty: shell \"{req}\" could not be started — using \"{}\" instead.", session.launched_shell()),
+            ),
+            _ => {}
+        }
+        Ok(session)
+    }
 
-        // The shell the caller explicitly requested (config `shell` override),
-        // remembered so we can tell whether the launch fell back to another one.
-        let requested = shell_override.clone().filter(|s| !s.is_empty());
-        let candidates = shell_candidates(shell_override);
+    /// Spawn the first of `plan.candidates[first..]` that starts, on a fresh
+    /// PTY of `size`, with its reader, writer and waiter threads. Its
+    /// `startup_notices` say only when the start directory could not be entered.
+    fn spawn_plan(size: PtySize, plan: SpawnPlan, first: usize, wake: Wake) -> std::io::Result<PtySession> {
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(size).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let cwd = plan.cwd.clone();
+        let env = &plan.env;
         let jetty_bin = jetty_bin_path();
 
         // Build a fully-configured CommandBuilder for a given shell path and start
@@ -795,7 +853,7 @@ impl PtySession {
             if let Some(exe) = &jetty_bin {
                 cmd.env("JETTY_BIN", exe);
             }
-            for (key, value) in &env {
+            for (key, value) in env {
                 cmd.env(key, value);
             }
             // An explicit cwd (inherited from the requesting tab) wins.
@@ -828,14 +886,14 @@ impl PtySession {
         // that no longer exists on disk (uninstalled/moved) must NOT prevent a
         // usable window — fall through to $SHELL/passwd/bash/sh instead (F2).
         let mut child = None;
-        let mut launched_shell = String::new();
+        let mut launched = first;
         let mut last_err = None;
         let mut cwd_notice = None;
-        for shell in &candidates {
+        for (i, shell) in plan.candidates.iter().enumerate().skip(first) {
             match spawn_one(shell, cwd.as_deref()) {
                 Ok(c) => {
                     child = Some(c);
-                    launched_shell = shell.clone();
+                    launched = i;
                     break;
                 }
                 Err(e) => {
@@ -851,7 +909,7 @@ impl PtySession {
                                 dir.display()
                             ));
                             child = Some(c);
-                            launched_shell = shell.clone();
+                            launched = i;
                             break;
                         }
                     }
@@ -867,18 +925,10 @@ impl PtySession {
                 ));
             }
         };
+        let started = Instant::now();
         drop(pair.slave);
-
-        // If the user asked for a specific shell and we ended up on a different
-        // one, surface a one-line notice so the fallback is not silent; same for
-        // a start directory that could not be entered.
-        let shell_notice = match requested {
-            Some(req) if req != launched_shell => Some(format!(
-                "jetty: shell \"{req}\" could not be started — using \"{launched_shell}\" instead.",
-            )),
-            _ => None,
-        };
-        let startup_notices: Vec<String> = shell_notice.into_iter().chain(cwd_notice).collect();
+        // A start directory that could not be entered is not silent either.
+        let startup_notices: Vec<String> = cwd_notice.into_iter().collect();
 
         // Dedicated WRITER thread (mirrors the reader thread below): it owns
         // the blocking Write half of the master; the UI thread only ever sends
@@ -947,11 +997,6 @@ impl PtySession {
             queued: AtomicUsize::new(0),
             wake_pending: AtomicBool::new(false),
         });
-        // Shared so the reader thread (coalesced output / EOF wakes), the waiter
-        // thread (exit wake) and `rearm_wake` can all drive it. `spawn`'s
-        // `on_data` is only `Send`, so it can't be cloned across threads
-        // directly; the `Mutex` makes it shareable.
-        let wake: Wake = Arc::new(Mutex::new(Box::new(on_data)));
 
         let wake_reader = Arc::clone(&wake);
         let read_reader = Arc::clone(&read);
@@ -1001,9 +1046,13 @@ impl PtySession {
         let pid = child.process_id();
         let exited_waiter = Arc::clone(&exited);
         let wake_waiter = Arc::clone(&wake);
+        let ended: Arc<Mutex<Option<(portable_pty::ExitStatus, Instant)>>> = Arc::new(Mutex::new(None));
+        let ended_waiter = Arc::clone(&ended);
         std::thread::spawn(move || {
             let mut child = child;
-            let _ = child.wait();
+            if let Ok(status) = child.wait() {
+                *ended_waiter.lock().unwrap() = Some((status, Instant::now()));
+            }
             exited_waiter.store(true, Ordering::SeqCst);
             (*wake_waiter.lock().unwrap())();
         });
@@ -1019,16 +1068,60 @@ impl PtySession {
             write_tx,
             write_queued,
             startup_notices,
+            plan,
+            launched,
+            wake,
+            started,
+            ended,
         })
+    }
+
+    /// The shell this session runs (or ran).
+    fn launched_shell(&self) -> &str {
+        &self.plan.candidates[self.launched]
     }
 
     /// One-line notices describing a spawn fallback — the configured `shell`
     /// override could not be launched (F2), the requested start directory
-    /// could not be entered — empty when the shell started as asked. Plain
-    /// text with outside data interpolated: the app shows each with
-    /// `Terminal::feed_notice`, which keeps it inert.
+    /// could not be entered, the previous shell died right after starting —
+    /// empty when the shell started as asked. Plain text with outside data
+    /// interpolated: the app shows each with `Terminal::feed_notice`, which
+    /// keeps it inert.
     pub fn startup_notices(&self) -> &[String] {
         &self.startup_notices
+    }
+
+    /// The shell exited UNSUCCESSFULLY right after starting (within
+    /// [`FAILED_START_WINDOW`]): a broken shell or rc file (`exit 1` in
+    /// `.zshrc`, a crash), not the user leaving it. Then start the next shell
+    /// candidate on a fresh PTY of the same size, start directory, environment
+    /// and wake, whose [`PtySession::startup_notices`] say what happened — so a
+    /// tab (and with the last tab, the whole app) does not just vanish.
+    /// `None` when the shell is alive, ended cleanly or later, or was the last
+    /// candidate; `Some(Err)` when no further candidate could be spawned.
+    /// Drain this session's remaining output first: it is the dead shell's
+    /// last words, usually the error.
+    pub fn respawn_after_failed_start(&self) -> Option<std::io::Result<PtySession>> {
+        let (status, ended) = self.ended.lock().ok()?.clone()?;
+        if !failed_start(status.success(), ended.duration_since(self.started)) {
+            return None;
+        }
+        let next = self.launched + 1;
+        if next >= self.plan.candidates.len() {
+            return None;
+        }
+        let size = self.master.lock().ok()?.get_size().ok()?;
+        let dead = self.launched_shell();
+        let how = match status.signal() {
+            Some(signal) => format!("died ({signal})"),
+            None => format!("exited with status {}", status.exit_code()),
+        };
+        Some(Self::spawn_plan(size, self.plan.clone(), next, Arc::clone(&self.wake)).map(|mut session| {
+            let notice =
+                format!("jetty: \"{dead}\" {how} right after starting — using \"{}\" instead.", session.launched_shell());
+            session.startup_notices.insert(0, notice);
+            session
+        }))
     }
 
     /// Feed queued output to `f`, oldest chunk first, until the queue is empty or
@@ -1365,6 +1458,16 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         drop(q);
         assert!(!producer.join().unwrap(), "send into a dropped queue must fail, not hang");
+    }
+
+    #[test]
+    fn only_an_unsuccessful_exit_right_after_starting_is_a_failed_start() {
+        let ms = Duration::from_millis;
+        assert!(failed_start(false, ms(150)), "a broken rc file: dies within ~0.2 s");
+        assert!(failed_start(false, FAILED_START_WINDOW - ms(1)));
+        assert!(!failed_start(true, ms(150)), "`exit` / Ctrl+D at once: the user closed it");
+        assert!(!failed_start(false, FAILED_START_WINDOW), "a later failure is the user's own `exit 1`");
+        assert!(!failed_start(false, Duration::from_secs(3600)));
     }
 
     #[test]
