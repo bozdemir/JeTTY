@@ -370,6 +370,16 @@ const PTY_DRAIN_BUDGET: usize = 2 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TabId(pub(crate) u64);
 
+impl TabId {
+    /// The "Tab N" a tab shows while nothing names it: its id, numbered from
+    /// 1 and never reused. Counting the tabs open at spawn repeated titles —
+    /// close or detach Tab 2 of 3 and the next new tab was a second "Tab 3"
+    /// (in the bar, the palette and notifications).
+    pub(crate) fn default_title(self) -> String {
+        format!("Tab {}", self.0)
+    }
+}
+
 /// A single terminal session: its grid model, PTY, writer, and tab title. One
 /// `Tab` per visible tab. Per-tab scroll/selection live inside `terminal`.
 pub(crate) struct Tab {
@@ -381,7 +391,7 @@ pub(crate) struct Tab {
     /// The DISPLAYED title (tab bar, detached bar/OS title, confirm-close).
     pub(crate) title: String,
     /// The frozen "Tab N" fallback restored when the shell resets/clears its
-    /// OSC title.
+    /// OSC title ([`TabId::default_title`]).
     pub(crate) default_title: String,
     /// Once the user commits a manual rename, shell OSC titles are ignored for
     /// this tab forever (manual > auto > default precedence).
@@ -4270,8 +4280,8 @@ impl App {
         for notice in pty.startup_notices() {
             terminal.feed_notice(notice);
         }
-        let title = format!("Tab {}", self.tabs.len() + 1);
         let id = self.alloc_tab_id();
+        let title = id.default_title();
         let mut tab = Tab {
             id,
             terminal,
@@ -13692,8 +13702,8 @@ impl ApplicationHandler<AppEvent> for App {
             terminal,
             pty,
             writer,
-            title: "Tab 1".to_string(),
-            default_title: "Tab 1".to_string(),
+            title: id.default_title(),
+            default_title: id.default_title(),
             manually_renamed: false,
             meta: crate::tabmeta::TabMeta::default(),
             pending_inject: None,
@@ -18742,6 +18752,21 @@ mod stable_tab_id_tests {
         let confirm = Some(TabId(2));
         assert_eq!(still_open(confirm, &[TabId(1), TabId(3)]), None);
         assert_eq!(still_open(None, &[TabId(1)]), None);
+    }
+}
+
+#[cfg(test)]
+mod default_title_tests {
+    use super::TabId;
+
+    #[test]
+    fn default_titles_never_repeat() {
+        // Ids are allocated from 1, once per tab, never reused: the first tab
+        // is "Tab 1", and a tab opened after Tab 2 of 3 closed is "Tab 4",
+        // not a second "Tab 3".
+        assert_eq!(TabId(1).default_title(), "Tab 1");
+        let titles: std::collections::HashSet<String> = (1..=50).map(|n| TabId(n).default_title()).collect();
+        assert_eq!(titles.len(), 50);
     }
 }
 
