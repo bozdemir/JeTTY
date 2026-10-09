@@ -4629,9 +4629,11 @@ impl Terminal {
         let display_offset = grid.display_offset();
         let pt = viewport_to_point(display_offset, Point::new(viewport_line, Column(col)));
 
-        // OSC 8 branch: underline the visible cells carrying the same link id
-        // (id equality groups multi-segment links exactly as the app emitted
-        // them; id-less links share one generated id per OSC run).
+        // OSC 8 branch: underline the visible cells of the same link — the same
+        // id AND URI, as the OSC 8 spec joins them (a multi-segment link the
+        // app emitted under one id; id-less links get one generated id per OSC
+        // run). Comparing `Hyperlink` values is one pointer compare for the
+        // cells of one OSC run; both strings are bounded (see `handler.rs`).
         if let Some(link) = grid[pt].hyperlink() {
             let mut spans: Vec<(usize, usize, usize)> = Vec::new();
             // The text the link wears on screen, to tell whether it shows
@@ -4641,7 +4643,7 @@ impl Terminal {
                 let line = viewport_to_point(display_offset, Point::new(vp_row, Column(0))).line;
                 for c in 0..self.cols {
                     let cell = &grid[Point::new(line, Column(c))];
-                    let same = cell.hyperlink().is_some_and(|h| h.id() == link.id());
+                    let same = cell.hyperlink().as_ref() == Some(&link);
                     if same {
                         if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                             text.push(cell.c);
@@ -6637,6 +6639,42 @@ mod tests {
         // Exactly the 8 label cells ("click me"), nothing after the OSC close.
         assert_eq!(hit.spans, vec![(0, 0, 7)]);
         assert!(t.link_at(0, 10).is_none(), "'plain' carries no link");
+    }
+
+    /// `text` inside an OSC 8 link with these params and URI.
+    fn osc8(params: &str, uri: &str, text: &str) -> String {
+        format!("\x1b]8;{params};{uri}\x1b\\{text}\x1b]8;;\x1b\\")
+    }
+
+    #[test]
+    fn link_at_joins_cells_of_the_same_id_and_uri() {
+        // The OSC 8 spec joins cells with the same id AND URI. JeTTY joined by
+        // id alone, comparing the id string for every viewport cell: with a
+        // ~1 MiB id each recompute of a Ctrl+hover (every mouse move, every
+        // drain while hovered) cost ~60 ms. Links compare as values now — one
+        // pointer compare for the cells of one OSC run.
+        let mut t = Terminal::new(30, 3);
+        let one = osc8("id=a", "https://one.test/", "one");
+        let two = osc8("id=a", "https://two.test/", "two");
+        t.feed(format!("{one} {two} {}", osc8("id=a", "https://one.test/", "uno")).as_bytes());
+        let hit = t.link_at(0, 0).unwrap();
+        assert_eq!(hit.spans, vec![(0, 0, 2), (0, 8, 10)], "both runs of one.test, not two.test");
+        assert_eq!(t.link_at(0, 5).unwrap().spans, vec![(0, 4, 6)]);
+    }
+
+    #[test]
+    fn overlong_osc8_ids_and_uris_are_dropped_as_vte_does() {
+        // Past VTE's limits an `id` is ignored (each run is a link of its own)
+        // and a URI makes no link, which also bounds every compare above.
+        let mut t = Terminal::new(30, 3);
+        let id = format!("id={}", "i".repeat(251));
+        t.feed(format!("{} {}", osc8(&id, "https://x.test/", "aa"), osc8(&id, "https://x.test/", "bb")).as_bytes());
+        assert_eq!(t.link_at(0, 0).unwrap().spans, vec![(0, 0, 1)], "an overlong id joins nothing");
+        let uri = format!("https://x.test/{}", "u".repeat(8 * 1024));
+        t.feed(format!("\r\n{}", osc8("", &uri, "cc")).as_bytes());
+        assert!(t.link_at(1, 0).is_none(), "an overlong URI is no link");
+        t.feed(format!("\r\n{}", osc8("id=ok", &uri[..8 * 1024], "dd")).as_bytes());
+        assert_eq!(t.link_at(2, 0).unwrap().uri.len(), 8 * 1024, "8 KiB is still a link");
     }
 
     #[test]

@@ -31,6 +31,8 @@
 //! * OSC 0 / 2 titles are clipped to [`TITLE_MAX_BYTES`]: alacritty kept the
 //!   whole payload and cloned it on every title-stack push (`CSI 22 t`, 4096
 //!   deep), so ~1 MB of output could pin ~4 GiB per tab.
+//! * An OSC 8 hyperlink `id` past 250 bytes is ignored and a URI past 8 KiB
+//!   makes no link (VTE ignores both too; its URI limit is lower).
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
@@ -51,6 +53,13 @@ use std::sync::mpsc::Sender;
 /// of UTF-8); alacritty stores the whole OSC 0 / 2 payload — up to the 1 MiB
 /// OSC cap — and clones it on every title-stack push (`CSI 22 t`, 4096 deep).
 pub(crate) const TITLE_MAX_BYTES: usize = 1024;
+
+/// Limits on an OSC 8 hyperlink: an `id` longer than VTE's 250 bytes is
+/// ignored (the link gets one of its own) and a URI past 8 KiB makes no link
+/// (VTE stops at 2083) — so comparing two links, which `Terminal::link_at`
+/// does for every viewport cell, stays cheap.
+const HYPERLINK_ID_MAX: usize = 250;
+const HYPERLINK_URI_MAX: usize = 8 * 1024;
 
 /// The primary device attributes JeTTY reports: a VT220-class terminal (62)
 /// with sixel graphics (4) and ANSI color (22). alacritty answers a bare VT102
@@ -242,7 +251,6 @@ impl<T: EventListener> Handler for Vt<T> {
         fn pop_title(&mut self);
         fn text_area_size_pixels(&mut self);
         fn text_area_size_chars(&mut self);
-        fn set_hyperlink(&mut self, link: Option<Hyperlink>);
         fn set_mouse_cursor_icon(&mut self, icon: CursorIcon);
         fn report_keyboard_mode(&mut self);
         fn push_keyboard_mode(&mut self, mode: KeyboardModes);
@@ -271,6 +279,16 @@ impl<T: EventListener> Handler for Vt<T> {
             t
         });
         Handler::set_title(&mut self.0, title);
+    }
+
+    fn set_hyperlink(&mut self, link: Option<Hyperlink>) {
+        let link = link.filter(|l| l.uri.len() <= HYPERLINK_URI_MAX).map(|mut l| {
+            if l.id.as_ref().is_some_and(|id| id.len() > HYPERLINK_ID_MAX) {
+                l.id = None;
+            }
+            l
+        });
+        Handler::set_hyperlink(&mut self.0, link);
     }
 
     fn reverse_index(&mut self) {
