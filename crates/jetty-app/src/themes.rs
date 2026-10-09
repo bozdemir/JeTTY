@@ -389,7 +389,12 @@ fn merge_into_builtins(user: Vec<jetty_core::Theme>) -> Vec<jetty_core::Theme> {
 /// on disk. Called once at startup and on every hot-reload of `themes/`. Returns a
 /// warning per skipped / shadowed theme file, for the app to show (also logged).
 pub fn rebuild_registry() -> Vec<String> {
-    let (user, warnings) = load_user_themes();
+    rebuild_registry_from(&crate::config::Config::dir().join("themes"))
+}
+
+/// [`rebuild_registry`] from the user themes in `dir`.
+pub(crate) fn rebuild_registry_from(dir: &std::path::Path) -> Vec<String> {
+    let (user, warnings) = load_user_themes_from(dir);
     jetty_core::set_registry(merge_into_builtins(user));
     warnings
 }

@@ -2577,21 +2577,16 @@ impl App {
     }
 
     /// Show configuration problems the user must see: a status pill on the main
-    /// window (long enough to read; several are summarized as "<first> (+N more)")
-    /// plus every one on stderr.
+    /// window (long enough to read; see [`config_pill_text`]) plus every one on
+    /// stderr.
     fn show_config_warnings(&mut self, warnings: &[String]) {
-        let Some(first) = warnings.first() else { return };
+        if warnings.is_empty() {
+            return;
+        }
         for w in warnings {
             eprintln!("jetty: {w}");
         }
-        let mut msg = format!("Config: {}", sanitize_notice(first));
-        if msg.chars().count() > 96 {
-            msg = msg.chars().take(93).collect::<String>() + "…";
-        }
-        if warnings.len() > 1 {
-            msg.push_str(&format!(" (+{} more)", warnings.len() - 1));
-        }
-        self.show_notice_pill(msg, 8000);
+        self.show_notice_pill(config_pill_text(warnings), 8000);
     }
 
     /// Show `msg` in the main window's status pill for `ms` milliseconds.
@@ -16101,6 +16096,23 @@ impl FirstShellEnv {
     }
 }
 
+/// The status-pill text for config problems: the first one (cut at 96
+/// characters), and — when there are more — how many and where to see them all
+/// (the pill has room for one, and stderr is invisible to a desktop launch).
+/// That part comes FIRST: a window too narrow for the whole text ellipsizes
+/// its tail, which must not eat the way to the rest.
+fn config_pill_text(warnings: &[String]) -> String {
+    let Some(first) = warnings.first() else { return String::new() };
+    let mut first = sanitize_notice(first);
+    if first.chars().count() > 96 {
+        first = first.chars().take(95).collect::<String>() + "…";
+    }
+    match warnings.len() {
+        1 => format!("Config: {first}"),
+        n => format!("Config ({n} problems — jetty --check-config): {first}"),
+    }
+}
+
 /// The notice for a reloaded `summon_hotkey = new` (the global grab is
 /// registered once, so it applies after a restart): `Some` when `new` differs
 /// from the live value (said once) and from the key `registered`.
@@ -17262,6 +17274,25 @@ mod desktop_exec_arg_tests {
         assert_eq!(out, expected);
         // The invalid single-backslash `\$` escape must NOT appear.
         assert!(out.contains("\\\\$"), "literal $ must be doubly escaped");
+    }
+}
+
+#[cfg(test)]
+mod config_pill_tests {
+    use super::config_pill_text;
+
+    #[test]
+    fn several_problems_say_where_to_see_them_all_first() {
+        let one = ["unknown key `fontsize` is ignored".to_string()];
+        assert_eq!(config_pill_text(&one), "Config: unknown key `fontsize` is ignored");
+        let three = [one[0].clone(), "b".to_string(), "c".to_string()];
+        assert!(config_pill_text(&three).starts_with("Config (3 problems — jetty --check-config): unknown key"));
+        // A long first problem is cut; escapes in it are made visible.
+        let long = ["x".repeat(200) + "\u{1b}"];
+        let t = config_pill_text(&long);
+        assert!(t.ends_with('…') && t.chars().count() == "Config: ".len() + 96, "{t}");
+        assert!(!config_pill_text(&["a\u{1b}[31m".to_string()]).contains('\u{1b}'));
+        assert_eq!(config_pill_text(&[]), "");
     }
 }
 

@@ -355,6 +355,8 @@ pub fn run() {
                      \x20   --hide         Hide a running instance.\n\
                      \x20   --background   Launch hidden — no window until the first summon. Does nothing\n\
                      \x20                  if JeTTY is already running (\"Launch at login\" uses this).\n\
+                     \x20   --check-config Check config.toml and the theme files: print every problem\n\
+                     \x20                  (with the closest valid spelling) and exit, 1 if there are any.\n\
                      \x20   --version      Print version and exit.\n\
                      \x20   --help         Print this help and exit.\n\
                      \x20   --print-shell-integration <zsh|bash|fish>\n\
@@ -370,6 +372,7 @@ pub fn run() {
                 );
                 std::process::exit(0);
             }
+            Some("--check-config") => std::process::exit(config::check::check_cli()),
             Some("--toggle") => cmd = "toggle",
             Some("--show") => cmd = "show",
             Some("--hide") => cmd = "hide",

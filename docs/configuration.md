@@ -33,7 +33,9 @@ change.
   the settings in use. Either way it never saves over a broken file.
 - **Where problems show.** At startup in the first tab (a desktop launch has no
   terminal for them), on a reload in a notice at the bottom of the window, and
-  always on stderr.
+  always on stderr. `jetty --check-config` prints every problem of the config
+  file and the theme files — the notice has room for one — and exits with 1 if
+  there are any.
 - **Your formatting stays.** Settings changes rewrite only the keys that changed:
   comments, order and keys JeTTY does not know survive. A symlinked file
   (dotfiles) is written through the link; a read-only one is never replaced.

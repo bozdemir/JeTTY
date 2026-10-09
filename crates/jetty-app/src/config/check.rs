@@ -647,6 +647,87 @@ pub(crate) fn pick_ui_font_family(want: &str, families: impl FnOnce() -> Vec<Str
     }
 }
 
+// ── `jetty --check-config` ───────────────────────────────────────────────────
+
+/// Every problem the config tree at `dir` has, worded as JeTTY reports them:
+/// config.toml's (read as at startup, but never copied aside), the theme
+/// files', a theme or font name that finds nothing, a summon hotkey that does
+/// not parse and rejected keybindings. `fonts` lists the installed families:
+/// `(monospace, every other)`. Rebuilds the theme registry from `dir`.
+pub(crate) fn problems_in(dir: &std::path::Path, fonts: impl FnOnce() -> (Vec<String>, Vec<String>)) -> Vec<String> {
+    use std::str::FromStr as _;
+    let mut out = Vec::new();
+    let path = dir.join("config.toml");
+    let cfg = match std::fs::read_to_string(&path) {
+        Ok(s) => match Config::parse_with_base(&s, &Config::default(), "using the default") {
+            Ok((cfg, warnings)) => {
+                out.extend(warnings);
+                cfg
+            }
+            Err(syntax) => {
+                out.push(format!("config.toml is not valid TOML ({syntax}) — JeTTY runs on defaults until it is fixed"));
+                Config::default()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            out.extend(Config::load_from(&path).warnings); // a dangling link, if any
+            Config::default()
+        }
+        Err(e) => {
+            out.push(format!("could not read {}: {e}", path.display()));
+            Config::default()
+        }
+    };
+    out.extend(crate::themes::rebuild_registry_from(&dir.join("themes")));
+    for (key, name) in [("theme", &cfg.theme), ("light_theme", &cfg.light_theme)] {
+        if !(key == "light_theme" && name.is_empty()) && jetty_core::theme_index(name).is_none() {
+            out.push(format!("{key} {name:?} not found{}", crate::themes::name_hint(name)));
+        }
+    }
+    let (mono, others) = fonts();
+    out.extend(pick_font_family(&cfg.font_family, &mono, || others.clone()).warning);
+    out.extend(pick_ui_font_family(&cfg.ui_font_family, || others.iter().chain(&mono).cloned().collect()).warning);
+    if let Err(e) = global_hotkey::hotkey::HotKey::from_str(&cfg.summon_hotkey) {
+        out.push(format!("summon_hotkey {:?} is invalid ({e}) — F9 is used", cfg.summon_hotkey));
+    }
+    out.extend(crate::keymap::KeyMap::compile(&cfg.keys).warnings().iter().map(|w| format!("[keys] {w}")));
+    out
+}
+
+/// The installed font families, `(monospace, every other)` — what the font
+/// pickers list — from a fresh font database.
+fn installed_fonts() -> (Vec<String>, Vec<String>) {
+    let fonts = jetty_render::TextLayer::build_font_system();
+    let (mut mono, mut other) = (Vec::new(), Vec::new());
+    for face in fonts.db().faces() {
+        if let Some((name, _)) = face.families.first() {
+            let list: &mut Vec<String> = if face.monospaced { &mut mono } else { &mut other };
+            if !list.contains(name) {
+                list.push(name.clone());
+            }
+        }
+    }
+    mono.sort();
+    other.sort();
+    (mono, other)
+}
+
+/// `jetty --check-config`: print every problem of the config tree in use, one
+/// per line, and return the exit status — 1 when there is any. All of them,
+/// unlike the reload notice, which has room for one.
+pub fn check_cli() -> i32 {
+    let problems = problems_in(&Config::dir(), installed_fonts);
+    println!("{}", Config::config_path().display());
+    if problems.is_empty() {
+        println!("no problems found");
+        return 0;
+    }
+    for p in &problems {
+        println!("- {p}");
+    }
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,6 +872,39 @@ mod tests {
             }
         }
         assert!(problems.is_empty(), "docs/configuration.md is out of date:\n{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn check_config_lists_every_problem_of_the_tree() {
+        let dir = std::env::temp_dir().join(format!("jetty-check-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("themes")).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "fontsize = 18\ntheme = \"draculaa\"\nfont_family = \"Nope Mono\"\nsummon_hotkey = \"Ctrl+Nope\"\n\
+             [keys]\ncopy = \"Ctrl+Shift+NoSuchKey\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("themes").join("bad.toml"), "background = 1\n").unwrap();
+        let fonts = || (vec!["MesloLGS NF".to_string()], vec!["Inter".to_string()]);
+        let p = problems_in(&dir, fonts);
+        let all = p.join("\n");
+        for want in [
+            "unknown key `fontsize` is ignored — did you mean `font_size`?",
+            "themes/bad.toml skipped",
+            "theme \"draculaa\" not found — did you mean \"dracula\"?",
+            "font_family \"Nope Mono\" is not installed",
+            "summon_hotkey \"Ctrl+Nope\" is invalid",
+            "[keys] ",
+        ] {
+            assert!(all.contains(want), "{want:?} missing from:\n{all}");
+        }
+        // A clean tree has nothing to say.
+        std::fs::write(dir.join("config.toml"), "theme = \"nord\"\n").unwrap();
+        std::fs::remove_file(dir.join("themes").join("bad.toml")).unwrap();
+        assert_eq!(problems_in(&dir, fonts), Vec::<String>::new());
+        jetty_core::set_registry(Vec::new());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
