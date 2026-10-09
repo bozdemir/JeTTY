@@ -1149,8 +1149,9 @@ pub struct Terminal {
 /// Maximum scrollback-search query length in chars (bounds per-keystroke DFA
 /// builds and the search-bar layout).
 pub const SEARCH_MAX_QUERY: usize = 256;
-/// Maximum number of collected search matches; the counter shows "5000+"
-/// when this cap is hit.
+/// Maximum number of collected search matches — the most recent ones are
+/// kept (see `Terminal::search_collect`); the counter shows "5000+" when this
+/// cap is hit.
 pub const SEARCH_MAX_MATCHES: usize = 5000;
 
 /// A link found under the pointer by [`Terminal::link_at`]: the target URI
@@ -4434,7 +4435,7 @@ impl Terminal {
     /// with alacritty's built-in smart-case: an all-lowercase query matches
     /// case-insensitively, any uppercase char makes it case-sensitive. The
     /// query is truncated to [`SEARCH_MAX_QUERY`] chars and matches are capped
-    /// at [`SEARCH_MAX_MATCHES`]. The current match becomes the bottom-most
+    /// at the [`SEARCH_MAX_MATCHES`] most recent. The current match becomes the bottom-most
     /// match at or above the viewport bottom (nearest as the user reads up)
     /// and the view scrolls to it if off-screen.
     ///
@@ -4584,19 +4585,37 @@ impl Terminal {
     }
 
     /// Re-collect `search_matches` from the whole grid with the compiled
-    /// regex (topmost→bottommost, capped at [`SEARCH_MAX_MATCHES`]).
+    /// regex (stored topmost→bottommost, capped at [`SEARCH_MAX_MATCHES`]).
+    ///
+    /// Collected BOTTOM-UP, so a query with more matches than the cap keeps
+    /// the most RECENT ones — the screen the search starts from — and drops
+    /// the oldest history. (Top-down, the cap kept the oldest: the visible
+    /// output had no matches and the view jumped far up into history.) The
+    /// early stop at the cap keeps a one-letter query in a huge scrollback as
+    /// cheap as before.
     fn search_collect(&mut self) {
         self.search_matches.clear();
         let Some(regex) = self.search_regex.as_mut() else {
             return;
         };
         let grid = self.term.grid();
-        let start = Point::new(grid.topmost_line(), Column(0));
-        let end = Point::new(grid.bottommost_line(), grid.last_column());
-        self.search_matches.extend(
-            RegexIter::new(start, end, Direction::Right, &self.term, regex)
-                .take(SEARCH_MAX_MATCHES),
-        );
+        let start = Point::new(grid.bottommost_line(), grid.last_column());
+        let end = Point::new(grid.topmost_line(), Column(0));
+        // A leftward scan resumes inside the match it just found, so a
+        // self-overlapping literal (`==` in `====`) also yields overlapping
+        // matches: keep only those that end before the last kept one starts.
+        let mut floor: Option<Point> = None;
+        for m in RegexIter::new(start, end, Direction::Left, &self.term, regex) {
+            if floor.is_some_and(|f| *m.end() >= f) {
+                continue;
+            }
+            floor = Some(*m.start());
+            self.search_matches.push(m);
+            if self.search_matches.len() >= SEARCH_MAX_MATCHES {
+                break;
+            }
+        }
+        self.search_matches.reverse();
     }
 
     /// Scroll so the current match is visible: no-op when it already is,
@@ -5855,6 +5874,50 @@ mod tests {
         let long = "x".repeat(1000);
         t.search_set_query(&long);
         assert_eq!(t.search_query().chars().count(), SEARCH_MAX_QUERY);
+    }
+
+    #[test]
+    fn search_cap_keeps_the_most_recent_matches() {
+        // More matches than SEARCH_MAX_MATCHES: the cap must drop the OLDEST
+        // ones. Collected top-down, it kept the 5000 oldest — the newest
+        // output (the visible screen, where a search starts) had no matches,
+        // and typing the query jumped the view ~1000 lines up into history.
+        let mut t = Terminal::new(40, 10);
+        let n = SEARCH_MAX_MATCHES + 1000;
+        for i in 0..n {
+            t.feed(format!("foo {i}\r\n").as_bytes());
+        }
+        let (cur, total) = t.search_set_query("foo");
+        assert_eq!(total, SEARCH_MAX_MATCHES);
+        assert_eq!(cur, total, "the current match is the newest one");
+        assert_eq!(t.scroll_offset(), 0, "a match on screen: the view must not move");
+        let snap = t.snapshot();
+        let last_row = (0..t.rows()).rev().find(|&r| !snap.row_text(r).trim().is_empty()).unwrap();
+        assert_eq!(snap.row_text(last_row).trim_end(), format!("foo {}", n - 1));
+        let hits = t.search_viewport_hits();
+        assert_eq!(hits.len(), 9, "every visible match is highlighted: {hits:?}");
+        assert!(hits.iter().any(|h| h.is_current && h.row == last_row));
+        // Navigating back from the oldest kept match wraps to the newest.
+        let first_kept = format!("foo {}", n - SEARCH_MAX_MATCHES);
+        t.search_nav(false);
+        assert_eq!(t.search_counter(), (1, total));
+        let snap = t.snapshot();
+        assert!(
+            (0..t.rows()).any(|r| snap.row_text(r).trim_end() == first_kept),
+            "the oldest kept match is {first_kept:?}"
+        );
+    }
+
+    #[test]
+    fn search_matches_of_a_self_overlapping_query_stay_disjoint() {
+        // `==` in `====` is two matches, never three overlapping ones.
+        let mut t = Terminal::new(40, 5);
+        t.feed(b"==== x aaa");
+        assert_eq!(t.search_set_query("==").1, 2);
+        let cols: Vec<(usize, usize)> =
+            t.search_viewport_hits().iter().map(|h| (h.col_start, h.col_end)).collect();
+        assert_eq!(cols, vec![(0, 1), (2, 3)]);
+        assert_eq!(t.search_set_query("aa").1, 1);
     }
 
     #[test]
