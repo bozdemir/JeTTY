@@ -661,6 +661,19 @@ fn push_cmd(v: &mut Vec<Chord>, chord: Chord) {
 #[cfg(not(target_os = "macos"))]
 fn push_cmd(_v: &mut [Chord], _chord: Chord) {}
 
+/// How [`KeyMap::add_chord`] treats a slot another action already holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Claim {
+    /// A user `[keys]` chord: user chords go in first, so the holder is an
+    /// earlier action's user chord — a conflict, reported; this one is dropped.
+    User,
+    /// A built-in default: it quietly yields the slot (a user chord wins over
+    /// every default, whichever action was declared first).
+    Default,
+    /// The reserved `open_palette` restore: it overwrites.
+    Force,
+}
+
 /// A compiled, ready-to-query keymap.
 pub struct KeyMap {
     /// Position chords (named keys, digits 1-9): always consulted.
@@ -698,6 +711,14 @@ impl KeyMap {
     /// Non-panicking: an invalid chord string is dropped with a warning; a
     /// control-byte-shadowing or no-modifier-printable bind is rejected with a
     /// warning; `open_palette` is re-inserted if the user locked it out.
+    ///
+    /// The user's chords go in first, then the defaults of the actions left
+    /// alone — so a remap onto ANOTHER action's default chord takes it whichever
+    /// of the two was declared first, and that default quietly yields the slot
+    /// (declaration order used to decide: `search_toggle = "Ctrl+Shift+T"` was
+    /// dropped as "already bound" while `new_tab = "Ctrl+Shift+F"` worked). Two
+    /// USER chords on one slot still conflict: the earlier action wins, the
+    /// later one is reported.
     pub fn compile(bindings: &KeyBindings) -> KeyMap {
         let mut km = KeyMap {
             physical: HashMap::new(),
@@ -707,15 +728,24 @@ impl KeyMap {
             warnings: Vec::new(),
         };
 
+        let mut by_action: Vec<(BindableAction, Vec<Chord>)> = Vec::with_capacity(BindableAction::ALL.len());
         for action in BindableAction::ALL {
-            let chords: Vec<Chord> = match action.user_spec(bindings) {
+            let chords = match action.user_spec(bindings) {
                 Some(spec) => km.parse_user_chords(action, spec),
-                None => action.default_chords(),
+                None => Vec::new(),
             };
             for ch in &chords {
-                km.add_chord(action, ch, false);
+                km.add_chord(action, ch, Claim::User);
             }
-            km.by_action.push((action, chords));
+            by_action.push((action, chords));
+        }
+        for (action, chords) in &mut by_action {
+            if action.user_spec(bindings).is_none() {
+                *chords = action.default_chords();
+                for ch in chords.iter() {
+                    km.add_chord(*action, ch, Claim::Default);
+                }
+            }
         }
 
         // Reserved: `open_palette` must stay reachable (it reaches every command,
@@ -724,20 +754,25 @@ impl KeyMap {
         if !km.contains_action(&KeyAction::OpenPalette) {
             let defaults = BindableAction::OpenPalette.default_chords();
             for ch in &defaults {
-                km.add_chord(BindableAction::OpenPalette, ch, true);
+                km.add_chord(BindableAction::OpenPalette, ch, Claim::Force);
             }
             km.warnings.push(
-                "open_palette is reserved and cannot be unbound — restored its default".to_string(),
+                "open_palette is reserved and can't be unbound or taken — restored its default".to_string(),
             );
             // Reflect the restored chords in the display table.
-            if let Some(entry) = km
-                .by_action
-                .iter_mut()
-                .find(|(a, _)| *a == BindableAction::OpenPalette)
-            {
+            if let Some(entry) = by_action.iter_mut().find(|(a, _)| *a == BindableAction::OpenPalette) {
                 entry.1 = defaults;
             }
         }
+
+        // The help and the menus list a chord only while it still holds its
+        // own slot — not a default that yielded it, nor a user chord that lost
+        // a conflict (pressing it does something else).
+        for (action, chords) in &mut by_action {
+            let ka = action.key_action();
+            chords.retain(|ch| km.primary_owner(ch) == Some(&ka));
+        }
+        km.by_action = by_action;
 
         km.warnings.dedup();
         km
@@ -807,9 +842,38 @@ impl KeyMap {
             || self.phys_fallback.values().any(|v| v == ka)
     }
 
+    /// The action holding a chord's PRIMARY slot: its exact modifiers on its
+    /// first label (or its position).
+    fn primary_owner(&self, ch: &Chord) -> Option<&KeyAction> {
+        match &ch.key {
+            KeyMatch::Phys(code) => self.physical.get(&(ch.mods, *code)),
+            KeyMatch::Logical { chars, phys_fallback } => match chars.first() {
+                Some(c) => self.logical.get(&(ch.mods, smol_lower(c))),
+                None => phys_fallback.and_then(|fb| self.phys_fallback.get(&(ch.mods, fb))),
+            },
+        }
+    }
+
+    /// Whether `claim` may take a slot `existing` (another action) holds; a
+    /// user chord that may not is reported as a conflict.
+    fn may_take(&mut self, claim: Claim, slot: impl FnOnce() -> String, action: BindableAction) -> bool {
+        match claim {
+            Claim::Force => true,
+            Claim::Default => false,
+            Claim::User => {
+                self.warnings.push(format!(
+                    "keybinding conflict on {}: {} is ignored (already bound)",
+                    slot(),
+                    action.name(),
+                ));
+                false
+            }
+        }
+    }
+
     /// Insert a chord's slots into the maps, expanding the Alt/Shift-insensitive
-    /// variants for defaults. `force` overwrites on conflict (reserved restore).
-    fn add_chord(&mut self, action: BindableAction, ch: &Chord, force: bool) {
+    /// variants for defaults; `claim` decides a slot another action holds.
+    fn add_chord(&mut self, action: BindableAction, ch: &Chord, claim: Claim) {
         let ka = action.key_action();
         // Enumerate the modifier variants (Alt / Shift insensitivity for defaults).
         let mut variants: Vec<Mods> = vec![ch.mods];
@@ -829,54 +893,43 @@ impl KeyMap {
         }
         for m in variants {
             match &ch.key {
-                KeyMatch::Phys(code) => self.put_phys(action, m, *code, &ka, force),
+                KeyMatch::Phys(code) => self.put_phys(action, m, *code, &ka, claim),
                 KeyMatch::Logical { chars, phys_fallback } => {
                     for cc in chars {
-                        self.put_logical(action, m, smol_lower(cc), &ka, force);
+                        self.put_logical(action, m, smol_lower(cc), &ka, claim);
                     }
                     if let Some(fb) = phys_fallback {
-                        self.put_phys_fallback(action, m, *fb, &ka, force);
+                        self.put_phys_fallback(action, m, *fb, &ka, claim);
                     }
                 }
             }
         }
     }
 
-    fn put_phys_fallback(&mut self, action: BindableAction, m: Mods, code: KeyCode, ka: &KeyAction, force: bool) {
+    fn put_phys_fallback(&mut self, action: BindableAction, m: Mods, code: KeyCode, ka: &KeyAction, claim: Claim) {
         if let Some(existing) = self.phys_fallback.get(&(m, code)) {
-            if existing == ka {
-                return;
-            }
-            if !force {
-                self.warnings.push(format!(
-                    "keybinding conflict on {}: {} is ignored (already bound)",
-                    pretty_slot_phys(m, code),
-                    action.name(),
-                ));
+            if existing == ka || !self.may_take(claim, || pretty_slot_phys(m, code), action) {
                 return;
             }
         }
         self.phys_fallback.insert((m, code), ka.clone());
     }
 
-    fn put_phys(&mut self, action: BindableAction, m: Mods, code: KeyCode, ka: &KeyAction, force: bool) {
+    fn put_phys(&mut self, action: BindableAction, m: Mods, code: KeyCode, ka: &KeyAction, claim: Claim) {
         if let Some(existing) = self.physical.get(&(m, code)) {
-            if existing == ka {
-                return; // same action already occupies this slot
-            }
-            if !force {
-                self.warnings.push(format!(
-                    "keybinding conflict on {}: {} is ignored (already bound)",
-                    pretty_slot_phys(m, code),
-                    action.name(),
-                ));
+            // Same action already there, or another one that keeps the slot.
+            if existing == ka || !self.may_take(claim, || pretty_slot_phys(m, code), action) {
                 return;
             }
         }
-        // Cross-kind: a logical entry for this key's US char under the same mods.
+        // Cross-kind: a logical entry for this key's US char under the same mods
+        // (it is consulted first, so it wins on a US layout). A default yields.
         if let Some(ch) = us_char(code) {
             if let Some(other) = self.logical.get(&(m, ch)) {
                 if other != ka {
+                    if claim == Claim::Default {
+                        return;
+                    }
                     self.warnings.push(format!(
                         "keybinding for {} shadows a logical binding on the same chord",
                         action.name()
@@ -887,25 +940,20 @@ impl KeyMap {
         self.physical.insert((m, code), ka.clone());
     }
 
-    fn put_logical(&mut self, action: BindableAction, m: Mods, ch: SmolStr, ka: &KeyAction, force: bool) {
+    fn put_logical(&mut self, action: BindableAction, m: Mods, ch: SmolStr, ka: &KeyAction, claim: Claim) {
         if let Some(existing) = self.logical.get(&(m, ch.clone())) {
-            if existing == ka {
-                return;
-            }
-            if !force {
-                self.warnings.push(format!(
-                    "keybinding conflict on {}+'{}': {} is ignored (already bound)",
-                    pretty_mods(m),
-                    ch,
-                    action.name(),
-                ));
+            if existing == ka || !self.may_take(claim, || format!("{}+'{}'", pretty_mods(m), ch), action) {
                 return;
             }
         }
-        // Cross-kind: a physical entry for this char's US position under the same mods.
+        // Cross-kind: a physical entry for this char's US position under the
+        // same mods. A default yields to it.
         if let Some(code) = us_phys(&ch) {
             if let Some(other) = self.physical.get(&(m, code)) {
                 if other != ka {
+                    if claim == Claim::Default {
+                        return;
+                    }
                     self.warnings.push(format!(
                         "keybinding for {} shadows a physical binding on the same chord",
                         action.name()
@@ -1488,6 +1536,44 @@ mod tests {
     }
 
     #[test]
+    fn a_user_chord_takes_another_actions_default_in_either_direction() {
+        let ct = Mods::new(true, true, false, false);
+        let t = |km: &KeyMap| km.lookup(ct, PhysicalKey::Code(KeyCode::KeyT), &ch("T"));
+        let f = |km: &KeyMap| km.lookup(ct, PhysicalKey::Code(KeyCode::KeyF), &ch("F"));
+        // search_toggle is declared AFTER new_tab: its remap onto new_tab's
+        // default was dropped as "already bound" — while the mirror image below
+        // always worked. The user's chord wins either way, quietly (the yielded
+        // default is no longer listed in the help), and the other action keeps
+        // the rest of its chords.
+        let km = km_with(|b| b.search_toggle = Some(ChordSpec::One("Ctrl+Shift+T".into())));
+        assert!(km.warnings().is_empty(), "{:?}", km.warnings());
+        assert_eq!(t(&km), Some(KeyAction::SearchToggle));
+        assert_eq!(f(&km), None, "search's own default moved with the remap");
+        assert!(km.pretty_chords(BindableAction::NewTab).is_empty(), "the help says new_tab lost its chord");
+        assert_eq!(km.menu_hint(BindableAction::NewTab), "");
+        let km = km_with(|b| b.new_tab = Some(ChordSpec::One("Ctrl+Shift+F".into())));
+        assert!(km.warnings().is_empty(), "{:?}", km.warnings());
+        assert_eq!(f(&km), Some(KeyAction::NewTab));
+        assert!(km.pretty_chords(BindableAction::SearchToggle).is_empty());
+        // A default only yields the slot it lost: paste keeps Shift+Insert.
+        let km = km_with(|b| b.copy = Some(ChordSpec::One("Ctrl+Shift+V".into())));
+        assert!(km.warnings().is_empty(), "{:?}", km.warnings());
+        assert_eq!(km.lookup(ct, PhysicalKey::Code(KeyCode::KeyV), &ch("V")), Some(KeyAction::Copy));
+        assert_eq!(km.pretty_chords(BindableAction::Paste), vec!["Shift+Insert".to_string()]);
+        let shift = Mods::new(false, true, false, false);
+        assert_eq!(
+            km.lookup(shift, PhysicalKey::Code(KeyCode::Insert), &Key::Named(winit::keyboard::NamedKey::Insert)),
+            Some(KeyAction::Paste)
+        );
+        // Two USER chords on one slot still conflict: the earlier action wins.
+        let km = km_with(|b| {
+            b.new_tab = Some(ChordSpec::One("Ctrl+Shift+G".into()));
+            b.search_toggle = Some(ChordSpec::One("Ctrl+Shift+G".into()));
+        });
+        assert!(km.warnings().iter().any(|w| w.contains("search_toggle is ignored")), "{:?}", km.warnings());
+    }
+
+    #[test]
     fn conflict_cross_physical_logical() {
         // A physical-letter bind vs a logical-symbol bind that share a US slot.
         // Bind copy to physical KeyG and search to logical "g" won't share; use a
@@ -1740,6 +1826,41 @@ mod tests {
             "default keymap must compile without conflicts: {:?}",
             KeyMap::defaults().warnings()
         );
+    }
+
+    #[test]
+    fn no_default_chord_yields_a_slot_to_another_default() {
+        // Defaults yield quietly to USER chords, so a default colliding with
+        // another default would vanish without a warning: check every slot of
+        // every default chord (Alt / Shift variants included) is its own.
+        let km = KeyMap::defaults();
+        for a in BindableAction::ALL {
+            let ka = a.key_action();
+            for c in a.default_chords() {
+                let mut variants = vec![c.mods];
+                if c.alt_insensitive {
+                    variants.push(Mods { alt: !c.mods.alt, ..c.mods });
+                }
+                if c.shift_insensitive {
+                    let flipped: Vec<Mods> = variants.iter().map(|m| Mods { shift: !m.shift, ..*m }).collect();
+                    variants.extend(flipped);
+                }
+                for m in variants {
+                    let owners: Vec<Option<&KeyAction>> = match &c.key {
+                        KeyMatch::Phys(code) => vec![km.physical.get(&(m, *code))],
+                        KeyMatch::Logical { chars, phys_fallback } => chars
+                            .iter()
+                            .map(|ch| km.logical.get(&(m, smol_lower(ch))))
+                            .chain(phys_fallback.map(|fb| km.phys_fallback.get(&(m, fb))))
+                            .collect(),
+                    };
+                    for owner in owners {
+                        assert_eq!(owner, Some(&ka), "{}: {} ({m:?})", a.name(), c.pretty());
+                    }
+                }
+            }
+            assert_eq!(km.pretty_chords(a).len(), a.default_chords().len(), "{}", a.name());
+        }
     }
 
     #[test]
