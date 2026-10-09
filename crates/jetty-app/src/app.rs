@@ -6472,6 +6472,36 @@ impl App {
         input::point_in(&bar.panel, cx, cy)
     }
 
+    /// A middle / right / back / forward press at `(cx, cy)` while window `s`'s
+    /// search bar is open: one on its panel is the panel's and reaches nothing
+    /// behind it (no context menu, no report to the program) — a middle-click
+    /// types the PRIMARY selection into the query, as the Paste chord types
+    /// the clipboard. Returns whether consumed.
+    fn search_bar_press(&mut self, s: Surface, button: MouseButton, cx: f32, cy: f32) -> bool {
+        if !self.ov_of(s).is_some_and(|o| o.search_open) {
+            return false;
+        }
+        let Some(bar) = self.layout_search_bar(s) else { return false };
+        if !input::point_in(&bar.panel, cx, cy) {
+            return false;
+        }
+        if button == MouseButton::Middle {
+            if let Some(text) = clipboard::get_for_middle_click(self.copy_on_select) {
+                self.search_extend_query(s, &text);
+                self.paint_surface(s);
+            }
+        }
+        true
+    }
+
+    /// [`Self::search_bar_press`] at detached window `pos`'s pointer.
+    fn detached_search_bar_press(&mut self, pos: usize, button: MouseButton) -> bool {
+        let Some((cx, cy)) = self.detached.get(pos).map(|d| (d.cursor.0 as f32, d.cursor.1 as f32)) else {
+            return false;
+        };
+        self.search_bar_press(Surface::Detached(pos), button, cx, cy)
+    }
+
     /// Toggle the perf HUD. Extracted so every caller shares the reflow: the HUD
     /// reserves grid rows via `status_h`, so a bare flag flip would leave the grid
     /// the wrong size (a bare `= !; persist; redraw` is a bug — see the config
@@ -11640,7 +11670,7 @@ impl App {
                 // window's help or palette, none in hint mode (keyboard-only —
                 // a menu opened there could never be clicked). The Menu key
                 // opens under the same gates (`menu_blocked`).
-                if self.menu_blocked(Surface::Detached(pos)) {
+                if self.menu_blocked(Surface::Detached(pos)) || self.detached_search_bar_press(pos, MouseButton::Right) {
                     return;
                 }
                 let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
@@ -11677,10 +11707,9 @@ impl App {
                 //  - a program that tracks the mouse (no Shift) gets the click.
                 // Otherwise it pastes the PRIMARY selection (same as main) — the
                 // clipboard under `copy_on_select = "clipboard"`.
-                if self.pointer_modal(Surface::Detached(pos)) {
+                if self.pointer_modal(Surface::Detached(pos)) || self.detached_search_bar_press(pos, MouseButton::Middle) {
                     return;
                 }
-                let copy_on_select = self.copy_on_select;
                 let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
@@ -11691,12 +11720,20 @@ impl App {
                 let now = std::time::Instant::now();
                 if with_detached_grid(dw, geom, mods, |g| {
                     crate::gridmouse::press(g, MouseButton::Middle, false, now)
-                }) == crate::gridmouse::Press::PastePrimary
+                }) != crate::gridmouse::Press::PastePrimary
                 {
-                    if let Some(text) = clipboard::get_for_middle_click(copy_on_select) {
-                        if Self::paste_to_tab(&mut dw.tab, &text) {
-                            dw.request_paint();
-                        }
+                    return;
+                }
+                // Where typed text would go, as in the main window: this
+                // window's search query (hint mode / copy-mode drop it), else
+                // its tab.
+                let Some(text) = clipboard::get_for_middle_click(self.copy_on_select) else { return };
+                if self.overlay_ime_commit(Surface::Detached(pos), &text) {
+                    return;
+                }
+                if let Some(dw) = self.detached.get_mut(pos) {
+                    if Self::paste_to_tab(&mut dw.tab, &text) {
+                        dw.request_paint();
                     }
                 }
             }
@@ -11711,7 +11748,8 @@ impl App {
                 // the main window.
                 let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let mods = self.modifiers;
-                let modal = self.pointer_modal(Surface::Detached(pos));
+                let modal = self.pointer_modal(Surface::Detached(pos))
+                    || (state == ElementState::Pressed && self.detached_search_bar_press(pos, button));
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                 let now = std::time::Instant::now();
@@ -15001,6 +15039,9 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.menu_blocked(Surface::Main) {
                     return;
                 }
+                if self.search_bar_press(Surface::Main, MouseButton::Right, self.cursor.0 as f32, self.cursor.1 as f32) {
+                    return;
+                }
                 // Right-click: open the context menu (Copy / Paste / Select All).
                 // Settings now live in a separate window, so the main terminal is
                 // always free to show its context menu.
@@ -15135,6 +15176,9 @@ impl ApplicationHandler<AppEvent> for App {
                 {
                     return;
                 }
+                if self.search_bar_press(Surface::Main, MouseButton::Middle, self.cursor.0 as f32, self.cursor.1 as f32) {
+                    return;
+                }
                 // Middle-click on a TAB asks to close it (the browser idiom) —
                 // the same confirmation as its "×" and Ctrl+Shift+W.
                 if let Some((w, h)) = self.gpu.as_ref().map(|g| (g.config.width, g.config.height)) {
@@ -15154,9 +15198,13 @@ impl ApplicationHandler<AppEvent> for App {
                     == Some(crate::gridmouse::Press::PastePrimary)
                 {
                     // PRIMARY — or the clipboard, where `copy_on_select =
-                    // "clipboard"` put the selection.
+                    // "clipboard"` put the selection — goes where typed text
+                    // would, as a dropped file does: into an open search bar's
+                    // query (hint mode / copy-mode drop it), else to the shell.
                     if let Some(text) = clipboard::get_for_middle_click(self.copy_on_select) {
-                        self.paste_text(&text);
+                        if !self.overlay_ime_commit(Surface::Main, &text) {
+                            self.paste_text(&text);
+                        }
                     }
                 }
             }
@@ -15176,6 +15224,7 @@ impl ApplicationHandler<AppEvent> for App {
                     && self.gpu.is_some()
                     && self.main_grid_geom().contains_y(self.cursor.1 as f32)
                     && !self.pointer_modal(Surface::Main)
+                    && !self.search_bar_press(Surface::Main, button, self.cursor.0 as f32, self.cursor.1 as f32)
                 {
                     self.with_main_grid(|g| crate::gridmouse::press(g, button, false, now));
                 }
