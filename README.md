@@ -43,7 +43,7 @@
 
 ## ✨ Features
 
-- 🚀 **Blazing fast** — GPU-rendered with [`wgpu`](https://github.com/gfx-rs/wgpu); ~1–2 ms to render a full-screen frame (144 Hz-ready), **~0 % CPU when idle** (damage-driven redraw), ~120 MB/s VT parsing. Measured, with the open items, in the [performance budget](docs/perf-budget.md).
+- 🚀 **Blazing fast** — GPU-rendered with [`wgpu`](https://github.com/gfx-rs/wgpu); ~1–2 ms to render a full-screen frame (144 Hz-ready), **~0 % CPU when idle** (damage-driven redraw), ~150 MB/s VT parsing. Measured, with the open items, in the [performance budget](docs/perf-budget.md).
 - 🎯 **Global summon hotkey** — press **F9** anywhere to bring JeTTY up. Three modes (switchable in settings):
   - **Center** — drops into the middle of your screen, then comes back where you left it.
   - **Dropdown** — slides down from the top edge, full screen width, Yakuake/Guake style, with adjustable width & height.
@@ -261,8 +261,8 @@ Measured headlessly with `jetty-bench` (`cargo run --release -p jetty-app --bin 
 |---|---|---|
 | Frame render (full screen, offscreen) | **~1.1–1.8 ms** | ≤ 6.9 ms (144 Hz) |
 | Idle CPU | **~0 %** (damage-driven redraw) | 0 % |
-| Per-frame snapshot (~11k cells) | **~0.08 ms** | ≤ 1 ms |
-| VT throughput (parse + grid) | **~118 MB/s** (median; 105–137) | ≥ 150 MB/s — *open* |
+| Per-frame snapshot (~11k cells) | **~0.04 ms** | ≤ 1 ms |
+| VT throughput (parse + grid) | **~146–150 MB/s** (8 KiB chunks, as the PTY reader feeds them) | ≥ 150 MB/s — *at the floor* |
 
 Speed comes first: changes are measured against these budgets before they ship. CI runs the CPU-only part of the bench on every push as an informational report (shared runners are too noisy to fail a build on).
 

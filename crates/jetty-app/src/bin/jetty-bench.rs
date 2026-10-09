@@ -226,9 +226,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return bench_frames(&device, &queue, format, font_size);
     }
 
+    // Split as the app pays it: the font-DB scan overlaps GPU init on a worker
+    // thread, the layer (atlas, pipelines, font loads) is built on the UI thread
+    // before the first frame — once per text layer.
     let t1 = Instant::now();
-    let mut text = TextLayer::new_with_family(&device, &queue, format, font_size, "MesloLGS NF");
-    let text_init_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let fonts = TextLayer::build_font_system();
+    let font_scan_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let t1 = Instant::now();
+    let mut text = TextLayer::new_with_family_and_fonts(&device, &queue, format, font_size, "MesloLGS NF", fonts);
+    let layer_init_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let text_init_ms = font_scan_ms + layer_init_ms;
 
     let (cw, ch) = text.cell_size();
     let cols = (width as f32 / cw).floor().max(1.0) as usize;
@@ -298,7 +305,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "gpu_init      {gpu_init_ms:6.1} ms    (adapter + device acquisition; {})",
         if filter.is_some() { "startup Vulkan driver filter" } else { "every installed Vulkan driver" }
     );
-    println!("text_init     {text_init_ms:6.1} ms    (font system + atlas)");
+    println!(
+        "text_init     {text_init_ms:6.1} ms    (font-DB scan {font_scan_ms:.1} — a worker thread in the app — \
+         + layer init {layer_init_ms:.1} on the UI thread)"
+    );
     println!("throughput    {mbps:6.0} MB/s   (fed {mb:.0} MB colored VT in {feed_s:.2}s)");
     println!("snapshot      {snap_ms:8.3} ms/frame  ({:.0}k cells)", (cols * rows) as f64 / 1000.0);
     println!("render        {frame_ms:8.3} ms/frame  ({:.0} fps cap; SAME snapshot every frame → no re-shape)", 1000.0 / frame_ms);
