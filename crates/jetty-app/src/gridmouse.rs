@@ -1297,11 +1297,11 @@ mod tests {
         assert!(text.contains("line15\nline16\nline17"), "the end followed the view: {text:?}");
         // A page key or a prompt jump moves the view the same way.
         w.term.scroll_page(true);
-        assert!(w.at(5.0, 0.0, NONE, |g| view_moved(g)).0);
+        assert!(w.at(5.0, 0.0, NONE, view_moved).0);
         assert!(w.term.selection_text().unwrap_or_default().contains("line12"));
         // No drag: nothing to carry.
         w.at(5.0, 0.0, NONE, |g| release(g, MouseButton::Left));
-        assert!(!w.at(5.0, 0.0, NONE, |g| view_moved(g)).0);
+        assert!(!w.at(5.0, 0.0, NONE, view_moved).0);
     }
 
     #[test]
@@ -1328,7 +1328,7 @@ mod tests {
         w.at(2.0, 1.0, NONE, |g| press(g, MouseButton::Left, false, t0()));
         w.at(2.0, 1.0, NONE, |g| press(g, MouseButton::Right, false, t0()));
         w.at(4.0, 1.0, NONE, |g| motion(g, t0()));
-        assert_eq!(w.at(4.0, 1.0, NONE, |g| end_gestures(g)).1, "\x1b[<0;5;2m\x1b[<2;5;2m");
+        assert_eq!(w.at(4.0, 1.0, NONE, end_gestures).1, "\x1b[<0;5;2m\x1b[<2;5;2m");
         // The physical release that may still arrive is not reported again.
         assert_eq!(w.at(4.0, 1.0, NONE, |g| release(g, MouseButton::Left)), (Release::Ignored, String::new()));
         assert_eq!(w.at(4.0, 1.0, NONE, |g| motion(g, t0())).1, "", "1002: nothing held any more");
@@ -1336,12 +1336,12 @@ mod tests {
         let mut w = Win::new(b"hello world");
         w.at(0.0, 0.0, NONE, |g| press(g, MouseButton::Left, false, t0()));
         assert!(w.selecting);
-        assert_eq!(w.at(4.0, 0.0, NONE, |g| end_gestures(g)).1, "");
+        assert_eq!(w.at(4.0, 0.0, NONE, end_gestures).1, "");
         assert!(!w.selecting);
         // X10 (mode 9) has no releases to send.
         let mut w = Win::new(b"\x1b[?9h");
         w.at(0.0, 0.0, NONE, |g| press(g, MouseButton::Left, false, t0()));
-        assert_eq!(w.at(0.0, 0.0, NONE, |g| end_gestures(g)).1, "");
+        assert_eq!(w.at(0.0, 0.0, NONE, end_gestures).1, "");
     }
 
     #[test]
