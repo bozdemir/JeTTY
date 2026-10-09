@@ -81,7 +81,8 @@ enum IsolatedSeq {
     ScrollUp { count: u16, delete: bool },
     /// `ESC c` — RIS, full reset (clears screen + scrollback, leaves the alt screen).
     Reset,
-    /// `ESC [ ? 47 | 1047 | 1049 h|l` — alternate-screen toggle.
+    /// `ESC [ ? 47 | 1047 | 1049 h|l` — alternate-screen toggle (also among
+    /// other modes: `ESC [ ? 1049 ; 25 h`).
     AltToggle,
 }
 
@@ -251,6 +252,10 @@ fn scroll_csi(digits: &[u8], fin: u8) -> Option<IsolatedSeq> {
     }
 }
 
+/// [`Scan::Decset`] bit: the sequence named an alternate-screen mode (47 /
+/// 1047 / 1049) among others — `CSI ? 1049 ; 25 h` toggles the screen as
+/// `CSI ? 1049 h` does ([`IsolatedSeq::AltToggle`]).
+const DECSET_ALT: u8 = 1;
 /// [`Scan::Decset`] bit: the sequence named mode 2031 (color-scheme reports).
 const DECSET_2031: u8 = 4;
 /// [`Scan::Decset`] bit: the sequence has more than one parameter (so it is not
@@ -260,6 +265,7 @@ const DECSET_MULTI: u8 = 0x80;
 /// The [`Scan::Decset`] bit for private mode `n` (0 for every other mode).
 fn decset_bit(n: u16) -> u8 {
     match n {
+        47 | 1047 | 1049 => DECSET_ALT,
         2031 => DECSET_2031,
         _ => 0,
     }
@@ -1980,8 +1986,10 @@ impl Terminal {
                                 Scan::Csi { params: [0; CSI_PARAMS_MAX], len: 0 }
                             }
                             // A private-mode CSI: watch it for the color-scheme
-                            // mode and query (the `?` is consumed here).
+                            // mode and query, and for an alternate-screen toggle
+                            // among other modes (the `?` is consumed here).
                             CsiPeek::Other if bytes.get(i + 1) == Some(&b'?') => {
+                                seq_start = i;
                                 self.scan = Scan::Decset { cur: 0, hit: 0 };
                                 i += 2;
                                 continue;
@@ -1999,6 +2007,7 @@ impl Terminal {
                         // the CSI — finish it byte-wise.
                         0x5b => match bytes.get(i + 1) {
                             Some(b'?') => {
+                                seq_start = i;
                                 self.scan = Scan::Decset { cur: 0, hit: 0 };
                                 i += 2;
                                 continue;
@@ -2123,7 +2132,13 @@ impl Terminal {
                         }
                         b';' => self.scan = Scan::Decset { cur: 0, hit: hit | decset_bit(cur) | DECSET_MULTI },
                         b'h' | b'l' | b'n' => {
-                            start = self.private_mode_csi(bytes, start, i, b, hit | decset_bit(cur), cur);
+                            let hit = hit | decset_bit(cur);
+                            // An alternate-screen toggle among other modes runs
+                            // in a sub-slice of its own, as a lone one does.
+                            if b != b'n' && hit & DECSET_ALT != 0 && self.isolates(IsolatedSeq::AltToggle) {
+                                start = self.isolate(bytes, start, seq_start, i + 1, IsolatedSeq::AltToggle);
+                            }
+                            start = self.private_mode_csi(bytes, start, i, b, hit, cur);
                             self.scan = Scan::Ground;
                         }
                         // ESC restarts, CAN/SUB abort (vte's "anywhere" rules).
@@ -8987,6 +9002,30 @@ mod tests {
         slice.extend_from_slice(b"x\r\ny\r\n");
         t.feed(&slice);
         assert_eq!(t.failed_prompt_rows(), vec![2], "marker followed the 2 primary scrolls");
+    }
+
+    #[test]
+    fn an_alt_toggle_among_other_modes_is_counted_too() {
+        // `CSI ? 1049 ; 25 h` toggles the screen like `CSI ? 1049 h`: the
+        // primary lines sharing its read must still move the marks.
+        for (enter, leave) in [("\x1b[?1049;25h", "\x1b[?25;1049l"), ("\x1b[?2004;47h", "\x1b[?47;2004l")] {
+            for split in [false, true] {
+                let feed = |t: &mut Terminal, read: String| {
+                    for chunk in read.as_bytes().chunks(if split { 1 } else { read.len() }) {
+                        t.feed(chunk);
+                    }
+                };
+                let mut t = Terminal::new(20, 5);
+                t.feed(b"1\r\n2\r\n3\r\n4\r\n");
+                t.feed(b"\x1b]133;A\x07\x1b]133;D;1\x07");
+                // Primary lines, then entering the alternate screen, in one read…
+                feed(&mut t, format!("x\r\ny\r\n{enter}tui\r\ntui\r\n"));
+                // …and leaving it, then the shell's lines, in another.
+                feed(&mut t, format!("{leave}z\r\n"));
+                assert!(!t.alt_screen());
+                assert_eq!(t.failed_prompt_rows(), vec![1], "{enter:?} split={split}: 3 primary scrolls");
+            }
+        }
     }
 
     #[test]
