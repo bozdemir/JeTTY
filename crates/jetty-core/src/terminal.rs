@@ -803,9 +803,6 @@ struct CmdBlock {
 /// `marks` (reflow, scroll overflow, RIS) can lose a completion.
 #[derive(Clone, Copy, Debug)]
 struct OpenCmd {
-    /// Absolute line of the prompt's `A`, used only to coalesce a double
-    /// emission (p10k's own integration + ours) on the same line.
-    prompt: i64,
     /// Monotonic instant stamped at the C mark (command start), so a duration can
     /// be computed at D. `None` when no C was seen (a shell integration that
     /// emits only A+D) — the completion then carries an unknown duration.
@@ -3045,9 +3042,12 @@ impl Terminal {
         let abs = self.abs_top + self.term.grid().cursor.point.line.0 as i64;
         match letter {
             b'A' => {
-                // Dedup double-emission (p10k's own integration + ours): same
-                // line, no command started in between.
-                if self.cur_cmd.is_some_and(|c| c.prompt == abs && c.started_at.is_none()) {
+                // Dedup an A re-sent for the newest prompt on its own line, no
+                // command started in between: a double emission (p10k's own
+                // integration + ours) or a redraw (the transient prompt). Keyed
+                // on that prompt's MARK: once a resize dropped the marks, the
+                // shell's repaint of the same line must mark it again.
+                if self.marks.back().is_some_and(|m| m.prompt == abs && !m.finished && m.output.is_none()) {
                     return;
                 }
                 // Run-selection readiness signal: count each DISTINCT prompt
@@ -3061,7 +3061,7 @@ impl Terminal {
                 if let Some(last) = self.marks.back_mut() {
                     last.finished = true;
                 }
-                self.cur_cmd = Some(OpenCmd { prompt: abs, started_at: None });
+                self.cur_cmd = Some(OpenCmd { started_at: None });
                 // Back at a prompt: whatever reported progress has ended (a
                 // program killed mid-build never sends its `9;4;0`).
                 self.set_progress(None);
@@ -3113,7 +3113,7 @@ impl Terminal {
                     let now = std::time::Instant::now();
                     match self.cur_cmd.as_mut() {
                         Some(c) => c.started_at = Some(now),
-                        None => self.cur_cmd = Some(OpenCmd { prompt: abs, started_at: Some(now) }),
+                        None => self.cur_cmd = Some(OpenCmd { started_at: Some(now) }),
                     }
                 }
                 // A command ran: the resize clean-prompt wipe must never fire again.
@@ -7877,10 +7877,18 @@ mod tests {
     const P10K_PROMPT: &[u8] =
         b"\x1b]133;A\x07\r\n\r\n\x1b[A\xe2\x95\xad\xe2\x94\x80 ~\r\n\xe2\x95\xb0\xe2\x94\x80 \x1b]133;B\x07";
 
-    /// Enter on [`P10K_PROMPT`] with `cmd` typed: the transient prompt redraws
-    /// both lines as `❯ <cmd>`, then the newline.
+    /// Enter on [`P10K_PROMPT`] with `cmd` typed: zsh climbs back to the row
+    /// the prompt began on (its `A` row) and the transient prompt redraws it as
+    /// `❯ <cmd>`, then the newline — recorded from a real zsh.
     fn p10k_accept(cmd: &str) -> Vec<u8> {
-        format!("\r\r\x1b[A\x1b[J\x1b]133;A\x07\u{276f} \x1b]133;B\x07{cmd}\x1b[K\r\r\n").into_bytes()
+        format!("\r\r\x1b[A\x1b[A\x1b[J\x1b]133;A\x07\u{276f} \x1b]133;B\x07{cmd}\x1b[K\r\r\n").into_bytes()
+    }
+
+    /// zsh's SIGWINCH repaint of [`P10K_PROMPT`] (recorded): back up to the
+    /// prompt's first row, clear below, print the whole prompt again — its `A`
+    /// included.
+    fn p10k_winch() -> Vec<u8> {
+        [&b"\r\r\x1b[A\x1b[A\x1b[J"[..], P10K_PROMPT].concat()
     }
 
     /// zsh's PROMPT_SP at 40 columns: `%` + padding, then back to column 0.
@@ -7926,6 +7934,50 @@ mod tests {
         let done = t.take_completions();
         assert_eq!(done.len(), 1, "`true` completed: {done:?}");
         assert_eq!(done[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn a_prompt_repainted_after_a_resize_is_marked_again() {
+        // A resize drops every mark, and zsh repaints the whole prompt — p10k's
+        // A included — on SIGWINCH. That A must mark the prompt anew, even on
+        // the very line the dropped mark sat on (row 0 of a wiped fresh tab):
+        // swallowed as a duplicate, the live prompt stayed unmarked, so the
+        // NEXT resize no longer wiped and the prompt scattered.
+        let mut t = Terminal::new(80, 24);
+        t.feed(P10K_PROMPT);
+        for (cols, rows) in [(60, 20), (80, 24), (60, 20)] {
+            t.resize(cols, rows);
+            assert!(!screen_has(&t, "\u{256d}"), "the clean prompt was wiped at {cols}x{rows}");
+            t.feed(&p10k_winch());
+            assert_eq!(t.marks.len(), 1, "the repainted prompt is marked at {cols}x{rows}");
+        }
+    }
+
+    #[test]
+    fn a_failed_command_after_a_resize_keeps_its_marker() {
+        // A used tab (no wipe) resized without rewrapping the prompt — a height
+        // change, a font zoom: the repainted prompt sits on the same absolute
+        // line as before. It must still get a block, or the next command's D
+        // finds none and the failure goes unmarked.
+        let mut t = Terminal::new(40, 24);
+        t.feed(P10K_PROMPT);
+        t.feed(b"true");
+        t.feed(&p10k_accept("true"));
+        t.feed(b"\x1b]133;C;\x07");
+        t.feed(&p10k_prompt_sp());
+        t.feed(b"\x1b]133;D;0\x07");
+        t.feed(P10K_PROMPT); // A on row 1
+        t.resize(40, 30);
+        t.feed(&p10k_winch());
+        t.feed(b"false");
+        t.feed(&p10k_accept("false"));
+        t.feed(b"\x1b]133;C;\x07");
+        t.feed(&p10k_prompt_sp());
+        t.feed(b"\x1b]133;D;1\x07");
+        t.feed(P10K_PROMPT);
+        assert_eq!(t.failed_prompt_rows(), vec![1], "`false` is marked failed on its prompt");
+        let done = t.take_completions();
+        assert_eq!(done.last().map(|c| c.exit_code), Some(Some(1)));
     }
 
     #[test]
