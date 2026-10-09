@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.29.0] — 2026-10-09
+
+**Menus from the keyboard, and an AppImage that updates itself.**
+
+### Added
+- **Every menu works from the keyboard.** In the right-click menu, a tab's
+  menu (and its Color list) and a detached window's menu, the arrows (or
+  `Home` / `End`) move over the rows you can use, `Enter` or `Space` picks,
+  `→` / `←` open and leave a tab's Color list, and `Esc` closes. The mouse
+  takes the highlight back only when it moves onto another row, so a brush of
+  the touchpad can't clear your pick and send `Enter` to the shell.
+- **The Menu key opens the right-click menu at the text cursor**
+  (`[keys] context_menu`), above the prompt when there's no room below, with
+  the first row ready. It's in the command palette too ("Open context menu")
+  for keyboards without a Menu key, and `context_menu = ""` hands the key back
+  to programs.
+- **The AppImage updates in place.** It carries update information and each
+  release publishes a `.zsync` next to it, so AppImageUpdate (or
+  AppImageLauncher) downloads only the blocks that changed.
+
+### Fixed
+- A failed command's desktop notification stayed on screen until dismissed:
+  it was sent as "critical", which notification daemons never expire and
+  which breaks through Do Not Disturb. It now expires like any other; its
+  title still says "failed (exit N)", and the taskbar/dock alert is unchanged.
+
 ## [0.28.1] — 2026-10-09
 
 ### Fixed
