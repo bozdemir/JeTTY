@@ -704,6 +704,25 @@ palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn the_documented_theme_example_loads_as_written() {
+        // docs/configuration.md's user-theme example is what users copy.
+        let doc = include_str!("../../../docs/configuration.md");
+        let section = &doc[doc.find("## User themes").expect("the user-themes section")..];
+        let example = section
+            .split("```toml\n")
+            .nth(1)
+            .and_then(|b| b.split("\n```").next())
+            .expect("its toml example");
+        let dir = theme_dir("documented");
+        std::fs::write(dir.join("my_theme.toml"), example).unwrap();
+        let (themes, warnings) = load_user_themes_from(&dir);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].name.as_ref(), "my_theme");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn theme_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("jetty-themes-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

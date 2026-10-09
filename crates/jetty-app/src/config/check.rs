@@ -916,6 +916,11 @@ mod tests {
                 (Some(d), Some(code)) if same(&d, code) => {}
                 (d, code) => problems.push(format!("`{path}`: documented default {d:?}, the code has {code:?}")),
             }
+            // A note that outlived the control it denies.
+            if cells.get(2).is_some_and(|c| c.contains("no Settings control")) && crate::settings_ui::find(&path).is_some()
+            {
+                problems.push(format!("`{path}` says it has no Settings control, but Settings has one"));
+            }
             documented.push(path);
         }
         for k in known.iter().filter(|k| !k.starts_with("keys.")) {
