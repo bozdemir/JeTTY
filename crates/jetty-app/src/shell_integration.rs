@@ -20,31 +20,29 @@
 
 /// zsh snippet — powerlevel10k-safe.
 ///
-/// Under p10k, an `add-zsh-hook precmd` that reads `$?` can report 0 depending on
-/// hook order (p10k's precmd runs commands that reset `$?` before ours reads it),
-/// so we do NOT install competing hooks when p10k is detected — instead the user
-/// enables `POWERLEVEL9K_TERM_SHELL_INTEGRATION=true` and p10k emits correct,
-/// instant-prompt-aware OSC 133 itself. On plain zsh (no p10k) our own hooks
-/// capture `$?` on the FIRST line of precmd, which is provably correct, and a
-/// `zle-line-init` hook (zsh ≥ 5.3, chained via `add-zle-hook-widget`) marks the
-/// input line with `B` once per prompt. Safe under `setopt nounset`.
+/// Under p10k we install NO hooks: p10k emits OSC 133 itself, inside its prompt,
+/// so its marks follow the transient prompt (redrawn one line up on Enter) —
+/// a precmd-printed A of ours would sit on the blank line above it, and the
+/// failed marker with it. p10k ships those marks OFF, so the snippet turns them
+/// on (`POWERLEVEL9K_TERM_SHELL_INTEGRATION=true`, read at the first prompt)
+/// unless ~/.p10k.zsh set the option either way; before, p10k users who added
+/// the line got no marks at all. On plain zsh our own hooks capture `$?` on the
+/// FIRST line of precmd (zsh hands every precmd hook the command's status), and
+/// a `zle-line-init` hook (zsh ≥ 5.3, chained via `add-zle-hook-widget`) marks
+/// the input line with `B` once per prompt. Safe under `setopt nounset`.
 pub const ZSH: &str = r#"# JeTTY zsh shell integration — OSC 133 semantic prompts.
 # (prompt marks + failed-command markers + Ctrl+Shift+Z/X prompt jump)
 #
-# Opt in from ~/.zshrc with (guarded; silent in other terminals):
+# Opt in from the END of ~/.zshrc with (guarded; silent in other terminals):
 #   [[ -n "${JETTY-}" ]] && source <("${JETTY_BIN:-jetty}" --print-shell-integration zsh 2>/dev/null)
 #
-# powerlevel10k users: the most robust, instant-prompt-safe path is to let p10k
-# emit the marks itself — add  POWERLEVEL9K_TERM_SHELL_INTEGRATION=true  to your
-# ~/.p10k.zsh. When p10k is detected below, JeTTY installs NOTHING (a naive
-# precmd $? capture is unreliable under p10k's hook order, and competing hooks
-# can perturb instant prompt). On plain zsh the hooks below are correct.
+# powerlevel10k: p10k emits the marks itself, in step with its transient prompt;
+# this turns them on (POWERLEVEL9K_TERM_SHELL_INTEGRATION=true) unless your
+# ~/.p10k.zsh sets that option, and installs no hooks. No output either way:
+# instant-prompt safe. On plain zsh the hooks below are used.
 if [[ -o interactive && -n "${JETTY-}" ]]; then
   if (( ${+functions[p10k]} )) || [[ -n "${POWERLEVEL9K_MODE:-}${POWERLEVEL9K_TERM_SHELL_INTEGRATION:-}" ]]; then
-    # powerlevel10k detected: see the note above — set
-    # POWERLEVEL9K_TERM_SHELL_INTEGRATION=true in ~/.p10k.zsh for correct marks.
-    # (No hooks installed, no runtime output: instant-prompt safe.)
-    :
+    (( ${+POWERLEVEL9K_TERM_SHELL_INTEGRATION} )) || typeset -g POWERLEVEL9K_TERM_SHELL_INTEGRATION=true
   else
     autoload -Uz add-zsh-hook
     typeset -gi _jetty_run=0 _jetty_input=0
@@ -374,6 +372,26 @@ mod tests {
         assert_eq!(text.matches("\x1b]133;D;0\x07").count(), 1, "printf, and nothing for the empty line:\n{text}");
     }
 
+    /// powerlevel10k's own marks follow its transient prompt (ours would sit on
+    /// the blank line above it), but p10k ships them OFF — users who added
+    /// JeTTY's line got no marks at all. Under p10k the snippet turns them on
+    /// unless ~/.p10k.zsh chose either way, and installs no hooks of its own.
+    #[cfg(unix)]
+    #[test]
+    fn zsh_under_p10k_turns_on_p10ks_own_marks_unless_the_user_chose() {
+        let script = "print -r -- \"OPT=[${POWERLEVEL9K_TERM_SHELL_INTEGRATION-unset}]\"\nexit\n";
+        for (setup, want) in [("", "true"), ("typeset -g POWERLEVEL9K_TERM_SHELL_INTEGRATION=false\n", "false")] {
+            // A stand-in for a loaded p10k (it defines `p10k`).
+            let snippet = format!("p10k() {{ :; }}\n{setup}{ZSH}");
+            let Some(text) = run_snippet_in_pty(ZSHES, &["-f", "-i"], "dumb", &snippet, script) else {
+                eprintln!("no zsh — skipped");
+                return;
+            };
+            assert!(text.contains(&format!("OPT=[{want}]")), "{setup:?}: {text:?}");
+            assert!(!text.contains("\x1b]133;"), "no marks of our own under p10k: {text:?}");
+        }
+    }
+
     /// zsh, loaded from ~/.zshrc at startup: the first command is reported.
     #[cfg(unix)]
     #[test]
@@ -469,5 +487,4 @@ mod tests {
         assert!(FISH.contains("set -l ret $status"));
         assert!(FISH.contains("status is-interactive"));
     }
-
 }
