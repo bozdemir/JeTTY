@@ -234,6 +234,20 @@ Settings, the palette, detach, copy, paste …) runs once per press.
 The command palette's **Reset keybindings** clears the table (after saving a
 `config.toml.bak-<time>` copy).
 
+How a chord finds its key, on any layout:
+
+- A letter or a symbol is the key that types it: `Ctrl+Shift+C` is the key
+  labeled C on Dvorak, AZERTY or Turkish-F too, and `Ctrl++` zooms on
+  Turkish-Q, where `+` is Shift+4. A letter on a layout without Latin letters
+  (Cyrillic, Greek) is its US position.
+- With `Shift` in the chord, a symbol (or `0`) also matches by the key's
+  unshifted character: `copy_mode = "Ctrl+Shift+/"` fires on the key typing
+  `?`.
+- The digits `1`–`9` and the named keys (`Tab`, `Enter`, `Space`, `Insert`,
+  the arrows, `F1`–`F24`, …) are positions — `Ctrl+1` is the first key of the
+  digit row on AZERTY as well; `0` is what the key types. `Menu` is whichever
+  key your layout calls Menu.
+
 ## User themes
 
 A theme is a TOML file in the `themes/` folder next to `config.toml`; it appears
