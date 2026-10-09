@@ -6745,10 +6745,7 @@ impl App {
                 let forward = matches!(cmd, C::NextPrompt);
                 if self.term_of_mut(s).is_some_and(|t| t.jump_prompt(forward)) {
                     self.paint_surface(s);
-                    match s {
-                        Surface::Main => self.update_link_hover(true),
-                        Surface::Detached(p) => self.update_detached_link_hover(p, true),
-                    }
+                    self.view_moved_under_pointer(s);
                 }
             }
             C::Copy => {
@@ -7884,6 +7881,28 @@ impl App {
         }
         if was_some || dw.link_hover.is_some() {
             dw.request_paint();
+        }
+    }
+
+    /// Window `s`'s view moved under a still pointer (a page key, a prompt
+    /// jump): a selection drag in progress carries its end along, as the
+    /// wheel's does (`gridmouse::view_moved`), and the Ctrl+hover link is read
+    /// again at the pointer.
+    fn view_moved_under_pointer(&mut self, s: Surface) {
+        match s {
+            Surface::Main => {
+                self.with_main_grid(crate::gridmouse::view_moved);
+                self.update_link_hover(true);
+            }
+            Surface::Detached(p) => {
+                let (ui_font, show_hud, padding, mods) =
+                    (self.ui_font_logical, self.show_perf_hud, self.padding(), self.modifiers);
+                if let Some(dw) = self.detached.get_mut(p) {
+                    let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
+                    with_detached_grid(dw, geom, mods, crate::gridmouse::view_moved);
+                }
+                self.update_detached_link_hover(p, true);
+            }
         }
     }
 
@@ -10793,7 +10812,7 @@ impl App {
                     _ => {}
                 }
                 if viewport_moved {
-                    self.update_detached_link_hover(pos, true);
+                    self.view_moved_under_pointer(Surface::Detached(pos));
                 }
             }
             // Key RELEASE: owed to this window's tab only if it was sent the
@@ -15232,12 +15251,12 @@ impl ApplicationHandler<AppEvent> for App {
                         self.active_tab_mut().terminal.scroll_page(true);
                         self.request_main_paint();
                         // Viewport moved under the pointer (see MouseWheel).
-                        self.update_link_hover(true);
+                        self.view_moved_under_pointer(Surface::Main);
                     }
                     input::KeyAction::ScrollPageDown => {
                         self.active_tab_mut().terminal.scroll_page(false);
                         self.request_main_paint();
-                        self.update_link_hover(true);
+                        self.view_moved_under_pointer(Surface::Main);
                     }
                     // OSC 133 prompt jump (Ctrl+Shift+Z prev / Ctrl+Shift+X next).
                     // Zero marks / at-the-end = pure no-op (jump_prompt returns
@@ -15246,7 +15265,7 @@ impl ApplicationHandler<AppEvent> for App {
                         let forward = action == input::KeyAction::NextPrompt;
                         if self.active_tab_mut().terminal.jump_prompt(forward) {
                             self.request_main_paint();
-                            self.update_link_hover(true);
+                            self.view_moved_under_pointer(Surface::Main);
                         }
                     }
                     input::KeyAction::FontUp => {

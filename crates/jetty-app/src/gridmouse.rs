@@ -577,7 +577,21 @@ pub(crate) fn wheel(
     if g.term.scroll_offset() == before {
         return Wheel::None;
     }
+    view_moved(g);
     Wheel::Scrolled
+}
+
+/// The view moved under the still pointer — the wheel, a page key, a prompt
+/// jump: a selection drag in progress carries its end along, onto the content
+/// now under the pointer (as an edge auto-scroll step does). Returns whether
+/// there was one (the caller's repaint covers it).
+pub(crate) fn view_moved(g: &mut Grid) -> bool {
+    if !*g.selecting || !g.geom.usable() {
+        return false;
+    }
+    let (line, col, left_half) = g.select_cell();
+    g.term.selection_update(line, col, left_half);
+    true
 }
 
 /// What dropping a file onto the terminal types: its path — single-quoted for
@@ -1152,6 +1166,30 @@ mod tests {
         assert_eq!(w.at(0.0, 0.0, NONE, |g| wheel(g, line(-1.0), false, &mut acc)).0, Wheel::Scrolled);
         let mut w = Win::new(b"\x1b[?1049h\x1b[?1000h");
         assert_eq!(w.at(0.0, 0.0, ModifiersState::SHIFT, |g| wheel(g, line(1.0), false, &mut acc)).0, Wheel::None);
+    }
+
+    #[test]
+    fn a_view_moved_under_a_selection_drag_carries_its_end_along() {
+        // Drag-select, keep the button held and the pointer still, and roll
+        // the wheel into the history: the view scrolled, but the selection's
+        // end stayed on the old content — the highlight and the text a release
+        // copies lagged until the mouse moved again.
+        let line = |n: f32| MouseScrollDelta::LineDelta(0.0, n);
+        let mut acc = ScrollAccumulator::new();
+        let mut w = with_history(b"");
+        w.at(0.0, 3.0, NONE, |g| press(g, MouseButton::Left, false, t0()));
+        w.at(5.0, 0.0, NONE, |g| motion(g, t0()));
+        assert!(!w.term.selection_text().unwrap_or_default().contains("line16"));
+        assert_eq!(w.at(5.0, 0.0, NONE, |g| wheel(g, line(1.0), false, &mut acc)).0, Wheel::Scrolled);
+        let text = w.term.selection_text().unwrap_or_default();
+        assert!(text.contains("line15\nline16\nline17"), "the end followed the view: {text:?}");
+        // A page key or a prompt jump moves the view the same way.
+        w.term.scroll_page(true);
+        assert!(w.at(5.0, 0.0, NONE, |g| view_moved(g)).0);
+        assert!(w.term.selection_text().unwrap_or_default().contains("line12"));
+        // No drag: nothing to carry.
+        w.at(5.0, 0.0, NONE, |g| release(g, MouseButton::Left));
+        assert!(!w.at(5.0, 0.0, NONE, |g| view_moved(g)).0);
     }
 
     #[test]
