@@ -637,6 +637,15 @@ impl GpuContext {
         self.shared.lost.load(Ordering::Acquire)
     }
 
+    /// Test hook for the nested harness (`JETTY_DEBUG_LOSE_GPU`, never a
+    /// setting): lose the shared device the way a driver reset does — every call
+    /// on it fails from now on and [`Self::is_lost`] turns true — so the rebuild
+    /// can be driven without a real GPU fault.
+    pub fn debug_lose_device(&self) {
+        self.shared.device.destroy();
+        self.shared.lost.store(true, Ordering::Release);
+    }
+
     /// Why the most recent [`Self::acquire_frame`] returned `None` (`None` when it
     /// succeeded). `Outdated` / `Timeout` / a recovered `Lost` deserve an immediate
     /// retry; `Occluded` should wait for the window to become visible again.

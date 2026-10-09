@@ -1509,6 +1509,12 @@ pub struct App {
     /// branch and the present path stays byte-identical (HARD RULE #1).
     frame_log: bool,
     frames_presented: u64,
+    /// Test hook for the nested harness (`JETTY_DEBUG_LOSE_GPU=1`, never a
+    /// setting): every summon finds the GPU device lost, as after a suspend /
+    /// resume while hidden, so `recover_lost_gpu` can be driven live (Settings and
+    /// detached windows on the shared device lose it too). Read ONCE at
+    /// construction; off, it is one false branch per summon.
+    debug_lose_gpu: bool,
 
     /// The main window's overlays (search bar, help, command palette, hint
     /// mode, copy-mode). Every detached window owns its own `Overlays`
@@ -2142,6 +2148,7 @@ impl App {
             perf: crate::perf::Perf::from_env(),
             frame_log: std::env::var_os("JETTY_FRAME_LOG").is_some(),
             frames_presented: 0,
+            debug_lose_gpu: std::env::var_os("JETTY_DEBUG_LOSE_GPU").is_some(),
             ov: Overlays::default(),
             confirm_close: None,
             confirm_quit: false,
@@ -8980,6 +8987,12 @@ impl App {
                 }
             }
             return;
+        }
+        // Test hook (`debug_lose_gpu`): this summon finds the device lost.
+        if want && self.debug_lose_gpu {
+            if let Some(g) = &self.gpu {
+                g.debug_lose_device();
+            }
         }
         self.visible = want;
         // An explicit visibility change supersedes any scheduled auto-hide.
