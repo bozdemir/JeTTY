@@ -3,6 +3,7 @@ mod base64;
 /// behind the DEC 2031 reports and `COLORFGBG`.
 pub mod contrast;
 pub mod fuzzy;
+mod handler;
 pub mod hints;
 pub mod kitty;
 mod pty;
