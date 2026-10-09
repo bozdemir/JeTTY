@@ -962,6 +962,11 @@ pub struct App {
     /// post-map redraws makes the WM honor the top-strip position; counts down to
     /// 0 so idle CPU returns to 0.
     pending_dock_frames: u8,
+    /// The strip the last dock asked for (`dock_window_top`): what those
+    /// re-assertions re-issue — computed once per dock, never re-derived each
+    /// frame from whichever monitor the window manager's placement chose — and
+    /// the top the Dropdown top-flush measures against.
+    dock_rect: Option<DockRect>,
     /// Center-mode analogue of pending_dock_frames: X11/KWin likewise ignores a
     /// set_outer_position issued before the window is mapped, discarding the
     /// user's saved position on every summon. Re-assert it on the first few
@@ -1040,12 +1045,13 @@ pub struct App {
     /// Shell to launch (the `shell` config key). Empty = auto-detect
     /// ($SHELL → passwd → /bin/bash); a path forces that shell.
     shell: String,
-    /// Cached "the window's top edge touches its monitor's top" (drives the
-    /// square top corners in Dropdown mode). On X11 `outer_position()` is a
-    /// blocking server round-trip, so this is recomputed only when
-    /// `top_flush_dirty` (set by Moved / Resized / ScaleFactorChanged / a
-    /// summon) — never per frame — and never mid-slide (the slide is a content
-    /// y-offset; the window itself does not move).
+    /// Cached "the window's top edge is where the dock put it" — the top of the
+    /// monitor's work area (drives the square top corners in Dropdown mode). On
+    /// X11 `outer_position()` is a blocking server round-trip, so this is
+    /// recomputed only when `top_flush_dirty` (set by Moved / Resized /
+    /// ScaleFactorChanged / a summon / a re-dock) — never per frame — and never
+    /// mid-slide (the slide is a content y-offset; the window itself does not
+    /// move).
     top_flush_pos: bool,
     /// The window may have moved since `top_flush_pos` was computed.
     top_flush_dirty: bool,
@@ -2151,6 +2157,7 @@ impl App {
             dropdown_width_pct: 1.0,
             slide_anim: None,
             pending_dock_frames: 0,
+            dock_rect: None,
             pending_center_frames: 0,
             pending_center_pos: None,
             pending_center_size: None,
@@ -3786,7 +3793,8 @@ impl App {
     fn redock_if_dropdown(&mut self) {
         if self.visible && dock_reassert_ok(self.window_mode, self.main_fullscreen) {
             if let Some(w) = &self.window {
-                dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
+                self.dock_rect = dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
+                self.top_flush_dirty = true;
                 self.pending_dock_frames = 5;
                 self.request_main_paint();
             }
@@ -7638,7 +7646,7 @@ impl App {
                         }
                     }
                     WindowMode::Dropdown => {
-                        dock_window_top(&win, self.dropdown_width_pct, self.dropdown_height_pct);
+                        self.dock_rect = dock_window_top(&win, self.dropdown_width_pct, self.dropdown_height_pct);
                         // No slide here: this is a restore, not a summon.
                     }
                 }
@@ -7924,7 +7932,7 @@ impl App {
                 // next F9.
                 if self.visible {
                     if let Some(w) = &self.window {
-                        dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
+                        self.dock_rect = dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
                     }
                     self.pending_dock_frames = 5;
                     self.slide_anim = Some(std::time::Instant::now());
@@ -10033,7 +10041,7 @@ impl App {
                     // re-asserts the top-strip geometry on the next few
                     // post-map redraws so it actually docks to the top.
                     win.set_visible(true);
-                    dock_window_top(win, self.dropdown_width_pct, self.dropdown_height_pct);
+                    self.dock_rect = dock_window_top(win, self.dropdown_width_pct, self.dropdown_height_pct);
                     self.pending_dock_frames = 5;
                     // Arm the render-side slide-down (not with reduced
                     // motion: the window simply appears, docked).
@@ -14051,7 +14059,7 @@ impl ApplicationHandler<AppEvent> for App {
                 jetty_platform::set_window_fullscreen(&window, true);
             }
             WindowMode::Dropdown => {
-                dock_window_top(&window, self.dropdown_width_pct, self.dropdown_height_pct);
+                self.dock_rect = dock_window_top(&window, self.dropdown_width_pct, self.dropdown_height_pct);
                 // KWin ignores the pre-map dock above (window not realized yet) →
                 // re-assert on the first post-map redraws so it actually lands at
                 // the top strip instead of the WM's default (centered) placement.
@@ -16125,13 +16133,17 @@ impl ApplicationHandler<AppEvent> for App {
                 // Re-assert the Dropdown dock AFTER the window is mapped: X11/KWin
                 // ignores a set_outer_position issued before the window is realized
                 // (it would land centered), so re-apply the top-strip geometry on
-                // the first few post-map redraws. Counts down → idle CPU back to 0.
+                // the first few post-map redraws — the rect the dock computed, not
+                // a fresh one off the monitor the WM's placement happened to pick.
+                // Counts down → idle CPU back to 0.
                 if self.pending_dock_frames > 0
                     && dock_reassert_ok(self.window_mode, self.main_fullscreen)
                 {
                     self.pending_dock_frames -= 1;
                     if let Some(win) = &self.window {
-                        dock_window_top(win, self.dropdown_width_pct, self.dropdown_height_pct);
+                        if let Some(rect) = self.dock_rect {
+                            apply_dock(win, rect);
+                        }
                         if self.pending_dock_frames > 0 {
                             win.request_redraw();
                         }
@@ -16368,11 +16380,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // SKIPPED entirely, and the CRT shader treats 0 as square.
                 let corner_radius_px =
                     effective_corner_radius_px(self.corner_radius, scale, self.main_fullscreen);
-                // In Dropdown mode the window is flush to the monitor top, so the
+                // In Dropdown mode the window is flush with the top of the work
+                // area (the monitor top, or a top panel / the menu bar), so the
                 // TOP corners must stay square (only the bottom corners round).
-                // Derive "top-flush" from the window's outer position vs the
-                // monitor top. On Wayland outer_position() is Err → not flush, so
-                // we keep all-4 rounding (accepted degradation, no DE code).
+                // Derive "top-flush" from the window's outer position vs the top
+                // the dock asked for (`dock_rect`): a window manager that put the
+                // strip elsewhere leaves it rounded. On Wayland outer_position()
+                // is Err → not flush, so we keep all-4 rounding (accepted
+                // degradation, no DE code).
                 // The position test is a BLOCKING X11 round-trip, so it runs only
                 // when the window may have moved (`top_flush_dirty`: Moved /
                 // Resized / ScaleFactorChanged / summon) — never per frame, and
@@ -16390,8 +16405,8 @@ impl ApplicationHandler<AppEvent> for App {
                         .as_ref()
                         .and_then(|w| {
                             let p = w.outer_position().ok()?;
-                            let mon = jetty_platform::monitor_for_window(w)?;
-                            Some(p.y <= mon.position().y + 1)
+                            let (dock_pos, _) = self.dock_rect?;
+                            Some(p.y <= dock_pos.y + 1)
                         })
                         .unwrap_or(false);
                 }
@@ -19412,42 +19427,61 @@ fn center_window(win: &Arc<Window>) {
     let _ = center_window_sized(win, None);
 }
 
-/// Dock the window as a Yakuake-style top strip on the current monitor: full
-/// monitor width (× `width_pct`), `height_pct` of the monitor height, flush to
-/// the top edge (y = monitor top), centered horizontally. Sizes/positions are
-/// set ONCE per summon (the slide-in is render-side, not a per-frame reposition).
-/// On Wayland set_outer_position/request_inner_size are no-ops — accepted
-/// degradation, same as the F9 hotkey.
+/// A docked Dropdown strip: its outer top-left and inner size, physical px.
+type DockRect = (winit::dpi::PhysicalPosition<i32>, winit::dpi::PhysicalSize<u32>);
+
+/// The Dropdown strip inside the work area `(x, y, w, h)` (physical px): the
+/// area's width (× `width_pct`) and `height_pct` of its height, never below the
+/// window's minimum, centered horizontally and flush with the area's top.
+/// Pure, so the docking maths is a unit test.
+fn dock_rect(area: (i32, i32, u32, u32), width_pct: f32, height_pct: f32) -> DockRect {
+    let (area_w, area_h) = (area.2 as f32, area.3 as f32);
+    // Clamp to the min_inner_size floor so the strip never collapses.
+    let win_w = (area_w * width_pct).max(400.0).min(area_w);
+    let win_h = (area_h * height_pct).max(200.0).min(area_h);
+    let x = area.0 + ((area_w - win_w) / 2.0).round() as i32;
+    (
+        winit::dpi::PhysicalPosition::new(x, area.1),
+        winit::dpi::PhysicalSize::new(win_w.round() as u32, win_h.round() as u32),
+    )
+}
+
+/// Dock the window as a Yakuake-style top strip on the current monitor, flush
+/// with the top of what the desktop leaves free there — below a top panel, the
+/// macOS menu bar or a notch, and never under a bottom panel or the Dock
+/// (`jetty_platform::work_area`; the raw monitor top put the strip's tab bar
+/// under the macOS menu bar). Sizes/positions are set ONCE per summon (the
+/// slide-in is render-side, not a per-frame reposition). Returns the rect it
+/// asked for — what the post-map re-assertion re-issues (`apply_dock`) and
+/// top-flush measures against — or `None` without monitor information. On
+/// Wayland set_outer_position is a no-op — accepted degradation, same as the
+/// F9 hotkey.
 ///
 /// The monitor is resolved by the SHARED `jetty_platform::monitor_for_window`
 /// chain (current monitor → the monitor containing the last outer position → the
 /// first available), which is where this function's own hidden-window fallback
 /// was factored out to.
-fn dock_window_top(win: &Arc<Window>, width_pct: f32, height_pct: f32) {
-    if let Some(mon) = jetty_platform::monitor_for_window(win) {
-        let mon_pos = mon.position();
-        let mon_size = mon.size();
-        let mon_w = mon_size.width as f32;
-        let mon_h = mon_size.height as f32;
-        // Clamp to the min_inner_size floor so the strip never collapses.
-        let win_w = (mon_w * width_pct).max(400.0).min(mon_w);
-        let win_h = (mon_h * height_pct).max(200.0).min(mon_h);
-        let x = mon_pos.x + ((mon_w - win_w) / 2.0).round() as i32;
-        let y = mon_pos.y; // top-flush
-        if std::env::var("JETTY_DEBUG_DOCK").is_ok() {
-            eprintln!(
-                "jetty dock: chosen monitor pos=({},{}) size={}x{} → target=({},{}) size={}x{}; window currently at outer_position={:?}",
-                mon_pos.x, mon_pos.y, mon_size.width, mon_size.height,
-                x, y, win_w.round() as u32, win_h.round() as u32,
-                win.outer_position(),
-            );
-        }
-        win.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
-        let _ = win.request_inner_size(winit::dpi::PhysicalSize::new(
-            win_w.round() as u32,
-            win_h.round() as u32,
-        ));
+fn dock_window_top(win: &Arc<Window>, width_pct: f32, height_pct: f32) -> Option<DockRect> {
+    let mon = jetty_platform::monitor_for_window(win)?;
+    let (area_pos, area_size) = jetty_platform::work_area(win, &mon);
+    let rect = dock_rect((area_pos.x, area_pos.y, area_size.width, area_size.height), width_pct, height_pct);
+    if std::env::var("JETTY_DEBUG_DOCK").is_ok() {
+        eprintln!(
+            "jetty dock: chosen monitor pos=({},{}) size={}x{}, work area ({},{}) {}x{} → target=({},{}) size={}x{}; window currently at outer_position={:?}",
+            mon.position().x, mon.position().y, mon.size().width, mon.size().height,
+            area_pos.x, area_pos.y, area_size.width, area_size.height,
+            rect.0.x, rect.0.y, rect.1.width, rect.1.height,
+            win.outer_position(),
+        );
     }
+    apply_dock(win, rect);
+    Some(rect)
+}
+
+/// Ask for a docked rect (the dock itself, and each post-map re-assertion).
+fn apply_dock(win: &Arc<Window>, (pos, size): DockRect) {
+    win.set_outer_position(pos);
+    let _ = win.request_inner_size(size);
 }
 
 /// Returns `true` when `bytes` represent a printable keystroke that should
@@ -21069,6 +21103,27 @@ mod fullscreen_helper_tests {
         // The monitor holding the spot was unplugged (F32): no spot — centre.
         assert_eq!(keep_on_monitor((2900, 500), (1000, 640), &[((0, 0), (1920, 1080))]), None);
         assert_eq!(keep_on_monitor((10, 10), (1000, 640), &[]), None);
+    }
+
+    #[test]
+    fn the_strip_docks_inside_the_work_area() {
+        use super::dock_rect;
+        let rect = |area, w, h| {
+            let (p, s) = dock_rect(area, w, h);
+            (p.x, p.y, s.width, s.height)
+        };
+        // A bare monitor: full width, half its height, flush with its top.
+        assert_eq!(rect((0, 0, 1920, 1080), 1.0, 0.5), (0, 0, 1920, 540));
+        // Below a 30 px top panel (or the macOS menu bar) on a second monitor:
+        // flush with the panel, its height a share of what is left — a 100%
+        // strip no longer runs off the bottom.
+        assert_eq!(rect((1920, 30, 1920, 1050), 1.0, 1.0), (1920, 30, 1920, 1050));
+        assert_eq!(rect((1920, 30, 1920, 1050), 1.0, 0.5), (1920, 30, 1920, 525));
+        // A narrower strip is centred in the area.
+        assert_eq!(rect((0, 0, 1920, 1080), 0.5, 0.5), (480, 0, 960, 540));
+        // Never below the window's minimum, never beyond the area.
+        assert_eq!(rect((0, 0, 1920, 1080), 0.1, 0.1), (760, 0, 400, 200));
+        assert_eq!(rect((0, 0, 300, 150), 1.0, 1.0), (0, 0, 300, 150));
     }
 
     #[test]

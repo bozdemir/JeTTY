@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::error::OsError;
 use winit::event_loop::ActiveEventLoop;
 use winit::monitor::MonitorHandle;
@@ -247,6 +247,109 @@ pub fn pick_monitor<M: PartialEq + Clone>(
         .and_then(|c| available.iter().find(|m| **m == c).cloned())
         .or_else(|| available.iter().find(|m| contains_last_pos(m)).cloned())
         .or_else(|| available.first().cloned())
+}
+
+/// What the desktop's own bars take from the edges of a monitor, physical px.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Insets {
+    top: u32,
+    bottom: u32,
+    left: u32,
+    right: u32,
+}
+
+/// A rectangle `(x, y, width, height)`, physical px.
+type Rect = (i32, i32, u32, u32);
+
+/// The part of `monitor` a window may cover without going under the
+/// desktop's own bars, as `(origin, size)` in physical px: the macOS menu bar
+/// and Dock (`NSScreen.visibleFrame`); on X11 the panels' EWMH struts, or the
+/// window manager's `_NET_WORKAREA` where no client reserves space itself (a
+/// top bar the compositor draws). The whole monitor elsewhere — on Wayland the
+/// compositor places windows itself. Standard protocols only, no desktop
+/// named; a few round trips on X11, so ask once per placement, never per
+/// frame.
+pub fn work_area(win: &Window, monitor: &MonitorHandle) -> (PhysicalPosition<i32>, PhysicalSize<u32>) {
+    let (p, s) = (monitor.position(), monitor.size());
+    let mon = (p.x, p.y, s.width, s.height);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let insets = x11::insets(win, mon);
+    #[cfg(target_os = "macos")]
+    let insets = macos::insets(monitor);
+    #[cfg(not(unix))]
+    let insets: Option<Insets> = None;
+    let _ = win;
+    let (x, y, w, h) = inset_rect(mon, insets.unwrap_or_default());
+    (PhysicalPosition::new(x, y), PhysicalSize::new(w, h))
+}
+
+/// `mon` less `insets`, never smaller than 1×1.
+fn inset_rect(mon: Rect, insets: Insets) -> Rect {
+    let w = mon.2.saturating_sub(insets.left).saturating_sub(insets.right).max(1);
+    let h = mon.3.saturating_sub(insets.top).saturating_sub(insets.bottom).max(1);
+    (mon.0.saturating_add_unsigned(insets.left), mon.1.saturating_add_unsigned(insets.top), w, h)
+}
+
+/// What EWMH struts take from `mon`. Each strut is `_NET_WM_STRUT_PARTIAL`'s
+/// twelve values — left, right, top and bottom, then where each runs along
+/// its edge (left_start_y, left_end_y, right_start_y, right_end_y,
+/// top_start_x, top_end_x, bottom_start_x, bottom_end_x) — in the coordinates
+/// of the root window, `root` px wide and high: a top strut reserves the
+/// root's top rows, not the monitor's. A strut counts on a monitor its range
+/// overlaps and whose edge it reaches past; one that would leave nothing of
+/// the monitor is ignored (a panel on an edge between two monitors, which
+/// EWMH cannot express), as window managers do.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn strut_insets(mon: Rect, root: (u32, u32), struts: &[[u32; 12]]) -> Insets {
+    let (mx, my) = (i64::from(mon.0), i64::from(mon.1));
+    let (mw, mh) = (i64::from(mon.2), i64::from(mon.3));
+    let (rw, rh) = (i64::from(root.0), i64::from(root.1));
+    let overlaps = |start: u32, end: u32, from: i64, len: i64| i64::from(start) < from + len && i64::from(end) >= from;
+    let depth = |d: i64, extent: i64| if d > 0 && d < extent { d as u32 } else { 0 };
+    let mut ins = Insets::default();
+    for &[left, right, top, bottom, ly0, ly1, ry0, ry1, tx0, tx1, bx0, bx1] in struts {
+        if top > 0 && overlaps(tx0, tx1, mx, mw) {
+            ins.top = ins.top.max(depth(i64::from(top) - my, mh));
+        }
+        if bottom > 0 && overlaps(bx0, bx1, mx, mw) {
+            ins.bottom = ins.bottom.max(depth(my + mh - (rh - i64::from(bottom)), mh));
+        }
+        if left > 0 && overlaps(ly0, ly1, my, mh) {
+            ins.left = ins.left.max(depth(i64::from(left) - mx, mw));
+        }
+        if right > 0 && overlaps(ry0, ry1, my, mh) {
+            ins.right = ins.right.max(depth(mx + mw - (rw - i64::from(right)), mw));
+        }
+    }
+    ins
+}
+
+/// `_NET_WM_STRUT`'s four values as a `_NET_WM_STRUT_PARTIAL` running along
+/// the whole of each edge of a `root`-sized root window.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn full_strut(s: [u32; 4], root: (u32, u32)) -> [u32; 12] {
+    let (w, h) = (root.0.saturating_sub(1), root.1.saturating_sub(1));
+    [s[0], s[1], s[2], s[3], 0, h, 0, h, 0, w, 0, w]
+}
+
+/// What a window manager's work area (`_NET_WORKAREA`: one rectangle for the
+/// whole desktop) takes from `mon`. One that misses the monitor says nothing
+/// about it.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn workarea_insets(mon: Rect, area: Rect) -> Insets {
+    let edges = |r: Rect| (i64::from(r.0), i64::from(r.1), i64::from(r.0) + i64::from(r.2), i64::from(r.1) + i64::from(r.3));
+    let (mx0, my0, mx1, my1) = edges(mon);
+    let (ax0, ay0, ax1, ay1) = edges(area);
+    if ax0 >= mx1 || ax1 <= mx0 || ay0 >= my1 || ay1 <= my0 {
+        return Insets::default();
+    }
+    let depth = |d: i64, extent: u32| if d > 0 && d < i64::from(extent) { d as u32 } else { 0 };
+    Insets {
+        top: depth(ay0 - my0, mon.3),
+        bottom: depth(my1 - ay1, mon.3),
+        left: depth(ax0 - mx0, mon.2),
+        right: depth(mx1 - ax1, mon.2),
+    }
 }
 
 /// Put `win` into (or out of) whole-monitor fullscreen, cross-platform, through
@@ -545,6 +648,38 @@ pub fn hide_window(win: &Window) {
     x11::withdraw(win);
 }
 
+#[cfg(target_os = "macos")]
+mod macos {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSScreen;
+    use winit::monitor::MonitorHandle;
+    use winit::platform::macos::MonitorHandleExtMacOS;
+
+    /// [`super::work_area`] on macOS: what the menu bar (and a notch) and the
+    /// Dock take from `monitor` — the gap between its `NSScreen`'s frame and
+    /// visible frame, in points, times the monitor's scale. AppKit's y axis
+    /// points up: the menu bar is the gap at the top of the frame (its
+    /// largest y). Borderless windows are never kept out of either by AppKit,
+    /// so a Dropdown strip docked at the monitor's top sat under the menu bar.
+    pub(super) fn insets(monitor: &MonitorHandle) -> Option<super::Insets> {
+        MainThreadMarker::new()?;
+        let screen = monitor.ns_screen()?;
+        // SAFETY: winit hands out the NSScreen of a connected display, which
+        // AppKit keeps alive in `+[NSScreen screens]`; it is read at once, on
+        // the main thread (checked above).
+        let screen: &NSScreen = unsafe { &*screen.cast::<NSScreen>() };
+        let (frame, visible) = (screen.frame(), screen.visibleFrame());
+        let scale = monitor.scale_factor();
+        let px = |points: f64| (points.max(0.0) * scale).round() as u32;
+        Some(super::Insets {
+            top: px((frame.origin.y + frame.size.height) - (visible.origin.y + visible.size.height)),
+            bottom: px(visible.origin.y - frame.origin.y),
+            left: px(visible.origin.x - frame.origin.x),
+            right: px((frame.origin.x + frame.size.width) - (visible.origin.x + visible.size.width)),
+        })
+    }
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 mod x11 {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -552,9 +687,7 @@ mod x11 {
     use winit::window::Window;
     use x11rb::connection::Connection;
     use x11rb::errors::ReplyError;
-    use x11rb::protocol::xproto::{
-        Atom, ClientMessageEvent, ConnectionExt as _, EventMask, UnmapNotifyEvent, UNMAP_NOTIFY_EVENT,
-    };
+    use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt as _, EventMask, UnmapNotifyEvent, UNMAP_NOTIFY_EVENT};
     use x11rb::rust_connection::RustConnection;
 
     /// EWMH `_NET_ACTIVE_WINDOW` source indication for a request made on the
@@ -570,22 +703,34 @@ mod x11 {
         }
     }
 
+    x11rb::atom_manager! {
+        /// The atoms the helper's requests name, interned in one batch.
+        Atoms: AtomsCookie {
+            _NET_ACTIVE_WINDOW,
+            _NET_CLIENT_LIST,
+            _NET_WM_STRUT_PARTIAL,
+            _NET_WM_STRUT,
+            _NET_WORKAREA,
+            _NET_CURRENT_DESKTOP,
+        }
+    }
+
     /// JeTTY's own connection for the few requests winit has no API for — the
-    /// activation, the withdraw, the focus question. Opened on the first one
-    /// and kept: each costs one round trip, where a connection per request
-    /// paid a socket, the Xauthority file and an atom lookup (0.5–3 ms) on
-    /// every F9 summon. The UI thread is its only user.
+    /// activation, the withdraw, the focus question, the work area. Opened on
+    /// the first one and kept: each costs a round trip or two, where a
+    /// connection per request paid a socket, the Xauthority file and an atom
+    /// lookup (0.5–3 ms) on every F9 summon. The UI thread is its only user.
     struct Helper {
         conn: RustConnection,
         root: u32,
-        net_active_window: Atom,
+        atoms: Atoms,
     }
 
     fn connect() -> Result<Helper, Box<dyn std::error::Error>> {
         let (conn, screen) = x11rb::connect(None)?;
         let root = conn.setup().roots.get(screen).ok_or("no X screen")?.root;
-        let net_active_window = conn.intern_atom(false, b"_NET_ACTIVE_WINDOW")?.reply()?.atom;
-        Ok(Helper { conn, root, net_active_window })
+        let atoms = Atoms::new(&conn)?.reply()?;
+        Ok(Helper { conn, root, atoms })
     }
 
     /// Run `request` on the kept connection, opening it first when there is
@@ -626,7 +771,7 @@ mod x11 {
             let event = ClientMessageEvent::new(
                 32,
                 xid,
-                h.net_active_window,
+                h.atoms._NET_ACTIVE_WINDOW,
                 [SOURCE_USER, x11rb::CURRENT_TIME, 0, 0, 0],
             );
             h.conn
@@ -672,6 +817,55 @@ mod x11 {
             return false;
         }
         with_helper(|h| Ok(h.conn.get_input_focus()?.reply()?.focus)).is_some_and(|focus| xids.contains(&focus))
+    }
+
+    /// [`super::work_area`] on X11: what the panels take from monitor `mon`
+    /// (root px). The struts of every client the window manager lists, asked
+    /// for in one batch — the requests go out together and the replies come
+    /// back together; where none reserves space, the window manager's work
+    /// area for the current desktop. `None` for a window that is not an X11
+    /// one, or when the server can't be reached.
+    pub(super) fn insets(win: &Window, mon: super::Rect) -> Option<super::Insets> {
+        use x11rb::protocol::xproto::AtomEnum;
+        xid(win)?;
+        with_helper(|h| {
+            let (c, a) = (&h.conn, &h.atoms);
+            let clients = c.get_property(false, h.root, a._NET_CLIENT_LIST, AtomEnum::WINDOW, 0, u32::MAX)?;
+            let geometry = c.get_geometry(h.root)?;
+            let area = c.get_property(false, h.root, a._NET_WORKAREA, AtomEnum::CARDINAL, 0, u32::MAX)?;
+            let desktop = c.get_property(false, h.root, a._NET_CURRENT_DESKTOP, AtomEnum::CARDINAL, 0, 1)?;
+            let values = |reply: x11rb::protocol::xproto::GetPropertyReply| -> Vec<u32> {
+                reply.value32().map(|v| v.collect()).unwrap_or_default()
+            };
+            let clients = values(clients.reply()?);
+            let geometry = geometry.reply()?;
+            let root = (u32::from(geometry.width), u32::from(geometry.height));
+            let area = values(area.reply()?);
+            let desktop = values(desktop.reply()?).first().copied().unwrap_or(0) as usize;
+            let mut asked = Vec::with_capacity(clients.len());
+            for &w in &clients {
+                asked.push((
+                    c.get_property(false, w, a._NET_WM_STRUT_PARTIAL, AtomEnum::CARDINAL, 0, 12)?,
+                    c.get_property(false, w, a._NET_WM_STRUT, AtomEnum::CARDINAL, 0, 4)?,
+                ));
+            }
+            let mut struts = Vec::new();
+            for (partial, plain) in asked {
+                // A client gone meanwhile answers BadWindow: it reserves nothing.
+                let partial = partial.reply().ok().map(values).and_then(|v| <[u32; 12]>::try_from(v).ok());
+                let plain = plain.reply().ok().map(values).and_then(|v| <[u32; 4]>::try_from(v).ok());
+                if let Some(s) = partial.or_else(|| plain.map(|p| super::full_strut(p, root))) {
+                    struts.push(s);
+                }
+            }
+            Ok(if !struts.is_empty() {
+                super::strut_insets(mon, root, &struts)
+            } else if let Some(&[x, y, w, h]) = area.chunks_exact(4).nth(desktop) {
+                super::workarea_insets(mon, (x as i32, y as i32, w, h))
+            } else {
+                super::Insets::default()
+            })
+        })
     }
 
     /// ICCCM `IconicState`, the first field of `WM_STATE`.
@@ -824,6 +1018,89 @@ mod dpi_tests {
         // Bogus scales fall back to 1.
         assert_eq!(dpi_physical((1000.0, 640.0), f64::NAN, MON, MIN), (1000, 640));
         assert_eq!(dpi_physical((1000.0, 640.0), 0.0, MON, MIN), (1000, 640));
+    }
+}
+
+#[cfg(test)]
+mod work_area_tests {
+    use super::{full_strut, inset_rect, strut_insets, workarea_insets, Insets};
+
+    const ROOT: (u32, u32) = (3840, 1080);
+    const LEFT: super::Rect = (0, 0, 1920, 1080);
+    const RIGHT: super::Rect = (1920, 0, 1920, 1080);
+
+    /// A panel's `_NET_WM_STRUT_PARTIAL`: `top` px along x `from..=to`.
+    fn top_panel(top: u32, from: u32, to: u32) -> [u32; 12] {
+        [0, 0, top, 0, 0, 0, 0, 0, from, to, 0, 0]
+    }
+
+    #[test]
+    fn a_top_panel_pushes_the_strip_down_on_its_own_monitor_only() {
+        // A 30 px panel along the top of the right monitor (KDE, Xfce): the
+        // strip docks below it there, flush with the top on the left one.
+        let struts = [top_panel(30, 1920, 3839)];
+        assert_eq!(strut_insets(RIGHT, ROOT, &struts), Insets { top: 30, ..Insets::default() });
+        assert_eq!(strut_insets(LEFT, ROOT, &struts), Insets::default());
+        assert_eq!(inset_rect(RIGHT, strut_insets(RIGHT, ROOT, &struts)), (1920, 30, 1920, 1050));
+    }
+
+    #[test]
+    fn bottom_and_side_struts_count_from_the_root_edges() {
+        // A 44 px bottom panel on the left monitor and a 60 px dock on the
+        // right edge of the right one.
+        let struts = [
+            [0, 0, 0, 44, 0, 0, 0, 0, 0, 0, 0, 1919],
+            [0, 60, 0, 0, 0, 0, 0, 1079, 0, 0, 0, 0],
+        ];
+        assert_eq!(strut_insets(LEFT, ROOT, &struts), Insets { bottom: 44, ..Insets::default() });
+        assert_eq!(strut_insets(RIGHT, ROOT, &struts), Insets { right: 60, ..Insets::default() });
+        assert_eq!(inset_rect(LEFT, Insets { bottom: 44, ..Insets::default() }), (0, 0, 1920, 1036));
+    }
+
+    #[test]
+    fn a_plain_strut_runs_along_the_whole_edge() {
+        // `_NET_WM_STRUT` (no ranges) reserves its edge on every monitor that
+        // touches it.
+        let s = full_strut([0, 0, 25, 0], ROOT);
+        assert_eq!(strut_insets(LEFT, ROOT, &[s]).top, 25);
+        assert_eq!(strut_insets(RIGHT, ROOT, &[s]).top, 25);
+    }
+
+    #[test]
+    fn a_strut_that_cannot_be_meant_for_a_monitor_is_ignored() {
+        // Monitors stacked: a panel on the top edge of the LOWER one can only be
+        // written as a strut covering the whole upper monitor — no monitor may
+        // be swallowed by one, so it counts on neither.
+        let root = (1920, 2160);
+        let upper = (0, 0, 1920, 1080);
+        let lower = (0, 1080, 1920, 1080);
+        let struts = [top_panel(1110, 0, 1919)];
+        assert_eq!(strut_insets(upper, root, &struts), Insets::default());
+        assert_eq!(strut_insets(lower, root, &struts).top, 30);
+        // The widest of several panels on one edge wins.
+        let two = [top_panel(24, 0, 1919), top_panel(36, 0, 999)];
+        assert_eq!(strut_insets(upper, root, &two).top, 36);
+    }
+
+    #[test]
+    fn the_work_area_of_a_bar_the_compositor_draws() {
+        // No client reserves space (a desktop that draws its own top bar):
+        // the window manager's work area says where windows go.
+        let area = (0, 32, 3840, 1048);
+        assert_eq!(workarea_insets(LEFT, area), Insets { top: 32, ..Insets::default() });
+        assert_eq!(workarea_insets(RIGHT, area), Insets { top: 32, ..Insets::default() });
+        // A work area that misses the monitor says nothing about it.
+        assert_eq!(workarea_insets(RIGHT, (0, 0, 1920, 1080)), Insets::default());
+        // A whole-desktop work area takes nothing.
+        assert_eq!(workarea_insets(LEFT, (0, 0, 3840, 1080)), Insets::default());
+    }
+
+    #[test]
+    fn an_inset_never_leaves_less_than_a_pixel() {
+        let all = Insets { top: 2000, bottom: 2000, left: 4000, right: 4000 };
+        assert_eq!(inset_rect(LEFT, all).2, 1);
+        assert_eq!(inset_rect(LEFT, all).3, 1);
+        assert_eq!(inset_rect(LEFT, Insets::default()), LEFT);
     }
 }
 

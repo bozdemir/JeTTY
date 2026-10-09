@@ -80,7 +80,7 @@ Names of fonts and themes are matched in any letter case, and a theme by its id
 | Key | Default | What it does |
 |---|---|---|
 | `window_mode` | `"center"` | How the summon hotkey shows the window: `"center"` (centered, or where you left it), `"dropdown"` (a full-width strip that slides down from the top) or `"fullscreen"` (the whole monitor). `F11` toggles fullscreen for the moment without changing this. |
-| `dropdown_height_pct` | `0.5` | The dropdown's height as a fraction of the monitor, `0.25`–`1`. |
+| `dropdown_height_pct` | `0.5` | The dropdown's height as a fraction of the monitor, `0.25`–`1` — of what panels, the macOS menu bar and the Dock leave free: the strip hangs from a top panel and never runs under a bottom one. |
 | `dropdown_width_pct` | `1.0` | The dropdown's width as a fraction of the monitor, `0.2`–`1`. |
 | `corner_radius` | `10.0` | Window corner radius in logical pixels, `0`–`24`. |
 | `padding_x` | `8.0` | Space between the window's left and right edges and the text, in logical pixels, `0`–`64`. The scrollbar lives in the right padding. |
