@@ -311,7 +311,7 @@ a failing CI job** (CI only reports; see rule 6).
 
 ## Live metrics (in-app HUD)
 
-The tab bar carries a live performance HUD (toggle: `show_perf_hud`, on by default).
+The bottom status strip carries a live performance HUD (toggle: `show_perf_hud`, on by default).
 It reads `⚡ <ms> ms · <fps> fps · <cpu>% CPU · <mb> MB/s`, computed in
 `jetty-app/src/app.rs::update_perf_hud`:
 

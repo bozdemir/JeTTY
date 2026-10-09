@@ -90,7 +90,7 @@ JETTY_SHOT_HELP=1 JETTY_SHOT_OUT=help.png \
 | `JETTY_SHOT_MENU` | `1` — render the right-click context menu |
 | `JETTY_SHOT_HELP` | `1` — render the help overlay |
 | `JETTY_SHOT_TABBAR` | `1` — render just the tab bar strip |
-| `JETTY_SHOT_PERF` | Inject a perf-HUD string into the tab bar |
+| `JETTY_SHOT_PERF` | Draw this perf-HUD string in the bottom status strip (with `JETTY_SHOT_TABBAR`) |
 | `JETTY_SHOT_WELCOME` | `1` — render the welcome overlay |
 | `JETTY_SHOT_CONFIRM` | `1` — render the close-tab confirm dialog (`last`: the last tab's, which quits JeTTY) |
 | `JETTY_SHOT_QUIT` | `1` — render the quit-app confirm dialog |

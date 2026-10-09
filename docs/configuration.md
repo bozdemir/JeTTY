@@ -102,7 +102,7 @@ Names of fonts and themes are matched in any letter case, and a theme by its id
 | `tab_bar_opacity` | `false` | `true` lets the tab bar follow `opacity` like the terminal area. |
 | `tab_title` | `"osc"` | Tab titles: `"osc"` (the program's title, else "Tab N") or `"auto"` (the program's title, else the running command or the shell's directory — needs shell integration). A manual rename always wins. |
 | `progress_bar` | `true` | Show the progress programs report (OSC 9;4: cargo, winget, Claude Code …) in the tab and along the bar's edge. |
-| `show_perf_hud` | `true` | The live performance readout in the status bar (frame time, fps, CPU, VT throughput). It never causes a redraw of its own. |
+| `show_perf_hud` | `true` | The live performance readout in the status bar (frame time, fps, CPU, VT throughput). Idle it costs nothing: one repaint ~0.7 s after the last activity shows "idle", then none until something happens. |
 | `show_welcome` | `true` | The welcome splash in the first tab at launch (gone at the first key). Applies at the next launch. |
 
 ## Motion and alerts
