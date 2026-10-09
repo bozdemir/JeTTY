@@ -25,8 +25,9 @@
 //!   insertion-order draw — same visual model as sixel).
 //! * `t=f`/`t=t`/`t=s` (file/temp/shm transfer) are REFUSED (an untrusted PTY must
 //!   never make us open a path). `o=z` zlib IS supported (via miniz_oxide).
-//! * server-side `c`/`r` scale-to-box is not applied (marquee tools pre-scale
-//!   client-side); we draw native px, clamping drawn rows to the reservation.
+//! * `c`/`r` scale the image to fill that many cells keeping its aspect ratio
+//!   (both given: letterboxed in the box), as the spec says; without them it
+//!   draws at native size (`Terminal::image_geometry`).
 //! * `C=1` (do not move the cursor) is honored; `U=1` virtual placements (shown
 //!   through Unicode placeholder cells) are refused with `ENOTSUPP` so clients
 //!   fall back instead of printing placeholder glyphs.
@@ -71,7 +72,8 @@ pub struct KittyCmd {
     pub quiet: u8,
     /// `o=z` zlib compression.
     pub compressed: bool,
-    /// `d=` delete selector (`a`/`A` all, `i`/`I` by id; 0 = unset).
+    /// `d=` delete selector (`a`/`A` all on screen, `i`/`I` by id, `n`/`N` by
+    /// number; 0 = unset).
     pub delete: u8,
     /// `C=1`: do not move the cursor after displaying (TUIs place images this way).
     pub no_cursor_move: bool,
