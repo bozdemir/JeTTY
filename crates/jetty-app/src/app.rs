@@ -10694,8 +10694,19 @@ impl App {
             }
         }
         // Pass 5d: this window's copy-mode "COPY" pill (main window's Pass 4f).
-        if let Some((_, _, selecting, line_mode)) = copy_mode_ui {
-            let pill = jetty_render::build_copy_pill(width, grid_top, &theme, &mut *chrome_text, cm, line_mode, selecting);
+        if let Some((cr, cc, selecting, line_mode)) = copy_mode_ui {
+            let (cell_w, cell_h) = text.cell_size();
+            let avoid = jetty_render::PillAvoid {
+                snap: &snap,
+                origin,
+                cell_w,
+                cell_h,
+                cursor: (cr, cc),
+                band_bottom: grid_bottom_px,
+            };
+            let pill = jetty_render::build_copy_pill(
+                width, grid_top, &theme, &mut *chrome_text, cm, line_mode, selecting, Some(&avoid),
+            );
             quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pill.quads);
             if !pill.labels.is_empty() {
                 let _ = chrome_text.render_overlays(&gpu.device, &gpu.queue, scene_view, width, height, &pill.labels);
@@ -14816,7 +14827,16 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     // Pass 4f: copy-mode "COPY" pill (top-left, discoverability +
                     // screenshot-verify surface).
-                    if let Some((_, _, selecting, line_mode)) = copy_mode_ui {
+                    if let Some((cr, cc, selecting, line_mode)) = copy_mode_ui {
+                        // Never over the copy cursor or the selection.
+                        let avoid = jetty_render::PillAvoid {
+                            snap: &snap,
+                            origin: origin.slid(slide_y_offset),
+                            cell_w,
+                            cell_h,
+                            cursor: (cr, cc),
+                            band_bottom: grid_bottom_px + slide_y_offset,
+                        };
                         let pill = jetty_render::build_copy_pill(
                             width,
                             grid_top + slide_y_offset,
@@ -14825,6 +14845,7 @@ impl ApplicationHandler<AppEvent> for App {
                             cm,
                             line_mode,
                             selecting,
+                            Some(&avoid),
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pill.quads);
                         if !pill.labels.is_empty() {

@@ -106,7 +106,53 @@ pub struct CopyPill {
     pub labels: Vec<(String, f32, f32, [u8; 3])>,
 }
 
-/// Build the copy-mode pill for a window `win_w` px wide, anchored at `grid_top`.
+/// What the copy-mode pill must not cover: the keyboard cursor and the
+/// selection, read from the frame's snapshot. Coordinates are the window's.
+pub struct PillAvoid<'a> {
+    pub snap: &'a jetty_core::GridSnapshot,
+    /// Window position of grid cell (0, 0), any dropdown slide included.
+    pub origin: crate::GridOrigin,
+    pub cell_w: f32,
+    pub cell_h: f32,
+    /// The copy-mode cursor cell `(row, col)`.
+    pub cursor: (usize, usize),
+    /// y just past the grid band: the pill's bottom-corner spot sits above it.
+    pub band_bottom: f32,
+}
+
+impl PillAvoid<'_> {
+    /// Whether a pill at `(x, y, w, h)` would hide the cursor or a selected cell.
+    fn blocks(&self, x: f32, y: f32, w: f32, h: f32) -> bool {
+        use unicode_width::UnicodeWidthChar;
+        let s = self.snap;
+        if s.rows == 0 || s.cols == 0 || !(self.cell_w > 0.0 && self.cell_h > 0.0) {
+            return false;
+        }
+        // The cells the rect touches, clamped to the grid.
+        let first = |p: f32, o: f32, cell: f32| ((p - o) / cell).floor();
+        let last = |p: f32, o: f32, cell: f32| ((p - o) / cell).ceil() - 1.0;
+        let (r0, r1) = (first(y, self.origin.top, self.cell_h), last(y + h, self.origin.top, self.cell_h));
+        let (c0, c1) = (first(x, self.origin.left, self.cell_w), last(x + w, self.origin.left, self.cell_w));
+        if r1 < 0.0 || c1 < 0.0 || r0 >= s.rows as f32 || c0 >= s.cols as f32 {
+            return false;
+        }
+        let rows = r0.max(0.0) as usize..=(r1 as usize).min(s.rows - 1);
+        let cols = c0.max(0.0) as usize..=(c1 as usize).min(s.cols - 1);
+        let (cr, cc) = self.cursor;
+        // A cursor on a wide char frames its spacer too.
+        let cursor_w = if cr < s.rows && cc + 1 < s.cols && s.cell(cr, cc).c.width() == Some(2) { 2 } else { 1 };
+        if rows.contains(&cr) && (cc..cc + cursor_w).any(|c| cols.contains(&c)) {
+            return true;
+        }
+        rows.clone().any(|r| cols.clone().any(|c| s.cell(r, c).selected))
+    }
+}
+
+/// Build the copy-mode pill for a window `win_w` px wide, anchored at
+/// `grid_top`. With `avoid`, the pill never hides the copy cursor or the
+/// selection: when its top-left spot would, it moves to the bottom-left of the
+/// grid (and stays put when that spot is taken too — a grid a few rows tall).
+#[allow(clippy::too_many_arguments)]
 pub fn build_copy_pill(
     win_w: u32,
     grid_top: f32,
@@ -115,6 +161,7 @@ pub fn build_copy_pill(
     cm: ChromeMetrics,
     line_mode: bool,
     selecting: bool,
+    avoid: Option<&PillAvoid>,
 ) -> CopyPill {
     let text = if line_mode {
         "COPY · LINE".to_string()
@@ -130,7 +177,18 @@ pub fn build_copy_pill(
     let text_w = m.text_w(&text);
     let pill_w = (text_w + pad * 2.0).min((win_w as f32 - 16.0).max(0.0));
     let x = 8.0f32.min((win_w as f32 - pill_w - 8.0).max(0.0));
-    let y = grid_top + 8.0;
+    let top_y = grid_top + 8.0;
+    let y = match avoid {
+        Some(a) if a.blocks(x, top_y, pill_w, pill_h) => {
+            let bottom_y = a.band_bottom - 8.0 - pill_h;
+            if bottom_y > top_y + pill_h && !a.blocks(x, bottom_y, pill_w, pill_h) {
+                bottom_y
+            } else {
+                top_y
+            }
+        }
+        _ => top_y,
+    };
 
     // The theme's cursor color with that fill's own readable text (the theme bg
     // read 2.6:1 on Palenight's purple cursor).
@@ -255,14 +313,14 @@ mod tests {
 
     #[test]
     fn pill_fits_and_scales() {
-        let p1 = build_copy_pill(1000, 36.0, &theme(), &mut mono(), CM, false, false);
-        let p2 = build_copy_pill(1000, 36.0, &theme(), &mut MonoMeasure(19.6), ChromeMetrics::new(2.0, 16.0), true, true);
+        let p1 = build_copy_pill(1000, 36.0, &theme(), &mut mono(), CM, false, false, None);
+        let p2 = build_copy_pill(1000, 36.0, &theme(), &mut MonoMeasure(19.6), ChromeMetrics::new(2.0, 16.0), true, true, None);
         assert_eq!(p1.labels[0].0, "COPY");
         assert_eq!(p2.labels[0].0, "COPY · LINE");
         // Pill scales with the chrome unit (2× → ~2× height).
         assert!((p2.quads[0].h - p1.quads[0].h * 2.0).abs() < 0.5, "pill must scale with the chrome unit");
         // Pill fits a narrow window.
-        let pn = build_copy_pill(200, 10.0, &theme(), &mut mono(), CM, false, false);
+        let pn = build_copy_pill(200, 10.0, &theme(), &mut mono(), CM, false, false, None);
         assert!(pn.quads[0].x + pn.quads[0].w <= 200.0 + 0.5, "pill overflows narrow window");
     }
 
@@ -278,7 +336,7 @@ mod tests {
             assert!(cr(rest, chip) >= 4.5, "{}: chip label {}", t.name, cr(rest, chip));
             assert!(cr(typed, chip) >= 3.0, "{}: typed prefix {}", t.name, cr(typed, chip));
             assert_ne!(typed, rest, "{}: the typed prefix must look consumed", t.name);
-            let p = build_copy_pill(1000, 36.0, &t, &mut mono(), CM, false, false);
+            let p = build_copy_pill(1000, 36.0, &t, &mut mono(), CM, false, false, None);
             let c = cr(p.labels[0].3, rgb(p.quads[0].color));
             assert!(c >= 4.5, "{}: COPY pill {c}", t.name);
         }
@@ -299,6 +357,77 @@ mod tests {
         assert_eq!(r[0].x, 27.0);
         assert_eq!(r[0].y, 36.0 + 2.0 * 18.0);
         assert_eq!(r[0].w, 9.0, "one cell wide");
+    }
+
+    /// Where the pill sits ON TOP: `grid_top` 36 + its 8 px margin.
+    const PILL_TOP: f32 = 36.0 + 8.0;
+    /// Where it sits at the BOTTOM: 8 px above the band bottom (400).
+    fn pill_bottom() -> f32 {
+        400.0 - 8.0 - 24.0 * CM.overlay_u()
+    }
+
+    /// The pill's y for a copy cursor at `cursor` on an 80×20 grid (cells
+    /// 9×18 px, origin (8, 40), band bottom 400), after `select` ran.
+    fn pill_y(cursor: (usize, usize), select: impl Fn(&mut jetty_core::Terminal)) -> f32 {
+        let mut t = jetty_core::Terminal::new(80, 20);
+        t.feed(b"first line of output\r\nsecond line\r\nthird line");
+        select(&mut t);
+        let snap = t.snapshot();
+        let avoid = PillAvoid {
+            snap: &snap,
+            origin: crate::GridOrigin::new(8.0, 40.0),
+            cell_w: 9.0,
+            cell_h: 18.0,
+            cursor,
+            band_bottom: 400.0,
+        };
+        build_copy_pill(1000, 36.0, &theme(), &mut mono(), CM, false, false, Some(&avoid)).quads[0].y
+    }
+
+    #[test]
+    fn pill_steps_aside_for_the_copy_cursor() {
+        // The pill covers rows 0–1 at the left: a cursor there (copy-mode `g`,
+        // `k` scrolling history) hid under it. It moves to the bottom-left.
+        assert_eq!(pill_y((0, 0), |_| {}), pill_bottom(), "cursor at (0, 0)");
+        assert_eq!(pill_y((1, 2), |_| {}), pill_bottom(), "cursor on row 1, under the pill");
+        // Clear of the pill: it stays at the top-left.
+        assert_eq!(pill_y((0, 40), |_| {}), PILL_TOP, "cursor right of the pill");
+        assert_eq!(pill_y((10, 0), |_| {}), PILL_TOP, "cursor below the pill");
+    }
+
+    #[test]
+    fn pill_steps_aside_for_the_selection() {
+        // A selection under the top-left spot (the anchor of a `g` + `v`) moves
+        // the pill even with the cursor far below.
+        let sel = |t: &mut jetty_core::Terminal| {
+            t.selection_start(0, 0, true);
+            t.selection_update(2, 5, false);
+        };
+        assert_eq!(pill_y((10, 0), sel), pill_bottom());
+        // A selection elsewhere leaves it alone.
+        let elsewhere = |t: &mut jetty_core::Terminal| {
+            t.selection_start(2, 0, true);
+            t.selection_update(2, 5, false);
+        };
+        assert_eq!(pill_y((10, 0), elsewhere), PILL_TOP);
+    }
+
+    #[test]
+    fn pill_keeps_its_spot_when_both_corners_are_taken() {
+        // A 2-row grid: the bottom spot overlaps the top one — stay on top.
+        let mut t = jetty_core::Terminal::new(80, 2);
+        t.feed(b"x");
+        let snap = t.snapshot();
+        let avoid = PillAvoid {
+            snap: &snap,
+            origin: crate::GridOrigin::new(8.0, 40.0),
+            cell_w: 9.0,
+            cell_h: 18.0,
+            cursor: (0, 0),
+            band_bottom: 40.0 + 36.0,
+        };
+        let p = build_copy_pill(1000, 36.0, &theme(), &mut mono(), CM, false, false, Some(&avoid));
+        assert_eq!(p.quads[0].y, PILL_TOP);
     }
 
     #[test]

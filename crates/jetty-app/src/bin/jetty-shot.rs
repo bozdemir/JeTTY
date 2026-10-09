@@ -1476,8 +1476,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             jetty_render::shift_x(&mut copy, shot_origin.left);
             rects.extend(copy);
+            let avoid = jetty_render::PillAvoid {
+                snap: &snap,
+                origin: shot_origin,
+                cell_w,
+                cell_h,
+                cursor: (cr, cc),
+                band_bottom: (height as f32 - shot_status_h - shot_bottom_bar_h).max(shot_grid_top),
+            };
             let pill = jetty_render::build_copy_pill(
-                width, shot_grid_top, terminal.theme(), &mut chrome_text, cm, line_mode, selecting,
+                width, shot_grid_top, terminal.theme(), &mut chrome_text, cm, line_mode, selecting, Some(&avoid),
             );
             rects.extend(pill.quads);
             chrome_labels.extend(pill.labels);
