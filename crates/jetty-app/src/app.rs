@@ -619,6 +619,18 @@ fn focus_ask(by: SummonBy) -> FocusAsk {
     }
 }
 
+/// Whether the main window gaining focus while JeTTY holds it hidden means
+/// the compositor showed it again. Only where a hide merely MINIMIZES
+/// (Wayland): the user brings the window back with its taskbar entry or
+/// Alt+Tab, and it must paint again — JeTTY used to stay "hidden" there, a
+/// frozen terminal that still took keystrokes. Never where a hide unmaps
+/// (X11): an unmapped window cannot gain focus, and a FocusIn queued before
+/// the unmap (the summon hotkey's grab ends on key release) must not re-show
+/// the window F9 just hid.
+fn focus_gain_shows(visible: bool, hide: jetty_platform::HideKind) -> bool {
+    !visible && hide == jetty_platform::HideKind::Minimize
+}
+
 /// Retry state for a frame whose swapchain acquire failed (`acquire_frame()` →
 /// `None`: Outdated, Lost, Timeout, Occluded, Validation). Without it a failed
 /// acquire on the LAST damage-driven frame left the screen stale until some
@@ -8174,7 +8186,8 @@ impl App {
             // never reach — a stuck summon_anim would pin the loop in Poll.
             self.summon_anim = None;
             self.summon_pending = false;
-            win.set_visible(false);
+            // Unmapped — or minimized on Wayland, which cannot unmap.
+            jetty_platform::hide_window(win);
         }
         self.visible = false;
         // Stamp the auto-hide: if this FocusOut was the summon hotkey's own key
@@ -8467,7 +8480,8 @@ impl App {
                 // long as the window stays hidden.
                 self.summon_anim = None;
                 self.summon_pending = false;
-                win.set_visible(false);
+                // Unmapped — or minimized on Wayland, which cannot unmap.
+                jetty_platform::hide_window(win);
                 // Save a still-debounced settings change now (non-blocking).
                 self.persister.borrow_mut().flush();
                 // The matching button-release never arrives once hidden — end
@@ -12879,6 +12893,17 @@ impl ApplicationHandler<AppEvent> for App {
                     // macOS first-paint nudge (see the settings window above): ensure
                     // a frame is drawn once the window is actually shown + focused.
                     self.request_main_paint();
+                }
+                // A hidden window that gains focus where a hide only minimized
+                // (Wayland) was brought back by the compositor — its taskbar
+                // entry, Alt+Tab: it is on screen, so it is shown (and paints)
+                // again instead of staying frozen.
+                if self
+                    .window
+                    .as_ref()
+                    .is_some_and(|w| focus_gain_shows(self.visible, jetty_platform::hide_kind(w)))
+                {
+                    self.set_visibility_by(true, SummonBy::App, event_loop);
                 }
             }
             WindowEvent::Focused(false) => {
@@ -18018,7 +18043,7 @@ mod scheduler_tests {
     //! The window itself can't run under `cargo test`, so every rule that keeps
     //! the loop at 0-CPU idle (or makes it wake) is a pure function tested here.
     use super::{
-        anim_expired, caret_drives_frames, focus_ask, main_tab_watched, next_acquire_retry,
+        anim_expired, caret_drives_frames, focus_ask, focus_gain_shows, main_tab_watched, next_acquire_retry,
         perf_idle_decision, toggle_action, FocusAsk, IdleHud, SummonBy, ToggleAction,
         FOCUS_CHURN_GRACE, KEY_ECHO_GRACE, RAISE_RETRY_WINDOW,
     };
@@ -18036,6 +18061,21 @@ mod scheduler_tests {
         // JeTTY's own summons (a finished command, an adopted detached shell)
         // never force focus: the WM may refuse them.
         assert_eq!(focus_ask(SummonBy::App), FocusAsk::Request);
+    }
+
+    #[test]
+    fn focus_back_on_a_minimized_hide_shows_the_window_again() {
+        use jetty_platform::HideKind;
+        // Wayland: a hide only minimizes, and the compositor brings the window
+        // back on a taskbar click / Alt+Tab — JeTTY used to stay "hidden" and
+        // never painted again (a frozen terminal the user could type into).
+        assert!(focus_gain_shows(false, HideKind::Minimize));
+        // X11 unmaps: a FocusIn queued before the unmap (the hotkey grab's
+        // release) must never re-show the window F9 just hid.
+        assert!(!focus_gain_shows(false, HideKind::Unmap));
+        // Already shown: nothing to do.
+        assert!(!focus_gain_shows(true, HideKind::Minimize));
+        assert!(!focus_gain_shows(true, HideKind::Unmap));
     }
 
     // ── idle HUD one-shot (the hidden-window 100% CPU spin) ──────────────────

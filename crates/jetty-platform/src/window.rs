@@ -261,7 +261,54 @@ pub fn activate_window(win: &Window) {
     if x11::request_activation(win) {
         return;
     }
+    if hide_kind(win) == HideKind::Minimize {
+        // Wayland: a client cannot raise or un-minimize itself without an
+        // activation token the compositor handed out for a user action, and
+        // winit's focus_window() is a no-op there. Ask for attention instead —
+        // the compositor flags the window (its taskbar entry) — so a summon is
+        // never silently lost.
+        win.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+        return;
+    }
     win.focus_window();
+}
+
+/// What hiding a window does on its display server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HideKind {
+    /// The window is unmapped (X11, macOS): off screen until JeTTY shows it.
+    Unmap,
+    /// The window is MINIMIZED (Wayland). A Wayland client cannot unmap its
+    /// own toplevel — winit's `set_visible` is a no-op there — and the
+    /// compositor may bring a minimized window back without JeTTY asking (its
+    /// taskbar entry, Alt+Tab): the app learns of that from the focus the
+    /// window then receives.
+    Minimize,
+}
+
+/// How [`hide_window`] hides `win`.
+pub fn hide_kind(win: &Window) -> HideKind {
+    use raw_window_handle::HasWindowHandle;
+    let handle = win.window_handle().ok().map(|h| h.as_raw());
+    hide_kind_for(handle.as_ref())
+}
+
+/// Pure core of [`hide_kind`] (unit-tested without a display).
+fn hide_kind_for(handle: Option<&raw_window_handle::RawWindowHandle>) -> HideKind {
+    match handle {
+        Some(raw_window_handle::RawWindowHandle::Wayland(_)) => HideKind::Minimize,
+        _ => HideKind::Unmap,
+    }
+}
+
+/// Take `win` off screen (the summon hide, the focus-loss auto-hide): unmapped
+/// where the platform can ([`HideKind::Unmap`]), minimized on Wayland, where
+/// `set_visible(false)` alone left the window on screen.
+pub fn hide_window(win: &Window) {
+    win.set_visible(false);
+    if hide_kind(win) == HideKind::Minimize {
+        win.set_minimized(true);
+    }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -313,6 +360,29 @@ mod x11 {
         // connection lingered). `check` also surfaces an X error (BadWindow).
         .check()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hide_tests {
+    use super::{hide_kind_for, HideKind};
+    use raw_window_handle::{RawWindowHandle, WaylandWindowHandle, XcbWindowHandle, XlibWindowHandle};
+    use std::num::NonZeroU32;
+    use std::ptr::NonNull;
+
+    #[test]
+    fn wayland_windows_hide_by_minimizing_everything_else_unmaps() {
+        // winit's set_visible is a no-op on Wayland: a hide that only asked for
+        // it left the window on screen (frozen — JeTTY stops painting a window
+        // it believes hidden). There the hide minimizes.
+        let wl = RawWindowHandle::Wayland(WaylandWindowHandle::new(NonNull::dangling()));
+        assert_eq!(hide_kind_for(Some(&wl)), HideKind::Minimize);
+        let xlib = RawWindowHandle::Xlib(XlibWindowHandle::new(7));
+        let xcb = RawWindowHandle::Xcb(XcbWindowHandle::new(NonZeroU32::new(7).unwrap()));
+        assert_eq!(hide_kind_for(Some(&xlib)), HideKind::Unmap);
+        assert_eq!(hide_kind_for(Some(&xcb)), HideKind::Unmap);
+        // No handle (macOS before creation, an error): today's unmap.
+        assert_eq!(hide_kind_for(None), HideKind::Unmap);
     }
 }
 
