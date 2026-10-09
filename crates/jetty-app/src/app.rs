@@ -11043,7 +11043,9 @@ impl App {
             // HUD string (built by the main window's frames). Quads, labels and
             // the title (in the platform's proportional sans, like main tab
             // titles) in ONE pass + submit; neither touches the grid band.
-            |quad, device, queue, view, w, h| {
+            // The scrollbar / decoration / cursor rects (`grid_rects`) ride the
+            // same pass, over the chrome's quads.
+            |quad, device, queue, view, w, h, grid_rects| {
                 let bar = jetty_render::build_detached_bar_styled(
                     w, &title, &theme, close_hover, &mut *chrome_text, cm, &tab_deco, &bar_opts,
                 );
@@ -11056,6 +11058,7 @@ impl App {
                     quads.push(strip.quad);
                     labels.extend(strip.label);
                 }
+                quads.extend_from_slice(grid_rects);
                 let _ = chrome_text.render_chrome(
                     device,
                     queue,
@@ -15230,7 +15233,10 @@ impl ApplicationHandler<AppEvent> for App {
                         // Chrome: the UI-font layer, so the bar text never scales
                         // with the TERMINAL font; tab TITLES in the platform's
                         // proportional sans, the ×/+/overflow/HUD/controls mono.
-                        |quad, device, queue, view, w, h| {
+                        // The scrollbar / decoration / cursor rects (`grid_rects`)
+                        // ride the same pass, over the chrome's quads.
+                        |quad, device, queue, view, w, h, grid_rects| {
+                            chrome_quads.extend_from_slice(grid_rects);
                             let _ = chrome_text.render_chrome(
                                 device,
                                 queue,
@@ -15976,11 +15982,11 @@ struct GridScene<'a> {
 ///   Pass 2  glyphs (recorded into the SAME render pass + submit as Pass 1)
 ///   Pass 2b inline (sixel/kitty) images, scissored to the grid area
 ///   Pass 3  CALLER-INJECTED mid-scene chrome (`draw_chrome`) — the main tab
-///           bar or the detached title bar, drawn BETWEEN the glyph pass and
-///           the scrollbar/cursor pass exactly as both windows do today
-///   Pass 4  scrollbar + failed-command markers + SGR decorations + link
+///           bar or the detached title bar (+ status strip), handed
+///   Pass 4  the scrollbar + failed-command markers + SGR decorations + link
 ///           underline + the thin cursor shapes (beam / underline / unfocused
-///           hollow) (+ main-only copy-mode cursor)
+///           hollow) (+ main-only copy-mode cursor) as rects to draw over its
+///           quads in the SAME pass (the grid band and the chrome never overlap)
 ///
 /// Everything else stays in the caller: the main-only caret GLOW pass, the
 /// summon-reveal / Tier-B routing, the dropdown-slide *decision*, the overlay
@@ -16004,7 +16010,7 @@ fn render_grid_scene(
     width: u32,
     height: u32,
     s: &GridScene,
-    draw_chrome: impl FnOnce(&mut QuadLayer, &wgpu::Device, &wgpu::Queue, &wgpu::TextureView, u32, u32),
+    draw_chrome: impl FnOnce(&mut QuadLayer, &wgpu::Device, &wgpu::Queue, &wgpu::TextureView, u32, u32, &[jetty_render::Rect]),
 ) {
     let device = &gpu.device;
     let queue = &gpu.queue;
@@ -16156,12 +16162,10 @@ fn render_grid_scene(
     let sc_h = (sc_bot as u32).saturating_sub(sc_y);
     image_layer.render(device, queue, scene_view, width, height, &image_draws, [0, sc_y, width, sc_h]);
 
-    // Pass 3: caller-injected mid-scene chrome (main tab bar / detached title
-    // bar), drawn over the grid but under the scrollbar/cursor pass.
-    draw_chrome(quad, device, queue, scene_view, width, height);
-
     // Pass 4: scrollbar, failed-command markers, SGR decorations, the
-    // Ctrl+hover / OSC 8 link underline, and the cursor — one quad pass.
+    // Ctrl+hover / OSC 8 link underline, and the cursor — handed to the chrome
+    // pass below, which draws them over its own quads: they lie inside the grid
+    // band, the chrome outside it, so they never overlap and one pass serves both.
     let mut rects: Vec<jetty_render::Rect> = Vec::new();
     if let Some(mut r) =
         s.scrollbar.and_then(|track| jetty_render::scrollbar_rect(s.snap, &track, scrollbar_thumb))
@@ -16200,7 +16204,11 @@ fn render_grid_scene(
         jetty_render::shift_x(&mut copy, origin.left);
         rects.extend(copy);
     }
-    quad.render(device, queue, scene_view, width, height, &rects);
+
+    // Pass 3: caller-injected mid-scene chrome (main tab bar / detached title
+    // bar), drawn over the grid — with Pass 4's rects on top of its quads, in
+    // the same render pass.
+    draw_chrome(quad, device, queue, scene_view, width, height, &rects);
 }
 
 /// The summon reveal that plays for the selected `effect`, and its length:
