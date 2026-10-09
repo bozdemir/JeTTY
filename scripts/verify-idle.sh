@@ -121,9 +121,11 @@ png_same() { # png_same a b -> 0 if visually identical
     cmp -s "$PNGDIR/$1.png" "$PNGDIR/$2.png"
   fi
 }
-# max %CPU of the process over DUR seconds
-cpu_max() { pidstat -u -p "$PID" 1 "$1" 2>/dev/null \
-  | awk '/^[0-9]/ && $NF!="Command" {for(i=1;i<=NF;i++) if($i ~ /^[0-9.]+$/){c=$i} print c}' \
+# max %CPU of the process over DUR seconds. The column is found by its header
+# name: the LAST numeric field of a data line is the CPU core number (pidstat
+# prints `… %CPU CPU Command`), and LC_ALL=C keeps an AM/PM column out.
+cpu_max() { LC_ALL=C pidstat -u -p "$PID" 1 "$1" 2>/dev/null \
+  | awk '/%CPU/ {for(i=1;i<=NF;i++) if($i=="%CPU") c=i; next} c && /^[0-9]/ {print $c}' \
   | sort -rn | head -1; }
 
 focus
