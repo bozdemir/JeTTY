@@ -3192,6 +3192,27 @@ impl App {
                 }
             }
         }
+        // The passes of effects no longer selected go: their pipelines, and a
+        // Tier-B pass's cached bind group, which would keep the scene texture
+        // alive. A Tier-B effect swapped for one that samples nothing drops
+        // that texture too (unless the post pass still renders into it).
+        let effect = self.summon_plan().0;
+        if effect != SummonEffect::Bayer {
+            self.bayer_reveal = None;
+        }
+        if effect != SummonEffect::Phosphor {
+            self.phosphor = None;
+        }
+        if effect != SummonEffect::Liquid {
+            self.liquid = None;
+        }
+        if effect != SummonEffect::Focus {
+            self.focus = None;
+        }
+        if effect.transform_kind().is_none() {
+            self.transform = None;
+        }
+        self.release_post_targets(self.crt_key);
     }
 
     /// Set `reduce_motion` (hot-reload, Settings, palette).
@@ -3265,6 +3286,8 @@ impl App {
         if want == self.crt_key {
             return;
         }
+        // CRT turned off: release its pipelines, bloom targets and textures.
+        self.release_post_targets(want);
         // Nothing to build (or no GPU yet — retried on the next frame).
         let (Some(key), Some(gpu)) = (want, self.gpu.as_ref()) else {
             self.crt_key = None;
@@ -3273,6 +3296,22 @@ impl App {
         let crt = self.crt.get_or_insert_with(|| jetty_render::Crt::new(&gpu.device, gpu.format));
         crt.prepare(&gpu.device, key);
         self.crt_key = Some(key);
+    }
+
+    /// Drop the post-pass GPU objects the settings no longer need for post
+    /// variant `want` and the summon that plays (`effects::post_retain`) — on a
+    /// settings change, never per frame. Each is rebuilt lazily when wanted.
+    fn release_post_targets(&mut self, want: Option<jetty_render::CrtKey>) {
+        let keep = crate::effects::post_retain(want, self.summon_plan().0.is_tier_b());
+        if !keep.crt {
+            self.crt = None;
+        }
+        if !keep.offscreen {
+            self.offscreen = None;
+        }
+        if !keep.summon_offscreen {
+            self.summon_offscreen = None;
+        }
     }
 
     /// Bring the backdrop image in line with `[backdrop]`: start a decode on a
@@ -10417,6 +10456,15 @@ impl App {
             if let Some(key) = post_key {
                 let crt = dw.crt.get_or_insert_with(|| jetty_render::Crt::new(&dw.gpu.device, dw.gpu.format));
                 crt.prepare(&dw.gpu.device, key);
+            }
+            // CRT turned off: release its pass and the scene texture (no
+            // summons here, so nothing else samples it).
+            let keep = crate::effects::post_retain(post_key, false);
+            if !keep.crt {
+                dw.crt = None;
+            }
+            if !keep.offscreen {
+                dw.offscreen = None;
             }
             dw.crt_key = post_key;
         }

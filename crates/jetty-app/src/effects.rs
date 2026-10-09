@@ -69,6 +69,29 @@ pub fn prepared_key(fx: &EffectsConfig) -> Option<CrtKey> {
     }
 }
 
+/// Which of a window's post-pass GPU objects its settings still need between
+/// frames — everything else is released when the settings change (turning CRT
+/// off frees its pipelines, bloom targets and the surface-sized scene texture).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PostRetain {
+    /// The `Crt` pass (its compiled variants and quarter-res bloom targets).
+    pub crt: bool,
+    /// The surface-sized scene texture the post pass / a Tier-B summon samples.
+    pub offscreen: bool,
+    /// The second target a Tier-B summon samples while the post pass runs
+    /// under it.
+    pub summon_offscreen: bool,
+}
+
+/// [`PostRetain`] for the post variant the settings keep prepared (`post_key`:
+/// CRT, or a glitch trigger — `motion::post_key`) and whether the summon
+/// that plays samples the scene (`tier_b_summon`: Liquid / Focus / Pop /
+/// Glide / Fade, the reduced-motion fade included).
+pub fn post_retain(post_key: Option<CrtKey>, tier_b_summon: bool) -> PostRetain {
+    let post = post_key.is_some();
+    PostRetain { crt: post, offscreen: post || tier_b_summon, summon_offscreen: post && tier_b_summon }
+}
+
 // ── Effect presets ──────────────────────────────────────────────────────────
 
 /// A partial `[effects]`: the keys a preset writes (`None` = left alone). A
@@ -451,6 +474,27 @@ mod tests {
         assert_eq!(frame_settings(&fx, false).map(|s| s.key()), Some(key));
         fx.glitch_on_error = false;
         assert!(!prepared_key(&fx).unwrap().contains(CrtKey::GLITCH));
+    }
+
+    /// Turning CRT off (no glitch trigger) releases the pass and the scene
+    /// texture; a Tier-B summon keeps the texture it samples; the summon's
+    /// second target exists only while both run.
+    #[test]
+    fn post_targets_are_kept_only_while_the_settings_need_them() {
+        let none = PostRetain { crt: false, offscreen: false, summon_offscreen: false };
+        assert_eq!(post_retain(None, false), none, "CRT off, a Tier-A summon: nothing kept");
+        let crt = Some(crt_settings(&EffectsConfig { crt_enabled: true, ..EffectsConfig::default() }).key());
+        assert_eq!(post_retain(crt, false), PostRetain { crt: true, offscreen: true, summon_offscreen: false });
+        assert_eq!(post_retain(crt, true), PostRetain { crt: true, offscreen: true, summon_offscreen: true });
+        assert_eq!(post_retain(None, true), PostRetain { crt: false, offscreen: true, summon_offscreen: false });
+        // A glitch trigger alone keeps its glitch-only pass ready.
+        let glitch = prepared_key(&EffectsConfig { glitch_on_bell: true, ..EffectsConfig::default() });
+        assert!(post_retain(glitch, false).crt && post_retain(glitch, false).offscreen);
+        // Off → on → off: the same answers each way (nothing is sticky).
+        for _ in 0..2 {
+            assert!(post_retain(crt, false).crt);
+            assert_eq!(post_retain(None, false), none);
+        }
     }
 
     #[test]
