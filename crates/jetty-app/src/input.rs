@@ -1148,8 +1148,12 @@ pub fn cell_at_0_side(
 /// logical character:
 /// * no Ctrl/Alt held (those paths — control bytes, Meta-ESC, macOS
 ///   Option-compose — must keep their existing behavior),
-/// * the logical key is a plain `Character` (Named keys like Enter/Tab produce
-///   control text that must keep going through `key_to_bytes`),
+/// * the logical key is a plain `Character` — or Space, which winit keeps
+///   reporting as the named key when a dead key or Compose sequence ends in it
+///   (`'` then Space → "'" on US-International, `^` Space → "^" on German,
+///   Compose Space Space → NBSP; xkb compose with no input method, i.e.
+///   Wayland). Other named keys like Enter/Tab produce control text that must
+///   keep going through `key_to_bytes`,
 /// * `text` is non-empty, differs from the logical character, and contains no
 ///   control characters.
 pub fn dead_key_text_override(
@@ -1161,11 +1165,13 @@ pub fn dead_key_text_override(
     if ctrl || alt {
         return None;
     }
-    let Key::Character(s) = logical else {
-        return None;
+    let base = match logical {
+        Key::Character(s) => s.as_str(),
+        Key::Named(NamedKey::Space) => " ",
+        _ => return None,
     };
     let t = text?;
-    if t.is_empty() || t == s.as_str() || t.chars().any(|c| c.is_control()) {
+    if t.is_empty() || t == base || t.chars().any(|c| c.is_control()) {
         return None;
     }
     Some(t.as_bytes().to_vec())
@@ -3096,6 +3102,53 @@ mod tests {
         // Empty / missing text → None.
         assert_eq!(dead_key_text_override(false, false, &make_logical_char("e"), Some("")), None);
         assert_eq!(dead_key_text_override(false, false, &make_logical_char("e"), None), None);
+    }
+
+    #[test]
+    fn dead_key_then_space_sends_the_accent_itself() {
+        // xkb compose without an input method (Wayland): the Space that ends a
+        // dead-key sequence is still the named key, its text the composed
+        // character — ' Space → "'" on US-International, ^ Space → "^" on
+        // German, ~ Space → "~" on ABNT2. A plain " " went out instead.
+        let space = Key::Named(NamedKey::Space);
+        for accent in ["'", "^", "~", "`", "\"", "´", "¨"] {
+            assert_eq!(
+                dead_key_text_override(false, false, &space, Some(accent)),
+                Some(accent.as_bytes().to_vec()),
+                "{accent}"
+            );
+        }
+        // Compose Space Space → NO-BREAK SPACE.
+        assert_eq!(
+            dead_key_text_override(false, false, &space, Some("\u{a0}")),
+            Some("\u{a0}".as_bytes().to_vec())
+        );
+        // A plain Space keeps going through the key encoder.
+        assert_eq!(dead_key_text_override(false, false, &space, Some(" ")), None);
+        assert_eq!(dead_key_text_override(false, false, &space, None), None);
+        // Ctrl+Space (NUL) and Alt+Space (Meta) keep their encodings.
+        assert_eq!(dead_key_text_override(true, false, &space, Some("'")), None);
+        assert_eq!(dead_key_text_override(false, true, &space, Some("'")), None);
+    }
+
+    #[test]
+    fn dead_key_then_space_types_the_accent_at_a_shell() {
+        let space = Key::Named(NamedKey::Space);
+        let none = KeyMods::default();
+        let ev = KeyInput::press(make_physical(KeyCode::Space), &space, none);
+        // Legacy encoding (bash/zsh at a prompt): the accent, not a space.
+        let accent = KeyInput { text: Some("~"), ..ev };
+        let legacy = KeyModes::default();
+        let opts = KeyOptions::default();
+        let km = crate::keymap::KeyMap::defaults();
+        assert_eq!(decide_key_event(&km, &accent, &legacy, &opts, false), KeyAction::Send(b"~".to_vec()));
+        // The kitty protocol already sent the text; it still does.
+        let kitty = KeyModes { kitty_flags: KITTY_DISAMBIGUATE, ..KeyModes::default() };
+        assert_eq!(decide_key_event(&km, &accent, &kitty, &opts, false), KeyAction::Send(b"~".to_vec()));
+        // A plain Space is a space in both.
+        let plain = KeyInput { text: Some(" "), ..ev };
+        assert_eq!(decide_key_event(&km, &plain, &legacy, &opts, false), KeyAction::Send(b" ".to_vec()));
+        assert_eq!(decide_key_event(&km, &plain, &kitty, &opts, false), KeyAction::Send(b" ".to_vec()));
     }
 
     #[test]
