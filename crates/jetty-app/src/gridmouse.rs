@@ -130,7 +130,7 @@ const AUTOSCROLL_MAX_LINES: i32 = 8;
 /// as a drag — an attempt to select.
 const DRAG_HINT_PX: f64 = 8.0;
 /// Wheel reports per event at most (a touchpad fling must not flood the PTY).
-const WHEEL_MAX_REPORTS: i32 = 8;
+const WHEEL_MAX_REPORTS: u32 = 8;
 /// Arrow keys per wheel event at most (alternate scroll).
 const WHEEL_MAX_ARROWS: u32 = 12;
 
@@ -174,8 +174,11 @@ pub(crate) struct GridMouse {
     last_cell: Option<(usize, usize)>,
     clicks: ClickTracker,
     autoscroll: Option<AutoScroll>,
-    /// Horizontal wheel remainder (each window keeps its own vertical one).
-    hwheel: ScrollAccumulator,
+    /// Wheel travel toward the next report to a tracking program, in NOTCHES
+    /// (vertical, horizontal): one report per whole notch, however finely the
+    /// device slices it ([`wheel_notches`]).
+    vnotches: ScrollAccumulator,
+    hnotches: ScrollAccumulator,
 }
 
 impl GridMouse {
@@ -483,6 +486,19 @@ pub(crate) enum Wheel {
     None,
 }
 
+/// A wheel delta in NOTCHES `(x, y)` — what wheel reports count: a
+/// `LineDelta` is in notches already (a classic wheel sends 1.0 a notch, a
+/// hi-res one or a touchpad fractions of it), `PixelDelta` travel is a notch
+/// per 3 cells (the 3 lines a notch scrolls).
+fn wheel_notches(delta: MouseScrollDelta, geom: GridGeom) -> (f32, f32) {
+    match delta {
+        MouseScrollDelta::LineDelta(x, y) => (x, y),
+        MouseScrollDelta::PixelDelta(_) => {
+            (input::wheel_columns(delta, geom.cell_w) / 3.0, input::wheel_lines(delta, geom.cell_h) / 3.0)
+        }
+    }
+}
+
 /// One wheel event. `vertical` is the window's line accumulator;
 /// `over_scrollbar` keeps the wheel on the host scrollback (the scrollbar is
 /// JeTTY's). Shift also always scrolls the host scrollback — the escape hatch
@@ -494,34 +510,31 @@ pub(crate) fn wheel(
     over_scrollbar: bool,
     vertical: &mut ScrollAccumulator,
 ) -> Wheel {
-    let lines = vertical.add(input::wheel_lines(delta, g.geom.cell_h));
-    let cols = g.mouse.hwheel.add(input::wheel_columns(delta, g.geom.cell_w));
     let tracking = gesture_tracking(g.term);
     let shift = g.mods.shift_key();
     let wheel_report = MouseReport::new(Some(MouseBtn::WheelUp), MouseAct::Press);
     if !shift && !over_scrollbar && input::mouse_reportable(tracking, &wheel_report) {
-        if lines == 0 && cols == 0 {
+        // One report per whole notch of travel (bounded): a touchpad's or a
+        // hi-res wheel's slices add up to the reports of a notched wheel.
+        let (x, y) = wheel_notches(delta, g.geom);
+        let (up, left) = (g.mouse.vnotches.add(y), g.mouse.hnotches.add(x));
+        if up == 0 && left == 0 {
             return Wheel::None;
         }
-        // One report per ~3 lines (a notch), bounded.
-        let notches = |n: i32| ((n.abs() + 2) / 3).clamp(1, WHEEL_MAX_REPORTS);
-        if lines != 0 {
-            let b = if lines > 0 { MouseBtn::WheelUp } else { MouseBtn::WheelDown };
-            for _ in 0..notches(lines) {
-                g.report(Some(b), MouseAct::Press);
-            }
-        }
-        if cols != 0 {
-            let b = if cols > 0 { MouseBtn::WheelLeft } else { MouseBtn::WheelRight };
-            for _ in 0..notches(cols) {
+        let axes = [(up, MouseBtn::WheelUp, MouseBtn::WheelDown), (left, MouseBtn::WheelLeft, MouseBtn::WheelRight)];
+        for (n, pos, neg) in axes {
+            let b = if n > 0 { pos } else { neg };
+            for _ in 0..n.unsigned_abs().min(WHEEL_MAX_REPORTS) {
                 g.report(Some(b), MouseAct::Press);
             }
         }
         return Wheel::Reported;
     }
-    // Nothing horizontal to scroll on the host: never let a remainder carry
-    // into a later program report.
-    g.mouse.hwheel.reset();
+    // The host scrolls whole lines — and nothing horizontal: never let a
+    // report remainder carry into a later program report.
+    g.mouse.vnotches.reset();
+    g.mouse.hnotches.reset();
+    let lines = vertical.add(input::wheel_lines(delta, g.geom.cell_h));
     if lines == 0 {
         return Wheel::None;
     }
@@ -791,6 +804,46 @@ mod tests {
         assert_eq!((r, bytes.as_str()), (Wheel::Scrolled, ""), "Shift: host scrollback");
         let (r, bytes) = w.at(0.0, 0.0, NONE, |g| wheel(g, line(1.0), true, &mut acc));
         assert_eq!((r, bytes.as_str()), (Wheel::Scrolled, ""), "over the scrollbar: host scrollback");
+    }
+
+    #[test]
+    fn wheel_reports_count_notches_however_finely_the_device_slices_them() {
+        // A notched wheel sends LineDelta(0, 1.0) per notch: one report. A
+        // touchpad or a hi-res wheel sends the same travel in slices — ten
+        // 0.1s, eight 1/8s (libinput's v120), or pixels (one notch = 3 cells).
+        // Each whole LINE they crossed used to send a report: three per notch,
+        // so vim / tmux / htop scrolled three times as far.
+        let px = |x: f64, y: f64| MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(x, y));
+        let line = |x: f32, y: f32| MouseScrollDelta::LineDelta(x, y);
+        let cases = [
+            (1, line(0.0, 1.0), "\x1b[<64;1;1M"),
+            (10, line(0.0, 0.1), "\x1b[<64;1;1M"),
+            (8, line(0.0, 0.125), "\x1b[<64;1;1M"),
+            (8, line(0.0, -0.125), "\x1b[<65;1;1M"),
+            (2, px(0.0, 15.0), "\x1b[<64;1;1M"),
+            (4, px(0.0, -7.5), "\x1b[<65;1;1M"),
+            (8, line(0.125, 0.0), "\x1b[<66;1;1M"),
+            (2, px(-15.0, 0.0), "\x1b[<67;1;1M"),
+        ];
+        for (slices, delta, notch) in cases {
+            let mut acc = ScrollAccumulator::new();
+            let mut w = Win::new(SGR_CLICKS);
+            let mut bytes = String::new();
+            for _ in 0..slices {
+                bytes += &w.at(0.0, 0.0, NONE, |g| wheel(g, delta, false, &mut acc)).1;
+            }
+            assert_eq!(bytes, notch, "{slices} × {delta:?}");
+            // The next slice starts the next notch: no report yet.
+            if slices > 1 {
+                assert_eq!(w.at(0.0, 0.0, NONE, |g| wheel(g, delta, false, &mut acc)), (Wheel::None, String::new()));
+            }
+        }
+        // Several notches in one event are several reports — bounded.
+        let mut acc = ScrollAccumulator::new();
+        let mut w = Win::new(SGR_CLICKS);
+        assert_eq!(w.at(0.0, 0.0, NONE, |g| wheel(g, line(0.0, 2.0), false, &mut acc)).1, "\x1b[<64;1;1M".repeat(2));
+        let fling = w.at(0.0, 0.0, NONE, |g| wheel(g, line(0.0, -40.0), false, &mut acc)).1;
+        assert_eq!(fling, "\x1b[<65;1;1M".repeat(WHEEL_MAX_REPORTS as usize));
     }
 
     #[test]
