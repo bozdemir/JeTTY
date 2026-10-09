@@ -939,20 +939,22 @@ pub fn point_in(r: &jetty_render::Rect, x: f32, y: f32) -> bool {
 
 /// The control byte Ctrl turns a typed ASCII character into: letters → 1..=26
 /// (Ctrl+C = SIGINT, Ctrl+D = EOF, …), and the C0 symbols by xterm's Control
-/// rule (`@` NUL; `[` `{` ESC; `\` `|` FS; `]` `}` GS; `^` `~` RS; `_` US),
-/// plus `/` → US (readline / emacs undo, Ctrl+Shift+- produces `_` too) and
-/// `?` → DEL as kitty sends them. `None`: Ctrl doesn't change this character
-/// (`;` `#` `'` `.` digits `` ` `` …) — it is typed as is.
+/// rule (Xlib / libxkbcommon: `@` `` ` `` NUL; `[` `{` ESC; `\` `|` FS; `]` `}`
+/// GS; `^` `~` RS; `_` `/` US — readline / emacs undo) with its digits (`2`
+/// NUL, `3`…`7` ESC…US, `8` DEL — the VT220's), plus `?` → DEL as kitty sends
+/// it. `None`: Ctrl doesn't change this character (`;` `#` `'` `.` `1` `9` …)
+/// — it is typed as is.
 fn ctrl_char_byte(c: char) -> Option<u8> {
     Some(match c {
         'a'..='z' | 'A'..='Z' => c.to_ascii_uppercase() as u8 - b'@',
-        '@' => 0x00,
+        '@' | '`' | '2' => 0x00,
         '[' | '{' => 0x1b,
         '\\' | '|' => 0x1c,
         ']' | '}' => 0x1d,
         '^' | '~' => 0x1e,
         '_' | '/' => 0x1f,
-        '?' => 0x7f,
+        '3'..='7' => c as u8 - b'3' + 0x1b,
+        '8' | '?' => 0x7f,
         _ => return None,
     })
 }
@@ -2917,7 +2919,20 @@ mod tests {
             (true, KeyCode::BracketRight, "}", b"\x1d", "us Ctrl+}"),
             (true, KeyCode::Backquote, "~", b"\x1e", "us Ctrl+~"),
             (false, KeyCode::Semicolon, ";", b";", "us Ctrl+;"),
-            (false, KeyCode::Backquote, "`", b"`", "us Ctrl+`"),
+            // xterm / libxkbcommon: '`' is NUL (tmux / emacs C-@ where Ctrl+Space
+            // switches the input method), and so is '2'; '3'…'7' are ESC…US, '8'
+            // DEL — the kitty protocol's own legacy table (`kitty_ctrled`) agrees.
+            (false, KeyCode::Backquote, "`", b"\x00", "us Ctrl+`"),
+            (true, KeyCode::Digit2, "2", b"\x00", "fr Ctrl+Shift+é (2)"),
+            (true, KeyCode::Digit3, "3", b"\x1b", "fr Ctrl+Shift+\" (3)"),
+            (true, KeyCode::Digit4, "4", b"\x1c", "fr Ctrl+Shift+' (4)"),
+            (true, KeyCode::Digit5, "5", b"\x1d", "fr Ctrl+Shift+( (5)"),
+            (true, KeyCode::Digit6, "6", b"\x1e", "fr Ctrl+Shift+- (6)"),
+            (true, KeyCode::Digit7, "7", b"\x1f", "fr Ctrl+Shift+è (7)"),
+            (true, KeyCode::Digit8, "8", b"\x7f", "fr Ctrl+Shift+_ (8)"),
+            (true, KeyCode::Digit1, "1", b"1", "fr Ctrl+Shift+& (1)"),
+            (true, KeyCode::Digit9, "9", b"9", "fr Ctrl+Shift+ç (9)"),
+            (false, KeyCode::Backslash, "`", b"\x00", "tr Ctrl+AltGr+, (`)"),
             // Non-ASCII letters keep the US position (Turkish-Q ğ / ü / ı,
             // German ü): the documented fallback for keys with no ASCII label.
             (false, KeyCode::BracketLeft, "ğ", b"\x1b", "tr Ctrl+ğ"),
@@ -2939,6 +2954,16 @@ mod tests {
             dk(true, false, false, make_physical(KeyCode::Space), &Key::Named(NamedKey::Space), false, false, false),
             send(b"\x00")
         );
+        // Ctrl+3 is a tab jump by default; unbound (`select_tab_3 = ""`) it is
+        // ESC, as in xterm — it used to type a '3'.
+        let b = crate::config::KeyBindings {
+            select_tab_3: Some(crate::config::ChordSpec::One(String::new())),
+            ..Default::default()
+        };
+        let km = crate::keymap::KeyMap::compile(&b);
+        let three = make_logical_char("3");
+        let at = make_physical(KeyCode::Digit3);
+        assert_eq!(decide_key(&km, true, false, false, false, at, &three, false, false, false), send(b"\x1b"));
     }
 
     // ── Modified Home/End/Delete/Insert (C5) ────────────────────────────────
