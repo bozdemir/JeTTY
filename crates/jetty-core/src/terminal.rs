@@ -1121,10 +1121,11 @@ pub struct Terminal {
     chunk_meta: Option<KittyCmd>,
     /// Count of chunks accumulated so far (bounds an endless-`m=1` stream).
     chunk_count: u32,
-    /// Bounded transmit-then-put image registry: `(i=/I= key, decoded image)`.
-    /// A later `a=p,i=N` displays without re-transmitting. LRU-evicted by count
-    /// and bytes ([`MAX_KITTY_STORED`] / [`MAX_KITTY_STORED_BYTES`]).
-    kitty_images: VecDeque<(u32, Arc<crate::sixel::InlineImage>)>,
+    /// Bounded transmit-then-put image registry: `(i=/I= key, content id,
+    /// decoded image)`. A later `a=p,i=N` displays without re-transmitting —
+    /// or re-hashing: the id is computed once, at transmit. LRU-evicted by
+    /// count and bytes ([`MAX_KITTY_STORED`] / [`MAX_KITTY_STORED_BYTES`]).
+    kitty_images: VecDeque<(u32, u64, Arc<crate::sixel::InlineImage>)>,
     /// Running sum of `rgba.len()` across `kitty_images` (the registry byte budget).
     kitty_stored_bytes: u64,
     /// Payload bytes of the OSC being scanned (bounded by `osc_cap`). Persists
@@ -3375,14 +3376,15 @@ impl Terminal {
                 }
                 match decode_kitty_image(&cmd, raw) {
                     Some(img) => {
+                        let id = crate::sixel::content_id(&img);
                         let img = Arc::new(img);
                         // Transmit: store in the registry if addressable.
                         if cmd.id != 0 || cmd.number != 0 {
-                            self.kitty_store(&cmd, img.clone());
+                            self.kitty_store(&cmd, id, img.clone());
                         }
                         // Display on `a=T`.
                         if cmd.action == b'T' {
-                            self.place_inline_image(&img, &cmd);
+                            self.place_inline_image(&img, id, &cmd);
                         }
                         self.kitty_reply(&cmd, "OK");
                     }
@@ -3396,42 +3398,44 @@ impl Terminal {
         }
     }
 
-    /// Store a decoded image in the transmit-then-put registry, replacing any
-    /// existing entry with the same key and LRU-evicting to stay within both caps.
-    fn kitty_store(&mut self, cmd: &KittyCmd, img: Arc<crate::sixel::InlineImage>) {
+    /// Store a decoded image (and its content `id`) in the transmit-then-put
+    /// registry, replacing any existing entry with the same key and
+    /// LRU-evicting to stay within both caps.
+    fn kitty_store(&mut self, cmd: &KittyCmd, id: u64, img: Arc<crate::sixel::InlineImage>) {
         let key = if cmd.id != 0 { cmd.id } else { cmd.number };
         if key == 0 {
             return;
         }
         // Replace an existing same-key entry (free its bytes).
-        if let Some(pos) = self.kitty_images.iter().position(|(k, _)| *k == key) {
-            if let Some((_, old)) = self.kitty_images.remove(pos) {
+        if let Some(pos) = self.kitty_images.iter().position(|(k, ..)| *k == key) {
+            if let Some((_, _, old)) = self.kitty_images.remove(pos) {
                 self.kitty_stored_bytes =
                     self.kitty_stored_bytes.saturating_sub(old.rgba.len() as u64);
             }
         }
         self.kitty_stored_bytes = self.kitty_stored_bytes.saturating_add(img.rgba.len() as u64);
-        self.kitty_images.push_back((key, img));
+        self.kitty_images.push_back((key, id, img));
         while self.kitty_images.len() > MAX_KITTY_STORED
             || self.kitty_stored_bytes > MAX_KITTY_STORED_BYTES
         {
-            let Some((_, old)) = self.kitty_images.pop_front() else { break };
+            let Some((_, _, old)) = self.kitty_images.pop_front() else { break };
             self.kitty_stored_bytes = self.kitty_stored_bytes.saturating_sub(old.rgba.len() as u64);
         }
     }
 
-    /// Display a previously-transmitted image (`a=p,i=N`/`I=N`). Unknown id ⇒
-    /// `ENOENT` and no placement.
+    /// Display a previously-transmitted image (`a=p,i=N`/`I=N`) under the id it
+    /// was stored with — a put costs nothing per pixel. Unknown id ⇒ `ENOENT`
+    /// and no placement.
     fn kitty_put(&mut self, cmd: &KittyCmd) {
         let key = if cmd.id != 0 { cmd.id } else { cmd.number };
         let found = self
             .kitty_images
             .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, i)| i.clone());
+            .find(|(k, ..)| *k == key)
+            .map(|(_, id, img)| (*id, img.clone()));
         match found {
-            Some(img) => {
-                self.place_inline_image(&img, cmd);
+            Some((id, img)) => {
+                self.place_inline_image(&img, id, cmd);
                 self.kitty_reply(cmd, "OK");
             }
             None => self.kitty_reply(cmd, "ENOENT"),
@@ -3460,8 +3464,8 @@ impl Terminal {
                 self.kitty_stored_bytes = 0;
             }
             b'I' => {
-                if let Some(pos) = self.kitty_images.iter().position(|(k, _)| *k == key) {
-                    if let Some((_, old)) = self.kitty_images.remove(pos) {
+                if let Some(pos) = self.kitty_images.iter().position(|(k, ..)| *k == key) {
+                    if let Some((_, _, old)) = self.kitty_images.remove(pos) {
                         self.kitty_stored_bytes =
                             self.kitty_stored_bytes.saturating_sub(old.rgba.len() as u64);
                     }
@@ -3500,11 +3504,11 @@ impl Terminal {
         let _ = self.reply_tx.send(out);
     }
 
-    /// Place a decoded Kitty image at the cursor. Unlike a sixel it anchors at
-    /// the cursor COLUMN, and `C=1` leaves the cursor (and the grid) untouched.
-    /// Guards: a zero cell metric drops it; an in-flight sync update is flushed
-    /// first so the cursor is where the app put it.
-    fn place_inline_image(&mut self, img: &Arc<crate::sixel::InlineImage>, cmd: &KittyCmd) {
+    /// Place a decoded Kitty image (content id `id`) at the cursor. Unlike a
+    /// sixel it anchors at the cursor COLUMN, and `C=1` leaves the cursor (and
+    /// the grid) untouched. Guards: a zero cell metric drops it; an in-flight
+    /// sync update is flushed first so the cursor is where the app put it.
+    fn place_inline_image(&mut self, img: &Arc<crate::sixel::InlineImage>, id: u64, cmd: &KittyCmd) {
         if self.cell_px_w <= 0.0 || self.cell_px_h <= 0.0 {
             return;
         }
@@ -3533,7 +3537,7 @@ impl Terminal {
         let box_h = ((rows as f32) * self.cell_px_h).ceil().min(u16::MAX as f32) as u16;
         let key = if cmd.id != 0 { cmd.id } else { cmd.number };
         let p = ImagePlacement {
-            id: crate::sixel::content_id(img),
+            id,
             abs_line: 0,
             col: 0,
             cols,
@@ -8831,6 +8835,27 @@ mod tests {
         // a=p,i=7 displays it.
         t.feed(&apc("a=p,i=7"));
         assert_eq!(t.placements.len(), 1, "a=p displays the stored image");
+    }
+
+    #[test]
+    fn kitty_put_costs_nothing_per_pixel_of_the_stored_image() {
+        // Every `a=p` re-hashed the whole stored RGBA for the placement id: a
+        // 20-byte put of a 4000×4000 image cost ~50 ms on the UI thread, so a
+        // few hundred KB of puts froze JeTTY for minutes (image.nvim re-puts on
+        // every redraw paid it too). The id is the stored image's own.
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        let px = [9u8, 8, 7, 255].repeat(512 * 512); // 1 MB of RGBA
+        t.feed(&apc(&format!("a=t,f=32,s=512,v=512,i=1,q=2;{}", b64(&px))));
+        let puts = apc("a=p,i=1,C=1,q=2").repeat(1000);
+        let started = std::time::Instant::now();
+        t.feed(&puts);
+        let took = started.elapsed();
+        assert!(took.as_millis() < 500, "1000 puts took {took:?}");
+        assert_eq!(t.placements.len(), 1, "each put replaced the one it covers");
+        let stored = &t.kitty_images[0];
+        assert!(Arc::ptr_eq(&t.placements[0].image, &stored.2), "the stored image, not a copy");
+        assert_eq!(t.placements[0].id, stored.1, "under the id it was stored with");
     }
 
     #[test]
