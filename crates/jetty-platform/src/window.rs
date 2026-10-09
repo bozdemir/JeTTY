@@ -394,6 +394,47 @@ pub fn holds_input_focus(windows: &[&Window]) -> bool {
     }
 }
 
+/// Tells JeTTY when the window manager minimizes one of its windows, or shows
+/// it again — which winit does not on X11. A minimize unmaps the window, and X
+/// sends no VisibilityNotify for a window that stops being viewable, so a
+/// terminal minimized from its taskbar entry, a shortcut or "show desktop"
+/// went on rendering its shell's output, and its paced animations, into a
+/// window nobody could see. The window manager's ICCCM `WM_STATE` says it:
+/// standard X11, no window manager is named. Zero cost while nothing changes —
+/// a thread blocked on its own connection, never a poll.
+///
+/// Nothing to watch elsewhere: macOS reports a minimized window as occluded
+/// itself, and a Wayland client is never told.
+pub struct MinimizeWatch {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    watch: x11::Watch,
+}
+
+impl MinimizeWatch {
+    /// Watch `win`, calling `on_change(window, minimized)` from the watch's
+    /// own thread whenever the window manager changes the state of a watched
+    /// window. `None` where there is nothing to watch (not an X11 window), or
+    /// when the X server can't be reached.
+    pub fn start(win: &Window, on_change: impl Fn(winit::window::WindowId, bool) + Send + 'static) -> Option<Self> {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        return x11::Watch::start(win, on_change).map(|watch| MinimizeWatch { watch });
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            let _ = (win, on_change);
+            None
+        }
+    }
+
+    /// Watch `win` too (a detached window), reporting through the same
+    /// `on_change`.
+    pub fn watch(&self, win: &Window) {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        self.watch.add(win);
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let _ = win;
+    }
+}
+
 /// What a window keeps across scale-factor (DPI) changes: its size in LOGICAL
 /// px — the size the user chose — and the PHYSICAL size last requested for it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -632,6 +673,81 @@ mod x11 {
         }
         with_helper(|h| Ok(h.conn.get_input_focus()?.reply()?.focus)).is_some_and(|focus| xids.contains(&focus))
     }
+
+    /// ICCCM `IconicState`, the first field of `WM_STATE`.
+    const ICONIC_STATE: u32 = 3;
+
+    /// Whether a window whose `WM_STATE` begins with `state` is minimized:
+    /// IconicState. NormalState (1) is on screen, WithdrawnState (0) — or no
+    /// `WM_STATE` at all — is a window the window manager does not manage: JeTTY
+    /// hid it itself, or it was never shown.
+    pub(super) fn iconic(state: Option<u32>) -> bool {
+        state == Some(ICONIC_STATE)
+    }
+
+    /// [`super::MinimizeWatch`] on X11: a thread blocked on a connection of its
+    /// own — no wakeup while nothing changes — told of every change of the
+    /// ICCCM `WM_STATE` property of the windows it watches. A window manager
+    /// sets it to IconicState when it minimizes a window (its taskbar entry, a
+    /// shortcut, "show desktop") and back to NormalState when it shows it
+    /// again, and deletes it when the window is withdrawn (JeTTY's own hide).
+    pub(super) struct Watch {
+        conn: std::sync::Arc<RustConnection>,
+    }
+
+    impl Watch {
+        pub(super) fn start(win: &Window, on_change: impl Fn(winit::window::WindowId, bool) + Send + 'static) -> Option<Watch> {
+            use x11rb::protocol::xproto::{AtomEnum, Property};
+            use x11rb::protocol::Event;
+            let xid = xid(win)?;
+            let (conn, _) = x11rb::connect(None).ok()?;
+            let wm_state = conn.intern_atom(false, b"WM_STATE").ok()?.reply().ok()?.atom;
+            let watch = Watch { conn: std::sync::Arc::new(conn) };
+            watch.select(xid);
+            let conn = std::sync::Arc::clone(&watch.conn);
+            std::thread::Builder::new()
+                .name("jetty-minimize".into())
+                .spawn(move || {
+                    // Ends when the connection does (the X server is gone).
+                    while let Ok(event) = conn.wait_for_event() {
+                        let Event::PropertyNotify(e) = event else { continue };
+                        if e.atom != wm_state {
+                            continue;
+                        }
+                        let minimized = e.state == Property::NEW_VALUE
+                            && iconic(
+                                conn.get_property(false, e.window, wm_state, AtomEnum::ANY, 0, 1)
+                                    .ok()
+                                    .and_then(|cookie| cookie.reply().ok())
+                                    .and_then(|r| r.value32().and_then(|mut v| v.next())),
+                            );
+                        // winit's X11 window ids are the windows' XIDs.
+                        on_change(winit::window::WindowId::from(u64::from(e.window)), minimized);
+                    }
+                })
+                .ok()?;
+            Some(watch)
+        }
+
+        pub(super) fn add(&self, win: &Window) {
+            if let Some(xid) = xid(win) {
+                self.select(xid);
+            }
+        }
+
+        /// Ask for `xid`'s property changes — on this connection only: event
+        /// masks are kept per client, so winit's own selection is untouched.
+        /// Sent from the UI thread while the watch thread waits for events on
+        /// the same connection, which x11rb supports.
+        fn select(&self, xid: u32) {
+            use x11rb::protocol::xproto::ChangeWindowAttributesAux;
+            let aux = ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE);
+            if let Ok(cookie) = self.conn.change_window_attributes(xid, &aux) {
+                cookie.ignore_error();
+            }
+            let _ = self.conn.flush();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -708,6 +824,25 @@ mod dpi_tests {
         // Bogus scales fall back to 1.
         assert_eq!(dpi_physical((1000.0, 640.0), f64::NAN, MON, MIN), (1000, 640));
         assert_eq!(dpi_physical((1000.0, 640.0), 0.0, MON, MIN), (1000, 640));
+    }
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod minimize_tests {
+    use super::x11::iconic;
+
+    #[test]
+    fn only_the_iconic_state_is_a_minimize() {
+        // ICCCM WM_STATE: what a window manager writes when it minimizes a
+        // window (3), shows it (1), or lets go of it (0, or deletes it — JeTTY's
+        // own hide). Only the first is a minimize: a window JeTTY hid stops
+        // painting through `visible`, not through this.
+        assert!(iconic(Some(3)));
+        assert!(!iconic(Some(1)));
+        assert!(!iconic(Some(0)));
+        assert!(!iconic(None));
+        // A state outside ICCCM's three is not a minimize either.
+        assert!(!iconic(Some(2)));
     }
 }
 

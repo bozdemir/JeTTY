@@ -27,6 +27,10 @@ pub enum AppEvent {
     /// macOS asked the running JeTTY to reopen: a click on its Dock icon,
     /// `open -a JeTTY`, Spotlight (`jetty_platform::on_reopen`).
     Reopen,
+    /// The window manager minimized one of JeTTY's windows (`true`) or showed
+    /// it again — from the X11 minimize watch (`jetty_platform::MinimizeWatch`),
+    /// as winit reports neither there.
+    Minimized(WindowId, bool),
     /// A watched config/theme file changed (from the `notify` watcher). Debounced
     /// and applied from `about_to_wait`; carries no payload (the reload re-reads).
     ConfigChanged,
@@ -1326,6 +1330,10 @@ pub struct App {
     /// turn-off. Re-armed after every reload so a recreated dir, a retargeted
     /// symlink or a later `themes/` keep being watched.
     config_watcher: Option<crate::watch::ConfigWatcher>,
+    /// Reports a window manager's minimize of the main and detached windows
+    /// (`AppEvent::Minimized`; X11 only — `None` elsewhere). Started in
+    /// `resumed` with the main window; each detached window is added to it.
+    minimize_watch: Option<jetty_platform::MinimizeWatch>,
     /// Set true ONLY for the duration of `reload_config_and_themes`. While set,
     /// `persist()` is a NO-OP — so a reload applying live keys through the normal
     /// setters can never write config.toml, making the watcher loop-free BY
@@ -2220,6 +2228,7 @@ impl App {
             keys: crate::config::KeyBindings::default(),
             help_rows: Vec::new(),
             config_watcher: None,
+            minimize_watch: None,
             reloading: false,
             persister: std::cell::RefCell::new(persister),
             // Set from the config below.
@@ -4594,6 +4603,10 @@ impl App {
                 // Same glyph options as the main window's grid.
                 dw.text.set_builtin_glyphs(self.builtin_glyphs);
                 dw.text.set_color_emoji(self.color_emoji);
+                // A window manager's minimize stops its paints too (X11).
+                if let Some(watch) = &self.minimize_watch {
+                    watch.watch(&dw.window);
+                }
                 dw
             }
             Err(tab) => {
@@ -14282,6 +14295,16 @@ impl ApplicationHandler<AppEvent> for App {
         jetty_platform::on_reopen(move || {
             let _ = proxy.send_event(AppEvent::Reopen);
         });
+        // X11: a window manager's minimize, which winit never reports (detached
+        // windows join in `detach_tab`). A no-op elsewhere.
+        if self.minimize_watch.is_none() {
+            if let Some(window) = &self.window {
+                let proxy = self.proxy.clone();
+                self.minimize_watch = jetty_platform::MinimizeWatch::start(window, move |id, minimized| {
+                    let _ = proxy.send_event(AppEvent::Minimized(id, minimized));
+                });
+            }
+        }
 
         // NO periodic heartbeat: every wake source is an event — PTY data/EOF
         // (reader thread), shell exit (waiter thread), F9 (hotkey thread), IPC,
@@ -14497,6 +14520,12 @@ impl ApplicationHandler<AppEvent> for App {
                     w.set_minimized(false);
                 }
                 self.set_visibility(true, event_loop);
+            }
+            AppEvent::Minimized(id, minimized) => {
+                // What winit reports as `Occluded` where it can see a minimize:
+                // every self-driven paint of that window stops until it is
+                // shown again (main or detached, routed like a winit event).
+                self.window_event(event_loop, id, WindowEvent::Occluded(minimized));
             }
             AppEvent::ConfigChanged => {
                 // Debounce an editor's write/rename/chmod burst: schedule ONE reload
