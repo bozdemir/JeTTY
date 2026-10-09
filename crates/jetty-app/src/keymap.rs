@@ -1126,6 +1126,18 @@ fn chord_reject_reason(ch: &Chord) -> Option<String> {
             );
         }
     }
+    // Shift alone on a key that types takes a typed character: `Shift+T`
+    // would turn every capital T into the command.
+    if ch.mods == Mods::new(false, true, false, false) {
+        let types = match &ch.key {
+            KeyMatch::Phys(code) => *code == KeyCode::Space || us_char(*code).is_some(),
+            KeyMatch::Named(_) => false,
+            KeyMatch::Logical { .. } => true,
+        };
+        if types {
+            return Some("Shift alone types a character there (add Ctrl, Alt or Super)".to_string());
+        }
+    }
     // Ctrl-only chord on a C0 control-byte producer → would kill SIGINT/EOF/ESC/…
     if ch.mods.ctrl_only() {
         let shadows = match &ch.key {
@@ -1631,6 +1643,25 @@ mod tests {
                 km.warnings().iter().any(|w| w.contains("modifier")),
                 "bare {k} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn shift_alone_on_a_key_that_types_is_rejected() {
+        // `new_tab = "Shift+T"` compiled, and every capital T opened a tab.
+        for s in ["Shift+T", "Shift+1", "Shift+0", "Shift+Space", "Shift+/", "Shift+="] {
+            let km = km_with(|b| b.new_tab = Some(ChordSpec::One(s.to_string())));
+            assert!(
+                km.warnings().iter().any(|w| w.contains("Shift alone") && w.ends_with("new_tab keeps its default")),
+                "{s}: {:?}",
+                km.warnings()
+            );
+            let cs = Mods::new(true, true, false, false);
+            assert_eq!(km.lookup(cs, PhysicalKey::Code(KeyCode::KeyT), &ch("T")), Some(KeyAction::NewTab), "{s}");
+        }
+        // Keys that type nothing, and Shift with another modifier, stay bindable.
+        for s in ["Shift+F5", "Shift+Insert", "Shift+Enter", "Shift+Tab", "Shift+Menu", "Shift+Up", "Alt+Shift+T"] {
+            assert!(chord_reject_reason(&parse_chord(s).unwrap()).is_none(), "{s}");
         }
     }
 

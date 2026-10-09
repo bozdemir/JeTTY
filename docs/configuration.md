@@ -220,7 +220,8 @@ context_menu = ["Menu", "Shift+F10"]       # Shift+F10 too, for keyboards withou
 
 A chord is modifiers and a key joined by `+` (`Ctrl`, `Shift`, `Alt`, `Super`/`Cmd`).
 Only F-keys, `PageUp` / `PageDown` and `Menu` (the context-menu key) may be bound
-without a modifier.
+without a modifier, and `Shift` alone is no modifier for a key that types
+(`Shift+T` would take every capital T).
 A chord you bind is taken from the action that had it by default (the help
 overlay shows the result). An unknown action name or a chord that cannot be
 parsed is reported and ignored; the rest still apply. Terminal control bytes —
