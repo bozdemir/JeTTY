@@ -1472,7 +1472,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // by the cell_bg_rects path above (the selection was applied pre-snapshot).
         if let Some((cr, cc, selecting, line_mode)) = copymode_cursor {
             let mut copy = jetty_render::copy_cursor_rects(
-                cr, cc, cell_w, cell_h, shot_origin.top, terminal.theme().cursor,
+                &snap, cr, cc, cell_w, cell_h, shot_origin.top, terminal.theme().cursor,
             );
             jetty_render::shift_x(&mut copy, shot_origin.left);
             rects.extend(copy);

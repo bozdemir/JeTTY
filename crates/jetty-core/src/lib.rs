@@ -22,7 +22,7 @@ pub use snapshot::{
 };
 pub use terminal::{
     CommandCompletion, LinkHit, Osc52Target, Progress, ProgressState, Terminal, OSC52_MAX_BYTES,
-    SEARCH_MAX_MATCHES, SEARCH_MAX_QUERY,
+    SEARCH_MAX_MATCHES, SEARCH_MAX_QUERY, WIDE_SPACER,
 };
 pub use theme::Theme;
 pub use theme::{builtins, set_registry, theme_at, theme_count, theme_index, theme_list};

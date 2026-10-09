@@ -4779,6 +4779,11 @@ impl App {
         if let Some(cm) = ov.copy_mode.as_mut() {
             cm.row = out.row.min(rows.saturating_sub(1));
             cm.col = out.col.min(cols.saturating_sub(1));
+            // A scroll moved new content under the cursor: keep it off a wide
+            // char's right half.
+            if out.scroll != ScrollReq::None {
+                cm.col = crate::copymode::snap_to_char(&term.viewport_rows_chars(), cm.row, cm.col);
+            }
         }
         self.copy_mode_refresh_selection(s);
         self.paint_surface(s);
@@ -15636,7 +15641,7 @@ fn render_grid_scene(
     // glyphs + decorations; the solid block was painted under the text (Pass 1).
     rects.extend(cursor.over);
     if let Some((cr, cc, _sel, _lm)) = s.copy_mode_ui {
-        let mut copy = jetty_render::copy_cursor_rects(cr, cc, cell_w, cell_h, grid_origin_y, s.theme.cursor);
+        let mut copy = jetty_render::copy_cursor_rects(s.snap, cr, cc, cell_w, cell_h, grid_origin_y, s.theme.cursor);
         jetty_render::shift_x(&mut copy, origin.left);
         rects.extend(copy);
     }

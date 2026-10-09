@@ -1146,6 +1146,10 @@ pub struct Terminal {
     vte_log: Option<Vec<u8>>,
 }
 
+/// What [`Terminal::viewport_rows_chars`] puts in a wide char's spacer cell
+/// (the right half of its glyph). NUL: a C0 control, so never a cell's char.
+pub const WIDE_SPACER: char = '\0';
+
 /// Maximum scrollback-search query length in chars (bounds per-keystroke DFA
 /// builds and the search-bar layout).
 pub const SEARCH_MAX_QUERY: usize = 256;
@@ -4375,9 +4379,11 @@ impl Terminal {
         tokens
     }
 
-    /// The visible viewport as rows-of-chars (`rows` × `cols`, wide spacers
-    /// blanked to `' '`, blank cells `' '`). Used by copy-mode word motions so
-    /// `w`/`b`/`e` can see neighbouring rows (BLOCKING 4). Keystroke-rate only.
+    /// The visible viewport as rows-of-chars (`rows` × `cols`, blank cells
+    /// `' '`). A wide char's spacer — the right half of its glyph — reads as
+    /// [`WIDE_SPACER`], so copy-mode can step over a wide char in one move and
+    /// keep a run of them one word. Used by copy-mode motions so `w`/`b`/`e`
+    /// can see neighbouring rows (BLOCKING 4). Keystroke-rate only.
     pub fn viewport_rows_chars(&self) -> Vec<Vec<char>> {
         let mut rows = vec![vec![' '; self.cols]; self.rows];
         let content = self.term.renderable_content();
@@ -4387,7 +4393,7 @@ impl Terminal {
                 if vp.line < self.rows && vp.column.0 < self.cols {
                     let cell = item.cell;
                     let c = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                        ' '
+                        WIDE_SPACER
                     } else {
                         cell.c
                     };
@@ -7298,6 +7304,13 @@ mod tests {
         t.feed(b"https://x.io/a\r\nhttps://x.io/a\r\n");
         let toks = t.hint_tokens();
         assert_eq!(toks.iter().filter(|h| h.text == "https://x.io/a").count(), 1);
+    }
+
+    #[test]
+    fn viewport_rows_chars_marks_wide_char_spacers() {
+        let mut t = Terminal::new(8, 2);
+        t.feed("a世b".as_bytes());
+        assert_eq!(&t.viewport_rows_chars()[0][..4], &['a', '世', WIDE_SPACER, 'b']);
     }
 
     #[test]

@@ -81,9 +81,15 @@ pub struct MotionOut {
 }
 
 /// Apply a motion to the cursor. Pure: `viewport` is the visible grid as
-/// rows-of-chars (`rows` × `cols`). Vertical motions past a viewport edge return
+/// rows-of-chars (`rows` × `cols`, a wide char's spacer cell =
+/// [`jetty_core::WIDE_SPACER`]). Vertical motions past a viewport edge return
 /// a `ScrollReq` and clamp the cursor to the edge row; word motions cross rows
 /// WITHIN the viewport (no scroll — use `j`/Ctrl+d at the edge).
+///
+/// The cursor never rests on a spacer: `h`/`l` step over a wide char in one
+/// press, and every other motion lands on the char's first cell (the app
+/// re-snaps with [`snap_to_char`] after a scroll moved new content under it).
+/// A spacer reads as part of its char, so a run of CJK text is one word.
 pub fn apply_motion(
     cm: &CopyMode,
     motion: Motion,
@@ -92,11 +98,15 @@ pub fn apply_motion(
     viewport: &[Vec<char>],
 ) -> MotionOut {
     let row = cm.row.min(rows.saturating_sub(1));
-    let col = cm.col.min(cols.saturating_sub(1));
-    let still = |r: usize, c: usize| MotionOut { row: r, col: c, scroll: ScrollReq::None };
+    let col = snap_to_char(viewport, row, cm.col.min(cols.saturating_sub(1)));
+    // Every in-viewport motion lands on a char's first cell.
+    let still = |r: usize, c: usize| MotionOut { row: r, col: snap_to_char(viewport, r, c), scroll: ScrollReq::None };
     match motion {
         Motion::Left => still(row, col.saturating_sub(1)),
-        Motion::Right => still(row, (col + 1).min(cols.saturating_sub(1))),
+        Motion::Right => {
+            let next = next_char_col(viewport, row, col);
+            still(row, if next < cols { next } else { col })
+        }
         Motion::Up => {
             if row == 0 {
                 MotionOut { row: 0, col, scroll: ScrollReq::Lines(1) }
@@ -139,6 +149,27 @@ pub fn apply_motion(
         }
         Motion::Top => MotionOut { row: 0, col: 0, scroll: ScrollReq::Top },
         Motion::Bottom => MotionOut { row: rows.saturating_sub(1), col: 0, scroll: ScrollReq::Bottom },
+    }
+}
+
+/// `col` moved off a wide char's spacer onto the char itself (the cell its
+/// glyph starts in); any other cell is returned unchanged.
+pub fn snap_to_char(vp: &[Vec<char>], row: usize, col: usize) -> usize {
+    if col > 0 && at(vp, row, col) == jetty_core::WIDE_SPACER {
+        col - 1
+    } else {
+        col
+    }
+}
+
+/// The column of the char after the one at `col`: one cell on, two past a wide
+/// char. May be `cols` (no next char on this row).
+fn next_char_col(vp: &[Vec<char>], row: usize, col: usize) -> usize {
+    let next = col + 1;
+    if at(vp, row, next) == jetty_core::WIDE_SPACER {
+        next + 1
+    } else {
+        next
     }
 }
 
@@ -232,9 +263,9 @@ fn word_end(vp: &[Vec<char>], row: usize, col: usize, rows: usize, cols: usize) 
     if rows == 0 || cols == 0 {
         return (row, col);
     }
-    // Within the current row, starting AFTER the cursor: skip whitespace, then
-    // advance to this word's end.
-    let mut c = col + 1;
+    // Within the current row, starting AFTER the cursor's char (past its
+    // spacer, for a wide one): skip whitespace, then advance to this word's end.
+    let mut c = next_char_col(vp, row, col);
     if c < cols {
         while c < cols && at(vp, row, c).is_whitespace() {
             c += 1;
@@ -314,6 +345,74 @@ mod tests {
         assert_eq!((|| { let o = apply_motion(&cm(1, 0), Motion::WordEnd, 3, 7, &v); (o.row, o.col) })(), (1, 2));
         // b from "bar" start crosses back up to the start of "foo" (row 0 col 4).
         assert_eq!((|| { let o = apply_motion(&cm(1, 0), Motion::WordBack, 3, 7, &v); (o.row, o.col) })(), (0, 4));
+    }
+
+    /// Like [`vp`], with each CJK ideograph followed by its wide-char spacer —
+    /// the shape `Terminal::viewport_rows_chars` hands copy-mode.
+    fn vpw(rows: &[&str], cols: usize) -> Vec<Vec<char>> {
+        rows.iter()
+            .map(|r| {
+                let mut v: Vec<char> = Vec::new();
+                for c in r.chars() {
+                    v.push(c);
+                    if ('\u{4e00}'..='\u{9fff}').contains(&c) {
+                        v.push(jetty_core::WIDE_SPACER);
+                    }
+                }
+                v.resize(cols, ' ');
+                v
+            })
+            .collect()
+    }
+    fn go(v: &[Vec<char>], from: (usize, usize), m: Motion) -> (usize, usize) {
+        let o = apply_motion(&cm(from.0, from.1), m, v.len(), v[0].len(), v);
+        (o.row, o.col)
+    }
+
+    #[test]
+    fn h_and_l_step_over_a_wide_char_in_one_press() {
+        // "a世界b": a=0, 世=1–2, 界=3–4, b=5. The spacer cells are the right
+        // halves of the glyphs — the cursor must never stop on one.
+        let v = vpw(&["a世界b"], 8);
+        assert_eq!(go(&v, (0, 0), Motion::Right), (0, 1));
+        assert_eq!(go(&v, (0, 1), Motion::Right), (0, 3), "l crosses 世 at once");
+        assert_eq!(go(&v, (0, 3), Motion::Right), (0, 5));
+        assert_eq!(go(&v, (0, 5), Motion::Left), (0, 3), "h lands on 界, not its spacer");
+        assert_eq!(go(&v, (0, 3), Motion::Left), (0, 1));
+        // A wide char in the last two columns: `l` has nowhere to go.
+        let v = vpw(&["ab世"], 4);
+        assert_eq!(go(&v, (0, 2), Motion::Right), (0, 2));
+    }
+
+    #[test]
+    fn vertical_moves_never_land_on_a_spacer() {
+        // Row 1 has 世 at cols 1–2: coming down from col 2 lands on 世 itself.
+        let v = vpw(&["abcd", "a世d"], 4);
+        assert_eq!(go(&v, (0, 2), Motion::Down), (1, 1));
+        let v = vpw(&["a世d", "abcd"], 4);
+        assert_eq!(go(&v, (1, 2), Motion::Up), (0, 1));
+    }
+
+    #[test]
+    fn word_motions_treat_a_cjk_run_as_one_word() {
+        // "世界 日本語 x": 世界=0–3, 日本語=5–10, x=12.
+        let v = vpw(&["世界 日本語 x"], 16);
+        assert_eq!(go(&v, (0, 0), Motion::WordFwd), (0, 5), "w skips the whole run");
+        assert_eq!(go(&v, (0, 5), Motion::WordFwd), (0, 12));
+        assert_eq!(go(&v, (0, 0), Motion::WordEnd), (0, 2), "e ends ON 界, not its spacer");
+        assert_eq!(go(&v, (0, 5), Motion::WordEnd), (0, 9), "e ends on 語");
+        assert_eq!(go(&v, (0, 2), Motion::WordEnd), (0, 9), "e from a word's last (wide) char → next word's end");
+        assert_eq!(go(&v, (0, 12), Motion::WordBack), (0, 5));
+        assert_eq!(go(&v, (0, 9), Motion::WordBack), (0, 5));
+        // `$` on a row ending in a wide char lands on the char.
+        assert_eq!(go(&v, (0, 0), Motion::LineEnd), (0, 12));
+        let v = vpw(&["ab 世界"], 10);
+        assert_eq!(go(&v, (0, 0), Motion::LineEnd), (0, 5));
+        // The snap helper the app runs after a scroll moved new content under
+        // the cursor.
+        assert_eq!(snap_to_char(&v, 0, 6), 5);
+        assert_eq!(snap_to_char(&v, 0, 5), 5);
+        assert_eq!(snap_to_char(&v, 0, 9), 9);
     }
 
     #[test]

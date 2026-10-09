@@ -144,10 +144,13 @@ pub fn build_copy_pill(
 }
 
 /// Hollow-box cursor rects for the copy-mode keyboard cursor at viewport cell
-/// `(row, col)`. The four-edge idiom from `cursor_rects`' HollowBlock, colored
-/// `color`, so it reads distinctly from both the shell cursor (suppressed while
-/// copy-mode is active) and the block selection tint.
+/// `(row, col)` of `snap`. The four-edge idiom from `cursor_rects`'
+/// HollowBlock, colored `color`, so it reads distinctly from both the shell
+/// cursor (suppressed while copy-mode is active) and the block selection tint.
+/// On a double-width glyph the box spans both of its cells (the shell cursor's
+/// rule), so it frames the whole char rather than its left half.
 pub fn copy_cursor_rects(
+    snap: &jetty_core::GridSnapshot,
     row: usize,
     col: usize,
     cell_w: f32,
@@ -155,15 +158,18 @@ pub fn copy_cursor_rects(
     y_offset: f32,
     color: [u8; 3],
 ) -> Vec<Rect> {
+    use unicode_width::UnicodeWidthChar;
+    let wide = row < snap.rows && col + 1 < snap.cols && snap.cell(row, col).c.width() == Some(2);
+    let w = if wide { cell_w * 2.0 } else { cell_w };
     let x = col as f32 * cell_w;
     let y = y_offset + row as f32 * cell_h;
     let b = (cell_w * 0.12).max(1.5);
     let col4 = [color[0], color[1], color[2], 255];
     vec![
-        Rect::new(x, y, cell_w, b, col4),                // top
-        Rect::new(x, y + cell_h - b, cell_w, b, col4),   // bottom
-        Rect::new(x, y, b, cell_h, col4),                // left
-        Rect::new(x + cell_w - b, y, b, cell_h, col4),   // right
+        Rect::new(x, y, w, b, col4),                // top
+        Rect::new(x, y + cell_h - b, w, b, col4),   // bottom
+        Rect::new(x, y, b, cell_h, col4),           // left
+        Rect::new(x + w - b, y, b, cell_h, col4),   // right
     ]
 }
 
@@ -278,12 +284,33 @@ mod tests {
         }
     }
 
+    fn snap_with(text: &str, cols: usize, rows: usize) -> jetty_core::GridSnapshot {
+        let mut t = jetty_core::Terminal::new(cols, rows);
+        t.feed(text.as_bytes());
+        t.snapshot()
+    }
+
     #[test]
     fn copy_cursor_is_a_hollow_box() {
-        let r = copy_cursor_rects(2, 3, 9.0, 18.0, 36.0, [255, 255, 255]);
+        let snap = snap_with("", 10, 4);
+        let r = copy_cursor_rects(&snap, 2, 3, 9.0, 18.0, 36.0, [255, 255, 255]);
         assert_eq!(r.len(), 4, "hollow box = 4 edges");
         // Anchored at cell (row 2, col 3) with the y offset.
         assert_eq!(r[0].x, 27.0);
         assert_eq!(r[0].y, 36.0 + 2.0 * 18.0);
+        assert_eq!(r[0].w, 9.0, "one cell wide");
+    }
+
+    #[test]
+    fn copy_cursor_frames_the_whole_wide_char() {
+        // "a世b": 世 spans cols 1–2. The box on it covers both cells — it
+        // framed only the left half of the glyph.
+        let snap = snap_with("a世b", 10, 2);
+        let r = copy_cursor_rects(&snap, 0, 1, 9.0, 18.0, 0.0, [255, 255, 255]);
+        assert_eq!((r[0].x, r[0].w), (9.0, 18.0), "top edge spans two cells");
+        assert_eq!(r[3].x + r[3].w, 27.0, "right edge at the end of the spacer");
+        // A narrow neighbour stays one cell.
+        let r = copy_cursor_rects(&snap, 0, 3, 9.0, 18.0, 0.0, [255, 255, 255]);
+        assert_eq!(r[0].w, 9.0);
     }
 }
