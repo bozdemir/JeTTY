@@ -56,7 +56,10 @@ machine: smaller chunks stay in cache).
   GPU submit; still excl. scanout). Percentiles are linear-interpolated (p99 is never
   silently the max); `n` and the display refresh are printed so the vsync component
   is interpretable. Sampled only at a quiescent prompt so a streaming tab can't
-  record a near-zero non-echo latency.
+  record a near-zero non-echo latency. A key with no output within 25 ms (the
+  app's own fallback-paint grace: a password prompt, `Esc` in vim) produced none —
+  the program's later reply is not recorded against it; the line counts such keys
+  as "not sampled".
 - `idle RSS … MB` once, when the app first settles to idle (resident set incl. shared
   pages — RSS, not PSS).
 

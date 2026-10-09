@@ -83,6 +83,14 @@ const SAMPLE_CAP: usize = 50_000;
 /// or a hung shell) so a single multi-second outlier can't distort the summary.
 const STALE_MS: f32 = 2_000.0;
 
+/// A keystroke with no active-tab output this long after its PTY write produced
+/// none of its own — a password prompt, `Esc` in vim's normal mode. This is the
+/// app's own fallback-paint grace (`KEY_ECHO_GRACE`): such a key paints at the
+/// deadline without an echo. Output arriving later is the program's next reply,
+/// not the key's echo; recording it against the key put 0.1–2 s samples into
+/// p99. The key is counted as unechoed instead, and every report says how many.
+const ECHO_GRACE: Duration = Duration::from_millis(25);
+
 /// True iff an environment flag is present (value irrelevant). The single seam both
 /// `JETTY_PERF_LOG` (this module) and `JETTY_BENCH_CPU_ONLY` (the bench) select on,
 /// so the "is it enabled" rule is defined and unit-tested in exactly one place.
@@ -213,6 +221,8 @@ pub struct Perf {
     lat_present_ms: Vec<f32>,
     /// Sample count at the last emit, so `about_to_wait` reports each new batch once.
     reported: usize,
+    /// Armed keystrokes that saw no output within [`ECHO_GRACE`] (not sampled).
+    unechoed: usize,
     /// Display refresh rate (Hz), captured at first frame; contextualises the vsync
     /// component of the pre-present number.
     refresh_hz: Option<f32>,
@@ -241,6 +251,7 @@ impl Perf {
             lat_ready_ms: if on { Vec::with_capacity(256) } else { Vec::new() },
             lat_present_ms: if on { Vec::with_capacity(256) } else { Vec::new() },
             reported: 0,
+            unechoed: 0,
             refresh_hz: None,
             first_frame_logged: false,
             idle_rss_logged: false,
@@ -252,32 +263,46 @@ impl Perf {
     /// — so we measure the representative keypress→echo case, never a stream frame.
     #[inline]
     pub fn note_key_send(&mut self) {
-        if !self.on || self.key_pending.is_some() {
-            return;
+        if self.on {
+            self.note_key_send_at(Instant::now());
         }
-        if self.quiescent() {
-            self.key_pending = Some(Instant::now());
+    }
+
+    fn note_key_send_at(&mut self, now: Instant) {
+        if self.key_pending.is_none() && self.quiescent(now) {
+            self.key_pending = Some(now);
             self.echo_seen = false;
         }
     }
 
     /// True iff the active tab has been quiescent for at least [`QUIESCENT_WINDOW`].
-    fn quiescent(&self) -> bool {
+    fn quiescent(&self, now: Instant) -> bool {
         self.last_active_output_at
-            .is_none_or(|t| t.elapsed() >= QUIESCENT_WINDOW)
+            .is_none_or(|t| now.saturating_duration_since(t) >= QUIESCENT_WINDOW)
     }
 
     /// Note that the active tab produced output this drain: refreshes the quiescent
     /// clock and, if a keystroke is armed, marks its echo as seen so the next present
     /// records the sample. Called from BOTH drain sites (Wake + RedrawRequested)
     /// because the echo is usually consumed by the Wake drain before the redraw.
+    /// Output later than [`ECHO_GRACE`] after the armed key is not its echo: the
+    /// key is dropped as unechoed (counted) and nothing is recorded. (Only here,
+    /// not at the next key: a slow echo landing after a type-ahead key re-armed
+    /// would record that key too short.)
     #[inline]
     pub fn note_active_output(&mut self) {
-        if !self.on {
-            return;
+        if self.on {
+            self.note_active_output_at(Instant::now());
         }
-        self.last_active_output_at = Some(Instant::now());
-        if self.key_pending.is_some() {
+    }
+
+    fn note_active_output_at(&mut self, now: Instant) {
+        self.last_active_output_at = Some(now);
+        let Some(t0) = self.key_pending.filter(|_| !self.echo_seen) else { return };
+        if now.saturating_duration_since(t0) > ECHO_GRACE {
+            self.key_pending = None;
+            self.unechoed += 1;
+        } else {
             self.echo_seen = true;
         }
     }
@@ -345,7 +370,9 @@ impl Perf {
         };
         eprintln!(
             "jetty-perf: {tag} n={n} display={hz} (quiescent-prompt keystrokes only; \
-             main window; excl. winit event-in)"
+             main window; excl. winit event-in; {} with no output within {} ms not sampled)",
+            self.unechoed,
+            ECHO_GRACE.as_millis()
         );
         eprintln!(
             "  keypress→frame-ready  (incl. shell-echo round-trip; excl. vsync-acquire + GPU-submit + scanout):  \
@@ -526,5 +553,38 @@ mod tests {
         let mut p = Perf::new(true);
         p.record_latency(1.0, STALE_MS + 1.0);
         assert!(p.lat_present_ms.is_empty(), "multi-second outliers are dropped");
+    }
+
+    #[test]
+    fn an_unechoed_key_is_not_recorded_against_later_output() {
+        // A password key: no echo; the program's reply comes a second later.
+        let mut p = Perf::new(true);
+        let t0 = Instant::now();
+        p.note_key_send_at(t0);
+        // More password keys while it is armed do not re-arm (oldest kept).
+        p.note_key_send_at(t0 + Duration::from_millis(150));
+        p.note_active_output_at(t0 + Duration::from_millis(1000));
+        assert!(p.pending_elapsed_ms().is_none(), "the reply is not the key's echo");
+        assert!(p.key_pending.is_none(), "the unechoed key is dropped");
+        assert_eq!(p.unechoed, 1, "and counted for the report");
+        // The next key at a quiet prompt is sampled as usual.
+        let t1 = t0 + Duration::from_millis(2000);
+        p.note_key_send_at(t1);
+        p.note_active_output_at(t1 + Duration::from_millis(4));
+        assert!(p.pending_elapsed_ms().is_some());
+    }
+
+    #[test]
+    fn a_slow_echo_within_the_grace_is_sampled_and_type_ahead_is_not_cut_short() {
+        let mut p = Perf::new(true);
+        let t0 = Instant::now();
+        p.note_key_send_at(t0);
+        // A second key typed ahead of the first one's echo does not re-arm…
+        p.note_key_send_at(t0 + Duration::from_millis(20));
+        // …so the echo arriving at the edge of the grace measures the FIRST key.
+        p.note_active_output_at(t0 + ECHO_GRACE);
+        assert_eq!(p.key_pending, Some(t0));
+        assert!(p.echo_seen);
+        assert_eq!(p.unechoed, 0);
     }
 }
