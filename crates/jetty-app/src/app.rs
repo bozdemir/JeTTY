@@ -4875,6 +4875,17 @@ impl App {
         }
     }
 
+    /// The app command `event`'s chord names in the live keymap
+    /// (`input::chord_action`): the menus and overlays resolve their own
+    /// chords — a toggle, the search bar's Paste — exactly as the key path
+    /// does, macOS Option chords included.
+    fn chord(&self, event: &winit::event::KeyEvent) -> Option<input::KeyAction> {
+        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+        let base = event.key_without_modifiers();
+        let ev = key_input(event, &base, &self.key_modifiers);
+        input::chord_action(&self.keymap, &ev, &input::KeyOptions::native(self.macos_option_as_alt))
+    }
+
     /// A key press while window `s` has a menu open. The menu is
     /// keyboard-modal (`crate::menunav::classify`): Up / Down move the
     /// highlight over the enabled rows (wrapping), Home / End jump to the
@@ -4901,8 +4912,7 @@ impl App {
             }
             MenuPress::Modifier => return false,
             MenuPress::Other => {
-                let chord = self.keymap.lookup(mods, event.physical_key, &event.logical_key);
-                if chord == Some(input::KeyAction::ContextMenu) {
+                if self.chord(event) == Some(input::KeyAction::ContextMenu) {
                     // The Menu key's toggle — on a fresh press only: held
                     // down, its auto-repeat must not flicker the menu.
                     if !event.repeat {
@@ -5711,11 +5721,8 @@ impl App {
             return false;
         }
         let ctrl = self.modifiers.control_key();
-        let shift = self.modifiers.shift_key();
-        let alt = self.modifiers.alt_key();
         let sup = self.modifiers.super_key();
-        let mods = crate::keymap::Mods::new(ctrl, shift, alt, sup);
-        let chord = self.keymap.lookup(mods, event.physical_key, &event.logical_key);
+        let chord = self.chord(event);
         if palette {
             if chord == Some(input::KeyAction::OpenPalette) {
                 self.close_palette(s);
@@ -5830,10 +5837,8 @@ impl App {
         }
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
-        let alt = self.modifiers.alt_key();
         let sup = self.modifiers.super_key();
-        let mods = crate::keymap::Mods::new(ctrl, shift, alt, sup);
-        let chord_action = self.keymap.lookup(mods, event.physical_key, &event.logical_key);
+        let chord_action = self.chord(event);
         if chord_action == Some(input::KeyAction::SearchToggle) {
             self.search_close(s);
             return true;
@@ -16826,15 +16831,7 @@ fn decide_window_key(
 ) -> input::KeyAction {
     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
     let base = event.key_without_modifiers();
-    let ev = input::KeyInput {
-        physical: event.physical_key,
-        logical: &event.logical_key,
-        key_without_modifiers: &base,
-        text: event.text.as_deref(),
-        location: event.location,
-        kind: input::KeyEventKind::from_winit(event.state, event.repeat),
-        mods: input::KeyMods::from_winit(mods),
-    };
+    let ev = key_input(event, &base, mods);
     let modes = input::KeyModes {
         app_cursor: terminal.app_cursor_keys(),
         // DECKPAM changes no byte (NumLock overrides it — see `KeyModes`).
@@ -16843,6 +16840,24 @@ fn decide_window_key(
         kitty_flags: terminal.kitty_keyboard_flags(),
     };
     input::decide_key_event(keymap, &ev, &modes, &input::KeyOptions::native(option_as_alt), false)
+}
+
+/// One winit key event as the key encoder's [`input::KeyInput`]; `base` is
+/// its `key_without_modifiers()`.
+fn key_input<'a>(
+    event: &'a winit::event::KeyEvent,
+    base: &'a winit::keyboard::Key,
+    mods: &winit::event::Modifiers,
+) -> input::KeyInput<'a> {
+    input::KeyInput {
+        physical: event.physical_key,
+        logical: &event.logical_key,
+        key_without_modifiers: base,
+        text: event.text.as_deref(),
+        location: event.location,
+        kind: input::KeyEventKind::from_winit(event.state, event.repeat),
+        mods: input::KeyMods::from_winit(mods),
+    }
 }
 
 /// A key RELEASE for `tab`, which was sent the press: report it when the

@@ -322,6 +322,18 @@ pub fn alt_is_meta(mods: KeyMods, opts: &KeyOptions) -> bool {
     }
 }
 
+/// The app command a key event's chord names in `keymap`, if any — step 3 of
+/// [`decide_key_event`], shared with the overlays and the menus so a chord
+/// means the same wherever it is pressed: on macOS with Option held the
+/// un-composed key is matched (Option+B is "Alt+B", not "∫"; Option+L on a
+/// German layout is "Alt+L", not "@").
+pub fn chord_action(keymap: &KeyMap, ev: &KeyInput<'_>, opts: &KeyOptions) -> Option<KeyAction> {
+    let m = ev.mods;
+    let mods = Mods::new(m.ctrl, m.shift, m.alt, m.super_);
+    let lookup_key = if opts.macos && m.alt { ev.key_without_modifiers } else { ev.logical };
+    keymap.lookup(mods, ev.physical, lookup_key)
+}
+
 /// Decide what one key event means — the single entry point for the main and
 /// detached windows (the keymap, the overlays' Escape, macOS Option-compose,
 /// dead keys, the kitty keyboard protocol and the legacy xterm encoders).
@@ -329,10 +341,9 @@ pub fn alt_is_meta(mods: KeyMods, opts: &KeyOptions) -> bool {
 /// Resolution order:
 /// 1. Releases → only the kitty protocol's event-type reporting wants them.
 /// 2. Escape + panel open → ClosePanel (overlay logic, not a keybinding).
-/// 3. `keymap.lookup` → the discrete app-command chords. On macOS with Option
-///    held the un-composed key is matched (Option+B is "Alt+B", not "∫").
-///    Unmodified Page keys bound to host scrolling yield to the program on the
-///    alternate screen (it has no scrollback).
+/// 3. [`chord_action`] → the discrete app-command chords. Unmodified Page keys
+///    bound to host scrolling yield to the program on the alternate screen (it
+///    has no scrollback).
 /// 4. macOS Cmd swallow: an unmapped bare Cmd chord is never sent to the PTY.
 /// 5. Kitty keyboard protocol, when the program enabled it.
 /// 6. Legacy: macOS Option-compose text, dead-key text, then the xterm
@@ -358,14 +369,12 @@ pub fn decide_key_event(
         return KeyAction::ClosePanel;
     }
 
-    let mods = Mods::new(m.ctrl, m.shift, m.alt, m.super_);
-    let lookup_key = if opts.macos && m.alt { ev.key_without_modifiers } else { ev.logical };
-    if let Some(action) = keymap.lookup(mods, ev.physical, lookup_key) {
+    if let Some(action) = chord_action(keymap, ev, opts) {
         // `[keys] scroll_page_up = ["Shift+PageUp", "PageUp"]` restores the
         // pre-v0.26 plain-PageUp scrolling; like then, the bare key still
         // reaches pagers/editors on the alternate screen.
         let page_passthrough = modes.alt_screen
-            && mods == Mods::default()
+            && !(m.ctrl || m.shift || m.alt || m.super_)
             && matches!(action, KeyAction::ScrollPageUp | KeyAction::ScrollPageDown);
         if !page_passthrough {
             return action;
@@ -3761,6 +3770,32 @@ mod tests {
         let (logical, base) = (Key::Character("∫".into()), Key::Character("b".into()));
         let ev = KeyInput { key_without_modifiers: &base, ..kev(KeyCode::KeyB, &logical, Some("∫"), KeyMods { alt: true, lalt: true, ..KeyMods::default() }) };
         assert_eq!(decide_key_event(&km, &ev, &KeyModes::default(), &mac(OptionAsAlt::None), false), KeyAction::NewTab);
+    }
+
+    #[test]
+    fn an_overlay_toggle_on_an_option_chord_closes_what_it_opened() {
+        // German Mac: `open_palette = "Alt+L"`, and Option+L types '@' — ASCII,
+        // so no US-position fallback either. The palette (like every overlay
+        // and menu) resolves its own chord through `chord_action`, which
+        // matches the bare key as the key path does; looking up the event's
+        // '@' found nothing, and the second press typed '@' into the query.
+        let b = crate::config::KeyBindings {
+            open_palette: Some(crate::config::ChordSpec::One("Alt+L".into())),
+            ..Default::default()
+        };
+        let km = crate::keymap::KeyMap::compile(&b);
+        assert!(km.warnings().is_empty(), "{:?}", km.warnings());
+        let (logical, base) = (Key::Character("@".into()), Key::Character("l".into()));
+        let mods = KeyMods { alt: true, lalt: true, ..KeyMods::default() };
+        let ev = KeyInput { key_without_modifiers: &base, ..kev(KeyCode::KeyL, &logical, Some("@"), mods) };
+        let alt = crate::keymap::Mods::new(false, false, true, false);
+        assert_eq!(km.lookup(alt, ev.physical, &logical), None, "the composed '@' names no chord");
+        assert_eq!(chord_action(&km, &ev, &mac(OptionAsAlt::None)), Some(KeyAction::OpenPalette));
+        assert_eq!(decide_key_event(&km, &ev, &KeyModes::default(), &mac(OptionAsAlt::None), false), KeyAction::OpenPalette);
+        // Off macOS, Alt never composes: the event's own key decides.
+        let l = Key::Character("l".into());
+        let ev = kev(KeyCode::KeyL, &l, Some("l"), KeyMods { alt: true, ..KeyMods::default() });
+        assert_eq!(chord_action(&km, &ev, &KeyOptions::default()), Some(KeyAction::OpenPalette));
     }
 
     #[test]

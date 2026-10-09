@@ -1,7 +1,8 @@
 //! Configurable keybindings: a chord grammar (parse + serialize), a compiled
 //! [`KeyMap`] (small hashmaps — logical, physical, physical-fallback), and
-//! [`KeyMap::lookup`], which `decide_key_event` calls once at the top to resolve
-//! the discrete app-command chords.
+//! [`KeyMap::lookup`], which `input::chord_action` calls — for the key path
+//! (`decide_key_event`) and the overlays and menus alike — to resolve the
+//! discrete app-command chords.
 //!
 //! Letter and symbol chords follow the key LABEL: they match the produced
 //! (case-folded) character, so Ctrl+Shift+C copies on Dvorak / AZERTY /
