@@ -13340,6 +13340,12 @@ impl App {
     /// visible instead of freezing the display until 2 MiB accumulate or an ESU
     /// arrives (F1 — e.g. an nvim/zellij that paused mid-redraw). Requests a
     /// redraw on each affected, actually-visible window; returns whether it did.
+    ///
+    /// What the update carried besides the grid — query replies, a title, a
+    /// progress report, a bell, an OSC 52 copy, a command completion — is applied
+    /// by a drain pass, which a background tab or a hidden / occluded window got
+    /// only with its next output (a program blocked on a DA reply hung): any
+    /// flush queues one Wake, whose drain runs for every tab of every window.
     fn flush_expired_syncs(&mut self, now: std::time::Instant) -> bool {
         let active = self.active;
         let main_visible = self.visible && !self.main_occluded;
@@ -13347,9 +13353,11 @@ impl App {
         // the `self.request_main_paint()` choke borrows all of `self`, so it cannot
         // be called inside the `self.tabs.iter_mut()` loop — request once after.
         let mut main_needs_paint = false;
+        let mut flushed = false;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             if tab.terminal.sync_deadline().is_some_and(|d| now >= d) {
                 tab.terminal.flush_sync();
+                flushed = true;
                 if i == active && main_visible {
                     main_needs_paint = true;
                 }
@@ -13362,11 +13370,15 @@ impl App {
         for dw in &mut self.detached {
             if dw.tab.terminal.sync_deadline().is_some_and(|d| now >= d) {
                 dw.tab.terminal.flush_sync();
+                flushed = true;
                 if !dw.occluded {
                     dw.request_paint();
                     painted = true;
                 }
             }
+        }
+        if flushed {
+            let _ = self.proxy.send_event(AppEvent::Wake);
         }
         painted
     }
@@ -14579,7 +14591,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // Damage-driven: only request a redraw when the active tab's PTY
                 // produced data (or query replies were sent). Background tabs still
                 // drained above but don't trigger a repaint. A Wake only ever
-                // comes from a PTY event (data, EOF, exit), never from a timer.
+                // comes from a PTY event (data, EOF, exit) — or a force-flushed
+                // synchronized update, whose replies need this drain.
                 // Also gated on the window being EFFECTIVELY VISIBLE (shown + not
                 // occluded/minimized): a hidden dropdown running `cat bigfile`
                 // must keep draining (so the shell never blocks) but must NOT run
