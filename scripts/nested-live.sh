@@ -35,7 +35,8 @@
 #
 # Env: DISPLAY_NUM, NESTED_WM=kwin|none|kwin-wayland (default: kwin when installed),
 #      NESTED_CONFIG=<config.toml to copy> (default: ~/.config/jetty/config.toml if
-#      present — copied, never written), NESTED_BIN=<binary> (default target/release/jetty),
+#      present — copied, never written), NESTED_BIN=<binary or a wrapper `jetty` script,
+#      e.g. one exec-ing a release AppImage> (default target/release/jetty),
 #      NESTED_SCALE=<output scale> (kwin-wayland only; default 1).
 
 set -u
@@ -113,7 +114,8 @@ launch_jetty() {
     (cd "$SB" && setsid -f "${JENV[@]}" \
         dbus-run-session --config-file="$SB/bus.conf" -- "$SB/bin/jetty" >>"$SB/jetty.log" 2>&1)
     for _ in $(seq 50); do
-        pid=$(for p in $(pgrep -x jetty); do
+        # An AppImage (NESTED_BIN wrapping one) runs jetty as `AppRun`.
+        pid=$(for p in $(pgrep -x 'jetty|AppRun'); do
             tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | grep -qx "JETTY_CONFIG_DIR=$SB/config/jetty" && echo "$p"
         done | head -1)
         [ -n "$pid" ] && break
@@ -129,7 +131,7 @@ stop_pid() { # only a pid we recorded, and only if it is still the process we st
     local f="$SB/$1.pid" want="$2" p
     [ -f "$f" ] || return 0
     p=$(cat "$f")
-    if [ -n "$p" ] && [ -d "/proc/$p" ] && [ "$(cat /proc/$p/comm)" = "$want" ]; then kill "$p"; fi
+    if [ -n "$p" ] && [ -d "/proc/$p" ] && [[ "$(cat /proc/$p/comm)" =~ ^($want)$ ]]; then kill "$p"; fi
     rm -f "$f"
 }
 
@@ -324,7 +326,7 @@ EOF
     echo "nested display $D ready (wm: $wm). Drive it with: $0 x …"
     ;;
 restart)
-    stop_pid jetty jetty
+    stop_pid jetty 'jetty|AppRun'
     sleep 1
     launch_jetty
     ;;
@@ -444,7 +446,7 @@ for w in (st.value if st else []):
 EOF
     ;;
 stop)
-    stop_pid jetty jetty
+    stop_pid jetty 'jetty|AppRun'
     if [ "$MODE" = wayland ]; then stop_pid wm kwin_wayland; else stop_pid wm kwin_x11; fi
     stop_pid xvfb Xvfb
     # The runtime dirs outside the sandbox: jetty's socket + lock, the compositor's,
