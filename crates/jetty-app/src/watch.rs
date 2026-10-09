@@ -334,6 +334,83 @@ mod tests {
         got
     }
 
+    /// Editors save in different ways; each must reach the app: an atomic save
+    /// (a temp file renamed over config.toml — VS Code, most tools), vim's
+    /// (config.toml renamed to a backup, then a new file written), and a delete
+    /// followed by a fresh file. The leftovers never count on their own.
+    #[test]
+    fn every_way_editors_save_is_noticed() {
+        let base = tmp("editors");
+        let cfg_dir = base.join("jetty");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let cfg = cfg_dir.join("config.toml");
+        std::fs::write(&cfg, "theme = \"nord\"\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let w = ConfigWatcher::spawn(cfg_dir.clone(), move || {
+            let _ = tx.lock().unwrap().send(());
+        })
+        .expect("watcher");
+        // Atomic replace.
+        std::fs::write(cfg_dir.join(".config.toml.swp-edit"), "theme = \"dracula\"\n").unwrap();
+        assert!(!changed_quick(&rx), "an editor's scratch file alone is not a change");
+        std::fs::rename(cfg_dir.join(".config.toml.swp-edit"), &cfg).unwrap();
+        assert!(changed(&rx), "temp file renamed over config.toml");
+        // vim: backup by rename, then a new file.
+        std::fs::rename(&cfg, cfg_dir.join("config.toml~")).unwrap();
+        std::fs::write(&cfg, "theme = \"gruvbox_dark\"\n").unwrap();
+        assert!(changed(&rx), "rename away + write new");
+        std::fs::remove_file(cfg_dir.join("config.toml~")).unwrap();
+        assert!(!changed_quick(&rx), "the backup going away is not a change");
+        // Delete, then a fresh file.
+        std::fs::remove_file(&cfg).unwrap();
+        assert!(changed(&rx), "deleted");
+        std::fs::write(&cfg, "theme = \"nord\"\n").unwrap();
+        assert!(changed(&rx), "recreated");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A config DIRECTORY symlinked from a dotfiles repo (stow, home-manager):
+    /// edits through it are seen, and so is the link being pointed elsewhere.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_dir_is_followed_and_its_retarget_seen() {
+        use std::os::unix::fs::symlink;
+        let base = tmp("dir-link");
+        let (repo_a, repo_b) = (base.join("dotfiles-a"), base.join("dotfiles-b"));
+        for r in [&repo_a, &repo_b] {
+            std::fs::create_dir_all(r).unwrap();
+            std::fs::write(r.join("config.toml"), "theme = \"nord\"\n").unwrap();
+        }
+        let cfg_dir = base.join("jetty");
+        symlink(&repo_a, &cfg_dir).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let mut w = ConfigWatcher::spawn(cfg_dir.clone(), move || {
+            let _ = tx.lock().unwrap().send(());
+        })
+        .expect("watcher");
+        std::fs::write(repo_a.join("config.toml"), "theme = \"dracula\"\n").unwrap();
+        assert!(changed(&rx), "an edit in the linked folder");
+        // Re-point the link (atomically, as stow / ln -sfn do).
+        symlink(&repo_b, base.join("jetty.new")).unwrap();
+        std::fs::rename(base.join("jetty.new"), &cfg_dir).unwrap();
+        assert!(changed(&rx), "the link re-pointed");
+        w.rearm();
+        std::fs::write(repo_b.join("config.toml"), "theme = \"gruvbox_dark\"\n").unwrap();
+        assert!(changed(&rx), "an edit in the new target");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Whether a change notification arrives soon (for "nothing happened").
+    fn changed_quick(rx: &mpsc::Receiver<()>) -> bool {
+        let got = rx.recv_timeout(Duration::from_millis(400)).is_ok();
+        while rx.recv_timeout(Duration::from_millis(100)).is_ok() {}
+        got
+    }
+
     /// End-to-end with the real OS watcher: an edit, a themes/ dir created after
     /// startup, and the whole config dir deleted and recreated all keep working.
     #[test]
