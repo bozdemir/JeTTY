@@ -1617,6 +1617,11 @@ pub struct App {
     /// The main-window tab under the pointer (hover lift, hover "×"). Updated
     /// on CursorMoved only when it changes — one repaint per change.
     tab_hover: Option<usize>,
+    /// Whether the pointer is over the main window: `cursor` is its last
+    /// position there. False from a CursorLeft (and a hide or focus loss: a
+    /// summon finds the pointer anywhere) until it moves over the window
+    /// again — nothing it hovered stays lit meanwhile.
+    main_pointer_in: bool,
     /// The wheel over the tab strip flips through the tabs (`tabmeta::TabWheel`).
     tab_wheel: crate::tabmeta::TabWheel,
     /// The main window's size across scale-factor changes
@@ -2248,6 +2253,7 @@ impl App {
             window_border: crate::tabmeta::WindowBorder::None,
             tab_title_mode: crate::tabmeta::TabTitleMode::Osc,
             tab_hover: None,
+            main_pointer_in: false,
             tab_wheel: crate::tabmeta::TabWheel::default(),
             main_dpi_size: None,
             focus_ring: None,
@@ -7690,6 +7696,28 @@ impl App {
     fn reset_main_pointer(&mut self) {
         self.with_main_grid(crate::gridmouse::end_gestures);
         self.forget_main_pointer();
+        // A hidden window gets no CursorLeft, and a summon finds the pointer
+        // wherever it is: nothing stays hovered until it moves over us again.
+        self.main_pointer_left();
+    }
+
+    /// The pointer left the main window (or may be anywhere — see
+    /// [`Self::reset_main_pointer`]): nothing it hovered stays lit until it
+    /// moves over the window again — a window control (the red "✕"), a tab's
+    /// lift and hover "×", a Ctrl+hover link (whose Ctrl chords kept
+    /// underlining a URL the pointer had long left).
+    fn main_pointer_left(&mut self) {
+        let control = self.main_pointer_in
+            && self.gpu.as_ref().is_some_and(|g| {
+                let bar_y = self.tabbar_y(g.config.height as f32);
+                let (x, y) = (self.cursor.0 as f32, self.cursor.1 as f32);
+                ctrl_hover_at(x, y, g.config.width, bar_y, self.chrome_metrics()) != jetty_render::CtrlHover::None
+            });
+        self.main_pointer_in = false;
+        if (self.tab_hover.take().is_some() || control) && self.visible {
+            self.request_main_paint();
+        }
+        self.update_link_hover(false);
     }
 
     /// [`Self::reset_main_pointer`] without the releases: the gestures belonged
@@ -7789,6 +7817,7 @@ impl App {
         // Same modal predicate as the resize-cursor block in CursorMoved.
         let modal_open = self.pointer_modal(Surface::Main);
         let gated = link_modifier_held(&self.modifiers)
+            && self.main_pointer_in
             && !self.tabs.is_empty()
             && !self.selecting
             && !self.dragging_scrollbar
@@ -7863,6 +7892,7 @@ impl App {
         let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
         let (cx, cy) = (dw.cursor.0 as f32, dw.cursor.1 as f32);
         let gated = held
+            && dw.pointer_in
             && !dw.selecting
             && !dw.dragging_scrollbar
             && dw.bar_drag.is_none()
@@ -10924,12 +10954,17 @@ impl App {
             }
             WindowEvent::CursorLeft { .. } => {
                 // The pointer left this window: no gutter hover any more
-                // (`scrollbar = "auto"` hides an idle thumb — one repaint).
+                // (`scrollbar = "auto"` hides an idle thumb — one repaint), no
+                // red "✕" (left through the top edge it stayed lit), and no
+                // Ctrl+hover link for the next Ctrl chord to underline.
                 if let Some(dw) = self.detached.get_mut(pos) {
-                    if std::mem::take(&mut dw.scrollbar_hover) && dw.tab.terminal.scroll_max() > 0 {
+                    dw.pointer_in = false;
+                    let gutter = std::mem::take(&mut dw.scrollbar_hover) && dw.tab.terminal.scroll_max() > 0;
+                    if std::mem::take(&mut dw.close_hover) || gutter {
                         dw.request_paint();
                     }
                 }
+                self.update_detached_link_hover(pos, false);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 // App-wide inputs, read before the dw (self.detached) borrow.
@@ -10940,6 +10975,7 @@ impl App {
                 // This window's chrome geometry (its own DPI × the UI font).
                 let cm = dw.chrome_metrics(ui_font);
                 dw.cursor = (position.x, position.y);
+                dw.pointer_in = true;
                 // --- Manual top-bar drag (move the window ourselves) ---
                 // global_cursor = outer_position + local cursor; the window's new
                 // top-left is global_cursor - the press offset. Doing this manually
@@ -14218,16 +14254,15 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::CursorLeft { .. } => {
                 // The pointer left the window: no gutter hover any more
-                // (`scrollbar = "auto"` hides an idle thumb — one repaint).
+                // (`scrollbar = "auto"` hides an idle thumb — one repaint),
+                // no hovered tab, window control or link.
                 self.set_main_scrollbar_hover(false);
-                // No tab is hovered once the pointer leaves the window.
-                if self.tab_hover.take().is_some() {
-                    self.request_main_paint();
-                }
+                self.main_pointer_left();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let prev = self.cursor;
+                let prev = self.main_pointer_in.then_some(self.cursor);
                 self.cursor = (position.x, position.y);
+                self.main_pointer_in = true;
                 // --- Resize-edge cursor feedback (borderless window) ---
                 // Only update the cursor when the zone changes, never while a host
                 // drag (scrollbar / selection) is in progress, and never while a
@@ -14275,7 +14310,9 @@ impl ApplicationHandler<AppEvent> for App {
                     let w = gpu.config.width;
                     let bar_y = self.tabbar_y(gpu.config.height as f32);
                     let cm = self.chrome_metrics();
-                    let before = ctrl_hover_at(prev.0 as f32, prev.1 as f32, w, bar_y, cm);
+                    let before = prev.map_or(jetty_render::CtrlHover::None, |p| {
+                        ctrl_hover_at(p.0 as f32, p.1 as f32, w, bar_y, cm)
+                    });
                     let after = ctrl_hover_at(position.x as f32, position.y as f32, w, bar_y, cm);
                     if before != after {
                         self.request_main_paint();
@@ -15921,7 +15958,9 @@ impl ApplicationHandler<AppEvent> for App {
                 } else {
                     Vec::new()
                 };
-                let cursor = self.cursor;
+                // The pointer while it is over the window (it hovers nothing
+                // once it left).
+                let cursor = self.main_pointer_in.then_some(self.cursor);
                 // Ctrl+hover link underline spans, snapshotted before the
                 // gpu/text/quad borrows (drawn only while the modifier is held).
                 let link_spans: Option<Vec<(usize, usize, usize)>> =
@@ -16040,7 +16079,9 @@ impl ApplicationHandler<AppEvent> for App {
                 let bar_y = if tab_bar_bottom { (height as f32 - bar_h - status_h).max(0.0) } else { 0.0 };
                 let grid_top = if tab_bar_bottom { 0.0 } else { bar_h };
                 // Compute window-control hover from the last cursor position.
-                let ctrl_hover = ctrl_hover_at(cursor.0 as f32, cursor.1 as f32, width, bar_y, cm);
+                let ctrl_hover = cursor.map_or(jetty_render::CtrlHover::None, |c| {
+                    ctrl_hover_at(c.0 as f32, c.1 as f32, width, bar_y, cm)
+                });
                 let rename_ref = rename_state.as_ref().map(|(i, b)| (*i, b.as_str()));
                 // The perf HUD now lives in the bottom STATUS BAR (off the tab row),
                 // so the tab bar is built WITHOUT it (None).

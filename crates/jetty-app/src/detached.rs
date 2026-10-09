@@ -408,6 +408,10 @@ pub(crate) struct DetachedWindow {
     pub applied_os_title: String,
     /// Last known cursor position inside THIS window (physical px).
     pub cursor: (f64, f64),
+    /// Whether the pointer is over THIS window (`cursor` is its last position
+    /// there): false from a CursorLeft until it moves over the window again —
+    /// nothing it hovered (the "✕", a Ctrl+hover link) stays lit meanwhile.
+    pub pointer_in: bool,
     /// Manual top-bar drag: `Some(local cursor at press)` while the bar is held.
     /// Each CursorMoved computes `global_cursor = outer_position + local` and
     /// moves the window to `global_cursor - offset`, so the RELEASE event is
@@ -633,6 +637,7 @@ impl DetachedWindow {
             applied_os_title: tab.title.clone(),
             tab,
             cursor: (0.0, 0.0),
+            pointer_in: false,
             bar_drag: None,
             bar_drag_start: None,
             resize_zone: crate::app::ResizeZone::None,
