@@ -230,6 +230,29 @@ fn launch_environment_identity_does_not_leak_into_shells() {
     assert!(out.lines().any(|l| l.starts_with("TERM_PROGRAM=jetty")), "TERM_PROGRAM:\n{out}");
 }
 
+#[cfg(unix)]
+#[test]
+fn variables_jetty_set_for_itself_stay_out_of_shells() {
+    // The startup Vulkan driver filter lives in JeTTY's own environment while
+    // the first shell spawns; `hide_from_shells` keeps it (and only it) out.
+    // (Unique names: the process environment is shared with the other tests.)
+    std::env::set_var("JETTY_TEST_HIDDEN_FROM_SHELLS", "*nvidia_icd*");
+    std::env::set_var("JETTY_TEST_PASSED_TO_SHELLS", "kept");
+    jetty_core::hide_from_shells("JETTY_TEST_HIDDEN_FROM_SHELLS");
+    let pty = PtySession::spawn(80, 24, 0, 0, Some("/bin/sh".into()), None, || {}).expect("spawn");
+    {
+        use std::io::Write;
+        let mut w = pty.writer();
+        w.write_all(b"env; echo ENV-DONE\n").unwrap();
+    }
+    let out = read_until(&pty, "\nENV-DONE");
+    assert!(
+        !out.lines().any(|l| l.starts_with("JETTY_TEST_HIDDEN_FROM_SHELLS=")),
+        "a hidden variable reached the shell:\n{out}"
+    );
+    assert!(out.lines().any(|l| l == "JETTY_TEST_PASSED_TO_SHELLS=kept"), "other variables must pass:\n{out}");
+}
+
 #[test]
 fn cwd_none_after_exit() {
     let pty = PtySession::spawn(80, 24, 0, 0, None, None, || {}).expect("spawn");

@@ -504,6 +504,15 @@ pub fn run() {
     // on exit). Leaking the File keeps the descriptor — and the lock — alive.
     std::mem::forget(lock_file);
 
+    // Startup Vulkan driver filter (Linux): the first GPU instance skips the
+    // drivers that cannot matter here (`jetty_render::vk_loader`). It is an
+    // environment variable, so it is set HERE, while the process still has one
+    // thread — and hidden from the shells (the first one starts before the GPU
+    // block releases it).
+    if jetty_render::vk_loader::install(jetty_render::vk_loader::wants_high_performance()).is_some() {
+        jetty_core::hide_from_shells(jetty_render::vk_loader::FILTER_VAR);
+    }
+
     let event_loop = EventLoop::<AppEvent>::with_user_event().build().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();

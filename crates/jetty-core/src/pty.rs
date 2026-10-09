@@ -590,6 +590,21 @@ const INHERITED_ENV_DENYLIST: &[&str] = &[
     "COLORFGBG",
 ];
 
+/// Variables JeTTY set in its OWN environment for its own use (see
+/// [`hide_from_shells`]); removed from every shell like the denylist above.
+static HIDDEN_FROM_SHELLS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+/// Keep `var` out of the environment of every shell spawned from now on — for a
+/// variable JeTTY sets for itself (the startup Vulkan driver filter), which the
+/// user's own programs must not inherit. A variable the user exported before
+/// JeTTY started is never passed here, so theirs still reaches the shells.
+pub fn hide_from_shells(var: &'static str) {
+    let mut hidden = HIDDEN_FROM_SHELLS.lock().unwrap_or_else(|e| e.into_inner());
+    if !hidden.contains(&var) {
+        hidden.push(var);
+    }
+}
+
 /// The path a shell should use to re-invoke JeTTY (`$JETTY_BIN`).
 fn jetty_bin_path() -> Option<std::ffi::OsString> {
     self_exe().map(|s| s.path.into_os_string())
@@ -848,6 +863,9 @@ impl PtySession {
             #[cfg(not(target_os = "macos"))]
             let mut cmd = CommandBuilder::new(shell);
             for key in INHERITED_ENV_DENYLIST {
+                cmd.env_remove(key);
+            }
+            for key in HIDDEN_FROM_SHELLS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
                 cmd.env_remove(key);
             }
             // `$SHELL` names the shell that runs here — the `shell` override or

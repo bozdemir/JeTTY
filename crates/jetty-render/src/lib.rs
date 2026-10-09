@@ -3,6 +3,9 @@ mod colors;
 mod cursor;
 mod cursor_trail;
 mod gpu;
+/// Startup Vulkan driver pre-selection (Linux): the first GPU instance skips
+/// drivers that cannot matter on this machine.
+pub mod vk_loader;
 mod text;
 mod builtin;
 mod emoji;

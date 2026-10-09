@@ -349,9 +349,10 @@ impl GpuContext {
         // `discrete`, `dgpu`) to select HighPerformance → the discrete GPU, which
         // fixes presentation on those systems. (`JETTY_BENCH_GPU` is the headless
         // analogue used only by jetty-bench.)
-        let power = match std::env::var("JETTY_GPU").as_deref() {
-            Ok("high") | Ok("discrete") | Ok("dgpu") => wgpu::PowerPreference::HighPerformance,
-            _ => wgpu::PowerPreference::LowPower,
+        let power = if crate::vk_loader::wants_high_performance() {
+            wgpu::PowerPreference::HighPerformance
+        } else {
+            wgpu::PowerPreference::LowPower
         };
         // Try a Vulkan-only instance first: this skips the GLES libEGL dlopen /
         // eglInitialize + GL adapter enumeration that Backends::all() pays on every
@@ -379,15 +380,29 @@ impl GpuContext {
         // Vulkan is tried first (`backend_attempts`); on non-Vulkan systems its
         // failure is expected, so only the last attempt's error is surfaced. That
         // error names the step that actually failed (surface creation vs adapter
-        // request) instead of always reporting "no adapter".
+        // request) instead of always reporting "no adapter". The Vulkan-only
+        // attempt runs under the startup driver filter when one is installed
+        // (`vk_loader`): the loader then initializes only the drivers that can
+        // matter, and the attempt is redone unfiltered unless its adapter is
+        // provably the unfiltered pick.
         let pinned = wgpu::Backends::from_env().filter(|b| !b.is_empty());
         let mut picked = Err(String::new());
         for backends in backend_attempts(pinned).into_iter().flatten() {
-            picked = make_instance_surface_adapter(backends);
+            picked = if backends == wgpu::Backends::VULKAN {
+                crate::vk_loader::with_prefilter(
+                    || make_instance_surface_adapter(backends),
+                    |(instance, _, adapter)| crate::vk_loader::Probe::of(instance, adapter),
+                )
+            } else {
+                make_instance_surface_adapter(backends)
+            };
             if picked.is_ok() {
                 break;
             }
         }
+        // The filter is for the first instance only (`with_prefilter` released it
+        // already unless no Vulkan-only attempt ran).
+        crate::vk_loader::release();
         // Software Vulkan (lavapipe) on a machine whose GPU has only a GL driver:
         // draw on that GPU through GL instead (`wants_gl_probe`, `prefers_gl`).
         // A hardware Vulkan pick skips this — no EGL, no added cold-start cost.

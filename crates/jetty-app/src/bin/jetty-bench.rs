@@ -96,7 +96,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let font_size: f32 = 16.0;
 
     // --- startup-dominant cost: GPU adapter + device ---
-    let t0 = Instant::now();
     // Match the live app: Vulkan-only instance (skips GLES enumeration), with an
     // all-backends fallback if no Vulkan adapter is present.
     // GPU selection. By default the bench requests LowPower → the integrated GPU,
@@ -109,24 +108,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok("high") | Ok("discrete") | Ok("dgpu") => wgpu::PowerPreference::HighPerformance,
         _ => wgpu::PowerPreference::LowPower,
     };
-    let mut instance = wgpu::Instance::new(jetty_render::instance_descriptor(wgpu::Backends::VULKAN));
-    let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: power,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    })) {
-        Ok(a) => a,
-        Err(_) => {
-            instance = wgpu::Instance::new(jetty_render::instance_descriptor(wgpu::Backends::all()));
+    // The app's startup Vulkan driver filter (`vk_loader`), installed the same
+    // way (single-threaded, before the first instance). `JETTY_BENCH_NO_VK_FILTER`
+    // measures the unfiltered loader instead.
+    let t0 = Instant::now();
+    let filter = if env_enabled(std::env::var_os("JETTY_BENCH_NO_VK_FILTER")) {
+        None
+    } else {
+        jetty_render::vk_loader::install(power == wgpu::PowerPreference::HighPerformance)
+    };
+    let instance_ms = std::cell::Cell::new(0.0f64);
+    let attempts = std::cell::Cell::new(0u32);
+    let vulkan = jetty_render::vk_loader::with_prefilter(
+        || {
+            attempts.set(attempts.get() + 1);
+            let t = Instant::now();
+            let instance = wgpu::Instance::new(jetty_render::instance_descriptor(wgpu::Backends::VULKAN));
+            instance_ms.set(instance_ms.get() + t.elapsed().as_secs_f64() * 1000.0);
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: power,
                 compatible_surface: None,
                 force_fallback_adapter: false,
-            }))?
+            }))
+            .map(|adapter| (instance, adapter))
+        },
+        |(instance, adapter)| jetty_render::vk_loader::Probe::of(instance, adapter),
+    );
+    let (_instance, adapter) = match vulkan {
+        Ok(t) => t,
+        Err(_) => {
+            let instance = wgpu::Instance::new(jetty_render::instance_descriptor(wgpu::Backends::all()));
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: power,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))?;
+            (instance, adapter)
         }
     };
+    let instance_ms = instance_ms.get();
+    let adapter_ms = t0.elapsed().as_secs_f64() * 1000.0 - instance_ms;
+    let only = std::env::var("JETTY_BENCH_ONLY").ok();
     // `JETTY_BENCH_ONLY=backdrop`: just the backdrop section (quick repeats).
-    if std::env::var("JETTY_BENCH_ONLY").as_deref() == Ok("backdrop") {
+    if only.as_deref() == Some("backdrop") {
         return bench_backdrop(&adapter);
     }
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -138,6 +162,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     }))?;
     let gpu_init_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    // `JETTY_BENCH_ONLY=gpu_init`: the startup-dominant GPU block alone, split
+    // into its steps (quick repeats to compare driver / loader setups), plus
+    // what it left resident (Linux).
+    if only.as_deref() == Some("gpu_init") {
+        print_gpu_init(&adapter, instance_ms, adapter_ms, gpu_init_ms);
+        match &filter {
+            Some(p) => println!(
+                "vk filter     {} attempt(s); skipped {}",
+                attempts.get(),
+                p.disable.replace('*', "").replace(',', " ")
+            ),
+            None => println!("vk filter     none (every installed driver initialized)"),
+        }
+        drop((device, queue));
+        return Ok(());
+    }
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let t1 = Instant::now();
@@ -208,7 +248,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         jetty_render::backend_display_name(adapter.get_info().backend)
     );
     println!("grid          {cols}x{rows} cells (cell {cw:.1}x{ch:.1}px) @ {width}x{height}");
-    println!("gpu_init      {gpu_init_ms:6.1} ms    (adapter + device acquisition)");
+    println!(
+        "gpu_init      {gpu_init_ms:6.1} ms    (adapter + device acquisition; {})",
+        if filter.is_some() { "startup Vulkan driver filter" } else { "every installed Vulkan driver" }
+    );
     println!("text_init     {text_init_ms:6.1} ms    (font system + atlas)");
     println!("throughput    {mbps:6.0} MB/s   (fed {mb:.0} MB colored VT in {feed_s:.2}s)");
     println!("snapshot      {snap_ms:8.3} ms/frame  ({:.0}k cells)", (cols * rows) as f64 / 1000.0);
@@ -221,6 +264,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bench_post_pass(&device, &queue, format, font_size)?;
     bench_backdrop(&adapter)?;
     Ok(())
+}
+
+/// The `JETTY_BENCH_ONLY=gpu_init` report: the GPU block's steps, the adapter it
+/// chose, and (Linux) the shared libraries the Vulkan loader left mapped — every
+/// installed ICD it initialized, chosen or not — with the process's resident set.
+fn print_gpu_init(adapter: &wgpu::Adapter, instance_ms: f64, adapter_ms: f64, total_ms: f64) {
+    let info = adapter.get_info();
+    println!(
+        "adapter       {} ({}, {:?})",
+        info.name,
+        jetty_render::backend_display_name(info.backend),
+        info.device_type
+    );
+    println!(
+        "gpu_init      {total_ms:6.1} ms    (instance {instance_ms:5.1} + adapter {adapter_ms:5.1} + device {:5.1})",
+        total_ms - instance_ms - adapter_ms
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        let mut libs: Vec<&str> = maps
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(5))
+            .filter(|p| p.contains(".so"))
+            .collect();
+        libs.sort_unstable();
+        libs.dedup();
+        let mib = |p: &str| std::fs::metadata(p).map_or(0.0, |m| m.len() as f64 / 1_048_576.0);
+        let total: f64 = libs.iter().map(|p| mib(p)).sum();
+        let mut big: Vec<(f64, &str)> = libs.iter().map(|p| (mib(p), *p)).filter(|(m, _)| *m >= 4.0).collect();
+        big.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        println!("mapped libs   {} files, {total:.0} MiB on disk", libs.len());
+        for (m, p) in big {
+            println!("  {m:6.1} MiB {}", p.rsplit('/').next().unwrap_or(p));
+        }
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for key in ["VmRSS:", "RssAnon:", "RssFile:"] {
+            if let Some(l) = status.lines().find(|l| l.starts_with(key)) {
+                println!("{:<13} {}", key.trim_end_matches(':'), l[key.len()..].trim());
+            }
+        }
+    }
 }
 
 /// The CRT post pass (`jetty_render::Crt`, the app's own settings path) on a
