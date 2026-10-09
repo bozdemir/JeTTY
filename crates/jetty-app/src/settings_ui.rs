@@ -143,8 +143,8 @@ pub enum Kind {
     /// `< value >` over `(config value, label)` options. A value that is not
     /// an option (hand-edited) shows verbatim; cycling from it starts over.
     Choice { options: fn(&Ctx) -> Vec<(String, String)> },
-    /// `< value >` over numeric steps; a value between steps snaps to its
-    /// nearest step first.
+    /// `< value >` over numeric steps, stopping at both ends; a value between
+    /// steps snaps to its nearest step first.
     Steps { steps: &'static [u64], fmt: fn(u64) -> String },
     /// `- value +` and a Reset button (to the default).
     Stepper { min: f32, max: f32, step: f32, fmt: fn(f32) -> String },
@@ -351,15 +351,16 @@ pub const SCROLLBACK_STEPS: [u64; 6] = [1_000, 5_000, 10_000, 25_000, 50_000, 10
 /// Notify minimum-duration steps, in seconds: "I stepped away" granularity.
 pub const NOTIFY_MIN_STEPS: [u64; 6] = [5, 10, 30, 60, 120, 300];
 
-/// The next / previous step (wraps). A value between steps first snaps to
-/// its NEAREST step, then moves ±1 — so the first click from a hand-edited
-/// value lands on a canonical one instead of jumping erratically.
+/// The next / previous step, stopping at the first and last — never wrapping:
+/// one click past 100k scrollback landed on 1k and cut every tab's history.
+/// A value between steps first snaps to its NEAREST step, then moves ±1 — so
+/// the first click from a hand-edited value lands on a canonical one instead
+/// of jumping erratically.
 pub fn cycle_steps(steps: &[u64], cur: u64, forward: bool) -> u64 {
     let Some(i) = steps.iter().enumerate().min_by_key(|(_, &s)| s.abs_diff(cur)).map(|(i, _)| i) else {
         return cur;
     };
-    let n = steps.len();
-    steps[if forward { (i + 1) % n } else { (i + n - 1) % n }]
+    steps[if forward { (i + 1).min(steps.len() - 1) } else { i.saturating_sub(1) }]
 }
 
 /// The last path component ("/usr/bin/zsh" → "zsh"); "" → "System default".
@@ -2165,6 +2166,21 @@ pub enum Nav {
     Pass,
 }
 
+/// Whether `nav` may run on a key's auto-repeat. A held key MOVES — the focus,
+/// a stepper, a live slider, a list, the gallery — but never PRESSES: a cycler,
+/// switch, chip, fold, filter or "Reset tab" acts once per key press, as a
+/// click does (held →, the scrollback cycler raced on to its end; a held Enter
+/// armed "Reset tab" and then confirmed it). A release-applied slider (the
+/// dropdown size re-docks the window) moves once per press too.
+pub fn repeats(nav: &Nav) -> bool {
+    match nav {
+        Nav::Press(_, part) => matches!(part, CtlPart::Minus | CtlPart::Plus),
+        Nav::Set(id, _) => find(id).is_some_and(live),
+        Nav::Fold(_) | Nav::Filter(_) | Nav::ResetTab => false,
+        Nav::Focus(_) | Nav::ListStep(..) | Nav::Gallery(_) | Nav::Pass => true,
+    }
+}
+
 /// The keys of the Settings focus model. Tab / Shift+Tab walk `stops`
 /// (wrapping; from no focus, the first / last). With a stop focused every
 /// nav key acts on it — never falling through to the gallery or the scroll —
@@ -2476,8 +2492,10 @@ mod tests {
         let mut odd = c.clone();
         odd.tab_bar_position = "left".into();
         assert_eq!(press(find("tab_bar_position").unwrap(), CtlPart::Next, &odd, &x), Press::Set(Val::S("top".into())));
-        // Steps snap then move.
+        // Steps snap then move, and stop at the ends.
         assert_eq!(p("scrollback_lines", CtlPart::Next), Press::Set(Val::U(25_000)));
+        let most = Config { scrollback_lines: 100_000, ..c.clone() };
+        assert_eq!(press(find("scrollback_lines").unwrap(), CtlPart::Next, &most, &x), Press::Set(Val::U(100_000)));
         // Stepper clamps and resets to the default.
         let mut big = c.clone();
         big.font_size = 48.0;
@@ -2498,14 +2516,17 @@ mod tests {
     }
 
     #[test]
-    fn steps_snap_and_wrap() {
+    fn steps_snap_and_stop_at_the_ends() {
         assert_eq!(cycle_steps(&SCROLLBACK_STEPS, 10_000, true), 25_000);
-        assert_eq!(cycle_steps(&SCROLLBACK_STEPS, 100_000, true), 1_000, "forward wraps");
-        assert_eq!(cycle_steps(&SCROLLBACK_STEPS, 1_000, false), 100_000, "backward wraps");
+        // No wrap: one click past 100k landed on 1k and cut every tab's
+        // history to 1,000 lines for good.
+        assert_eq!(cycle_steps(&SCROLLBACK_STEPS, 100_000, true), 100_000, "forward stops at the last step");
+        assert_eq!(cycle_steps(&SCROLLBACK_STEPS, 1_000, false), 1_000, "backward stops at the first");
         assert_eq!(cycle_steps(&SCROLLBACK_STEPS, 12_345, true), 25_000);
         assert_eq!(cycle_steps(&SCROLLBACK_STEPS, 12_345, false), 5_000);
         assert_eq!(cycle_steps(&NOTIFY_MIN_STEPS, 10, true), 30);
-        assert_eq!(cycle_steps(&NOTIFY_MIN_STEPS, 300, true), 5);
+        assert_eq!(cycle_steps(&NOTIFY_MIN_STEPS, 300, true), 300);
+        assert_eq!(cycle_steps(&NOTIFY_MIN_STEPS, 5, false), 5);
         assert_eq!(cycle_steps(&NOTIFY_MIN_STEPS, 50, true), 120);
         assert_eq!(cycle_steps(&NOTIFY_MIN_STEPS, 50, false), 30);
         assert_eq!(cycle_steps(&[], 7, true), 7);
@@ -3152,6 +3173,31 @@ mod tests {
         let flash = Stop::Part("effects.caret_flash_color", CtlPart::Channel(0));
         let Nav::Set(_, Val::Rgb(v)) = go(flash, NavKey::Left) else { panic!("channel") };
         assert!((v[0] - (c.effects.caret_flash_color[0] - 1.0 / 16.0).max(0.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_held_key_moves_but_never_presses() {
+        // Auto-repeat on the focused scrollback cycler raced it on to its end
+        // (it used to wrap to 1k, cutting every tab's history), and a held
+        // Enter on "Reset tab" armed it and then confirmed.
+        assert!(!repeats(&Nav::Press("scrollback_lines", CtlPart::Next)));
+        assert!(!repeats(&Nav::Press("scrollback_lines", CtlPart::Prev)));
+        assert!(!repeats(&Nav::Press("launch_at_login", CtlPart::Switch)));
+        assert!(!repeats(&Nav::Press("effects.crt_animate", CtlPart::Chip(1))));
+        assert!(!repeats(&Nav::Press("font_size", CtlPart::Reset)));
+        assert!(!repeats(&Nav::ResetTab));
+        assert!(!repeats(&Nav::Fold("shell.startup")));
+        assert!(!repeats(&Nav::Filter(jetty_render::ThemeFilter::Dark)));
+        // A release-applied slider (it re-docks the window) moves per press.
+        assert!(!repeats(&Nav::Set("dropdown_height_pct", Val::F(0.5))));
+        // The focus, a stepper, a live slider, a list and the gallery move.
+        assert!(repeats(&Nav::Focus(Stop::ResetTab)));
+        assert!(repeats(&Nav::Press("font_size", CtlPart::Plus)));
+        assert!(repeats(&Nav::Press("font_size", CtlPart::Minus)));
+        assert!(repeats(&Nav::Set("opacity", Val::F(0.5))));
+        assert!(repeats(&Nav::ListStep("font_family", 1)));
+        assert!(repeats(&Nav::Gallery(GalleryKey::Down)));
+        assert!(repeats(&Nav::Pass), "the legacy keys (the scroll) repeat");
     }
 
     #[test]

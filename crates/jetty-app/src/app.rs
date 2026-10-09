@@ -9888,6 +9888,10 @@ impl App {
             let stops = sui::tab_stops(&sui::tab_items(tab, &cfg, &ctx), !sui::tab_at_defaults(&cfg, tab));
             sui::nav(&stops, self.settings_kb, key, self.settings_mods.shift_key(), &cfg, &ctx)
         };
+        // A held key moves but never presses (`settings_ui::repeats`).
+        if repeat && !sui::repeats(&nav) {
+            return true;
+        }
         // Anything but "Reset tab" itself disarms it (as any other click does).
         if !matches!(nav, Nav::Pass | Nav::ResetTab) {
             self.reset_armed = false;
@@ -9913,9 +9917,7 @@ impl App {
             }
             Nav::Press(id, part) => self.settings_ctl_press(id, part),
             Nav::Set(id, v) => {
-                // A release-applied slider (the dropdown size re-docks the
-                // window) moves per press, never per auto-repeat.
-                if let Some(d) = sui::find(id).filter(|d| !repeat || sui::live(d)) {
+                if let Some(d) = sui::find(id) {
                     if self.apply_settings_change(|c| (d.set)(c, v)) {
                         self.persist();
                     }
