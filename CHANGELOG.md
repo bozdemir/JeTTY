@@ -7,14 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased] — visuals v2
+## [0.27.0] — 2026-10-09
 
-New themes, a background layer, a faster and richer effects pass, built-in box
-glyphs, tab styles and a rebuilt Settings window. Everything new is off by
-default unless listed under "Changed". Plan:
+**Visuals v2.** One-click Looks, new themes, a background layer, a faster and
+richer effects pass, built-in box glyphs, cursor styles, new summon reveals,
+tab styles and a rebuilt Settings window — with typing and scrolling frames as
+fast as v0.26.1 (`docs/perf-budget.md`). Everything new is off by default
+unless listed under "Changed". Plan:
 `docs/superpowers/plans/2026-10-08-visuals-v2.md`.
 
 ### Added
+- **Looks** — one-click bundles at the top of Settings › Look and as
+  `Look: …` in the command palette: Amber VT, P1 Green, Trinitron, Neon Night,
+  Aurora, Paper and Clean. A look sets a theme, an effects preset, a backdrop,
+  the summon effect and the cursor in one go; Clean is the defaults and keeps
+  your theme. A look's chip stays lit while every key it set still holds.
 - **24 new themes (46 in all, 11 light):** Catppuccin Latte/Frappé, Tokyo
   Night Storm/Moon/Day, Rosé Pine Moon/Dawn, Gruvbox Light, GitHub Light,
   Alucard (Dracula Light), Flexoki Light/Dark, Everforest Light, Kanagawa
@@ -42,6 +49,22 @@ default unless listed under "Changed". Plan:
   (amber/green/white/blue/paper/custom, with "keep colors"), film grain, a 1-bit
   dither "e-ink" look, a bloom radius, and an optional 200 ms glitch on a
   failed command or the bell.
+- **Cursor** (`[cursor]`): `shape` (block / beam / underline /
+  double_underline / thick_underline — a program's own cursor request still
+  wins), `thickness`, `unfocused` (hollow / unchanged / none), `color` (theme /
+  cell / auto), a faint row `guide` (off / shell / always), and an optional
+  **trail** (`trail`, `trail_ms`, `trail_threshold`) that smears from where the
+  cursor sat when it jumps — never while you type.
+- **Summon reveals:** Pop, Glide and Fade join Phosphor, Bayer, Liquid and
+  Focus (`summon_effect`). The Dropdown strip itself now slides in, with its
+  real bottom edge and rounded corners.
+- **Motion and alerts:** `reduce_motion` = off / on / system (system follows
+  the desktop) calms every animation JeTTY owns — reveals become a short fade,
+  the Dropdown appears docked, the CRT holds still, no glitch or trail, a still
+  backdrop. `visual_bell` = off / flash / rim. `command_pulse` = off /
+  failures / all — a brief glow along the window edge when a command fails (or
+  a long one succeeds), played on the next summon if JeTTY was hidden. Palette
+  commands for each, and for the cursor shape, trail and guide.
 - **Tabs:** five styles (`tab_style` = pill / underline / slant / powerline /
   compact), close-button modes, a translucent tab bar, per-tab colors (tab
   menu › Color), smart titles (`tab_title = "auto"`), finished/failed/bell
@@ -69,7 +92,11 @@ default unless listed under "Changed". Plan:
   graphs); `builtin_glyphs = false` goes back to the font's glyphs.
 - **Faint text** blends toward the background (it got darker — more prominent —
   on light themes).
-- Underlines sit at the font's underline position (about 1 px higher).
+- Underlines — and the underline cursor — sit at the font's underline
+  position (about 1 px higher).
+- The Phosphor reveal's scan line takes the theme's UI accent.
+- Startup builds no summon pipeline; the first summon builds only the chosen
+  effect. CRT, backdrop, glow, trail and rim passes are built only when used.
 - The CRT pass is rebuilt: ~45% faster on the owner's look (1.59 → 0.86 ms at
   1440p on an Intel iGPU), pixel-identical to the eye; bloom is keyed to
   brightness above the background (light themes no longer wash out); CRT
@@ -89,6 +116,16 @@ default unless listed under "Changed". Plan:
 - The scrollbar was mis-sized on 2× displays.
 - The launch splash covered a two-line prompt's input line.
 - Tokyo Night's bright colors and Everforest Dark's brights were off upstream.
+- The default Phosphor reveal had played upside down since v0.1.0: the window
+  sat dark above the scan line and popped in at the end. It reveals top-down
+  again.
+- With CRT on, the Focus and Liquid reveals showed the plain frame and the
+  scanlines snapped back when they ended; the CRT look now stays on through
+  every reveal.
+- The caret flash made the cursor vanish on light themes (a white flash on a
+  near-white page); it now turns black or white when the configured color
+  wouldn't show. The caret glow has a variant for light pages and works in
+  detached windows too.
 
 ## [0.26.1] — 2026-10-08
 

@@ -6,6 +6,8 @@ The user and host are neutral (`dev@jetty`, `~/src/jetty`).
 """
 
 import math
+import os
+import re
 
 E = "\x1b"
 
@@ -120,11 +122,18 @@ def bat(cols, path="crates/jetty-app/src/motion.rs"):
     return out
 
 
+def jetty_version():
+    """The version in the repo's Cargo.toml, so the sample build log stays current."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Cargo.toml")
+    with open(path) as f:
+        return re.search(r'^version = "([^"]+)"', f.read(), re.M).group(1)
+
+
 def cargo_build():
-    gb = sgr(1, 32)
+    gb, v = sgr(1, 32), jetty_version()
     return [
-        f"{gb}   Compiling{R} jetty-render v0.26.1 (~/src/jetty/crates/jetty-render)",
-        f"{gb}   Compiling{R} jetty-app v0.26.1 (~/src/jetty/crates/jetty-app)",
+        f"{gb}   Compiling{R} jetty-app v{v} (~/src/jetty/crates/jetty-app)",
+        f"{gb}   Compiling{R} jetty v{v} (~/src/jetty)",
         f"{gb}    Finished{R} `release` profile [optimized] target(s) in 41.87s",
     ]
 
