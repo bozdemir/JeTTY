@@ -425,55 +425,34 @@ fn passwd_home() -> Option<String> {
     None
 }
 
+/// How long [`pid_cwd`] waits for the directory to answer a stat.
+const CWD_STAT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Run `f` on a helper thread and wait at most `timeout` for its answer —
+/// `None` when it is late (or no thread could be started). For filesystem
+/// checks on the UI thread: a directory on a dead network mount (sshfs/NFS
+/// after the link dropped) blocks stat(2) until the mount gives up, possibly
+/// never. A late check is abandoned; its thread ends whenever the mount answers.
+fn answer_within<T: Send + 'static>(timeout: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = sync_channel(1);
+    std::thread::Builder::new()
+        .name("jetty-stat".into())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .ok()?;
+    rx.recv_timeout(timeout).ok()
+}
+
 /// Current working directory of a live process by PID, or `None` when it
-/// can't be read (process gone, permission, unsupported OS) or the directory
-/// no longer exists.
-#[cfg(target_os = "linux")]
+/// can't be read (process gone, permission, unsupported OS), no longer
+/// exists, or does not answer within [`CWD_STAT_TIMEOUT`]. Callers run on the
+/// UI thread (Ctrl+Shift+T reads the active tab's directory): a cwd on a dead
+/// network mount used to freeze the whole app until the mount gave up.
 fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
-    // /proc resolves symlinks; a deleted cwd reads as "/path (deleted)" and
-    // fails the is_dir filter.
-    std::fs::read_link(format!("/proc/{pid}/cwd")).ok().filter(|p| p.is_dir())
-}
-
-#[cfg(target_os = "macos")]
-fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
-    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
-    // SAFETY: the buffer is sized and aligned for proc_vnodepathinfo; the
-    // kernel writes at most `size` bytes and returns the count written, so
-    // ret == size proves the struct is fully initialized.
-    let ret = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if ret != size {
-        return None;
-    }
-    let info = unsafe { info.assume_init() };
-    // SAFETY: vip_path is declared [[c_char; 32]; 32] (libc flattens the C
-    // char[MAXPATHLEN] to dodge an old-rustc array limit) — 1024 contiguous
-    // bytes, NUL-terminated by the kernel. Read it as one flat buffer.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(info.pvi_cdir.vip_path.as_ptr().cast::<u8>(), 1024)
-    };
-    let len = bytes.iter().position(|&b| b == 0)?;
-    if len == 0 {
-        return None;
-    }
-    let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..len]));
-    if path.is_dir() { Some(path) } else { None }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
-    let _ = pid;
-    None
+    let dir = pid_cwd_nostat(pid)?;
+    let probe = dir.clone();
+    answer_within(CWD_STAT_TIMEOUT, move || probe.is_dir()).unwrap_or(false).then_some(dir)
 }
 
 /// The working directory of a live process WITHOUT touching the directory
@@ -492,8 +471,9 @@ fn pid_cwd_nostat(pid: u32) -> Option<std::path::PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
-    // SAFETY: as in `pid_cwd` — the kernel fills at most `size` bytes and
-    // returns the count written; ret == size proves full initialization.
+    // SAFETY: the buffer is sized and aligned for proc_vnodepathinfo; the
+    // kernel writes at most `size` bytes and returns the count written, so
+    // ret == size proves the struct is fully initialized.
     let ret = unsafe {
         libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDVNODEPATHINFO, 0, info.as_mut_ptr().cast(), size)
     };
@@ -501,7 +481,9 @@ fn pid_cwd_nostat(pid: u32) -> Option<std::path::PathBuf> {
         return None;
     }
     let info = unsafe { info.assume_init() };
-    // SAFETY: vip_path is 1024 contiguous, NUL-terminated bytes (see `pid_cwd`).
+    // SAFETY: vip_path is declared [[c_char; 32]; 32] (libc flattens the C
+    // char[MAXPATHLEN] to dodge an old-rustc array limit) — 1024 contiguous
+    // bytes, NUL-terminated by the kernel. Read it as one flat buffer.
     let bytes = unsafe { std::slice::from_raw_parts(info.pvi_cdir.vip_path.as_ptr().cast::<u8>(), 1024) };
     let len = bytes.iter().position(|&b| b == 0)?;
     (len > 0).then(|| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..len])))
@@ -1500,6 +1482,23 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         drop(q);
         assert!(!producer.join().unwrap(), "send into a dropped queue must fail, not hang");
+    }
+
+    #[test]
+    fn a_stat_that_does_not_answer_is_abandoned_on_time() {
+        // A directory on a dead network mount blocks stat(2) until the mount
+        // gives up; the UI thread asking for a tab's directory must not wait
+        // with it (reproduced with a FUSE mount that stops answering).
+        let t = Instant::now();
+        let stuck = answer_within(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(3));
+            true
+        });
+        assert_eq!(stuck, None);
+        assert!(t.elapsed() < Duration::from_secs(1), "gave up on time: {:?}", t.elapsed());
+        assert_eq!(answer_within(Duration::from_secs(5), || 42), Some(42), "a prompt answer comes through");
+        let dir = std::env::temp_dir();
+        assert_eq!(answer_within(CWD_STAT_TIMEOUT, move || dir.is_dir()), Some(true));
     }
 
     #[test]
