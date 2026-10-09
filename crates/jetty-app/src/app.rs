@@ -204,6 +204,15 @@ fn build_notification_text(
     (summary, c.last_line.clone())
 }
 
+/// Whether a bell in an unfocused window asks for attention now: once until the
+/// window is focused again (`asked` is its `main_attention` / `attention`,
+/// which Focused(true) clears). An X11 urgency hint stays set anyway, and each
+/// request is a round trip to the window manager — a `yes $'\a'` flood made
+/// one per drain pass.
+fn bell_asks_attention(asked: &mut bool) -> bool {
+    !std::mem::replace(asked, true)
+}
+
 /// The winit taskbar/dock urgency level for a completion: `Critical` (persistent /
 /// dock-bounce) on failure, `Informational` on success.
 fn attention_for(failed: bool) -> winit::window::UserAttentionType {
@@ -8743,8 +8752,8 @@ impl App {
 
     /// The main window's active tab rang the bell: play the visual bell
     /// (`visual_bell`; the rim while motion is reduced) — at most one per
-    /// `BELL_MIN_GAP`. A shown but unfocused window asks for attention instead;
-    /// a hidden one has nobody to show it to.
+    /// `BELL_MIN_GAP`. A shown but unfocused window asks for attention instead
+    /// (once until it is focused); a hidden one has nobody to show it to.
     fn ring_main_bell(&mut self) {
         let kind = self.visual_bell.effective(self.motion_reduced());
         if kind == crate::motion::VisualBell::Off || !self.visible || self.main_occluded {
@@ -8752,8 +8761,9 @@ impl App {
         }
         if !self.main_focused {
             if let Some(w) = &self.window {
-                w.request_user_attention(Some(winit::window::UserAttentionType::Informational));
-                self.main_attention = true;
+                if bell_asks_attention(&mut self.main_attention) {
+                    w.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+                }
             }
             return;
         }
@@ -8772,8 +8782,9 @@ impl App {
             return;
         }
         if !dw.focused {
-            dw.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
-            dw.attention = true;
+            if bell_asks_attention(&mut dw.attention) {
+                dw.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+            }
             return;
         }
         let now = std::time::Instant::now();
@@ -20964,6 +20975,17 @@ mod scheduler_tests {
         assert_eq!(main_finish_actions(true, false, false), (true, false));
         assert_eq!(main_finish_actions(true, true, true), (true, false), "shown: nothing to summon");
         assert_eq!(main_finish_actions(false, false, false), (false, false));
+    }
+
+    #[test]
+    fn a_bell_flood_asks_for_attention_once_until_focus() {
+        // `yes $'\a'` in an unfocused window: one request, not one per drain
+        // (each is a round trip to the window manager on X11).
+        let mut asked = false;
+        assert!(super::bell_asks_attention(&mut asked));
+        assert!((0..100).all(|_| !super::bell_asks_attention(&mut asked)));
+        asked = false; // Focused(true)
+        assert!(super::bell_asks_attention(&mut asked), "the next burst asks again");
     }
 }
 
