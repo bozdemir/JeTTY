@@ -447,9 +447,11 @@ stop)
     stop_pid jetty jetty
     if [ "$MODE" = wayland ]; then stop_pid wm kwin_wayland; else stop_pid wm kwin_x11; fi
     stop_pid xvfb Xvfb
-    # The runtime dirs outside the sandbox: jetty's socket + lock, the compositor's.
+    # The runtime dirs outside the sandbox: jetty's socket + lock, the compositor's,
+    # and the dconf cache a program in the session may have left.
     sleep 0.3
-    rm -f "$RUN"/jetty*.sock "$RUN"/jetty*.sock.lock "$WL" "$WL.lock"
+    rm -f "$RUN"/jetty*.sock "$RUN"/jetty*.sock.lock "$WL" "$WL.lock" "$RUN/dconf/user" "$RUN/wm/dconf/user"
+    rmdir "$RUN/dconf" "$RUN/wm/dconf" 2>/dev/null
     rmdir "$RUN/wm" 2>/dev/null
     [ "$RUN" != "$SB/run" ] && rmdir "$RUN" 2>/dev/null
     rm -f "$SB/mode"
