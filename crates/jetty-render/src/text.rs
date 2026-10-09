@@ -161,14 +161,26 @@ fn is_color_emoji_char(c: char) -> bool {
     emoji::is_emoji_presentation(c) && c.width() == Some(2)
 }
 
+/// Whether a glyph of advance `w` (px) is laid out exactly one cell wide in a
+/// grid row. The row's monospace snap (`set_monospace_width`) rounds each
+/// advance to a whole number of `cell_w / px` steps — a fraction of a pixel,
+/// not a cell — so only an advance within half a step of `cell_w` becomes
+/// `cell_w` (`px` steps; `px` is whole, see `rounded_font_px`). Any other keeps
+/// about its own width and moves every later glyph of the row.
+fn snaps_to_one_cell(w: f32, cell_w: f32, px: f32) -> bool {
+    (w / (cell_w / px)).round() == px
+}
+
 /// Probe how the row shaping would lay `c` out in a cell of style `shape`: shape
 /// it alone with the SAME face (`face_attrs`) under `Shaping::Basic` (no
 /// fallback). A glyph id of 0 (`.notdef`, the tofu box) means that face lacks the
 /// char — e.g. MesloLGS NF Bold has no box drawing although Regular does — and an
-/// advance wider than ~1.5 cells means a double-width glyph that would shift the
-/// row if laid out inline. Both take the `Overdraw` route (blanked in the row,
-/// overdrawn at the exact cell origin from a buffer shaped with font fallback,
-/// which finds the regular face or another font that has it).
+/// advance the row's snap does not make one cell (see [`snaps_to_one_cell`]: a
+/// double-width CJK glyph, Noto Sans Mono's zero-width fraction slash, a
+/// 1⅓-cell letter) would shift the rest of the row if laid out inline. Both take
+/// the `Overdraw` route (blanked in the row, overdrawn at the exact cell origin
+/// from a buffer shaped with font fallback, which finds the regular face or
+/// another font that has it).
 fn probe_route(
     font_system: &mut FontSystem,
     probe: &mut Buffer,
@@ -178,17 +190,25 @@ fn probe_route(
     shape: u8,
     cell_w: f32,
 ) -> CellRoute {
+    // U+2029 PARAGRAPH SEPARATOR lays out a glyph alone, but inside a row it ends
+    // the bidi paragraph and drops out, moving the rest of the row a cell left.
+    if c == '\u{2029}' {
+        return CellRoute::Blank;
+    }
     let mut tmp = [0u8; 4];
     let s = c.encode_utf8(&mut tmp);
     probe.set_text(font_system, s, &face_attrs(family, weights, shape), Shaping::Basic, None);
+    let px = probe.metrics().font_size;
     probe
         .layout_runs()
         .flat_map(|run| run.glyphs.iter())
         .next()
-        .map(|g| if g.glyph_id == 0 || g.w > cell_w * 1.5 { CellRoute::Overdraw } else { CellRoute::Inline })
-        // No glyph laid out at all (e.g. zero-width/control) — leave it inline for
-        // the main grid; don't try to overdraw.
-        .unwrap_or(CellRoute::Inline)
+        .map(|g| {
+            if g.glyph_id == 0 || !snaps_to_one_cell(g.w, cell_w, px) { CellRoute::Overdraw } else { CellRoute::Inline }
+        })
+        // No glyph laid out at all: nothing to draw, and a blank cell keeps the
+        // rest of the row on the grid.
+        .unwrap_or(CellRoute::Blank)
 }
 
 /// Whether the face a cell of style `shape` is shaped with maps every char of
@@ -424,10 +444,11 @@ enum CellRoute {
     /// in the main grid run.
     Inline,
     /// The primary font either lacks the glyph (tofu box under `Shaping::Basic`), or
-    /// renders it double-width (a CJK glyph advances ~2 cells and would shift every
-    /// following column of the row if laid out inline). Either way, blank the cell in
-    /// the main run and overdraw the real glyph from its own buffer at the exact cell
-    /// origin, keeping the grid aligned regardless of the glyph's advance.
+    /// renders it at an advance other than one cell (a CJK glyph advances ~2 cells,
+    /// a fraction slash none: either would shift every following column of the row
+    /// if laid out inline). Either way, blank the cell in the main run and overdraw
+    /// the real glyph from its own buffer at the exact cell origin, keeping the grid
+    /// aligned regardless of the glyph's advance.
     Overdraw,
     /// A built-in glyph (`builtin.rs` slot): blank in the row, drawn as a
     /// cell-exact custom glyph in the cell's fg (box drawing, blocks, Powerline,
@@ -1335,13 +1356,14 @@ impl TextLayer {
     /// A fresh single-line buffer for one grid row. `None` width disables wrapping
     /// so columns stay on the monospace grid; the height bound is one line.
     ///
-    /// Every grid glyph's advance is snapped to the cell width: cosmic-text rounds
-    /// each glyph's x_advance to the nearest `cell_w` (shape.rs), which keeps a real
-    /// Bold/Italic face — or any stray wide/fallback glyph — column-aligned even
-    /// when its natural advance differs from Regular. This is the alignment
-    /// guarantee that lets us render real bold/italic faces (v0.13 amendment). Set
-    /// ONLY on grid rows; the chrome overlay buffers are proportional
-    /// (Shaping::Advanced) and never get this.
+    /// The row's monospace snap: cosmic-text rounds each glyph's x_advance to a
+    /// whole number of `cell_w / px` steps (shape.rs), so a glyph within half a
+    /// step of `cell_w` — every glyph of a monospace face, its real Bold/Italic
+    /// faces included (v0.13 amendment) — advances exactly one cell. The rest of
+    /// the alignment guarantee is the router's: `probe_route` lays out inline only
+    /// glyphs the snap makes one cell wide (`snaps_to_one_cell`), and overdraws
+    /// every other at its cell origin. Set ONLY on grid rows; the chrome overlay
+    /// buffers are proportional (Shaping::Advanced) and never get this.
     fn new_row_buffer(&mut self) -> Buffer {
         grid_row_buffer(&mut self.font_system, self.metrics, self.cell_w)
     }
@@ -2146,9 +2168,10 @@ impl TextLayer {
             runs.iter().map(|&(s, e, color, shape)| {
                 // BOLD -> real Bold face, ITALIC -> real Italic face, under
                 // Shaping::Basic — at the weights the family has (`FaceWeights`),
-                // so no run leaves the family. Monospace alignment is guaranteed by
-                // the row's monospace snap (see `new_row_buffer`). A char that face
-                // lacks never gets here: `probe_route` sent it to the overdraw.
+                // so no run leaves the family. The row's monospace snap lays each
+                // glyph one cell on (see `new_row_buffer`): a char that face lacks,
+                // or that the snap would not make one cell wide, never gets here —
+                // `probe_route` sent it to the overdraw.
                 (&text[s..e], face_attrs(&family, weights, shape).color(color))
             }),
             &default_attrs,
@@ -2587,8 +2610,8 @@ impl TextLayer {
     }
 }
 
-/// An empty single-line grid-row buffer at `metrics`, every glyph advance
-/// snapped to `cell_w` (see `TextLayer::new_row_buffer`).
+/// An empty single-line grid-row buffer at `metrics`, its glyph advances
+/// snapped toward `cell_w` (see `TextLayer::new_row_buffer`).
 fn grid_row_buffer(font_system: &mut FontSystem, metrics: Metrics, cell_w: f32) -> Buffer {
     let mut b = Buffer::new(font_system, metrics);
     b.set_size(font_system, None, Some(metrics.line_height));
@@ -3534,6 +3557,84 @@ mod tests {
             checked += 1;
         }
         eprintln!("{checked} monospace families aligned in all four styles");
+    }
+
+    /// A broad sample of what terminals print beyond ASCII: Latin, Greek and
+    /// Cyrillic letters, punctuation, Latin Extended-D/E and Powerline icons
+    /// whole; every third arrow, math and technical symbol, box drawing char,
+    /// shape, dingbat and Nerd Font icon.
+    fn alignment_sample() -> Vec<char> {
+        let ranges = [
+            (0x20..0x7F, 1),
+            (0xA0..0x250, 1),
+            (0x370..0x460, 1),
+            (0x2010..0x2060, 1),
+            (0x2190..0x2400, 3),
+            (0x2500..0x2800, 3),
+            (0xA710..0xA730, 1),
+            (0xAB30..0xAB70, 1),
+            (0xE0A0..0xE0D8, 1),
+            (0xF000..0xF100, 3),
+        ];
+        let chars = ranges.into_iter().flat_map(|(r, step)| r.step_by(step)).filter_map(char::from_u32);
+        chars.filter(|c| !c.is_control()).collect()
+    }
+
+    #[test]
+    fn every_glyph_the_router_inlines_lands_on_its_cell() {
+        // The alignment guarantee, end to end: for every installed monospace
+        // family in all four styles, each sample char `probe_route` lays out
+        // inline lands exactly on its cell in a grid row. Regression: the router
+        // overdrew only a missing glyph or one over 1.5 cells, so Noto Sans
+        // Mono's zero-width U+2044 (and Liberation Mono's zero-advance U+0374)
+        // shifted the rest of the row a cell left, and its 1⅓-cell U+AB60 a
+        // third of one. Families or chars that are not installed are skipped.
+        let mut fs = TextLayer::build_font_system();
+        let mut families: Vec<String> =
+            fs.db().faces().filter(|f| f.monospaced).filter_map(|f| f.families.first().map(|(n, _)| n.clone())).collect();
+        families.sort();
+        families.dedup();
+        let sample = alignment_sample();
+        let offenders = [('\u{2044}', "Noto Sans Mono"), ('\u{AB60}', "Noto Sans Mono"), ('\u{0374}', "Liberation Mono")];
+        let mut checked = 0;
+        for px in [16.0f32, 23.0] {
+            let metrics = layer_metrics(px, LINE_HEIGHT_DEFAULT);
+            let mut probe = Buffer::new(&mut fs, metrics);
+            for family in &families {
+                let weights = resolve_face_weights(&mut fs, family, wght_axis_range);
+                let cell_w = measure_advance_family(&mut fs, metrics, family, weights.of(0));
+                for shape in 0..4u8 {
+                    let inline: String = sample
+                        .iter()
+                        .copied()
+                        .filter(|&c| probe_route(&mut fs, &mut probe, family, weights, c, shape, cell_w) == CellRoute::Inline)
+                        .collect();
+                    for &(c, fam) in &offenders {
+                        assert!(fam != family || !inline.contains(c), "{family} inlines U+{:04X}", c as u32);
+                    }
+                    // Shaped as grid rows of 200 columns.
+                    let inline: Vec<char> = inline.chars().collect();
+                    for row in inline.chunks(200) {
+                        let text: String = row.iter().collect();
+                        let mut b = grid_row_buffer(&mut fs, metrics, cell_w);
+                        let attrs = face_attrs(family, weights, shape);
+                        b.set_rich_text(&mut fs, [(text.as_str(), attrs.clone())], &attrs, Shaping::Basic, None);
+                        let xs: Vec<f32> = b.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| g.x)).collect();
+                        assert_eq!(xs.len(), row.len(), "{family} style {shape}");
+                        for ((col, &x), c) in xs.iter().enumerate().zip(row) {
+                            let want = col as f32 * cell_w;
+                            assert!(
+                                (x - want).abs() < 0.01,
+                                "{family} style {shape} @ {px}px: U+{:04X} at col {col} is at x {x}, its cell at {want}",
+                                *c as u32
+                            );
+                        }
+                    }
+                    checked += inline.len();
+                }
+            }
+        }
+        eprintln!("{checked} inlined glyphs on their cells");
     }
 
     /// A device on the low-power adapter, for the GPU tests — `#[ignore]`d, as
