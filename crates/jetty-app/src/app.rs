@@ -1836,6 +1836,55 @@ fn arm_shift_hint(
     true
 }
 
+/// The keys that jump to tabs 1–9, as the help lists them: each bound
+/// `select_tab_N`'s first chord, runs of `<modifiers>+N` with the same
+/// modifiers folded ("Ctrl+1…9" — the default — or "Alt+1…9"), the rest
+/// listed one by one; "(unbound)" when none is bound.
+fn tab_jump_keys(km: &crate::keymap::KeyMap) -> String {
+    use crate::keymap::BindableAction as A;
+    const TABS: [A; 9] = [
+        A::SelectTab1,
+        A::SelectTab2,
+        A::SelectTab3,
+        A::SelectTab4,
+        A::SelectTab5,
+        A::SelectTab6,
+        A::SelectTab7,
+        A::SelectTab8,
+        A::SelectTab9,
+    ];
+    // A run of foldable chords: (modifiers prefix, first tab, last tab).
+    let mut run: Option<(String, usize, usize)> = None;
+    let mut parts: Vec<String> = Vec::new();
+    let flush = |run: &mut Option<(String, usize, usize)>, parts: &mut Vec<String>| {
+        if let Some((p, a, b)) = run.take() {
+            parts.push(match b - a {
+                0 => format!("{p}{a}"),
+                1 => format!("{p}{a} / {p}{b}"),
+                _ => format!("{p}{a}…{b}"),
+            });
+        }
+    };
+    for (i, action) in TABS.into_iter().enumerate() {
+        let n = i + 1;
+        let chord = km.pretty_chords(action).into_iter().next();
+        let prefix = chord.as_deref().and_then(|c| c.strip_suffix(&n.to_string())).filter(|p| p.ends_with('+'));
+        match (prefix, &mut run) {
+            (Some(p), Some((rp, _, last))) if rp == p && *last + 1 == n => *last = n,
+            (Some(p), _) => {
+                flush(&mut run, &mut parts);
+                run = Some((p.to_string(), n, n));
+            }
+            (None, _) => {
+                flush(&mut run, &mut parts);
+                parts.extend(chord);
+            }
+        }
+    }
+    flush(&mut run, &mut parts);
+    if parts.is_empty() { "(unbound)".to_string() } else { parts.join(" / ") }
+}
+
 /// The base ASCII letter a key event denotes for hint-mode narrowing,
 /// INDEPENDENT of Alt/compose (BLOCKING 5): prefer the produced logical letter
 /// (layout-correct), falling back to the physical QWERTY position when
@@ -2304,7 +2353,7 @@ impl App {
         app.keys = cfg.keys;
         app.keymap = crate::keymap::KeyMap::compile(&app.keys);
         startup_warnings.extend(app.keymap.warnings().iter().map(|w| format!("[keys] {w}")));
-        app.help_rows = App::compute_help_rows(&app.keymap, app.summon_key_shown().as_deref());
+        app.refresh_help_rows();
         for w in &startup_warnings {
             eprintln!("jetty: {}", sanitize_notice(w));
         }
@@ -2334,13 +2383,25 @@ impl App {
         self.startup_failed
     }
 
+    /// Rebuild the cached Help overlay rows (`compute_help_rows`) from the live
+    /// keymap, the summoning key (`summon_key_shown`) and `copy_on_select` — on
+    /// load, on hot-reload and on a keybinding reset.
+    fn refresh_help_rows(&mut self) {
+        let summon = self.summon_key_shown();
+        self.help_rows = App::compute_help_rows(&self.keymap, summon.as_deref(), self.copy_on_select);
+    }
+
     /// Build the Help overlay rows from the CURRENT keymap (so a remap is
-    /// reflected) plus the static, non-keymap rows (drag / right-click / URL open /
-    /// Ctrl+D EOF / Esc). `summon_hotkey` is the global key that summons JeTTY
-    /// ([`App::summon_key_shown`]; `None` on Wayland). Called on load + on
-    /// hot-reload; the result is cached in `self.help_rows`, so the render path
-    /// never re-derives it.
-    fn compute_help_rows(km: &crate::keymap::KeyMap, summon_hotkey: Option<&str>) -> Vec<String> {
+    /// reflected — the tab jumps included) and `copy_on_select` (where a drag
+    /// copies), plus the static, non-keymap rows (right-click / URL open / Ctrl+D
+    /// EOF / Esc). `summon_hotkey` is the global key that summons JeTTY
+    /// ([`App::summon_key_shown`]; `None` on Wayland). Cached in `self.help_rows`
+    /// (`refresh_help_rows`), so the render path never re-derives it.
+    fn compute_help_rows(
+        km: &crate::keymap::KeyMap,
+        summon_hotkey: Option<&str>,
+        copy_on_select: clipboard::CopyOnSelect,
+    ) -> Vec<String> {
         use crate::keymap::BindableAction as A;
         let all = |a: A| {
             let v = km.pretty_chords(a);
@@ -2357,6 +2418,13 @@ impl App {
             .chain(km.pretty_chords(A::ContextMenu))
             .collect::<Vec<_>>()
             .join(" / ");
+        // Where a finished drag goes (`copy_on_select`): "auto-copies" only
+        // where the clipboard gets it.
+        let drag = match copy_on_select.targets(clipboard::HAS_PRIMARY) {
+            (_, true) => "Left-drag — Select text (auto-copies)",
+            (true, false) => "Left-drag — Select text (middle-click pastes it)",
+            (false, false) => "Left-drag — Select text",
+        };
         // Sectioned (`## ` header, "" spacer, "KEY — desc" item) so the overlay
         // renders section headers + aligned key/description columns. Mirrors the
         // static `jetty_render::HELP_ROWS`, but with LIVE keymap chords.
@@ -2365,7 +2433,7 @@ impl App {
             format!("{} — New tab", all(A::NewTab)),
             format!("{} — Close tab", all(A::CloseTab)),
             format!("{} / {} — Next / previous tab", first(A::NextTab), first(A::PrevTab)),
-            "Ctrl+1…9 — Jump to tab".to_string(),
+            format!("{} — Jump to tab", tab_jump_keys(km)),
             format!(
                 "{} — Detach / reattach tab   (drag off bar; right-click for menu)",
                 all(A::DetachTab)
@@ -2396,7 +2464,7 @@ impl App {
                 "{} — Run selection in a new tab   (multi-line lands staged)",
                 all(A::RunSelection)
             ),
-            "Left-drag — Select text (auto-copies)".to_string(),
+            drag.to_string(),
             "Shift+drag — Select over mouse apps (vim / htop / Claude Code)".to_string(),
             format!("{menu_keys} — Context menu   (arrows move, Enter picks)"),
             String::new(),
@@ -3317,9 +3385,11 @@ impl App {
             warnings.extend(new_km.warnings().iter().map(|w| format!("[keys] {w}")));
             self.keys = cfg.keys.clone();
             self.keymap = new_km;
-            self.help_rows = App::compute_help_rows(&self.keymap, self.summon_key_shown().as_deref());
             self.dismiss_all_menus();
         }
+        // The help names the live chords, the summoning key and where a drag
+        // copies.
+        self.refresh_help_rows();
     }
 
     /// Apply a `[cursor]` table live (hot-reload, Settings): the shape every
@@ -6676,7 +6746,7 @@ impl App {
                 // Clear every user `[keys]` override → back to the built-in defaults.
                 self.keys = crate::config::KeyBindings::default();
                 self.keymap = crate::keymap::KeyMap::compile(&self.keys);
-                self.help_rows = App::compute_help_rows(&self.keymap, self.summon_key_shown().as_deref());
+                self.refresh_help_rows();
                 self.persist();
                 let msg = match backup {
                     Some(p) => format!(
@@ -19592,7 +19662,7 @@ mod fullscreen_helper_tests {
         // format-identical, and BOTH default chords must appear (`all()`, not
         // `first()`) — bare F11 is dead on macOS keyboards without standard
         // function keys, so the companion chord is the discoverable one there.
-        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"));
+        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"), Default::default());
         let live = rows
             .iter()
             .find(|r| r.contains("Fullscreen (whole monitor)"))
@@ -19618,14 +19688,14 @@ mod fullscreen_helper_tests {
         // The static jetty_render::HELP_ROWS must equal the live rows for the
         // default keymap (macOS adds Cmd companions, so Linux-only), so changing
         // a default chord can never leave the fallback overlay stale.
-        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"));
+        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"), Default::default());
         assert_eq!(rows, jetty_render::default_help_rows());
     }
 
     #[test]
     fn the_help_names_the_summon_key_that_works() {
         let row = |summon: Option<&str>| {
-            super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), summon)
+            super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), summon, Default::default())
                 .into_iter()
                 .find(|r| r.contains("— Summon / hide window"))
                 .expect("no summon help row")
@@ -19640,7 +19710,7 @@ mod fullscreen_helper_tests {
     #[test]
     fn help_rows_name_the_menu_key_beside_the_right_click() {
         let row = |km: &crate::keymap::KeyMap| {
-            super::App::compute_help_rows(km, Some("F9"))
+            super::App::compute_help_rows(km, Some("F9"), Default::default())
                 .into_iter()
                 .find(|r| r.contains("— Context menu"))
                 .expect("no context-menu help row")
@@ -19663,12 +19733,74 @@ mod fullscreen_helper_tests {
         assert!(unbound.starts_with("Right-click — "), "{unbound:?}");
     }
 
+    /// The tab-jump row follows `select_tab_N` like every other row: remapped
+    /// or unbound, the help used to keep saying "Ctrl+1…9".
+    #[test]
+    fn help_rows_follow_the_tab_jump_keys() {
+        use crate::config::{ChordSpec, KeyBindings};
+        let row = |keys: &KeyBindings| {
+            super::App::compute_help_rows(&crate::keymap::KeyMap::compile(keys), Some("F9"), Default::default())
+                .into_iter()
+                .find(|r| r.ends_with(" — Jump to tab"))
+                .expect("no tab-jump help row")
+        };
+        assert_eq!(row(&KeyBindings::default()), "Ctrl+1…9 — Jump to tab");
+        let all = |f: &dyn Fn(usize) -> String| {
+            let one = |n| Some(ChordSpec::One(f(n)));
+            KeyBindings {
+                select_tab_1: one(1),
+                select_tab_2: one(2),
+                select_tab_3: one(3),
+                select_tab_4: one(4),
+                select_tab_5: one(5),
+                select_tab_6: one(6),
+                select_tab_7: one(7),
+                select_tab_8: one(8),
+                select_tab_9: one(9),
+                ..Default::default()
+            }
+        };
+        assert_eq!(row(&all(&|n| format!("Alt+{n}"))), "Alt+1…9 — Jump to tab");
+        assert_eq!(row(&all(&|_| String::new())), "(unbound) — Jump to tab");
+        // A partial remap: each run folds on its own.
+        let one = KeyBindings { select_tab_1: Some(ChordSpec::One("Alt+1".into())), ..Default::default() };
+        assert_eq!(row(&one), "Alt+1 / Ctrl+2…9 — Jump to tab");
+        let gap = KeyBindings {
+            select_tab_5: Some(ChordSpec::One(String::new())),
+            select_tab_9: Some(ChordSpec::One("F9".into())),
+            ..Default::default()
+        };
+        assert_eq!(row(&gap), "Ctrl+1…4 / Ctrl+6…8 / F9 — Jump to tab");
+    }
+
+    /// The drag row says where a selection goes (`copy_on_select`): with
+    /// "off" nothing is copied, and "auto-copies" is kept for the clipboard.
+    #[test]
+    fn help_rows_say_where_a_drag_copies() {
+        use crate::clipboard::CopyOnSelect as C;
+        let row = |c: C| {
+            super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"), c)
+                .into_iter()
+                .find(|r| r.starts_with("Left-drag — "))
+                .expect("no drag help row")
+        };
+        assert_eq!(row(C::Off), "Left-drag — Select text");
+        assert_eq!(row(C::Clipboard), "Left-drag — Select text (auto-copies)");
+        assert_eq!(row(C::Both), "Left-drag — Select text (auto-copies)");
+        let primary = if crate::clipboard::HAS_PRIMARY {
+            "Left-drag — Select text (middle-click pastes it)"
+        } else {
+            "Left-drag — Select text (auto-copies)"
+        };
+        assert_eq!(row(C::Primary), primary);
+    }
+
     #[test]
     fn help_rows_include_run_selection_and_mirror_matches() {
         // Live row: default chord + the staged-multiline note, in the
         // clipboard section; static HELP_ROWS mirror carries the same row
         // verbatim (the default chord pretty-prints as Ctrl+Shift+Enter).
-        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"));
+        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"), Default::default());
         let live = rows
             .iter()
             .find(|r| r.contains("Run selection in a new tab"))

@@ -28,7 +28,7 @@ pub const HELP_ROWS: &[&str] = &[
     "## Clipboard & selection",
     "Ctrl+Shift+C / Ctrl+Shift+V — Copy / paste",
     "Ctrl+Shift+Enter — Run selection in a new tab   (multi-line lands staged)",
-    "Left-drag — Select text (auto-copies)",
+    "Left-drag — Select text (middle-click pastes it)",
     "Shift+drag — Select over mouse apps (vim / htop / Claude Code)",
     "Right-click / Menu — Context menu   (arrows move, Enter picks)",
     "",
