@@ -100,7 +100,17 @@ fn main() {
         unit.extend_from_slice(b"\x1b]133;D;0\x07");
         unit
     };
-    let workloads: [(&str, Vec<u8>, bool); 8] = [
+    // A TUI redrawing its region of the primary screen in synchronized updates
+    // (Claude Code's frames), some of them spanning reads.
+    let frames = {
+        let mut unit = b"\x1b[?2026h\x1b[10;1H".to_vec();
+        for _ in 0..30 {
+            unit.extend_from_slice(color);
+        }
+        unit.extend_from_slice(b"\x1b[?2026l");
+        unit
+    };
+    let workloads: [(&str, Vec<u8>, bool); 9] = [
         ("yes", repeat(b"y\r\n", TOTAL), false),
         ("yes+mark", repeat(b"y\r\n", TOTAL), true),
         ("long120", repeat(long_line.as_bytes(), TOTAL), false),
@@ -109,6 +119,7 @@ fn main() {
         ("prompts-every-50", repeat(&prompts, TOTAL), false),
         ("sixel-1MB", repeat(&sixel_image(), TOTAL / 8), false),
         ("kitty-png-chunked", repeat(&kitty_png(), TOTAL / 8), false),
+        ("sync-frames+mark", repeat(&frames, TOTAL), true),
     ];
     for (name, data, mark) in &workloads {
         let mut best = f64::MAX;

@@ -652,6 +652,11 @@ const SLICE_MAX_LINES: usize = 768;
 /// [`Terminal::advance_slice`]).
 const SLICE_BLOCK: usize = 256;
 
+/// Longest a synchronized update (DEC 2026) may hold the display back: vte ends
+/// one 150 ms after its LAST BSU, so a program repeating `CSI ? 2026 h` without
+/// ever sending the ESU froze the screen until 2 MiB had piled up.
+const SYNC_UPDATE_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Line-feed bytes in `s` (LF 0x0A, VT 0x0B and FF 0x0C all line-feed in vte).
 /// Counted in u8 lanes over ≤ 255-byte chunks so it auto-vectorizes: no
 /// per-match cost even on `yes`-dense data (a `memchr` iterator is far slower
@@ -1123,13 +1128,13 @@ pub struct Terminal {
     /// count (a full scrollback no longer disables marks, Run & Notify or
     /// images). With nothing anchored nothing reads it: slices go through whole
     /// and it may under-count, harmlessly. Only a sub-slice that scrolls more
-    /// than it could be bounded (a sync-update replay, a long `CSI Ps b` repeat,
-    /// a screen taller than the scrollback) pins it — that drops every anchor
-    /// once (correct-or-absent) and tracking resumes exactly on the next
-    /// sub-slice. FROZEN on the alt screen and across an alt-screen toggle (that
-    /// history change is not a scroll); toggles are isolated into their own
-    /// sub-slice — inside a synchronized update too — so no primary output is
-    /// lost with them.
+    /// than it could be bounded (a sync-update replay past the piece budget, a
+    /// long `CSI Ps b` repeat, a screen taller than the scrollback) pins it —
+    /// that drops every anchor once (correct-or-absent) and tracking resumes
+    /// exactly on the next sub-slice. FROZEN on the alt screen and across an
+    /// alt-screen toggle (that history change is not a scroll); toggles are
+    /// isolated into their own sub-slice — inside a synchronized update too —
+    /// so no primary output is lost with them.
     abs_top: i64,
     /// The scrollback cap (the alacritty grid's max). While anchors exist, room
     /// is made BEFORE each sub-slice, so the retained history sits between this
@@ -1249,6 +1254,20 @@ pub struct Terminal {
     /// Payload bytes of the OSC being scanned (bounded by `osc_cap`). Persists
     /// across `feed` calls like `scan`.
     osc_len: u32,
+    /// When the synchronized update in flight began (`None` outside one), for
+    /// the [`SYNC_UPDATE_MAX`] ceiling of [`Terminal::sync_deadline`].
+    sync_began: Option<std::time::Instant>,
+    /// vte's sync buffer length after the last feed. Every byte vte gets during
+    /// an update is buffered, so a shorter buffer means a new update began.
+    sync_buffered: usize,
+    /// Bytes handed to vte during the current feed (`advance_piece`) — less
+    /// than the feed when the scanner keeps image data from it.
+    vte_fed: usize,
+    /// At most how many lines the update in flight scrolls when vte replays it:
+    /// the sum of its sub-slices' bounds, kept while they are bounded (anchors
+    /// exist). The replay runs in the sub-slice that ends the update (or in a
+    /// forced flush), which makes room for all of it.
+    sync_lines: usize,
     /// The OSC payload cap in force: [`OSC_MAX_BYTES`], lowered only by tests so
     /// the vte differential fuzz reaches it cheaply.
     osc_cap: u32,
@@ -1497,6 +1516,10 @@ impl Terminal {
             kitty_seq: 0,
             image_work: IMAGE_WORK_MAX,
             osc_len: 0,
+            sync_began: None,
+            sync_buffered: 0,
+            vte_fed: 0,
+            sync_lines: 0,
             osc_cap: OSC_MAX_BYTES,
             min_contrast: 1.0,
             color_reports,
@@ -2502,6 +2525,26 @@ impl Terminal {
         if start < bytes.len() {
             self.advance_slice(&bytes[start..]);
         }
+        self.note_sync();
+    }
+
+    /// Note when a synchronized update began, after a feed (see
+    /// [`Terminal::sync_deadline`]). One branch while none is in flight.
+    #[inline]
+    fn note_sync(&mut self) {
+        let fed = std::mem::take(&mut self.vte_fed);
+        if self.parser.sync_timeout().sync_timeout().is_none() {
+            self.sync_began = None;
+            return;
+        }
+        // vte buffers every byte it gets during an update (not the image data
+        // the scanner keeps from it): fewer means the update ended and a new
+        // one began within this feed.
+        let buffered = self.parser.sync_bytes_count();
+        if self.sync_began.is_none() || buffered < self.sync_buffered + fed {
+            self.sync_began = Some(std::time::Instant::now());
+        }
+        self.sync_buffered = buffered;
     }
 
     /// The ONLY entry for bytes into alacritty. Each sub-slice goes through
@@ -2641,10 +2684,17 @@ impl Terminal {
         // long-lived tab). Room beyond the piece budget is not made: that would
         // trim — or wipe — history for a push that overflows the cap anyway, so
         // such a piece goes through as before (anchors dropped once). Inside a
-        // synchronized update (SU / DL) the bytes are only buffered: nothing to
-        // bound.
-        let room = (kind.scrolls_a_screen() && self.has_anchors() && self.sync_deadline().is_none())
-            .then(|| self.lines_pushed_by(kind) + seq.len() + 1)
+        // synchronized update (SU / DL) the bytes are only buffered, so the grid
+        // they will scroll is not known yet: bounded by their count, they add to
+        // what the update's replay scrolls (`sync_lines`).
+        let pushed = match kind {
+            IsolatedSeq::ScrollUp { count, .. } if self.sync_deadline().is_some() => {
+                usize::from(count.max(1)).min(self.rows)
+            }
+            _ => self.lines_pushed_by(kind),
+        };
+        let room = (kind.scrolls_a_screen() && self.has_anchors())
+            .then(|| pushed + seq.len() + 1)
             .filter(|&lines| lines <= self.piece_budget());
         match room {
             Some(lines) => self.advance_piece(seq, Some(lines)),
@@ -2826,11 +2876,14 @@ impl Terminal {
 
     /// Advance alacritty by ONE sub-slice and fold its history change into
     /// `abs_top`. `Some(max_lines)` (anchors exist) first makes room below the cap
-    /// for at most that many scrolled lines, so the change is exact.
+    /// for at most that many scrolled lines, so the change is exact. While vte
+    /// buffers a synchronized update, the sub-slice that ends it replays all of
+    /// it at once: room is made for the lines buffered so far too (`sync_lines`,
+    /// within the piece budget — past it the count is lost as before).
     fn advance_piece(&mut self, s: &[u8], max_lines: Option<usize>) {
         let alt_before = self.term.mode().contains(TermMode::ALT_SCREEN);
         if let (Some(lines), false) = (max_lines, alt_before) {
-            self.make_room(lines);
+            self.make_room((self.sync_lines + lines).min(self.piece_budget().max(lines)));
         }
         let h0 = self.term.grid().history_size();
         let d0 = self.term.grid().display_offset();
@@ -2838,8 +2891,13 @@ impl Terminal {
         if let Some(log) = self.vte_log.as_mut() {
             log.extend_from_slice(s);
         }
+        self.vte_fed += s.len();
         let parser = &mut self.parser;
         crate::handler::parse(&mut self.term, &mut self.vt, &self.reply_tx, |vt| parser.advance(vt, s));
+        self.sync_lines = match max_lines {
+            Some(lines) if self.parser.sync_timeout().sync_timeout().is_some() => self.sync_lines + lines,
+            _ => 0,
+        };
         let alt_after = self.term.mode().contains(TermMode::ALT_SCREEN);
         let h1 = self.term.grid().history_size();
         self.after_vte(alt_before, alt_after, h0, h1, d0);
@@ -2858,9 +2916,9 @@ impl Terminal {
             self.abs_top += (h1 - h0) as i64;
             // `make_room` keeps history strictly below the cap for any sub-slice
             // within its bound, so reaching the cap means this one scrolled more
-            // than counted (a sync-update replay, a long `CSI Ps b` repeat, a
-            // screen taller than the scrollback) and `history_size()` pinned:
-            // the count is lost.
+            // than counted (a sync-update replay past the piece budget, a long
+            // `CSI Ps b` repeat, a screen taller than the scrollback) and
+            // `history_size()` pinned: the count is lost.
             // Drop every anchor once (correct-or-absent); the next sub-slice is
             // exact again.
             if h1 >= self.scrollback_limit && (h1 > h0 || self.scrollback_limit == 0) {
@@ -4063,9 +4121,12 @@ impl Terminal {
     /// the embedder polls this deadline and calls [`Terminal::flush_sync`]. An
     /// app that sends a BSU and then crashes/pauses mid-redraw (nvim, zellij)
     /// would otherwise freeze the display until 2 MiB accumulate; the app must
-    /// schedule a wakeup at this instant and force-flush on expiry.
+    /// schedule a wakeup at this instant and force-flush on expiry. vte's 150 ms
+    /// restart with every BSU; the update still ends [`SYNC_UPDATE_MAX`] after
+    /// it began.
     pub fn sync_deadline(&self) -> Option<std::time::Instant> {
-        self.parser.sync_timeout().sync_timeout()
+        let vte = self.parser.sync_timeout().sync_timeout()?;
+        Some(self.sync_began.map_or(vte, |began| vte.min(began + SYNC_UPDATE_MAX)))
     }
 
     /// Force-terminate a pending synchronized update, flushing every byte that
@@ -4074,8 +4135,13 @@ impl Terminal {
     /// has elapsed.
     pub fn flush_sync(&mut self) {
         // The buffered lines become real here, so bracket `abs_top` the same way
-        // `advance_slice` does (a sync block that scrolled must advance abs_top).
+        // `advance_slice` does (a sync block that scrolled must advance abs_top),
+        // after making room for every line they can scroll (`sync_lines`).
         let alt_before = self.term.mode().contains(TermMode::ALT_SCREEN);
+        if self.sync_lines > 0 && !alt_before {
+            self.make_room(self.sync_lines.min(self.piece_budget()));
+        }
+        (self.sync_began, self.sync_buffered, self.sync_lines) = (None, 0, 0);
         let h0 = self.term.grid().history_size();
         let d0 = self.term.grid().display_offset();
         let parser = &mut self.parser;
@@ -8934,6 +9000,70 @@ mod tests {
                 assert_eq!(lines, vec![line], "sync={sync} split={split}: {:?}", String::from_utf8_lossy(body));
             }
         }
+    }
+
+    #[test]
+    fn an_update_over_several_reads_keeps_a_full_scrollbacks_marks() {
+        // vte buffers an update and replays it whole at its end, but room was
+        // made per read: once the history had filled up, any frame spanning more
+        // than one read (Claude Code's, nvim's) dropped every mark and image.
+        // 18 lines in three reads, onto a history of 84 lines with a cap of 100.
+        let frame = |t: &mut Terminal| {
+            t.feed(b"\x1b[?2026h");
+            for _ in 0..3 {
+                t.feed("frame line\r\n".repeat(6).as_bytes());
+            }
+        };
+        for su in [false, true] {
+            let mut t = full_history_with_a_failed_prompt(); // mark on row 36 of 40
+            frame(&mut t);
+            if su {
+                // A scroll the scanner splits out — 10 lines from 5 bytes.
+                t.feed(b"\x1b[10S");
+            }
+            t.feed(b"\x1b[?2026l");
+            let row = if su { 8 } else { 18 };
+            assert_eq!(t.failed_prompt_rows(), vec![row], "su={su}: moved up with the frame");
+            assert!(t.scroll_max() < 100, "below the cap: {}", t.scroll_max());
+        }
+        // The same frame cut short by the deadline flush.
+        let mut t = full_history_with_a_failed_prompt();
+        frame(&mut t);
+        t.flush_sync();
+        assert_eq!(t.failed_prompt_rows(), vec![18]);
+    }
+
+    #[test]
+    fn an_update_kept_open_by_more_bsus_still_ends_a_second_after_it_began() {
+        // vte re-arms its 150 ms timeout for every BSU, so a program repeating
+        // `\e[?2026h` without an ESU froze the display until 2 MiB piled up.
+        let mut t = Terminal::new(20, 3);
+        t.feed(b"\x1b[?2026hx");
+        let began = t.sync_began.expect("an update began");
+        t.feed(b"\x1b[?2026hy");
+        assert_eq!(t.sync_began, Some(began), "a nested BSU continues the update");
+        let back = std::time::Duration::from_secs(5);
+        t.sync_began = Some(began - back);
+        assert!(t.sync_deadline().unwrap() <= began - back + SYNC_UPDATE_MAX, "capped");
+        t.flush_sync();
+        assert_eq!((t.sync_deadline(), t.sync_began), (None, None));
+        assert_eq!(t.snapshot().row_text(0).trim_end(), "xy");
+        // An ESU and the next BSU in one read: a new update, a second of its own.
+        t.feed(b"\x1b[?2026ha");
+        t.sync_began = Some(began - back);
+        t.feed(b"b\x1b[?2026l\x1b[?2026hc");
+        assert!(t.sync_began.unwrap() >= began, "a new update starts its own second");
+        t.feed(b"\x1b[?2026l");
+        assert_eq!((t.sync_deadline(), t.sync_began), (None, None));
+        // Image data the scanner keeps from vte (never buffered) is no new
+        // update either: an endless image stream can't keep the screen frozen.
+        t.feed(b"\x1b[?2026h\x1b_Ga=T,f=32,s=1,v=1;");
+        t.sync_began = Some(began - back);
+        for _ in 0..3 {
+            t.feed(b"AAAAAAAA");
+        }
+        assert_eq!(t.sync_began, Some(began - back), "still the same update");
+        t.flush_sync();
     }
 
     #[test]
