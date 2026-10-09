@@ -98,12 +98,13 @@ pub(crate) type HintDrawData = (Vec<(String, usize, usize)>, String);
 
 /// What the theme on screen does after the palette selection changed (see
 /// [`Overlays::theme_preview_step`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ThemePreview {
     /// Leave it.
     Keep,
-    /// Show theme `i` — `theme_idx` only: nothing is chosen or saved.
-    Show(usize),
+    /// Show the theme of this name — `theme_idx` only: nothing is chosen or
+    /// saved.
+    Show(String),
     /// Show the chosen theme again (the preview ended without a pick).
     Restore,
 }
@@ -234,7 +235,7 @@ impl Overlays {
     /// selection off the theme rows ends it, showing the chosen theme again.
     pub fn theme_preview_step(&mut self, navigated: bool) -> ThemePreview {
         let selected = match self.palette_filtered.get(self.palette_selected).map(|h| &h.cmd) {
-            Some(crate::palette::PaletteCmd::SetTheme(i)) => Some(*i),
+            Some(crate::palette::PaletteCmd::SetTheme(name)) => Some(name.clone()),
             _ => None,
         };
         match (self.theme_preview, selected) {
@@ -369,8 +370,8 @@ mod tests {
         use crate::palette::{PaletteCmd as C, PaletteEntry};
         let reg = vec![
             PaletteEntry { title: "New tab".into(), keywords: "", cmd: C::NewTab },
-            PaletteEntry { title: "Theme: A".into(), keywords: "", cmd: C::SetTheme(4) },
-            PaletteEntry { title: "Theme: B".into(), keywords: "", cmd: C::SetTheme(9) },
+            PaletteEntry { title: "Theme: A".into(), keywords: "", cmd: C::SetTheme("a".into()) },
+            PaletteEntry { title: "Theme: B".into(), keywords: "", cmd: C::SetTheme("b".into()) },
             PaletteEntry { title: "Quit".into(), keywords: "", cmd: C::Quit },
         ];
         Overlays {
@@ -386,10 +387,10 @@ mod tests {
         let mut ov = theme_rows_palette();
         assert_eq!(ov.theme_preview_step(true), ThemePreview::Keep, "on `New tab`: nothing");
         ov.palette_move(1);
-        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show(4));
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show("a".into()));
         assert!(ov.theme_preview);
         ov.palette_move(1);
-        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show(9));
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show("b".into()));
         ov.palette_move(1);
         assert_eq!(ov.theme_preview_step(true), ThemePreview::Restore, "off the theme rows");
         assert!(!ov.theme_preview);
@@ -403,9 +404,9 @@ mod tests {
         ov.palette_selected = 1;
         assert_eq!(ov.theme_preview_step(false), ThemePreview::Keep);
         // Once arrowed into, a later refilter keeps the preview in step.
-        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show(4));
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show("a".into()));
         ov.palette_selected = 2;
-        assert_eq!(ov.theme_preview_step(false), ThemePreview::Show(9));
+        assert_eq!(ov.theme_preview_step(false), ThemePreview::Show("b".into()));
         ov.palette_selected = 0;
         assert_eq!(ov.theme_preview_step(false), ThemePreview::Restore);
     }
@@ -414,14 +415,14 @@ mod tests {
     fn esc_reverts_and_enter_on_the_theme_keeps_it() {
         let mut ov = theme_rows_palette();
         ov.palette_move(2);
-        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show(9));
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show("b".into()));
         assert!(ov.end_theme_preview(false), "Esc / click outside / other command: restore");
         assert!(!ov.theme_preview);
         assert!(!ov.end_theme_preview(false), "nothing to restore twice");
 
         let mut ov = theme_rows_palette();
         ov.palette_move(1);
-        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show(4));
+        assert_eq!(ov.theme_preview_step(true), ThemePreview::Show("a".into()));
         assert!(!ov.end_theme_preview(true), "Enter on the theme row keeps it");
         assert!(!ov.theme_preview);
 

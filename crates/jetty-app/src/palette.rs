@@ -11,11 +11,13 @@
 
 use jetty_core::fuzzy_match;
 
-/// A palette action. `SetTheme` carries the theme index (themes never move
-/// while the palette is open); `SelectTab` / `Reattach` carry the STABLE id of
-/// their target tab (a main-window tab, or the tab a detached window holds), so
-/// a tab closing or moving between open and Enter can never retarget the action
-/// — an id that vanished is a clean no-op.
+/// A palette action. `SetTheme` carries the theme's NAME, resolved when it
+/// previews and runs (a themes/ hot reload while the palette is open can
+/// re-index the registry: a name still finds its theme, or nothing);
+/// `SelectTab` / `Reattach` carry the STABLE id of their target tab (a
+/// main-window tab, or the tab a detached window holds), so a tab closing or
+/// moving between open and Enter can never retarget the action — an id that
+/// vanished is a clean no-op.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteCmd {
     NewTab,
@@ -71,7 +73,7 @@ pub enum PaletteCmd {
     ToggleFollowSystemTheme,
     /// Step `minimum_contrast` through off → 3 → 4.5 → 7 → off.
     CycleMinimumContrast,
-    SetTheme(usize),
+    SetTheme(String),
     SelectTab(u64),
     Reattach(u64),
     /// Apply `effects::effect_presets()[i]`.
@@ -329,11 +331,11 @@ pub fn build_registry(
             cmd: PaletteCmd::ApplyLook(i),
         });
     }
-    for (i, (_name, display)) in themes.iter().enumerate() {
+    for (name, display) in themes {
         v.push(PaletteEntry {
             title: format!("Theme: {display}"),
             keywords: "theme colour color scheme palette",
-            cmd: PaletteCmd::SetTheme(i),
+            cmd: PaletteCmd::SetTheme(name.clone()),
         });
     }
     for (i, p) in crate::effects::effect_presets().iter().enumerate() {
@@ -469,6 +471,10 @@ mod tests {
         let r = build_registry(&themes, &tabs, &[]);
         let theme_entries = r.iter().filter(|e| e.title.starts_with("Theme: ")).count();
         assert_eq!(theme_entries, jetty_core::theme_count());
+        // Theme rows carry the theme's NAME, never its registry position: a
+        // themes/ reload while the palette is open re-indexes the registry.
+        let (name, display) = &themes[3];
+        assert!(r.iter().any(|e| e.cmd == PaletteCmd::SetTheme(name.clone()) && e.title == format!("Theme: {display}")));
         let tab_entries = r.iter().filter(|e| e.title.starts_with("Switch to tab: ")).count();
         assert_eq!(tab_entries, 2);
         // No Reattach entries when there are no detached windows.

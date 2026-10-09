@@ -5756,7 +5756,11 @@ impl App {
         let Some(step) = self.ov_of_mut(s).map(|o| o.theme_preview_step(navigated)) else { return };
         match step {
             ThemePreview::Keep => {}
-            ThemePreview::Show(i) => self.preview_theme(i),
+            ThemePreview::Show(name) => {
+                if let Some(i) = jetty_core::theme_index(&name) {
+                    self.preview_theme(i);
+                }
+            }
             ThemePreview::Restore => self.reresolve_theme(false),
         }
     }
@@ -6752,14 +6756,15 @@ impl App {
                 };
                 self.show_notice_pill(msg, 1500);
             }
-            // Index-bearing dynamic actions: `.get()`-guard against a stale index.
-            C::SetTheme(i) => {
-                if i < jetty_core::theme_count() {
+            // A theme by name: one that vanished (a themes/ reload) is a no-op.
+            C::SetTheme(name) => {
+                if let Some(i) = jetty_core::theme_index(&name) {
                     self.pick_theme(i);
                     self.persist();
                     self.redraw_main_and_detached();
                 }
             }
+            // Index-bearing dynamic actions: `.get()`-guard against a stale index.
             // An effects preset is a macro over `[effects]` keys (no preset name
             // is stored): write them, save, repaint every window.
             C::EffectsPreset(i) => {
