@@ -742,6 +742,15 @@ fn main_tab_watched(main_watching: bool, tab: usize, active: usize) -> bool {
     main_watching && tab == active
 }
 
+/// What a main tab's finished command earns when it passes the notification
+/// gate (`notify::should_notify`): `(toast, summon)` — the desktop toast and
+/// taskbar urgency with `notify_on_command_finish`, the auto-summon with
+/// `auto_summon_on_finish` while JeTTY is hidden. Independent settings: with
+/// toasts off, auto-summon used to never fire.
+fn main_finish_actions(notify_on_finish: bool, auto_summon: bool, visible: bool) -> (bool, bool) {
+    (notify_on_finish, auto_summon && !visible)
+}
+
 // The Settings window size is DERIVED at runtime from the panel's scaled size —
 // see `App::desired_settings_logical_size` — so it fits ANY UI font (size or
 // family), not just the default; the window is also user-resizable.
@@ -8565,11 +8574,12 @@ impl App {
                     }
                 }
             }
-            if enabled {
+            if enabled || self.auto_summon_on_finish {
                 for c in completions {
                     let watching = main_tab_watched(main_watching, i, active);
-                    if let Some(failed) = self.maybe_notify_main(i, c, watching) {
-                        if self.auto_summon_on_finish && !self.visible {
+                    let (toast, summon) = main_finish_actions(enabled, self.auto_summon_on_finish, self.visible);
+                    if let Some(failed) = self.maybe_notify_main(i, c, watching, toast) {
+                        if summon {
                             if failed && !summon_is_failure {
                                 summon_target = Some(i);
                                 summon_is_failure = true;
@@ -8656,17 +8666,19 @@ impl App {
         }
     }
 
-    /// Gate + fire a notification for a MAIN-window tab's completion. `watching` is
-    /// whether THIS tab is on screen per the batch-start snapshot
-    /// (`main_tab_watched` over `main_user_watching()` + the active tab, so an
-    /// auto-summon earlier in the same drain can't suppress this tab). Returns
-    /// `Some(failed)` when a notification fired (the caller decides the single
-    /// batch auto-summon), or `None` when gated out.
+    /// Gate a MAIN-window tab's completion, and fire its notification when
+    /// `toast` (`main_finish_actions`). `watching` is whether THIS tab is on
+    /// screen per the batch-start snapshot (`main_tab_watched` over
+    /// `main_user_watching()` + the active tab, so an auto-summon earlier in the
+    /// same drain can't suppress this tab). Returns `Some(failed)` when it
+    /// passed the gate (the caller decides the single batch auto-summon), or
+    /// `None` when gated out.
     fn maybe_notify_main(
         &mut self,
         tab: usize,
         c: jetty_core::CommandCompletion,
         watching: bool,
+        toast: bool,
     ) -> Option<bool> {
         // Throttled per TAB (its stable id), not per position: closing an
         // earlier tab must not hand this tab's throttle to its neighbour.
@@ -8683,8 +8695,11 @@ impl App {
         ) {
             return None;
         }
-        self.notify_last_at.insert(key, std::time::Instant::now());
         let failed = matches!(c.exit_code, Some(code) if code != 0);
+        if !toast {
+            return Some(failed);
+        }
+        self.notify_last_at.insert(key, std::time::Instant::now());
         let (summary, body) = build_notification_text(&self.main_tab_label(tab), &c, failed);
         self.notifier.fire(summary, body);
         // Taskbar/dock urgency baseline — the guaranteed macOS signal (dock bounce)
@@ -19276,9 +19291,9 @@ mod scheduler_tests {
     //! The window itself can't run under `cargo test`, so every rule that keeps
     //! the loop at 0-CPU idle (or makes it wake) is a pure function tested here.
     use super::{
-        anim_expired, autohide_due, caret_drives_frames, focus_ask, focus_gain_shows, main_tab_watched,
-        next_acquire_retry, perf_idle_decision, toggle_action, AutohideDue, FocusAsk, IdleHud, SummonBy,
-        ToggleAction, AUTOHIDE_GRACE_MS, AUTOHIDE_GRAB_FAST_FOR, AUTOHIDE_GRAB_SLOW_RECHECK,
+        anim_expired, autohide_due, caret_drives_frames, focus_ask, focus_gain_shows, main_finish_actions,
+        main_tab_watched, next_acquire_retry, perf_idle_decision, toggle_action, AutohideDue, FocusAsk, IdleHud,
+        SummonBy, ToggleAction, AUTOHIDE_GRACE_MS, AUTOHIDE_GRAB_FAST_FOR, AUTOHIDE_GRAB_SLOW_RECHECK,
         FOCUS_CHURN_GRACE, KEY_ECHO_GRACE, RAISE_RETRY_WINDOW,
     };
     use std::time::{Duration, Instant};
@@ -19567,6 +19582,16 @@ mod scheduler_tests {
         assert!(main_tab_watched(true, 2, 2), "the tab on screen is watched");
         assert!(!main_tab_watched(true, 1, 2), "a background tab must still notify");
         assert!(!main_tab_watched(false, 2, 2), "hidden/unfocused window → notify");
+    }
+
+    #[test]
+    fn auto_summon_does_not_need_the_toasts() {
+        // (notify_on_finish, auto_summon, visible) → (toast, summon).
+        assert_eq!(main_finish_actions(false, true, false), (false, true), "toasts off, hidden: summon");
+        assert_eq!(main_finish_actions(true, true, false), (true, true));
+        assert_eq!(main_finish_actions(true, false, false), (true, false));
+        assert_eq!(main_finish_actions(true, true, true), (true, false), "shown: nothing to summon");
+        assert_eq!(main_finish_actions(false, false, false), (false, false));
     }
 }
 
