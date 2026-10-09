@@ -52,13 +52,14 @@ pub struct Config {
     /// concealed text and powerline / block / sextant glyphs never change.
     #[serde(default = "default_minimum_contrast")]
     pub minimum_contrast: f32,
-    /// Background opacity in 0.0..=1.0.
+    /// Background opacity in 0.1..=1.0 (a visible floor).
     #[serde(default = "default_opacity")]
     pub opacity: f32,
-    /// Logical font size in points.
+    /// Logical font size in points, 6..=48.
     #[serde(default = "default_font_size")]
     pub font_size: f32,
-    /// Monospace font family name.
+    /// Terminal font family name (any letter case). One that is not installed
+    /// shows a fallback (`check::pick_font_family`); this name is kept.
     #[serde(default = "default_font_family")]
     pub font_family: String,
     /// UI (chrome) font family — tab titles, status bar, menus, panel, help,
@@ -111,8 +112,9 @@ pub struct Config {
     /// [`ScrollbarMode`].
     #[serde(default)]
     pub scrollbar: ScrollbarMode,
-    /// Window-summon reveal effect: "none", "bayer", "phosphor", "liquid", or
-    /// "focus" (the last two are Tier-B effects that sample the rendered frame).
+    /// Window-summon reveal effect: "none", "bayer", "phosphor", "liquid",
+    /// "focus", "pop", "glide" or "fade" (all but the first three are Tier-B
+    /// effects that sample the rendered frame).
     #[serde(default = "default_summon_effect")]
     pub summon_effect: String,
     /// Window summon mode: "center" (re-summon centered/last-pos), "dropdown"
@@ -281,8 +283,9 @@ pub struct Config {
     /// Watch `~/.config/jetty/` and hot-reload config + themes live (no restart).
     /// Default `true`. The watcher is OS-event-driven (inotify/FSEvents), so it adds
     /// zero idle CPU; set `false` to disable it entirely (a pure escape hatch — no
-    /// watcher thread is spawned). NOTE: `summon_hotkey` and `launch_at_login` are
-    /// RESTART/external-only even with hot-reload on (documented at those keys).
+    /// watcher thread is spawned; turning it back on needs a restart). NOTE:
+    /// `summon_hotkey` is RESTART-only even with hot-reload on (a reload that
+    /// changes it says so).
     #[serde(default = "default_hot_reload")]
     pub hot_reload: bool,
     /// macOS: which Option key(s) act as Meta (ESC-prefix, like Alt elsewhere)

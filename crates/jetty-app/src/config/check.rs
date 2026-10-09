@@ -732,6 +732,67 @@ mod tests {
         }
     }
 
+    /// A TOML value compared the way the config holds it: floats as `f32`.
+    fn same(a: &toml::Value, b: &toml::Value) -> bool {
+        use toml::Value::{Array, Float, Integer};
+        match (a, b) {
+            (Float(x), Float(y)) => *x as f32 == *y as f32,
+            (Float(x), Integer(y)) | (Integer(y), Float(x)) => *x as f32 == *y as f32,
+            (Array(x), Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same(p, q)),
+            _ => a == b,
+        }
+    }
+
+    #[test]
+    fn the_configuration_reference_matches_the_code() {
+        // docs/configuration.md lists every key with its default between the
+        // `config-keys` markers: every key the structs read must be there once,
+        // with the default `Config::default()` has — and every listed key must
+        // be one JeTTY reads. (`[keys]` names are README's table, checked by
+        // tests/readme_keybindings.rs.)
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/configuration.md"))
+            .expect("docs/configuration.md");
+        let start = doc.find("<!-- config-keys:start").expect("config-keys:start marker");
+        let end = doc.find("<!-- config-keys:end -->").expect("config-keys:end marker");
+        let defaults = to_table(&Config::default());
+        let known = known_keys();
+        let mut table: Option<String> = None;
+        let mut documented: Vec<String> = Vec::new();
+        let mut problems = Vec::new();
+        for line in doc[start..end].lines() {
+            if line.starts_with('#') {
+                table = line.split_once("`[").and_then(|(_, r)| r.split_once("]`")).map(|(t, _)| t.to_string());
+                continue;
+            }
+            let cells: Vec<&str> = line.trim().trim_matches('|').split('|').map(str::trim).collect();
+            if cells.len() < 3 || !cells[0].starts_with('`') {
+                continue;
+            }
+            let key = cells[0].trim_matches('`');
+            let path = table.as_ref().map_or_else(|| key.to_string(), |t| format!("{t}.{key}"));
+            if !known.contains(&path) {
+                problems.push(format!("`{path}` is documented but JeTTY does not read it"));
+                continue;
+            }
+            let src = cells[1].trim_matches('`');
+            let doc_value = toml::from_str::<toml::Table>(&format!("v = {src}")).ok().and_then(|t| t.get("v").cloned());
+            let parts: Vec<String> = path.split('.').map(str::to_string).collect();
+            match (doc_value, get_path(&defaults, &parts)) {
+                (Some(d), Some(code)) if same(&d, code) => {}
+                (d, code) => problems.push(format!("`{path}`: documented default {d:?}, the code has {code:?}")),
+            }
+            documented.push(path);
+        }
+        for k in known.iter().filter(|k| !k.starts_with("keys.")) {
+            match documented.iter().filter(|d| *d == k).count() {
+                1 => {}
+                0 => problems.push(format!("`{k}` is not documented")),
+                n => problems.push(format!("`{k}` is documented {n} times")),
+            }
+        }
+        assert!(problems.is_empty(), "docs/configuration.md is out of date:\n{}", problems.join("\n"));
+    }
+
     #[test]
     fn serde_variant_errors_get_a_suggestion() {
         let msg = "unknown variant `ambr`, expected one of `off`, `amber`, `green`";
