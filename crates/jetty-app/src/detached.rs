@@ -428,6 +428,11 @@ pub(crate) struct DetachedWindow {
     /// `App::paced_paint_at`; see `pace_paint`).
     pub last_present_at: Option<std::time::Instant>,
     pub paced_paint_at: Option<std::time::Instant>,
+    /// This window's display refresh interval for that pacing — its OWN
+    /// monitor's (`App::frame_interval` is the main window's, which may sit on
+    /// another): `None` until [`Self::frame_interval`] reads it, and again
+    /// after the window moved.
+    pub frame_interval: Option<std::time::Duration>,
     /// Whether THIS detached window is in OS fullscreen (F11 pressed in it).
     /// Session-only and PER WINDOW — detached windows persist no geometry at all,
     /// have no `window_mode`, and are never hidden, so this is purely a live
@@ -678,6 +683,7 @@ impl DetachedWindow {
             perf_idle_shown: false,
             last_present_at: None,
             paced_paint_at: None,
+            frame_interval: None,
             // A freshly-detached window is created focused (the WM focuses it on
             // map); its Focused events keep this current thereafter.
             focused: true,
@@ -805,6 +811,14 @@ impl DetachedWindow {
     /// there verbatim — do not move them into this wrapper.
     pub(crate) fn request_paint(&self) {
         self.window.request_redraw();
+    }
+
+    /// This window's display refresh interval (flood pacing), read from its
+    /// monitor on first use after a create or a move — never per frame.
+    pub(crate) fn frame_interval(&mut self) -> std::time::Duration {
+        *self.frame_interval.get_or_insert_with(|| {
+            crate::app::refresh_interval(self.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()))
+        })
     }
 
     /// This window's chrome metrics: its OWN DPI (it may sit on a different

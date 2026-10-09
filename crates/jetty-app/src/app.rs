@@ -10665,6 +10665,9 @@ impl App {
                 // (idempotent: take_completions() drains).
                 self.dispatch_completions(event_loop);
             }
+            // The window may now be on a monitor with another refresh rate:
+            // re-read it at the next flood frame (not on every move of a drag).
+            WindowEvent::Moved(_) if pos < self.detached.len() => self.detached[pos].frame_interval = None,
             WindowEvent::Occluded(occluded) if pos < self.detached.len() => {
                 // Track per-window occlusion/minimize so a hidden detached window
                 // stops self-driving CRT/caret animation and PTY-output redraws
@@ -13895,7 +13898,6 @@ impl ApplicationHandler<AppEvent> for App {
                 let mut runsel_notices: Vec<crate::runsel::Notice> = Vec::new();
                 // Detached windows whose tab rang the bell (visual bell after the loop).
                 let mut detached_bells: Vec<usize> = Vec::new();
-                let frame_interval = self.frame_interval;
                 let title_mode = self.tab_title_mode;
                 for (i, dw) in self.detached.iter_mut().enumerate() {
                     let read_before = vt_read;
@@ -13917,7 +13919,9 @@ impl ApplicationHandler<AppEvent> for App {
                     // (F16). A title-only change repaints too: the detached
                     // top bar draws the title (F1/F14).
                     if (had || title_changed) && !dw.occluded {
-                        // Same flood pacing as the main window.
+                        // Same flood pacing as the main window, at THIS
+                        // window's monitor's refresh rate.
+                        let frame_interval = dw.frame_interval();
                         match pace_paint(flood, dw.last_present_at, frame_interval, std::time::Instant::now()) {
                             PaintPacing::Now => dw.request_paint(),
                             PaintPacing::At(t) => {
@@ -18389,7 +18393,7 @@ fn pace_paint(
 
 /// The display refresh interval for a monitor rate in millihertz (winit's
 /// `refresh_rate_millihertz`), clamped to 20–250 Hz; 60 Hz when unknown.
-fn refresh_interval(mhz: Option<u32>) -> std::time::Duration {
+pub(crate) fn refresh_interval(mhz: Option<u32>) -> std::time::Duration {
     match mhz {
         Some(m) if m > 0 => std::time::Duration::from_micros((1_000_000_000u64 / m as u64).clamp(4_000, 50_000)),
         _ => std::time::Duration::from_micros(16_667),
