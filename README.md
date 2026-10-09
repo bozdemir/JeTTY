@@ -175,6 +175,8 @@ chmod +x JeTTY-*-x86_64.AppImage && ./JeTTY-*-x86_64.AppImage     # any distro
 
 The AppImage carries its update information, so [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) (or a manager built on it, such as AppImageLauncher) fetches a new version downloading only what changed. Launched while an older JeTTY runs, the new one says how to switch and moves Launch at login to itself.
 
+Every release file (from v0.30.0) has a signed build provenance: `gh attestation verify <file> --repo bozdemir/JeTTY` checks that this repository's release workflow built it — `SHA256SUMS.txt` alone shows a download is intact, not where it came from.
+
 ### Build from source (Linux or macOS)
 
 ```bash
