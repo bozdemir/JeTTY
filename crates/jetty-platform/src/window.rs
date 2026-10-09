@@ -454,7 +454,8 @@ pub fn set_window_fullscreen(win: &Window, on: bool) {
 /// indication 2, the one pagers and taskbars send for a user's click, which
 /// every EWMH window manager honors (KWin, Mutter, Xfwm4, Openbox, i3). Not a
 /// desktop-specific hack: one freedesktop message, no WM is named. Wayland,
-/// macOS and an unreachable X server keep winit's `focus_window()`.
+/// macOS (a minimized window un-minimized first) and an unreachable X server
+/// keep winit's `focus_window()`.
 pub fn activate_window(win: &Window) {
     #[cfg(all(unix, not(target_os = "macos")))]
     if x11::request_activation(win) {
@@ -469,6 +470,12 @@ pub fn activate_window(win: &Window) {
         // anew instead, which the compositor focuses: see `HideKind::Close`.)
         win.request_user_attention(Some(winit::window::UserAttentionType::Informational));
         return;
+    }
+    // macOS: winit's focus_window() does nothing for a minimized window — it
+    // stays in the Dock, as `jetty --show` left it. Bring it back first, as a
+    // click on its Dock tile would (the X11 activation above does both).
+    if win.is_minimized() == Some(true) {
+        win.set_minimized(false);
     }
     win.focus_window();
 }

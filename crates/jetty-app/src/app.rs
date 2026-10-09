@@ -9914,13 +9914,10 @@ impl App {
             ToggleAction::Hide => self.set_visibility(false, event_loop),
             ToggleAction::Raise => {
                 self.raise_attempt_at = Some(now);
-                // A minimized (iconified) window is "visible" but off-screen:
-                // restore it first (a no-op when it isn't minimized).
-                if let Some(w) = &self.window {
-                    w.set_minimized(false);
-                }
                 // The already-visible branch of `set_visibility(true)` is exactly
-                // a raise: it cancels a scheduled auto-hide, focuses and repaints.
+                // a raise: it cancels a scheduled auto-hide, focuses and repaints
+                // — and brings back a minimized window, which is "visible" but
+                // off screen (`jetty_platform::activate_window`).
                 self.set_visibility(true, event_loop);
             }
         }
@@ -9963,10 +9960,12 @@ impl App {
                     // below finds no visible window and does nothing.
                     jetty_platform::unhide_application();
                     // F9's raise, `--show`, a detached window's command on the main
-                    // one: ask the WM the way a taskbar click does — a plain
-                    // `focus_window()` was refused by KWin's focus-stealing
-                    // prevention and F9 left the window behind. (JeTTY's own
-                    // summons only run while hidden, so never reach here.)
+                    // one: ask the WM the way a taskbar click does — a minimized
+                    // window comes back too — as a plain `focus_window()` was
+                    // refused by KWin's focus-stealing prevention and F9 left the
+                    // window behind (and does nothing for a minimized window on
+                    // macOS). (JeTTY's own summons only run while hidden, so never
+                    // reach here.)
                     ask_focus(win);
                     self.request_main_paint();
                 }
