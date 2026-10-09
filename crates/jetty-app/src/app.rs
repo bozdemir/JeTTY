@@ -6030,18 +6030,11 @@ impl App {
         true
     }
 
-    /// Type `text` into window `s`'s palette query (printable chars only),
-    /// refiltering when it changed.
+    /// Type `text` into window `s`'s palette query (printable chars only, up
+    /// to its cap), refiltering when it changed.
     fn palette_type(&mut self, s: Surface, text: &str) {
         let Some(ov) = self.ov_of_mut(s) else { return };
-        let mut changed = false;
-        for ch in text.chars() {
-            if !ch.is_control() {
-                ov.palette_query.push(ch);
-                changed = true;
-            }
-        }
-        if changed {
+        if ov.type_palette(text) {
             ov.refilter_palette();
             self.palette_preview_step(s, false);
         }

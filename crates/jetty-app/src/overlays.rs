@@ -180,6 +180,16 @@ impl Overlays {
         self.palette_scroll = 0;
     }
 
+    /// Append `text`'s printable chars to the palette query, up to
+    /// [`crate::palette::PALETTE_MAX_QUERY`] chars. Whether it changed (the
+    /// caller refilters only then).
+    pub fn type_palette(&mut self, text: &str) -> bool {
+        let room = crate::palette::PALETTE_MAX_QUERY.saturating_sub(self.palette_query.chars().count());
+        let before = self.palette_query.len();
+        self.palette_query.extend(text.chars().filter(|c| !c.is_control()).take(room));
+        self.palette_query.len() != before
+    }
+
     /// Close the palette and free its transient state. Returns whether it was
     /// open (the caller repaints only then).
     pub fn close_palette(&mut self) -> bool {
@@ -429,6 +439,20 @@ mod tests {
         // No preview at all: closing restores nothing.
         let mut ov = theme_rows_palette();
         assert!(!ov.end_theme_preview(false));
+    }
+
+    /// The query is capped like search's: every keystroke refilters the whole
+    /// registry against it, so a huge IME commit or dropped path must not make
+    /// that unbounded.
+    #[test]
+    fn the_palette_query_is_capped() {
+        let mut ov = Overlays { palette_open: true, ..Default::default() };
+        assert!(ov.type_palette("ne\u{7}w"), "printable chars typed, controls dropped");
+        assert_eq!(ov.palette_query, "new");
+        assert!(ov.type_palette(&"é".repeat(1000)));
+        assert_eq!(ov.palette_query.chars().count(), crate::palette::PALETTE_MAX_QUERY);
+        assert!(!ov.type_palette("x"), "full: nothing changes, no refilter");
+        assert!(!ov.type_palette("\u{1b}"), "control chars alone change nothing");
     }
 
     #[test]

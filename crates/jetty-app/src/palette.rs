@@ -11,6 +11,11 @@
 
 use jetty_core::fuzzy_match;
 
+/// The longest palette query kept, in chars — search's `SEARCH_MAX_QUERY`.
+/// Every keystroke refilters the whole registry against the query, so a huge
+/// IME commit or dropped path must not make that cost unbounded.
+pub const PALETTE_MAX_QUERY: usize = 256;
+
 /// A palette action. `SetTheme` carries the theme's NAME, resolved when it
 /// previews and runs (a themes/ hot reload while the palette is open can
 /// re-index the registry: a name still finds its theme, or nothing);
