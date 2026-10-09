@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.29.1] — 2026-10-09
+
+**Fixes from a scan of the whole codebase: menus that behave, output that
+can't freeze JeTTY, prompt marks that stay put, and GPU resets that no longer
+take your shells with them.**
+
+### Fixed
+- **An open menu holds the keyboard like a native one** (regression in
+  0.29.0). Its keys drive it, and any other key closes it and does its usual
+  job: typing after a stray Menu press no longer pastes at the first Space,
+  and Enter after a right-click no longer runs a row the pointer drifted onto.
+  Menus also close when the window loses focus or hides, when the active tab
+  changes under them, and when the UI font, `[keys]` or the display scale
+  changes; while a menu, the help or a confirmation is open, the wheel,
+  pointer motion and clicks no longer reach the program behind it.
+- **Program output can no longer freeze JeTTY or eat its memory.**
+  - Re-placing a stored Kitty image (`a=p`) re-hashed all its pixels: a stream
+    of puts could freeze the window for minutes. Each image is now identified
+    once, when it arrives.
+  - A few KB of sixel, PNG or zlib that unpack to 64 MB were decoded on the UI
+    thread. Decoding is now paid from a budget that output earns; Kitty
+    images over it get `EBUSY`, and queries nobody can receive are not decoded.
+  - A huge window title pushed onto the title stack (`CSI 22 t`) could pin
+    gigabytes per tab; titles are clipped to 1 KiB before they are stored.
+  - Ctrl+hover over an OSC 8 link with a huge id stalled. Links now join only
+    when id and URI both match; ids over 250 bytes are ignored and URIs over
+    8 KiB make no link.
+- **Shell-integration marks** (powerlevel10k and friends):
+  - Resizing or zooming a fresh tab more than once scattered the prompt again,
+    and after a resize the next failed command could lose its marker and its
+    prompt-jump stop (regression in 0.26.0).
+  - With the transient prompt off, an empty Enter after a failed command was
+    marked failed again when the input line carried right-side text.
+  - After quitting an editor that ends inside a synchronized update (Neovim ≥
+    0.10) with output right behind it, failure markers, prompt-jump stops and
+    inline images could sit rows away from their lines; clears inside a
+    synchronized update dropped or misplaced them too.
+- Scrolled back over a mouse-tracking program (fzf's Ctrl+R), a click selects
+  text and the wheel brings the view back down, instead of hitting whatever
+  live row sat under the pointer.
+- A quick double-click on "+" opens a tab without putting it into rename,
+  which swallowed the next command typed.
+- The Settings scrollback cycler stops at 100k instead of wrapping to 1k,
+  which cut every tab's history. A held key no longer repeats presses in
+  Settings (a held Enter could arm and confirm "Reset tab").
+- A `[keys]` binding none of whose chords can be used (e.g. `Ctrl+T`) keeps
+  the action's default shortcut and says so, instead of leaving it with none;
+  the examples in the README and the configuration reference now bind a chord
+  JeTTY accepts.
+- Bold and bold-italic in fonts without a separate bold face (Ubuntu Mono,
+  Ubuntu Sans Mono, Noto Mono) no longer switch to a proportional fallback and
+  shift the columns after them: variable fonts draw their own bold, and a
+  family without one draws bold at its regular weight.
+- Recovering from a GPU reset (suspend/resume, a driver reset) no longer
+  closes JeTTY and every shell (Wayland with Mesa, and Vulkan drivers that
+  allow one swapchain per window). With `[cursor] trail = true`, the first
+  cursor jump after a reset no longer crashes it. A GPU that can't draw to the
+  window at startup prints the no-GPU help instead of crashing.
+- X11: a held global shortcut, a window manager's keyboard-grabbing
+  move/resize (Xfwm4, Openbox) or Alt+Tab no longer auto-hides a focused
+  JeTTY; it hides only when the focus really goes elsewhere.
+- Wayland: a dead key followed by Space types the accent (`'` `"` `~` `^`)
+  at the shell instead of a space (US-International, German, ABNT2, … without
+  an input method).
+- macOS: hiding the terminal (F9, `jetty --hide`) gives the keyboard back to
+  the app you came from, and a hidden start (the login item) no longer takes
+  it; a Dock click, `open -a JeTTY` or a Spotlight/Finder launch brings a
+  hidden terminal back; shells started from JeTTY.app get your system locale
+  in UTF-8 when none is set.
+- `scripts/make-macos-app.sh` stopped before building `JeTTY.app`: its version
+  sed had no closing delimiter (broken since 0.6; #7).
+- Development: the test harnesses can no longer reach a JeTTY you are using.
+  `livetest.sh`, `selftest.sh` and `uitest.sh` are retired in favour of
+  `scripts/nested-live.sh`, and `verify-idle.sh` runs on a nested display.
+
 ## [0.29.0] — 2026-10-09
 
 **Menus from the keyboard, and an AppImage that updates itself.**
