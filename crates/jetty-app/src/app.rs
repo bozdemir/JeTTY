@@ -9,6 +9,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::event::MouseScrollDelta;
 use winit::window::{Window, WindowId};
 use crate::{clipboard, input};
+use crate::config::sanitize_notice;
 
 /// Events sent through the winit user-event channel.
 #[derive(Debug, Clone)]
@@ -2302,7 +2303,7 @@ impl App {
         startup_warnings.extend(app.keymap.warnings().iter().map(|w| format!("[keys] {w}")));
         app.help_rows = App::compute_help_rows(&app.keymap, app.summon_key_shown().as_deref());
         for w in &startup_warnings {
-            eprintln!("jetty: {w}");
+            eprintln!("jetty: {}", sanitize_notice(w));
         }
         app.startup_warnings = startup_warnings;
         // Save only what the user changes from here on: the baseline is the file
@@ -2617,7 +2618,7 @@ impl App {
                 // Still starting up (no window yet): shown in the first tab with
                 // the other startup problems.
                 for w in warnings {
-                    eprintln!("jetty: {w}");
+                    eprintln!("jetty: {}", sanitize_notice(&w));
                     if !self.startup_warnings.contains(&w) {
                         self.startup_warnings.push(w);
                     }
@@ -2742,7 +2743,7 @@ impl App {
             return;
         }
         for w in warnings {
-            eprintln!("jetty: {w}");
+            eprintln!("jetty: {}", sanitize_notice(w));
         }
         self.show_notice_pill(config_pill_text(warnings), 8000);
     }
@@ -17043,17 +17044,15 @@ impl FirstShellEnv {
     }
 }
 
-/// The status-pill text for config problems: the first one (cut at 96
-/// characters), and — when there are more — how many and where to see them all
-/// (the pill has room for one, and stderr is invisible to a desktop launch).
-/// That part comes FIRST: a window too narrow for the whole text ellipsizes
-/// its tail, which must not eat the way to the rest.
+/// The status-pill text for config problems: the first one (cut to 96
+/// characters, keeping what it means at its end — see `fit_notice`), and —
+/// when there are more — how many and where to see them all (the pill has room
+/// for one, and stderr is invisible to a desktop launch). That part comes
+/// FIRST: a window too narrow for the whole text ellipsizes its tail, which
+/// must not eat the way to the rest.
 fn config_pill_text(warnings: &[String]) -> String {
     let Some(first) = warnings.first() else { return String::new() };
-    let mut first = sanitize_notice(first);
-    if first.chars().count() > 96 {
-        first = first.chars().take(95).collect::<String>() + "…";
-    }
+    let first = crate::config::fit_notice(&sanitize_notice(first), 96);
     match warnings.len() {
         1 => format!("Config: {first}"),
         n => format!("Config ({n} problems — jetty --check-config): {first}"),
@@ -17109,13 +17108,6 @@ fn theme_missing_warning(name: &str, shown: &str) -> String {
          {shown:?} until it loads",
         crate::themes::name_hint(name)
     )
-}
-
-/// Make user-derived notice text safe to print into a terminal or a pill: every
-/// control character (ESC, CR, C1, …) becomes a visible `�`, so a value quoted
-/// from config.toml can never inject an escape sequence.
-fn sanitize_notice(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() { '\u{FFFD}' } else { c }).collect()
 }
 
 /// Forward global summon-hotkey presses to the event loop (blocks for the
@@ -18301,6 +18293,11 @@ mod config_pill_tests {
         assert!(t.ends_with('…') && t.chars().count() == "Config: ".len() + 96, "{t}");
         assert!(!config_pill_text(&["a\u{1b}[31m".to_string()]).contains('\u{1b}'));
         assert_eq!(config_pill_text(&[]), "");
+        // A cut notice still says what it means.
+        let rejected = ["[keys] keybinding 'Ctrl+T' for new_tab rejected: would shadow a terminal control \
+                         byte (Ctrl+letter / Ctrl+Space/[/\\/]//) — new_tab keeps its default"
+            .to_string()];
+        assert!(config_pill_text(&rejected).ends_with("… — new_tab keeps its default"));
     }
 }
 

@@ -1634,6 +1634,37 @@ pub(crate) fn preserve_copy(path: &Path, tag: &str) -> std::io::Result<PathBuf> 
     Err(std::io::Error::other("no free backup file name"))
 }
 
+// ── Notices ──────────────────────────────────────────────────────────────────
+
+/// Make user-derived notice text safe to print into a terminal or a pill: every
+/// control character (ESC, CR, C1, …) becomes a visible `�`, so a value quoted
+/// from config.toml — or a theme file's name — can never inject an escape
+/// sequence (an OSC 52 clipboard write, a title). Every copy of a config or
+/// theme problem goes through it: the pill, the first tab, stderr and
+/// `jetty --check-config`.
+pub(crate) fn sanitize_notice(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '\u{FFFD}' } else { c }).collect()
+}
+
+/// `notice` in at most `max` characters: whole when it fits, else its start cut
+/// to "…" with its last " — …" clause kept whole — what the problem means or
+/// what to do about it ("— new_tab keeps its default", "— using the default"),
+/// which a cut tail used to lose. A clause too long to keep (over two thirds of
+/// `max`) is cut with the tail.
+pub(crate) fn fit_notice(notice: &str, max: usize) -> String {
+    if notice.chars().count() <= max {
+        return notice.to_string();
+    }
+    let clause = notice.rfind(" — ").map(|i| &notice[i..]).filter(|c| c.chars().count() <= max * 2 / 3);
+    match clause {
+        Some(clause) => {
+            let head: String = notice.chars().take(max - clause.chars().count() - 1).collect();
+            format!("{}…{clause}", head.trim_end())
+        }
+        None => notice.chars().take(max - 1).collect::<String>() + "…",
+    }
+}
+
 // ── Diff + in-place edit ─────────────────────────────────────────────────────
 
 /// One changed setting: its TOML key path and new value (`None` = remove the key,
@@ -1877,7 +1908,7 @@ impl Persister {
             // No writer thread (spawn failed): write synchronously rather than lose
             // the change.
             if let Err(e) = write_changes(&self.path, &changes, &full, &self.shared) {
-                eprintln!("jetty: {e}");
+                eprintln!("jetty: {}", sanitize_notice(&e));
             }
             lock(&self.shared).inflight -= 1;
         }
@@ -1957,7 +1988,7 @@ impl Persister {
                         match msg {
                             WriterMsg::Write { changes, full } => {
                                 if let Err(e) = write_changes(&path, &changes, &full, &shared) {
-                                    eprintln!("jetty: {e}");
+                                    eprintln!("jetty: {}", sanitize_notice(&e));
                                     notice(e);
                                 }
                                 let mut s = lock(&shared);
@@ -3765,6 +3796,27 @@ caret_glow_enabled = true\n";
         let (_, w) = parse("[backdrop]\ncolors = [\"#111\", \"#222\", \"#333\", \"#444\", \"#555\"]\n");
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("first 4"), "{w:?}");
+    }
+
+    #[test]
+    fn a_notice_too_long_to_show_keeps_what_it_means() {
+        // The pill cut a notice's tail — the part that says what happens
+        // ("— new_tab keeps its default") or what to do.
+        let w = "[keys] keybinding 'Ctrl+T' for new_tab rejected: would shadow a terminal control byte \
+                 (Ctrl+letter / Ctrl+Space/[/\\/]//) — new_tab keeps its default";
+        let fit = fit_notice(w, 96);
+        assert_eq!(fit.chars().count(), 96, "{fit}");
+        assert!(fit.starts_with("[keys] keybinding 'Ctrl+T' for new_tab rejected: would shadow"), "{fit}");
+        assert!(fit.ends_with("… — new_tab keeps its default"), "{fit}");
+        // What fits stays whole; a notice without such a clause, or with one
+        // too long to keep, loses its tail.
+        assert_eq!(fit_notice("short — fine", 96), "short — fine");
+        let plain = "x".repeat(120);
+        assert_eq!(fit_notice(&plain, 96), "x".repeat(95) + "…");
+        let long_tail = format!("problem — {}", "y".repeat(90));
+        assert!(fit_notice(&long_tail, 96).ends_with("yy…"));
+        // Escapes never survive sanitizing.
+        assert_eq!(sanitize_notice("a\u{1b}]52;c;QQ==\u{7}b\u{9b}"), "a\u{FFFD}]52;c;QQ==\u{FFFD}b\u{FFFD}");
     }
 
     #[test]

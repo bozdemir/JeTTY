@@ -721,20 +721,28 @@ fn installed_fonts() -> (Vec<String>, Vec<String>) {
     (mono, other)
 }
 
+/// What `jetty --check-config` prints for the config at `path`: the path, then
+/// one line per problem (or "no problems found"). Sanitized: a problem quotes
+/// the user's files — a theme file's NAME too — and run in a terminal, an
+/// escape sequence in one would be executed (an OSC 52 clipboard write).
+fn report(path: &std::path::Path, problems: &[String]) -> Vec<String> {
+    let mut out = vec![super::sanitize_notice(&path.display().to_string())];
+    if problems.is_empty() {
+        out.push("no problems found".to_string());
+    }
+    out.extend(problems.iter().map(|p| format!("- {}", super::sanitize_notice(p))));
+    out
+}
+
 /// `jetty --check-config`: print every problem of the config tree in use, one
 /// per line, and return the exit status — 1 when there is any. All of them,
 /// unlike the reload notice, which has room for one.
 pub fn check_cli() -> i32 {
     let problems = problems_in(&Config::dir(), installed_fonts);
-    println!("{}", Config::config_path().display());
-    if problems.is_empty() {
-        println!("no problems found");
-        return 0;
+    for line in report(&Config::config_path(), &problems) {
+        println!("{line}");
     }
-    for p in &problems {
-        println!("- {p}");
-    }
-    1
+    i32::from(!problems.is_empty())
 }
 
 #[cfg(test)]
@@ -912,6 +920,23 @@ mod tests {
         std::fs::write(dir.join("config.toml"), "theme = \"nord\"\n").unwrap();
         std::fs::remove_file(dir.join("themes").join("bad.toml")).unwrap();
         assert_eq!(problems_in(&dir, fonts), Vec::<String>::new());
+        jetty_core::set_registry(Vec::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_prints_no_escape_sequence_a_file_name_carries() {
+        // A theme pack's file named `\e]52;c;…\a.toml` printed a raw OSC 52 —
+        // run inside JeTTY, `jetty --check-config` overwrote the clipboard.
+        let dir = std::env::temp_dir().join(format!("jetty-check-esc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("themes")).unwrap();
+        std::fs::write(dir.join("themes").join("\u{1b}]52;c;cHduZWQ=\u{7}.toml"), "background = 1\n").unwrap();
+        let problems = problems_in(&dir, || (Vec::new(), Vec::new()));
+        assert!(problems.iter().any(|p| p.contains("]52;c;")), "{problems:?}");
+        let lines = report(&dir.join("config.toml"), &problems);
+        assert!(lines.iter().any(|l| l.contains("]52;c;cHduZWQ=")), "still says which file: {lines:?}");
+        assert!(lines.iter().all(|l| !l.chars().any(char::is_control)), "{lines:?}");
         jetty_core::set_registry(Vec::new());
         let _ = std::fs::remove_dir_all(&dir);
     }
