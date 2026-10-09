@@ -86,7 +86,10 @@ fi
 /// Registers via bash-preexec's `precmd_functions` when present, else PREPENDS
 /// to a scalar or array `PROMPT_COMMAND` so `$?` on the first line is the user
 /// command's true exit status — and returns it, so the user's own
-/// `PROMPT_COMMAND` hooks after ours still see it. The A mark carries
+/// `PROMPT_COMMAND` hooks after ours still see it. Registered as
+/// `_jetty_precmd && :`: the left side of `&&` is exempt from the ERR trap
+/// (and `set -e`), which a failing hook of its own fired again at every
+/// prompt after a failure. The A mark carries
 /// `redraw=0` (kitty's extension): readline repaints only the LAST line of a
 /// multi-line `PS1` after a resize, so JeTTY must not wipe the prompt then.
 /// Safe under `set -u` (every variable read has a default).
@@ -120,11 +123,12 @@ if [[ $- == *i* && -n "${JETTY-}" && -z "${_jetty_bash_loaded:-}" ]]; then
     # bash-preexec present: register through its array (it preserves $?).
     precmd_functions+=(_jetty_precmd)
   elif [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a "* ]]; then
-    # bash 5.1+ array PROMPT_COMMAND: prepend our element.
-    PROMPT_COMMAND=(_jetty_precmd "${PROMPT_COMMAND[@]}")
+    # bash 5.1+ array PROMPT_COMMAND: prepend our element. `&& :` keeps the
+    # status it returns from firing an ERR trap (the list's $? is still it).
+    PROMPT_COMMAND=('_jetty_precmd && :' "${PROMPT_COMMAND[@]}")
   else
     # Scalar PROMPT_COMMAND: prepend, preserving any existing value.
-    PROMPT_COMMAND="_jetty_precmd${PROMPT_COMMAND:+$'\n'$PROMPT_COMMAND}"
+    PROMPT_COMMAND="_jetty_precmd && :${PROMPT_COMMAND:+$'\n'$PROMPT_COMMAND}"
   fi
   [[ "${PS0-}" == *$'\033]133;C'* ]] || PS0+=$_jetty_ps0
 fi
@@ -423,6 +427,30 @@ mod tests {
             }
             assert!(text.contains("\x1b]133;D;1\x07"), "our D still sees `false` ({setup}):\n{text}");
             assert!(text.contains("<ST=1>"), "the user's hook must see `false`'s status ({setup}):\n{text}");
+        }
+    }
+
+    /// The user's ERR trap fires once per failed command — never for our hook,
+    /// which returns that command's status to hand it on: run as a plain
+    /// `PROMPT_COMMAND` command it re-fired the trap at the prompt after every
+    /// failure, and again at each empty Enter. Scalar and (bash >= 5.1) array
+    /// `PROMPT_COMMAND`.
+    #[cfg(unix)]
+    #[test]
+    fn bash_never_fires_the_users_err_trap_itself() {
+        for setup in ["", "PROMPT_COMMAND=('true')"] {
+            let snippet = format!("trap 'printf \"<ERR>\"' ERR\n{setup}\n{BASH}");
+            let script = format!("{PRINT_BASH_VERSION}false\n\n\ntrue\nexit\n");
+            let Some(text) = run_snippet_in_pty(BASHES, &["--norc", "--noprofile", "-i"], "dumb", &snippet, &script)
+            else {
+                eprintln!("no bash — skipped");
+                return;
+            };
+            if !setup.is_empty() && bash_version(&text) < 501 {
+                continue; // array PROMPT_COMMAND is bash 5.1+
+            }
+            assert_eq!(text.matches("<ERR>").count(), 1, "`false` alone fires it ({setup:?}):\n{text}");
+            assert!(text.contains("\x1b]133;D;1\x07"), "our D still sees `false` ({setup:?}):\n{text}");
         }
     }
 
