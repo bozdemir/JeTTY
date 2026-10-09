@@ -6996,6 +6996,16 @@ impl App {
                     self.reattach_tab(p, event_loop);
                 }
             }
+            // Raise a detached window as a taskbar click would (the user asked).
+            // Focus moves to it: the main window's auto-hide must not take its
+            // Focused(false) for the user leaving JeTTY (as for a detach).
+            C::FocusWindow(id) => {
+                if let Some(dw) = self.detached_index(TabId(id)).and_then(|p| self.detached.get(p)) {
+                    dw.window.set_minimized(false);
+                    jetty_platform::activate_window(&dw.window);
+                    self.switching_to_detached = true;
+                }
+            }
             C::SetBackdrop(pick) => self.apply_backdrop_pick(pick),
         }
     }

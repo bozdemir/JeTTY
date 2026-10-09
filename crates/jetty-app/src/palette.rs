@@ -85,6 +85,8 @@ pub enum PaletteCmd {
     SetTheme(String),
     SelectTab(u64),
     Reattach(u64),
+    /// Raise and focus the detached window holding this tab.
+    FocusWindow(u64),
     /// Apply `effects::effect_presets()[i]`.
     EffectsPreset(usize),
     // ── Chrome (visuals v2) ──
@@ -290,8 +292,8 @@ pub struct PaletteHit {
 
 /// Build the full palette registry: the fixed static actions, then one entry per
 /// theme (`Theme: {display}`), per open tab (`Switch to tab: {title}`), and per
-/// detached window (`Reattach: {title}`, only when there are any). `tabs` and
-/// `detached` are `(stable tab id, title)` pairs.
+/// detached window (`Go to window: {title}` and `Reattach: {title}`, only when
+/// there are any). `tabs` and `detached` are `(stable tab id, title)` pairs.
 pub fn build_registry(
     themes: &[(String, String)],
     tabs: &[(u64, String)],
@@ -423,6 +425,11 @@ pub fn build_registry(
     }
     for (id, title) in detached {
         v.push(PaletteEntry {
+            title: format!("Go to window: {title}"),
+            keywords: "detached window focus raise show switch",
+            cmd: PaletteCmd::FocusWindow(*id),
+        });
+        v.push(PaletteEntry {
             title: format!("Reattach: {title}"),
             keywords: "attach dock window",
             cmd: PaletteCmd::Reattach(*id),
@@ -548,6 +555,9 @@ mod tests {
         assert!(!r.iter().any(|e| e.cmd == PaletteCmd::SelectTab(1)));
         let r = build_registry(&themes, &tabs, &[(12, "Tab 3".to_string())]);
         assert!(r.iter().any(|e| e.cmd == PaletteCmd::Reattach(12) && e.title == "Reattach: Tab 3"));
+        // A detached window can be raised from the palette too, not only
+        // pulled back.
+        assert!(r.iter().any(|e| e.cmd == PaletteCmd::FocusWindow(12) && e.title == "Go to window: Tab 3"));
     }
 
     #[test]
