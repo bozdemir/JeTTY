@@ -680,6 +680,9 @@ impl DetachedWindow {
     ) -> bool {
         let size = self.window.inner_size();
         let scale = self.window.scale_factor() as f32;
+        // The lost surface still holds the window's swapchain: release it before
+        // the new one is made (`GpuContext::release_surface`).
+        self.gpu.release_surface();
         let Some(gpu) = GpuContext::new_sharing(gpu_shared, self.window.clone(), size.width, size.height) else {
             return false;
         };

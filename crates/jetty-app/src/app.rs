@@ -9297,15 +9297,21 @@ impl App {
     /// new SURFACE on the main window's device (no adapter enumeration or device
     /// creation on the UI thread), and fonts from the already-loaded font
     /// database (no fontconfig rescan) — opening Settings used to stall every
-    /// window and the PTY drain for both. `settings_gpu` is `None` (and the
-    /// window simply stays blank) when no GPU can present to it.
+    /// window and the PTY drain for both. When no GPU can present to it the window
+    /// simply stays blank: `settings_gpu` stays `None` on open, and keeps the lost
+    /// context after a loss (so `recover_lost_gpu` tries again).
     fn build_settings_stack(&mut self, window: &Arc<Window>) {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
         let shared = self.gpu.as_ref().map(|g| g.shared());
+        // After a loss: the lost surface still holds the window's swapchain —
+        // release it before the new one is made (`GpuContext::release_surface`).
+        if let Some(lost) = self.settings_gpu.as_mut() {
+            lost.release_surface();
+        }
         let gpu = GpuContext::new_sharing(shared.as_ref(), window.clone(), size.width, size.height);
         let fonts = || self.text.as_ref().map_or_else(TextLayer::build_font_system, |t| t.clone_font_system());
-        if let Some(ref g) = gpu {
+        if let Some(g) = gpu {
             // The settings panel body text renders at the CAPPED UI size ([13,17])
             // so the absolute-px panel layout never overflows its fixed window,
             // independent of the terminal font. The chosen UI family is applied via
@@ -9331,8 +9337,8 @@ impl App {
             self.settings_text = Some(text);
             self.settings_specimen_text = Some(specimen);
             self.settings_quad = Some(quad);
+            self.settings_gpu = Some(g);
         }
-        self.settings_gpu = gpu;
     }
 
     /// Re-read the main window's display refresh interval (flood pacing). Cheap:
@@ -9402,6 +9408,11 @@ impl App {
         let Some(window) = self.window.clone() else { return false };
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
+        // The lost surface still holds the window's swapchain: release it before
+        // the new one is made (`GpuContext::release_surface`).
+        if let Some(lost) = self.gpu.as_mut() {
+            lost.release_surface();
+        }
         let Some(gpu) = GpuContext::new(window, size.width, size.height) else { return false };
         let font_db = || self.text.as_ref().map_or_else(TextLayer::build_font_system, |t| t.clone_font_system());
         let (grid_fonts, chrome_fonts) = (font_db(), font_db());

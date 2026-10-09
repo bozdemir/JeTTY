@@ -305,7 +305,9 @@ pub enum AcquireError {
 }
 
 pub struct GpuContext {
-    pub surface: wgpu::Surface<'static>,
+    /// The window's surface — `None` once released for a rebuild
+    /// ([`Self::release_surface`]); every frame acquire is skipped then.
+    surface: Option<wgpu::Surface<'static>>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
@@ -472,12 +474,9 @@ impl GpuContext {
             }
         };
 
-        // wgpu routes Surface::configure (and other) validation failures to the
-        // device error sink, which panics by default. A mismatched adapter — e.g. an
-        // iGPU that cannot present to a dGPU-driven compositor (see the JETTY_GPU
-        // note above) — would abort the process here instead of degrading. Install a
-        // non-fatal handler so such failures log and the app keeps running (with no
-        // rendering) rather than crashing.
+        // wgpu routes validation failures to the device error sink, which panics by
+        // default: log them instead (each distinct message once) and keep running.
+        // The surface configure below is checked on its own (`configure`).
         device.on_uncaptured_error(Arc::new(|e: wgpu::Error| log_wgpu_error(&e.to_string())));
         // A genuine device loss (driver reset / GPU hang / suspend) leaves every
         // window frozen on its last frame: flag it so the app can rebuild its GPU
@@ -502,13 +501,20 @@ impl GpuContext {
             queue,
             lost,
         });
-        Some(Self::configure(shared, surface, width, height))
+        let gpu = Self::configure(shared, surface, width, height);
+        if gpu.is_none() && power == wgpu::PowerPreference::LowPower {
+            // An iGPU that cannot present to a compositor running on the dGPU
+            // (see `power` above).
+            eprintln!("jetty: on a laptop whose display runs on the discrete GPU, start JeTTY with JETTY_GPU=high");
+        }
+        gpu
     }
 
     /// A further window on an existing GPU: only its `Surface` is created and
     /// configured — no adapter enumeration, no device creation. `None` when the
-    /// surface cannot be created or the shared adapter cannot present to it
-    /// (e.g. a window on a screen driven by another GPU); see [`Self::new_sharing`].
+    /// surface cannot be created, configured, or the shared adapter cannot
+    /// present to it (e.g. a window on a screen driven by another GPU); see
+    /// [`Self::new_sharing`].
     pub fn with_shared<W: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + Send + Sync + 'static>(
         shared: &Arc<GpuShared>,
         window: Arc<W>,
@@ -529,7 +535,7 @@ impl GpuContext {
             eprintln!("jetty: the shared GPU cannot present to this window; acquiring another");
             return None;
         }
-        Some(Self::configure(Arc::clone(shared), surface, width, height))
+        Self::configure(Arc::clone(shared), surface, width, height)
     }
 
     /// [`Self::with_shared`] when a shared GPU is available and can present to
@@ -550,8 +556,11 @@ impl GpuContext {
     }
 
     /// Pick this surface's format + alpha mode from ITS capabilities and configure
-    /// it on the shared device.
-    fn configure(shared: Arc<GpuShared>, surface: wgpu::Surface<'static>, width: u32, height: u32) -> Self {
+    /// it on the shared device. `None` (logged) when the configure fails: wgpu
+    /// leaves that surface unconfigured and PANICS on the first frame acquired
+    /// from it, so no context is handed out for it — a first window then gets
+    /// `NO_GPU_HELP`, a rebuild tries again later.
+    fn configure(shared: Arc<GpuShared>, surface: wgpu::Surface<'static>, width: u32, height: u32) -> Option<Self> {
         let caps = surface.get_capabilities(&shared.adapter);
         // Prefer an sRGB format; if the driver reports no formats at all (e.g. an
         // incompatible surface returns an empty list), fall back to a sane default
@@ -599,10 +608,25 @@ impl GpuContext {
             // keystroke's echo — up to one extra refresh of input latency.
             desired_maximum_frame_latency: 1,
         };
+        // Catch every error the configure raises — an adapter that cannot present
+        // here (an iGPU under a compositor on the dGPU), a window that still has
+        // another surface's swapchain (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR), out of
+        // memory. A device loss reaches no error scope: the lost flag reports it.
+        let invalid = shared.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let out_of_memory = shared.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         surface.configure(&shared.device, &config);
+        let out_of_memory = pollster::block_on(out_of_memory.pop());
+        if let Some(e) = pollster::block_on(invalid.pop()).or(out_of_memory) {
+            eprintln!("jetty: the GPU cannot draw to this window: {e}");
+            return None;
+        }
+        if shared.lost.load(Ordering::Acquire) {
+            eprintln!("jetty: the GPU was lost while setting up this window");
+            return None;
+        }
 
-        Self {
-            surface,
+        Some(Self {
+            surface: Some(surface),
             device: shared.device.clone(),
             queue: shared.queue.clone(),
             config,
@@ -612,7 +636,7 @@ impl GpuContext {
             max_dim,
             shared,
             last_acquire_error: None,
-        }
+        })
     }
 
     /// The shared GPU (instance/adapter/device/queue) — pass to
@@ -637,6 +661,17 @@ impl GpuContext {
         self.shared.lost.load(Ordering::Acquire)
     }
 
+    /// Drop the window's surface — and with it the swapchain it holds — ahead of
+    /// rebuilding a LOST context: a new surface on the same window may create
+    /// its swapchain only once the old one is gone (Vulkan returns
+    /// VK_ERROR_NATIVE_WINDOW_IN_USE_KHR on drivers that enforce it; Mesa on
+    /// Wayland makes a second fifo object for the surface, a protocol error that
+    /// ends the connection). Every later acquire on this context is skipped; it
+    /// still reports [`Self::is_lost`], so a failed rebuild is retried.
+    pub fn release_surface(&mut self) {
+        self.surface = None;
+    }
+
     /// Test hook for the nested harness (`JETTY_DEBUG_LOSE_GPU`, never a
     /// setting): lose the shared device the way a driver reset does — every call
     /// on it fails from now on and [`Self::is_lost`] turns true — so the rebuild
@@ -657,7 +692,9 @@ impl GpuContext {
         if w > 0 && h > 0 {
             self.config.width = w.min(self.max_dim);
             self.config.height = h.min(self.max_dim);
-            self.surface.configure(&self.device, &self.config);
+            if let Some(surface) = &self.surface {
+                surface.configure(&self.device, &self.config);
+            }
         }
     }
 
@@ -666,13 +703,18 @@ impl GpuContext {
     /// (surface was reconfigured, occluded, or timed out) — the reason is kept in
     /// [`Self::last_acquire_error`] so the caller can decide whether to retry.
     pub fn acquire_frame(&mut self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
-        let texture = match self.surface.get_current_texture() {
+        let Some(surface) = &self.surface else {
+            // Released for a rebuild of this lost context.
+            self.last_acquire_error = Some(AcquireError::Lost);
+            return None;
+        };
+        let texture = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated => {
                 // Stale configuration (e.g. after a resize); reconfigure and skip
                 // this frame. The next acquire will use the new config.
-                self.surface.configure(&self.device, &self.config);
+                surface.configure(&self.device, &self.config);
                 self.last_acquire_error = Some(AcquireError::Outdated);
                 return None;
             }
@@ -681,8 +723,8 @@ impl GpuContext {
                 // once. Reconfiguring is the best safe recovery available here,
                 // since full surface recreation would require the window handle,
                 // which GpuContext does not retain.
-                self.surface.configure(&self.device, &self.config);
-                match self.surface.get_current_texture() {
+                surface.configure(&self.device, &self.config);
+                match surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(t)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
                     other => {
