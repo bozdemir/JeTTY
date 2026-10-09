@@ -14,7 +14,7 @@ command -v sips >/dev/null 2>&1 || { echo "error: sips not found (macOS only)"; 
 command -v iconutil >/dev/null 2>&1 || { echo "error: iconutil not found (macOS only)"; exit 1; }
 [ -f assets/icons/jetty-256.png ] || { echo "error: assets/icons/jetty-256.png missing"; exit 1; }
 
-VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1')"
+VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
 [ -n "$VERSION" ] || { echo "error: could not parse version from Cargo.toml"; exit 1; }
 
 BIN=target/release/jetty
