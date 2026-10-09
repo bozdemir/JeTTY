@@ -1070,6 +1070,8 @@ pub struct App {
     /// After a GPU device loss whose rebuild failed (the driver still resetting),
     /// the next attempt is not before this instant — see `recover_lost_gpu`.
     gpu_rebuild_retry_at: Option<std::time::Instant>,
+    /// Failed rebuild attempts in a row (the backoff's step); 0 once one works.
+    gpu_rebuild_failures: u32,
     /// When the main window last presented a frame — the anchor of flood frame
     /// pacing (`pace_paint`).
     last_present_at: Option<std::time::Instant>,
@@ -2081,6 +2083,7 @@ impl App {
             settings_acquire_retry: None,
             settings_occluded: false,
             gpu_rebuild_retry_at: None,
+            gpu_rebuild_failures: 0,
             last_present_at: None,
             frame_interval: refresh_interval(None),
             paced_paint_at: None,
@@ -9882,7 +9885,7 @@ impl App {
     /// stack from a fresh device, then re-surface every detached window and the
     /// Settings window whose device was lost (they share the main one). When no
     /// GPU can be acquired yet (the driver still resetting) the attempt repeats
-    /// after `GPU_REBUILD_RETRY`, as a single `WaitUntil` wake — never a spin.
+    /// after `gpu_rebuild_backoff`, as a single `WaitUntil` wake — never a spin.
     /// Returns whether a rebuild was attempted (the caller repaints).
     fn recover_lost_gpu(&mut self, now: std::time::Instant) -> bool {
         let main_lost = self.gpu.as_ref().is_some_and(|g| g.is_lost());
@@ -9895,11 +9898,15 @@ impl App {
         if main_lost {
             ok &= self.rebuild_main_gpu();
         }
-        // Everything else re-surfaces on the (possibly new) main device.
+        // Everything else re-surfaces on the (possibly new) main device — and
+        // waits while the main window's is still down, instead of taking a
+        // private device each (~70–90 ms apiece, kept after the main one
+        // returns).
+        let main_down = self.gpu.as_ref().is_some_and(|g| g.is_lost());
         let shared = self.gpu.as_ref().filter(|g| !g.is_lost()).map(|g| g.shared());
         let (font_logical, ui_font_logical) = (self.font_logical, self.ui_font_logical);
         for dw in &mut self.detached {
-            if dw.gpu.is_lost() {
+            if dw.gpu.is_lost() && !main_down {
                 ok &= dw.rebuild_gpu(
                     shared.as_ref(),
                     font_logical,
@@ -9911,14 +9918,15 @@ impl App {
         }
         // Rebuilt grid layers start at the defaults: re-apply the glyph options.
         self.apply_glyph_options();
-        if settings_lost {
+        if settings_lost && !main_down {
             if let Some(win) = self.settings_window.clone() {
                 self.build_settings_stack(&win);
                 self.settings_acquire_retry = None;
                 ok &= self.settings_gpu.as_ref().is_some_and(|g| !g.is_lost());
             }
         }
-        self.gpu_rebuild_retry_at = if ok { None } else { Some(now + GPU_REBUILD_RETRY) };
+        self.gpu_rebuild_failures = if ok { 0 } else { self.gpu_rebuild_failures.saturating_add(1) };
+        self.gpu_rebuild_retry_at = (!ok).then(|| now + gpu_rebuild_backoff(self.gpu_rebuild_failures));
         self.mark_dirty_all();
         true
     }
@@ -18578,10 +18586,14 @@ pub(crate) fn refresh_interval(mhz: Option<u32>) -> std::time::Duration {
     }
 }
 
-/// Pause between GPU rebuild attempts while the device stays unavailable (a
-/// driver reset can take seconds; each attempt enumerates adapters on the UI
-/// thread, so it must not repeat every frame).
-const GPU_REBUILD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+/// Pause before the next GPU rebuild attempt after `failures` (≥ 1) failed
+/// ones in a row: 1 s, doubling up to 30 s. A driver reset can take seconds,
+/// and each attempt enumerates adapters on the UI thread (tens of ms, up to
+/// ~100 with EGL): it must not repeat every frame, nor every second forever
+/// when the GPU is gone for good (an unplugged eGPU, an unloaded driver).
+fn gpu_rebuild_backoff(failures: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((1u64 << failures.saturating_sub(1).min(5)).min(30))
+}
 
 /// Whether `App::recover_lost_gpu` should attempt a rebuild now: a device is
 /// lost and no failed attempt is still backing off.
@@ -20579,9 +20591,9 @@ mod window_mode_tests {
 #[cfg(test)]
 mod window_parity_tests {
     use super::{
-        detach_logical_size, gpu_recovery_due, pace_paint, perf_hud_text, refresh_interval, settings_drag_end,
-        settings_fullscreen_exit, settings_grown_size, smooth_frame_ms, CtlDrag, FullscreenExit, PaintPacing,
-        GPU_REBUILD_RETRY,
+        detach_logical_size, gpu_rebuild_backoff, gpu_recovery_due, pace_paint, perf_hud_text, refresh_interval,
+        settings_drag_end, settings_fullscreen_exit, settings_grown_size, smooth_frame_ms, CtlDrag, FullscreenExit,
+        PaintPacing,
     };
     use std::time::{Duration, Instant};
 
@@ -20622,9 +20634,19 @@ mod window_parity_tests {
         assert!(!gpu_recovery_due(false, None, now), "nothing lost → nothing to do");
         assert!(gpu_recovery_due(true, None, now), "a loss is rebuilt at once");
         // A failed rebuild waits for its backoff — never a per-frame retry loop…
-        assert!(!gpu_recovery_due(true, Some(now + GPU_REBUILD_RETRY), now));
+        assert!(!gpu_recovery_due(true, Some(now + gpu_rebuild_backoff(1)), now));
         // …and retries once it elapses.
         assert!(gpu_recovery_due(true, Some(now), now));
+    }
+
+    /// Each rebuild attempt enumerates adapters on the UI thread (tens of ms
+    /// up to ~100): a GPU gone for good must not stall input and the PTY drain
+    /// every second forever. 1 s after the first failure, doubling to 30 s.
+    #[test]
+    fn gpu_rebuild_retries_back_off_to_half_a_minute() {
+        let secs = |n| gpu_rebuild_backoff(n).as_secs();
+        assert_eq!((1..=8).map(secs).collect::<Vec<_>>(), [1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(secs(u32::MAX), 30);
     }
 
     /// Tripwire for the single active-tab path: `self.active` may be ASSIGNED
