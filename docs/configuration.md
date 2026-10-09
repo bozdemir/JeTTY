@@ -252,7 +252,8 @@ How a chord finds its key, on any layout:
 
 A theme is a TOML file in the `themes/` folder next to `config.toml`; it appears
 in Settings and the command palette, and `theme = "<name>"` picks it. A theme
-whose `name` matches a built-in (`dracula`) replaces that built-in. Editing a
+whose `name` (or file name) matches a built-in in any spelling (`dracula`,
+`Dracula`, `tokyo-night`) replaces that built-in. Editing a
 theme that is on screen applies at once; a save that does not load (a typo
 mid-edit) keeps the last version that did, and says where the problem is.
 

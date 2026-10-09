@@ -114,7 +114,9 @@ pub fn theme_index(name: &str) -> Option<usize> {
 
 /// A theme name with case and separators dropped, for [`theme_index`]'s loose
 /// match: `Solarized Light`, `solarized-light` and `solarized_light` agree.
-fn loose_name(s: &str) -> String {
+/// Public for the user-theme loader, whose themes replace a built-in (or each
+/// other) by the same rule.
+pub fn loose_name(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 

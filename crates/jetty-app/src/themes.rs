@@ -2,7 +2,8 @@
 //!
 //! Reads `~/.config/jetty/themes/*.toml`, parses each into a `jetty_core::Theme`,
 //! and merges them with the 46 built-ins into the runtime registry (a user theme
-//! whose `name` matches a built-in REPLACES it in place; new names append). Parsing
+//! whose `name` matches a built-in — in any spelling — REPLACES it in place; new
+//! names append). Parsing
 //! lives here (jetty-app already carries serde/toml/dirs); jetty-core holds only the
 //! parsed data + the registry.
 //!
@@ -322,8 +323,10 @@ pub fn load_user_themes_from(dir: &std::path::Path) -> (Vec<jetty_core::Theme>, 
                 }
             },
         };
-        // Duplicate user name → last wins (drop the earlier one), reported.
-        if let Some(pos) = out.iter().position(|t| t.name == theme.name) {
+        // Duplicate user name (in any spelling: `theme = …` finds either) →
+        // last wins (drop the earlier one), reported.
+        let key = jetty_core::theme::loose_name(&theme.name);
+        if let Some(pos) = out.iter().position(|t| jetty_core::theme::loose_name(&t.name) == key) {
             warnings.push(format!("two theme files are named {:?} — themes/{file} wins", theme.name));
             out.remove(pos);
         }
@@ -368,12 +371,18 @@ pub fn name_hint(name: &str) -> String {
 }
 
 /// Merge the built-ins (PRESETS order) with `user` themes: a user theme whose `name`
-/// matches a built-in REPLACES it in place; a new name appends. Pure + testable.
+/// matches a built-in — in any spelling `theme = …` accepts (`Dracula`,
+/// `tokyo-night`) — REPLACES it in place, under the built-in's id; a new name
+/// appends. Pure + testable.
 fn merge_into_builtins(user: Vec<jetty_core::Theme>) -> Vec<jetty_core::Theme> {
     let mut merged = jetty_core::builtins();
-    for u in user {
-        if let Some(slot) = merged.iter_mut().find(|t| t.name == u.name) {
-            *slot = u; // shadow the built-in in place (keeps its ordered position)
+    for mut u in user {
+        let key = jetty_core::theme::loose_name(&u.name);
+        if let Some(slot) = merged.iter_mut().find(|t| jetty_core::theme::loose_name(&t.name) == key) {
+            // Shadow the built-in in place (keeps its ordered position). Its id
+            // stays, so a config naming it exactly still finds this one first.
+            u.name = slot.name.clone();
+            *slot = u;
         } else {
             merged.push(u); // new theme appends after the built-ins
         }
@@ -819,5 +828,33 @@ palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606"
         assert_eq!(merged[di].display_name.as_ref(), "My Dracula");
         assert_eq!(merged[di].bg, [1, 2, 3, 255]);
         assert_eq!(merged.last().unwrap().name.as_ref(), "novel");
+    }
+
+    #[test]
+    fn a_theme_named_like_a_builtin_in_any_spelling_replaces_it() {
+        // `Dracula.toml` / `tokyo-night.toml` without a `name`: named by the
+        // file stem, they matched no built-in exactly and were appended as a
+        // second "Dracula" / "Tokyo Night" card — while `theme = "dracula"`
+        // kept finding the built-in, so the file was never used that way.
+        let dir = theme_dir("loose-shadow");
+        let text = theme_text("#123456").replace("name = \"mine\"\n", "");
+        std::fs::write(dir.join("Dracula.toml"), &text).unwrap();
+        std::fs::write(dir.join("tokyo-night.toml"), &text).unwrap();
+        let (user, w) = load_user_themes_from(&dir);
+        assert!(w.is_empty(), "{w:?}");
+        let merged = merge_into_builtins(user);
+        assert_eq!(merged.len(), jetty_core::theme::PRESETS.len(), "replaced, not appended");
+        for id in ["dracula", "tokyo_night"] {
+            let i = jetty_core::theme::PRESETS.iter().position(|&n| n == id).unwrap();
+            assert_eq!(merged[i].bg, [0x12, 0x34, 0x56, 255], "{id}");
+            assert_eq!(merged[i].name.as_ref(), id, "the built-in's id stays: config names keep matching");
+        }
+        // Two files for one name, however they spell it: the last one wins,
+        // and it is said.
+        std::fs::write(dir.join("dracula.toml"), theme_text("#654321").replace("name = \"mine\"\n", "")).unwrap();
+        let (user, w) = load_user_themes_from(&dir);
+        assert_eq!(user.len(), 2, "{w:?}");
+        assert_eq!(w, ["two theme files are named \"dracula\" — themes/dracula.toml wins"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
