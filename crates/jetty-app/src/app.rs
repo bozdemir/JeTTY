@@ -11831,14 +11831,15 @@ impl App {
 
     /// Render a detached window: its single tab's grid plus the window chrome —
     /// a top bar (title pill + close ✕, its metrics' bar height), the bottom status strip
-    /// (perf HUD) when `show_perf_hud`, and the Reattach/Copy/Paste context menu
-    /// when open. Mirrors the main window's terminal draw passes from the
-    /// `RedrawRequested` arm of `window_event` using the detached window's OWN
-    /// `gpu`/`text`/`chrome_text`/`quad`, and applies the SAME final effects:
-    /// the rounded-corner mask (all four corners — a detached window is never
-    /// top-flush), the transparent theme-bg clear, the caret flash, and the CRT
-    /// post-pass (which owns the rounded corners while active, exactly like the
-    /// main window). Summon/Tier-B reveals stay main-window-only.
+    /// (perf HUD) when `show_perf_hud`, and the context menu (Reattach / Copy /
+    /// Paste / Run in New Tab) when open. Mirrors the main window's terminal draw
+    /// passes from the `RedrawRequested` arm of `window_event` using the detached
+    /// window's OWN `gpu`/`text`/`chrome_text`/`quad`, and applies the SAME final
+    /// effects: the rounded-corner mask (all four corners — a detached window is
+    /// never top-flush), the transparent theme-bg clear, the caret flash and
+    /// glow, and the CRT post-pass (which owns the rounded corners while
+    /// active, exactly like the main window). Summon/Tier-B reveals stay
+    /// main-window-only.
     fn render_detached_window(&mut self, pos: usize) {
         // Drain this tab's PTY output into its terminal before snapshotting.
         // Detached tabs are no longer in `self.tabs`, so the main `drain_pty`
@@ -16228,8 +16229,8 @@ impl ApplicationHandler<AppEvent> for App {
                     // exactly where it was drawn before. Main threads its own
                     // slide offset, search-hit tint, and copy-mode cursor through
                     // the params, so this is byte-identical to the pre-refactor
-                    // body. The main-only caret GLOW, summon-reveal/Tier-B, and
-                    // the corner-mask/CRT tail all stay BELOW, in this caller.
+                    // body. The caret GLOW, the main-only summon-reveal/Tier-B,
+                    // and the corner-mask/CRT tail all stay BELOW, in this caller.
                     //
                     // The backdrop (visuals v2): `None` for mode "none" — no layer
                     // exists and the frame is exactly the clear. Built on the first
@@ -16997,13 +16998,12 @@ impl ApplicationHandler<AppEvent> for App {
 /// sites (main + detached) readable. GPU resources and the mid-scene chrome
 /// closure are passed separately.
 ///
-/// EQUIVALENCE CONTRACT (v0.23 BLOCKING 5): a detached window passes
-/// `slide_y = 0.0`, `search_hits = &[]`, `copy_mode_active = false`, and
-/// `copy_mode_ui = None`. As a result the shared core adds NO dropdown slide
-/// and NO copy-mode cursor for detached — exactly as before. The main-only
-/// caret GLOW, the summon-reveal / Tier-B passes, and the whole overlay +
-/// corner-mask/CRT tail live in the MAIN caller AFTER this core, so a detached
-/// window still gains none of them.
+/// EQUIVALENCE CONTRACT (v0.23 BLOCKING 5): each window passes its own state —
+/// its search hits and copy-mode cursor (both are per window) — and a detached
+/// window passes `slide_y = 0.0`, so the shared core adds NO dropdown slide for
+/// it. The caret GLOW, the overlays and the corner-mask/CRT tail live in each
+/// caller AFTER this core; the summon-reveal / Tier-B passes in the main one
+/// only.
 struct GridScene<'a> {
     snap: &'a jetty_core::GridSnapshot,
     theme: &'a jetty_core::Theme,
@@ -17021,7 +17021,7 @@ struct GridScene<'a> {
     scrollbar: Option<jetty_render::ScrollbarTrack>,
     /// Physical-px scale factor (failed-command marker bar width).
     scale: f32,
-    /// Search-hit tint source; empty (`&[]`) unless the main search bar is open.
+    /// Search-hit tint source; empty (`&[]`) unless the window's search bar is open.
     search_hits: &'a [jetty_core::SearchHit],
     failed_rows: &'a [u16],
     link_spans: Option<&'a Vec<(usize, usize, usize)>>,
@@ -17037,10 +17037,9 @@ struct GridScene<'a> {
     /// This frame's cursor trail (`None` = no smear), drawn by the caller's
     /// `CursorTrailLayer` between the cell backgrounds and the glyphs.
     trail: Option<jetty_render::TrailUniform>,
-    /// Copy-mode is main-only. Detached passes `false` → the shell cursor is
-    /// never suppressed here.
+    /// The window is in copy mode: its shell cursor is suppressed.
     copy_mode_active: bool,
-    /// Copy-mode keyboard cursor. Detached passes `None` → no extra cursor.
+    /// The window's copy-mode keyboard cursor (`None` outside copy mode).
     copy_mode_ui: Option<(usize, usize, jetty_render::CopySelect)>,
 }
 
@@ -17048,7 +17047,7 @@ struct GridScene<'a> {
 /// `RedrawRequested` arm ∩ `render_detached_window` (v0.23 Task 8 / BLOCKING 5).
 ///
 /// It performs ONLY the common sequence:
-///   Pass 1  clear + per-cell background quads (+ main-only search-hit tint) + the
+///   Pass 1  clear + per-cell background quads (+ the search-hit tint) + the
 ///           solid block cursor (under its glyph)
 ///   Pass 2  glyphs (recorded into the SAME render pass + submit as Pass 1)
 ///   Pass 2b inline (sixel/kitty) images, scissored to the grid area
@@ -17056,10 +17055,10 @@ struct GridScene<'a> {
 ///           bar or the detached title bar (+ status strip), handed
 ///   Pass 4  the scrollbar + failed-command markers + SGR decorations + link
 ///           underline + the thin cursor shapes (beam / underline / unfocused
-///           hollow) (+ main-only copy-mode cursor) as rects to draw over its
+///           hollow) (+ the copy-mode cursor) as rects to draw over its
 ///           quads in the SAME pass (the grid band and the chrome never overlap)
 ///
-/// Everything else stays in the caller: the main-only caret GLOW pass, the
+/// Everything else stays in the caller: the caret GLOW pass, the (main-only)
 /// summon-reveal / Tier-B routing, the dropdown-slide *decision*, the overlay
 /// stack (search/hint/copy/help/confirm/palette/menus/welcome/status/toast),
 /// and the corner-mask + CRT tail + present + animation self-drive. The slide
@@ -17100,8 +17099,8 @@ fn render_grid_scene(
     // The shell cursor, split by layer: the SOLID block is painted under the
     // glyphs (Pass 1) with the glyph it covers recolored for contrast (Pass 2);
     // beam / underline / unfocused hollow draw over the text (Pass 4). In
-    // copy-mode (main only) the shell cursor is SUPPRESSED so only the copy-mode
-    // keyboard cursor shows; detached always passes `copy_mode_active = false`.
+    // copy-mode the shell cursor is SUPPRESSED so only the copy-mode keyboard
+    // cursor shows.
     let cursor = if s.copy_mode_active {
         jetty_render::CursorDraw::default()
     } else {
@@ -17121,7 +17120,7 @@ fn render_grid_scene(
 
     // Pass 1: clear to the (premultiplied, opacity-correct) theme bg and paint
     // the per-cell background quads under the text. Search-hit tint rects are
-    // appended AFTER the selection rects (main-only; empty for detached) so the
+    // appended AFTER the selection rects (empty unless a search is open) so the
     // match tint wins where they overlap, still under the glyphs; the block
     // cursor goes last so it covers both.
     // The `[cursor] guide` band goes FIRST so cell backgrounds, the selection

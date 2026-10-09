@@ -1888,7 +1888,8 @@ impl Backdrop {
     }
 
     /// How many times the cache has been baked (an unchanged frame never bakes).
-    pub fn bake_count(&self) -> u64 {
+    #[cfg(test)]
+    fn bake_count(&self) -> u64 {
         self.bakes
     }
 

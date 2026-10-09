@@ -1009,7 +1009,8 @@ impl Crt {
     }
 
     /// Whether variant `key` (and its bloom chain) is built.
-    pub fn is_prepared(&self, key: CrtKey) -> bool {
+    #[cfg(test)]
+    fn is_prepared(&self, key: CrtKey) -> bool {
         let g = self.gpu.borrow();
         let main = g.pipelines.iter().any(|(k, _)| *k == key);
         let bloom = !key.contains(CrtKey::BLOOM)

@@ -5283,7 +5283,8 @@ impl Terminal {
     }
 
     /// Whether a search query is currently set.
-    pub fn search_is_active(&self) -> bool {
+    #[cfg(test)]
+    fn search_is_active(&self) -> bool {
         !self.search_query.is_empty()
     }
 

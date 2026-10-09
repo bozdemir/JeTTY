@@ -165,7 +165,8 @@ fn check_dims(w: u32, h: u32) -> Result<(), String> {
 /// Decode PNG or JPEG bytes into straight RGBA8, upright: a photo's EXIF
 /// orientation (a phone stores portrait shots turned) is applied. Dimensions
 /// are checked from the header before the frame buffer is allocated.
-pub fn decode_bytes(data: &[u8]) -> Result<RawImage, String> {
+#[cfg(test)]
+fn decode_bytes(data: &[u8]) -> Result<RawImage, String> {
     decode_stored(data).map(|(raw, o)| orient(raw, o))
 }
 

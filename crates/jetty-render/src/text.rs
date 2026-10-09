@@ -1533,13 +1533,6 @@ impl TextLayer {
         (self.cell_w, self.cell_h)
     }
 
-    /// The grid rows' monospace snap width. Exposed for the alignment self-test /
-    /// inspection; the grid glyph advances are rounded to this so real bold/italic
-    /// faces stay column-aligned.
-    pub fn grid_monospace_width(&self) -> Option<f32> {
-        Some(self.cell_w)
-    }
-
     /// The cached underline/strikethrough quads for the last rendered frame,
     /// already PLACED at the grid origin passed to `prepare_grid` (window
     /// coordinates — unlike the grid-space quad builders, do not shift them).
