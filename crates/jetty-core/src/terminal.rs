@@ -7017,7 +7017,7 @@ mod tests {
     #[test]
     fn jump_prompt_prev_next_and_clamps() {
         let mut t = Terminal::new(20, 5);
-        let mut add_prompt = |t: &mut Terminal, tag: char| {
+        let add_prompt = |t: &mut Terminal, tag: char| {
             t.feed(b"\x1b]133;A\x07");
             t.feed(b"\x1b]133;D;0\x07");
             for i in 0..6 {
@@ -8411,8 +8411,8 @@ mod tests {
         let rows = t.viewport_rows_chars();
         let snap = t.snapshot();
         assert_eq!(rows.len(), 4);
-        for r in 0..4 {
-            let s: String = rows[r].iter().collect();
+        for (r, row) in rows.iter().enumerate() {
+            let s: String = row.iter().collect();
             assert_eq!(s, snap.row_text(r), "row {r}");
         }
     }

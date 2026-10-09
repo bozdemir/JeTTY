@@ -253,9 +253,7 @@ pub fn decode_png(data: &[u8], caps: SixelCaps) -> Option<InlineImage> {
     // STRIP_16: 16-bit channels → 8-bit. Bounds the per-pixel width we handle.
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     // Bound 2 (A9, mandatory): cap ancillary-chunk (PLTE/iCCP/zTXt) allocation.
-    let mut limits = png::Limits::default();
-    limits.bytes = MAX_DECODE_BYTES;
-    decoder.set_limits(limits);
+    decoder.set_limits(png::Limits { bytes: MAX_DECODE_BYTES });
 
     let mut reader = decoder.read_info().ok()?;
     // Bound 3: enforce caps on the HEADER dims BEFORE allocating the frame buffer

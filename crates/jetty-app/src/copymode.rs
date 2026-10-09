@@ -420,14 +420,18 @@ mod tests {
     fn word_motions_cross_rows() {
         // Row 0 ends with "foo", row 1 begins with "bar baz".
         let v = vp(&["one foo", "bar baz", "qux"], 7);
+        let from = |row, col, m| {
+            let o = apply_motion(&cm(row, col), m, 3, 7, &v);
+            (o.row, o.col)
+        };
         // From col 0 ('o' of "one"), w → start of "foo" (col 4).
-        assert_eq!((|| { let o = apply_motion(&cm(0, 0), Motion::WordFwd, 3, 7, &v); (o.row, o.col) })(), (0, 4));
+        assert_eq!(from(0, 0, Motion::WordFwd), (0, 4));
         // From "foo" (col 4), w crosses the row boundary to "bar" (row 1, col 0).
-        assert_eq!((|| { let o = apply_motion(&cm(0, 4), Motion::WordFwd, 3, 7, &v); (o.row, o.col) })(), (1, 0));
+        assert_eq!(from(0, 4, Motion::WordFwd), (1, 0));
         // e from "bar" start → end of "bar" (row 1 col 2).
-        assert_eq!((|| { let o = apply_motion(&cm(1, 0), Motion::WordEnd, 3, 7, &v); (o.row, o.col) })(), (1, 2));
+        assert_eq!(from(1, 0, Motion::WordEnd), (1, 2));
         // b from "bar" start crosses back up to the start of "foo" (row 0 col 4).
-        assert_eq!((|| { let o = apply_motion(&cm(1, 0), Motion::WordBack, 3, 7, &v); (o.row, o.col) })(), (0, 4));
+        assert_eq!(from(1, 0, Motion::WordBack), (0, 4));
     }
 
     /// Like [`vp`], with each CJK ideograph followed by its wide-char spacer —
