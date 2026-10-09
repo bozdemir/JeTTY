@@ -20,6 +20,8 @@
 //!   (alacritty kept an empty region, and output stopped scrolling).
 //! * Modes 47 / 1047 (the alternate screen without 1049's cursor save) and
 //!   1048 (save / restore the cursor) work.
+//! * DECSCNM (`CSI ? 5 h`, the reverse-video screen vim's visual bell
+//!   flashes) is tracked here and drawn by the snapshot; alacritty ignored it.
 //! * OSC 4 / 10 / 11 / 12 queries answer with the color a program set (pywal,
 //!   base16-shell) instead of the theme's, so the background a program
 //!   detects (neovim, bat, delta) is the one on screen.
@@ -50,11 +52,15 @@ pub(crate) struct VtState {
     /// lines. Kept in step at every change: DECSTBM, RIS, DECCOLM and a resize
     /// (`Terminal::resize` resets it, as `Term::resize` does).
     pub(crate) region: (i32, i32),
+    /// DECSCNM (`CSI ? 5 h`): the whole screen in reverse video — what vim's
+    /// visual bell flashes (terminfo `flash`). alacritty ignores the mode; the
+    /// snapshot swaps the colors.
+    pub(crate) reverse: bool,
 }
 
 impl VtState {
     pub(crate) fn new(rows: usize) -> VtState {
-        VtState { region: (0, rows as i32) }
+        VtState { region: (0, rows as i32), reverse: false }
     }
 }
 
@@ -254,11 +260,12 @@ impl<T: EventListener> Handler for Vt<'_, T> {
 
     fn reset_state(&mut self) {
         Handler::reset_state(&mut *self.term);
-        self.full_region();
+        *self.st = VtState::new(self.term.screen_lines());
     }
 
     fn set_private_mode(&mut self, mode: PrivateMode) {
         match mode {
+            PrivateMode::Unknown(5) => self.st.reverse = true,
             PrivateMode::Unknown(1048) => Handler::save_cursor_position(&mut *self.term),
             PrivateMode::Unknown(47 | 1047) => {
                 if !self.term.mode().contains(TermMode::ALT_SCREEN) {
@@ -276,6 +283,7 @@ impl<T: EventListener> Handler for Vt<'_, T> {
 
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         match mode {
+            PrivateMode::Unknown(5) => self.st.reverse = false,
             PrivateMode::Unknown(1048) => Handler::restore_cursor_position(&mut *self.term),
             PrivateMode::Unknown(47 | 1047) => {
                 if self.term.mode().contains(TermMode::ALT_SCREEN) {
@@ -292,12 +300,17 @@ impl<T: EventListener> Handler for Vt<'_, T> {
     }
 
     fn report_private_mode(&mut self, mode: PrivateMode) {
-        match mode {
-            PrivateMode::Unknown(n @ (47 | 1047)) => {
-                let state = if self.term.mode().contains(TermMode::ALT_SCREEN) { 1 } else { 2 };
-                self.send(format!("\x1b[?{n};{state}$y").into_bytes());
+        let on = match mode {
+            PrivateMode::Unknown(5) => Some(self.st.reverse),
+            PrivateMode::Unknown(47 | 1047) => Some(self.term.mode().contains(TermMode::ALT_SCREEN)),
+            _ => None,
+        };
+        match on {
+            Some(on) => {
+                let state = if on { 1 } else { 2 };
+                self.send(format!("\x1b[?{};{state}$y", mode.raw()).into_bytes());
             }
-            _ => Handler::report_private_mode(&mut *self.term, mode),
+            None => Handler::report_private_mode(&mut *self.term, mode),
         }
     }
 

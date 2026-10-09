@@ -3697,6 +3697,13 @@ impl Terminal {
             let bg = [self.theme.bg[0], self.theme.bg[1], self.theme.bg[2]];
             crate::contrast::ContrastMemo::new(self.min_contrast, self.theme.fg, bg)
         });
+        // DECSCNM (`CSI ? 5 h` — vim's visual bell): the whole screen in
+        // reverse video. Every cell swaps its colors, as SGR 7 swaps one (VTE's
+        // reading: a reversed cell shows normal), and so does the frame.
+        let reverse_screen = self.vt.reverse;
+        // The plain-cell shortcut below holds only while nothing recolors such a
+        // cell: one flag for the loop to test.
+        let plain_as_is = mc_memo.is_none() && !reverse_screen;
         // Color resolution memo: neighbouring cells overwhelmingly share their
         // colors (a run of text, a background band), so the last palette color →
         // RGB pair is remembered for fg and for bg. `resolve_rgb` is pure for one
@@ -3715,9 +3722,10 @@ impl Terminal {
             let row_start = cells.len();
             for (col, cell) in row_cells.iter().take(cols).enumerate() {
                 // The common cell — no SGR attribute, no marks / underline color /
-                // link (`extra`), `minimum_contrast` off — is exactly its char and
-                // two colors: everything below would leave it unchanged.
-                if cell.flags.is_empty() && cell.extra.is_none() && mc_memo.is_none() {
+                // link (`extra`), `minimum_contrast` off, screen not reversed — is
+                // exactly its char and two colors: everything below would leave
+                // it unchanged.
+                if cell.flags.is_empty() && cell.extra.is_none() && plain_as_is {
                     let fg = fg_memo.get(cell.fg);
                     let bg = bg_memo.get(cell.bg);
                     cells.push(CellSnapshot { c: cell.c, fg, bg, uline: fg, attrs: 0, selected: false });
@@ -3734,8 +3742,9 @@ impl Terminal {
                 let mut bg = bg_memo.get(cell.bg);
                 // Reverse video (`\e[7m`, also used by selections and `ls`
                 // highlights): swap fg/bg after resolving to RGB so the cell
-                // renders inverted once backgrounds are painted.
-                if cell.flags.contains(Flags::INVERSE) {
+                // renders inverted once backgrounds are painted. A reversed
+                // screen (DECSCNM) flips it again.
+                if cell.flags.contains(Flags::INVERSE) != reverse_screen {
                     std::mem::swap(&mut fg, &mut bg);
                 }
                 // SGR 2 (dim): alacritty sets Flags::DIM but leaves fg as a
@@ -3917,10 +3926,17 @@ impl Terminal {
         let scroll_max = grid.history_size();
 
         // Honor OSC 11 (background) / OSC 12 (cursor) dynamic overrides, keeping
-        // the theme's background alpha; fall back to the theme when unset.
-        let bg_rgba = match colors[257] {
-            Some(rgb) => [rgb.r, rgb.g, rgb.b, self.theme.bg[3]],
-            None => self.theme.bg,
+        // the theme's background alpha; fall back to the theme when unset. A
+        // reversed screen (DECSCNM) is cleared with the default foreground.
+        let bg_rgba = if reverse_screen {
+            use alacritty_terminal::vte::ansi::{Color, NamedColor};
+            let [r, g, b] = resolve_rgb(&self.theme, colors, Color::Named(NamedColor::Foreground));
+            [r, g, b, self.theme.bg[3]]
+        } else {
+            match colors[257] {
+                Some(rgb) => [rgb.r, rgb.g, rgb.b, self.theme.bg[3]],
+                None => self.theme.bg,
+            }
         };
         let cursor_rgb = match colors[258] {
             Some(rgb) => [rgb.r, rgb.g, rgb.b],
@@ -4102,7 +4118,7 @@ impl Terminal {
         let new_size = Size { cols, lines: rows };
         self.term.resize(new_size);
         // `Term::resize` resets the scroll region to the whole screen.
-        self.vt = VtState::new(rows);
+        self.vt.region = (0, rows as i32);
         // p10k / starship prompt-scatter fix. alacritty's reflow rewraps a
         // full-width, absolute-positioned prompt into stray fragments (its
         // right-aligned segment lands on a wrapped row), and on GROW pulls
@@ -7315,6 +7331,37 @@ mod tests {
             t.feed(format!("new {i}\r\n").as_bytes());
         }
         assert_eq!(t.snapshot().row_text(0), before, "viewport content did not move");
+    }
+
+    #[test]
+    fn reverse_screen_mode_swaps_every_cells_colors() {
+        // DECSCNM (`CSI ? 5 h`) — what vim's `set visualbell` flashes (terminfo
+        // `flash` = `\e[?5h`, 100 ms, `\e[?5l`); alacritty ignored the mode.
+        let mut t = Terminal::new(10, 2);
+        t.feed(b"a\x1b[7mb\x1b[m\x1b[31mc\x1b[m");
+        let normal = t.snapshot();
+        let swapped = |c: &CellSnapshot| (c.bg, c.fg);
+        let colors = |c: &CellSnapshot| (c.fg, c.bg);
+        t.feed(b"\x1b[?5h");
+        let rev = t.snapshot();
+        assert_eq!(rev.bg_rgba[..3], t.theme().fg, "the frame is cleared with the default fg");
+        assert_eq!(rev.bg_rgba[3], normal.bg_rgba[3], "opacity kept");
+        assert_eq!(colors(rev.cell(0, 0)), swapped(normal.cell(0, 0)), "plain text reversed");
+        assert_eq!(colors(rev.cell(0, 1)), colors(normal.cell(0, 0)), "SGR 7 text shows normal");
+        assert_eq!(colors(rev.cell(0, 2)), swapped(normal.cell(0, 2)), "colored text reversed");
+        assert_eq!(colors(rev.cell(1, 5)), swapped(normal.cell(1, 5)), "blank cells too");
+        t.feed(b"\x1b[?5$p");
+        assert_eq!(t.drain_pty_writes(), b"\x1b[?5;1$y");
+        t.feed(b"\x1b[?5l\x1b[?5$p");
+        assert_eq!(t.drain_pty_writes(), b"\x1b[?5;2$y");
+        let back = t.snapshot();
+        assert_eq!((back.cells, back.bg_rgba), (normal.cells, normal.bg_rgba));
+        // A resize keeps the mode; RIS ends it.
+        t.feed(b"\x1b[?5h");
+        t.resize(12, 3);
+        assert_eq!(t.snapshot().bg_rgba[..3], t.theme().fg);
+        t.feed(b"\x1bc");
+        assert_eq!(t.snapshot().bg_rgba, normal.bg_rgba);
     }
 
     #[test]
