@@ -168,6 +168,12 @@ pub fn tab_color_from_label(label: &str) -> Option<Option<u8>> {
     jetty_render::TAB_COLORS.iter().find(|(_, n)| *n == label).map(|(i, _)| Some(*i))
 }
 
+/// Whether an open tab menu's rows are the "Color ▸" list (Left goes back
+/// from it to the tab menu proper) rather than the tab menu itself.
+pub fn is_tab_color_list(labels: &[&str]) -> bool {
+    !labels.is_empty() && labels.iter().all(|l| tab_color_from_label(l).is_some())
+}
+
 /// Swatches for the color list's rows: a small rounded square of each color
 /// at the right end of its row (where a shortcut hint would sit), the tab's
 /// `current` color ringed. Rows that are not colors get none.
@@ -426,8 +432,12 @@ pub(crate) struct DetachedWindow {
     /// Disabled menu indices, computed once at open (Copy=1 and Run in New
     /// Tab=3 dim without a selection — same rule as the main menu's cache).
     pub menu_disabled: Vec<usize>,
-    /// Menu item currently under the cursor (hover highlight).
+    /// Highlighted menu item — the pointer's hover or the arrow keys'.
     pub menu_hover: Option<usize>,
+    /// The menu row the pointer was over at its last move (`None`: off the
+    /// rows), reset at every open: the pointer moves the highlight only when
+    /// it crosses rows (`menunav::pointer_hover`).
+    pub menu_pointer_row: Option<usize>,
     /// Whether the cursor is over the close ✕ (drives the red hover highlight).
     pub close_hover: bool,
     /// Time + position of the last left press on the top bar, for the
@@ -630,6 +640,7 @@ impl DetachedWindow {
             menu_rects: Vec::new(),
             menu_disabled: Vec::new(),
             menu_hover: None,
+            menu_pointer_row: None,
             close_hover: false,
             last_bar_click: None,
             occluded: false,
@@ -1000,6 +1011,18 @@ mod tests {
         for l in &items {
             assert!(menu_action(l).is_none(), "{l}");
         }
+    }
+
+    #[test]
+    fn the_color_list_is_told_apart_from_the_tab_menu() {
+        // Left goes back only from the color list.
+        assert!(is_tab_color_list(&tab_color_menu_items()));
+        for can in [true, false] {
+            assert!(!is_tab_color_list(&tab_menu_items(can)));
+        }
+        assert!(!is_tab_color_list(&[]));
+        // The tab menu's submenu row is in both of its variants.
+        assert!(tab_menu_items(false).contains(&TAB_MENU_COLOR));
     }
 
     #[test]

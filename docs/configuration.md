@@ -215,9 +215,12 @@ Every shortcut is a default you can remap here, by the names in the
 new_tab = "Ctrl+T"
 paste = ["Ctrl+Shift+V", "Shift+Insert"]   # several chords for one action
 toggle_fullscreen = ""                       # "" unbinds: F11 goes to the program
+context_menu = ["Menu", "Shift+F10"]       # Shift+F10 too, for keyboards without a Menu key
 ```
 
 A chord is modifiers and a key joined by `+` (`Ctrl`, `Shift`, `Alt`, `Super`/`Cmd`).
+Only F-keys, `PageUp` / `PageDown` and `Menu` (the context-menu key) may be bound
+without a modifier.
 A chord you bind is taken from the action that had it by default (the help
 overlay shows the result). An unknown action name or a chord that cannot be
 parsed is reported and ignored; the rest still apply. Terminal control bytes

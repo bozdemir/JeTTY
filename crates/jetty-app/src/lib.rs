@@ -13,6 +13,9 @@ mod detached;
 /// through the SAME settings path as the app.
 pub mod effects;
 mod gridmouse;
+/// Keyboard navigation of the menus (pure). Public so the `jetty-shot`
+/// self-test moves the highlight and anchors a menu exactly as the app does.
+pub mod menunav;
 pub mod motion;
 mod notify;
 mod overlays;

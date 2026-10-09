@@ -8,7 +8,9 @@
 //! Turkish-F exactly where the control-byte path already sends Ctrl+C = 0x03.
 //! Their US physical position is only a fallback for keys that produce no ASCII
 //! character (Cyrillic / Greek layouts, Turkish `ı`, dead / unidentified keys).
-//! Named keys and the digit row (Ctrl+1…9 tab jumps) match by position.
+//! Named keys and the digit row (Ctrl+1…9 tab jumps) match by position — except
+//! the Menu key, which matches the key the layout calls Menu (see
+//! [`KeyMatch::Named`]).
 //!
 //! The Ctrl+Shift / tab-nav chords never tested Alt, so their defaults are
 //! Alt-INSENSITIVE; the macOS `Cmd` chords never tested Shift, so their
@@ -16,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use winit::keyboard::{Key, KeyCode, PhysicalKey, SmolStr};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey, SmolStr};
 
 use crate::config::{ChordSpec, KeyBindings};
 use crate::input::KeyAction;
@@ -58,6 +60,12 @@ enum KeyMatch {
         chars: Vec<SmolStr>,
         phys_fallback: Option<KeyCode>,
     },
+    /// Match the event's logical NAMED key, wherever it sits. Only the Menu
+    /// key: xkb options commonly give its position another job — Compose
+    /// (`compose:menu`), Right Ctrl (`ctrl:menu_rctrl`) — and that key must
+    /// keep doing what the layout says, while a key the layout made Menu
+    /// opens the menu.
+    Named(NamedKey),
 }
 
 /// A single parsed/compiled chord.
@@ -108,6 +116,7 @@ impl Chord {
     fn key_canonical(&self) -> String {
         match &self.key {
             KeyMatch::Phys(code) => keycode_word(*code).to_string(),
+            KeyMatch::Named(named) => named_word(*named).to_string(),
             KeyMatch::Logical { chars, phys_fallback } => {
                 if let Some(fb) = phys_fallback {
                     keycode_word(*fb).to_string()
@@ -139,6 +148,7 @@ impl Chord {
         }
         match &self.key {
             KeyMatch::Phys(code) => s.push_str(&keycode_menu_glyph(*code)),
+            KeyMatch::Named(named) => s.push_str(named_word(*named)),
             KeyMatch::Logical { chars, phys_fallback } => match (chars.first(), phys_fallback) {
                 (Some(c), _) => s.push_str(&c.to_uppercase()),
                 (None, Some(code)) => s.push_str(&keycode_menu_glyph(*code)),
@@ -165,6 +175,7 @@ impl Chord {
         }
         match &self.key {
             KeyMatch::Phys(code) => s.push_str(&keycode_pretty(*code)),
+            KeyMatch::Named(named) => s.push_str(named_word(*named)),
             KeyMatch::Logical { chars, .. } => {
                 if let Some(c) = chars.first() {
                     // Letters are stored case-folded; show them as engraved.
@@ -228,10 +239,13 @@ pub enum BindableAction {
     /// the command palette has "Next theme" / "Previous theme" either way.
     NextTheme,
     PrevTheme,
+    /// Open the window's context menu at the text cursor (the Menu key; the
+    /// menus then take arrows / Enter). Appended LAST, like every new action.
+    ContextMenu,
 }
 
 impl BindableAction {
-    pub const ALL: [BindableAction; 36] = [
+    pub const ALL: [BindableAction; 37] = [
         BindableAction::ToggleSettings,
         BindableAction::OpenPalette,
         BindableAction::NewTab,
@@ -268,6 +282,7 @@ impl BindableAction {
         BindableAction::ScrollPageDown,
         BindableAction::NextTheme,
         BindableAction::PrevTheme,
+        BindableAction::ContextMenu,
     ];
 
     /// Stable name for warnings / debugging.
@@ -310,6 +325,7 @@ impl BindableAction {
             ScrollPageDown => "scroll_page_down",
             NextTheme => "next_theme",
             PrevTheme => "prev_theme",
+            ContextMenu => "context_menu",
         }
     }
 
@@ -353,6 +369,7 @@ impl BindableAction {
             ScrollPageDown => KeyAction::ScrollPageDown,
             NextTheme => KeyAction::NextTheme,
             PrevTheme => KeyAction::PrevTheme,
+            ContextMenu => KeyAction::ContextMenu,
         }
     }
 
@@ -396,6 +413,7 @@ impl BindableAction {
             ScrollPageDown => &b.scroll_page_down,
             NextTheme => &b.next_theme,
             PrevTheme => &b.prev_theme,
+            ContextMenu => &b.context_menu,
         }
     }
 
@@ -552,6 +570,17 @@ impl BindableAction {
             // No default chord (no new default chords this release): theme
             // cycling is a palette command and a `[keys]` opt-in.
             NextTheme | PrevTheme => Vec::new(),
+            // The bare Menu key — the PC keyboard's own "context menu" key,
+            // and the second default (after F11) bound without a modifier,
+            // which `chord_reject_reason` permits for it. The legacy encoders
+            // send nothing for it, so the shell loses nothing; a program on
+            // the kitty keyboard protocol loses its `CSI 57363 u` (the opt-out
+            // is `[keys] context_menu = ""`, as with F11). EXACT, like F11.
+            // Matched by the key the LAYOUT calls Menu (`KeyMatch::Named`), so
+            // `compose:menu` keeps that key composing. Apple keyboards have no
+            // Menu key (winit maps none on macOS): the palette's "Open context
+            // menu" or a `[keys]` chord serves there.
+            ContextMenu => vec![Chord::exact(Mods::default(), KeyMatch::Named(NamedKey::ContextMenu))],
         }
     }
 }
@@ -685,6 +714,9 @@ pub struct KeyMap {
     /// dead / unidentified keys) — never on a layout that types another ASCII
     /// character there (Dvorak's KeyC is 'J', and Ctrl+Shift+J is not Copy).
     phys_fallback: HashMap<(Mods, KeyCode), KeyAction>,
+    /// Logical named-key chords (the Menu key), keyed by the named key the
+    /// layout reports — consulted only for a `Key::Named` event.
+    named: HashMap<(Mods, NamedKey), KeyAction>,
     /// The compiled chords per action (unexpanded), for help/display.
     by_action: Vec<(BindableAction, Vec<Chord>)>,
     /// Human-readable compile warnings (conflicts / rejected binds / invalid
@@ -698,6 +730,7 @@ impl PartialEq for KeyMap {
         self.physical == other.physical
             && self.logical == other.logical
             && self.phys_fallback == other.phys_fallback
+            && self.named == other.named
     }
 }
 
@@ -724,6 +757,7 @@ impl KeyMap {
             physical: HashMap::new(),
             logical: HashMap::new(),
             phys_fallback: HashMap::new(),
+            named: HashMap::new(),
             by_action: Vec::new(),
             warnings: Vec::new(),
         };
@@ -779,15 +813,23 @@ impl KeyMap {
     }
 
     /// Resolve a key event to an app action, or `None` when unmapped (the caller
-    /// falls through to raw PTY encoding): the produced character (label) first,
-    /// then the position chords, then — only for a key that produced no ASCII
-    /// character — the label chords' US positions.
+    /// falls through to raw PTY encoding): the produced character (label) — or
+    /// named key (Menu) — first, then the position chords, then — only for a
+    /// key that produced no ASCII character — the label chords' US positions.
     pub fn lookup(&self, m: Mods, physical: PhysicalKey, logical: &Key) -> Option<KeyAction> {
-        if let Key::Character(s) = logical {
-            let key = smol_lower(s);
-            if let Some(a) = self.logical.get(&(m, key)) {
-                return Some(a.clone());
+        match logical {
+            Key::Character(s) => {
+                let key = smol_lower(s);
+                if let Some(a) = self.logical.get(&(m, key)) {
+                    return Some(a.clone());
+                }
             }
+            Key::Named(named) => {
+                if let Some(a) = self.named.get(&(m, *named)) {
+                    return Some(a.clone());
+                }
+            }
+            _ => {}
         }
         if let PhysicalKey::Code(code) = physical {
             if let Some(a) = self.physical.get(&(m, code)) {
@@ -840,6 +882,7 @@ impl KeyMap {
         self.physical.values().any(|v| v == ka)
             || self.logical.values().any(|v| v == ka)
             || self.phys_fallback.values().any(|v| v == ka)
+            || self.named.values().any(|v| v == ka)
     }
 
     /// The action holding a chord's PRIMARY slot: its exact modifiers on its
@@ -847,6 +890,7 @@ impl KeyMap {
     fn primary_owner(&self, ch: &Chord) -> Option<&KeyAction> {
         match &ch.key {
             KeyMatch::Phys(code) => self.physical.get(&(ch.mods, *code)),
+            KeyMatch::Named(named) => self.named.get(&(ch.mods, *named)),
             KeyMatch::Logical { chars, phys_fallback } => match chars.first() {
                 Some(c) => self.logical.get(&(ch.mods, smol_lower(c))),
                 None => phys_fallback.and_then(|fb| self.phys_fallback.get(&(ch.mods, fb))),
@@ -894,6 +938,7 @@ impl KeyMap {
         for m in variants {
             match &ch.key {
                 KeyMatch::Phys(code) => self.put_phys(action, m, *code, &ka, claim),
+                KeyMatch::Named(named) => self.put_named(action, m, *named, &ka, claim),
                 KeyMatch::Logical { chars, phys_fallback } => {
                     for cc in chars {
                         self.put_logical(action, m, smol_lower(cc), &ka, claim);
@@ -904,6 +949,15 @@ impl KeyMap {
                 }
             }
         }
+    }
+
+    fn put_named(&mut self, action: BindableAction, m: Mods, named: NamedKey, ka: &KeyAction, claim: Claim) {
+        if let Some(existing) = self.named.get(&(m, named)) {
+            if existing == ka || !self.may_take(claim, || pretty_slot_named(m, named), action) {
+                return;
+            }
+        }
+        self.named.insert((m, named), ka.clone());
     }
 
     fn put_phys_fallback(&mut self, action: BindableAction, m: Mods, code: KeyCode, ka: &KeyAction, claim: Claim) {
@@ -1013,18 +1067,19 @@ fn smol_lower(s: &SmolStr) -> SmolStr {
 fn chord_reject_reason(ch: &Chord) -> Option<String> {
     // A no-modifier bind shadows whatever the key normally sends — printable
     // chars, but ALSO Enter/Tab/Space/Backspace/Escape and the arrow/nav keys a
-    // TUI needs. Only F-keys and PageUp/PageDown (the pre-v0.26 scroll keys —
+    // TUI needs. Only F-keys, PageUp/PageDown (the pre-v0.26 scroll keys —
     // `scroll_page_up = ["Shift+PageUp", "PageUp"]`; programs on the alternate
-    // screen still get them) may be bound bare; anything else would lock that
-    // key out of the shell.
+    // screen still get them) and the Menu key (it types nothing) may be bound
+    // bare; anything else would lock that key out of the shell.
     if ch.mods.is_empty() {
-        let ok_bare = matches!(
-            &ch.key,
-            KeyMatch::Phys(code) if is_fkey(*code) || matches!(code, KeyCode::PageUp | KeyCode::PageDown)
-        );
+        let ok_bare = match &ch.key {
+            KeyMatch::Phys(code) => is_fkey(*code) || matches!(code, KeyCode::PageUp | KeyCode::PageDown),
+            KeyMatch::Named(named) => *named == NamedKey::ContextMenu,
+            KeyMatch::Logical { .. } => false,
+        };
         if !ok_bare {
             return Some(
-                "bindings need a modifier (only F-keys and PageUp/PageDown may be bound bare)"
+                "bindings need a modifier (only F-keys, PageUp/PageDown and Menu may be bound bare)"
                     .to_string(),
             );
         }
@@ -1033,6 +1088,7 @@ fn chord_reject_reason(ch: &Chord) -> Option<String> {
     if ch.mods.ctrl_only() {
         let shadows = match &ch.key {
             KeyMatch::Phys(code) => is_ctrl_byte_key(*code),
+            KeyMatch::Named(_) => false,
             KeyMatch::Logical { chars, .. } => chars.iter().any(|c| is_ctrl_byte_char(c)),
         };
         if shadows {
@@ -1155,6 +1211,11 @@ fn parse_key(tok: &str) -> Result<KeyMatch, String> {
         return Ok(km);
     }
 
+    // The Menu key, matched by name (see `KeyMatch::Named`).
+    if matches!(t.to_ascii_lowercase().as_str(), "menu" | "contextmenu" | "apps") {
+        return Ok(KeyMatch::Named(NamedKey::ContextMenu));
+    }
+
     // Named key (word).
     if let Some(code) = named_keycode(t) {
         return Ok(KeyMatch::Phys(code));
@@ -1272,6 +1333,15 @@ fn keycode_word(code: KeyCode) -> &'static str {
     }
 }
 
+/// The name of a logical named-key chord's key (serialization, the help
+/// overlay and the menu hints alike). Only the Menu key is bindable by name.
+fn named_word(named: NamedKey) -> &'static str {
+    match named {
+        NamedKey::ContextMenu => "Menu",
+        _ => "Unknown",
+    }
+}
+
 /// Human-facing pretty name for a keycode (symbols where natural).
 fn keycode_pretty(code: KeyCode) -> String {
     use KeyCode::*;
@@ -1370,6 +1440,10 @@ fn pretty_mods(m: Mods) -> String {
 
 fn pretty_slot_phys(m: Mods, code: KeyCode) -> String {
     format!("{}+{}", pretty_mods(m), keycode_pretty(code))
+}
+
+fn pretty_slot_named(m: Mods, named: NamedKey) -> String {
+    format!("{}+{}", pretty_mods(m), named_word(named))
 }
 
 #[cfg(test)]
@@ -1759,15 +1833,16 @@ mod tests {
     fn run_selection_ordering_in_all() {
         // New actions are APPENDED so they never win a slot from an older one:
         // … CopyMode, RunSelection, ToggleFullscreen, then the v0.26 scroll
-        // actions.
+        // actions, theme cycling, and the context-menu key.
         let all = BindableAction::ALL;
-        assert_eq!(all[all.len() - 1], BindableAction::PrevTheme);
-        assert_eq!(all[all.len() - 2], BindableAction::NextTheme);
-        assert_eq!(all[all.len() - 3], BindableAction::ScrollPageDown);
-        assert_eq!(all[all.len() - 4], BindableAction::ScrollPageUp);
-        assert_eq!(all[all.len() - 5], BindableAction::ToggleFullscreen);
-        assert_eq!(all[all.len() - 6], BindableAction::RunSelection);
-        assert_eq!(all[all.len() - 7], BindableAction::CopyMode);
+        assert_eq!(all[all.len() - 1], BindableAction::ContextMenu);
+        assert_eq!(all[all.len() - 2], BindableAction::PrevTheme);
+        assert_eq!(all[all.len() - 3], BindableAction::NextTheme);
+        assert_eq!(all[all.len() - 4], BindableAction::ScrollPageDown);
+        assert_eq!(all[all.len() - 5], BindableAction::ScrollPageUp);
+        assert_eq!(all[all.len() - 6], BindableAction::ToggleFullscreen);
+        assert_eq!(all[all.len() - 7], BindableAction::RunSelection);
+        assert_eq!(all[all.len() - 8], BindableAction::CopyMode);
     }
 
     #[test]
@@ -1848,6 +1923,7 @@ mod tests {
                 for m in variants {
                     let owners: Vec<Option<&KeyAction>> = match &c.key {
                         KeyMatch::Phys(code) => vec![km.physical.get(&(m, *code))],
+                        KeyMatch::Named(named) => vec![km.named.get(&(m, *named))],
                         KeyMatch::Logical { chars, phys_fallback } => chars
                             .iter()
                             .map(|ch| km.logical.get(&(m, smol_lower(ch))))
@@ -1930,9 +2006,98 @@ mod tests {
         assert!(km.pretty_chords(BindableAction::ToggleFullscreen).is_empty());
     }
 
+    // ── context menu (the Menu key) ───────────────────────────────────────────
+
+    fn menu() -> Key {
+        Key::Named(NamedKey::ContextMenu)
+    }
+
+    const MENU_POS: PhysicalKey = PhysicalKey::Code(KeyCode::ContextMenu);
+
+    #[test]
+    fn the_bare_menu_key_opens_the_context_menu() {
+        let km = KeyMap::defaults();
+        assert_eq!(km.lookup(Mods::default(), MENU_POS, &menu()), Some(KeyAction::ContextMenu));
+        // EXACT, like F11: a modified Menu key is not the chord.
+        for m in [
+            Mods::new(false, true, false, false),
+            Mods::new(true, false, false, false),
+            Mods::new(false, false, true, false),
+        ] {
+            assert_eq!(km.lookup(m, MENU_POS, &menu()), None, "{m:?}");
+        }
+        assert_eq!(km.pretty_chords(BindableAction::ContextMenu), vec!["Menu".to_string()]);
+        assert_eq!(km.menu_hint(BindableAction::ContextMenu), "Menu");
+        assert!(km.warnings().is_empty(), "{:?}", km.warnings());
+    }
+
+    #[test]
+    fn the_menu_key_follows_the_layout_not_the_position() {
+        let km = KeyMap::defaults();
+        // `compose:menu` / `ctrl:menu_rctrl`: the Menu key's position types
+        // Compose / is Right Ctrl — it must keep doing that.
+        for other in [NamedKey::Compose, NamedKey::Control] {
+            assert_eq!(km.lookup(Mods::default(), MENU_POS, &Key::Named(other)), None, "{other:?}");
+        }
+        // A key the layout made Menu opens the menu wherever it sits.
+        assert_eq!(
+            km.lookup(Mods::default(), PhysicalKey::Code(KeyCode::SuperRight), &menu()),
+            Some(KeyAction::ContextMenu)
+        );
+    }
+
+    #[test]
+    fn menu_parses_binds_bare_remaps_and_unbinds() {
+        for s in ["Menu", "menu", "ContextMenu", "Apps"] {
+            let c = parse_chord(s).unwrap();
+            assert_eq!(c.key, KeyMatch::Named(NamedKey::ContextMenu), "{s}");
+            assert!(chord_reject_reason(&c).is_none(), "bare {s} is bindable: it types nothing");
+            assert_eq!(c.canonical(), "Menu");
+        }
+        assert_eq!(parse_chord("Shift+Menu").unwrap().canonical(), "Shift+Menu");
+        assert!(chord_reject_reason(&parse_chord("Ctrl+Menu").unwrap()).is_none(), "no control byte");
+        // Remapped (Shift+F10 is the other keyboards' menu chord): the new
+        // chords fire, the bare Menu key is free.
+        let km = km_with(|b| {
+            b.context_menu = Some(ChordSpec::Many(vec!["Shift+F10".into(), "Ctrl+Menu".into()]))
+        });
+        assert!(km.warnings().is_empty(), "{:?}", km.warnings());
+        let f10 = Key::Named(NamedKey::F10);
+        assert_eq!(
+            km.lookup(Mods::new(false, true, false, false), PhysicalKey::Code(KeyCode::F10), &f10),
+            Some(KeyAction::ContextMenu)
+        );
+        assert_eq!(km.lookup(Mods::new(true, false, false, false), MENU_POS, &menu()), Some(KeyAction::ContextMenu));
+        assert_eq!(km.lookup(Mods::default(), MENU_POS, &menu()), None);
+        assert_eq!(
+            km.pretty_chords(BindableAction::ContextMenu),
+            vec!["Shift+F10".to_string(), "Ctrl+Menu".to_string()]
+        );
+        // `context_menu = ""` unbinds it (the key then reaches the program).
+        let km = km_with(|b| b.context_menu = Some(ChordSpec::One(String::new())));
+        assert_eq!(km.lookup(Mods::default(), MENU_POS, &menu()), None);
+        assert!(km.pretty_chords(BindableAction::ContextMenu).is_empty());
+        // Another action may take the Menu key (the default yields quietly) …
+        let km = km_with(|b| b.search_toggle = Some(ChordSpec::One("Menu".into())));
+        assert!(km.warnings().is_empty(), "{:?}", km.warnings());
+        assert_eq!(km.lookup(Mods::default(), MENU_POS, &menu()), Some(KeyAction::SearchToggle));
+        assert!(km.pretty_chords(BindableAction::ContextMenu).is_empty());
+        // … but two user chords on it conflict, the earlier action winning.
+        let km = km_with(|b| {
+            b.new_tab = Some(ChordSpec::One("Menu".into()));
+            b.context_menu = Some(ChordSpec::One("Menu".into()));
+        });
+        assert!(
+            km.warnings().iter().any(|w| w.contains("(none)+Menu") && w.contains("context_menu")),
+            "{:?}",
+            km.warnings()
+        );
+        assert_eq!(km.lookup(Mods::default(), MENU_POS, &menu()), Some(KeyAction::NewTab));
+    }
+
     #[test]
     fn bindable_action_all_is_exhaustive() {
-        assert_eq!(BindableAction::ALL.len(), 36);
+        assert_eq!(BindableAction::ALL.len(), 37);
         for a in BindableAction::ALL {
             assert_eq!(
                 BindableAction::ALL.iter().filter(|x| **x == a).count(),

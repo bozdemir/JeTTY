@@ -1375,8 +1375,13 @@ pub struct App {
     /// is config-disabled) and cached beside `menu_item_rects` so hover/click
     /// and the per-frame rebuild never re-query the terminal.
     menu_disabled: Vec<usize>,
-    /// Index of the menu item currently under the cursor (for hover highlight).
+    /// Index of the highlighted menu item — the pointer's hover, or where the
+    /// arrow keys moved it (`crate::menunav`); Enter / Space run it.
     menu_hover: Option<usize>,
+    /// The menu row the pointer was over at its last move (`None`: off the
+    /// rows), reset at every open: the pointer moves the highlight only when
+    /// it crosses rows (`menunav::pointer_hover`).
+    menu_pointer_row: Option<usize>,
     /// Next [`TabId`] to hand out (monotonic; ids are never reused).
     next_tab_id: u64,
     /// Inline tab rename: `Some(tab)` while the user is editing a tab title.
@@ -1508,8 +1513,11 @@ pub struct App {
     tab_menu_labels: Vec<&'static str>,
     /// Cached hit-test rects for the open tab menu (built once on open).
     tab_menu_rects: Vec<jetty_render::Rect>,
-    /// Tab-menu item currently under the cursor (hover highlight).
+    /// Highlighted tab-menu item — the pointer's hover or the arrow keys'.
     tab_menu_hover: Option<usize>,
+    /// The tab-menu row the pointer was over at its last move (see
+    /// `menu_pointer_row`), reset at every open.
+    tab_menu_pointer_row: Option<usize>,
     // ── Chrome (visuals v2): mirrors of the persisted keys ────────────────────
     /// `tab_style`.
     tab_style: jetty_render::TabStyle,
@@ -2052,6 +2060,7 @@ impl App {
             menu_item_rects: Vec::new(),
             menu_disabled: Vec::new(),
             menu_hover: None,
+            menu_pointer_row: None,
             next_tab_id: 1,
             renaming: None,
             rename_buf: String::new(),
@@ -2097,6 +2106,7 @@ impl App {
             tab_menu_labels: Vec::new(),
             tab_menu_rects: Vec::new(),
             tab_menu_hover: None,
+            tab_menu_pointer_row: None,
             tab_style: jetty_render::TabStyle::Pill,
             tab_close_button: jetty_render::CloseButton::Always,
             tab_bar_opacity: false,
@@ -2282,6 +2292,11 @@ impl App {
                 .next()
                 .unwrap_or_else(|| "(unbound)".to_string())
         };
+        // The menu opens by right-click, and by its key(s) when bound.
+        let menu_keys: String = std::iter::once("Right-click".to_string())
+            .chain(km.pretty_chords(A::ContextMenu))
+            .collect::<Vec<_>>()
+            .join(" / ");
         // Sectioned (`## ` header, "" spacer, "KEY — desc" item) so the overlay
         // renders section headers + aligned key/description columns. Mirrors the
         // static `jetty_render::HELP_ROWS`, but with LIVE keymap chords.
@@ -2323,7 +2338,7 @@ impl App {
             ),
             "Left-drag — Select text (auto-copies)".to_string(),
             "Shift+drag — Select over mouse apps (vim / htop / Claude Code)".to_string(),
-            "Right-click — Context menu".to_string(),
+            format!("{menu_keys} — Context menu   (arrows move, Enter picks)"),
             String::new(),
             "## Search & scroll".to_string(),
             format!(
@@ -4402,6 +4417,7 @@ impl App {
         );
         self.tab_menu = Some((x, y, tab));
         self.tab_menu_hover = None;
+        self.tab_menu_pointer_row = None;
         self.tab_menu_rects = menu.item_rects;
         self.tab_menu_labels = labels;
         self.request_main_paint();
@@ -4438,6 +4454,448 @@ impl App {
         self.tab_menu_hover = None;
         self.tab_menu_rects.clear();
         self.tab_menu_labels.clear();
+    }
+
+    // ── Context menus: open, run a row, keyboard ─────────────────────────────
+    //
+    // The pointer and the keyboard drive the SAME menu state: a right-click and
+    // the Menu key open a menu through one helper (same grayed rows), a click
+    // on a row and Enter / Space on the highlighted row run it through one
+    // method, and the highlight is the menu's hover index whichever moved it
+    // last. The navigation itself is pure (`crate::menunav`).
+
+    /// Whether window `s` may not open a context menu now (right-click, the
+    /// Menu key): a modal is up (quit / close confirmation, help, palette),
+    /// hint mode owns it (keyboard-only — a menu there could never be
+    /// clicked), the summon slide is moving the scene (no menu at coordinates
+    /// the slide shifts), or the last tab is gone.
+    fn menu_blocked(&self, s: Surface) -> bool {
+        let overlay = self.ov_of(s).is_none_or(|o| o.help_open || o.palette_open || o.hint_mode.is_some());
+        match s {
+            Surface::Main => {
+                overlay
+                    || self.slide_anim.is_some()
+                    || self.confirm_quit
+                    || self.confirm_close.is_some()
+                    || self.tabs.is_empty()
+            }
+            Surface::Detached(_) => overlay,
+        }
+    }
+
+    /// Open the terminal context menu (Copy / Paste / Run in New Tab / Select
+    /// All / Clear / Close Tab) at physical `(x, y)` — for a right-click and
+    /// the Menu key alike, so both gray the same rows. Commits an in-progress
+    /// rename and closes the help so the menu can't be orphaned under them;
+    /// the tab menu is mutually exclusive with this one.
+    fn open_context_menu(&mut self, x: f32, y: f32) {
+        self.commit_rename();
+        self.ov.help_open = false;
+        self.tab_menu = None;
+        self.tab_menu_hover = None;
+        self.tab_menu_rects.clear();
+        self.tab_menu_labels.clear();
+        self.context_menu = Some((x, y));
+        self.menu_hover = None;
+        self.menu_pointer_row = None;
+        // Disabled rows, computed once at open: "Copy" (0) and "Run in New
+        // Tab" (2) share the needs-a-selection property (Copy silently
+        // no-ops without one — dimming is the honest UI for the same
+        // property); Run additionally dims when the feature is
+        // config-disabled.
+        let has_sel = self
+            .active_tab()
+            .terminal
+            .selection_text()
+            .is_some_and(|t| !t.is_empty());
+        self.menu_disabled = match (has_sel, self.run_selection_enabled) {
+            (false, _) => vec![0, 2],
+            (true, false) => vec![2],
+            (true, true) => Vec::new(),
+        };
+        // THE teachable moment for mouse-grabbing apps (Claude Code, vim,
+        // htop): the user Shift+right-clicked (or pressed the Menu key)
+        // wanting Copy / Run in New Tab, but their drag was forwarded to the
+        // app, so there is no selection and both rows sit dimmed with no
+        // explanation. Surface the Shift+drag hint alongside the menu —
+        // deliberately BYPASSING the 25s drag-cooldown: an explicit request
+        // for the menu over dimmed rows is a direct question, not a nag.
+        let tracking = crate::gridmouse::tracking(&self.active_tab().terminal);
+        if !has_sel && tracking != input::MouseTracking::Off {
+            if let Some(id) = self.window.as_ref().map(|w| w.id()) {
+                arm_shift_hint(&mut self.shift_hint_until, &mut self.shift_hint_cooldown, id, true);
+            }
+        }
+        // Cache the item hit-test rects once (anchor + size fixed for the
+        // menu's lifetime) so CursorMoved hover doesn't rebuild the menu.
+        if let Some(gpu) = &self.gpu {
+            let (w, h) = (gpu.config.width, gpu.config.height);
+            let theme = self.current_theme();
+            let cm = self.chrome_metrics();
+            let mut fallback = mono_fallback(cm);
+            let hints = crate::detached::context_menu_hints(&self.keymap);
+            let hint_refs: Vec<&str> = hints.iter().map(String::as_str).collect();
+            let menu = jetty_render::build_context_menu(
+                x, y, w, h, None, &theme,
+                measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
+                &hint_refs, &self.menu_disabled,
+            );
+            self.menu_item_rects = menu.item_rects;
+        }
+        self.request_main_paint();
+    }
+
+    /// Open detached window `pos`'s context menu (Reattach / Copy / Paste /
+    /// Run in New Tab) at physical `(x, y)` — its right-click and the Menu key
+    /// alike, graying the same rows.
+    fn open_detached_menu(&mut self, pos: usize, x: f32, y: f32) {
+        let theme = self.current_theme();
+        let run_enabled = self.run_selection_enabled;
+        let ui_font = self.ui_font_logical;
+        let Some(dw) = self.detached.get_mut(pos) else { return };
+        let cm = dw.chrome_metrics(ui_font);
+        dw.menu_open = Some((x, y));
+        dw.menu_hover = None;
+        dw.menu_pointer_row = None;
+        // Disabled rows, computed once at open — the same needs-a-selection
+        // class as the main menu: Copy (1) and Run in New Tab (3) dim without
+        // a selection; Run also dims when the feature is config-disabled.
+        let has_sel = dw
+            .tab
+            .terminal
+            .selection_text()
+            .is_some_and(|t| !t.is_empty());
+        dw.menu_disabled = match (has_sel, run_enabled) {
+            (false, _) => vec![1, 3],
+            (true, false) => vec![3],
+            (true, true) => Vec::new(),
+        };
+        // The v0.25.1 teachable moment, as in the main window: a menu opened
+        // over a mouse-grabbing program with nothing selected gets the
+        // Shift+drag hint right away.
+        if !has_sel && crate::gridmouse::tracking(&dw.tab.terminal) != input::MouseTracking::Off {
+            let id = dw.window.id();
+            arm_shift_hint(&mut self.shift_hint_until, &mut self.shift_hint_cooldown, id, true);
+        }
+        // Cache the item hit-test rects once (anchor + size fixed for the
+        // menu's lifetime), same pattern as the main context menu. Hints come
+        // from the live keymap; widths from this window's chrome layer (the
+        // same measurement the render pass uses).
+        let hints: Vec<String> = crate::detached::DETACHED_MENU_ITEMS
+            .iter()
+            .map(|&l| crate::detached::menu_hint(&self.keymap, l))
+            .collect();
+        let items: Vec<(&str, &str)> = crate::detached::DETACHED_MENU_ITEMS
+            .iter()
+            .zip(&hints)
+            .map(|(&l, h)| (l, h.as_str()))
+            .collect();
+        let menu = jetty_render::build_menu(
+            x,
+            y,
+            dw.gpu.config.width,
+            dw.gpu.config.height,
+            None,
+            &theme,
+            &mut dw.chrome_text,
+            cm,
+            &items,
+            &[],
+            &dw.menu_disabled,
+        );
+        dw.menu_rects = menu.item_rects;
+        dw.request_paint();
+    }
+
+    /// Close the terminal context menu and run its row `row` — THE one
+    /// implementation of each row's action, shared by a click on the row and
+    /// Enter / Space on the highlighted one. A grayed row, or `None` (a click
+    /// outside the rows), only closes the menu: the "click anywhere closes"
+    /// contract.
+    fn run_context_menu_row(&mut self, row: Option<usize>) {
+        self.context_menu = None;
+        self.menu_hover = None;
+        match row.filter(|i| !self.menu_disabled.contains(i)) {
+            Some(0) => {
+                // Copy — then clear the selection so the highlight doesn't
+                // linger after an explicit copy.
+                let copied = self
+                    .active_tab()
+                    .terminal
+                    .selection_text()
+                    .filter(|t| !t.is_empty());
+                if let Some(text) = copied {
+                    clipboard::set(&text);
+                    self.active_tab_mut().terminal.selection_clear();
+                }
+            }
+            Some(1) => {
+                // Paste
+                if let Some(text) = clipboard::get() {
+                    self.paste_text(&text);
+                }
+            }
+            Some(2) => {
+                // Run in New Tab — the browser gesture: the selection runs in
+                // a fresh tab at this tab's cwd.
+                self.run_selection_in_new_tab(SelSource::Main);
+            }
+            Some(3) => {
+                // Select All
+                self.active_tab_mut().terminal.select_all();
+            }
+            Some(4) => {
+                // Clear — emulates Ctrl+L (form-feed 0x0C) sent to the active
+                // PTY. This is the same byte the Ctrl+L keybinding produces via
+                // ctrl_byte('L') in input.rs; reuse the same writer path. A
+                // user-originated PTY byte — cancels a staged run-selection
+                // inject (same rule as write_key_to_pty).
+                crate::runsel::cancel_on_user_write(&mut self.tabs[self.active].pending_inject);
+                self.active_tab_mut().terminal.scroll_to_bottom();
+                let w = &mut self.tabs[self.active].writer;
+                let _ = w.write_all(&[0x0C]);
+                let _ = w.flush();
+            }
+            Some(5) => {
+                // Close Tab — mirrors the Ctrl+Shift+W handler: set
+                // confirm_close to open the confirmation popup. This reuses the
+                // exact same flow as KeyAction::CloseTab.
+                self.confirm_close = self.tabs.get(self.active).map(|t| t.id);
+            }
+            _ => {}
+        }
+        // Whether a row ran or not, the menu is closed — repaint.
+        self.request_main_paint();
+    }
+
+    /// Close the tab context menu and run its row `row` — the one
+    /// implementation shared by a click and Enter / Space. The row maps
+    /// through the labels snapshotted at open time ("Detach" is present only
+    /// when detaching was allowed). "Color ▸" re-opens the menu in place with
+    /// the color list (same anchor, same tab); a color row sets it.
+    fn run_tab_menu_row(&mut self, row: Option<usize>, event_loop: &ActiveEventLoop) {
+        let Some((menu_x, menu_y, tab_id)) = self.tab_menu.take() else { return };
+        self.tab_menu_hover = None;
+        let label = row.and_then(|i| self.tab_menu_labels.get(i).copied());
+        self.tab_menu_labels.clear();
+        self.tab_menu_rects.clear();
+        if let Some(tab_idx) = self.tab_index(tab_id) {
+            match label {
+                Some("Detach") => {
+                    // Same flow as Ctrl+Shift+D, for THAT tab.
+                    self.detach_tab(tab_idx, event_loop, None);
+                }
+                Some("Rename") => {
+                    // Same inline-rename flow as double-click.
+                    self.renaming = Some(tab_id);
+                    self.rename_buf = self.tabs[tab_idx].title.clone();
+                }
+                Some("Close Tab") => {
+                    // Same confirm-close flow as the × / Ctrl+Shift+W.
+                    self.confirm_close = Some(tab_id);
+                }
+                Some(crate::detached::TAB_MENU_COLOR) => {
+                    self.open_tab_menu(menu_x, menu_y, tab_id, crate::detached::tab_color_menu_items());
+                    return;
+                }
+                Some(l) => {
+                    if let Some(color) = crate::detached::tab_color_from_label(l) {
+                        self.set_tab_color(tab_id, color);
+                    }
+                }
+                None => {}
+            }
+        }
+        // Whether a row ran or not, the menu is closed — repaint.
+        self.request_main_paint();
+    }
+
+    /// Close detached window `pos`'s menu and run its row `row`
+    /// (`DETACHED_MENU_ITEMS` order: Reattach / Copy / Paste / Run in New
+    /// Tab) — the one implementation shared by a click and Enter / Space. A
+    /// grayed row, or `None`, only closes the menu.
+    fn run_detached_menu_row(&mut self, pos: usize, row: Option<usize>, event_loop: &ActiveEventLoop) {
+        let Some(dw) = self.detached.get_mut(pos) else { return };
+        let row = row.filter(|i| !dw.menu_disabled.contains(i));
+        dw.menu_open = None;
+        dw.menu_hover = None;
+        dw.menu_rects.clear();
+        dw.menu_disabled.clear();
+        dw.request_paint();
+        match row {
+            Some(0) => self.reattach_tab(pos, event_loop),
+            Some(1) => {
+                // Same copy-then-clear flow as the main window.
+                let copied = dw.tab.terminal.selection_text().filter(|t| !t.is_empty());
+                if let Some(text) = copied {
+                    clipboard::set(&text);
+                    dw.tab.terminal.selection_clear();
+                }
+            }
+            Some(2) => {
+                if let Some(text) = clipboard::get() {
+                    Self::paste_to_tab(&mut dw.tab, &text);
+                }
+            }
+            // Run this window's selection in a new MAIN-window tab.
+            Some(3) => self.run_selection_in_new_tab(SelSource::Detached(pos)),
+            _ => {}
+        }
+    }
+
+    /// Where window `s`'s menu opens from the keyboard, in physical pixels: at
+    /// its text cursor's cell — below the cursor's line, or above it where the
+    /// card would not fit below (`menunav::cursor_anchor`). `None` before the
+    /// window has cell metrics.
+    fn cursor_menu_anchor(&self, s: Surface) -> Option<(f32, f32)> {
+        let (row, col) = self.term_of(s)?.cursor_viewport_cell();
+        let (cell, origin, menu_h, win_h) = match s {
+            Surface::Main => (
+                self.text.as_ref()?.cell_size(),
+                self.grid_origin(),
+                jetty_render::context_menu_height(self.chrome_metrics()),
+                self.gpu.as_ref()?.config.height,
+            ),
+            Surface::Detached(p) => {
+                let dw = self.detached.get(p)?;
+                let cm = dw.chrome_metrics(self.ui_font_logical);
+                (
+                    dw.text.cell_size(),
+                    dw.grid_origin(self.ui_font_logical, self.padding()),
+                    jetty_render::menu_height(crate::detached::DETACHED_MENU_ITEMS.len(), 0, cm),
+                    dw.gpu.config.height,
+                )
+            }
+        };
+        Some(crate::menunav::cursor_anchor(row, col, cell, origin, menu_h, win_h as f32))
+    }
+
+    /// The Menu key (`[keys] context_menu`) in window `s`: close the menu that
+    /// is open there, else open the context menu at the text cursor.
+    fn toggle_menu_at_cursor(&mut self, s: Surface) {
+        let open = match s {
+            Surface::Main => self.context_menu.is_some() || self.tab_menu.is_some(),
+            Surface::Detached(p) => self.detached.get(p).is_some_and(|d| d.menu_open.is_some()),
+        };
+        if open {
+            self.dismiss_surface_menus(s);
+            self.paint_surface(s);
+        } else {
+            self.open_menu_at_cursor(s);
+        }
+    }
+
+    /// Open window `s`'s context menu at its text cursor with the first
+    /// enabled row highlighted, so the arrows and Enter work at once — the
+    /// Menu key and the palette's "Open context menu". Under the right-click's
+    /// modal gates (`menu_blocked`).
+    fn open_menu_at_cursor(&mut self, s: Surface) {
+        if self.menu_blocked(s) {
+            return;
+        }
+        let Some((x, y)) = self.cursor_menu_anchor(s) else { return };
+        match s {
+            Surface::Main => {
+                self.open_context_menu(x, y);
+                self.menu_hover =
+                    crate::menunav::first_enabled(jetty_render::MENU_ITEMS.len(), &self.menu_disabled);
+            }
+            Surface::Detached(p) => {
+                self.open_detached_menu(p, x, y);
+                if let Some(dw) = self.detached.get_mut(p) {
+                    dw.menu_hover = crate::menunav::first_enabled(
+                        crate::detached::DETACHED_MENU_ITEMS.len(),
+                        &dw.menu_disabled,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The keys an open menu of window `s` takes (`crate::menunav`): Up / Down
+    /// move the highlight over the enabled rows (wrapping), Home / End jump to
+    /// the first / last of them, and Enter / Space run the highlighted row
+    /// through the click's own method; in the tab menu Right opens "Color ▸"'s
+    /// list and Left goes back from it. Returns whether the key was consumed —
+    /// never for a chord (Ctrl / Alt / Super held) nor Enter / Space with
+    /// nothing highlighted: those keep today's path, like every other key.
+    fn menu_key(&mut self, s: Surface, event: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) -> bool {
+        use crate::menunav::{self, MenuStep};
+        let m = self.modifiers;
+        let mods = crate::keymap::Mods::new(m.control_key(), m.shift_key(), m.alt_key(), m.super_key());
+        let Some(key) = menunav::classify(&event.logical_key, mods) else { return false };
+        match s {
+            Surface::Main if self.context_menu.is_some() => {
+                let rows = jetty_render::MENU_ITEMS.len();
+                match menunav::step(key, self.menu_hover, rows, &self.menu_disabled) {
+                    Some(MenuStep::Highlight(h)) => {
+                        if h != self.menu_hover {
+                            self.menu_hover = h;
+                            self.request_main_paint();
+                        }
+                    }
+                    Some(MenuStep::Run(i)) => self.run_context_menu_row(Some(i)),
+                    // No submenus here: Right / Left keep today's path.
+                    _ => return false,
+                }
+                true
+            }
+            Surface::Main if self.tab_menu.is_some() => self.tab_menu_key(key, event_loop),
+            Surface::Main => false,
+            Surface::Detached(p) => {
+                let Some(dw) = self.detached.get_mut(p) else { return false };
+                if dw.menu_open.is_none() {
+                    return false;
+                }
+                let rows = crate::detached::DETACHED_MENU_ITEMS.len();
+                match menunav::step(key, dw.menu_hover, rows, &dw.menu_disabled) {
+                    Some(MenuStep::Highlight(h)) => {
+                        if h != dw.menu_hover {
+                            dw.menu_hover = h;
+                            dw.request_paint();
+                        }
+                    }
+                    Some(MenuStep::Run(i)) => self.run_detached_menu_row(p, Some(i), event_loop),
+                    _ => return false,
+                }
+                true
+            }
+        }
+    }
+
+    /// [`App::menu_key`] for the open tab menu (no grayed rows): "Color ▸"
+    /// opens the color list in place on Enter / Space or Right, with its first
+    /// row highlighted; Left in the color list goes back to the tab menu with
+    /// "Color ▸" highlighted.
+    fn tab_menu_key(&mut self, key: crate::menunav::MenuKey, event_loop: &ActiveEventLoop) -> bool {
+        use crate::menunav::{self, MenuStep};
+        let run = match menunav::step(key, self.tab_menu_hover, self.tab_menu_labels.len(), &[]) {
+            Some(MenuStep::Highlight(h)) => {
+                if h != self.tab_menu_hover {
+                    self.tab_menu_hover = h;
+                    self.request_main_paint();
+                }
+                return true;
+            }
+            Some(MenuStep::Run(i)) => i,
+            Some(MenuStep::Open(i)) if self.tab_menu_labels.get(i) == Some(&crate::detached::TAB_MENU_COLOR) => i,
+            Some(MenuStep::Back) if crate::detached::is_tab_color_list(&self.tab_menu_labels) => {
+                let Some((x, y, tab)) = self.tab_menu else { return false };
+                let labels = crate::detached::tab_menu_items(crate::detached::can_detach(self.tabs.len()));
+                let color_row = labels.iter().position(|&l| l == crate::detached::TAB_MENU_COLOR);
+                self.open_tab_menu(x, y, tab, labels);
+                self.tab_menu_hover = color_row;
+                return true;
+            }
+            _ => return false,
+        };
+        self.run_tab_menu_row(Some(run), event_loop);
+        // "Color ▸" re-opened the menu in place as the color list: the
+        // keyboard stays in it, on its first row.
+        if self.tab_menu.is_some() {
+            self.tab_menu_hover = menunav::first_enabled(self.tab_menu_labels.len(), &[]);
+        }
+        true
     }
 
     /// Drop the long-lived tab references (rename box, close confirmation)
@@ -5916,6 +6374,9 @@ impl App {
                     }
                 }
             }
+            // The Menu key's menu, at the text cursor of the window the palette
+            // was opened over (the palette closed itself first).
+            C::ContextMenu => self.open_menu_at_cursor(s),
             C::ToggleLaunchAtLogin => {
                 self.toggle_launch_at_login_setting();
                 self.persist();
@@ -9556,6 +10017,11 @@ impl App {
                 if self.overlay_key_modal(s, &event, event_loop) || self.overlay_key_bars(s, &event) {
                     return;
                 }
+                // --- Then THIS window's open menu takes its navigation keys
+                // (arrows, Home / End, Enter / Space on the highlighted row) ---
+                if self.menu_key(s, &event, event_loop) {
+                    return;
+                }
                 // The SAME key decision as the main window (`decide_window_key`),
                 // against THIS window's own terminal. macOS Cmd chords are folded
                 // into the keymap and dispatched below through the same action
@@ -9678,6 +10144,12 @@ impl App {
                     // The theme is app-wide: every window takes it.
                     input::KeyAction::NextTheme | input::KeyAction::PrevTheme => {
                         self.cycle_theme(if action == input::KeyAction::NextTheme { 1 } else { -1 });
+                        return;
+                    }
+                    // The Menu key: THIS window's menu at its text cursor (or
+                    // close the one that is open).
+                    input::KeyAction::ContextMenu => {
+                        self.toggle_menu_at_cursor(s);
                         return;
                     }
                     _ => {}
@@ -9928,18 +10400,19 @@ impl App {
                 }
                 if dw.menu_open.is_some() {
                     // Menu hover tracking from the cached rects (menu is modal;
-                    // no resize/close hover underneath it). Disabled (grayed)
-                    // rows are inert: no hover state.
-                    let new_hover = dw
-                        .menu_rects
-                        .iter()
-                        .position(|r| {
-                            cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
-                        })
-                        .filter(|i| !dw.menu_disabled.contains(i));
-                    if new_hover != dw.menu_hover {
-                        dw.menu_hover = new_hover;
-                        dw.request_paint();
+                    // no resize/close hover underneath it). The highlight moves
+                    // when the pointer crosses rows (a nudge off them keeps the
+                    // arrow keys' one); disabled (grayed) rows are inert.
+                    let row = dw.menu_rects.iter().position(|r| {
+                        cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
+                    });
+                    if let Some(new_hover) =
+                        crate::menunav::pointer_hover(row, &mut dw.menu_pointer_row, &dw.menu_disabled)
+                    {
+                        if new_hover != dw.menu_hover {
+                            dw.menu_hover = new_hover;
+                            dw.request_paint();
+                        }
                     }
                     return;
                 }
@@ -10017,10 +10490,9 @@ impl App {
                 enum Act {
                     None,
                     Reattach,
-                    Copy,
-                    Paste,
-                    /// Run this window's selection in a new MAIN-window tab.
-                    RunSelection,
+                    /// A click while the context menu is open: it closes, and
+                    /// runs the row hit (if any) — the method Enter uses too.
+                    MenuRow(Option<usize>),
                     /// Leave fullscreen on THIS window (double-click on its bar
                     /// while fullscreen). Deferred out of the `dw` borrow.
                     ExitFullscreen,
@@ -10052,29 +10524,13 @@ impl App {
                     let (bar_h, _) = dw.chrome_bands(ui_font, show_hud);
                     let (cx, cy) = (dw.cursor.0 as f32, dw.cursor.1 as f32);
                     let (w, h) = (dw.gpu.config.width, dw.gpu.config.height);
-                    if dw.menu_open.take().is_some() {
-                        // --- Context menu hit-test (consume the click entirely) ---
-                        dw.menu_hover = None;
-                        let hit = dw
-                            .menu_rects
-                            .iter()
-                            .position(|r| {
-                                cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
-                            })
-                            // Disabled rows no-op (the menu still closes).
-                            .filter(|i| !dw.menu_disabled.contains(i));
-                        dw.menu_rects.clear();
-                        dw.menu_disabled.clear();
-                        dw.request_paint();
-                        // Index → DETACHED_MENU_ITEMS order
-                        // (Reattach/Copy/Paste/Run in New Tab).
-                        match hit {
-                            Some(0) => Act::Reattach,
-                            Some(1) => Act::Copy,
-                            Some(2) => Act::Paste,
-                            Some(3) => Act::RunSelection,
-                            _ => Act::None,
-                        }
+                    if dw.menu_open.is_some() {
+                        // --- Context menu hit-test (consume the click entirely):
+                        // the row in DETACHED_MENU_ITEMS order, or none (a
+                        // grayed row no-ops; the menu closes either way) ---
+                        Act::MenuRow(dw.menu_rects.iter().position(|r| {
+                            cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
+                        }))
                     } else {
                         // --- Resize edges: corners > edges, before the bar. ---
                         // Inert while fullscreen: `drag_resize_window` on a
@@ -10204,30 +10660,7 @@ impl App {
                 };
                 match act {
                     Act::Reattach => self.reattach_tab(pos, event_loop),
-                    Act::Copy => {
-                        if let Some(dw) = self.detached.get_mut(pos) {
-                            let copied = dw
-                                .tab
-                                .terminal
-                                .selection_text()
-                                .filter(|t| !t.is_empty());
-                            if let Some(text) = copied {
-                                clipboard::set(&text);
-                                dw.tab.terminal.selection_clear();
-                                dw.request_paint();
-                            }
-                        }
-                    }
-                    Act::Paste => {
-                        if let Some(text) = clipboard::get() {
-                            if let Some(dw) = self.detached.get_mut(pos) {
-                                if Self::paste_to_tab(&mut dw.tab, &text) {
-                                    dw.request_paint();
-                                }
-                            }
-                        }
-                    }
-                    Act::RunSelection => self.run_selection_in_new_tab(SelSource::Detached(pos)),
+                    Act::MenuRow(row) => self.run_detached_menu_row(pos, row, event_loop),
                     Act::ExitFullscreen => self.set_detached_fullscreen(pos, false),
                     Act::ToggleHelp => self.toggle_help(s),
                     Act::None => {}
@@ -10369,15 +10802,11 @@ impl App {
                 // menu): the shared gridmouse routing, as in the main window.
                 // Same modal gates as the main window: no menu over this
                 // window's help or palette, none in hint mode (keyboard-only —
-                // a menu opened there could never be clicked).
-                if self
-                    .ov_of(Surface::Detached(pos))
-                    .is_none_or(|o| o.help_open || o.palette_open || o.hint_mode.is_some())
-                {
+                // a menu opened there could never be clicked). The Menu key
+                // opens under the same gates (`menu_blocked`).
+                if self.menu_blocked(Surface::Detached(pos)) {
                     return;
                 }
-                let theme = self.current_theme();
-                let run_enabled = self.run_selection_enabled;
                 let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
@@ -10393,59 +10822,10 @@ impl App {
                         return;
                     }
                 }
-                let cm = dw.chrome_metrics(ui_font);
+                // The menu at the pointer — the Menu key's own open path, so
+                // both gray the same rows.
                 let (cx, cy) = (dw.cursor.0 as f32, dw.cursor.1 as f32);
-                dw.menu_open = Some((cx, cy));
-                dw.menu_hover = None;
-                // Disabled rows, computed once at open — the same needs-a-
-                // selection class as the main menu: Copy (1) and Run in New
-                // Tab (3) dim without a selection; Run also dims when the
-                // feature is config-disabled.
-                let has_sel = dw
-                    .tab
-                    .terminal
-                    .selection_text()
-                    .is_some_and(|t| !t.is_empty());
-                dw.menu_disabled = match (has_sel, run_enabled) {
-                    (false, _) => vec![1, 3],
-                    (true, false) => vec![3],
-                    (true, true) => Vec::new(),
-                };
-                // The v0.25.1 teachable moment, as in the main window: a menu
-                // opened (with Shift) over a mouse-grabbing program with nothing
-                // selected gets the Shift+drag hint right away.
-                if !has_sel && crate::gridmouse::tracking(&dw.tab.terminal) != input::MouseTracking::Off {
-                    let id = dw.window.id();
-                    arm_shift_hint(&mut self.shift_hint_until, &mut self.shift_hint_cooldown, id, true);
-                }
-                // Cache the item hit-test rects once (anchor + size fixed for the
-                // menu's lifetime), same pattern as the main context menu. Hints
-                // come from the live keymap; widths from this window's chrome
-                // layer (the same measurement the render pass uses).
-                let hints: Vec<String> = crate::detached::DETACHED_MENU_ITEMS
-                    .iter()
-                    .map(|&l| crate::detached::menu_hint(&self.keymap, l))
-                    .collect();
-                let items: Vec<(&str, &str)> = crate::detached::DETACHED_MENU_ITEMS
-                    .iter()
-                    .zip(&hints)
-                    .map(|(&l, h)| (l, h.as_str()))
-                    .collect();
-                let menu = jetty_render::build_menu(
-                    cx,
-                    cy,
-                    dw.gpu.config.width,
-                    dw.gpu.config.height,
-                    None,
-                    &theme,
-                    &mut dw.chrome_text,
-                    cm,
-                    &items,
-                    &[],
-                    &dw.menu_disabled,
-                );
-                dw.menu_rects = menu.item_rects;
-                dw.request_paint();
+                self.open_detached_menu(pos, cx, cy);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -13249,16 +13629,21 @@ impl ApplicationHandler<AppEvent> for App {
                         self.drag_reorder_tab(position.x as f32);
                     }
                 }
-                // --- Tab context menu hover update (cached rects, like above) ---
+                // --- Tab context menu hover update (cached rects, like above;
+                // the highlight moves when the pointer crosses rows) ---
                 if self.tab_menu.is_some() {
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
-                    let new_hover = self.tab_menu_rects.iter().position(|r| {
+                    let row = self.tab_menu_rects.iter().position(|r| {
                         cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
                     });
-                    if new_hover != self.tab_menu_hover {
-                        self.tab_menu_hover = new_hover;
-                        self.request_main_paint();
+                    if let Some(new_hover) =
+                        crate::menunav::pointer_hover(row, &mut self.tab_menu_pointer_row, &[])
+                    {
+                        if new_hover != self.tab_menu_hover {
+                            self.tab_menu_hover = new_hover;
+                            self.request_main_paint();
+                        }
                     }
                 }
                 // --- Grid pointer motion (shared with detached windows) ---
@@ -13276,20 +13661,22 @@ impl ApplicationHandler<AppEvent> for App {
                 // --- Context menu hover update ---
                 // Reuse the cached item_rects (built when the menu opened) instead
                 // of rebuilding the whole menu on every (high-frequency) move.
+                // The highlight moves when the pointer crosses rows, so a nudge
+                // off the rows keeps the one the arrow keys made; disabled
+                // (grayed) rows are inert: no hover state.
                 if self.context_menu.is_some() {
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
-                    let new_hover = self
-                        .menu_item_rects
-                        .iter()
-                        .position(|r| {
-                            cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
-                        })
-                        // Disabled (grayed) rows are inert: no hover state.
-                        .filter(|i| !self.menu_disabled.contains(i));
-                    if new_hover != self.menu_hover {
-                        self.menu_hover = new_hover;
-                        self.request_main_paint();
+                    let row = self.menu_item_rects.iter().position(|r| {
+                        cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
+                    });
+                    if let Some(new_hover) =
+                        crate::menunav::pointer_hover(row, &mut self.menu_pointer_row, &self.menu_disabled)
+                    {
+                        if new_hover != self.menu_hover {
+                            self.menu_hover = new_hover;
+                            self.request_main_paint();
+                        }
                     }
                 }
                 // --- Ctrl+hover link tracking (cached on the hovered cell) ---
@@ -13381,121 +13768,29 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 // --- Tab context menu hit-test (consume the click entirely) ---
-                if let Some((menu_x, menu_y, tab_id)) = self.tab_menu.take() {
-                    self.tab_menu_hover = None;
+                if self.tab_menu.is_some() {
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
                     let hit = self.tab_menu_rects.iter().position(|r| {
                         cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
                     });
-                    // Map the hit through the labels snapshotted at open time
-                    // ("Detach" is present only when detaching was allowed).
-                    let label = hit.and_then(|i| self.tab_menu_labels.get(i).copied());
-                    self.tab_menu_labels.clear();
-                    self.tab_menu_rects.clear();
-                    if let Some(tab_idx) = self.tab_index(tab_id) {
-                        match label {
-                            Some("Detach") => {
-                                // Same flow as Ctrl+Shift+D, for THAT tab.
-                                self.detach_tab(tab_idx, event_loop, None);
-                            }
-                            Some("Rename") => {
-                                // Same inline-rename flow as double-click.
-                                self.renaming = Some(tab_id);
-                                self.rename_buf = self.tabs[tab_idx].title.clone();
-                            }
-                            Some("Close Tab") => {
-                                // Same confirm-close flow as the × / Ctrl+Shift+W.
-                                self.confirm_close = Some(tab_id);
-                            }
-                            // "Color ▸" opens the color list in place (same
-                            // anchor, same tab); a color row sets it.
-                            Some(crate::detached::TAB_MENU_COLOR) => {
-                                self.open_tab_menu(menu_x, menu_y, tab_id, crate::detached::tab_color_menu_items());
-                                return;
-                            }
-                            Some(l) => {
-                                if let Some(color) = crate::detached::tab_color_from_label(l) {
-                                    self.set_tab_color(tab_id, color);
-                                }
-                            }
-                            None => {}
-                        }
-                    }
-                    // Hit or not, the menu is closed — consume the click.
-                    self.request_main_paint();
+                    // Hit or not, the menu closes ("Color ▸" re-opens it as the
+                    // color list) — the row runs through the method Enter uses.
+                    self.run_tab_menu_row(hit, event_loop);
                     return;
                 }
 
                 // --- Context menu hit-test (consume the click entirely) ---
-                if self.context_menu.take().is_some() {
-                    self.menu_hover = None;
+                if self.context_menu.is_some() {
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
                     // Reuse the cached item_rects built when the menu opened.
                     let hit = self.menu_item_rects.iter().position(|r| {
                         cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
                     });
-                    // A click on a DISABLED (grayed) row is a no-op that still
-                    // closes the menu — the "click anywhere closes" contract.
-                    let hit = hit.filter(|i| !self.menu_disabled.contains(i));
-                    if let Some(idx) = hit {
-                        match idx {
-                            0 => {
-                                // Copy — then clear the selection so the highlight
-                                // doesn't linger after an explicit copy.
-                                let copied = self
-                                    .active_tab()
-                                    .terminal
-                                    .selection_text()
-                                    .filter(|t| !t.is_empty());
-                                if let Some(text) = copied {
-                                    clipboard::set(&text);
-                                    self.active_tab_mut().terminal.selection_clear();
-                                    self.request_main_paint();
-                                }
-                            }
-                            1 => {
-                                // Paste
-                                if let Some(text) = clipboard::get() {
-                                    self.paste_text(&text);
-                                }
-                            }
-                            2 => {
-                                // Run in New Tab — the browser gesture: the
-                                // selection runs in a fresh tab at this tab's cwd.
-                                self.run_selection_in_new_tab(SelSource::Main);
-                            }
-                            3 => {
-                                // Select All
-                                self.active_tab_mut().terminal.select_all();
-                            }
-                            4 => {
-                                // Clear — emulates Ctrl+L (form-feed 0x0C) sent to the active PTY.
-                                // This is the same byte the Ctrl+L keybinding produces via
-                                // ctrl_byte('L') in input.rs; reuse the same writer path.
-                                // A user-originated PTY byte — cancels a staged
-                                // run-selection inject (same rule as write_key_to_pty).
-                                crate::runsel::cancel_on_user_write(
-                                    &mut self.tabs[self.active].pending_inject,
-                                );
-                                self.active_tab_mut().terminal.scroll_to_bottom();
-                                let w = &mut self.tabs[self.active].writer;
-                                let _ = w.write_all(&[0x0C]);
-                                let _ = w.flush();
-                            }
-                            5 => {
-                                // Close Tab — mirrors the Ctrl+Shift+W handler: set confirm_close
-                                // to open the confirmation popup (or close directly if no child).
-                                // This reuses the exact same flow as KeyAction::CloseTab.
-                                self.confirm_close = self.tabs.get(self.active).map(|t| t.id);
-                            }
-                            _ => {}
-                        }
-                    }
-                    // Whether we hit an item or clicked outside, the menu is
-                    // closed (Take above) — request a redraw and consume the click.
-                    self.request_main_paint();
+                    // Whether we hit an item, a grayed row or outside, the menu
+                    // closes — the row runs through the method Enter uses.
+                    self.run_context_menu_row(hit);
                     return;
                 }
 
@@ -13742,15 +14037,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // empty, so no menu appears over a quit/close-confirm or the help,
                 // and no menu opens at coordinates the slide has shifted.
                 // Hint mode is keyboard-only: a menu opened there could never be
-                // clicked (its left press is swallowed by the mode).
-                if self.slide_anim.is_some()
-                    || self.confirm_quit
-                    || self.confirm_close.is_some()
-                    || self.ov.help_open
-                    || self.ov.palette_open
-                    || self.ov.hint_mode.is_some()
-                    || self.tabs.is_empty()
-                {
+                // clicked (its left press is swallowed by the mode). The Menu
+                // key opens under the same gates (`menu_blocked`).
+                if self.menu_blocked(Surface::Main) {
                     return;
                 }
                 // Right-click: open the context menu (Copy / Paste / Select All).
@@ -13802,62 +14091,10 @@ impl ApplicationHandler<AppEvent> for App {
                         return;
                     }
                 }
-                // Commit any in-progress rename and close the help overlay so the
-                // menu can't be orphaned under it. The tab menu is mutually
-                // exclusive with the terminal menu.
-                self.commit_rename();
-                self.ov.help_open = false;
-                self.tab_menu = None;
-                self.tab_menu_hover = None;
-                self.tab_menu_rects.clear();
-                self.tab_menu_labels.clear();
-                self.context_menu = Some((cx, cy));
-                self.menu_hover = None;
-                // Disabled rows, computed once at open: "Copy" (0) and "Run in
-                // New Tab" (2) share the needs-a-selection property (Copy
-                // silently no-ops without one today — dimming is the honest UI
-                // for the same property); Run additionally dims when the
-                // feature is config-disabled.
-                let has_sel = self
-                    .active_tab()
-                    .terminal
-                    .selection_text()
-                    .is_some_and(|t| !t.is_empty());
-                self.menu_disabled = match (has_sel, self.run_selection_enabled) {
-                    (false, _) => vec![0, 2],
-                    (true, false) => vec![2],
-                    (true, true) => Vec::new(),
-                };
-                // THE teachable moment for mouse-grabbing apps (Claude Code,
-                // vim, htop): the user Shift+right-clicked wanting Copy / Run in
-                // New Tab, but their drag was forwarded to the app, so there is
-                // no selection and both rows sit dimmed with no explanation.
-                // Surface the Shift+drag hint alongside the menu — deliberately
-                // BYPASSING the 25s drag-cooldown: an explicit right-click on
-                // dimmed rows is a direct question, not a nag.
-                let tracking = crate::gridmouse::tracking(&self.active_tab().terminal);
-                if !has_sel && tracking != input::MouseTracking::Off {
-                    if let Some(id) = self.window.as_ref().map(|w| w.id()) {
-                        arm_shift_hint(&mut self.shift_hint_until, &mut self.shift_hint_cooldown, id, true);
-                    }
-                }
-                // Cache the item hit-test rects once (anchor + size fixed for the
-                // menu's lifetime) so CursorMoved hover doesn't rebuild the menu.
-                if let Some(gpu) = &self.gpu {
-                    let (w, h) = (gpu.config.width, gpu.config.height);
-                    let theme = self.current_theme();
-                    let cm = self.chrome_metrics();
-                    let mut fallback = mono_fallback(cm);
-                    let hints = crate::detached::context_menu_hints(&self.keymap);
-                    let hint_refs: Vec<&str> = hints.iter().map(String::as_str).collect();
-                    let menu = jetty_render::build_context_menu(
-                        cx, cy, w, h, None, &theme,
-                        measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
-                        &hint_refs, &self.menu_disabled,
-                    );
-                    self.menu_item_rects = menu.item_rects;
-                }
-                self.request_main_paint();
+                // The menu at the pointer — the Menu key's own open path, so
+                // both gray the same rows (nothing highlighted: the pointer is
+                // the mouse user's highlight).
+                self.open_context_menu(cx, cy);
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 // --- Tab drag-out release ---
@@ -14180,6 +14417,13 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.overlay_key_bars(Surface::Main, &event) {
                     return;
                 }
+                // --- An open context / tab menu takes its navigation keys:
+                // arrows, Home / End, Enter / Space on the highlighted row (and
+                // Right / Left into and out of the tab menu's color list).
+                // Shared with the detached windows ---
+                if self.menu_key(Surface::Main, &event, event_loop) {
+                    return;
+                }
                 let ctrl = self.modifiers.control_key();
                 let shift = self.modifiers.shift_key();
                 // The shared key decision (keymap chords incl. the folded macOS
@@ -14228,6 +14472,7 @@ impl ApplicationHandler<AppEvent> for App {
                         input::KeyAction::ToggleFullscreen => "ToggleFullscreen",
                         input::KeyAction::NextTheme => "NextTheme",
                         input::KeyAction::PrevTheme => "PrevTheme",
+                        input::KeyAction::ContextMenu => "ContextMenu",
                         input::KeyAction::Send(_) => "Send",
                         input::KeyAction::None => "None",
                     };
@@ -14382,6 +14627,10 @@ impl ApplicationHandler<AppEvent> for App {
                     // `[keys] next_theme` / `prev_theme` (no default chord).
                     input::KeyAction::NextTheme => self.cycle_theme(1),
                     input::KeyAction::PrevTheme => self.cycle_theme(-1),
+                    // The Menu key (`[keys] context_menu`): the terminal context
+                    // menu at the text cursor, first enabled row highlighted —
+                    // or, with a menu open, close it.
+                    input::KeyAction::ContextMenu => self.toggle_menu_at_cursor(Surface::Main),
                     input::KeyAction::Send(bytes) => {
                         // Escape closes an open context/tab menu before forwarding to PTY.
                         // Decided on the KEY, not the encoded bytes: under the kitty
@@ -18828,6 +19077,32 @@ mod fullscreen_helper_tests {
         // a default chord can never leave the fallback overlay stale.
         let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), "F9");
         assert_eq!(rows, jetty_render::default_help_rows());
+    }
+
+    #[test]
+    fn help_rows_name_the_menu_key_beside_the_right_click() {
+        let row = |km: &crate::keymap::KeyMap| {
+            super::App::compute_help_rows(km, "F9")
+                .into_iter()
+                .find(|r| r.contains("— Context menu"))
+                .expect("no context-menu help row")
+        };
+        let live = row(&crate::keymap::KeyMap::defaults());
+        assert!(live.starts_with("Right-click / Menu — "), "{live:?}");
+        assert!(live.contains("Enter"), "the keyboard navigation is documented: {live:?}");
+        assert!(jetty_render::HELP_ROWS.contains(&live.as_str()), "static mirror out of sync: {live:?}");
+        // Remapped / unbound: the row follows the keymap, and the right-click
+        // never reads "(unbound)".
+        let keys = |spec: crate::config::ChordSpec| {
+            crate::keymap::KeyMap::compile(&crate::config::KeyBindings {
+                context_menu: Some(spec),
+                ..Default::default()
+            })
+        };
+        let remapped = row(&keys(crate::config::ChordSpec::One("Shift+F10".into())));
+        assert!(remapped.starts_with("Right-click / Shift+F10 — "), "{remapped:?}");
+        let unbound = row(&keys(crate::config::ChordSpec::One(String::new())));
+        assert!(unbound.starts_with("Right-click — "), "{unbound:?}");
     }
 
     #[test]

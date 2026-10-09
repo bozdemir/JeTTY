@@ -30,7 +30,7 @@ pub const HELP_ROWS: &[&str] = &[
     "Ctrl+Shift+Enter — Run selection in a new tab   (multi-line lands staged)",
     "Left-drag — Select text (auto-copies)",
     "Shift+drag — Select over mouse apps (vim / htop / Claude Code)",
-    "Right-click — Context menu",
+    "Right-click / Menu — Context menu   (arrows move, Enter picks)",
     "",
     "## Search & scroll",
     "Ctrl+Shift+F — Search scrollback   (Enter next, Shift+Enter prev, Esc close)",

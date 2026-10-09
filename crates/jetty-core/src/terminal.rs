@@ -3679,6 +3679,17 @@ impl Terminal {
         p
     }
 
+    /// The viewport cell `(row, col)` of the cursor — the snapshot's
+    /// `cursor_row` / `cursor_col`, without building a snapshot (for UI placed
+    /// at the cursor on demand, like the keyboard-opened context menu).
+    /// Clamped into the view the same way: scrolled back past the cursor, it
+    /// is on the bottom row. Hidden (DECTCEM) or not, it is where the cursor is.
+    pub fn cursor_viewport_cell(&self) -> (usize, usize) {
+        point_to_viewport(self.term.grid().display_offset(), self.cursor_cell())
+            .map(|p| (p.line.min(self.rows.saturating_sub(1)), p.column.0.min(self.cols.saturating_sub(1))))
+            .unwrap_or((0, 0))
+    }
+
     pub fn snapshot(&self) -> GridSnapshot {
         let (rows, cols) = (self.rows, self.cols);
         // Filled in row-major order below (every cell is pushed exactly once), so
@@ -5498,6 +5509,7 @@ mod tests {
                     (want.cursor_row, want.cursor_col, want.cursor_visible, want.cursor_shape),
                     "{ctx}"
                 );
+                assert_eq!(t.cursor_viewport_cell(), (got.cursor_row, got.cursor_col), "{ctx}: cursor_viewport_cell");
                 assert_eq!((got.bg_rgba, got.cursor_rgb), (want.bg_rgba, want.cursor_rgb), "{ctx}");
                 assert_eq!((got.scroll_offset, got.scroll_max), (want.scroll_offset, want.scroll_max), "{ctx}");
                 checked += 1;
@@ -7443,6 +7455,29 @@ mod tests {
         t.selection_start_block_abs(0, 4, false);
         t.selection_update_abs(1, 4, true);
         assert_eq!(t.selection_text().as_deref(), Some("\n"));
+    }
+
+    #[test]
+    fn cursor_viewport_cell_is_the_snapshots_cursor_without_a_snapshot() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"$ ls\r\nfoo bar\r\n$ ec");
+        assert_eq!(t.cursor_viewport_cell(), (2, 4));
+        // On a wide glyph's right half the cursor covers the glyph.
+        t.feed("中\x1b[D".as_bytes());
+        let s = t.snapshot();
+        assert_eq!(t.cursor_viewport_cell(), (s.cursor_row, s.cursor_col));
+        // Hidden by the program: still where it is.
+        t.feed(b"\x1b[?25l");
+        assert_eq!(t.cursor_viewport_cell(), (s.cursor_row, s.cursor_col));
+        // Scrolled back past it: clamped onto the bottom row, like the snapshot.
+        for i in 0..20 {
+            t.feed(format!("\r\nline {i}").as_bytes());
+        }
+        t.scroll_lines(8);
+        let s = t.snapshot();
+        assert!(!s.cursor_visible, "premise: the cursor scrolled out of view");
+        assert_eq!(t.cursor_viewport_cell(), (s.cursor_row, s.cursor_col));
+        assert_eq!(t.cursor_viewport_cell().0, 4);
     }
 
     #[test]

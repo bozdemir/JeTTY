@@ -54,6 +54,8 @@ pub enum PaletteCmd {
     NextPrompt,
     Copy,
     Paste,
+    /// The window's context menu at the text cursor (the Menu key's action).
+    ContextMenu,
     ToggleLaunchAtLogin,
     ResetKeybindings,
     ResetInputModes,
@@ -231,7 +233,7 @@ pub fn build_registry(
     tabs: &[(u64, String)],
     detached: &[(u64, String)],
 ) -> Vec<PaletteEntry> {
-    let statics: [(&str, &str, PaletteCmd); 42] = [
+    let statics: [(&str, &str, PaletteCmd); 43] = [
         ("New tab", "create open window shell", PaletteCmd::NewTab),
         ("Close tab", "kill remove", PaletteCmd::CloseTab),
         ("Next tab", "cycle switch forward", PaletteCmd::NextTab),
@@ -275,6 +277,11 @@ pub fn build_registry(
             "Run selection in new tab",
             "execute run selected command tab shell browser",
             PaletteCmd::RunSelection,
+        ),
+        (
+            "Open context menu",
+            "right click popup menu key select all clear keyboard",
+            PaletteCmd::ContextMenu,
         ),
         ("Toggle launch at login", "autostart startup boot", PaletteCmd::ToggleLaunchAtLogin),
         ("Reset keybindings to defaults", "shortcut hotkey rebind reset keys", PaletteCmd::ResetKeybindings),
@@ -539,6 +546,17 @@ mod tests {
         let hits = filter(&r, "run sel");
         assert_eq!(hits[0].cmd, PaletteCmd::RunSelection, "top hit for 'run sel'");
         assert_eq!(hits[0].title, "Run selection in new tab");
+    }
+
+    #[test]
+    fn registry_contains_the_context_menu_and_ranks_it() {
+        // The keyboard path to the menu where there is no Menu key (laptops,
+        // Apple keyboards): found by its title and by "right click".
+        let r = reg();
+        assert_eq!(r.iter().filter(|e| e.cmd == PaletteCmd::ContextMenu).count(), 1);
+        for q in ["context menu", "right click", "open context"] {
+            assert_eq!(filter(&r, q)[0].cmd, PaletteCmd::ContextMenu, "top hit for {q:?}");
+        }
     }
 
     #[test]

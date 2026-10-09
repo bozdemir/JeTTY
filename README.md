@@ -207,6 +207,7 @@ JeTTY renders through **Vulkan** when a Vulkan driver is installed, and otherwis
 | `Ctrl+Shift+C` | Copy | `copy` |
 | `Ctrl+Shift+V` · `Shift+Insert` | Paste | `paste` |
 | — (right-click menu; Cmd+A on macOS) | Select all | `select_all` |
+| `Menu` | The right-click menu, at the text cursor | `context_menu` |
 | `Ctrl+Shift+H` | Hint mode — label every URL / path / hash on screen | `hint_mode` |
 | `Ctrl+Shift+Space` | Keyboard copy-mode | `copy_mode` |
 | `Ctrl+Shift+Enter` | Run the selection in a new tab | `run_selection` |
@@ -218,7 +219,9 @@ JeTTY renders through **Vulkan** when a Vulkan driver is installed, and otherwis
 | — (command palette: "Previous theme") | Previous theme | `prev_theme` |
 <!-- keybindings:end -->
 
-Mouse: **left-drag** selects (double-click a word, triple-click a line); **Shift+drag** selects even over programs that track the mouse (vim, htop, tmux, Claude Code) — those programs get the clicks otherwise, right and middle buttons included, and **Shift+right-click** opens JeTTY's menu there; **right-click** opens the Copy / Paste / Run in New Tab / Select All / Clear / Close Tab menu; **middle-click** pastes the primary selection; **Ctrl+click** opens a link. Tabs: drag one along the bar to reorder it, off the bar to detach it (drop it back on the bar to reattach), right-click a tab for Detach / Rename / Close, double-click to rename, middle-click to close, scroll the wheel over the bar to switch. `Ctrl+D` exits the shell.
+Mouse: **left-drag** selects (double-click a word, triple-click a line); **Shift+drag** selects even over programs that track the mouse (vim, htop, tmux, Claude Code) — those programs get the clicks otherwise, right and middle buttons included, and **Shift+right-click** opens JeTTY's menu there; **right-click** opens the Copy / Paste / Run in New Tab / Select All / Clear / Close Tab menu; **middle-click** pastes the primary selection; **Ctrl+click** opens a link. Tabs: drag one along the bar to reorder it, off the bar to detach it (drop it back on the bar to reattach), right-click a tab for Detach / Rename / Color / Close, double-click to rename, middle-click to close, scroll the wheel over the bar to switch. `Ctrl+D` exits the shell.
+
+Menus work from the keyboard too: the **Menu** key opens the right-click menu at the text cursor, and in any menu the arrows (or `Home` / `End`) move, `Enter` picks, `→` / `←` open and leave a tab's Color list, and `Esc` closes it.
 
 *The theme is picked in Settings (`Ctrl+,`) or the command palette — there is no theme shortcut.*
 

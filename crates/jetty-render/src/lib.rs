@@ -77,7 +77,7 @@ pub use crt::{
 pub use transform::{transform_params, transform_secs, SummonTransform, TransformKind};
 pub use image_layer::{ImageDraw, ImageLayer};
 pub use caret_fx::{caret_glow_look, caret_glow_scissor, CaretFx, CaretFxUniform};
-pub use menu::{build_context_menu, build_menu, ContextMenu, MENU_HINTS, MENU_ITEMS};
+pub use menu::{build_context_menu, build_menu, context_menu_height, menu_height, ContextMenu, MENU_HINTS, MENU_ITEMS};
 pub use help::{build_help_overlay, default_help_rows, HelpOverlay, HELP_ROWS};
 pub use confirm::{build_confirm, build_confirm_close, ConfirmPopup};
 pub use tabbar::{

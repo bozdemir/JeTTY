@@ -73,6 +73,9 @@ pub enum KeyAction {
     /// next_theme` / `prev_theme`).
     NextTheme,
     PrevTheme,
+    /// Open the window's context menu at the text cursor, its first enabled
+    /// row highlighted — or close the menu that is open (the Menu key).
+    ContextMenu,
     /// Raw bytes to write to the PTY.
     Send(Vec<u8>),
     None,
@@ -2281,6 +2284,34 @@ mod tests {
             ),
             KeyAction::Send(b"\x1b[23~".to_vec())
         );
+    }
+
+    #[test]
+    fn the_menu_key_opens_the_context_menu_before_any_encoder() {
+        // Bare Menu is the context-menu action — for a kitty-protocol program
+        // too (the keymap runs first, like F11).
+        let menu = Key::Named(NamedKey::ContextMenu);
+        let ev = kev(KeyCode::ContextMenu, &menu, None, KeyMods::default());
+        let kitty = KeyModes { kitty_flags: KITTY_DISAMBIGUATE, ..KeyModes::default() };
+        for modes in [KeyModes::default(), kitty] {
+            assert_eq!(decide(&ev, modes, KeyOptions::default()), KeyAction::ContextMenu);
+        }
+        // `[keys] context_menu = ""` hands the key back: a kitty program gets
+        // `CSI 57363 u`, a legacy shell nothing — exactly as before the binding.
+        let b = crate::config::KeyBindings {
+            context_menu: Some(crate::config::ChordSpec::One(String::new())),
+            ..Default::default()
+        };
+        let km = crate::keymap::KeyMap::compile(&b);
+        assert_eq!(
+            decide_key_event(&km, &ev, &kitty, &KeyOptions::default(), false),
+            KeyAction::Send(b"\x1b[57363u".to_vec())
+        );
+        assert_eq!(decide_key_event(&km, &ev, &KeyModes::default(), &KeyOptions::default(), false), KeyAction::None);
+        // The default chord is EXACT: Shift+Menu is not the menu (and, legacy,
+        // sends nothing).
+        let shifted = kev(KeyCode::ContextMenu, &menu, None, KeyMods { shift: true, ..KeyMods::default() });
+        assert_eq!(decide(&shifted, KeyModes::default(), KeyOptions::default()), KeyAction::None);
     }
 
     #[test]

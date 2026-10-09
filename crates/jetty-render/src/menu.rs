@@ -53,6 +53,21 @@ const MENU_H: f32 = ROW_H * N as f32 + SEP_GAP;
 // 2px halo to match every other overlay (panel/help/confirm all use a 2px
 // border with a radius delta of 2 over the bg).
 const BORDER: f32 = 2.0;
+/// The standard menu's separator: above "Clear" (idx 4).
+const CONTEXT_SEP_BEFORE: [usize; 1] = [4];
+
+/// The outer height (border included) of a [`build_menu`] card with `n_items`
+/// rows and `n_seps` separators, at chrome metrics `cm` — for a caller that
+/// places a menu before building it (the keyboard-opened menu opens above the
+/// cursor's line when it would not fit below).
+pub fn menu_height(n_items: usize, n_seps: usize, cm: ChromeMetrics) -> f32 {
+    cm.px(ROW_H) * n_items as f32 + cm.px(SEP_GAP) * n_seps as f32 + cm.px(BORDER) * 2.0
+}
+
+/// [`menu_height`] of the standard context menu ([`build_context_menu`]).
+pub fn context_menu_height(cm: ChromeMetrics) -> f32 {
+    menu_height(MENU_ITEMS.len(), CONTEXT_SEP_BEFORE.len(), cm)
+}
 
 /// Geometry and draw data for the right-click context menu.
 pub struct ContextMenu {
@@ -106,7 +121,7 @@ pub fn build_context_menu(
         .enumerate()
         .map(|(i, &label)| (label, hints.get(i).copied().unwrap_or("")))
         .collect();
-    build_menu(x, y, win_w, win_h, hovered, theme, m, cm, &items, &[4], disabled)
+    build_menu(x, y, win_w, win_h, hovered, theme, m, cm, &items, &CONTEXT_SEP_BEFORE, disabled)
 }
 
 /// Build a context menu from an arbitrary `(label, hint)` item list anchored at
@@ -575,6 +590,22 @@ mod tests {
             assert!((r.h - ROW_H * cm.u).abs() < 0.01, "row {i} not scaled");
             let label = menu.labels.iter().find(|l| l.0 == MENU_ITEMS[i]).unwrap();
             assert!(label.2 >= r.y && label.2 + line_h <= r.y + r.h + 0.5, "row {i} label spills");
+        }
+    }
+
+    #[test]
+    fn menu_height_is_the_built_cards_height() {
+        // Callers place a keyboard-opened menu by this height before building
+        // it: it must be exactly the card's outer (border-included) height.
+        for cm in [CM, ChromeMetrics::new(2.0, 16.0), ChromeMetrics::new(1.0, 28.0)] {
+            let mut m = MonoMeasure(TEST_CHAR_W * cm.u);
+            let std = build_context_menu(10.0, 10.0, 4000, 4000, None, &theme(), &mut m, cm, &MENU_HINTS, &[]);
+            assert!((std.quads[0].h - context_menu_height(cm)).abs() < 0.01, "standard menu at u={}", cm.u);
+            for n in [4usize, 7] {
+                let items: Vec<(&str, &str)> = (0..n).map(|_| ("Row", "")).collect();
+                let menu = build_menu(10.0, 10.0, 4000, 4000, None, &theme(), &mut m, cm, &items, &[], &[]);
+                assert!((menu.quads[0].h - menu_height(n, 0, cm)).abs() < 0.01, "{n} rows at u={}", cm.u);
+            }
         }
     }
 
