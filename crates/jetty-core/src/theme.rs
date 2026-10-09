@@ -195,13 +195,19 @@ fn builtin_by_name(name: &str) -> Theme {
 impl Theme {
     /// Resolve a theme by name string. Consults the runtime registry FIRST (a user
     /// theme whose `name` matches shadows the built-in), then the hardcoded 46
-    /// built-ins, then falls back to catppuccin_mocha. Cheap in the common built-in
+    /// built-ins, then any other spelling [`theme_index`] accepts (`"Solarized
+    /// Light"`), then falls back to catppuccin_mocha. Cheap in the common built-in
     /// case; a user theme clones its owned strings.
     pub fn by_name(name: &str) -> Theme {
         if let Some(t) = REGISTRY.read().unwrap().iter().find(|t| t.name.as_ref() == name) {
             return t.clone();
         }
-        builtin_by_name(name)
+        if PRESETS.contains(&name) {
+            return builtin_by_name(name);
+        }
+        // (The registry's read lock above is released: `theme_index` and
+        // `theme_at` take it again.)
+        theme_index(name).map_or_else(catppuccin_mocha, theme_at)
     }
 
     /// A guaranteed-visible error red for the OSC 133 failed-command marker.

@@ -125,5 +125,11 @@ fn a_theme_is_found_by_any_spelling_of_its_name() {
     assert_eq!(jetty_core::theme_index("Midnight Oil"), Some(n - 2));
     assert_eq!(jetty_core::theme_index("My Theme"), Some(n - 2), "the id, loosely");
     assert_eq!(jetty_core::theme_index("dracula"), Some(3), "the exact id wins");
+    // `Theme::by_name` resolves the same spellings (Settings seeds colors from it).
+    assert_eq!(Theme::by_name("Midnight Oil").name.as_ref(), "my_theme");
+    assert_eq!(Theme::by_name("dracula").name.as_ref(), "dracula");
     jetty_core::set_registry(Vec::new());
+    assert_eq!(Theme::by_name("Solarized Light").name.as_ref(), "solarized_light");
+    assert_eq!(Theme::by_name("tokyo-night").name.as_ref(), "tokyo_night");
+    assert_eq!(Theme::by_name("nope_xyz").name.as_ref(), "catppuccin_mocha");
 }
