@@ -485,7 +485,8 @@ pub(crate) enum Wheel {
     Arrows,
     /// The host scrollback moved: repaint and revalidate the link hover.
     Scrolled,
-    /// Nothing (a fraction of a line so far).
+    /// Nothing: a fraction of a notch or line so far, or a view that can't
+    /// move that way (the live bottom, the top of the history, an alt screen).
     None,
 }
 
@@ -569,7 +570,13 @@ pub(crate) fn wheel(
         }
         return Wheel::Arrows;
     }
+    // At the live bottom (the usual state), a wheel down moves nothing: no
+    // frame to repaint for it.
+    let before = g.term.scroll_offset();
     g.term.scroll_lines(lines);
+    if g.term.scroll_offset() == before {
+        return Wheel::None;
+    }
     Wheel::Scrolled
 }
 
@@ -841,7 +848,7 @@ mod tests {
     fn wheel_reports_shift_and_the_scrollbar_keep_it_on_the_host() {
         let line = |n: f32| MouseScrollDelta::LineDelta(0.0, n);
         let mut acc = ScrollAccumulator::new();
-        let mut w = Win::new(b"\x1b[?1000h\x1b[?1006h");
+        let mut w = with_history(b"\x1b[?1000h\x1b[?1006h");
         let (r, bytes) = w.at(0.0, 0.0, NONE, |g| wheel(g, line(1.0), false, &mut acc));
         assert_eq!((r, bytes.as_str()), (Wheel::Reported, "\x1b[<64;1;1M"));
         let (_, bytes) = w.at(0.0, 0.0, ModifiersState::CONTROL, |g| wheel(g, line(-1.0), false, &mut acc));
@@ -931,7 +938,7 @@ mod tests {
         assert_eq!(r, Wheel::Arrows, "no tracking: Shift changes nothing");
         let mut w = Win::new(b"\x1b[?1049h\x1b[?1000h");
         let (r, bytes) = w.at(0.0, 0.0, ModifiersState::SHIFT, |g| wheel(g, line(1.0), false, &mut acc));
-        assert_eq!((r, bytes.as_str()), (Wheel::Scrolled, ""), "tracking + Shift: host scrollback");
+        assert_eq!((r, bytes.as_str()), (Wheel::None, ""), "tracking + Shift: the (empty) host scrollback");
     }
 
     /// A padded 80×24 grid below a 36-px tab bar at DPI `scale` (MesloLGS-like
@@ -1128,6 +1135,23 @@ mod tests {
         assert_eq!(w.at(0.0, 0.0, NONE, |g| wheel(g, line(-1.0), false, &mut acc)).1, "\x1b[<65;1;1M");
         assert_eq!(w.at(3.0, 2.0, NONE, |g| motion(g, t0())).1, "\x1b[<35;4;3M");
         assert_eq!(w.at(3.0, 2.0, NONE, |g| press(g, MouseButton::Left, false, t0())).1, "\x1b[<0;4;3M");
+    }
+
+    #[test]
+    fn a_wheel_that_moves_no_view_asks_for_no_repaint() {
+        // At the live bottom — the usual state — every wheel-down notch and
+        // every touchpad / momentum event used to repaint an identical frame.
+        let line = |n: f32| MouseScrollDelta::LineDelta(0.0, n);
+        let mut acc = ScrollAccumulator::new();
+        let mut w = with_history(b"");
+        assert_eq!(w.at(0.0, 0.0, NONE, |g| wheel(g, line(-1.0), false, &mut acc)), (Wheel::None, String::new()));
+        assert_eq!(w.at(0.0, 0.0, NONE, |g| wheel(g, line(1.0), false, &mut acc)).0, Wheel::Scrolled);
+        // At the top of the history, and on an alt screen (no history at all).
+        w.term.scroll_to_offset(w.term.scroll_max());
+        assert_eq!(w.at(0.0, 0.0, NONE, |g| wheel(g, line(1.0), false, &mut acc)).0, Wheel::None);
+        assert_eq!(w.at(0.0, 0.0, NONE, |g| wheel(g, line(-1.0), false, &mut acc)).0, Wheel::Scrolled);
+        let mut w = Win::new(b"\x1b[?1049h\x1b[?1000h");
+        assert_eq!(w.at(0.0, 0.0, ModifiersState::SHIFT, |g| wheel(g, line(1.0), false, &mut acc)).0, Wheel::None);
     }
 
     #[test]
