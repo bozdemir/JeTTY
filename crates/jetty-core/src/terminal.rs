@@ -664,8 +664,10 @@ fn redraw_step(kv: u8, b: u8) -> u8 {
 /// Cap on the sixel carry buffer (`sixel_buf`). A never-terminated or hostile
 /// sixel cannot grow memory without bound: past this the scanner latches
 /// `sixel_overflow`, keeps scanning for the terminator to resync, then DROPS the
-/// image (correct-or-absent). 4 MiB comfortably holds any real terminal image.
-const SIXEL_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// image (correct-or-absent). Two bytes per pixel of [`crate::sixel::SIXEL_CAPS`]
+/// (32 MB): a dithered full-window frame runs about one byte per pixel, so a
+/// 4K one (8.3 Mpx) fits — a 4 MiB cap dropped it though its pixels did.
+const SIXEL_MAX_BYTES: usize = crate::sixel::SIXEL_CAPS.max_pixels as usize * 2;
 
 /// Clamp on the reserved cell-rows for one image (the injected line-feeds). Even
 /// a legitimately tall image cannot scroll the grid without bound.
@@ -8945,6 +8947,29 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn a_large_sixel_within_the_pixel_caps_draws() {
+        // A dithered full-window frame runs ~1 byte per pixel: 4K (8.3 Mpx) is
+        // ~8 MB of sixel, past the old 4 MiB byte cap that dropped it silently
+        // though its pixels are within SIXEL_CAPS. Here: 4.2 MB for 3.6 Mpx.
+        let mut data = String::from("#0;2;100;0;0#1;2;0;100;0");
+        for _ in 0..600 {
+            for c in 0..7 {
+                data.push_str(&format!("#{}", c % 2));
+                data.push_str(&"~".repeat(1000));
+                data.push('$');
+            }
+            data.push('-');
+        }
+        let seq = sixel(&data);
+        assert!(seq.len() > 4 * 1024 * 1024);
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&seq);
+        assert_eq!(t.placements.len(), 1, "drawn");
+        assert_eq!((t.placements[0].image.width, t.placements[0].image.height), (1000, 3600));
+    }
 
     #[test]
     fn resize_clears_placements() {
