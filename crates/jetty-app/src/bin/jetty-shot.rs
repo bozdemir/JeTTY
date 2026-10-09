@@ -46,6 +46,8 @@
 ///   JETTY_SHOT_TABBAR_N — number of sample tabs for JETTY_SHOT_TABBAR (default 3).
 ///   JETTY_SHOT_TAB_TITLES — comma list of the sample tabs' titles (default
 ///                    "Tab N"; an OSC 0/2 title in the input still wins for tab 1).
+///                    The first two also name the palette's "Switch to tab"
+///                    rows, and the second the close-tab confirmation's tab.
 ///   JETTY_SHOT_HELP_SCROLL — first help row for JETTY_SHOT_HELP when its rows
 ///                    overflow the window (large UI font / short window).
 ///   JETTY_SHOT_PILL="text" — draw the app's toast pill (run-selection status /
@@ -332,6 +334,14 @@ fn shot_backdrop(
 /// can turn a mode off with `=0` instead of the mode staying on for any value.
 fn env_flag(k: &str) -> bool {
     std::env::var(k).map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+}
+
+/// Sample tab `n`'s title (1-based): JETTY_SHOT_TAB_TITLES' n-th entry, else
+/// "Tab n".
+fn sample_tab_title(n: usize) -> String {
+    let titles = std::env::var("JETTY_SHOT_TAB_TITLES").unwrap_or_default();
+    let named = titles.split(',').map(str::trim).nth(n - 1).filter(|t| !t.is_empty());
+    named.map_or_else(|| format!("Tab {n}"), str::to_string)
 }
 
 /// The highlighted row of a shot menu of `rows` rows (`disabled` grayed).
@@ -1640,26 +1650,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A representative registry: the SHARED builder over the live theme
             // list plus two sample tabs, filtered exactly like the app.
             let themes = jetty_core::theme_list();
-            let tabs = vec![(1, "Tab 1".to_string()), (2, "Tab 2".to_string())];
+            let tabs: Vec<(u64, String)> = (1..=2).map(|n| (n, sample_tab_title(n as usize))).collect();
             let registry = jetty_app::palette::build_registry(&themes, &tabs, &[]);
             let hits = jetty_app::palette::filter(&registry, &query);
+            // Each row's chord from the default keymap, as the app shows it.
+            let hints = jetty_app::palette::chord_hints(&jetty_app::keymap::KeyMap::defaults());
             let total = hits.len();
             let sel = sel.min(total.saturating_sub(1));
             let win = jetty_render::MAX_PALETTE_ROWS;
             let first = if sel >= win { sel + 1 - win } else { 0 };
-            let vis: Vec<(String, Vec<usize>, bool)> = hits
+            let vis: Vec<(String, Vec<usize>, bool, String)> = hits
                 .iter()
                 .enumerate()
                 .skip(first)
                 .take(win)
-                .map(|(i, h)| (h.title.clone(), h.indices.clone(), i == sel))
+                .map(|(i, h)| {
+                    let hint = jetty_app::palette::row_hint(&hints, &h.cmd);
+                    (h.title.clone(), h.indices.clone(), i == sel, hint)
+                })
                 .collect();
             let prows: Vec<jetty_render::PaletteRow> = vis
                 .iter()
-                .map(|(t, idx, s)| jetty_render::PaletteRow {
+                .map(|(t, idx, s, hint)| jetty_render::PaletteRow {
                     title: t,
                     match_indices: idx,
                     selected: *s,
+                    hint,
                 })
                 .collect();
             let pal = jetty_render::build_command_palette(
@@ -1851,7 +1867,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // JETTY_SHOT_CONFIRM — render the "Close this tab?" confirmation popup.
         if env_flag("JETTY_SHOT_CONFIRM") {
             let popup = jetty_render::build_confirm_close(
-                width, height, "Tab 2", terminal.theme(), &mut chrome_text, cm,
+                width, height, &sample_tab_title(2), terminal.theme(), &mut chrome_text, cm,
             );
             rects.extend(popup.quads);
             chrome_labels.extend(popup.labels);

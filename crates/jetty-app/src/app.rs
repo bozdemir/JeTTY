@@ -3914,7 +3914,12 @@ impl App {
         let (q, vis, total, first) = self.ov_of(s)?.palette_draw()?;
         let prows: Vec<jetty_render::PaletteRow> = vis
             .iter()
-            .map(|(t, idx, sel)| jetty_render::PaletteRow { title: t, match_indices: idx, selected: *sel })
+            .map(|(t, idx, sel, hint)| jetty_render::PaletteRow {
+                title: t,
+                match_indices: idx,
+                selected: *sel,
+                hint,
+            })
             .collect();
         let mut fallback = mono_fallback(cm);
         let m = measure_or(self.surface_chrome_text(s), &mut fallback);
@@ -5798,8 +5803,11 @@ impl App {
         // The backdrop rows, with the images in `<config dir>/backgrounds/`.
         let images = crate::backdrop::background_images(&crate::config::Config::dir());
         registry.extend(crate::palette::backdrop_entries(&images));
+        // Each row's live chord, resolved once now (no per-frame keymap work).
+        let hints = crate::palette::chord_hints(&self.keymap);
         let Some(ov) = self.ov_of_mut(s) else { return };
         ov.palette_registry = registry;
+        ov.palette_hints = hints;
         ov.palette_query.clear();
         ov.palette_open = true;
         ov.refilter_palette();
@@ -11993,7 +12001,12 @@ impl App {
         if let Some((q, prows_data, total, first)) = &palette_ui {
             let prows: Vec<jetty_render::PaletteRow> = prows_data
                 .iter()
-                .map(|(t, idx, sel)| jetty_render::PaletteRow { title: t, match_indices: idx, selected: *sel })
+                .map(|(t, idx, sel, hint)| jetty_render::PaletteRow {
+                    title: t,
+                    match_indices: idx,
+                    selected: *sel,
+                    hint,
+                })
                 .collect();
             let pal = jetty_render::build_command_palette(
                 width, height, &theme, &mut *chrome_text, cm, q, &prows, *total, *first,
@@ -16232,10 +16245,11 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some((q, prows_data, total, first)) = &palette_ui {
                         let prows: Vec<jetty_render::PaletteRow> = prows_data
                             .iter()
-                            .map(|(t, idx, sel)| jetty_render::PaletteRow {
+                            .map(|(t, idx, sel, hint)| jetty_render::PaletteRow {
                                 title: t,
                                 match_indices: idx,
                                 selected: *sel,
+                                hint,
                             })
                             .collect();
                         let pal = jetty_render::build_command_palette(

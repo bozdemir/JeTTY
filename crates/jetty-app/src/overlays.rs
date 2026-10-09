@@ -88,9 +88,9 @@ pub(crate) fn wheel_rows(delta: winit::event::MouseScrollDelta, row_px: f32) -> 
 }
 
 /// Owned command-palette draw data, captured before the render borrow:
-/// `(query, visible rows as (title, matched-char indices, selected), total,
-/// first_visible)`.
-pub(crate) type PaletteDrawData = (String, Vec<(String, Vec<usize>, bool)>, usize, usize);
+/// `(query, visible rows as (title, matched-char indices, selected, chord
+/// hint), total, first_visible)`.
+pub(crate) type PaletteDrawData = (String, Vec<(String, Vec<usize>, bool, String)>, usize, usize);
 
 /// Hint-mode overlay draw data captured before the mutable render borrow: the
 /// visible `(label, vp_row, col_start)` chips + the typed prefix.
@@ -156,6 +156,9 @@ pub(crate) struct Overlays {
     /// recomputed on each keystroke. Enter runs the stored command, never a
     /// stale index.
     pub palette_filtered: Vec<crate::palette::PaletteHit>,
+    /// The live chord of each bound action (`palette::chord_hints`), resolved
+    /// on open and shown on the rows that run one; dropped on close.
+    pub palette_hints: Vec<(crate::keymap::BindableAction, String)>,
     /// A live theme preview is on screen: the selection was navigated onto a
     /// `Theme: …` row (see [`Overlays::theme_preview_step`]). Ends by Enter on a
     /// theme row (kept) or any other close (the chosen theme comes back).
@@ -200,6 +203,7 @@ impl Overlays {
         self.palette_query.clear();
         self.palette_filtered = Vec::new();
         self.palette_registry = Vec::new();
+        self.palette_hints = Vec::new();
         self.palette_wheel_acc.reset();
         true
     }
@@ -318,8 +322,8 @@ impl Overlays {
         })
     }
 
-    /// Palette rows to draw: `(query, visible (title, matched indices, selected),
-    /// total, first_visible)`. `None` while closed.
+    /// Palette rows to draw: `(query, visible (title, matched indices, selected,
+    /// chord hint), total, first_visible)`. `None` while closed.
     pub fn palette_draw(&self) -> Option<PaletteDrawData> {
         if !self.palette_open {
             return None;
@@ -332,7 +336,10 @@ impl Overlays {
             .enumerate()
             .skip(first)
             .take(jetty_render::MAX_PALETTE_ROWS)
-            .map(|(i, h)| (h.title.clone(), h.indices.clone(), i == sel))
+            .map(|(i, h)| {
+                let hint = crate::palette::row_hint(&self.palette_hints, &h.cmd);
+                (h.title.clone(), h.indices.clone(), i == sel, hint)
+            })
             .collect();
         Some((self.palette_query.clone(), rows, self.palette_filtered.len(), first))
     }

@@ -222,6 +222,59 @@ pub struct PaletteEntry {
     pub cmd: PaletteCmd,
 }
 
+/// The bindable action palette command `cmd` runs, when it has one: its row
+/// shows that action's live chord, so the palette teaches the faster way.
+pub fn cmd_action(cmd: &PaletteCmd) -> Option<crate::keymap::BindableAction> {
+    use crate::keymap::BindableAction as A;
+    use PaletteCmd as C;
+    Some(match cmd {
+        C::NewTab => A::NewTab,
+        C::CloseTab => A::CloseTab,
+        C::NextTab => A::NextTab,
+        C::PrevTab => A::PrevTab,
+        C::DetachTab => A::DetachTab,
+        C::OpenSettings => A::ToggleSettings,
+        C::FontUp => A::FontUp,
+        C::FontDown => A::FontDown,
+        C::FontReset => A::FontReset,
+        C::OpacityUp => A::OpacityUp,
+        C::OpacityDown => A::OpacityDown,
+        C::Search => A::SearchToggle,
+        C::HintMode => A::HintMode,
+        C::CopyMode => A::CopyMode,
+        C::RunSelection => A::RunSelection,
+        C::PrevPrompt => A::PrevPrompt,
+        C::NextPrompt => A::NextPrompt,
+        C::Copy => A::Copy,
+        C::Paste => A::Paste,
+        C::ContextMenu => A::ContextMenu,
+        C::ToggleFullscreen => A::ToggleFullscreen,
+        C::Quit => A::Quit,
+        C::NextTheme => A::NextTheme,
+        C::PrevTheme => A::PrevTheme,
+        _ => return None,
+    })
+}
+
+/// The live chord of every bound action, in the menus' compact form
+/// (`KeyMap::menu_hint`: "⇧⌃T", "⌘T") — resolved once as the palette opens,
+/// so a `[keys]` remap or unbind shows on its rows too.
+pub fn chord_hints(km: &crate::keymap::KeyMap) -> Vec<(crate::keymap::BindableAction, String)> {
+    crate::keymap::BindableAction::ALL
+        .iter()
+        .map(|&a| (a, km.menu_hint(a)))
+        .filter(|(_, hint)| !hint.is_empty())
+        .collect()
+}
+
+/// The chord hint shown on `cmd`'s row (from [`chord_hints`]); "" when the
+/// command has no action or the action no chord.
+pub fn row_hint(hints: &[(crate::keymap::BindableAction, String)], cmd: &PaletteCmd) -> String {
+    cmd_action(cmd)
+        .and_then(|a| hints.iter().find(|(b, _)| *b == a))
+        .map_or_else(String::new, |(_, hint)| hint.clone())
+}
+
 /// A filtered result: the (owned) title, the matched TITLE character indices for
 /// the highlight, and the resolved command to run on Enter.
 #[derive(Clone)]
@@ -694,6 +747,36 @@ mod tests {
         assert_eq!(hits[0].cmd, PaletteCmd::ToggleFollowSystemTheme);
         assert_eq!(hits[1].cmd, PaletteCmd::SettingsAt("follow_system_theme"));
         assert!(r.iter().any(|e| e.title == "Settings › Effects › Bloom"));
+    }
+
+    /// Rows that run a bindable action show its LIVE chord — remapped or
+    /// unbound ones included — and the rest show none.
+    #[test]
+    fn rows_show_their_live_chord() {
+        use crate::config::{ChordSpec, KeyBindings};
+        let defaults = chord_hints(&crate::keymap::KeyMap::defaults());
+        let hint = |hints: &[_], cmd: PaletteCmd| row_hint(hints, &cmd);
+        assert_eq!(hint(&defaults, PaletteCmd::NewTab), crate::keymap::KeyMap::defaults().menu_hint(
+            crate::keymap::BindableAction::NewTab,
+        ));
+        assert!(!hint(&defaults, PaletteCmd::Search).is_empty());
+        assert_eq!(hint(&defaults, PaletteCmd::ToggleCrt), "", "no action, no chord");
+        assert_eq!(hint(&defaults, PaletteCmd::NextTheme), "", "no default chord");
+        let km = crate::keymap::KeyMap::compile(&KeyBindings {
+            search_toggle: Some(ChordSpec::One(String::new())),
+            next_theme: Some(ChordSpec::One("Ctrl+Alt+T".into())),
+            ..Default::default()
+        });
+        let live = chord_hints(&km);
+        assert_eq!(hint(&live, PaletteCmd::Search), "", "unbound");
+        assert_eq!(hint(&live, PaletteCmd::NextTheme), km.menu_hint(crate::keymap::BindableAction::NextTheme));
+        assert!(!hint(&live, PaletteCmd::NextTheme).is_empty());
+        // Every command a chord can run maps to its own action.
+        for e in reg() {
+            if let Some(a) = cmd_action(&e.cmd) {
+                assert!(crate::keymap::BindableAction::ALL.contains(&a), "{:?}", e.cmd);
+            }
+        }
     }
 
     #[test]

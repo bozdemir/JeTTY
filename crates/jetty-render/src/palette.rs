@@ -15,12 +15,20 @@ pub fn palette_row_h(cm: ChromeMetrics) -> f32 {
 
 /// One result row handed to [`build_command_palette`]: a (possibly already
 /// tail/head-truncated) title, the matched CHARACTER indices into that title
-/// (for the accent highlight), and whether it is the selected row.
+/// (for the accent highlight), whether it is the selected row, and the
+/// command's live shortcut ("" for none — drawn right-aligned and dimmed,
+/// like a menu's).
 pub struct PaletteRow<'a> {
     pub title: &'a str,
     pub match_indices: &'a [usize],
     pub selected: bool,
+    pub hint: &'a str,
 }
+
+/// The widest a row's shortcut hint may be, as a share of the content width:
+/// past it (a narrow window, a long chord) the hint is dropped so the title
+/// keeps its room.
+const HINT_MAX_SHARE: f32 = 0.4;
 
 /// Geometry + draw data for the command-palette overlay.
 pub struct CommandPalette {
@@ -74,6 +82,10 @@ pub fn build_command_palette(
     let accent = ui.accent;
     let accent_on_sel = ensure_contrast(ui.accent, &[ui.surface_hi], UiPalette::ACCENT_FLOOR);
     let row_selected_col = ui.text;
+    // Shortcut hints: the menus' dim hint color, lifted on the selected row's
+    // raised fill where it would be faint there.
+    let hint_col = ui.text_hint;
+    let hint_on_sel = ensure_contrast(ui.text_hint, &[ui.surface_hi], UiPalette::HINT_FLOOR);
     let caret_col = rgba(ui.text, 255);
     let thumb_col = rgba(ui.text_hint, 255);
 
@@ -185,9 +197,20 @@ pub fn build_command_palette(
             quads.push(Rect::rounded(sel_x, row_top, sel_w, row_h, sel_bg, cm.px(6.0)));
         }
 
-        // Head-truncate the title to the content width (append … when it overflows),
+        // The command's shortcut, right-aligned against the right padding (the
+        // counter's edge) by its MEASURED width — the ⇧ ⌃ ⌘ glyphs are not one
+        // cell each; the title truncates before it.
+        let hint_w = if row.hint.is_empty() { 0.0 } else { m.text_w(row.hint) };
+        let show_hint = hint_w > 0.0 && hint_w + gap <= content_w * HINT_MAX_SHARE;
+        let title_w = if show_hint { content_w - hint_w - gap } else { content_w };
+        if show_hint {
+            let col = if row.selected { hint_on_sel } else { hint_col };
+            labels.push((row.hint.to_string(), text_x + content_w - hint_w, row_text_y, col));
+        }
+
+        // Head-truncate the title to its width (append … when it overflows),
         // and keep only the matched indices that survive inside the visible head.
-        let shown_title = fit_head(m, row.title, content_w, false);
+        let shown_title = fit_head(m, row.title, title_w, false);
         let kept = if shown_title == row.title {
             shown_title.chars().count()
         } else {
@@ -267,7 +290,7 @@ mod tests {
         titles
             .iter()
             .enumerate()
-            .map(|(i, t)| PaletteRow { title: t.as_str(), match_indices: &[], selected: i == sel })
+            .map(|(i, t)| PaletteRow { title: t.as_str(), match_indices: &[], selected: i == sel, hint: "" })
             .collect()
     }
 
@@ -280,7 +303,10 @@ mod tests {
             "Toggle performance HUD".into(),
         ];
         for w in [320u32, 500, 700, 1000, 1600] {
-            let rows = sample_rows(&titles, 0);
+            let mut rows = sample_rows(&titles, 0);
+            for r in &mut rows {
+                r.hint = "⇧⌃T";
+            }
             let p = build_command_palette(w, 700, &theme(), &mut mono(), CM, "the", &rows, 4, 0);
             assert!(p.panel.x >= 0.0 && p.panel.y >= 0.0, "panel off-screen at {w}");
             assert!(p.panel.x + p.panel.w <= w as f32 + 0.5, "panel exceeds width at {w}");
@@ -316,7 +342,7 @@ mod tests {
         // With NO selection: none.
         let rows: Vec<PaletteRow> = titles
             .iter()
-            .map(|t| PaletteRow { title: t, match_indices: &[], selected: false })
+            .map(|t| PaletteRow { title: t, match_indices: &[], selected: false, hint: "" })
             .collect();
         let p = build_command_palette(1000, 700, &theme(), &mut mono(), CM, "", &rows, 3, 0);
         assert_eq!(p.quads.iter().filter(|q| q.radius == 6.0).count(), 0);
@@ -365,7 +391,7 @@ mod tests {
         // caret right after the typed "> ml" (8+4+14+4 = 30) + 2.
         let title = "Mail list".to_string();
         let idx = vec![0usize, 3, 5];
-        let rows = vec![PaletteRow { title: &title, match_indices: &idx, selected: true }];
+        let rows = vec![PaletteRow { title: &title, match_indices: &idx, selected: true, hint: "" }];
         let p = build_command_palette(1000, 700, &theme(), &mut PropMeasure, CM, "ml", &rows, 1, 0);
         let ui = UiPalette::from_theme(&theme());
         let accent = ensure_contrast(ui.accent, &[ui.surface_hi], UiPalette::ACCENT_FLOOR);
@@ -384,7 +410,7 @@ mod tests {
         // must sit at text_x + the measured prefix width (monospace here).
         let title = "New tab".to_string();
         let indices = vec![0usize, 4usize];
-        let rows = vec![PaletteRow { title: &title, match_indices: &indices, selected: true }];
+        let rows = vec![PaletteRow { title: &title, match_indices: &indices, selected: true, hint: "" }];
         let p = build_command_palette(1000, 700, &theme(), &mut mono(), CM, "nt", &rows, 1, 0);
         let ui = UiPalette::from_theme(&theme());
         let accent = ensure_contrast(ui.accent, &[ui.surface_hi], UiPalette::ACCENT_FLOOR);
@@ -409,8 +435,8 @@ mod tests {
         for i in 0..jetty_core::theme::PRESETS.len() {
             let t = jetty_core::theme::theme_at(i);
             let rows = vec![
-                PaletteRow { title: &titles[0], match_indices: &i0, selected: true },
-                PaletteRow { title: &titles[1], match_indices: &i1, selected: false },
+                PaletteRow { title: &titles[0], match_indices: &i0, selected: true, hint: "⇧⌃T" },
+                PaletteRow { title: &titles[1], match_indices: &i1, selected: false, hint: "⇧⌃T" },
             ];
             let p = build_command_palette(1000, 700, &t, &mut mono(), CM, "", &rows, 2, 0);
             let card = rgb(p.panel.color);
@@ -429,12 +455,33 @@ mod tests {
         }
     }
 
+    /// A row's shortcut sits right-aligned at the counter's edge, dimmed like a
+    /// menu's, and a long title truncates before it; a box too narrow for both
+    /// drops the hint so the title keeps the row.
+    #[test]
+    fn a_row_shortcut_is_right_aligned_and_the_title_yields_to_it() {
+        let long = "Detach tab to new window, a title much longer than the box".to_string();
+        let rows = vec![PaletteRow { title: &long, match_indices: &[], selected: false, hint: "⇧⌃D" }];
+        let p = build_command_palette(700, 700, &theme(), &mut mono(), CM, "", &rows, 1, 0);
+        let right = |l: &(String, f32, f32, [u8; 3])| l.1 + mono().text_w(&l.0);
+        let hint = p.labels.iter().find(|l| l.0 == "⇧⌃D").expect("hint label");
+        let title = p.labels.iter().find(|l| l.0.starts_with("Detach")).expect("title label");
+        let counter = p.labels.iter().find(|l| l.0 == "1 result").expect("counter");
+        assert!((right(hint) - right(counter)).abs() < 0.01, "flush with the counter");
+        assert!(title.0.ends_with('…'), "the long title truncates: {:?}", title.0);
+        assert!(right(title) <= hint.1, "the title stops before the hint");
+        assert_eq!(hint.3, UiPalette::from_theme(&theme()).text_hint);
+        let p = build_command_palette(100, 700, &theme(), &mut mono(), CM, "", &rows, 1, 0);
+        assert!(!p.labels.iter().any(|l| l.0 == "⇧⌃D"), "no room: no hint");
+        assert!(p.labels.iter().any(|l| l.0.starts_with('D')), "the title keeps the row");
+    }
+
     #[test]
     fn long_title_head_truncated_with_ellipsis_inside_panel() {
         // A very long title on a narrow window must be head-truncated with '…'
         // and still fit inside the panel.
         let long = "This is an extremely long command title that will not fit".to_string();
-        let rows = vec![PaletteRow { title: &long, match_indices: &[], selected: false }];
+        let rows = vec![PaletteRow { title: &long, match_indices: &[], selected: false, hint: "" }];
         let p = build_command_palette(360, 700, &theme(), &mut mono(), CM, "", &rows, 1, 0);
         let row_label = p.labels.iter().find(|l| l.0.contains('…')).expect("ellipsis title");
         let est_right = row_label.1 + mono().text_w(&row_label.0);
