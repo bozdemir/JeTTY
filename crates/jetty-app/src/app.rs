@@ -1150,6 +1150,10 @@ pub struct App {
     settings_list_wheel: input::ScrollAccumulator,
     /// The Settings keyboard focus (Tab / Shift+Tab; see `settings_ui::nav`).
     settings_kb: Option<crate::settings_ui::Stop>,
+    /// `settings_kb` came from a click: it takes the keys (the arrows work the
+    /// control just clicked) but its band and ring stay hidden until a key is
+    /// used, as a toolkit shows focus only to keyboard users.
+    settings_kb_quiet: bool,
     /// The Settings scrollbar thumb is being dragged: where it was grabbed
     /// (pointer y − thumb top, physical px).
     settings_scroll_grab: Option<f32>,
@@ -2085,6 +2089,7 @@ impl App {
             ctl_drag: None,
             settings_list_wheel: input::ScrollAccumulator::new(),
             settings_kb: None,
+            settings_kb_quiet: false,
             settings_scroll_grab: None,
             settings_hover: None,
             settings_focus: None,
@@ -9866,9 +9871,11 @@ impl App {
         inp.theme_idx = self.theme_idx;
         inp.filter = self.gallery_filter;
         inp.hover = self.settings_hover;
-        // A deep link's band, else the keyboard focus (its band and ring).
-        inp.focus = self.settings_focus.or(self.settings_kb.and_then(|s| s.band()));
-        inp.focus_part = self.settings_kb.and_then(|s| crate::settings_ui::focus_ring(s, &items, self.theme_idx));
+        // A deep link's band, else the keyboard focus (its band and ring) —
+        // none for a click's until a key is used.
+        let kb = self.settings_kb.filter(|_| !self.settings_kb_quiet);
+        inp.focus = self.settings_focus.or(kb.and_then(|s| s.band()));
+        inp.focus_part = kb.and_then(|s| crate::settings_ui::focus_ring(s, &items, self.theme_idx));
         inp.ui_font_size = self.ui_font_logical;
         inp.reset = reset;
         inp.footer_hint = footer;
@@ -10324,6 +10331,10 @@ impl App {
         if repeat && !sui::repeats(&nav) {
             return true;
         }
+        // A key that acts on a click's quiet focus shows it.
+        if !matches!(nav, Nav::Pass) {
+            self.settings_kb_quiet = false;
+        }
         // Anything but "Reset tab" itself disarms it (as any other click does).
         if !matches!(nav, Nav::Pass | Nav::ResetTab) {
             self.reset_armed = false;
@@ -10452,6 +10463,7 @@ impl App {
             let st = stops(&tab_items(tab, &cfg, &self.settings_ctx()));
             stop_of(&st, id).or_else(|| stop_of(&st, target))
         };
+        self.settings_kb_quiet = false;
         let margin = 12.0 * self.settings_metrics().overlay_u();
         if let Some(pv) = self.settings_view_now() {
             if let Some((top, _)) = pv.geom.anchor(target) {
@@ -12225,9 +12237,21 @@ impl App {
         action: input::MouseAction,
         geom: &jetty_render::PanelGeom,
     ) {
+        use crate::settings_ui::{stop_for, Stop};
         use input::MouseAction as A;
-        // Any press ends a deep-link highlight and the keyboard focus, and
-        // disarms "Reset tab" unless it IS the second click on it.
+        // Any press ends a deep-link highlight, and disarms "Reset tab" unless
+        // it IS the second click on it. The keyboard focus follows the press:
+        // the control (or card, filter, section, "Reset tab") pressed takes the
+        // keys — the arrows then work it, where they used to scroll, or on the
+        // Look tab browse and save themes — any other press drops it.
+        let pressed = match &action {
+            A::Ctl { id, part } => Some(stop_for(id, *part)),
+            A::SettingsSection(id) => Some(Stop::Section(id)),
+            A::GalleryCard(_) => Some(Stop::Gallery),
+            A::GalleryFilter(f) => Some(Stop::Filter(*f)),
+            A::ResetTab => Some(Stop::ResetTab),
+            _ => None,
+        };
         self.settings_focus = None;
         self.settings_kb = None;
         if action != A::ResetTab {
@@ -12278,7 +12302,20 @@ impl App {
             | A::ScrollbarTrackJump
             | A::None => {}
         }
+        // Only a stop the tab still has once the press applied (a disabled row
+        // has none, nor "Reset tab" back at the defaults). Quiet: its band and
+        // ring show once a key is used.
+        self.settings_kb = pressed.filter(|s| self.settings_tab_stops().contains(s));
+        self.settings_kb_quiet = true;
         self.request_settings_paint();
+    }
+
+    /// The focus stops of the Settings tab shown, as they are now.
+    fn settings_tab_stops(&self) -> Vec<crate::settings_ui::Stop> {
+        use crate::settings_ui as sui;
+        let cfg = self.settings_snapshot();
+        let tab = self.settings_tab.min(jetty_render::N_TABS - 1);
+        sui::tab_stops(&sui::tab_items(tab, &cfg, &self.settings_ctx()), !sui::tab_at_defaults(&cfg, tab))
     }
 
     /// Handle a `WindowEvent` that belongs to the settings window. Hit-testing

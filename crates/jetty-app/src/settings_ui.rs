@@ -2398,6 +2398,19 @@ pub fn stop_of(stops: &[Stop], id: &str) -> Option<Stop> {
     })
 }
 
+/// The focus stop of part `part` of control `id` — where a click on it leaves
+/// the keyboard: a cycler's "<" is its ">" stop, a stepper's "-" its "+", a
+/// list's rows and scroll buttons the list. (Whether the tab has that stop is
+/// the caller's check: a disabled row has none.)
+pub fn stop_for(id: CtlId, part: CtlPart) -> Stop {
+    match part {
+        CtlPart::Prev | CtlPart::Next => Stop::Part(id, CtlPart::Next),
+        CtlPart::Minus | CtlPart::Plus => Stop::Part(id, CtlPart::Plus),
+        CtlPart::Row(_) | CtlPart::ScrollUp | CtlPart::ScrollDown => Stop::List(id),
+        p => Stop::Part(id, p),
+    }
+}
+
 /// The first visible row of a `rows`-row list (`len` items, first visible
 /// `offset`) after selecting row `i`: unchanged when `i` is in view, else
 /// moved just enough to show it.
@@ -3344,6 +3357,28 @@ mod tests {
         let master = Stop::Part("notify_on_command_finish", CtlPart::Switch);
         assert_eq!(stop_of(&shell, "notify_on_command_finish"), Some(master));
         assert_eq!(stop_of(&stops(&tab_items(WINDOW, &c, &x)), "dropdown_height_pct"), None);
+    }
+
+    #[test]
+    fn a_click_leaves_the_keyboard_on_the_part_it_pressed() {
+        // Every part a stop rings, pressed with the mouse, lands back on that
+        // stop — so the arrows work the control just clicked.
+        let (mono, ui) = fonts();
+        let x = ctx(&mono, &ui);
+        let c = Config { font_family: "Hack".into(), ..Config::default() };
+        for tab in 0..jetty_render::N_TABS {
+            let items = tab_items(tab, &c, &x);
+            for stop in stops(&items) {
+                if let Some(PanelHit::Ctl { id, part }) = focus_ring(stop, &items, 0) {
+                    assert_eq!(stop_for(id, part), stop, "tab {tab}: a click on {id}/{part:?}");
+                }
+            }
+        }
+        // The other parts of a control land on its one stop.
+        assert_eq!(stop_for("scrollback_lines", CtlPart::Prev), Stop::Part("scrollback_lines", CtlPart::Next));
+        assert_eq!(stop_for("font_size", CtlPart::Minus), Stop::Part("font_size", CtlPart::Plus));
+        assert_eq!(stop_for("font_family", CtlPart::ScrollDown), Stop::List("font_family"));
+        assert_eq!(stop_for("font_family", CtlPart::Row(5)), Stop::List("font_family"));
     }
 
     #[test]
