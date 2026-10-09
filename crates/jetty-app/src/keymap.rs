@@ -1217,7 +1217,9 @@ fn keycode_word(code: KeyCode) -> &'static str {
         End => "End", PageUp => "PageUp", PageDown => "PageDown",
         ArrowUp => "Up", ArrowDown => "Down", ArrowLeft => "Left", ArrowRight => "Right",
         F1 => "F1", F2 => "F2", F3 => "F3", F4 => "F4", F5 => "F5", F6 => "F6", F7 => "F7",
-        F8 => "F8", F9 => "F9", F10 => "F10", F11 => "F11", F12 => "F12",
+        F8 => "F8", F9 => "F9", F10 => "F10", F11 => "F11", F12 => "F12", F13 => "F13",
+        F14 => "F14", F15 => "F15", F16 => "F16", F17 => "F17", F18 => "F18", F19 => "F19",
+        F20 => "F20", F21 => "F21", F22 => "F22", F23 => "F23", F24 => "F24",
         _ => "Unknown",
     }
 }
@@ -1445,6 +1447,30 @@ mod tests {
         assert!(
             !km.warnings().iter().any(|w| w.contains("modifier")),
             "bare F5 should be accepted"
+        );
+    }
+
+    #[test]
+    fn every_bindable_fkey_is_named_in_the_help_and_the_menus() {
+        // F13–F24 parse and bind like F1–F12 (Apple keyboards have F13–F19;
+        // remappers emit them), so the help overlay, the menu hints and the
+        // conflict warnings must name them — they printed "Unknown".
+        for n in 1..=24 {
+            let chord = format!("Ctrl+F{n}");
+            let km = km_with(|b| b.next_theme = Some(ChordSpec::One(chord.clone())));
+            assert!(km.warnings().is_empty(), "{chord}: {:?}", km.warnings());
+            assert_eq!(km.pretty_chords(BindableAction::NextTheme), vec![chord.clone()]);
+            assert_eq!(km.menu_hint(BindableAction::NextTheme), format!("⌃F{n}"));
+            assert_eq!(parse_chord(&chord).unwrap().canonical(), chord);
+        }
+        let km = km_with(|b| {
+            b.next_theme = Some(ChordSpec::One("F13".into()));
+            b.prev_theme = Some(ChordSpec::One("F13".into()));
+        });
+        assert!(
+            km.warnings().iter().any(|w| w.contains("(none)+F13")),
+            "the conflict names the key: {:?}",
+            km.warnings()
         );
     }
 
