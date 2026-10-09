@@ -6002,8 +6002,9 @@ impl App {
         }
     }
 
-    /// An IME commit while one of window `s`'s overlays owns its keyboard: hint
-    /// mode / copy-mode DROP it (a CJK IME routes even Latin letters through
+    /// An IME commit (or a dropped file's path — typed text all the same)
+    /// while one of window `s`'s overlays owns its keyboard: hint mode /
+    /// copy-mode DROP it (a CJK IME routes even Latin letters through
     /// commits, which must neither leak to the shell behind the overlay nor
     /// silently fail the mode's own keys — BLOCKING 1); the palette and the
     /// search bar take it into their query (CJK queries). Returns whether the
@@ -11172,10 +11173,17 @@ impl App {
                 }
             }
             WindowEvent::DroppedFile(path) => {
-                // A file dropped on this window types its shell-quoted path into
-                // its tab (through the sanitizing paste path, like main).
+                // A file dropped on this window types its shell-quoted path: this
+                // window's overlays take it first (palette / search queries;
+                // hint/copy-mode drop it), else its tab gets it through the
+                // sanitizing paste path — the main window's order.
+                let s = Surface::Detached(pos);
+                let text = crate::gridmouse::dropped_path_text(&path);
+                self.dismiss_surface_menus(s);
+                if self.overlay_ime_commit(s, &text) {
+                    return;
+                }
                 if let Some(dw) = self.detached.get_mut(pos) {
-                    let text = crate::gridmouse::dropped_path_text(&path);
                     if Self::paste_to_tab(&mut dw.tab, &text) {
                         dw.request_paint();
                     }
@@ -14565,11 +14573,23 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::DroppedFile(path) => {
-                // A file dropped on the terminal types its shell-quoted path into
-                // the active tab (through the paste path: sanitized, bracketed
-                // when the program asked for it).
-                if !self.tabs.is_empty() {
-                    let text = crate::gridmouse::dropped_path_text(&path);
+                // A file dropped on the terminal types its shell-quoted path, so
+                // it meets the keyboard's owner as typed text does (the IME
+                // commit's order): nothing lands behind a confirmation or the
+                // rename box, the palette / search query take it, hint mode /
+                // copy-mode drop it (a paste would scroll the view out from
+                // under copy-mode) — else it goes to the active tab through the
+                // paste path (sanitized, bracketed when the program asked).
+                if self.tabs.is_empty()
+                    || self.confirm_quit
+                    || self.confirm_close.is_some()
+                    || self.renaming.is_some()
+                {
+                    return;
+                }
+                let text = crate::gridmouse::dropped_path_text(&path);
+                self.dismiss_surface_menus(Surface::Main);
+                if !self.overlay_ime_commit(Surface::Main, &text) {
                     self.paste_text(&text);
                 }
             }
