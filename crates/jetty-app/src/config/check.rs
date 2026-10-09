@@ -720,8 +720,11 @@ pub(crate) fn problems_in(dir: &std::path::Path, fonts: impl FnOnce() -> (Vec<St
     let (mono, others) = fonts();
     out.extend(pick_font_family(&cfg.font_family, &mono, || others.clone()).warning);
     out.extend(pick_ui_font_family(&cfg.ui_font_family, || others.iter().chain(&mono).cloned().collect()).warning);
-    if let Err(e) = global_hotkey::hotkey::HotKey::from_str(&cfg.summon_hotkey) {
-        out.push(format!("summon_hotkey {:?} is invalid ({e}) — F9 is used", cfg.summon_hotkey));
+    // `"none"` / `""`: no built-in grab, not a key.
+    if !crate::config::summon_hotkey_off(&cfg.summon_hotkey) {
+        if let Err(e) = global_hotkey::hotkey::HotKey::from_str(&cfg.summon_hotkey) {
+            out.push(format!("summon_hotkey {:?} is invalid ({e}) — F9 is used", cfg.summon_hotkey));
+        }
     }
     out.extend(crate::keymap::KeyMap::compile(&cfg.keys).warnings().iter().map(|w| format!("[keys] {w}")));
     if cfg.hot_reload {
@@ -962,6 +965,11 @@ mod tests {
         std::fs::write(dir.join("config.toml"), "theme = \"nord\"\n").unwrap();
         std::fs::remove_file(dir.join("themes").join("bad.toml")).unwrap();
         assert_eq!(problems_in(&dir, fonts), Vec::<String>::new());
+        // No built-in grab is a setting, not a bad key.
+        for off in ["none", "None", ""] {
+            std::fs::write(dir.join("config.toml"), format!("summon_hotkey = {off:?}\n")).unwrap();
+            assert_eq!(problems_in(&dir, fonts), Vec::<String>::new(), "{off:?}");
+        }
         jetty_core::set_registry(Vec::new());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -2607,13 +2607,16 @@ impl App {
     /// The global key the help names for summoning JeTTY: the one the grab was
     /// registered with (an edited `summon_hotkey` applies after a restart) —
     /// before the grab, the one it will be, F9 for an invalid value — and none
-    /// on a Wayland session, where a compositor shortcut is the global key.
+    /// on a Wayland session or with `summon_hotkey = "none"`, where a shortcut
+    /// running `jetty --toggle` is the global key.
     fn summon_key_shown(&self) -> Option<String> {
         if wayland_session() {
             return None;
         }
         let registered = self.summon_hotkey_registered.as_deref();
-        Some(registered.unwrap_or_else(|| summon_hotkey_name(&self.summon_hotkey)).to_string())
+        let key = registered.unwrap_or_else(|| summon_hotkey_name(&self.summon_hotkey));
+        // `summon_hotkey = "none"`: a shortcut bound to `jetty --toggle`, as on Wayland.
+        (!crate::config::summon_hotkey_off(key)).then(|| key.to_string())
     }
 
     /// The Settings / palette "Launch at login" toggle: write or remove the login
@@ -2971,7 +2974,21 @@ impl App {
     /// to the event loop as `ToggleVisibility`. An invalid hotkey string falls back
     /// to F9 and a registration failure is reported in-app — except where it is the
     /// expected state (a Wayland session, which binds `jetty --toggle` instead).
+    /// No grab at all with `summon_hotkey = "none"`, nor for a Wayland window.
     fn start_summon_hotkey(&mut self) {
+        // A Wayland window is summoned through the compositor's binding of
+        // `jetty --toggle`: an X11 grab would reach JeTTY through XWayland,
+        // taking the key from the X11 apps only (an IDE's F9) and doing nothing
+        // in native ones — and start an on-demand XWayland to do it.
+        let wayland = self
+            .window
+            .as_deref()
+            .is_some_and(|w| jetty_platform::hide_kind(w) == jetty_platform::HideKind::Close);
+        if wayland || crate::config::summon_hotkey_off(&self.summon_hotkey) {
+            // What a reload's notice compares against.
+            self.summon_hotkey_registered = Some(self.summon_hotkey.clone());
+            return;
+        }
         let proxy = self.proxy.clone();
         // global_hotkey's own parser ("F9", "F12", "Ctrl+Shift+F12").
         let hotkey = match summon_hotkey_key(&self.summon_hotkey) {
@@ -18175,14 +18192,15 @@ fn summon_hotkey_key(spec: &str) -> Result<global_hotkey::hotkey::HotKey, String
 }
 
 /// How the help and the notices name the key a `summon_hotkey` value grabs:
-/// the value itself, or F9 for one that names no key.
+/// the value itself — `"none"` grabs none — or F9 for one that names no key.
 fn summon_hotkey_name(spec: &str) -> &str {
-    if summon_hotkey_key(spec).is_ok() { spec } else { "F9" }
+    if summon_hotkey_key(spec).is_ok() || crate::config::summon_hotkey_off(spec) { spec } else { "F9" }
 }
 
 /// A Wayland session: apps can't grab keys there (by design), so a global
-/// summon key is a compositor shortcut running `jetty --toggle`. The grab
-/// JeTTY still makes reaches only the X11 apps (XWayland).
+/// summon key is a compositor shortcut running `jetty --toggle`. JeTTY makes
+/// no grab for a Wayland window (through XWayland it would reach only the X11
+/// apps); one running as an X11 client still grabs.
 fn wayland_session() -> bool {
     !cfg!(target_os = "macos")
         && (std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
@@ -18192,21 +18210,26 @@ fn wayland_session() -> bool {
 /// The notice for a reloaded `summon_hotkey = new` (the global grab is
 /// registered once, so it applies after a restart): `Some` when `new` differs
 /// from the live value (said once) and grabs another key than the one
-/// `registered` (its name, F9 after an invalid value) — or names no key at all.
-/// On a Wayland session it points at the compositor shortcut instead: the grab
-/// summons JeTTY from X11 apps only.
+/// `registered` (its name, F9 after an invalid value) — or names no key at all
+/// (`"none"`, no grab, is a setting like a key). On a Wayland session it
+/// points at the compositor shortcut instead: JeTTY grabs no key there.
 fn summon_hotkey_restart_note(new: &str, live: &str, registered: Option<&str>, wayland: bool) -> Option<String> {
     let registered = registered.filter(|_| new != live)?;
     if wayland {
         return Some(format!("summon_hotkey = {new:?}: on Wayland, bind `jetty --toggle` in your compositor instead"));
     }
-    let Ok(key) = summon_hotkey_key(new) else {
-        return Some(format!("summon_hotkey {new:?} is invalid — {registered:?} summons JeTTY"));
+    let off = crate::config::summon_hotkey_off;
+    // What summons JeTTY until the restart.
+    let now = if off(registered) { "no key".to_string() } else { format!("{registered:?}") };
+    let same = if off(new) {
+        off(registered)
+    } else {
+        let Ok(key) = summon_hotkey_key(new) else {
+            return Some(format!("summon_hotkey {new:?} is invalid — {now} summons JeTTY"));
+        };
+        summon_hotkey_key(registered).is_ok_and(|r| r == key)
     };
-    if summon_hotkey_key(registered).is_ok_and(|r| r == key) {
-        return None;
-    }
-    Some(format!("summon_hotkey = {new:?} takes effect after a restart — {registered:?} summons JeTTY until then"))
+    (!same).then(|| format!("summon_hotkey = {new:?} takes effect after a restart — {now} summons JeTTY until then"))
 }
 
 fn theme_missing_warning(name: &str, shown: &str) -> String {
@@ -19633,7 +19656,22 @@ mod summon_hotkey_note_tests {
         assert_eq!(super::summon_hotkey_name("F12"), "F12");
         assert_eq!(super::summon_hotkey_name("Ctrl+Shift+F12"), "Ctrl+Shift+F12");
         assert_eq!(super::summon_hotkey_name("Ctrl+Nope"), "F9");
-        assert_eq!(super::summon_hotkey_name(""), "F9");
+        // `none` / `""` grab nothing — no F9 either.
+        assert_eq!(super::summon_hotkey_name("none"), "none");
+        assert_eq!(super::summon_hotkey_name(""), "");
+    }
+
+    #[test]
+    fn turning_the_grab_off_or_on_needs_a_restart_too() {
+        let n = note("none", "F9", Some("F9"), false).expect("a notice");
+        assert!(n.contains("\"none\" takes effect after a restart") && n.contains("\"F9\" summons"), "{n}");
+        let n = note("F12", "none", Some("none"), false).expect("a notice");
+        assert!(n.contains("\"F12\" takes effect after a restart — no key summons JeTTY"), "{n}");
+        // Still off, however it is spelled: nothing to restart for.
+        assert_eq!(note("NONE", "none", Some("none"), false), None);
+        assert_eq!(note("", "none", Some("none"), false), None);
+        let n = note("Ctrl+Nope", "none", Some("none"), false).expect("a notice");
+        assert!(n.contains("is invalid — no key summons JeTTY"), "{n}");
     }
 }
 

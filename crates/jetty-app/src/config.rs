@@ -149,7 +149,10 @@ pub struct Config {
     #[serde(default = "default_launch_at_login")]
     pub launch_at_login: bool,
     /// Global summon hotkey, e.g. "F9" (default), "F12", or "Ctrl+Shift+F12".
-    /// Parsed by `global_hotkey`'s `HotKey::from_str`. Config-only (no panel UI).
+    /// Parsed by `global_hotkey`'s `HotKey::from_str`. `"none"` (or `""`) grabs
+    /// no key: a key bound to `jetty --toggle` summons JeTTY instead — as on
+    /// Wayland, where JeTTY grabs none ([`summon_hotkey_off`]). Config-only (no
+    /// panel UI).
     #[serde(default = "default_summon_hotkey")]
     pub summon_hotkey: String,
     /// Shell to launch. Empty (default) = auto-detect: `$SHELL`, then the
@@ -585,6 +588,15 @@ fn default_launch_at_login() -> bool {
 
 fn default_summon_hotkey() -> String {
     "F9".to_string()
+}
+
+/// Whether `summon_hotkey = spec` turns the built-in grab off: `"none"` (any
+/// case) or empty — as `""` unbinds an action in `[keys]`. The X11 grab takes
+/// its key from every other app (htop's F9, an IDE's debugger), so a user who
+/// binds `jetty --toggle` in the window manager can give it back.
+pub(crate) fn summon_hotkey_off(spec: &str) -> bool {
+    let spec = spec.trim();
+    spec.is_empty() || spec.eq_ignore_ascii_case("none")
 }
 
 fn default_tab_bar_position() -> String {
