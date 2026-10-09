@@ -15796,9 +15796,6 @@ impl ApplicationHandler<AppEvent> for App {
                 // its fallback paint is no longer owed; the caret burst may now
                 // pump frames (`caret_drives_frames`).
                 self.key_paint_due = None;
-                // Auto-exit hint/copy-mode if a program switched to the alt screen
-                // while a mode was active (shared with the detached windows).
-                self.exit_modes_on_alt_screen(Surface::Main);
                 // Re-assert the Dropdown dock AFTER the window is mapped: X11/KWin
                 // ignores a set_outer_position issued before the window is realized
                 // (it would land centered), so re-apply the top-strip geometry on
@@ -15876,6 +15873,12 @@ impl ApplicationHandler<AppEvent> for App {
                     self.ov.note_output();
                 }
                 self.refresh_search_if_due(Surface::Main, std::time::Instant::now());
+                // Auto-exit hint/copy-mode if a program switched to the alt screen
+                // while a mode was active (shared with the detached windows) —
+                // after the drain: a TUI whose switch THIS frame's drain consumed
+                // gets no chips or copy cursor drawn over it (no later Wake
+                // repaints when the bytes were already eaten here).
+                self.exit_modes_on_alt_screen(Surface::Main);
                 // SINGLE clearing point for the activity indicator: the active
                 // tab is on screen this frame, so its pending dot is consumed.
                 // Covers every switch path (click, Ctrl+Tab, Ctrl+1..9, close
