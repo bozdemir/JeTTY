@@ -2269,8 +2269,10 @@ mod tests {
     fn f11_pty_passthrough_restored_when_unbound() {
         // `[keys] toggle_fullscreen = ""` gives bare F11 back to the shell: the
         // F-key encoder is untouched and still produces `\e[23~`.
-        let mut b = crate::config::KeyBindings::default();
-        b.toggle_fullscreen = Some(crate::config::ChordSpec::One(String::new()));
+        let b = crate::config::KeyBindings {
+            toggle_fullscreen: Some(crate::config::ChordSpec::One(String::new())),
+            ..Default::default()
+        };
         let km = crate::keymap::KeyMap::compile(&b);
         assert_eq!(
             decide_key(
