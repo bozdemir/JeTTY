@@ -432,13 +432,16 @@ pub(crate) fn motion(g: &mut Grid, now: Instant) -> Motion {
         return Motion::default();
     }
     if *g.selecting {
+        // A frame only when the selection changed: a 1 kHz mouse moving
+        // inside one half-cell asked for one per event.
+        let before = g.term.selection_bounds();
         let (line, col, left_half) = g.select_cell();
         g.term.selection_update(line, col, left_half);
         let rows = g.term.rows();
         let next = g.mouse.autoscroll.map_or(now + AUTOSCROLL_TICK, |a| a.next);
         g.mouse.autoscroll = autoscroll_lines(g.geom, rows, g.pointer.1 as f32)
             .map(|lines| AutoScroll { lines, next });
-        return Motion { paint: true };
+        return Motion { paint: g.term.selection_bounds() != before };
     }
     if g.mouse.held == 0
         && (gesture_tracking(g.term) == MouseTracking::Off || !g.geom.contains_y(g.pointer.1 as f32))
@@ -455,8 +458,10 @@ pub(crate) fn motion(g: &mut Grid, now: Instant) -> Motion {
 
 /// Run a due edge auto-scroll step: scroll one step toward the pointer and
 /// extend the selection to the grid edge under it. Returns whether the view
-/// moved (repaint). Further steps stay scheduled while the drag remains
-/// outside the grid ([`GridMouse::autoscroll_due`]).
+/// or the selection moved (repaint) — at the live bottom only the selection
+/// can: output streaming in rotates its end up with the content, and the
+/// step brings it back onto the last row. Further steps stay scheduled while
+/// the drag remains outside the grid ([`GridMouse::autoscroll_due`]).
 pub(crate) fn autoscroll_step(g: &mut Grid, now: Instant) -> bool {
     let Some(a) = g.mouse.autoscroll else { return false };
     if !*g.selecting || !g.geom.usable() {
@@ -467,12 +472,12 @@ pub(crate) fn autoscroll_step(g: &mut Grid, now: Instant) -> bool {
         return false;
     }
     g.mouse.autoscroll = Some(AutoScroll { next: now + AUTOSCROLL_TICK, ..a });
-    let before = g.term.scroll_offset();
+    let before = (g.term.scroll_offset(), g.term.selection_bounds());
     g.term.scroll_lines(a.lines);
     // The pointer is outside the rows, so its clamped cell IS the edge row.
     let (line, col, left_half) = g.select_cell();
     g.term.selection_update(line, col, left_half);
-    g.term.scroll_offset() != before
+    (g.term.scroll_offset(), g.term.selection_bounds()) != before
 }
 
 /// What the caller does after [`wheel`].
@@ -836,6 +841,38 @@ mod tests {
         assert!(m.paint);
         assert_eq!(w.at(4.6, 0.0, NONE, |g| release(g, MouseButton::Left)).0, Release::Copy("hello".into()));
         assert!(!w.selecting);
+    }
+
+    #[test]
+    fn a_selection_drag_repaints_only_when_the_selection_changes() {
+        // Every move while selecting asked for a frame, even inside one cell:
+        // a 1 kHz mouse kept the window repainting at the refresh rate.
+        let mut w = Win::new(b"hello world");
+        w.at(0.0, 0.0, NONE, |g| press(g, MouseButton::Left, false, t0()));
+        assert!(w.at(4.6, 0.0, NONE, |g| motion(g, t0())).0.paint);
+        assert!(!w.at(4.7, 0.0, NONE, |g| motion(g, t0())).0.paint, "same half of the same cell");
+        assert!(w.at(4.2, 0.0, NONE, |g| motion(g, t0())).0.paint, "the left half drops the cell");
+        assert!(w.at(5.6, 1.0, NONE, |g| motion(g, t0())).0.paint);
+    }
+
+    #[test]
+    fn an_edge_step_that_only_moves_the_selection_still_repaints() {
+        // Drag-select with the pointer held below the grid while output
+        // streams in at the live bottom: there is nothing to scroll, but the
+        // step moves the selection's end — rotated up with its content — back
+        // onto the last row. Nothing repainted, so a release copied more than
+        // the highlight showed.
+        let mut w = with_history(b"");
+        let t = Instant::now();
+        w.at(1.0, 1.0, NONE, |g| press(g, MouseButton::Left, false, t));
+        w.at(1.0, 5.0, NONE, |g| motion(g, t));
+        let due = w.mouse.autoscroll_due().expect("armed");
+        assert!(!w.at(1.0, 5.0, NONE, |g| autoscroll_step(g, due)).0, "nothing moved: no frame");
+        w.term.feed(b"more1\r\nmore2\r\n");
+        let due = w.mouse.autoscroll_due().expect("still armed");
+        assert!(w.at(1.0, 5.0, NONE, |g| autoscroll_step(g, due)).0, "the end moved: repaint");
+        let due = w.mouse.autoscroll_due().expect("still armed");
+        assert!(!w.at(1.0, 5.0, NONE, |g| autoscroll_step(g, due)).0);
     }
 
     #[test]

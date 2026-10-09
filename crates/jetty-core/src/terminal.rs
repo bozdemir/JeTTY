@@ -4573,6 +4573,15 @@ impl Terminal {
         self.set_selection(None);
     }
 
+    /// The selected cells' bounds — `(start, end)` as (buffer line, column),
+    /// inclusive, in reading order — or `None` when nothing is selected. No
+    /// text is built: a mouse drag compares it to tell whether a step changed
+    /// what is drawn.
+    pub fn selection_bounds(&self) -> Option<((i32, usize), (i32, usize))> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        Some(((range.start.line.0, range.start.column.0), (range.end.line.0, range.end.column.0)))
+    }
+
     /// Return the currently-selected text, or `None` if no selection is active
     /// or the selection is empty.
     pub fn selection_text(&self) -> Option<String> {
