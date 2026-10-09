@@ -8941,8 +8941,8 @@ impl App {
     /// saved); the grid shows it — or, when it is not installed, the fallback
     /// `check::pick_font_family` names, reported in the returned warning (an
     /// unvalidated name left the grid to the font engine's fallback, often not
-    /// monospace). Tells the TextLayer to remeasure, then reflows and requests a
-    /// redraw.
+    /// monospace). Tells the TextLayer to remeasure, then arms ONE debounced
+    /// grid + PTY reflow per window and requests a redraw.
     fn set_font_family(&mut self, name: String) -> Option<String> {
         let text = self.text.as_ref();
         let pick = crate::config::check::pick_font_family(&name, &self.font_families, || {
@@ -8953,20 +8953,29 @@ impl App {
         if let Some(text) = &mut self.text {
             text.set_font_family(&self.font_family);
         }
-        // Detached windows: swap their terminal font too, then debounce their
-        // grid/PTY reflow (family changes cell width → cols/rows) (F7/F20).
+        // The family changes the cell width → cols/rows: DEBOUNCE the grid/PTY
+        // reflow of every window, exactly like a font-size change (F7/F20). An
+        // immediate one per pick sent every shell a SIGWINCH per step while ↓
+        // was held in the Settings font list — the p10k prompt scatter.
         let reflow_at = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        self.reflow_pending_at = Some(reflow_at);
         for dw in &mut self.detached {
             dw.text.set_font_family(&self.font_family);
             dw.reflow_pending_at = Some(reflow_at);
             dw.request_paint();
+        }
+        // The cell metrics changed in place under a possibly-held link modifier:
+        // revalidate every window's hover now (the debounced reflow revalidates
+        // again when the grid snaps).
+        self.update_link_hover(true);
+        for pos in 0..self.detached.len() {
+            self.update_detached_link_hover(pos, true);
         }
         // The chrome is now DECOUPLED from the terminal font: it follows the
         // separate `ui_font_family`/`ui_font_logical` (set via `set_ui_font_*`),
         // NOT the terminal family. So a terminal-font change no longer touches
         // chrome_text — leaving the chrome typeface stable while the grid font
         // changes (and avoiding a chrome re-measure on every terminal-font pick).
-        self.reflow();
         self.persist();
         self.mark_dirty_all();
         pick.warning
@@ -19716,6 +19725,22 @@ mod fullscreen_helper_tests {
         assert_eq!((p, d), (Some(next), false));
         let (p2, d2) = reflow_terms_on_summon(p, d, next);
         assert_eq!((p2, d2), (Some(next), false), "no extra reflow armed");
+    }
+
+    /// Tripwire: the immediate grid + PTY reflow (`App::reflow`, a SIGWINCH to
+    /// every shell) runs only from the debounced deadline in `about_to_wait` and
+    /// from `set_perf_hud` (a one-off toggle). Every geometry setter — the font
+    /// size AND family, padding, line height, the UI size, a window resize —
+    /// arms `reflow_pending_at` instead: one reflow per burst. A font-family
+    /// change used to reflow at once, so holding ↓ in the Settings font list
+    /// sent every shell a SIGWINCH per step and scattered p10k prompts.
+    #[test]
+    fn shells_are_resized_only_through_the_debounce() {
+        let calls = include_str!("app.rs")
+            .lines()
+            .filter(|l| l.contains(concat!("self.reflow", "();")) && !l.trim_start().starts_with("//"))
+            .count();
+        assert_eq!(calls, 2, "a new immediate reflow() — arm reflow_pending_at instead");
     }
 
     #[test]
