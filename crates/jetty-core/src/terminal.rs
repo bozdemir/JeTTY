@@ -829,8 +829,7 @@ struct OpenCmd {
 /// plain screen row: the alt screen has no scrollback. The decoded RGBA lives
 /// behind an `Arc` so the render layer can clone it cheaply to upload to (each
 /// window's) GPU without copying, and so a texture evicted then
-/// re-scrolled-into-view can re-upload. `cols`/`rows` are the cell footprint;
-/// `px_w`/`px_h` are the native pixel size the image draws at.
+/// re-scrolled-into-view can re-upload. `cols`/`rows` are the cell footprint.
 #[derive(Clone, Debug)]
 struct ImagePlacement {
     id: u64,
@@ -838,8 +837,11 @@ struct ImagePlacement {
     col: u16,
     cols: u16,
     rows: u16,
-    px_w: u16,
-    px_h: u16,
+    /// The rectangle the image draws in, in CELLS from the footprint's
+    /// top-left: `[x, y, w, h]` (see [`Terminal::image_geometry`]). Cells, not
+    /// pixels, so it scales with the cell size: a font or DPI change that
+    /// keeps the grid's dimensions keeps the image in its rows.
+    draw: [f32; 4],
     image: Arc<crate::sixel::SixelImage>,
     /// The Kitty protocol image id (`i=`) or number (`I=`) this placement was
     /// created from, so `a=d,d=i,i=N` can target it (amendment A6). `None` for
@@ -3280,17 +3282,14 @@ impl Terminal {
         if self.sync_deadline().is_some() {
             self.flush_sync();
         }
-        // Footprint in cells (ceil), clamped to the grid width and a row cap.
-        let cols = ((img.width as f32 / self.cell_px_w).ceil() as usize).clamp(1, self.cols) as u16;
-        let rows = ((img.height as f32 / self.cell_px_h).ceil() as usize).clamp(1, MAX_IMAGE_ROWS) as u16;
+        let (cols, rows, draw) = self.image_geometry(img.width, img.height, 0, 0);
         let p = ImagePlacement {
             id: crate::sixel::content_id(&[SIXEL_TAG, p2], &buf),
             abs_line: 0,
             col: 0,
             cols,
             rows,
-            px_w: img.width.min(u16::MAX as u32) as u16,
-            px_h: img.height.min(u16::MAX as u32) as u16,
+            draw,
             image: Arc::new(img),
             kitty_id: None,
             kitty_placement: None,
@@ -3643,6 +3642,33 @@ impl Terminal {
         let _ = self.reply_tx.send(out);
     }
 
+    /// The cell footprint (`cols`, `rows`) of a `width`×`height` px image and
+    /// the rectangle it draws in ([`ImagePlacement::draw`]), for a Kitty `c=` /
+    /// `r=` request (0 = not given; a sixel gives neither): its native size, or
+    /// scaled up or down to fill the columns / rows given — one given, the other
+    /// follows the aspect ratio; both, it is as large as fits that box and
+    /// centred in it (the spec's letterbox). At most [`MAX_IMAGE_ROWS`] rows (a
+    /// taller image shrinks to fit them, never painting over the rows below its
+    /// reservation) and the grid's width: a wider image is cut at the grid's
+    /// edge where it is drawn, not squashed.
+    fn image_geometry(&self, width: u32, height: u32, c: u16, r: u16) -> (u16, u16, [f32; 4]) {
+        let (cw, ch) = (self.cell_px_w, self.cell_px_h);
+        let (iw, ih) = (width as f32, height as f32);
+        let (c, r) = (f32::from(c), f32::from(r));
+        let scale = match (c > 0.0, r > 0.0) {
+            (false, false) => 1.0,
+            (true, false) => c * cw / iw,
+            (false, true) => r * ch / ih,
+            (true, true) => (c * cw / iw).min(r * ch / ih),
+        };
+        let rows = if r > 0.0 { r } else { (ih * scale / ch).ceil() }.clamp(1.0, MAX_IMAGE_ROWS as f32);
+        let scale = scale.min(rows * ch / ih);
+        let (w, h) = (iw * scale / cw, ih * scale / ch);
+        let cols = if c > 0.0 { c } else { w.ceil() }.max(1.0);
+        let (x, y) = if c > 0.0 && r > 0.0 { ((cols - w) / 2.0, (rows - h) / 2.0) } else { (0.0, 0.0) };
+        (cols.min(self.cols as f32) as u16, rows as u16, [x, y, w, h])
+    }
+
     /// Place a decoded Kitty image (content id `id`) at the cursor, moved left
     /// to fit; `C=1` leaves the cursor (and the grid) untouched. Guards: a zero
     /// cell metric drops it; an in-flight sync update is flushed first so the
@@ -3655,26 +3681,7 @@ impl Terminal {
         if self.sync_deadline().is_some() {
             self.flush_sync();
         }
-        // Cell footprint: explicit c=/r= override, else derive from pixels (ceil).
-        let (cols, rows) = if cmd.cols > 0 && cmd.rows > 0 {
-            (
-                (cmd.cols as usize).clamp(1, self.cols) as u16,
-                (cmd.rows as usize).clamp(1, MAX_IMAGE_ROWS) as u16,
-            )
-        } else {
-            (
-                ((img.width as f32 / self.cell_px_w).ceil() as usize).clamp(1, self.cols) as u16,
-                ((img.height as f32 / self.cell_px_h).ceil() as usize).clamp(1, MAX_IMAGE_ROWS) as u16,
-            )
-        };
-        // Clamp cols to the grid width unconditionally (A8 — avoid an underflow /
-        // panic when cols > self.cols or self.cols == 0).
-        let cols = cols.min(self.cols.max(1) as u16);
-        // Clamp the drawn pixel size to the cell box so a mismatched explicit
-        // `c=`/`r=` (smaller than the native image) can never overpaint the rows
-        // below it (M4). No-op for the derived footprint.
-        let box_w = ((cols as f32) * self.cell_px_w).ceil().min(u16::MAX as f32) as u16;
-        let box_h = ((rows as f32) * self.cell_px_h).ceil().min(u16::MAX as f32) as u16;
+        let (cols, rows, draw) = self.image_geometry(img.width, img.height, cmd.cols, cmd.rows);
         let key = if cmd.id != 0 { cmd.id } else { cmd.number };
         let p = ImagePlacement {
             id,
@@ -3682,8 +3689,7 @@ impl Terminal {
             col: 0,
             cols,
             rows,
-            px_w: (img.width.min(u16::MAX as u32) as u16).min(box_w),
-            px_h: (img.height.min(u16::MAX as u32) as u16).min(box_h),
+            draw,
             image: img.clone(),
             kitty_id: (key != 0).then_some(key),
             kitty_placement: (cmd.placement != 0).then_some(cmd.placement),
@@ -3709,6 +3715,7 @@ impl Terminal {
         } else {
             (&self.placements, self.term.grid().display_offset() as i64 - self.abs_top)
         };
+        let (cw, ch) = (self.cell_px_w, self.cell_px_h);
         list.iter()
             .filter_map(|p| {
                 // Viewport row of the image's top-left cell (may be negative).
@@ -3717,14 +3724,19 @@ impl Terminal {
                 if bottom <= 0 || top >= self.rows as i64 {
                     return None; // span does not intersect the visible grid
                 }
+                let [x, y, w, h] = p.draw;
                 Some(crate::snapshot::VisibleImage {
                     id: p.id,
                     top_row: top as f32,
                     col: p.col,
                     cols: p.cols,
                     rows: p.rows,
-                    px_w: p.px_w,
-                    px_h: p.px_h,
+                    px_x: x * cw,
+                    px_y: y * ch,
+                    // Whole pixels: at the cell size it was placed at, a
+                    // native-size image is exactly its own size again.
+                    px_w: (w * cw).round(),
+                    px_h: (h * ch).round(),
                 })
             })
             .collect()
@@ -8660,7 +8672,7 @@ mod tests {
         t.feed(&sixel(RED_1X12)); // 1×12 px → rows = ceil(12/10) = 2
         assert_eq!(t.placements.len(), 1, "one placement recorded");
         let p = &t.placements[0];
-        assert_eq!((p.px_w, p.px_h), (1, 12), "native size");
+        assert_eq!((p.image.width, p.image.height), (1, 12), "native size");
         assert_eq!((p.cols, p.rows), (1, 2), "cell footprint (ceil)");
         assert_eq!(p.abs_line, 0, "anchored at the starting row");
         assert_eq!(p.col, 0, "image starts at column 0");
@@ -8678,7 +8690,7 @@ mod tests {
         let imgs = t.visible_images();
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].top_row, 0.0, "top of image at viewport row 0");
-        assert_eq!((imgs[0].px_w, imgs[0].px_h), (1, 6));
+        assert_eq!((imgs[0].px_w, imgs[0].px_h), (1.0, 6.0));
         assert!(t.image_rgba(imgs[0].id).is_some(), "rgba retrievable by id");
     }
 
@@ -8692,7 +8704,7 @@ mod tests {
         t.feed(&full[..cut]);
         t.feed(&full[cut..]);
         assert_eq!(t.placements.len(), 1, "one image across the two feeds");
-        assert_eq!((t.placements[0].px_w, t.placements[0].px_h), (1, 12));
+        assert_eq!((t.placements[0].image.width, t.placements[0].image.height), (1, 12));
     }
 
     #[test]
@@ -8716,7 +8728,7 @@ mod tests {
         t.set_cell_px(10.0, 10.0);
         t.feed(&sixel("#0;2;100;0;0#0~\x07~"));
         assert_eq!(t.placements.len(), 1);
-        assert_eq!(t.placements[0].px_w, 2, "BEL was data; both columns drawn");
+        assert_eq!(t.placements[0].image.width, 2, "BEL was data; both columns drawn");
     }
 
     #[test]
@@ -8937,7 +8949,7 @@ mod tests {
         t.feed(&red_rgba_2x2(""));
         assert_eq!(t.placements.len(), 1, "one placement");
         let p = &t.placements[0];
-        assert_eq!((p.px_w, p.px_h), (2, 2));
+        assert_eq!((p.image.width, p.image.height), (2, 2));
         assert_eq!(&p.image.rgba[0..4], &[255, 0, 0, 255], "opaque red premultiplied");
     }
 
@@ -8968,6 +8980,52 @@ mod tests {
         t.feed(b"abc"); // cursor at column 3
         t.feed(&red_rgba_2x2(""));
         assert_eq!(t.placements[0].col, 3, "image anchors at the cursor column");
+    }
+
+    /// Feed a `w`×`h` opaque Kitty image with the extra control `keys` to a
+    /// fresh `cols`-wide terminal of 10×20 px cells; return its one placement
+    /// as drawn (footprint, then `[x, y, w, h]` in px).
+    fn kitty_drawn(cols: usize, w: u32, h: u32, keys: &str) -> ((u16, u16), [f32; 4]) {
+        let mut t = Terminal::new(cols, 30);
+        t.set_cell_px(10.0, 20.0);
+        let px = b64(&[9u8, 9, 9, 255].repeat((w * h) as usize));
+        t.feed(&apc(&format!("a=T,f=32,s={w},v={h},C=1{keys};{px}")));
+        let v = t.visible_images()[0];
+        ((v.cols, v.rows), [v.px_x, v.px_y, v.px_w, v.px_h])
+    }
+
+    #[test]
+    fn kitty_c_and_r_scale_the_image_keeping_its_shape() {
+        // A 400×100 image in a `c=10,r=10` box of 10×20 px cells (100×200 px)
+        // drew at 100×100, squashed 4× sideways; a lone `c=` or `r=` was
+        // ignored. The spec: the image is scaled to fill the area, one of the
+        // two given makes the other follow its aspect ratio, and with both it
+        // is letterboxed.
+        assert_eq!(kitty_drawn(40, 400, 100, ",c=10,r=10"), ((10, 10), [0.0, 87.5, 100.0, 25.0]), "letterboxed");
+        assert_eq!(kitty_drawn(40, 400, 100, ",c=20"), ((20, 3), [0.0, 0.0, 200.0, 50.0]), "rows follow");
+        assert_eq!(kitty_drawn(40, 400, 100, ",r=2"), ((16, 2), [0.0, 0.0, 160.0, 40.0]), "columns follow");
+        assert_eq!(kitty_drawn(40, 2, 2, ",c=4,r=2"), ((4, 2), [0.0, 0.0, 40.0, 40.0]), "scaled up to fit");
+        // Wider than the grid: native size, cut at the grid's edge when drawn
+        // (it was squashed into the grid's width at its full height).
+        assert_eq!(kitty_drawn(30, 400, 100, ""), ((30, 5), [0.0, 0.0, 400.0, 100.0]), "not squashed");
+        // Taller than the most rows an image reserves: shrunk to fit them.
+        let ((_, rows), [.., w, h]) = kitty_drawn(40, 2, 2, ",r=4000");
+        assert_eq!((rows, w, h), (MAX_IMAGE_ROWS as u16, 20480.0, 20480.0));
+    }
+
+    #[test]
+    fn an_image_scales_with_the_cell_size_when_the_grid_keeps_its_size() {
+        // A window moved to a monitor of another scale keeps its grid and gets
+        // twice (or half) the cell size: its images kept their pixel size and
+        // painted over twice the rows they reserve (or shrank to half).
+        let mut t = Terminal::new(20, 6);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&sixel(RED_1X12)); // 1×12 px: 1 column, 2 rows
+        t.feed(&red_rgba_2x2(",c=2,r=1"));
+        t.set_cell_px(20.0, 20.0);
+        let imgs = t.visible_images();
+        assert_eq!((imgs[0].px_w, imgs[0].px_h, imgs[0].rows), (2.0, 24.0, 2));
+        assert_eq!((imgs[1].px_x, imgs[1].px_w, imgs[1].px_h), (10.0, 20.0, 20.0), "c=2,r=1 still fills its box");
     }
 
     #[test]
@@ -9093,7 +9151,7 @@ mod tests {
         assert_eq!(t.placements.len(), 0, "not placed until finalized");
         t.feed(&apc(&format!("m=0;{b}")));
         assert_eq!(t.placements.len(), 1, "two-chunk image assembles to one placement");
-        assert_eq!((t.placements[0].px_w, t.placements[0].px_h), (2, 2));
+        assert_eq!((t.placements[0].image.width, t.placements[0].image.height), (2, 2));
     }
 
     #[test]
@@ -9393,7 +9451,7 @@ mod tests {
         let bomb = sixel_bomb(20);
         let stream = bomb.repeat(10);
         t.feed(&stream);
-        let decoded = t.placements.iter().filter(|p| p.px_w == 1000).count();
+        let decoded = t.placements.iter().filter(|p| p.image.width == 1000).count();
         assert_eq!(decoded, 3, "the bank, plus {} bytes earned", stream.len() as u64 * IMAGE_WORK_PER_BYTE);
     }
 

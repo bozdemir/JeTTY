@@ -3,7 +3,8 @@
 //!
 //! Modeled on `QuadLayer` (a persistent, grown-on-demand instance buffer) crossed
 //! with `Crt` (a texture + sampler bind group). Each visible image is a single
-//! textured quad drawn at its NATIVE pixel size at the placement anchor; images
+//! textured quad drawn at the placement anchor — at its native pixel size, on
+//! whole pixels, or scaled to a Kitty `c=`/`r=` box ([`image_dst`]); images
 //! are uploaded ONCE and cached under a VRAM byte budget with frame-counter LRU.
 //!
 //! PER-WINDOW: the main `App` holds one `ImageLayer` and each `DetachedWindow`
@@ -25,6 +26,8 @@
 //! Self-contained: our own wgpu/WGSL, no desktop-environment / OS-specific code.
 
 use std::collections::HashMap;
+
+use crate::GridOrigin;
 
 pub(crate) const IMAGE_SHADER: &str = r#"
 struct Screen { size: vec2<f32>, _pad: vec2<f32> };
@@ -75,10 +78,34 @@ pub struct ImageDraw<'a> {
     pub w: u32,
     pub h: u32,
     pub rgba: &'a [u8],
-    /// Destination rect `[x, y, w, h]` in physical pixels (native image size).
+    /// Destination rect `[x, y, w, h]` in physical pixels ([`image_dst`]).
     pub dst: [f32; 4],
     /// 0..1 (usually 1.0). Multiplies the premultiplied texel.
     pub opacity: f32,
+}
+
+/// Where a visible image draws ([`ImageDraw::dst`], physical px) in a grid
+/// whose cell (0, 0) is at `origin`: snapped to whole pixels, so a native-size
+/// image maps each texel onto one pixel. Most columns start at a fractional x
+/// (`cell_w` is the font's advance), where the linear sampler blended every
+/// texel with its neighbor and screenshots and pixel art drew soft.
+pub fn image_dst(vi: &jetty_core::VisibleImage, origin: GridOrigin, cell_w: f32, cell_h: f32) -> [f32; 4] {
+    [
+        (origin.col_x(vi.col as usize, cell_w) + vi.px_x).round(),
+        (origin.top + vi.top_row * cell_h + vi.px_y).round(),
+        vi.px_w,
+        vi.px_h,
+    ]
+}
+
+/// The image scissor's horizontal span `[x, w]` in a `width`-px attachment:
+/// the grid's `cols` columns, so an image wider than the columns it has is cut
+/// at the grid's right edge instead of drawing into the padding and the
+/// scrollbar.
+pub fn image_scissor_x(origin: GridOrigin, cols: usize, cell_w: f32, width: u32) -> [u32; 2] {
+    let x = origin.left.clamp(0.0, width as f32) as u32;
+    let right = origin.col_x(cols, cell_w).ceil().clamp(0.0, width as f32) as u32;
+    [x, right.saturating_sub(x)]
 }
 
 /// A cached GPU texture for one image id.
@@ -324,7 +351,7 @@ impl ImageLayer {
 
     /// Draw the visible images into `view` (`LoadOp::Load`), clipped to `scissor`
     /// (`[x, y, w, h]`, physical px, already clamped to the attachment by the
-    /// caller). Each image draws at its native size at `dst`.
+    /// caller). Each image is stretched over its `dst`.
     ///
     /// The frame counter is advanced ONCE here BEFORE any upload, so a texture
     /// touched this frame is never evicted this frame (no re-upload thrash).
@@ -457,6 +484,27 @@ impl ImageLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn images_draw_on_whole_pixels_and_are_cut_at_the_grids_edge() {
+        let vi = jetty_core::VisibleImage {
+            id: 1,
+            top_row: 2.0,
+            col: 61,
+            cols: 10,
+            rows: 3,
+            px_x: 0.0,
+            px_y: 0.0,
+            px_w: 80.0,
+            px_h: 60.0,
+        };
+        // Column 61 of 8.4 px cells starts at x = 4 + 512.4.
+        let dst = image_dst(&vi, GridOrigin::new(4.0, 30.0), 8.4, 21.0);
+        assert_eq!(dst, [516.0, 72.0, 80.0, 60.0], "an exact texel-per-pixel mapping");
+        // 80 columns of 8.4 px from x = 4 end at 676: past it is padding.
+        assert_eq!(image_scissor_x(GridOrigin::new(4.0, 30.0), 80, 8.4, 700), [4, 672]);
+        assert_eq!(image_scissor_x(GridOrigin::new(4.0, 30.0), 80, 8.4, 600), [4, 596], "clamped");
+    }
 
     /// The image WGSL must parse and pass naga validation (the always-run gate,
     /// like `crt_shader_compiles`).

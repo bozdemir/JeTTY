@@ -121,9 +121,11 @@ pub struct SearchHit {
 ///
 /// `top_row` is the viewport row of the image's top-left cell and MAY be
 /// negative (the image is partly scrolled above the grid) — the render scissor
-/// clips it. The image is drawn at its NATIVE pixel size (`px_w`×`px_h`), while
-/// `cols`×`rows` describe the reserved cell footprint (used only for the
-/// scroll-anchor span, not the draw rectangle).
+/// clips it. `cols`×`rows` describe the reserved cell footprint (used only for
+/// the scroll-anchor span, not the draw rectangle); the image draws in the
+/// `px_*` rectangle — its native size, or scaled to a Kitty `c=` / `r=` box —
+/// which runs past the grid's right edge only for an image wider than the
+/// columns it has (the renderer cuts it there).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VisibleImage {
     /// Content id (see `sixel::content_id`) — the texture-cache key.
@@ -135,9 +137,13 @@ pub struct VisibleImage {
     /// Reserved footprint in cells.
     pub cols: u16,
     pub rows: u16,
-    /// Native image size in physical-ish pixels (the decoded sixel dimensions).
-    pub px_w: u16,
-    pub px_h: u16,
+    /// Where the image draws, in physical px at the current cell size: its
+    /// offset from the anchor cell's top-left corner and its size (whole
+    /// pixels — a native-size image is exactly its decoded size).
+    pub px_x: f32,
+    pub px_y: f32,
+    pub px_w: f32,
+    pub px_h: f32,
 }
 
 #[derive(Clone, Debug)]

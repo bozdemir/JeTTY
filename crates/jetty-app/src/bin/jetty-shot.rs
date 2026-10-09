@@ -1246,7 +1246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         text.end_grid_frame();
     }
 
-    // --- Pass 2b: inline (sixel) images over the grid, at native pixel size,
+    // --- Pass 2b: inline (sixel / Kitty) images over the grid, on whole pixels,
     // scissored to the grid area — the same ImageLayer the live app runs, so the
     // headless PNG exercises the real decode → upload → draw path. ---
     {
@@ -1262,19 +1262,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 w: img.width,
                 h: img.height,
                 rgba: &img.rgba,
-                dst: [
-                    shot_origin.col_x(vi.col as usize, cell_w),
-                    shot_origin.top + vi.top_row * cell_h,
-                    vi.px_w as f32,
-                    vi.px_h as f32,
-                ],
+                dst: jetty_render::image_dst(vi, shot_origin, cell_w, cell_h),
                 opacity: 1.0,
             })
             .collect();
         let grid_bottom_px = (height as f32 - shot_status_h - shot_bottom_bar_h).max(0.0);
         let sc_y = shot_origin.top.clamp(0.0, height as f32) as u32;
         let sc_h = (grid_bottom_px.clamp(0.0, height as f32) as u32).saturating_sub(sc_y);
-        image_layer.render(&device, &queue, &view, width, height, &draws, [0, sc_y, width, sc_h]);
+        let [sc_x, sc_w] = jetty_render::image_scissor_x(shot_origin, terminal.cols(), cell_w, width);
+        image_layer.render(&device, &queue, &view, width, height, &draws, [sc_x, sc_y, sc_w, sc_h]);
     }
 
     // --- Draw scrollbar quad (and optionally the settings panel) over the text ---

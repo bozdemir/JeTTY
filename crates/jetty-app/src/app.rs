@@ -17158,22 +17158,18 @@ fn render_grid_scene(
             w: img.width,
             h: img.height,
             rgba: &img.rgba,
-            dst: [
-                origin.col_x(vi.col as usize, cell_w),
-                grid_origin_y + vi.top_row * cell_h,
-                vi.px_w as f32,
-                vi.px_h as f32,
-            ],
+            dst: jetty_render::image_dst(vi, origin, cell_w, cell_h),
             opacity: 1.0,
         })
         .collect();
     // From row 0's top (an image scrolled half off the top stays out of the
-    // top padding) to the band bottom.
+    // top padding) to the band bottom, across the grid's columns.
     let sc_top = grid_origin_y.clamp(0.0, height as f32);
     let sc_bot = (s.grid_bottom + s.slide_y).clamp(0.0, height as f32);
     let sc_y = sc_top as u32;
     let sc_h = (sc_bot as u32).saturating_sub(sc_y);
-    image_layer.render(device, queue, scene_view, width, height, &image_draws, [0, sc_y, width, sc_h]);
+    let [sc_x, sc_w] = jetty_render::image_scissor_x(origin, s.snap.cols, cell_w, width);
+    image_layer.render(device, queue, scene_view, width, height, &image_draws, [sc_x, sc_y, sc_w, sc_h]);
 
     // Pass 4: scrollbar, failed-command markers, SGR decorations, the
     // Ctrl+hover / OSC 8 link underline, and the cursor — handed to the chrome
