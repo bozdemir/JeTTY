@@ -1,5 +1,5 @@
 use std::io::Write;
-use crate::overlays::{HintDrawData, HintState, Overlays, PaletteDrawData, Surface, ThemePreview};
+use crate::overlays::{HintDrawData, HintState, Layer, Overlays, PaletteDrawData, Surface, ThemePreview};
 use std::sync::Arc;
 use jetty_core::{PtySession, Terminal};
 use jetty_render::{GpuContext, QuadLayer, TextLayer};
@@ -1450,9 +1450,10 @@ pub struct App {
     /// draws its own resize edges).
     resize_cursor: ResizeZone,
     /// Whether the neofetch-style welcome splash is still open. Shown on launch
-    /// (when `show_welcome` is true in config); dismissed on the first real PTY
-    /// keypress, any mouse click in the grid area, or Esc. A single bool — the
-    /// check and the clear are both O(1) so the idle path is unaffected.
+    /// (when `show_welcome` is true in config) over the first tab; dismissed by
+    /// the first key, any mouse click in the grid area, a change of the active
+    /// tab, or any layer taking the keyboard (`Layer::Welcome`). A single bool —
+    /// the check and the clear are both O(1) so the idle path is unaffected.
     welcome_open: bool,
     /// The persisted `show_welcome` startup preference (distinct from the runtime
     /// `welcome_open` dismissal state). Cached at startup so `persist()` can write
@@ -3853,27 +3854,18 @@ impl App {
     }
 
     /// Toggle window `s`'s keyboard-shortcuts help (the "?" button). Opening it
-    /// closes that window's context menu so the two are mutually exclusive.
+    /// takes that window's keyboard: its menus, search bar and the other
+    /// overlays close — the bar would keep taking keys under the help's scrim.
     fn toggle_help(&mut self, s: Surface) {
-        let Some(ov) = self.ov_of_mut(s) else { return };
-        ov.help_open = !ov.help_open;
-        if ov.help_open {
+        let Some(open) = self.ov_of(s).map(|o| !o.help_open) else { return };
+        if open {
+            self.take_keyboard(s, Layer::Help);
+        }
+        if let Some(ov) = self.ov_of_mut(s) {
+            ov.help_open = open;
             ov.help_scroll = 0;
-            self.dismiss_help_peers(s);
         }
         self.paint_surface(s);
-    }
-
-    /// Close the context menus that the help overlay replaces in window `s`
-    /// (main: the terminal context menu; detached: its menu).
-    fn dismiss_help_peers(&mut self, s: Surface) {
-        match s {
-            Surface::Main => {
-                self.context_menu = None;
-                self.menu_hover = None;
-            }
-            Surface::Detached(_) => self.dismiss_surface_menus(s),
-        }
     }
 
     /// Whole wheel lines for window `s`, through ITS fractional accumulator at
@@ -4526,8 +4518,10 @@ impl App {
 
     /// Open the tab context menu for `tab` at `(x, y)` with `labels` (the main
     /// rows, or the "Color ▸" list shown in its place), caching its hit rects.
+    /// Takes the window's keyboard, like the terminal menu.
     fn open_tab_menu(&mut self, x: f32, y: f32, tab: TabId, labels: Vec<&'static str>) {
         let Some((w, h)) = self.gpu.as_ref().map(|g| (g.config.width, g.config.height)) else { return };
+        self.take_keyboard(Surface::Main, Layer::Menu);
         let theme = self.current_theme();
         let cm = self.chrome_metrics();
         // Hints from the live keymap (the same strings the draw uses); the item
@@ -4619,12 +4613,11 @@ impl App {
 
     /// Open the terminal context menu (Copy / Paste / Run in New Tab / Select
     /// All / Clear / Close Tab) at physical `(x, y)` — for a right-click and
-    /// the Menu key alike, so both gray the same rows. Commits an in-progress
-    /// rename and closes the help so the menu can't be orphaned under them;
-    /// the tab menu is mutually exclusive with this one.
+    /// the Menu key alike, so both gray the same rows. Takes the window's
+    /// keyboard (an in-progress rename commits; the search bar and copy-mode
+    /// stay under it); the tab menu is mutually exclusive with this one.
     fn open_context_menu(&mut self, x: f32, y: f32) {
-        self.commit_rename();
-        self.ov.help_open = false;
+        self.take_keyboard(Surface::Main, Layer::Menu);
         self.tab_menu = None;
         self.tab_menu_hover = None;
         self.tab_menu_rects.clear();
@@ -4682,8 +4675,9 @@ impl App {
 
     /// Open detached window `pos`'s context menu (Reattach / Copy / Paste /
     /// Run in New Tab) at physical `(x, y)` — its right-click and the Menu key
-    /// alike, graying the same rows.
+    /// alike, graying the same rows. Takes the window's keyboard.
     fn open_detached_menu(&mut self, pos: usize, x: f32, y: f32) {
+        self.take_keyboard(Surface::Detached(pos), Layer::Menu);
         let theme = self.current_theme();
         let run_enabled = self.run_selection_enabled;
         let ui_font = self.ui_font_logical;
@@ -4822,6 +4816,7 @@ impl App {
                 }
                 Some("Rename") => {
                     // Same inline-rename flow as double-click.
+                    self.take_keyboard(Surface::Main, Layer::Rename);
                     self.renaming = Some(tab_id);
                     self.rename_buf = self.tabs[tab_idx].title.clone();
                 }
@@ -5172,6 +5167,60 @@ impl App {
         }
     }
 
+    /// Window `s`'s open layers, top first (`overlays::Layer`).
+    fn open_layers(&self, s: Surface) -> Vec<Layer> {
+        let main = s == Surface::Main;
+        let ov = self.ov_of(s);
+        let is = |f: fn(&Overlays) -> bool| ov.is_some_and(f);
+        [
+            (Layer::Confirm, main && (self.confirm_quit || self.confirm_close.is_some())),
+            (Layer::Palette, is(|o| o.palette_open)),
+            (Layer::Help, is(|o| o.help_open)),
+            (Layer::Menu, self.menu_open(s)),
+            (Layer::Rename, main && self.renaming.is_some()),
+            (Layer::Hint, is(|o| o.hint_mode.is_some())),
+            (Layer::Copy, is(|o| o.copy_mode.is_some())),
+            (Layer::Search, is(|o| o.search_open)),
+            (Layer::Welcome, main && self.welcome_open),
+        ]
+        .into_iter()
+        .filter_map(|(layer, open)| open.then_some(layer))
+        .collect()
+    }
+
+    /// Layer `owner` opens in window `s` and takes its keyboard — the one
+    /// opening rule of every layer (`overlays::Layer`): each other open layer
+    /// of the window closes unless it stays under `owner`
+    /// (`Layer::stays_under`), so the layer drawn on top is the one the keys
+    /// and the pointer reach.
+    fn take_keyboard(&mut self, s: Surface, owner: Layer) {
+        for layer in self.open_layers(s) {
+            if layer == owner || layer.stays_under(owner) {
+                continue;
+            }
+            match layer {
+                Layer::Palette => self.close_palette(s),
+                Layer::Help => {
+                    if let Some(ov) = self.ov_of_mut(s) {
+                        ov.help_open = false;
+                    }
+                    self.paint_surface(s);
+                }
+                Layer::Menu => self.dismiss_surface_menus(s),
+                Layer::Rename => self.commit_rename(),
+                Layer::Hint => self.exit_hint_mode(s),
+                Layer::Copy => self.cancel_copy_mode(s),
+                Layer::Search => self.search_close(s),
+                Layer::Welcome => {
+                    self.welcome_open = false;
+                    self.request_main_paint();
+                }
+                // Nothing closes a confirmation (it stays under every layer).
+                Layer::Confirm => {}
+            }
+        }
+    }
+
     /// The run-selection source for window `s`.
     fn sel_source(s: Surface) -> SelSource {
         match s {
@@ -5227,11 +5276,16 @@ impl App {
         self.paint_surface(s);
     }
 
-    /// Open window `s`'s search bar (the search chord / palette). Every close
-    /// path clears, so the bar normally opens empty; should query state somehow
-    /// survive on this terminal, re-collect so stale points (the scrollback
-    /// rotated while closed) never render. No-op re-collect without a query.
+    /// Open window `s`'s search bar (the search chord / palette), taking that
+    /// window's keyboard (an open help closes: the bar must not take keys
+    /// under its scrim). Every close path clears, so the bar normally opens
+    /// empty; should query state somehow survive on this terminal, re-collect
+    /// so stale points (the scrollback rotated while closed) never render.
+    /// No-op re-collect without a query.
     fn search_open(&mut self, s: Surface) {
+        if self.ov_of(s).is_some_and(|o| !o.search_open) {
+            self.take_keyboard(s, Layer::Search);
+        }
         let Some(ov) = self.ov_of_mut(s) else { return };
         if !ov.search_open {
             ov.search_open = true;
@@ -5286,35 +5340,14 @@ impl App {
 
     // ── Hint mode (Ctrl+Shift+H) + keyboard copy-mode (Ctrl+Shift+Space) ──────
 
-    /// True while another overlay owns window `s`'s keyboard, so the hint /
-    /// copy-mode chords cannot start a mode (single-owner rule). In the main
-    /// window the app-level modals (confirm/quit popups, inline rename, the
-    /// welcome splash) count too: palette/search/rename/confirm capture the chord
-    /// BEFORE `decide_key` runs; welcome + help only capture Esc, so they are
-    /// checked explicitly here (amendment 6 — "cannot enter while another owns
-    /// keys", INCLUDING welcome, for parity).
-    fn overlay_owns_keys(&self, s: Surface) -> bool {
-        let window_overlay = self.ov_of(s).is_some_and(|o| o.owns_keys());
-        match s {
-            Surface::Main => {
-                self.confirm_quit
-                    || self.confirm_close.is_some()
-                    || self.renaming.is_some()
-                    || self.welcome_open
-                    || window_overlay
-            }
-            Surface::Detached(_) => window_overlay,
-        }
-    }
-
     /// Enter hint mode in window `s`: scan the visible URL/path/hash/IPv4 tokens
-    /// ONCE and show their labels. No-op on the alt screen, while another
-    /// overlay owns keys, or when the scan finds ZERO tokens (n=0 auto-exit —
-    /// never trap the user in an empty mode requiring Esc).
+    /// ONCE and show their labels, taking the window's keyboard (an open help,
+    /// search bar or welcome splash closes — the chord never silently does
+    /// nothing under them). No-op on the alt screen, or when the scan finds
+    /// ZERO tokens (n=0 auto-exit — never trap the user in an empty mode
+    /// requiring Esc). The layers that capture every key (palette, menus,
+    /// rename, confirmations, copy-mode) take the chord before it gets here.
     fn enter_hint_mode(&mut self, s: Surface) {
-        if self.overlay_owns_keys(s) || self.ov_of(s).is_none_or(|o| o.copy_mode.is_some()) {
-            return;
-        }
         let Some(term) = self.term_of(s) else { return };
         if term.alt_screen() {
             return;
@@ -5324,6 +5357,7 @@ impl App {
             return;
         }
         let labels = jetty_core::hints::assign_labels(tokens.len());
+        self.take_keyboard(s, Layer::Hint);
         if let Some(ov) = self.ov_of_mut(s) {
             ov.hint_mode = Some(HintState { tokens, labels, typed: String::new() });
         }
@@ -5407,17 +5441,15 @@ impl App {
     }
 
     /// Enter copy-mode in window `s`: a keyboard vi-cursor over the viewport +
-    /// scrollback. No-op on the alt screen or while another overlay owns keys.
-    /// Clears any leftover mouse selection on enter so the old highlight never
-    /// lingers.
+    /// scrollback, taking the window's keyboard as hint mode does. No-op on
+    /// the alt screen. Clears any leftover mouse selection on enter so the old
+    /// highlight never lingers.
     fn enter_copy_mode(&mut self, s: Surface) {
-        if self.overlay_owns_keys(s) || self.ov_of(s).is_none_or(|o| o.hint_mode.is_some()) {
+        if self.term_of(s).is_none_or(|t| t.alt_screen()) {
             return;
         }
+        self.take_keyboard(s, Layer::Copy);
         let Some(term) = self.term_of_mut(s) else { return };
-        if term.alt_screen() {
-            return;
-        }
         let snap = term.snapshot();
         let (row, col) = if snap.cursor_visible {
             (
@@ -5660,14 +5692,10 @@ impl App {
     /// (Re)build the palette registry FRESH and open the overlay in window `s`.
     /// Building on open (~50 short entries) — not incrementally and NOT in
     /// `apply_theme` (which auto-repeats on opacity) — keeps the dynamic
-    /// theme/tab/detach entries current at zero per-frame cost. Dismisses every
-    /// peer overlay of that window so exactly one overlay owns keys + draws on
-    /// top.
+    /// theme/tab/detach entries current at zero per-frame cost. Takes that
+    /// window's keyboard: its peers close (the search bar stays under it).
     fn open_palette(&mut self, s: Surface) {
-        self.dismiss_surface_menus(s);
-        if s == Surface::Main {
-            self.welcome_open = false;
-        }
+        self.take_keyboard(s, Layer::Palette);
         let themes = jetty_core::theme_list();
         let tabs: Vec<(u64, String)> = self.tabs.iter().map(|t| (t.id.0, t.title.clone())).collect();
         let detached: Vec<(u64, String)> =
@@ -5677,7 +5705,6 @@ impl App {
         let images = crate::backdrop::background_images(&crate::config::Config::dir());
         registry.extend(crate::palette::backdrop_entries(&images));
         let Some(ov) = self.ov_of_mut(s) else { return };
-        ov.help_open = false;
         ov.palette_registry = registry;
         ov.palette_query.clear();
         ov.palette_open = true;
@@ -5877,7 +5904,6 @@ impl App {
             if let Some(ov) = self.ov_of_mut(s) {
                 ov.help_open = false;
             }
-            self.dismiss_help_peers(s);
             self.paint_surface(s);
             return true;
         }
@@ -6521,7 +6547,8 @@ impl App {
             }
             C::Search => self.search_open(s),
             // The palette has already closed (run_palette_cmd runs after
-            // close_palette), so overlay_owns_keys() is false and the mode enters.
+            // close_palette); the mode takes the window's keyboard, closing a
+            // search bar left open under the palette.
             C::HintMode => self.enter_hint_mode(s),
             C::CopyMode => self.enter_copy_mode(s),
             // Clean no-op without a selection (the method aborts on Empty).
@@ -6808,6 +6835,8 @@ impl App {
     /// hovered CELL is unchanged, so without the forced recompute tab 1's
     /// underline ghosts over tab 2's text (F12).
     fn entered_new_active_tab(&mut self) {
+        // The welcome splash belongs to the tab it was shown over.
+        self.welcome_open = false;
         // Smart titles refresh on a tab switch too (the user looks at it now).
         let mode = self.tab_title_mode;
         if mode == crate::tabmeta::TabTitleMode::Auto {
@@ -11368,7 +11397,8 @@ impl App {
         let (help_open, help_scroll) = (ov.help_open, ov.help_scroll);
         // The IME preedit isn't drawn while one of the window's overlays owns
         // its keyboard (mirrors the main window).
-        let overlay_owns_keys = ov.owns_keys() || hint_ui.is_some() || copy_mode_ui.is_some();
+        let overlay_owns_keys =
+            ov.palette_open || ov.help_open || ov.search_open || hint_ui.is_some() || copy_mode_ui.is_some();
         let help_rows: Vec<String> = if help_open { self.help_rows.clone() } else { Vec::new() };
         let font_logical = self.font_logical;
         let padding = self.padding();
@@ -14002,17 +14032,9 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
 
-                // --- Hint mode / copy-mode, then the command palette (which
-                // captures the mouse while open) — shared with the detached
-                // windows ---
-                if self.modes_click(Surface::Main) {
-                    return;
-                }
-                if self.palette_click(Surface::Main, self.cursor.0 as f32, self.cursor.1 as f32, event_loop) {
-                    return;
-                }
-
-                // --- Quit confirmation popup is modal (highest priority) ---
+                // --- Quit confirmation popup is modal (highest priority: the
+                // top layer, drawn over everything — a palette left open under
+                // it included) ---
                 if self.confirm_quit {
                     let cx = self.cursor.0 as f32;
                     let cy = self.cursor.1 as f32;
@@ -14061,6 +14083,16 @@ impl ApplicationHandler<AppEvent> for App {
                         self.confirm_close = None;
                     }
                     self.request_main_paint();
+                    return;
+                }
+
+                // --- Hint mode / copy-mode, then the command palette (which
+                // captures the mouse while open) — shared with the detached
+                // windows ---
+                if self.modes_click(Surface::Main) {
+                    return;
+                }
+                if self.palette_click(Surface::Main, self.cursor.0 as f32, self.cursor.1 as f32, event_loop) {
                     return;
                 }
 
@@ -14216,6 +14248,7 @@ impl ApplicationHandler<AppEvent> for App {
                         let target = StripTarget::Tab(tab_id);
                         let is_double = strip_double_click(last_click, now, cx, cy, target);
                         if is_double && self.renaming != Some(tab_id) {
+                            self.take_keyboard(Surface::Main, Layer::Rename);
                             self.renaming = Some(tab_id);
                             self.rename_buf = self.tabs[i].title.clone();
                             self.request_main_paint();
@@ -14361,10 +14394,8 @@ impl ApplicationHandler<AppEvent> for App {
                         .iter()
                         .position(|r| input::point_in(r, cx, cy))
                     {
-                        // Close the other overlays so the menu can't be orphaned
-                        // under them (mutually exclusive with the terminal menu).
-                        self.commit_rename();
-                        self.ov.help_open = false;
+                        // Mutually exclusive with the terminal menu (the other
+                        // layers close as the tab menu takes the keyboard).
                         self.context_menu = None;
                         self.menu_hover = None;
                         let labels = crate::detached::tab_menu_items(crate::detached::can_detach(self.tabs.len()));
@@ -14606,6 +14637,13 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.tabs.is_empty() {
                     return;
                 }
+                // The welcome splash is gone at the first key, whatever the key
+                // goes on to do (a bare modifier is no key yet) — it never
+                // blocks a chord, nor follows a new tab.
+                if self.welcome_open && !input::is_modifier_key(&event.logical_key) {
+                    self.welcome_open = false;
+                    self.request_main_paint();
+                }
                 // --- Quit confirmation popup captures Enter / Esc (highest priority) ---
                 if self.confirm_quit {
                     use winit::keyboard::{Key, NamedKey};
@@ -14712,19 +14750,6 @@ impl ApplicationHandler<AppEvent> for App {
                 // detached windows) ---
                 if self.overlay_key_modal(Surface::Main, &event, event_loop) {
                     return;
-                }
-                // --- Welcome splash captures Escape (dismiss only, non-modal) ---
-                // Esc dismisses the welcome splash without consuming the key further
-                // (it still falls through to the help/PTY path so the shell also
-                // sees the ESC byte, which is the normal behaviour for Esc → PTY).
-                if self.welcome_open
-                    && matches!(
-                        event.logical_key,
-                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
-                    )
-                {
-                    self.welcome_open = false;
-                    // Don't return — let Esc continue through to the PTY path.
                 }
                 // --- Help (Esc + its scroll keys) and the scrollback-search bar
                 // (every key while open), shared with the detached windows ---
@@ -14939,11 +14964,6 @@ impl ApplicationHandler<AppEvent> for App {
                     // open menu took the key above and closed).
                     input::KeyAction::ContextMenu => self.open_menu_at_cursor(Surface::Main),
                     input::KeyAction::Send(bytes) => {
-                        // Esc also dismisses the welcome splash (but still reaches PTY).
-                        // Any real Send to the PTY also dismisses the welcome splash.
-                        if self.welcome_open {
-                            self.welcome_open = false;
-                        }
                         // Any real keystroke jumps back to the bottom so the user
                         // sees their input, then writes to the PTY (shared input
                         // core, v0.23 Task 9).
@@ -15794,6 +15814,66 @@ impl ApplicationHandler<AppEvent> for App {
                             );
                         },
                     );
+                    // Pass 4b: welcome splash — the bottom layer: drawn over the
+                    // grid but UNDER every other one (pills, search bar, hint
+                    // chips, menus, help, palette, confirm popups). Only shown
+                    // while welcome_open is true (gone at the first key, a grid
+                    // click, a tab change, or any layer opening). Skipped while a
+                    // modal is up, to avoid visual clutter.
+                    if welcome_open
+                        && context_menu.is_none()
+                        && !help_open
+                        && confirm_close.is_none()
+                        && !confirm_quit
+                        && palette_ui.is_none()
+                    {
+                        // Render the neofetch splash with the MONOSPACE terminal
+                        // font (its cell metrics), NOT the chrome/UI font: the
+                        // block-art logo needs fixed advances + row pitch to stay
+                        // aligned, and a proportional UI font garbled it.
+                        let (welcome_cw, welcome_ch) = text.cell_size();
+                        // Start BELOW the shell's prompt, not at a fixed inset: the
+                        // splash is an overlay, and at the top it covered a two-line
+                        // prompt's input line (powerlevel10k) — the line the user
+                        // types on. It follows the cursor until the first key.
+                        let prompt_rows = snap.cursor_row.min(snap.rows.saturating_sub(1)) + 1;
+                        let mut splash = jetty_render::build_welcome_overlay(
+                            origin.top + slide_y_offset + prompt_rows as f32 * welcome_ch,
+                            env!("CARGO_PKG_VERSION"),
+                            &gpu_backend_name,
+                            &welcome_tip,
+                            &theme,
+                            welcome_cw,
+                            welcome_ch,
+                        );
+                        // Clip the splash to the grid area so it never draws over a
+                        // bottom tab bar (e.g. on a very short window): drop swatch
+                        // quads / label rows below the grid bottom and trim a quad
+                        // that straddles the edge. The status strip is always
+                        // reserved; the tab bar only in bottom mode.
+                        let grid_bottom = if tab_bar_bottom {
+                            (height as f32 - bar_h - status_h).max(0.0)
+                        } else {
+                            (height as f32 - status_h).max(0.0)
+                        };
+                        splash.quads.retain(|q| q.y < grid_bottom);
+                        for q in &mut splash.quads {
+                            if q.y + q.h > grid_bottom {
+                                q.h = (grid_bottom - q.y).max(0.0);
+                            }
+                        }
+                        splash.labels.retain(|l| l.2 + 18.0 <= grid_bottom);
+                        if !splash.quads.is_empty() {
+                            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &splash.quads);
+                        }
+                        if !splash.labels.is_empty() {
+                            // Terminal (monospace) layer so the block-art logo
+                            // aligns regardless of the UI font.
+                            let _ = text.render_overlays(
+                                &gpu.device, &gpu.queue, scene_view, width, height, &splash.labels,
+                            );
+                        }
+                    }
                     // Pass 4c: Shift+drag hint toast — a brief, centered pill shown
                     // when the user drags (no Shift) inside a mouse-reporting app, so
                     // they discover the Shift+drag-to-select gesture. Throttled.
@@ -15940,66 +16020,6 @@ impl ApplicationHandler<AppEvent> for App {
                             );
                         }
                     }
-                    // Pass 4b: welcome splash — drawn over the grid but UNDER all
-                    // modals (context menu, help, confirm popups). Only shown when
-                    // welcome_open is true (dismissed on first PTY input/click/Esc).
-                    // No modal is active at this draw position, so it won't occlude
-                    // the splash, and modals drawn afterward sit on top of it.
-                    // Skip the splash if any modal is active to avoid visual clutter.
-                    if welcome_open
-                        && context_menu.is_none()
-                        && !help_open
-                        && confirm_close.is_none()
-                        && !confirm_quit
-                        && palette_ui.is_none()
-                    {
-                        // Render the neofetch splash with the MONOSPACE terminal
-                        // font (its cell metrics), NOT the chrome/UI font: the
-                        // block-art logo needs fixed advances + row pitch to stay
-                        // aligned, and a proportional UI font garbled it.
-                        let (welcome_cw, welcome_ch) = text.cell_size();
-                        // Start BELOW the shell's prompt, not at a fixed inset: the
-                        // splash is an overlay, and at the top it covered a two-line
-                        // prompt's input line (powerlevel10k) — the line the user
-                        // types on. It follows the cursor until the first key.
-                        let prompt_rows = snap.cursor_row.min(snap.rows.saturating_sub(1)) + 1;
-                        let mut splash = jetty_render::build_welcome_overlay(
-                            origin.top + slide_y_offset + prompt_rows as f32 * welcome_ch,
-                            env!("CARGO_PKG_VERSION"),
-                            &gpu_backend_name,
-                            &welcome_tip,
-                            &theme,
-                            welcome_cw,
-                            welcome_ch,
-                        );
-                        // Clip the splash to the grid area so it never draws over a
-                        // bottom tab bar (e.g. on a very short window): drop swatch
-                        // quads / label rows below the grid bottom and trim a quad
-                        // that straddles the edge. The status strip is always
-                        // reserved; the tab bar only in bottom mode.
-                        let grid_bottom = if tab_bar_bottom {
-                            (height as f32 - bar_h - status_h).max(0.0)
-                        } else {
-                            (height as f32 - status_h).max(0.0)
-                        };
-                        splash.quads.retain(|q| q.y < grid_bottom);
-                        for q in &mut splash.quads {
-                            if q.y + q.h > grid_bottom {
-                                q.h = (grid_bottom - q.y).max(0.0);
-                            }
-                        }
-                        splash.labels.retain(|l| l.2 + 18.0 <= grid_bottom);
-                        if !splash.quads.is_empty() {
-                            quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &splash.quads);
-                        }
-                        if !splash.labels.is_empty() {
-                            // Terminal (monospace) layer so the block-art logo
-                            // aligns regardless of the UI font.
-                            let _ = text.render_overlays(
-                                &gpu.device, &gpu.queue, scene_view, width, height, &splash.labels,
-                            );
-                        }
-                    }
                     // Draw the right-click context menu on top of everything.
                     if let Some((mx, my)) = context_menu {
                         let hint_refs: Vec<&str> = context_hints.iter().map(String::as_str).collect();
@@ -16047,8 +16067,8 @@ impl ApplicationHandler<AppEvent> for App {
                             );
                         }
                     }
-                    // Draw the Help overlay (Keyboard Shortcuts) on top of all
-                    // else — a dim layer, a bordered panel, and the binding rows.
+                    // Draw the Help overlay (Keyboard Shortcuts) over the menus —
+                    // a dim layer, a bordered panel, and the binding rows.
                     if help_open && palette_ui.is_none() {
                         let help = jetty_render::build_help_overlay(
                             width, height, &theme, &mut *chrome_text, cm, &help_rows, help_scroll,
@@ -16065,8 +16085,33 @@ impl ApplicationHandler<AppEvent> for App {
                             );
                         }
                     }
-                    // Draw the close-tab confirmation popup on top of everything
-                    // (above the help overlay): dim + bordered panel + buttons.
+                    // Command palette — above help/welcome/menus, under only a
+                    // confirmation (the one layer order, `overlays::Layer`).
+                    // Built + drawn strictly inside this Some() branch: nothing when
+                    // closed (zero idle cost).
+                    if let Some((q, prows_data, total, first)) = &palette_ui {
+                        let prows: Vec<jetty_render::PaletteRow> = prows_data
+                            .iter()
+                            .map(|(t, idx, sel)| jetty_render::PaletteRow {
+                                title: t,
+                                match_indices: idx,
+                                selected: *sel,
+                            })
+                            .collect();
+                        let pal = jetty_render::build_command_palette(
+                            width, height, &theme, &mut *chrome_text, cm, q, &prows, *total, *first,
+                        );
+                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pal.quads);
+                        if !pal.labels.is_empty() {
+                            let _ = chrome_text.render_overlays(
+                                &gpu.device, &gpu.queue, scene_view, width, height, &pal.labels,
+                            );
+                        }
+                    }
+                    // Draw the quit / close-tab confirmation popup LAST, on top of
+                    // everything (a palette left open under it included — the keys
+                    // and clicks are the confirmation's): dim + bordered panel +
+                    // buttons.
                     if confirm_quit {
                         let popup = jetty_render::build_confirm(
                             width, height, "Quit JeTTY? — all tabs will close", &theme,
@@ -16091,29 +16136,6 @@ impl ApplicationHandler<AppEvent> for App {
                                 width,
                                 height,
                                 &popup.labels,
-                            );
-                        }
-                    }
-                    // Command palette — drawn LAST (above help/welcome/menus/
-                    // confirm) so the single active overlay owns the top layer.
-                    // Built + drawn strictly inside this Some() branch: nothing when
-                    // closed (zero idle cost).
-                    if let Some((q, prows_data, total, first)) = &palette_ui {
-                        let prows: Vec<jetty_render::PaletteRow> = prows_data
-                            .iter()
-                            .map(|(t, idx, sel)| jetty_render::PaletteRow {
-                                title: t,
-                                match_indices: idx,
-                                selected: *sel,
-                            })
-                            .collect();
-                        let pal = jetty_render::build_command_palette(
-                            width, height, &theme, &mut *chrome_text, cm, q, &prows, *total, *first,
-                        );
-                        quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &pal.quads);
-                        if !pal.labels.is_empty() {
-                            let _ = chrome_text.render_overlays(
-                                &gpu.device, &gpu.queue, scene_view, width, height, &pal.labels,
                             );
                         }
                     }

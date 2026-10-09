@@ -5,8 +5,63 @@
 //! owns its own (`DetachedWindow::ov`), so an overlay opened in a window acts on
 //! THAT window's terminal and is drawn in that window. Operations name their
 //! window with a [`Surface`].
+//!
+//! Every layer of a window — these overlays, its menus, and in the main window
+//! the confirmations, the tab rename and the welcome splash — sits in ONE order
+//! ([`Layer`]): keys, pointer presses and the draw pass all meet the layers in
+//! it, and whatever opens takes the keyboard by its rule
+//! ([`Layer::stays_under`], applied by `App::take_keyboard`), so the layer
+//! drawn on top is always the one the input reaches.
 
 use std::time::Instant;
+
+/// A window's input layers in THE one order, top first. The key routing, the
+/// pointer routing and the draw pass all follow it (the draw paints it
+/// bottom-up). Opening a layer closes every open one that may not stay under
+/// it ([`Layer::stays_under`]), so the pairs that can be open together are
+/// few, and each of them is routed top first on every path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Layer {
+    /// The quit / close-tab confirmation (main window): Enter / Esc, every
+    /// other key and every press swallowed.
+    Confirm,
+    /// The command palette: every key and press.
+    Palette,
+    /// The keyboard-shortcuts help: every press, Esc and its scroll keys (the
+    /// rest reach the shell).
+    Help,
+    /// A context or tab menu: its keys and every press.
+    Menu,
+    /// The inline tab rename (main window): every key.
+    Rename,
+    /// Hint mode: every key and press.
+    Hint,
+    /// Copy-mode: every key; a press leaves it.
+    Copy,
+    /// The scrollback-search bar: every key, presses on its panel.
+    Search,
+    /// The welcome splash (main window): gone at the first key or click.
+    Welcome,
+}
+
+impl Layer {
+    /// Whether this open layer stays open when `owner` opens and takes the
+    /// keyboard. A confirmation keeps everything (it is the top layer, and
+    /// cancelling it hands the window back as it was) and nothing closes it.
+    /// The search bar stays under the palette, a menu and the tab rename, and
+    /// copy-mode under a menu (its Copy row copies copy-mode's selection): each
+    /// of them is above the one it covers on every path and hands it back on
+    /// close. Every other open layer closes — the search bar would keep taking
+    /// keys under the help's scrim, hint mode would swallow the clicks meant
+    /// for a menu, and the welcome splash is gone once anything takes over.
+    pub fn stays_under(self, owner: Layer) -> bool {
+        use Layer::*;
+        matches!(
+            (owner, self),
+            (_, Confirm) | (Confirm, _) | (Palette | Menu | Rename, Search) | (Menu, Copy)
+        )
+    }
+}
 
 /// How often an open search re-collects its matches while output streams in
 /// (stored match points go stale as the scrollback rotates).
@@ -116,12 +171,6 @@ pub(crate) struct Overlays {
 }
 
 impl Overlays {
-    /// True while one of this window's bar/modal overlays owns the keyboard
-    /// (palette, help, search) — hint and copy-mode can't start then.
-    pub fn owns_keys(&self) -> bool {
-        self.palette_open || self.help_open || self.search_open
-    }
-
     /// Recompute the palette hits from the query (on open + each keystroke) and
     /// reset the selection/scroll to the top.
     pub fn refilter_palette(&mut self) {
@@ -460,6 +509,99 @@ mod tests {
         assert!(ov.hint_draw().is_none());
         assert!(ov.palette_draw().is_none());
         assert!(ov.copy_draw().is_none());
-        assert!(!ov.owns_keys());
+    }
+
+    const LAYERS: [Layer; 9] = [
+        Layer::Confirm,
+        Layer::Palette,
+        Layer::Help,
+        Layer::Menu,
+        Layer::Rename,
+        Layer::Hint,
+        Layer::Copy,
+        Layer::Search,
+        Layer::Welcome,
+    ];
+
+    /// A window's open layers after `owner` opens: `App::take_keyboard`'s rule
+    /// as a pure state machine.
+    fn open(layers: &[Layer], owner: Layer) -> Vec<Layer> {
+        let mut v: Vec<Layer> = layers.iter().copied().filter(|l| *l != owner && l.stays_under(owner)).collect();
+        v.push(owner);
+        v.sort();
+        v
+    }
+
+    /// Whatever opens is the layer the input reaches — the top of the open
+    /// ones, under a confirmation at most — after ANY sequence of opens: every
+    /// pair that can be open together is ordered by `Layer`, which the keys,
+    /// the pointer and the draw pass all follow.
+    #[test]
+    fn whatever_opens_is_on_top_after_any_sequence() {
+        let mut seen = 0;
+        for a in LAYERS {
+            for b in LAYERS {
+                for c in LAYERS {
+                    let mut layers = Vec::new();
+                    for owner in [a, b, c] {
+                        layers = open(&layers, owner);
+                        let top = match owner {
+                            Layer::Confirm => layers.first(),
+                            _ => layers.iter().find(|l| **l != Layer::Confirm),
+                        };
+                        assert_eq!(top, Some(&owner), "{a:?} {b:?} {c:?}: {layers:?}");
+                        seen += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, 3 * 9 * 9 * 9);
+    }
+
+    /// The search bar never sits under the help: typing would edit a query the
+    /// help's scrim hides (and scroll the terminal behind it). Whichever opens
+    /// second wins.
+    #[test]
+    fn the_help_and_the_search_bar_take_the_window_from_each_other() {
+        assert_eq!(open(&open(&[], Layer::Search), Layer::Help), [Layer::Help]);
+        assert_eq!(open(&open(&[], Layer::Help), Layer::Search), [Layer::Search]);
+        // Hint mode / copy-mode start over the help (closing it) instead of
+        // silently refusing the chord.
+        assert_eq!(open(&[Layer::Help], Layer::Hint), [Layer::Hint]);
+        assert_eq!(open(&[Layer::Help, Layer::Search], Layer::Copy), [Layer::Copy]);
+    }
+
+    /// The layers that cover the search bar on every path hand it back; a
+    /// menu also keeps copy-mode (its Copy row copies copy-mode's selection).
+    #[test]
+    fn the_search_bar_stays_under_the_palette_a_menu_and_a_rename() {
+        for owner in [Layer::Palette, Layer::Menu, Layer::Rename, Layer::Confirm] {
+            assert_eq!(open(&[Layer::Search], owner), [owner, Layer::Search], "{owner:?}");
+        }
+        assert_eq!(open(&[Layer::Copy, Layer::Search], Layer::Menu), [Layer::Menu, Layer::Copy, Layer::Search]);
+        assert_eq!(open(&[Layer::Copy], Layer::Palette), [Layer::Palette]);
+        assert_eq!(open(&[Layer::Hint], Layer::Menu), [Layer::Menu]);
+    }
+
+    /// A confirmation keeps the window as it was under it, and nothing that
+    /// opens later closes it.
+    #[test]
+    fn a_confirmation_keeps_everything_and_is_never_closed() {
+        let all: Vec<Layer> = LAYERS.iter().copied().filter(|l| *l != Layer::Confirm).collect();
+        let mut with = all.clone();
+        with.insert(0, Layer::Confirm);
+        assert_eq!(open(&all, Layer::Confirm), with);
+        for owner in LAYERS {
+            assert!(open(&[Layer::Confirm], owner).contains(&Layer::Confirm), "{owner:?}");
+        }
+    }
+
+    /// The welcome splash is gone once anything takes the window — save a
+    /// confirmation, which hands the window back exactly as it was.
+    #[test]
+    fn every_layer_takes_the_welcome_away() {
+        for owner in LAYERS.iter().copied().filter(|l| !matches!(l, Layer::Welcome | Layer::Confirm)) {
+            assert!(!open(&[Layer::Welcome], owner).contains(&Layer::Welcome), "{owner:?}");
+        }
     }
 }
