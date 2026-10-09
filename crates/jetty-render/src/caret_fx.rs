@@ -43,7 +43,7 @@ struct C {
     cell:       vec2<f32>,   // cell size (w, h in px)      @ 16
     t:          f32,          // burst progress [0..1]       @ 24
     intensity:  f32,          // effect brightness           @ 28
-    color:      vec4<f32>,   // rgb + pad                   @ 32
+    color:      vec4<f32>,   // linear rgb + pad            @ 32
 };
 @group(0) @binding(0) var<uniform> p: C;
 
@@ -133,8 +133,20 @@ pub struct CaretFxUniform {
     pub t: f32,
     /// Effect brightness multiplier [0..1]. (offset 28)
     pub intensity: f32,
-    /// Glow colour: rgb in [0..1], [3] is padding. (offset 32)
+    /// Glow colour: sRGB rgb in [0..1], [3] is padding. (offset 32)
     pub color: [f32; 4],
+}
+
+impl CaretFxUniform {
+    /// The uniform as the shader reads it: the color in LINEAR light, which
+    /// both variants work in (the additive one adds it to the sRGB target,
+    /// the multiply one scales the page toward it) — like every color the
+    /// quad and ring shaders draw (`s2l`).
+    fn for_gpu(&self) -> Self {
+        let [r, g, b, pad] = self.color;
+        let [r, g, b] = [r, g, b].map(crate::crt::srgb_to_linear);
+        CaretFxUniform { color: [r, g, b, pad], ..*self }
+    }
 }
 
 /// Glow strength on a dark page (additive): bright enough to be visible,
@@ -328,7 +340,7 @@ impl CaretFx {
         let Some([sx, sy, sw, sh]) = caret_glow_scissor(u.cursor_px, u.cell, w, h) else {
             return;
         };
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(u));
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u.for_gpu()));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("caret-fx-encoder"),
@@ -376,6 +388,27 @@ mod tests {
         validator
             .validate(&module)
             .expect("CARET_FX_SHADER must pass naga validation");
+    }
+
+    /// The glow color is an sRGB color (the configured `caret_flash_color`),
+    /// and both variants work in LINEAR light — the additive one adds it, the
+    /// multiply one scales the page toward it — so it is linearized for the
+    /// GPU; the rest of the uniform goes up unchanged. The defaults (white on
+    /// a dark page, black on a light one) are the same in both spaces.
+    #[test]
+    fn the_glow_color_goes_up_as_linear_light() {
+        let u = CaretFxUniform {
+            resolution: [800.0, 600.0],
+            cursor_px: [10.0, 20.0],
+            cell: [9.0, 18.0],
+            t: 0.3,
+            intensity: 0.5,
+            color: [0.5, 1.0, 0.0, 0.0],
+        };
+        let g = u.for_gpu();
+        assert!((g.color[0] - 0.214_041).abs() < 1e-5, "{:?}", g.color);
+        assert_eq!(&g.color[1..], &[1.0, 0.0, 0.0]);
+        assert_eq!((g.resolution, g.cursor_px, g.cell, g.t, g.intensity), (u.resolution, u.cursor_px, u.cell, u.t, u.intensity));
     }
 
     #[test]

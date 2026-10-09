@@ -108,13 +108,34 @@ pub struct PhosphorUniform {
     pub radius: f32,
     /// Progress 0..1. (offset 12)
     pub t: f32,
-    /// Accent RGB 0..1. (offset 16)
+    /// Accent RGB 0..1, linear light. (offset 16)
     pub accent: [f32; 3],
     /// The window shape's vertical offset (≤ 0 during the Dropdown slide). (offset 28)
     pub offset_y: f32,
     /// Top corner radius in physical px (0 for a top-flush Dropdown). (offset 32)
     pub radius_top: f32,
     pub _pad: [f32; 3],
+}
+
+impl PhosphorUniform {
+    /// One frame's uniform ([`PhosphorIgnition::apply_slid`]'s arguments).
+    fn frame(width: u32, height: u32, radii: [f32; 2], offset_y: f32, t: f32, accent: [f32; 3]) -> Self {
+        // Each radius at most half the smaller side (the corner mask's clamp).
+        let max_r = width.min(height) as f32 / 2.0;
+        let r = |v: f32| if v.is_finite() { v.clamp(0.0, max_r) } else { 0.0 };
+        PhosphorUniform {
+            size: [width as f32, height as f32],
+            radius: r(radii[1]),
+            t,
+            // The glow adds LINEAR light to the sRGB target: the sRGB accent
+            // is linearized, like every color the quad and ring shaders draw
+            // (`s2l`) — once here, not per fragment.
+            accent: accent.map(crate::crt::srgb_to_linear),
+            offset_y: if offset_y.is_finite() { offset_y } else { 0.0 },
+            radius_top: r(radii[0]),
+            _pad: [0.0; 3],
+        }
+    }
 }
 
 pub struct PhosphorIgnition {
@@ -213,7 +234,7 @@ impl PhosphorIgnition {
     }
 
     /// Run the Phosphor Ignition reveal over `view` at progress `t` (0..1) with a
-    /// theme `accent` color (0..1 RGB) and the window's corner `radius` (physical
+    /// theme `accent` color (sRGB, 0..1 RGB) and the window's corner `radius` (physical
     /// px). At `t >= 1.0` the interior is fully revealed and the glow envelope is
     /// 0 — caller should stop driving the animation there so idle CPU is zero.
     #[allow(clippy::too_many_arguments)]
@@ -249,18 +270,7 @@ impl PhosphorIgnition {
         t: f32,
         accent: [f32; 3],
     ) {
-        // Each radius at most half the smaller side (the corner mask's clamp).
-        let max_r = width.min(height) as f32 / 2.0;
-        let r = |v: f32| if v.is_finite() { v.clamp(0.0, max_r) } else { 0.0 };
-        let u = PhosphorUniform {
-            size: [width as f32, height as f32],
-            radius: r(radii[1]),
-            t,
-            accent,
-            offset_y: if offset_y.is_finite() { offset_y } else { 0.0 },
-            radius_top: r(radii[0]),
-            _pad: [0.0; 3],
-        };
+        let u = PhosphorUniform::frame(width, height, radii, offset_y, t, accent);
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -325,6 +335,37 @@ mod tests {
         let d = qx.max(qy).min(0.0) + (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() - r;
         let rim = smoothstep(-5.0, -2.0, d) * (1.0 - smoothstep(-2.0, 0.5, d));
         rim * (-d).clamp(0.0, 1.0)
+    }
+
+    /// The linear light `l` as the sRGB target stores it (0..255).
+    fn linear_to_srgb8(l: f32) -> u8 {
+        let l = l.clamp(0.0, 1.0);
+        let s = if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
+        (s * 255.0).round() as u8
+    }
+
+    /// The accent is the theme's sRGB color, and the glow ADDS it as linear
+    /// light into the sRGB target: it is linearized first, like every other
+    /// color path (the quad and ring shaders' `s2l`). Added raw, Tokyo Night's
+    /// #7aa2f7 came out as a washed-out (184, 209, 251) rim.
+    #[test]
+    fn the_glow_adds_the_accent_as_linear_light() {
+        let accent = [122.0 / 255.0, 162.0 / 255.0, 247.0 / 255.0];
+        let u = PhosphorUniform::frame(400, 200, [16.0, 16.0], 0.0, 0.5, accent);
+        // Full glow over black shows the accent itself.
+        assert_eq!(u.accent.map(linear_to_srgb8), [122, 162, 247]);
+        // White and black are the same in both spaces.
+        assert_eq!(PhosphorUniform::frame(400, 200, [0.0; 2], 0.0, 0.5, [1.0; 3]).accent, [1.0; 3]);
+        assert_eq!(PhosphorUniform::frame(400, 200, [0.0; 2], 0.0, 0.5, [0.0; 3]).accent, [0.0; 3]);
+    }
+
+    /// The rest of the uniform: radii clamped to half the smaller side, a
+    /// non-finite slide offset dropped.
+    #[test]
+    fn the_uniform_clamps_its_geometry() {
+        let u = PhosphorUniform::frame(400, 200, [500.0, f32::NAN], f32::INFINITY, 0.25, [0.0; 3]);
+        assert_eq!((u.size, u.t), ([400.0, 200.0], 0.25));
+        assert_eq!((u.radius_top, u.radius, u.offset_y), (100.0, 0.0, 0.0));
     }
 
     /// The uniform: 48 bytes, the WGSL `P` byte for byte.
