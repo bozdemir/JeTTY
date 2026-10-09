@@ -230,6 +230,45 @@ pub(crate) fn smart_title(running: Option<&str>, cwd: Option<&Path>, home: Optio
     }
 }
 
+/// The mouse wheel over the tab strip flips through the tabs instead of
+/// scrolling the grid below it: one notch (3 lines) per tab — a touchpad's
+/// fractional deltas accumulate to the same — wheel up / left = the previous
+/// tab, down / right = the next.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct TabWheel {
+    acc: f32,
+}
+
+impl TabWheel {
+    /// Wheel lines that make one tab step (one mouse-wheel notch).
+    const LINES_PER_TAB: f32 = 3.0;
+
+    /// Feed a wheel delta — `lines` vertical (positive = up), `cols`
+    /// horizontal (positive = left), as `input::wheel_lines` / `wheel_columns`
+    /// measure them — and return the tab steps it makes now (negative = toward
+    /// the first tab). A reversal drops the remainder of the old direction.
+    pub(crate) fn add(&mut self, lines: f32, cols: f32) -> i32 {
+        let d = lines + cols;
+        if !d.is_finite() || d == 0.0 {
+            return 0;
+        }
+        if self.acc != 0.0 && self.acc.signum() != d.signum() {
+            self.acc = 0.0;
+        }
+        self.acc += d;
+        let steps = (self.acc / Self::LINES_PER_TAB).trunc();
+        self.acc -= steps * Self::LINES_PER_TAB;
+        -(steps as i32)
+    }
+}
+
+/// The tab a wheel step from `active` lands on among `n` tabs: clamped at the
+/// first / last tab (a spun wheel stops at the end instead of wrapping).
+pub(crate) fn wheel_tab_target(active: usize, n: usize, steps: i32) -> usize {
+    let last = n.saturating_sub(1) as i64;
+    (active as i64 + i64::from(steps)).clamp(0, last) as usize
+}
+
 /// The user's home directory, read once (smart titles show it as "~").
 pub(crate) fn home_dir() -> Option<&'static Path> {
     static HOME: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
@@ -313,6 +352,37 @@ mod tests {
         assert_eq!(main[at].osc_title.as_deref(), Some("build"));
         assert_eq!(main[at].deco().color, Some(5));
         assert_eq!(main[at].deco().progress, tab.progress);
+    }
+
+    #[test]
+    fn a_wheel_notch_over_the_tab_strip_is_one_tab() {
+        let mut w = TabWheel::default();
+        // A mouse notch is LineDelta 1.0 = 3 lines: down → next, up → previous.
+        assert_eq!(w.add(-3.0, 0.0), 1);
+        assert_eq!(w.add(3.0, 0.0), -1);
+        assert_eq!(w.add(-9.0, 0.0), 3, "three notches in one event");
+        // A touchpad's small pixel deltas accumulate to a step.
+        let steps: i32 = (0..10).map(|_| w.add(-0.5, 0.0)).sum();
+        assert_eq!(steps, 1, "5 lines of small deltas = one tab (2 left over)");
+        // Reversing drops the old direction's remainder: no lurch.
+        assert_eq!(w.add(1.0, 0.0), 0);
+        assert_eq!(w.add(2.0, 0.0), -1);
+        // Horizontal scrolling counts too (left = previous).
+        assert_eq!(w.add(0.0, 3.0), -1);
+        assert_eq!(w.add(0.0, -3.0), 1);
+        assert_eq!(w.add(f32::NAN, 0.0), 0);
+        assert_eq!(w.add(0.0, 0.0), 0);
+    }
+
+    #[test]
+    fn the_wheel_stops_at_the_first_and_last_tab() {
+        assert_eq!(wheel_tab_target(2, 5, 1), 3);
+        assert_eq!(wheel_tab_target(2, 5, -1), 1);
+        assert_eq!(wheel_tab_target(4, 5, 1), 4, "no wrap past the last tab");
+        assert_eq!(wheel_tab_target(0, 5, -3), 0, "no wrap before the first");
+        assert_eq!(wheel_tab_target(1, 5, 10), 4);
+        assert_eq!(wheel_tab_target(0, 1, 1), 0);
+        assert_eq!(wheel_tab_target(0, 0, 1), 0);
     }
 
     #[test]

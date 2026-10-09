@@ -1526,6 +1526,8 @@ pub struct App {
     /// The main-window tab under the pointer (hover lift, hover "×"). Updated
     /// on CursorMoved only when it changes — one repaint per change.
     tab_hover: Option<usize>,
+    /// The wheel over the tab strip flips through the tabs (`tabmeta::TabWheel`).
+    tab_wheel: crate::tabmeta::TabWheel,
     /// The focus-ring pass on the MAIN device, built on the first frame that
     /// draws a ring (`window_border` on) — never in `resumed`.
     focus_ring: Option<jetty_render::FocusRing>,
@@ -2099,6 +2101,7 @@ impl App {
             window_border: crate::tabmeta::WindowBorder::None,
             tab_title_mode: crate::tabmeta::TabTitleMode::Osc,
             tab_hover: None,
+            tab_wheel: crate::tabmeta::TabWheel::default(),
             focus_ring: None,
             title_recheck_at: None,
             cursor_cfg: crate::config::CursorConfig::default(),
@@ -3805,6 +3808,32 @@ impl App {
             (height - self.bar_h() - self.status_h()).max(0.0)
         } else {
             0.0
+        }
+    }
+
+    /// Whether the pointer is over the main window's tab strip.
+    fn pointer_on_main_tab_bar(&self) -> bool {
+        let Some(h) = self.gpu.as_ref().map(|g| g.config.height as f32) else { return false };
+        let (y, bar_y) = (self.cursor.1 as f32, self.tabbar_y(h));
+        y >= bar_y && y < bar_y + self.bar_h()
+    }
+
+    /// The wheel over the tab strip: step through the tabs. Inert while a
+    /// popup, a menu, an inline rename or a tab drag owns the strip.
+    fn wheel_tabs(&mut self, delta: MouseScrollDelta) {
+        if self.confirm_quit
+            || self.confirm_close.is_some()
+            || self.tab_menu.is_some()
+            || self.context_menu.is_some()
+            || self.renaming.is_some()
+            || self.tab_drag.is_some()
+        {
+            return;
+        }
+        let (cw, ch) = self.text.as_ref().map_or((0.0, 0.0), |t| t.cell_size());
+        let steps = self.tab_wheel.add(input::wheel_lines(delta, ch), input::wheel_columns(delta, cw));
+        if steps != 0 {
+            self.select_tab(crate::tabmeta::wheel_tab_target(self.active, self.tabs.len(), steps));
         }
     }
 
@@ -10517,6 +10546,12 @@ impl App {
                 if self.overlay_wheel(Surface::Detached(pos), delta) {
                     return;
                 }
+                // The title bar is chrome: the wheel there never reaches the grid
+                // (or a mouse-tracking program) below it.
+                let (ui_font, show_hud) = (self.ui_font_logical, self.show_perf_hud);
+                if self.detached.get(pos).is_some_and(|dw| (dw.cursor.1 as f32) < dw.chrome_bands(ui_font, show_hud).0) {
+                    return;
+                }
                 let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let mods = self.modifiers;
                 let scrollbar_on = self.scrollbar_mode.has_gutter();
@@ -13865,6 +13900,13 @@ impl ApplicationHandler<AppEvent> for App {
                 // The help overlay (while its rows overflow) and the palette
                 // own the wheel too (shared with the detached windows).
                 if self.overlay_wheel(Surface::Main, delta) {
+                    return;
+                }
+                // Over the tab strip the wheel flips through the tabs — one
+                // notch per tab, stopping at the ends — instead of scrolling the
+                // grid below it (or reaching a mouse-tracking program at row 0).
+                if self.pointer_on_main_tab_bar() {
+                    self.wheel_tabs(delta);
                     return;
                 }
                 // The shared grid wheel (detached windows run the same). Deltas
