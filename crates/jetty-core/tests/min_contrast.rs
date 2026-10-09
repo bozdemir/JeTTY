@@ -76,6 +76,18 @@ fn shape_glyphs_keep_their_exact_colors() {
 }
 
 #[test]
+fn a_powerline_icon_is_adjusted_with_its_text() {
+    // Regression: the branch icon of a " main" prompt segment kept its
+    // unreadable color while "main" beside it was adjusted — U+E0A0–E0A3 are
+    // icons drawn in the segment's text color, not separators.
+    let mut t = term("catppuccin_mocha", 4.5);
+    t.feed("\x1b[38;2;40;40;60m\u{E0A0} main\x1b[0m".as_bytes());
+    let s = t.snapshot();
+    assert_eq!(s.cell(0, 0).fg, s.cell(0, 2).fg, "the icon and its text match");
+    assert!(contrast_ratio(s.cell(0, 0).fg, s.cell(0, 0).bg) >= 4.5);
+}
+
+#[test]
 fn the_underline_follows_the_adjusted_glyph() {
     let mut t = term("solarized_dark", 4.5);
     t.feed(b"\x1b[4;90mu\x1b[0m");

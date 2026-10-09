@@ -59,7 +59,7 @@ Names of fonts and themes are matched in any letter case, and a theme by its id
 | `theme` | `"catppuccin_mocha"` | The color theme: one of the 46 built-ins or a [user theme](#user-themes). Settings and the command palette show them all. |
 | `follow_system_theme` | `false` | Follow the desktop's light/dark preference (the freedesktop settings portal on Linux and BSD, the system appearance on macOS): `light_theme` while it prefers light or states no preference, `theme` while it prefers dark. Without a portal (a bare window manager) `theme` stays. |
 | `light_theme` | `"catppuccin_latte"` | The theme shown while `follow_system_theme` is on and the system is light. While it is on screen, a theme picked in Settings or the palette is saved here. `""` = no light variant. |
-| `minimum_contrast` | `1.0` | Minimum contrast ratio between text and its background, `1`–`21`. `1` is off; `4.5` is WCAG AA, `3` large text. Text below it is pushed toward white or black, keeping its hue; powerline, block and sextant glyphs never change. |
+| `minimum_contrast` | `1.0` | Minimum contrast ratio between text and its background, `1`–`21`. `1` is off; `4.5` is WCAG AA, `3` large text. Text below it is pushed toward white or black, keeping its hue; powerline separators, block and sextant glyphs never change. |
 | `opacity` | `1.0` | Background opacity, `0.1`–`1` (needs a compositor). `Ctrl+Alt+=` / `Ctrl+Alt+-` step it. |
 
 ## Fonts and text

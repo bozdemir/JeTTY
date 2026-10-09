@@ -112,15 +112,17 @@ pub fn ensure_contrast(fg: [u8; 3], bg: [u8; 3], min: f32) -> [u8; 3] {
 }
 
 /// Glyphs `minimum_contrast` never recolors, because their color IS the drawing
-/// rather than text on a background: powerline / Nerd Font separators
-/// (U+E0A0–E0D7 — drawn in the NEXT segment's background color so the arrow
-/// blends into it), block elements (U+2580–259F) and the sextant mosaics
-/// (U+1FB00–1FB3B) that chafa / timg / notcurses paint pixel art with.
+/// rather than text on a background: the powerline / Nerd Font separators and
+/// shapes (U+E0B0–E0D7 — drawn in the NEXT segment's background color so the
+/// arrow blends into it), block elements (U+2580–259F) and the sextant mosaics
+/// (U+1FB00–1FB3B) that chafa / timg / notcurses paint pixel art with. The
+/// powerline icons before them (U+E0A0–E0A3: branch, line number, lock) are
+/// text in their segment's text color, and are adjusted with it.
 #[inline]
 pub fn min_contrast_exempt(c: char) -> bool {
     // Every exempt range lies above U+257F: one compare clears ordinary text.
     let u = c as u32;
-    u >= 0x2580 && matches!(u, 0x2580..=0x259F | 0xE0A0..=0xE0D7 | 0x1FB00..=0x1FB3B)
+    u >= 0x2580 && matches!(u, 0x2580..=0x259F | 0xE0B0..=0xE0D7 | 0x1FB00..=0x1FB3B)
 }
 
 /// Slots in [`ContrastMemo`]'s direct-mapped table.
@@ -295,11 +297,12 @@ mod tests {
     }
 
     #[test]
-    fn exemptions_cover_powerline_blocks_and_sextants_only() {
-        for c in ['\u{E0A0}', '\u{E0B0}', '\u{E0B6}', '\u{E0D7}', '█', '▀', '▐', '░', '\u{1FB00}', '\u{1FB3B}'] {
+    fn exemptions_cover_powerline_separators_blocks_and_sextants_only() {
+        for c in ['\u{E0B0}', '\u{E0B6}', '\u{E0D7}', '█', '▀', '▐', '░', '\u{1FB00}', '\u{1FB3B}'] {
             assert!(min_contrast_exempt(c), "{:X}", c as u32);
         }
-        for c in ['a', ' ', '─', '│', '⠿', '\u{E0D8}', '\u{E09F}', '\u{1FB3C}', '✔'] {
+        // The powerline icons (branch, line number, lock, column) are text.
+        for c in ['a', ' ', '─', '│', '⠿', '\u{E0A0}', '\u{E0A3}', '\u{E0AF}', '\u{E0D8}', '\u{E09F}', '\u{1FB3C}', '✔'] {
             assert!(!min_contrast_exempt(c), "{:X}", c as u32);
         }
     }
