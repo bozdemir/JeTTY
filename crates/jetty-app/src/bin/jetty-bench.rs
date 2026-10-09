@@ -178,8 +178,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         drop((device, queue));
         return Ok(());
     }
-
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    // `JETTY_BENCH_ONLY=frames`: just the per-frame table + scene passes (quick
+    // repeats for A/B runs).
+    if only.as_deref() == Some("frames") {
+        return bench_frames(&device, &queue, format, font_size);
+    }
+
     let t1 = Instant::now();
     let mut text = TextLayer::new_with_family(&device, &queue, format, font_size, "MesloLGS NF");
     let text_init_ms = t1.elapsed().as_secs_f64() * 1000.0;
@@ -501,11 +506,12 @@ fn bench_frames(
             }
             let n = 300usize;
             let mut cpu = Vec::with_capacity(n);
-            let mut total = 0.0f64;
+            let (mut total, mut snap_total) = (0.0f64, 0.0f64);
             for k in 0..n {
                 step(&mut term, k);
                 let t = Instant::now();
                 let snap = term.snapshot();
+                snap_total += t.elapsed().as_secs_f64() * 1000.0;
                 text.render_to(device, queue, &view, width, height, &snap, true, 0.0)?;
                 cpu.push(t.elapsed().as_secs_f32() * 1000.0);
                 device.poll(wgpu::PollType::wait_indefinitely())?;
@@ -514,7 +520,8 @@ fn bench_frames(
             let mean = cpu.iter().sum::<f32>() / n as f32;
             cpu.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             println!(
-                "  {cols:3}x{rows:<3} {label:<7} cpu {mean:7.3} ms | total {:7.3} ms | p99 cpu {:7.3} ms",
+                "  {cols:3}x{rows:<3} {label:<7} cpu {mean:7.3} ms (snapshot {:5.3}) | total {:7.3} ms | p99 cpu {:7.3} ms",
+                snap_total / n as f64,
                 total / n as f64,
                 percentile(&cpu, 99.0)
             );
