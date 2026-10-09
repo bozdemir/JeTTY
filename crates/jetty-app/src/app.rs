@@ -13751,6 +13751,16 @@ impl ApplicationHandler<AppEvent> for App {
         if self.window.as_ref().map(|w| w.id()) != Some(id) {
             return;
         }
+        // No tab left: the last one closed (its shell exited, or the user closed
+        // it) and the loop is exiting — yet winit still delivers what this
+        // iteration queued, on Wayland AFTER the Wake that closed it. The arms
+        // below assume a tab: a scrollbar drag's CursorMoved reached
+        // `active_tab()`, which panics on an empty vec — and a panic skips
+        // `exiting` and its settings flush. Nothing is left to handle (the
+        // per-arm F29 guards predate this one).
+        if self.tabs.is_empty() {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.confirm_quit = true;
@@ -20093,6 +20103,19 @@ mod window_parity_tests {
         // + close_exited_tabs (2) + resumed (1) + drag_reorder_tab (1: the SAME
         // tab re-indexed by a reorder — not a change, so its state must stay).
         assert_eq!(assigns, 10, "a new direct `self.active` assignment — use set_active_tab");
+    }
+
+    /// Tripwire: a main-window event winit delivers after the last tab closed
+    /// (the loop is exiting) stops before the arms, which all assume a tab — a
+    /// scrollbar drag's CursorMoved panicked in `active_tab()` there (Wayland).
+    #[test]
+    fn main_window_events_stop_once_no_tab_is_left() {
+        let src = include_str!("app.rs");
+        let handler = concat!("fn window_event(&mut self, event_loop: &ActiveEventLoop, ", "id: WindowId, event: WindowEvent)");
+        let body = &src[src.find(handler).expect("window_event")..];
+        let guard = body.find("if self.tabs.is_empty() {").expect("an empty-tabs guard");
+        let first_arm = body.find("WindowEvent::CloseRequested => {").expect("the main-window arms");
+        assert!(guard < first_arm, "the main-window arms must sit behind the empty-tabs guard");
     }
 
     #[test]
