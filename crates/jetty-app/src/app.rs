@@ -1277,6 +1277,9 @@ pub struct App {
     /// unchanged) does not re-show the very same warnings after every save.
     themes_fp: u64,
     shown_warnings: Vec<String>,
+    /// The theme files' problems as last loaded: what a reload that changed
+    /// no theme file reports again without reading and parsing them all.
+    theme_warnings: Vec<String>,
     /// "Reset keybindings" asks for confirmation: the first run arms it until this
     /// instant; running it again before then resets (after writing a backup).
     reset_keys_armed_until: Option<std::time::Instant>,
@@ -2070,6 +2073,7 @@ impl App {
             minimum_contrast: 1.0,
             startup_warnings: Vec::new(),
             themes_fp,
+            theme_warnings: theme_warnings.clone(),
             shown_warnings: theme_warnings,
             reset_keys_armed_until: None,
             start_hidden: false,
@@ -2948,11 +2952,12 @@ impl App {
     ///
     /// * A save still pending or being written goes first: the reload is postponed
     ///   until it lands, or reading the file would revert that change in memory.
-    /// * THEMES are ALWAYS rebuilt + reapplied (amendment T3): editing the active
-    ///   theme file leaves config.toml untouched, so the config hash-skip must not
-    ///   gate the repaint. The CHOSEN theme (`theme_name`) is re-resolved against
-    ///   the rebuilt registry (amendment T2) — so a theme file fixed after a broken
-    ///   save comes back — then `apply_theme` repaints all tabs + detached.
+    /// * THEMES are ALWAYS looked at (amendment T3): editing the active theme file
+    ///   leaves config.toml untouched, so the config hash-skip must not gate the
+    ///   repaint. When a theme file changed (their fingerprint), the registry is
+    ///   rebuilt; the CHOSEN theme (`theme_name`) is re-resolved against it
+    ///   (amendment T2) — so a theme file fixed after a broken save comes back —
+    ///   and `apply_theme` repaints all tabs + detached when what is shown changed.
     /// * CONFIG is parsed key by key: an invalid value keeps the live setting, a
     ///   syntax error keeps everything — never `.bad`, never defaults — and each
     ///   problem is shown in a status pill. A file whose content hashes to our own
@@ -2980,10 +2985,16 @@ impl App {
         self.reloading = true;
         let mut warnings = Vec::new();
 
-        // (A) Themes — always. Rebuild the registry from disk.
-        warnings.extend(crate::themes::rebuild_registry());
+        // (A) Themes — always looked at; the registry is rebuilt from disk only
+        // when a theme file changed. The echo of every Settings save changes
+        // none, and it read and parsed every theme file twice (rebuild, then
+        // fingerprint) and allocated a new registry.
         let themes_fp = crate::themes::fingerprint();
         let themes_changed = std::mem::replace(&mut self.themes_fp, themes_fp) != themes_fp;
+        if themes_changed {
+            self.theme_warnings = crate::themes::rebuild_registry();
+        }
+        warnings.extend(self.theme_warnings.iter().cloned());
         let mut config_read = false;
 
         // (B) Config — per-key, hash-guarded.
@@ -3052,9 +3063,16 @@ impl App {
         }
 
         // (C) The chosen theme against the rebuilt registry (indices may have
-        // shifted), then repaint every surface with the (possibly changed) palette.
+        // shifted), then repaint every surface with the palette — when it, or the
+        // theme files, changed: an echo reload repainted every window.
+        let shown = self.theme_idx;
         self.resolve_chosen_theme(&mut warnings);
-        self.apply_theme();
+        if themes_changed
+            || self.theme_idx != shown
+            || self.active_theme.name != jetty_core::theme_at(self.theme_idx).name
+        {
+            self.apply_theme();
+        }
 
         // (D) Keep watching a recreated config dir, a retargeted config symlink or a
         // newly created themes/ dir — and say when a dir cannot be watched.
