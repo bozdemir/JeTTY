@@ -9,8 +9,10 @@
 //!   or declare a gigantic raster to force a huge allocation. So sizing is done
 //!   by a **bounded measuring pass** over the actual data (`measure`), which
 //!   rejects (returns `None`) the instant any set pixel or repeat run would
-//!   exceed the caps. The raster attributes are parsed only to keep the token
-//!   stream in sync; they never drive allocation.
+//!   exceed the caps. The declared raster only GROWS the image to `Ph`×`Pv`, as
+//!   in xterm (an encoder sizes a picture with a transparent bottom / right
+//!   margin by it) — a declaration past `max_w`/`max_h` is ignored, and the
+//!   grown size is held to `max_pixels` like any other.
 //! * **Overflow-safe counting.** Every parsed number is folded digit-by-digit
 //!   with `saturating_mul(10).saturating_add(d)` (never wraps); all position
 //!   math is `u64`; the final `w * h * 4` allocation size is checked against
@@ -109,8 +111,9 @@ pub fn content_id(params: &[u32], data: &[u8]) -> u64 {
 }
 
 /// Bounded measuring pass: determine the true drawn extent (rightmost and
-/// bottom-most set pixel) while rejecting anything that would exceed the caps.
-/// Returns `(width, height)` (both ≥ 1) or `None`.
+/// bottom-most set pixel), grown to the declared raster, while rejecting
+/// anything that would exceed the caps. Returns `(width, height)` (both ≥ 1)
+/// or `None`.
 ///
 /// Position math is `u64` and every count is saturating, so no arithmetic here
 /// can overflow or loop unboundedly (a huge `!Pn` repeat is resolved to an end
@@ -124,17 +127,38 @@ fn measure(data: &[u8], caps: SixelCaps) -> Option<(u32, u32)> {
     // Highest column / row index touched by a SET pixel (-1 = nothing drawn).
     let mut max_col: i64 = -1;
     let mut max_row: i64 = -1;
+    // The declared raster `Ph`×`Pv`, where within the size caps (0 = none).
+    let (mut declared_w, mut declared_h) = (0u64, 0u64);
 
     while i < data.len() {
         let b = data[i];
         match b {
-            // Raster attributes / color introducer: parse & discard the numeric
-            // params so their digits are not misread as data. Colors do not
-            // affect geometry, so measurement ignores them.
+            // Raster attributes `"Pan;Pad;Ph;Pv`: the image is at least `Ph`×`Pv`.
             0x22 => {
                 i += 1;
-                skip_params(data, &mut i);
+                let mut v = [0u32; 4];
+                let mut n = 0;
+                loop {
+                    let p = parse_uint(data, &mut i);
+                    if n < v.len() {
+                        v[n] = p;
+                    }
+                    n += 1;
+                    if i < data.len() && data[i] == b';' {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let (ph, pv) = (u64::from(v[2]), u64::from(v[3]));
+                if ph <= max_w && pv <= max_h {
+                    declared_w = declared_w.max(ph);
+                    declared_h = declared_h.max(pv);
+                }
             }
+            // Color introducer: parse & discard the numeric params so their
+            // digits are not misread as data. Colors do not affect geometry,
+            // so measurement ignores them.
             0x23 => {
                 i += 1;
                 skip_params(data, &mut i);
@@ -200,8 +224,8 @@ fn measure(data: &[u8], caps: SixelCaps) -> Option<(u32, u32)> {
     if max_col < 0 || max_row < 0 {
         return None; // nothing was drawn
     }
-    let width = (max_col + 1) as u64;
-    let height = (max_row + 1) as u64;
+    let width = ((max_col + 1) as u64).max(declared_w);
+    let height = ((max_row + 1) as u64).max(declared_h);
     if width > max_w || height > max_h {
         return None;
     }
@@ -527,11 +551,25 @@ mod tests {
     }
 
     #[test]
-    fn raster_attrs_are_parsed_and_ignored_for_sizing() {
-        // A `"1;1;99;99` raster header must NOT size the canvas; the actual drawn
-        // extent (1×6) wins, and the huge declared raster is harmless.
-        let img = decode_sixel(0, b"\"1;1;99;99#0;2;100;0;0#0~", CAPS).expect("decodes");
+    fn the_declared_raster_is_a_lower_bound() {
+        // `"1;1;Ph;Pv` grows the image to Ph×Pv as in xterm: an encoder sizes a
+        // picture with a transparent bottom / right margin by it, and the rows
+        // reserved for it (and the cursor after it) follow. Unset pixels stay
+        // transparent.
+        let img = decode_sixel(0, b"\"1;1;99;40#0;2;100;0;0#0~", CAPS).expect("decodes");
+        assert_eq!((img.width, img.height), (99, 40));
+        assert_eq!(px(&img, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(px(&img, 98, 39)[3], 0, "transparent where nothing was drawn");
+        // Drawn past the declaration: the drawing wins.
+        let img = decode_sixel(0, b"\"1;1;1;1#0;2;100;0;0#0~~", CAPS).expect("decodes");
+        assert_eq!((img.width, img.height), (2, 6));
+        // A declaration past the caps is ignored, never allocated.
+        let tiny = SixelCaps { max_w: 50, max_h: 50, max_pixels: 2500 };
+        let img = decode_sixel(0, b"\"1;1;99;40#0~", tiny).expect("decodes");
         assert_eq!((img.width, img.height), (1, 6));
+        // Within the size caps but over the pixel budget: no image at all.
+        let small = SixelCaps { max_w: 100, max_h: 100, max_pixels: 100 };
+        assert!(decode_sixel(0, b"\"1;1;99;40#0~", small).is_none());
     }
 
     #[test]

@@ -8949,6 +8949,18 @@ mod tests {
 
 
     #[test]
+    fn a_sixel_reserves_the_rows_it_declares() {
+        // chafa and yazi declare `"1;1;W;H` for a picture with a transparent
+        // bottom margin; JeTTY reserved only the rows drawn on, so the text
+        // after it landed higher than the encoder meant.
+        let mut t = Terminal::new(20, 8);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(&sixel("\"1;1;20;40#0;2;100;0;0#0~"));
+        assert_eq!((t.placements[0].cols, t.placements[0].rows), (2, 4));
+        assert_eq!(t.snapshot().cursor_row, 4, "below the declared 40 px");
+    }
+
+    #[test]
     fn a_large_sixel_within_the_pixel_caps_draws() {
         // A dithered full-window frame runs ~1 byte per pixel: 4K (8.3 Mpx) is
         // ~8 MB of sixel, past the old 4 MiB byte cap that dropped it silently
