@@ -713,6 +713,8 @@ const EXIT_CODE_MAX: u32 = 255;
 /// terminators are DIFFERENT — `{0x18 CAN, 0x1A SUB, 0x1B ESC, 0x9C ST}`, and
 /// **0x07 BEL is a DATA byte inside a DCS**, never a terminator (vte's
 /// advance_dcs_passthrough). The two terminator sets are kept strictly separate.
+/// A Kitty APC ends at BEL as well as at ST, as kitty ends it (vte, whose APC
+/// string ends only at ESC / CAN / SUB, is handed an ST of its own there).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scan {
     /// Not inside an escape; scan forward to the next ESC via memchr.
@@ -770,7 +772,7 @@ enum Scan {
     /// Saw `ESC _` (APC introducer): expecting the graphics identifier `G` (0x47).
     ApcIntro,
     /// Inside `ESC _ G`: accumulating the control+base64 payload into `apc_buf`
-    /// until an APC terminator (ST / CAN / SUB / 8-bit ST). BEL is DATA here.
+    /// until an APC terminator (ST / BEL / 8-bit ST; CAN / SUB abort).
     Apc,
     /// An APC that is NOT `_G…` (some other APC use): skip to the terminator,
     /// accumulate nothing, emit nothing.
@@ -2296,13 +2298,17 @@ impl Terminal {
                     i += 1;
                 }
                 // Accumulating a Kitty APC's control+payload until a terminator.
-                // BEL is DATA here (like a DCS). ST/8-bit-ST finish; CAN/SUB abort.
+                // ST, BEL (kitty ends every APC there) and 8-bit ST finish;
+                // CAN/SUB abort.
                 Scan::Apc => match b {
-                    0x9c => {
-                        // 8-bit ST: real terminator — flush the APC to vte (which
-                        // swallows it), then decode/place.
+                    0x07 | 0x9c => {
+                        // BEL / 8-bit ST: flush the APC to vte and end it there
+                        // with an ST of its own — vte's APC string ends only at
+                        // ESC / CAN / SUB, so it would swallow the output after
+                        // the image up to the next ESC. Then decode/place.
                         let k = i + 1;
                         self.advance_slice(&bytes[start..k]);
+                        self.advance_slice(b"\x1b\\");
                         self.finish_kitty_apc();
                         self.scan = Scan::Ground;
                         start = k;
@@ -2872,8 +2878,8 @@ impl Terminal {
     /// Anchor `p` at the cursor on the PRIMARY screen. With `reserve`, the cursor
     /// then moves down `p.rows` lines to column 0 (a sixel first returns to column
     /// 0: `sixel`), scrolling as needed — through alacritty's `Handler`, never by
-    /// injecting bytes into a parser that may sit mid-sequence (e.g. inside an APC
-    /// that 0x9C ended for the scanner but not for vte). Room for that scroll is
+    /// injecting bytes into a parser that may sit mid-sequence (e.g. in the
+    /// Escape state an ESC-ended DCS or APC leaves it in). Room for that scroll is
     /// made first so it is counted exactly; an anchor reset on the way drops `p`.
     fn place_primary_at_cursor(&mut self, mut p: ImagePlacement, reserve: bool, sixel: bool) {
         use alacritty_terminal::vte::ansi::Handler;
@@ -8948,6 +8954,28 @@ mod tests {
         t.feed(&full[..mid]);
         t.feed(&full[mid..]);
         assert_eq!(t.placements.len(), 1, "resumes across a feed boundary");
+    }
+
+    #[test]
+    fn a_kitty_apc_ends_at_bel_and_8bit_st_for_vte_too() {
+        // kitty ends an APC at BEL; vte's APC string ends only at ESC / CAN /
+        // SUB. A BEL-terminated image was dropped and an 8-bit-ST-terminated
+        // one drawn — and either way the output after it was swallowed up to
+        // the next ESC.
+        let px = b64(&[255u8, 0, 0, 255].repeat(4));
+        for end in [0x07u8, 0x9c] {
+            let mut seq = format!("\x1b_Ga=T,f=32,s=2,v=2;{px}").into_bytes();
+            seq.push(end);
+            seq.extend_from_slice(b"after");
+            for cut in 0..=seq.len() {
+                let mut t = Terminal::new(20, 5);
+                t.set_cell_px(10.0, 10.0);
+                t.feed(&seq[..cut]);
+                t.feed(&seq[cut..]);
+                assert_eq!(t.placements.len(), 1, "{end:#04x}, cut at {cut}: the image");
+                assert!(screen_has(&t, "after"), "{end:#04x}, cut at {cut}: the output after it");
+            }
+        }
     }
 
     #[test]
