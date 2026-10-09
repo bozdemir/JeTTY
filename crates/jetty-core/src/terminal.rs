@@ -99,6 +99,29 @@ fn osc_terminator(s: &[u8]) -> Option<usize> {
     b.or(a)
 }
 
+/// Index of the first DCS terminator in `s` — CAN, SUB, ESC or 8-bit ST (vte
+/// 0.15's `advance_dcs_passthrough` set; BEL is data in a DCS) — via SIMD scans.
+fn dcs_terminator(s: &[u8]) -> Option<usize> {
+    let a = memchr::memchr3(0x18, 0x1a, 0x1b, s);
+    let b = memchr::memchr(0x9c, &s[..a.unwrap_or(s.len())]);
+    b.or(a)
+}
+
+/// Index of the first Kitty APC terminator in `s`: a DCS terminator, or BEL.
+fn apc_terminator(s: &[u8]) -> Option<usize> {
+    let a = dcs_terminator(s);
+    let b = memchr::memchr(0x07, &s[..a.unwrap_or(s.len())]);
+    b.or(a)
+}
+
+/// Where the DCS / APC body starting at `bytes[i]` ends: at its terminator, or
+/// at the end of `bytes`. Out of line: no image arrives in the common case.
+#[cold]
+#[inline(never)]
+fn dcs_end(bytes: &[u8], i: usize) -> usize {
+    dcs_terminator(&bytes[i..]).map_or(bytes.len(), |n| i + n)
+}
+
 /// Drop the placements `keep` rejects, keeping the live-bytes counter exact.
 fn retain_placements(
     list: &mut VecDeque<ImagePlacement>,
@@ -1769,8 +1792,10 @@ impl Terminal {
     /// the first un-flushed byte); the scanner sub-advances alacritty up to AND
     /// INCLUDING a sequence's terminator so the grid is caught up before the
     /// cursor line is read, then decodes/places the image (or binds the 133).
-    /// Image payloads ARE still fed to alacritty (which ignores them) so its own
-    /// parser walks the DCS/APC in lockstep and stays consistent. While anchors
+    /// Image payloads are copied in runs and NOT handed to alacritty, which would
+    /// only ignore them byte by byte: it gets each image's introducer and
+    /// terminator, so its own parser enters and leaves the DCS/APC in lockstep
+    /// (its DCS / APC states ignore every byte a payload holds). While anchors
     /// exist, ED 2/3, SU/DL, RIS and alt-screen toggles are advanced in
     /// sub-slices of their own so `abs_top` sees each one's history effect in
     /// isolation.
@@ -2301,19 +2326,12 @@ impl Terminal {
                         start = k;
                         i = k;
                     }
-                    _ => {
-                        // Data byte: accumulate up to the cap, then latch overflow
-                        // and stop pushing (keep scanning to resync at the terminator).
-                        if self.sixel_buf.len() < SIXEL_MAX_BYTES {
-                            self.sixel_buf.push(b);
-                        } else {
-                            self.sixel_overflow = true;
-                        }
-                        i += 1;
-                    }
+                    // Data, up to the terminator, in one run.
+                    _ => (start, i) = self.sixel_run(bytes, start, i),
                 },
-                // A non-sixel DCS (DECRQSS/XTGETTCAP/…): skip to the terminator,
-                // accumulate nothing, emit nothing. Same terminators as `Sixel`.
+                // A non-sixel DCS (DECRQSS/XTGETTCAP/…): skip to the terminator
+                // (one SIMD scan), accumulate nothing, emit nothing. Same
+                // terminators as `Sixel`.
                 Scan::DcsOther => match b {
                     0x18 | 0x1a | 0x9c => {
                         self.scan = Scan::Ground;
@@ -2323,9 +2341,7 @@ impl Terminal {
                         self.scan = Scan::Esc;
                         i += 1;
                     }
-                    _ => {
-                        i += 1;
-                    }
+                    _ => i = dcs_end(bytes, i),
                 },
                 // Saw `ESC _`: only `G` (0x47) is a Kitty graphics command; any
                 // other APC use is skipped (touch nothing).
@@ -2379,16 +2395,11 @@ impl Terminal {
                         start = k;
                         i = k;
                     }
-                    _ => {
-                        if self.apc_buf.len() < APC_MAX_BYTES {
-                            self.apc_buf.push(b);
-                        } else {
-                            self.apc_overflow = true;
-                        }
-                        i += 1;
-                    }
+                    // Control and payload, up to the terminator, in one run.
+                    _ => (start, i) = self.apc_run(bytes, start, i),
                 },
-                // A non-`_G` APC: skip to the terminator, touch nothing.
+                // A non-`_G` APC: skip to the terminator (one SIMD scan), touch
+                // nothing.
                 Scan::ApcOther => match b {
                     0x18 | 0x1a | 0x9c => {
                         self.scan = Scan::Ground;
@@ -2398,9 +2409,7 @@ impl Terminal {
                         self.scan = Scan::Esc;
                         i += 1;
                     }
-                    _ => {
-                        i += 1;
-                    }
+                    _ => i = dcs_end(bytes, i),
                 },
             }
         }
@@ -2476,6 +2485,46 @@ impl Terminal {
         self.advance_slice(b"\x18");
         self.scan = Scan::OscDiscard;
         cut
+    }
+
+    /// Copy the sixel data from `bytes[i]` up to its terminator (or the end of
+    /// `bytes`) in one run — never past [`SIXEL_MAX_BYTES`]: past it, latch the
+    /// overflow and keep scanning to resync at the terminator. vte steps over
+    /// it ([`Terminal::skip_payload`]). Returns the new `start` and `i`.
+    #[cold]
+    #[inline(never)]
+    fn sixel_run(&mut self, bytes: &[u8], start: usize, i: usize) -> (usize, usize) {
+        let end = dcs_end(bytes, i);
+        let room = SIXEL_MAX_BYTES.saturating_sub(self.sixel_buf.len());
+        let run = &bytes[i..end];
+        self.sixel_buf.extend_from_slice(&run[..run.len().min(room)]);
+        self.sixel_overflow |= run.len() > room;
+        (self.skip_payload(bytes, start, i, end), end)
+    }
+
+    /// [`Terminal::sixel_run`] for a Kitty APC's control and payload, up to
+    /// [`APC_MAX_BYTES`].
+    #[cold]
+    #[inline(never)]
+    fn apc_run(&mut self, bytes: &[u8], start: usize, i: usize) -> (usize, usize) {
+        let end = apc_terminator(&bytes[i..]).map_or(bytes.len(), |n| i + n);
+        let room = APC_MAX_BYTES.saturating_sub(self.apc_buf.len());
+        let run = &bytes[i..end];
+        self.apc_buf.extend_from_slice(&run[..run.len().min(room)]);
+        self.apc_overflow |= run.len() > room;
+        (self.skip_payload(bytes, start, i, end), end)
+    }
+
+    /// `bytes[i..end]` is a sixel's data or a Kitty APC's payload, which vte
+    /// would only ignore byte by byte (alacritty's DCS `put` is a no-op; an APC
+    /// string is discarded) — and which can run to megabytes. Hand vte what
+    /// precedes it and step over it: vte stays in its DCS / APC state and is
+    /// handed the terminator. Returns the new `start`.
+    fn skip_payload(&mut self, bytes: &[u8], start: usize, i: usize, end: usize) -> usize {
+        if start < i {
+            self.advance_slice(&bytes[start..i]);
+        }
+        end
     }
 
     /// Advance `bytes[start..k]` with the isolated sequence `bytes[seq_start..k]`
@@ -9926,6 +9975,61 @@ mod tests {
         assert!(t.placements.is_empty(), "no placeholder-cell rendering");
         let reply = String::from_utf8_lossy(&t.drain_pty_writes()).to_string();
         assert!(reply.contains("ENOTSUPP"), "got {reply:?}");
+    }
+
+    #[test]
+    fn images_split_anywhere_draw_the_same() {
+        // A PTY read can end at any byte of an image. Every split — and one
+        // byte per read — must place the same image and leave vte where it
+        // was: the text after it prints. A CAN / SUB anywhere in it draws
+        // nothing and leaves the terminal ready for the next one.
+        let px = b64(&[10u8, 20, 30, 255].repeat(6));
+        let third = px.len() / 3 / 4 * 4; // chunks split base64 at a multiple of 4
+        let mut kitty = apc(&format!("a=T,f=32,s=3,v=2,i=3,q=2,m=1;{}", &px[..third]));
+        kitty.extend(apc(&format!("m=1;{}", &px[third..2 * third])));
+        kitty.extend(apc(&format!("m=0;{}", &px[2 * third..])));
+        let drawn = |t: &Terminal| -> Vec<(i64, u16, u16, u16, u64)> {
+            t.placements.iter().map(|p| (p.abs_line, p.col, p.cols, p.rows, p.id)).collect()
+        };
+        for image in [sixel(RED_1X12), kitty] {
+            let mut seq = b"ab".to_vec();
+            seq.extend_from_slice(&image);
+            seq.extend_from_slice(b"after");
+            let mut whole = Terminal::new(20, 6);
+            whole.set_cell_px(10.0, 10.0);
+            whole.feed(&seq);
+            let want = (drawn(&whole), whole.snapshot().row_text(2), whole.cursor_viewport_cell());
+            assert_eq!(want.0.len(), 1);
+            assert!(screen_has(&whole, "after"));
+            let mut bytewise = Terminal::new(20, 6);
+            bytewise.set_cell_px(10.0, 10.0);
+            for b in &seq {
+                bytewise.feed(std::slice::from_ref(b));
+            }
+            assert_eq!((drawn(&bytewise), bytewise.snapshot().row_text(2), bytewise.cursor_viewport_cell()), want);
+            for cut in 0..=seq.len() {
+                let mut t = Terminal::new(20, 6);
+                t.set_cell_px(10.0, 10.0);
+                t.feed(&seq[..cut]);
+                t.feed(&seq[cut..]);
+                assert_eq!((drawn(&t), t.snapshot().row_text(2), t.cursor_viewport_cell()), want, "cut at {cut}");
+            }
+            // Cancelled anywhere inside it (after its introducer).
+            for at in 4..2 + image.len() - 2 {
+                for cancel in [0x18u8, 0x1a] {
+                    let mut t = Terminal::new(20, 6);
+                    t.set_cell_px(10.0, 10.0);
+                    let mut bytes = seq[..at].to_vec();
+                    bytes.push(cancel);
+                    bytes.extend_from_slice(b"ok");
+                    t.feed(&bytes);
+                    assert!(t.placements.is_empty(), "cancelled at {at}");
+                    assert!(screen_has(&t, "ok"), "the terminal reads on after a cancel at {at}");
+                    t.feed(&sixel(RED_1X6));
+                    assert_eq!(t.placements.len(), 1, "and draws the next image");
+                }
+            }
+        }
     }
 
     #[test]
