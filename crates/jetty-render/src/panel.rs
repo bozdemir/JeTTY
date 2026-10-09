@@ -27,7 +27,7 @@
 use std::borrow::Cow;
 
 use crate::chrome::{fit_head, ChromeMeasure, ChromeMetrics};
-use crate::ui_palette::{mix, UiPalette};
+use crate::ui_palette::{ensure_contrast, mix, UiPalette};
 use crate::Rect;
 
 /// A text label: `(text, x, y, rgb)` with `(x, y)` the top-left of its line box.
@@ -519,6 +519,43 @@ struct Colors {
     accent_fill: [u8; 4],
     row_sel: [u8; 4],
     focus: [u8; 4],
+    /// The text roles on the surface (UiPalette's own), on the focus band, on
+    /// a control body (`ctl` / `ctl_hi`) and on the selected list row.
+    ink: Ink,
+    band_ink: Ink,
+    ctl_ink: Ink,
+    sel_ink: Ink,
+}
+
+/// The text roles for one fill. UiPalette guarantees its floors on `surface`
+/// only; the panel also draws text on the focus band, on control bodies and
+/// on the selected list row, so each gets the roles re-floored for it —
+/// unchanged wherever they already pass.
+#[derive(Clone, Copy)]
+struct Ink {
+    text: [u8; 3],
+    dim: [u8; 3],
+    hint: [u8; 3],
+}
+
+impl Ink {
+    fn on(ui: &UiPalette, fills: &[[u8; 3]]) -> Ink {
+        Ink {
+            text: ensure_contrast(ui.text, fills, UiPalette::TEXT_FLOOR),
+            dim: ensure_contrast(ui.text_dim, fills, UiPalette::TEXT_FLOOR),
+            hint: ensure_contrast(ui.text_hint, fills, UiPalette::HINT_FLOOR),
+        }
+    }
+
+    /// A row label: dim, or a hint shade when the row is dimmed / disabled.
+    fn label(&self, state: RowState) -> [u8; 3] {
+        if state == RowState::Normal { self.dim } else { self.hint }
+    }
+
+    /// A row's value readout.
+    fn value(&self, state: RowState) -> [u8; 3] {
+        if state == RowState::Normal { self.text } else { self.hint }
+    }
 }
 
 fn rgba(c: [u8; 3], a: u8) -> [u8; 4] {
@@ -533,7 +570,9 @@ impl Colors {
         // light one (control bodies, off-switch tracks, hairlines), so light
         // themes blend further. Dark themes keep the historical weights.
         let k = if ui.is_light { 1.7 } else { 1.0 };
-        let s = |t: f32| rgba(ui.shade(t * k), 255);
+        let shade = |t: f32| ui.shade(t * k);
+        let s = |t: f32| rgba(shade(t), 255);
+        let (row_sel, focus) = (mix(ui.surface, ui.accent, 0.25), mix(ui.surface, ui.accent, 0.16));
         Colors {
             ui,
             surface: rgba(ui.surface, 255),
@@ -550,19 +589,13 @@ impl Colors {
             knob_on: rgba(ui.surface, 255),
             accent: rgba(ui.accent, 255),
             accent_fill: rgba(ui.accent, 200),
-            row_sel: rgba(mix(ui.surface, ui.accent, 0.25), 255),
-            focus: rgba(mix(ui.surface, ui.accent, 0.16), 255),
+            row_sel: rgba(row_sel, 255),
+            focus: rgba(focus, 255),
+            ink: Ink { text: ui.text, dim: ui.text_dim, hint: ui.text_hint },
+            band_ink: Ink::on(&ui, &[focus]),
+            ctl_ink: Ink::on(&ui, &[shade(0.10), shade(0.16)]),
+            sel_ink: Ink::on(&ui, &[row_sel]),
         }
-    }
-
-    /// A row label: dim, or a hint shade when the row is dimmed / disabled.
-    fn label(&self, state: RowState) -> [u8; 3] {
-        if state == RowState::Normal { self.ui.text_dim } else { self.ui.text_hint }
-    }
-
-    /// A row's value readout.
-    fn value(&self, state: RowState) -> [u8; 3] {
-        if state == RowState::Normal { self.ui.text } else { self.ui.text_hint }
     }
 }
 
@@ -661,6 +694,11 @@ impl Lay<'_> {
         if self.focus == Some(id) { self.c.focus } else { self.c.surface }
     }
 
+    /// The ink of text drawn on that color (see `under`).
+    fn ink(&self, id: &str) -> Ink {
+        if self.focus == Some(id) { self.c.band_ink } else { self.c.ink }
+    }
+
     fn right(&self) -> f32 {
         self.x0 + self.cw
     }
@@ -722,16 +760,21 @@ impl Lay<'_> {
         let top = if first { 0.0 } else { SECTION_GAP };
         let hy = y + top;
         let sw_room = if master.is_some() { SW_W + 12.0 } else { 0.0 };
-        if self.focus == Some(id) {
+        // The header's ink: on its focus band, its hover fill or the surface.
+        let ink = if self.focus == Some(id) {
             self.quad(Rect::rounded(x0 - 8.0, hy - 3.0, cw + 16.0, SECTION_H + 6.0, c.focus, 8.0));
+            c.band_ink
         } else if self.hover == Some(PanelHit::Section(id)) {
             self.quad(Rect::rounded(x0 - 8.0, hy - 3.0, cw + 16.0 - sw_room, SECTION_H + 6.0, c.ctl, 8.0));
-        }
-        self.chevron(x0, hy + 9.0, collapsed, c.ui.text_dim);
+            c.ctl_ink
+        } else {
+            c.ink
+        };
+        self.chevron(x0, hy + 9.0, collapsed, ink.dim);
         let tx = x0 + 16.0;
         let t = self.fit(title, cw - 16.0 - sw_room - 24.0);
         let t_w = self.tw(&t);
-        self.label(t, tx, hy + 4.0, c.ui.text);
+        self.label(t, tx, hy + 4.0, ink.text);
         let rx = tx + t_w + 12.0;
         let rend = x0 + cw - sw_room;
         if rend - rx > 8.0 {
@@ -749,7 +792,7 @@ impl Lay<'_> {
         let mut h = top + SECTION_H;
         if let Some(hint) = hint.filter(|_| !collapsed) {
             let s = self.fit(hint, cw - 16.0);
-            self.label(s, tx, hy + SECTION_H - 2.0, c.ui.text_hint);
+            self.label(s, tx, hy + SECTION_H - 2.0, ink.hint);
             h += HINT_H;
         }
         h += 6.0;
@@ -798,7 +841,7 @@ impl Lay<'_> {
                 _ => y + dy + CTL_H + 5.0,
             };
             let s = self.fit(hint, self.cw);
-            let col = self.c.ui.text_hint;
+            let col = self.ink(row.id).hint;
             self.label(s, self.x0, hy, col);
         }
         self.out.anchors.push((row.id, y, y + h));
@@ -808,7 +851,7 @@ impl Lay<'_> {
     /// A row label left of a control that starts at `ctl_x`.
     fn row_label(&mut self, row: &CtlRow, y: f32, ctl_x: f32) {
         let s = self.fit(&row.label, ctl_x - 12.0 - self.x0);
-        let col = self.c.label(row.state);
+        let col = self.ink(row.id).label(row.state);
         self.label(s, self.x0, y, col);
     }
 
@@ -861,7 +904,7 @@ impl Lay<'_> {
         let frac = if frac.is_finite() { frac.clamp(0.0, 1.0) } else { 0.0 };
         let v_w = self.tw(text);
         self.row_label(row, y, x0 + cw - v_w);
-        let vc = c.value(row.state);
+        let vc = self.ink(row.id).value(row.state);
         self.label(text.to_string(), x0 + cw - v_w, y, vc);
         let st = row.state;
         self.quad(faded(Rect::rounded(x0, y + 30.0, cw, 4.0, c.track, 2.0), st));
@@ -925,8 +968,8 @@ impl Lay<'_> {
         let gap_w = cyc_w - 2.0 * CYC_SEG;
         let shown = self.fit(value, gap_w - 8.0);
         let sx = gap_x + ((gap_w - self.tw(&shown)) * 0.5).max(0.0);
-        self.label(shown, sx, y + LABEL_DY, c.value(st));
-        let gc = c.label(st);
+        self.label(shown, sx, y + LABEL_DY, c.ctl_ink.value(st));
+        let gc = c.ctl_ink.label(st);
         self.seg_glyph("<", x, CYC_SEG, y + LABEL_DY, gc);
         self.seg_glyph(">", x + cyc_w - CYC_SEG, CYC_SEG, y + LABEL_DY, gc);
         if self.live(row) {
@@ -962,8 +1005,8 @@ impl Lay<'_> {
         let vw = step_w - 2.0 * STEP_SEG;
         let shown = self.fit(value, vw - VAL_PAD);
         let sx = x + STEP_SEG + ((vw - self.tw(&shown)) * 0.5).max(0.0);
-        self.label(shown, sx, y + LABEL_DY, c.value(st));
-        let gc = c.label(st);
+        self.label(shown, sx, y + LABEL_DY, c.ctl_ink.value(st));
+        let gc = c.ctl_ink.label(st);
         self.seg_glyph("-", x, STEP_SEG, y + LABEL_DY, gc);
         self.seg_glyph("+", x + step_w - STEP_SEG, STEP_SEG, y + LABEL_DY, gc);
         let reset = self.fit("Reset", RESET_W - 8.0);
@@ -994,7 +1037,7 @@ impl Lay<'_> {
             let sx = x0 + i as f32 * (seg_w + MINI_GAP);
             let x = sx + RGB_LETTER_W;
             let f = ch(i);
-            let lc = c.label(st);
+            let lc = self.ink(row.id).label(st);
             self.label(name.to_string(), sx, y + 22.0, lc);
             self.quad(faded(Rect::rounded(x, y + 30.0, track_w, 4.0, c.track, 2.0), st));
             let fill_w = (f * (track_w - 14.0) + 7.0).clamp(4.0, track_w);
@@ -1036,7 +1079,7 @@ impl Lay<'_> {
             let r = Rect::rounded(x, y + 2.0, w, CHIP_H, fill, CHIP_H / 2.0);
             self.ring(PanelHit::Ctl { id: row.id, part: CtlPart::Chip(i as u8) }, r, banded);
             self.quad(faded(r, st));
-            let tc = if *on { c.ui.on_accent } else { c.label(st) };
+            let tc = if *on { c.ui.on_accent } else { c.ctl_ink.label(st) };
             let shown = self.fit(t, w - 8.0);
             let tx = x + ((w - self.tw(&shown)) * 0.5).max(0.0);
             self.label(shown, tx, y + 2.0 + 4.0, tc);
@@ -1073,7 +1116,7 @@ impl Lay<'_> {
         let status = self.fit(status, self.cw * 0.5);
         let status_w = self.tw(&status);
         self.row_label(row, y, self.right() - status_w);
-        let sc = c.label(st);
+        let sc = self.ink(row.id).label(st);
         self.label(status, self.right() - status_w, y, sc);
         let under = self.under(row.id);
         for (line, items) in self.chip_flow_lines(chips).into_iter().enumerate() {
@@ -1086,7 +1129,7 @@ impl Lay<'_> {
                 self.quad(faded(r, st));
                 let shown = self.fit(t, w - 8.0);
                 let tx = x + ((w - self.tw(&shown)) * 0.5).max(0.0);
-                let tc = if *on { c.ui.on_accent } else { c.label(st) };
+                let tc = if *on { c.ui.on_accent } else { c.ctl_ink.label(st) };
                 self.label(shown, tx, cy + 4.0, tc);
                 if self.live(row) {
                     self.hit(r, PanelHit::Ctl { id: row.id, part: CtlPart::Chip(i.min(255) as u8) });
@@ -1117,11 +1160,12 @@ impl Lay<'_> {
             let counter = format!("{}/{}", (offset + visible).min(total), total);
             let cw_ = self.tw(&counter);
             let cx = up_x - 10.0 - cw_;
-            self.label(counter, cx, y, c.ui.text_hint);
+            let col = self.ink(row.id).hint;
+            self.label(counter, cx, y, col);
             label_end = cx;
         }
         self.row_label(row, y, label_end);
-        let gc = c.label(st);
+        let gc = c.ctl_ink.label(st);
         for (x, g, part) in [(up_x, "^", CtlPart::ScrollUp), (dn_x, "v", CtlPart::ScrollDown)] {
             let r = Rect::rounded(x, y - 1.0, 22.0, 22.0, c.ctl, R_CTL);
             self.quad(faded(r, st));
@@ -1145,7 +1189,7 @@ impl Lay<'_> {
                 self.quad(faded(Rect::rounded(rx, ry + 3.0, 3.0, LIST_ROW_H - 6.0, c.accent, 1.5), st));
             }
             let shown = self.fit(name, rw - 24.0);
-            let tc = if sel { c.value(st) } else { c.label(st) };
+            let tc = if sel { c.sel_ink.value(st) } else { c.ink.label(st) };
             self.label(shown, rx + 12.0, ry + 3.0, tc);
             if self.live(row) {
                 self.hit(r, PanelHit::Ctl { id: row.id, part: CtlPart::Row(abs) });
@@ -1171,7 +1215,7 @@ impl Lay<'_> {
             let r = Rect::rounded(x, cy + 2.0, w, CHIP_H, fill, CHIP_H / 2.0);
             self.ring(PanelHit::GalleryFilter(f), r, c.surface);
             self.quad(r);
-            let tc = if on { c.ui.on_accent } else { c.ui.text_dim };
+            let tc = if on { c.ui.on_accent } else { c.ctl_ink.dim };
             let shown = self.fit(t, w - 8.0);
             let tx = x + ((w - self.tw(&shown)) * 0.5).max(0.0);
             self.label(shown, tx, cy + 6.0, tc);
@@ -1464,7 +1508,7 @@ pub fn build_panel(inp: &PanelInput, m: &mut dyn ChromeMeasure) -> PanelView {
         ResetState::Armed => ("Confirm reset", rgba(c.ui.danger, 255), c.ui.on_danger),
         ResetState::Ready => {
             let hov = inp.hover == Some(PanelHit::ResetTab);
-            ("Reset tab", if hov { c.ctl_hi } else { c.ctl }, c.ui.text_dim)
+            ("Reset tab", if hov { c.ctl_hi } else { c.ctl }, c.ctl_ink.dim)
         }
         ResetState::Disabled => ("Reset tab", rgba(c.ui.shade(0.10), 102), c.ui.text_hint),
     };
@@ -1923,6 +1967,86 @@ mod tests {
             let v = build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK));
             assert!(v.labels.iter().any(|l| l.0 == text), "{state:?}");
             assert_eq!(v.geom.chrome_hits.iter().any(|(_, h)| *h == PanelHit::ResetTab), live, "{state:?}");
+        }
+    }
+
+    /// The fill a label at `(x, y)` is read on: the panel's quads under that
+    /// point in draw order (the content ones only inside their viewport),
+    /// blended over black.
+    fn fill_at(v: &PanelView, x: f32, y: f32) -> [u8; 3] {
+        let inside = |r: &&Rect| r.color[3] > 0 && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+        let in_view = v.content_viewport.is_some_and(|[vx, vy, vw, vh]| {
+            x >= vx as f32 && x < (vx + vw) as f32 && y >= vy as f32 && y < (vy + vh) as f32
+        });
+        let content = v.content_quads.iter().filter(|_| in_view);
+        v.quads.iter().chain(content).filter(inside).fold([0; 3], |under, q| {
+            crate::ui_palette::mix(under, [q.color[0], q.color[1], q.color[2]], q.color[3] as f32 / 255.0)
+        })
+    }
+
+    /// Every text role the panel draws, with its floor (see `UiPalette`).
+    fn text_roles(c: &Colors) -> Vec<([u8; 3], f32)> {
+        let (text, hint) = (UiPalette::TEXT_FLOOR, UiPalette::HINT_FLOOR);
+        let mut roles = vec![(c.ui.on_accent, UiPalette::ON_FILL_FLOOR), (c.ui.on_danger, UiPalette::ON_FILL_FLOOR)];
+        for ink in [c.ink, c.band_ink, c.ctl_ink, c.sel_ink] {
+            roles.extend([(ink.text, text), (ink.dim, text), (ink.hint, hint)]);
+        }
+        roles
+    }
+
+    #[test]
+    fn panel_text_meets_its_floor_on_the_fill_under_it() {
+        // UiPalette guarantees its floors on `surface` only, but the panel also
+        // draws text on the focus band (an accent tint: row labels fell to
+        // 3.1:1 on every built-in theme), on control bodies (chips, cyclers,
+        // steppers, filters, "Reset tab") and on the selected list row. Every
+        // label in a UI role, on every built-in theme, with each row and
+        // section focused and each hover state, meets its floor on the panel
+        // fill under it (theme-card previews draw on the theme's own colors).
+        let items = sample_items();
+        let ids: Vec<&'static str> = items
+            .iter()
+            .filter_map(|it| match it {
+                PanelItem::Section { id, .. } => Some(*id),
+                PanelItem::Row(r) => Some(r.id),
+                _ => None,
+            })
+            .collect();
+        let hovers = [
+            None,
+            Some(PanelHit::Section("s.two")),
+            Some(PanelHit::GalleryFilter(ThemeFilter::Dark)),
+            Some(PanelHit::ResetTab),
+        ];
+        for i in 0..jetty_core::theme_count() {
+            let theme = jetty_core::theme_at(i);
+            let c = Colors::new(&theme);
+            let roles = text_roles(&c);
+            let fills = [c.surface, c.focus, c.ctl, c.ctl_hi, c.row_sel, c.well, c.accent, rgba(c.ui.danger, 255)]
+                .map(|f| [f[0], f[1], f[2]]);
+            let states = ids
+                .iter()
+                .map(|id| (Some(*id), None, ResetState::Ready))
+                .chain(hovers.iter().map(|h| (None, *h, ResetState::Ready)))
+                .chain([(None, None, ResetState::Armed)]);
+            for (focus, hover, reset) in states {
+                let mut inp = PanelInput::new(420, 3000, &theme, ChromeMetrics::DEFAULT, &items);
+                (inp.focus, inp.hover, inp.reset) = (focus, hover, reset);
+                let v = build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK));
+                for (text, x, y, col) in v.labels.iter().chain(v.content_labels.iter()) {
+                    let fill = fill_at(&v, x + 2.0, y + 9.0);
+                    let Some(&(_, floor)) = roles.iter().find(|(r, _)| r == col) else { continue };
+                    if !fills.contains(&fill) {
+                        continue;
+                    }
+                    let ratio = crate::contrast_ratio(*col, fill);
+                    assert!(
+                        ratio >= floor,
+                        "{}: {text:?} is {ratio:.2}:1 on {fill:?} (floor {floor}; focus {focus:?}, hover {hover:?})",
+                        theme.name
+                    );
+                }
+            }
         }
     }
 
