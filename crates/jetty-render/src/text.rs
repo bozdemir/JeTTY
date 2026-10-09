@@ -484,6 +484,22 @@ impl OverdrawStyle {
     }
 }
 
+/// Most (char, style) routes `TextLayer::glyph_route` keeps: far above what real
+/// text shows (every CJK ideograph in all four BOLD|ITALIC styles fits), while a
+/// program cycling through all of Unicode can no longer grow it toward the
+/// ~4.4 M possible keys (tens of MB).
+const GLYPH_ROUTE_CAP: usize = 1 << 17;
+
+/// Insert into a bounded cache map; a full map starts over. Every entry of such a
+/// cache is a pure function of its key, so dropping them costs only re-deriving
+/// what is on screen.
+fn insert_bounded<K: std::hash::Hash + Eq, V>(map: &mut FxHashMap<K, V>, key: K, value: V, cap: usize) {
+    if map.len() >= cap {
+        map.clear();
+    }
+    map.insert(key, value);
+}
+
 /// Entries per family in [`OverlayCache`] before it evicts: far above the
 /// distinct labels of any one frame (a tab bar is ~20, the Settings panel a few
 /// hundred), and each entry is bounded (`MAX_LABEL_CHARS`).
@@ -1398,7 +1414,7 @@ impl TextLayer {
             return v;
         }
         let route = self.classify(c, shape);
-        self.glyph_route.insert(key, route);
+        insert_bounded(&mut self.glyph_route, key, route, GLYPH_ROUTE_CAP);
         route
     }
 
@@ -2803,6 +2819,25 @@ mod tests {
     /// A monospace family to shape with: the default terminal font when it is
     /// installed, else any monospace face (CI runners lack MesloLGS NF); `None`
     /// on a machine without one (the shaping tests then have nothing to test).
+    #[test]
+    fn glyph_routes_stay_bounded_under_a_stream_of_every_code_point() {
+        // A program printing every code point in every style: each new (char,
+        // style) is probed and cached. The cache must stay within its cap and keep
+        // what was just routed.
+        let mut routes: FxHashMap<u32, CellRoute> = FxHashMap::default();
+        let mut inserted = 0usize;
+        for c in (0x80u32..=0x10FFFF).filter_map(char::from_u32) {
+            for shape in [0u8, jetty_core::attr::BOLD, jetty_core::attr::ITALIC] {
+                let key = route_key(c, shape);
+                insert_bounded(&mut routes, key, CellRoute::Inline, GLYPH_ROUTE_CAP);
+                inserted += 1;
+                assert!(routes.len() <= GLYPH_ROUTE_CAP);
+                assert!(routes.contains_key(&key));
+            }
+        }
+        assert!(inserted > 3 * GLYPH_ROUTE_CAP, "the stream did exceed the cap");
+    }
+
     #[test]
     fn overlay_labels_are_shaped_once_and_reused_per_family() {
         let mut fs = TextLayer::build_font_system();
