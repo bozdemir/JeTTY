@@ -326,12 +326,14 @@ pub fn alt_is_meta(mods: KeyMods, opts: &KeyOptions) -> bool {
 /// [`decide_key_event`], shared with the overlays and the menus so a chord
 /// means the same wherever it is pressed: on macOS with Option held the
 /// un-composed key is matched (Option+B is "Alt+B", not "∫"; Option+L on a
-/// German layout is "Alt+L", not "@").
+/// German layout is "Alt+L", not "@"), and a Shift chord on a symbol or `0`
+/// matches the key's unshifted character too (`Ctrl+Shift+/` while `?` is
+/// typed — [`KeyMap::lookup_event`]).
 pub fn chord_action(keymap: &KeyMap, ev: &KeyInput<'_>, opts: &KeyOptions) -> Option<KeyAction> {
     let m = ev.mods;
     let mods = Mods::new(m.ctrl, m.shift, m.alt, m.super_);
     let lookup_key = if opts.macos && m.alt { ev.key_without_modifiers } else { ev.logical };
-    keymap.lookup(mods, ev.physical, lookup_key)
+    keymap.lookup_event(mods, ev.physical, lookup_key, ev.key_without_modifiers)
 }
 
 /// Decide what one key event means — the single entry point for the main and
@@ -3648,6 +3650,22 @@ mod tests {
         let key = Key::Character("T".into());
         let ev = KeyInput { physical: PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified), ..kev(KeyCode::KeyT, &key, None, ctrl_shift()) };
         assert_eq!(decide(&ev, KeyModes::default(), KeyOptions::default()), KeyAction::NewTab);
+    }
+
+    #[test]
+    fn a_shift_chord_on_a_symbol_fires_where_shift_changes_the_character() {
+        // `copy_mode = "Ctrl+Shift+/"` on US: the event types '?', which used to
+        // miss the chord and send DEL (Ctrl+?) — deleting a character.
+        let b = crate::config::KeyBindings {
+            copy_mode: Some(crate::config::ChordSpec::One("Ctrl+Shift+/".into())),
+            ..Default::default()
+        };
+        let km = crate::keymap::KeyMap::compile(&b);
+        let (logical, base) = (Key::Character("?".into()), Key::Character("/".into()));
+        let ev = KeyInput { key_without_modifiers: &base, ..kev(KeyCode::Slash, &logical, Some("?"), ctrl_shift()) };
+        assert_eq!(decide_key_event(&km, &ev, &KeyModes::default(), &KeyOptions::default(), false), KeyAction::CopyMode);
+        // Unbound (the default), Ctrl+Shift+/ still reaches the shell.
+        assert_eq!(decide(&ev, KeyModes::default(), KeyOptions::default()), KeyAction::Send(vec![0x7f]));
     }
 
     #[test]

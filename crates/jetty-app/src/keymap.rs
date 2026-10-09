@@ -816,17 +816,29 @@ impl KeyMap {
         km
     }
 
+    /// [`KeyMap::lookup_event`] for a key whose unshifted character is the one
+    /// it produced.
+    pub fn lookup(&self, m: Mods, physical: PhysicalKey, logical: &Key) -> Option<KeyAction> {
+        self.lookup_event(m, physical, logical, logical)
+    }
+
     /// Resolve a key event to an app action, or `None` when unmapped (the caller
     /// falls through to raw PTY encoding): the produced character (label) — or
-    /// named key (Menu) — first, then the position chords, then — only for a
-    /// key that produced no ASCII character — the label chords' US positions.
-    pub fn lookup(&self, m: Mods, physical: PhysicalKey, logical: &Key) -> Option<KeyAction> {
+    /// named key (Menu) — first, then the position chords, then — with Shift
+    /// held — the key's `unshifted` character (`key_without_modifiers`), then —
+    /// only for a key that produced no ASCII character — the label chords' US
+    /// positions. A chord can spell only the unshifted key of a symbol or `0`
+    /// (`Ctrl+Shift+/`, `Cmd+Shift+]`), while the event carries the shifted
+    /// character (`?`, `}`).
+    pub fn lookup_event(&self, m: Mods, physical: PhysicalKey, logical: &Key, unshifted: &Key) -> Option<KeyAction> {
+        let mut produced = None;
         match logical {
             Key::Character(s) => {
-                let key = smol_lower(s);
-                if let Some(a) = self.logical.get(&(m, key)) {
+                let slot = (m, smol_lower(s));
+                if let Some(a) = self.logical.get(&slot) {
                     return Some(a.clone());
                 }
+                produced = Some(slot.1);
             }
             Key::Named(named) => {
                 if let Some(a) = self.named.get(&(m, *named)) {
@@ -839,6 +851,20 @@ impl KeyMap {
             if let Some(a) = self.physical.get(&(m, code)) {
                 return Some(a.clone());
             }
+        }
+        // Only a key Shift changed costs a second probe (a capital letter's
+        // unshifted key is the same letter, already looked up).
+        if m.shift {
+            if let Key::Character(u) = unshifted {
+                let u = smol_lower(u);
+                if produced.as_ref() != Some(&u) {
+                    if let Some(a) = self.logical.get(&(m, u)) {
+                        return Some(a.clone());
+                    }
+                }
+            }
+        }
+        if let PhysicalKey::Code(code) = physical {
             let ascii_char = matches!(logical, Key::Character(s) if s.is_ascii());
             if !ascii_char {
                 if let Some(a) = self.phys_fallback.get(&(m, code)) {
@@ -2169,6 +2195,62 @@ mod tests {
                 Some(KeyAction::NewTab)
             );
         }
+    }
+
+    #[test]
+    fn a_shift_chord_on_a_symbol_or_0_matches_the_keys_unshifted_character() {
+        // A chord can only spell the unshifted key (`]`, `/`, `0` — there is no
+        // `}` / `?` / `)` token), while the event carries the shifted one: these
+        // compiled without a warning and never fired.
+        let km = km_with(|b| {
+            b.next_tab = Some(ChordSpec::One("Super+Shift+]".into()));
+            b.prev_tab = Some(ChordSpec::One("Super+Shift+[".into()));
+            b.copy_mode = Some(ChordSpec::One("Ctrl+Shift+/".into()));
+            b.font_reset = Some(ChordSpec::One("Ctrl+Shift+0".into()));
+        });
+        assert!(km.warnings().is_empty(), "{:?}", km.warnings());
+        let cs = Mods::new(true, true, false, false);
+        let ss = Mods::new(false, true, false, true);
+        let us = |code: KeyCode, shifted: &str, base: &str, m: Mods| {
+            km.lookup_event(m, PhysicalKey::Code(code), &ch(shifted), &ch(base))
+        };
+        assert_eq!(us(KeyCode::BracketRight, "}", "]", ss), Some(KeyAction::NextTab));
+        assert_eq!(us(KeyCode::BracketLeft, "{", "[", ss), Some(KeyAction::PrevTab));
+        assert_eq!(us(KeyCode::Slash, "?", "/", cs), Some(KeyAction::CopyMode));
+        assert_eq!(us(KeyCode::Digit0, ")", "0", cs), Some(KeyAction::FontReset));
+        // The produced character still comes first: Turkish-Q's Shift+0 types
+        // '=', which zooms in (Ctrl + whatever types '+' or '='), as before.
+        assert_eq!(us(KeyCode::Digit0, "=", "0", cs), Some(KeyAction::FontUp));
+        // Without Shift held the unshifted key is the produced one anyway.
+        assert_eq!(us(KeyCode::Slash, "/", "/", Mods::new(true, false, false, false)), None);
+    }
+
+    #[test]
+    fn the_unshifted_retry_takes_no_default_chord_from_the_shell() {
+        // The defaults are untouched: Ctrl+Shift+- types '_' → 0x1f (readline
+        // undo), never FontDown; Ctrl+Shift+2 types '@' → NUL, never a tab jump.
+        let km = KeyMap::defaults();
+        let cs = Mods::new(true, true, false, false);
+        for (code, shifted, base) in [
+            (KeyCode::Minus, "_", "-"),
+            (KeyCode::Digit2, "@", "2"),
+            (KeyCode::Slash, "?", "/"),
+            (KeyCode::Comma, "<", ","),
+            (KeyCode::Digit0, ")", "0"),
+            (KeyCode::BracketRight, "}", "]"),
+        ] {
+            assert_eq!(
+                km.lookup_event(cs, PhysicalKey::Code(code), &ch(shifted), &ch(base)),
+                None,
+                "Ctrl+Shift+{base}"
+            );
+        }
+        // A capital letter's unshifted key is the same letter: Ctrl+Shift+T is
+        // New tab either way.
+        assert_eq!(
+            km.lookup_event(cs, PhysicalKey::Code(KeyCode::KeyT), &ch("T"), &ch("t")),
+            Some(KeyAction::NewTab)
+        );
     }
 
     // ── layout independence (remapped font still logical) ─────────────────────
