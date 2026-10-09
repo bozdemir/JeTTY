@@ -5483,19 +5483,24 @@ impl Terminal {
     /// Select all text — the entire scrollback history plus the visible screen.
     ///
     /// Creates a Simple selection from the oldest history line (top-left) to the
-    /// last visible row (bottom-right), so a subsequent `selection_text()` call
-    /// returns the full terminal contents. Any prior selection is replaced.
+    /// end of the last row that has text, so a subsequent `selection_text()` call
+    /// returns the full terminal contents — without a newline for every empty
+    /// row below the prompt. Any prior selection is replaced.
     pub fn select_all(&mut self) {
+        use alacritty_terminal::term::cell::LineLength;
         let grid = self.term.grid();
         let history = grid.history_size();
         let cols = self.cols;
-        let rows = self.rows;
         // The grid uses negative line indices for history in alacritty's model.
         // `history_size()` lines of scrollback live above line 0.
-        // We want to start at the very top of history and end at the last row.
-        // alacritty's Line type is a newtype over i32 (via index::Line).
+        // We want to start at the very top of history and end at the last row
+        // with text. alacritty's Line type is a newtype over i32 (via index::Line).
         let top = Point::new(Line(-(history as i32)), Column(0));
-        let bottom = Point::new(Line(rows as i32 - 1), Column(cols.saturating_sub(1)));
+        let last = (top.line.0..self.rows as i32)
+            .rev()
+            .find(|&l| grid[Line(l)].line_length().0 > 0)
+            .unwrap_or(top.line.0);
+        let bottom = Point::new(Line(last), Column(cols.saturating_sub(1)));
         let mut sel = Selection::new(SelectionType::Simple, top, Side::Left);
         sel.update(bottom, Side::Right);
         self.set_selection(Some(sel));
@@ -7160,6 +7165,27 @@ mod tests {
         let text = t.selection_text().unwrap_or_default();
         assert!(text.contains("hello"), "select_all text should contain 'hello'; got {text:?}");
         assert!(text.contains("world"), "select_all text should contain 'world'; got {text:?}");
+    }
+
+    #[test]
+    fn select_all_stops_at_the_last_line_with_text() {
+        // A 50-row tab with its prompt on row 10: Select All copied the text and
+        // then one newline per empty row below it.
+        let mut t = Terminal::new(20, 50);
+        for i in 0..60 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        t.feed(b"\x1b[H\x1b[2J$ ls\r\na  b\r\n$ "); // a clear keeps the history
+        t.select_all();
+        let text = t.selection_text().unwrap();
+        assert!(text.starts_with("line 0\n"), "{text:?}");
+        assert!(text.ends_with("$ ls\na  b\n$"), "no trailing blank lines: {text:?}");
+        let snap = t.snapshot();
+        assert!(snap.cells[2 * 20].selected && !snap.cells[3 * 20].selected, "the highlight agrees");
+        // Nothing to select at all: an empty copy, not 49 newlines.
+        let mut t = Terminal::new(20, 50);
+        t.select_all();
+        assert_eq!(t.selection_text().as_deref(), Some(""));
     }
 
     #[test]
