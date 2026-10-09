@@ -4783,7 +4783,17 @@ impl Terminal {
         // self-overlapping literal (`==` in `====`) also yields overlapping
         // matches: keep only those that end before the last kept one starts.
         let mut floor: Option<Point> = None;
+        let mut prev: Option<Point> = None;
         for m in RegexIter::new(start, end, Direction::Left, &self.term, regex) {
+            // Each step resumes one cell left of the match it just found; past
+            // a wide char in the buffer's top-left corner alacritty wraps around
+            // to the bottom and finds every match again, endlessly (the skip
+            // below never reaches the cap): a match that does not start further
+            // left than the one before it means the scan wrapped.
+            if prev.is_some_and(|p| *m.start() >= p) {
+                break;
+            }
+            prev = Some(*m.start());
             if floor.is_some_and(|f| *m.end() >= f) {
                 continue;
             }
@@ -6355,6 +6365,31 @@ mod tests {
         assert_eq!(hits.len(), 3, "all three matches visible");
         for h in &hits {
             assert_eq!(h.col_end - h.col_start + 1, 5, "each hit spans 'error'");
+        }
+    }
+
+    #[test]
+    fn search_for_a_wide_char_at_the_top_of_the_buffer_finishes() {
+        // The match scan runs leftward and resumes one cell left of each match;
+        // past a wide char in the buffer's top-left corner alacritty wrapped
+        // around to the bottom and found every match again, forever: searching
+        // 中 in a tab whose first line starts with it froze JeTTY. Run in a
+        // thread so a regression fails here instead of hanging the suite.
+        let cases: [(&str, usize, usize, &str, usize); 3] = [
+            ("中文 notes\r\n$ ls 中\r\n", 80, 24, "中", 2),
+            ("中文", 5, 1, "中", 1),
+            ("😀 hi 😀 x\r\n", 20, 3, "😀", 2),
+        ];
+        for (text, cols, rows, query, want) in cases {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut t = Terminal::new(cols, rows);
+                t.set_scrollback_lines(if rows == 1 { 0 } else { 100 });
+                t.feed(text.as_bytes());
+                let _ = tx.send(t.search_set_query(query).1);
+            });
+            let total = rx.recv_timeout(std::time::Duration::from_secs(20));
+            assert_eq!(total, Ok(want), "{text:?} / {query:?}: the search never finished");
         }
     }
 
