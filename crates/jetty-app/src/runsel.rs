@@ -237,7 +237,9 @@ const FRAME_CHARS: [char; 9] = ['│', '┃', '║', '┆', '┇', '┊', '┋',
 /// line — a mixed selection is left byte-for-byte alone:
 ///
 /// 1. A shared LEADING frame border (`│` etc. + optional one space) on every
-///    line is stripped (Claude Code / boxed-TUI left edge).
+///    line is stripped (Claude Code / boxed-TUI left edge) — also when the
+///    frame sits a few columns in, provided every line after the first has
+///    the same indentation before it (the first line's was trimmed away).
 /// 2. A shared TRAILING frame border (optional spaces + `│` etc.) is stripped
 ///    (the right edge of a full-width frame selection).
 /// 3. A shared doc-style PROMPT marker `"$ "` or `"❯ "` on every line is
@@ -251,12 +253,19 @@ pub fn strip_decorations(text: &str) -> String {
     let non_empty = |l: &&str| !l.trim().is_empty();
     let mut out: Vec<String> = text.lines().map(str::to_string).collect();
 
-    // 1. Uniform leading frame char (+ at most one following space).
+    // 1. Uniform leading frame char (+ at most one following space). The frame
+    //    may sit a few columns in: the first line's indentation is already gone
+    //    (sanitize trims the whole text), every later line must carry the SAME
+    //    indentation before the border — one frame column, or nothing strips.
     if let Some(first) = out.iter().find(|l| non_empty(&l.as_str())) {
-        if let Some(f) = first.chars().next().filter(|c| FRAME_CHARS.contains(c)) {
-            if out.iter().filter(|l| non_empty(&l.as_str())).all(|l| l.starts_with(f)) {
+        if let Some(f) = first.trim_start().chars().next().filter(|c| FRAME_CHARS.contains(c)) {
+            let indent = |l: &str| l.len() - l.trim_start().len();
+            let mut later = out.iter().filter(|l| non_empty(&l.as_str())).skip(1);
+            let col = later.clone().next().map_or(0, |l| indent(l));
+            if later.all(|l| indent(l) == col && l[col..].starts_with(f)) {
                 for l in &mut out {
-                    if let Some(rest) = l.strip_prefix(f) {
+                    let body = l.trim_start();
+                    if let Some(rest) = body.strip_prefix(f) {
                         *l = rest.strip_prefix(' ').unwrap_or(rest).to_string();
                     }
                 }
@@ -532,6 +541,24 @@ mod tests {
     fn strip_frame_right_border_full_width_selection() {
         assert_eq!(strip_decorations("│ cargo build        │"), "cargo build");
         assert_eq!(strip_decorations("│ a   │\n│ b │"), "a\nb");
+    }
+
+    #[test]
+    fn strip_frame_left_border_of_an_indented_frame() {
+        // A box drawn two columns in, triple-clicked: sanitize trims only the
+        // whole text, so the lines after the first keep the indentation before
+        // the border — which then never stripped (the left border, then the
+        // right, ended up in the command).
+        let raw = "  │ cargo build   │\n  │ cargo test    │\n";
+        assert_eq!(prepare(raw).text, "cargo build\ncargo test");
+        assert_eq!(strip_decorations("│ line1\n  │ line2"), "line1\nline2");
+        assert_eq!(strip_decorations("  │ line1\n  │ line2"), "line1\nline2");
+        // Indentation INSIDE the frame is content and survives.
+        assert_eq!(strip_decorations("│ if x:\n  │     y"), "if x:\n    y");
+        // Still uniform-only: a line without the border, or a border at a
+        // different column, leaves everything alone.
+        assert_eq!(strip_decorations("│ a\n  b"), "│ a\n  b");
+        assert_eq!(strip_decorations("│ a\n  │ b\n    │ c"), "│ a\n  │ b\n    │ c");
     }
 
     #[test]
