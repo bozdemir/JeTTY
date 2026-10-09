@@ -1920,6 +1920,9 @@ fn tab_jump_keys(km: &crate::keymap::KeyMap) -> String {
     flush(&mut run, &mut parts);
     if parts.is_empty() { "(unbound)".to_string() } else { parts.join(" / ") }
 }
+/// The pill when hint mode or copy-mode is asked for over a full-screen
+/// program (the alternate screen): they label and select JeTTY's own lines.
+const MSG_MODES_ALT_SCREEN: &str = "Hint and copy-mode work outside full-screen programs — Shift+drag selects there";
 
 /// The base ASCII letter a key event denotes for hint-mode narrowing,
 /// INDEPENDENT of Alt/compose (BLOCKING 5): prefer the produced logical letter
@@ -4305,7 +4308,7 @@ impl App {
                 // simply doesn't appear reads as a dead shortcut.
                 eprintln!("jetty: failed to spawn tab PTY: {e}");
                 self.show_status_pill(crate::runsel::Notice {
-                    msg: "Couldn't open a new tab — no shell could be started",
+                    msg: "Couldn't open a new tab — no shell could be started (Settings › Shell)",
                     window: None,
                 });
                 return None;
@@ -5553,17 +5556,20 @@ impl App {
     /// Enter hint mode in window `s`: scan the visible URL/path/hash/IPv4 tokens
     /// ONCE and show their labels, taking the window's keyboard (an open help,
     /// search bar or welcome splash closes — the chord never silently does
-    /// nothing under them). No-op on the alt screen, or when the scan finds
-    /// ZERO tokens (n=0 auto-exit — never trap the user in an empty mode
-    /// requiring Esc). The layers that capture every key (palette, menus,
+    /// nothing under them). On the alt screen, or when the scan finds ZERO
+    /// tokens (n=0 auto-exit — never trap the user in an empty mode requiring
+    /// Esc), a pill says why instead — a chord that silently does nothing reads
+    /// as a broken one. The layers that capture every key (palette, menus,
     /// rename, confirmations, copy-mode) take the chord before it gets here.
     fn enter_hint_mode(&mut self, s: Surface) {
         let Some(term) = self.term_of(s) else { return };
         if term.alt_screen() {
+            self.surface_pill(s, MSG_MODES_ALT_SCREEN);
             return;
         }
         let tokens = term.hint_tokens();
         if tokens.is_empty() {
+            self.surface_pill(s, "Hint mode: nothing to label on screen");
             return;
         }
         let labels = jetty_core::hints::assign_labels(tokens.len());
@@ -5658,11 +5664,13 @@ impl App {
     }
 
     /// Enter copy-mode in window `s`: a keyboard vi-cursor over the viewport +
-    /// scrollback, taking the window's keyboard as hint mode does. No-op on
-    /// the alt screen. Clears any leftover mouse selection on enter so the old
-    /// highlight never lingers.
+    /// scrollback, taking the window's keyboard as hint mode does. On the alt
+    /// screen a pill says why it can't. Clears any leftover mouse selection on
+    /// enter so the old highlight never lingers.
     fn enter_copy_mode(&mut self, s: Surface) {
-        if self.term_of(s).is_none_or(|t| t.alt_screen()) {
+        let Some(alt) = self.term_of(s).map(|t| t.alt_screen()) else { return };
+        if alt {
+            self.surface_pill(s, MSG_MODES_ALT_SCREEN);
             return;
         }
         self.take_keyboard(s, Layer::Copy);
@@ -8107,7 +8115,13 @@ impl App {
     /// completion.
     fn run_selection_in_new_tab(&mut self, source: SelSource) {
         if !self.run_selection_enabled {
-            return; // config opt-out: `run_selection = false`
+            // Config opt-out — said, so the chord / palette entry isn't a mystery.
+            let s = match source {
+                SelSource::Main => Surface::Main,
+                SelSource::Detached(i) => Surface::Detached(i),
+            };
+            self.surface_pill(s, "Run in New Tab is off (run_selection = false)");
+            return;
         }
         // 1. Capture everything from the SOURCE tab.
         let (text, cwd, wait_for_mark, notify_window) = match source {
@@ -8180,6 +8194,15 @@ impl App {
     /// Surface a run-selection feedback pill in the window that hosted the
     /// trigger (falls back to the main window when the source window is gone).
     /// Reuses the shift-hint pill surface: themed, bottom-centered, ~4 s.
+    /// [`Self::show_status_pill`] with `msg` on window `s`.
+    fn surface_pill(&mut self, s: Surface, msg: &'static str) {
+        let window = match s {
+            Surface::Main => self.window.as_ref().map(|w| w.id()),
+            Surface::Detached(p) => self.detached.get(p).map(|d| d.window.id()),
+        };
+        self.show_status_pill(crate::runsel::Notice { msg, window });
+    }
+
     fn show_status_pill(&mut self, n: crate::runsel::Notice) {
         let target = n
             .window
