@@ -8279,6 +8279,26 @@ impl App {
         true
     }
 
+    /// What a detached window owes its tab's drain (`had` output, `read`
+    /// bytes), on BOTH paths that drain it — the `Wake` loop and the window's
+    /// own render: its open search goes stale, a flood paces its paints
+    /// (`flood_at`), an OSC title reaches the OS window, and the bell is taken
+    /// (a reattach never shows a phantom Bell dot; detached windows draw no
+    /// indicator — the tab IS their visible tab). Returns `(flood, rang)`; the
+    /// caller rings it (`ring_detached_bell`). A bell the render path consumed
+    /// used to wait for the next output anywhere.
+    fn after_detached_drain(dw: &mut crate::detached::DetachedWindow, had: bool, read: u64) -> (bool, bool) {
+        if had {
+            dw.ov.note_output();
+        }
+        let flood = read >= FLOOD_PACE_BYTES;
+        if flood {
+            dw.flood_at = Some(std::time::Instant::now());
+        }
+        dw.sync_os_title();
+        (flood, dw.tab.terminal.take_bell())
+    }
+
     /// The third element is a run-selection feedback [`runsel::Notice`]
     /// (refusal/staged pill) — `None` on every normal pass; the caller
     /// surfaces it via `show_status_pill` (a pill needs `&mut self`).
@@ -11626,22 +11646,22 @@ impl App {
         // A run-selection notice needs `&mut self` (pill state), so the drain
         // runs in its own scope before the long `dw` borrow below.
         let title_mode = self.tab_title_mode;
-        let notice = {
+        let (notice, rang) = {
             let Some(dw) = self.detached.get_mut(pos) else { return };
             // This frame shows the latest keystroke's effect: its fallback paint
             // is no longer owed (mirrors the main window's RedrawRequested).
             dw.key_paint_due = None;
             let mut vt_read: u64 = 0;
             let (had, _, notice) = Self::drain_one_tab(&mut dw.tab, &mut vt_read, title_mode);
-            if had {
-                dw.ov.note_output();
-            }
-            // OSC titles: keep the OS window title in sync (no-op unless changed).
-            dw.sync_os_title();
-            notice
+            let (_, rang) = Self::after_detached_drain(dw, had, vt_read);
+            self.vt_bytes += vt_read;
+            (notice, rang)
         };
         if let Some(n) = notice {
             self.show_status_pill(n);
+        }
+        if rang {
+            self.ring_detached_bell(pos);
         }
         self.arm_title_recheck();
         // This window's open search: throttled streaming re-collect (the main
@@ -13736,27 +13756,16 @@ impl ApplicationHandler<AppEvent> for App {
                     let read_before = vt_read;
                     let (had, title_changed, notice) =
                         Self::drain_one_tab(&mut dw.tab, &mut vt_read, title_mode);
-                    // Output rotated the scrollback under this window's open
-                    // search: its matches are stale until the next re-collect.
-                    if had {
-                        dw.ov.note_output();
-                    }
-                    let flood = vt_read - read_before >= FLOOD_PACE_BYTES;
-                    if flood {
-                        dw.flood_at = Some(std::time::Instant::now());
-                    }
+                    // Stale search, flood pacing, the OS title (synced even when
+                    // occluded: a minimized window's taskbar entry must update)
+                    // and the bell — shared with the render path's drain.
+                    let (flood, rang) = Self::after_detached_drain(dw, had, vt_read - read_before);
                     if let Some(n) = notice {
                         runsel_notices.push(n);
                     }
-                    // Consume the bell so a reattach never shows a phantom Bell
-                    // dot. Detached windows draw no indicator by design: the tab
-                    // IS the visible, active tab of its own window.
-                    if dw.tab.terminal.take_bell() {
+                    if rang {
                         detached_bells.push(i);
                     }
-                    // OSC titles: sync the OS window title even when occluded
-                    // (the taskbar entry of a minimized window must update).
-                    dw.sync_os_title();
                     // Same damage-driven + visibility discipline as the main
                     // window: drain always (keep the shell unblocked) but only
                     // repaint a detached window that isn't occluded/minimized
