@@ -272,6 +272,19 @@ pub(crate) fn background_images(config_dir: &Path) -> Vec<String> {
     names
 }
 
+/// The `[backdrop] image` value for an image file dropped on Settings: its
+/// bare name when it sits in `<config_dir>/backgrounds/` — the picker lists
+/// that folder by name, and an absolute path is no option its cycler knows —
+/// else its path.
+pub(crate) fn dropped_image_setting(path: &Path, config_dir: &Path) -> String {
+    let folder = config_dir.join("backgrounds");
+    let same = |dir: &Path| dir == folder || dir.canonicalize().is_ok_and(|d| folder.canonicalize().is_ok_and(|f| d == f));
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) if path.parent().is_some_and(same) => name.to_string(),
+        _ => path.to_string_lossy().into_owned(),
+    }
+}
+
 /// Decode `key` on a worker thread and wake the event loop with the result.
 pub(crate) fn spawn_decode(proxy: winit::event_loop::EventLoopProxy<crate::app::AppEvent>, gen: u64, key: ImageKey) {
     let spawned = std::thread::Builder::new().name("jetty-backdrop".into()).spawn(move || {
@@ -491,6 +504,28 @@ mod tests {
         std::fs::create_dir_all(bg.join("sub.png")).unwrap(); // a folder, not an image
         assert_eq!(background_images(&dir), vec!["a.png", "b.JPG", "c.jpeg"]);
         assert!(background_images(&dir.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dropped_background_is_saved_by_its_name() {
+        // The Image cycler lists the backgrounds/ folder by name: a file dropped
+        // from there was saved as its absolute path, which the cycler did not
+        // know — its ">" jumped to "None" and removed the image.
+        let dir = std::env::temp_dir().join(format!("jetty-bd-drop-{}", std::process::id()));
+        let bg = dir.join("backgrounds");
+        std::fs::create_dir_all(bg.join("sub")).unwrap();
+        for f in ["wall.png", "sub/deep.png"] {
+            std::fs::write(bg.join(f), b"x").unwrap();
+        }
+        assert_eq!(dropped_image_setting(&bg.join("wall.png"), &dir), "wall.png");
+        // The same folder spelled another way (a `..` detour) is still it.
+        assert_eq!(dropped_image_setting(&bg.join("sub/../wall.png"), &dir), "wall.png");
+        // Anywhere else, a subfolder included (not listed): the full path.
+        let deep = bg.join("sub/deep.png");
+        assert_eq!(dropped_image_setting(&deep, &dir), deep.to_string_lossy());
+        let elsewhere = Path::new("/somewhere/else/pic.jpg");
+        assert_eq!(dropped_image_setting(elsewhere, &dir), "/somewhere/else/pic.jpg");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

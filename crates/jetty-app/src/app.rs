@@ -10412,7 +10412,7 @@ impl App {
             self.show_notice_pill("Backdrop: drop a PNG or JPEG image".to_string(), 3000);
             return;
         }
-        let image = path.to_string_lossy().into_owned();
+        let image = crate::backdrop::dropped_image_setting(&path, &crate::config::Config::dir());
         if self.apply_settings_change(|c| {
             c.backdrop.mode = "image".to_string();
             c.backdrop.image = image;
