@@ -85,22 +85,39 @@ pub fn spawn_notifier() -> Notifier {
         .spawn(move || {
             for msg in rx {
                 let NotifyMsg::Fire { summary, body } = msg;
-                // Shed rather than spawn once too many deliveries are already
-                // stranded (pathological non-replying daemon) — bounds threads.
-                if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT_SENDS {
-                    continue;
-                }
-                inflight.fetch_add(1, Ordering::Relaxed);
-                let inflight = Arc::clone(&inflight);
-                let _ = std::thread::Builder::new()
-                    .name("jetty-notify-send".into())
-                    .spawn(move || {
-                        show(&summary, &body);
-                        inflight.fetch_sub(1, Ordering::Relaxed);
-                    });
+                start_delivery(
+                    &inflight,
+                    move || show(&summary, &body),
+                    |job| std::thread::Builder::new().name("jetty-notify-send".into()).spawn(job).map(drop),
+                );
             }
         });
     Notifier { tx }
+}
+
+/// Run `deliver` on a thread of its own (`spawn` starts it), holding one of
+/// the `MAX_INFLIGHT_SENDS` slots in `inflight` until it returns — or shed it
+/// (false) when every slot is taken: deliveries stranded by a daemon that never
+/// replies. A thread that cannot be started (out of threads or memory) gives
+/// its slot straight back: four such failures used to shed every later toast.
+fn start_delivery(
+    inflight: &Arc<AtomicUsize>,
+    deliver: impl FnOnce() + Send + 'static,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) -> bool {
+    if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT_SENDS {
+        return false;
+    }
+    inflight.fetch_add(1, Ordering::Relaxed);
+    let slot = Arc::clone(inflight);
+    let started = spawn(Box::new(move || {
+        deliver();
+        slot.fetch_sub(1, Ordering::Relaxed);
+    }));
+    if started.is_err() {
+        inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+    started.is_ok()
 }
 
 /// Escape `& < >` so text is shown verbatim by a server that parses the body
@@ -336,6 +353,30 @@ mod tests {
         for i in 0..1000 {
             n.fire(format!("t{i}"), String::new());
         }
+    }
+
+    #[test]
+    fn a_delivery_thread_that_cannot_start_gives_its_slot_back() {
+        // Nothing here reaches the desktop: `deliver` is a no-op and `spawn`
+        // either fails (EAGAIN: out of threads) or hands the job back to us.
+        let inflight = Arc::new(AtomicUsize::new(0));
+        for _ in 0..MAX_INFLIGHT_SENDS * 2 {
+            assert!(!start_delivery(&inflight, || {}, |_| Err(std::io::Error::other("EAGAIN"))));
+        }
+        assert_eq!(inflight.load(Ordering::Relaxed), 0, "every failed start gave its slot back");
+        // Started deliveries hold their slots until they return; past the cap
+        // the next one is shed.
+        let mut jobs = Vec::new();
+        for _ in 0..MAX_INFLIGHT_SENDS {
+            assert!(start_delivery(&inflight, || {}, |job| {
+                jobs.push(job);
+                Ok(())
+            }));
+        }
+        assert!(!start_delivery(&inflight, || {}, |_| panic!("shed: never started")));
+        jobs.pop().unwrap()();
+        assert_eq!(inflight.load(Ordering::Relaxed), MAX_INFLIGHT_SENDS - 1, "a finished delivery frees its slot");
+        assert!(start_delivery(&inflight, || {}, |_| Ok(())));
     }
 
     #[test]
