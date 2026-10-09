@@ -2300,7 +2300,7 @@ impl App {
         app.keys = cfg.keys;
         app.keymap = crate::keymap::KeyMap::compile(&app.keys);
         startup_warnings.extend(app.keymap.warnings().iter().map(|w| format!("[keys] {w}")));
-        app.help_rows = App::compute_help_rows(&app.keymap, &app.summon_hotkey);
+        app.help_rows = App::compute_help_rows(&app.keymap, app.summon_key_shown().as_deref());
         for w in &startup_warnings {
             eprintln!("jetty: {w}");
         }
@@ -2332,9 +2332,11 @@ impl App {
 
     /// Build the Help overlay rows from the CURRENT keymap (so a remap is
     /// reflected) plus the static, non-keymap rows (drag / right-click / URL open /
-    /// Ctrl+D EOF / Esc). Called on load + on hot-reload; the result is cached in
-    /// `self.help_rows`, so the render path never re-derives it.
-    fn compute_help_rows(km: &crate::keymap::KeyMap, summon_hotkey: &str) -> Vec<String> {
+    /// Ctrl+D EOF / Esc). `summon_hotkey` is the global key that summons JeTTY
+    /// ([`App::summon_key_shown`]; `None` on Wayland). Called on load + on
+    /// hot-reload; the result is cached in `self.help_rows`, so the render path
+    /// never re-derives it.
+    fn compute_help_rows(km: &crate::keymap::KeyMap, summon_hotkey: Option<&str>) -> Vec<String> {
         use crate::keymap::BindableAction as A;
         let all = |a: A| {
             let v = km.pretty_chords(a);
@@ -2419,10 +2421,25 @@ impl App {
             "Ctrl+click — Open URL   (Ctrl+hover underlines)".to_string(),
             String::new(),
             "## Other".to_string(),
-            format!("{summon_hotkey} (configurable) — Summon / hide window"),
+            match summon_hotkey {
+                Some(key) => format!("{key} (configurable) — Summon / hide window"),
+                None => "Compositor shortcut — Summon / hide window   (bind it to jetty --toggle)".to_string(),
+            },
             "Ctrl+D — Close shell (EOF)".to_string(),
             "Esc — Close this help".to_string(),
         ]
+    }
+
+    /// The global key the help names for summoning JeTTY: the one the grab was
+    /// registered with (an edited `summon_hotkey` applies after a restart) —
+    /// before the grab, the one it will be, F9 for an invalid value — and none
+    /// on a Wayland session, where a compositor shortcut is the global key.
+    fn summon_key_shown(&self) -> Option<String> {
+        if wayland_session() {
+            return None;
+        }
+        let registered = self.summon_hotkey_registered.as_deref();
+        Some(registered.unwrap_or_else(|| summon_hotkey_name(&self.summon_hotkey)).to_string())
     }
 
     /// The Settings / palette "Launch at login" toggle: write or remove the login
@@ -2751,20 +2768,21 @@ impl App {
     /// to F9 and a registration failure is reported in-app — except where it is the
     /// expected state (a Wayland session, which binds `jetty --toggle` instead).
     fn start_summon_hotkey(&mut self) {
-        use std::str::FromStr;
         let proxy = self.proxy.clone();
-        let spec = self.summon_hotkey.clone();
-        self.summon_hotkey_registered = Some(spec.clone());
         // global_hotkey's own parser ("F9", "F12", "Ctrl+Shift+F12").
-        let hotkey = match global_hotkey::hotkey::HotKey::from_str(&spec) {
+        let hotkey = match summon_hotkey_key(&self.summon_hotkey) {
             Ok(h) => h,
             Err(e) => {
                 let _ = proxy.send_event(AppEvent::ConfigNotice(format!(
-                    "summon_hotkey {spec:?} is invalid ({e}) — using F9"
+                    "summon_hotkey {:?} is invalid ({e}) — using F9",
+                    self.summon_hotkey
                 )));
                 global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::F9)
             }
         };
+        // The key that grabs — what the help and a reload's notice name.
+        let spec = summon_hotkey_name(&self.summon_hotkey).to_string();
+        self.summon_hotkey_registered = Some(spec.clone());
         // macOS: upstream requires the manager to be created — and kept — on the
         // MAIN thread (here, in `resumed`); registering there is a cheap Carbon
         // call. A background-thread manager (the old code) was documented as
@@ -3232,11 +3250,13 @@ impl App {
         // stale startup value. Its live EFFECT stays restart-only (the summon grab
         // is registered once at startup) — but the on-disk value must survive an
         // external edit + a subsequent unrelated Settings change. Said once, so
-        // the new key not working yet is no mystery.
+        // the new key not working yet is no mystery. (The help keeps naming the
+        // registered key: `summon_key_shown`.)
         warnings.extend(summon_hotkey_restart_note(
             &cfg.summon_hotkey,
             &self.summon_hotkey,
             self.summon_hotkey_registered.as_deref(),
+            wayland_session(),
         ));
         self.summon_hotkey = cfg.summon_hotkey.clone();
         self.cfg_show_welcome = cfg.show_welcome;
@@ -3252,7 +3272,7 @@ impl App {
             warnings.extend(new_km.warnings().iter().map(|w| format!("[keys] {w}")));
             self.keys = cfg.keys.clone();
             self.keymap = new_km;
-            self.help_rows = App::compute_help_rows(&self.keymap, &self.summon_hotkey);
+            self.help_rows = App::compute_help_rows(&self.keymap, self.summon_key_shown().as_deref());
             self.dismiss_all_menus();
         }
     }
@@ -6530,7 +6550,7 @@ impl App {
                 // Clear every user `[keys]` override → back to the built-in defaults.
                 self.keys = crate::config::KeyBindings::default();
                 self.keymap = crate::keymap::KeyMap::compile(&self.keys);
-                self.help_rows = App::compute_help_rows(&self.keymap, &self.summon_hotkey);
+                self.help_rows = App::compute_help_rows(&self.keymap, self.summon_key_shown().as_deref());
                 self.persist();
                 let msg = match backup {
                     Some(p) => format!(
@@ -17040,11 +17060,46 @@ fn config_pill_text(warnings: &[String]) -> String {
     }
 }
 
+/// The key a `summon_hotkey` value grabs, in global-hotkey's own syntax ("F9",
+/// "F12", "Ctrl+Shift+F12"): `Err` with the reason for a value that names no
+/// key — the grab falls back to F9 then.
+fn summon_hotkey_key(spec: &str) -> Result<global_hotkey::hotkey::HotKey, String> {
+    use std::str::FromStr;
+    global_hotkey::hotkey::HotKey::from_str(spec).map_err(|e| e.to_string())
+}
+
+/// How the help and the notices name the key a `summon_hotkey` value grabs:
+/// the value itself, or F9 for one that names no key.
+fn summon_hotkey_name(spec: &str) -> &str {
+    if summon_hotkey_key(spec).is_ok() { spec } else { "F9" }
+}
+
+/// A Wayland session: apps can't grab keys there (by design), so a global
+/// summon key is a compositor shortcut running `jetty --toggle`. The grab
+/// JeTTY still makes reaches only the X11 apps (XWayland).
+fn wayland_session() -> bool {
+    !cfg!(target_os = "macos")
+        && (std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+            || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland"))
+}
+
 /// The notice for a reloaded `summon_hotkey = new` (the global grab is
 /// registered once, so it applies after a restart): `Some` when `new` differs
-/// from the live value (said once) and from the key `registered`.
-fn summon_hotkey_restart_note(new: &str, live: &str, registered: Option<&str>) -> Option<String> {
-    let registered = registered.filter(|r| *r != new && new != live)?;
+/// from the live value (said once) and grabs another key than the one
+/// `registered` (its name, F9 after an invalid value) — or names no key at all.
+/// On a Wayland session it points at the compositor shortcut instead: the grab
+/// summons JeTTY from X11 apps only.
+fn summon_hotkey_restart_note(new: &str, live: &str, registered: Option<&str>, wayland: bool) -> Option<String> {
+    let registered = registered.filter(|_| new != live)?;
+    if wayland {
+        return Some(format!("summon_hotkey = {new:?}: on Wayland, bind `jetty --toggle` in your compositor instead"));
+    }
+    let Ok(key) = summon_hotkey_key(new) else {
+        return Some(format!("summon_hotkey {new:?} is invalid — {registered:?} summons JeTTY"));
+    };
+    if summon_hotkey_key(registered).is_ok_and(|r| r == key) {
+        return None;
+    }
     Some(format!("summon_hotkey = {new:?} takes effect after a restart — {registered:?} summons JeTTY until then"))
 }
 
@@ -17081,9 +17136,7 @@ fn forward_hotkey_presses(proxy: &EventLoopProxy<AppEvent>) {
 /// design and `jetty --toggle` bound in the compositor is the documented path.
 fn report_hotkey_failure(proxy: &EventLoopProxy<AppEvent>, spec: &str, err: &str) {
     eprintln!("jetty: global hotkey {spec} unavailable — {err}");
-    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
-        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland");
-    if cfg!(target_os = "macos") || !wayland {
+    if !wayland_session() {
         let hint = if cfg!(target_os = "macos") {
             "grant JeTTY Accessibility permission, or bind `jetty --toggle` to a shortcut"
         } else {
@@ -18258,14 +18311,40 @@ mod summon_hotkey_note_tests {
     #[test]
     fn an_edited_summon_hotkey_says_it_needs_a_restart_once() {
         // F9 is registered; the file now says F12: say so.
-        let n = note("F12", "F9", Some("F9")).expect("a notice");
+        let n = note("F12", "F9", Some("F9"), false).expect("a notice");
         assert!(n.contains("\"F12\" takes effect after a restart") && n.contains("\"F9\" summons"), "{n}");
         // The next reload (live already mirrors F12): quiet.
-        assert_eq!(note("F12", "F12", Some("F9")), None);
-        // Back to the registered key: nothing to restart for.
-        assert_eq!(note("F9", "F12", Some("F9")), None);
+        assert_eq!(note("F12", "F12", Some("F9"), false), None);
+        // Back to the registered key: nothing to restart for — however it is
+        // spelled.
+        assert_eq!(note("F9", "F12", Some("F9"), false), None);
+        assert_eq!(note("shift+ctrl+f12", "F9", Some("Ctrl+Shift+F12"), false), None);
         // No grab registered yet (no window): nothing to say.
-        assert_eq!(note("F12", "F9", None), None);
+        assert_eq!(note("F12", "F9", None, false), None);
+    }
+
+    #[test]
+    fn the_note_names_the_key_that_summons_and_never_an_invalid_one() {
+        // `summon_hotkey = "Ctrl+Nope"` at startup: F9 is what was grabbed, and
+        // what the note names — it named "Ctrl+Nope".
+        let n = note("F12", "Ctrl+Nope", Some("F9"), false).expect("a notice");
+        assert!(n.contains("\"F9\" summons JeTTY until then"), "{n}");
+        // An invalid new value doesn't "take effect after a restart".
+        let n = note("Ctrl+Nope", "F12", Some("F12"), false).expect("a notice");
+        assert!(n.contains("\"Ctrl+Nope\" is invalid") && n.contains("\"F12\" summons"), "{n}");
+        assert!(!n.contains("restart"), "{n}");
+        // Wayland: a compositor shortcut summons JeTTY — never the grab.
+        let n = note("F12", "F9", Some("F9"), true).expect("a notice");
+        assert!(n.contains("jetty --toggle") && !n.contains("summons"), "{n}");
+        assert_eq!(note("F12", "F12", Some("F9"), true), None, "said once there too");
+    }
+
+    #[test]
+    fn an_invalid_summon_hotkey_is_named_as_the_f9_it_grabs() {
+        assert_eq!(super::summon_hotkey_name("F12"), "F12");
+        assert_eq!(super::summon_hotkey_name("Ctrl+Shift+F12"), "Ctrl+Shift+F12");
+        assert_eq!(super::summon_hotkey_name("Ctrl+Nope"), "F9");
+        assert_eq!(super::summon_hotkey_name(""), "F9");
     }
 }
 
@@ -19339,7 +19418,7 @@ mod fullscreen_helper_tests {
         // format-identical, and BOTH default chords must appear (`all()`, not
         // `first()`) — bare F11 is dead on macOS keyboards without standard
         // function keys, so the companion chord is the discoverable one there.
-        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), "F9");
+        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"));
         let live = rows
             .iter()
             .find(|r| r.contains("Fullscreen (whole monitor)"))
@@ -19365,14 +19444,29 @@ mod fullscreen_helper_tests {
         // The static jetty_render::HELP_ROWS must equal the live rows for the
         // default keymap (macOS adds Cmd companions, so Linux-only), so changing
         // a default chord can never leave the fallback overlay stale.
-        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), "F9");
+        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"));
         assert_eq!(rows, jetty_render::default_help_rows());
+    }
+
+    #[test]
+    fn the_help_names_the_summon_key_that_works() {
+        let row = |summon: Option<&str>| {
+            super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), summon)
+                .into_iter()
+                .find(|r| r.contains("— Summon / hide window"))
+                .expect("no summon help row")
+        };
+        assert!(row(Some("Ctrl+Shift+F12")).starts_with("Ctrl+Shift+F12 (configurable) — "));
+        // Wayland: the grab reaches X11 apps only — a compositor shortcut is the
+        // global key there.
+        let wayland = row(None);
+        assert!(wayland.starts_with("Compositor shortcut — ") && wayland.contains("jetty --toggle"), "{wayland:?}");
     }
 
     #[test]
     fn help_rows_name_the_menu_key_beside_the_right_click() {
         let row = |km: &crate::keymap::KeyMap| {
-            super::App::compute_help_rows(km, "F9")
+            super::App::compute_help_rows(km, Some("F9"))
                 .into_iter()
                 .find(|r| r.contains("— Context menu"))
                 .expect("no context-menu help row")
@@ -19400,7 +19494,7 @@ mod fullscreen_helper_tests {
         // Live row: default chord + the staged-multiline note, in the
         // clipboard section; static HELP_ROWS mirror carries the same row
         // verbatim (the default chord pretty-prints as Ctrl+Shift+Enter).
-        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), "F9");
+        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"));
         let live = rows
             .iter()
             .find(|r| r.contains("Run selection in a new tab"))
