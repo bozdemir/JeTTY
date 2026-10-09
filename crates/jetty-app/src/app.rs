@@ -265,6 +265,47 @@ const DROPDOWN_SLIDE_SECS: f32 = 0.15;
 /// when focus genuinely leaves JeTTY.
 const AUTOHIDE_GRACE_MS: u64 = 100;
 
+/// How long a focus "loss" that is really another client's keyboard grab is
+/// re-checked every [`AUTOHIDE_GRACE_MS`]: a held key, a window drag and
+/// Alt+Tab end well within it. After that, once per
+/// [`AUTOHIDE_GRAB_SLOW_RECHECK`] — a screen locker holds its grab for hours.
+const AUTOHIDE_GRAB_FAST_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+const AUTOHIDE_GRAB_SLOW_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What a due focus-loss auto-hide does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutohideDue {
+    Hide,
+    /// Keep the window and ask again at this instant.
+    RecheckAt(std::time::Instant),
+}
+
+/// The auto-hide deadline fired with no JeTTY window focused again.
+/// `focus_held`: the X server still has its input focus on a JeTTY window
+/// (`jetty_platform::holds_input_focus`) — the `Focused(false)` was another
+/// client's keyboard grab (a held global shortcut, a window manager's keyboard-
+/// grabbing move/resize, Alt+Tab), not a focus change. Hiding then unmapped the
+/// terminal mid-key-press and mid-drag. The window stays: the grab's release
+/// sends the FocusIn that cancels the deadline, and when the window manager
+/// moves the focus while it still holds the grab (winit drops that second
+/// FocusOut, so nothing more is reported) the next look catches it.
+fn autohide_due(
+    focus_held: bool,
+    focus_lost_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> AutohideDue {
+    if !focus_held {
+        return AutohideDue::Hide;
+    }
+    let held_for = focus_lost_at.map_or(std::time::Duration::ZERO, |t| now.saturating_duration_since(t));
+    let wait = if held_for < AUTOHIDE_GRAB_FAST_FOR {
+        std::time::Duration::from_millis(AUTOHIDE_GRACE_MS)
+    } else {
+        AUTOHIDE_GRAB_SLOW_RECHECK
+    };
+    AutohideDue::RecheckAt(now + wait)
+}
+
 /// Default logical (device-independent) font size in points. This is the value
 /// used when the user resets the font size with Ctrl+0 and on first launch.
 /// Scaled by the display's scale_factor before being passed to TextLayer so
@@ -941,7 +982,9 @@ pub struct App {
     /// any JeTTY window (main/settings/detached) gaining focus in the interim —
     /// this closes the X11 race where the main FocusOut is delivered before the
     /// FocusIn of the sibling JeTTY window the user actually clicked. Fired by
-    /// `about_to_wait`; also cleared by any explicit visibility change.
+    /// `about_to_wait`, which re-arms it instead of hiding while another X
+    /// client's keyboard grab merely hides the focus (`autohide_due`); also
+    /// cleared by any explicit visibility change.
     pending_autohide_at: Option<std::time::Instant>,
     /// One-time guard for the Wayland "positioning is a no-op" diagnostic.
     wayland_warned: bool,
@@ -8767,6 +8810,17 @@ impl App {
         pick.warning
     }
 
+    /// Whether the X server still has its input focus on one of JeTTY's windows
+    /// — after a `Focused(false)`, the mark of another client's keyboard grab
+    /// (see `autohide_due`). One X round trip; `false` off X11.
+    fn focus_still_on_jetty(&self) -> bool {
+        let mut wins: Vec<&Window> = Vec::with_capacity(2 + self.detached.len());
+        wins.extend(self.window.as_deref());
+        wins.extend(self.settings_window.as_deref());
+        wins.extend(self.detached.iter().map(|d| &*d.window));
+        jetty_platform::holds_input_focus(&wins)
+    }
+
     /// Perform the Yakuake-style focus-loss auto-hide of the main window.
     /// Called from `about_to_wait` when the `pending_autohide_at` grace period
     /// elapsed without any JeTTY window regaining focus (see the field docs).
@@ -12152,13 +12206,21 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
         // Deferred focus-loss auto-hide: the grace period elapsed without any
-        // JeTTY window regaining focus (which would have cancelled it) — hide.
+        // JeTTY window regaining focus (which would have cancelled it) — hide,
+        // unless the X server says the focus never left (`autohide_due`: one
+        // round trip, only here, only while the window is up).
         if self
             .pending_autohide_at
             .is_some_and(|d| std::time::Instant::now() >= d)
         {
             self.pending_autohide_at = None;
-            self.autohide_main_window();
+            if self.visible {
+                let now = std::time::Instant::now();
+                match autohide_due(self.focus_still_on_jetty(), self.focus_lost_at, now) {
+                    AutohideDue::Hide => self.autohide_main_window(),
+                    AutohideDue::RecheckAt(d) => self.pending_autohide_at = Some(d),
+                }
+            }
         }
         // Debounced config/theme hot-reload: the burst settled (no newer
         // ConfigChanged pushed the deadline out) — apply it once. (The deadline is
@@ -13526,6 +13588,13 @@ impl ApplicationHandler<AppEvent> for App {
                         self.request_main_paint();
                     }
                 }
+                // All of the above runs for another X client's keyboard grab too
+                // (winit reports its FocusOut alike): telling one apart takes a
+                // round trip, which only the auto-hide's deadline pays for
+                // (`autohide_due`). A menu a held key closed reopens with a
+                // click; one kept open while the window manager moved the focus
+                // during its grab (winit reports nothing more then) would take
+                // the first Enter typed when the user comes back.
                 // Yakuake-style auto-hide: hide when the window loses focus, but
                 // only when ENABLED, currently visible, NOT mid-summon (X11 fires
                 // a synthetic Focused(false) during set_visible/focus), and focus
@@ -18538,11 +18607,54 @@ mod scheduler_tests {
     //! The window itself can't run under `cargo test`, so every rule that keeps
     //! the loop at 0-CPU idle (or makes it wake) is a pure function tested here.
     use super::{
-        anim_expired, caret_drives_frames, focus_ask, focus_gain_shows, main_tab_watched, next_acquire_retry,
-        perf_idle_decision, toggle_action, FocusAsk, IdleHud, SummonBy, ToggleAction,
+        anim_expired, autohide_due, caret_drives_frames, focus_ask, focus_gain_shows, main_tab_watched,
+        next_acquire_retry, perf_idle_decision, toggle_action, AutohideDue, FocusAsk, IdleHud, SummonBy,
+        ToggleAction, AUTOHIDE_GRACE_MS, AUTOHIDE_GRAB_FAST_FOR, AUTOHIDE_GRAB_SLOW_RECHECK,
         FOCUS_CHURN_GRACE, KEY_ECHO_GRACE, RAISE_RETRY_WINDOW,
     };
     use std::time::{Duration, Instant};
+
+    // ── focus-loss auto-hide vs another X client's keyboard grab ─────────────
+
+    #[test]
+    fn an_autohide_keeps_the_window_while_a_grab_holds_the_focus() {
+        let grace = Duration::from_millis(AUTOHIDE_GRACE_MS);
+        let lost = Instant::now();
+        let due = lost + grace;
+        // The focus went to another window: hide, as always.
+        assert_eq!(autohide_due(false, Some(lost), due), AutohideDue::Hide);
+        // Another client's keyboard grab (a held global shortcut, a window
+        // manager's keyboard-grabbing drag, Alt+Tab while choosing): the X
+        // focus never left JeTTY. Hiding unmapped the terminal mid-press and
+        // mid-drag — keep it and look again a grace later (the release's
+        // FocusIn cancels the deadline before that, normally)…
+        assert_eq!(autohide_due(true, Some(lost), due), AutohideDue::RecheckAt(due + grace));
+        // …and a look that finds the focus elsewhere — moved by the window
+        // manager before it let go of its grab, which winit never reports —
+        // hides.
+        assert_eq!(autohide_due(false, Some(lost), due + grace), AutohideDue::Hide);
+    }
+
+    #[test]
+    fn a_long_grab_is_looked_at_once_a_second() {
+        let grace = Duration::from_millis(AUTOHIDE_GRACE_MS);
+        let lost = Instant::now();
+        let young = lost + AUTOHIDE_GRAB_FAST_FOR - Duration::from_millis(1);
+        assert_eq!(autohide_due(true, Some(lost), young), AutohideDue::RecheckAt(young + grace));
+        // A screen locker holds its grab for hours: one round trip a second.
+        let old = lost + AUTOHIDE_GRAB_FAST_FOR;
+        assert_eq!(
+            autohide_due(true, Some(lost), old),
+            AutohideDue::RecheckAt(old + AUTOHIDE_GRAB_SLOW_RECHECK)
+        );
+        let hours = lost + Duration::from_secs(3 * 3600);
+        assert_eq!(
+            autohide_due(true, Some(lost), hours),
+            AutohideDue::RecheckAt(hours + AUTOHIDE_GRAB_SLOW_RECHECK)
+        );
+        // No recorded loss (never expected): the short cadence.
+        assert_eq!(autohide_due(true, None, old), AutohideDue::RecheckAt(old + grace));
+    }
 
     // ── how a summon asks for focus ──────────────────────────────────────────
 

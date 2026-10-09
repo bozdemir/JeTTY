@@ -278,6 +278,30 @@ pub fn activate_window(win: &Window) {
     win.focus_window();
 }
 
+/// Whether the X server still has its keyboard focus on one of `windows`.
+///
+/// After a `Focused(false)` this tells another client's keyboard GRAB from a
+/// real focus change. A grab — a held global shortcut, a window manager's
+/// keyboard-grabbing move or resize (Xfwm4, Openbox), Alt+Tab while the user
+/// picks — makes the server send the focused window a FocusOut with mode
+/// NotifyGrab while the input focus stays where it was, and winit reports that
+/// as `Focused(false)` like any other (it does not filter by mode). Asking the
+/// server is standard X11 (core GetInputFocus), no window manager is named.
+///
+/// One round trip on a connection opened on first use and kept: ask only when
+/// a decision is due, never per event or per frame. `false` where there is no
+/// such grab (Wayland, macOS), for windows that are not X11 windows, and when
+/// the server can't be reached — the caller then takes the loss as real.
+pub fn holds_input_focus(windows: &[&Window]) -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    return x11::focus_on(windows);
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = windows;
+        false
+    }
+}
+
 /// What a window keeps across scale-factor (DPI) changes: its size in LOGICAL
 /// px — the size the user chose — and the PHYSICAL size last requested for it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -387,28 +411,49 @@ pub fn hide_window(win: &Window) {
 #[cfg(all(unix, not(target_os = "macos")))]
 mod x11 {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use std::sync::OnceLock;
     use winit::window::Window;
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt as _, EventMask};
+    use x11rb::rust_connection::RustConnection;
 
     /// EWMH `_NET_ACTIVE_WINDOW` source indication for a request made on the
     /// user's behalf (pagers, taskbars — and a global hotkey).
     const SOURCE_USER: u32 = 2;
+
+    /// The X id of `win`; `None` when it is not an X11 window (Wayland).
+    fn xid(win: &Window) -> Option<u32> {
+        match win.window_handle().ok()?.as_raw() {
+            RawWindowHandle::Xlib(h) => Some(h.window as u32),
+            RawWindowHandle::Xcb(h) => Some(h.window.get()),
+            _ => None,
+        }
+    }
 
     /// Send `_NET_ACTIVE_WINDOW` (source 2) for `win` over a short-lived
     /// connection of its own (a raise is rare: one hotkey press). `false` when
     /// `win` is not an X11 window (Wayland) or the server can't be reached, so
     /// the caller falls back to winit.
     pub(super) fn request_activation(win: &Window) -> bool {
-        let Ok(handle) = win.window_handle() else {
+        xid(win).is_some_and(|xid| send(xid).is_ok())
+    }
+
+    /// [`super::holds_input_focus`]: GetInputFocus names one of `windows`. The
+    /// connection is opened on the first question and kept — unlike a raise,
+    /// a grab is asked about again while it lasts.
+    pub(super) fn focus_on(windows: &[&Window]) -> bool {
+        static CONN: OnceLock<Option<RustConnection>> = OnceLock::new();
+        let xids: Vec<u32> = windows.iter().filter_map(|w| xid(w)).collect();
+        if xids.is_empty() {
+            return false;
+        }
+        let Some(conn) = CONN.get_or_init(|| x11rb::connect(None).ok().map(|(c, _)| c)) else {
             return false;
         };
-        let xid = match handle.as_raw() {
-            RawWindowHandle::Xlib(h) => h.window as u32,
-            RawWindowHandle::Xcb(h) => h.window.get(),
-            _ => return false,
-        };
-        send(xid).is_ok()
+        conn.get_input_focus()
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_some_and(|r| xids.contains(&r.focus))
     }
 
     fn send(xid: u32) -> Result<(), Box<dyn std::error::Error>> {
