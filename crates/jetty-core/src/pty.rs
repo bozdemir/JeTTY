@@ -334,6 +334,38 @@ fn shell_candidates(override_shell: Option<String>) -> Vec<String> {
     out
 }
 
+/// Whether `path` names an interactive shell (by file name) — what `$SHELL`
+/// may be set to. Anything else, e.g. a multiplexer (`screen` reads `$SHELL`
+/// for its windows), keeps the inherited value.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn is_interactive_shell(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        name,
+        "sh" | "bash"
+            | "rbash"
+            | "dash"
+            | "ash"
+            | "zsh"
+            | "fish"
+            | "ksh"
+            | "mksh"
+            | "oksh"
+            | "loksh"
+            | "pdksh"
+            | "yash"
+            | "csh"
+            | "tcsh"
+            | "nu"
+            | "xonsh"
+            | "elvish"
+            | "ion"
+            | "pwsh"
+            | "osh"
+            | "ysh"
+    )
+}
+
 /// The current user's login shell (`pw_shell`) from the passwd database, or
 /// `None` if it can't be resolved. One-shot at spawn; `getpwuid` returns a
 /// pointer into a static buffer, copied out immediately.
@@ -829,6 +861,16 @@ impl PtySession {
             let mut cmd = CommandBuilder::new(shell);
             for key in INHERITED_ENV_DENYLIST {
                 cmd.env_remove(key);
+            }
+            // `$SHELL` names the shell that runs here — the `shell` override or
+            // a fallback, not the login shell JeTTY inherited — so tmux, `vim
+            // :sh`, `sudo -s`, mc… open the same shell as the tab (macOS sets it
+            // above; xterm does the same). Only for an actual shell: a
+            // multiplexer set as `shell` (screen) would start itself in every
+            // window.
+            #[cfg(not(target_os = "macos"))]
+            if is_interactive_shell(shell) {
+                cmd.env("SHELL", shell);
             }
             // Advertise a capable terminal so shells (and prompts like p10k) run
             // their capability probes and emit truecolor; without TERM set, those
@@ -1458,6 +1500,18 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         drop(q);
         assert!(!producer.join().unwrap(), "send into a dropped queue must fail, not hang");
+    }
+
+    #[test]
+    fn shell_var_follows_only_actual_shells() {
+        for shell in ["/bin/zsh", "/usr/bin/bash", "/usr/local/bin/fish", "/bin/sh", "nu", "/opt/homebrew/bin/zsh"] {
+            assert!(is_interactive_shell(shell), "{shell}");
+        }
+        // Multiplexers read $SHELL for their windows; editors and scripts are
+        // not shells either.
+        for other in ["/usr/bin/screen", "/usr/bin/tmux", "/usr/bin/zellij", "/usr/bin/vim", "/home/u/bin/zsh-wrapper"] {
+            assert!(!is_interactive_shell(other), "{other}");
+        }
     }
 
     #[test]
