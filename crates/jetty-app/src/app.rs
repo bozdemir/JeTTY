@@ -2629,7 +2629,15 @@ impl App {
     /// make it the remembered choice of the slot in effect — `light_theme_name`
     /// while following a light system appearance, else `theme_name` (so a pick
     /// always changes what is on screen, and survives the next system flip).
+    /// Ends a gallery browsing session: its Esc must not take back a theme
+    /// chosen elsewhere (the gallery's own picks are `choose_theme`).
     fn pick_theme(&mut self, i: usize) {
+        self.gallery.keep();
+        self.choose_theme(i);
+    }
+
+    /// [`Self::pick_theme`] inside a gallery session, which it leaves running.
+    fn choose_theme(&mut self, i: usize) {
         self.theme_idx = i;
         let name = jetty_core::theme_at(i).name.to_string();
         if self.light_slot_active() {
@@ -2779,6 +2787,8 @@ impl App {
         if self.follow_system_theme == on {
             return;
         }
+        // A theme choice: a gallery session's Esc must not undo what it shows.
+        self.gallery.keep();
         self.follow_system_theme = on;
         self.ensure_appearance_watcher();
         self.reresolve_theme(true);
@@ -3183,6 +3193,14 @@ impl App {
     fn apply_reloaded_config(&mut self, cfg: crate::config::Config, warnings: &mut Vec<String>) {
         let eps = f32::EPSILON;
 
+        // A theme choice made here (a Settings control, Reset tab, an edit of
+        // the file) ends a gallery browsing session: its Esc must not undo it.
+        if cfg.theme != self.theme_name
+            || cfg.light_theme != self.light_theme_name
+            || cfg.follow_system_theme != self.follow_system_theme
+        {
+            self.gallery.keep();
+        }
         // Theme: remember the chosen name; the caller resolves it against the
         // rebuilt registry right after (a missing theme falls back visibly).
         if cfg.theme != self.theme_name {
@@ -10020,6 +10038,9 @@ impl App {
     /// (the light slot while following a light system), then one save.
     fn apply_look(&mut self, i: usize) {
         let Some(look) = crate::settings_ui::LOOKS.get(i) else { return };
+        // A look is a whole choice: a gallery session's Esc must not take its
+        // theme back and leave the rest of it.
+        self.gallery.keep();
         self.apply_settings_change(|c| crate::settings_ui::apply_look_keys(c, look));
         if let Some(idx) = look.theme.and_then(jetty_core::theme_index) {
             if idx != self.theme_idx || jetty_core::theme_at(idx).name != self.active_theme.name {
@@ -10148,15 +10169,23 @@ impl App {
     }
 
     /// Show theme `i` from the gallery (a click or an arrow key): applied live
-    /// and saved; the browsing session remembers the theme it started from.
+    /// and saved; the browsing session remembers the choice it started from.
     fn gallery_pick(&mut self, i: usize) {
         self.end_theme_previews();
         if i >= jetty_core::theme_count() || i == self.theme_idx {
             return;
         }
-        self.gallery.begin(self.theme_idx);
-        self.pick_theme(i);
+        self.gallery.begin(self.theme_choice());
+        self.choose_theme(i);
         self.persist();
+    }
+
+    /// The chosen theme names (what a gallery session restores).
+    fn theme_choice(&self) -> crate::settings_ui::ThemeChoice {
+        crate::settings_ui::ThemeChoice {
+            theme: self.theme_name.clone(),
+            light_theme: self.light_theme_name.clone(),
+        }
     }
 
     /// A gallery arrow / Home / End key: move to the next card of the filtered
@@ -10224,8 +10253,10 @@ impl App {
                     // Disarmed.
                 } else if let Some(o) = self.gallery.restore() {
                     self.end_theme_previews();
-                    if o != self.theme_idx && o < jetty_core::theme_count() {
-                        self.pick_theme(o);
+                    if o != self.theme_choice() {
+                        self.theme_name = o.theme;
+                        self.light_theme_name = o.light_theme;
+                        self.reresolve_theme(true);
                         self.persist();
                     }
                 } else {

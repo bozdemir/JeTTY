@@ -2034,12 +2034,23 @@ pub fn gallery_step(order: &[usize], cols: usize, current: usize, key: GalleryKe
     (q != p).then_some(order[q])
 }
 
+/// The themes the user chose: the `theme` and `light_theme` names — what a
+/// gallery session restores (by name: a themes/ reload can shift registry
+/// indices).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThemeChoice {
+    pub theme: String,
+    pub light_theme: String,
+}
+
 /// A gallery browsing session: clicks and arrow keys apply each theme live
-/// (and save it), Enter keeps the one shown, Esc restores the theme shown
-/// when the session began.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// (and save it), Enter keeps the one shown, Esc restores the themes chosen
+/// when the session began. Any theme choice made elsewhere — a look, a
+/// Settings control, the palette — ends it (`keep`): Esc must not take that
+/// back.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GallerySession {
-    origin: Option<usize>,
+    origin: Option<ThemeChoice>,
 }
 
 impl GallerySession {
@@ -2047,9 +2058,9 @@ impl GallerySession {
         self.origin.is_some()
     }
 
-    /// About to switch away from `current`: the session begins there (a
-    /// running session keeps its first origin).
-    pub fn begin(&mut self, current: usize) {
+    /// About to switch away from the `current` choice: the session begins
+    /// there (a running session keeps its first origin).
+    pub fn begin(&mut self, current: ThemeChoice) {
         self.origin.get_or_insert(current);
     }
 
@@ -2058,8 +2069,8 @@ impl GallerySession {
         self.origin.take().is_some()
     }
 
-    /// Esc: the theme to restore, ending the session (`None` = no session).
-    pub fn restore(&mut self) -> Option<usize> {
+    /// Esc: the choice to restore, ending the session (`None` = no session).
+    pub fn restore(&mut self) -> Option<ThemeChoice> {
         self.origin.take()
     }
 }
@@ -3080,16 +3091,19 @@ mod tests {
 
     #[test]
     fn gallery_session_keeps_or_restores_the_origin() {
+        let chose = |theme: &str| ThemeChoice { theme: theme.into(), light_theme: "catppuccin_latte".into() };
         let mut s = GallerySession::default();
         assert!(!s.active());
         assert_eq!(s.restore(), None, "Esc with no session: nothing to restore (closes)");
-        s.begin(3);
-        s.begin(5); // a later move keeps the first origin
+        s.begin(chose("nord"));
+        s.begin(chose("dracula")); // a later move keeps the first origin
         assert!(s.active());
-        assert_eq!(s.restore(), Some(3));
+        // By name, both slots: an index shifts when a user theme is filed
+        // before it, and the light slot may be the one the gallery changed.
+        assert_eq!(s.restore(), Some(chose("nord")));
         assert!(!s.active());
-        s.begin(7);
-        assert!(s.keep(), "Enter ends a running session");
+        s.begin(chose("gruvbox_dark"));
+        assert!(s.keep(), "Enter (or a choice made elsewhere) ends a running session");
         assert!(!s.keep(), "…and is a no-op without one");
         assert_eq!(s.restore(), None);
     }
