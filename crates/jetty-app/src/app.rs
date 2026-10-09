@@ -4238,6 +4238,38 @@ impl App {
         Some(idx)
     }
 
+    /// A tab's `Terminal`, set up from the current config. The ONE place one
+    /// is configured — for the first tab (`resumed`) and every later one
+    /// (`spawn_tab`) — so they cannot drift: the first tab never got its cell
+    /// size, and images and `CSI 14 t` used 8×16 px cells until a reflow.
+    fn new_terminal(&self, cols: usize, rows: usize) -> Terminal {
+        let mut terminal = Terminal::new(cols, rows);
+        terminal.set_theme(self.current_theme());
+        terminal.set_minimum_contrast(self.minimum_contrast);
+        // Seed the cell-px metric from the live grid font so an image fed
+        // before the first reflow reserves the right number of rows.
+        if let Some((cw, ch)) = self.text.as_ref().map(|t| t.cell_size()) {
+            terminal.set_cell_px(cw, ch);
+        }
+        // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
+        // Applied at spawn so new tabs pick up the current setting.
+        terminal.set_osc52_allow_paste(self.osc52_allow_paste);
+        // Kitty keyboard protocol (config `kitty_keyboard`, default on): answer
+        // `CSI ? u` and track the app's `CSI > u` flag stack — the key path
+        // encodes per those flags (`decide_window_key`), so a program that opts
+        // in gets kitty keys.
+        terminal.set_kitty_keyboard(self.kitty_keyboard);
+        terminal.set_bold_is_bright(self.bold_is_bright);
+        // The `[cursor] shape` programs reset to (a no-op for the block default).
+        terminal.set_default_cursor_shape(self.cursor_spec.shape.terminal_shape());
+        // Apply the configured scrollback cap (guard skips the no-op
+        // set_options round-trip on the 10k default path).
+        if self.scrollback_lines != 10_000 {
+            terminal.set_scrollback_lines(self.scrollback_lines);
+        }
+        terminal
+    }
+
     /// Spawn a new main-window tab WITHOUT making it active (a background tab):
     /// the shared core of `new_tab_with_cwd`, and what a detached window's
     /// run-selection uses so the main window's active tab — and its search bar,
@@ -4277,30 +4309,7 @@ impl App {
             }
         };
         let writer = pty.writer();
-        let mut terminal = Terminal::new(cols, rows);
-        terminal.set_theme(self.current_theme());
-        terminal.set_minimum_contrast(self.minimum_contrast);
-        // Seed the sixel cell-px metric from the live grid font so an image fed
-        // before the first reflow reserves the right number of rows.
-        if let Some((cw, ch)) = self.text.as_ref().map(|t| t.cell_size()) {
-            terminal.set_cell_px(cw, ch);
-        }
-        // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
-        // Applied at spawn so new tabs pick up the current setting.
-        terminal.set_osc52_allow_paste(self.osc52_allow_paste);
-        // Kitty keyboard protocol (config `kitty_keyboard`, default on): answer
-        // `CSI ? u` and track the app's `CSI > u` flag stack — the key path
-        // encodes per those flags (`decide_window_key`), so a program that opts
-        // in gets kitty keys.
-        terminal.set_kitty_keyboard(self.kitty_keyboard);
-        terminal.set_bold_is_bright(self.bold_is_bright);
-        // The `[cursor] shape` programs reset to (a no-op for the block default).
-        terminal.set_default_cursor_shape(self.cursor_spec.shape.terminal_shape());
-        // Apply the configured scrollback cap (guard skips the no-op
-        // set_options round-trip on the 10k default path).
-        if self.scrollback_lines != 10_000 {
-            terminal.set_scrollback_lines(self.scrollback_lines);
-        }
+        let mut terminal = self.new_terminal(cols, rows);
         // Surface the shell / start-directory fallback notices here too (F2) —
         // through feed_notice: they carry outside data (paths) and must stay inert.
         for notice in pty.startup_notices() {
@@ -13707,25 +13716,7 @@ impl ApplicationHandler<AppEvent> for App {
         // in while the GPU initialized: follow it before the first frame. A slower
         // portal delivers it as an event instead (one theme flip, then steady).
         self.take_first_appearance();
-        let mut terminal = Terminal::new(cols, rows);
-        terminal.set_theme(self.current_theme());
-        terminal.set_minimum_contrast(self.minimum_contrast);
-        // OSC 52 paste (remote clipboard READ) is opt-in and off by default (secure).
-        // Applied at spawn so new tabs pick up the current setting.
-        terminal.set_osc52_allow_paste(self.osc52_allow_paste);
-        // Kitty keyboard protocol (config `kitty_keyboard`, default on): answer
-        // `CSI ? u` and track the app's `CSI > u` flag stack — the key path
-        // encodes per those flags (`decide_window_key`), so a program that opts
-        // in gets kitty keys.
-        terminal.set_kitty_keyboard(self.kitty_keyboard);
-        terminal.set_bold_is_bright(self.bold_is_bright);
-        // The `[cursor] shape` programs reset to (a no-op for the block default).
-        terminal.set_default_cursor_shape(self.cursor_spec.shape.terminal_shape());
-        // Apply the configured scrollback cap (guard skips the no-op
-        // set_options round-trip on the 10k default path).
-        if self.scrollback_lines != 10_000 {
-            terminal.set_scrollback_lines(self.scrollback_lines);
-        }
+        let mut terminal = self.new_terminal(cols, rows);
         // Join the PTY worker (forked in parallel with the GPU block) and resize
         // it from the provisional grid to the real cols/rows now that the cell
         // size is known.
