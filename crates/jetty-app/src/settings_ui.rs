@@ -265,12 +265,14 @@ pub static SECTIONS: &[Section] = &[
     // Hook: reduce motion.
     Section { id: "window.motion", tab: WINDOW, title: "Motion", ..Section::DEFAULT },
     Section { id: "shell.startup", tab: SHELL, title: "Startup", ..Section::DEFAULT },
+    // No master switch: auto-summon (and the filters it shares) works with
+    // the notifications off.
     Section {
         id: "shell.notify",
         tab: SHELL,
         title: "Run & Notify",
-        master: Some("notify_on_command_finish"),
-        hint: Some("Notify on finish while hidden"),
+        hint: Some("Needs shell integration (OSC 133)"),
+        ..Section::DEFAULT
     },
     // Effect presets (Clean, Retro CRT, Amber, Green Phosphor, Neon, Paper, E-ink).
     Section { id: "fx.presets", tab: EFFECTS, title: "Presets", ..Section::DEFAULT },
@@ -791,7 +793,7 @@ pub static DESCS: &[Desc] = &[
         kind: Kind::Choice { options: |_| pairs(&[("osc", "Program"), ("auto", "Smart")]) },
         get: get_s!(tab_title),
         set: set_s!(tab_title),
-        hint: Some("Smart: the command, else the folder"),
+        hint: Some("Smart: command, else folder (OSC 133)"),
         ..Desc::DEFAULT
     },
     Desc {
@@ -1122,6 +1124,7 @@ pub static DESCS: &[Desc] = &[
         kind: Kind::Toggle,
         get: get_b!(notify_on_command_finish),
         set: set_b!(notify_on_command_finish),
+        hint: Some("When a command finishes out of sight"),
         ..Desc::DEFAULT
     },
     Desc {
@@ -3353,9 +3356,9 @@ mod tests {
         assert_eq!(focus_ring(Stop::Gallery, &look, 7), Some(PanelHit::GalleryCard(7)));
         assert_eq!(focus_ring(Stop::Section("look.theme"), &look, 7), None, "a section: its band only");
         // A master switch's link focuses the switch; an inert control has no stop.
-        let shell = stops(&tab_items(SHELL, &c, &x));
-        let master = Stop::Part("notify_on_command_finish", CtlPart::Switch);
-        assert_eq!(stop_of(&shell, "notify_on_command_finish"), Some(master));
+        let fx = stops(&tab_items(EFFECTS, &c, &x));
+        let master = Stop::Part("effects.crt_enabled", CtlPart::Switch);
+        assert_eq!(stop_of(&fx, "effects.crt_enabled"), Some(master));
         assert_eq!(stop_of(&stops(&tab_items(WINDOW, &c, &x)), "dropdown_height_pct"), None);
     }
 
