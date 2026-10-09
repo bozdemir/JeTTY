@@ -62,6 +62,10 @@ instead for a dedicated summon / dismiss key. The control invocation forwards
 the command and exits immediately — no window, no GUI work. (`jetty
 --background`, used by "Launch at login", starts Jetty hidden and does nothing
 if it already runs.) The welcome splash and the help (`?`) say the same.
+Scripts can write the same words to the socket themselves:
+`echo toggle | nc -U "$XDG_RUNTIME_DIR/jetty.sock"` (JeTTY answers with its
+version, waits a quarter second for the introduction a `jetty` launch sends, then
+acts).
 
 A Wayland app can't take its own window off screen, and a compositor brings an
 existing window back to the front only for an activation token handed over

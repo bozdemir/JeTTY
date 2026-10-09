@@ -273,16 +273,14 @@ fn forward_command(sock_path: &str, cmd: &str, me: &ipc::Caller) -> ConnectResul
                 answer => ConnectResult::Forwarded(answer),
             }
         }
-        Err(e) => {
+        Err(e) => match e.kind() {
             // ECONNREFUSED: socket file exists but nobody is listening — stale.
-            if e.raw_os_error() == Some(libc_econnrefused()) {
-                ConnectResult::Stale
-            } else if e.kind() == std::io::ErrorKind::NotFound {
-                ConnectResult::NoSocket
-            } else {
-                ConnectResult::Other
-            }
-        }
+            // std maps it on every unix (a hard-coded errno was 0 on the BSDs,
+            // where a crash then left IPC dead for good).
+            std::io::ErrorKind::ConnectionRefused => ConnectResult::Stale,
+            std::io::ErrorKind::NotFound => ConnectResult::NoSocket,
+            _ => ConnectResult::Other,
+        },
     }
 }
 
@@ -327,18 +325,72 @@ fn forwarded(answer: ipc::Answer, me: &ipc::Caller) {
     }
 }
 
-/// Returns the `ECONNREFUSED` errno value portably without a libc dependency.
-/// On Linux/macOS/BSDs this is always 111 (Linux) or 61 (macOS). We read it
-/// from a refused loopback connect at start-up … but that adds latency and a
-/// syscall. Instead, rely on the OS constant directly: POSIX guarantees the
-/// value is defined; we hard-code the Linux and macOS values and fall back to
-/// 0 (which means the stale-socket heuristic is conservatively disabled) for
-/// any other host OS.
-#[inline]
-fn libc_econnrefused() -> i32 {
-    #[cfg(target_os = "linux")]   { 111 }
-    #[cfg(target_os = "macos")]   { 61  }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))] { 0 }
+/// A summon verb a connection to the IPC socket sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IpcCommand {
+    Show,
+    Hide,
+    Toggle,
+    /// `--background`: never pops up an instance that is already running (a
+    /// login autostart), but the launch is still greeted (`ipc`).
+    Background,
+}
+
+/// The verb in what a connection sent first — `jetty --show` / `--hide` /
+/// `--toggle` / `--background` send the bare word. ASCII whitespace around it
+/// is ignored, so `echo toggle | nc -U <socket>` works too. Anything else is
+/// not one of ours.
+fn ipc_command(bytes: &[u8]) -> Option<IpcCommand> {
+    match bytes.trim_ascii() {
+        b"show" => Some(IpcCommand::Show),
+        b"hide" => Some(IpcCommand::Hide),
+        b"toggle" => Some(IpcCommand::Toggle),
+        b"background" => Some(IpcCommand::Background),
+        _ => None,
+    }
+}
+
+/// How long the IPC thread waits for a connection's verb (and introduction):
+/// an idle or half-open client (`nc -U`) can't wedge the serial accept loop.
+const IPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The pause after a failed `accept`, doubled per failure in a row up to
+/// [`IPC_ACCEPT_BACKOFF_MAX`].
+const IPC_ACCEPT_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(10);
+const IPC_ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The primary's IPC loop: read each connection's verb ([`ipc_command`]) and
+/// hand it, with the connection (for the `ipc` exchange), to `serve` until
+/// that reports the event loop gone. A failed `accept` is retried after a
+/// growing `pause`: out of file descriptors (EMFILE — macOS gives a GUI app
+/// 256) it fails before taking the pending connection, so retrying at once
+/// spun a core until a tab closed.
+fn serve_ipc(
+    conns: impl Iterator<Item = std::io::Result<std::os::unix::net::UnixStream>>,
+    mut serve: impl FnMut(IpcCommand, &mut std::os::unix::net::UnixStream) -> bool,
+    mut pause: impl FnMut(std::time::Duration),
+) {
+    let mut backoff = IPC_ACCEPT_BACKOFF_MIN;
+    for conn in conns {
+        let mut s = match conn {
+            Ok(s) => s,
+            Err(_) => {
+                pause(backoff);
+                backoff = (backoff * 2).min(IPC_ACCEPT_BACKOFF_MAX);
+                continue;
+            }
+        };
+        backoff = IPC_ACCEPT_BACKOFF_MIN;
+        let _ = s.set_read_timeout(Some(IPC_READ_TIMEOUT));
+        let mut buf = [0u8; 16];
+        // Zero bytes (a bare connect) or a read timeout: no command.
+        let n = std::io::Read::read(&mut s, &mut buf).unwrap_or(0);
+        if let Some(cmd) = ipc_command(&buf[..n]) {
+            if !serve(cmd, &mut s) {
+                break;
+            }
+        }
+    }
 }
 
 /// Try to acquire the primary-instance lock: an `flock`-style exclusive lock
@@ -650,42 +702,30 @@ pub fn run() {
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    // IPC accept thread (primary only): map each forwarded command to an event.
-    // `show`/`hide` set visibility explicitly; anything else toggles. Shares the
-    // summon code path with the X11 global-hotkey grab. Every launch is greeted
-    // and says who it is (`ipc`): one on another display is turned away, and a
-    // newer JeTTY is announced once — it would otherwise only ever toggle this
-    // older one.
+    // IPC accept thread (primary only): map each forwarded command to an event
+    // (`serve_ipc`). `show`/`hide` set visibility explicitly, `toggle` toggles.
+    // Shares the summon code path with the X11 global-hotkey grab. Every launch
+    // is greeted and says who it is (`ipc`): one on another display is turned
+    // away, and a newer JeTTY is announced once — it would otherwise only ever
+    // toggle this older one.
     if let Some(listener) = listener {
         let proxy_ipc = proxy.clone();
         let sock_cleanup = sock_path.clone();
         let here = me.display.clone();
         std::thread::spawn(move || {
             let mut announced: Option<String> = None;
-            for mut s in listener.incoming().flatten() {
-                // Bound the read so an idle/half-open client (e.g. `nc -U`)
-                // can't wedge this serial accept loop and silently kill
-                // summon IPC.
-                let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(250)));
-                let mut buf = [0u8; 16];
-                let n = std::io::Read::read(&mut s, &mut buf).unwrap_or(0);
-                if n == 0 {
-                    // Zero-byte connect or read timeout: never toggle.
-                    continue;
-                }
-                let event = match &buf[..n] {
-                    b"show" => Some(AppEvent::SetVisible(true)),
-                    b"hide" => Some(AppEvent::SetVisible(false)),
-                    b"toggle" => Some(AppEvent::ToggleVisibility),
+            let serve = |cmd, s: &mut std::os::unix::net::UnixStream| {
+                let event = match cmd {
+                    IpcCommand::Show => Some(AppEvent::SetVisible(true)),
+                    IpcCommand::Hide => Some(AppEvent::SetVisible(false)),
+                    IpcCommand::Toggle => Some(AppEvent::ToggleVisibility),
                     // `--background`: no-op, don't toggle (a login autostart must
                     // never pop up an instance that's already running).
-                    b"background" => None,
-                    // Unknown command: not one of ours.
-                    _ => continue,
+                    IpcCommand::Background => None,
                 };
-                let (caller, serve) = ipc::greet(&mut s, version, &here);
+                let (caller, serve) = ipc::greet(s, version, &here);
                 if !serve {
-                    continue;
+                    return true;
                 }
                 // The launcher's activation token goes just ahead of a summon:
                 // a Wayland summon builds the window with it.
@@ -701,10 +741,9 @@ pub fn run() {
                     events.push(AppEvent::Notice(app::newer_version_notice(&c.version, version, moved)));
                     announced = Some(c.version);
                 }
-                if events.into_iter().any(|e| proxy_ipc.send_event(e).is_err()) {
-                    break;
-                }
-            }
+                !events.into_iter().any(|e| proxy_ipc.send_event(e).is_err())
+            };
+            serve_ipc(listener.incoming(), serve, std::thread::sleep);
             remove_socket_if_ours(&sock_cleanup, bound_ident);
         });
     }
@@ -839,5 +878,101 @@ mod primary_lock_tests {
             try_acquire_primary_lock(path),
             LockAttempt::Unavailable
         ));
+    }
+}
+
+#[cfg(test)]
+mod ipc_serve_tests {
+    use super::{
+        forward_command, ipc, ipc_command, serve_ipc, ConnectResult, IpcCommand, IPC_ACCEPT_BACKOFF_MAX,
+    };
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::time::Duration;
+
+    /// The server end of a connection whose client sent `bytes` and hung up.
+    fn sent(bytes: &[u8]) -> UnixStream {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(bytes).unwrap();
+        server
+    }
+
+    #[test]
+    fn a_command_may_carry_ascii_whitespace() {
+        let cases: [(&[u8], Option<IpcCommand>); 11] = [
+            (b"toggle", Some(IpcCommand::Toggle)),
+            (b"toggle\n", Some(IpcCommand::Toggle)), // `echo toggle | nc -U <socket>`
+            (b" show\r\n", Some(IpcCommand::Show)),
+            (b"\thide ", Some(IpcCommand::Hide)),
+            (b"background", Some(IpcCommand::Background)),
+            (b"", None),
+            (b"\n", None),
+            (b"toggle!", None),
+            (b"TOGGLE", None),
+            (b"to ggle", None),
+            (b"v1\0", None),
+        ];
+        for (bytes, want) in cases {
+            assert_eq!(ipc_command(bytes), want, "{:?}", String::from_utf8_lossy(bytes));
+        }
+    }
+
+    #[test]
+    fn silent_or_unknown_connections_ask_for_nothing() {
+        let (hung_up, client) = UnixStream::pair().unwrap();
+        drop(client);
+        // Still open and never writing: the read times out.
+        let (idle, _open) = UnixStream::pair().unwrap();
+        let conns = vec![Ok(hung_up), Ok(idle), Ok(sent(b"bogus")), Ok(sent(b"toggle\n"))];
+        let mut got = Vec::new();
+        serve_ipc(conns.into_iter(), |c, _| { got.push(c); true }, |_| {});
+        assert_eq!(got, [IpcCommand::Toggle]);
+    }
+
+    #[test]
+    fn failed_accepts_back_off_instead_of_spinning() {
+        let emfile = || Err(std::io::Error::from_raw_os_error(24));
+        let conns = vec![emfile(), emfile(), emfile(), Ok(sent(b"toggle")), emfile(), Ok(sent(b"show"))];
+        let (mut got, mut pauses) = (Vec::new(), Vec::new());
+        serve_ipc(conns.into_iter(), |c, _| { got.push(c); true }, |d| pauses.push(d));
+        assert_eq!(got, [IpcCommand::Toggle, IpcCommand::Show], "the queued commands still arrive");
+        let ms = Duration::from_millis;
+        assert_eq!(pauses, [ms(10), ms(20), ms(40), ms(10)], "doubling, reset by an accept");
+        let mut pauses = Vec::new();
+        serve_ipc((0..20).map(|_| emfile()), |_, _| true, |d| pauses.push(d));
+        assert_eq!(pauses.len(), 20);
+        assert!(pauses.iter().all(|&d| d <= IPC_ACCEPT_BACKOFF_MAX));
+        assert_eq!(pauses.last(), Some(&IPC_ACCEPT_BACKOFF_MAX));
+    }
+
+    #[test]
+    fn the_loop_ends_with_the_event_loop() {
+        let conns = vec![Ok(sent(b"show")), Ok(sent(b"hide"))];
+        let mut got = Vec::new();
+        serve_ipc(conns.into_iter(), |c, _| { got.push(c); false }, |_| {});
+        assert_eq!(got, [IpcCommand::Show], "nothing is read once the send failed");
+    }
+
+    #[test]
+    fn a_socket_nobody_listens_on_is_stale() {
+        let path = std::env::temp_dir().join(format!("jetty-stale-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_str().unwrap();
+        let me = ipc::Caller::current();
+        assert!(matches!(forward_command(p, "toggle", &me), ConnectResult::NoSocket));
+        // A live primary (older than the introductions: it reads the verb and
+        // hangs up) takes it.
+        let live = UnixListener::bind(&path).unwrap();
+        let primary = std::thread::spawn(move || {
+            let (mut s, _) = live.accept().unwrap();
+            let mut verb = [0u8; 16];
+            let n = s.read(&mut verb).unwrap();
+            verb[..n].to_vec()
+        });
+        assert!(matches!(forward_command(p, "show", &me), ConnectResult::Forwarded(_)));
+        assert_eq!(primary.join().unwrap(), b"show");
+        // A crashed primary leaves its socket file behind: refused, so stale.
+        assert!(matches!(forward_command(p, "toggle", &me), ConnectResult::Stale));
+        let _ = std::fs::remove_file(&path);
     }
 }
