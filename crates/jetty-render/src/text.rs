@@ -470,8 +470,8 @@ fn row_cache_cap(rows: usize, cols: usize) -> usize {
 /// scanned during eviction is rotated to the back (treated as most-recent)
 /// instead of dropped. Pure + generic so it is unit-testable independent of
 /// cosmic-text `Buffer`. (F25)
-fn evict_fifo_cache<K: std::hash::Hash + Eq, V>(
-    map: &mut std::collections::HashMap<K, V>,
+fn evict_fifo_cache<K: std::hash::Hash + Eq, V, S: std::hash::BuildHasher>(
+    map: &mut std::collections::HashMap<K, V, S>,
     order: &mut std::collections::VecDeque<K>,
     visible: impl Fn(&K) -> bool,
     cap: usize,
@@ -497,13 +497,13 @@ fn evict_fifo_cache<K: std::hash::Hash + Eq, V>(
 /// program prints. Generic over the cached value only so the bounds are testable
 /// without a font; the renderer caches shaped [`OverdrawGlyph`]s.
 struct ClusterGlyphCache<V = OverdrawGlyph> {
-    map: std::collections::HashMap<Box<str>, V>,
+    map: FxHashMap<Box<str>, V>,
     order: std::collections::VecDeque<Box<str>>,
 }
 
 impl<V> Default for ClusterGlyphCache<V> {
     fn default() -> Self {
-        Self { map: std::collections::HashMap::new(), order: std::collections::VecDeque::new() }
+        Self { map: FxHashMap::default(), order: std::collections::VecDeque::new() }
     }
 }
 
@@ -990,7 +990,7 @@ pub struct TextLayer {
     /// fallback supplies a glyph the primary font lacks (or the primary font's own
     /// double-width glyph). Cleared on `set_font_family`/`set_font_size` (glyphs are
     /// per family + size).
-    fallback_glyphs: std::collections::HashMap<char, OverdrawGlyph>,
+    fallback_glyphs: FxHashMap<char, OverdrawGlyph>,
     /// Insertion order of `fallback_glyphs` keys, used to evict the oldest
     /// entries once the cache exceeds `FALLBACK_GLYPH_CAP` so a session scrolling
     /// through a large CJK/emoji corpus can't accumulate shaped buffers without
@@ -1195,7 +1195,7 @@ impl TextLayer {
             cell_ranges_scratch: Vec::new(),
             glyph_route: FxHashMap::default(),
             coverage_buffer,
-            fallback_glyphs: std::collections::HashMap::new(),
+            fallback_glyphs: FxHashMap::default(),
             fallback_order: std::collections::VecDeque::new(),
             shape_gen: 0,
             deco_rects: Vec::new(),
