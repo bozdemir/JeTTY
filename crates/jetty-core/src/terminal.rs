@@ -51,7 +51,10 @@ fn term_config(scrollback: usize, osc52: Osc52, kitty_keyboard: bool, cursor: Cu
 /// sub-slice is bounded by the lines they actually push, not by their byte
 /// count (primary screen only: on the alt screen they cannot touch the primary
 /// scrollback and are not split out). An alt-screen toggle freezes `abs_top`, so
-/// primary output sharing its slice would go uncounted.
+/// primary output sharing its slice would go uncounted. A synchronized update
+/// in flight is applied first — vte would otherwise only buffer the sequence
+/// and replay it together with the rest of the update — except before SU / DL
+/// (the replay counts their scroll) and RIS (it drops every anchor anyway).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IsolatedSeq {
     /// `ESC [ 2 J` — erase the whole screen.
@@ -1013,7 +1016,8 @@ pub struct Terminal {
     /// once (correct-or-absent) and tracking resumes exactly on the next
     /// sub-slice. FROZEN on the alt screen and across an alt-screen toggle (that
     /// history change is not a scroll); toggles are isolated into their own
-    /// sub-slice so no primary output is lost with them.
+    /// sub-slice — inside a synchronized update too — so no primary output is
+    /// lost with them.
     abs_top: i64,
     /// The scrollback cap (the alacritty grid's max). While anchors exist, room
     /// is made BEFORE each sub-slice, so the retained history sits between this
@@ -2408,6 +2412,16 @@ impl Terminal {
     fn isolate(&mut self, bytes: &[u8], start: usize, seq_start: usize, k: usize, kind: IsolatedSeq) -> usize {
         let s0 = seq_start.max(start);
         self.advance_slice(&bytes[start..s0]);
+        // Inside a DEC 2026 synchronized update vte only BUFFERS, then replays
+        // the whole update in one piece, where these would not run alone: a
+        // toggle would freeze `abs_top` over the primary lines after it, ED 3's
+        // shrink would hide the scroll before it, ED 2's prune would run before
+        // the erase. Apply the update first (the frame tears at most once, as
+        // for a mark or image inside a sync). SU / DL only scroll, which the
+        // replay counts like any line feed, and RIS drops every anchor anyway.
+        if !matches!(kind, IsolatedSeq::ScrollUp { .. } | IsolatedSeq::Reset) {
+            self.apply_pending_sync();
+        }
         let seq = &bytes[s0..k];
         // A handful of bytes that may push a whole screen into scrollback: make
         // room for the lines it really pushes (+1 per byte), or a nearly full
@@ -2415,21 +2429,14 @@ impl Terminal {
         // long-lived tab). Room beyond the piece budget is not made: that would
         // trim — or wipe — history for a push that overflows the cap anyway, so
         // such a piece goes through as before (anchors dropped once). Inside a
-        // synchronized update the bytes are only buffered: nothing to bound.
+        // synchronized update (SU / DL) the bytes are only buffered: nothing to
+        // bound.
         let room = (kind.scrolls_a_screen() && self.has_anchors() && self.sync_deadline().is_none())
             .then(|| self.lines_pushed_by(kind) + seq.len() + 1)
             .filter(|&lines| lines <= self.piece_budget());
         match room {
             Some(lines) => self.advance_piece(seq, Some(lines)),
             None => self.advance_slice(seq),
-        }
-        // Inside a DEC 2026 synchronized update vte only BUFFERED the ED 3; the
-        // block would later apply as one net history change in which the shrink
-        // can hide (`\e[2J\e[3J` + a redraw that scrolls), leaving old anchors on
-        // new rows. Apply the buffered block now so the shrink is seen in order
-        // (the frame tears at most once, as for a mark or image inside a sync).
-        if kind == IsolatedSeq::EraseSaved && self.has_anchors() && self.sync_deadline().is_some() {
-            self.flush_sync();
         }
         self.after_isolated(kind);
         k
@@ -3040,18 +3047,14 @@ impl Terminal {
     /// meaningless). Coalesces a duplicate A on the same line so p10k + our own
     /// snippet both emitting A cannot create two blocks.
     fn bind_mark(&mut self, letter: u8, exit: Option<i32>, redraws: bool) {
+        // Inside a DEC 2026 synchronized update vte is still BUFFERING the bytes
+        // before this mark, so the cursor has not reached the mark's row yet —
+        // nor has a buffered alt-screen exit run. Flush the update now (the
+        // frame tears at most once) so the mark binds to its real row, on the
+        // screen it really is on.
+        self.apply_pending_sync();
         if self.term.mode().contains(TermMode::ALT_SCREEN) {
             return;
-        }
-        // Inside a DEC 2026 synchronized update vte is still BUFFERING the bytes
-        // before this mark, so the cursor has not reached the mark's row yet.
-        // Flush the update now (the frame tears at most once) so the mark binds
-        // to its real row instead of the pre-sync one.
-        if self.sync_deadline().is_some() {
-            self.flush_sync();
-            if self.term.mode().contains(TermMode::ALT_SCREEN) {
-                return;
-            }
         }
         let abs = self.abs_top + self.term.grid().cursor.point.line.0 as i64;
         match letter {
@@ -7707,6 +7710,59 @@ mod tests {
     }
 
     #[test]
+    fn a_synchronized_update_never_moves_the_marks() {
+        // vte only BUFFERS a DEC 2026 update and replays it at its end in one
+        // piece, so a sequence the scanner isolates did not run alone in it:
+        // an alt-screen toggle froze `abs_top` over the primary lines sharing
+        // its replay (nvim >= 0.10 wraps its exit, rmcup included, in BSU/ESU),
+        // ED 2 pruned the screen's marks before it pushed them into scrollback,
+        // ED 3 hid the scroll before it. In an update or not, the same bytes
+        // must leave the marks on the same lines (a negative one: scrollback).
+        let setup: &[u8] = b"1\r\n2\r\n\x1b]133;A\x07$ false\r\n\x1b]133;D;1\x07"; // prompt on row 2
+        // Bytes before the update, its body, bytes after it, the prompt's line.
+        type Case = (&'static [u8], &'static [u8], &'static [u8], i64);
+        let cases: [Case; 5] = [
+            // Leaving the alt screen, then the shell's lines, in one read.
+            (b"\x1b[?1049htui\r\n", b"\x1b[?1049lx\r\ny\r\n", b"", 1),
+            // Primary output, then entering the alt screen.
+            (b"", b"a\r\nb\r\n\x1b[?1049htui", b"\x1b[?1049l", 1),
+            // A clear that keeps the scrollback: the prompt is pushed into it.
+            (b"", b"\x1b[H\x1b[2Jredraw", b"", -1),
+            // Scrolling, then a scrollback clear.
+            (b"", b"x\r\ny\r\nz\r\n\x1b[3J", b"", 0),
+            (b"", b"\x1b[2S", b"", 0),
+        ];
+        for (before, body, after, line) in cases {
+            for (sync, split) in [(false, false), (true, false), (true, true)] {
+                let mut t = Terminal::new(20, 5);
+                t.feed(setup);
+                t.feed(before);
+                let wrap = |s: &'static [u8]| if sync { s } else { b"" };
+                let read = [wrap(b"\x1b[?2026h"), body, wrap(b"\x1b[?2026l")].concat();
+                // One PTY read, or one per byte (sequences cut by read boundaries).
+                for chunk in read.chunks(if split { 1 } else { read.len() }) {
+                    t.feed(chunk);
+                }
+                t.feed(after);
+                let lines: Vec<i64> = t.marks.iter().map(|m| m.prompt - t.abs_top).collect();
+                assert_eq!(lines, vec![line], "sync={sync} split={split}: {:?}", String::from_utf8_lossy(body));
+            }
+        }
+    }
+
+    #[test]
+    fn a_mark_after_an_alt_exit_inside_a_synchronized_update_binds() {
+        // Nothing anchored yet, so the toggle is not split out and is still
+        // buffered when the prompt's mark arrives in the same update: the mark
+        // belongs to the primary screen the update returns to.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[?1049htui");
+        t.feed(b"\x1b[?2026h\x1b[?1049l\x1b]133;A\x07$ false\r\n\x1b]133;D;1\x07\x1b[?2026l");
+        assert!(!t.alt_screen());
+        assert_eq!(t.failed_prompt_rows(), vec![0], "the failed prompt is marked");
+    }
+
+    #[test]
     fn resize_wipe_spares_an_a_and_d_only_shell() {
         // Integrations that never send C (old bash) used to look "clean" forever,
         // so every resize erased the whole tab. A completed command (D) latches.
@@ -9035,6 +9091,19 @@ mod tests {
         t.feed(&red_rgba_2x2(""));
         assert_eq!(t.placements.len(), 2);
         assert!(t.sync_deadline().is_none());
+    }
+
+    #[test]
+    fn an_image_follows_the_lines_after_an_alt_exit_inside_a_sync_block() {
+        // An editor quit (rmcup inside BSU/ESU) and the shell's lines in one
+        // read: the image scrolls with them instead of staying on its old row.
+        let mut t = Terminal::new(20, 5);
+        t.set_cell_px(10.0, 10.0);
+        t.feed(b"1\r\n2\r\n");
+        t.feed(&sixel(RED_1X6)); // row 2; the cursor moves below it
+        t.feed(b"\x1b[?1049htui");
+        t.feed(b"\x1b[?2026h\x1b[?1049l\x1b[?2026lx\r\ny\r\n");
+        assert_eq!(t.visible_images()[0].top_row, 1.0, "moved up with the one scrolled line");
     }
 
     #[test]
