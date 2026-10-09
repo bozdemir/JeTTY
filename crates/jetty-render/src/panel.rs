@@ -495,6 +495,8 @@ const GAL_CHIPS_H: f32 = 38.0;
 const GAL_CARD_H: f32 = 72.0;
 const GAL_GAP_X: f32 = 16.0;
 const GAL_CAPTION_H: f32 = 24.0;
+/// The pitch of a wrapped caption's second line.
+const GAL_CAPTION_LINE: f32 = 20.0;
 const GAL_GAP_Y: f32 = 8.0;
 
 /// Far offscreen (an absent specimen).
@@ -1197,25 +1199,53 @@ impl Lay<'_> {
         }
         let cols = GALLERY_COLS;
         let card_w = ((cw - GAL_GAP_X * (cols - 1) as f32) / cols as f32).floor();
-        let pitch = GAL_CARD_H + GAL_CAPTION_H + GAL_GAP_Y;
-        for (k, (idx, t)) in themes.iter().enumerate() {
-            let cx = x0 + (k % cols) as f32 * (card_w + GAL_GAP_X);
-            let cy = y + h + (k / cols) as f32 * pitch;
-            self.card(cx, cy, card_w, *idx, t);
+        // Row by row: a row whose names wrap gets a taller caption band.
+        let mut cy = y + h;
+        for row in themes.chunks(cols) {
+            let caps: Vec<Vec<String>> = row.iter().map(|(_, t)| self.caption_lines(&t.display_name, card_w)).collect();
+            let lines = caps.iter().map(Vec::len).max().unwrap_or(1);
+            let cap_h = GAL_CAPTION_H + lines.saturating_sub(1) as f32 * GAL_CAPTION_LINE;
+            for (j, ((idx, t), cap)) in row.iter().zip(caps).enumerate() {
+                let cx = x0 + j as f32 * (card_w + GAL_GAP_X);
+                self.card(cx, cy, card_w, *idx, t, &cap, cap_h);
+            }
+            cy += GAL_CARD_H + cap_h + GAL_GAP_Y;
         }
-        h += n.div_ceil(cols) as f32 * pitch;
+        h = cy - y;
         h
     }
 
+    /// A theme card's caption: the name on one line, or — too long for the
+    /// card — wrapped at its last space that fits onto two (the second line
+    /// ellipsized if it still overflows), so similar names ("Catppuccin
+    /// Mocha", "Catppuccin Latte") never shrink to the same prefix.
+    fn caption_lines(&mut self, name: &str, w: f32) -> Vec<String> {
+        if self.tw(name) <= w {
+            return vec![name.to_string()];
+        }
+        let mut cut = None;
+        for (i, _) in name.match_indices(' ') {
+            if self.tw(&name[..i]) <= w {
+                cut = Some(i);
+            }
+        }
+        match cut {
+            Some(i) => vec![name[..i].to_string(), self.fit(name[i..].trim_start(), w)],
+            None => vec![self.fit(name, w)],
+        }
+    }
+
     /// One theme card: the theme's background, a two-line colored prompt
-    /// sample, its eight normal ANSI colors, and its name underneath.
-    fn card(&mut self, cx: f32, cy: f32, w: f32, idx: usize, t: &jetty_core::Theme) {
+    /// sample, its eight normal ANSI colors, and its name (`caption`, one
+    /// line or two, in a band `cap_h` tall) underneath.
+    #[allow(clippy::too_many_arguments)]
+    fn card(&mut self, cx: f32, cy: f32, w: f32, idx: usize, t: &jetty_core::Theme, caption: &[String], cap_h: f32) {
         let c = self.c;
         let h = GAL_CARD_H;
         let selected = idx == self.theme_idx;
         let hovered = self.hover == Some(PanelHit::GalleryCard(idx));
         // Focused: a ring around the whole tile, its name included.
-        let tile = shape(cx - 3.0, cy - 3.0, w + 6.0, h + GAL_CAPTION_H + 3.0, 11.0);
+        let tile = shape(cx - 3.0, cy - 3.0, w + 6.0, h + cap_h + 3.0, 11.0);
         self.ring(PanelHit::GalleryCard(idx), tile, c.surface);
         if selected {
             self.quad(Rect::rounded(cx - 3.0, cy - 3.0, w + 6.0, h + 6.0, c.accent, 11.0));
@@ -1236,10 +1266,11 @@ impl Lay<'_> {
             let sx = cx + 9.0 + k as f32 * (sw + 2.0);
             self.quad(Rect::rounded(sx, cy + 52.0, sw, 10.0, rgba(*col, 255), 2.0));
         }
-        let name = self.fit(&t.display_name, w);
         let nc = if selected { c.ui.text } else { c.ui.text_dim };
-        self.label(name, cx, cy + h + 4.0, nc);
-        self.hit(area(cx - 3.0, cy - 3.0, w + 6.0, h + GAL_CAPTION_H + 3.0), PanelHit::GalleryCard(idx));
+        for (i, line) in caption.iter().enumerate() {
+            self.label(line.clone(), cx, cy + h + 4.0 + i as f32 * GAL_CAPTION_LINE, nc);
+        }
+        self.hit(area(cx - 3.0, cy - 3.0, w + 6.0, h + cap_h + 3.0), PanelHit::GalleryCard(idx));
     }
 
     /// Colored text runs left to right from `(x, y)`, cut (with an ellipsis)
@@ -1767,6 +1798,40 @@ mod tests {
         // Cards stay inside the column.
         let right = v.geom.panel.x + v.geom.panel.w - PAD;
         assert!(cards.iter().all(|(r, _)| r.x + r.w <= right + 4.0));
+    }
+
+    /// Every theme card's caption tells its theme apart, inside its card: a
+    /// long name wraps onto a second line instead of being cut to a prefix
+    /// several themes share ("Catppuccin …" was Mocha — the default —, Latte,
+    /// Frappe and Macchiato; "Tokyo Night…" three more).
+    #[test]
+    fn gallery_captions_tell_every_theme_apart() {
+        for (scale, font) in [(1.0, 16.0), (2.0, 16.0), (1.0, 13.0)] {
+            let cm = ChromeMetrics::new(scale, font);
+            let u = cm.overlay_u();
+            let adv = CHAR_W_FALLBACK * u;
+            let v = view_with(&[PanelItem::Gallery], (PANEL_W * u) as u32, 20_000, scale, font, 0.0);
+            let mut captions = Vec::new();
+            for (r, h) in &v.geom.hits {
+                let PanelHit::GalleryCard(_) = h else { continue };
+                let below = r.y + (3.0 + GAL_CARD_H) * u;
+                let lines: Vec<&Label> = v
+                    .content_labels
+                    .iter()
+                    .filter(|l| l.1 >= r.x - 0.5 && l.1 < r.x + r.w && l.2 >= below && l.2 < r.y + r.h)
+                    .collect();
+                for l in &lines {
+                    let end = l.1 + l.0.chars().count() as f32 * adv;
+                    assert!(end <= r.x + r.w + 0.5, "{scale}×: {:?} overflows its card", l.0);
+                }
+                captions.push(lines.iter().map(|l| l.0.as_str()).collect::<Vec<_>>().join(" "));
+            }
+            let mut unique = captions.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(unique.len(), captions.len(), "{scale}×/{font}pt: ambiguous captions {captions:?}");
+            assert!(captions.iter().any(|c| c == "Catppuccin Mocha"), "{scale}×: the default theme's full name");
+        }
     }
 
     #[test]
