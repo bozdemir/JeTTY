@@ -5714,7 +5714,9 @@ impl App {
                         Surface::Main => self.paste_text(&text),
                         Surface::Detached(p) => {
                             if let Some(dw) = self.detached.get_mut(p) {
-                                Self::paste_to_tab(&mut dw.tab, &text);
+                                if Self::paste_to_tab(&mut dw.tab, &text) {
+                                    dw.request_paint();
+                                }
                             }
                         }
                     }
@@ -6855,7 +6857,9 @@ impl App {
             return;
         }
         let active = self.active;
-        Self::paste_to_tab(&mut self.tabs[active], text);
+        if Self::paste_to_tab(&mut self.tabs[active], text) {
+            self.request_main_paint();
+        }
     }
 
     /// Paste `text` into `tab`'s PTY (bracketed when the app enabled it).
@@ -6863,17 +6867,11 @@ impl App {
     /// context-menu / Ctrl+Shift+V paste, so all windows paste identically.
     /// The wire bytes — control characters stripped (no `^C` can split a paste
     /// into typed commands, no ESC can forge the end marker), line breaks
-    /// normalized — come from the pure, unit-tested `runsel::paste_bytes`.
-    fn paste_to_tab(tab: &mut Tab, text: &str) {
-        let bytes = crate::runsel::paste_bytes(text, tab.terminal.bracketed_paste());
-        if bytes.is_empty() {
-            return;
-        }
-        // A user paste claims the prompt — cancel any staged run-selection
-        // inject for this tab (same rule as write_key_to_pty).
-        crate::runsel::cancel_on_user_write(&mut tab.pending_inject);
-        let _ = tab.writer.write_all(&bytes);
-        let _ = tab.writer.flush();
+    /// normalized — come from the pure, unit-tested `runsel::paste_bytes`; the
+    /// rest (cancel a staged inject, jump to the prompt) from `runsel::paste_into`.
+    /// Returns whether the view jumped (the caller repaints that window).
+    fn paste_to_tab(tab: &mut Tab, text: &str) -> bool {
+        crate::runsel::paste_into(&mut tab.terminal, &mut tab.pending_inject, &mut tab.writer, text)
     }
 
     /// Run the current selection in a NEW tab — the browser's "open link in a
@@ -9336,7 +9334,9 @@ impl App {
                     }
                     input::KeyAction::Paste => {
                         if let Some(text) = clipboard::get() {
-                            Self::paste_to_tab(&mut dw.tab, &text);
+                            if Self::paste_to_tab(&mut dw.tab, &text) {
+                                dw.request_paint();
+                            }
                         }
                     }
                     // Folded from the old detached Cmd+A block: select all on THIS
@@ -9817,7 +9817,9 @@ impl App {
                     Act::Paste => {
                         if let Some(text) = clipboard::get() {
                             if let Some(dw) = self.detached.get_mut(pos) {
-                                Self::paste_to_tab(&mut dw.tab, &text);
+                                if Self::paste_to_tab(&mut dw.tab, &text) {
+                                    dw.request_paint();
+                                }
                             }
                         }
                     }
@@ -10076,7 +10078,9 @@ impl App {
                 }) == crate::gridmouse::Press::PastePrimary
                 {
                     if let Some(text) = clipboard::get_for_middle_click(copy_on_select) {
-                        Self::paste_to_tab(&mut dw.tab, &text);
+                        if Self::paste_to_tab(&mut dw.tab, &text) {
+                            dw.request_paint();
+                        }
                     }
                 }
             }
@@ -10104,7 +10108,9 @@ impl App {
                 // its tab (through the sanitizing paste path, like main).
                 if let Some(dw) = self.detached.get_mut(pos) {
                     let text = crate::gridmouse::dropped_path_text(&path);
-                    Self::paste_to_tab(&mut dw.tab, &text);
+                    if Self::paste_to_tab(&mut dw.tab, &text) {
+                        dw.request_paint();
+                    }
                 }
             }
             WindowEvent::Focused(true) if pos < self.detached.len() => {

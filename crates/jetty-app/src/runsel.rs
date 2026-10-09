@@ -174,6 +174,32 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     out
 }
 
+/// Everything a user paste does to its tab, Tab-free so it is testable: the
+/// [`paste_bytes`] for `text` (bracketed when the program asked for it) go to
+/// `w`, a staged run-selection inject is cancelled — the user claimed the
+/// prompt — and the view jumps back to the live bottom, where the text lands
+/// (a keystroke's rule, F30). Nothing survives sanitizing → nothing happens at
+/// all. EVERY paste path (shortcut, menu, palette, middle click, dropped file,
+/// detached windows) lands here through `App::paste_to_tab`. Returns whether
+/// the view moved (the caller repaints: a no-echo prompt sends no output).
+pub fn paste_into(
+    term: &mut jetty_core::Terminal,
+    pending: &mut Option<PendingInject>,
+    w: &mut dyn Write,
+    text: &str,
+) -> bool {
+    let bytes = paste_bytes(text, term.bracketed_paste());
+    if bytes.is_empty() {
+        return false;
+    }
+    cancel_on_user_write(pending);
+    let moved = term.scroll_offset() != 0;
+    term.scroll_to_bottom();
+    let _ = w.write_all(&bytes);
+    let _ = w.flush();
+    moved
+}
+
 /// The run-vs-type decision over a sanitized selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
@@ -601,6 +627,36 @@ mod tests {
         // must not become two (ICRNL would turn its CR into a second LF).
         assert_eq!(sanitize_paste("a\r\nb\rc\nd", false), "a\rb\rc\rd");
         assert_eq!(paste_bytes("ls\r\n", false), b"ls\r".to_vec());
+    }
+
+    #[test]
+    fn a_paste_jumps_back_to_the_prompt() {
+        // Scrolled back into history, a paste went to the prompt off-screen
+        // and the view stayed put — a keystroke jumps to the live bottom
+        // (F30); a paste is typing too.
+        let mut t = jetty_core::Terminal::new(20, 5);
+        for i in 0..50 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        t.scroll_lines(10);
+        assert!(t.scroll_offset() > 0);
+        let mut slot = Some(pending("echo hi", true, Instant::now(), true));
+        let mut w: Vec<u8> = Vec::new();
+        assert!(paste_into(&mut t, &mut slot, &mut w, "ls -la"), "the view moved");
+        assert_eq!(w, b"ls -la");
+        assert_eq!(t.scroll_offset(), 0, "the view follows the paste to the prompt");
+        assert!(slot.is_none(), "the paste claimed the prompt");
+        // Bracketed when the program asked for it.
+        t.feed(b"\x1b[?2004h");
+        w.clear();
+        assert!(!paste_into(&mut t, &mut None, &mut w, "a\nb"), "already at the bottom");
+        assert_eq!(w, b"\x1b[200~a\nb\x1b[201~");
+        // Nothing survives sanitizing: nothing is written, nothing moves.
+        t.scroll_lines(10);
+        w.clear();
+        assert!(!paste_into(&mut t, &mut None, &mut w, "\x03\x1b"));
+        assert!(w.is_empty());
+        assert!(t.scroll_offset() > 0);
     }
 
     #[test]
