@@ -3668,7 +3668,8 @@ impl Terminal {
         // coordinates) and iterate over viewport rows to mark covered cells.
         let sel_range = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term));
         if let Some(range) = sel_range {
-            let display_offset = self.term.grid().display_offset();
+            let grid = self.term.grid();
+            let display_offset = grid.display_offset();
             for vp_row in 0..self.rows {
                 let term_point = viewport_to_point(display_offset, Point::new(vp_row, Column(0)));
                 let term_line = term_point.line;
@@ -3676,10 +3677,21 @@ impl Terminal {
                 if term_line < range.start.line || term_line > range.end.line {
                     continue;
                 }
+                let row = &grid[term_line];
+                let base = vp_row * self.cols;
                 for col in 0..self.cols {
                     let pt = Point::new(term_line, Column(col));
                     if range.contains(pt) {
-                        cells[vp_row * self.cols + col].selected = true;
+                        cells[base + col].selected = true;
+                        // A wide glyph spans its cell and the spacer after it,
+                        // and the copied text takes the whole char when either
+                        // is selected: highlight both halves.
+                        let flags = row[Column(col)].flags;
+                        if flags.contains(Flags::WIDE_CHAR) && col + 1 < self.cols {
+                            cells[base + col + 1].selected = true;
+                        } else if flags.contains(Flags::WIDE_CHAR_SPACER) && col > 0 {
+                            cells[base + col - 1].selected = true;
+                        }
                     }
                 }
             }
@@ -5254,6 +5266,33 @@ mod tests {
             assert!(!snap2.cell(0, col).selected,
                 "cell (0, {col}) should not be selected after clear");
         }
+    }
+
+    #[test]
+    fn selection_highlights_both_cells_of_a_wide_char() {
+        // A wide glyph spans its cell and the spacer after it. The copied text
+        // takes the whole char whenever either cell is selected, so the
+        // highlight must cover both — it lit only the selected half.
+        let mut t = Terminal::new(20, 3);
+        t.feed("ab世界cd".as_bytes()); // 世 = cols 2–3, 界 = cols 4–5
+        let selected = |t: &Terminal| -> Vec<usize> {
+            let snap = t.snapshot();
+            (0..8).filter(|&c| snap.cell(0, c).selected).collect()
+        };
+        // Ending ON 世 (a drag ending over its left half, copy-mode `e`).
+        t.selection_start(0, 0, true);
+        t.selection_update(0, 2, false);
+        assert_eq!(t.selection_text().as_deref(), Some("ab世"));
+        assert_eq!(selected(&t), vec![0, 1, 2, 3], "both halves of 世");
+        // Starting on 世's spacer (a drag from its right half, leftward end).
+        t.selection_start(0, 3, true);
+        t.selection_update(0, 5, false);
+        assert_eq!(t.selection_text().as_deref(), Some("世界"));
+        assert_eq!(selected(&t), vec![2, 3, 4, 5], "both halves of 世 and 界");
+        // A selection of only narrow cells is untouched.
+        t.selection_start(0, 6, true);
+        t.selection_update(0, 7, false);
+        assert_eq!(selected(&t), vec![6, 7]);
     }
 
     #[test]
