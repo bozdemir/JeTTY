@@ -173,7 +173,7 @@ sudo apt install ./jetty_*_amd64.deb                              # Debian / Ubu
 chmod +x JeTTY-*-x86_64.AppImage && ./JeTTY-*-x86_64.AppImage     # any distro
 ```
 
-The AppImage carries its update information, so [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) (or a manager built on it, such as AppImageLauncher) updates it in place, downloading only what changed.
+The AppImage carries its update information, so [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) (or a manager built on it, such as AppImageLauncher) fetches a new version downloading only what changed. Launched while an older JeTTY runs, the new one says how to switch and moves Launch at login to itself.
 
 ### Build from source (Linux or macOS)
 

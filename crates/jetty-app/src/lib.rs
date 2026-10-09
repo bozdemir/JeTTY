@@ -13,6 +13,9 @@ mod detached;
 /// through the SAME settings path as the app.
 pub mod effects;
 mod gridmouse;
+/// What a launch and the running JeTTY say after the summon verb (version,
+/// display) — see there.
+mod ipc;
 /// Keyboard navigation of the menus (pure). Public so the `jetty-shot`
 /// self-test moves the highlight and anchors a menu exactly as the app does.
 pub mod menunav;
@@ -144,12 +147,15 @@ pub fn configured_backdrop() -> (jetty_render::BackdropSettings, Option<std::pat
 /// [`ipc_runtime_dir`]) so no other local user can pre-bind our path — which
 /// would silently swallow every summon (a DoS) and leak our commands — or squat
 /// the lock. We never place the socket directly in world-writable `/tmp`.
-fn ipc_socket_path() -> String {
+///
+/// `display`: the socket of this display's own JeTTY, for a launch the one at
+/// the usual path turned away as running elsewhere (see `ipc`).
+fn ipc_socket_path(display: Option<&ipc::Display>) -> String {
     let override_dir = std::env::var_os("JETTY_CONFIG_DIR")
         .filter(|d| !d.is_empty())
         .map(std::path::PathBuf::from);
     ipc_runtime_dir()
-        .join(ipc_socket_name(override_dir.as_deref()))
+        .join(ipc_socket_name(override_dir.as_deref(), display))
         .to_string_lossy()
         .into_owned()
 }
@@ -159,16 +165,25 @@ fn ipc_socket_path() -> String {
 /// config dir: `JETTY_CONFIG_DIR=/x jetty` used to find the user's running
 /// instance and merely summon it, so the variable had no effect while JeTTY ran.
 /// The hash is FNV-1a over the absolute, component-normalized path (`/x/` and
-/// `/x` agree) — stable across builds, unlike std's hasher.
-fn ipc_socket_name(config_dir_override: Option<&std::path::Path>) -> String {
-    let Some(dir) = config_dir_override else {
+/// `/x` agree) — stable across builds, unlike std's hasher. A JeTTY on another
+/// display than the one at that name (`display`) hashes its display in too.
+fn ipc_socket_name(config_dir_override: Option<&std::path::Path>, display: Option<&ipc::Display>) -> String {
+    let mut key: Vec<u8> = Vec::new();
+    if let Some(dir) = config_dir_override {
+        let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let norm: std::path::PathBuf = abs.components().collect();
+        key.extend_from_slice(norm.as_os_str().as_encoded_bytes());
+    }
+    if let Some(d) = display {
+        for part in ["\0display", &d.wayland, &d.x11] {
+            key.extend_from_slice(part.as_bytes());
+            key.push(0);
+        }
+    }
+    if key.is_empty() {
         return "jetty.sock".to_string();
-    };
-    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let norm: std::path::PathBuf = abs.components().collect();
-    let hash = norm
-        .as_os_str()
-        .as_encoded_bytes()
+    }
+    let hash = key
         .iter()
         .fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
     format!("jetty-{hash:016x}.sock")
@@ -216,8 +231,11 @@ fn ipc_runtime_dir() -> std::path::PathBuf {
 
 /// Outcome of an IPC connect attempt.
 enum ConnectResult {
-    /// Connected to a live primary; message was sent. This process should exit.
-    Forwarded,
+    /// Connected to a live primary; message was sent, and this is how it took
+    /// it. This process should exit.
+    Forwarded(ipc::Answer),
+    /// A live primary on another display: it left the command alone.
+    Elsewhere,
     /// No socket file exists (first launch).
     NoSocket,
     /// A socket file exists but `connect` returned `ECONNREFUSED` — it is a
@@ -229,9 +247,10 @@ enum ConnectResult {
 }
 
 /// Connect to a live Jetty instance and forward a summon command (`toggle`,
-/// `show`, or `hide`). Returns the outcome so the caller can decide whether to
-/// unlink a stale socket or become the primary.
-fn forward_command(sock_path: &str, cmd: &str) -> ConnectResult {
+/// `show`, or `hide`), then introduce ourselves as `me` (see `ipc`). Returns the
+/// outcome so the caller can decide whether to unlink a stale socket or become
+/// the primary.
+fn forward_command(sock_path: &str, cmd: &str, me: &ipc::Caller) -> ConnectResult {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
 
@@ -239,7 +258,13 @@ fn forward_command(sock_path: &str, cmd: &str) -> ConnectResult {
         Ok(mut stream) => {
             let _ = stream.write_all(cmd.as_bytes());
             let _ = stream.flush();
-            ConnectResult::Forwarded
+            // The verb is delivered; this bounds only how long we wait to hear
+            // how it was taken (the summon itself never waits on it).
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+            match ipc::introduce(&mut stream, me) {
+                ipc::Answer::Elsewhere => ConnectResult::Elsewhere,
+                answer => ConnectResult::Forwarded(answer),
+            }
         }
         Err(e) => {
             // ECONNREFUSED: socket file exists but nobody is listening — stale.
@@ -250,6 +275,47 @@ fn forward_command(sock_path: &str, cmd: &str) -> ConnectResult {
             } else {
                 ConnectResult::Other
             }
+        }
+    }
+}
+
+/// [`forward_command`] to the JeTTY of this launch's display: the one at
+/// `sock_path` — or, when that one runs on another display (`ssh -X`, a second
+/// X session), this display's own, which `sock_path` then names. Never returns
+/// `Elsewhere`: anything but `Forwarded` means no live primary at `sock_path`.
+fn forward_here(sock_path: &mut String, cmd: &str, me: &ipc::Caller) -> ConnectResult {
+    let r = forward_command(sock_path, cmd, me);
+    if !matches!(r, ConnectResult::Elsewhere) {
+        return r;
+    }
+    let own = ipc_socket_path(Some(&me.display));
+    if *sock_path == own {
+        // This display's own socket turned us away too (its display changed
+        // under it?): nothing sensible to start — leave it there.
+        return ConnectResult::Forwarded(ipc::Answer::Elsewhere);
+    }
+    *sock_path = own;
+    match forward_command(sock_path, cmd, me) {
+        ConnectResult::Elsewhere => ConnectResult::Forwarded(ipc::Answer::Elsewhere),
+        r => r,
+    }
+}
+
+/// A primary took the command. One older than the introductions (`Older`)
+/// can't know a newer JeTTY was launched, so a newer AppImage moves the login
+/// item to itself here (`app::follow_newer_appimage`) — or every login would
+/// keep starting the old file.
+fn forwarded(answer: ipc::Answer, me: &ipc::Caller) {
+    if answer != ipc::Answer::Older {
+        return;
+    }
+    if let Some(exe) = &me.appimage {
+        if app::follow_newer_appimage(exe) {
+            eprintln!(
+                "jetty: an older JeTTY is running — Launch at login now starts {}; quit the \
+                 running one to switch now",
+                exe.display()
+            );
         }
     }
 }
@@ -422,13 +488,15 @@ pub fn run() {
         }
     }
 
-    let sock_path = ipc_socket_path();
+    // Who this launch is (version, display, AppImage): said to a running
+    // primary after the command (see `ipc`).
+    let me = ipc::Caller::current();
+    let mut sock_path = ipc_socket_path(None);
 
     // Secondary invocation: forward the command to the running primary and exit.
     // No banner, no GUI setup — a compositor-bound keypress stays instant.
-    match forward_command(&sock_path, cmd) {
-        ConnectResult::Forwarded => return,
-        ConnectResult::Stale | ConnectResult::NoSocket | ConnectResult::Other => {}
+    if let ConnectResult::Forwarded(answer) = forward_here(&mut sock_path, cmd, &me) {
+        return forwarded(answer, &me);
     }
     // No live instance: `--hide` has nothing to hide; toggle/show launch.
     if cmd == "hide" {
@@ -444,12 +512,14 @@ pub fn run() {
     // keeps retrying forward_command (the winner's socket appears within ms)
     // and exits once it gets through. The winning lock `File` is intentionally
     // leaked below (held for the process lifetime); the kernel releases it on
-    // ANY exit, crash included, so no stale-lock handling is ever needed.
-    let lock_path = format!("{sock_path}.lock");
+    // ANY exit, crash included, so no stale-lock handling is ever needed. A
+    // primary on another display that binds the usual socket meanwhile turns us
+    // to this display's own (`forward_here`): its lock is taken instead.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let lock_file: Option<std::fs::File> = loop {
-        match try_acquire_primary_lock(&lock_path) {
-            LockAttempt::Acquired(f) => break Some(f),
+        let lock_path = format!("{sock_path}.lock");
+        let lock = match try_acquire_primary_lock(&lock_path) {
+            LockAttempt::Acquired(f) => Some(f),
             LockAttempt::Unavailable => {
                 // The lock file can never be created here. Retrying would just
                 // spin the full 2 s for nothing — degrade to a lockless bind NOW
@@ -460,43 +530,48 @@ pub fn run() {
                     "jetty: single-instance lock at {lock_path} is unavailable; \
                      proceeding without it"
                 );
-                break None;
+                None
             }
             // Held: a live peer owns the lock (the kernel releases it on ANY exit).
-            // Fall through to retry-forward below.
-            LockAttempt::Held => {}
+            LockAttempt::Held => {
+                // Another instance is mid-startup: give it a beat, then try forwarding.
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                if let ConnectResult::Forwarded(answer) = forward_here(&mut sock_path, cmd, &me) {
+                    return forwarded(answer, &me);
+                }
+                if std::time::Instant::now() >= deadline {
+                    // Reaching the deadline means the lock was HELD on every
+                    // iteration, i.e. a live primary exists but we could never
+                    // reach its socket — its socket file was removed out from
+                    // under it. Booting a second primary here would split-brain
+                    // (two windows, two config writers, the hotkey and --toggle
+                    // driving different instances) — the very bug the lock exists
+                    // to prevent. Refuse to duplicate; the existing instance is
+                    // alive (F23). Exit non-zero: a launcher or the login item
+                    // must not see success.
+                    eprintln!(
+                        "jetty: another instance holds the lock but its IPC socket at \
+                         {sock_path} is unreachable; not starting a second instance"
+                    );
+                    std::process::exit(1);
+                }
+                continue;
+            }
+        };
+        // UNDER the lock, re-check for a live primary (one may have bound while
+        // we waited) and only now unlink a provably stale socket (ECONNREFUSED).
+        let locked = sock_path.clone();
+        match forward_here(&mut sock_path, cmd, &me) {
+            ConnectResult::Forwarded(answer) => return forwarded(answer, &me),
+            ConnectResult::Stale if sock_path == locked => {
+                std::fs::remove_file(&sock_path).ok();
+            }
+            _ => {}
         }
-        // Another instance is mid-startup: give it a beat, then try forwarding.
-        std::thread::sleep(std::time::Duration::from_millis(25));
-        if matches!(forward_command(&sock_path, cmd), ConnectResult::Forwarded) {
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            // Reaching the deadline means the lock was HELD on every iteration
-            // (Acquired/Unavailable both break out), i.e. a live primary exists
-            // but we could never reach its socket — its socket file was removed
-            // out from under it. Booting a second primary here would split-brain
-            // (two windows, two config writers, the hotkey and --toggle driving
-            // different instances) — the very bug the lock exists to prevent.
-            // Refuse to duplicate; the existing instance is alive (F23). Exit
-            // non-zero: a launcher or the login item must not see success.
-            eprintln!(
-                "jetty: another instance holds the lock but its IPC socket at \
-                 {sock_path} is unreachable; not starting a second instance"
-            );
-            std::process::exit(1);
+        if sock_path == locked {
+            break lock;
         }
     };
-
-    // UNDER the lock, re-check for a live primary (one may have bound while we
-    // waited) and only now unlink a provably stale socket (ECONNREFUSED).
-    match forward_command(&sock_path, cmd) {
-        ConnectResult::Forwarded => return,
-        ConnectResult::Stale => {
-            std::fs::remove_file(&sock_path).ok();
-        }
-        ConnectResult::NoSocket | ConnectResult::Other => {}
-    }
 
     eprintln!("jetty {version} ({build})");
 
@@ -569,11 +644,16 @@ pub fn run() {
 
     // IPC accept thread (primary only): map each forwarded command to an event.
     // `show`/`hide` set visibility explicitly; anything else toggles. Shares the
-    // summon code path with the X11 global-hotkey grab.
+    // summon code path with the X11 global-hotkey grab. Every launch is greeted
+    // and says who it is (`ipc`): one on another display is turned away, and a
+    // newer JeTTY is announced once — it would otherwise only ever toggle this
+    // older one.
     if let Some(listener) = listener {
         let proxy_ipc = proxy.clone();
         let sock_cleanup = sock_path.clone();
+        let here = me.display.clone();
         std::thread::spawn(move || {
+            let mut announced: Option<String> = None;
             for mut s in listener.incoming().flatten() {
                 // Bound the read so an idle/half-open client (e.g. `nc -U`)
                 // can't wedge this serial accept loop and silently kill
@@ -586,14 +666,27 @@ pub fn run() {
                     continue;
                 }
                 let event = match &buf[..n] {
-                    b"show" => AppEvent::SetVisible(true),
-                    b"hide" => AppEvent::SetVisible(false),
-                    b"toggle" => AppEvent::ToggleVisibility,
-                    // `--background` / unknown command: no-op, don't toggle (a login
-                    // autostart must never pop up an instance that's already running).
+                    b"show" => Some(AppEvent::SetVisible(true)),
+                    b"hide" => Some(AppEvent::SetVisible(false)),
+                    b"toggle" => Some(AppEvent::ToggleVisibility),
+                    // `--background`: no-op, don't toggle (a login autostart must
+                    // never pop up an instance that's already running).
+                    b"background" => None,
+                    // Unknown command: not one of ours.
                     _ => continue,
                 };
-                if proxy_ipc.send_event(event).is_err() {
+                let (caller, serve) = ipc::greet(&mut s, version, &here);
+                if !serve {
+                    continue;
+                }
+                let mut events: Vec<AppEvent> = event.into_iter().collect();
+                let newer = caller.filter(|c| c.newer_than(version) && announced.as_ref() != Some(&c.version));
+                if let Some(c) = newer {
+                    let moved = c.appimage.as_deref().is_some_and(app::follow_newer_appimage);
+                    events.push(AppEvent::Notice(app::newer_version_notice(&c.version, version, moved)));
+                    announced = Some(c.version);
+                }
+                if events.into_iter().any(|e| proxy_ipc.send_event(e).is_err()) {
                     break;
                 }
             }
@@ -616,22 +709,38 @@ pub fn run() {
 
 #[cfg(test)]
 mod ipc_socket_tests {
-    use super::ipc_socket_name;
+    use super::{ipc, ipc_socket_name};
     use std::path::Path;
 
     #[test]
     fn an_alternate_config_dir_gets_its_own_instance() {
         // The default socket is unchanged — a `jetty --toggle` bound in the
         // compositor keeps finding the user's instance.
-        assert_eq!(ipc_socket_name(None), "jetty.sock");
-        let a = ipc_socket_name(Some(Path::new("/home/u/try-config")));
+        assert_eq!(ipc_socket_name(None, None), "jetty.sock");
+        let a = ipc_socket_name(Some(Path::new("/home/u/try-config")), None);
         assert!(a.starts_with("jetty-") && a.ends_with(".sock") && a != "jetty.sock", "{a}");
-        assert_eq!(a, ipc_socket_name(Some(Path::new("/home/u/try-config/"))), "trailing slash");
-        assert_eq!(a, ipc_socket_name(Some(Path::new("/home/u//try-config"))), "doubled slash");
-        assert_ne!(a, ipc_socket_name(Some(Path::new("/home/u/other-config"))));
-        // Stable across runs/builds: a fixed FNV-1a, not std's hasher.
-        assert_eq!(ipc_socket_name(Some(Path::new("/x"))), ipc_socket_name(Some(Path::new("/x"))));
+        assert_eq!(a, ipc_socket_name(Some(Path::new("/home/u/try-config/")), None), "trailing slash");
+        assert_eq!(a, ipc_socket_name(Some(Path::new("/home/u//try-config")), None), "doubled slash");
+        assert_ne!(a, ipc_socket_name(Some(Path::new("/home/u/other-config")), None));
+        // Stable across runs/builds — and versions, so an older launch finds a
+        // newer primary: a fixed FNV-1a of the path, not std's hasher.
+        assert_eq!(a, "jetty-9b075b403ed34830.sock");
         assert_eq!(a.len(), "jetty-".len() + 16 + ".sock".len());
+    }
+
+    #[test]
+    fn another_display_gets_its_own_socket() {
+        // A launch turned away by a JeTTY on another display (ssh -X, a second
+        // X session) uses its display's own socket — per config dir as well.
+        let d0 = ipc::Display { wayland: String::new(), x11: ":0".into() };
+        let d1 = ipc::Display { wayland: String::new(), x11: "localhost:10".into() };
+        let own = ipc_socket_name(None, Some(&d1));
+        assert!(own.starts_with("jetty-") && own != "jetty.sock", "{own}");
+        assert_ne!(own, ipc_socket_name(None, Some(&d0)));
+        assert_eq!(own, ipc_socket_name(None, Some(&d1.clone())));
+        let cfg = Some(Path::new("/home/u/try-config"));
+        assert_ne!(ipc_socket_name(cfg, Some(&d1)), own);
+        assert_ne!(ipc_socket_name(cfg, Some(&d1)), ipc_socket_name(cfg, None));
     }
 }
 

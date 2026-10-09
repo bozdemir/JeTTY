@@ -29,6 +29,9 @@ pub enum AppEvent {
     /// A user-facing configuration problem found off the UI thread (a refused
     /// save, an unusable summon hotkey) — shown as a status pill + logged.
     ConfigNotice(String),
+    /// Something to tell the user from off the UI thread that is not a config
+    /// problem (a newer JeTTY was launched) — shown as a status pill.
+    Notice(String),
     /// The system appearance (light/dark preference, reduced motion, accent)
     /// was read or changed — from the settings-portal watcher thread
     /// (`appearance.rs`), which blocks on the bus in between.
@@ -14020,6 +14023,10 @@ impl ApplicationHandler<AppEvent> for App {
                     Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
             }
             AppEvent::ConfigNotice(msg) => self.show_config_warnings(&[msg]),
+            AppEvent::Notice(msg) => {
+                eprintln!("jetty: {msg}");
+                self.show_notice_pill(sanitize_notice(&msg), 8000);
+            }
             AppEvent::Appearance(a) => self.apply_appearance(a),
             AppEvent::BackdropImage(gen, result) => {
                 // A failure keeps the base gradient and says why; a stale
@@ -17984,6 +17991,52 @@ fn sync_launch_at_login(path: &std::path::Path, enabled: bool, target: &Autostar
     sync_autostart_file(path, contents.as_deref()).map(|_| ())
 }
 
+/// Point JeTTY's login item at the newer JeTTY AppImage `exe`: a newer launch
+/// reached this running JeTTY, or found an older one running. AppImageUpdate
+/// writes the new version NEXT TO the old file, and the newer one only ever
+/// forwards to the running instance — so the item started the old file at
+/// every login, indefinitely. It follows when it starts an AppImage (or a
+/// program that is gone); JeTTY's own enabled entry only, and never for an
+/// alternate config tree. Returns whether it moved.
+pub(crate) fn follow_newer_appimage(exe: &std::path::Path) -> bool {
+    !crate::config::Config::dir_overridden() && retarget_login_item(&autostart_path(), exe)
+}
+
+/// [`follow_newer_appimage`] for the entry at `path`.
+fn retarget_login_item(path: &std::path::Path, exe: &std::path::Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else { return false };
+    if !is_jetty_autostart_entry(&content) || autostart_entry_disabled(&content) {
+        return false;
+    }
+    let Some(current) = autostart_entry_program(&content) else { return false };
+    let current = std::path::Path::new(&current);
+    if current == exe || (current.is_file() && !is_appimage_file(current)) || !is_appimage_file(exe) {
+        return false;
+    }
+    let entry = autostart_entry_for(&exe.to_string_lossy());
+    matches!(sync_autostart_file(path, Some(&entry)), Ok(AutostartSync::Changed))
+}
+
+/// Is `path` an AppImage (type 1 or 2: `AI` + the type at byte 8 of its ELF
+/// header)?
+fn is_appimage_file(path: &std::path::Path) -> bool {
+    let mut head = [0u8; 11];
+    std::fs::File::open(path)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+        .is_ok_and(|()| head[..4] == *b"\x7fELF" && head[8..10] == *b"AI" && matches!(head[10], 1 | 2))
+}
+
+/// The pill when a newer JeTTY (`newer`) was launched while this one (`this`)
+/// runs: the launch only reached this instance, so say how to switch — and
+/// that the login item now starts the newer one, when it moved.
+pub(crate) fn newer_version_notice(newer: &str, this: &str, login_item_moved: bool) -> String {
+    if login_item_moved {
+        format!("JeTTY {newer} is installed and now starts at login — quit this {this} and start it to switch")
+    } else {
+        format!("JeTTY {newer} is installed — quit this {this} and start JeTTY again to switch")
+    }
+}
+
 /// The program an autostart entry launches: the first `ProgramArguments` string of
 /// a LaunchAgent, or the program of a `.desktop` `Exec=` line — quoted per the
 /// Desktop Entry spec (undoing `desktop_exec_arg`) or a bare legacy path.
@@ -19050,8 +19103,8 @@ mod reload_warning_tests {
 mod autostart_tests {
     use super::{
         autostart_desktop_entry, autostart_entry_for, autostart_entry_program, autostart_program,
-        launch_agent_plist, reloaded_launch_at_login, set_launch_at_login, startup_launch_at_login,
-        sync_autostart_file, AutostartSync, AutostartTarget,
+        launch_agent_plist, newer_version_notice, reloaded_launch_at_login, retarget_login_item,
+        set_launch_at_login, startup_launch_at_login, sync_autostart_file, AutostartSync, AutostartTarget,
     };
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -19124,6 +19177,64 @@ mod autostart_tests {
         // Its own `X-GNOME-Autostart-enabled=true` is not "off".
         assert_eq!(startup_launch_at_login(&path, true, Some(true), false, &target(&exe)), (true, None));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_newer_appimage_takes_over_the_login_item_of_an_older_one() {
+        // AppImageUpdate writes the new version beside the old file, and the
+        // new one only forwards to the running JeTTY: without this the login
+        // item started the old AppImage at every login, indefinitely.
+        let dir = scratch("follow");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("jetty.desktop");
+        let elf = |name: &str, kind: &[u8]| {
+            let p = dir.join(name);
+            let mut head = b"\x7fELF\x02\x01\x01\x00".to_vec();
+            head.extend_from_slice(kind);
+            head.resize(64, 0);
+            std::fs::write(&p, head).unwrap();
+            p
+        };
+        let old = elf("JeTTY-0.30.0-x86_64.AppImage", b"AI\x02");
+        let new = elf("JeTTY-0.31.0-x86_64.AppImage", b"AI\x02");
+        let entry = |p: &std::path::Path| autostart_entry_for(&p.to_string_lossy());
+        let read = || std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, entry(&old)).unwrap();
+        assert!(retarget_login_item(&path, &new));
+        assert_eq!(read(), entry(&new));
+        assert!(!retarget_login_item(&path, &new), "already there");
+        // The old file deleted: the item follows too.
+        std::fs::write(&path, entry(std::path::Path::new("/gone/JeTTY.AppImage"))).unwrap();
+        assert!(retarget_login_item(&path, &new));
+        // An installed binary (not an AppImage) keeps its login item.
+        let bin = elf("jetty", b"\0\0\0");
+        std::fs::write(&path, entry(&bin)).unwrap();
+        assert!(!retarget_login_item(&path, &new));
+        assert_eq!(read(), entry(&bin));
+        // Switched off in the desktop's settings, or not JeTTY's: left alone.
+        for kept in [
+            autostart_desktop_entry(&old.to_string_lossy()) + "Hidden=true\n",
+            format!("[Desktop Entry]\nExec={}\n", old.display()),
+        ] {
+            std::fs::write(&path, &kept).unwrap();
+            assert!(!retarget_login_item(&path, &new));
+            assert_eq!(read(), kept);
+        }
+        // No login item: none is made.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!retarget_login_item(&path, &new));
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_newer_launch_says_how_to_switch() {
+        for moved in [false, true] {
+            let n = newer_version_notice("0.31.0", "0.30.0", moved);
+            assert!(n.starts_with("JeTTY 0.31.0 is installed") && n.contains("quit this 0.30.0"), "{n}");
+            assert_eq!(n.contains("starts at login"), moved, "{n}");
+            assert!(n.chars().count() <= 96, "{n}");
+        }
     }
 
     #[test]

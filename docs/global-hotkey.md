@@ -115,6 +115,13 @@ it runs brings the terminal back, like `jetty --show`.
   Either works; the hotkey grab is faster (no process fork).
 - The socket is cleaned up on normal exit; stale sockets from crashes are
   automatically removed at next startup.
+- One JeTTY per display: `jetty` run on another display than the running
+  instance's (an `ssh -X` session, a second X session) starts or summons that
+  display's own JeTTY instead of toggling this one. A launch with no display at
+  all (a console) still controls the running one.
+- A newer JeTTY launched while an older one runs (an updated AppImage next to
+  the old file, an upgraded package) toggles the running one, which then says
+  how to switch; an AppImage also moves Launch at login to itself.
 - The built-in global grab uses the `global-hotkey` crate, which supports a
   system-wide grab on X11, macOS, and Windows. On Wayland the crate cannot
   register a grab, which is why the compositor-binding + IPC fallback is required
