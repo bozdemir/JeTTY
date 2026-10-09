@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.28.1] — 2026-10-09
+
+### Fixed
+- **The AppImage starts on systems without libxkbcommon-x11.** JeTTY loads its
+  X11, keyboard and cursor libraries at run time, so the packaging tools never
+  saw them: the AppImage carried none, and on a system lacking
+  `libxkbcommon-x11` (the AppImage catalog's test machine) it stopped at once
+  with "Library libxkbcommon-x11.so could not be loaded". The AppImage now
+  carries libxkbcommon, libxkbcommon-x11, libXcursor and libXi; X11, xcb and
+  OpenGL/EGL stay the system's.
+- The `.deb` now depends on what JeTTY loads (libxkbcommon-x11-0, libx11-6,
+  libx11-xcb1, libxcursor1, libxi6) and recommends the Wayland and EGL
+  libraries, so a minimal Debian/Ubuntu install gets them.
+
 ## [0.28.0] — 2026-10-09
 
 **The fix-and-polish release.** Ten parallel reviews of the whole codebase —
