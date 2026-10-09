@@ -31,6 +31,16 @@ pub(crate) struct ImageKey {
     pub blur_q: u16,
     /// The monitor size the image is downscaled to cover.
     pub max: (u32, u32),
+    /// The file's size and modification time when asked (`None`: unreadable):
+    /// new contents at the same path — a fixed broken file, a replaced
+    /// wallpaper — are a new image.
+    pub file: Option<(u64, std::time::SystemTime)>,
+}
+
+/// [`ImageKey::file`] for `path`.
+fn file_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
 }
 
 impl ImageKey {
@@ -146,7 +156,8 @@ impl BackdropState {
             return None;
         }
         let path = self.cfg.image_path(config_dir)?;
-        Some(ImageKey { path, blur_q: (self.settings.blur.clamp(0.0, 1.0) * 1000.0).round() as u16, max })
+        let file = file_stamp(&path);
+        Some(ImageKey { path, blur_q: (self.settings.blur.clamp(0.0, 1.0) * 1000.0).round() as u16, max, file })
     }
 
     /// Bring the image in line with the settings: drop everything when no image
@@ -385,6 +396,33 @@ mod tests {
         // An unchanged config reports no change.
         let same = s.cfg.clone();
         assert!(!s.set_config(same));
+    }
+
+    /// The same path with new contents is a new image: a broken file fixed on
+    /// disk is tried again, a replaced wallpaper is decoded again — but an
+    /// unchanged file never is (no repeated notice for a known-broken one).
+    #[test]
+    fn a_changed_file_is_decoded_again() {
+        let dir = std::env::temp_dir().join(format!("jetty-bd-stamp-{}", std::process::id()));
+        let bg = dir.join("backgrounds");
+        std::fs::create_dir_all(&bg).unwrap();
+        let file = bg.join("wall.png");
+        std::fs::write(&file, b"not a png yet").unwrap();
+        let mut s = BackdropState::new(image_cfg("wall.png", 0.0));
+        let mut gens = Vec::new();
+        s.sync_image(&dir, || (800, 600), |g, _| gens.push(g));
+        assert_eq!(gens.len(), 1);
+        assert!(s.on_decoded(gens[0], Err("not a PNG or JPEG file".into())).is_some());
+        // Unchanged: not retried.
+        s.sync_image(&dir, || (800, 600), |_, _| panic!("an unchanged broken file is not re-decoded"));
+        // Fixed on disk (new contents): tried again.
+        std::fs::write(&file, b"now a longer, different file").unwrap();
+        s.sync_image(&dir, || (800, 600), |g, _| gens.push(g));
+        assert_eq!(gens.len(), 2, "the fixed file is decoded");
+        assert_eq!(s.on_decoded(gens[1], Ok(tiny_image())), None);
+        // Shown and unchanged: nothing to do.
+        s.sync_image(&dir, || (800, 600), |_, _| panic!("the shown image is current"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

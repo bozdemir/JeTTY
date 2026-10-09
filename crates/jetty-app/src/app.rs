@@ -5883,6 +5883,9 @@ impl App {
     /// drop the image decode, save the changed keys, repaint every window.
     fn apply_backdrop_pick(&mut self, pick: crate::palette::BackdropPick) {
         use crate::palette::BackdropPick as P;
+        // Picking the image already set re-reads it when the file changed on
+        // disk (a fixed broken file, a replaced wallpaper — `ImageKey::file`).
+        let image_pick = matches!(pick, P::Image(_));
         let mut cfg = self.backdrop.cfg.clone();
         match pick {
             P::Off => cfg.mode = "none".into(),
@@ -5902,6 +5905,8 @@ impl App {
             self.sync_backdrop_image();
             self.persist();
             self.mark_dirty_all();
+        } else if image_pick {
+            self.sync_backdrop_image();
         }
     }
 
@@ -9066,6 +9071,9 @@ impl App {
             c.backdrop.image = image;
         }) {
             self.persist();
+        } else {
+            // The same file again: re-read it if it changed on disk.
+            self.sync_backdrop_image();
         }
         self.reveal_setting("backdrop.image");
     }
