@@ -1560,6 +1560,10 @@ pub struct App {
     /// detached windows on the shared device lose it too). Read ONCE at
     /// construction; off, it is one false branch per summon.
     debug_lose_gpu: bool,
+    /// Test hook (`JETTY_DEBUG_LOSE_SURFACE=1`): every summon drops only the main
+    /// window's surface, as a surface lost for good does, so its recreation by
+    /// the next frame (`GpuContext::acquire_frame`) can be driven live.
+    debug_lose_surface: bool,
 
     /// The main window's overlays (search bar, help, command palette, hint
     /// mode, copy-mode). Every detached window owns its own `Overlays`
@@ -2248,6 +2252,7 @@ impl App {
             frame_log: std::env::var_os("JETTY_FRAME_LOG").is_some(),
             frames_presented: 0,
             debug_lose_gpu: std::env::var_os("JETTY_DEBUG_LOSE_GPU").is_some(),
+            debug_lose_surface: std::env::var_os("JETTY_DEBUG_LOSE_SURFACE").is_some(),
             ov: Overlays::default(),
             confirm_close: None,
             confirm_quit: false,
@@ -9515,6 +9520,12 @@ impl App {
                 g.debug_lose_device();
             }
         }
+        // Test hook (`debug_lose_surface`): this summon finds the surface gone.
+        if want && self.debug_lose_surface {
+            if let Some(g) = &mut self.gpu {
+                g.release_surface();
+            }
+        }
         self.visible = want;
         // An explicit visibility change supersedes any scheduled auto-hide.
         self.pending_autohide_at = None;
@@ -12111,9 +12122,12 @@ impl App {
 
         let Some((frame, view)) = gpu.acquire_frame() else {
             // Acquire failed: this frame's damage was not shown. Start the
-            // bounded retry schedule (`about_to_wait` issues + advances it).
-            dw.acquire_retry
-                .get_or_insert_with(|| next_acquire_retry(None, std::time::Instant::now()));
+            // bounded retry schedule (`about_to_wait` issues + advances it) —
+            // unless occluded: Occluded(false) repaints.
+            if gpu.last_acquire_error().is_none_or(|e| e.wants_retry()) {
+                dw.acquire_retry
+                    .get_or_insert_with(|| next_acquire_retry(None, std::time::Instant::now()));
+            }
             return;
         };
         let width = gpu.config.width;
@@ -16977,11 +16991,12 @@ impl ApplicationHandler<AppEvent> for App {
                             self.perf.log_first_frame(hz);
                         }
                     }
-                } else {
-                    // Acquire failed (Outdated/Lost/Timeout/Occluded/Validation):
-                    // this frame's damage was NOT shown. Start the bounded retry
+                } else if gpu.last_acquire_error().is_none_or(|e| e.wants_retry()) {
+                    // Acquire failed (Outdated/Lost/Timeout/Validation): this
+                    // frame's damage was NOT shown. Start the bounded retry
                     // schedule (`about_to_wait` issues and advances it) — a retry
                     // already in flight keeps its schedule, so each retry counts once.
+                    // An Occluded window waits for Occluded(false), which repaints.
                     self.acquire_retry
                         .get_or_insert_with(|| next_acquire_retry(None, std::time::Instant::now()));
                 }

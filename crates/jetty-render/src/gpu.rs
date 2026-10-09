@@ -287,6 +287,25 @@ fn first_report(seen: &mut Vec<u64>, msg: &str) -> Report {
     }
 }
 
+/// Configure `surface`, catching every error the configure raises — an adapter
+/// that cannot present here (an iGPU under a compositor on the dGPU), a window
+/// that still has another surface's swapchain (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR),
+/// out of memory. A device loss reaches no error scope: the lost flag reports it.
+fn configure_checked(
+    device: &wgpu::Device,
+    surface: &wgpu::Surface<'static>,
+    config: &wgpu::SurfaceConfiguration,
+) -> Result<(), wgpu::Error> {
+    let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    surface.configure(device, config);
+    let out_of_memory = pollster::block_on(out_of_memory.pop());
+    match pollster::block_on(invalid.pop()).or(out_of_memory) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// Why [`GpuContext::acquire_frame`] skipped a frame
 /// ([`GpuContext::last_acquire_error`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,20 +313,35 @@ pub enum AcquireError {
     /// The configuration was stale (e.g. after a resize): reconfigured, so the
     /// next acquire should succeed — worth an immediate redraw.
     Outdated,
-    /// The surface was lost and a reconfigure did not bring it back.
+    /// The surface was lost and neither a reconfigure nor a new surface brought
+    /// it back (or it was released for a rebuild of a lost device).
     Lost,
     /// The presentation engine did not hand out an image in time.
     Timeout,
-    /// The window is occluded / minimized: there is nothing to draw into.
+    /// The window is occluded / minimized: there is nothing to draw into until
+    /// it is shown again (no retry needed: the window system says when).
     Occluded,
-    /// The surface reported a validation error.
+    /// The surface reported a validation error (e.g. left unconfigured by a
+    /// refused configure): configured again for the next acquire.
     Validation,
+}
+
+impl AcquireError {
+    /// Whether the frame should be retried on a timer. `Occluded` waits for
+    /// the window to be shown, which repaints it.
+    pub fn wants_retry(self) -> bool {
+        self != AcquireError::Occluded
+    }
 }
 
 pub struct GpuContext {
     /// The window's surface — `None` once released for a rebuild
-    /// ([`Self::release_surface`]); every frame acquire is skipped then.
+    /// ([`Self::release_surface`]; every frame acquire is skipped then) or while
+    /// a lost one cannot be recreated yet ([`Self::acquire_frame`]).
     surface: Option<wgpu::Surface<'static>>,
+    /// The window the surface draws to: a surface that stays lost is recreated
+    /// on it.
+    window: Arc<dyn wgpu::DisplayAndWindowHandle>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
@@ -501,7 +535,7 @@ impl GpuContext {
             queue,
             lost,
         });
-        let gpu = Self::configure(shared, surface, width, height);
+        let gpu = Self::configure(shared, surface, window, width, height);
         if gpu.is_none() && power == wgpu::PowerPreference::LowPower {
             // An iGPU that cannot present to a compositor running on the dGPU
             // (see `power` above).
@@ -524,7 +558,7 @@ impl GpuContext {
         if shared.lost.load(Ordering::Acquire) {
             return None;
         }
-        let surface = match shared.instance.create_surface(window) {
+        let surface = match shared.instance.create_surface(window.clone()) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("jetty: surface creation on the shared GPU failed ({e})");
@@ -535,7 +569,7 @@ impl GpuContext {
             eprintln!("jetty: the shared GPU cannot present to this window; acquiring another");
             return None;
         }
-        Self::configure(Arc::clone(shared), surface, width, height)
+        Self::configure(Arc::clone(shared), surface, window, width, height)
     }
 
     /// [`Self::with_shared`] when a shared GPU is available and can present to
@@ -560,7 +594,13 @@ impl GpuContext {
     /// leaves that surface unconfigured and PANICS on the first frame acquired
     /// from it, so no context is handed out for it — a first window then gets
     /// `NO_GPU_HELP`, a rebuild tries again later.
-    fn configure(shared: Arc<GpuShared>, surface: wgpu::Surface<'static>, width: u32, height: u32) -> Option<Self> {
+    fn configure(
+        shared: Arc<GpuShared>,
+        surface: wgpu::Surface<'static>,
+        window: Arc<dyn wgpu::DisplayAndWindowHandle>,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
         let caps = surface.get_capabilities(&shared.adapter);
         // Prefer an sRGB format; if the driver reports no formats at all (e.g. an
         // incompatible surface returns an empty list), fall back to a sane default
@@ -608,15 +648,7 @@ impl GpuContext {
             // keystroke's echo — up to one extra refresh of input latency.
             desired_maximum_frame_latency: 1,
         };
-        // Catch every error the configure raises — an adapter that cannot present
-        // here (an iGPU under a compositor on the dGPU), a window that still has
-        // another surface's swapchain (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR), out of
-        // memory. A device loss reaches no error scope: the lost flag reports it.
-        let invalid = shared.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let out_of_memory = shared.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        surface.configure(&shared.device, &config);
-        let out_of_memory = pollster::block_on(out_of_memory.pop());
-        if let Some(e) = pollster::block_on(invalid.pop()).or(out_of_memory) {
+        if let Err(e) = configure_checked(&shared.device, &surface, &config) {
             eprintln!("jetty: the GPU cannot draw to this window: {e}");
             return None;
         }
@@ -627,6 +659,7 @@ impl GpuContext {
 
         Some(Self {
             surface: Some(surface),
+            window,
             device: shared.device.clone(),
             queue: shared.queue.clone(),
             config,
@@ -666,8 +699,10 @@ impl GpuContext {
     /// its swapchain only once the old one is gone (Vulkan returns
     /// VK_ERROR_NATIVE_WINDOW_IN_USE_KHR on drivers that enforce it; Mesa on
     /// Wayland makes a second fifo object for the surface, a protocol error that
-    /// ends the connection). Every later acquire on this context is skipped; it
-    /// still reports [`Self::is_lost`], so a failed rebuild is retried.
+    /// ends the connection). Every later acquire on this context is skipped while
+    /// it reports [`Self::is_lost`], so a failed rebuild is retried; on a live
+    /// device the next acquire makes a new surface instead (what the nested
+    /// harness's `JETTY_DEBUG_LOSE_SURFACE` drives).
     pub fn release_surface(&mut self) {
         self.surface = None;
     }
@@ -682,8 +717,7 @@ impl GpuContext {
     }
 
     /// Why the most recent [`Self::acquire_frame`] returned `None` (`None` when it
-    /// succeeded). `Outdated` / `Timeout` / a recovered `Lost` deserve an immediate
-    /// retry; `Occluded` should wait for the window to become visible again.
+    /// succeeded) — see [`AcquireError::wants_retry`].
     pub fn last_acquire_error(&self) -> Option<AcquireError> {
         self.last_acquire_error
     }
@@ -703,64 +737,100 @@ impl GpuContext {
     /// (surface was reconfigured, occluded, or timed out) — the reason is kept in
     /// [`Self::last_acquire_error`] so the caller can decide whether to retry.
     pub fn acquire_frame(&mut self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
-        let Some(surface) = &self.surface else {
-            // Released for a rebuild of this lost context.
-            self.last_acquire_error = Some(AcquireError::Lost);
-            return None;
-        };
-        let texture = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                // Stale configuration (e.g. after a resize); reconfigure and skip
-                // this frame. The next acquire will use the new config.
-                surface.configure(&self.device, &self.config);
-                self.last_acquire_error = Some(AcquireError::Outdated);
-                return None;
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                // A genuinely lost surface: reconfigure and retry the acquire
-                // once. Reconfiguring is the best safe recovery available here,
-                // since full surface recreation would require the window handle,
-                // which GpuContext does not retain.
-                surface.configure(&self.device, &self.config);
-                match surface.get_current_texture() {
-                    wgpu::CurrentSurfaceTexture::Success(t)
-                    | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-                    other => {
-                        // Reconfigure did not recover the surface. Log only once per
-                        // process: the caret animation drives continuous redraws, so
-                        // an every-frame log would flood stderr/journald without bound
-                        // while the surface stays lost.
-                        use std::sync::Once;
-                        static LOST_ONCE: Once = Once::new();
-                        LOST_ONCE.call_once(|| {
-                            eprintln!(
-                                "jetty: surface lost and reconfigure did not recover it ({other:?}); \
-                                 skipping frames (surface recreation not yet supported)"
-                            );
-                        });
-                        self.last_acquire_error = Some(AcquireError::Lost);
-                        return None;
-                    }
-                }
-            }
-            wgpu::CurrentSurfaceTexture::Occluded => {
-                self.last_acquire_error = Some(AcquireError::Occluded);
-                return None;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout => {
-                self.last_acquire_error = Some(AcquireError::Timeout);
-                return None;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                self.last_acquire_error = Some(AcquireError::Validation);
+        let texture = match self.acquire() {
+            Ok(t) => t,
+            Err(e) => {
+                self.last_acquire_error = Some(e);
                 return None;
             }
         };
         self.last_acquire_error = None;
         let view = texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
         Some((texture, view))
+    }
+
+    /// [`Self::acquire_frame`]'s acquire and its recovery.
+    fn acquire(&mut self) -> Result<wgpu::SurfaceTexture, AcquireError> {
+        let texture = |s: &wgpu::Surface| match s.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => Ok(t),
+            other => Err(other),
+        };
+        // Released for a rebuild of this lost context — or a lost surface that
+        // could not be recreated yet: try again (on a live device only).
+        if self.surface.is_none() && (self.is_lost() || !self.recreate_surface()) {
+            return Err(AcquireError::Lost);
+        }
+        let Some(surface) = &self.surface else { return Err(AcquireError::Lost) };
+        match texture(surface) {
+            Ok(t) => Ok(t),
+            Err(wgpu::CurrentSurfaceTexture::Outdated) => {
+                // Stale configuration (e.g. after a resize); reconfigure and skip
+                // this frame. The next acquire will use the new config.
+                surface.configure(&self.device, &self.config);
+                Err(AcquireError::Outdated)
+            }
+            Err(wgpu::CurrentSurfaceTexture::Lost) => {
+                // A genuinely lost surface: reconfigure and retry the acquire
+                // once; when it stays lost, wgpu's documented recovery — a new
+                // surface on the window, configured as before — and once more.
+                surface.configure(&self.device, &self.config);
+                if let Ok(t) = texture(surface) {
+                    return Ok(t);
+                }
+                if self.recreate_surface() {
+                    if let Some(t) = self.surface.as_ref().and_then(|s| texture(s).ok()) {
+                        return Ok(t);
+                    }
+                }
+                // Logged once per process: the caret animation drives continuous
+                // redraws, so an every-frame log would flood stderr/journald
+                // while the surface stays lost.
+                use std::sync::Once;
+                static LOST_ONCE: Once = Once::new();
+                LOST_ONCE.call_once(|| {
+                    eprintln!("jetty: the window's surface was lost and could not be recreated yet; skipping frames");
+                });
+                Err(AcquireError::Lost)
+            }
+            Err(wgpu::CurrentSurfaceTexture::Validation) => {
+                // A configure the driver refused (a resize, a reconfigure after a
+                // loss) leaves the surface unconfigured — wgpu drops its old
+                // configuration first — and every later acquire lands here:
+                // configure it again (the caller retries on a bounded backoff).
+                surface.configure(&self.device, &self.config);
+                Err(AcquireError::Validation)
+            }
+            Err(wgpu::CurrentSurfaceTexture::Occluded) => Err(AcquireError::Occluded),
+            // Timeout: no image handed out in time.
+            Err(_) => Err(AcquireError::Timeout),
+        }
+    }
+
+    /// Replace a surface that stays lost with a new one on the same window and
+    /// device, configured as before; `false` (no surface held) when that fails,
+    /// and the next acquire tries again. The old surface goes FIRST: it still
+    /// holds the window's swapchain (see [`Self::release_surface`]).
+    fn recreate_surface(&mut self) -> bool {
+        self.surface = None;
+        // Each distinct failure is logged once (`log_wgpu_error`): this repeats
+        // on every retry while the window cannot take a surface.
+        let surface = match self.shared.instance.create_surface(Arc::clone(&self.window)) {
+            Ok(s) => s,
+            Err(e) => {
+                log_wgpu_error(&format!("recreating the window's surface: {e}"));
+                return false;
+            }
+        };
+        if !self.shared.adapter.is_surface_supported(&surface) {
+            log_wgpu_error("recreating the window's surface: the GPU cannot present to it");
+            return false;
+        }
+        if let Err(e) = configure_checked(&self.device, &surface, &self.config) {
+            log_wgpu_error(&format!("configuring the recreated surface: {e}"));
+            return false;
+        }
+        self.surface = Some(surface);
+        true
     }
 
     pub fn clear(&mut self, rgba: [f64; 4]) -> Result<(), String> {
@@ -990,6 +1060,17 @@ mod tests {
         assert_eq!(effect_format(Backend::Gl, false), Rgba8UnormSrgb);
         // Only GL is ever probed; any other backend renders half-float.
         assert_eq!(effect_format(Backend::Vulkan, false), Rgba16Float);
+    }
+
+    /// A failed acquire is retried on the app's bounded timer — except for an
+    /// occluded window, whose Occluded(false) repaints it.
+    #[test]
+    fn only_an_occluded_window_waits_without_a_retry() {
+        use super::AcquireError as E;
+        for e in [E::Outdated, E::Lost, E::Timeout, E::Validation] {
+            assert!(e.wants_retry(), "{e:?}");
+        }
+        assert!(!E::Occluded.wants_retry());
     }
 
     /// An error that recurs every frame is printed once, not ~50 times a second.
