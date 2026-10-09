@@ -71,6 +71,16 @@
 ///                    for none), aligned with the tabs.
 ///   JETTY_SHOT_TAB_MENU — "1" draws the tab context menu under tab 1;
 ///                    "colors" its Color ▸ list with swatches.
+///                    JETTY_SHOT_TAB_MENU_HOVER=n highlights row n.
+///   JETTY_SHOT_MENU / JETTY_SHOT_DMENU — "1" draws the terminal / detached
+///                    window's context menu (_DISABLED=1: the no-selection
+///                    grayed rows). JETTY_SHOT_MENU_AT=cursor opens them where
+///                    the Menu key does: below the text cursor's line, or
+///                    above it when the card does not fit below.
+///   JETTY_SHOT_MENU_KEYS="down,down,end" — the menus (all three) the keyboard
+///                    way: open on the first enabled row, then each key (up /
+///                    down / home / end) moves the highlight through the app's
+///                    own `menunav` (wrapping, grayed rows skipped).
 ///   JETTY_SHOT_WINDOW_BORDER — `focus|always` draws the window ring (the real
 ///                    GPU pass, before the corner mask) in the accent or tab 1's
 ///                    color; JETTY_SHOT_CURSOR_UNFOCUSED=1 shows the unfocused
@@ -322,6 +332,36 @@ fn shot_backdrop(
 /// can turn a mode off with `=0` instead of the mode staying on for any value.
 fn env_flag(k: &str) -> bool {
     std::env::var(k).map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+}
+
+/// The highlighted row of a shot menu of `rows` rows (`disabled` grayed).
+/// JETTY_SHOT_MENU_KEYS="down,down,end" drives it the keyboard way: the menu
+/// opens on its first enabled row (as the Menu key opens it), then each key
+/// (up / down / home / end) moves the highlight through the app's own
+/// `menunav` — the logic its key handler runs. Without it: `fallback`.
+fn shot_menu_hover(rows: usize, disabled: &[usize], fallback: Option<usize>) -> Option<usize> {
+    use jetty_app::menunav::{self, MenuStep};
+    use winit::keyboard::{Key, NamedKey};
+    let Ok(keys) = std::env::var("JETTY_SHOT_MENU_KEYS") else { return fallback };
+    let mut hover = menunav::first_enabled(rows, disabled);
+    for k in keys.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        let named = match k.to_ascii_lowercase().as_str() {
+            "up" => NamedKey::ArrowUp,
+            "down" => NamedKey::ArrowDown,
+            "home" => NamedKey::Home,
+            "end" => NamedKey::End,
+            other => {
+                eprintln!("jetty-shot: JETTY_SHOT_MENU_KEYS: skipping {other:?} (up/down/home/end)");
+                continue;
+            }
+        };
+        let key = menunav::classify(&Key::Named(named), jetty_app::keymap::Mods::default());
+        if let Some(MenuStep::Highlight(h)) = key.and_then(|k| menunav::step(k, hover, rows, disabled)) {
+            hover = h;
+        }
+    }
+    eprintln!("jetty-shot: JETTY_SHOT_MENU_KEYS={keys:?} -> highlighted row {hover:?}");
+    hover
 }
 
 /// The `[effects]` the shot's post pass renders with (see the JETTY_SHOT_CRT /
@@ -1508,18 +1548,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             chrome_labels.extend(pill.labels);
         }
 
+        // Where a shot menu `menu_h` tall opens: a fixed spot, or — JETTY_SHOT_
+        // MENU_AT=cursor — where the Menu key opens it, at the text cursor's
+        // cell (the app's own anchor rule over the shot's grid origin).
+        let menu_at = |menu_h: f32| {
+            if std::env::var("JETTY_SHOT_MENU_AT").is_ok_and(|v| v == "cursor") {
+                let (row, col) = terminal.cursor_viewport_cell();
+                let at = jetty_app::menunav::cursor_anchor(
+                    row, col, (cell_w, cell_h), shot_origin, menu_h, height as f32,
+                );
+                eprintln!("jetty-shot: JETTY_SHOT_MENU_AT=cursor: cell ({row},{col}) -> anchor {at:?}");
+                at
+            } else {
+                (620.0 * dpi, 120.0 * dpi)
+            }
+        };
+
         // JETTY_SHOT_MENU — render the right-click context menu for visual checks.
         // JETTY_SHOT_MENU_DISABLED=1 renders the no-selection state: Copy (0)
         // and Run in New Tab (2) dimmed with the hover on an ENABLED row —
         // verifies the grayed-row rendering and the ⇧⌃⏎ hint glyph.
+        // JETTY_SHOT_MENU_KEYS moves the highlight the keyboard way.
         if env_flag("JETTY_SHOT_MENU") {
             let disabled: &[usize] =
                 if env_flag("JETTY_SHOT_MENU_DISABLED") { &[0, 2] } else { &[] };
+            let hover = shot_menu_hover(jetty_render::MENU_ITEMS.len(), disabled, Some(1));
             // Hints from the DEFAULT keymap, derived exactly like the app's.
             let hints = jetty_app::default_context_menu_hints();
             let hint_refs: Vec<&str> = hints.iter().map(String::as_str).collect();
+            let (mx, my) = menu_at(jetty_render::context_menu_height(cm));
             let menu = jetty_render::build_context_menu(
-                620.0 * dpi, 120.0 * dpi, width, height, Some(1), terminal.theme(),
+                mx, my, width, height, hover, terminal.theme(),
                 &mut chrome_text, cm, &hint_refs, disabled,
             );
             rects.extend(menu.quads);
@@ -1535,8 +1594,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let items: Vec<(&str, &str)> = owned.iter().map(|(l, h)| (*l, h.as_str())).collect();
             let disabled: &[usize] =
                 if env_flag("JETTY_SHOT_DMENU_DISABLED") { &[1, 3] } else { &[] };
+            let hover = shot_menu_hover(items.len(), disabled, Some(0));
+            let (mx, my) = menu_at(jetty_render::menu_height(items.len(), 0, cm));
             let menu = jetty_render::build_menu(
-                620.0 * dpi, 120.0 * dpi, width, height, Some(0), terminal.theme(),
+                mx, my, width, height, hover, terminal.theme(),
                 &mut chrome_text, cm, &items, &[], disabled,
             );
             rects.extend(menu.quads);
@@ -1692,7 +1753,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let items: Vec<(&str, &str)> = labels.iter().map(|&l| (l, "")).collect();
                 let my = if tab_bar_bottom { (height as f32 - cm.bar_h() - shot_status_h - cm.px(240.0)).max(0.0) } else { cm.bar_h() };
-                let hover = std::env::var("JETTY_SHOT_TAB_MENU_HOVER").ok().and_then(|v| v.parse().ok());
+                let hover = shot_menu_hover(
+                    labels.len(),
+                    &[],
+                    std::env::var("JETTY_SHOT_TAB_MENU_HOVER").ok().and_then(|v| v.parse().ok()),
+                );
                 let mut menu = jetty_render::build_menu(
                     t0.x + cm.px(20.0), my, width, height, hover, terminal.theme(), &mut chrome_text, cm, &items, &[], &[],
                 );
