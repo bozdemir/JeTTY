@@ -11332,19 +11332,22 @@ impl App {
                     ToggleHelp,
                 }
                 // --- THIS window's overlays first, in the main window's order:
-                // hint mode / copy-mode, the command palette (captures the mouse
-                // while open), then — unless a context menu takes the click —
-                // the help (modal) and the search bar (✕ / panel) ---
+                // the command palette (captures the mouse while open), then —
+                // unless the context menu takes the click (below, its Copy row
+                // copying copy-mode's selection) — hint mode / copy-mode, the
+                // help (modal) and the search bar (✕ / panel) ---
                 let s = Surface::Detached(pos);
                 let Some((cx, cy)) = self.detached.get(pos).map(|d| (d.cursor.0 as f32, d.cursor.1 as f32))
                 else {
                     return;
                 };
-                if self.modes_click(s) || self.palette_click(s, cx, cy, event_loop) {
+                if self.palette_click(s, cx, cy, event_loop) {
                     return;
                 }
                 let menu_open = self.detached.get(pos).is_some_and(|d| d.menu_open.is_some());
-                if !menu_open && (self.help_click(s, cx, cy) || self.search_bar_click(s, cx, cy)) {
+                if !menu_open
+                    && (self.modes_click(s) || self.help_click(s, cx, cy) || self.search_bar_click(s, cx, cy))
+                {
                     return;
                 }
                 // App-wide inputs, read before the dw (self.detached) borrow.
@@ -14763,12 +14766,7 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
 
-                // --- Hint mode / copy-mode, then the command palette (which
-                // captures the mouse while open) — shared with the detached
-                // windows ---
-                if self.modes_click(Surface::Main) {
-                    return;
-                }
+                // --- The command palette (captures the mouse while open) ---
                 if self.palette_click(Surface::Main, self.cursor.0 as f32, self.cursor.1 as f32, event_loop) {
                     return;
                 }
@@ -14797,6 +14795,14 @@ impl ApplicationHandler<AppEvent> for App {
                     // Whether we hit an item, a grayed row or outside, the menu
                     // closes — the row runs through the method Enter uses.
                     self.run_context_menu_row(hit);
+                    return;
+                }
+
+                // --- Hint mode / copy-mode, below the menus (`overlays::Layer`):
+                // a press on a menu over copy-mode is the menu's, so its Copy
+                // row still has copy-mode's selection to copy — shared with the
+                // detached windows ---
+                if self.modes_click(Surface::Main) {
                     return;
                 }
 
