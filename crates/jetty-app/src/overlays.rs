@@ -131,10 +131,14 @@ pub(crate) struct Overlays {
     /// tab. While open, keys edit the query; Esc / ✕ / the search chord close
     /// it and clear the matches.
     pub search_open: bool,
-    /// Last streaming refresh of the open search's matches (throttled to
-    /// [`SEARCH_REFRESH_INTERVAL`] on the drain path so heavy output never
-    /// re-scans history every frame). `None` until the first refresh.
+    /// When the last streaming refresh of the open search's matches ENDED
+    /// (throttled to [`SEARCH_REFRESH_INTERVAL`] on the drain path so heavy
+    /// output never re-scans history every frame). `None` until the first
+    /// refresh.
     pub search_refresh_at: Option<Instant>,
+    /// What that refresh cost: the next one waits at least four times as long
+    /// (see [`Overlays::search_refresh_gap`]).
+    pub search_refresh_cost: std::time::Duration,
     /// True while the open search's stored matches may be stale: set when a
     /// drain consumed output but the throttle skipped the re-collect, cleared by
     /// every refresh. While set, `about_to_wait` schedules ONE wake at the
@@ -287,20 +291,29 @@ impl Overlays {
     pub fn search_refresh_due(&self, now: Instant) -> bool {
         self.search_open
             && self.search_dirty
-            && self.search_refresh_at.is_none_or(|t| now.saturating_duration_since(t) >= SEARCH_REFRESH_INTERVAL)
+            && self.search_refresh_at.is_none_or(|t| now.saturating_duration_since(t) >= self.search_refresh_gap())
     }
 
-    /// Record a search re-collect at `now`.
-    pub fn search_refreshed(&mut self, now: Instant) {
+    /// The throttle window after a refresh: [`SEARCH_REFRESH_INTERVAL`], or
+    /// four times what the refresh cost when that is longer — re-collects
+    /// never take more than a fifth of the UI thread (a full re-read of a
+    /// huge scrollback after a reflow can outlast the interval itself).
+    fn search_refresh_gap(&self) -> std::time::Duration {
+        SEARCH_REFRESH_INTERVAL.max(self.search_refresh_cost * 4)
+    }
+
+    /// Record a search re-collect that ran from `start` to `end`.
+    pub fn search_refreshed(&mut self, start: Instant, end: Instant) {
         self.search_dirty = false;
-        self.search_refresh_at = Some(now);
+        self.search_refresh_at = Some(end);
+        self.search_refresh_cost = end.saturating_duration_since(start);
     }
 
     /// The one wake a skipped (throttled) refresh needs — the throttle deadline —
     /// or `None` when nothing is pending (idle costs nothing).
     pub fn search_wake(&self) -> Option<Instant> {
         if self.search_open && self.search_dirty {
-            self.search_refresh_at.map(|t| t + SEARCH_REFRESH_INTERVAL)
+            self.search_refresh_at.map(|t| t + self.search_refresh_gap())
         } else {
             None
         }
@@ -484,13 +497,35 @@ mod tests {
         ov.search_open = true;
         ov.note_output();
         assert!(ov.search_refresh_due(t0), "first refresh is due at once");
-        ov.search_refreshed(t0);
+        ov.search_refreshed(t0, t0);
         assert_eq!(ov.search_wake(), None, "clean → no wake");
         ov.note_output();
         let soon = t0 + SEARCH_REFRESH_INTERVAL / 2;
         assert!(!ov.search_refresh_due(soon), "inside the throttle window");
         assert_eq!(ov.search_wake(), Some(t0 + SEARCH_REFRESH_INTERVAL), "one trailing wake");
         assert!(ov.search_refresh_due(t0 + SEARCH_REFRESH_INTERVAL));
+    }
+
+    #[test]
+    fn a_slow_search_refresh_waits_for_four_times_its_cost_after_it_ends() {
+        // A full-history re-collect can take longer than the interval itself
+        // (a reflow, 100k lines): stamped with its START, the next one was
+        // due the moment it returned — back to back, every frame.
+        let t0 = Instant::now();
+        let took = std::time::Duration::from_millis(100);
+        let mut ov = Overlays { search_open: true, ..Default::default() };
+        ov.note_output();
+        ov.search_refreshed(t0, t0 + took);
+        ov.note_output();
+        let done = t0 + took;
+        assert!(!ov.search_refresh_due(done + SEARCH_REFRESH_INTERVAL), "not right after the interval");
+        assert!(ov.search_refresh_due(done + took * 4), "four times its cost after it ended");
+        assert_eq!(ov.search_wake(), Some(done + took * 4));
+        // A cheap one keeps the plain interval.
+        ov.search_refreshed(done, done + std::time::Duration::from_micros(200));
+        ov.note_output();
+        let done = done + std::time::Duration::from_micros(200);
+        assert_eq!(ov.search_wake(), Some(done + SEARCH_REFRESH_INTERVAL));
     }
 
     /// The palette moves one row per wheel notch and one row per row of

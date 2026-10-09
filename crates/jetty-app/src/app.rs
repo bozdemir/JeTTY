@@ -5538,7 +5538,7 @@ impl App {
             return false;
         }
         term.search_refresh();
-        ov.search_refreshed(now);
+        ov.search_refreshed(now, std::time::Instant::now());
         true
     }
 
@@ -6204,8 +6204,9 @@ impl App {
                 // rotated rows (F10). Enter/F3 = older; +Shift = newer.
                 if let Some((ov, term)) = self.ov_term_mut(s) {
                     if ov.search_dirty {
+                        let start = std::time::Instant::now();
                         term.search_refresh();
-                        ov.search_refreshed(std::time::Instant::now());
+                        ov.search_refreshed(start, std::time::Instant::now());
                     }
                     term.search_nav(!shift);
                 }
@@ -12984,9 +12985,11 @@ impl ApplicationHandler<AppEvent> for App {
         // counter and Enter-navigation stale indefinitely. Service the skipped
         // refresh exactly once at the throttle deadline (scheduled via the
         // WaitUntil merge below); the flag only exists while the bar is open
-        // AND output was drained, so idle stays at zero work.
+        // AND output was drained, so idle stays at zero work. Only for a window
+        // someone can see: a hidden or occluded one keeps its matches dirty,
+        // and its first frame back refreshes them.
         let search_now = std::time::Instant::now();
-        if self.refresh_search_if_due(Surface::Main, search_now) && self.visible && !self.main_occluded {
+        if self.visible && !self.main_occluded && self.refresh_search_if_due(Surface::Main, search_now) {
             if let Some(w) = &self.window {
                 w.request_redraw();
                 painted = true;
@@ -12994,11 +12997,12 @@ impl ApplicationHandler<AppEvent> for App {
         }
         // Same trailing refresh for every detached window's own search bar.
         for p in 0..self.detached.len() {
+            if self.detached[p].occluded {
+                continue;
+            }
             if self.refresh_search_if_due(Surface::Detached(p), search_now) {
-                if let Some(dw) = self.detached.get(p).filter(|dw| !dw.occluded) {
-                    dw.request_paint();
-                    painted = true;
-                }
+                self.detached[p].request_paint();
+                painted = true;
             }
         }
         let now = std::time::Instant::now();
@@ -13392,10 +13396,11 @@ impl ApplicationHandler<AppEvent> for App {
             merge_wake(&mut wake_at, d);
         }
         // Skipped (throttled) open-search refresh: wake once at the throttle
-        // deadline so the trailing re-collect above runs (F10). An elapsed
-        // deadline was serviced above, so this is strictly in the future.
-        let search_wakes = std::iter::once(self.ov.search_wake())
-            .chain(self.detached.iter().map(|d| d.ov.search_wake()))
+        // deadline so the trailing re-collect above runs (F10) — in a window
+        // someone can see. An elapsed deadline was serviced above, so this is
+        // strictly in the future.
+        let search_wakes = std::iter::once(self.ov.search_wake().filter(|_| main_visible))
+            .chain(self.detached.iter().map(|d| d.ov.search_wake().filter(|_| !d.occluded)))
             .flatten();
         for t in search_wakes {
             merge_wake(&mut wake_at, t);
