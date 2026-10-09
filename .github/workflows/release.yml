@@ -46,7 +46,8 @@ jobs:
         run: cargo test --workspace
 
       - name: Build release binary
-        run: cargo build --release --bin jetty
+        # Stamp the commit so `jetty --version` names it ("dev" is for local builds).
+        run: JETTY_BUILD="${GITHUB_SHA::7}" cargo build --release --bin jetty
 
       - name: glibc floor check
         # Fail before anything ships if the binary needs a glibc newer than
