@@ -969,6 +969,20 @@ pub struct App {
     pending_center_frames: u8,
     /// The position to re-assert while pending_center_frames > 0.
     pending_center_pos: Option<winit::dpi::PhysicalPosition<i32>>,
+    /// The size to re-assert with it: a `center_size` given back
+    /// (`place_center`), else `None` — a user's resize is never fought.
+    pending_center_size: Option<winit::dpi::PhysicalSize<u32>>,
+    /// The window's own inner size while a Dropdown strip — sized from the
+    /// monitor — has taken it over: kept when the window enters the strip,
+    /// given back (and cleared) by the next Center placement
+    /// (`place_center`). Without it a switch from Dropdown to Center kept the
+    /// monitor-wide strip for good.
+    center_size: Option<winit::dpi::PhysicalSize<u32>>,
+    /// Whether the window manager has placed the main window at a windowed spot
+    /// yet (a `Moved` while shown and not fullscreen). Until then its position
+    /// is winit's creation default — the root origin on X11 — never a spot to
+    /// come back to (`capture_pre_fullscreen`).
+    main_placed: bool,
     /// Whether the MAIN window is currently in OS fullscreen. A MIRROR of the
     /// window's real state, kept so the render path never calls the syscall-backed
     /// `Window::fullscreen()` per frame (it feeds `effective_corner_radius_px` and
@@ -2139,6 +2153,9 @@ impl App {
             pending_dock_frames: 0,
             pending_center_frames: 0,
             pending_center_pos: None,
+            pending_center_size: None,
+            center_size: None,
+            main_placed: false,
             // Session-only; the first open / first summon establishes it from
             // `window_mode` (rule F0: never fullscreen while hidden).
             main_fullscreen: false,
@@ -4256,6 +4273,7 @@ impl App {
                 // old size, and a window manager keeping it on screen shifts it
                 // (KWin did: centred for 1000×640 while still 1728×972).
                 self.pending_center_pos = center_window_sized(&win, Some(size));
+                self.pending_center_size = None;
                 self.pending_center_frames = if self.pending_center_pos.is_some() { 5 } else { 0 };
             }
         }
@@ -7542,6 +7560,8 @@ impl App {
             capture_pre_fullscreen(
                 &win,
                 self.window_mode,
+                self.main_placed,
+                self.center_size,
                 &mut self.last_pos,
                 &mut self.last_windowed_size,
             );
@@ -7576,15 +7596,14 @@ impl App {
             // restorable, so we centre on a live monitor instead of mapping
             // off-screen.
             let maximized = win.is_maximized();
-            let restorable = self
-                .last_pos
-                .map(|p| pos_on_some_monitor(&win, p))
-                .unwrap_or(false);
+            let size = self.center_size.or(self.last_windowed_size).unwrap_or_else(|| win.outer_size());
+            let restorable = self.last_pos.and_then(|p| spot_on_monitor(&win, p, size)).is_some();
             let (dock_frames, center_frames) =
                 fullscreen_exit_frames(self.visible, maximized, self.window_mode, restorable);
             self.pending_dock_frames = dock_frames;
             self.pending_center_frames = center_frames;
             self.pending_center_pos = None;
+            self.pending_center_size = None;
             // Geometry is only ever issued on a VISIBLE, non-maximized window:
             // hidden ⇒ the next summon places it (and an OS geometry call while
             // hidden is forbidden); maximized ⇒ the WM restores the maximized frame
@@ -7597,32 +7616,25 @@ impl App {
                     // fullscreen, so the escape is self-healing and needs no
                     // "escaped" flag.
                     WindowMode::Center | WindowMode::Fullscreen => {
-                        match self.last_pos.filter(|_| restorable) {
-                            Some(p) => {
-                                win.set_outer_position(p);
-                                self.pending_center_pos = Some(p);
-                            }
-                            None => {
-                                // Centre from the size captured on the way IN, never
-                                // from the live `outer_size()`: the un-fullscreen
-                                // request above is an async ClientMessage on X11, so
-                                // a live read still reports the MONITOR and the
-                                // centring would resolve to the monitor origin.
-                                // Re-assert the COMPUTED target for the next few
-                                // post-map frames, exactly like the `Some(p)` sibling
-                                // — the WM processes our restore and our position
-                                // request in its own order, and whichever lands first
-                                // the re-assertion settles it.
-                                let target = center_window_sized(&win, self.last_windowed_size);
-                                self.pending_center_pos = target;
-                                if target.is_none() {
-                                    // No monitor info ⇒ nothing was issued ⇒ nothing
-                                    // to re-assert (never leave a counter armed with
-                                    // no work: it would be 5 frames of Poll).
-                                    self.pending_center_frames = 0;
-                                }
-                                self.last_pos = None;
-                            }
+                        // The saved spot, or the centre — computed from the size
+                        // captured on the way IN (or the window's own, if a
+                        // Dropdown strip had it before), never from the live
+                        // `outer_size()`: the un-fullscreen request above is an
+                        // async ClientMessage on X11, so a live read still
+                        // reports the MONITOR and the centring would resolve to
+                        // the monitor origin. Either target is re-asserted on the
+                        // next few post-map frames — the WM processes our
+                        // restore and our position request in its own order, and
+                        // whichever lands first the re-assertion settles it.
+                        let give_back = self.center_size.take();
+                        self.pending_center_pos =
+                            place_center(&win, &mut self.last_pos, give_back, self.last_windowed_size);
+                        self.pending_center_size = give_back;
+                        if self.pending_center_pos.is_none() {
+                            // No monitor info ⇒ nothing was issued ⇒ nothing to
+                            // re-assert (never leave a counter armed with no
+                            // work: it would be 5 frames of Poll).
+                            self.pending_center_frames = 0;
                         }
                     }
                     WindowMode::Dropdown => {
@@ -7818,14 +7830,33 @@ impl App {
     }
 
     /// Select a new window mode: persist it, and apply it live. Switching to
-    /// Center clears any in-progress slide; switching to Dropdown clears last_pos
-    /// so the next summon re-docks from a clean top-flush geometry; switching to
-    /// Fullscreen covers the monitor immediately when visible.
+    /// Dropdown keeps the window's own size and spot (`center_size`, `last_pos`)
+    /// for when it leaves the monitor-wide strip; switching to Center clears any
+    /// in-progress slide and gives them back (at once when visible, else at the
+    /// next summon); switching to Fullscreen covers the monitor immediately when
+    /// visible.
     fn set_window_mode(&mut self, mode: WindowMode) {
         if self.window_mode == mode {
             return;
         }
         let was_fullscreen = self.main_fullscreen;
+        if mode == WindowMode::Dropdown {
+            // The strip takes the window's size: keep its own, and its spot when
+            // it is shown, to give back when it leaves the strip (`place_center`).
+            // A size already kept stays — the window still has the strip's.
+            // Fullscreen now, or hidden in Fullscreen mode (the hide left
+            // fullscreen as it unmapped), the live size may still be the
+            // monitor's: the one captured on the way in is its own.
+            if let Some(w) = &self.window {
+                let live_is_stale = was_fullscreen || (self.window_mode == WindowMode::Fullscreen && !self.visible);
+                if self.center_size.is_none() {
+                    self.center_size = if live_is_stale { self.last_windowed_size } else { Some(w.inner_size()) };
+                }
+                if self.visible && !was_fullscreen {
+                    self.last_pos = w.outer_position().ok().or(self.last_pos);
+                }
+            }
+        }
         // Assign FIRST: `set_main_fullscreen` reads `window_mode` to decide both
         // the `last_pos` capture and where an exit lands.
         self.window_mode = mode;
@@ -7846,10 +7877,9 @@ impl App {
                     self.pending_dock_frames = 0;
                 }
                 WindowMode::Dropdown => {
-                    // Match today's Dropdown mode-switch exactly, so the slide-in
-                    // does not depend on whether F11 happened to be pressed earlier.
-                    self.last_pos = None;
-                    // …but only when the exit actually DOCKED the window.
+                    // Match the plain Dropdown mode-switch below, so the slide-in
+                    // does not depend on whether F11 happened to be pressed
+                    // earlier — but only when the exit actually DOCKED the window.
                     // `set_main_fullscreen(false)` skips the dock while maximized
                     // (amendment I-F: a position on a maximized X11 window is
                     // ignored or half-applied) and `fullscreen_exit_frames` returns
@@ -7875,13 +7905,23 @@ impl App {
                 // Stop any in-flight dropdown dock re-assertion so it can't snap a
                 // just-switched Center window back to the top strip.
                 self.pending_dock_frames = 0;
+                // Leaving a Dropdown strip: the window's own size and spot come
+                // back — now when it is shown; when hidden, the next summon
+                // places it (no geometry call while hidden).
+                if self.visible && self.center_size.is_some() {
+                    if let Some(win) = &self.window {
+                        let give_back = self.center_size.take();
+                        self.pending_center_pos = place_center(win, &mut self.last_pos, give_back, None);
+                        self.pending_center_size = give_back;
+                        self.pending_center_frames = if self.pending_center_pos.is_some() { 5 } else { 0 };
+                    }
+                }
             }
             WindowMode::Dropdown => {
-                // Recompute dock geometry (ignore stale pos). If the window is
-                // already visible, dock it LIVE so switching mode in settings
-                // immediately drops it to the top strip (re-asserted post-map via
-                // pending_dock_frames) instead of waiting for the next F9.
-                self.last_pos = None;
+                // If the window is already visible, dock it LIVE so switching mode
+                // in settings immediately drops it to the top strip (re-asserted
+                // post-map via pending_dock_frames) instead of waiting for the
+                // next F9.
                 if self.visible {
                     if let Some(w) = &self.window {
                         dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
@@ -9966,30 +10006,25 @@ impl App {
             jetty_platform::unhide_application();
             match mode {
                 WindowMode::Center => {
-                    win.set_visible(true);
-                    // Re-summon at the spot the user left it; first → center.
-                    // X11/KWin ignores a position issued before the window is
-                    // mapped, so re-assert it on the next few post-map redraws
-                    // (mirrors pending_dock_frames) or the saved spot is lost.
-                    match self.last_pos {
-                        // Only restore a saved position that still lands on a
-                        // connected monitor. If the monitor was unplugged while
-                        // hidden, the verbatim restore (plus the 5-frame
-                        // re-assertion) would map the window off-screen and
-                        // fight any WM rescue — center on a live monitor
-                        // instead and forget the stale spot (F32).
-                        Some(pos) if pos_on_some_monitor(win, pos) => {
-                            win.set_outer_position(pos);
-                            self.pending_center_pos = Some(pos);
-                            self.pending_center_frames = 5;
-                        }
-                        _ => {
-                            center_window(win);
-                            self.pending_center_pos = None;
-                            self.pending_center_frames = 0;
-                            self.last_pos = None;
-                        }
+                    // A size a Dropdown strip took comes back BEFORE the map: a
+                    // window manager judges a window by the size it maps with
+                    // (KWin maximized a monitor-wide one horizontally).
+                    let give_back = self.center_size.take();
+                    if let Some(s) = give_back {
+                        let _ = win.request_inner_size(s);
                     }
+                    win.set_visible(true);
+                    // Re-summon at the spot the user left it — kept whole on a
+                    // connected monitor; one unplugged while hidden centres on
+                    // a live monitor instead (F32); first → centre. X11/KWin
+                    // ignores a position issued before the window is mapped —
+                    // the computed centre as much as a saved spot — so re-assert
+                    // it (and a size given back) on the next few post-map
+                    // redraws (mirrors pending_dock_frames) or the WM's own
+                    // placement wins.
+                    self.pending_center_pos = place_center(win, &mut self.last_pos, give_back, None);
+                    self.pending_center_size = give_back;
+                    self.pending_center_frames = if self.pending_center_pos.is_some() { 5 } else { 0 };
                 }
                 WindowMode::Dropdown => {
                     // Show FIRST so the window is mapped, THEN dock: on X11 a
@@ -10034,9 +10069,14 @@ impl App {
                     // Settings switch back to Center) with no position AND no
                     // size to restore, so the exit centred from the stale
                     // monitor-sized `outer_size()` and landed in the corner.
+                    // The spot only once the window manager has placed the
+                    // window: the first summon of a `--background` start reads
+                    // winit's creation origin here (X11).
                     capture_pre_fullscreen(
                         win,
                         mode,
+                        self.main_placed,
+                        self.center_size,
                         &mut self.last_pos,
                         &mut self.last_windowed_size,
                     );
@@ -13979,6 +14019,11 @@ impl ApplicationHandler<AppEvent> for App {
         if self.start_hidden {
             self.visible = false;
         }
+        // A Dropdown start: the strip takes the window's size — keep the one
+        // it was made with, to give back on a switch to Center.
+        if self.window_mode == WindowMode::Dropdown {
+            self.center_size = Some(window.inner_size());
+        }
         match self.window_mode {
             _ if self.start_hidden => {}
             WindowMode::Center => center_window(&window),
@@ -13990,10 +14035,15 @@ impl ApplicationHandler<AppEvent> for App {
                 // Capture the windowed geometry first (this inline enter used to
                 // bypass it): an F11 escape right after startup must have a size to
                 // centre from, or it centres from the monitor-sized live read and
-                // lands in the corner.
+                // lands in the corner. The size only: the window manager has not
+                // placed the window yet (`placed: false`), and the position read
+                // now is winit's creation origin — "restored", an F11 escape put
+                // the window in the corner of the screen.
                 capture_pre_fullscreen(
                     &window,
                     WindowMode::Fullscreen,
+                    false,
+                    self.center_size,
                     &mut self.last_pos,
                     &mut self.last_windowed_size,
                 );
@@ -14599,6 +14649,12 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::Moved(_) => {
+                // The window manager has put the shown, windowed window somewhere:
+                // from now on its position is a spot of its own
+                // (`capture_pre_fullscreen`).
+                if self.visible && !self.main_fullscreen {
+                    self.main_placed = true;
+                }
                 // The only event that can change the Dropdown top-flush answer
                 // without a resize; re-derived once on the next frame instead of
                 // an X11 round-trip on every frame.
@@ -16094,6 +16150,11 @@ impl ApplicationHandler<AppEvent> for App {
                     self.pending_center_frames -= 1;
                     if let (Some(win), Some(pos)) = (&self.window, self.pending_center_pos) {
                         win.set_outer_position(pos);
+                        // A size given back with it (`place_center`) races the
+                        // window manager the same way.
+                        if let Some(size) = self.pending_center_size {
+                            let _ = win.request_inner_size(size);
+                        }
                         if self.pending_center_frames > 0 {
                             win.request_redraw();
                         }
@@ -19043,17 +19104,74 @@ fn center_reassert_ok(mode: WindowMode, fullscreen: bool) -> bool {
     mode != WindowMode::Dropdown && !fullscreen
 }
 
-/// Whether `pos` (a window outer top-left, physical px) lies within some
-/// currently-connected monitor. Used to reject a saved Center-mode position that
-/// now falls on a since-disconnected monitor (F32). The containment test itself
-/// lives in `jetty_platform::pos_in_monitor_rect`, shared with
-/// `monitor_for_window` so "which screen" is decided in exactly one place.
-fn pos_on_some_monitor(win: &Arc<Window>, pos: winit::dpi::PhysicalPosition<i32>) -> bool {
-    win.available_monitors().any(|m| {
-        let p = m.position();
-        let s = m.size();
-        jetty_platform::pos_in_monitor_rect((pos.x, pos.y), (p.x, p.y), (s.width, s.height))
-    })
+/// A monitor as `(origin, size)`, physical px.
+type MonitorRect = ((i32, i32), (u32, u32));
+
+/// Where a saved Center-mode spot `pos` puts a `size` window now (all physical
+/// px), given the connected `monitors`: on the monitor that holds its top-left
+/// corner, moved just enough to keep the whole window on it — a monitor that
+/// shrank, or changed resolution, while the window was hidden brought it back
+/// mostly off screen, and the re-assertion then fought the window manager's
+/// rescue. `None` when no monitor holds the spot any more (unplugged while
+/// hidden, F32): centre instead. The containment test is
+/// `jetty_platform::pos_in_monitor_rect`, shared with `monitor_for_window` so
+/// "which screen" is decided in exactly one place.
+fn keep_on_monitor(pos: (i32, i32), size: (u32, u32), monitors: &[MonitorRect]) -> Option<(i32, i32)> {
+    let &(mon_pos, mon_size) = monitors.iter().find(|(p, s)| jetty_platform::pos_in_monitor_rect(pos, *p, *s))?;
+    Some(crate::detached::clamp_pos(pos.0, pos.1, size.0, size.1, (mon_pos.0, mon_pos.1, mon_size.0, mon_size.1)))
+}
+
+/// [`keep_on_monitor`] over `win`'s connected monitors.
+fn spot_on_monitor(
+    win: &Arc<Window>,
+    pos: winit::dpi::PhysicalPosition<i32>,
+    size: winit::dpi::PhysicalSize<u32>,
+) -> Option<winit::dpi::PhysicalPosition<i32>> {
+    let monitors: Vec<MonitorRect> = win
+        .available_monitors()
+        .map(|m| ((m.position().x, m.position().y), (m.size().width, m.size().height)))
+        .collect();
+    keep_on_monitor((pos.x, pos.y), (size.width, size.height), &monitors)
+        .map(|(x, y)| winit::dpi::PhysicalPosition::new(x, y))
+}
+
+/// Put the visible main window in its Center-mode geometry: the size a
+/// Dropdown strip took from it given back (`give_back`, the taken
+/// `center_size`), at the spot the user left it (`last_pos`, kept whole on its
+/// monitor) or centred — and that spot forgotten when it is gone. `size` is
+/// the window's size when nothing is given back and the live one is stale (the
+/// fullscreen exit's capture); `None` reads it.
+///
+/// Returns the spot it asked for, which the caller re-asserts on the next few
+/// post-map frames (`pending_center_*`, together with `give_back`): a window
+/// manager applies a request it gets before it manages the window in its own
+/// order, or not at all. `None` only without monitor information, when
+/// nothing was asked. A free function for the same reason as
+/// `capture_pre_fullscreen`: its callers hold the `&self.window` borrow.
+fn place_center(
+    win: &Arc<Window>,
+    last_pos: &mut Option<winit::dpi::PhysicalPosition<i32>>,
+    give_back: Option<winit::dpi::PhysicalSize<u32>>,
+    size: Option<winit::dpi::PhysicalSize<u32>>,
+) -> Option<winit::dpi::PhysicalPosition<i32>> {
+    if let Some(s) = give_back {
+        // A window manager may take a monitor-wide window for a maximized one
+        // (KWin maximized the strip horizontally when it mapped it): un-maximize
+        // it first, or the width asked for is ignored.
+        win.set_maximized(false);
+        let _ = win.request_inner_size(s);
+    }
+    let size = give_back.or(size).unwrap_or_else(|| win.outer_size());
+    match last_pos.and_then(|p| spot_on_monitor(win, p, size)) {
+        Some(pos) => {
+            win.set_outer_position(pos);
+            Some(pos)
+        }
+        None => {
+            *last_pos = None;
+            center_window_sized(win, Some(size))
+        }
+    }
 }
 
 /// Remember where and how big the main window is, immediately BEFORE it enters
@@ -19070,22 +19188,36 @@ fn pos_on_some_monitor(win: &Arc<Window>, pos: winit::dpi::PhysicalPosition<i32>
 /// The position is captured only when the mode is NOT Dropdown (amendment
 /// BLOCKING 7: Dropdown re-docks from monitor geometry and never restores a
 /// saved spot, and `set_window_mode` assigns the NEW mode before we run, so
-/// `!= Dropdown` — not `== Center` — is the reachable predicate). The SIZE is
-/// captured in every mode: the exit's centring maths needs it whatever the mode,
-/// and a Dropdown exit simply re-docks and ignores it.
+/// `!= Dropdown` — not `== Center` — is the reachable predicate), and only from
+/// a window that has a spot of its own: `placed` (the window manager has put it
+/// somewhere — a window read before that sits at winit's creation origin, and
+/// an F11 escape "restored" it into the corner of the screen) and not holding
+/// a Dropdown strip (`center_size`: the strip's spot is the monitor's top). The
+/// SIZE is captured in every mode — the window's own, `center_size`, while a
+/// strip has it: the exit's centring maths needs it whatever the mode, and a
+/// Dropdown exit simply re-docks and ignores it.
 fn capture_pre_fullscreen(
     win: &Arc<Window>,
     mode: WindowMode,
+    placed: bool,
+    center_size: Option<winit::dpi::PhysicalSize<u32>>,
     last_pos: &mut Option<winit::dpi::PhysicalPosition<i32>>,
     last_windowed_size: &mut Option<winit::dpi::PhysicalSize<u32>>,
 ) {
-    if mode != WindowMode::Dropdown {
+    if spot_is_its_own(mode, placed, center_size.is_some()) {
         // `.or(*last_pos)` keeps an existing saved spot when the read fails
         // (Wayland). Consistent with the loosened `center_reassert_ok`.
         *last_pos = win.outer_position().ok().or(*last_pos);
     }
     // Read BEFORE the fullscreen request: afterwards this is the monitor size.
-    *last_windowed_size = Some(win.outer_size());
+    *last_windowed_size = Some(center_size.unwrap_or_else(|| win.outer_size()));
+}
+
+/// `capture_pre_fullscreen`'s position predicate (pure): the window's position
+/// is a spot to come back to only outside Dropdown mode, once the window
+/// manager has `placed` it, and while no Dropdown strip holds it.
+fn spot_is_its_own(mode: WindowMode, placed: bool, strip_holds_it: bool) -> bool {
+    mode != WindowMode::Dropdown && placed && !strip_holds_it
 }
 
 /// Logical size for a window torn out of the main window (detach): the main
@@ -20915,6 +21047,52 @@ mod fullscreen_helper_tests {
         // wraps to a huge negative that would map it off-screen.
         assert_eq!(centered_pos((0, 0), (1280, 800), (1920, 1200)), (0, 0));
         assert_eq!(centered_pos((-1920, -100), (1920, 1200), (1000, 640)), (-1460, 180));
+    }
+
+    #[test]
+    fn a_restored_spot_keeps_the_whole_window_on_its_monitor() {
+        use super::keep_on_monitor;
+        let two = [((0, 0), (1920u32, 1080u32)), ((1920, 0), (2560, 1440))];
+        // Still fits: the spot the user left is kept as it is.
+        assert_eq!(keep_on_monitor((460, 220), (1000, 640), &two), Some((460, 220)));
+        assert_eq!(keep_on_monitor((2000, 100), (1000, 640), &two), Some((2000, 100)));
+        // The second monitor shrank to 1280×720 while the window was hidden: its
+        // old spot still holds the top-left corner but would put most of the
+        // window off screen — moved just enough to fit, on the same monitor.
+        let shrunk = [((0, 0), (1920u32, 1080u32)), ((1920, 0), (1280, 720))];
+        assert_eq!(keep_on_monitor((2900, 500), (1000, 640), &shrunk), Some((2200, 80)));
+        // A window larger than its monitor pins to the monitor's origin.
+        assert_eq!(keep_on_monitor((1950, 10), (1600, 900), &shrunk), Some((1920, 0)));
+        // A monitor left of the primary (negative origin) is a monitor too.
+        let left = [((-1920, 0), (1920u32, 1080u32)), ((0, 0), (1920, 1080))];
+        assert_eq!(keep_on_monitor((-300, 900), (1000, 640), &left), Some((-1000, 440)));
+        // The monitor holding the spot was unplugged (F32): no spot — centre.
+        assert_eq!(keep_on_monitor((2900, 500), (1000, 640), &[((0, 0), (1920, 1080))]), None);
+        assert_eq!(keep_on_monitor((10, 10), (1000, 640), &[]), None);
+    }
+
+    #[test]
+    fn only_a_placed_window_without_a_strip_has_a_spot_to_capture() {
+        use super::spot_is_its_own;
+        use WindowMode::{Center, Dropdown, Fullscreen};
+        // The window manager placed it, no strip holds it: Center and
+        // Fullscreen remember where it is before going fullscreen.
+        assert!(spot_is_its_own(Center, true, false));
+        assert!(spot_is_its_own(Fullscreen, true, false));
+        // Never placed (summon#7): a Fullscreen-mode start, or the first summon
+        // of a `--background` start, reads winit's creation origin — kept, an
+        // F11 escape put the window in the corner of the screen.
+        assert!(!spot_is_its_own(Fullscreen, false, false));
+        assert!(!spot_is_its_own(Center, false, false));
+        // A Dropdown strip holds it (a switch from Dropdown to Fullscreen): its
+        // spot is the monitor's top, not the window's own.
+        assert!(!spot_is_its_own(Fullscreen, true, true));
+        // Dropdown re-docks and never restores a spot.
+        for placed in [false, true] {
+            for strip in [false, true] {
+                assert!(!spot_is_its_own(Dropdown, placed, strip));
+            }
+        }
     }
 
     #[test]
