@@ -20,6 +20,7 @@
 #   scripts/nested-live.sh raw-key 75               # XTEST keycode (xdotool adds Alt to F9)
 #   scripts/nested-live.sh shot out.png [x y w h [scale]]
 #   scripts/nested-live.sh state                   # map state, active window, stacking
+#   scripts/nested-live.sh ctl --toggle            # jetty --toggle/--show/--hide, to THIS jetty
 #   scripts/nested-live.sh restart                 # relaunch jetty (after a rebuild)
 #   scripts/nested-live.sh stop                    # kills only what start launched
 #
@@ -32,6 +33,13 @@ cd "$(dirname "$0")/.."
 ROOT=$PWD
 N="${DISPLAY_NUM:-187}"
 SB="$ROOT/target/nested-live-$N"
+# The runtime dir holds jetty's IPC socket (`ctl`), and a Unix socket path must
+# fit in sun_path (108 bytes): deep in a worktree, `$SB/run/jetty-<hash>.sock`
+# does not, and jetty then runs without IPC. Use a short private dir instead.
+RUN="$SB/run"
+if [ $(( ${#RUN} + 28 )) -gt 100 ]; then
+    RUN="${XDG_RUNTIME_DIR:-/tmp}/jetty-nested-$N"
+fi
 # NOT $JETTY_BIN: inside JeTTY that names the INSTALLED binary (JeTTY sets it
 # for its shells), which would silently test the wrong build.
 BIN="${NESTED_BIN:-$ROOT/target/release/jetty}"
@@ -41,6 +49,18 @@ die() { echo "nested-live: $*" >&2; exit 1; }
 [ "$N" != "0" ] && [ "$D" != "${DISPLAY:-}" ] || die "refusing to use the real display ($D)"
 
 py() { python3 -I - "$@"; }
+
+# jetty's sandbox environment: the nested display, the sandbox config/cache/
+# data/state/runtime dirs — so a `jetty --toggle` run in it (`ctl`) can only
+# ever reach the sandbox's own socket — and software Vulkan.
+JENV=(env -u JETTY -u JETTY_BIN -u TERM_PROGRAM -u TERM_PROGRAM_VERSION
+    -u WAYLAND_DISPLAY -u SESSION_MANAGER DISPLAY="$D"
+    XDG_CONFIG_HOME="$SB/config" XDG_CACHE_HOME="$SB/cache" XDG_DATA_HOME="$SB/data"
+    XDG_STATE_HOME="$SB/state" XDG_RUNTIME_DIR="$RUN" JETTY_CONFIG_DIR="$SB/config/jetty"
+    PATH="$SB/bin:$PATH" HISTFILE="$SB/zsh_history" GITSTATUS_CACHE_DIR="$HOME/.cache/gitstatus"
+    DISABLE_AUTO_UPDATE=true
+    VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+    VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json)
 
 # A private session bus with NO service activation, used by jetty and the WM:
 # nothing on it can D-Bus-activate a real desktop service (a portal backend, a
@@ -66,14 +86,8 @@ launch_jetty() {
     [ -x "$BIN" ] || die "no binary at $BIN (cargo build --release --bin jetty)"
     [ -f "$SB/bus.conf" ] || write_bus_conf
     ln -sfn "$BIN" "$SB/bin/jetty"
-    (cd "$SB" && setsid -f env -u JETTY -u JETTY_BIN -u TERM_PROGRAM -u TERM_PROGRAM_VERSION \
-        -u WAYLAND_DISPLAY -u SESSION_MANAGER DISPLAY="$D" \
-        XDG_CONFIG_HOME="$SB/config" XDG_CACHE_HOME="$SB/cache" XDG_DATA_HOME="$SB/data" \
-        XDG_STATE_HOME="$SB/state" XDG_RUNTIME_DIR="$SB/run" JETTY_CONFIG_DIR="$SB/config/jetty" \
-        PATH="$SB/bin:$PATH" HISTFILE="$SB/zsh_history" GITSTATUS_CACHE_DIR="$HOME/.cache/gitstatus" \
-        DISABLE_AUTO_UPDATE=true \
-        VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
-        VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
+    mkdir -p "$RUN" && chmod 700 "$RUN"
+    (cd "$SB" && setsid -f "${JENV[@]}" \
         dbus-run-session --config-file="$SB/bus.conf" -- "$SB/bin/jetty" >>"$SB/jetty.log" 2>&1)
     for _ in $(seq 50); do
         pid=$(for p in $(pgrep -x jetty); do
@@ -137,6 +151,15 @@ x)
     shift
     exec env DISPLAY="$D" xdotool "$@"
     ;;
+ctl)
+    # `jetty --toggle` & co. in the sandbox env: the socket is the sandbox's, and
+    # only while its jetty runs — without one, `jetty --toggle` would launch a
+    # second, untracked jetty instead of toggling.
+    shift
+    p=$(cat "$SB/jetty.pid" 2>/dev/null)
+    [ -n "$p" ] && [ -d "/proc/$p" ] || die "the sandbox jetty is not running"
+    exec "${JENV[@]}" "$SB/bin/jetty" "$@"
+    ;;
 raw-key)
     py "$D" "$2" <<'EOF'
 import sys, time
@@ -186,10 +209,16 @@ stop)
     stop_pid jetty jetty
     stop_pid wm kwin_x11
     stop_pid xvfb Xvfb
+    # The short runtime dir outside the sandbox: only jetty's socket + lock.
+    if [ "$RUN" != "$SB/run" ] && [ -d "$RUN" ]; then
+        sleep 0.3
+        rm -f "$RUN"/jetty*.sock "$RUN"/jetty*.sock.lock
+        rmdir "$RUN" 2>/dev/null
+    fi
     echo "stopped (sandbox kept at $SB)"
     ;;
 *)
-    sed -n '2,32p' "$0"
+    sed -n '2,29p' "$0"
     exit 1
     ;;
 esac
