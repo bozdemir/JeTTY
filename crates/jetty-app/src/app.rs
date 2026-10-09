@@ -5010,8 +5010,8 @@ impl App {
 
     /// Close detached window `pos`'s menu and run its row `row`
     /// (`DETACHED_MENU_ITEMS` order: Reattach / Copy / Paste / Run in New
-    /// Tab) — the one implementation shared by a click and Enter / Space. A
-    /// grayed row, or `None`, only closes the menu.
+    /// Tab / Select All / Clear) — the one implementation shared by a click
+    /// and Enter / Space. A grayed row, or `None`, only closes the menu.
     fn run_detached_menu_row(&mut self, pos: usize, row: Option<usize>, event_loop: &ActiveEventLoop) {
         let Some(dw) = self.detached.get_mut(pos) else { return };
         let row = row.filter(|i| !dw.menu_disabled.contains(i));
@@ -5037,6 +5037,15 @@ impl App {
             }
             // Run this window's selection in a new MAIN-window tab.
             Some(3) => self.run_selection_in_new_tab(SelSource::Detached(pos)),
+            Some(4) => dw.tab.terminal.select_all(),
+            Some(5) => {
+                // Clear — Ctrl+L to this window's shell, as the main menu's
+                // row (a user-originated PTY byte: cancels a staged inject).
+                crate::runsel::cancel_on_user_write(&mut dw.tab.pending_inject);
+                dw.tab.terminal.scroll_to_bottom();
+                let _ = dw.tab.writer.write_all(&[0x0C]);
+                let _ = dw.tab.writer.flush();
+            }
             _ => {}
         }
     }
@@ -6797,6 +6806,14 @@ impl App {
                     if let Some(term) = self.term_of_mut(s) {
                         term.selection_clear();
                     }
+                    self.paint_surface(s);
+                }
+            }
+            // Select All of the tab the palette was opened over (no default
+            // chord on Linux, and a detached window had no row for it).
+            C::SelectAll => {
+                if let Some(term) = self.term_of_mut(s) {
+                    term.select_all();
                     self.paint_surface(s);
                 }
             }

@@ -63,6 +63,8 @@ pub enum PaletteCmd {
     NextPrompt,
     Copy,
     Paste,
+    /// Select the whole scrollback + screen of the window's tab.
+    SelectAll,
     /// The window's context menu at the text cursor (the Menu key's action).
     ContextMenu,
     ToggleLaunchAtLogin,
@@ -295,7 +297,7 @@ pub fn build_registry(
     tabs: &[(u64, String)],
     detached: &[(u64, String)],
 ) -> Vec<PaletteEntry> {
-    let statics: [(&str, &str, PaletteCmd); 44] = [
+    let statics: [(&str, &str, PaletteCmd); 45] = [
         ("New tab", "create open window shell", PaletteCmd::NewTab),
         ("Close tab", "kill remove", PaletteCmd::CloseTab),
         ("Next tab", "cycle switch forward", PaletteCmd::NextTab),
@@ -336,6 +338,7 @@ pub fn build_registry(
         ("Jump to next prompt", "osc133 shell down", PaletteCmd::NextPrompt),
         ("Copy selection", "clipboard yank", PaletteCmd::Copy),
         ("Paste", "clipboard insert", PaletteCmd::Paste),
+        ("Select all", "selection everything scrollback copy whole", PaletteCmd::SelectAll),
         (
             "Run selection in new tab",
             "execute run selected command tab shell browser",

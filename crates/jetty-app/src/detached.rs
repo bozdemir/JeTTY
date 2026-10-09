@@ -264,7 +264,9 @@ pub fn tab_color_swatches(
 /// Items of a DETACHED window's context menu (right-click anywhere).
 /// "Run in New Tab" runs THIS window's selection in a new MAIN-window tab at
 /// this tab's cwd (the main window is the only tabbed one; it is not summoned).
-pub const DETACHED_MENU_ITEMS: [&str; 4] = ["Reattach", "Copy", "Paste", "Run in New Tab"];
+/// "Select All" and "Clear" are the main menu's rows (Select All had no other
+/// way in on Linux: no default chord, no palette row).
+pub const DETACHED_MENU_ITEMS: [&str; 6] = ["Reattach", "Copy", "Paste", "Run in New Tab", "Select All", "Clear"];
 
 /// Per-corner radii (tl, tr, bl, br) for a detached window's corner mask.
 /// A detached window is a free-floating window — it is never docked top-flush
@@ -283,6 +285,7 @@ pub fn menu_action(label: &str) -> Option<crate::keymap::BindableAction> {
         "Copy" => A::Copy,
         "Paste" => A::Paste,
         "Run in New Tab" => A::RunSelection,
+        "Select All" => A::SelectAll,
         "Close Tab" => A::CloseTab,
         _ => return None,
     })
@@ -306,8 +309,12 @@ pub fn context_menu_hints(km: &crate::keymap::KeyMap) -> [String; 6] {
 
 /// Right-aligned keyboard-shortcut hint for a menu label, from the LIVE keymap
 /// (a `[keys]` remap — or macOS's ⌘ chords — shows in the menu); blank when
-/// the action has no binding.
+/// the action has no binding. "Clear" is the raw Ctrl+L byte (as in
+/// [`context_menu_hints`]).
 pub fn menu_hint(km: &crate::keymap::KeyMap, label: &str) -> String {
+    if label == "Clear" {
+        return "⌃L".to_string();
+    }
     menu_action(label).map(|a| km.menu_hint(a)).unwrap_or_default()
 }
 
@@ -1112,10 +1119,16 @@ mod tests {
     }
 
     #[test]
-    fn detached_menu_is_reattach_copy_paste_run() {
+    fn detached_menu_is_reattach_copy_paste_run_select_all_clear() {
         // Pinned order — app.rs's detached click dispatch matches on these
-        // hard indices (0 Reattach, 1 Copy, 2 Paste, 3 Run in New Tab).
-        assert_eq!(DETACHED_MENU_ITEMS, ["Reattach", "Copy", "Paste", "Run in New Tab"]);
+        // hard indices (0 Reattach, 1 Copy, 2 Paste, 3 Run in New Tab,
+        // 4 Select All, 5 Clear).
+        assert_eq!(DETACHED_MENU_ITEMS, ["Reattach", "Copy", "Paste", "Run in New Tab", "Select All", "Clear"]);
+        // Their hints are the main menu's (Select All has none on Linux).
+        let km = crate::keymap::KeyMap::defaults();
+        let main = context_menu_hints(&km);
+        assert_eq!(menu_hint(&km, "Select All"), main[3]);
+        assert_eq!(menu_hint(&km, "Clear"), main[4]);
     }
 
     #[test]
