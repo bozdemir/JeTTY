@@ -6,11 +6,11 @@
 //! textured quad drawn at its NATIVE pixel size at the placement anchor; images
 //! are uploaded ONCE and cached under a VRAM byte budget with frame-counter LRU.
 //!
-//! PER-WINDOW: wgpu textures / views / bind groups / pipelines are device-scoped,
-//! and detached windows own their own device. So the main `App` holds one
-//! `ImageLayer` on the main device and each `DetachedWindow` holds its own — the
-//! decoded RGBA lives device-independent in `jetty_core`; each layer uploads it to
-//! ITS device on demand (exactly like `dw.crt`).
+//! PER-WINDOW: the main `App` holds one `ImageLayer` and each `DetachedWindow`
+//! its own (every window normally shares ONE device — `GpuShared` — but a window
+//! the shared adapter cannot present to gets a device of its own). The decoded
+//! RGBA lives device-independent in `jetty_core`; each layer uploads it to ITS
+//! window's device on demand (exactly like `dw.crt`).
 //!
 //! Color: image textures are `Rgba8UnormSrgb`, so the sampler auto-linearizes and
 //! the sRGB render target auto-encodes — the decoded sixel RGBA (sRGB) needs no
