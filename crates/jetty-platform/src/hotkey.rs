@@ -32,6 +32,21 @@ pub const MOD_SUPER: u16 = 1 << 6;
 #[cfg(any(test, all(unix, not(target_os = "macos"))))]
 const IGNORED_MODS: [u16; 4] = [0, 1 << 4, 1 << 1, (1 << 4) | (1 << 1)];
 
+/// The key a hotkey grabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotkeyKey {
+    /// The keysym the key types — how letters, F-keys and the other named keys
+    /// are found: the key typing it unshifted, else with Shift; never one that
+    /// types it only with AltGr, which the grab doesn't hold (a press of that
+    /// key without AltGr types something else).
+    pub keysym: u32,
+    /// The XKB name of the physical key (`*b"TLDE"`, `*b"AE01"` …), for keys
+    /// named by their position — the digit row and the symbol keys, whose
+    /// characters move between keys and levels from layout to layout. Looked
+    /// up first.
+    pub position: Option<[u8; 4]>,
+}
+
 /// Why the hotkey could not be installed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HotkeyError {
@@ -90,14 +105,14 @@ impl PressFilter {
     }
 }
 
-/// Grab `keysym` with `mods` (`MOD_*` bits) on the root window of `$DISPLAY`,
+/// Grab `key` with `mods` (`MOD_*` bits) on the root window of `$DISPLAY`,
 /// report the outcome through `ready`, then call `on_press` for every press until
 /// it returns `false` or the X connection closes. Blocks the calling thread for
 /// that whole time (run it on a thread of its own); while no key is pressed the
 /// thread sleeps in the kernel.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn run_x11_hotkey(
-    keysym: u32,
+    key: HotkeyKey,
     mods: u16,
     ready: impl FnOnce(Result<(), HotkeyError>),
     mut on_press: impl FnMut() -> bool,
@@ -113,7 +128,11 @@ pub fn run_x11_hotkey(
         return ready(Err(HotkeyError::NoDisplay("no X screen".into())));
     };
     detectable_auto_repeat(&conn);
-    let keycode = match keycode_for(&conn, keysym) {
+    let found = match key.position.and_then(|name| keycode_named(&conn, name)) {
+        Some(k) => Ok(Some(k)),
+        None => keycode_for(&conn, key.keysym),
+    };
+    let keycode = match found {
         Ok(Some(k)) => k,
         Ok(None) => return ready(Err(HotkeyError::NoKeycode)),
         Err(e) => return ready(Err(HotkeyError::Failed(e))),
@@ -163,8 +182,8 @@ fn detectable_auto_repeat(conn: &impl x11rb::connection::Connection) {
     }
 }
 
-/// The first keycode whose keyboard mapping carries `keysym` (the `global-hotkey`
-/// lookup, so a configured hotkey binds the same key as before).
+/// The keycode that types `keysym` on the current keyboard mapping
+/// ([`keycode_typing`]).
 #[cfg(all(unix, not(target_os = "macos")))]
 fn keycode_for(conn: &impl x11rb::connection::Connection, keysym: u32) -> Result<Option<u8>, String> {
     use x11rb::protocol::xproto::ConnectionExt as _;
@@ -176,13 +195,46 @@ fn keycode_for(conn: &impl x11rb::connection::Connection, keysym: u32) -> Result
         .map_err(|e| e.to_string())?
         .reply()
         .map_err(|e| e.to_string())?;
-    let per = usize::from(map.keysyms_per_keycode).max(1);
-    Ok(map
-        .keysyms
-        .chunks(per)
-        .position(|syms| syms.contains(&keysym))
+    Ok(keycode_typing(&map.keysyms, usize::from(map.keysyms_per_keycode), min, keysym))
+}
+
+/// The first keycode a core keyboard mapping (`per` keysyms for each keycode
+/// from `min`) gives `keysym` at level 1 — unshifted — of group 1 or 2, else
+/// at level 2 (Shift). A core mapping lists group 1's levels 1–2, then group
+/// 2's, then the higher levels: a keysym only there needs AltGr, which the
+/// grab doesn't hold — the old "anywhere" search made `Ctrl+Backquote` on
+/// Turkish-Q grab Ctrl+the comma key (`grave` is its AltGr level), taking
+/// JeTTY's own Ctrl+, from it.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn keycode_typing(syms: &[u32], per: usize, min: u8, keysym: u32) -> Option<u8> {
+    let keys = || syms.chunks(per.max(1));
+    [[0, 2], [1, 3]]
+        .into_iter()
+        .find_map(|levels| keys().position(|k| levels.iter().any(|&l| k.get(l) == Some(&keysym))))
         .and_then(|i| u8::try_from(i).ok())
-        .map(|i| min.saturating_add(i)))
+        .map(|i| min.saturating_add(i))
+}
+
+/// The keycode XKB names `name` (`*b"TLDE"`) — a key's position, whatever the
+/// layout types there. `None` without XKB or when no key has the name.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn keycode_named(conn: &impl x11rb::connection::Connection, name: [u8; 4]) -> Option<u8> {
+    use x11rb::protocol::xkb::{self, ConnectionExt as _};
+    let names = conn
+        .xkb_get_names(xkb::ID::USE_CORE_KBD.into(), xkb::NameDetail::KEY_NAMES)
+        .ok()?
+        .reply()
+        .ok()?;
+    let keys: Vec<[u8; 4]> = names.value_list.key_names?.iter().map(|k| k.name).collect();
+    keycode_with_name(&keys, names.first_key, name)
+}
+
+/// The keycode of the key named `name` among XKB's key names for the keycodes
+/// from `first`.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn keycode_with_name(names: &[[u8; 4]], first: u8, name: [u8; 4]) -> Option<u8> {
+    let i = names.iter().position(|n| *n == name)?;
+    first.checked_add(u8::try_from(i).ok()?)
 }
 
 /// Grab `keycode` + `mods` on `root` with every NumLock/CapsLock combination. A
@@ -263,6 +315,63 @@ mod tests {
         assert!(f.press(F9, 0));
         f.release(F9 + 1);
         assert!(!f.press(F9, 0), "another key's release does not re-arm");
+    }
+
+    // Keysyms (X11 keysymdef.h).
+    const GRAVE: u32 = 0x60;
+    const COMMA: u32 = 0x2c;
+    const SEMICOLON: u32 = 0x3b;
+    const QUOTEDBL: u32 = 0x22;
+    const LESS: u32 = 0x3c;
+    const NOSYMBOL: u32 = 0;
+
+    /// keycodes 49–51 of `setxkbmap tr` (xmodmap -pke on Xvfb): TLDE, Shift_L,
+    /// BKSL — 7 keysyms each: group 1 levels 1–2, group 2's, then levels 3–4.
+    fn turkish_q() -> Vec<u32> {
+        vec![
+            QUOTEDBL, 0xe9, QUOTEDBL, 0xe9, LESS, 0xb0, LESS, // 49 TLDE: " é, AltGr <
+            0xffe1, NOSYMBOL, 0xffe1, NOSYMBOL, NOSYMBOL, NOSYMBOL, NOSYMBOL, // 50 Shift_L
+            COMMA, SEMICOLON, COMMA, SEMICOLON, GRAVE, 0xfe50, GRAVE, // 51 BKSL: , ; AltGr `
+        ]
+    }
+
+    #[test]
+    fn a_keysym_only_altgr_types_grabs_no_key() {
+        // Ctrl+Backquote on Turkish-Q: `grave` is the comma key's AltGr level —
+        // grabbing that key took Ctrl+, (JeTTY's Settings chord) and never fired
+        // on a press that types a backquote.
+        let tr = turkish_q();
+        assert_eq!(keycode_typing(&tr, 7, 49, GRAVE), None);
+        assert_eq!(keycode_typing(&tr, 7, 49, LESS), None);
+        // Levels 1 and 2 are the key's own.
+        assert_eq!(keycode_typing(&tr, 7, 49, COMMA), Some(51));
+        assert_eq!(keycode_typing(&tr, 7, 49, SEMICOLON), Some(51));
+        assert_eq!(keycode_typing(&tr, 7, 49, QUOTEDBL), Some(49));
+        // US: `grave` is TLDE's level 1.
+        let us = [GRAVE, 0x7e, GRAVE, 0x7e];
+        assert_eq!(keycode_typing(&us, 4, 49, GRAVE), Some(49));
+    }
+
+    #[test]
+    fn level_1_wins_and_a_second_group_counts() {
+        // `T` (Shift) on keycode 10, `T` unshifted on keycode 11: the unshifted one.
+        let syms = [0x74, 0x54, 0x74, 0x54, 0x54, 0x74, 0x54, 0x74];
+        assert_eq!(keycode_typing(&syms, 4, 10, 0x54), Some(11));
+        // ru,us: Cyrillic in group 1, the T key's `t` / `T` in group 2.
+        let ru_us = [0x6c5, 0x6e5, 0x74, 0x54];
+        assert_eq!(keycode_typing(&ru_us, 4, 28, 0x54), Some(28));
+        assert_eq!(keycode_typing(&ru_us, 4, 28, 0x74), Some(28));
+        // A narrow mapping (2 keysyms per keycode) is read the same way.
+        assert_eq!(keycode_typing(&[COMMA, SEMICOLON, GRAVE, 0x7e], 2, 8, GRAVE), Some(9));
+    }
+
+    #[test]
+    fn a_position_is_found_by_its_xkb_name() {
+        let names = [*b"TLDE", *b"LFSH", *b"BKSL"];
+        assert_eq!(keycode_with_name(&names, 49, *b"TLDE"), Some(49));
+        assert_eq!(keycode_with_name(&names, 49, *b"BKSL"), Some(51));
+        assert_eq!(keycode_with_name(&names, 49, *b"AE01"), None);
+        assert_eq!(keycode_with_name(&names, 254, *b"BKSL"), None, "past keycode 255");
     }
 
     #[test]

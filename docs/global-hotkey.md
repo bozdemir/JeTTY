@@ -11,6 +11,11 @@ reported in the window — not only on stderr.
 On X11, Jetty automatically registers a system-wide grab of the summon key at
 startup using the `global-hotkey` crate. No configuration is needed.
 
+Key names are `global-hotkey`'s (`F12`, `KeyT`, `Digit1`, `Backquote`, `Space`
+…). A letter is the key your layout labels with it; the digit row and the
+symbol keys are positions — `Ctrl+Backquote` is the key below Esc whatever it
+types, as on macOS.
+
 F9 does what you'd expect from the window's state:
 
 - **hidden** → summons it;

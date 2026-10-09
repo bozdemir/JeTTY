@@ -5,11 +5,14 @@
 //!
 //! The key table is `global-hotkey` 0.8's own (`platform_impl/x11`, Apache-2.0
 //! OR MIT, © Tauri Programme within The Commons Conservancy), so a configured
-//! hotkey grabs exactly the key it did before — with two upstream slips fixed:
-//! `NumLock` named F1's keysym, and `Quote` a keysym no layout carries.
+//! hotkey grabs the key it did before — with two upstream slips fixed:
+//! `NumLock` named F1's keysym, and `Quote` a keysym no layout carries. The
+//! digit row and the symbol keys go by position ([`position`]), as their names
+//! say and as on macOS: their keysyms move between keys and levels from layout
+//! to layout.
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use jetty_platform::hotkey::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_SUPER};
+use jetty_platform::hotkey::{HotkeyKey, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_SUPER};
 use xkeysym::key;
 
 /// The X11 keysym bound for `code` (`None`: the key has no X11 binding).
@@ -133,6 +136,38 @@ pub(crate) fn keysym(code: Code) -> Option<u32> {
     })
 }
 
+/// The XKB name of the key at `code`'s position, for the digit row and the
+/// symbol keys: `Ctrl+Backquote` is the key below Esc on every layout, as on
+/// macOS — by keysym it was a key typing a backquote anywhere, which on
+/// Turkish-Q is the comma key's AltGr level. Letters and named keys go by
+/// keysym (`None`).
+pub(crate) fn position(code: Code) -> Option<[u8; 4]> {
+    Some(*match code {
+        Code::Backquote => b"TLDE",
+        Code::Digit1 => b"AE01",
+        Code::Digit2 => b"AE02",
+        Code::Digit3 => b"AE03",
+        Code::Digit4 => b"AE04",
+        Code::Digit5 => b"AE05",
+        Code::Digit6 => b"AE06",
+        Code::Digit7 => b"AE07",
+        Code::Digit8 => b"AE08",
+        Code::Digit9 => b"AE09",
+        Code::Digit0 => b"AE10",
+        Code::Minus => b"AE11",
+        Code::Equal => b"AE12",
+        Code::BracketLeft => b"AD11",
+        Code::BracketRight => b"AD12",
+        Code::Backslash => b"BKSL",
+        Code::Semicolon => b"AC10",
+        Code::Quote => b"AC11",
+        Code::Comma => b"AB08",
+        Code::Period => b"AB09",
+        Code::Slash => b"AB10",
+        _ => return None,
+    })
+}
+
 /// `mods` as X11 modifier bits (Super and Meta are both Mod4, as upstream).
 pub(crate) fn mods(mods: Modifiers) -> u16 {
     let mut x = 0;
@@ -159,7 +194,8 @@ pub(crate) fn run(hotkey: HotKey, ready: impl FnOnce(Result<(), String>), on_pre
     let Some(sym) = keysym(hotkey.key) else {
         return ready(Err(format!("{} has no X11 key", hotkey.key)));
     };
-    jetty_platform::hotkey::run_x11_hotkey(sym, mods(hotkey.mods), |r| ready(r.map_err(|e| e.to_string())), on_press);
+    let key = HotkeyKey { keysym: sym, position: position(hotkey.key) };
+    jetty_platform::hotkey::run_x11_hotkey(key, mods(hotkey.mods), |r| ready(r.map_err(|e| e.to_string())), on_press);
 }
 
 #[cfg(test)]
@@ -185,6 +221,28 @@ mod tests {
         for n in 1..=24u32 {
             let hk = HotKey::from_str(&format!("F{n}")).unwrap();
             assert_eq!(keysym(hk.key), Some(key::F1 + n - 1), "F{n}");
+        }
+    }
+
+    #[test]
+    fn the_digit_row_and_the_symbol_keys_go_by_position() {
+        let grave = HotKey::from_str("Ctrl+Backquote").unwrap();
+        assert_eq!(position(grave.key), Some(*b"TLDE"));
+        for (code, name) in [
+            (Code::Digit1, b"AE01"),
+            (Code::Digit0, b"AE10"),
+            (Code::Minus, b"AE11"),
+            (Code::BracketRight, b"AD12"),
+            (Code::Backslash, b"BKSL"),
+            (Code::Quote, b"AC11"),
+            (Code::Slash, b"AB10"),
+        ] {
+            assert_eq!(position(code), Some(*name), "{code}");
+            assert!(keysym(code).is_some(), "{code} keeps its keysym (the fallback)");
+        }
+        // Letters, F-keys and the other named keys go by keysym.
+        for code in [Code::KeyT, Code::F9, Code::Space, Code::Enter, Code::Numpad5] {
+            assert_eq!(position(code), None, "{code}");
         }
     }
 
