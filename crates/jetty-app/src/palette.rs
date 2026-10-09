@@ -53,6 +53,8 @@ pub enum PaletteCmd {
     ToggleColorEmoji,
     ToggleBoldIsBright,
     ShowWelcome,
+    /// The window's keyboard-shortcuts help (the "?" button's overlay).
+    ShowHelp,
     Search,
     HintMode,
     CopyMode,
@@ -293,7 +295,7 @@ pub fn build_registry(
     tabs: &[(u64, String)],
     detached: &[(u64, String)],
 ) -> Vec<PaletteEntry> {
-    let statics: [(&str, &str, PaletteCmd); 43] = [
+    let statics: [(&str, &str, PaletteCmd); 44] = [
         ("New tab", "create open window shell", PaletteCmd::NewTab),
         ("Close tab", "kill remove", PaletteCmd::CloseTab),
         ("Next tab", "cycle switch forward", PaletteCmd::NextTab),
@@ -326,6 +328,7 @@ pub fn build_registry(
         ("Toggle color emoji", "emoji colour smiley font", PaletteCmd::ToggleColorEmoji),
         ("Toggle bold is bright", "bold bright colors ansi palette xterm", PaletteCmd::ToggleBoldIsBright),
         ("Show welcome screen", "splash about neofetch", PaletteCmd::ShowWelcome),
+        ("Help: keyboard shortcuts", "show keys bindings hotkeys cheat sheet list ?", PaletteCmd::ShowHelp),
         ("Search scrollback…", "find grep filter", PaletteCmd::Search),
         ("Hint mode: label URLs/paths", "hint link url path hash copy open keyboard", PaletteCmd::HintMode),
         ("Copy-mode: keyboard select", "copy mode select vi cursor yank keyboard", PaletteCmd::CopyMode),
@@ -559,6 +562,17 @@ mod tests {
         }
         assert_eq!(filter(&r, "reduce motion")[0].cmd, PaletteCmd::CycleReduceMotion);
         assert_eq!(filter(&r, "cursor trail")[0].cmd, PaletteCmd::ToggleCursorTrail);
+    }
+
+    /// The shortcut list is one palette search away (the "?" button was its
+    /// only way in).
+    #[test]
+    fn registry_contains_the_keyboard_shortcuts() {
+        let r = reg();
+        assert_eq!(r.iter().filter(|e| e.cmd == PaletteCmd::ShowHelp).count(), 1);
+        for q in ["help", "shortcuts", "keyboard shortcuts", "cheat sheet", "?"] {
+            assert_eq!(filter(&r, q)[0].cmd, PaletteCmd::ShowHelp, "top hit for {q:?}");
+        }
     }
 
     #[test]

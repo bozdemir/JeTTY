@@ -6676,6 +6676,12 @@ impl App {
                 self.request_main_paint();
                 reveal_main(self, event_loop);
             }
+            // Opened in the palette's window (the palette closed it, if open).
+            C::ShowHelp => {
+                if self.ov_of(s).is_some_and(|o| !o.help_open) {
+                    self.toggle_help(s);
+                }
+            }
             C::Search => self.search_open(s),
             // The palette has already closed (run_palette_cmd runs after
             // close_palette); the mode takes the window's keyboard, closing a
