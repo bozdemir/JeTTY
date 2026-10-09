@@ -10,7 +10,7 @@ use glyphon::{
 use jetty_core::{CellSnapshot, GridSnapshot};
 use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::Hasher;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use unicode_width::UnicodeWidthChar;
 use wgpu::MultisampleState;
 
@@ -159,6 +159,22 @@ fn draws_text(db: &Database, id: ID) -> bool {
 /// text-default symbol (✔ ❤ ☐ stay on the font unless a VS16 follows).
 fn is_color_emoji_char(c: char) -> bool {
     emoji::is_emoji_presentation(c) && c.width() == Some(2)
+}
+
+/// Whether `c` is a REGIONAL INDICATOR letter (U+1F1E6–1F1FF): two in a row
+/// spell a flag.
+fn is_regional_indicator(c: char) -> bool {
+    ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
+}
+
+/// The flag two REGIONAL INDICATOR letters spell, as one string — from a table
+/// of all 26 × 26, built on the first flag drawn.
+fn flag_str(a: char, b: char) -> &'static str {
+    static FLAGS: OnceLock<Vec<String>> = OnceLock::new();
+    let letter = |i: u32| char::from_u32(0x1F1E6 + i).unwrap_or(' ');
+    let flags = FLAGS.get_or_init(|| (0..26 * 26).map(|i| [letter(i / 26), letter(i % 26)].iter().collect()).collect());
+    let index = |c: char| (c as usize).saturating_sub(0x1F1E6).min(25);
+    &flags[index(a) * 26 + index(b)]
 }
 
 /// Whether a glyph of advance `w` (px) is laid out exactly one cell wide in a
@@ -462,6 +478,11 @@ enum CellRoute {
     /// A color emoji (`color_emoji`): blank in the row, overdrawn from the emoji
     /// font, scaled and centred across its two cells.
     Emoji,
+    /// A REGIONAL INDICATOR letter while color emoji are drawn. The VT engine
+    /// gives each letter its own cell, so two in a row (counted from the start
+    /// of a run of them) are one flag, drawn as one color emoji across both
+    /// cells; a lone letter is overdrawn like any glyph the font lacks.
+    Flag,
 }
 
 /// Upper bound on the number of distinct shaped fallback (overdraw) glyph
@@ -850,6 +871,34 @@ impl PackedGrid<'_> {
     }
 }
 
+/// The index of `key` (a clamped cluster of `n` chars, and its style) among a
+/// frame's distinct clusters, added while the frame is within its budgets —
+/// `GRAPHEME_GLYPH_CAP` distinct clusters, `GRAPHEME_FRAME_CHARS` chars across
+/// all cells (`chars` so far); `None` past them.
+fn intern_cluster<'a>(
+    clusters: &mut Vec<(&'a str, u8)>,
+    index: &mut FxHashMap<(&'a str, u8), u32>,
+    chars: &mut usize,
+    key: (&'a str, u8),
+    n: usize,
+) -> Option<u32> {
+    if n == 0 || *chars + n > GRAPHEME_FRAME_CHARS {
+        return None;
+    }
+    let ci = match index.get(&key) {
+        Some(&ci) => ci,
+        None if clusters.len() < GRAPHEME_GLYPH_CAP => {
+            let ci = clusters.len() as u32;
+            clusters.push(key);
+            index.insert(key, ci);
+            ci
+        }
+        None => return None,
+    };
+    *chars += n;
+    Some(ci)
+}
+
 /// Pack every cell of `snapshot` (pure: no GPU, no font system — `route` answers
 /// whether a char must be overdrawn). Applies the paint inputs (selection colors,
 /// the block-cursor glyph color) and the grapheme overrides under their budgets:
@@ -860,7 +909,8 @@ impl PackedGrid<'_> {
 ///
 /// `color_emoji`: emoji clusters (VS16 / ZWJ, see `emoji::is_emoji_cluster`) are
 /// drawn as color emoji — sized to two cells, or squeezed into one (`half`) when
-/// a narrow base char's right neighbour is not blank.
+/// a narrow base char's right neighbour is not blank. Flags (`CellRoute::Flag`)
+/// are clusters too.
 fn pack_grid<'a>(
     snapshot: &GridSnapshot,
     paint: &GridPaint<'a>,
@@ -903,6 +953,8 @@ fn pack_grid<'a>(
     for row in 0..rows {
         let mut h = FxHasher::default();
         let mut inked = false;
+        // The cell after a flag's first letter: its letter is drawn already.
+        let mut flag_tail = false;
         for col in 0..cols {
             let cell = snapshot.cell(row, col);
             crate::quad::fold_decoration(&mut deco_hasher, cell);
@@ -942,20 +994,7 @@ fn pack_grid<'a>(
                 // has no bold or italic: one buffer for every style).
                 let is_emoji = color_emoji && emoji::is_emoji_cluster(cluster);
                 let key = (cluster, if is_emoji { 0 } else { cell.shape_bits() });
-                let ci = if n == 0 || cluster_chars + n > GRAPHEME_FRAME_CHARS {
-                    None
-                } else if let Some(&ci) = cluster_index.get(&key) {
-                    Some(ci)
-                } else if clusters.len() < GRAPHEME_GLYPH_CAP {
-                    let ci = clusters.len() as u32;
-                    clusters.push(key);
-                    cluster_index.insert(key, ci);
-                    Some(ci)
-                } else {
-                    None
-                };
-                if let Some(ci) = ci {
-                    cluster_chars += n;
+                if let Some(ci) = intern_cluster(&mut clusters, &mut cluster_index, &mut cluster_chars, key, n) {
                     // An emoji on a NARROW base (`❤️`: VS16 does not widen the
                     // cell) spans two cells only when its right neighbour is blank;
                     // otherwise it is squeezed into its own cell.
@@ -988,6 +1027,34 @@ fn pack_grid<'a>(
                         ch = ' ';
                     }
                     CellRoute::Blank => ch = ' ',
+                    CellRoute::Flag if flag_tail => {
+                        // The flag's second letter, drawn with the first.
+                        flag_tail = false;
+                        ch = ' ';
+                    }
+                    CellRoute::Flag => {
+                        // A first letter: with the next cell's letter (when that
+                        // cell has no cluster of its own) it is one flag, drawn
+                        // across both cells; a lone letter is an overdraw.
+                        let next = (col + 1 < cols).then(|| snapshot.cell(row, col + 1).c);
+                        let next_override = order[g_next..]
+                            .iter()
+                            .map(|&i| g_pos(i))
+                            .take_while(|&p| p <= (row, col + 1))
+                            .any(|p| p == (row, col + 1));
+                        let second = next.filter(|&c| is_regional_indicator(c) && !next_override);
+                        let ci = second.and_then(|second| {
+                            let key = (flag_str(ch, second), 0);
+                            intern_cluster(&mut clusters, &mut cluster_index, &mut cluster_chars, key, 2)
+                        });
+                        if let Some(ci) = ci {
+                            graphemes.push((col as f32 * cell_w, row as f32 * cell_h, ci, fg, false));
+                            flag_tail = true;
+                        } else {
+                            fallback.push((col as f32 * cell_w, row as f32 * cell_h, ch, cell.shape_bits(), fg));
+                        }
+                        ch = ' ';
+                    }
                 }
             }
             inked |= ch != ' ';
@@ -1719,6 +1786,9 @@ impl TextLayer {
         }
         if is_color_emoji_char(c) && self.active_emoji_family().is_some() {
             return CellRoute::Emoji;
+        }
+        if is_regional_indicator(c) && self.active_emoji_family().is_some() {
+            return CellRoute::Flag;
         }
         let fam = Arc::clone(&self.font_family);
         probe_route(&mut self.font_system, &mut self.coverage_buffer, &fam, self.face_weights, c, shape, self.cell_w)
@@ -2850,6 +2920,8 @@ mod tests {
             CellRoute::Builtin(s)
         } else if emoji::is_emoji_presentation(c) && c.width() == Some(2) {
             CellRoute::Emoji
+        } else if is_regional_indicator(c) {
+            CellRoute::Flag
         } else {
             CellRoute::Inline
         }
@@ -2933,6 +3005,40 @@ mod tests {
             let packed = pack_grid(&g, &paint, 10.0, 20.0, &mut test_route, false, PackScratch::default());
             assert!(!packed.graphemes[0].4);
         }
+    }
+
+    #[test]
+    fn regional_indicator_pairs_draw_as_one_flag() {
+        // The VT engine gives each REGIONAL INDICATOR letter a cell of its own
+        // (unicode width 1), so 🇹🇷 arrives as two cells and was drawn as two
+        // overlapping letters.
+        let mut term = jetty_core::Terminal::new(10, 2);
+        term.feed("🇹🇷".as_bytes());
+        let snap = term.snapshot();
+        assert_eq!((snap.cell(0, 0).c, snap.cell(0, 1).c), ('🇹', '🇷'));
+        // Pairs count from the start of a run: two flags across two cells each,
+        // a lone fifth letter, and no flag when the second cell has a cluster of
+        // its own.
+        let g = text_grid("🇹🇷🇺🇸🇯 🇫🇷", 10);
+        let overrides = [(0usize, 7usize, "🇷\u{301}")];
+        let paint = GridPaint { graphemes: &overrides, ..Default::default() };
+        let packed = pack_grid(&g, &paint, 10.0, 20.0, &mut test_route, true, PackScratch::default());
+        let drawn: Vec<(f32, &str, bool)> =
+            packed.graphemes.iter().map(|&(x, _, ci, _, half)| (x, packed.clusters[ci as usize].0, half)).collect();
+        assert_eq!(drawn, vec![(0.0, "🇹🇷", false), (20.0, "🇺🇸", false), (70.0, "🇷\u{301}", false)]);
+        assert!(packed.clusters.iter().all(|&(c, s)| s == 0 || c.starts_with('🇷')), "a flag has no style");
+        let lone: Vec<(f32, char)> = packed.fallback.iter().map(|f| (f.0, f.2)).collect();
+        assert_eq!(lone, vec![(40.0, '🇯'), (60.0, '🇫')]);
+        assert_eq!(packed.row_hashes, vec![0], "every letter left the row");
+        // Never across a line end.
+        let mut g = text_grid("", 3);
+        g.rows = 2;
+        g.cells = vec![jetty_core::CellSnapshot::default(); 6];
+        g.cells[2].c = '🇹';
+        g.cells[3].c = '🇷';
+        let packed = pack_grid(&g, &GridPaint::default(), 10.0, 20.0, &mut test_route, true, PackScratch::default());
+        assert!(packed.graphemes.is_empty());
+        assert_eq!(packed.fallback.len(), 2);
     }
 
     #[test]
