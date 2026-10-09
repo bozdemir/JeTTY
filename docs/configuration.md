@@ -81,7 +81,7 @@ Names of fonts and themes are matched in any letter case, and a theme by its id
 |---|---|---|
 | `window_mode` | `"center"` | How the summon hotkey shows the window: `"center"` (centered, or where you left it), `"dropdown"` (a full-width strip that slides down from the top) or `"fullscreen"` (the whole monitor). `F11` toggles fullscreen for the moment without changing this. |
 | `dropdown_height_pct` | `0.5` | The dropdown's height as a fraction of the monitor, `0.25`–`1`. |
-| `dropdown_width_pct` | `1.0` | The dropdown's width as a fraction of the monitor, `0.2`–`1` (no Settings control). |
+| `dropdown_width_pct` | `1.0` | The dropdown's width as a fraction of the monitor, `0.2`–`1`. |
 | `corner_radius` | `10.0` | Window corner radius in logical pixels, `0`–`24`. |
 | `padding_x` | `8.0` | Space between the window's left and right edges and the text, in logical pixels, `0`–`64`. The scrollbar lives in the right padding. |
 | `padding_y` | `4.0` | Space above and below the text, in logical pixels, `0`–`64`. |

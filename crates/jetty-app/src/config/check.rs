@@ -903,6 +903,12 @@ mod tests {
                 problems.push(format!("`{path}` is documented but JeTTY does not read it"));
                 continue;
             }
+            // A note that sends the reader to the file must stay true: the
+            // dropdown width kept its "(no Settings control)" for releases after
+            // Settings grew one.
+            if line.contains("no Settings control") && crate::settings_ui::find(&path).is_some() {
+                problems.push(format!("`{path}` says it has no Settings control, but Settings has one"));
+            }
             let src = cells[1].trim_matches('`');
             let doc_value = toml::from_str::<toml::Table>(&format!("v = {src}")).ok().and_then(|t| t.get("v").cloned());
             let parts: Vec<String> = path.split('.').map(str::to_string).collect();
