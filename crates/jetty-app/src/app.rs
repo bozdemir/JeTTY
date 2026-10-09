@@ -8946,7 +8946,7 @@ impl App {
     fn set_font_family(&mut self, name: String) -> Option<String> {
         let text = self.text.as_ref();
         let pick = crate::config::check::pick_font_family(&name, &self.font_families, || {
-            text.map(TextLayer::proportional_families).unwrap_or_default()
+            text.map(TextLayer::other_families).unwrap_or_default()
         });
         self.font_family_chosen = name;
         self.font_family = pick.shown;
@@ -13134,7 +13134,13 @@ impl ApplicationHandler<AppEvent> for App {
         // then we join after the GPU is ready. Window/surface stay on the main
         // thread (they are !Send). The PTY is spawned at a provisional grid and
         // resized to the real cols/rows once the cell size is known.
-        let font_handle = std::thread::spawn(TextLayer::build_font_system);
+        // The worker also lists the terminal fonts: one cmap read per fixed-pitch
+        // family (the letterless ones are left out), off the critical path.
+        let font_handle = std::thread::spawn(|| {
+            let fonts = TextLayer::build_font_system();
+            let mono = TextLayer::monospace_families_in(fonts.db());
+            (fonts, mono)
+        });
         // System appearance known synchronously: winit's system theme (macOS,
         // Windows; `None` on X11/Wayland), or the portal's first reading if it is
         // already in. Decided before the window exists, so the first frame and the
@@ -13254,7 +13260,7 @@ impl ApplicationHandler<AppEvent> for App {
         }
         // GPU is ready — join the font worker (its ~20ms load happened in
         // parallel with the GPU block above, so this join is typically free).
-        let font_system = font_handle.join().expect("font worker panicked");
+        let (font_system, mono_families) = font_handle.join().expect("font worker panicked");
         let (text, quad, cols, rows) = if let Some(ref g) = gpu {
             let mut text = TextLayer::new_with_family_and_fonts(
                 &g.device, &g.queue, g.format, self.font_logical * scale, &self.font_family,
@@ -13265,10 +13271,10 @@ impl ApplicationHandler<AppEvent> for App {
             // from another machine) left the grid to the font engine's own
             // fallback, which need not be monospace. Shown only: the chosen
             // family is kept (and saved) for when it is installed again.
-            self.font_families = text.monospace_families();
+            self.font_families = mono_families;
             eprintln!("jetty: found {} monospace families", self.font_families.len());
             let pick = crate::config::check::pick_font_family(&self.font_family, &self.font_families, || {
-                text.proportional_families()
+                text.other_families()
             });
             if pick.shown != self.font_family {
                 eprintln!("jetty: font {:?} is not installed — using {:?}", self.font_family, pick.shown);

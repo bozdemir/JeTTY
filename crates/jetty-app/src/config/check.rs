@@ -742,20 +742,13 @@ fn is_executable(shell: &str) -> bool {
 }
 
 /// The installed font families, `(monospace, every other)` — what the font
-/// pickers list — from a fresh font database.
+/// pickers list, split as the app splits them (a fixed-pitch family without
+/// letters is no terminal font) — from a fresh font database.
 fn installed_fonts() -> (Vec<String>, Vec<String>) {
-    let fonts = jetty_render::TextLayer::build_font_system();
-    let (mut mono, mut other) = (Vec::new(), Vec::new());
-    for face in fonts.db().faces() {
-        if let Some((name, _)) = face.families.first() {
-            let list: &mut Vec<String> = if face.monospaced { &mut mono } else { &mut other };
-            if !list.contains(name) {
-                list.push(name.clone());
-            }
-        }
-    }
-    mono.sort();
-    other.sort();
+    use jetty_render::TextLayer;
+    let fonts = TextLayer::build_font_system();
+    let mono = TextLayer::monospace_families_in(fonts.db());
+    let other = TextLayer::other_families_in(fonts.db(), &mono);
     (mono, other)
 }
 

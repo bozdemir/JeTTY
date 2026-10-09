@@ -139,6 +139,21 @@ fn wght_axis_range(db: &Database, id: ID) -> Option<(u16, u16)> {
     })?
 }
 
+/// Whether face `id` sets text: it maps the basic Latin letters. A terminal
+/// font needs them — Noto Color Emoji marks itself fixed-pitch, and so does a
+/// symbol font, yet neither has a letter. Reads the face's cmap (its font file,
+/// memory-mapped).
+fn draws_text(db: &Database, id: ID) -> bool {
+    use glyphon::cosmic_text::skrifa::{FontRef, MetadataProvider};
+    db.with_face_data(id, |data, index| {
+        FontRef::from_index(data, index).is_ok_and(|font| {
+            let map = font.charmap();
+            ['M', 'a'].into_iter().all(|c| map.map(c).is_some())
+        })
+    })
+    .unwrap_or(false)
+}
+
 /// A char drawn as a color emoji (when an emoji font is installed and
 /// `color_emoji` is on): wide and emoji-presentation (😀 ✅ 🚀) — never a
 /// text-default symbol (✔ ❤ ☐ stay on the font unless a VS16 follows).
@@ -1237,17 +1252,34 @@ impl TextLayer {
     }
 
     /// Returns the sorted, deduplicated list of monospaced font family names
-    /// known to the font system. Uses `fontdb::FaceInfo::monospaced` to detect
-    /// monospace faces; falls back to name-based matching when the flag is absent.
+    /// known to the font system — the terminal fonts (see
+    /// [`Self::monospace_families_in`]).
     pub fn monospace_families(&self) -> Vec<String> {
+        Self::monospace_families_in(self.font_system.db())
+    }
+
+    /// Every installed family [`Self::monospace_families`] leaves out, sorted:
+    /// the proportional ones and the fixed-pitch ones without letters — what a
+    /// hand-written `font_family` may still name.
+    pub fn other_families(&self) -> Vec<String> {
+        let db = self.font_system.db();
+        Self::other_families_in(db, &Self::monospace_families_in(db))
+    }
+
+    /// The terminal fonts of `db`, sorted and deduplicated: the families whose
+    /// faces `fontdb::FaceInfo::monospaced` marks (by name when no face has the
+    /// flag) and that set text (`draws_text` — Noto Color Emoji marks itself
+    /// fixed-pitch, and the Settings font list offered it). One cmap read per
+    /// fixed-pitch family.
+    pub fn monospace_families_in(db: &Database) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut families: Vec<String> = Vec::new();
 
-        for face in self.font_system.db().faces() {
+        for face in db.faces() {
             if face.monospaced {
                 // The first family entry is always English US.
                 if let Some((name, _)) = face.families.first() {
-                    if seen.insert(name.clone()) {
+                    if seen.insert(name.clone()) && draws_text(db, face.id) {
                         families.push(name.clone());
                     }
                 }
@@ -1257,10 +1289,10 @@ impl TextLayer {
         // Fallback: if nothing was found via the flag, collect by name patterns.
         if families.is_empty() {
             let keywords = ["Mono", "Code", "Consolas", "Menlo", "Meslo", "Term", "Fixed"];
-            for face in self.font_system.db().faces() {
+            for face in db.faces() {
                 if let Some((name, _)) = face.families.first() {
                     let matches = keywords.iter().any(|kw| name.contains(kw));
-                    if matches && seen.insert(name.clone()) {
+                    if matches && seen.insert(name.clone()) && draws_text(db, face.id) {
                         families.push(name.clone());
                     }
                 }
@@ -1268,6 +1300,19 @@ impl TextLayer {
         }
 
         families.sort();
+        families
+    }
+
+    /// Every family of `db` that is not in `mono` (the terminal fonts), sorted
+    /// and deduplicated.
+    pub fn other_families_in(db: &Database, mono: &[String]) -> Vec<String> {
+        let mut families: Vec<String> = db
+            .faces()
+            .filter_map(|f| f.families.first().map(|(n, _)| n.clone()))
+            .filter(|n| !mono.contains(n))
+            .collect();
+        families.sort();
+        families.dedup();
         families
     }
 
@@ -3202,6 +3247,38 @@ mod tests {
         // name), so cosmic-text rasterizes them from it at their wght.
         let added = fs.db().faces().find(|f| f.families[0].0 == "Variable" && f.weight.0 == 700 && f.style == i);
         assert_eq!(added.map(|f| f.post_script_name.as_str()), Some("ItalicVF"));
+    }
+
+    #[test]
+    fn the_terminal_fonts_are_the_fixed_pitch_ones_with_letters() {
+        // Noto Color Emoji marks itself fixed-pitch, so Settings offered it as a
+        // terminal font (a held ↓ in the font list picked it), and so would a
+        // symbol font: every family listed must set text. A fixed-pitch family
+        // without letters is listed with the others instead, where a
+        // hand-written `font_family` still finds it.
+        let fs = TextLayer::build_font_system();
+        let db = fs.db();
+        let mono = TextLayer::monospace_families_in(db);
+        let others = TextLayer::other_families_in(db, &mono);
+        let first_face = |family: &str| db.faces().find(|f| f.families.first().is_some_and(|(n, _)| n == family));
+        for family in &mono {
+            let face = first_face(family).expect("a listed family is installed");
+            assert!(draws_text(db, face.id), "{family:?} has no letters");
+            assert!(!others.contains(family), "{family:?} is in both lists");
+        }
+        for face in db.faces().filter(|f| f.monospaced) {
+            let Some((name, _)) = face.families.first() else { continue };
+            assert!(mono.contains(name) || others.contains(name), "{name:?} is in neither list");
+        }
+        assert!(!mono.iter().any(|f| f.contains("Emoji")), "an emoji font is no terminal font: {mono:?}");
+        // The letters test itself: a text face has them…
+        if let Some(face) = first_face(FONT_FAMILY_DEFAULT).or_else(|| mono.first().and_then(|f| first_face(f))) {
+            assert!(draws_text(db, face.id));
+        }
+        // …an emoji face does not.
+        if let Some(face) = first_face("Noto Color Emoji") {
+            assert!(!draws_text(db, face.id), "Noto Color Emoji has no letters");
+        }
     }
 
     #[test]
