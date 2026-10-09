@@ -1,5 +1,37 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// A platform display connection wgpu can hold: `HasDisplayHandle` + `Debug` +
+/// `Send` + `Sync` + `'static` (winit's `OwnedDisplayHandle` is one).
+pub use wgpu::wgt::WgpuHasDisplayHandle;
+
+/// The windowing system's display connection — the X11 `Display*`, the Wayland
+/// `wl_display` — that every JeTTY window lives on. See [`set_platform_display`].
+static PLATFORM_DISPLAY: OnceLock<Arc<dyn WgpuHasDisplayHandle>> = OnceLock::new();
+
+/// Register the windowing system's display connection (winit's
+/// `OwnedDisplayHandle`) BEFORE the first window acquires the GPU. wgpu's GL
+/// backend binds EGL to it when the instance is created; without it EGL falls back
+/// to its surfaceless platform, whose adapter can present to no window — so a
+/// machine with no Vulkan driver (a VM, an old GPU, Mesa llvmpipe only) mapped a
+/// window that was never painted. One per process, like winit's event loop: later
+/// calls are ignored. Vulkan and Metal never read it.
+pub fn set_platform_display(display: impl WgpuHasDisplayHandle) {
+    let _ = PLATFORM_DISPLAY.set(Arc::new(display));
+}
+
+/// The descriptor of an instance [`GpuContext::new`] creates for `backends`. Only
+/// an instance with the GL backend carries the platform display
+/// ([`set_platform_display`]) — GL presents through it; Vulkan never reads it, so
+/// the Vulkan-first instance stays exactly as it was.
+fn instance_descriptor(backends: wgpu::Backends) -> wgpu::InstanceDescriptor {
+    let display = if backends.contains(wgpu::Backends::GL) {
+        PLATFORM_DISPLAY.get().map(|d| Box::new(Arc::clone(d)) as Box<dyn WgpuHasDisplayHandle>)
+    } else {
+        None
+    };
+    wgpu::InstanceDescriptor { backends, display, ..wgpu::InstanceDescriptor::new_without_display_handle() }
+}
 
 /// The GPU objects every JeTTY window shares: ONE wgpu instance, adapter, device
 /// and queue. Acquiring them is the dominant GPU cost (~70–90 ms of adapter
@@ -91,13 +123,11 @@ impl GpuContext {
         // eglInitialize + GL adapter enumeration that Backends::all() pays on every
         // cold start, even though the Vulkan adapter is what gets selected anyway.
         // This is the dominant cold-start win (~78ms off gpu_init on the Intel Arc).
-        // If no Vulkan adapter is found (no working ICD), fall back to all backends.
+        // If no Vulkan adapter is found (no working ICD), fall back to all backends
+        // — with the platform display, which the GL backend presents through.
         let make_instance_surface_adapter = |backends: wgpu::Backends|
             -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter), String> {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends,
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            });
+            let instance = wgpu::Instance::new(instance_descriptor(backends));
             let surface = instance
                 .create_surface(window.clone())
                 .map_err(|e| format!("surface creation failed: {e}"))?;
@@ -441,5 +471,34 @@ impl GpuContext {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{instance_descriptor, set_platform_display};
+    use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle, RawDisplayHandle, XlibDisplayHandle};
+    use wgpu::Backends;
+
+    /// Stands in for winit's `OwnedDisplayHandle` (no X connection is opened).
+    #[derive(Debug)]
+    struct TestDisplay;
+    impl HasDisplayHandle for TestDisplay {
+        fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+            // SAFETY: never dereferenced — no instance is created from it.
+            Ok(unsafe { DisplayHandle::borrow_raw(RawDisplayHandle::Xlib(XlibDisplayHandle::new(None, 0))) })
+        }
+    }
+
+    /// Without the display, wgpu's GL backend binds EGL's surfaceless platform,
+    /// whose adapter can present to no window: on a machine without Vulkan the
+    /// window was mapped but never painted. The Vulkan-first instance stays
+    /// without it (Vulkan never reads it).
+    #[test]
+    fn the_gl_capable_instance_carries_the_platform_display() {
+        set_platform_display(TestDisplay);
+        assert!(instance_descriptor(Backends::VULKAN).display.is_none(), "the Vulkan path is unchanged");
+        assert!(instance_descriptor(Backends::all()).display.is_some(), "GL presents through the display");
+        assert!(instance_descriptor(Backends::GL).display.is_some());
     }
 }
