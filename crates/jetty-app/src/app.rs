@@ -13924,8 +13924,18 @@ impl ApplicationHandler<AppEvent> for App {
         // `jetty --background` (the login autostart entry) creates the window
         // UNMAPPED — no flash at login. The first summon then places, maps and
         // reveals it per `window_mode` through the normal show path, exactly like
-        // any later summon (rule F0: never fullscreen while hidden).
-        let start = jetty_platform::WindowStart { hidden: self.start_hidden, ..Default::default() };
+        // any later summon (rule F0: never fullscreen while hidden). A visible
+        // start hands the compositor the token it was launched with (Wayland),
+        // so the window takes the focus where a compositor wants a token for it.
+        let start = jetty_platform::WindowStart {
+            hidden: self.start_hidden,
+            activation_token: if self.start_hidden {
+                None
+            } else {
+                jetty_platform::launch_activation_token(event_loop)
+            },
+            ..Default::default()
+        };
         let window = match jetty_platform::build_window_with(event_loop, "JeTTY", (1000, 640), start) {
             Ok(window) => window,
             Err(e) => {

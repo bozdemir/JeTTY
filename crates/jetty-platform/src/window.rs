@@ -121,6 +121,25 @@ fn with_activation_token(attrs: WindowAttributes, event_loop: &ActiveEventLoop, 
     attrs
 }
 
+/// The activation token JeTTY itself was launched with, for its first window:
+/// the launcher's `XDG_ACTIVATION_TOKEN` (an app menu, KRunner, a compositor's
+/// `exec`). Wayland only — `None` on X11 and macOS, whose launch protocols
+/// JeTTY leaves alone. The variable stays set: shells never inherit it
+/// (`jetty-core`'s environment denylist).
+pub fn launch_activation_token(event_loop: &ActiveEventLoop) -> Option<String> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use winit::platform::startup_notify::EventLoopExtStartupNotify;
+        let token = event_loop.read_token_from_env().map(|t| t.into_raw());
+        wayland_token(display_kind(event_loop).as_ref(), token)
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = event_loop;
+        None
+    }
+}
+
 /// The raw kind of display `event_loop` runs on (`None` if winit can't say).
 #[cfg(all(unix, not(target_os = "macos")))]
 fn display_kind(event_loop: &ActiveEventLoop) -> Option<raw_window_handle::RawDisplayHandle> {
