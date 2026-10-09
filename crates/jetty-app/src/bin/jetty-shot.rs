@@ -1334,7 +1334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => jetty_render::ResetState::Ready,
             };
             let footer = match reset {
-                jetty_render::ResetState::Armed => "Click again to reset this tab",
+                jetty_render::ResetState::Armed => "Press again to reset",
                 _ if env_flag("JETTY_SHOT_PANEL_SESSION") => "Enter keeps · Esc restores",
                 _ => "",
             };

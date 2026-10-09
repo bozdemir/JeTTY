@@ -2039,8 +2039,13 @@ pub enum Stop {
     Part(CtlId, CtlPart),
     /// A list: Up / Down move its selection.
     List(CtlId),
+    /// A theme-gallery filter chip: Space / Enter pick it.
+    Filter(jetty_render::ThemeFilter),
     /// The theme gallery: the arrows browse it.
     Gallery,
+    /// The footer's "Reset tab" (a stop while the tab differs from its
+    /// defaults): Space / Enter arm it, again to reset — like two clicks.
+    ResetTab,
 }
 
 impl Stop {
@@ -2048,9 +2053,19 @@ impl Stop {
     pub fn band(self) -> Option<&'static str> {
         match self {
             Stop::Section(id) | Stop::Part(id, _) | Stop::List(id) => Some(id),
-            Stop::Gallery => None,
+            Stop::Filter(_) | Stop::Gallery | Stop::ResetTab => None,
         }
     }
+}
+
+/// The focus stops of a whole tab: its content's ([`stops`]), then "Reset
+/// tab" while it is live (`reset_live`: the tab differs from its defaults).
+pub fn tab_stops(items: &[PanelItem], reset_live: bool) -> Vec<Stop> {
+    let mut v = stops(items);
+    if reset_live {
+        v.push(Stop::ResetTab);
+    }
+    v
 }
 
 /// The focus stops of a tab's content, in display order: each section
@@ -2082,7 +2097,10 @@ pub fn stops(items: &[PanelItem]) -> Vec<Stop> {
                     CtlShow::List { .. } => v.push(Stop::List(r.id)),
                 }
             }
-            PanelItem::Gallery => v.push(Stop::Gallery),
+            PanelItem::Gallery => {
+                v.extend(jetty_render::ThemeFilter::ALL.map(Stop::Filter));
+                v.push(Stop::Gallery);
+            }
             _ => {}
         }
     }
@@ -2119,6 +2137,10 @@ pub enum Nav {
     Fold(&'static str),
     /// Browse the theme gallery.
     Gallery(GalleryKey),
+    /// Pick a gallery filter.
+    Filter(jetty_render::ThemeFilter),
+    /// Press "Reset tab" (arm it, or reset when armed).
+    ResetTab,
     /// Not the focus model's key: the caller's own handling.
     Pass,
 }
@@ -2200,6 +2222,16 @@ pub fn nav(stops: &[Stop], focus: Option<Stop>, key: NavKey, fine: bool, cfg: &C
                 None => Nav::Focus(f),
             }
         }
+        (Stop::Filter(flt), NavKey::Activate) => Nav::Filter(flt),
+        (Stop::Filter(_), NavKey::Left | NavKey::Right) => {
+            // Along the filter row (it never wraps into other stops).
+            let d = if key == NavKey::Left { -1 } else { 1 };
+            match stops.get((i as isize + d).max(0) as usize) {
+                Some(s @ Stop::Filter(_)) => Nav::Focus(*s),
+                _ => Nav::Focus(f),
+            }
+        }
+        (Stop::ResetTab, NavKey::Activate) => Nav::ResetTab,
         // Any other nav key on a focused stop does nothing — it must not
         // reach the legacy keys (a Left on a switch browsing the gallery).
         _ => Nav::Focus(f),
@@ -2275,7 +2307,9 @@ pub fn focus_ring(stop: Stop, items: &[PanelItem], theme_idx: usize) -> Option<P
             }
             _ => None,
         }),
+        Stop::Filter(f) => Some(PanelHit::GalleryFilter(f)),
         Stop::Gallery => Some(PanelHit::GalleryCard(theme_idx)),
+        Stop::ResetTab => Some(PanelHit::ResetTab),
     }
 }
 
@@ -2285,7 +2319,7 @@ pub fn stop_of(stops: &[Stop], id: &str) -> Option<Stop> {
     stops.iter().copied().find(|s| match s {
         Stop::Part(sid, _) | Stop::List(sid) => *sid == id,
         Stop::Gallery => find(id).is_some_and(|d| matches!(d.kind, Kind::Gallery)),
-        Stop::Section(_) => false,
+        Stop::Section(_) | Stop::Filter(_) | Stop::ResetTab => false,
     })
 }
 
@@ -2980,7 +3014,8 @@ mod tests {
                     let hit = match *stop {
                         Stop::Section(id) => Some(PanelHit::Section(id)),
                         Stop::Part(id, part) => Some(PanelHit::Ctl { id, part }),
-                        Stop::List(_) | Stop::Gallery => None,
+                        Stop::Filter(f) => Some(PanelHit::GalleryFilter(f)),
+                        Stop::List(_) | Stop::Gallery | Stop::ResetTab => None,
                     };
                     if let Some(h) = hit {
                         assert!(g.rect_of(h).is_some(), "tab {tab}: {stop:?} is not drawn");
@@ -3083,6 +3118,31 @@ mod tests {
         let Some(Val::F(v)) = nudge(angle, CtlPart::Track, &Val::F(0.0), -1.0, false, false) else { panic!() };
         assert_eq!(v, 0.0, "clamped at the end");
         assert_eq!(nudge(radius, CtlPart::Next, &Val::F(1.0), 1.0, false, false), None);
+    }
+
+    /// The gallery's filter chips and the footer's "Reset tab" are reachable
+    /// from the keyboard too (they were the last mouse-only controls).
+    #[test]
+    fn filters_and_reset_tab_are_stops() {
+        use jetty_render::ThemeFilter as F;
+        let (mono, ui) = fonts();
+        let x = ctx(&mono, &ui);
+        let c = Config::default();
+        let look = tab_items(LOOK, &c, &x);
+        let s = tab_stops(&look, true);
+        let g = s.iter().position(|s| *s == Stop::Gallery).unwrap();
+        assert_eq!(&s[g - 4..g], &F::ALL.map(Stop::Filter), "the filters, then the cards");
+        assert_eq!(s.last(), Some(&Stop::ResetTab));
+        assert!(!tab_stops(&look, false).contains(&Stop::ResetTab), "inert at the defaults");
+        let go = |f: Stop, k: NavKey| nav(&s, Some(f), k, false, &c, &x);
+        assert_eq!(go(Stop::Filter(F::Light), NavKey::Activate), Nav::Filter(F::Light));
+        assert_eq!(go(Stop::Filter(F::Dark), NavKey::Right), Nav::Focus(Stop::Filter(F::Light)));
+        assert_eq!(go(Stop::Filter(F::All), NavKey::Left), Nav::Focus(Stop::Filter(F::All)), "the row's start");
+        assert_eq!(go(Stop::Filter(F::Mine), NavKey::Right), Nav::Focus(Stop::Filter(F::Mine)), "never into the cards");
+        assert_eq!(go(Stop::ResetTab, NavKey::Activate), Nav::ResetTab);
+        assert_eq!(go(Stop::ResetTab, NavKey::Tab), Nav::Focus(s[0]), "wraps to the top");
+        assert_eq!(focus_ring(Stop::Filter(F::Dark), &look, 0), Some(PanelHit::GalleryFilter(F::Dark)));
+        assert_eq!(focus_ring(Stop::ResetTab, &look, 0), Some(PanelHit::ResetTab));
     }
 
     #[test]

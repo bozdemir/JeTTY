@@ -8736,7 +8736,7 @@ impl App {
             jetty_render::ResetState::Ready
         };
         let footer = if self.reset_armed {
-            "Click again to reset this tab"
+            "Press again to reset"
         } else if tab == LOOK && self.gallery.active() {
             "Enter keeps · Esc restores"
         } else {
@@ -9175,11 +9175,25 @@ impl App {
         let tab = self.settings_tab.min(jetty_render::N_TABS - 1);
         let nav = {
             let ctx = self.settings_ctx();
-            let stops = sui::stops(&sui::tab_items(tab, &cfg, &ctx));
+            let stops = sui::tab_stops(&sui::tab_items(tab, &cfg, &ctx), !sui::tab_at_defaults(&cfg, tab));
             sui::nav(&stops, self.settings_kb, key, self.settings_mods.shift_key(), &cfg, &ctx)
         };
+        // Anything but "Reset tab" itself disarms it (as any other click does).
+        if !matches!(nav, Nav::Pass | Nav::ResetTab) {
+            self.reset_armed = false;
+        }
         match nav {
             Nav::Pass => return false,
+            Nav::Filter(f) => self.gallery_filter = f,
+            Nav::ResetTab => {
+                if std::mem::take(&mut self.reset_armed) {
+                    if self.apply_settings_change(|c| *c = sui::reset_tab(c, tab)) {
+                        self.persist();
+                    }
+                } else {
+                    self.reset_armed = true;
+                }
+            }
             Nav::Focus(s) => {
                 // Leaving the gallery keeps the theme it shows.
                 if self.settings_kb == Some(Stop::Gallery) && s != Stop::Gallery {
@@ -9240,6 +9254,8 @@ impl App {
         let span = stop.band().and_then(|b| g.anchor(b)).or_else(|| match stop {
             Stop::Gallery => part_span(PanelHit::GalleryCard(self.theme_idx)),
             Stop::Part(id, part) => part_span(PanelHit::Ctl { id, part }),
+            Stop::Filter(f) => part_span(PanelHit::GalleryFilter(f)),
+            // Sections have their anchor; "Reset tab" is chrome, never scrolled.
             _ => None,
         });
         if let Some((top, bottom)) = span {

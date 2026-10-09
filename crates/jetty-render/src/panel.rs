@@ -1169,6 +1169,7 @@ impl Lay<'_> {
             let hov = self.hover == Some(PanelHit::GalleryFilter(f));
             let fill = if on { c.accent } else if hov { c.ctl_hi } else { c.ctl };
             let r = Rect::rounded(x, cy + 2.0, w, CHIP_H, fill, CHIP_H / 2.0);
+            self.ring(PanelHit::GalleryFilter(f), r, c.surface);
             self.quad(r);
             let tc = if on { c.ui.on_accent } else { c.ui.text_dim };
             let shown = self.fit(t, w - 8.0);
@@ -1470,6 +1471,11 @@ pub fn build_panel(inp: &PanelInput, m: &mut dyn ChromeMeasure) -> PanelView {
     let btn_tw = m.text_w(btn_text) / u;
     let btn_w = (btn_tw + 28.0).max(88.0);
     let btn = Rect::rounded(x0 + cw - btn_w, fy + (FOOTER_H - 26.0) / 2.0, btn_w, 26.0, btn_fill, R_CTL);
+    if inp.focus_part == Some(PanelHit::ResetTab) && inp.reset != ResetState::Disabled {
+        // The keyboard-focus ring (as `Lay::ring` draws it on the content).
+        quads.push(Rect::rounded(btn.x - 4.0, btn.y - 4.0, btn.w + 8.0, btn.h + 8.0, c.accent, R_CTL + 4.0));
+        quads.push(Rect::rounded(btn.x - 2.0, btn.y - 2.0, btn.w + 4.0, btn.h + 4.0, c.surface, R_CTL + 2.0));
+    }
     quads.push(btn);
     labels.push((btn_text.to_string(), btn.x + (btn_w - btn_tw) * 0.5, btn.y + 3.0, btn_col));
     if inp.reset != ResetState::Disabled {
@@ -1974,6 +1980,17 @@ mod tests {
         let mut inp = PanelInput::new(420, 3000, &theme, ChromeMetrics::DEFAULT, &items);
         inp.focus_part = Some(PanelHit::Ctl { id: "nope", part: CtlPart::Switch });
         assert_eq!(build_panel(&inp, &mut MonoMeasure(CHAR_W_FALLBACK * ChromeMetrics::DEFAULT.overlay_u())).content_quads.len(), plain.content_quads.len());
+        // A gallery filter chip (content) and "Reset tab" (chrome, while live).
+        let m = || MonoMeasure(CHAR_W_FALLBACK * ChromeMetrics::DEFAULT.overlay_u());
+        inp.focus_part = Some(PanelHit::GalleryFilter(ThemeFilter::Dark));
+        assert_eq!(build_panel(&inp, &mut m()).content_quads.len(), plain.content_quads.len() + 2);
+        inp.focus_part = Some(PanelHit::ResetTab);
+        assert_eq!(build_panel(&inp, &mut m()).quads.len(), plain.quads.len() + 2);
+        let mut inert = PanelInput::new(420, 3000, &theme, ChromeMetrics::DEFAULT, &items);
+        inert.reset = ResetState::Disabled;
+        let unringed = build_panel(&inert, &mut m()).quads.len();
+        inert.focus_part = Some(PanelHit::ResetTab);
+        assert_eq!(build_panel(&inert, &mut m()).quads.len(), unringed, "an inert button has no ring");
     }
 
     /// The stepper's value always shows whole, clear of the "-" / "+"
