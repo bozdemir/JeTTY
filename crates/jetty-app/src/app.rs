@@ -4486,6 +4486,17 @@ impl App {
         }
     }
 
+    /// Whether a popup owns window `s`'s pointer: a menu, the help, the
+    /// palette or hint mode — and in the main window a quit / close
+    /// confirmation. The grid under it then gets no wheel, motion or button,
+    /// not even as a report to the program behind it, and shows no
+    /// resize-edge cursor (a press there is the popup's).
+    fn pointer_modal(&self, s: Surface) -> bool {
+        let overlay = self.ov_of(s).is_none_or(|o| o.help_open || o.palette_open || o.hint_mode.is_some());
+        let confirm = s == Surface::Main && (self.confirm_quit || self.confirm_close.is_some());
+        overlay || confirm || self.menu_open(s)
+    }
+
     /// Open the terminal context menu (Copy / Paste / Run in New Tab / Select
     /// All / Clear / Close Tab) at physical `(x, y)` — for a right-click and
     /// the Menu key alike, so both gray the same rows. Commits an in-progress
@@ -7404,11 +7415,7 @@ impl App {
     /// that cache — used when the grid/viewport moved under a still pointer).
     fn update_link_hover(&mut self, force: bool) {
         // Same modal predicate as the resize-cursor block in CursorMoved.
-        let modal_open = self.confirm_quit
-            || self.confirm_close.is_some()
-            || self.ov.help_open
-            || self.context_menu.is_some()
-            || self.tab_menu.is_some();
+        let modal_open = self.pointer_modal(Surface::Main);
         let gated = link_modifier_held(&self.modifiers)
             && !self.tabs.is_empty()
             && !self.selecting
@@ -10401,6 +10408,7 @@ impl App {
                 // App-wide inputs, read before the dw (self.detached) borrow.
                 let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let scrollbar_mode = self.scrollbar_mode;
+                let modal = self.pointer_modal(Surface::Detached(pos));
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 // This window's chrome geometry (its own DPI × the UI font).
                 let cm = dw.chrome_metrics(ui_font);
@@ -10515,10 +10523,12 @@ impl App {
                 // --- Grid pointer motion: the shared gridmouse step, exactly as
                 // the main window runs it — extend a selection drag (edge
                 // auto-scroll past the top/bottom), or report the motion to a
-                // program that tracks it, once per cell. ---
+                // program that tracks it, once per cell; never under this
+                // window's help, palette or hint mode (its menu returned
+                // above). ---
                 let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                 let now = std::time::Instant::now();
-                if with_detached_grid(dw, geom, self.modifiers, |g| crate::gridmouse::motion(g, now)).paint {
+                if !modal && with_detached_grid(dw, geom, self.modifiers, |g| crate::gridmouse::motion(g, now)).paint {
                     dw.request_paint();
                 }
                 // --- Ctrl+hover link tracking (mirrors the main window) ---
@@ -10854,7 +10864,9 @@ impl App {
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
-                if geom.contains_y(dw.cursor.1 as f32) {
+                // With its menu open the click is that modal menu's (it moves
+                // to the pointer) — never a report to the program behind it.
+                if dw.menu_open.is_none() && geom.contains_y(dw.cursor.1 as f32) {
                     let now = std::time::Instant::now();
                     if with_detached_grid(dw, geom, mods, |g| {
                         crate::gridmouse::press(g, MouseButton::Right, false, now)
@@ -10882,19 +10894,13 @@ impl App {
                 //  - a program that tracks the mouse (no Shift) gets the click.
                 // Otherwise it pastes the PRIMARY selection (same as main) — the
                 // clipboard under `copy_on_select = "clipboard"`.
-                if self
-                    .ov_of(Surface::Detached(pos))
-                    .is_none_or(|o| o.help_open || o.palette_open || o.hint_mode.is_some())
-                {
+                if self.pointer_modal(Surface::Detached(pos)) {
                     return;
                 }
                 let copy_on_select = self.copy_on_select;
                 let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let mods = self.modifiers;
                 let Some(dw) = self.detached.get_mut(pos) else { return };
-                if dw.menu_open.is_some() {
-                    return;
-                }
                 let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                 if !geom.contains_y(dw.cursor.1 as f32) {
                     return;
@@ -10918,15 +10924,17 @@ impl App {
             } => {
                 // Releases of middle/right presses that went to the program
                 // (their presses have their own arms above), and back/forward
-                // over the grid — the same shared handling as the main window.
+                // over the grid — the same shared handling (and modal gate) as
+                // the main window.
                 let (ui_font, show_hud, padding) = (self.ui_font_logical, self.show_perf_hud, self.padding());
                 let mods = self.modifiers;
+                let modal = self.pointer_modal(Surface::Detached(pos));
                 let Some(dw) = self.detached.get_mut(pos) else { return };
                 let geom = detached_grid_geom(dw, ui_font, show_hud, padding);
                 let now = std::time::Instant::now();
                 if state == ElementState::Released {
                     with_detached_grid(dw, geom, mods, |g| crate::gridmouse::release(g, button));
-                } else if dw.menu_open.is_none() && geom.contains_y(dw.cursor.1 as f32) {
+                } else if !modal && geom.contains_y(dw.cursor.1 as f32) {
                     with_detached_grid(dw, geom, mods, |g| crate::gridmouse::press(g, button, false, now));
                 }
             }
@@ -11028,6 +11036,11 @@ impl App {
                 // windows (F26). This window's overlays own the wheel first
                 // (hint/copy-mode swallow it, the help and palette scroll).
                 if self.overlay_wheel(Surface::Detached(pos), delta) {
+                    return;
+                }
+                // Under its menu or help, the content stays put — no scrolling,
+                // no wheel report (the main window's gate).
+                if self.pointer_modal(Surface::Detached(pos)) {
                     return;
                 }
                 // The title bar is chrome: the wheel there never reaches the grid
@@ -13569,13 +13582,10 @@ impl ApplicationHandler<AppEvent> for App {
                 // --- Resize-edge cursor feedback (borderless window) ---
                 // Only update the cursor when the zone changes, never while a host
                 // drag (scrollbar / selection) is in progress, and never while a
-                // modal (confirm / help / context menu) is open — a press there is
-                // consumed by the modal, so a resize-edge cursor under it is wrong.
-                let modal_open = self.confirm_quit
-                    || self.confirm_close.is_some()
-                    || self.ov.help_open
-                    || self.context_menu.is_some()
-                    || self.tab_menu.is_some();
+                // modal (confirm / help / palette / hint mode / menu) is open — a
+                // press there is consumed by the modal, so a resize-edge cursor
+                // under it is wrong.
+                let modal_open = self.pointer_modal(Surface::Main);
                 if !self.dragging_scrollbar
                     && !self.selecting
                     && !modal_open
@@ -13704,8 +13714,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // past the grid's top/bottom), or reports the motion to a program
                 // that tracks it (1002 while one of its buttons is held, 1003
                 // always), once per cell. Host drags (scrollbar, tab) own the
-                // pointer meanwhile.
-                if !self.dragging_scrollbar && self.tab_drag.is_none() {
+                // pointer meanwhile, and so does a modal: no hover reports reach
+                // the program under a menu the pointer is working.
+                if !modal_open && !self.dragging_scrollbar && self.tab_drag.is_none() {
                     let now = std::time::Instant::now();
                     if self.with_main_grid(|g| crate::gridmouse::motion(g, now)).is_some_and(|m| m.paint) {
                         self.request_main_paint();
@@ -14132,8 +14143,10 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 // On the grid, a program that tracks the mouse gets the click
                 // (nvim / tmux / mc menus) — unless Shift is held or JeTTY holds
-                // a selection, which keep JeTTY's menu (shared with detached).
-                if self.main_grid_geom().contains_y(cy) {
+                // a selection, which keep JeTTY's menu (shared with detached),
+                // or a menu is open: the click is that modal menu's, and moves
+                // it to the pointer.
+                if !self.menu_open(Surface::Main) && self.main_grid_geom().contains_y(cy) {
                     let now = std::time::Instant::now();
                     if self.with_main_grid(|g| crate::gridmouse::press(g, MouseButton::Right, false, now))
                         == Some(crate::gridmouse::Press::Reported)
@@ -14223,13 +14236,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // It pastes the PRIMARY selection (the text last selected
                 // anywhere), not the clipboard.
                 if self.slide_anim.is_some()
-                    || self.confirm_quit
-                    || self.confirm_close.is_some()
-                    || self.ov.help_open
-                    || self.ov.palette_open
-                    || self.ov.hint_mode.is_some()
-                    || self.context_menu.is_some()
-                    || self.tab_menu.is_some()
+                    || self.pointer_modal(Surface::Main)
                     || self.tabs.is_empty()
                     || self.gpu.is_none()
                 {
@@ -14275,13 +14282,7 @@ impl ApplicationHandler<AppEvent> for App {
                 } else if !self.tabs.is_empty()
                     && self.gpu.is_some()
                     && self.main_grid_geom().contains_y(self.cursor.1 as f32)
-                    && !(self.confirm_quit
-                        || self.confirm_close.is_some()
-                        || self.ov.help_open
-                        || self.ov.palette_open
-                        || self.ov.hint_mode.is_some()
-                        || self.context_menu.is_some()
-                        || self.tab_menu.is_some())
+                    && !self.pointer_modal(Surface::Main)
                 {
                     self.with_main_grid(|g| crate::gridmouse::press(g, button, false, now));
                 }
@@ -14310,6 +14311,12 @@ impl ApplicationHandler<AppEvent> for App {
                 // The help overlay (while its rows overflow) and the palette
                 // own the wheel too (shared with the detached windows).
                 if self.overlay_wheel(Surface::Main, delta) {
+                    return;
+                }
+                // Under a confirmation, the help or a menu, the content behind
+                // the popup stays put: no scrolling, no wheel report to the
+                // program (detached windows run the same gate).
+                if self.pointer_modal(Surface::Main) {
                     return;
                 }
                 // Over the tab strip the wheel flips through the tabs — one
