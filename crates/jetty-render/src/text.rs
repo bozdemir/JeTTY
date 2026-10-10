@@ -140,19 +140,49 @@ fn wght_axis_range(db: &Database, id: ID) -> Option<(u16, u16)> {
     })?
 }
 
-/// Whether face `id` sets text: it maps the basic Latin letters. A terminal
-/// font needs them — Noto Color Emoji marks itself fixed-pitch, and so does a
-/// symbol font, yet neither has a letter. Reads the face's cmap (its font file,
+/// What face `id` draws at the basic Latin letters' code points.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LatinLetters {
+    /// Nothing: an emoji font, a symbol font, a font of another script.
+    None,
+    /// Symbols: a symbol font that puts them at the letters' code points —
+    /// D050000L's dingbats, Standard Symbols PS's Greek — names those glyphs
+    /// for what they are ("a40", "alpha"), not for the letters.
+    Symbols,
+    /// The letters.
+    Letters,
+}
+
+/// Read what face `id` draws at the basic Latin letters ('M', 'a'): its cmap
+/// and, when the face names its glyphs, those glyphs' names (the font file,
 /// memory-mapped).
-fn draws_text(db: &Database, id: ID) -> bool {
+fn latin_letters(db: &Database, id: ID) -> LatinLetters {
     use glyphon::cosmic_text::skrifa::{FontRef, MetadataProvider};
     db.with_face_data(id, |data, index| {
-        FontRef::from_index(data, index).is_ok_and(|font| {
-            let map = font.charmap();
-            ['M', 'a'].into_iter().all(|c| map.map(c).is_some())
-        })
+        let Ok(font) = FontRef::from_index(data, index) else { return LatinLetters::None };
+        let (map, names) = (font.charmap(), font.glyph_names());
+        let mut letters = LatinLetters::Letters;
+        for c in ['M', 'a'] {
+            let Some(glyph) = map.map(c) else { return LatinLetters::None };
+            let named = names.get(glyph).filter(|n| !n.is_synthesized());
+            let letter = |n: &str| {
+                let base = n.split('.').next().unwrap_or(n);
+                base == c.encode_utf8(&mut [0; 4]) || base.eq_ignore_ascii_case(&format!("uni{:04X}", c as u32))
+            };
+            if named.is_some_and(|n| !letter(n.as_str())) {
+                letters = LatinLetters::Symbols;
+            }
+        }
+        letters
     })
-    .unwrap_or(false)
+    .unwrap_or(LatinLetters::None)
+}
+
+/// Whether face `id` sets text: it draws the basic Latin letters. A terminal
+/// font needs them — Noto Color Emoji marks itself fixed-pitch, and so does a
+/// symbol font, yet neither has a letter (see [`latin_letters`]).
+fn draws_text(db: &Database, id: ID) -> bool {
+    latin_letters(db, id) == LatinLetters::Letters
 }
 
 /// A char drawn as a color emoji (when an emoji font is installed and
@@ -1594,19 +1624,28 @@ impl TextLayer {
 
     /// Returns the sorted, deduplicated list of PROPORTIONAL (non-monospaced)
     /// font family names known to the font system — the candidates for the UI
-    /// (chrome) font picker. Mirrors `monospace_families` but inverts the
-    /// `monospaced` flag, so the list offers the user real sans/serif UI faces
-    /// (the synthetic "System Sans (default)" row in the panel always provides
-    /// the escape hatch back to the platform sans).
+    /// (chrome) font picker (see [`Self::proportional_families_in`]).
     pub fn proportional_families(&self) -> Vec<String> {
+        Self::proportional_families_in(self.font_system.db())
+    }
+
+    /// The UI (chrome) font picker's families of `db`, sorted and deduplicated:
+    /// mirrors `monospace_families_in` but inverts the `monospaced` flag, so the
+    /// list offers the user real sans/serif UI faces (the synthetic "System Sans
+    /// (default)" row in the panel always provides the escape hatch back to the
+    /// platform sans). A symbol font that draws symbols at the letters' code
+    /// points (`LatinLetters::Symbols`: D050000L turned the whole Settings
+    /// panel into dingbats) is left out — a hand-written `ui_font_family` may
+    /// still name it. One cmap read per family.
+    pub fn proportional_families_in(db: &Database) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut families: Vec<String> = Vec::new();
 
-        for face in self.font_system.db().faces() {
+        for face in db.faces() {
             if !face.monospaced {
                 // The first family entry is always English US.
                 if let Some((name, _)) = face.families.first() {
-                    if seen.insert(name.clone()) {
+                    if seen.insert(name.clone()) && latin_letters(db, face.id) != LatinLetters::Symbols {
                         families.push(name.clone());
                     }
                 }
@@ -3801,6 +3840,40 @@ mod tests {
         // name), so cosmic-text rasterizes them from it at their wght.
         let added = fs.db().faces().find(|f| f.families[0].0 == "Variable" && f.weight.0 == 700 && f.style == i);
         assert_eq!(added.map(|f| f.post_script_name.as_str()), Some("ItalicVF"));
+    }
+
+    #[test]
+    fn a_symbol_font_with_symbols_at_the_letters_is_no_text_font() {
+        // D050000L (URW's Dingbats) maps 'M' and 'a' — to dingbats — so a
+        // letters check offered it as a UI font, and picking it turned the
+        // Settings panel into dingbats. Its glyphs are named for what they are.
+        let fs = TextLayer::build_font_system();
+        let db = fs.db();
+        let face = |family: &str| db.faces().find(|f| f.families.first().is_some_and(|(n, _)| n == family));
+        for (family, want) in [
+            ("D050000L", LatinLetters::Symbols),
+            ("Standard Symbols PS", LatinLetters::Symbols),
+            ("Noto Color Emoji", LatinLetters::None),
+            ("DejaVu Sans", LatinLetters::Letters),
+            ("Nimbus Sans", LatinLetters::Letters),
+            (FONT_FAMILY_DEFAULT, LatinLetters::Letters),
+        ] {
+            let Some(f) = face(family) else { continue };
+            assert_eq!(latin_letters(db, f.id), want, "{family}");
+        }
+        let ui = TextLayer::proportional_families_in(db);
+        assert!(!ui.iter().any(|f| f == "D050000L" || f == "Standard Symbols PS"), "{ui:?}");
+        if face("DejaVu Sans").is_some() {
+            assert!(ui.iter().any(|f| f == "DejaVu Sans"));
+        }
+        // Every family the UI list leaves out is still installed for a
+        // hand-written name.
+        let mono = TextLayer::monospace_families_in(db);
+        let others = TextLayer::other_families_in(db, &mono);
+        assert!(ui.iter().all(|f| others.contains(f)));
+        if face("D050000L").is_some() {
+            assert!(others.iter().any(|f| f == "D050000L"));
+        }
     }
 
     #[test]

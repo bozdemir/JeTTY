@@ -9453,8 +9453,12 @@ impl App {
     /// family). Does NOT reflow the grid/PTY (chrome family is orthogonal to
     /// cols/rows), so the hot/idle paths are untouched.
     fn set_ui_font_family(&mut self, name: String) -> Option<String> {
+        // Every installed family: one the picker leaves out (a symbol font) is
+        // still the user's choice when named by hand.
+        let chrome = self.chrome_text.as_ref();
         let pick = crate::config::check::pick_ui_font_family(&name, || {
-            self.ui_font_families.iter().skip(1).chain(&self.font_families).cloned().collect()
+            let others = chrome.map(TextLayer::other_families).unwrap_or_default();
+            others.into_iter().chain(self.font_families.iter().cloned()).collect()
         });
         self.ui_font_family_chosen = name;
         self.ui_font_family = pick.shown;
@@ -13686,7 +13690,9 @@ impl ApplicationHandler<AppEvent> for App {
         let font_handle = std::thread::spawn(|| {
             let fonts = TextLayer::build_font_system();
             let mono = TextLayer::monospace_families_in(fonts.db());
-            (fonts, mono)
+            // The UI-font picker's list too (one cmap read per family).
+            let ui = TextLayer::proportional_families_in(fonts.db());
+            (fonts, mono, ui)
         });
         // System appearance known synchronously: winit's system theme (macOS,
         // Windows; `None` on X11/Wayland), or the portal's first reading if it is
@@ -13830,7 +13836,7 @@ impl ApplicationHandler<AppEvent> for App {
         });
         // GPU is ready — join the font worker (its ~20ms load happened in
         // parallel with the GPU block above, so this join is typically free).
-        let (font_system, mono_families) = font_handle.join().expect("font worker panicked");
+        let (font_system, mono_families, ui_families) = font_handle.join().expect("font worker panicked");
         let (text, quad, cols, rows) = if let Some(ref g) = gpu {
             let mut text = TextLayer::for_gpu(g, self.font_logical * scale, &self.font_family, font_system);
             // The configured family must be installed — a missing one (the
@@ -13905,10 +13911,9 @@ impl ApplicationHandler<AppEvent> for App {
             // (Its glyphon pipeline is the grid layer's: `TextLayer::for_gpu`.)
             let mut chrome = TextLayer::for_gpu(g, self.ui_font_logical * scale, &self.chrome_font_family, fonts);
             // Populate the UI-font picker list: a synthetic "System Sans (default)"
-            // row (→ "") first, then the installed proportional families.
-            self.ui_font_families = std::iter::once("System Sans (default)".to_string())
-                .chain(chrome.proportional_families())
-                .collect();
+            // row (→ "") first, then the installed proportional families (listed
+            // by the font worker).
+            self.ui_font_families = std::iter::once("System Sans (default)".to_string()).chain(ui_families).collect();
             eprintln!(
                 "jetty: found {} proportional UI families",
                 self.ui_font_families.len().saturating_sub(1)
@@ -13917,8 +13922,10 @@ impl ApplicationHandler<AppEvent> for App {
             // installed falls back to "" (platform sans) so a removed font never
             // leaves blank chrome — and says so. Shown only:
             // `ui_font_family_chosen` keeps (and saves) the choice.
+            // Every installed family: one the picker leaves out (a symbol font)
+            // is still the user's choice when named by hand.
             let pick = crate::config::check::pick_ui_font_family(&self.ui_font_family, || {
-                self.ui_font_families[1..].iter().chain(&self.font_families).cloned().collect()
+                chrome.other_families().into_iter().chain(self.font_families.iter().cloned()).collect()
             });
             self.ui_font_family = pick.shown;
             if let Some(w) = pick.warning {
