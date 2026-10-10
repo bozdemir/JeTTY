@@ -15134,8 +15134,10 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::ActivationToken(token) => self.activation_token = Some(token),
             AppEvent::NewTab(request, opened) => {
-                // No tab left: the loop is exiting — no window to open it in.
-                if self.tabs.is_empty() {
+                // The loop is exiting (the last tab closed, or the quit dialog):
+                // no window to open it in. JeTTY waiting with no tab
+                // (`close_last_tab = "hide"`) opens it, and is summoned with it.
+                if event_loop.exiting() {
                     let _ = opened.send(Err("JeTTY is quitting".to_string()));
                 } else {
                     let _ = opened.send(self.open_requested_tab(request));
@@ -20369,6 +20371,17 @@ mod close_last_tab_tests {
         let spawn = body.find("if self.tabs.is_empty() && self.new_tab_with_cwd(None)").expect("the fresh tab");
         let show = body.find("win.set_visible(true)").expect("the show");
         assert!(spawn < show);
+    }
+
+    /// Tripwire: `jetty --new-tab` / `-e` reaching a JeTTY that waits with no
+    /// tab opens that tab — only an exiting loop turns the request away.
+    #[test]
+    fn a_tab_request_opens_in_a_jetty_waiting_with_no_tab() {
+        let src = include_str!("app.rs");
+        let arm = &src[src.find(concat!("AppEvent::NewTab(request, opened)", " => {")).expect("the NewTab arm")..];
+        let arm = &arm[..arm.find("\n            }\n").expect("the end of the arm")];
+        assert!(arm.contains("if event_loop.exiting() {"), "{arm}");
+        assert!(!arm.contains("self.tabs.is_empty()"), "{arm}");
     }
 }
 
