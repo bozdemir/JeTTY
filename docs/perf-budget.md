@@ -279,6 +279,34 @@ lines take **+28 MiB**, a 240-column one **+55 MiB** (~2.9 / 5.8 KiB per line),
 per tab. The largest steady-state memory item once tabs fill their scrollback;
 shrinking it means a different history representation inside the grid.
 
+### Drain priority (v0.30.0)
+
+Every drain pass used to feed up to 2 MiB into EACH tab in tab order, and a frame
+ran two passes (the Wake drain, then the paint path drained every tab again), so
+each flooding background tab put ~2 × 13 ms of parsing in front of the active
+tab's keystroke echo. Now the active tab drains first with the full 2 MiB; the
+background tabs share one 256 KiB budget per event-loop iteration (round-robin,
+~1.7 ms of parsing; while the active tab floods itself they share as much as it
+fed), and the paint path drains only the active tab (`drain_pass` in app.rs).
+
+Nested Xvfb + lavapipe, the shared dev machine under load (load average 6–20 on
+24 threads), base = v0.29.1 + test fix, A/B runs alternating:
+
+| | before | after |
+|---|---|---|
+| keypress→frame-ready p50, typing while a background tab `cat`s a log in a loop (n=64 per run) | 51.7 / 61.5 / 63.8 ms | **3.0–3.25 ms** (4 runs) |
+| … p99 | 62.8–92.4 ms | **10.1–11.7 ms** |
+| keypress→pre-present p50 | 57.5–69.6 ms | **5.4–7.5 ms** |
+| 100 MB `cat` in a background tab, active tab idle (median of 9) | 97.9 MB/s | 96.8 MB/s |
+| both tabs `cat` 100 MB at once, total (median of 4) | 77.9 MB/s | 83.5 MB/s |
+| 100 MB `cat` in the active tab | — | same code path (traced iterations identical) |
+
+Wall-clock throughput there is ±20% run to run; the background-only cost was
+traced instead: each 256 KiB iteration adds ~20 µs of loop overhead (winit ~13 µs,
+`about_to_wait` ~6 µs) — ~1% of the 1.7 ms of parsing at 150 MB/s. Idle stays at
+0 ms CPU, 0 context switches and 0 frames per 10 s, shown, hidden and re-shown
+(the owner's config, nested).
+
 ## Where we lead vs. match vs. must improve
 
 - **Lead (architecture already gives us the edge):**
