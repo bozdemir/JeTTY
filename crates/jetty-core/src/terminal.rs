@@ -5053,6 +5053,30 @@ impl Terminal {
         Some(text)
     }
 
+    /// Whether the selection holds any text — a cell other than a blank —
+    /// without building it: what the menus gray Copy / Run in New Tab on and
+    /// the right-click routing asks, on every press. `selection_text` built
+    /// the whole string for that bool — after Select All over a 100k-line
+    /// scrollback, tens of MB, twice per right-click. Stops at the first such
+    /// cell.
+    pub fn has_selection(&self) -> bool {
+        let Some(range) = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term)) else {
+            return false;
+        };
+        let grid = self.term.grid();
+        let last = self.cols - 1;
+        (range.start.line.0..=range.end.line.0).any(|line| {
+            let (first, end) = if range.is_block {
+                (range.start.column.0, range.end.column.0)
+            } else {
+                let first = if line == range.start.line.0 { range.start.column.0 } else { 0 };
+                (first, if line == range.end.line.0 { range.end.column.0 } else { last })
+            };
+            let row = &grid[Line(line)];
+            (first..=end.min(last)).any(|c| row[Column(c)].c != ' ')
+        })
+    }
+
     /// `Term::bounds_to_string(start, end)` without alacritty 0.26's bug: when
     /// the text ENDS on a row whose last cell is the placeholder of a wide char
     /// that did not fit and wrapped to the next row, it appended the char at the
@@ -11372,6 +11396,32 @@ mod tests {
         assert!(!t.mouse_utf8());
         t.feed(b"\x1b[?1005h");
         assert!(t.mouse_utf8());
+    }
+
+    #[test]
+    fn has_selection_tells_text_from_blanks_without_building_it() {
+        let mut t = Terminal::new(20, 4);
+        t.feed(b"ab  cd\r\n\r\nxyz");
+        assert!(!t.has_selection(), "none");
+        t.selection_start(0, 0, true);
+        t.selection_update(0, 4, false);
+        assert!(t.has_selection());
+        t.selection_start(0, 2, true);
+        t.selection_update(0, 3, false);
+        assert!(!t.has_selection(), "only the blanks between words");
+        t.selection_start(0, 10, true);
+        t.selection_update(1, 5, false);
+        assert!(!t.has_selection(), "blank cells across lines");
+        t.selection_start_block_abs(t.viewport_line_to_buffer(0), 3, true);
+        t.selection_update_abs(t.viewport_line_to_buffer(2), 3, false);
+        assert!(!t.has_selection(), "a blank column block");
+        t.selection_start_block_abs(t.viewport_line_to_buffer(0), 2, true);
+        t.selection_update_abs(t.viewport_line_to_buffer(2), 3, false);
+        assert!(t.has_selection(), "the block reaches the z");
+        t.select_all();
+        assert!(t.has_selection());
+        t.selection_clear();
+        assert!(!t.has_selection());
     }
 
     #[test]

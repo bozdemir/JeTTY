@@ -337,8 +337,7 @@ pub(crate) fn press(g: &mut Grid, button: MouseButton, link_mod: bool, now: Inst
             return Press::OpenLink(hit.uri);
         }
     }
-    let has_selection =
-        btn == MouseBtn::Right && g.term.selection_text().is_some_and(|t| !t.is_empty());
+    let has_selection = btn == MouseBtn::Right && g.term.has_selection();
     match route_press(gesture_tracking(g.term), shift, btn, has_selection) {
         Route::Program => {
             if !g.report(Some(btn), MouseAct::Press) {

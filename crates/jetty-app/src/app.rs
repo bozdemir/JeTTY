@@ -4823,11 +4823,7 @@ impl App {
         // no-ops without one — dimming is the honest UI for the same
         // property); Run additionally dims when the feature is
         // config-disabled.
-        let has_sel = self
-            .active_tab()
-            .terminal
-            .selection_text()
-            .is_some_and(|t| !t.is_empty());
+        let has_sel = self.active_tab().terminal.has_selection();
         self.menu_disabled = match (has_sel, self.run_selection_enabled) {
             (false, _) => vec![0, 2],
             (true, false) => vec![2],
@@ -4882,11 +4878,7 @@ impl App {
         // Disabled rows, computed once at open — the same needs-a-selection
         // class as the main menu: Copy (1) and Run in New Tab (3) dim without
         // a selection; Run also dims when the feature is config-disabled.
-        let has_sel = dw
-            .tab
-            .terminal
-            .selection_text()
-            .is_some_and(|t| !t.is_empty());
+        let has_sel = dw.tab.terminal.has_selection();
         dw.menu_disabled = match (has_sel, run_enabled) {
             (false, _) => vec![1, 3],
             (true, false) => vec![3],
