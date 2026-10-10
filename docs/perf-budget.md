@@ -25,8 +25,11 @@ JETTY_BENCH_ONLY=backdrop target/release/jetty-bench
 #   JETTY_BENCH_NO_VK_FILTER=1: GPU init without the startup Vulkan driver filter.
 JETTY_BENCH_ONLY=first_frame target/release/jetty-bench  # cold start's text layers +
                                                           # first-frame effect pipelines
-#   JETTY_BENCH_FIRST_FRAME=serial: the pre-0.30 order. One measurement per process
+#   JETTY_BENCH_FIRST_FRAME=serial|overlap|shared: the pre-0.30 order, effects on a
+#   worker, + shared text pipelines (default, the app). One measurement per process
 #   (the driver caches pipelines in memory): alternate many runs of each.
+JETTY_BENCH_ONLY=detach   target/release/jetty-bench  # a detached window's layers:
+                                                       # own pipelines vs shared
 
 # Live metrics on the running app: exec→first-frame cold start, input latency
 # (keypress→glyph, percentiles), and idle RSS. Zero cost unless the flag is set.
@@ -244,7 +247,28 @@ before.
   The scrollbar / decoration / cursor rects that followed in a pass of their own
   (every frame with the default `scrollbar = "always"` once there is scrollback)
   now ride that same pass: a typical main-window frame is three submits — grid,
-  chrome, corner mask — where v0.27.0 recorded seven.
+  chrome, corner mask — where v0.27.0 recorded seven. (v0.30.0: two — the mask
+  rides the chrome pass when nothing draws after it, below.)
+
+### GPU plumbing (v0.30.0)
+
+Intel ARL iGPU, same machine, medians of interleaved runs:
+
+- **The corner mask rides the chrome pass** on a frame with nothing drawn after
+  the chrome (no pill, menu, overlay, bell, glow or window border — the typing
+  frame): one pass and submit fewer. Tab bar + HUD + mask (`frames` section):
+  **0.079 → 0.057 ms** CPU per frame and 149 → 101 allocations (a busier run:
+  0.191 → 0.150 ms). Byte-identical (GPU test).
+- **First-frame effect pipelines off the critical path.** `resumed` compiles the
+  summon reveal (Phosphor) and the CRT variant on a worker while the text layers
+  build, instead of frame 1 compiling them after (`first_frame`, the text layers +
+  Phosphor + the Retro CRT variant): warm driver cache **8.8 → 6.5 ms**, cold
+  38.2 → 36.2 ms; lavapipe 17.8 → 15.1 / 25.1 → 19.2 ms.
+- **Pipelines shared per device.** Every window's text, quad, corner-mask and
+  image layers take one shader module / pipeline per device and surface format
+  (`SharedPipelines`) instead of compiling their own: a detach's layers
+  **3.3 → 1.05 ms** (`detach`); the main window's chrome text layer reuses the
+  grid layer's glyphon pipeline (text layers 4.8 → 3.8 ms on the main thread).
 
 **Memory per scrollback line (measured, not changed).** alacritty_terminal stores
 every history row at full width, 24 B per cell: a 120-column tab's default 10 000
