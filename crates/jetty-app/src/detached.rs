@@ -450,6 +450,10 @@ pub(crate) struct DetachedWindow {
     /// Whether THIS detached window holds OS focus (from its Focused events).
     /// Drives the unfocused-hollow cursor, per-window like the main one.
     pub focused: bool,
+    /// Whether JeTTY asked for attention on THIS window since it last had
+    /// focus — cleared on its next Focused(true), and only then (see
+    /// `App::main_attention`).
+    pub attention: bool,
     /// When `Some`, a grid+PTY reflow is scheduled for this instant (mirrors
     /// `App::reflow_pending_at`): a border drag fires many Resized events, and
     /// reflow+SIGWINCH per event scatters p10k's prompt — the surface resizes
@@ -692,6 +696,7 @@ impl DetachedWindow {
             paced_paint_at: None,
             frame_interval: None,
             focused,
+            attention: false,
             fullscreen: false,
             reflow_pending_at: None,
             // build_window above already titled the OS window from tab.title.

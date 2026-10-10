@@ -1084,6 +1084,13 @@ pub struct App {
     /// this — it stays set to the main id after focus leaves when auto-hide is
     /// off). Drives the unfocused-hollow cursor.
     main_focused: bool,
+    /// Whether JeTTY asked for attention on the main window (a command's
+    /// notification, a bell while unfocused) since it last had focus. The
+    /// next Focused(true) clears it — and only then: on X11 the clear is a
+    /// blocking WM_HINTS round trip plus a property write the window manager
+    /// reacts to, which every focus gain (each summon key's grab among them)
+    /// paid for nothing.
+    main_attention: bool,
     /// When a toggle last RAISED (rather than hid) the visible-but-unfocused main
     /// window. Cleared when focus arrives; a toggle within `RAISE_RETRY_WINDOW`
     /// of a raise that never got focus hides instead (see `toggle_action`).
@@ -2191,6 +2198,7 @@ impl App {
             applied_main_os_title: "JeTTY".to_string(),
             last_focused_window: None,
             main_focused: false,
+            main_attention: false,
             raise_attempt_at: None,
             focus_lost_at: None,
             autohidden_at: None,
@@ -8650,6 +8658,7 @@ impl App {
         if !self.main_focused {
             if let Some(w) = &self.window {
                 w.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+                self.main_attention = true;
             }
             return;
         }
@@ -8669,6 +8678,7 @@ impl App {
         }
         if !dw.focused {
             dw.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+            dw.attention = true;
             return;
         }
         let now = std::time::Instant::now();
@@ -9251,6 +9261,7 @@ impl App {
         if !(self.visible && self.main_focused) {
             if let Some(w) = &self.window {
                 w.request_user_attention(Some(attention_for(failed)));
+                self.main_attention = true;
             }
         }
         Some(failed)
@@ -9282,9 +9293,9 @@ impl App {
         let label = format!("{} (detached)", self.detached[pos].tab.title);
         let (summary, body) = build_notification_text(&label, &c, failed);
         self.notifier.fire(summary, body);
-        self.detached[pos]
-            .window
-            .request_user_attention(Some(attention_for(failed)));
+        let dw = &mut self.detached[pos];
+        dw.window.request_user_attention(Some(attention_for(failed)));
+        dw.attention = true;
     }
 
     /// Update the live perf-HUD metrics and return the formatted HUD string, or
@@ -12105,9 +12116,12 @@ impl App {
                 if self.window_border != crate::tabmeta::WindowBorder::None {
                     self.detached[pos].request_paint();
                 }
-                // Clear any command-finish urgency raised on THIS detached window
-                // (X11 latches it until cleared; parity with the main window).
-                self.detached[pos].window.request_user_attention(None);
+                // Clear a command-finish / bell urgency raised on THIS detached
+                // window (X11 latches it until cleared; parity with the main
+                // window) — only one JeTTY raised: see `main_attention`.
+                if std::mem::take(&mut self.detached[pos].attention) {
+                    self.detached[pos].window.request_user_attention(None);
+                }
                 // Cancel any scheduled main-window auto-hide: focus moved to one
                 // of OUR windows (this arm can arrive AFTER the main FocusOut on
                 // X11 — the exact race the deferred hide exists for).
@@ -14825,12 +14839,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // silently disable auto-hide.
                 self.switching_to_detached = false;
                 self.switching_to_settings = false;
-                // Clear any taskbar/dock urgency we raised on a command-finish
-                // notification: X11 latches XUrgencyHint until explicitly cleared,
-                // so without this the taskbar entry stays lit after the user
-                // returns. A no-op where none was set / unsupported (Wayland).
+                // Clear the taskbar/dock urgency we raised on a command-finish
+                // notification or a bell: X11 latches XUrgencyHint until
+                // explicitly cleared, so without this the taskbar entry stays lit
+                // after the user returns. Only when we raised one (`main_attention`).
                 if let Some(w) = &self.window {
-                    w.request_user_attention(None);
+                    if std::mem::take(&mut self.main_attention) {
+                        w.request_user_attention(None);
+                    }
                     // macOS first-paint nudge (see the settings window above): ensure
                     // a frame is drawn once the window is actually shown + focused.
                     self.request_main_paint();
