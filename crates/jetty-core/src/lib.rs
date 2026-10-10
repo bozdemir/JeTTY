@@ -6,6 +6,8 @@ pub mod fuzzy;
 mod handler;
 pub mod hints;
 pub mod kitty;
+/// Desktop notifications programs ask for (OSC 9, OSC 777, kitty's OSC 99).
+mod notification;
 mod pty;
 pub mod sixel;
 mod snapshot;
@@ -18,6 +20,7 @@ pub mod url;
 
 pub use fuzzy::{fuzzy_match, FuzzyMatch};
 pub use hints::{HintToken, TokenKind};
+pub use notification::ProgramNotification;
 pub use pty::{hide_from_shells, self_exe, set_advertised_version, uninherited_env, PtySession, SelfExe};
 pub use sixel::{decode_sixel, InlineImage, SixelCaps, SixelImage, SIXEL_CAPS};
 pub use snapshot::{

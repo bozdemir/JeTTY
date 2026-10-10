@@ -1,6 +1,7 @@
 use crate::handler::VtState;
 use crate::hints::HintToken;
 use crate::kitty::KittyCmd;
+use crate::notification::{Notifications, NotifyOsc, ProgramNotification};
 use crate::snapshot::{
     attr, CellGrapheme, CellSnapshot, CursorShapeSnap, GridSnapshot, SearchHit, GRAPHEME_MAX_BYTES,
     GRAPHEME_MAX_MARKS,
@@ -768,7 +769,8 @@ const EXIT_CODE_MAX: u32 = 255;
 
 /// State of the tiny escape scanner, carried across [`Terminal::feed`] calls so
 /// a sequence split across PTY chunks resumes mid-parse. It recognizes OSC 133
-/// prompt marks (`ESC ]`), sixel DCS images (`ESC P … q … ST`), Kitty APC images
+/// prompt marks, OSC 9;4 progress and the OSC 9 / 777 / 99 desktop
+/// notifications (`ESC ]`), sixel DCS images (`ESC P … q … ST`), Kitty APC images
 /// (`ESC _ G`) and — only while anchors exist — the history-rewriting CSIs and
 /// RIS ([`IsolatedSeq`]) in ONE single-ESC state machine. Ground uses a
 /// `memchr(ESC)` fast path, so a stream with no escapes costs one SIMD scan per
@@ -818,6 +820,12 @@ enum Scan {
     /// `kv` matches the current parameter against [`REDRAW_OFF`];
     /// `no_redraw` latches once one matched (an `A;redraw=0`).
     Payload { letter: u8, code: Option<u32>, in_code: bool, code_done: bool, kv: u8, no_redraw: bool },
+    /// Inside `ESC ]`, matching the rest of a notification's introducer —
+    /// `777;notify;` or `99;` — (`n` bytes of [`NotifyOsc::prefix`] matched).
+    NotifyPrefix { osc: NotifyOsc, n: u8 },
+    /// In a notification's payload ([`crate::notification`]): its head is kept
+    /// up to the terminator, where the notification is read.
+    Notify { osc: NotifyOsc },
     /// Inside some OTHER OSC (title/hyperlink/color); skip to its terminator.
     Skip,
     /// An OSC overran [`OSC_MAX_BYTES`]: vte was handed CAN to end it, and every
@@ -1189,6 +1197,10 @@ pub struct Terminal {
     progress: Option<Progress>,
     /// `progress` changed since the last [`Terminal::take_progress_update`].
     progress_dirty: bool,
+    /// Desktop notifications programs asked for (OSC 9 / 777 / 99): the one
+    /// being scanned, a kitty one arriving in chunks, and those the app has
+    /// yet to take ([`Terminal::take_notifications`]).
+    notifications: Notifications,
     /// An OSC 133 `A`, `C` or `D` bound since the last
     /// [`Terminal::take_command_marks`] — the shell started or finished a
     /// command (smart tab titles re-derive "what runs here" on it).
@@ -1498,6 +1510,7 @@ impl Terminal {
             completed: Vec::new(),
             progress: None,
             progress_dirty: false,
+            notifications: Notifications::default(),
             cmd_marks_dirty: false,
             sixel_buf: Vec::new(),
             sixel_overflow: false,
@@ -2175,8 +2188,11 @@ impl Terminal {
                                 Scan::Prefix { n: n2 }
                             };
                         }
-                        // `9` opens the OSC 9;4 progress candidate.
+                        // `9` opens the OSC 9;4 progress candidate (or an OSC 9
+                        // / 99 notification).
                         b'9' if n == 0 => self.scan = Scan::Prefix94 { n: 1 },
+                        // `7` opens the OSC 777 notification candidate.
+                        b'7' if n == 0 => self.scan = Scan::NotifyPrefix { osc: NotifyOsc::Osc777, n: 1 },
                         // Some other OSC (title/hyperlink/color): skip to its end.
                         _ => self.scan = Scan::Skip,
                     }
@@ -2199,7 +2215,16 @@ impl Terminal {
                                 Scan::Prefix94 { n: n2 }
                             };
                         }
-                        // `OSC 9 ; text` (a notification) or any other OSC 9.
+                        // `99;`: a kitty notification.
+                        b'9' if n == 1 => self.scan = Scan::NotifyPrefix { osc: NotifyOsc::Osc99, n: 2 },
+                        // `OSC 9 ; text`, an iTerm2 notification: its text begins
+                        // with `b` — after the `4` already read, if one was.
+                        _ if n >= 2 => {
+                            self.notifications.begin(&OSC94_PREFIX[2..n as usize]);
+                            self.notifications.capture(&[b]);
+                            self.scan = Scan::Notify { osc: NotifyOsc::Osc9 };
+                        }
+                        // Any other OSC 9x.
                         _ => self.scan = Scan::Skip,
                     }
                     if !matches!(b, 0x07 | 0x18 | 0x1a | 0x1b) {
@@ -2323,6 +2348,30 @@ impl Terminal {
                         i += 1;
                     }
                 },
+                Scan::NotifyPrefix { osc, n } => {
+                    let prefix = osc.prefix();
+                    match b {
+                        // Same framing as `Prefix`.
+                        0x1b => self.scan = Scan::Esc,
+                        0x07 | 0x18 | 0x1a => self.scan = Scan::Ground,
+                        _ if b == prefix[n as usize] => {
+                            let n2 = n + 1;
+                            self.scan = if n2 as usize == prefix.len() {
+                                self.notifications.begin(b"");
+                                Scan::Notify { osc }
+                            } else {
+                                Scan::NotifyPrefix { osc, n: n2 }
+                            };
+                        }
+                        // `777;preexec`, `999;…`: some other OSC.
+                        _ => self.scan = Scan::Skip,
+                    }
+                    if !matches!(b, 0x07 | 0x18 | 0x1a | 0x1b) {
+                        self.osc_len += 1;
+                    }
+                    i += 1;
+                }
+                Scan::Notify { osc } => (start, i) = self.notify_run(bytes, start, i, osc),
                 // Some other OSC: jump straight to its terminator (one SIMD scan,
                 // not a step per byte), counting the payload toward the cap.
                 Scan::Skip => {
@@ -2644,6 +2693,32 @@ impl Terminal {
         self.sixel_buf.extend_from_slice(&run[..run.len().min(room)]);
         self.sixel_overflow |= run.len() > room;
         (self.skip_payload(bytes, start, i, end), end)
+    }
+
+    /// A notification's payload from `bytes[i]`: jump to its terminator as
+    /// `Skip` does (vte gets every byte, as for any OSC), keeping its head; at
+    /// the terminator the notification is read — every OSC terminator ends
+    /// it, as vte dispatches on each. An overrun of the OSC cap ends it
+    /// unread. Returns the new `start` and `i`.
+    #[cold]
+    #[inline(never)]
+    fn notify_run(&mut self, bytes: &[u8], start: usize, i: usize, osc: NotifyOsc) -> (usize, usize) {
+        let term = osc_terminator(&bytes[i..]);
+        let run = term.unwrap_or(bytes.len() - i);
+        let room = self.osc_cap.saturating_sub(self.osc_len) as usize;
+        if run > room {
+            return (self.abort_osc(bytes, start, i + room), i + room);
+        }
+        self.notifications.capture(&bytes[i..i + run]);
+        self.osc_len += run as u32;
+        let j = i + run;
+        if term.is_none() {
+            return (start, j);
+        }
+        self.notifications.finish(osc);
+        // ESC (= ST) also begins a new escape; BEL/CAN/SUB end it.
+        self.scan = if bytes[j] == 0x1b { Scan::Esc } else { Scan::Ground };
+        (start, j + 1)
     }
 
     /// [`Terminal::sixel_run`] for a Kitty APC's control and payload, up to
@@ -4769,6 +4844,14 @@ impl Terminal {
         } else {
             std::mem::take(&mut self.completed)
         }
+    }
+
+    /// Take the desktop notifications programs asked for (OSC 9 / 777 / 99)
+    /// since the last call, made safe to show ([`ProgramNotification`]). Empty —
+    /// no allocation — in the common case, so this rides the PTY-drain pass
+    /// at no idle cost. Consuming.
+    pub fn take_notifications(&mut self) -> Vec<ProgramNotification> {
+        self.notifications.take()
     }
 
     /// The program-reported OSC 9;4 progress, if any is showing.
@@ -7520,6 +7603,115 @@ mod tests {
         assert_eq!(t.progress(), None, "a capped OSC applies nothing");
         let snap = t.snapshot();
         assert_eq!(snap.cell(0, 0).c, 'x', "the stream resyncs after the terminator");
+    }
+
+    /// Feed `seq` split at EVERY byte boundary (and whole) and return the
+    /// desktop notifications each run asked for.
+    fn notifications_after(seq: &[u8]) -> Vec<Vec<ProgramNotification>> {
+        (0..=seq.len())
+            .map(|cut| {
+                let mut t = Terminal::new(30, 6);
+                t.feed(&seq[..cut]);
+                t.feed(&seq[cut..]);
+                t.take_notifications()
+            })
+            .collect()
+    }
+
+    fn shown(title: &str, body: &str) -> ProgramNotification {
+        ProgramNotification { title: title.to_string(), body: body.to_string() }
+    }
+
+    #[test]
+    fn notifications_parse_at_any_split() {
+        let cases: [(&[u8], Vec<ProgramNotification>); 12] = [
+            (b"\x1b]9;Build finished\x07", vec![shown("", "Build finished")]),
+            (b"\x1b]9;Build finished\x1b\\", vec![shown("", "Build finished")]), // ST
+            (b"\x1b]9;42 files\x07", vec![shown("", "42 files")]),
+            (b"\x1b]9;4x\x07", vec![shown("", "4x")]), // a `4` that is no progress
+            (b"\x1b]9;a\nb\x07", vec![shown("", "ab")]), // vte ignores C0 in an OSC
+            (b"\x1b]777;notify;Claude Code;Waiting for you\x1b\\", vec![shown("Claude Code", "Waiting for you")]),
+            (b"\x1b]777;notify;Done\x07", vec![shown("Done", "")]),
+            (b"\x1b]99;;Hello\x1b\\", vec![shown("Hello", "")]),
+            (b"\x1b]99;i=1:d=0;Hello\x1b\\\x1b]99;i=1:p=body;World\x1b\\", vec![shown("Hello", "World")]),
+            (b"\x1b]99;i=2:e=1;SMOpbGxvIHfDtnJsZA==\x07", vec![shown("H\u{e9}llo w\u{f6}rld", "")]),
+            (
+                "\x1b]777;notify;Sys\u{202e}tem;Your pass\u{200b}word\x1b\\".as_bytes(),
+                vec![shown("System", "Your password")],
+            ),
+            (
+                b"\x1b]9;one\x07\x1b]777;notify;two;2\x07\x1b]99;;three\x07",
+                vec![shown("", "one"), shown("two", "2"), shown("three", "")],
+            ),
+        ];
+        for (seq, want) in cases {
+            for got in notifications_after(seq) {
+                assert_eq!(got, want, "{:?}", String::from_utf8_lossy(seq));
+            }
+        }
+    }
+
+    #[test]
+    fn notification_lookalikes_notify_nothing() {
+        for seq in [
+            &b"\x1b]9;4;1;50\x07"[..],     // progress
+            b"\x1b]9;4\x07",               // a bare progress
+            b"\x1b]9;9;\"/home/u\"\x1b\\", // ConEmu's working directory
+            b"\x1b]9;1;500\x07",           // ConEmu's sleep
+            b"\x1b]9;\x07",                // empty
+            b"\x1b]777;preexec\x07",       // another OSC 777
+            b"\x1b]777;notif;x;y\x07",
+            b"\x1b]7;file:///tmp\x07", // OSC 7 (the working directory)
+            b"\x1b]999;x\x07",
+            b"\x1b]90;x\x07",
+            b"\x1b]99;i=1:p=?;\x1b\\", // a query: never answered either
+            b"\x1b]99;i=1:d=0;unfinished\x1b\\",
+            b"\x1b]0;9;a title\x07",
+            b"\x1bP9;x\x1b\\", // a DCS
+        ] {
+            for got in notifications_after(seq) {
+                assert!(got.is_empty(), "{:?}: {got:?}", String::from_utf8_lossy(seq));
+            }
+        }
+        // Progress still parses next to a notification.
+        let mut t = Terminal::new(30, 6);
+        t.feed(b"\x1b]9;4;1;40\x07\x1b]9;hi\x07");
+        assert_eq!(t.progress(), prog(ProgressState::Normal, Some(40)));
+        assert_eq!(t.take_notifications(), [shown("", "hi")]);
+        assert!(t.take_notifications().is_empty(), "consumed");
+    }
+
+    #[test]
+    fn notifications_leave_the_grid_and_the_scanner_in_sync() {
+        // Every byte still reaches vte: nothing leaks onto the grid, and an
+        // ESC that ends one (vte parity) begins the next sequence.
+        let mut t = Terminal::new(30, 6);
+        t.feed(b"ab\x1b]9;one\x07cd\x1b]777;notify;t;b\x1b\\ef\x1b]99;;x\x1b\\gh");
+        let snap = t.snapshot();
+        let row: String = (0..8).map(|c| snap.cell(0, c).c).collect();
+        assert_eq!(row, "abcdefgh");
+        assert_eq!(t.take_notifications().len(), 3);
+        t.feed(b"\x1b]9;x\x1b]133;A\x07");
+        assert_eq!(t.prompt_count(), 1);
+        assert_eq!(t.take_notifications(), [shown("", "x")]);
+    }
+
+    #[test]
+    fn a_notification_flood_is_capped_like_every_osc() {
+        let mut t = Terminal::new(30, 6);
+        t.osc_cap = 64;
+        t.feed(b"\x1b]777;notify;");
+        t.feed(&[b'z'; 200]);
+        assert!(matches!(t.scan, Scan::OscDiscard), "scan = {:?}", t.scan);
+        t.feed(b"\x07xy");
+        assert!(t.take_notifications().is_empty(), "an overrun notifies nothing");
+        assert_eq!(t.snapshot().cell(0, 0).c, 'x', "the stream resyncs after the terminator");
+        // Many finished ones between two drains: a few are kept.
+        let mut t = Terminal::new(30, 6);
+        t.feed(&b"\x1b]9;spam\x07".repeat(10_000));
+        let got = t.take_notifications();
+        assert_eq!(got.len(), crate::notification::MAX_PENDING);
+        assert!(t.take_notifications().is_empty());
     }
 
     #[test]
@@ -11471,6 +11663,7 @@ mod tests {
                     1 => stream.extend_from_slice(b"\x1b]0;"),
                     2 => stream.extend_from_slice(b"\x1b]133;"),
                     3 => stream.extend_from_slice(b"\x1b]9;4;"),
+                    4 => stream.extend_from_slice([&b"\x1b]9;"[..], b"\x1b]99;", b"\x1b]777;notify;"][next() as usize % 3]),
                     _ => stream.push(alphabet[next() as usize % alphabet.len()]),
                 }
             }
@@ -11486,7 +11679,13 @@ mod tests {
                 seen = log.len();
                 let scanning_osc = matches!(
                     t.scan,
-                    Scan::Prefix { .. } | Scan::Payload { .. } | Scan::Skip | Scan::Prefix94 { .. } | Scan::Progress { .. }
+                    Scan::Prefix { .. }
+                        | Scan::Payload { .. }
+                        | Scan::Skip
+                        | Scan::Prefix94 { .. }
+                        | Scan::Progress { .. }
+                        | Scan::NotifyPrefix { .. }
+                        | Scan::Notify { .. }
                 );
                 assert_eq!(scanning_osc, model.state == VState::Osc, "case {case} @{i}: scan {:?} vs vte {:?}", t.scan, model.state);
                 assert_eq!(t.scan == Scan::Esc, model.state == VState::Escape, "case {case} @{i}: scan {:?} vs vte {:?}", t.scan, model.state);
