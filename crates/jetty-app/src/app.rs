@@ -1380,9 +1380,10 @@ pub struct App {
     /// turn-off. Re-armed after every reload so a recreated dir, a retargeted
     /// symlink or a later `themes/` keep being watched.
     config_watcher: Option<crate::watch::ConfigWatcher>,
-    /// Reports a window manager's minimize of the main and detached windows
+    /// Reports a window manager's minimize of JeTTY's windows
     /// (`AppEvent::Minimized`; X11 only — `None` elsewhere). Started in
-    /// `resumed` with the main window; each detached window is added to it.
+    /// `resumed` with the main window; each detached window and the Settings
+    /// window are added to it.
     minimize_watch: Option<jetty_platform::MinimizeWatch>,
     /// Set true ONLY for the duration of `reload_config_and_themes`. While set,
     /// `persist()` is a NO-OP — so a reload applying live keys through the normal
@@ -10226,6 +10227,10 @@ impl App {
                 return;
             }
         };
+        // A window manager's minimize reaches `settings_occluded` too (X11).
+        if let Some(watch) = &self.minimize_watch {
+            watch.watch(&window);
+        }
         // The Shell cycler's options: /etc/shells, and the backdrop images —
         // read once per open (never per frame).
         self.shell_options = detect_shells();
@@ -14606,7 +14611,8 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::Minimized(id, minimized) => {
                 // What winit reports as `Occluded` where it can see a minimize:
                 // every self-driven paint of that window stops until it is
-                // shown again (main or detached, routed like a winit event).
+                // shown again (main, detached or Settings, routed like a winit
+                // event).
                 self.window_event(event_loop, id, WindowEvent::Occluded(minimized));
             }
             AppEvent::ConfigChanged => {
