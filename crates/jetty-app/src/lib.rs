@@ -3,6 +3,8 @@ mod app;
 /// settings portal on Linux/BSD; winit's system theme elsewhere).
 mod appearance;
 mod backdrop;
+/// The command line: what `jetty …` asks for.
+mod cli;
 /// Persisted settings. Public so the `jetty-shot` self-test can render the
 /// Settings panel from a real config file.
 pub mod config;
@@ -326,8 +328,10 @@ fn forward_command(sock_path: &str, cmd: &str, me: &ipc::Caller) -> ConnectResul
             let _ = stream.write_all(cmd.as_bytes());
             let _ = stream.flush();
             // The verb is delivered; this bounds only how long we wait to hear
-            // how it was taken (the summon itself never waits on it).
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+            // how it was taken (the summon itself never waits on it) — a tab,
+            // how it opened.
+            let wait = if me.tab.is_some() { TAB_ANSWER_WAIT } else { std::time::Duration::from_secs(1) };
+            let _ = stream.set_read_timeout(Some(wait));
             match ipc::introduce(&mut stream, me) {
                 ipc::Answer::Elsewhere => ConnectResult::Elsewhere,
                 answer => ConnectResult::Forwarded(answer),
@@ -369,23 +373,37 @@ fn forward_here(sock_path: &mut String, cmd: &str, me: &ipc::Caller) -> ConnectR
 /// A primary took the command. One older than the introductions (`Older`)
 /// can't know a newer JeTTY was launched, so a newer AppImage moves the login
 /// item to itself here (`app::follow_newer_appimage`) — or every login would
-/// keep starting the old file.
+/// keep starting the old file. A tab it refused — or, older than `new-tab`,
+/// ignored — was not opened: said, and the launch fails (status 1).
 fn forwarded(answer: ipc::Answer, me: &ipc::Caller) {
-    if answer != ipc::Answer::Older {
-        return;
-    }
-    if let Some(exe) = &me.appimage {
-        if app::follow_newer_appimage(exe) {
-            eprintln!(
-                "jetty: an older JeTTY is running — Launch at login now starts {}; quit the \
-                 running one to switch now",
-                exe.display()
-            );
+    let unopened = match &answer {
+        _ if me.tab.is_none() => None,
+        ipc::Answer::Refused(why) => Some(why.clone()),
+        ipc::Answer::Older => Some(format!(
+            "the running JeTTY is older than {} and can't open a tab on request — nothing was \
+             opened; quit it and run this again",
+            env!("CARGO_PKG_VERSION")
+        )),
+        _ => None,
+    };
+    if answer == ipc::Answer::Older {
+        if let Some(exe) = &me.appimage {
+            if app::follow_newer_appimage(exe) {
+                eprintln!(
+                    "jetty: an older JeTTY is running — Launch at login now starts {}; quit the \
+                     running one to switch now",
+                    exe.display()
+                );
+            }
         }
+    }
+    if let Some(why) = unopened {
+        eprintln!("jetty: {why}");
+        std::process::exit(1);
     }
 }
 
-/// A summon verb a connection to the IPC socket sent.
+/// A verb a connection to the IPC socket sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IpcCommand {
     Show,
@@ -394,18 +412,22 @@ enum IpcCommand {
     /// `--background`: never pops up an instance that is already running (a
     /// login autostart), but the launch is still greeted (`ipc`).
     Background,
+    /// `--new-tab` / `-e` / `--cwd`: open the tab the launch's introduction
+    /// asks for, and summon.
+    NewTab,
 }
 
 /// The verb in what a connection sent first — `jetty --show` / `--hide` /
-/// `--toggle` / `--background` send the bare word. ASCII whitespace around it
-/// is ignored, so `echo toggle | nc -U <socket>` works too. Anything else is
-/// not one of ours.
+/// `--toggle` / `--background` / `--new-tab` send the bare word. ASCII
+/// whitespace around it is ignored, so `echo toggle | nc -U <socket>` works
+/// too. Anything else is not one of ours.
 fn ipc_command(bytes: &[u8]) -> Option<IpcCommand> {
     match bytes.trim_ascii() {
         b"show" => Some(IpcCommand::Show),
         b"hide" => Some(IpcCommand::Hide),
         b"toggle" => Some(IpcCommand::Toggle),
         b"background" => Some(IpcCommand::Background),
+        b"new-tab" => Some(IpcCommand::NewTab),
         _ => None,
     }
 }
@@ -413,6 +435,14 @@ fn ipc_command(bytes: &[u8]) -> Option<IpcCommand> {
 /// How long the IPC thread waits for a connection's verb (and introduction):
 /// an idle or half-open client (`nc -U`) can't wedge the serial accept loop.
 const IPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long the IPC thread waits for the event loop to open a requested tab
+/// before it answers `ok` anyway — it opens when the loop gets to it.
+const TAB_OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a `new-tab` launch waits to hear how its tab came out: longer
+/// than the primary waits for its event loop ([`TAB_OPEN_WAIT`]).
+const TAB_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The pause after a failed `accept`, doubled per failure in a row up to
 /// [`IPC_ACCEPT_BACKOFF_MAX`].
@@ -536,81 +566,85 @@ pub fn run() {
     // before the IPC socket is named after it and the shells inherit it.
     config::Config::pin_dir_env();
 
-    // `--print-shell-integration <zsh|bash|fish>`: emit the OSC 133 opt-in
-    // snippet and exit, BEFORE any IPC/GUI. Safe arg parsing — no panic on a
-    // missing/non-UTF8 argument; a bad/absent shell prints usage to stderr and
-    // exits 2. Handled here (not the loop below) so it can read the next token.
-    {
-        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-        if let Some(pos) = args.iter().position(|a| a.as_os_str() == "--print-shell-integration") {
-            let shell = args.get(pos + 1).and_then(|a| a.to_str());
-            match shell.and_then(shell_integration::snippet_for) {
-                Some(snippet) => {
-                    print!("{snippet}");
-                    std::process::exit(0);
-                }
-                None => {
-                    eprintln!("jetty: usage: jetty --print-shell-integration <zsh|bash|fish>");
-                    std::process::exit(2);
-                }
-            }
+    // args_os: std::env::args() panics on non-UTF8 argv — a bad byte in an
+    // unknown argument is ignored like any other, and a command's arguments
+    // and directories are bytes anyway (`cli`).
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let (cmd, tab) = match cli::parse(&args, std::env::current_dir().ok().as_deref()) {
+        Ok(cli::Cli::Version) => {
+            println!("jetty {version} ({build})");
+            std::process::exit(0);
         }
-    }
-
-    let mut cmd = "toggle";
-    // args_os + to_str: std::env::args() panics on non-UTF8 argv; a bad byte in
-    // an unknown arg should be ignored like any other unrecognized flag, not
-    // abort the process before any window or IPC handling.
-    for arg in std::env::args_os().skip(1) {
-        match arg.to_str() {
-            Some("--version") | Some("-version") | Some("-V") | Some("version") => {
-                println!("jetty {version} ({build})");
+        Ok(cli::Cli::Help) => {
+            println!(
+                "JeTTY {version} — a blazing-fast GPU terminal with a global summon hotkey.\n\n\
+                 USAGE:\n    jetty [FLAGS]\n    jetty --new-tab [--cwd DIR] [-- COMMAND [ARGS…]]\n    \
+                 jetty -e COMMAND [ARGS…]\n\n\
+                 FLAGS:\n\
+                 \x20   --toggle       Show/hide a running instance (or launch one); same as plain `jetty`.\n\
+                 \x20   --show         Summon a running instance (or launch one).\n\
+                 \x20   --hide         Hide a running instance.\n\
+                 \x20   --background   Launch hidden — no window until the first summon. Does nothing\n\
+                 \x20                  if JeTTY is already running (\"Launch at login\" uses this).\n\
+                 \x20   --new-tab      Open a tab in the running JeTTY and summon it (or launch JeTTY\n\
+                 \x20                  with it): in the current directory, running your shell.\n\
+                 \x20   --cwd DIR      Start the tab in DIR (implies --new-tab); --working-directory DIR too.\n\
+                 \x20   -e COMMAND [ARGS…], -- COMMAND [ARGS…]\n\
+                 \x20                  Run COMMAND in the tab instead of your shell (implies --new-tab):\n\
+                 \x20                  everything after -e / -- is its own, run as given — no shell parses\n\
+                 \x20                  it — with the running JeTTY's environment. The tab closes when it\n\
+                 \x20                  exits; if it fails right away, the tab stays open to show why.\n\
+                 \x20   --check-config Check config.toml and the theme files: print every problem\n\
+                 \x20                  (with the closest valid spelling) and exit, 1 if there are any.\n\
+                 \x20   --version      Print version and exit.\n\
+                 \x20   --help         Print this help and exit.\n\
+                 \x20   --print-shell-integration <zsh|bash|fish>\n\
+                 \x20                  Print the OSC 133 shell-integration snippet to stdout.\n\
+                 Anything else is ignored.\n\n\
+                 Bind `jetty --toggle` to a key in your compositor to summon from anywhere.\n\
+                 Settings: Ctrl+, or Ctrl+Shift+O · Command palette: Ctrl+Shift+P\n\
+                 Config: {config} (another dir: set JETTY_CONFIG_DIR)\n\
+                 Shell integration (prompt marks, Ctrl+Shift+Z/X jump, Run & Notify). Add to your rc file:\n\
+                 \x20 zsh:  {zsh}\n\
+                 \x20 bash: {bash}\n\
+                 \x20 fish: {fish}\n\
+                 \x20       (fish 4+ marks its prompts itself — nothing to add)",
+                config = config::Config::config_path().display(),
+                zsh = shell_integration::ZSH_LINE,
+                bash = shell_integration::BASH_LINE,
+                fish = shell_integration::FISH_LINE,
+            );
+            std::process::exit(0);
+        }
+        Ok(cli::Cli::CheckConfig) => std::process::exit(config::check::check_cli()),
+        // The OSC 133 opt-in snippet, BEFORE any IPC/GUI; a bad or absent
+        // shell prints usage to stderr and exits 2.
+        Ok(cli::Cli::PrintShellIntegration(shell)) => match shell.as_deref().and_then(shell_integration::snippet_for) {
+            Some(snippet) => {
+                print!("{snippet}");
                 std::process::exit(0);
             }
-            Some("--help") | Some("-help") | Some("-h") | Some("help") => {
-                println!(
-                    "JeTTY {version} — a blazing-fast GPU terminal with a global summon hotkey.\n\n\
-                     USAGE:\n    jetty [FLAGS]\n\n\
-                     FLAGS:\n\
-                     \x20   --toggle       Show/hide a running instance (or launch one); same as plain `jetty`.\n\
-                     \x20   --show         Summon a running instance (or launch one).\n\
-                     \x20   --hide         Hide a running instance.\n\
-                     \x20   --background   Launch hidden — no window until the first summon. Does nothing\n\
-                     \x20                  if JeTTY is already running (\"Launch at login\" uses this).\n\
-                     \x20   --check-config Check config.toml and the theme files: print every problem\n\
-                     \x20                  (with the closest valid spelling) and exit, 1 if there are any.\n\
-                     \x20   --version      Print version and exit.\n\
-                     \x20   --help         Print this help and exit.\n\
-                     \x20   --print-shell-integration <zsh|bash|fish>\n\
-                     \x20                  Print the OSC 133 shell-integration snippet to stdout.\n\
-                     Anything else is ignored: there is no `-e` — JeTTY always starts your shell.\n\n\
-                     Bind `jetty --toggle` to a key in your compositor to summon from anywhere.\n\
-                     Settings: Ctrl+, or Ctrl+Shift+O · Command palette: Ctrl+Shift+P\n\
-                     Config: {config} (another dir: set JETTY_CONFIG_DIR)\n\
-                     Shell integration (prompt marks, Ctrl+Shift+Z/X jump, Run & Notify). Add to your rc file:\n\
-                     \x20 zsh:  {zsh}\n\
-                     \x20 bash: {bash}\n\
-                     \x20 fish: {fish}\n\
-                     \x20       (fish 4+ marks its prompts itself — nothing to add)",
-                    config = config::Config::config_path().display(),
-                    zsh = shell_integration::ZSH_LINE,
-                    bash = shell_integration::BASH_LINE,
-                    fish = shell_integration::FISH_LINE,
-                );
-                std::process::exit(0);
+            None => {
+                eprintln!("jetty: usage: jetty --print-shell-integration <zsh|bash|fish>");
+                std::process::exit(2);
             }
-            Some("--check-config") => std::process::exit(config::check::check_cli()),
-            Some("--toggle") => cmd = "toggle",
-            Some("--show") => cmd = "show",
-            Some("--hide") => cmd = "hide",
-            Some("--background") => cmd = "background",
-            _ => {}
+        },
+        Ok(cli::Cli::Launch { verb, tab }) => (verb, tab),
+        Err(e) => {
+            eprintln!("jetty: {e} — see jetty --help");
+            std::process::exit(2);
         }
+    };
+    // A tab that can't be opened (no such directory, a command too long to
+    // hand over) is said before anything runs or is reached.
+    if let Some(Err(e)) = tab.as_ref().map(ipc::TabRequest::check) {
+        eprintln!("jetty: {e}");
+        std::process::exit(2);
     }
 
-    // Who this launch is (version, display, AppImage): said to a running
-    // primary after the command (see `ipc`).
-    let me = ipc::Caller::current();
+    // Who this launch is (version, display, AppImage) and the tab it asks for:
+    // said to a running primary after the command (see `ipc`).
+    let mut me = ipc::Caller { tab, ..ipc::Caller::current() };
     let mut sock_path = ipc_socket_path(None);
 
     // Secondary invocation: forward the command to the running primary and exit.
@@ -618,7 +652,8 @@ pub fn run() {
     if let ConnectResult::Forwarded(answer) = forward_here(&mut sock_path, cmd, &me) {
         return forwarded(answer, &me);
     }
-    // No live instance: `--hide` has nothing to hide; toggle/show launch.
+    // No live instance: `--hide` has nothing to hide; toggle/show launch, and
+    // a new tab is the first one.
     if cmd == "hide" {
         return;
     }
@@ -776,24 +811,41 @@ pub fn run() {
         std::thread::spawn(move || {
             let mut announced: Option<String> = None;
             let serve = |cmd, s: &mut std::os::unix::net::UnixStream| {
-                let event = match cmd {
-                    IpcCommand::Show => Some(AppEvent::SetVisible(true)),
-                    IpcCommand::Hide => Some(AppEvent::SetVisible(false)),
-                    IpcCommand::Toggle => Some(AppEvent::ToggleVisibility),
-                    // `--background`: no-op, don't toggle (a login autostart must
-                    // never pop up an instance that's already running).
-                    IpcCommand::Background => None,
+                let (caller, event, opened) = match cmd {
+                    // A tab is heard and checked here, and opened by the event
+                    // loop, which says how that went before the launch is
+                    // answered (a program that can't start is the launch's
+                    // error too).
+                    IpcCommand::NewTab => {
+                        let (caller, tab) = ipc::hear_tab(s, version, &here);
+                        let Some(tab) = tab else { return true };
+                        let (reply, opened) = std::sync::mpsc::sync_channel(1);
+                        (caller, Some(AppEvent::NewTab(tab, reply)), Some(opened))
+                    }
+                    _ => {
+                        let (caller, serve) = ipc::greet(s, version, &here);
+                        if !serve {
+                            return true;
+                        }
+                        let event = match cmd {
+                            IpcCommand::Show => Some(AppEvent::SetVisible(true)),
+                            IpcCommand::Hide => Some(AppEvent::SetVisible(false)),
+                            IpcCommand::Toggle => Some(AppEvent::ToggleVisibility),
+                            // `--background`: no-op, don't toggle (a login autostart
+                            // must never pop up an instance that's already running).
+                            IpcCommand::Background | IpcCommand::NewTab => None,
+                        };
+                        (caller, event, None)
+                    }
                 };
-                let (caller, serve) = ipc::greet(s, version, &here);
-                if !serve {
-                    return true;
-                }
                 // The launcher's activation token goes just ahead of a summon:
                 // a Wayland summon builds the window with it.
-                let token = caller
-                    .as_ref()
-                    .and_then(|c| c.activation_token.clone())
-                    .filter(|_| matches!(event, Some(AppEvent::SetVisible(true) | AppEvent::ToggleVisibility)));
+                let token = caller.as_ref().and_then(|c| c.activation_token.clone()).filter(|_| {
+                    matches!(
+                        event,
+                        Some(AppEvent::SetVisible(true) | AppEvent::ToggleVisibility | AppEvent::NewTab(..))
+                    )
+                });
                 let mut events: Vec<AppEvent> =
                     token.map(AppEvent::ActivationToken).into_iter().chain(event).collect();
                 let newer = caller.filter(|c| c.newer_than(version) && announced.as_ref() != Some(&c.version));
@@ -802,7 +854,13 @@ pub fn run() {
                     events.push(AppEvent::Notice(app::newer_version_notice(&c.version, version, moved)));
                     announced = Some(c.version);
                 }
-                !events.into_iter().any(|e| proxy_ipc.send_event(e).is_err())
+                if events.into_iter().any(|e| proxy_ipc.send_event(e).is_err()) {
+                    return false;
+                }
+                if let Some(opened) = opened {
+                    ipc::answer_tab(s, opened.recv_timeout(TAB_OPEN_WAIT).unwrap_or(Ok(())));
+                }
+                true
             };
             serve_ipc(listener.incoming(), serve, std::thread::sleep);
             remove_socket_if_ours(&sock_cleanup, bound_ident);
@@ -811,6 +869,7 @@ pub fn run() {
 
     let mut app = app::App::new(proxy);
     app.set_start_hidden(cmd == "background");
+    app.set_first_tab(me.tab.take());
     event_loop.run_app(&mut app).expect("run_app");
 
     // Best-effort cleanup on normal exit. Crashes are handled by the
@@ -1005,12 +1064,15 @@ mod ipc_serve_tests {
 
     #[test]
     fn a_command_may_carry_ascii_whitespace() {
-        let cases: [(&[u8], Option<IpcCommand>); 11] = [
+        let cases: [(&[u8], Option<IpcCommand>); 14] = [
             (b"toggle", Some(IpcCommand::Toggle)),
             (b"toggle\n", Some(IpcCommand::Toggle)), // `echo toggle | nc -U <socket>`
             (b" show\r\n", Some(IpcCommand::Show)),
             (b"\thide ", Some(IpcCommand::Hide)),
             (b"background", Some(IpcCommand::Background)),
+            (b"new-tab", Some(IpcCommand::NewTab)),
+            (b"new-tab\n", Some(IpcCommand::NewTab)),
+            (b"new-tab\0/tmp", None),
             (b"", None),
             (b"\n", None),
             (b"toggle!", None),

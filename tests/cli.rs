@@ -162,6 +162,93 @@ fn a_launch_on_another_display_does_not_toggle_this_one() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A running JeTTY at the sandbox's socket, for one launch: it greets as
+/// `version`, hears the introduction and answers `answer` — or, with no
+/// version, it is older than the greeting and `new-tab`: it reads the verb and
+/// hangs up. Returns what it heard: the verb and the introduction.
+fn fake_primary(dir: &Path, version: Option<&'static str>, answer: &'static [u8]) -> std::thread::JoinHandle<(Vec<u8>, Vec<u8>)> {
+    let sock = dir.join("run").join("jetty.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut verb = [0u8; 16];
+        let n = s.read(&mut verb).unwrap();
+        let mut intro = Vec::new();
+        if let Some(v) = version {
+            s.write_all(format!("jetty {v}\n").as_bytes()).unwrap();
+            s.read_to_end(&mut intro).unwrap();
+            s.write_all(answer).unwrap();
+        }
+        (verb[..n].to_vec(), intro)
+    })
+}
+
+#[test]
+fn a_tab_the_launch_cannot_ask_for_is_a_usage_error() {
+    let dir = sandbox("tabusage");
+    for (args, want) in [
+        (&["--new-tab", "--cwd", "/nonexistent/jetty-dir"][..], "/nonexistent/jetty-dir: not a directory"),
+        (&["-e"][..], "-e needs a command to run"),
+        (&["--hide", "-e", "htop"][..], "--hide can't open a tab"),
+    ] {
+        let out = jetty(&dir, args);
+        let err = stderr(&out);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains(want), "{args:?}: {err}");
+    }
+    // Said before anything ran: no socket, no lock.
+    assert_eq!(std::fs::read_dir(dir.join("run")).unwrap().count(), 0);
+    let help = jetty(&dir, &["--help"]);
+    let usage = String::from_utf8_lossy(&help.stdout);
+    assert!(usage.contains("--new-tab") && usage.contains("-e COMMAND") && usage.contains("--cwd DIR"), "{usage}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_new_tab_goes_to_the_running_jetty_with_its_directory_and_command() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = sandbox("newtab");
+    let here = std::fs::canonicalize(dir.join("home")).unwrap();
+    // The running JeTTY could not start the program: the launch says why.
+    let primary = fake_primary(&dir, Some("0.31.0"), b"refused \"htpo\": not found in PATH\n");
+    let out = command(&dir, &["--new-tab", "--", "htpo", "-d", ""]).current_dir(&here).output().unwrap();
+    let err = stderr(&out);
+    let (verb, intro) = primary.join().unwrap();
+    assert_eq!(verb, b"new-tab", "the verb comes alone, as an older JeTTY reads it");
+    let fields: Vec<&[u8]> = intro.split(|&b| b == 0).collect();
+    assert_eq!(fields[0], b"v1", "{intro:?}");
+    let tab = fields.iter().position(|f| *f == b"tab1").expect("a tab request");
+    assert_eq!(fields[tab + 1], here.as_os_str().as_bytes(), "here, by default");
+    assert_eq!(fields[tab + 2..], [&b"htpo"[..], b"-d", b""], "the command as given");
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("jetty: \"htpo\": not found in PATH"), "{err}");
+    // Opened: success, nothing said.
+    let primary = fake_primary(&dir, Some("0.31.0"), b"ok\n");
+    let out = command(&dir, &["--working-directory=/", "-e", "htop"]).output().unwrap();
+    let (_, intro) = primary.join().unwrap();
+    let fields: Vec<&[u8]> = intro.split(|&b| b == 0).collect();
+    let tab = fields.iter().position(|f| *f == b"tab1").expect("a tab request");
+    assert_eq!(fields[tab + 1..], [&b"/"[..], b"htop"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(out.stderr.is_empty(), "{}", stderr(&out));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_older_running_jetty_opens_no_tab_and_the_launch_says_so() {
+    // JeTTY ≤ 0.30 doesn't know `new-tab`: it reads the verb, does nothing
+    // and hangs up — the launch must not pass that off as success.
+    let dir = sandbox("oldtab");
+    let primary = fake_primary(&dir, None, b"");
+    let out = command(&dir, &["-e", "htop"]).current_dir(dir.join("home")).output().unwrap();
+    let err = stderr(&out);
+    assert_eq!(primary.join().unwrap().0, b"new-tab");
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("older") && err.contains("nothing was opened"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn hide_with_nothing_running_does_nothing() {
     let dir = sandbox("hide");

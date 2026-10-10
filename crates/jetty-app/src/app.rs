@@ -24,6 +24,10 @@ pub enum AppEvent {
     /// launched with (its `XDG_ACTIVATION_TOKEN`), sent just ahead of its
     /// command: a Wayland summon builds the window with it (`App::activation_token`).
     ActivationToken(String),
+    /// `jetty --new-tab` / `-e` / `--cwd` reached this JeTTY: open the tab it
+    /// asks for in the main window, and summon it. The sender hears whether
+    /// it opened — the launch says why not.
+    NewTab(crate::ipc::TabRequest, std::sync::mpsc::SyncSender<Result<(), String>>),
     /// macOS asked the running JeTTY to reopen: a click on its Dock icon,
     /// `open -a JeTTY`, Spotlight (`jetty_platform::on_reopen`).
     Reopen,
@@ -487,6 +491,10 @@ pub(crate) struct Tab {
     /// Keys this tab was sent a press for (their releases are owed to it under
     /// the kitty keyboard protocol) and its last observed focus (DECSET 1004).
     pub(crate) input: input::TabInputState,
+    /// The program run in place of a shell (`jetty -e`) failed right after
+    /// starting: the tab stays open, its error on screen, until the user
+    /// closes it ([`App::revive_failed_start`]).
+    pub(crate) held: bool,
 }
 
 /// Which surface a run-selection trigger fired from: the main window's active
@@ -1526,6 +1534,9 @@ pub struct App {
     /// Start hidden (`jetty --background`, used by the login autostart entry): the
     /// window is created unmapped and the first summon shows it.
     start_hidden: bool,
+    /// The first tab's directory and command when the launch asked for one
+    /// (`App::set_first_tab`); taken by `resumed`.
+    first_tab: Option<crate::ipc::TabRequest>,
     /// No GPU could draw the main window, or no shell could be started, at
     /// startup: the loop exits and `run` exits with status 1
     /// ([`App::startup_failed`]).
@@ -2431,6 +2442,7 @@ impl App {
             shown_warnings: theme_warnings,
             reset_keys_armed_until: None,
             start_hidden: false,
+            first_tab: None,
             startup_failed: false,
             pending_reload_at: None,
             config_recheck: false,
@@ -2689,6 +2701,13 @@ impl App {
     /// first summon shows it. Call before the event loop runs.
     pub fn set_start_hidden(&mut self, hidden: bool) {
         self.start_hidden = hidden;
+    }
+
+    /// Start with this tab (`jetty --new-tab` / `-e` / `--cwd` with no JeTTY
+    /// running) instead of the shell in the home directory. Call before the
+    /// event loop runs.
+    pub(crate) fn set_first_tab(&mut self, tab: Option<crate::ipc::TabRequest>) {
+        self.first_tab = tab;
     }
 
     /// Whether startup failed for good (no GPU could draw the main window, or
@@ -4564,6 +4583,18 @@ impl App {
     /// run-selection uses so the main window's active tab — and its search bar,
     /// hint/copy mode and selection — are left untouched. Returns the new index.
     fn spawn_tab(&mut self, cwd: Option<std::path::PathBuf>) -> Option<usize> {
+        self.spawn_tab_running(cwd, Vec::new()).ok()
+    }
+
+    /// [`App::spawn_tab`] running `argv` — exec'd as given, no shell parses
+    /// it — in place of the shell when it isn't empty (`jetty -e`). A program
+    /// that can't start opens no tab: the error (`"htpo": not found in PATH`)
+    /// is shown in a pill and returned.
+    fn spawn_tab_running(
+        &mut self,
+        cwd: Option<std::path::PathBuf>,
+        argv: Vec<std::ffi::OsString>,
+    ) -> Result<usize, String> {
         let (cols, rows) = self.grid_dims();
         let proxy_wake = self.proxy.clone();
         let shell = self.opt_shell();
@@ -4582,10 +4613,24 @@ impl App {
         // shell-integration line finds its snippet.
         let mut env = colorfgbg_env(&self.active_theme);
         env.extend(crate::shell_integration::shell_env());
-        let pty = match PtySession::spawn_with_env(cols as u16, rows as u16, px_w, px_h, shell, cwd, env, move || {
+        let wake = move || {
             let _ = proxy_wake.send_event(AppEvent::Wake);
-        }) {
+        };
+        let (w, h) = (cols as u16, rows as u16);
+        let runs_program = !argv.is_empty();
+        let spawned = if runs_program {
+            PtySession::spawn_program(w, h, px_w, px_h, shell, argv, cwd, env, wake)
+        } else {
+            PtySession::spawn_with_env(w, h, px_w, px_h, shell, cwd, env, wake)
+        };
+        let pty = match spawned {
             Ok(p) => p,
+            // Its reason: a mistyped name, a script without its x bit.
+            Err(e) if runs_program => {
+                eprintln!("jetty: couldn't run {e}");
+                self.show_notice_pill(sanitize_notice(&format!("Couldn't run {e}")), 8000);
+                return Err(e.to_string());
+            }
             Err(e) => {
                 // Not silent: a GUI launch never shows stderr, and a new tab that
                 // simply doesn't appear reads as a dead shortcut.
@@ -4594,7 +4639,7 @@ impl App {
                     msg: "Couldn't open a new tab — no shell could be started (Settings › Shell)",
                     window: None,
                 });
-                return None;
+                return Err(e.to_string());
             }
         };
         let writer = pty.writer();
@@ -4617,12 +4662,21 @@ impl App {
             meta: crate::tabmeta::TabMeta::default(),
             pending_inject: None,
             input: input::TabInputState::default(),
+            held: false,
         };
         Self::init_smart_title(&mut tab, self.tab_title_mode, spawn_cwd.as_deref());
         self.tabs.push(tab);
         // The tab bar gained an entry either way (active or background).
         self.request_main_paint();
-        Some(self.tabs.len() - 1)
+        Ok(self.tabs.len() - 1)
+    }
+
+    /// A tab `jetty --new-tab` / `-e` asked for (IPC): opened and made active
+    /// in the main window. `Err` says why not.
+    fn open_requested_tab(&mut self, request: crate::ipc::TabRequest) -> Result<(), String> {
+        let idx = self.spawn_tab_running(request.cwd, request.argv)?;
+        self.set_active_tab(idx);
+        Ok(())
     }
 
     /// Would closing a main-window tab quit JeTTY — it is the last tab and no
@@ -8789,7 +8843,7 @@ impl App {
             if i == active && rang {
                 active_bell = true;
             }
-            if tab.terminal.child_exited() || tab.pty.child_exited() {
+            if (tab.terminal.child_exited() || tab.pty.child_exited()) && !tab.held {
                 if Self::revive_failed_start(tab) {
                     active_had_data |= i == active;
                 } else {
@@ -8942,27 +8996,44 @@ impl App {
     /// typed into (`PtySession::note_user_input`), did start: whatever ended
     /// it was the user's. True when the tab lives on (see
     /// `PtySession::respawn_after_failed_start`).
+    ///
+    /// A program run in place of a shell (`jetty -e`) that failed right after
+    /// starting is held instead: its tab stays, the error it printed on
+    /// screen above "[process exited with status N]", until it is closed
+    /// (`Tab::held`; `PtySession::failed_program_start`).
     fn revive_failed_start(tab: &mut Tab) -> bool {
+        if let Some(how) = tab.pty.failed_program_start() {
+            Self::take_last_words(tab);
+            tab.terminal.feed_notice(&format!("[process {how}]"));
+            tab.held = true;
+            return true;
+        }
         if tab.terminal.prompt_count() > 0 {
             return false;
         }
         let Some(Ok(pty)) = tab.pty.respawn_after_failed_start() else { return false };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
-        while std::time::Instant::now() < deadline {
-            let Some(chunk) = tab.pty.recv_output_timeout(std::time::Duration::from_millis(20)) else { break };
-            tab.terminal.feed(&chunk);
-        }
-        // Replies to the dead shell's queries must not reach its successor,
-        // nor the modes it left on (the alternate screen, kitty keys, mouse
-        // reporting… of a tmux its rc file exec'd).
-        let _ = tab.terminal.drain_pty_writes();
-        tab.terminal.reset_after_exit();
+        Self::take_last_words(tab);
         for notice in pty.startup_notices() {
             tab.terminal.feed_notice(notice);
         }
         tab.writer = pty.writer();
         tab.pty = pty;
         true
+    }
+
+    /// The last output of `tab`'s program that ended (usually its error),
+    /// shown; then what it leaves behind dropped — replies to its queries,
+    /// which must not reach a successor, and the modes it left on (the
+    /// alternate screen, kitty keys, mouse reporting… of a tmux an rc file
+    /// exec'd).
+    fn take_last_words(tab: &mut Tab) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        while std::time::Instant::now() < deadline {
+            let Some(chunk) = tab.pty.recv_output_timeout(std::time::Duration::from_millis(20)) else { break };
+            tab.terminal.feed(&chunk);
+        }
+        let _ = tab.terminal.drain_pty_writes();
+        tab.terminal.reset_after_exit();
     }
 
     /// What a detached window owes its tab's drain (`had` output, `read`
@@ -14293,24 +14364,43 @@ impl ApplicationHandler<AppEvent> for App {
         let proxy_wake = self.proxy.clone();
         let shell = self.opt_shell();
         let first_shell_env = self.first_shell_env();
+        // `jetty --new-tab` / `-e` with no JeTTY running: the first tab is the
+        // one it asked for.
+        let first = self.first_tab.take().unwrap_or_default();
+        let first_cwd = first.cwd.clone();
         let pty_handle = std::thread::spawn(move || {
             // The shell-integration snippets are written here, off the main thread.
             let mut env = first_shell_env.resolve();
             env.extend(crate::shell_integration::shell_env());
+            let wake = move || {
+                let _ = proxy_wake.send_event(AppEvent::Wake);
+            };
             // Provisional grid at startup: the real text-area pixel size is set by
             // the immediate resize once the cell metrics are known (see below).
-            PtySession::spawn_with_env(
-                FALLBACK_COLS as u16,
-                FALLBACK_ROWS as u16,
+            let (cols, rows) = (FALLBACK_COLS as u16, FALLBACK_ROWS as u16);
+            if first.argv.is_empty() {
+                return (PtySession::spawn_with_env(cols, rows, 0, 0, shell, first.cwd, env, wake), None);
+            }
+            let program = PtySession::spawn_program(
+                cols,
+                rows,
                 0,
                 0,
-                shell,
-                None,
-                env,
-                move || {
-                    let _ = proxy_wake.send_event(AppEvent::Wake);
-                },
-            )
+                shell.clone(),
+                first.argv,
+                first.cwd.clone(),
+                env.clone(),
+                wake.clone(),
+            );
+            match program {
+                Ok(pty) => (Ok(pty), None),
+                // A command that can't start: the shell takes its place, saying
+                // why — a window must have a tab.
+                Err(e) => (
+                    PtySession::spawn_with_env(cols, rows, 0, 0, shell, first.cwd, env, wake),
+                    Some(format!("couldn't run {e} — your shell runs instead")),
+                ),
+            }
         });
 
         // Startup: a failure to create the main window is genuinely fatal (there
@@ -14577,7 +14667,12 @@ impl ApplicationHandler<AppEvent> for App {
         // Join the PTY worker (forked in parallel with the GPU block) and resize
         // it from the provisional grid to the real cols/rows now that the cell
         // size is known.
-        let pty = match pty_handle.join().expect("pty worker panicked") {
+        let (spawned, first_failed) = pty_handle.join().expect("pty worker panicked");
+        if let Some(why) = first_failed {
+            eprintln!("jetty: {why}");
+            self.startup_warnings.push(why);
+        }
+        let pty = match spawned {
             Ok(pty) => pty,
             Err(e) => {
                 // Every shell candidate failed (or no PTY could be opened): a
@@ -14635,9 +14730,11 @@ impl ApplicationHandler<AppEvent> for App {
             meta: crate::tabmeta::TabMeta::default(),
             pending_inject: None,
             input: input::TabInputState::default(),
+            held: false,
         };
-        // The first shell starts in the home directory.
-        Self::init_smart_title(&mut tab, self.tab_title_mode, None);
+        // The first shell starts in the home directory — or where the launch
+        // asked for its tab.
+        Self::init_smart_title(&mut tab, self.tab_title_mode, first_cwd.as_deref());
         self.tabs.push(tab);
         self.active = 0;
 
@@ -14834,7 +14931,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // window's `close_exited_tabs`, there is no "last window" special
                     // case here: the app keeps running even if every detached window
                     // closes, so we never call `event_loop.exit()` for this.
-                    if dw.tab.terminal.child_exited() || dw.tab.pty.child_exited() {
+                    if (dw.tab.terminal.child_exited() || dw.tab.pty.child_exited()) && !dw.tab.held {
                         if Self::revive_failed_start(&mut dw.tab) {
                             dw.request_paint();
                         } else {
@@ -14877,6 +14974,18 @@ impl ApplicationHandler<AppEvent> for App {
                 self.activation_token = None;
             }
             AppEvent::ActivationToken(token) => self.activation_token = Some(token),
+            AppEvent::NewTab(request, opened) => {
+                // No tab left: the loop is exiting — no window to open it in.
+                if self.tabs.is_empty() {
+                    let _ = opened.send(Err("JeTTY is quitting".to_string()));
+                } else {
+                    let _ = opened.send(self.open_requested_tab(request));
+                    // Summoned even when the program could not start: its pill
+                    // says why (a desktop launch shows no stderr).
+                    self.set_visibility(true, event_loop);
+                }
+                self.activation_token = None;
+            }
             AppEvent::Reopen => {
                 // Shown and raised like `jetty --show`, never hidden. A minimized
                 // window comes back too, as AppKit's own reopen handling (which
