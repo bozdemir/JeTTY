@@ -65,6 +65,9 @@ pub enum PaletteCmd {
     Paste,
     /// Select the whole scrollback + screen of the window's tab.
     SelectAll,
+    /// Copy / select the last command's output (shell integration).
+    CopyLastOutput,
+    SelectLastOutput,
     /// The window's context menu at the text cursor (the Menu key's action).
     ContextMenu,
     ToggleLaunchAtLogin,
@@ -254,6 +257,8 @@ pub fn cmd_action(cmd: &PaletteCmd) -> Option<crate::keymap::BindableAction> {
         C::Copy => A::Copy,
         C::Paste => A::Paste,
         C::ContextMenu => A::ContextMenu,
+        C::CopyLastOutput => A::CopyLastOutput,
+        C::SelectLastOutput => A::SelectLastOutput,
         C::ToggleFullscreen => A::ToggleFullscreen,
         C::Quit => A::Quit,
         C::NextTheme => A::NextTheme,
@@ -366,6 +371,23 @@ pub fn build_registry(
     let mut v: Vec<PaletteEntry> =
         Vec::with_capacity(statics.len() + themes.len() + tabs.len() + detached.len());
     for (title, keywords, cmd) in statics {
+        v.push(PaletteEntry { title: title.to_string(), keywords, cmd });
+    }
+    // A command's output (shell integration): the last one's here; the
+    // right-click menu has the one under the pointer.
+    let output: [(&str, &str, PaletteCmd); 2] = [
+        (
+            "Copy last command's output",
+            "osc133 shell integration clipboard result previous",
+            PaletteCmd::CopyLastOutput,
+        ),
+        (
+            "Select last command's output",
+            "osc133 shell integration selection result previous highlight",
+            PaletteCmd::SelectLastOutput,
+        ),
+    ];
+    for (title, keywords, cmd) in output {
         v.push(PaletteEntry { title: title.to_string(), keywords, cmd });
     }
     v.extend(chrome_entries());
@@ -637,6 +659,20 @@ mod tests {
         let hits = filter(&r, "run sel");
         assert_eq!(hits[0].cmd, PaletteCmd::RunSelection, "top hit for 'run sel'");
         assert_eq!(hits[0].title, "Run selection in new tab");
+    }
+
+    #[test]
+    fn registry_has_the_command_output_commands() {
+        // The keyboard way to the last command's output (no default chord).
+        let r = reg();
+        for (q, cmd) in [
+            ("copy output", PaletteCmd::CopyLastOutput),
+            ("copy last command", PaletteCmd::CopyLastOutput),
+            ("select output", PaletteCmd::SelectLastOutput),
+            ("select last output", PaletteCmd::SelectLastOutput),
+        ] {
+            assert_eq!(filter(&r, q)[0].cmd, cmd, "top hit for {q:?}");
+        }
     }
 
     #[test]

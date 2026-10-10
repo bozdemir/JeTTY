@@ -226,7 +226,13 @@ new_tab = "Ctrl+Shift+N"
 paste = ["Ctrl+Shift+V", "Shift+Insert"]   # several chords for one action
 toggle_fullscreen = ""                       # "" unbinds: F11 goes to the program
 context_menu = ["Menu", "Shift+F10"]       # Shift+F10 too, for keyboards without a Menu key
+copy_last_output = "Ctrl+Shift+Y"           # an action with no default chord
 ```
+
+`next_theme`, `prev_theme`, `copy_last_output` and `select_last_output` have no
+default chord: the palette runs them, and the last two — copy or select the
+last command's output, with shell integration — are also the right-click menu's
+**Copy Output** / **Select Output** for the output under the pointer.
 
 A chord is modifiers and a key joined by `+` (`Ctrl`, `Shift`, `Alt`, `Super`/`Cmd`).
 Only F-keys, `PageUp` / `PageDown` and `Menu` (the context-menu key) may be bound

@@ -264,9 +264,11 @@ pub fn tab_color_swatches(
 /// Items of a DETACHED window's context menu (right-click anywhere).
 /// "Run in New Tab" runs THIS window's selection in a new MAIN-window tab at
 /// this tab's cwd (the main window is the only tabbed one; it is not summoned).
-/// "Select All" and "Clear" are the main menu's rows (Select All had no other
-/// way in on Linux: no default chord, no palette row).
-pub const DETACHED_MENU_ITEMS: [&str; 6] = ["Reattach", "Copy", "Paste", "Run in New Tab", "Select All", "Clear"];
+/// "Select All", "Copy Output", "Select Output" and "Clear" are the main
+/// menu's rows (Select All had no other way in on Linux: no default chord, no
+/// palette row).
+pub const DETACHED_MENU_ITEMS: [&str; 8] =
+    ["Reattach", "Copy", "Paste", "Run in New Tab", "Select All", "Copy Output", "Select Output", "Clear"];
 
 /// Per-corner radii (tl, tr, bl, br) for a detached window's corner mask.
 /// A detached window is a free-floating window — it is never docked top-flush
@@ -291,17 +293,20 @@ pub fn menu_action(label: &str) -> Option<crate::keymap::BindableAction> {
     })
 }
 
-/// The six shortcut hints of the main right-click menu (`jetty_render::
-/// MENU_ITEMS` order: Copy, Paste, Run in New Tab, Select All, Clear, Close
-/// Tab) from the LIVE keymap. "Clear" is the raw Ctrl+L byte, not a remappable
-/// action, so its hint is fixed.
-pub fn context_menu_hints(km: &crate::keymap::KeyMap) -> [String; 6] {
+/// The eight shortcut hints of the main right-click menu (`jetty_render::
+/// MENU_ITEMS` order: Copy, Paste, Run in New Tab, Select All, Copy Output,
+/// Select Output, Clear, Close Tab) from the LIVE keymap. "Clear" is the raw
+/// Ctrl+L byte, not a remappable action, so its hint is fixed; the Output rows
+/// act on the output under the pointer, which no key does: none.
+pub fn context_menu_hints(km: &crate::keymap::KeyMap) -> [String; 8] {
     use crate::keymap::BindableAction as A;
     [
         km.menu_hint(A::Copy),
         km.menu_hint(A::Paste),
         km.menu_hint(A::RunSelection),
         km.menu_hint(A::SelectAll),
+        String::new(),
+        String::new(),
         "⌃L".to_string(),
         km.menu_hint(A::CloseTab),
     ]
@@ -1153,16 +1158,21 @@ mod tests {
     }
 
     #[test]
-    fn detached_menu_is_reattach_copy_paste_run_select_all_clear() {
+    fn detached_menu_is_reattach_copy_paste_run_select_all_output_clear() {
         // Pinned order — app.rs's detached click dispatch matches on these
         // hard indices (0 Reattach, 1 Copy, 2 Paste, 3 Run in New Tab,
-        // 4 Select All, 5 Clear).
-        assert_eq!(DETACHED_MENU_ITEMS, ["Reattach", "Copy", "Paste", "Run in New Tab", "Select All", "Clear"]);
+        // 4 Select All, 5 Copy Output, 6 Select Output, 7 Clear).
+        assert_eq!(
+            DETACHED_MENU_ITEMS,
+            ["Reattach", "Copy", "Paste", "Run in New Tab", "Select All", "Copy Output", "Select Output", "Clear"]
+        );
         // Their hints are the main menu's (Select All has none on Linux).
         let km = crate::keymap::KeyMap::defaults();
         let main = context_menu_hints(&km);
         assert_eq!(menu_hint(&km, "Select All"), main[3]);
-        assert_eq!(menu_hint(&km, "Clear"), main[4]);
+        assert_eq!(menu_hint(&km, "Copy Output"), main[4]);
+        assert_eq!(menu_hint(&km, "Select Output"), main[5]);
+        assert_eq!(menu_hint(&km, "Clear"), main[6]);
     }
 
     #[test]

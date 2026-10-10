@@ -1681,9 +1681,14 @@ pub struct App {
     menu_item_rects: Vec<jetty_render::Rect>,
     /// Disabled context-menu indices, computed ONCE at menu open (needs-a-
     /// selection rows: Copy=0 and Run in New Tab=2; Run also when the feature
-    /// is config-disabled) and cached beside `menu_item_rects` so hover/click
-    /// and the per-frame rebuild never re-query the terminal.
+    /// is config-disabled; Copy / Select Output=4/5 off a command's output)
+    /// and cached beside `menu_item_rects` so hover/click and the per-frame
+    /// rebuild never re-query the terminal.
     menu_disabled: Vec<usize>,
+    /// The command output a context menu (main or detached) opened over — its
+    /// tab, the absolute line, and that terminal's `anchor_epoch` then — which
+    /// its Copy / Select Output rows act on (`note_menu_output`).
+    menu_output: Option<(TabId, i64, u64)>,
     /// Index of the highlighted menu item — the pointer's hover, or where the
     /// arrow keys moved it (`crate::menunav`); Enter / Space run it.
     menu_hover: Option<usize>,
@@ -2489,6 +2494,7 @@ impl App {
             context_menu: None,
             menu_item_rects: Vec::new(),
             menu_disabled: Vec::new(),
+            menu_output: None,
             menu_hover: None,
             menu_pointer_row: None,
             next_tab_id: 1,
@@ -5157,11 +5163,13 @@ impl App {
     }
 
     /// Open the terminal context menu (Copy / Paste / Run in New Tab / Select
-    /// All / Clear / Close Tab) at physical `(x, y)` — for a right-click and
-    /// the Menu key alike, so both gray the same rows. Takes the window's
-    /// keyboard (an in-progress rename commits; the search bar and copy-mode
-    /// stay under it); the tab menu is mutually exclusive with this one.
-    fn open_context_menu(&mut self, x: f32, y: f32) {
+    /// All / Copy Output / Select Output / Clear / Close Tab) at physical
+    /// `(x, y)` — for a right-click and the Menu key alike, so both gray the
+    /// same rows; `row` is the viewport row it opens over (the pointer's, the
+    /// text cursor's), whose command output the Output rows act on. Takes the
+    /// window's keyboard (an in-progress rename commits; the search bar and
+    /// copy-mode stay under it); the tab menu is mutually exclusive with this one.
+    fn open_context_menu(&mut self, x: f32, y: f32, row: Option<usize>) {
         self.take_keyboard(Surface::Main, Layer::Menu);
         self.tab_menu = None;
         self.tab_menu_hover = None;
@@ -5181,6 +5189,11 @@ impl App {
             (true, false) => vec![2],
             (true, true) => Vec::new(),
         };
+        // "Copy Output" (4) and "Select Output" (5) act on the command whose
+        // output the menu opened over: dim anywhere else.
+        if !self.note_menu_output(Surface::Main, row) {
+            self.menu_disabled.extend([4, 5]);
+        }
         // THE teachable moment for mouse-grabbing apps (Claude Code, vim,
         // htop): the user Shift+right-clicked (or pressed the Menu key)
         // wanting Copy / Run in New Tab, but their drag was forwarded to the
@@ -5214,11 +5227,13 @@ impl App {
         self.request_main_paint();
     }
 
-    /// Open detached window `pos`'s context menu (Reattach / Copy / Paste /
-    /// Run in New Tab) at physical `(x, y)` — its right-click and the Menu key
-    /// alike, graying the same rows. Takes the window's keyboard.
-    fn open_detached_menu(&mut self, pos: usize, x: f32, y: f32) {
+    /// Open detached window `pos`'s context menu (`DETACHED_MENU_ITEMS`) at
+    /// physical `(x, y)` — its right-click and the Menu key alike, graying the
+    /// same rows; `row` is the viewport row it opens over (see
+    /// [`App::open_context_menu`]). Takes the window's keyboard.
+    fn open_detached_menu(&mut self, pos: usize, x: f32, y: f32, row: Option<usize>) {
         self.take_keyboard(Surface::Detached(pos), Layer::Menu);
+        let on_output = self.note_menu_output(Surface::Detached(pos), row);
         let theme = self.current_theme();
         let run_enabled = self.run_selection_enabled;
         let ui_font = self.ui_font_logical;
@@ -5229,13 +5244,17 @@ impl App {
         dw.menu_pointer_row = None;
         // Disabled rows, computed once at open — the same needs-a-selection
         // class as the main menu: Copy (1) and Run in New Tab (3) dim without
-        // a selection; Run also dims when the feature is config-disabled.
+        // a selection; Run also dims when the feature is config-disabled; Copy
+        // / Select Output (5, 6) off a command's output.
         let has_sel = dw.tab.terminal.has_selection();
         dw.menu_disabled = match (has_sel, run_enabled) {
             (false, _) => vec![1, 3],
             (true, false) => vec![3],
             (true, true) => Vec::new(),
         };
+        if !on_output {
+            dw.menu_disabled.extend([5, 6]);
+        }
         // The v0.25.1 teachable moment, as in the main window: a menu opened
         // over a mouse-grabbing program with nothing selected gets the
         // Shift+drag hint right away.
@@ -5310,7 +5329,10 @@ impl App {
                 // Select All
                 self.active_tab_mut().terminal.select_all();
             }
-            Some(4) => {
+            // Copy Output / Select Output — of the command the menu opened over.
+            Some(4) => self.run_menu_output_row(Surface::Main, true),
+            Some(5) => self.run_menu_output_row(Surface::Main, false),
+            Some(6) => {
                 // Clear — emulates Ctrl+L (form-feed 0x0C) sent to the active
                 // PTY. This is the same byte the Ctrl+L keybinding produces via
                 // ctrl_byte('L') in input.rs; reuse the same writer path. A
@@ -5322,7 +5344,7 @@ impl App {
                 let _ = w.write_all(&[0x0C]);
                 let _ = w.flush();
             }
-            Some(5) => {
+            Some(7) => {
                 // Close Tab — mirrors the Ctrl+Shift+W handler: set
                 // confirm_close to open the confirmation popup. This reuses the
                 // exact same flow as KeyAction::CloseTab.
@@ -5379,8 +5401,9 @@ impl App {
 
     /// Close detached window `pos`'s menu and run its row `row`
     /// (`DETACHED_MENU_ITEMS` order: Reattach / Copy / Paste / Run in New
-    /// Tab / Select All / Clear) — the one implementation shared by a click
-    /// and Enter / Space. A grayed row, or `None`, only closes the menu.
+    /// Tab / Select All / Copy Output / Select Output / Clear) — the one
+    /// implementation shared by a click and Enter / Space. A grayed row, or
+    /// `None`, only closes the menu.
     fn run_detached_menu_row(&mut self, pos: usize, row: Option<usize>, event_loop: &ActiveEventLoop) {
         let Some(dw) = self.detached.get_mut(pos) else { return };
         let row = row.filter(|i| !dw.menu_disabled.contains(i));
@@ -5407,7 +5430,9 @@ impl App {
             // Run this window's selection in a new MAIN-window tab.
             Some(3) => self.run_selection_in_new_tab(SelSource::Detached(pos)),
             Some(4) => dw.tab.terminal.select_all(),
-            Some(5) => {
+            Some(5) => self.run_menu_output_row(Surface::Detached(pos), true),
+            Some(6) => self.run_menu_output_row(Surface::Detached(pos), false),
+            Some(7) => {
                 // Clear — Ctrl+L to this window's shell, as the main menu's
                 // row (a user-originated PTY byte: cancels a staged inject).
                 crate::runsel::cancel_on_user_write(&mut dw.tab.pending_inject);
@@ -5416,6 +5441,63 @@ impl App {
                 let _ = dw.tab.writer.flush();
             }
             _ => {}
+        }
+    }
+
+    /// Copy (`copy`) or select the output of command `of` in window `s`'s tab
+    /// — the last command's (palette, `[keys]`), or the one a context menu
+    /// opened over — and say in the pill what was copied, what is missing, or
+    /// why nothing could be (`Terminal::command_output`). A selection shows
+    /// itself, brought into view.
+    fn command_output(&mut self, s: Surface, of: jetty_core::OutputOf, copy: bool) {
+        let Some(term) = self.term_of_mut(s) else { return };
+        let mut moved = false;
+        let done = term.command_output(of).map(|r| {
+            if copy {
+                let text = term.output_text(&r);
+                clipboard::set(&text);
+                (text.lines().count(), r.clipped)
+            } else {
+                moved = term.select_output(&r);
+                (0, r.clipped)
+            }
+        });
+        if done.is_ok() && !copy {
+            self.paint_surface(s);
+            if moved {
+                self.view_moved_under_pointer(s);
+            }
+        }
+        if let Some(msg) = output_notice(of, copy, done) {
+            self.show_notice_pill_in(s, msg, if done.is_ok() { 2500 } else { 4000 });
+        }
+    }
+
+    /// Whether a context menu of window `s` opening over viewport row `row`
+    /// (the pointer's; the text cursor's for the Menu key) is over a command's
+    /// output — its Copy / Select Output rows act on that output — and note
+    /// where in `menu_output`.
+    fn note_menu_output(&mut self, s: Surface, row: Option<usize>) -> bool {
+        self.menu_output = row.and_then(|row| {
+            let t = self.term_of(s)?;
+            let line = t.viewport_row_abs(row);
+            let found = t.command_output(jetty_core::OutputOf::Line(line)).is_ok();
+            found.then_some((self.tab_id_of(s)?, line, t.anchor_epoch()))
+        });
+        self.menu_output.is_some()
+    }
+
+    /// Window `s`'s menu row Copy Output (`copy`) or Select Output: the output
+    /// the menu opened over (`note_menu_output`) — gone, if its lines were
+    /// re-anchored since (or the window shows another tab now).
+    fn run_menu_output_row(&mut self, s: Surface, copy: bool) {
+        let Some((tab, line, epoch)) = self.menu_output.take() else { return };
+        let of = jetty_core::OutputOf::Line(line);
+        let same = self.tab_id_of(s) == Some(tab) && self.term_of(s).is_some_and(|t| t.anchor_epoch() == epoch);
+        if same {
+            self.command_output(s, of, copy);
+        } else if let Some(msg) = output_notice(of, copy, Err(jetty_core::NoOutput::Gone)) {
+            self.show_notice_pill_in(s, msg, 4000);
         }
     }
 
@@ -5464,14 +5546,17 @@ impl App {
             return;
         }
         let Some((x, y)) = self.cursor_menu_anchor(s) else { return };
+        // Over the text cursor's row: its Output rows act on a command output
+        // there (a running command's, around the cursor).
+        let row = self.term_of(s).map(|t| t.cursor_viewport_cell().0);
         match s {
             Surface::Main => {
-                self.open_context_menu(x, y);
+                self.open_context_menu(x, y, row);
                 self.menu_hover =
                     crate::menunav::first_enabled(jetty_render::MENU_ITEMS.len(), &self.menu_disabled);
             }
             Surface::Detached(p) => {
-                self.open_detached_menu(p, x, y);
+                self.open_detached_menu(p, x, y, row);
                 if let Some(dw) = self.detached.get_mut(p) {
                     dw.menu_hover = crate::menunav::first_enabled(
                         crate::detached::DETACHED_MENU_ITEMS.len(),
@@ -5654,6 +5739,14 @@ impl App {
         match s {
             Surface::Main => Some(&mut self.ov),
             Surface::Detached(p) => self.detached.get_mut(p).map(|d| &mut d.ov),
+        }
+    }
+
+    /// The id of the tab window `s` shows.
+    fn tab_id_of(&self, s: Surface) -> Option<TabId> {
+        match s {
+            Surface::Main => self.tabs.get(self.active).map(|t| t.id),
+            Surface::Detached(p) => self.detached.get(p).map(|d| d.tab.id),
         }
     }
 
@@ -7344,6 +7437,9 @@ impl App {
             // The Menu key's menu, at the text cursor of the window the palette
             // was opened over (the palette closed itself first).
             C::ContextMenu => self.open_menu_at_cursor(s),
+            // The last command's output in the palette's window (shell integration).
+            C::CopyLastOutput => self.command_output(s, jetty_core::OutputOf::Last, true),
+            C::SelectLastOutput => self.command_output(s, jetty_core::OutputOf::Last, false),
             C::ToggleLaunchAtLogin => {
                 self.toggle_launch_at_login_setting();
                 self.persist();
@@ -11644,6 +11740,13 @@ impl App {
                         self.open_menu_at_cursor(s);
                         return;
                     }
+                    // `[keys] copy_last_output` / `select_last_output`: THIS
+                    // window's last command.
+                    input::KeyAction::CopyLastOutput | input::KeyAction::SelectLastOutput => {
+                        let copy = action == input::KeyAction::CopyLastOutput;
+                        self.command_output(s, jetty_core::OutputOf::Last, copy);
+                        return;
+                    }
                     _ => {}
                 }
                 // Whether a printable key arms this window's caret burst
@@ -12333,9 +12436,11 @@ impl App {
                     }
                 }
                 // The menu at the pointer — the Menu key's own open path, so
-                // both gray the same rows.
+                // both gray the same rows — over the pointer's row.
                 let (cx, cy) = (dw.cursor.0 as f32, dw.cursor.1 as f32);
-                self.open_detached_menu(pos, cx, cy);
+                let t = &dw.tab.terminal;
+                let row = geom.contains_y(cy).then(|| geom.select_cell(cx, cy, t.cols(), t.rows()).0);
+                self.open_detached_menu(pos, cx, cy, row);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -15875,8 +15980,10 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 // The menu at the pointer — the Menu key's own open path, so
                 // both gray the same rows (nothing highlighted: the pointer is
-                // the mouse user's highlight).
-                self.open_context_menu(cx, cy);
+                // the mouse user's highlight) — over the pointer's row.
+                let on_grid = self.main_grid_geom().contains_y(cy);
+                let row = self.cursor_cell_0_side().filter(|_| on_grid).map(|(row, ..)| row);
+                self.open_context_menu(cx, cy, row);
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 // --- Tab drag-out release ---
@@ -16279,6 +16386,8 @@ impl ApplicationHandler<AppEvent> for App {
                         input::KeyAction::NextTheme => "NextTheme",
                         input::KeyAction::PrevTheme => "PrevTheme",
                         input::KeyAction::ContextMenu => "ContextMenu",
+                        input::KeyAction::CopyLastOutput => "CopyLastOutput",
+                        input::KeyAction::SelectLastOutput => "SelectLastOutput",
                         input::KeyAction::Send(_) => "Send",
                         input::KeyAction::None => "None",
                     };
@@ -16437,6 +16546,14 @@ impl ApplicationHandler<AppEvent> for App {
                     // menu at the text cursor, first enabled row highlighted (an
                     // open menu took the key above and closed).
                     input::KeyAction::ContextMenu => self.open_menu_at_cursor(Surface::Main),
+                    // `[keys] copy_last_output` / `select_last_output` (no
+                    // default chord): the last command's output.
+                    input::KeyAction::CopyLastOutput => {
+                        self.command_output(Surface::Main, jetty_core::OutputOf::Last, true);
+                    }
+                    input::KeyAction::SelectLastOutput => {
+                        self.command_output(Surface::Main, jetty_core::OutputOf::Last, false);
+                    }
                     input::KeyAction::Send(bytes) => {
                         // Any real keystroke jumps back to the bottom so the user
                         // sees their input, then writes to the PTY (shared input
@@ -18731,6 +18848,36 @@ fn config_pill_text(warnings: &[String]) -> String {
     }
 }
 
+/// The status pill after copying (`copy`) or selecting the output of command
+/// `of`, given what was found — `(lines copied, start scrolled out)` — or why
+/// nothing was: what was copied and what is missing, or the reason. `None`
+/// for a whole output selected: the selection shows it.
+fn output_notice(
+    of: jetty_core::OutputOf,
+    copy: bool,
+    found: Result<(usize, bool), jetty_core::NoOutput>,
+) -> Option<String> {
+    use jetty_core::NoOutput as N;
+    let last = of == jetty_core::OutputOf::Last;
+    let why = match found {
+        Ok((lines, clipped)) => {
+            let done = match (copy, clipped) {
+                (true, _) => format!("Copied {lines} line{} of output", if lines == 1 { "" } else { "s" }),
+                (false, true) => "Selected what is left of the output".to_string(),
+                (false, false) => return None,
+            };
+            return Some(if clipped { format!("{done} — its start scrolled out of the scrollback") } else { done });
+        }
+        Err(N::NoIntegration) => "Needs shell integration — jetty --help prints the line for your shell",
+        Err(N::AltScreen) => "Not while a full-screen program is open",
+        Err(N::NoCommand) if last => "No command has finished yet",
+        Err(N::Empty) if last => "The last command printed nothing",
+        Err(N::Empty) => "That command printed nothing",
+        Err(N::NoCommand | N::Gone) => "This output is no longer in the scrollback",
+    };
+    Some(why.to_string())
+}
+
 /// The key a `summon_hotkey` value grabs, in global-hotkey's own syntax ("F9",
 /// "F12", "Ctrl+Shift+F12"): `Err` with the reason for a value that names no
 /// key — the grab falls back to F9 then.
@@ -20227,6 +20374,32 @@ mod config_pill_tests {
                          byte (Ctrl+letter / Ctrl+Space/[/\\/]//) — new_tab keeps its default"
             .to_string()];
         assert!(config_pill_text(&rejected).ends_with("… — new_tab keeps its default"));
+    }
+}
+
+#[cfg(test)]
+mod output_notice_tests {
+    use super::output_notice;
+    use jetty_core::{NoOutput, OutputOf};
+
+    #[test]
+    fn the_pill_says_what_was_copied_and_what_is_missing() {
+        let last = OutputOf::Last;
+        assert_eq!(output_notice(last, true, Ok((1, false))).as_deref(), Some("Copied 1 line of output"));
+        let partial = output_notice(last, true, Ok((9998, true))).unwrap();
+        assert!(partial.starts_with("Copied 9998 lines") && partial.contains("scrolled out"), "{partial}");
+        // A whole selection shows itself; a partial one says what is missing.
+        assert_eq!(output_notice(last, false, Ok((0, false))), None);
+        assert!(output_notice(last, false, Ok((0, true))).is_some_and(|m| m.contains("scrolled out")));
+        // Every reason has words, a menu row's included.
+        for of in [last, OutputOf::Line(7)] {
+            for why in [NoOutput::NoIntegration, NoOutput::NoCommand, NoOutput::Empty, NoOutput::Gone, NoOutput::AltScreen] {
+                let msg = output_notice(of, true, Err(why)).unwrap();
+                assert!(!msg.is_empty() && msg.chars().count() <= 96, "{why:?}: {msg}");
+            }
+        }
+        assert!(output_notice(last, true, Err(NoOutput::NoIntegration)).unwrap().contains("shell integration"));
+        assert!(output_notice(last, false, Err(NoOutput::Gone)).unwrap().contains("no longer in the scrollback"));
     }
 }
 

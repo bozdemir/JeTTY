@@ -69,7 +69,7 @@ pub fn detached_menu_items() -> Vec<(&'static str, String)> {
         .collect()
 }
 
-/// The main context menu's six shortcut hints under the DEFAULT keymap (for
+/// The main context menu's eight shortcut hints under the DEFAULT keymap (for
 /// `jetty-shot`; the app derives them from its live keymap the same way).
 pub fn default_context_menu_hints() -> Vec<String> {
     detached::context_menu_hints(&keymap::KeyMap::defaults()).to_vec()

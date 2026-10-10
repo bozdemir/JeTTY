@@ -403,6 +403,10 @@ pub struct KeyBindings {
     /// The context menu at the text cursor, default the Menu key;
     /// `context_menu = ""` gives that key back to programs (kitty protocol).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub context_menu: Option<ChordSpec>,
+    /// Copy / select the last command's output (shell integration). No
+    /// default chord (palette: "Copy last command's output" / "Select …").
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub copy_last_output: Option<ChordSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub select_last_output: Option<ChordSpec>,
 }
 
 impl KeyBindings {

@@ -1573,13 +1573,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // JETTY_SHOT_MENU — render the right-click context menu for visual checks.
-        // JETTY_SHOT_MENU_DISABLED=1 renders the no-selection state: Copy (0)
-        // and Run in New Tab (2) dimmed with the hover on an ENABLED row —
-        // verifies the grayed-row rendering and the ⇧⌃⏎ hint glyph.
+        // JETTY_SHOT_MENU_DISABLED=1 renders the no-selection state away from
+        // any command output: Copy (0), Run in New Tab (2) and the Output rows
+        // (4, 5) dimmed with the hover on an ENABLED row — verifies the
+        // grayed-row rendering and the ⇧⌃⏎ hint glyph.
         // JETTY_SHOT_MENU_KEYS moves the highlight the keyboard way.
         if env_flag("JETTY_SHOT_MENU") {
             let disabled: &[usize] =
-                if env_flag("JETTY_SHOT_MENU_DISABLED") { &[0, 2] } else { &[] };
+                if env_flag("JETTY_SHOT_MENU_DISABLED") { &[0, 2, 4, 5] } else { &[] };
             let hover = shot_menu_hover(jetty_render::MENU_ITEMS.len(), disabled, Some(1));
             // Hints from the DEFAULT keymap, derived exactly like the app's.
             let hints = jetty_app::default_context_menu_hints();
@@ -1593,15 +1594,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             chrome_labels.extend(menu.labels);
         }
 
-        // JETTY_SHOT_DMENU — render the DETACHED window's 4-item context menu
-        // (Reattach / Copy / Paste / Run in New Tab) through the same generic
-        // builder the app uses. JETTY_SHOT_DMENU_DISABLED=1 dims Copy (1) +
-        // Run in New Tab (3) — the no-selection state.
+        // JETTY_SHOT_DMENU — render the DETACHED window's context menu
+        // (`DETACHED_MENU_ITEMS`) through the same generic builder the app
+        // uses. JETTY_SHOT_DMENU_DISABLED=1 dims Copy (1), Run in New Tab (3)
+        // and the Output rows (5, 6) — the no-selection state off any output.
         if env_flag("JETTY_SHOT_DMENU") {
             let owned = jetty_app::detached_menu_items();
             let items: Vec<(&str, &str)> = owned.iter().map(|(l, h)| (*l, h.as_str())).collect();
             let disabled: &[usize] =
-                if env_flag("JETTY_SHOT_DMENU_DISABLED") { &[1, 3] } else { &[] };
+                if env_flag("JETTY_SHOT_DMENU_DISABLED") { &[1, 3, 5, 6] } else { &[] };
             let hover = shot_menu_hover(items.len(), disabled, Some(0));
             let (mx, my) = menu_at(jetty_render::menu_height(items.len(), 0, cm));
             let menu = jetty_render::build_menu(

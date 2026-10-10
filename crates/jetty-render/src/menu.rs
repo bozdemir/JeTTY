@@ -2,22 +2,25 @@ use crate::chrome::{ChromeMeasure, ChromeMetrics};
 use crate::ui_palette::{ensure_contrast, mix, rgba, UiPalette};
 use crate::Rect;
 
-/// The six clickable items in the right-click context menu, in display order.
-/// "Run in New Tab" sits right after the clipboard pair — the browser puts
-/// "Open link in new tab" adjacent to the link actions.
+/// The eight clickable items in the right-click context menu, in display
+/// order. "Run in New Tab" sits right after the clipboard pair — the browser
+/// puts "Open link in new tab" adjacent to the link actions. "Copy Output" /
+/// "Select Output" act on the command whose output the menu opened over
+/// (shell integration), and are grayed anywhere else.
 ///
-/// The separator between "Select All" (idx 3) and "Clear" (idx 4) is purely
+/// The separator between "Select Output" (idx 5) and "Clear" (idx 6) is purely
 /// visual — a thin quad drawn in the gap — and does NOT appear here.
-/// Click-index → action mapping is therefore 0..5 with no gaps.
-pub const MENU_ITEMS: [&str; 6] =
-    ["Copy", "Paste", "Run in New Tab", "Select All", "Clear", "Close Tab"];
+/// Click-index → action mapping is therefore 0..7 with no gaps.
+pub const MENU_ITEMS: [&str; 8] =
+    ["Copy", "Paste", "Run in New Tab", "Select All", "Copy Output", "Select Output", "Clear", "Close Tab"];
 
 /// The DEFAULT (Linux) keyboard-shortcut hints for [`MENU_ITEMS`], used by
 /// tests and fixed-size harnesses. The app passes hints derived from the LIVE
 /// keymap instead (a `[keys]` remap, or macOS's ⌘ chords, must show in the
 /// menu) — "Clear" is the only fixed one (it is the raw Ctrl+L byte, not a
-/// remappable action). Blank for items that have no shortcut. The symbols
-/// (⇧ ⌃) render through MesloLGS NF (the chrome Nerd Font).
+/// remappable action). Blank for items that have no shortcut — the Output
+/// rows always: they act on the output under the pointer, no key's job. The
+/// symbols (⇧ ⌃) render through MesloLGS NF (the chrome Nerd Font).
 ///
 /// Default bindings:
 ///   ⇧⌃C = Ctrl+Shift+C     → KeyAction::Copy
@@ -25,7 +28,7 @@ pub const MENU_ITEMS: [&str; 6] =
 ///   ⇧⌃⏎ = Ctrl+Shift+Enter → KeyAction::RunSelection
 ///   ⌃L  = Ctrl+L           → ctrl_byte(L) = 0x0C (form-feed / clear)
 ///   ⇧⌃W = Ctrl+Shift+W     → KeyAction::CloseTab
-pub const MENU_HINTS: [&str; 6] = ["⇧⌃C", "⇧⌃V", "⇧⌃⏎", "", "⌃L", "⇧⌃W"];
+pub const MENU_HINTS: [&str; 8] = ["⇧⌃C", "⇧⌃V", "⇧⌃⏎", "", "", "", "⌃L", "⇧⌃W"];
 
 // --- Layout constants (DESIGN px: 16pt UI font, 1× — scaled by the chrome unit) ---
 //
@@ -39,10 +42,10 @@ const MENU_HPAD: f32 = 10.0;
 /// Minimum gap between a label's right edge and its right-aligned hint (px).
 const MENU_LABEL_HINT_GAP: f32 = 20.0;
 const ROW_H: f32 = 28.0;
-/// Extra vertical gap inserted between "Select All" (idx 2) and "Clear"
-/// (idx 3) to house the separator line.
+/// Extra vertical gap inserted between "Select Output" (idx 5) and "Clear"
+/// (idx 6) to house the separator line.
 const SEP_GAP: f32 = 10.0;
-/// Total clickable items count of the STANDARD menu (6). The generic
+/// Total clickable items count of the STANDARD menu (8). The generic
 /// `build_menu` derives its count from the item list; this and `MENU_H` remain
 /// as the standard menu's reference values (asserted by the unit tests).
 #[allow(dead_code)]
@@ -53,8 +56,8 @@ const MENU_H: f32 = ROW_H * N as f32 + SEP_GAP;
 // 2px halo to match every other overlay (panel/help/confirm all use a 2px
 // border with a radius delta of 2 over the bg).
 const BORDER: f32 = 2.0;
-/// The standard menu's separator: above "Clear" (idx 4).
-const CONTEXT_SEP_BEFORE: [usize; 1] = [4];
+/// The standard menu's separator: above "Clear" (idx 6).
+const CONTEXT_SEP_BEFORE: [usize; 1] = [6];
 
 /// The outer height (border included) of a [`build_menu`] card with `n_items`
 /// rows and `n_seps` separators, at chrome metrics `cm` — for a caller that
@@ -77,8 +80,8 @@ pub struct ContextMenu {
     /// Text labels: (text, x, y, rgb).  Includes both item labels and the
     /// right-aligned shortcut hints.
     pub labels: Vec<(String, f32, f32, [u8; 3])>,
-    /// Hit-test rects, one per item in MENU_ITEMS order (6 rects).
-    /// The separator occupies dead space between rect[3] and rect[4].
+    /// Hit-test rects, one per item in MENU_ITEMS order (8 rects).
+    /// The separator occupies dead space between rect[5] and rect[6].
     pub item_rects: Vec<Rect>,
 }
 
@@ -91,16 +94,17 @@ fn row_y_in(i: usize, sep_before: &[usize]) -> f32 {
 }
 
 /// Build the standard right-click context menu (Copy / Paste / Run in New Tab /
-/// Select All / Clear / Close Tab) anchored at `(x, y)` (physical pixels). A
-/// thin wrapper over the generic `build_menu` with `MENU_ITEMS`/`MENU_HINTS`
-/// and the visual separator before "Clear" (idx 4).
+/// Select All / Copy Output / Select Output / Clear / Close Tab) anchored at
+/// `(x, y)` (physical pixels). A thin wrapper over the generic `build_menu`
+/// with `MENU_ITEMS`/`MENU_HINTS` and the visual separator before "Clear"
+/// (idx 6).
 ///
 /// `disabled` lists item indices drawn dim (label + hint in the hint color)
 /// with hover suppressed — native-menu grayed rows; a click on one is the
 /// caller's no-op. Indices NEVER shift (the array is static), so cached
 /// hit-rects stay valid.
 ///
-/// `hints` are the shortcut hints for the six items in `MENU_ITEMS` order (the
+/// `hints` are the shortcut hints for the eight items in `MENU_ITEMS` order (the
 /// app derives them from the live keymap; [`MENU_HINTS`] is the default set);
 /// a missing entry reads as blank. `m` / `cm`: see [`build_menu`].
 #[allow(clippy::too_many_arguments)]
@@ -315,28 +319,28 @@ mod tests {
     }
 
     #[test]
-    fn exactly_six_item_rects() {
+    fn exactly_eight_item_rects() {
         let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
         assert_eq!(
             menu.item_rects.len(),
-            6,
-            "must have exactly 6 hit-rects (one per clickable item)"
+            8,
+            "must have exactly 8 hit-rects (one per clickable item)"
         );
     }
 
     #[test]
     fn separator_not_a_hit_rect() {
         // The separator is drawn as a quad in `quads`, NOT as an item_rect.
-        // Verify that six item_rects exist and the gap between rect[3]
-        // (Select All) and rect[4] (Clear) is positive (SEP_GAP wide).
+        // Verify that eight item_rects exist and the gap between rect[5]
+        // (Select Output) and rect[6] (Clear) is positive (SEP_GAP wide).
         let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
-        assert_eq!(menu.item_rects.len(), 6);
-        let bottom_of_3 = menu.item_rects[3].y + menu.item_rects[3].h;
-        let top_of_4 = menu.item_rects[4].y;
+        assert_eq!(menu.item_rects.len(), 8);
+        let bottom_of_5 = menu.item_rects[5].y + menu.item_rects[5].h;
+        let top_of_6 = menu.item_rects[6].y;
         assert!(
-            top_of_4 > bottom_of_3,
-            "rect[4] must start below rect[3] bottom (gap = {})",
-            top_of_4 - bottom_of_3
+            top_of_6 > bottom_of_5,
+            "rect[6] must start below rect[5] bottom (gap = {})",
+            top_of_6 - bottom_of_5
         );
     }
 
@@ -398,9 +402,9 @@ mod tests {
         let outer = &menu.quads[0];
         assert!(
             outer.w >= MENU_W + BORDER * 2.0,
-            "6-item card must be at least the historical floor wide"
+            "8-item card must be at least the historical floor wide"
         );
-        assert_eq!(outer.h, MENU_H + BORDER * 2.0, "6 rows + one separator gap");
+        assert_eq!(outer.h, MENU_H + BORDER * 2.0, "8 rows + one separator gap");
         assert!(outer.x >= 0.0);
         assert!(outer.y >= 0.0);
         assert!(
@@ -418,29 +422,31 @@ mod tests {
     }
 
     #[test]
-    fn menu_items_order_is_copy_paste_run_selectall_clear_closetab() {
+    fn menu_items_order_is_copy_paste_run_selectall_output_clear_closetab() {
         // Pin the exact MENU_ITEMS order so accidental reordering is caught —
         // app.rs's click dispatch matches on these hard indices.
         assert_eq!(MENU_ITEMS[0], "Copy",           "item[0] must be Copy");
         assert_eq!(MENU_ITEMS[1], "Paste",          "item[1] must be Paste");
         assert_eq!(MENU_ITEMS[2], "Run in New Tab", "item[2] must be Run in New Tab");
         assert_eq!(MENU_ITEMS[3], "Select All",     "item[3] must be Select All");
-        assert_eq!(MENU_ITEMS[4], "Clear",          "item[4] must be Clear");
-        assert_eq!(MENU_ITEMS[5], "Close Tab",      "item[5] must be Close Tab");
+        assert_eq!(MENU_ITEMS[4], "Copy Output",    "item[4] must be Copy Output");
+        assert_eq!(MENU_ITEMS[5], "Select Output",  "item[5] must be Select Output");
+        assert_eq!(MENU_ITEMS[6], "Clear",          "item[6] must be Clear");
+        assert_eq!(MENU_ITEMS[7], "Close Tab",      "item[7] must be Close Tab");
         assert_eq!(MENU_HINTS[2], "⇧⌃⏎", "Run's hint is the Ctrl+Shift+Enter glyph");
     }
 
     #[test]
     fn click_in_separator_gap_hits_no_item_rect() {
-        // The separator gap between item[3] (Select All) and item[4] (Clear) must
-        // be a dead zone — a click coordinate inside it should not fall within any
-        // item_rect.
+        // The separator gap between item[5] (Select Output) and item[6] (Clear)
+        // must be a dead zone — a click coordinate inside it should not fall
+        // within any item_rect.
         let menu = build_context_menu(50.0, 50.0, 1280, 800, None, &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
-        assert_eq!(menu.item_rects.len(), 6);
+        assert_eq!(menu.item_rects.len(), 8);
 
-        // The dead zone is the pixel band between bottom of rect[3] and top of rect[4].
-        let gap_top    = menu.item_rects[3].y + menu.item_rects[3].h;
-        let gap_bottom = menu.item_rects[4].y;
+        // The dead zone is the pixel band between bottom of rect[5] and top of rect[6].
+        let gap_top    = menu.item_rects[5].y + menu.item_rects[5].h;
+        let gap_bottom = menu.item_rects[6].y;
         assert!(gap_bottom > gap_top, "expected a separator gap but rects are adjacent");
 
         // A click in the middle of the gap.
@@ -492,16 +498,16 @@ mod tests {
     }
 
     #[test]
-    fn legacy_menu_matches_generic_with_separator_at_4() {
+    fn legacy_menu_matches_generic_with_separator_at_6() {
         // build_context_menu is now a wrapper over build_menu; pin that the
-        // separator layout (gap before item 4, "Clear") is preserved exactly.
+        // separator layout (gap before item 6, "Clear") is preserved exactly.
         let legacy = build_context_menu(100.0, 100.0, 1280, 800, Some(5), &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
         let items: Vec<(&str, &str)> = MENU_ITEMS
             .iter()
             .copied()
             .zip(MENU_HINTS.iter().copied())
             .collect();
-        let generic = build_menu(100.0, 100.0, 1280, 800, Some(5), &theme(), &mut mono(), CM, &items, &[4], &[]);
+        let generic = build_menu(100.0, 100.0, 1280, 800, Some(5), &theme(), &mut mono(), CM, &items, &[6], &[]);
         assert_eq!(legacy.item_rects.len(), generic.item_rects.len());
         for (a, b) in legacy.item_rects.iter().zip(&generic.item_rects) {
             assert_eq!(a.y, b.y);
@@ -511,9 +517,9 @@ mod tests {
 
     #[test]
     fn hover_highlight_aligns_with_item_rects() {
-        // For each of the 6 items, the hover quad y must match the item rect y.
+        // For each of the 8 items, the hover quad y must match the item rect y.
         // Quad order: [0] border, [1] bg, [2] hover, [3] separator.
-        for hovered in 0..6 {
+        for hovered in 0..MENU_ITEMS.len() {
             let menu = build_context_menu(50.0, 50.0, 1280, 800, Some(hovered), &theme(), &mut mono(), CM, &MENU_HINTS, &[]);
             let hover_quad = &menu.quads[2];
             let item = &menu.item_rects[hovered];
@@ -625,7 +631,7 @@ mod tests {
     #[test]
     fn caller_hints_replace_the_defaults() {
         // The app feeds hints from the LIVE keymap (remaps, macOS ⌘ chords).
-        let hints = ["⌘C", "⌘V", "", "⌘A", "⌃L", "⌘W"];
+        let hints = ["⌘C", "⌘V", "", "⌘A", "", "", "⌃L", "⌘W"];
         let menu = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), &mut mono(), CM, &hints, &[]);
         let texts: Vec<&str> = menu.labels.iter().map(|l| l.0.as_str()).collect();
         for h in hints.iter().filter(|h| !h.is_empty()) {
@@ -634,6 +640,6 @@ mod tests {
         assert!(!texts.contains(&"⇧⌃C"), "default hint must not leak through");
         // A short hint list reads as blank for the missing items.
         let short = build_context_menu(100.0, 100.0, 1280, 800, None, &theme(), &mut mono(), CM, &["⇧⌃C"], &[]);
-        assert_eq!(short.labels.len(), 7, "6 labels + the one hint");
+        assert_eq!(short.labels.len(), 9, "8 labels + the one hint");
     }
 }

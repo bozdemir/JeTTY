@@ -76,6 +76,10 @@ pub enum KeyAction {
     /// Open the window's context menu at the text cursor, its first enabled
     /// row highlighted — or close the menu that is open (the Menu key).
     ContextMenu,
+    /// Copy / select the last command's output (shell integration; no
+    /// default chord: `[keys] copy_last_output` / `select_last_output`).
+    CopyLastOutput,
+    SelectLastOutput,
     /// Raw bytes to write to the PTY.
     Send(Vec<u8>),
     None,

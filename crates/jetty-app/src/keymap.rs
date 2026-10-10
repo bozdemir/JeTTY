@@ -243,10 +243,15 @@ pub enum BindableAction {
     /// Open the window's context menu at the text cursor (the Menu key; the
     /// menus then take arrows / Enter). Appended LAST, like every new action.
     ContextMenu,
+    /// Copy / select the last command's output (shell integration). NO
+    /// default chord: the palette has both, and the right-click menu does it
+    /// for the command under the pointer. Appended LAST, like every new action.
+    CopyLastOutput,
+    SelectLastOutput,
 }
 
 impl BindableAction {
-    pub const ALL: [BindableAction; 37] = [
+    pub const ALL: [BindableAction; 39] = [
         BindableAction::ToggleSettings,
         BindableAction::OpenPalette,
         BindableAction::NewTab,
@@ -284,6 +289,8 @@ impl BindableAction {
         BindableAction::NextTheme,
         BindableAction::PrevTheme,
         BindableAction::ContextMenu,
+        BindableAction::CopyLastOutput,
+        BindableAction::SelectLastOutput,
     ];
 
     /// Stable name for warnings / debugging.
@@ -327,6 +334,8 @@ impl BindableAction {
             NextTheme => "next_theme",
             PrevTheme => "prev_theme",
             ContextMenu => "context_menu",
+            CopyLastOutput => "copy_last_output",
+            SelectLastOutput => "select_last_output",
         }
     }
 
@@ -371,6 +380,8 @@ impl BindableAction {
             NextTheme => KeyAction::NextTheme,
             PrevTheme => KeyAction::PrevTheme,
             ContextMenu => KeyAction::ContextMenu,
+            CopyLastOutput => KeyAction::CopyLastOutput,
+            SelectLastOutput => KeyAction::SelectLastOutput,
         }
     }
 
@@ -415,6 +426,8 @@ impl BindableAction {
             NextTheme => &b.next_theme,
             PrevTheme => &b.prev_theme,
             ContextMenu => &b.context_menu,
+            CopyLastOutput => &b.copy_last_output,
+            SelectLastOutput => &b.select_last_output,
         }
     }
 
@@ -582,6 +595,12 @@ impl BindableAction {
             // Menu key (winit maps none on macOS): the palette's "Open context
             // menu" or a `[keys]` chord serves there.
             ContextMenu => vec![Chord::exact(Mods::default(), KeyMatch::Named(NamedKey::ContextMenu))],
+            // No default chord: no Ctrl+Shift letter is free everywhere — U and
+            // E are input-method keys (IBus Unicode / emoji), the rest belong
+            // to programs on the kitty keyboard protocol — and every macOS Cmd
+            // chord is Shift-insensitive (Cmd+Shift+A is Select All). The
+            // palette and the right-click menu have them; `[keys]` binds them.
+            CopyLastOutput | SelectLastOutput => Vec::new(),
         }
     }
 }
@@ -1951,16 +1970,18 @@ mod tests {
     fn run_selection_ordering_in_all() {
         // New actions are APPENDED so they never win a slot from an older one:
         // … CopyMode, RunSelection, ToggleFullscreen, then the v0.26 scroll
-        // actions, theme cycling, and the context-menu key.
+        // actions, theme cycling, the context-menu key and the command output.
         let all = BindableAction::ALL;
-        assert_eq!(all[all.len() - 1], BindableAction::ContextMenu);
-        assert_eq!(all[all.len() - 2], BindableAction::PrevTheme);
-        assert_eq!(all[all.len() - 3], BindableAction::NextTheme);
-        assert_eq!(all[all.len() - 4], BindableAction::ScrollPageDown);
-        assert_eq!(all[all.len() - 5], BindableAction::ScrollPageUp);
-        assert_eq!(all[all.len() - 6], BindableAction::ToggleFullscreen);
-        assert_eq!(all[all.len() - 7], BindableAction::RunSelection);
-        assert_eq!(all[all.len() - 8], BindableAction::CopyMode);
+        assert_eq!(all[all.len() - 1], BindableAction::SelectLastOutput);
+        assert_eq!(all[all.len() - 2], BindableAction::CopyLastOutput);
+        assert_eq!(all[all.len() - 3], BindableAction::ContextMenu);
+        assert_eq!(all[all.len() - 4], BindableAction::PrevTheme);
+        assert_eq!(all[all.len() - 5], BindableAction::NextTheme);
+        assert_eq!(all[all.len() - 6], BindableAction::ScrollPageDown);
+        assert_eq!(all[all.len() - 7], BindableAction::ScrollPageUp);
+        assert_eq!(all[all.len() - 8], BindableAction::ToggleFullscreen);
+        assert_eq!(all[all.len() - 9], BindableAction::RunSelection);
+        assert_eq!(all[all.len() - 10], BindableAction::CopyMode);
     }
 
     #[test]
@@ -1982,6 +2003,23 @@ mod tests {
             km.lookup(mods, PhysicalKey::Code(KeyCode::KeyR), &Key::Character("r".into())),
             Some(KeyAction::PrevTheme)
         );
+    }
+
+    #[test]
+    fn command_output_has_no_default_chord_and_binds_from_keys() {
+        let km = KeyMap::defaults();
+        assert!(km.pretty_chords(BindableAction::CopyLastOutput).is_empty());
+        assert!(km.pretty_chords(BindableAction::SelectLastOutput).is_empty());
+        let km = km_with(|b| {
+            b.copy_last_output = Some(ChordSpec::One("Ctrl+Shift+Y".into()));
+            b.select_last_output = Some(ChordSpec::One("Ctrl+Alt+Y".into()));
+        });
+        assert!(km.warnings().is_empty(), "{:?}", km.warnings());
+        let y = |ctrl, shift, alt| km.lookup(Mods::new(ctrl, shift, alt, false), PhysicalKey::Code(KeyCode::KeyY), &Key::Character("y".into()));
+        assert_eq!(y(true, true, false), Some(KeyAction::CopyLastOutput));
+        assert_eq!(y(true, false, true), Some(KeyAction::SelectLastOutput));
+        // Each runs once per press: a held chord copies once.
+        assert!(!KeyAction::CopyLastOutput.repeats() && !KeyAction::SelectLastOutput.repeats());
     }
 
     // ── fullscreen (F11) ──────────────────────────────────────────────────────
@@ -2215,7 +2253,7 @@ mod tests {
 
     #[test]
     fn bindable_action_all_is_exhaustive() {
-        assert_eq!(BindableAction::ALL.len(), 37);
+        assert_eq!(BindableAction::ALL.len(), 39);
         for a in BindableAction::ALL {
             assert_eq!(
                 BindableAction::ALL.iter().filter(|x| **x == a).count(),
