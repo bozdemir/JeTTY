@@ -68,7 +68,7 @@ Names of fonts and themes are matched in any letter case, and a theme by its id
 |---|---|---|
 | `font_family` | `"MesloLGS NF"` | The terminal font: any installed family (Settings lists the monospace ones that have letters — never an emoji or symbol font). One that is not installed shows "MesloLGS NF" — or the first monospace font, when that is missing too — and says so; the name you chose is kept for when it is installed. The default itself falls back without a notice. Bold and italic always come from the family itself (a variable font's own bold weight; regular weight in a family with no bold), so they never shift a column. |
 | `font_size` | `16.0` | The terminal font size in points, `6`–`48`. `Ctrl+=` / `Ctrl+-` / `Ctrl+0` change it. |
-| `ui_font_family` | `""` | The font of the window chrome — tab titles, status bar, menus, Settings, dialogs. `""` is the system's sans-serif. |
+| `ui_font_family` | `""` | The font of the window chrome — tab titles, status bar, menus, Settings, dialogs. `""` draws the tab titles in a sans-serif font and the rest of the chrome in the terminal font (the one JeTTY started with). |
 | `ui_font_size` | `16.0` | The chrome font size in points, `10`–`28`. |
 | `line_height` | `1.3` | Line height as a multiple of the font size, `1.0`–`2.0`. Glyphs are centered in the taller row; backgrounds, selection and the cursor fill it. |
 | `builtin_glyphs` | `true` | Draw box drawing, block elements, Powerline separators, braille and sextants as cell-exact built-in glyphs, so borders and prompts join without seams at any size. `false` takes them from the font. |

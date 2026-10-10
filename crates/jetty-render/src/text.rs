@@ -1315,11 +1315,14 @@ impl TextLayer {
         let mut font_system = FontSystem::new();
         // Insurance: make sure user-installed fonts (e.g. ~/.local/share/fonts,
         // where MesloLGS NF lives) are in the database, not only the fontconfig
-        // defaults that FontSystem::new() scans.
+        // defaults that FontSystem::new() scans — unless that scan covered the
+        // directory (fontconfig lists it: `<dir prefix="xdg">fonts</dir>`), which
+        // loading it again would add every user font a second time.
         if let Ok(home) = std::env::var("HOME") {
-            font_system
-                .db_mut()
-                .load_fonts_dir(format!("{home}/.local/share/fonts"));
+            let dir = std::path::PathBuf::from(format!("{home}/.local/share/fonts"));
+            if !font_system.db().faces().any(|f| face_path(f).is_some_and(|p| p.starts_with(&dir))) {
+                font_system.db_mut().load_fonts_dir(dir);
+            }
         }
         // Which chars any of these fonts has, read on a background thread while
         // the files are still in the page cache (see `coverage`).
@@ -2817,6 +2820,15 @@ fn grid_row_buffer(font_system: &mut FontSystem, metrics: Metrics, cell_w: f32) 
     b
 }
 
+/// The file face `face` was loaded from (`None` for one loaded from memory).
+fn face_path(face: &FaceInfo) -> Option<&std::path::Path> {
+    use glyphon::fontdb::Source;
+    match &face.source {
+        Source::File(path) | Source::SharedFile(path, _) => Some(path),
+        Source::Binary(_) => None,
+    }
+}
+
 /// The emoji font: the first installed family whose name contains "Emoji" (any
 /// case), a color one ("Noto Color Emoji") preferred over a monochrome one
 /// ("Noto Emoji"); ties broken by name so the pick never depends on scan order.
@@ -3447,6 +3459,20 @@ mod tests {
             assert!((b - a - 5.5).abs() <= 1.0, "{d:?} → {t:?}");
         }
         assert!(t.bottom < 29.0, "{t:?}");
+    }
+
+    #[test]
+    fn every_font_file_is_loaded_once() {
+        // Regression: ~/.local/share/fonts was loaded again after the fontconfig
+        // scan had loaded it, so every user font (the owner's MesloLGS NF)
+        // was in the database twice.
+        let fs = TextLayer::build_font_system();
+        let mut seen = HashSet::new();
+        for face in fs.db().faces() {
+            if let Some(path) = face_path(face) {
+                assert!(seen.insert((path.to_path_buf(), face.index)), "{} loaded twice", path.display());
+            }
+        }
     }
 
     #[test]
