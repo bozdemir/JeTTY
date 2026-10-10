@@ -1012,6 +1012,21 @@ pub static DESCS: &[Desc] = &[
         ..Desc::DEFAULT
     },
     Desc {
+        id: "close_last_tab",
+        tab: WINDOW,
+        section: "window.summon",
+        label: "Last tab closed",
+        kind: Kind::Choice { options: |_| pairs(&[("quit", "Quit"), ("hide", "Hide")]) },
+        get: |c| Val::S(c.close_last_tab.as_str().to_string()),
+        set: |c, v| {
+            if let Val::S(x) = v {
+                c.close_last_tab = crate::config::CloseLastTab::parse(&x);
+            }
+        },
+        hint: Some("Hide keeps JeTTY ready to summon"),
+        ..Desc::DEFAULT
+    },
+    Desc {
         id: "dropdown_height_pct",
         tab: WINDOW,
         section: "window.dropdown",
