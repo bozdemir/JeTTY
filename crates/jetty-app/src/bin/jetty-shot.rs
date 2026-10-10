@@ -2376,7 +2376,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keep_alpha = std::env::var("JETTY_SHOT_UNDERLAY").is_ok_and(|v| v == "none");
     let composited = if keep_alpha {
         let mut out = tight;
-        for px in out.chunks_exact_mut(4) {
+        for px in out.as_chunks_mut::<4>().0 {
             let a = px[3] as f32 / 255.0;
             for c in &mut px[..3] {
                 *c = if a > 0.0 { (*c as f32 / a).min(255.0) as u8 } else { 0 };

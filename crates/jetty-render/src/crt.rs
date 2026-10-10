@@ -1673,7 +1673,7 @@ mod tests {
         buf.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("map"));
         device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
         let bytes = buf.slice(..).get_mapped_range().to_vec();
-        bytes.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+        bytes.as_chunks::<4>().0.to_vec()
     }
 
     /// Scanlines and the shadow mask are sized in DPI-scaled cells, like the

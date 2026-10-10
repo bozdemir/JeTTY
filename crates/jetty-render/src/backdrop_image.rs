@@ -348,11 +348,11 @@ fn decode_jpeg(data: &[u8]) -> Result<(RawImage, u8), String> {
 /// Premultiply straight sRGB RGBA8 by alpha IN LINEAR LIGHT (opaque images are
 /// left untouched — the common case costs one scan).
 pub fn premultiply(img: &mut RawImage) {
-    if img.rgba.chunks_exact(4).all(|p| p[3] == 255) {
+    if img.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255) {
         return;
     }
     let lut = to_linear_lut();
-    for p in img.rgba.chunks_exact_mut(4) {
+    for p in img.rgba.as_chunks_mut::<4>().0 {
         let a = p[3];
         if a == 255 {
             continue;
@@ -432,7 +432,7 @@ pub fn resize_area(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
             }
         }
         let o = &mut out[dy * row_len..(dy + 1) * row_len];
-        for (px, a) in o.chunks_exact_mut(4).zip(acc.chunks_exact(4)) {
+        for (px, a) in o.as_chunks_mut::<4>().0.iter_mut().zip(acc.as_chunks::<4>().0) {
             px[0] = encode(a[0]);
             px[1] = encode(a[1]);
             px[2] = encode(a[2]);
@@ -495,7 +495,9 @@ pub fn blur3(rgba: &[u8], w: u32, h: u32, radius: u32) -> Vec<u8> {
     let (w, h) = (w as usize, h as usize);
     let lut = to_linear_lut();
     let mut a: Vec<f32> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize], p[3] as f32 / 255.0])
         .collect();
     let mut b = vec![0.0f32; a.len()];
@@ -507,7 +509,9 @@ pub fn blur3(rgba: &[u8], w: u32, h: u32, radius: u32) -> Vec<u8> {
         box_h(&t, &mut t2, h, w, r);
         a = transpose(&t2, h, w);
     }
-    a.chunks_exact(4)
+    a.as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [encode(p[0]), encode(p[1]), encode(p[2]), alpha_code(p[3])])
         .collect()
 }
@@ -742,7 +746,7 @@ mod tests {
         use png::{BitDepth, ColorType};
         let rgb: Vec<u8> = (0..3 * 3 * 2).map(|i| (i * 13) as u8).collect();
         let raw = decode_bytes(&png_of(3, 2, ColorType::Rgb, BitDepth::Eight, &rgb, None)).unwrap();
-        let want: Vec<u8> = rgb.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+        let want: Vec<u8> = rgb.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect();
         assert_eq!((raw.w, raw.h, raw.rgba), (3, 2, want));
 
         let gray = [0u8, 64, 128, 255, 7, 99];
@@ -752,7 +756,7 @@ mod tests {
 
         let ga = [10u8, 0, 20, 50, 30, 128, 40, 255];
         let raw = decode_bytes(&png_of(4, 1, ColorType::GrayscaleAlpha, BitDepth::Eight, &ga, None)).unwrap();
-        let want: Vec<u8> = ga.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect();
+        let want: Vec<u8> = ga.as_chunks::<2>().0.iter().flat_map(|p| [p[0], p[0], p[0], p[1]]).collect();
         assert_eq!(raw.rgba, want);
 
         let palette = [255u8, 0, 0, 0, 255, 0, 0, 0, 255];
@@ -771,7 +775,7 @@ mod tests {
         let (w, h) = (37u32, 23u32);
         let big: Vec<u8> = (0..w * h * 3).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
         let raw = decode_bytes(&png_of(w, h, ColorType::Rgb, BitDepth::Eight, &big, None)).unwrap();
-        let want: Vec<u8> = big.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+        let want: Vec<u8> = big.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect();
         assert!(raw.rgba == want, "a 37×23 RGB image survives the expansion");
     }
 
@@ -792,7 +796,7 @@ mod tests {
         let px = |x: usize, y: usize| &raw.rgba[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4];
         assert!(px(2, 4)[0] > 200 && px(2, 4)[2] < 60, "{:?}", px(2, 4));
         assert!(px(13, 4)[2] > 200 && px(13, 4)[0] < 60, "{:?}", px(13, 4));
-        assert!(raw.rgba.chunks_exact(4).all(|p| p[3] == 255));
+        assert!(raw.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
     }
 
     /// The 16×8 red|blue picture as a phone stores it: pixels turned 90° CCW
@@ -849,7 +853,7 @@ mod tests {
         // Stored 3×2:  a b c / d e f  (one byte per pixel tells them apart).
         let stored = || RawImage { w: 3, h: 2, rgba: (0..6u8).flat_map(|v| [b'a' + v, 0, 0, 255]).collect() };
         let shown = |r: &RawImage| -> (u32, u32, String) {
-            (r.w, r.h, r.rgba.chunks_exact(4).map(|p| p[0] as char).collect())
+            (r.w, r.h, r.rgba.as_chunks::<4>().0.iter().map(|p| p[0] as char).collect())
         };
         for (o, want) in [
             (1, (3, 2, "abcdef")),
