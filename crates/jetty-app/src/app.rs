@@ -7483,15 +7483,14 @@ impl App {
         &self.cached_tabs_meta
     }
 
-    /// Give the main window's OS title the active tab's (the window is
-    /// undecorated, so this shows in the taskbar / Alt+Tab only), when it
-    /// changed. Also from the PTY drain whenever a title changed, not only from
-    /// a frame: a minimized or covered window — or one hidden on Wayland,
-    /// where hiding minimizes — paints nothing, and its taskbar entry kept an
-    /// old title until it did. A string compare when nothing changed.
+    /// Give the main window's OS title the active tab's (`main_os_title`; the
+    /// window is undecorated, so this shows in the taskbar / Alt+Tab only),
+    /// when it changed. Also from the PTY drain whenever a title changed, not
+    /// only from a frame: a minimized or covered window paints nothing, and its
+    /// taskbar entry kept an old title until it did. A string compare when
+    /// nothing changed.
     fn sync_main_os_title(&mut self) {
-        let active_title = self.tabs.get(self.active).map(|t| t.title.as_str()).unwrap_or("JeTTY");
-        let desired = crate::detached::os_window_title(active_title);
+        let desired = self.main_os_title();
         if desired != self.applied_main_os_title {
             if let Some(w) = &self.window {
                 w.set_title(&desired);
@@ -9915,7 +9914,7 @@ impl App {
     /// The main window's OS title (taskbar, Alt+Tab): the active tab's.
     fn main_os_title(&self) -> String {
         let active_title = self.tabs.get(self.active).map(|t| t.title.as_str()).unwrap_or("JeTTY");
-        format!("{active_title} — JeTTY")
+        crate::detached::os_window_title(active_title)
     }
 
     /// Toggle window visibility (F9 / Yakuake-style summon / `jetty --toggle`).
@@ -14474,7 +14473,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // not one per Wake — while a background OSC 0/2 title update
                 // still reaches the tab bar and taskbar title (F1/F14). The
                 // taskbar title follows even when nothing paints (minimized,
-                // covered, hidden on Wayland), as detached windows' do.
+                // covered), as detached windows' do.
                 if chrome_changed {
                     self.sync_main_os_title();
                 }
