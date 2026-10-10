@@ -179,14 +179,17 @@ enum NotifyKey {
     Detached(WindowId),
 }
 
-/// Build a command-finish notification's `(summary, body)`. The summary NAMES the
-/// firing tab (amendments §1) plus the status and, when known, the duration; the
-/// body is the command's last output line.
+/// Build a command-finish notification's `(summary, body)`. The summary NAMES
+/// JeTTY and the firing tab first (amendments §1; [`crate::notify::toast_source`]
+/// — a tab's OSC title is the program's) plus the status and, when known, the
+/// duration; the body is the command's last output line (escaped for a markup
+/// server on the way out).
 fn build_notification_text(
     label: &str,
     c: &jetty_core::CommandCompletion,
     failed: bool,
 ) -> (String, String) {
+    let label = crate::notify::toast_source(label);
     let dur = c.duration.map(crate::notify::fmt_duration).unwrap_or_default();
     let status = if failed {
         match c.exit_code {
@@ -21129,6 +21132,25 @@ mod scheduler_tests {
         assert_eq!(main_finish_actions(true, false, false), (true, false));
         assert_eq!(main_finish_actions(true, true, true), (true, false), "shown: nothing to summon");
         assert_eq!(main_finish_actions(false, false, false), (false, false));
+    }
+
+    #[test]
+    fn a_finish_toast_names_jetty_and_its_tab_before_any_program_text() {
+        let c = jetty_core::CommandCompletion {
+            exit_code: Some(2),
+            duration: Some(std::time::Duration::from_secs(72)),
+            last_line: "make: *** [all] Error 2".to_string(),
+        };
+        assert_eq!(
+            super::build_notification_text("Tab 3 · make", &c, true),
+            ("JeTTY · Tab 3 · make — failed (exit 2) · 1m 12s".to_string(), c.last_line.clone())
+        );
+        // A detached window's label is its (program-set) title: it can't start
+        // the summary, nor push the status out of sight.
+        let long = format!("{} (detached)", "Your password expired ".repeat(10));
+        let (summary, _) = super::build_notification_text(&long, &c, true);
+        assert!(summary.starts_with("JeTTY · Your password expired"), "{summary}");
+        assert!(summary.ends_with("… — failed (exit 2) · 1m 12s"), "{summary}");
     }
 
     #[test]

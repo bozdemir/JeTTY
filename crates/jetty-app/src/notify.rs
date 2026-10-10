@@ -143,6 +143,20 @@ fn escape_markup(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// A toast's body as sent to a server that renders bodies as markup
+/// (`markup`) or as plain text. Every body is text JeTTY did not write — a
+/// command's last output line, a program's notification — so for a markup
+/// server it is escaped: a program can't put a link, an image or formatting
+/// into a JeTTY toast. (The summary is plain text by spec.)
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn server_body(body: &str, markup: bool) -> std::borrow::Cow<'_, str> {
+    if markup {
+        escape_markup(body)
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    }
+}
+
 /// Whether the notification server renders the body as markup (it advertises
 /// `body-markup` — Plasma, GNOME Shell, dunst, mako do). Asked ONCE, on a
 /// delivery thread; a server that can't be asked is assumed to (escaping text
@@ -163,7 +177,7 @@ fn body_is_markup() -> bool {
 fn show(summary: &str, body: &str) {
     use notify_rust::{Hint, Notification, Urgency};
     // The summary is plain text by spec; only the body may be parsed as markup.
-    let body = if body_is_markup() { escape_markup(body) } else { std::borrow::Cow::Borrowed(body) };
+    let body = server_body(body, body_is_markup());
     // Fire-and-forget: the returned handle is dropped (no action callbacks), so
     // we never wait on a click. A slow daemon blocks only THIS worker; zbus'
     // own method-call timeout unwedges it and the bounded queue sheds load
@@ -310,22 +324,32 @@ impl ToastBudget {
     }
 }
 
-/// Most chars of the tab's label a program notification's summary keeps, so
-/// the program's own title still shows after it.
-const PROGRAM_LABEL_MAX_CHARS: usize = 40;
+/// Most chars of a tab's label a toast's summary keeps: the label is partly
+/// the program's (its OSC title), and what follows it must stay in sight.
+const SOURCE_LABEL_MAX_CHARS: usize = 40;
 
-/// A program notification's `(summary, body)`. Its text is the program's —
-/// anything a `cat`ed file holds — so the summary starts with the label of the
-/// tab that asked (cut to [`PROGRAM_LABEL_MAX_CHARS`]), where no daemon's
-/// ellipsis can hide it, then the program's title; the body is the program's.
-/// Both arrive sanitized ([`jetty_core::ProgramNotification`]).
-pub fn program_text(label: &str, title: &str, body: &str) -> (String, String) {
-    let label: String = if label.chars().count() > PROGRAM_LABEL_MAX_CHARS {
-        label.chars().take(PROGRAM_LABEL_MAX_CHARS - 1).chain(std::iter::once('…')).collect()
+/// What every JeTTY toast's summary starts with: JeTTY and the tab it is
+/// about (`label`, cut to [`SOURCE_LABEL_MAX_CHARS`]). Text a program
+/// controls — its title, a command's last line, the tab's OSC title — never
+/// starts a summary, so a toast can't pass for another app or the system,
+/// even on a server that shows no app name (mako's and dunst's defaults),
+/// and no daemon's ellipsis can cut the source away.
+pub fn toast_source(label: &str) -> String {
+    if label.chars().count() > SOURCE_LABEL_MAX_CHARS {
+        let cut: String = label.chars().take(SOURCE_LABEL_MAX_CHARS - 1).collect();
+        format!("JeTTY · {cut}…")
     } else {
-        label.to_string()
-    };
-    let summary = if title.is_empty() { label } else { format!("{label} — {title}") };
+        format!("JeTTY · {label}")
+    }
+}
+
+/// A program notification's `(summary, body)`: `JeTTY · <tab>: <title>`
+/// ([`toast_source`]) and the program's body. Both texts arrive sanitized
+/// ([`jetty_core::ProgramNotification`]); the body is escaped for a markup
+/// server on the way out ([`server_body`]).
+pub fn program_text(label: &str, title: &str, body: &str) -> (String, String) {
+    let source = toast_source(label);
+    let summary = if title.is_empty() { source } else { format!("{source}: {title}") };
     (summary, body.to_string())
 }
 
@@ -443,18 +467,37 @@ mod tests {
     }
 
     #[test]
-    fn a_program_toast_names_its_tab_first() {
+    fn a_program_toast_names_jetty_and_its_tab_first() {
         assert_eq!(
             program_text("Tab 2 · claude", "Claude Code", "Waiting for your input"),
-            ("Tab 2 · claude — Claude Code".to_string(), "Waiting for your input".to_string())
+            ("JeTTY · Tab 2 · claude: Claude Code".to_string(), "Waiting for your input".to_string())
         );
-        // OSC 9 has no title: the tab's label is the summary.
-        assert_eq!(program_text("Tab 3", "", "Build finished"), ("Tab 3".to_string(), "Build finished".to_string()));
-        // A long tab title can't push the program's title out of sight.
+        // OSC 9 has no title: the source is the whole summary.
+        assert_eq!(program_text("Tab 3", "", "Build finished"), ("JeTTY · Tab 3".to_string(), "Build finished".to_string()));
+        // A program that titles its tab and its notification like the system
+        // still can't start the summary…
+        let (summary, _) = program_text("System Settings (detached)", "Password expired", "");
+        assert_eq!(summary, "JeTTY · System Settings (detached): Password expired");
+        // …nor push its notification's title out of sight with a long tab title.
         let (summary, _) = program_text(&format!("Tab 4 · {}", "x".repeat(200)), "Update", "");
-        assert!(summary.starts_with("Tab 4 · xxx"));
-        assert!(summary.ends_with("x… — Update"), "{summary}");
-        assert_eq!(summary.chars().count(), PROGRAM_LABEL_MAX_CHARS + " — Update".chars().count());
+        assert!(summary.starts_with("JeTTY · Tab 4 · xxx"));
+        assert!(summary.ends_with("x…: Update"), "{summary}");
+        assert_eq!(summary.chars().count(), "JeTTY · ".chars().count() + SOURCE_LABEL_MAX_CHARS + ": Update".len());
+    }
+
+    #[test]
+    fn a_markup_server_gets_no_link_image_or_formatting_from_a_body() {
+        // Nothing here reaches a desktop: the body as `show` would send it.
+        let body = "<a href=\"https://evil.example\">Update</a><img src=\"file:///x.png\"/><b>&amp;</b>";
+        assert_eq!(
+            server_body(body, true),
+            "&lt;a href=\"https://evil.example\"&gt;Update&lt;/a&gt;&lt;img src=\"file:///x.png\"/&gt;&lt;b&gt;&amp;amp;&lt;/b&gt;"
+        );
+        // A plain-text server shows the text as it is.
+        assert_eq!(server_body(body, false), body);
+        // Program notifications and Run & Notify bodies take the same path.
+        let (_, body) = program_text("Tab 1", "", "Vec<String> & co");
+        assert_eq!(server_body(&body, true), "Vec&lt;String&gt; &amp; co");
     }
 
     #[test]
