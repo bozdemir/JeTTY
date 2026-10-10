@@ -867,7 +867,7 @@ mod x11 {
             }
             Ok(if !struts.is_empty() {
                 super::strut_insets(mon, root, &struts)
-            } else if let Some(&[x, y, w, h]) = area.chunks_exact(4).nth(desktop) {
+            } else if let Some(&[x, y, w, h]) = area.as_chunks::<4>().0.get(desktop) {
                 super::workarea_insets(mon, (x as i32, y as i32, w, h))
             } else {
                 super::Insets::default()
