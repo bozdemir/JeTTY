@@ -4663,6 +4663,13 @@ impl App {
                 let at = idx.min(self.tabs.len());
                 self.tabs.insert(at, tab);
                 self.active = prev_active.min(self.tabs.len().saturating_sub(1));
+                // Not silent: the constructor's reason went to stderr, which a
+                // GUI launch never shows, and a tab that simply stays reads as
+                // a dead shortcut.
+                self.show_status_pill(crate::runsel::Notice {
+                    msg: "Couldn't detach the tab — no new window could be opened",
+                    window: None,
+                });
                 self.request_main_paint();
                 return;
             }
@@ -4788,9 +4795,12 @@ impl App {
         // If the main window is hidden (e.g. the last main tab's shell exited
         // while hidden and close_exited_tabs reattached a detached tab to keep its
         // shell alive), summon it — otherwise the user's live shell would be
-        // parked in an invisible window, looking dead until the next F9 (F15). The
-        // drag-to-reattach path only runs while visible, so this is a no-op there.
-        if !self.visible {
+        // parked in an invisible window, looking dead until the next F9 (F15).
+        // A USER reattach also brings a shown one forward — un-minimized, raised
+        // and focused, like `jetty --show`: with focus_autohide off the main
+        // window is often minimized or behind others, and the tab vanished into
+        // it with nothing coming up.
+        if !self.visible || by == SummonBy::User {
             self.set_visibility_by(true, by, event_loop);
         }
 
@@ -11921,7 +11931,11 @@ impl App {
                     }
                 };
                 if let Some((gx, gy)) = drop_global {
-                    if self.visible {
+                    // Only onto a tab bar the user can see: a minimized main
+                    // window still answers its position (X11), and a drop on the
+                    // empty screen band where its tab bar was reattached the tab
+                    // into it.
+                    if self.visible && !self.main_occluded {
                         // Convert the detached-window release point and the main
                         // window's outer rect BOTH into the one space the desktop
                         // shares (`detached::desktop_unit_scale`: points on macOS,
