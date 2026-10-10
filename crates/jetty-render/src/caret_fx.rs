@@ -66,8 +66,10 @@ fn glow_at(frag: vec2<f32>) -> f32 {
     // Distance from fragment to the cursor cell centre (pixels). Fragment
     // position: y=0 at the top-left of the viewport, the cursor_px convention.
     let d = length(frag - p.cursor_px);
-    // Characteristic cell radius used to scale falloff distances.
-    let cell_r = max(p.cell.x, p.cell.y);
+    // Characteristic cell radius used to scale falloff distances. At least a
+    // pixel, like the scissor (`caret_glow_scissor`): a cell is never smaller,
+    // but the falloffs divide by it.
+    let cell_r = max(max(p.cell.x, p.cell.y), 1.0);
     // --- Halo: Gaussian radial glow centred on the cursor, fading with time. ---
     // sigma = 1.5 * cell_r  => at d = 2*cell_r: exp(-4/2.25) ≈ 0.17 (still warm),
     //                          at d = 3*cell_r: exp(-4)      ≈ 0.02 (near zero).
