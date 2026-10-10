@@ -867,6 +867,30 @@ struct Binds {
     down: Option<wgpu::BindGroup>,
 }
 
+/// The composite variants a `Crt` keeps compiled, the least recently prepared
+/// dropped first: the current look, the one a slider dragged across a feature's
+/// threshold flips back to, the glitch and reduced-motion variants — never a
+/// pipeline for every variant a Settings session touched.
+const CRT_VARIANTS_KEPT: usize = 4;
+
+/// Make `key` the most recent entry of `list` (last), building its value with
+/// `make` when absent; past `cap` entries the least recent (first) goes.
+fn touch_lru<K: PartialEq + Copy, V>(list: &mut Vec<(K, V)>, key: K, cap: usize, make: impl FnOnce() -> V) {
+    match list.iter().position(|(k, _)| *k == key) {
+        Some(i) if i + 1 == list.len() => {}
+        Some(i) => {
+            let entry = list.remove(i);
+            list.push(entry);
+        }
+        None => {
+            list.push((key, make()));
+            if list.len() > cap {
+                list.remove(0);
+            }
+        }
+    }
+}
+
 /// Lazily built GPU state: nothing here exists until a variant is prepared.
 #[derive(Default)]
 struct CrtGpu {
@@ -874,7 +898,8 @@ struct CrtGpu {
     bloom_module: Option<wgpu::ShaderModule>,
     main_layout: Option<wgpu::PipelineLayout>,
     bloom_layout: Option<wgpu::PipelineLayout>,
-    /// One pipeline per prepared variant (a handful at most).
+    /// One pipeline per recently prepared variant, the most recent last
+    /// ([`CRT_VARIANTS_KEPT`]).
     pipelines: Vec<(CrtKey, wgpu::RenderPipeline)>,
     /// Down pass without / with the phosphor remap.
     down: [Option<wgpu::RenderPipeline>; 2],
@@ -1065,23 +1090,23 @@ impl Crt {
     }
 
     fn ensure_pipelines(&self, g: &mut CrtGpu, device: &wgpu::Device, key: CrtKey) {
-        if !g.pipelines.iter().any(|(k, _)| *k == key) {
-            let module = g.main_module.get_or_insert_with(|| {
+        let CrtGpu { main_module, main_layout, pipelines, .. } = g;
+        touch_lru(pipelines, key, CRT_VARIANTS_KEPT, || {
+            let module = main_module.get_or_insert_with(|| {
                 device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("crt-shader"),
                     source: wgpu::ShaderSource::Wgsl(crt_shader_source().into()),
                 })
             });
-            let layout = g.main_layout.get_or_insert_with(|| {
+            let layout = main_layout.get_or_insert_with(|| {
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("crt-layout"),
                     bind_group_layouts: &[Some(&self.bgl)],
                     ..Default::default()
                 })
             });
-            let pipe = Self::pipeline(device, "crt-pipeline", layout, module, "fs", self.format, &key.constants());
-            g.pipelines.push((key, pipe));
-        }
+            Self::pipeline(device, "crt-pipeline", layout, module, "fs", self.format, &key.constants())
+        });
         if !key.contains(CrtKey::BLOOM) {
             return;
         }
@@ -1417,6 +1442,35 @@ mod tests {
             dpi_scale: 2.0,
             glitch: 0.0,
         }
+    }
+
+    /// A `Crt` keeps the variants it prepared most recently, not one compiled
+    /// pipeline per variant ever touched: Settings sliders dragged across their
+    /// thresholds for a while built dozens, kept for as long as the CRT stayed
+    /// on. Using a kept one again makes it the most recent.
+    #[test]
+    fn crt_variants_are_kept_most_recent_first() {
+        let mut list: Vec<(u32, &str)> = Vec::new();
+        let mut built = Vec::new();
+        for k in [1, 2, 3, 4] {
+            touch_lru(&mut list, k, 4, || {
+                built.push(k);
+                "pipe"
+            });
+        }
+        assert_eq!(list.iter().map(|e| e.0).collect::<Vec<_>>(), [1, 2, 3, 4]);
+        // 1 again: nothing is built, it becomes the most recent.
+        touch_lru(&mut list, 1, 4, || panic!("1 is kept"));
+        assert_eq!(list.iter().map(|e| e.0).collect::<Vec<_>>(), [2, 3, 4, 1]);
+        // A fifth variant evicts the least recently used (2).
+        touch_lru(&mut list, 5, 4, || "pipe");
+        assert_eq!(list.iter().map(|e| e.0).collect::<Vec<_>>(), [3, 4, 1, 5]);
+        // The most recent one again: no change.
+        touch_lru(&mut list, 5, 4, || panic!("5 is kept"));
+        assert_eq!(list.len(), 4);
+        assert_eq!(built, [1, 2, 3, 4]);
+        // A slider dragged across a threshold flips between two variants.
+        const { assert!(CRT_VARIANTS_KEPT >= 2) };
     }
 
     /// Each slider compiles its feature in only when it can change a pixel.
