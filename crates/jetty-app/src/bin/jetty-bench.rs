@@ -599,6 +599,16 @@ fn bench_frames(
             line += 1;
             t.feed(&numbered_line(line));
         })?;
+        // A page of fresh output per frame (a flood, PageDown in a pager, a tab
+        // switch): every row is new and re-shaped — the frame the 6.9 ms budget
+        // is about.
+        let mut page_line = 2_000_000usize;
+        run("page", None, &mut |t, _k| {
+            for _ in 0..rows {
+                page_line += 1;
+                t.feed(&numbered_line(page_line));
+            }
+        })?;
         // A btop-like TUI: a rounded box-drawing frame around braille graph rows,
         // redrawn in place every frame with the graph shifted one column (the
         // borders stay, every graph row changes).

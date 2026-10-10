@@ -286,8 +286,10 @@ shrinking it means a different history representation inside the grid.
 
 ## Gates (review rules)
 
-These are enforced by review and by running the bench before a release — **not by
-a failing CI job** (CI only reports; see rule 6).
+Timings are enforced by review and by running the bench before a release — **not
+by a failing CI job** (CI only reports them; see rule 6). What is exact fails CI:
+allocation counts (rule 7) and the paint chokepoint (rule 3's
+`scripts/check-paint-choke.sh`).
 
 1. `jetty-bench` render ≤ 6.9 ms/frame and snapshot ≤ 1 ms/frame on the baseline.
 2. Throughput ≥ 150 MB/s. *(~146–150 at the live 8 KiB chunk size on a quiet
@@ -308,6 +310,13 @@ a failing CI job** (CI only reports; see rule 6).
    many runs. Until then nothing in CI fails on a perf regression. CPU-only avoids
    GPU-availability / software-rasterizer timing variance on runners (it is
    display-independent, not a claim that the GPU bench "crashes" there).
+7. **Allocation counts (blocking).** Unlike timings they are exact, so CI fails on
+   them: `crates/jetty-core/tests/alloc.rs` holds `Terminal::feed` of output into a
+   full scrollback (plain text and SGR runs) at **0** allocations and the per-frame
+   `snapshot()` of a plain screen at **1** (its cells). jetty-bench's frames table
+   prints allocations per frame for the GPU side; its `page` row (a page of fresh
+   lines every frame — every row re-shaped) is the frame the 6.9 ms gate is about,
+   and `feed_bench` has a sixel and a chunked kitty PNG workload, decode included.
 
 ## Live metrics (in-app HUD)
 
