@@ -869,11 +869,12 @@ palette = ["#000000","#010101","#020202","#030303","#040404","#050505","#060606"
             assert_eq!(merged[i].name.as_ref(), id, "the built-in's id stays: config names keep matching");
         }
         // Two files for one name, however they spell it: the last one wins,
-        // and it is said.
-        std::fs::write(dir.join("dracula.toml"), theme_text("#654321").replace("name = \"mine\"\n", "")).unwrap();
+        // and it is said. (Not `dracula.toml`: on a case-insensitive file
+        // system — macOS — that is the same file as `Dracula.toml`.)
+        std::fs::write(dir.join("dra-cula.toml"), theme_text("#654321").replace("name = \"mine\"\n", "")).unwrap();
         let (user, w) = load_user_themes_from(&dir);
         assert_eq!(user.len(), 2, "{w:?}");
-        assert_eq!(w, ["two theme files are named \"dracula\" — themes/dracula.toml wins"]);
+        assert_eq!(w, ["two theme files are named \"dra-cula\" — themes/dra-cula.toml wins"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

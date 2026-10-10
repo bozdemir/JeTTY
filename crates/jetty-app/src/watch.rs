@@ -553,6 +553,9 @@ mod tests {
         })
         .expect("watcher");
         assert_eq!(problem, None);
+        // FSEvents (macOS) can still report the write made just before the
+        // watch started: let it pass before asserting that nothing changes.
+        while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
         // Atomic replace.
         std::fs::write(cfg_dir.join(".config.toml.swp-edit"), "theme = \"dracula\"\n").unwrap();
         assert!(!changed_quick(&rx), "an editor's scratch file alone is not a change");
@@ -599,7 +602,14 @@ mod tests {
         // Re-point the link (atomically, as stow / ln -sfn do).
         symlink(&repo_b, base.join("jetty.new")).unwrap();
         std::fs::rename(base.join("jetty.new"), &cfg_dir).unwrap();
-        assert!(changed(&rx), "the link re-pointed");
+        // Linux sees the re-point itself (the parent is watched while the
+        // config dir is a symlink). macOS's FSEvents doesn't: the new target is
+        // picked up at the next rearm — a reload or a restart.
+        if cfg!(target_os = "linux") {
+            assert!(changed(&rx), "the link re-pointed");
+        } else {
+            while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+        }
         w.rearm();
         std::fs::write(repo_b.join("config.toml"), "theme = \"gruvbox_dark\"\n").unwrap();
         assert!(changed(&rx), "an edit in the new target");
