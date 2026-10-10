@@ -5582,6 +5582,7 @@ impl App {
         if let Some(ov) = self.ov_of_mut(s) {
             ov.hint_mode = Some(HintState { tokens, labels, typed: String::new(), entry, epoch });
         }
+        self.sync_ime(s);
         self.paint_surface(s);
     }
 
@@ -5589,11 +5590,31 @@ impl App {
     /// and put back where hint mode began.
     fn exit_hint_mode(&mut self, s: Surface) {
         let entry = self.ov_of_mut(s).and_then(|o| o.hint_mode.take()).map(|hs| hs.entry);
-        if let (Some(entry), Some(term)) = (entry, self.term_of_mut(s)) {
-            term.set_view_pinned(false);
-            term.scroll_to_spot(entry);
+        if let Some(entry) = entry {
+            if let Some(term) = self.term_of_mut(s) {
+                term.set_view_pinned(false);
+                term.scroll_to_spot(entry);
+            }
+            self.sync_ime(s);
         }
         self.paint_surface(s);
+    }
+
+    /// Window `s`'s input method follows its modes: off while hint mode /
+    /// copy-mode take the keys — a CJK input method in native mode turned
+    /// their letters into an invisible preedit and the commit was dropped, so
+    /// a label or a motion could never be typed (alacritty's vi mode turns it
+    /// off too) — on otherwise. Called where a mode starts or ends.
+    fn sync_ime(&self, s: Surface) {
+        let Some(ov) = self.ov_of(s) else { return };
+        let allowed = ov.hint_mode.is_none() && ov.copy_mode.is_none();
+        let window = match s {
+            Surface::Main => self.window.as_ref(),
+            Surface::Detached(p) => self.detached.get(p).map(|d| &d.window),
+        };
+        if let Some(w) = window {
+            w.set_ime_allowed(allowed);
+        }
     }
 
     /// Hint mode's tokens sit on the absolute line scale: when a reflow (or a
@@ -5735,6 +5756,7 @@ impl App {
         if let Some(ov) = self.ov_of_mut(s) {
             ov.copy_mode = Some(crate::copymode::CopyMode { entry, ..crate::copymode::CopyMode::new(row, col) });
         }
+        self.sync_ime(s);
         self.paint_surface(s);
     }
 
@@ -5745,6 +5767,7 @@ impl App {
             if let Some(term) = self.term_of_mut(s) {
                 term.set_view_pinned(false);
             }
+            self.sync_ime(s);
         }
         self.paint_surface(s);
     }
@@ -6308,11 +6331,11 @@ impl App {
 
     /// An IME commit (or a dropped file's path — typed text all the same)
     /// while one of window `s`'s overlays owns its keyboard: hint mode /
-    /// copy-mode DROP it (a CJK IME routes even Latin letters through
-    /// commits, which must neither leak to the shell behind the overlay nor
-    /// silently fail the mode's own keys — BLOCKING 1); the palette and the
-    /// search bar take it into their query (CJK queries). Returns whether the
-    /// commit was consumed.
+    /// copy-mode DROP it — it must not leak to the shell behind the overlay
+    /// (BLOCKING 1); their window's input method is off meanwhile
+    /// ([`Self::sync_ime`]), so their own letters arrive as keys — and the
+    /// palette and the search bar take it into their query (CJK queries).
+    /// Returns whether the commit was consumed.
     fn overlay_ime_commit(&mut self, s: Surface, text: &str) -> bool {
         let Some(ov) = self.ov_of(s) else { return false };
         if ov.hint_mode.is_some() || ov.copy_mode.is_some() {
@@ -6360,6 +6383,7 @@ impl App {
             term.set_view_pinned(false);
             ov.hint_mode = None;
             ov.copy_mode = None;
+            self.sync_ime(s);
         }
     }
 
@@ -7242,8 +7266,11 @@ impl App {
                 Self::sync_tab_title(tab, mode);
             }
         }
-        self.ov.hint_mode = None;
-        self.ov.copy_mode = None;
+        if self.ov.hint_mode.is_some() || self.ov.copy_mode.is_some() {
+            self.ov.hint_mode = None;
+            self.ov.copy_mode = None;
+            self.sync_ime(Surface::Main);
+        }
         // A menu still open here was opened over the old tab (its shell
         // exited under it, a reattach, a detached window's tab command): its
         // Copy would copy the new tab's selection, Clear and Close Tab would
