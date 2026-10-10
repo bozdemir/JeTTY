@@ -159,6 +159,46 @@ pub struct GpuShared {
     /// Set by the device-lost callback on a genuine loss (driver reset, GPU
     /// hang, suspend) — see [`GpuContext::is_lost`].
     lost: Arc<AtomicBool>,
+    /// What every window's layers draw with ([`SharedPipelines`]).
+    pipelines: SharedPipelines,
+}
+
+/// The pipelines every window on a device draws with — each layer's shader
+/// module, layouts and pipeline (wgpu handles, cloned cheaply) — built once per
+/// layer type and surface format, on first use. A detached or Settings window
+/// then compiles nothing its layers need: naga translates each shader once per
+/// device, not once per window. [`GpuShared`] holds the device's
+/// ([`GpuContext::pipelines`]).
+#[derive(Default)]
+pub struct SharedPipelines(std::sync::Mutex<Vec<SharedPipeline>>);
+
+/// One entry of [`SharedPipelines`]: the type, the format it targets, the value.
+type SharedPipeline = (std::any::TypeId, wgpu::TextureFormat, Box<dyn std::any::Any + Send + Sync>);
+
+impl SharedPipelines {
+    /// The `T` for `format` on `device` — `build` runs on first use.
+    pub(crate) fn get<T: Clone + Send + Sync + 'static>(
+        &self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        build: impl FnOnce(&wgpu::Device, wgpu::TextureFormat) -> T,
+    ) -> T {
+        self.get_or(format, || build(device, format))
+    }
+
+    /// [`Self::get`]'s lookup: the `T` kept for `format`, else `build`'s.
+    fn get_or<T: Clone + Send + Sync + 'static>(&self, format: wgpu::TextureFormat, build: impl FnOnce() -> T) -> T {
+        let ty = std::any::TypeId::of::<T>();
+        let mut built = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let found =
+            built.iter().find(|(t, f, _)| *t == ty && *f == format).and_then(|(_, _, v)| v.downcast_ref::<T>());
+        if let Some(v) = found {
+            return v.clone();
+        }
+        let v = build();
+        built.push((ty, format, Box::new(v.clone())));
+        v
+    }
 }
 
 /// The surface's composite alpha mode from what it offers, transparency first:
@@ -534,6 +574,7 @@ impl GpuContext {
             device,
             queue,
             lost,
+            pipelines: Default::default(),
         });
         let gpu = Self::configure(shared, surface, window, width, height);
         if gpu.is_none() && power == wgpu::PowerPreference::LowPower {
@@ -676,6 +717,11 @@ impl GpuContext {
     /// [`Self::with_shared`] / [`Self::new_sharing`] for every further window.
     pub fn shared(&self) -> Arc<GpuShared> {
         Arc::clone(&self.shared)
+    }
+
+    /// The pipelines every window on this device shares ([`SharedPipelines`]).
+    pub fn pipelines(&self) -> &SharedPipelines {
+        &self.shared.pipelines
     }
 
     /// Whether the adapter is a CPU (software) rasterizer — lavapipe/llvmpipe,
@@ -1060,6 +1106,28 @@ mod tests {
         assert_eq!(effect_format(Backend::Gl, false), Rgba8UnormSrgb);
         // Only GL is ever probed; any other backend renders half-float.
         assert_eq!(effect_format(Backend::Vulkan, false), Rgba16Float);
+    }
+
+    /// Every window's layers take one build per type and surface format: the
+    /// first caller builds, the rest get that value.
+    #[test]
+    fn shared_pipelines_build_once_per_type_and_format() {
+        use wgpu::TextureFormat as F;
+        let shared = super::SharedPipelines::default();
+        let mut builds = 0;
+        let mut get = |format, value: u32| {
+            shared.get_or(format, || {
+                builds += 1;
+                value
+            })
+        };
+        assert_eq!(get(F::Bgra8UnormSrgb, 1), 1);
+        assert_eq!(get(F::Bgra8UnormSrgb, 2), 1, "kept: not built again");
+        assert_eq!(get(F::Rgba8UnormSrgb, 3), 3, "another format builds its own");
+        assert_eq!(builds, 2);
+        // Another type for the same format is its own entry.
+        assert_eq!(shared.get_or(F::Bgra8UnormSrgb, || "quad"), "quad");
+        assert_eq!(shared.get_or(F::Bgra8UnormSrgb, || "mask"), "quad");
     }
 
     /// A failed acquire is retried on the app's bounded timer — except for an

@@ -1097,9 +1097,42 @@ impl TextLayer {
         family: &str,
         font_system: FontSystem,
     ) -> Self {
+        Self::with_cache(device, queue, format, font_size, family, font_system, Cache::new(device))
+    }
+
+    /// [`Self::new_with_family_and_fonts`] for `gpu`'s window, sharing glyphon's
+    /// shader and pipeline with every text layer on its device (built once per
+    /// device: ~0.9 ms per layer on an Intel iGPU).
+    pub fn for_gpu(gpu: &crate::GpuContext, font_size: f32, family: &str, font_system: FontSystem) -> Self {
+        Self::shared(&gpu.device, &gpu.queue, gpu.format, font_size, family, font_system, gpu.pipelines())
+    }
+
+    /// [`Self::new_with_family_and_fonts`] with glyphon's shader and pipeline
+    /// from `pipelines` (built there once).
+    pub fn shared(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        font_size: f32,
+        family: &str,
+        font_system: FontSystem,
+        pipelines: &crate::SharedPipelines,
+    ) -> Self {
+        let cache = pipelines.get(device, format, |device, _| Cache::new(device));
+        Self::with_cache(device, queue, format, font_size, family, font_system, cache)
+    }
+
+    fn with_cache(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        font_size: f32,
+        family: &str,
+        font_system: FontSystem,
+        cache: Cache,
+    ) -> Self {
         let mut font_system = font_system;
         let swash = SwashCache::new();
-        let cache = Cache::new(device);
         let viewport = Viewport::new(device, &cache);
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
         let renderer =

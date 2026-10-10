@@ -215,18 +215,19 @@ pub struct QuadLayer {
     instance_scratch: Vec<f32>,
 }
 
-impl QuadLayer {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+/// The quad pass's pipeline and the layout of its bind group: the same for
+/// every window on a device ([`QuadLayer::for_gpu`] builds it once).
+#[derive(Clone)]
+struct QuadPipeline {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl QuadPipeline {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("quad-shader"),
             source: wgpu::ShaderSource::Wgsl(QUAD_SHADER.into()),
-        });
-
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("quad-uniform"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -240,15 +241,6 @@ impl QuadLayer {
                     min_binding_size: None,
                 },
                 count: None,
-            }],
-        });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("quad-bg"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buf.as_entire_binding(),
             }],
         });
 
@@ -304,8 +296,46 @@ impl QuadLayer {
             cache: None,
         });
 
+        Self { pipeline, bind_group_layout }
+    }
+}
+
+impl QuadLayer {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        Self::with_pipeline(device, QuadPipeline::new(device, format))
+    }
+
+    /// A quad layer for `gpu`'s window, drawing with the pipeline every window
+    /// on its device shares (compiled once per device, not per window).
+    pub fn for_gpu(gpu: &crate::GpuContext) -> Self {
+        Self::shared(&gpu.device, gpu.format, gpu.pipelines())
+    }
+
+    /// [`Self::new`] with its pipeline from `pipelines` (built there once).
+    pub fn shared(device: &wgpu::Device, format: wgpu::TextureFormat, pipelines: &crate::SharedPipelines) -> Self {
+        Self::with_pipeline(device, pipelines.get(device, format, QuadPipeline::new))
+    }
+
+    /// The layer's own uniform buffer and bind group around `pipeline`.
+    fn with_pipeline(device: &wgpu::Device, pipeline: QuadPipeline) -> Self {
+        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quad-uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("quad-bg"),
+            layout: &pipeline.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            }],
+        });
+
         Self {
-            pipeline,
+            pipeline: pipeline.pipeline,
             uniform_buf,
             bind_group,
             instance_buf: None,

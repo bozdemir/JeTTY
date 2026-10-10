@@ -9851,9 +9851,7 @@ impl App {
             // set_ui_family (no rescan). The true UI size is used only for the live
             // "Aa" specimen, drawn separately via chrome_text.
             let capped = self.ui_font_logical.clamp(PANEL_TEXT_MIN, PANEL_TEXT_MAX);
-            let mut text = TextLayer::new_with_family_and_fonts(
-                &g.device, &g.queue, g.format, capped * scale, &self.font_family, fonts(),
-            );
+            let mut text = TextLayer::for_gpu(&g, capped * scale, &self.font_family, fonts());
             let ui_fam = if self.ui_font_family.is_empty() {
                 None
             } else {
@@ -9862,11 +9860,9 @@ impl App {
             text.set_ui_family(ui_fam);
             // Dedicated TRUE-size specimen layer on the settings device for the
             // live "Aa" preview (the panel body text above is capped).
-            let mut specimen = TextLayer::new_with_family_and_fonts(
-                &g.device, &g.queue, g.format, self.ui_font_logical * scale, &self.font_family, fonts(),
-            );
+            let mut specimen = TextLayer::for_gpu(&g, self.ui_font_logical * scale, &self.font_family, fonts());
             specimen.set_ui_family(ui_fam);
-            let quad = QuadLayer::new(&g.device, g.format);
+            let quad = QuadLayer::for_gpu(&g);
             self.settings_text = Some(text);
             self.settings_specimen_text = Some(specimen);
             self.settings_quad = Some(quad);
@@ -9954,21 +9950,16 @@ impl App {
         let Some(gpu) = GpuContext::new(window, size.width, size.height) else { return false };
         let font_db = || self.text.as_ref().map_or_else(TextLayer::build_font_system, |t| t.clone_font_system());
         let (grid_fonts, chrome_fonts) = (font_db(), font_db());
-        let mut text = TextLayer::new_with_family_and_fonts(
-            &gpu.device, &gpu.queue, gpu.format, self.font_logical * scale, &self.font_family, grid_fonts,
-        );
+        let mut text = TextLayer::for_gpu(&gpu, self.font_logical * scale, &self.font_family, grid_fonts);
         text.set_line_height(self.line_height);
-        let mut chrome = TextLayer::new_with_family_and_fonts(
-            &gpu.device, &gpu.queue, gpu.format, self.ui_font_logical * scale, &self.font_family, chrome_fonts,
-        );
+        let mut chrome = TextLayer::for_gpu(&gpu, self.ui_font_logical * scale, &self.font_family, chrome_fonts);
         chrome.set_ui_family(if self.ui_font_family.is_empty() {
             None
         } else {
             Some(self.ui_font_family.as_str())
         });
-        let (device, format) = (&gpu.device, gpu.format);
-        self.quad = Some(QuadLayer::new(device, format));
-        self.corner_mask = Some(jetty_render::CornerMask::new(device, format));
+        self.quad = Some(QuadLayer::for_gpu(&gpu));
+        self.corner_mask = Some(jetty_render::CornerMask::for_gpu(&gpu));
         // Device-scoped and lazy: rebuilt on the first ring frame after this.
         self.focus_ring = None;
         // Summon passes: rebuilt on the new device by the next summon frame.
@@ -9980,7 +9971,7 @@ impl App {
         // Rebuilt lazily on the new device by the next `sync_main_post`.
         self.crt = None;
         self.crt_key = None;
-        self.image_layer = Some(jetty_render::ImageLayer::new(device, format));
+        self.image_layer = Some(jetty_render::ImageLayer::for_gpu(&gpu));
         // Rebuilt on the new device by the next frame that wants it. A layer of
         // the lost device must never reach a pass on the new one: its ids name
         // nothing (or something else) there, and wgpu panics on them.
@@ -13681,10 +13672,7 @@ impl ApplicationHandler<AppEvent> for App {
         // parallel with the GPU block above, so this join is typically free).
         let (font_system, mono_families) = font_handle.join().expect("font worker panicked");
         let (text, quad, cols, rows) = if let Some(ref g) = gpu {
-            let mut text = TextLayer::new_with_family_and_fonts(
-                &g.device, &g.queue, g.format, self.font_logical * scale, &self.font_family,
-                font_system,
-            );
+            let mut text = TextLayer::for_gpu(g, self.font_logical * scale, &self.font_family, font_system);
             // The configured family must be installed — a missing one (the
             // default "MesloLGS NF" on a machine without it, a dotfiles config
             // from another machine) left the grid to the font engine's own
@@ -13711,7 +13699,7 @@ impl ApplicationHandler<AppEvent> for App {
             // (self.window isn't stored yet).
             let (cols, rows) =
                 self.main_grid_dims_at(size.width as f32, size.height as f32, scale, cw, ch);
-            let quad = QuadLayer::new(&g.device, g.format);
+            let quad = QuadLayer::for_gpu(g);
             (Some(text), Some(quad), cols, rows)
         } else {
             (None, None, FALLBACK_COLS, FALLBACK_ROWS)
@@ -13719,7 +13707,7 @@ impl ApplicationHandler<AppEvent> for App {
         // Build the rounded-corner mask (final fullscreen pass) for the borderless
         // main window, using the same surface format as the rest of the pipeline.
         if let Some(ref g) = gpu {
-            self.corner_mask = Some(jetty_render::CornerMask::new(&g.device, g.format));
+            self.corner_mask = Some(jetty_render::CornerMask::for_gpu(g));
             // The focus ring is device-scoped and lazy: never one from an older
             // device (rebuilt on the first frame that draws a ring).
             self.focus_ring = None;
@@ -13733,7 +13721,7 @@ impl ApplicationHandler<AppEvent> for App {
             // frame that uses it — CRT off costs nothing at startup.
             // Inline-image (sixel) layer on the main device. Same surface format
             // as the scene target; zero cost until an image is visible.
-            self.image_layer = Some(jetty_render::ImageLayer::new(&g.device, g.format));
+            self.image_layer = Some(jetty_render::ImageLayer::for_gpu(g));
             // The caret glow (Task 12) is NOT built here: the first frame with
             // the glow enabled builds just the variant it needs (zero cost off).
             self.summon_pending = true;
@@ -13751,9 +13739,8 @@ impl ApplicationHandler<AppEvent> for App {
             // fontconfig scan here cost ~15–20ms on the main thread at EVERY cold
             // start, undoing the worker-thread overlap above.
             let fonts = text.as_ref().map_or_else(TextLayer::build_font_system, |t| t.clone_font_system());
-            let mut chrome = TextLayer::new_with_family_and_fonts(
-                &g.device, &g.queue, g.format, self.ui_font_logical * scale, &self.font_family, fonts,
-            );
+            // (Its glyphon pipeline is the grid layer's: `TextLayer::for_gpu`.)
+            let mut chrome = TextLayer::for_gpu(g, self.ui_font_logical * scale, &self.font_family, fonts);
             // Populate the UI-font picker list: a synthetic "System Sans (default)"
             // row (→ "") first, then the installed proportional families.
             self.ui_font_families = std::iter::once("System Sans (default)".to_string())

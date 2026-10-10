@@ -42,7 +42,7 @@ pub use chrome::{
 };
 pub use gpu::{
     backend_display_name, instance_descriptor, set_platform_display, AcquireError, GpuContext, GpuShared,
-    WgpuHasDisplayHandle, NO_GPU_HELP,
+    SharedPipelines, WgpuHasDisplayHandle, NO_GPU_HELP,
 };
 pub use text::{GridPaint, TextLayer};
 pub use colors::{

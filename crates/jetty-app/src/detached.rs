@@ -628,28 +628,26 @@ impl DetachedWindow {
         let fonts = || font_source.map_or_else(TextLayer::build_font_system, |t| t.clone_font_system());
         // Terminal content layer — mirrors the grid TextLayer built in
         // `App::resumed`: terminal font at logical × scale_factor.
-        let text = TextLayer::new_with_family_and_fonts(
-            &gpu.device, &gpu.queue, gpu.format, font_logical * scale, font_family, fonts(),
-        );
+        let text = TextLayer::for_gpu(&gpu, font_logical * scale, font_family, fonts());
         // Chrome layer — mirrors the chrome TextLayer built in `App::resumed`:
         // UI font at ui_font_logical × scale_factor, with the chrome family
         // applied via `set_ui_family` (no fontconfig rescan).
-        let mut chrome_text = TextLayer::new_with_family_and_fonts(
-            &gpu.device, &gpu.queue, gpu.format, ui_font_logical * scale, font_family, fonts(),
-        );
+        let mut chrome_text = TextLayer::for_gpu(&gpu, ui_font_logical * scale, font_family, fonts());
         chrome_text.set_ui_family(if ui_font_family.is_empty() {
             None
         } else {
             Some(ui_font_family)
         });
         // Quad layer — same call as both sites in `app.rs` (~1823, ~2735).
-        let quad = QuadLayer::new(&gpu.device, gpu.format);
+        // Every layer here draws with the pipeline the main window's built
+        // (`GpuContext::shared_pipeline`): a detach compiles no shader.
+        let quad = QuadLayer::for_gpu(&gpu);
 
         // Rounded-corner mask — same unconditional construction as the main
         // window's in `App::resumed`, but a PER-WINDOW instance (it caches its
         // uniform/bind group). The CRT pass is built lazily (see the field doc).
-        let corner_mask = jetty_render::CornerMask::new(&gpu.device, gpu.format);
-        let image_layer = jetty_render::ImageLayer::new(&gpu.device, gpu.format);
+        let corner_mask = jetty_render::CornerMask::for_gpu(&gpu);
+        let image_layer = jetty_render::ImageLayer::for_gpu(&gpu);
 
         // Focus the new window so it receives keyboard events immediately.
         window.focus_window();
@@ -750,23 +748,19 @@ impl DetachedWindow {
         let (grid_fonts, chrome_fonts) = (self.text.clone_font_system(), self.text.clone_font_system());
         // The rebuilt grid layer keeps the lost one's row spacing.
         let line_height = self.text.line_height();
-        self.text = TextLayer::new_with_family_and_fonts(
-            &gpu.device, &gpu.queue, gpu.format, font_logical * scale, font_family, grid_fonts,
-        );
+        self.text = TextLayer::for_gpu(&gpu, font_logical * scale, font_family, grid_fonts);
         self.text.set_line_height(line_height);
-        let mut chrome_text = TextLayer::new_with_family_and_fonts(
-            &gpu.device, &gpu.queue, gpu.format, ui_font_logical * scale, font_family, chrome_fonts,
-        );
+        let mut chrome_text = TextLayer::for_gpu(&gpu, ui_font_logical * scale, font_family, chrome_fonts);
         chrome_text.set_ui_family(if ui_font_family.is_empty() { None } else { Some(ui_font_family) });
         self.chrome_text = chrome_text;
-        self.quad = QuadLayer::new(&gpu.device, gpu.format);
-        self.corner_mask = jetty_render::CornerMask::new(&gpu.device, gpu.format);
+        self.quad = QuadLayer::for_gpu(&gpu);
+        self.corner_mask = jetty_render::CornerMask::for_gpu(&gpu);
         // Device-scoped: rebuilt lazily on the next ring frame.
         self.focus_ring = None;
         // Rebuilt lazily on the new device by the next CRT frame's sync.
         self.crt = None;
         self.crt_key = None;
-        self.image_layer = jetty_render::ImageLayer::new(&gpu.device, gpu.format);
+        self.image_layer = jetty_render::ImageLayer::for_gpu(&gpu);
         // Lazily re-allocated on the next CRT frame, on the new device.
         self.offscreen = None;
         // Rebuilt on the next frame that draws a backdrop, on the new device.

@@ -73,18 +73,19 @@ pub struct CornerMask {
     bind_group: wgpu::BindGroup,
 }
 
-impl CornerMask {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+/// The mask's pipeline and the layout of its bind group: the same for every
+/// window on a device ([`CornerMask::for_gpu`] builds it once).
+#[derive(Clone)]
+struct MaskPipeline {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl MaskPipeline {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("corner-mask-shader"),
             source: wgpu::ShaderSource::Wgsl(MASK_SHADER.into()),
-        });
-
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("corner-mask-uniform"),
-            size: 32,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -98,15 +99,6 @@ impl CornerMask {
                     min_binding_size: None,
                 },
                 count: None,
-            }],
-        });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("corner-mask-bg"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buf.as_entire_binding(),
             }],
         });
 
@@ -154,7 +146,45 @@ impl CornerMask {
             cache: None,
         });
 
-        Self { pipeline, uniform_buf, bind_group }
+        Self { pipeline, bind_group_layout }
+    }
+}
+
+impl CornerMask {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        Self::with_pipeline(device, MaskPipeline::new(device, format))
+    }
+
+    /// A corner mask for `gpu`'s window, drawing with the pipeline every window
+    /// on its device shares (compiled once per device, not per window).
+    pub fn for_gpu(gpu: &crate::GpuContext) -> Self {
+        Self::shared(&gpu.device, gpu.format, gpu.pipelines())
+    }
+
+    /// [`Self::new`] with its pipeline from `pipelines` (built there once).
+    pub fn shared(device: &wgpu::Device, format: wgpu::TextureFormat, pipelines: &crate::SharedPipelines) -> Self {
+        Self::with_pipeline(device, pipelines.get(device, format, MaskPipeline::new))
+    }
+
+    /// The mask's own uniform buffer and bind group around `pipeline`.
+    fn with_pipeline(device: &wgpu::Device, pipeline: MaskPipeline) -> Self {
+        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("corner-mask-uniform"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("corner-mask-bg"),
+            layout: &pipeline.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            }],
+        });
+
+        Self { pipeline: pipeline.pipeline, uniform_buf, bind_group }
     }
 
     /// Run the rounded-corner mask over `view` with a per-corner radius
@@ -473,7 +503,7 @@ mod tests {
             crate::quad::Rect::new(0.0, 0.0, w as f32, 12.0, [137, 180, 250, 255]),
         ];
         let draw = |folded: bool, radii: [f32; 4], offset_y: f32, quad: &mut crate::quad::QuadLayer,
-                    text: &mut crate::text::TextLayer| {
+                    text: &mut crate::text::TextLayer, mask: &super::CornerMask| {
             let target = device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -516,8 +546,8 @@ mod tests {
             bytes
         };
         for (radii, offset_y) in [([10.0; 4], 0.0), ([0.0, 0.0, 10.0, 10.0], 0.0), ([0.0, 0.0, 10.0, 10.0], -20.0)] {
-            let own = draw(false, radii, offset_y, &mut quad, &mut text);
-            let folded = draw(true, radii, offset_y, &mut quad, &mut text);
+            let own = draw(false, radii, offset_y, &mut quad, &mut text, &mask);
+            let folded = draw(true, radii, offset_y, &mut quad, &mut text, &mask);
             assert_eq!(own.len(), folded.len());
             assert!(own == folded, "radii {radii:?} offset {offset_y}: the folded mask differs");
             // And the mask did run: the top-left corner pixel is transparent
@@ -531,6 +561,21 @@ mod tests {
             let bottom = ((h - 1) * w * 4 + 3) as usize;
             assert_eq!(own[bottom], 0, "the bottom-left corner is masked");
         }
+        // A second window's layers, drawing with the pipelines the first one's
+        // built (`SharedPipelines`), make the same frame.
+        let pipelines = crate::SharedPipelines::default();
+        let fonts = crate::text::TextLayer::build_font_system;
+        let _first = (
+            crate::quad::QuadLayer::shared(&device, format, &pipelines),
+            super::CornerMask::shared(&device, format, &pipelines),
+            crate::text::TextLayer::shared(&device, &queue, format, 14.0, "monospace", fonts(), &pipelines),
+        );
+        let mut quad2 = crate::quad::QuadLayer::shared(&device, format, &pipelines);
+        let mask2 = super::CornerMask::shared(&device, format, &pipelines);
+        let mut text2 = crate::text::TextLayer::shared(&device, &queue, format, 14.0, "monospace", fonts(), &pipelines);
+        let radii = [10.0; 4];
+        let own = draw(true, radii, 0.0, &mut quad, &mut text, &mask);
+        assert!(own == draw(true, radii, 0.0, &mut quad2, &mut text2, &mask2), "shared pipelines draw alike");
     }
 
     #[test]

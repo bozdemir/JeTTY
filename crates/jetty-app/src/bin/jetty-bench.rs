@@ -230,6 +230,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if only.as_deref() == Some("first_frame") {
         return bench_first_frame(&device, &queue, format, font_size);
     }
+    // `JETTY_BENCH_ONLY=detach`: the GPU layers a detached window builds.
+    if only.as_deref() == Some("detach") {
+        return bench_detach(&device, &queue, format, font_size);
+    }
 
     // Split as the app pays it: the font-DB scan overlaps GPU init on a worker
     // thread, the layer (atlas, pipelines, font loads) is built on the UI thread
@@ -369,15 +373,76 @@ fn print_gpu_init(adapter: &wgpu::Adapter, instance_ms: f64, adapter_ms: f64, to
     }
 }
 
+/// What a detach (or the Settings window) builds on the shared device, on the UI
+/// thread (`JETTY_BENCH_ONLY=detach`): the grid and chrome text layers from the
+/// loaded font database, the quad layer, the corner mask and the image layer —
+/// each timed, after the main window's set exists (the driver has seen every
+/// shader once, as in the app). Each layer compiling its own pipelines (the
+/// pre-0.30 build) vs. taking them from the device's `SharedPipelines` (what
+/// the app does). Median of 9 detaches each.
+fn bench_detach(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    font_size: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jetty_render::{CornerMask, ImageLayer, QuadLayer, SharedPipelines};
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+    let fonts = TextLayer::new_with_family(device, queue, format, font_size, "MesloLGS NF");
+    let font_db = || fonts.clone_font_system();
+    for shared in [false, true] {
+        let pipelines = SharedPipelines::default();
+        // One window's layers: (grid text, chrome text, quad, mask, image).
+        let window = || {
+            if shared {
+                (
+                    TextLayer::shared(device, queue, format, font_size, "MesloLGS NF", font_db(), &pipelines),
+                    TextLayer::shared(device, queue, format, 16.0, "MesloLGS NF", font_db(), &pipelines),
+                    QuadLayer::shared(device, format, &pipelines),
+                    CornerMask::shared(device, format, &pipelines),
+                    ImageLayer::shared(device, format, &pipelines),
+                )
+            } else {
+                (
+                    TextLayer::new_with_family_and_fonts(device, queue, format, font_size, "MesloLGS NF", font_db()),
+                    TextLayer::new_with_family_and_fonts(device, queue, format, 16.0, "MesloLGS NF", font_db()),
+                    QuadLayer::new(device, format),
+                    CornerMask::new(device, format),
+                    ImageLayer::new(device, format),
+                )
+            }
+        };
+        // The main window's set, then the detaches.
+        let _main = window();
+        let mut rows: Vec<f64> = Vec::new();
+        let mut keep = Vec::new();
+        for _ in 0..9 {
+            let t = Instant::now();
+            keep.push(window());
+            rows.push(ms(t));
+        }
+        rows.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        println!(
+            "detach        {:6.2} ms  (grid + chrome text, quad, mask, image layers; {}; median of 9)",
+            rows[rows.len() / 2],
+            if shared { "pipelines shared per device" } else { "pipelines per window" }
+        );
+    }
+    Ok(())
+}
+
 /// The cold start's critical path after the GPU block (`JETTY_BENCH_ONLY=
 /// first_frame`): the two text layers `resumed` builds (from an already-loaded
 /// font database, as there), and the first frame's effect pipelines — the
-/// default summon pass (Phosphor) and the Retro CRT preset's post-pass variant —
-/// compiled after them on this thread (`JETTY_BENCH_FIRST_FRAME=serial`: what
-/// frame 1 did) or on a worker while they build (the default, `overlap`: what
-/// `resumed` does). ONE measurement per process — a second build would hit the
-/// driver's in-memory pipeline cache — so compare many runs of each, with and
-/// without `MESA_SHADER_CACHE_DISABLE=true` (a cold on-disk shader cache).
+/// default summon pass (Phosphor) and the Retro CRT preset's post-pass variant.
+/// `JETTY_BENCH_FIRST_FRAME=serial`: each text layer compiles its own glyphon
+/// pipeline and the effects compile after them (frame 1 did); `overlap`: the
+/// effects compile on a worker while the text layers build; `shared` (the
+/// default, what `resumed` does): that, with the chrome layer taking the grid
+/// layer's pipeline (`SharedPipelines`). ONE measurement per process — a second
+/// build would hit the driver's in-memory pipeline cache — so compare many runs
+/// of each, with and without `MESA_SHADER_CACHE_DISABLE=true` (a cold on-disk
+/// shader cache).
 fn bench_first_frame(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -385,7 +450,8 @@ fn bench_first_frame(
     font_size: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use jetty_app::effects::{self, EffectsConfig};
-    let overlap = std::env::var("JETTY_BENCH_FIRST_FRAME").map_or(true, |v| v != "serial");
+    let mode = std::env::var("JETTY_BENCH_FIRST_FRAME").unwrap_or_else(|_| "shared".into());
+    let (overlap, shared) = (mode != "serial", mode != "serial" && mode != "overlap");
     let mut fx = EffectsConfig::default();
     if let Some(p) = effects::effect_presets().iter().find(|p| p.id == "retro_crt") {
         p.patch.apply_to(&mut fx);
@@ -405,16 +471,16 @@ fn bench_first_frame(
         let device = device.clone();
         std::thread::spawn(move || effect_pipelines(&device, format, key))
     });
-    let grid = TextLayer::new_with_family_and_fonts(device, queue, format, font_size, "MesloLGS NF", fonts);
-    let chrome_fonts = grid.clone_font_system();
-    let _chrome = TextLayer::new_with_family_and_fonts(
-        device,
-        queue,
-        format,
-        jetty_render::UI_FONT_BASE,
-        "MesloLGS NF",
-        chrome_fonts,
-    );
+    let pipelines = jetty_render::SharedPipelines::default();
+    let text_layer = |size: f32, fonts| {
+        if shared {
+            TextLayer::shared(device, queue, format, size, "MesloLGS NF", fonts, &pipelines)
+        } else {
+            TextLayer::new_with_family_and_fonts(device, queue, format, size, "MesloLGS NF", fonts)
+        }
+    };
+    let grid = text_layer(font_size, fonts);
+    let _chrome = text_layer(jetty_render::UI_FONT_BASE, grid.clone_font_system());
     let text_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let fx_ms = match worker {
         Some(h) => h.join().map_err(|_| "effect worker panicked")?,
@@ -422,8 +488,7 @@ fn bench_first_frame(
     };
     let wall = t0.elapsed().as_secs_f64() * 1000.0;
     println!(
-        "first_frame   {}: {wall:6.1} ms (text layers {text_ms:5.1} ms, effect pipelines {fx_ms:5.1} ms)",
-        if overlap { "overlap" } else { "serial " }
+        "first_frame   {mode:7}: {wall:6.1} ms (text layers {text_ms:5.1} ms, effect pipelines {fx_ms:5.1} ms)"
     );
     Ok(())
 }

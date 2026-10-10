@@ -189,18 +189,21 @@ pub struct ImageLayer {
     max_dim: u32,
 }
 
-impl ImageLayer {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+/// The image pass's pipeline, bind group layouts and sampler: the same for
+/// every window on a device ([`ImageLayer::for_gpu`] builds them once).
+#[derive(Clone)]
+struct ImagePipeline {
+    pipeline: wgpu::RenderPipeline,
+    screen_bgl: wgpu::BindGroupLayout,
+    tex_bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+impl ImagePipeline {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("image-shader"),
             source: wgpu::ShaderSource::Wgsl(IMAGE_SHADER.into()),
-        });
-
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("image-uniform"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
 
         let screen_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -214,14 +217,6 @@ impl ImageLayer {
                     min_binding_size: None,
                 },
                 count: None,
-            }],
-        });
-        let screen_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("image-screen-bg"),
-            layout: &screen_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buf.as_entire_binding(),
             }],
         });
 
@@ -308,12 +303,50 @@ impl ImageLayer {
             cache: None,
         });
 
+        Self { pipeline, screen_bgl, tex_bgl, sampler }
+    }
+}
+
+impl ImageLayer {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        Self::with_pipeline(device, ImagePipeline::new(device, format))
+    }
+
+    /// An image layer for `gpu`'s window, drawing with the pipeline every
+    /// window on its device shares (compiled once per device, not per window).
+    pub fn for_gpu(gpu: &crate::GpuContext) -> Self {
+        Self::shared(&gpu.device, gpu.format, gpu.pipelines())
+    }
+
+    /// [`Self::new`] with its pipeline from `pipelines` (built there once).
+    pub fn shared(device: &wgpu::Device, format: wgpu::TextureFormat, pipelines: &crate::SharedPipelines) -> Self {
+        Self::with_pipeline(device, pipelines.get(device, format, ImagePipeline::new))
+    }
+
+    /// The layer's own uniform buffer, bind group and texture cache around
+    /// `pipeline`.
+    fn with_pipeline(device: &wgpu::Device, pipeline: ImagePipeline) -> Self {
+        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image-uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let screen_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("image-screen-bg"),
+            layout: &pipeline.screen_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            }],
+        });
+
         Self {
-            pipeline,
+            pipeline: pipeline.pipeline,
             uniform_buf,
             screen_bg,
-            tex_bgl,
-            sampler,
+            tex_bgl: pipeline.tex_bgl,
+            sampler: pipeline.sampler,
             instance_buf: None,
             instance_cap: 0,
             instance_scratch: Vec::new(),
