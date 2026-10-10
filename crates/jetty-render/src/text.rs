@@ -3330,7 +3330,12 @@ mod tests {
         let mut fs = TextLayer::build_font_system();
         let Some(fam) = mono_family(&fs) else { return };
         let style = overdraw_style_for(&mut fs, &fam);
+        // Only what some installed font draws (a CI runner has few fonts).
+        let cov = wait_for_coverage();
         for text in ["中", "한", "\u{23F5}", "\u{23FA}", "\u{2714}", "e\u{301}", "\u{0E01}\u{0E34}"] {
+            if !text.chars().all(|c| cov.covers(c)) {
+                continue;
+            }
             let g = style.shape_text(&mut fs, text, 0, Shaping::Advanced);
             let Some(run) = g.buffer.layout_runs().next() else { continue };
             let baseline = (run.line_y - run.line_top).round() + g.dy;
@@ -3340,8 +3345,13 @@ mod tests {
             let want = if run.line_w > 0.0 && run.line_w < span { (span - run.line_w) / 2.0 } else { 0.0 };
             assert_eq!(g.dx, want, "{text:?}: {} wide in {span}", run.line_w);
             let own = run.glyphs.iter().all(|gl| fs.db().face(gl.font_id).is_some_and(|f| f.families[0].0 == fam));
+            // The grid font's own glyph keeps its baseline, and in one cell its
+            // place (a wide one narrower than its two cells is centred above).
             if own {
-                assert_eq!((g.dx, g.dy), (0.0, 0.0), "{text:?}: the grid font's own glyph stays put");
+                assert_eq!(g.dy, 0.0, "{text:?}: the grid font's own glyph keeps its baseline");
+                if cells == 1 {
+                    assert_eq!(g.dx, 0.0, "{text:?}: the grid font's own glyph stays put");
+                }
             }
         }
         // The CJK fallback really sat elsewhere (when it is installed).
@@ -3414,8 +3424,10 @@ mod tests {
         assert_eq!(over, vec![(MISSING_GLYPH, 0), (MISSING_GLYPH, bold), (MISSING_GLYPH, 0)]);
         // A char some font has still comes from font fallback, a cluster with a
         // missing mark from the cell's face.
-        let g = shape_overdraw(&mut fs, &mut probe, &style, "中", 0, false);
-        assert!(g.buffer.layout_runs().flat_map(|r| r.glyphs.iter()).all(|g| g.glyph_id != 0));
+        if cov.covers('中') {
+            let g = shape_overdraw(&mut fs, &mut probe, &style, "中", 0, false);
+            assert!(g.buffer.layout_runs().flat_map(|r| r.glyphs.iter()).all(|g| g.glyph_id != 0));
+        }
         let g = shape_overdraw(&mut fs, &mut probe, &style, "a\u{F0000}", 0, false);
         let ids: Vec<u16> = g.buffer.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| g.glyph_id)).collect();
         assert_eq!(ids.len(), 2);
@@ -3430,7 +3442,10 @@ mod tests {
         // so the label's per-char boundaries still line up.
         let cov = wait_for_coverage();
         let Some(missing) = (0xF0000..0xF1000).filter_map(char::from_u32).find(|&c| !cov.covers(c)) else { return };
-        assert!(matches!(drawable_label("burak@omen: ~ 中 ✔"), Cow::Borrowed(_)));
+        let drawable = "burak@omen: ~ 中 ✔";
+        if drawable.chars().all(|c| cov.covers(c)) {
+            assert!(matches!(drawable_label(drawable), Cow::Borrowed(_)));
+        }
         let label = format!("a{missing}b\t");
         let shown = drawable_label(&label);
         let replacement = if cov.covers('\u{FFFD}') { '\u{FFFD}' } else { '?' };
