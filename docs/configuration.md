@@ -117,7 +117,7 @@ Names of fonts and themes are matched in any letter case, and a theme by its id
 
 | Key | Default | What it does |
 |---|---|---|
-| `shell` | `""` | The shell to run. `""` = `$SHELL`, then your login shell, then `/bin/bash`; or an absolute path such as `"/usr/bin/fish"`. Applies to new tabs. |
+| `shell` | `""` | The shell to run. `""` = `$SHELL`, then your login shell, then `/bin/bash`; or an absolute path such as `"/usr/bin/fish"`. Applies to new tabs. A tab opened with a command (`jetty -e htop`) runs that instead, its `$SHELL` naming this shell. |
 | `scrollback_lines` | `10000` | History kept per tab, in lines, `100`–`100000`. |
 | `kitty_keyboard` | `true` | Offer the kitty keyboard protocol to programs that ask for it (unambiguous keys: Ctrl+I ≠ Tab, key releases). `false` turns it off in every tab. |
 | `osc52_allow_paste` | `false` | Let programs — a remote host over SSH too — READ your clipboard with OSC 52. Copying through OSC 52 always works; reading is off because it can leak whatever is on the clipboard. A program that asks anyway gets an empty clipboard back, so it never hangs waiting for an answer (nvim's OSC 52 paste waited 10 s). |

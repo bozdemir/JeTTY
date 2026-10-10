@@ -9,3 +9,10 @@ Terminal=false
 Categories=System;TerminalEmulator;Utility;
 Keywords=terminal;shell;console;tty;prompt;
 StartupWMClass=jetty
+Actions=new-tab;
+X-TerminalArgExec=--
+X-TerminalArgDir=--working-directory=
+
+[Desktop Action new-tab]
+Name=New Tab
+Exec=jetty --new-tab

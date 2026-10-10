@@ -200,6 +200,20 @@ The default font is **MesloLGS NF** (the powerlevel10k font, with the prompt's i
 - **X11** — `F9` works immediately, no setup. (`summon_hotkey = "none"` grabs no key, if you would rather bind `jetty --toggle` in your window manager.)
 - **Wayland** — Wayland routes global shortcuts through the compositor, so bind **`jetty --toggle`** to a key (first press launches JeTTY; each press after toggles the running instance via the single-instance socket; `--show` / `--hide` set the state explicitly). A hide closes the window — tabs and shells keep running — and a summon opens it again, focused, on every compositor (tiling ones too). See [`docs/global-hotkey.md`](docs/global-hotkey.md). *(Note: in Dropdown mode, top-edge anchoring relies on window positioning, which the compositor controls on Wayland — it works fully on X11.)*
 
+### Command line
+
+Plain `jetty` toggles the running JeTTY, or starts it (`--show` / `--hide` / `--background`: see `jetty --help`). To open a tab in it — or start JeTTY with that tab when none is running — and summon it:
+
+| Command | Opens |
+|---|---|
+| `jetty --new-tab` | a tab in the current directory, running your shell |
+| `jetty --cwd ~/src` (or `--working-directory ~/src`) | a tab in `~/src` |
+| `jetty -e htop` · `jetty --new-tab -- htop -d 10` | a tab running `htop` (with `--cwd`: there) |
+
+A command runs as given — everything after `-e` or `--` is its own, no shell parses it — with the running JeTTY's environment (its `PATH` finds the command). Its tab closes when it exits; one that fails right after starting stays open, its error above `[process exited with status N]`, until you close it. A command that can't start opens nothing and `jetty` says why (exit status 1); so does a JeTTY older than these flags, which ignores them.
+
+The app menu's **New Tab** action runs `jetty --new-tab`, and the desktop entry carries the [xdg-terminal-exec](https://github.com/Vladimir-csp/xdg-terminal-exec) keys, so `xdg-terminal-exec` — and the file managers and launchers that use it — open their commands and folders in a JeTTY tab. To make JeTTY that terminal, list `jetty.desktop` in `~/.config/xdg-terminals.list`; list `jetty.desktop:new-tab` instead to get a new tab (in the folder it is started from) even when no command is given — plain `jetty` toggles.
+
 ## ⌨️ Keybindings
 
 `F9` summons / hides JeTTY from anywhere (`summon_hotkey`; `fn`+`F9` on Mac keyboards). The **?** in the tab bar (or the palette's **Help: keyboard shortcuts**) lists every shortcut as currently bound. Inside the window, every shortcut below is a default you can remap in the [`[keys]` table](#️-configuration) under the name in the last column (`""` unbinds it). On macOS the `Cmd` forms of the usual shortcuts work too.
