@@ -1874,11 +1874,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // JETTY_SHOT_CONFIRM — render the "Close this tab?" confirmation popup
-        // (`=last`: the last tab's, which asks to quit JeTTY).
+        // (`=last`: the last tab's, which asks to quit JeTTY; `=last-hide`: the
+        // last tab's with `close_last_tab = "hide"`).
         if env_flag("JETTY_SHOT_CONFIRM") {
-            let quits = std::env::var("JETTY_SHOT_CONFIRM").is_ok_and(|v| v == "last");
+            let effect = match std::env::var("JETTY_SHOT_CONFIRM").as_deref() {
+                Ok("last") => jetty_render::TabCloseEffect::Quit,
+                Ok("last-hide") => jetty_render::TabCloseEffect::Hide,
+                _ => jetty_render::TabCloseEffect::Tab,
+            };
             let popup = jetty_render::build_confirm_close(
-                width, height, &sample_tab_title(2), quits, terminal.theme(), &mut chrome_text, cm,
+                width, height, &sample_tab_title(2), effect, terminal.theme(), &mut chrome_text, cm,
             );
             rects.extend(popup.quads);
             chrome_labels.extend(popup.labels);

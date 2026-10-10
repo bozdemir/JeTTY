@@ -1112,6 +1112,10 @@ pub struct App {
     main_fullscreen: bool,
     /// Hide the window on focus loss (Yakuake auto-hide). Default ON.
     focus_autohide: bool,
+    /// What the main window running out of tabs does with no detached window
+    /// left (config `close_last_tab`): quit (default), or hide and stay
+    /// resident with no tab until the next summon opens one (`out_of_tabs`).
+    close_last_tab: crate::config::CloseLastTab,
     /// Scrollback history limit in lines (config `scrollback_lines`, clamped
     /// 100..=100_000, default 10_000). Applied live to every tab (main +
     /// detached) when changed via the Settings cycler.
@@ -2327,6 +2331,7 @@ impl App {
             // `window_mode` (rule F0: never fullscreen while hidden).
             main_fullscreen: false,
             focus_autohide: true,
+            close_last_tab: crate::config::CloseLastTab::Quit,
             scrollback_lines: 10_000,
             launch_at_login: false,
             launch_at_login_in_file: None,
@@ -2622,6 +2627,7 @@ impl App {
         app.dropdown_height_pct = cfg.dropdown_height_pct.clamp(0.25, 1.0);
         app.dropdown_width_pct = cfg.dropdown_width_pct.clamp(0.2, 1.0);
         app.focus_autohide = cfg.focus_autohide;
+        app.close_last_tab = cfg.close_last_tab;
         // Re-clamp for belt-and-suspenders (mirrors the opacity/font clamps
         // above); Config::load's sanitize pass already applied this range.
         app.scrollback_lines = cfg.scrollback_lines.clamp(100, 100_000);
@@ -2724,23 +2730,26 @@ impl App {
     }
 
     /// Rebuild the cached Help overlay rows (`compute_help_rows`) from the live
-    /// keymap, the summoning key (`summon_key_shown`) and `copy_on_select` — on
-    /// load, on hot-reload and on a keybinding reset.
+    /// keymap, the summoning key (`summon_key_shown`), `copy_on_select` and
+    /// `close_last_tab` — on load, on hot-reload and on a keybinding reset.
     fn refresh_help_rows(&mut self) {
         let summon = self.summon_key_shown();
-        self.help_rows = App::compute_help_rows(&self.keymap, summon.as_deref(), self.copy_on_select);
+        self.help_rows =
+            App::compute_help_rows(&self.keymap, summon.as_deref(), self.copy_on_select, self.close_last_tab);
     }
 
     /// Build the Help overlay rows from the CURRENT keymap (so a remap is
     /// reflected — the tab jumps included) and `copy_on_select` (where a drag
     /// copies), plus the static, non-keymap rows (right-click / URL open / Ctrl+D
-    /// EOF / Esc). `summon_hotkey` is the global key that summons JeTTY
+    /// EOF — what it does in the last tab, `close_last_tab` — / Esc).
+    /// `summon_hotkey` is the global key that summons JeTTY
     /// ([`App::summon_key_shown`]; `None` on Wayland). Cached in `self.help_rows`
     /// (`refresh_help_rows`), so the render path never re-derives it.
     fn compute_help_rows(
         km: &crate::keymap::KeyMap,
         summon_hotkey: Option<&str>,
         copy_on_select: clipboard::CopyOnSelect,
+        close_last_tab: crate::config::CloseLastTab,
     ) -> Vec<String> {
         use crate::keymap::BindableAction as A;
         let all = |a: A| {
@@ -2837,7 +2846,11 @@ impl App {
                 Some(key) => format!("{key} (configurable) — Summon / hide window"),
                 None => "Compositor shortcut — Summon / hide window   (bind it to jetty --toggle)".to_string(),
             },
-            "Ctrl+D — Close shell (EOF)   (in the last tab: quits JeTTY)".to_string(),
+            match close_last_tab {
+                crate::config::CloseLastTab::Quit => "Ctrl+D — Close shell (EOF)   (in the last tab: quits JeTTY)",
+                crate::config::CloseLastTab::Hide => "Ctrl+D — Close shell (EOF)   (in the last tab: hides JeTTY)",
+            }
+            .to_string(),
             "Esc — Close this help".to_string(),
         ]
     }
@@ -2913,6 +2926,7 @@ impl App {
             dropdown_height_pct: self.dropdown_height_pct,
             dropdown_width_pct: self.dropdown_width_pct,
             focus_autohide: self.focus_autohide,
+            close_last_tab: self.close_last_tab,
             launch_at_login: self.launch_at_login,
             summon_hotkey: self.summon_hotkey.clone(),
             shell: self.shell.clone(),
@@ -3304,7 +3318,8 @@ impl App {
     }
 
     /// The active tab. Panics if `tabs` is empty, which only happens before
-    /// `resumed` has run or after the last tab closed (we exit then).
+    /// `resumed` has run or after the last tab closed (we exit then — or hide
+    /// with none until the next summon opens one, `out_of_tabs`).
     fn active_tab(&self) -> &Tab {
         &self.tabs[self.active]
     }
@@ -3663,8 +3678,10 @@ impl App {
             self.dropdown_width_pct = dw;
             self.redock_if_dropdown();
         }
-        // Focus auto-hide.
+        // Focus auto-hide, and what closing the last tab does (read when it
+        // happens: nothing to apply now).
         self.focus_autohide = cfg.focus_autohide;
+        self.close_last_tab = cfg.close_last_tab;
         // Scrollback (live to every tab + detached).
         let sb = cfg.scrollback_lines.clamp(100, 100_000);
         if sb != self.scrollback_lines {
@@ -4685,17 +4702,44 @@ impl App {
         Ok(())
     }
 
-    /// Would closing a main-window tab quit JeTTY — it is the last tab and no
-    /// detached window would be pulled back in its place (see `close_tab`)?
-    fn closing_tab_quits(&self) -> bool {
-        self.tabs.len() == 1 && self.detached.is_empty()
+    /// What closing a main-window tab does, for its confirmation's wording
+    /// (see `close_tab`).
+    fn closing_tab_effect(&self) -> jetty_render::TabCloseEffect {
+        tab_close_effect(self.tabs.len(), !self.detached.is_empty(), self.close_last_tab)
+    }
+
+    /// The main window ran out of tabs with no detached window left (its last
+    /// tab closed, or the shell in it exited): quit — or, with
+    /// `close_last_tab = "hide"`, hide and stay resident with no tab, no
+    /// shell and no timer until the next summon opens a fresh tab
+    /// (`set_visibility_by`).
+    fn out_of_tabs(&mut self, event_loop: &ActiveEventLoop) {
+        if self.close_last_tab == crate::config::CloseLastTab::Quit {
+            event_loop.exit();
+            return;
+        }
+        // The removal paths keep `active` on the same tab or clamp it, so the
+        // last tab gone leaves it at 0 — where the next summon's tab lands.
+        debug_assert_eq!(self.active, 0);
+        // A close confirmation, rename box, tab menu or drag named a tab that
+        // is gone; the active tab's hint/copy mode, menus, pointer gestures
+        // and hover go with it (the reset every removal does; none needs a
+        // tab). A quit dialog left open would greet the next summon — it was
+        // about the tabs that just went.
+        self.drop_stale_tab_refs();
+        self.entered_new_active_tab();
+        self.confirm_quit = false;
+        if self.visible {
+            // The one hide routine, as F9's (Wayland: the window closes).
+            self.hide_main_window(HideCause::User, event_loop);
+        }
     }
 
     /// Close tab `i` (its PtySession Drop kills the child). Fix up `active`. If
-    /// no tabs remain ANYWHERE (main window or detached), exit the event loop;
-    /// when detached windows still hold live shells, the first detached tab is
-    /// pulled back into the main window instead — exiting would drop every
-    /// `DetachedWindow` and silently SIGKILL their shells mid-job.
+    /// no tabs remain ANYWHERE (main window or detached), JeTTY quits or hides
+    /// (`out_of_tabs`); when detached windows still hold live shells, the first
+    /// detached tab is pulled back into the main window instead — exiting would
+    /// drop every `DetachedWindow` and silently SIGKILL their shells mid-job.
     fn close_tab(&mut self, i: usize, event_loop: &ActiveEventLoop) {
         if i >= self.tabs.len() {
             return;
@@ -4709,7 +4753,7 @@ impl App {
         self.tabs.remove(i);
         if self.tabs.is_empty() {
             if self.detached.is_empty() {
-                event_loop.exit();
+                self.out_of_tabs(event_loop);
                 return;
             }
             // Adopt the first detached tab (its window closes; the shell
@@ -9784,10 +9828,11 @@ impl App {
     }
 
     /// Close every tab index in `exited` (descending so earlier indices stay
-    /// valid), fixing up `active`. If no tabs remain anywhere, exit the event
-    /// loop; if detached windows still exist, the first detached tab is
-    /// reattached instead so their shells survive.
-    /// Returns true if the app should keep running.
+    /// valid), fixing up `active`. If no tabs remain anywhere, JeTTY quits or
+    /// hides (`out_of_tabs`); if detached windows still exist, the first
+    /// detached tab is reattached instead so their shells survive.
+    /// Returns false when the main window is left with no tab (the loop is
+    /// exiting, or JeTTY hid with none): nothing tab-shaped is left to do.
     fn close_exited_tabs(&mut self, mut exited: Vec<usize>, event_loop: &ActiveEventLoop) -> bool {
         if exited.is_empty() {
             return true;
@@ -9814,11 +9859,11 @@ impl App {
         }
         self.drop_stale_tab_refs();
         if self.tabs.is_empty() {
-            // Exit only when NO tabs exist anywhere: while detached windows
-            // hold live shells, adopt the first detached tab into the main
-            // window instead (its window closes; the shell keeps running).
+            // Quit or hide only when NO tabs exist anywhere: while detached
+            // windows hold live shells, adopt the first detached tab into the
+            // main window instead (its window closes; the shell keeps running).
             if self.detached.is_empty() {
-                event_loop.exit();
+                self.out_of_tabs(event_loop);
                 return false;
             }
             self.reattach_tab_by(0, SummonBy::App, event_loop);
@@ -10416,6 +10461,13 @@ impl App {
         // The hide: one routine, shared with the focus-loss auto-hide.
         if !want {
             self.hide_main_window(HideCause::User, event_loop);
+            return;
+        }
+        // JeTTY hid with its last tab (`close_last_tab = "hide"`): this summon
+        // opens a fresh one — the configured shell, in the home directory.
+        // When no shell can start there is nothing to show: it stays hidden
+        // (`spawn_tab` said why) and the next summon tries again.
+        if self.tabs.is_empty() && self.new_tab_with_cwd(None).is_none() {
             return;
         }
         // Test hook (`debug_lose_gpu`): this summon finds the device lost.
@@ -13712,10 +13764,11 @@ impl ApplicationHandler<AppEvent> for App {
     /// The event loop is about to return: leave OS fullscreen on every JeTTY
     /// window while they still exist.
     ///
-    /// This is the ONE chokepoint for app exit — there are five `event_loop.exit()`
-    /// sites (last tab closed, last shell exited, the quit confirmation's ✕ and its
-    /// Enter, a fatal PTY spawn failure) and winit calls `exiting` after all of
-    /// them, with `App` (and therefore every window) still alive.
+    /// This is the ONE chokepoint for app exit — winit calls `exiting` after
+    /// every `event_loop.exit()` (the last tab closed or its shell exited, with
+    /// `close_last_tab = "quit"` — `out_of_tabs`; the quit confirmation's ✕ and
+    /// its Enter; a fatal startup failure), with `App` (and therefore every
+    /// window) still alive.
     ///
     /// Why it matters: macOS `set_simple_fullscreen(true)` SAVES and overwrites the
     /// app-scoped `NSApplication.presentationOptions` (auto-hide Dock + menu bar)
@@ -14924,9 +14977,10 @@ impl ApplicationHandler<AppEvent> for App {
                     self.perf.note_active_output();
                 }
                 // A tab whose shell exited (Ctrl+D / `exit`) closes THAT tab,
-                // Yakuake-style; if it was the last tab, close_exited_tabs exits
-                // the loop. The PTY's waiter thread sends this Wake the moment it
-                // reaps the shell, so we react at once (no polling tick).
+                // Yakuake-style; if it was the last tab, close_exited_tabs quits
+                // or hides JeTTY (`out_of_tabs`). The PTY's waiter thread sends
+                // this Wake the moment it reaps the shell, so we react at once
+                // (no polling tick).
                 if !self.close_exited_tabs(exited, event_loop) {
                     return;
                 }
@@ -15173,8 +15227,11 @@ impl ApplicationHandler<AppEvent> for App {
         // below assume a tab: a scrollbar drag's CursorMoved reached
         // `active_tab()`, which panics on an empty vec — and a panic skips
         // `exiting` and its settings flush. Nothing is left to handle (the
-        // per-arm F29 guards predate this one).
-        if self.tabs.is_empty() {
+        // per-arm F29 guards predate this one) — but the window's own state:
+        // with `close_last_tab = "hide"` it waits hidden with no tab for the
+        // next summon, which needs its size (an F11 exit lands after the hide),
+        // focus and modifiers current (`tabless_window_event`).
+        if self.tabs.is_empty() && !tabless_window_event(&event) {
             return;
         }
         // Wayland: a key or a click on the window its ─ button minimized means
@@ -15673,12 +15730,12 @@ impl ApplicationHandler<AppEvent> for App {
                     let cy = self.cursor.1 as f32;
                     let target = self.tab_index(id);
                     let title = target.map(|i| self.tabs[i].title.clone()).unwrap_or_default();
-                    let quits = self.closing_tab_quits();
+                    let effect = self.closing_tab_effect();
                     let theme = self.current_theme();
                     let cm = self.chrome_metrics();
                     let mut fallback = mono_fallback(cm);
                     let popup = jetty_render::build_confirm_close(
-                        w, h, &title, quits, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
+                        w, h, &title, effect, &theme, measure_or(self.chrome_text.as_mut(), &mut fallback), cm,
                     );
                     if input::point_in(&popup.close_rect, cx, cy) {
                         self.confirm_close = None;
@@ -16934,10 +16991,10 @@ impl ApplicationHandler<AppEvent> for App {
                     .map(|g| g.backend_name.clone())
                     .unwrap_or_else(|| "?".to_string());
                 let confirm_quit = self.confirm_quit;
-                let confirm_close: Option<(String, bool)> = self
+                let confirm_close: Option<(String, jetty_render::TabCloseEffect)> = self
                     .confirm_close
                     .and_then(|id| self.tab_index(id))
-                    .map(|i| (self.tabs[i].title.clone(), self.closing_tab_quits()));
+                    .map(|i| (self.tabs[i].title.clone(), self.closing_tab_effect()));
                 let rename_state: Option<(usize, String)> =
                     self.rename_ref().map(|(i, buf)| (i, buf.to_string()));
                 // Corner-mask inputs captured before the mutable render borrows.
@@ -17782,9 +17839,9 @@ impl ApplicationHandler<AppEvent> for App {
                                 &gpu.device, &gpu.queue, scene_view, width, height, &popup.labels,
                             );
                         }
-                    } else if let Some((title, quits)) = &confirm_close {
+                    } else if let Some((title, effect)) = &confirm_close {
                         let popup = jetty_render::build_confirm_close(
-                            width, height, title, *quits, &theme, &mut *chrome_text, cm,
+                            width, height, title, *effect, &theme, &mut *chrome_text, cm,
                         );
                         quad.render(&gpu.device, &gpu.queue, scene_view, width, height, &popup.quads);
                         if !popup.labels.is_empty() {
@@ -18579,6 +18636,41 @@ fn trail_step(
 /// rule for every id-holding piece of UI state.
 fn still_open(r: Option<TabId>, live: &[TabId]) -> Option<TabId> {
     r.filter(|id| live.contains(id))
+}
+
+/// The main-window events still handled with no tab in it — while JeTTY waits
+/// hidden for the next summon (`close_last_tab = "hide"`), or exits: the
+/// window's own state (size, scale, position, focus, modifiers, occlusion, the
+/// system theme). None of their arms touches a tab; input and paints do.
+fn tabless_window_event(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::Resized(_)
+            | WindowEvent::ScaleFactorChanged { .. }
+            | WindowEvent::Moved(_)
+            | WindowEvent::Focused(_)
+            | WindowEvent::ModifiersChanged(_)
+            | WindowEvent::Occluded(_)
+            | WindowEvent::ThemeChanged(_)
+    )
+}
+
+/// What closing one of the main window's `tabs` tabs does: just the tab —
+/// unless it is the last one and no detached window (`detached_left`) would
+/// be pulled back in its place; then JeTTY quits with it or, with
+/// `close_last_tab = "hide"`, hides (`App::out_of_tabs`).
+fn tab_close_effect(
+    tabs: usize,
+    detached_left: bool,
+    close_last_tab: crate::config::CloseLastTab,
+) -> jetty_render::TabCloseEffect {
+    use crate::config::CloseLastTab;
+    use jetty_render::TabCloseEffect as E;
+    match close_last_tab {
+        _ if tabs != 1 || detached_left => E::Tab,
+        CloseLastTab::Quit => E::Quit,
+        CloseLastTab::Hide => E::Hide,
+    }
 }
 
 /// Shared input core (v0.23 Task 9 / amendment I5): a keystroke (or IME commit)
@@ -20231,6 +20323,56 @@ mod stable_tab_id_tests {
 }
 
 #[cfg(test)]
+mod close_last_tab_tests {
+    use super::tab_close_effect;
+    use crate::config::CloseLastTab::{Hide, Quit};
+    use jetty_render::TabCloseEffect as E;
+
+    #[test]
+    fn only_the_last_tab_with_no_detached_window_quits_or_hides() {
+        for mode in [Quit, Hide] {
+            // Other tabs stay: just this one closes.
+            assert_eq!(tab_close_effect(3, false, mode), E::Tab);
+            assert_eq!(tab_close_effect(2, true, mode), E::Tab);
+            // A detached window's tab moves back in the last one's place.
+            assert_eq!(tab_close_effect(1, true, mode), E::Tab);
+        }
+        assert_eq!(tab_close_effect(1, false, Quit), E::Quit);
+        assert_eq!(tab_close_effect(1, false, Hide), E::Hide);
+    }
+
+    /// The body of the first `fn` whose signature starts with `sig`.
+    fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
+        let body = &src[src.find(sig).unwrap_or_else(|| panic!("{sig}"))..];
+        &body[..body.find("\n    }\n").expect("the end of the fn")]
+    }
+
+    /// Tripwire: both paths that leave the main window without a tab (a close,
+    /// a shell exit) end in `out_of_tabs` — the one place `close_last_tab`
+    /// chooses between quitting and hiding — never in a bare exit.
+    #[test]
+    fn running_out_of_tabs_goes_through_one_decision() {
+        let src = include_str!("app.rs");
+        for sig in ["fn close_tab(&mut self", "fn close_exited_tabs(&mut self"] {
+            let body = body_of(src, sig);
+            assert!(body.contains("self.out_of_tabs(event_loop);"), "{sig}");
+            assert!(!body.contains(concat!("event_loop", ".exit()")), "{sig}: a bare exit skips close_last_tab");
+        }
+    }
+
+    /// Tripwire: a summon finding no tab (JeTTY hid with its last one) opens a
+    /// fresh tab before the window is shown — `window_event` drops a tabless
+    /// main window's input and paints.
+    #[test]
+    fn a_summon_with_no_tab_opens_one_before_showing() {
+        let body = body_of(include_str!("app.rs"), "fn set_visibility_by(&mut self");
+        let spawn = body.find("if self.tabs.is_empty() && self.new_tab_with_cwd(None)").expect("the fresh tab");
+        let show = body.find("win.set_visible(true)").expect("the show");
+        assert!(spawn < show);
+    }
+}
+
+#[cfg(test)]
 mod default_title_tests {
     use super::TabId;
 
@@ -21514,6 +21656,7 @@ mod hot_reload_tests {
             "dropdown_height_pct",
             "dropdown_width_pct",
             "focus_autohide",
+            "close_last_tab",
             "scrollback_lines",
             "show_perf_hud",
             "effects",
@@ -21862,7 +22005,12 @@ mod fullscreen_helper_tests {
         // format-identical, and BOTH default chords must appear (`all()`, not
         // `first()`) — bare F11 is dead on macOS keyboards without standard
         // function keys, so the companion chord is the discoverable one there.
-        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"), Default::default());
+        let rows = super::App::compute_help_rows(
+            &crate::keymap::KeyMap::defaults(),
+            Some("F9"),
+            Default::default(),
+            Default::default(),
+        );
         let live = rows
             .iter()
             .find(|r| r.contains("Fullscreen (whole monitor)"))
@@ -21888,14 +22036,36 @@ mod fullscreen_helper_tests {
         // The static jetty_render::HELP_ROWS must equal the live rows for the
         // default keymap (macOS adds Cmd companions, so Linux-only), so changing
         // a default chord can never leave the fallback overlay stale.
-        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"), Default::default());
+        let rows = super::App::compute_help_rows(
+            &crate::keymap::KeyMap::defaults(),
+            Some("F9"),
+            Default::default(),
+            Default::default(),
+        );
         assert_eq!(rows, jetty_render::default_help_rows());
+    }
+
+    #[test]
+    fn the_help_says_what_ctrl_d_does_in_the_last_tab() {
+        let row = |mode: crate::config::CloseLastTab| {
+            super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"), Default::default(), mode)
+                .into_iter()
+                .find(|r| r.starts_with("Ctrl+D — "))
+                .expect("no Ctrl+D help row")
+        };
+        assert!(row(crate::config::CloseLastTab::Quit).ends_with("(in the last tab: quits JeTTY)"));
+        assert!(row(crate::config::CloseLastTab::Hide).ends_with("(in the last tab: hides JeTTY)"));
     }
 
     #[test]
     fn the_help_names_the_summon_key_that_works() {
         let row = |summon: Option<&str>| {
-            super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), summon, Default::default())
+            super::App::compute_help_rows(
+                &crate::keymap::KeyMap::defaults(),
+                summon,
+                Default::default(),
+                Default::default(),
+            )
                 .into_iter()
                 .find(|r| r.contains("— Summon / hide window"))
                 .expect("no summon help row")
@@ -21910,7 +22080,7 @@ mod fullscreen_helper_tests {
     #[test]
     fn help_rows_name_the_menu_key_beside_the_right_click() {
         let row = |km: &crate::keymap::KeyMap| {
-            super::App::compute_help_rows(km, Some("F9"), Default::default())
+            super::App::compute_help_rows(km, Some("F9"), Default::default(), Default::default())
                 .into_iter()
                 .find(|r| r.contains("— Context menu"))
                 .expect("no context-menu help row")
@@ -21939,7 +22109,12 @@ mod fullscreen_helper_tests {
     fn help_rows_follow_the_tab_jump_keys() {
         use crate::config::{ChordSpec, KeyBindings};
         let row = |keys: &KeyBindings| {
-            super::App::compute_help_rows(&crate::keymap::KeyMap::compile(keys), Some("F9"), Default::default())
+            super::App::compute_help_rows(
+                &crate::keymap::KeyMap::compile(keys),
+                Some("F9"),
+                Default::default(),
+                Default::default(),
+            )
                 .into_iter()
                 .find(|r| r.ends_with(" — Jump to tab"))
                 .expect("no tab-jump help row")
@@ -21979,7 +22154,7 @@ mod fullscreen_helper_tests {
     fn help_rows_say_where_a_drag_copies() {
         use crate::clipboard::CopyOnSelect as C;
         let row = |c: C| {
-            super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"), c)
+            super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"), c, Default::default())
                 .into_iter()
                 .find(|r| r.starts_with("Left-drag — "))
                 .expect("no drag help row")
@@ -22000,7 +22175,12 @@ mod fullscreen_helper_tests {
         // Live row: default chord + the staged-multiline note, in the
         // clipboard section; static HELP_ROWS mirror carries the same row
         // verbatim (the default chord pretty-prints as Ctrl+Shift+Enter).
-        let rows = super::App::compute_help_rows(&crate::keymap::KeyMap::defaults(), Some("F9"), Default::default());
+        let rows = super::App::compute_help_rows(
+            &crate::keymap::KeyMap::defaults(),
+            Some("F9"),
+            Default::default(),
+            Default::default(),
+        );
         let live = rows
             .iter()
             .find(|r| r.contains("Run selection in a new tab"))
@@ -22391,16 +22571,34 @@ mod window_parity_tests {
     }
 
     /// Tripwire: a main-window event winit delivers after the last tab closed
-    /// (the loop is exiting) stops before the arms, which all assume a tab — a
-    /// scrollbar drag's CursorMoved panicked in `active_tab()` there (Wayland).
+    /// (the loop is exiting, or JeTTY hid with no tab) stops before the arms,
+    /// which assume a tab — a scrollbar drag's CursorMoved panicked in
+    /// `active_tab()` there (Wayland) — except the window-state events
+    /// (`tabless_window_event`), whose arms must never reach a tab.
     #[test]
     fn main_window_events_stop_once_no_tab_is_left() {
         let src = include_str!("app.rs");
         let handler = concat!("fn window_event(&mut self, event_loop: &ActiveEventLoop, ", "id: WindowId, event: WindowEvent)");
         let body = &src[src.find(handler).expect("window_event")..];
-        let guard = body.find("if self.tabs.is_empty() {").expect("an empty-tabs guard");
+        let guard = body.find("if self.tabs.is_empty() && !tabless_window_event(&event) {").expect("an empty-tabs guard");
         let first_arm = body.find("WindowEvent::CloseRequested => {").expect("the main-window arms");
         assert!(guard < first_arm, "the main-window arms must sit behind the empty-tabs guard");
+        for arm in [
+            "WindowEvent::ThemeChanged(t) =>",
+            "WindowEvent::Occluded(occluded) => {",
+            "WindowEvent::Moved(_) => {",
+            "WindowEvent::Resized(size) => {",
+            "WindowEvent::ScaleFactorChanged {",
+            "WindowEvent::ModifiersChanged(m) => {",
+            "WindowEvent::Focused(true) => {",
+            "WindowEvent::Focused(false) => {",
+        ] {
+            let start = first_arm + body[first_arm..].find(arm).expect(arm);
+            let end = start + body[start..].find("\n            WindowEvent::").expect("the next arm");
+            for tab in ["active_tab", "self.tabs[", "tabs.get(self.active)", "tabs.get_mut(self.active)"] {
+                assert!(!body[start..end].contains(tab), "`{arm}` reaches a tab ({tab}) but runs with none");
+            }
+        }
     }
 
     #[test]

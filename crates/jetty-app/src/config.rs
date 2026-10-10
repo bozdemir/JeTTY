@@ -138,6 +138,12 @@ pub struct Config {
     /// Hide the window on focus loss (Yakuake-style auto-hide). Default ON.
     #[serde(default = "default_focus_autohide")]
     pub focus_autohide: bool,
+    /// What closing the last tab does — its ✕, Ctrl+Shift+W, a menu, or its
+    /// shell exiting: `"quit"` (default) quits JeTTY, summon hotkey included;
+    /// `"hide"` hides it and keeps it running, and the next summon opens a
+    /// fresh tab. See [`CloseLastTab`].
+    #[serde(default)]
+    pub close_last_tab: CloseLastTab,
     /// Launch JeTTY at login via the freedesktop XDG autostart standard (a
     /// `.desktop` file under `~/.config/autostart/`; a LaunchAgent on macOS).
     /// Default OFF. `true` writes the entry (at startup too); the toggle, or an
@@ -568,6 +574,53 @@ impl<'de> Deserialize<'de> for ScrollbarMode {
             Raw::Bool(true) => ScrollbarMode::Always,
             Raw::Bool(false) => ScrollbarMode::Never,
         })
+    }
+}
+
+/// What closing the main window's last tab does when no detached window is
+/// left to take its place (config key `close_last_tab`):
+/// * `"quit"` (default, the long-standing behaviour) — JeTTY quits, and the
+///   summon hotkey with it;
+/// * `"hide"` — JeTTY hides and stays resident, Yakuake / Guake style: the
+///   summon hotkey keeps working, and the next summon opens a fresh tab (the
+///   configured shell, in the home directory).
+///
+/// A detached window's last tab closes just that window either way.
+/// Unknown values read as `"quit"`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CloseLastTab {
+    #[default]
+    Quit,
+    Hide,
+}
+
+impl CloseLastTab {
+    /// The config spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CloseLastTab::Quit => "quit",
+            CloseLastTab::Hide => "hide",
+        }
+    }
+
+    /// Lenient parse (case-insensitive); anything unknown is the default.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "hide" => CloseLastTab::Hide,
+            _ => CloseLastTab::Quit,
+        }
+    }
+}
+
+impl Serialize for CloseLastTab {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CloseLastTab {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(CloseLastTab::parse(&String::deserialize(d)?))
     }
 }
 
@@ -1125,6 +1178,7 @@ impl Default for Config {
             dropdown_height_pct: default_dropdown_height_pct(),
             dropdown_width_pct: default_dropdown_width_pct(),
             focus_autohide: default_focus_autohide(),
+            close_last_tab: CloseLastTab::default(),
             launch_at_login: default_launch_at_login(),
             summon_hotkey: default_summon_hotkey(),
             shell: default_shell(),
@@ -2578,6 +2632,7 @@ mod tests {
             dropdown_height_pct: 0.6,
             dropdown_width_pct: 1.0,
             focus_autohide: false,
+            close_last_tab: CloseLastTab::Hide,
             launch_at_login: false,
             summon_hotkey: "F12".to_string(),
             shell: "/usr/bin/zsh".to_string(),
@@ -2667,6 +2722,7 @@ mod tests {
             dropdown_height_pct: 0.5,
             dropdown_width_pct: 1.0,
             focus_autohide: true,
+            close_last_tab: CloseLastTab::Quit,
             launch_at_login: true,
             summon_hotkey: "F9".to_string(),
             shell: String::new(),
@@ -2902,6 +2958,43 @@ corner_radius = 8.0
             let c = Config { scrollbar: m, ..Config::default() };
             let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
             assert_eq!(back.scrollbar, m);
+        }
+    }
+
+    #[test]
+    fn close_last_tab_parses_leniently_and_round_trips() {
+        let parse = |s: &str| Config::parse_with_base(s, &Config::default(), "using the default").unwrap();
+        assert_eq!(Config::default().close_last_tab, CloseLastTab::Quit, "today's behaviour");
+        assert_eq!(parse("theme = \"dracula\"\n").0.close_last_tab, CloseLastTab::Quit);
+        for (src, want) in [
+            ("close_last_tab = \"quit\"", CloseLastTab::Quit),
+            ("close_last_tab = \"hide\"", CloseLastTab::Hide),
+            ("close_last_tab = \"Hide\"", CloseLastTab::Hide),
+            ("close_last_tab = \" QUIT \"", CloseLastTab::Quit),
+        ] {
+            let (cfg, warnings) = parse(src);
+            assert_eq!(cfg.close_last_tab, want, "{src}");
+            assert!(warnings.is_empty(), "{src}: {warnings:?}");
+        }
+        // A typo reads as the default and says what was meant.
+        let (cfg, warnings) = parse("close_last_tab = \"hid\"\n");
+        assert_eq!(cfg.close_last_tab, CloseLastTab::Quit);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("did you mean `hide`?"), "{warnings:?}");
+        // A wrong type falls back with a warning, per key.
+        let (cfg, warnings) = parse("close_last_tab = true\nopacity = 0.5\n");
+        assert_eq!((cfg.close_last_tab, cfg.opacity, warnings.len()), (CloseLastTab::Quit, 0.5, 1), "{warnings:?}");
+        // On a reload, a bad value keeps the one in use.
+        let live = Config { close_last_tab: CloseLastTab::Hide, ..Config::default() };
+        let (cfg, warnings) = Config::parse_with_base("close_last_tab = \"hyde\"\n", &live, "keeping the current value").unwrap();
+        assert_eq!((cfg.close_last_tab, warnings.len()), (CloseLastTab::Hide, 1), "{warnings:?}");
+        // Saved spelling.
+        for m in [CloseLastTab::Quit, CloseLastTab::Hide] {
+            let c = Config { close_last_tab: m, ..Config::default() };
+            let text = toml::to_string(&c).unwrap();
+            assert!(text.contains(&format!("close_last_tab = \"{}\"", m.as_str())), "{text}");
+            let back: Config = toml::from_str(&text).unwrap();
+            assert_eq!(back.close_last_tab, m);
         }
     }
 

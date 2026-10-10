@@ -80,7 +80,7 @@ pub use image_layer::{image_dst, image_scissor_x, ImageDraw, ImageLayer};
 pub use caret_fx::{caret_glow_look, caret_glow_scissor, CaretFx, CaretFxUniform};
 pub use menu::{build_context_menu, build_menu, context_menu_height, menu_height, ContextMenu, MENU_HINTS, MENU_ITEMS};
 pub use help::{build_help_overlay, default_help_rows, HelpOverlay, HELP_ROWS};
-pub use confirm::{build_confirm, build_confirm_close, ConfirmPopup};
+pub use confirm::{build_confirm, build_confirm_close, ConfirmPopup, TabCloseEffect};
 pub use tabbar::{
     build_detached_bar, build_detached_bar_styled, build_tab_bar, build_tab_bar_ex, build_tab_bar_styled,
     detached_close_rect, detached_help_rect, tab_color_name, tab_color_rgb, valid_tab_color, CloseButton,

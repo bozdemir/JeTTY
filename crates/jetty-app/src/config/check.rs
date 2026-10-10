@@ -294,6 +294,14 @@ pub(crate) fn choices() -> Vec<Choice> {
             canon: |s| recognize(s, |x| WindowMode::from_config(x).to_config(), &[]),
         },
         Choice {
+            path: &["close_last_tab"],
+            values: || {
+                use super::CloseLastTab as C;
+                [C::Quit, C::Hide].iter().map(|m| m.as_str()).collect()
+            },
+            canon: |s| recognize(s, |x| super::CloseLastTab::parse(x).as_str(), &[]),
+        },
+        Choice {
             path: &["summon_effect"],
             values: || SummonEffect::ORDER.iter().map(|e| e.to_config()).collect(),
             canon: |s| recognize(s, |x| SummonEffect::from_config(x).to_config(), &[]),

@@ -173,25 +173,34 @@ fn wrap_lines(m: &mut dyn ChromeMeasure, s: &str, max_w: f32, max_lines: usize) 
     lines
 }
 
-/// The close-tab prompt when the tab is the last one: closing it quits JeTTY —
-/// the summon hotkey with it — so it asks the way the quit dialog does.
+/// What closing a tab does — what its confirmation has to say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabCloseEffect {
+    /// Only the tab closes: other tabs stay, or a detached window's tab takes
+    /// its place.
+    Tab,
+    /// The last tab: JeTTY quits with it, the summon hotkey too
+    /// (`close_last_tab = "quit"`).
+    Quit,
+    /// The last tab: JeTTY hides and keeps running, and the next summon opens
+    /// a fresh tab (`close_last_tab = "hide"`).
+    Hide,
+}
+
+/// The close-tab prompt when closing the last tab quits JeTTY — the summon
+/// hotkey with it — so it asks the way the quit dialog does.
 pub const CLOSE_LAST_TAB_PROMPT: &str = "Close the last tab and quit JeTTY?";
 
-/// Confirmation popup asking whether to close the tab titled `title` — or,
-/// when it is the last tab (`quits`), whether to close it and quit JeTTY.
-///
-/// `m` / `cm` are forwarded to `build_confirm`; see its docs.
-pub fn build_confirm_close(
-    win_w: u32,
-    win_h: u32,
-    title: &str,
-    quits: bool,
-    theme: &jetty_core::Theme,
-    m: &mut dyn ChromeMeasure,
-    cm: ChromeMetrics,
-) -> ConfirmPopup {
-    if quits {
-        return build_confirm(win_w, win_h, CLOSE_LAST_TAB_PROMPT, theme, m, cm);
+/// The close-tab prompt when closing the last tab only hides JeTTY: it still
+/// says that this tab is the last one.
+pub const CLOSE_LAST_TAB_HIDE_PROMPT: &str = "Close the last tab?";
+
+/// The confirmation's question for closing the tab titled `title`.
+pub fn close_prompt(title: &str, effect: TabCloseEffect) -> String {
+    match effect {
+        TabCloseEffect::Quit => return CLOSE_LAST_TAB_PROMPT.to_string(),
+        TabCloseEffect::Hide => return CLOSE_LAST_TAB_HIDE_PROMPT.to_string(),
+        TabCloseEffect::Tab => {}
     }
     // Clip first: the title is program-controlled (OSC 0/2) and may be huge.
     let (title, _) = crate::chrome::clip_head(title);
@@ -201,7 +210,23 @@ pub fn build_confirm_close(
     } else {
         title.to_string()
     };
-    build_confirm(win_w, win_h, &format!("Close tab \"{shown_title}\"?"), theme, m, cm)
+    format!("Close tab \"{shown_title}\"?")
+}
+
+/// Confirmation popup asking whether to close the tab titled `title`, worded
+/// for what closing it does (`effect`): the last tab's quits or hides JeTTY.
+///
+/// `m` / `cm` are forwarded to `build_confirm`; see its docs.
+pub fn build_confirm_close(
+    win_w: u32,
+    win_h: u32,
+    title: &str,
+    effect: TabCloseEffect,
+    theme: &jetty_core::Theme,
+    m: &mut dyn ChromeMeasure,
+    cm: ChromeMetrics,
+) -> ConfirmPopup {
+    build_confirm(win_w, win_h, &close_prompt(title, effect), theme, m, cm)
 }
 
 #[cfg(test)]
@@ -224,7 +249,7 @@ mod tests {
 
     #[test]
     fn popup_is_centered_and_has_buttons() {
-        let p = build_confirm_close(1000, 700, "Tab 1", false, &theme(), &mut mono(), CM);
+        let p = build_confirm_close(1000, 700, "Tab 1", TabCloseEffect::Tab, &theme(), &mut mono(), CM);
         assert!(p.panel.x >= 0.0 && p.panel.y >= 0.0);
         assert!(p.panel.x + p.panel.w <= 1000.0 + 0.5);
         // Close button sits left of Cancel.
@@ -237,17 +262,31 @@ mod tests {
     fn closing_the_last_tab_asks_to_quit() {
         // Closing the last tab quits JeTTY (and its summon hotkey): a plain
         // "Close tab?" hid that. The prompt says it, whole.
-        let p = build_confirm_close(1000, 700, "zsh", true, &theme(), &mut mono(), CM);
+        let p = build_confirm_close(1000, 700, "zsh", TabCloseEffect::Quit, &theme(), &mut mono(), CM);
         assert_eq!(p.labels[0].0, CLOSE_LAST_TAB_PROMPT);
         assert!(CLOSE_LAST_TAB_PROMPT.contains("quit JeTTY"));
-        let other = build_confirm_close(1000, 700, "zsh", false, &theme(), &mut mono(), CM);
+        let other = build_confirm_close(1000, 700, "zsh", TabCloseEffect::Tab, &theme(), &mut mono(), CM);
         assert_eq!(other.labels[0].0, "Close tab \"zsh\"?");
+    }
+
+    #[test]
+    fn closing_the_last_tab_that_hides_never_says_quit() {
+        // `close_last_tab = "hide"`: JeTTY stays running, so the prompt must
+        // not promise a quit — it still says this is the last tab.
+        let p = build_confirm_close(1000, 700, "zsh", TabCloseEffect::Hide, &theme(), &mut mono(), CM);
+        assert_eq!(p.labels[0].0, CLOSE_LAST_TAB_HIDE_PROMPT);
+        assert_eq!(close_prompt("zsh", TabCloseEffect::Hide), "Close the last tab?");
+        assert!(!CLOSE_LAST_TAB_HIDE_PROMPT.to_lowercase().contains("quit"));
+        // Every wording, side by side: the title shows only for a tab that
+        // isn't the last one.
+        assert_eq!(close_prompt("zsh", TabCloseEffect::Tab), "Close tab \"zsh\"?");
+        assert_eq!(close_prompt("zsh", TabCloseEffect::Quit), "Close the last tab and quit JeTTY?");
     }
 
     #[test]
     fn long_title_is_truncated() {
         let long = "a".repeat(80);
-        let p = build_confirm_close(1000, 700, &long, false, &theme(), &mut mono(), CM);
+        let p = build_confirm_close(1000, 700, &long, TabCloseEffect::Tab, &theme(), &mut mono(), CM);
         let prompt = &p.labels[0].0;
         assert!(prompt.contains('…'), "long title should be truncated: {prompt}");
         assert!(p.panel.x + p.panel.w <= 1000.0 + 0.5);
