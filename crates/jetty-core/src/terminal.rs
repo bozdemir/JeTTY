@@ -941,9 +941,12 @@ pub enum NoOutput {
     NoCommand,
     /// The command printed nothing (blank lines at most).
     Empty,
-    /// Its output scrolled out of the scrollback, or its marks were dropped
-    /// (a reflow, a scroll count lost to an overfull scrollback).
+    /// Its output scrolled out of the scrollback.
     Gone,
+    /// Its marks were dropped — a reflow, a reset, a scroll count lost to an
+    /// overfull scrollback: the output may still show, but where it starts and
+    /// ends can't be told.
+    Dropped,
     /// A full-screen program shows the alternate screen.
     AltScreen,
 }
@@ -1249,6 +1252,10 @@ pub struct Terminal {
     /// Latched when a command that started output (a C) finished: what tells
     /// "its output is gone" from "no command has run yet". Never reset.
     output_ended: bool,
+    /// The marks of a finished command's output were dropped since the last
+    /// such command finished: it may still show, but can't be found
+    /// (`NoOutput::Dropped`).
+    output_dropped: bool,
     /// Lifetime count of DISTINCT OSC 133 `A` prompt marks this terminal has
     /// seen (post-dedup; never decremented, survives mark pruning). The
     /// run-selection-in-new-tab readiness signal: `> 0` means the shell emits
@@ -1581,6 +1588,7 @@ impl Terminal {
             marks_sorted: true,
             spilled: None,
             output_ended: false,
+            output_dropped: false,
             prompts_seen: 0,
             saw_command_output: false,
             completed: Vec::new(),
@@ -3167,6 +3175,9 @@ impl Terminal {
     #[cold]
     #[inline(never)]
     fn drop_anchors(&mut self) {
+        // A finished command's output that could be found no longer can.
+        let found = |b: &CmdBlock| b.finished && b.output.is_some() && b.end.is_some();
+        self.output_dropped |= self.marks.iter().rev().any(found) || self.spilled.as_ref().is_some_and(found);
         self.marks.clear();
         self.marks_sorted = true;
         // A command still running keeps its spill: its output start is gone
@@ -3553,7 +3564,9 @@ impl Terminal {
                 // completion for it). The open block may be the spilled one: its
                 // prompt and output start scrolled out while it ran.
                 if let Some(last) = self.marks.back_mut().or(self.spilled.as_mut()) {
-                    self.output_ended |= !last.finished && last.output.is_some();
+                    if !last.finished && last.output.is_some() {
+                        (self.output_ended, self.output_dropped) = (true, false);
+                    }
                     last.close_at(abs, col);
                 }
                 self.cur_cmd = Some(OpenCmd { started_at: None });
@@ -3624,9 +3637,10 @@ impl Terminal {
                 // (shells emit strictly A…B…C…D, so "most recent open" is correct
                 // even with gaps). Absent if anchors were dropped meanwhile.
                 let mut output_top = None;
+                let mut ended = false;
                 if let Some(block) = self.marks.iter_mut().rev().find(|m| !m.finished) {
                     block.exit = exit;
-                    self.output_ended |= block.output.is_some();
+                    ended = block.output.is_some();
                     block.close_at(abs, col);
                     // Where its output starts: the C row, else the row after the
                     // command line (an integration without C).
@@ -3636,8 +3650,11 @@ impl Terminal {
                     // the last output line is looked for unbounded): only its
                     // end and exit code are recorded.
                     block.exit = exit;
-                    self.output_ended |= block.output.is_some();
+                    ended = block.output.is_some();
                     block.close_at(abs, col);
+                }
+                if ended {
+                    (self.output_ended, self.output_dropped) = (true, false);
                 }
                 // Run & Notify: emit a completion iff a command was open (a
                 // spurious lone D produces nothing). Independent of `marks`, so a
@@ -5816,8 +5833,11 @@ impl Terminal {
                 .find(|(start, last, _)| (start.0..=last.0).contains(&line)),
         };
         let Some((start, last, clipped)) = found else {
-            let gone = of == OutputOf::Last && self.output_ended;
-            return Err(if gone { NoOutput::Gone } else { NoOutput::NoCommand });
+            return Err(match of {
+                OutputOf::Last if self.output_dropped => NoOutput::Dropped,
+                OutputOf::Last if self.output_ended => NoOutput::Gone,
+                _ => NoOutput::NoCommand,
+            });
         };
         let last = if last.0 > bottom { (bottom, last_col) } else { last };
         if last.0 < top {
@@ -9976,7 +9996,7 @@ mod tests {
     }
 
     #[test]
-    fn output_whose_marks_were_dropped_is_gone() {
+    fn output_whose_marks_were_dropped_is_not_found() {
         // Correct-or-absent: a scroll count lost to an overfull scrollback, and
         // a reflow, drop the marks — and with them where any output is.
         let mut t = Terminal::new(40, 24);
@@ -9985,11 +10005,20 @@ mod tests {
         p10k_run(&mut t, "ls", b"a  b\r\n", 0);
         assert!(t.command_output(OutputOf::Last).is_ok());
         t.feed("\x1b[200S".repeat(20).as_bytes()); // 4,000 lines in one slice
-        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::Gone));
+        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::Dropped));
         p10k_run(&mut t, "ls", b"a  b\r\n", 0);
         assert_eq!(output_of(&t, OutputOf::Last), Ok("a  b".to_string()), "fresh marks find it again");
         t.resize(30, 24);
-        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::Gone), "a reflow drops them too");
+        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::Dropped), "a reflow drops them too");
+        // An output that merely scrolled out is gone, not dropped.
+        let mut t = Terminal::new(40, 5);
+        t.set_scrollback_lines(10);
+        t.feed(P10K_PROMPT);
+        p10k_run(&mut t, "ls", b"a  b\r\n", 0);
+        for i in 0..40 {
+            t.feed(format!("{i}\r\n").as_bytes());
+        }
+        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::Gone));
     }
 
     #[test]

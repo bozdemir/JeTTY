@@ -18874,6 +18874,7 @@ fn output_notice(
         Err(N::Empty) if last => "The last command printed nothing",
         Err(N::Empty) => "That command printed nothing",
         Err(N::NoCommand | N::Gone) => "This output is no longer in the scrollback",
+        Err(N::Dropped) => "Lost track of that output — the window was resized (or reset) since",
     };
     Some(why.to_string())
 }
@@ -20393,7 +20394,8 @@ mod output_notice_tests {
         assert!(output_notice(last, false, Ok((0, true))).is_some_and(|m| m.contains("scrolled out")));
         // Every reason has words, a menu row's included.
         for of in [last, OutputOf::Line(7)] {
-            for why in [NoOutput::NoIntegration, NoOutput::NoCommand, NoOutput::Empty, NoOutput::Gone, NoOutput::AltScreen] {
+            let all = [NoOutput::NoIntegration, NoOutput::NoCommand, NoOutput::Empty, NoOutput::Gone, NoOutput::Dropped];
+            for why in all.into_iter().chain([NoOutput::AltScreen]) {
                 let msg = output_notice(of, true, Err(why)).unwrap();
                 assert!(!msg.is_empty() && msg.chars().count() <= 96, "{why:?}: {msg}");
             }
