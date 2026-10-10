@@ -8836,21 +8836,6 @@ impl App {
         }
     }
 
-    /// Drain one tab's PTY output into its terminal, and flush any query
-    /// replies (DSR/DA, etc.) the terminal produced back to the PTY. Returns
-    /// `(had, title_changed)`: whether the tab fed any bytes or sent any
-    /// reply (i.e. "had data"), and whether an OSC 0/2 changed the tab title.
-    /// The title is reported SEPARATELY because folding it into `had` only
-    /// guaranteed a redraw for the ACTIVE tab — an inactive tab whose
-    /// activity dot was already lit produced no transition, so its new title
-    /// never repainted the tab bar or the OS/taskbar title (F1/F14).
-    /// `vt_read` accumulates bytes read, for the perf-HUD VT throughput
-    /// counter; callers that don't track that (e.g. detached windows) pass a
-    /// throwaway local.
-    ///
-    /// Shared by `drain_pty` (per `self.tabs` entry) and the `AppEvent::Wake`
-    /// handler's detached-window loop, so both paths drain identically.
-    ///
     /// A tab whose shell exited UNSUCCESSFULLY right after starting — a broken
     /// shell or rc file — gets the next shell candidate instead of closing
     /// (with the last tab, the whole app used to vanish without a word). The
@@ -8902,6 +8887,21 @@ impl App {
         (flood, dw.tab.terminal.take_bell())
     }
 
+    /// Drain one tab's PTY output into its terminal, and flush any query
+    /// replies (DSR/DA, etc.) the terminal produced back to the PTY. Returns
+    /// `(had, title_changed, notice)`: whether the tab fed any bytes or sent any
+    /// reply (i.e. "had data"), and whether an OSC 0/2 changed the tab title.
+    /// The title is reported SEPARATELY because folding it into `had` only
+    /// guaranteed a redraw for the ACTIVE tab — an inactive tab whose
+    /// activity dot was already lit produced no transition, so its new title
+    /// never repainted the tab bar or the OS/taskbar title (F1/F14).
+    /// `vt_read` accumulates bytes read, for the perf-HUD VT throughput
+    /// counter (every caller folds it into `App::vt_bytes`).
+    ///
+    /// Shared by `drain_pty` (per `self.tabs` entry) and both of a detached
+    /// window's drain paths (the `AppEvent::Wake` loop and its render, each
+    /// followed by `after_detached_drain`), so every tab drains identically.
+    ///
     /// The third element is a run-selection feedback [`runsel::Notice`]
     /// (refusal/staged pill) — `None` on every normal pass; the caller
     /// surfaces it via `show_status_pill` (a pill needs `&mut self`).
