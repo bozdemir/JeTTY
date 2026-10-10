@@ -8634,12 +8634,13 @@ impl App {
 
 
     /// Drain pending PTY output into the main window's tabs and flush each tab's
-    /// query replies back to its own PTY. With `background` (the Wake path) every
-    /// tab is drained — the active one first, the background ones sharing this
-    /// iteration's `BG_DRAIN_BUDGET` (`drain_pass`) — so their shells never
-    /// block on a full pipe; without it (the paint path) only the active tab:
-    /// a frame shows nothing of the others, and whatever they still have queued
-    /// gets the next iteration's Wake (`rearm_pty_wakes`).
+    /// query replies back to its own PTY, the active tab first (`drain_pass`).
+    /// With `background` (the Wake path) the background tabs share this
+    /// iteration's `BG_DRAIN_BUDGET`, so their shells never block on a full
+    /// pipe; without it (the paint path) they get nothing in front of the frame
+    /// — it shows nothing of theirs, and whatever they still have queued gets
+    /// the next iteration's Wake (`rearm_pty_wakes`) — except, on both paths,
+    /// their fair share behind a flooding active tab.
     ///
     /// Returns `(active_had_data, active_bytes, chrome_changed, exited)` where
     /// `active_had_data` is true if the ACTIVE tab consumed bytes (so the caller
@@ -8714,13 +8715,11 @@ impl App {
             }
             (vt_read - read_before) as usize
         };
-        let active_bytes = if background {
-            drain_pass(n, active, &mut self.bg_drain_next, &mut self.bg_drain_left, &mut drain_tab)
-        } else if active < n {
-            drain_tab(active, PTY_DRAIN_BUDGET)
-        } else {
-            0
-        };
+        // The paint path has no budget of its own for the background: it feeds
+        // them only behind a flooding active tab (`drain_pass`'s fair share).
+        let mut paint_share = 0;
+        let bg_left = if background { &mut self.bg_drain_left } else { &mut paint_share };
+        let active_bytes = drain_pass(n, active, &mut self.bg_drain_next, bg_left, &mut drain_tab);
         self.vt_bytes += vt_read;
         if active_bell && self.fx.glitch_on_bell && !self.motion_reduced() {
             self.trigger_main_glitch();
@@ -16362,12 +16361,13 @@ impl ApplicationHandler<AppEvent> for App {
                     self.ensure_summon_fx();
                     self.summon_anim = Some(std::time::Instant::now());
                 }
-                // Drain the ACTIVE tab — what this frame shows — and close it if
-                // its child exited as part of the output we just drained. The
+                // Drain the ACTIVE tab — what this frame shows — and close any tab
+                // whose child exited as part of the output we just drained. The
                 // background tabs drain on the Wake path, which every iteration
-                // that leaves output queued gets (`rearm_pty_wakes`): draining
-                // them here too put up to a `PTY_DRAIN_BUDGET` per flooding tab
-                // in front of every frame, the echo's included.
+                // that leaves output queued gets (`rearm_pty_wakes`), and here
+                // only behind a flooding active tab (`drain_pass`): draining them
+                // in full here too put up to a `PTY_DRAIN_BUDGET` per flooding
+                // tab in front of every frame, the echo's included.
                 // (chrome changes are picked up by this same frame's
                 // tabs_meta()/tab_activity snapshot below, so the flag is moot here.)
                 let (had, _active_bytes, _chrome_changed, exited) = self.drain_pty(false);
@@ -21736,6 +21736,23 @@ mod drain_pass_tests {
         let (active_fed, fed, _) = pass(&mut q, 1, &mut next, &mut left);
         assert_eq!(active_fed, 0);
         assert_eq!(fed.iter().sum::<usize>(), BG_DRAIN_BUDGET, "a keystroke waits ~1.7 ms at most");
+    }
+
+    #[test]
+    fn the_paint_path_feeds_the_background_only_behind_a_flooding_active_tab() {
+        // The paint path passes no budget: an echo's frame waits for no
+        // background drain, while every tab is still visited…
+        let mut q = vec![5, FLOOD, FLOOD];
+        let (mut next, mut left) = (0, 0);
+        let (_, fed, order) = pass(&mut q, 0, &mut next, &mut left);
+        assert_eq!((fed[1], fed[2]), (0, 0));
+        assert_eq!(order.len(), 3);
+        // …and a flooding active tab's frame carries the background's share too,
+        // so a paced frame holds as many bytes as before.
+        let mut q = vec![FLOOD, FLOOD];
+        let (mut next, mut left) = (0, 0);
+        let (active_fed, fed, _) = pass(&mut q, 0, &mut next, &mut left);
+        assert_eq!(fed[1], active_fed);
     }
 
     #[test]
