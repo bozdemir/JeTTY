@@ -875,6 +875,14 @@ struct CmdBlock {
     input_col: usize,
     /// OSC 133 C — command-output start.
     output: Option<i64>,
+    /// Column of that C: the output starts at (`output`, `output_col`).
+    output_col: usize,
+    /// Where the output ends (exclusive): the D's cell, or — a command closed
+    /// without a D — the next prompt's `A`. Set only when a block that is
+    /// still open closes, so a blank Enter (closed at its C) has none.
+    end: Option<i64>,
+    /// Column of that end.
+    end_col: usize,
     /// OSC 133 D exit code (None = no/empty/non-numeric code → unknown).
     exit: Option<i32>,
     /// Set once a D arrives (or a later A closes an abandoned command, e.g. ^C).
@@ -882,6 +890,62 @@ struct CmdBlock {
     /// The shell repaints this whole prompt after a resize (false for an
     /// `A;redraw=0`, e.g. bash: readline repaints only a prompt's last line).
     redraws: bool,
+}
+
+impl CmdBlock {
+    /// The line whose leaving the scrollback drops this block: its output's
+    /// first line — the prompt above it may be gone already, the output it
+    /// starts is still all there — else (no C) its prompt.
+    fn top_line(&self) -> i64 {
+        self.output.map_or(self.prompt, |c| c.max(self.prompt))
+    }
+
+    /// Close a block that is still open at absolute cell (`line`, `col`): a D,
+    /// or the next prompt for a command that never sent one.
+    fn close_at(&mut self, line: i64, col: usize) {
+        if !self.finished {
+            self.finished = true;
+            self.end = Some(line);
+            self.end_col = col;
+        }
+    }
+}
+
+/// Which command's output [`Terminal::command_output`] finds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputOf {
+    /// The newest command that has finished.
+    Last,
+    /// The command whose output holds this absolute line
+    /// ([`Terminal::viewport_row_abs`]) — a running one too.
+    Line(i64),
+}
+
+/// A command's output as [`Terminal::command_output`] found it: its first and
+/// last cell as (buffer line, column), inclusive — trailing blank lines left
+/// out. Valid until the terminal is next fed or resized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputRange {
+    pub start: (i32, usize),
+    pub end: (i32, usize),
+    /// Its beginning scrolled out of the scrollback: this is what remains.
+    pub clipped: bool,
+}
+
+/// Why [`Terminal::command_output`] has no output to give.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoOutput {
+    /// No OSC 133 prompt was ever marked: the shell has no integration.
+    NoIntegration,
+    /// No command has finished yet — or, for a line, none's output is there.
+    NoCommand,
+    /// The command printed nothing (blank lines at most).
+    Empty,
+    /// Its output scrolled out of the scrollback, or its marks were dropped
+    /// (a reflow, a scroll count lost to an overfull scrollback).
+    Gone,
+    /// A full-screen program shows the alternate screen.
+    AltScreen,
 }
 
 /// The shell command between its prompt mark (`A`) and its completion (`D`) —
@@ -1175,6 +1239,16 @@ pub struct Terminal {
     /// holds, the out-of-window marks are a prefix and a suffix, so `prune_marks`
     /// trims both ends in O(pruned) instead of rescanning every mark per prompt.
     marks_sorted: bool,
+    /// The newest block whose output start scrolled out of the scrollback (or
+    /// that the scrollback cleared): what remains of its output runs from the
+    /// top of the scrollback to its end. Its own lines are stale — nothing
+    /// anchors them, so a flood past it runs unanchored as before — and only
+    /// its end is used: one that a D (or the next prompt) sets after the drop
+    /// is on the same scale as the prompt marked next.
+    spilled: Option<CmdBlock>,
+    /// Latched when a command that started output (a C) finished: what tells
+    /// "its output is gone" from "no command has run yet". Never reset.
+    output_ended: bool,
     /// Lifetime count of DISTINCT OSC 133 `A` prompt marks this terminal has
     /// seen (post-dedup; never decremented, survives mark pruning). The
     /// run-selection-in-new-tab readiness signal: `> 0` means the shell emits
@@ -1505,6 +1579,8 @@ impl Terminal {
             scan: Scan::Ground,
             marks: VecDeque::new(),
             marks_sorted: true,
+            spilled: None,
+            output_ended: false,
             prompts_seen: 0,
             saw_command_output: false,
             completed: Vec::new(),
@@ -3072,8 +3148,8 @@ impl Terminal {
         // out-of-order straggler maps outside the viewport and goes at the next
         // full prune.
         let min_abs = self.abs_top - target as i64;
-        while self.marks.front().is_some_and(|m| m.prompt < min_abs) {
-            self.marks.pop_front();
+        while self.marks.front().is_some_and(|m| m.top_line() < min_abs) {
+            self.spilled = self.marks.pop_front();
         }
         while let Some(p) = self.placements.front() {
             if p.abs_line + p.rows as i64 > min_abs {
@@ -3093,6 +3169,12 @@ impl Terminal {
     fn drop_anchors(&mut self) {
         self.marks.clear();
         self.marks_sorted = true;
+        // A command still running keeps its spill: its output start is gone
+        // either way, and its end is yet to come, on the new scale. A
+        // finished one's end was on the old one.
+        if self.spilled.is_some_and(|b| b.finished) {
+            self.spilled = None;
+        }
         self.clear_placements();
         self.anchor_epoch = self.anchor_epoch.wrapping_add(1);
     }
@@ -3117,7 +3199,9 @@ impl Terminal {
     }
 
     /// Drop marks outside the live window `[abs_top - history_size, abs_top + rows)`
-    /// and cap the total (defensive). Called on every A-bind and on a shrink.
+    /// — at the top once its output's first line ([`CmdBlock::top_line`]) has
+    /// left, the newest such kept in `spilled` — and cap the total
+    /// (defensive). Called on every A-bind and on a shrink.
     /// O(pruned) while `marks_sorted`: the out-of-window marks are then a prefix
     /// (scrolled off) and a suffix (below the screen). Only after an out-of-order
     /// bind does it rescan, and re-derives the order flag from the survivors.
@@ -3127,14 +3211,17 @@ impl Terminal {
         let min_abs = self.abs_top - history_size as i64;
         let max_abs = self.abs_top + self.rows as i64;
         if self.marks_sorted {
-            while self.marks.front().is_some_and(|m| m.prompt < min_abs) {
-                self.marks.pop_front();
+            while self.marks.front().is_some_and(|m| m.top_line() < min_abs) {
+                self.spilled = self.marks.pop_front();
             }
             while self.marks.back().is_some_and(|m| m.prompt >= max_abs) {
                 self.marks.pop_back();
             }
         } else {
-            self.marks.retain(|m| m.prompt >= min_abs && m.prompt < max_abs);
+            if let Some(m) = self.marks.iter().rev().find(|m| m.top_line() < min_abs) {
+                self.spilled = Some(*m);
+            }
+            self.marks.retain(|m| m.top_line() >= min_abs && m.prompt < max_abs);
             self.marks_sorted = marks_ascending(&self.marks);
         }
         while self.marks.len() > MAX_MARKS {
@@ -3444,6 +3531,7 @@ impl Terminal {
             return;
         }
         let abs = self.abs_top + self.term.grid().cursor.point.line.0 as i64;
+        let col = self.term.grid().cursor.point.column.0;
         match letter {
             b'A' => {
                 // Dedup an A re-sent for the newest prompt on its own line, no
@@ -3460,10 +3548,13 @@ impl Terminal {
                 // scanner. Never per byte.
                 self.prompts_seen += 1;
                 // A new prompt closes any previous still-open block (a command
-                // that never emitted D, e.g. ^C at the prompt) as unknown, and
-                // abandons its Run & Notify state (no completion for it).
-                if let Some(last) = self.marks.back_mut() {
-                    last.finished = true;
+                // that never emitted D, e.g. ^C at the prompt) as unknown — its
+                // output ends here — and abandons its Run & Notify state (no
+                // completion for it). The open block may be the spilled one: its
+                // prompt and output start scrolled out while it ran.
+                if let Some(last) = self.marks.back_mut().or(self.spilled.as_mut()) {
+                    self.output_ended |= !last.finished && last.output.is_some();
+                    last.close_at(abs, col);
                 }
                 self.cur_cmd = Some(OpenCmd { started_at: None });
                 // Back at a prompt: whatever reported progress has ended (a
@@ -3479,6 +3570,9 @@ impl Terminal {
                     input: None,
                     input_col: 0,
                     output: None,
+                    output_col: 0,
+                    end: None,
+                    end_col: 0,
                     exit: None,
                     finished: false,
                     redraws,
@@ -3487,7 +3581,6 @@ impl Terminal {
                 self.prune_marks(history);
             }
             b'B' => {
-                let col = self.term.grid().cursor.point.column.0;
                 if let Some(last) = self.marks.back_mut() {
                     // The leftmost B on a row wins: an integration that also ends
                     // a RIGHT prompt with B (p10k under Warp) must not move the
@@ -3499,10 +3592,10 @@ impl Terminal {
                 }
             }
             b'C' => {
-                let col = self.term.grid().cursor.point.column.0;
                 let blank = self.marks.back().is_some_and(|m| self.command_line_blank(m, abs, col));
                 if let Some(last) = self.marks.back_mut() {
                     last.output = Some(abs);
+                    last.output_col = col;
                     // Nothing typed, nothing ran: close the block WITHOUT an exit
                     // code, so the `D` that follows marks nothing failed.
                     last.finished |= blank;
@@ -3533,10 +3626,18 @@ impl Terminal {
                 let mut output_top = None;
                 if let Some(block) = self.marks.iter_mut().rev().find(|m| !m.finished) {
                     block.exit = exit;
-                    block.finished = true;
+                    self.output_ended |= block.output.is_some();
+                    block.close_at(abs, col);
                     // Where its output starts: the C row, else the row after the
                     // command line (an integration without C).
                     output_top = Some(block.output.unwrap_or(block.input.unwrap_or(block.prompt) + 1));
+                } else if let Some(block) = self.spilled.as_mut().filter(|b| !b.finished) {
+                    // Its start scrolled out while it ran (its lines are stale:
+                    // the last output line is looked for unbounded): only its
+                    // end and exit code are recorded.
+                    block.exit = exit;
+                    self.output_ended |= block.output.is_some();
+                    block.close_at(abs, col);
                 }
                 // Run & Notify: emit a completion iff a command was open (a
                 // spurious lone D produces nothing). Independent of `marks`, so a
@@ -4189,10 +4290,14 @@ impl Terminal {
         let display_offset = self.term.grid().display_offset() as i64;
         // Absolute line currently at viewport row 0 (top visible line).
         let viewport_top_abs = self.abs_top - display_offset;
+        // A block stays while its output starts in the scrollback, its prompt
+        // perhaps gone already: no target there.
+        let top = self.abs_top - self.term.grid().history_size() as i64;
+        let prompts = self.marks.iter().map(|m| m.prompt).filter(|&p| p >= top);
         let target = if forward {
-            self.marks.iter().map(|m| m.prompt).filter(|&p| p > viewport_top_abs).min()
+            prompts.filter(|&p| p > viewport_top_abs).min()
         } else {
-            self.marks.iter().map(|m| m.prompt).filter(|&p| p < viewport_top_abs).max()
+            prompts.filter(|&p| p < viewport_top_abs).max()
         };
         let Some(target) = target else {
             return false; // clamp at the ends (no wrap)
@@ -5670,6 +5775,99 @@ impl Terminal {
         self.set_selection(Some(sel));
     }
 
+    /// Where command `of`'s output is — from its OSC 133 `C` to its `D` (or
+    /// the next prompt) — or why there is none. Correct-or-absent like the
+    /// marks it reads: once they were dropped (a reflow, a scroll count lost
+    /// to an overfull scrollback) or the output scrolled out of the
+    /// scrollback, it is [`NoOutput::Gone`]; an output whose start scrolled
+    /// out is what remains ([`OutputRange::clipped`]). Never the prompt or
+    /// the command line, never trailing blank lines. A running command's
+    /// output (a line in it) is what it printed so far. Reads the marks and
+    /// the output's own last lines — run on request, never per frame.
+    pub fn command_output(&self, of: OutputOf) -> Result<OutputRange, NoOutput> {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return Err(NoOutput::AltScreen);
+        }
+        if self.prompts_seen == 0 {
+            return Err(NoOutput::NoIntegration);
+        }
+        let grid = self.term.grid();
+        let top = self.abs_top - grid.history_size() as i64;
+        let bottom = self.abs_top + self.rows as i64 - 1;
+        let last_col = self.cols - 1;
+        let cursor = (self.abs_top + grid.cursor.point.line.0 as i64, grid.cursor.point.column.0);
+        // A block's output as absolute cells, first and last (inclusive), and
+        // whether its start is gone: from its C — the top of the scrollback for
+        // the spilled block — to the cell before its end, or before the cursor
+        // while it runs (only the newest block can still be open).
+        let span = |m: &CmdBlock, spilled: bool| {
+            let c = m.output?;
+            let clipped = spilled || c < top;
+            let start = if clipped { (top, 0) } else { (c, m.output_col) };
+            let end = m.end.map(|l| (l, m.end_col)).or((!m.finished).then_some(cursor))?;
+            let last = if end.1 == 0 { (end.0 - 1, last_col) } else { (end.0, (end.1 - 1).min(last_col)) };
+            Some((start, last, clipped))
+        };
+        let blocks = self.marks.iter().rev().map(|m| (m, false)).chain(self.spilled.iter().map(|m| (m, true)));
+        let found = match of {
+            OutputOf::Last => blocks.filter(|(m, _)| m.finished).find_map(|(m, spilled)| span(m, spilled)),
+            OutputOf::Line(line) => blocks
+                .filter_map(|(m, spilled)| span(m, spilled))
+                .find(|(start, last, _)| (start.0..=last.0).contains(&line)),
+        };
+        let Some((start, last, clipped)) = found else {
+            let gone = of == OutputOf::Last && self.output_ended;
+            return Err(if gone { NoOutput::Gone } else { NoOutput::NoCommand });
+        };
+        let last = if last.0 > bottom { (bottom, last_col) } else { last };
+        if last.0 < top {
+            return Err(NoOutput::Gone);
+        }
+        // Trailing blank lines (and blanks) are left out: the last cell
+        // holding text, walking back from the end.
+        let mut end = None;
+        for line in (start.0..=last.0).rev() {
+            let row = &grid[Line((line - self.abs_top) as i32)];
+            let from = if line == start.0 { start.1 } else { 0 };
+            let to = if line == last.0 { last.1 } else { last_col };
+            if let Some(c) = (from..=to).rev().find(|&c| !matches!(row[Column(c)].c, ' ' | '\0')) {
+                end = Some((line, c));
+                break;
+            }
+        }
+        let end = end.ok_or(NoOutput::Empty)?;
+        let buffer = |(line, col): (i64, usize)| ((line - self.abs_top) as i32, col);
+        Ok(OutputRange { start: buffer(start), end: buffer(end), clipped })
+    }
+
+    /// The text of `r` (from [`Terminal::command_output`]) as Copy builds a
+    /// selection's: wrapped lines joined, wide chars whole.
+    pub fn output_text(&self, r: &OutputRange) -> String {
+        let point = |(line, col): (i32, usize)| Point::new(Line(line), Column(col));
+        self.text_between(point(r.start), point(r.end), true)
+    }
+
+    /// Select `r` (from [`Terminal::command_output`]) and bring it into view:
+    /// all of it when it fits, else its first line at the top. Returns whether
+    /// the view moved.
+    pub fn select_output(&mut self, r: &OutputRange) -> bool {
+        let point = |(line, col): (i32, usize)| Point::new(Line(line), Column(col));
+        self.set_selection(Some(cell_range_selection(point(r.start), point(r.end))));
+        let rows = self.rows as i32;
+        let view_top = -(self.term.grid().display_offset() as i32);
+        let (first, last) = (r.start.0, r.end.0);
+        let want_top = if first >= view_top && last < view_top + rows {
+            return false;
+        } else if last - first < rows && first >= view_top {
+            last - rows + 1
+        } else {
+            first
+        };
+        let before = self.scroll_offset();
+        self.scroll_to_offset(want_top.min(0).unsigned_abs() as usize);
+        self.scroll_offset() != before
+    }
+
     /// Set (or replace) the scrollback-search query and recompute all matches.
     ///
     /// The query is a LITERAL string (regex metachars are escaped) compiled
@@ -6598,6 +6796,9 @@ mod tests {
             input: None,
             input_col: 0,
             output: None,
+            output_col: 0,
+            end: None,
+            end_col: 0,
             exit: None,
             finished: true,
             redraws: true,
@@ -9123,7 +9324,11 @@ mod tests {
         assert_eq!(t.failed_prompt_rows(), vec![0]);
         t.feed(b"\x1b[H\x1b[2J\x1b[3J\x1b]133;D;0\x07\x1b]133;A\x07$ ");
         assert!(t.failed_prompt_rows().is_empty(), "no stale marker after clear");
-        assert_eq!(t.marks.len(), 1, "only the fresh prompt remains");
+        // `false` went with the scrollback; `clear` stays only while its output
+        // (none: it starts where the fresh prompt is) is on the screen.
+        let blocks: Vec<_> = t.marks.iter().map(|m| (m.output.map(|c| c - t.abs_top), m.exit)).collect();
+        assert_eq!(blocks, [(Some(0), Some(0)), (None, None)], "only `clear` and the fresh prompt remain");
+        assert!(!t.jump_prompt(false), "and no prompt above to jump to");
     }
 
     #[test]
@@ -9682,6 +9887,190 @@ mod tests {
         t.feed(b"false\r\n\x1b]133;C\x07\x1b]133;D;1\x07");
         assert_eq!(t.failed_prompt_rows(), vec![0], "the failed command keeps its marker");
         assert_eq!(t.take_completions().len(), 1);
+    }
+
+    // ── A command's output (copy / select it) ─────────────────────────────────
+
+    /// Type and run `cmd` at [`P10K_PROMPT`] as zsh + p10k do (40 columns):
+    /// the transient prompt, the `C`, its `output`, PROMPT_SP, the `D` and a
+    /// fresh prompt.
+    fn p10k_run(t: &mut Terminal, cmd: &str, output: &[u8], exit: i32) {
+        t.feed(cmd.as_bytes());
+        t.feed(&p10k_accept(cmd));
+        t.feed(b"\x1b]133;C;\x07");
+        t.feed(output);
+        t.feed(&p10k_prompt_sp());
+        t.feed(format!("\x1b]133;D;{exit}\x07").as_bytes());
+        t.feed(P10K_PROMPT);
+    }
+
+    fn output_of(t: &Terminal, of: OutputOf) -> Result<String, NoOutput> {
+        t.command_output(of).map(|r| t.output_text(&r))
+    }
+
+    /// The absolute line of the visible row reading `text`.
+    fn line_showing(t: &Terminal, text: &str) -> i64 {
+        let rows = t.viewport_rows_chars();
+        let row = rows.iter().position(|r| r.iter().collect::<String>().trim_end() == text);
+        t.viewport_row_abs(row.unwrap_or_else(|| panic!("no row reads {text:?}: {rows:?}")))
+    }
+
+    #[test]
+    fn the_last_commands_output_is_its_output_alone() {
+        let mut t = Terminal::new(40, 24);
+        t.feed(P10K_PROMPT);
+        p10k_run(&mut t, "seq 3", b"1\r\n2\r\n3\r\n", 0);
+        assert_eq!(output_of(&t, OutputOf::Last), Ok("1\n2\n3".to_string()), "no prompt, no command line");
+        // A failed command is a command too; trailing blank lines are left out.
+        p10k_run(&mut t, "ls nope", b"ls: nope: No such file\r\n\r\n\r\n", 2);
+        assert_eq!(output_of(&t, OutputOf::Last), Ok("ls: nope: No such file".to_string()));
+        // An empty Enter (p10k's `C;` + a stale `D`) runs nothing: still `ls`.
+        t.feed(&p10k_accept(""));
+        t.feed(&p10k_prompt_sp());
+        t.feed(b"\x1b]133;C;\x07\x1b]133;D;2\x07");
+        t.feed(P10K_PROMPT);
+        let r = t.command_output(OutputOf::Last).expect("the `ls` output");
+        assert!(!r.clipped);
+        assert_eq!(t.output_text(&r), "ls: nope: No such file");
+        // Selecting it selects exactly what copying it copies.
+        t.select_output(&r);
+        assert_eq!(t.selection_text().as_deref(), Some("ls: nope: No such file"));
+    }
+
+    #[test]
+    fn a_command_that_printed_nothing_has_no_output() {
+        let mut t = Terminal::new(40, 24);
+        t.feed(P10K_PROMPT);
+        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::NoCommand), "nothing ran yet");
+        p10k_run(&mut t, "true", b"", 0);
+        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::Empty));
+        p10k_run(&mut t, "echo", b"\r\n", 0);
+        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::Empty), "a blank line is nothing");
+    }
+
+    #[test]
+    fn without_shell_integration_no_output_is_found() {
+        let mut t = Terminal::new(40, 10);
+        t.feed(b"$ ls\r\nfile\r\n$ ");
+        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::NoIntegration));
+        assert_eq!(t.command_output(OutputOf::Line(1)), Err(NoOutput::NoIntegration));
+    }
+
+    #[test]
+    fn a_full_screen_program_leaves_no_output_behind() {
+        let mut t = Terminal::new(40, 24);
+        t.feed(P10K_PROMPT);
+        p10k_run(&mut t, "ls", b"a  b\r\n", 0);
+        // vim: the alternate screen comes and goes, the cursor is restored.
+        t.feed(b"vim");
+        t.feed(&p10k_accept("vim"));
+        t.feed(b"\x1b]133;C;\x07\x1b[?1049h\x1b[H~\r\n~  VIM");
+        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::AltScreen), "not while it shows");
+        t.feed(b"\x1b[?1049l");
+        t.feed(&p10k_prompt_sp());
+        t.feed(b"\x1b]133;D;0\x07");
+        t.feed(P10K_PROMPT);
+        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::Empty));
+        // `ls` before it is still found by its line.
+        assert_eq!(output_of(&t, OutputOf::Line(line_showing(&t, "a  b"))), Ok("a  b".to_string()));
+    }
+
+    #[test]
+    fn output_whose_marks_were_dropped_is_gone() {
+        // Correct-or-absent: a scroll count lost to an overfull scrollback, and
+        // a reflow, drop the marks — and with them where any output is.
+        let mut t = Terminal::new(40, 24);
+        t.set_scrollback_lines(30);
+        t.feed(P10K_PROMPT);
+        p10k_run(&mut t, "ls", b"a  b\r\n", 0);
+        assert!(t.command_output(OutputOf::Last).is_ok());
+        t.feed("\x1b[200S".repeat(20).as_bytes()); // 4,000 lines in one slice
+        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::Gone));
+        p10k_run(&mut t, "ls", b"a  b\r\n", 0);
+        assert_eq!(output_of(&t, OutputOf::Last), Ok("a  b".to_string()), "fresh marks find it again");
+        t.resize(30, 24);
+        assert_eq!(t.command_output(OutputOf::Last), Err(NoOutput::Gone), "a reflow drops them too");
+    }
+
+    #[test]
+    fn output_partly_scrolled_out_is_what_remains() {
+        // `seq 200` in a 30-line scrollback, read by read as from a PTY: its
+        // prompt and first lines scroll out. Nothing stays anchored for it — the
+        // rest of the flood runs unanchored and loses its scroll count — yet
+        // what is left of its output is found, and says it is partial.
+        let mut t = Terminal::new(40, 5);
+        t.set_scrollback_lines(30);
+        t.feed(P10K_PROMPT);
+        t.feed(b"seq 200");
+        t.feed(&p10k_accept("seq 200"));
+        t.feed(b"\x1b]133;C;\x07");
+        for i in 1..=200 {
+            t.feed(format!("{i}\r\n").as_bytes());
+        }
+        assert!(!t.has_anchors(), "a command whose start scrolled out anchors nothing");
+        t.feed(&p10k_prompt_sp());
+        t.feed(b"\x1b]133;D;0\x07");
+        t.feed(P10K_PROMPT);
+        let r = t.command_output(OutputOf::Last).expect("what remains");
+        assert!(r.clipped, "its start is gone");
+        let text = t.output_text(&r);
+        let lines: Vec<&str> = text.lines().collect();
+        let first: usize = lines[0].parse().unwrap_or_else(|_| panic!("not output: {text:?}"));
+        assert!(first > 1 && lines.len() == 200 - first + 1, "{text:?}");
+        assert_eq!(lines.last(), Some(&"200"));
+        // Its lines find it too; the next command's output is its own.
+        let line_200 = line_showing(&t, "200");
+        assert_eq!(t.command_output(OutputOf::Line(line_200)), Ok(r));
+        p10k_run(&mut t, "echo hi", b"hi\r\n", 0);
+        assert_eq!(output_of(&t, OutputOf::Last), Ok("hi".to_string()));
+        assert!(output_of(&t, OutputOf::Line(line_200)).is_ok_and(|s| s.ends_with("\n199\n200")));
+    }
+
+    #[test]
+    fn a_line_finds_the_command_whose_output_holds_it() {
+        let mut t = Terminal::new(40, 24);
+        t.feed(P10K_PROMPT);
+        p10k_run(&mut t, "echo one", b"one\r\n", 0);
+        p10k_run(&mut t, "echo two", b"two\r\n", 1);
+        let at = |t: &Terminal, text| output_of(t, OutputOf::Line(line_showing(t, text)));
+        assert_eq!(at(&t, "one"), Ok("one".to_string()));
+        assert_eq!(at(&t, "two"), Ok("two".to_string()));
+        // The prompt and the command line are no output.
+        assert_eq!(at(&t, "\u{276f} echo two"), Err(NoOutput::NoCommand));
+        // A running command's output is what it printed so far.
+        t.feed(b"ping");
+        t.feed(&p10k_accept("ping"));
+        t.feed(b"\x1b]133;C;\x07reply 1\r\nreply 2\r\n");
+        assert_eq!(at(&t, "reply 1"), Ok("reply 1\nreply 2".to_string()));
+        assert_eq!(output_of(&t, OutputOf::Last), Ok("two".to_string()), "the last FINISHED command");
+    }
+
+    #[test]
+    fn output_copies_wide_chars_and_wrapped_lines_like_copy() {
+        let mut t = Terminal::new(40, 24);
+        t.feed(P10K_PROMPT);
+        let long = "x".repeat(50); // wraps at 40 columns
+        p10k_run(&mut t, "cat f", format!("日本語\r\n{long}\r\n").as_bytes(), 0);
+        assert_eq!(output_of(&t, OutputOf::Last), Ok(format!("日本語\n{long}")));
+    }
+
+    #[test]
+    fn selecting_an_output_brings_it_into_view() {
+        let mut t = Terminal::new(40, 5);
+        t.feed(P10K_PROMPT);
+        let out: String = (1..=20).map(|i| format!("{i}\r\n")).collect();
+        p10k_run(&mut t, "seq 20", out.as_bytes(), 0);
+        let r = t.command_output(OutputOf::Last).expect("seq's output");
+        assert!(t.select_output(&r), "the view moved to it");
+        let top_row = |t: &Terminal| t.viewport_rows_chars()[0].iter().collect::<String>();
+        assert_eq!(top_row(&t).trim_end(), "1", "longer than the screen: its first line on top");
+        assert_eq!(t.selection_text(), Some(t.output_text(&r)));
+        assert!(!t.select_output(&r), "already there");
+        t.scroll_to_bottom();
+        p10k_run(&mut t, "echo hi", b"hi\r\n", 0);
+        let r = t.command_output(OutputOf::Last).expect("echo's output");
+        assert!(!t.select_output(&r), "on the screen: nothing moves");
+        assert_eq!(t.selection_text().as_deref(), Some("hi"));
     }
 
     // ── OSC 133 command-completion event (v0.15 Run & Notify) ─────────────────
