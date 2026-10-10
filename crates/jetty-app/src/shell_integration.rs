@@ -191,11 +191,12 @@ const DIR_VAR: &str = "JETTY_SHELL_INTEGRATION_DIR";
 /// What every JeTTY shell needs for its opt-in line: `$JETTY_SHELL_INTEGRATION_DIR`,
 /// naming this run's snippets — written now unless they are there already
 /// ([`install_in`]), so one that went missing comes back with the next tab.
-/// Under `$XDG_RUNTIME_DIR` (a per-user tmpfs), else the `jetty` dir of the
-/// user's cache (macOS) — never the shared temp dir. Empty when they could
+/// Under `$XDG_RUNTIME_DIR` (a per-user tmpfs) when it is ours and private, as
+/// for the IPC socket (`crate::session_runtime_dir`), else the `jetty` dir of
+/// the user's cache (macOS) — never the shared temp dir. Empty when they could
 /// not be written: the line then does nothing.
 pub fn shell_env() -> Vec<(String, String)> {
-    let root = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()).map(PathBuf::from).or_else(|| {
+    let root = crate::session_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR")).or_else(|| {
         use std::os::unix::fs::DirBuilderExt;
         let dir = dirs::cache_dir()?.join("jetty");
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).ok()?;
@@ -210,9 +211,10 @@ pub fn shell_env() -> Vec<(String, String)> {
 /// Write the three snippets into `<root>/jetty-shell-<id>/` (0700) unless they
 /// are there, and return that directory. `<id>` hashes their content, so two
 /// JeTTYs at once (another config dir, another version) never source each
-/// other's. `None` when `root` is writable by other users — a snippet planted
-/// there would run in every shell — or a file could not be written. Each file
-/// is renamed into place whole: a starting shell never reads half of one.
+/// other's. `None` when `root` or that directory is not ours or is writable by
+/// other users — a snippet planted there would run in every shell — or a file
+/// could not be written. Each file is renamed into place whole: a starting
+/// shell never reads half of one.
 fn install_in(root: &Path) -> Option<PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -220,8 +222,10 @@ fn install_in(root: &Path) -> Option<PathBuf> {
     // Temp names unique within this process too: the first shell's worker
     // thread and a new tab may install at once.
     static TMP: AtomicUsize = AtomicUsize::new(0);
-    let meta = std::fs::metadata(root).ok()?;
-    if !meta.is_dir() || meta.mode() & 0o022 != 0 {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let ours = |m: std::fs::Metadata| m.is_dir() && m.uid() == uid && m.mode() & 0o022 == 0;
+    if !std::fs::metadata(root).is_ok_and(ours) {
         return None;
     }
     let files = [("jetty.zsh", ZSH), ("jetty.bash", BASH), ("jetty.fish", FISH)];
@@ -230,13 +234,17 @@ fn install_in(root: &Path) -> Option<PathBuf> {
         .flat_map(|(_, text)| text.bytes().chain([0]))
         .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
     let dir = root.join(format!("jetty-shell-{id:016x}"));
-    if files.iter().all(|(name, _)| dir.join(name).is_file()) {
-        return Some(dir);
-    }
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(_) => return None,
+    }
+    // One that was there already must be ours too (not a symlink to someone's).
+    if !std::fs::symlink_metadata(&dir).is_ok_and(ours) {
+        return None;
+    }
+    if files.iter().all(|(name, _)| dir.join(name).is_file()) {
+        return Some(dir);
     }
     for (name, text) in files {
         let tmp = dir.join(format!(".{name}.{}.{}", std::process::id(), TMP.fetch_add(1, Ordering::Relaxed)));
@@ -655,8 +663,22 @@ mod tests {
         let shared = private_root("shared");
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert_eq!(install_in(&shared), None);
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&shared);
+        // A snippet directory that was there already must be ours: not a link
+        // to a directory of planted snippets, not one others can write in.
+        let planted = private_root("planted");
+        for name in ["jetty.zsh", "jetty.bash", "jetty.fish"] {
+            std::fs::write(planted.join(name), "echo planted").unwrap();
+        }
+        let other = private_root("other");
+        std::os::unix::fs::symlink(&planted, other.join(dir.file_name().unwrap())).unwrap();
+        assert_eq!(install_in(&other), None, "a symlinked snippet directory");
+        let loose = private_root("loose");
+        std::fs::create_dir(loose.join(dir.file_name().unwrap())).unwrap();
+        std::fs::set_permissions(loose.join(dir.file_name().unwrap()), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(install_in(&loose), None, "a snippet directory others can write in");
+        for d in [root, shared, planted, other, loose] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 
     /// The opt-in line, loaded from the rc file as in real use, sources the
