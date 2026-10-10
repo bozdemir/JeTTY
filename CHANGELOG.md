@@ -7,6 +7,229 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.30.0] — 2026-10-10
+
+**The rest of the whole-codebase scan: Wayland that summons, a terminal that stays
+quick while another tab floods, and about 170 smaller fixes across every part of JeTTY.**
+
+Highlights:
+- **Wayland works**: F9 / `jetty --toggle` bring JeTTY back after a hide, tiling compositors hide it, paste reads native Wayland apps, and docks show its icon.
+- **Typing stays instant while another tab floods**: keypress-to-frame ~47 ms → ~3 ms.
+- **Search keeps up with streaming output** (a refresh at 100k lines: ~220 ms → 0.2 ms), and copy-mode/hint mode hold still while output arrives.
+- **Text**: bold and italic reach NFD and fallback glyphs, flags draw as emoji, every glyph stays on its cell, and characters no font has no longer freeze the window.
+- **Images** start at the cursor, keep their rows through resizes, and survive `mpv --vo=kitty`.
+- **Overlays share one order**, palette rows show their live shortcut, and Settings follows clicks with the keyboard.
+- **Safer output**: bidi and control characters can't spoof titles, link previews lead with the real host, hidden text is never run.
+
+### Changed and fixed
+
+#### Wayland
+- Wayland: hiding JeTTY closes its window (every tab and shell keeps running), and F9 / `jetty --toggle` / `--show` open it again, focused. A summon no longer just flashes the taskbar entry after the first hide, and tiling compositors (sway, river, Hyprland, niri) hide it too. The launcher's activation token travels with `jetty --toggle`.
+- Wayland: JeTTY launched from an app menu or a compositor shortcut takes the focus where the compositor wants an activation token.
+- Windows carry the app id of `jetty.desktop`: Wayland docks show JeTTY's icon and group it with its launcher, and the AppImage's X11 WM_CLASS is `jetty` instead of its file name.
+- `summon_hotkey = "none"` turns the built-in grab off, so you can bind `jetty --toggle` yourself and keep F9 for your apps. On Wayland JeTTY no longer grabs the key through XWayland.
+- The welcome splash says how to summon JeTTY: the hotkey, or on Wayland the binding to make. install.sh says so on Wayland too.
+- Wayland: a terminal minimized with ─ on a compositor that ignores minimizing paints again on the next key or click.
+- Wayland: pasting (Ctrl+Shift+V, the menu, middle click, OSC 52 reads) now gets what native Wayland apps copied — JeTTY uses the compositor's clipboard and primary selection directly, not XWayland's. A paste from a frozen app gives up after 4 s instead of freezing JeTTY.
+- Copy and paste start working once the clipboard becomes reachable, instead of staying off until a restart.
+- Wayland, macOS: a key held while the window loses focus (Alt+Tab, Settings, hide) now gets its kitty release; a key held across a tab switch is released in every tab that saw it.
+- Wayland: no crash when the last shell exits during a scrollbar drag.
+- Clicked links open with a fresh activation token, so the browser comes to the front, and without JeTTY's launch or AppImage variables.
+- Wayland: the Settings image hint no longer offers drag-and-drop, which winit does not deliver there yet.
+
+#### Speed
+- Typing in a tab no longer waits behind output flooding another tab: keypress-to-frame drops from about 47 ms to about 3 ms while a background tab streams.
+- A flood in a background tab no longer delays the active tab's echo or switches off its cursor trail.
+- The unfocused (hollow) cursor now appears when focus moves to Settings, a detached window or another app; a detached window's cursor follows its focus both ways.
+- `JETTY_PERF_LOG` no longer counts a key that produced no output (a password, Esc in vim) against the program's next reply.
+
+#### Summon and window modes
+- A window the window manager minimizes (taskbar, shortcut, show desktop) stops rendering its shell's output (X11); a minimized Settings window no longer redraws on a config reload.
+- Minimizing JeTTY with focus auto-hide on no longer leaves a dead taskbar entry (X11).
+- F9 is faster: JeTTY's X11 requests reuse one connection instead of opening one per summon.
+- Switching from Dropdown to Center gives the window back its own size and spot.
+- The Dropdown strip docks below a top panel and the macOS menu bar, never under a bottom panel or the Dock.
+- A summon with no saved spot stays centred, a restored spot keeps the whole window on its monitor, and an F11 escape after a Fullscreen-mode start no longer lands in the corner.
+- A detached window the window manager didn't focus no longer counts as focused, and the focus auto-hide keeps working after a detach.
+- F9 pressed right after a summon hides again instead of raising.
+- macOS: `jetty --show` brings a minimized terminal back.
+- With reduce_motion the Dropdown strip never slides.
+- The main window's taskbar title follows its shell while minimized or covered.
+- Reattaching a tab brings the main window forward; a drop no longer reattaches into a minimized window; a failed detach says so.
+
+#### Text
+- Bold and italic now reach text with combining marks (NFD names from macOS) and glyphs from fallback fonts — a bold "Café" is bold all the way, bold CJK is bold.
+- Characters no installed font has (octant art, newer emoji, a `cat` of a binary) no longer freeze JeTTY: a screen of them draws in milliseconds instead of seconds.
+- Every glyph stays on its cell: zero-width or odd-width glyphs (Noto Sans Mono's fraction slash) no longer shift the rest of the row, and a paragraph separator (U+2029) no longer cuts it.
+- CJK and symbols from fallback fonts sit on the text's baseline, CJK centred in its two cells.
+- Flags (🇹🇷) are drawn as one color emoji instead of two overlapping letters.
+- `minimum_contrast` now adjusts powerline icons (branch, lock) with their text.
+- After a terminal-font change, the chrome of every window — Settings, detached windows — keeps one typeface.
+- The UI-font list no longer offers symbol fonts (Dingbats) that turned the Settings panel into symbols.
+- The IME composition is underlined like other text, and its candidate window follows a composition shifted at the right edge.
+- Dragging a window's border no longer re-shapes every row on each frame.
+
+#### Search, hints and copy mode
+- Search keeps up with streaming output by reading only the new lines (a refresh at 100k lines: ~220 ms → 0.2 ms), and the match you jumped to stays current while output scrolls or the window is resized.
+- Search no longer hides older matches in scrollbacks with CJK text.
+- An open search no longer re-scans back to back, or at all in a hidden or covered window.
+- A middle-click on the open search bar pastes into the query.
+- Copy-mode and hint mode hold the view still while output streams in: the cursor, the selection and the chips stay on their text, and `y` copies what you selected.
+- Hint chips follow their text through a resize; a chip whose text changed disappears instead of copying the old token.
+- Hint mode labels the newest tokens when more than 100 are on screen, and no longer treats `//TODO` as a path.
+- In copy-mode, right-click → Copy / Run in New Tab acts on copy-mode's selection.
+- Copy-mode and hint mode end cleanly when another window switches the main window's tab, and are never drawn over a TUI that just started.
+- Hint mode and copy-mode work with a CJK input method in native mode.
+- A double-clicked bracket no longer slows every frame (up to 100 ms with a big scrollback), and a right-click no longer builds the whole selection just to check it exists.
+
+#### Inline images
+- Kitty images ended by BEL are drawn, and the output after a BEL- or 8-bit-ST-ended image no longer vanishes.
+- Sixel images start at the cursor (after `printf 'Plot: '`, in `timg -ps --grid`) and leave the cursor under the image, as in xterm.
+- Kitty images leave the cursor right of their last row, as in kitty: no blank row under `icat`/`timg` output, and `timg --grid` no longer staggers.
+- Kitty `c=`/`r=` scale an image keeping its shape (letterboxed when both are given); images wider than the grid are cut at its edge, not squashed.
+- Images draw pixel-crisp and no longer spill into the padding or scrollbar.
+- Images follow the cell size when a window moves to a monitor of another scale, and survive window resizes, fullscreen, font zoom and moving a tab between windows.
+- Quitting `mpv --vo=kitty` no longer erases the shell's images; `kitten icat --clear` keeps the scrollback's; `d=i,…,p=` deletes just that placement.
+- Re-sending a Kitty image id replaces its old placements; `I=` numbers get ids of their own and replies name `i=`, `I=` and `p=`.
+- A TUI's re-placed icon no longer vanishes when many other images are stored.
+- Kitty replies keep their place inside a synchronized update.
+- `CSI 14 t` reports the exact text-area size, so lsix montages fit the grid.
+- Full-window HiDPI sixels (up to 32 MB) are no longer dropped; sixels reserve the rows their declared size asks for.
+- The first tab knows its cell size at startup, so startup logos (fastfetch, neofetch) reserve the right rows.
+- A flood of tiny Kitty commands can no longer stall the UI by scrolling.
+- Faster image streams, and video-as-images no longer piles up GPU memory.
+
+#### Mouse, tab bar and detached windows
+- Touchpads and hi-res wheels send one wheel report per notch to vim/tmux/htop, not three.
+- The wheel and hover over the status strip no longer reach the program (tmux switched windows).
+- macOS: Shift+wheel scrolls JeTTY's scrollback over a mouse-tracking program with a classic wheel.
+- A wheel that can't move the view no longer repaints.
+- A selection drag follows the view when the wheel, a page key or a prompt jump scrolls it, and repaints when its selection changes, and only then.
+- A drag auto-scrolls even when the grid is flush with the screen edge.
+- The double/triple-click distance is 5 logical px at every DPI (grid, tab strip, detached bar).
+- tmux/vim no longer stay mid-drag after a focus loss, a hide or a tab switch.
+- Nothing the pointer hovered stays lit after it leaves a window, and Ctrl no longer underlines a link the pointer has left.
+- A new tab's "Tab N" never repeats one already open.
+- A detached window's notice pills show in that window.
+- Clicking a tab of an overflowed strip no longer moves the strip or the tab; another tab closing no longer cancels a tab drag or closes the tab menu.
+- X11 mixed DPI: a torn-off tab lands where it was dropped.
+- Detached windows: Select All and Clear menu rows, a "Select all" palette row, "— JeTTY" in the taskbar title, a "?" hover, their own monitor's refresh pacing, and a palette "Go to window: X".
+
+#### Keyboard
+- A held F11, Ctrl+Shift+D, Ctrl+, , the Menu key or an overlay chord acts once; scrolling, tab/prompt/theme stepping, font size and opacity still repeat. Copy and paste run once per press.
+- A Shift chord on a symbol or `0` (`Ctrl+Shift+/`, `Cmd+Shift+]`, `Ctrl+Shift+0`) fires where Shift changes the character.
+- macOS: a palette, search, hint or copy-mode toggle bound to an Option chord closes the overlay again.
+- Renaming a tab: Ctrl+Shift+V / Cmd+V pastes, and other Ctrl/Cmd chords type nothing.
+- F13–F24, an unbound Menu key and NumLock-off keypad 5 reach the program (xterm's sequences); Shift/Ctrl/Alt+Menu now sends CSI 29;m ~.
+- Ctrl+` and Ctrl+2…8 send xterm's control bytes.
+- The help and the reload notice name the summon key that actually works (F9 after an invalid value, the old key until a restart, a compositor shortcut on Wayland).
+- X11: a summon chord grabs the key that types it, and digit and symbol keys by position — Ctrl+Backquote no longer takes the comma key on Turkish-Q.
+- A Shift-only `[keys]` chord on a typing key (`Shift+T`) is rejected instead of swallowing capitals.
+- keyprobe flags typed text JeTTY sends differently and prints the session type.
+
+#### Palette, help, menus and overlays
+- Overlays follow one order for keys, clicks and drawing: the search bar no longer opens under the shortcuts help, and help, search, hint mode and copy-mode take the window from each other instead of a chord silently doing nothing.
+- The quit / close-tab confirmation is drawn above a command palette left open and gets the keys and clicks.
+- The welcome splash is gone at the first key, as documented; it no longer blocks hint/copy mode or shows over a new tab.
+- A detached window shows the IME composition under its help, like the main window, and no longer underlines Ctrl+hovered links under its help, palette or hint mode.
+- A dropped file no longer types into the shell behind a confirmation or the rename box; it goes into an open palette or search query, and hint/copy mode ignore it.
+- In hint mode, Ctrl/Cmd chords no longer pick a label and overwrite the clipboard.
+- Palette theme rows follow a theme by name, so a themes/ change while the palette is open can't retarget them; a theme only previewed in the palette is no longer what Esc in the Settings gallery restores, nor the base of next/previous/random theme; closing a detached window mid-preview restores the chosen theme everywhere.
+- The palette query is capped at 256 characters, like search's.
+- The shortcuts help follows remapped tab-jump keys and says where a drag copies.
+- Palette rows show their live shortcut, and "Help: keyboard shortcuts" opens the list from the palette.
+- The palette placeholder no longer runs into the result counter in narrow windows.
+
+#### Settings
+- Settings: browsing the terminal-font list resizes your shells once when you stop, not once per step — no more scattered p10k prompts.
+- Settings: the terminal-font list no longer offers fonts without letters (Noto Color Emoji calls itself monospace).
+- Settings: a covered or minimized Settings window no longer repaints (on macOS it woke JeTTY once a second); opening Settings no longer renders ~36 extra frames on Linux.
+- Settings: Esc after choosing a look no longer reverts just its theme; any theme choice outside the gallery ends the gallery's browsing.
+- Settings: an arrow key on a slider whose value is past its range (e.g. minimum_contrast 10) no longer drops the value to the slider's end.
+- Settings: changing the UI font or its size keeps the size you gave the Settings window.
+- Settings: an image dropped from backgrounds/ stays in the Image picker instead of jumping to None.
+- Settings: a released scrollbar thumb no longer stays highlighted.
+- Settings: text on a focused row, on buttons and on the selected list row is readable on every theme.
+- Settings: the keyboard follows a click — after clicking a control, the arrows adjust it.
+- Settings: dragging a slider costs about half the CPU.
+- docs: `dropdown_width_pct` has a Settings control.
+
+#### Configuration and hot reload
+- Hot reload works with a symlinked config folder (stow, home-manager) or a `JETTY_CONFIG_DIR` under `/tmp` on macOS.
+- `JETTY_CONFIG_DIR` may be relative or start with `~`; hot reload works and `jetty --toggle` from a JeTTY shell reaches the same instance.
+- On Linux the hot-reload watcher no longer wakes for every file opened in `~/.config`.
+- Hot reload says when it can't watch (inotify limits), in the window and in `jetty --check-config`.
+- The first settings change without a config file saves only that change, so later improved defaults reach you.
+- Deleting config.toml while JeTTY runs is reported and no longer undone by the next settings change.
+- An emptied or briefly missing config.toml is checked again before it applies.
+- Settings saves no longer reload every theme file or repaint every window.
+- `crt_phosphor` accepts any letter case.
+- A user theme replaces a built-in in any spelling.
+- Emacs lock files in `themes/` are ignored.
+- `jetty --check-config` and stderr never print a raw escape sequence from a file name; a shortened notice keeps its closing advice.
+- `jetty --check-config` also checks the backdrop image and `shell`.
+- macOS: `reduce_motion = "system"` follows Accessibility › Reduce motion.
+
+#### Shell integration and notifications
+- Ctrl+D or `exit` in a just-opened tab closes it even after a failed command; it used to swap in another shell.
+- A JeTTY started from a VS Code / Cursor terminal no longer hands that editor's git askpass, commit editor and sockets to every shell (nor zellij's, Neovim's or xterm's variables).
+- Auto-summon on finish works with desktop notifications off, and Settings no longer greys it out.
+- A command that printed nothing gets an empty notification body, not its prompt line.
+- bash integration no longer re-fires your ERR trap at every prompt.
+- New shell-integration line: it sources a file JeTTY writes, so no process starts per shell (an AppImage no longer mounts itself for every tab), and it works on macOS's bash 3.2. `--help`, the README and the snippets show the same line, and the old line keeps working.
+- fish 4, which marks its prompts itself, no longer gets duplicate marks.
+- Ctrl+C now interrupts a huge paste a program is still reading, and query replies are no longer dropped during a big paste.
+- Settings says Run & Notify and Smart titles need shell integration.
+- A bell in a detached window rings at once.
+- The shell that takes over a failed start gets a clean terminal.
+- Closing a tab gives its shell 2 s to save its history before it is killed.
+- A notification thread that fails to start no longer silences later toasts.
+- Toasts are tied to `jetty.desktop`, and AppImage toasts show JeTTY's icon.
+- Docs: on macOS, Run & Notify bounces the Dock icon.
+
+#### Terminal and untrusted output
+- `echo toggle | nc -U "$XDG_RUNTIME_DIR/jetty.sock"` toggles JeTTY; out of file descriptors the IPC thread no longer spins a core; on the BSDs a socket left by a crash is cleaned up again.
+- Program titles, process and directory names, notification text and config/theme notices can't reorder or break the chrome: control and invisible bidi/format characters (RLO …) are dropped, and shown as `�` in notices.
+- The Ctrl+hover link pill leads with the real host (`https://…@evil.example/`), shortens long paths in the middle and shows hidden characters as `%E2%80%AE`.
+- Run in New Tab stages, instead of running, a selection that covers text you couldn't see (SGR 8 concealed, or drawn in its own background colour). A link's hidden text no longer hides its target, and a plain URL ends where hidden text starts.
+- A program reading the clipboard with OSC 52 always gets an answer, so nvim's OSC 52 paste no longer stalls for 10 s.
+- Mouse tracking modes replace each other as in xterm, and DECRQM reports modes 9 and 1015.
+- Select All no longer copies an empty line for every blank row below the prompt.
+- A timed-out synchronized update in a background tab or hidden window delivers its replies, title, bell and clipboard at once; updates spanning several reads keep a full scrollback's marks and images, and an update can't freeze the screen (it ends 1 s after it began).
+- A bell flood in an unfocused window asks for attention once, until the window is focused again.
+- A `file://` link that names another machine is no longer opened as a local file; a pill says where the file is.
+- The IPC socket goes only in a directory of your own; outside `XDG_RUNTIME_DIR` the instance lock lives in the state dir.
+- An alt-screen toggle sent among other modes (`CSI ? 1049 ; 25 h`) keeps prompt marks on their rows.
+- Shell-integration snippets are sourced only from a directory you own.
+
+#### GPU and effects
+- The Phosphor summon rim and scan line glow in the theme's accent instead of a washed-out pastel of it; a colored caret glow likewise.
+- A broken backdrop image replaced by another pick while it decoded no longer blanks the image on screen or blames the new file.
+- The backdrop image stays sharp when the window moves to a bigger monitor.
+- CRT scanlines and the shadow mask keep their size on HiDPI screens.
+- A window whose surface is lost or left unconfigured recovers on its own instead of staying blank until a resize.
+- After a GPU loss that does not recover, retries back off up to 30 s, and detached and Settings windows wait for the main device instead of taking one each.
+- Faster: one GPU submit fewer on typing frames; the first frame's effect pipelines compile during startup; detaching a tab and opening Settings no longer recompile shaders; the CRT keeps only its four most recent variants.
+
+#### Platform, CLI and releases
+- A newer JeTTY launched while an older one runs says how to switch; an updated AppImage moves Launch at login to itself.
+- `jetty` in an `ssh -X` session or a second X session starts that display's own JeTTY instead of toggling the other screen's.
+- A login item switched off in the desktop's startup settings stays off.
+- A summon key that can't be grabbed says what to do (another key, or `jetty --toggle`); macOS no longer points at Accessibility.
+- Closing the last tab asks "Close the last tab and quit JeTTY?".
+- Hint mode, copy-mode and Run in New Tab say why when they can't act.
+- A `[keys]` conflict names the action that holds the chord.
+- A failed start notifies the desktop when launched from it; no display is a clean error (exit 1); a refused second instance exits 1.
+- A home directory that can't take file locks (NFS without lockd) no longer stops JeTTY from starting.
+- `jetty --help` says other arguments, like `-e`, are ignored.
+- Release files carry signed build provenance; the tarball holds only what install.sh installs.
+- Docs: perf numbers, smart-case search, Center remembers its spot, the perf HUD lives in the status strip, global-hotkey.md, roadmap, fonts and GPU.
+
+#### Development
+- `verify-idle.sh` reads %CPU instead of the CPU core number; `check-paint-choke.sh` checks every jetty-app module.
+- The newest stable clippy is satisfied; the theme and watcher tests run on macOS too.
+- Font-dependent text tests hold on CI runners with only DejaVu installed.
+
 ## [0.29.1] — 2026-10-09
 
 **Fixes from a scan of the whole codebase: menus that behave, output that
