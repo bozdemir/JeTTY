@@ -12064,7 +12064,11 @@ impl App {
         // winit only when that cell moves) — mirrors the main window.
         let ime_area = {
             let (cw, ch) = dw.text.cell_size();
-            input::ime_cursor_area(snap.cursor_row, snap.cursor_col, cw, ch, origin)
+            let col = match &dw.ime_preedit {
+                Some(p) => jetty_render::preedit_start_col(p, snap.cursor_col, snap.cols),
+                None => snap.cursor_col,
+            };
+            input::ime_cursor_area(snap.cursor_row, col, cw, ch, origin)
         };
         if dw.ime_area != Some(ime_area) {
             dw.ime_area = Some(ime_area);
@@ -12471,7 +12475,8 @@ impl App {
         if let Some(p) = &preedit_ui {
             let (cell_w, cell_h) = text.cell_size();
             if let Some(mut ov) = jetty_render::build_preedit_overlay(
-                p, snap.cursor_row, snap.cursor_col, snap.cols, cell_w, cell_h, origin.top, &theme, scale,
+                p, snap.cursor_row, snap.cursor_col, snap.cols, cell_w, cell_h, origin.top, &theme,
+                text.underline_geom(),
             ) {
                 jetty_render::shift_x(&mut ov.quads, origin.left);
                 jetty_render::shift_labels_x(&mut ov.labels, origin.left);
@@ -15924,10 +15929,15 @@ impl ApplicationHandler<AppEvent> for App {
                 let snap = self.active_tab().terminal.snapshot();
                 let theme = self.current_theme();
                 // The IME candidate window follows the cursor cell (handed to
-                // winit only when that cell moves, not every frame).
+                // winit only when that cell moves, not every frame) — where the
+                // composition starts, which shifts left at the right edge.
                 let ime_area = self.text.as_ref().map(|t| {
                     let (cw, ch) = t.cell_size();
-                    input::ime_cursor_area(snap.cursor_row, snap.cursor_col, cw, ch, self.grid_origin())
+                    let col = match &self.ime_preedit {
+                        Some(p) => jetty_render::preedit_start_col(p, snap.cursor_col, snap.cols),
+                        None => snap.cursor_col,
+                    };
+                    input::ime_cursor_area(snap.cursor_row, col, cw, ch, self.grid_origin())
                 });
                 if let Some(area) = ime_area {
                     if self.ime_area != Some(area) {
@@ -16746,7 +16756,7 @@ impl ApplicationHandler<AppEvent> for App {
                             cell_h,
                             origin.top + slide_y_offset,
                             &theme,
-                            scale,
+                            text.underline_geom(),
                         ) {
                             jetty_render::shift_x(&mut ov.quads, origin.left);
                             jetty_render::shift_labels_x(&mut ov.labels, origin.left);

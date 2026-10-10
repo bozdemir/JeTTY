@@ -1523,7 +1523,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(p) = std::env::var("JETTY_SHOT_PREEDIT") {
             if let Some(mut ov) = jetty_render::build_preedit_overlay(
                 &p, snap.cursor_row, snap.cursor_col, snap.cols, cell_w, cell_h, shot_origin.top,
-                terminal.theme(), dpi,
+                terminal.theme(), text.underline_geom(),
             ) {
                 jetty_render::shift_x(&mut ov.quads, shot_origin.left);
                 jetty_render::shift_labels_x(&mut ov.labels, shot_origin.left);
