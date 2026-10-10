@@ -502,3 +502,61 @@ fn a_paste_past_the_reply_cap_still_arrives_whole() {
     }
     assert!(seen.contains(&want), "the program must receive all {N} bytes; it printed {seen:?}");
 }
+
+/// `argv` run in place of a shell (`jetty -e`) on a fresh 80×24 PTY, with the
+/// test shells' environment and `sh` as the tab's shell.
+fn spawn_program(argv: &[&str], cwd: Option<std::path::PathBuf>) -> std::io::Result<PtySession> {
+    let argv = argv.iter().map(std::ffi::OsString::from).collect();
+    PtySession::spawn_program(80, 24, 0, 0, Some(SH.into()), argv, cwd, common::hermetic_env(), || {})
+}
+
+#[cfg(unix)]
+#[test]
+fn a_program_gets_exactly_its_arguments_no_shell_reads_them() {
+    // `jetty -e echo …`: what would be a substitution, a second command or a
+    // glob to a shell reaches the program as typed.
+    let pty = spawn_program(&["echo", "a  b", "$(echo pwned);x", "*"], None).expect("spawn echo");
+    let out = read_until(&pty, "*");
+    assert!(out.contains("a  b $(echo pwned);x *"), "{out:?}");
+    assert!(wait_exited(&pty), "echo exits");
+    assert_eq!(pty.failed_program_start(), None, "a clean exit closes the tab");
+    assert!(pty.respawn_after_failed_start().is_none(), "a program is never replaced by a shell");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_program_starts_where_it_is_asked_with_the_tab_shell_as_shell() {
+    let dir = std::fs::canonicalize(env!("CARGO_TARGET_TMPDIR")).unwrap().join("program-cwd");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pty = spawn_program(&["sh", "-c", "echo \"in=$(pwd -P) shell=$SHELL\""], Some(dir.clone())).expect("spawn");
+    let want = format!("in={} shell={SH}", dir.display());
+    let out = read_until(&pty, &want);
+    assert!(out.contains(&want), "{out:?}");
+    // A directory that is not there is an error, never a start somewhere else.
+    let gone = dir.join("missing");
+    let err = spawn_program(&["true"], Some(gone.clone())).map(|_| ()).unwrap_err();
+    assert_eq!(err.to_string(), format!("\"{}\": not a directory", gone.display()));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_program_that_fails_right_away_says_how() {
+    let pty = spawn_program(&["false"], None).expect("spawn false");
+    assert!(wait_exited(&pty), "premise: false exits");
+    assert_eq!(pty.failed_program_start().as_deref(), Some("exited with status 1"));
+    assert!(pty.respawn_after_failed_start().is_none(), "no shell takes over a program");
+    // Typed into, its end is the user's.
+    let mut typed = spawn_program(&["false"], None).expect("spawn false");
+    typed.note_user_input();
+    assert!(wait_exited(&typed));
+    assert_eq!(typed.failed_program_start(), None);
+}
+
+#[test]
+fn a_program_that_cannot_start_is_a_short_error() {
+    let missing = spawn_program(&["jetty-no-such-program"], None).map(|_| ()).unwrap_err();
+    assert_eq!(missing.to_string(), "\"jetty-no-such-program\": not found in PATH");
+    let empty = spawn_program(&[""], None).map(|_| ()).unwrap_err();
+    assert_eq!(empty.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(spawn_program(&[], None).is_err());
+}

@@ -290,6 +290,10 @@ pub struct PtySession {
 #[derive(Clone)]
 struct SpawnPlan {
     candidates: Vec<String>,
+    /// A program run in place of the shell ([`PtySession::spawn_program`]):
+    /// its arguments, `[0]` the program. Then the candidates only name the
+    /// shell `$SHELL` points at.
+    program: Option<Vec<std::ffi::OsString>>,
     cwd: Option<std::path::PathBuf>,
     env: Vec<(String, String)>,
 }
@@ -312,6 +316,33 @@ const HANGUP_GRACE: Duration = Duration::from_secs(2);
 fn failed_start(status: &portable_pty::ExitStatus, lived: Duration) -> bool {
     let interrupted = status.signal().is_none() && status.exit_code() == 130;
     !status.success() && !interrupted && lived < FAILED_START_WINDOW
+}
+
+/// How a process ended, for a notice: "exited with status 1", "died
+/// (Segmentation fault)".
+fn exit_how(status: &portable_pty::ExitStatus) -> String {
+    match status.signal() {
+        Some(signal) => format!("died ({signal})"),
+        None => format!("exited with status {}", status.exit_code()),
+    }
+}
+
+/// Why `program` could not be started, in a few words, from portable-pty's
+/// error — which quotes the whole `PATH` and runs over several lines:
+/// `"htpo": not found in PATH`.
+fn program_error(program: &std::ffi::OsStr, err: &str) -> String {
+    let why = if err.contains("not executable") {
+        "not executable"
+    } else if err.contains("is a directory") {
+        "is a directory"
+    } else if err.contains("No viable candidates found in PATH") {
+        "not found in PATH"
+    } else if err.contains("does not exist") || err.contains("doesn't exist") {
+        "no such file"
+    } else {
+        err.lines().next().unwrap_or(err)
+    };
+    format!("\"{}\": {why}", program.to_string_lossy())
 }
 
 /// `Write` adapter handed to the app: forwards buffers to the PTY writer
@@ -1046,7 +1077,8 @@ impl PtySession {
         let requested = shell_override.clone().filter(|s| !s.is_empty());
         // A vanished directory silently degrades to existing behavior;
         // portable-pty re-guards (non-dir → home) at exec time.
-        let plan = SpawnPlan { candidates: shell_candidates(shell_override), cwd: cwd.filter(|d| d.is_dir()), env };
+        let plan =
+            SpawnPlan { candidates: shell_candidates(shell_override), program: None, cwd: cwd.filter(|d| d.is_dir()), env };
         // Shared so the reader thread (coalesced output / EOF wakes), the waiter
         // thread (exit wake) and `rearm_wake` can all drive it. `spawn`'s
         // `on_data` is only `Send`, so it can't be cloned across threads
@@ -1070,6 +1102,39 @@ impl PtySession {
         Ok(session)
     }
 
+    /// [`PtySession::spawn_with_env`] running `argv` — `[0]` the program,
+    /// looked up in `PATH` unless it names a path — in place of a shell, the
+    /// way a terminal's `-e` does: exec'd with exactly these arguments, no
+    /// shell parses them. It gets the shells' environment, `$SHELL` naming
+    /// the shell its tab would have run (`shell_override` first), for the
+    /// shells it starts itself (tmux, `vim :sh`). Unlike a shell, it starts
+    /// only where it was asked to: a `cwd` that is not a directory, or a
+    /// program that can't be started, is the error — a short reason
+    /// (`"htpo": not found in PATH`) — never a fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_program(
+        cols: u16,
+        rows: u16,
+        px_w: u16,
+        px_h: u16,
+        shell_override: Option<String>,
+        argv: Vec<std::ffi::OsString>,
+        cwd: Option<std::path::PathBuf>,
+        env: Vec<(String, String)>,
+        on_data: impl Fn() + Send + 'static,
+    ) -> std::io::Result<PtySession> {
+        use std::io::{Error, ErrorKind};
+        let program = argv.first().filter(|p| !p.is_empty()).cloned();
+        let program = program.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no program to run"))?;
+        if let Some(dir) = cwd.as_deref().filter(|d| !d.is_dir()) {
+            return Err(Error::new(ErrorKind::NotFound, format!("\"{}\": not a directory", dir.display())));
+        }
+        let plan = SpawnPlan { candidates: shell_candidates(shell_override), program: Some(argv), cwd, env };
+        let wake: Wake = Arc::new(Mutex::new(Box::new(on_data)));
+        let size = PtySize { rows, cols, pixel_width: px_w, pixel_height: px_h };
+        Self::spawn_plan(size, plan, 0, wake).map_err(|e| Error::new(e.kind(), program_error(&program, &e.to_string())))
+    }
+
     /// Spawn the first of `plan.candidates[first..]` that starts, on a fresh
     /// PTY of `size`, with its reader, writer and waiter threads. Its
     /// `startup_notices` say only when the start directory could not be entered.
@@ -1082,33 +1147,46 @@ impl PtySession {
 
         // Build a fully-configured CommandBuilder for a given shell path and start
         // directory. Kept as a closure so every fallback candidate gets the
-        // identical environment.
+        // identical environment — and a program run in place of the shell too.
         let make_cmd = |shell: &str, cwd: Option<&std::path::Path>| {
-            // macOS terminals start LOGIN shells (argv0 "-zsh") so /etc/zprofile
-            // runs path_helper and ~/.zprofile sets up Homebrew/rustup — without
-            // it a Dock/Finder-launched JeTTY has a bare PATH. portable-pty's
-            // default-program builder does exactly that for the shell named by
-            // `SHELL`. Linux keeps the conventional non-login interactive shell.
-            #[cfg(target_os = "macos")]
-            let mut cmd = {
-                let mut cmd = CommandBuilder::new_default_prog();
-                cmd.env("SHELL", shell);
-                cmd
+            let mut cmd = match &plan.program {
+                // A program: exec'd with exactly its arguments (portable-pty
+                // looks the program up in `PATH` and keeps `argv[0]`).
+                Some(argv) => {
+                    let mut cmd = CommandBuilder::from_argv(argv.clone());
+                    if is_interactive_shell(shell) {
+                        cmd.env("SHELL", shell);
+                    }
+                    cmd
+                }
+                // macOS terminals start LOGIN shells (argv0 "-zsh") so /etc/zprofile
+                // runs path_helper and ~/.zprofile sets up Homebrew/rustup — without
+                // it a Dock/Finder-launched JeTTY has a bare PATH. portable-pty's
+                // default-program builder does exactly that for the shell named by
+                // `SHELL`. Linux keeps the conventional non-login interactive shell.
+                #[cfg(target_os = "macos")]
+                None => {
+                    let mut cmd = CommandBuilder::new_default_prog();
+                    cmd.env("SHELL", shell);
+                    cmd
+                }
+                #[cfg(not(target_os = "macos"))]
+                None => {
+                    let mut cmd = CommandBuilder::new(shell);
+                    // `$SHELL` names the shell that runs here — the `shell`
+                    // override or a fallback, not the login shell JeTTY
+                    // inherited — so tmux, `vim :sh`, `sudo -s`, mc… open the
+                    // same shell as the tab (macOS sets it above; xterm does the
+                    // same). Only for an actual shell: a multiplexer set as
+                    // `shell` (screen) would start itself in every window.
+                    if is_interactive_shell(shell) {
+                        cmd.env("SHELL", shell);
+                    }
+                    cmd
+                }
             };
-            #[cfg(not(target_os = "macos"))]
-            let mut cmd = CommandBuilder::new(shell);
             for key in uninherited_env() {
                 cmd.env_remove(key);
-            }
-            // `$SHELL` names the shell that runs here — the `shell` override or
-            // a fallback, not the login shell JeTTY inherited — so tmux, `vim
-            // :sh`, `sudo -s`, mc… open the same shell as the tab (macOS sets it
-            // above; xterm does the same). Only for an actual shell: a
-            // multiplexer set as `shell` (screen) would start itself in every
-            // window.
-            #[cfg(not(target_os = "macos"))]
-            if is_interactive_shell(shell) {
-                cmd.env("SHELL", shell);
             }
             // Advertise a capable terminal so shells (and prompts like p10k) run
             // their capability probes and emit truecolor; without TERM set, those
@@ -1168,7 +1246,7 @@ impl PtySession {
 
         let spawn_one = |shell: &str, cwd: Option<&std::path::Path>| {
             #[cfg(target_os = "macos")]
-            if !is_executable(shell) {
+            if plan.program.is_none() && !is_executable(shell) {
                 return Err(format!("{shell} is not an executable file"));
             }
             pair.slave.spawn_command(make_cmd(shell, cwd)).map_err(|e| e.to_string())
@@ -1177,11 +1255,21 @@ impl PtySession {
         // Try each candidate until one actually spawns. A persisted override
         // that no longer exists on disk (uninstalled/moved) must NOT prevent a
         // usable window — fall through to $SHELL/passwd/bash/sh instead (F2).
+        // A program runs once, where it was asked to, its `$SHELL` the first
+        // candidate that is there — no candidate is tried for it.
         let mut child = None;
         let mut launched = first;
         let mut last_err = None;
         let mut cwd_notice = None;
-        for (i, shell) in plan.candidates.iter().enumerate().skip(first) {
+        let shells: &[String] = if plan.program.is_some() { &[] } else { &plan.candidates };
+        if plan.program.is_some() {
+            let shell = plan.candidates.iter().find(|c| std::path::Path::new(c).is_file());
+            match spawn_one(shell.map_or("", String::as_str), cwd.as_deref()) {
+                Ok(c) => child = Some(c),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        for (i, shell) in shells.iter().enumerate().skip(first) {
             match spawn_one(shell, cwd.as_deref()) {
                 Ok(c) => {
                     child = Some(c);
@@ -1381,12 +1469,13 @@ impl PtySession {
     /// and wake, whose [`PtySession::startup_notices`] say what happened — so a
     /// tab (and with the last tab, the whole app) does not just vanish.
     /// `None` when the shell is alive, ended cleanly or later, was typed into
-    /// ([`PtySession::note_user_input`]), or was the last candidate;
+    /// ([`PtySession::note_user_input`]), or was the last candidate — and for
+    /// a program run in place of a shell, which has none;
     /// `Some(Err)` when no further candidate could be spawned. Drain this
     /// session's remaining output first: it is the dead shell's last words,
     /// usually the error.
     pub fn respawn_after_failed_start(&self) -> Option<std::io::Result<PtySession>> {
-        if self.user_input {
+        if self.user_input || self.plan.program.is_some() {
             return None;
         }
         let (status, ended) = self.ended.lock().ok()?.clone()?;
@@ -1399,16 +1488,28 @@ impl PtySession {
         }
         let size = self.master.lock().ok()?.get_size().ok()?;
         let dead = self.launched_shell();
-        let how = match status.signal() {
-            Some(signal) => format!("died ({signal})"),
-            None => format!("exited with status {}", status.exit_code()),
-        };
+        let how = exit_how(&status);
         Some(Self::spawn_plan(size, self.plan.clone(), next, Arc::clone(&self.wake)).map(|mut session| {
             let notice =
                 format!("jetty: \"{dead}\" {how} right after starting — using \"{}\" instead.", session.launched_shell());
             session.startup_notices.insert(0, notice);
             session
         }))
+    }
+
+    /// How a program run in place of a shell ([`PtySession::spawn_program`])
+    /// failed right after starting — ended unsuccessfully within
+    /// [`FAILED_START_WINDOW`], nothing typed into it ("exited with status
+    /// 127", "died (Segmentation fault)"): a tab that closed then would take
+    /// the error it printed with it, so the app keeps it open, saying so.
+    /// `None` while it runs, when it ended any other way, and for a shell
+    /// ([`PtySession::respawn_after_failed_start`] is the shell's).
+    pub fn failed_program_start(&self) -> Option<String> {
+        if self.user_input || self.plan.program.is_none() {
+            return None;
+        }
+        let (status, ended) = self.ended.lock().ok()?.clone()?;
+        failed_start(&status, ended.duration_since(self.started)).then(|| exit_how(&status))
     }
 
     /// Record that the user typed, pasted or ran a command in this shell (the
@@ -1890,6 +1991,20 @@ mod tests {
         for other in ["/usr/bin/screen", "/usr/bin/tmux", "/usr/bin/zellij", "/usr/bin/vim", "/home/u/bin/zsh-wrapper"] {
             assert!(!is_interactive_shell(other), "{other}");
         }
+    }
+
+    #[test]
+    fn a_program_that_cannot_start_says_why_in_a_few_words() {
+        use std::ffi::OsStr;
+        let why = |err: &str| program_error(OsStr::new("htpo"), err);
+        // portable-pty 0.9's errors: the PATH search quotes the whole PATH.
+        let path = "Unable to spawn htpo because:\nNo viable candidates found in PATH \"/usr/bin:/bin\"";
+        assert_eq!(why(path), "\"htpo\": not found in PATH");
+        assert_eq!(why("Unable to spawn ./htpo because it does not exist"), "\"htpo\": no such file");
+        assert_eq!(why("Unable to spawn /x/htpo because it doesn't exist on the filesystem (ENOENT)"), "\"htpo\": no such file");
+        assert_eq!(why("Unable to spawn ./htpo because it is not executable"), "\"htpo\": not executable");
+        assert_eq!(why("Unable to spawn /tmp because it is a directory"), "\"htpo\": is a directory");
+        assert_eq!(why("Permission denied (os error 13)\nmore"), "\"htpo\": Permission denied (os error 13)");
     }
 
     #[test]
