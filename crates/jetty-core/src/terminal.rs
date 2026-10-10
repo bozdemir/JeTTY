@@ -1079,6 +1079,13 @@ pub struct Terminal {
     /// selection with scrolling output, so no stored point goes stale. Reset
     /// by every new selection ([`Terminal::set_selection`]).
     url_select: Option<bool>,
+    /// While a double-click (word / bracket-pair) selection is live: where the
+    /// double-clicked cell is, as `(lines below the selection's first cell,
+    /// column)` — alacritty moves the selection with scrolling output, so the
+    /// offset stays true. The selection is stored as the cells it resolved to
+    /// (see [`Terminal::select_words`]); every drag re-derives it from that
+    /// cell. Reset by every new selection.
+    word_select: Option<(i32, usize)>,
     /// Absolute grid-line index of the active-region top (grid `Line(0)`).
     /// Advanced by `history_size()` growth in [`Terminal::advance_piece`] /
     /// [`Terminal::flush_sync`]; the stable anchor that lets OSC 133 prompt marks
@@ -1439,6 +1446,7 @@ impl Terminal {
             screen_switches: 0,
             view_pinned: false,
             url_select: None,
+            word_select: None,
             abs_top: 0,
             scrollback_limit,
             anchor_epoch: 0,
@@ -4801,6 +4809,7 @@ impl Terminal {
     /// go through here, which ends a URL double-click drag.
     fn set_selection(&mut self, sel: Option<Selection>) {
         self.url_select = None;
+        self.word_select = None;
         self.term.selection = sel;
     }
 
@@ -4821,7 +4830,25 @@ impl Terminal {
             self.url_select = Some(true);
             return;
         }
-        self.set_selection(Some(Selection::new(SelectionType::Semantic, pt, Side::Left)));
+        self.select_words(pt, pt, Side::Left);
+    }
+
+    /// Select from double-clicked cell `origin` to `pt` as alacritty's word
+    /// (Semantic) selection does — the bracket pair when `pt` is `origin` on a
+    /// bracket, else whole words — resolved ONCE and stored as those cells,
+    /// with `word_select` noting where `origin` is. Left Semantic, every
+    /// `to_range` re-derived it — each frame, each selection_text — and on an
+    /// unmatched bracket that is a bracket search through the whole
+    /// scrollback (or the rest of the screen).
+    fn select_words(&mut self, origin: Point, pt: Point, side: Side) {
+        let mut sel = Selection::new(SelectionType::Semantic, origin, Side::Left);
+        sel.update(pt, side);
+        let Some(range) = sel.to_range(&self.term) else {
+            self.set_selection(None);
+            return;
+        };
+        self.set_selection(Some(cell_range_selection(range.start, range.end)));
+        self.word_select = Some((origin.line.0 - range.start.line.0, origin.column.0));
     }
 
     /// Update the end of the current selection to the given viewport cell.
@@ -4834,6 +4861,14 @@ impl Terminal {
             return;
         }
         let side = if left_half { Side::Left } else { Side::Right };
+        if let Some((lines, column)) = self.word_select {
+            // The double-clicked cell, below the stored cells' first one.
+            let range = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term));
+            if let Some(range) = range {
+                self.select_words(Point::new(range.start.line + lines, Column(column)), pt, side);
+                return;
+            }
+        }
         if let Some(sel) = self.term.selection.as_mut() {
             sel.update(pt, side);
         }
@@ -11337,6 +11372,64 @@ mod tests {
         assert!(!t.mouse_utf8());
         t.feed(b"\x1b[?1005h");
         assert!(t.mouse_utf8());
+    }
+
+    #[test]
+    fn a_double_click_on_a_bracket_is_resolved_once() {
+        // A double-click selection was a Semantic one, re-derived by every
+        // `to_range` — every frame, every selection_text: on an unmatched
+        // bracket that is a bracket search through the whole scrollback.
+        let mut t = Terminal::new(30, 4);
+        for i in 0..200 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        t.feed(b">>> x) f(a, b) y");
+        t.selection_start_semantic(3, 8); // the `(` of f(a, b)
+        assert_eq!(t.selection_text().as_deref(), Some("(a, b)"));
+        assert_eq!(t.term.selection.as_ref().map(|s| s.ty), Some(SelectionType::Simple), "stored as its cells");
+        t.selection_start_semantic(3, 5); // the unmatched `)`
+        assert_eq!(t.term.selection.as_ref().map(|s| s.ty), Some(SelectionType::Simple));
+        // Output scrolls the double-clicked word up two rows; a drag still
+        // grows it from that word.
+        t.selection_start_semantic(3, 12); // `b`
+        t.feed(b"\r\nmore\r\nlines");
+        t.selection_update(1, 15, false); // `y`, two rows up now
+        assert_eq!(t.selection_text().as_deref(), Some("b) y"));
+    }
+
+    #[test]
+    fn a_double_click_selection_covers_what_alacritty_s_word_selection_does() {
+        // Resolved once and re-derived from the double-clicked cell on every
+        // drag, the range equals a Semantic selection's — words, bracket
+        // pairs, separators, wide chars — back on the origin cell too.
+        let mut r = Rng(0x5eed_d0b1);
+        let pieces: [&[u8]; 13] = [
+            b"ab", b" ", b"(", b")", b"[", b"]", b"<", b">", "\u{4e2d}".as_bytes(), b"\r\n", b"x:y", b"{", b"}",
+        ];
+        let at = |t: &Terminal, row: usize, col: usize| {
+            viewport_to_point(t.term.grid().display_offset(), Point::new(row, Column(col)))
+        };
+        let range = |t: &Terminal, sel: &Selection| sel.to_range(&t.term).map(|r| (r.start, r.end));
+        let mine = |t: &Terminal| t.term.selection.as_ref().and_then(|s| s.to_range(&t.term)).map(|r| (r.start, r.end));
+        for case in 0..300 {
+            let mut t = Terminal::new(2 + r.below(20), 1 + r.below(6));
+            for _ in 0..r.below(60) {
+                t.feed(r.pick(&pieces));
+            }
+            let (rows, cols) = (t.rows, t.cols);
+            let (row, col) = (r.below(rows), r.below(cols));
+            let mut reference = Selection::new(SelectionType::Semantic, at(&t, row, col), Side::Left);
+            t.selection_start_semantic(row, col);
+            assert_eq!(mine(&t), range(&t, &reference), "case {case}: double-click at {row},{col}");
+            for step in 0..r.below(6) {
+                let (row2, col2, left) =
+                    if r.chance(4) { (row, col, true) } else { (r.below(rows), r.below(cols), r.chance(2)) };
+                let side = if left { Side::Left } else { Side::Right };
+                reference.update(at(&t, row2, col2), side);
+                t.selection_update(row2, col2, left);
+                assert_eq!(mine(&t), range(&t, &reference), "case {case} step {step}: drag to {row2},{col2}");
+            }
+        }
     }
 
     #[test]
