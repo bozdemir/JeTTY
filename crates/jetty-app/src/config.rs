@@ -1696,13 +1696,14 @@ pub(crate) fn preserve_copy(path: &Path, tag: &str) -> std::io::Result<PathBuf> 
 // ── Notices ──────────────────────────────────────────────────────────────────
 
 /// Make user-derived notice text safe to print into a terminal or a pill: every
-/// control character (ESC, CR, C1, …) becomes a visible `�`, so a value quoted
-/// from config.toml — or a theme file's name — can never inject an escape
-/// sequence (an OSC 52 clipboard write, a title). Every copy of a config or
-/// theme problem goes through it: the pill, the first tab, stderr and
-/// `jetty --check-config`.
+/// character that must not reach the chrome ([`jetty_core::untrusted::hides_text`]:
+/// ESC, CR, C1, an RLO reordering the rest of the pill, …) becomes a visible
+/// `�`, so a value quoted from config.toml — or a theme file's name — can never
+/// inject an escape sequence (an OSC 52 clipboard write, a title) or disguise
+/// itself. Every copy of a config or theme problem goes through it: the pill,
+/// the first tab, stderr and `jetty --check-config`.
 pub(crate) fn sanitize_notice(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() { '\u{FFFD}' } else { c }).collect()
+    s.chars().map(|c| if jetty_core::untrusted::hides_text(c) { '\u{FFFD}' } else { c }).collect()
 }
 
 /// `notice` in at most `max` characters: whole when it fits, else its start cut
@@ -3974,8 +3975,10 @@ caret_glow_enabled = true\n";
         assert_eq!(fit_notice(&plain, 96), "x".repeat(95) + "…");
         let long_tail = format!("problem — {}", "y".repeat(90));
         assert!(fit_notice(&long_tail, 96).ends_with("yy…"));
-        // Escapes never survive sanitizing.
+        // Escapes never survive sanitizing, nor a character that reorders or
+        // hides the rest of the pill.
         assert_eq!(sanitize_notice("a\u{1b}]52;c;QQ==\u{7}b\u{9b}"), "a\u{FFFD}]52;c;QQ==\u{FFFD}b\u{FFFD}");
+        assert_eq!(sanitize_notice("theme \u{202E}lmot.\u{200B}x"), "theme \u{FFFD}lmot.\u{FFFD}x");
     }
 
     #[test]
