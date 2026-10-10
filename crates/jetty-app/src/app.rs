@@ -6782,6 +6782,10 @@ impl App {
                 painted = true;
             }
         }
+        if main_changed {
+            // The taskbar title too, painted or not (see `sync_main_os_title`).
+            self.sync_main_os_title();
+        }
         if main_changed && self.visible && !self.main_occluded {
             self.request_main_paint();
             painted = true;
@@ -7451,22 +7455,30 @@ impl App {
                 .map(|(i, t)| (t.title.clone(), i == self.active))
                 .collect();
             self.cached_tabs_sig = sig;
-            // Sync the main window's OS title to the active tab (the window is
-            // undecorated, so this shows in the taskbar/alt-tab only). Runs
-            // ONLY inside this sig-changed branch — never per-frame — and the
-            // hash covers every title mutation path (OSC, rename, tab switch,
+            // Sync the main window's OS title to the active tab. Runs ONLY
+            // inside this sig-changed branch — never per-frame — and the hash
+            // covers every title mutation path (OSC, rename, tab switch,
             // close, reattach) for free.
-            let active_title =
-                self.tabs.get(self.active).map(|t| t.title.as_str()).unwrap_or("JeTTY");
-            let desired = crate::detached::os_window_title(active_title);
-            if desired != self.applied_main_os_title {
-                if let Some(w) = &self.window {
-                    w.set_title(&desired);
-                    self.applied_main_os_title = desired;
-                }
-            }
+            self.sync_main_os_title();
         }
         &self.cached_tabs_meta
+    }
+
+    /// Give the main window's OS title the active tab's (the window is
+    /// undecorated, so this shows in the taskbar / Alt+Tab only), when it
+    /// changed. Also from the PTY drain whenever a title changed, not only from
+    /// a frame: a minimized or covered window — or one hidden on Wayland,
+    /// where hiding minimizes — paints nothing, and its taskbar entry kept an
+    /// old title until it did. A string compare when nothing changed.
+    fn sync_main_os_title(&mut self) {
+        let active_title = self.tabs.get(self.active).map(|t| t.title.as_str()).unwrap_or("JeTTY");
+        let desired = crate::detached::os_window_title(active_title);
+        if desired != self.applied_main_os_title {
+            if let Some(w) = &self.window {
+                w.set_title(&desired);
+                self.applied_main_os_title = desired;
+            }
+        }
     }
 
     /// Jump to tab `n` (0-based), clamped to the valid range.
@@ -14427,7 +14439,12 @@ impl ApplicationHandler<AppEvent> for App {
                 // TITLE change (bounded by how often the shell rewrites it),
                 // so a flooding background tab costs one extra redraw total,
                 // not one per Wake — while a background OSC 0/2 title update
-                // still reaches the tab bar and taskbar title (F1/F14).
+                // still reaches the tab bar and taskbar title (F1/F14). The
+                // taskbar title follows even when nothing paints (minimized,
+                // covered, hidden on Wayland), as detached windows' do.
+                if chrome_changed {
+                    self.sync_main_os_title();
+                }
                 if (had_data || chrome_changed) && self.visible && !self.main_occluded {
                     // Flood output paints at most once per refresh (`pace_paint`);
                     // interactive output paints now.
