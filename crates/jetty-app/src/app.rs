@@ -7907,7 +7907,7 @@ impl App {
                     // a top strip that was never there.
                     let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
                     if self.visible && !maximized {
-                        self.slide_anim = Some(std::time::Instant::now());
+                        self.slide_anim = slide_start(self.motion_reduced(), std::time::Instant::now());
                     }
                 }
                 // Unreachable: this branch only runs when `mode != Fullscreen`.
@@ -7946,7 +7946,7 @@ impl App {
                         self.dock_rect = dock_window_top(w, self.dropdown_width_pct, self.dropdown_height_pct);
                     }
                     self.pending_dock_frames = 5;
-                    self.slide_anim = Some(std::time::Instant::now());
+                    self.slide_anim = slide_start(self.motion_reduced(), std::time::Instant::now());
                 }
             }
             WindowMode::Fullscreen => {
@@ -10056,9 +10056,7 @@ impl App {
                     self.pending_dock_frames = 5;
                     // Arm the render-side slide-down (not with reduced
                     // motion: the window simply appears, docked).
-                    if !self.motion_reduced() {
-                        self.slide_anim = Some(std::time::Instant::now());
-                    }
+                    self.slide_anim = slide_start(self.motion_reduced(), std::time::Instant::now());
                 }
                 WindowMode::Fullscreen => {
                     // Show FIRST so the window is mapped: X11 resolves
@@ -14075,7 +14073,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // re-assert on the first post-map redraws so it actually lands at
                 // the top strip instead of the WM's default (centered) placement.
                 self.pending_dock_frames = 5;
-                self.slide_anim = Some(std::time::Instant::now());
+                self.slide_anim = slide_start(self.motion_reduced(), std::time::Instant::now());
             }
         }
         // One-time Wayland diagnostic: winit cannot report the outer position on
@@ -19048,6 +19046,14 @@ fn dock_reassert_ok(mode: WindowMode, fullscreen: bool) -> bool {
     mode == WindowMode::Dropdown && !fullscreen
 }
 
+/// When the Dropdown strip's slide-in starts (`slide_anim`) — never while
+/// motion is reduced: the strip then simply appears, docked. Every arming site
+/// goes through it; the startup dock, a live switch to Dropdown and leaving F11
+/// into it slid regardless, where only the summon asked.
+fn slide_start(motion_reduced: bool, now: std::time::Instant) -> Option<std::time::Instant> {
+    (!motion_reduced).then_some(now)
+}
+
 /// The post-map re-assertion counters a fullscreen EXIT may arm:
 /// `(pending_dock_frames, pending_center_frames)`.
 ///
@@ -21140,6 +21146,16 @@ mod fullscreen_helper_tests {
         // The monitor holding the spot was unplugged (F32): no spot — centre.
         assert_eq!(keep_on_monitor((2900, 500), (1000, 640), &[((0, 0), (1920, 1080))]), None);
         assert_eq!(keep_on_monitor((10, 10), (1000, 640), &[]), None);
+    }
+
+    #[test]
+    fn the_strip_never_slides_while_motion_is_reduced() {
+        use super::slide_start;
+        let now = std::time::Instant::now();
+        assert_eq!(slide_start(false, now), Some(now));
+        // reduce_motion: the strip simply appears, docked — at startup, on a
+        // live switch to Dropdown and leaving F11 into it, as on a summon.
+        assert_eq!(slide_start(true, now), None);
     }
 
     #[test]
