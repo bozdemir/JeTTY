@@ -380,8 +380,8 @@ pub struct GpuContext {
     /// a lost one cannot be recreated yet ([`Self::acquire_frame`]).
     surface: Option<wgpu::Surface<'static>>,
     /// The window the surface draws to: a surface that stays lost is recreated
-    /// on it.
-    window: Arc<dyn wgpu::DisplayAndWindowHandle>,
+    /// on it. `None` once released with the window ([`Self::release_window`]).
+    window: Option<Arc<dyn wgpu::DisplayAndWindowHandle>>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
@@ -700,7 +700,7 @@ impl GpuContext {
 
         Some(Self {
             surface: Some(surface),
-            window,
+            window: Some(window),
             device: shared.device.clone(),
             queue: shared.queue.clone(),
             config,
@@ -751,6 +751,15 @@ impl GpuContext {
     /// harness's `JETTY_DEBUG_LOSE_SURFACE` drives).
     pub fn release_surface(&mut self) {
         self.surface = None;
+    }
+
+    /// Let go of the window as well as its surface: a window its app closes
+    /// (a Wayland hide) must not be kept open by its GPU context. The device,
+    /// the queue and the configuration stay — a new window's surface on them
+    /// comes from [`Self::with_shared`]. Every acquire is skipped meanwhile.
+    pub fn release_window(&mut self) {
+        self.surface = None;
+        self.window = None;
     }
 
     /// Test hook for the nested harness (`JETTY_DEBUG_LOSE_GPU`, never a
@@ -858,9 +867,11 @@ impl GpuContext {
     /// holds the window's swapchain (see [`Self::release_surface`]).
     fn recreate_surface(&mut self) -> bool {
         self.surface = None;
+        // Released with its window: there is nothing to draw to.
+        let Some(window) = &self.window else { return false };
         // Each distinct failure is logged once (`log_wgpu_error`): this repeats
         // on every retry while the window cannot take a surface.
-        let surface = match self.shared.instance.create_surface(Arc::clone(&self.window)) {
+        let surface = match self.shared.instance.create_surface(Arc::clone(window)) {
             Ok(s) => s,
             Err(e) => {
                 log_wgpu_error(&format!("recreating the window's surface: {e}"));

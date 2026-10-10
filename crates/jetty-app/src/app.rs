@@ -20,6 +20,10 @@ pub enum AppEvent {
     ToggleVisibility,
     /// `jetty --show` / `--hide` — set window visibility explicitly.
     SetVisible(bool),
+    /// The activation token the `jetty --toggle` / `--show` being forwarded was
+    /// launched with (its `XDG_ACTIVATION_TOKEN`), sent just ahead of its
+    /// command: a Wayland summon builds the window with it (`App::activation_token`).
+    ActivationToken(String),
     /// macOS asked the running JeTTY to reopen: a click on its Dock icon,
     /// `open -a JeTTY`, Spotlight (`jetty_platform::on_reopen`).
     Reopen,
@@ -677,16 +681,45 @@ fn focus_ask(by: SummonBy) -> FocusAsk {
     }
 }
 
-/// Whether the main window gaining focus while JeTTY holds it hidden means
-/// the compositor showed it again. Only where a hide merely MINIMIZES
-/// (Wayland): the user brings the window back with its taskbar entry or
-/// Alt+Tab, and it must paint again — JeTTY used to stay "hidden" there, a
-/// frozen terminal that still took keystrokes. Never where a hide unmaps
-/// (X11): an unmapped window cannot gain focus, and a FocusIn queued before
-/// the unmap (the summon hotkey's grab ends on key release) must not re-show
-/// the window F9 just hid.
-fn focus_gain_shows(visible: bool, hide: jetty_platform::HideKind) -> bool {
-    !visible && hide == jetty_platform::HideKind::Minimize
+/// Whether a summon of the SHOWN main window closes it and opens it afresh
+/// instead of raising it: a user's summon (F9's raise, `jetty --show`) of a
+/// window that is not in front, where a hide closes the window (Wayland). A
+/// compositor brings an existing window to the front only for an activation
+/// token handed over with it, which winit has no call for — JeTTY could just
+/// ask for attention, and the terminal stayed behind the app the user was in.
+/// A new window is focused (with the launcher's token where the compositor
+/// wants one).
+fn summon_reopens(by: SummonBy, main_focused: bool, hide: jetty_platform::HideKind) -> bool {
+    by == SummonBy::User && !main_focused && hide == jetty_platform::HideKind::Close
+}
+
+/// The inner size, in logical px, a main window closed by a hide is built
+/// again with: its size at its scale — or, hidden while fullscreen, the
+/// windowed size kept on the way in (the fullscreen exit is asynchronous, so
+/// the surface may still be monitor-sized) — never below the minimum.
+fn parked_size(
+    inner: winit::dpi::PhysicalSize<u32>,
+    scale: f64,
+    windowed: Option<winit::dpi::PhysicalSize<u32>>,
+) -> (u32, u32) {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let size = windowed.unwrap_or(inner).to_logical::<f64>(scale);
+    let (min_w, min_h) = jetty_platform::MIN_TERMINAL_SIZE;
+    (size.width.max(min_w).round() as u32, size.height.max(min_h).round() as u32)
+}
+
+/// The main window a Wayland hide closed (`jetty_platform::HideKind::Close`),
+/// as the next summon builds it again (`App::unpark_main_window`).
+#[derive(Debug, Clone, Copy)]
+struct ParkedMain {
+    /// Its inner size in logical px — the windowed size when it was
+    /// fullscreen.
+    size: (u32, u32),
+    maximized: bool,
+    /// Its DPI: the grid keeps that geometry while no window exists.
+    scale: f64,
+    /// Its id: what was tagged with it (a pill) moves to the new window.
+    id: WindowId,
 }
 
 /// Retry state for a frame whose swapchain acquire failed (`acquire_frame()` →
@@ -782,6 +815,13 @@ struct CtlDrag {
 pub struct App {
     proxy: EventLoopProxy<AppEvent>,
     window: Option<Arc<Window>>,
+    /// The main window a Wayland hide closed (`HideKind::Close`; `window` is
+    /// `None` meanwhile): what the next summon builds it again with.
+    parked_main: Option<ParkedMain>,
+    /// The launcher's activation token that came with the forwarded command
+    /// being handled (`AppEvent::ActivationToken`) — good for that one command:
+    /// a user's summon of a closed Wayland window builds it with the token.
+    activation_token: Option<String>,
     /// Whether the window is currently visible (toggled by F9).
     visible: bool,
     /// Whether the main window is occluded or minimized (`WindowEvent::Occluded(true)`
@@ -2029,6 +2069,8 @@ impl App {
         let mut app = App {
             proxy,
             window: None,
+            parked_main: None,
+            activation_token: None,
             visible: true,
             main_occluded: false,
             hotkey_manager: None,
@@ -3941,8 +3983,7 @@ impl App {
     /// the bar / strip / menus / pills grow with the text they hold and clicks
     /// land where the chrome is drawn.
     fn chrome_metrics(&self) -> jetty_render::ChromeMetrics {
-        let dpi = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
-        jetty_render::ChromeMetrics::new(dpi, self.ui_font_logical)
+        jetty_render::ChromeMetrics::new(self.main_scale() as f32, self.ui_font_logical)
     }
 
     /// Chrome metrics of the SETTINGS window: its own DPI × the CAPPED panel
@@ -9291,7 +9332,7 @@ impl App {
     fn set_font_size(&mut self, new_logical: f32) {
         let clamped = new_logical.clamp(6.0, 48.0);
         self.font_logical = clamped;
-        let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
+        let scale = self.main_scale() as f32;
         // Resize the font IN-PLACE, reusing the existing FontSystem — rebuilding
         // it (new_with_family) would rescan fontconfig (~20ms) on the main thread
         // on every Ctrl+/Ctrl- press. The family list is unchanged by a size
@@ -9399,11 +9440,7 @@ impl App {
         self.ui_font_logical = new_logical.clamp(UI_FONT_MIN, UI_FONT_MAX);
         // The menus' rows grow or shrink with it.
         self.dismiss_all_menus();
-        let scale = self
-            .window
-            .as_ref()
-            .map(|w| w.scale_factor() as f32)
-            .unwrap_or(1.0);
+        let scale = self.main_scale() as f32;
         if let Some(ct) = self.chrome_text.as_mut() {
             ct.set_font_size(self.ui_font_logical * scale);
         }
@@ -9530,7 +9567,7 @@ impl App {
             // never reach — a stuck summon_anim would pin the loop in Poll.
             self.summon_anim = None;
             self.summon_pending = false;
-            // Unmapped — or minimized on Wayland, which cannot unmap.
+            // Unmapped — or, on Wayland, closed at the end of this hide.
             jetty_platform::hide_window(win);
         }
         self.visible = false;
@@ -9571,6 +9608,8 @@ impl App {
             reflow_terms_on_hide(self.reflow_pending_at, self.reflow_deferred_by_hide);
         self.reflow_pending_at = pending;
         self.reflow_deferred_by_hide = deferred;
+        // Wayland: the hidden window is closed, not kept.
+        self.park_main_window(was_fullscreen);
     }
 
     /// Drop every paint owed to the main window that only makes sense while it
@@ -9583,6 +9622,123 @@ impl App {
         self.key_paint_due = None;
         self.acquire_retry = None;
         self.raise_attempt_at = None;
+    }
+
+    /// The end of a hide where hiding closes the window (Wayland,
+    /// `HideKind::Close`): drop the main window and its surface. Tabs, shells,
+    /// the GPU device and every layer on it stay; the next summon builds the
+    /// window again (`unpark_main_window`). A no-op where a hide unmaps.
+    /// `was_fullscreen`: the hide just left fullscreen (the windowed size is
+    /// the one to come back at).
+    fn park_main_window(&mut self, was_fullscreen: bool) {
+        if self.window.as_deref().map(jetty_platform::hide_kind) != Some(jetty_platform::HideKind::Close) {
+            return;
+        }
+        let Some(win) = self.window.take() else { return };
+        let windowed = if was_fullscreen { self.last_windowed_size } else { None };
+        self.parked_main = Some(ParkedMain {
+            size: parked_size(win.inner_size(), win.scale_factor(), windowed),
+            maximized: win.is_maximized(),
+            scale: win.scale_factor(),
+            id: win.id(),
+        });
+        // The GPU context holds the window (and its swapchain): it lets go
+        // first, or dropping ours would leave the window open.
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.release_window();
+        }
+        // Nothing may point at the window that is gone.
+        if self.last_focused_window == Some(win.id()) {
+            self.last_focused_window = None;
+        }
+        self.main_focused = false;
+        self.main_occluded = false;
+        self.ime_area = None;
+        self.ime_preedit = None;
+    }
+
+    /// Build the main window again for a summon after `park_main_window` —
+    /// at the size it had, maximized if it was, with the launcher's activation
+    /// token on a USER's summon (`activation_token`), so the compositor gives
+    /// it the focus as it does a launched app's window. Its surface goes on
+    /// the GPU device every layer already lives on: nothing else is rebuilt.
+    /// Returns whether a window was built (`false` when there was nothing to
+    /// build or the compositor refused it — then the main window stays closed).
+    fn unpark_main_window(&mut self, by: SummonBy, event_loop: &ActiveEventLoop) -> bool {
+        let Some(parked) = self.parked_main else { return false };
+        let title = self.main_os_title();
+        let start = jetty_platform::WindowStart {
+            maximized: parked.maximized,
+            activation_token: self.activation_token.take().filter(|_| by == SummonBy::User),
+            ..Default::default()
+        };
+        let window = match jetty_platform::build_window_with(event_loop, &title, parked.size, start) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("jetty: could not open the window again: {e}");
+                return false;
+            }
+        };
+        self.parked_main = None;
+        window.set_ime_allowed(true);
+        apply_option_as_alt(&window, self.macos_option_as_alt);
+        self.applied_main_os_title = title;
+        // A pill shown in the closed window shows in this one.
+        let id = window.id();
+        if let Some(pill) = self.status_pill.as_mut().filter(|p| p.2 == parked.id) {
+            pill.2 = id;
+        }
+        if let Some(hint) = self.shift_hint_until.as_mut().filter(|h| h.1 == parked.id) {
+            hint.1 = id;
+        }
+        // A new surface on the device everything was built on. A format the
+        // layers weren't built for (another GPU, never seen in practice) or a
+        // surface the device can't present to takes the full rebuild.
+        let size = window.inner_size();
+        let shared = self.gpu.as_ref().filter(|g| !g.is_lost()).map(|g| g.shared());
+        let surface = shared.and_then(|s| GpuContext::with_shared(&s, window.clone(), size.width, size.height));
+        self.window = Some(window);
+        match surface {
+            Some(g) if self.gpu.as_ref().is_some_and(|old| old.format == g.format) => {
+                self.gpu = Some(g);
+                self.acquire_retry = None;
+            }
+            _ => {
+                if !self.rebuild_main_gpu() {
+                    eprintln!("jetty: no GPU can draw the window yet");
+                }
+            }
+        }
+        // The text is drawn at the DPI it had; the new window may be on
+        // another monitor (its ScaleFactorChanged follows to correct it).
+        if self.main_scale() != parked.scale {
+            let scale = self.main_scale() as f32;
+            if let Some(t) = self.text.as_mut() {
+                t.set_font_size(self.font_logical * scale);
+            }
+            if let Some(t) = self.chrome_text.as_mut() {
+                t.set_font_size(self.ui_font_logical * scale);
+            }
+            self.reflow_deferred_by_hide = true;
+        }
+        self.refresh_frame_interval();
+        true
+    }
+
+    /// The main window's DPI: its scale factor — while a Wayland hide has it
+    /// closed, the one it had (the grid keeps that geometry) — 1 without one.
+    fn main_scale(&self) -> f64 {
+        self.window
+            .as_ref()
+            .map(|w| w.scale_factor())
+            .or(self.parked_main.map(|p| p.scale))
+            .unwrap_or(1.0)
+    }
+
+    /// The main window's OS title (taskbar, Alt+Tab): the active tab's.
+    fn main_os_title(&self) -> String {
+        let active_title = self.tabs.get(self.active).map(|t| t.title.as_str()).unwrap_or("JeTTY");
+        format!("{active_title} — JeTTY")
     }
 
     /// Toggle window visibility (F9 / Yakuake-style summon / `jetty --toggle`).
@@ -9637,6 +9793,17 @@ impl App {
             FocusAsk::Activate => jetty_platform::activate_window(win),
             FocusAsk::Request => win.focus_window(),
         };
+        // Wayland: a shown window behind another app can't be raised — close it
+        // and summon it afresh, focused (`summon_reopens`).
+        if want
+            && self.visible
+            && self
+                .window
+                .as_deref()
+                .is_some_and(|w| summon_reopens(by, self.main_focused, jetty_platform::hide_kind(w)))
+        {
+            self.set_visibility_by(false, by, event_loop);
+        }
         // A redundant `--show` (already visible) just raises/focuses; a redundant
         // `--hide` (already hidden) is a no-op.
         if want == self.visible {
@@ -9702,6 +9869,14 @@ impl App {
             // alongside an already-fullscreen detached window would NEST the
             // app-scoped `presentationOptions` (see `enforce_single_fullscreen`).
             self.enforce_single_fullscreen(None);
+        }
+        // Wayland: the hide closed the window — build it again. The compositor
+        // focuses it as a new window (with the launcher's token where it wants
+        // one), so it needs no focus request below. Unbuildable: stay hidden.
+        let reopened = self.visible && self.unpark_main_window(by, event_loop);
+        if self.visible && self.window.is_none() {
+            self.visible = false;
+            return;
         }
         if let Some(win) = &self.window {
             if self.visible {
@@ -9811,7 +9986,9 @@ impl App {
                 self.reflow_deferred_by_hide = deferred;
                 // The map above was already flushed, so the WM handles it before
                 // this request.
-                ask_focus(win);
+                if !reopened {
+                    ask_focus(win);
+                }
                 // Crystallize/reveal on every summon (F9 show), mirroring first open.
                 // Start the clock on the FIRST real frame (summon_pending), not here:
                 // on macOS the window can take a beat to present, which would
@@ -9846,7 +10023,7 @@ impl App {
                 // long as the window stays hidden.
                 self.summon_anim = None;
                 self.summon_pending = false;
-                // Unmapped — or minimized on Wayland, which cannot unmap.
+                // Unmapped — or, on Wayland, closed at the end of this hide.
                 jetty_platform::hide_window(win);
                 // macOS keeps the app active with no window: typed keys went
                 // nowhere until the user clicked the app they came from. With no
@@ -9887,6 +10064,10 @@ impl App {
                 self.reflow_pending_at = pending;
                 self.reflow_deferred_by_hide = deferred;
             }
+        }
+        // Wayland: the hidden window is closed, not kept.
+        if !self.visible {
+            self.park_main_window(was_fullscreen);
         }
     }
 
@@ -10043,7 +10224,9 @@ impl App {
     /// after `gpu_rebuild_backoff`, as a single `WaitUntil` wake — never a spin.
     /// Returns whether a rebuild was attempted (the caller repaints).
     fn recover_lost_gpu(&mut self, now: std::time::Instant) -> bool {
-        let main_lost = self.gpu.as_ref().is_some_and(|g| g.is_lost());
+        // A main window a Wayland hide closed is rebuilt by its next summon
+        // (`unpark_main_window`), not retried for while hidden.
+        let main_lost = self.window.is_some() && self.gpu.as_ref().is_some_and(|g| g.is_lost());
         let detached_lost = self.detached.iter().any(|d| d.gpu.is_lost());
         let settings_lost = self.settings_gpu.as_ref().is_some_and(|g| g.is_lost());
         if !gpu_recovery_due(main_lost || detached_lost || settings_lost, self.gpu_rebuild_retry_at, now) {
@@ -13676,7 +13859,7 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if self.window.is_some() || self.parked_main.is_some() {
             return;
         }
         // Without Vulkan, wgpu's GL backend presents through the display connection.
@@ -13742,12 +13925,8 @@ impl ApplicationHandler<AppEvent> for App {
         // UNMAPPED — no flash at login. The first summon then places, maps and
         // reveals it per `window_mode` through the normal show path, exactly like
         // any later summon (rule F0: never fullscreen while hidden).
-        let window = match jetty_platform::build_window_with_visibility(
-            event_loop,
-            "JeTTY",
-            (1000, 640),
-            !self.start_hidden,
-        ) {
+        let start = jetty_platform::WindowStart { hidden: self.start_hidden, ..Default::default() };
+        let window = match jetty_platform::build_window_with(event_loop, "JeTTY", (1000, 640), start) {
             Ok(window) => window,
             Err(e) => {
                 eprintln!("jetty: could not create the window: {e}");
@@ -14090,6 +14269,12 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
 
+        // A hidden start on Wayland keeps no window (`HideKind::Close`): the
+        // never-shown one goes, and the first summon builds it with the
+        // launcher's activation token.
+        if self.start_hidden {
+            self.park_main_window(false);
+        }
         self.request_main_paint();
     }
 
@@ -14251,10 +14436,14 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::ToggleVisibility => {
                 self.toggle_visibility(event_loop);
+                // The token was this command's: never a later summon's.
+                self.activation_token = None;
             }
             AppEvent::SetVisible(want) => {
                 self.set_visibility(want, event_loop);
+                self.activation_token = None;
             }
+            AppEvent::ActivationToken(token) => self.activation_token = Some(token),
             AppEvent::Reopen => {
                 // Shown and raised like `jetty --show`, never hidden. A minimized
                 // window comes back too, as AppKit's own reopen handling (which
@@ -14486,17 +14675,6 @@ impl ApplicationHandler<AppEvent> for App {
                     // macOS first-paint nudge (see the settings window above): ensure
                     // a frame is drawn once the window is actually shown + focused.
                     self.request_main_paint();
-                }
-                // A hidden window that gains focus where a hide only minimized
-                // (Wayland) was brought back by the compositor — its taskbar
-                // entry, Alt+Tab: it is on screen, so it is shown (and paints)
-                // again instead of staying frozen.
-                if self
-                    .window
-                    .as_ref()
-                    .is_some_and(|w| focus_gain_shows(self.visible, jetty_platform::hide_kind(w)))
-                {
-                    self.set_visibility_by(true, SummonBy::App, event_loop);
                 }
             }
             WindowEvent::Focused(false) => {
@@ -19978,9 +20156,9 @@ mod scheduler_tests {
     //! The window itself can't run under `cargo test`, so every rule that keeps
     //! the loop at 0-CPU idle (or makes it wake) is a pure function tested here.
     use super::{
-        anim_expired, autohide_due, caret_drives_frames, focus_ask, focus_gain_shows, main_finish_actions,
-        main_tab_watched, next_acquire_retry, perf_idle_decision, toggle_action, AutohideDue, FocusAsk, IdleHud,
-        SummonBy, ToggleAction, AUTOHIDE_GRACE_MS, AUTOHIDE_GRAB_FAST_FOR, AUTOHIDE_GRAB_SLOW_RECHECK,
+        anim_expired, autohide_due, caret_drives_frames, focus_ask, main_finish_actions, main_tab_watched,
+        next_acquire_retry, parked_size, perf_idle_decision, summon_reopens, toggle_action, AutohideDue, FocusAsk,
+        IdleHud, SummonBy, ToggleAction, AUTOHIDE_GRACE_MS, AUTOHIDE_GRAB_FAST_FOR, AUTOHIDE_GRAB_SLOW_RECHECK,
         FOCUS_CHURN_GRACE, KEY_ECHO_GRACE, RAISE_RETRY_WINDOW,
     };
     use std::time::{Duration, Instant};
@@ -20042,18 +20220,36 @@ mod scheduler_tests {
     }
 
     #[test]
-    fn focus_back_on_a_minimized_hide_shows_the_window_again() {
+    fn a_wayland_summon_of_an_unfocused_window_opens_it_afresh() {
         use jetty_platform::HideKind;
-        // Wayland: a hide only minimizes, and the compositor brings the window
-        // back on a taskbar click / Alt+Tab — JeTTY used to stay "hidden" and
-        // never painted again (a frozen terminal the user could type into).
-        assert!(focus_gain_shows(false, HideKind::Minimize));
-        // X11 unmaps: a FocusIn queued before the unmap (the hotkey grab's
-        // release) must never re-show the window F9 just hid.
-        assert!(!focus_gain_shows(false, HideKind::Unmap));
-        // Already shown: nothing to do.
-        assert!(!focus_gain_shows(true, HideKind::Minimize));
-        assert!(!focus_gain_shows(true, HideKind::Unmap));
+        // Wayland: F9 / `jetty --show` on a terminal left open behind another
+        // app could only ask for attention (the compositor raises an existing
+        // window for a token winit can't hand it) — the window stayed behind.
+        // A new window is focused, so the summon closes and reopens it.
+        assert!(summon_reopens(SummonBy::User, false, HideKind::Close));
+        // In front already (a `--show` typed in its own shell): nothing to do.
+        assert!(!summon_reopens(SummonBy::User, true, HideKind::Close));
+        // JeTTY's own summons never take the focus.
+        assert!(!summon_reopens(SummonBy::App, false, HideKind::Close));
+        // X11 / macOS raise the window they have.
+        assert!(!summon_reopens(SummonBy::User, false, HideKind::Unmap));
+    }
+
+    #[test]
+    fn a_closed_window_comes_back_at_the_size_the_user_left() {
+        use winit::dpi::PhysicalSize;
+        // 2000×1280 physical at 2× is the 1000×640 the window is built with.
+        assert_eq!(parked_size(PhysicalSize::new(2000, 1280), 2.0, None), (1000, 640));
+        assert_eq!(parked_size(PhysicalSize::new(1000, 640), 1.0, None), (1000, 640));
+        // Hidden while fullscreen: the windowed size kept on the way in, not
+        // the monitor-sized surface (the exit is asynchronous).
+        assert_eq!(
+            parked_size(PhysicalSize::new(3840, 2160), 2.0, Some(PhysicalSize::new(1600, 1000))),
+            (800, 500)
+        );
+        // Never below the minimum, never from a bogus scale.
+        assert_eq!(parked_size(PhysicalSize::new(10, 10), 1.0, None), (200, 120));
+        assert_eq!(parked_size(PhysicalSize::new(1000, 640), 0.0, None), (1000, 640));
     }
 
     // ── idle HUD one-shot (the hidden-window 100% CPU spin) ──────────────────

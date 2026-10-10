@@ -6,7 +6,8 @@
 //!
 //! 1. launch → the verb alone (an older primary acts on it and hangs up);
 //! 2. primary → `jetty <version>\n`;
-//! 3. launch → who it is ([`Caller`]: version, display, AppImage), then EOF;
+//! 3. launch → who it is ([`Caller`]: version, display, AppImage, the
+//!    activation token it was launched with), then EOF;
 //! 4. primary → `ok\n`, and acts on the verb — or `elsewhere\n` when the launch
 //!    runs on another display (`ssh -X`, a second X session), which then starts
 //!    or reaches that display's own JeTTY instead of toggling this one.
@@ -66,6 +67,11 @@ pub(crate) struct Caller {
     pub display: Display,
     /// The AppImage file it runs from, if it is one.
     pub appimage: Option<PathBuf>,
+    /// The xdg-activation token it was launched with (`XDG_ACTIVATION_TOKEN`:
+    /// a compositor shortcut, an app menu on Wayland). A Wayland summon
+    /// builds the window with it, so a compositor that focuses a new window
+    /// only for a token focuses this one (`AppEvent::ActivationToken`).
+    pub activation_token: Option<String>,
 }
 
 impl Caller {
@@ -75,6 +81,7 @@ impl Caller {
             version: env!("CARGO_PKG_VERSION").to_string(),
             display: Display::current(),
             appimage: jetty_core::self_exe().filter(|e| e.appimage).map(|e| e.path),
+            activation_token: std::env::var("XDG_ACTIVATION_TOKEN").ok().filter(|t| activation_token_ok(t)),
         }
     }
 
@@ -88,6 +95,10 @@ impl Caller {
         out.push(0);
         if let Some(p) = &self.appimage {
             out.extend_from_slice(p.as_os_str().as_bytes());
+        }
+        out.push(0);
+        if let Some(t) = &self.activation_token {
+            out.extend_from_slice(t.as_bytes());
         }
         out
     }
@@ -103,7 +114,12 @@ impl Caller {
             .next()
             .filter(|p| !p.is_empty())
             .map(|p| PathBuf::from(std::ffi::OsStr::from_bytes(p)));
-        Some(Caller { version, display: Display { wayland, x11 }, appimage })
+        let activation_token = fields
+            .next()
+            .and_then(|t| std::str::from_utf8(t).ok())
+            .filter(|t| activation_token_ok(t))
+            .map(str::to_owned);
+        Some(Caller { version, display: Display { wayland, x11 }, appimage, activation_token })
     }
 
     /// Is this caller a newer JeTTY than `version`?
@@ -113,6 +129,12 @@ impl Caller {
             _ => false,
         }
     }
+}
+
+/// Whether `t` can be an activation token: printable ASCII, no spaces, short
+/// (KWin's are UUIDs). Anything else is dropped, never handed on.
+fn activation_token_ok(t: &str) -> bool {
+    !t.is_empty() && t.len() <= 512 && t.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// `major.minor.patch` of a version (anything after a `-` or `+` ignored).
@@ -197,7 +219,7 @@ mod tests {
     use std::time::Duration;
 
     fn caller(version: &str, display: Display, appimage: Option<&str>) -> Caller {
-        Caller { version: version.to_string(), display, appimage: appimage.map(PathBuf::from) }
+        Caller { version: version.to_string(), display, appimage: appimage.map(PathBuf::from), activation_token: None }
     }
 
     fn pair() -> (UnixStream, UnixStream) {
@@ -249,6 +271,40 @@ mod tests {
         assert_eq!(Caller::decode(b""), None);
         assert_eq!(Caller::decode(b"v9\0x"), None);
         assert_eq!(Caller::decode(b"v1\x000.30.0"), None, "fields missing");
+    }
+
+    #[test]
+    fn a_launch_hands_on_its_activation_token() {
+        let tok = "{5f1c3a52-9d0e-4a7b-8c61-2e3d4f5a6b7c}";
+        let with = |t: &str| Caller { activation_token: Some(t.to_string()), ..caller("0.30.0", Display::new("wayland-0", ""), None) };
+        assert_eq!(Caller::decode(&with(tok).encode()), Some(with(tok)));
+        // Next to an AppImage path.
+        let c = Caller { appimage: Some(PathBuf::from("/a/JeTTY.AppImage")), ..with(tok) };
+        assert_eq!(Caller::decode(&c.encode()), Some(c));
+        // An introduction without the field (or an empty one) carries none.
+        let plain = caller("0.30.0", Display::default(), None);
+        assert_eq!(Caller::decode(b"v1\x000.30.0\0\0\0"), Some(plain.clone()));
+        assert_eq!(Caller::decode(&plain.encode()), Some(plain));
+        // Something that can't be a token is never handed on.
+        for bad in ["bad token", "\x1b[2J", &"x".repeat(513)] {
+            let decoded = Caller::decode(&with(bad).encode()).unwrap();
+            assert_eq!(decoded.activation_token, None, "{bad:?}");
+        }
+        // Through the exchange: the primary hears it with the caller.
+        let (mut launch, mut primary) = pair();
+        let me = with(tok);
+        let t = std::thread::spawn(move || {
+            launch.write_all(b"toggle").unwrap();
+            introduce(&mut launch, &me)
+        });
+        let mut verb = [0u8; 16];
+        let n = primary.read(&mut verb).unwrap();
+        assert_eq!(&verb[..n], b"toggle", "the verb still comes alone");
+        let (got, serve) = greet(&mut primary, "0.30.0", &Display::new("wayland-0", ""));
+        assert!(serve);
+        assert_eq!(got.and_then(|c| c.activation_token).as_deref(), Some(tok));
+        drop(primary);
+        assert_eq!(t.join().unwrap(), Answer::Served);
     }
 
     #[test]

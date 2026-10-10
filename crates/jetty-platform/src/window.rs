@@ -49,8 +49,26 @@ fn with_app_id(attrs: WindowAttributes) -> WindowAttributes {
     attrs
 }
 
-/// Build the main window: a borderless (client-side decorations) window with
-/// our custom titlebar + the JeTTY app icon.
+/// How [`build_window_with`] starts a terminal window besides its title and
+/// size. The default is a plain visible window.
+#[derive(Debug, Clone, Default)]
+pub struct WindowStart {
+    /// Created UNMAPPED: a hidden start (`jetty --background`) must not flash
+    /// a window at login; the first summon maps it.
+    pub hidden: bool,
+    /// Created maximized: a Wayland summon builds the main window again
+    /// ([`HideKind::Close`]) the way the user left it.
+    pub maximized: bool,
+    /// The xdg-activation token of the launch this window answers (the
+    /// launcher's `XDG_ACTIVATION_TOKEN`). The compositor gets it with the new
+    /// window, so a compositor that focuses new windows only for a token
+    /// focuses this one. Wayland only: an X11 window ignores it.
+    pub activation_token: Option<String>,
+}
+
+/// Build a terminal window (the main one, a detached tab's): a borderless
+/// (client-side decorations) window with our custom titlebar + the JeTTY app
+/// icon.
 ///
 /// Returns the OS error on failure instead of panicking: this builder is also
 /// used at runtime (tab detach), where a transient window-creation failure (X
@@ -62,20 +80,20 @@ pub fn build_window(
     title: &str,
     size: (u32, u32),
 ) -> Result<Arc<Window>, OsError> {
-    build_window_with_visibility(event_loop, title, size, true)
+    build_window_with(event_loop, title, size, WindowStart::default())
 }
 
-/// [`build_window`], optionally created UNMAPPED (`visible == false`): a hidden
-/// start (`jetty --background`) must not flash a window at login; the first
-/// summon maps it.
-pub fn build_window_with_visibility(
+/// [`build_window`], started per `start`: hidden, maximized, or handed the
+/// launcher's activation token.
+pub fn build_window_with(
     event_loop: &ActiveEventLoop,
     title: &str,
     size: (u32, u32),
-    visible: bool,
+    start: WindowStart,
 ) -> Result<Arc<Window>, OsError> {
     let attrs = with_app_id(Window::default_attributes())
-        .with_visible(visible)
+        .with_visible(!start.hidden)
+        .with_maximized(start.maximized)
         .with_title(title)
         .with_window_icon(app_icon())
         .with_inner_size(LogicalSize::new(size.0, size.1))
@@ -86,7 +104,39 @@ pub fn build_window_with_visibility(
         // keeps the runtime opacity working and the rounded corners.
         .with_decorations(false)
         .with_transparent(true);
+    let attrs = with_activation_token(attrs, event_loop, start.activation_token);
     event_loop.create_window(attrs).map(Arc::new)
+}
+
+/// Hand `token` to the new window's compositor with `attrs`, where it can be
+/// used ([`wayland_token`]).
+fn with_activation_token(attrs: WindowAttributes, event_loop: &ActiveEventLoop, token: Option<String>) -> WindowAttributes {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(token) = wayland_token(display_kind(event_loop).as_ref(), token) {
+        use winit::platform::startup_notify::WindowAttributesExtStartupNotify;
+        return attrs.with_activation_token(winit::window::ActivationToken::from_raw(token));
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let _ = (event_loop, token);
+    attrs
+}
+
+/// The raw kind of display `event_loop` runs on (`None` if winit can't say).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn display_kind(event_loop: &ActiveEventLoop) -> Option<raw_window_handle::RawDisplayHandle> {
+    use raw_window_handle::HasDisplayHandle;
+    event_loop.display_handle().ok().map(|h| h.as_raw())
+}
+
+/// `token`, when it can be used: a non-empty token on a Wayland display. On
+/// X11 winit would treat it as a startup-notification id — not JeTTY's to
+/// change there. Pure (unit-tested without a display).
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn wayland_token(display: Option<&raw_window_handle::RawDisplayHandle>, token: Option<String>) -> Option<String> {
+    match display {
+        Some(raw_window_handle::RawDisplayHandle::Wayland(_)) => token.filter(|t| !t.is_empty()),
+        _ => None,
+    }
 }
 
 /// Build a decorated utility window (the settings dialog), sized by the caller
@@ -288,12 +338,13 @@ pub fn activate_window(win: &Window) {
     if x11::request_activation(win) {
         return;
     }
-    if hide_kind(win) == HideKind::Minimize {
+    if hide_kind(win) == HideKind::Close {
         // Wayland: a client cannot raise or un-minimize itself without an
         // activation token the compositor handed out for a user action, and
         // winit's focus_window() is a no-op there. Ask for attention instead —
         // the compositor flags the window (its taskbar entry) — so a summon is
-        // never silently lost.
+        // never silently lost. (The main window's summon builds the window
+        // anew instead, which the compositor focuses: see `HideKind::Close`.)
         win.request_user_attention(Some(winit::window::UserAttentionType::Informational));
         return;
     }
@@ -392,20 +443,24 @@ fn sane_scale(s: f64) -> f64 {
     }
 }
 
-/// What hiding a window does on its display server.
+/// What hiding a window takes on its display server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HideKind {
     /// The window is unmapped (X11, macOS): off screen until JeTTY shows it.
     Unmap,
-    /// The window is MINIMIZED (Wayland). A Wayland client cannot unmap its
-    /// own toplevel — winit's `set_visible` is a no-op there — and the
-    /// compositor may bring a minimized window back without JeTTY asking (its
-    /// taskbar entry, Alt+Tab): the app learns of that from the focus the
-    /// window then receives.
-    Minimize,
+    /// The window is CLOSED (Wayland): the app drops it — tabs, shells and the
+    /// GPU stay — and builds a new one on the next summon. A Wayland client
+    /// can't take its toplevel off screen through winit (`set_visible` is a
+    /// no-op there), a minimize is a request tiling compositors (sway, river,
+    /// Hyprland, niri) ignore, and a compositor brings an existing window
+    /// back to the front only for an activation token that winit can't hand
+    /// it. A new window is placed and focused the way the compositor treats
+    /// every new window — with the launcher's token (`jetty --toggle`
+    /// forwards it, [`WindowStart::activation_token`]) where it wants one.
+    Close,
 }
 
-/// How [`hide_window`] hides `win`.
+/// How a hide takes `win` off screen.
 pub fn hide_kind(win: &Window) -> HideKind {
     use raw_window_handle::HasWindowHandle;
     let handle = win.window_handle().ok().map(|h| h.as_raw());
@@ -415,19 +470,16 @@ pub fn hide_kind(win: &Window) -> HideKind {
 /// Pure core of [`hide_kind`] (unit-tested without a display).
 fn hide_kind_for(handle: Option<&raw_window_handle::RawWindowHandle>) -> HideKind {
     match handle {
-        Some(raw_window_handle::RawWindowHandle::Wayland(_)) => HideKind::Minimize,
+        Some(raw_window_handle::RawWindowHandle::Wayland(_)) => HideKind::Close,
         _ => HideKind::Unmap,
     }
 }
 
-/// Take `win` off screen (the summon hide, the focus-loss auto-hide): unmapped
-/// where the platform can ([`HideKind::Unmap`]), minimized on Wayland, where
-/// `set_visible(false)` alone left the window on screen.
+/// Take `win` off screen (the summon hide, the focus-loss auto-hide) where the
+/// platform unmaps ([`HideKind::Unmap`]). A [`HideKind::Close`] window goes
+/// when the app drops it.
 pub fn hide_window(win: &Window) {
     win.set_visible(false);
-    if hide_kind(win) == HideKind::Minimize {
-        win.set_minimized(true);
-    }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -600,24 +652,42 @@ mod app_id_tests {
 
 #[cfg(test)]
 mod hide_tests {
-    use super::{hide_kind_for, HideKind};
-    use raw_window_handle::{RawWindowHandle, WaylandWindowHandle, XcbWindowHandle, XlibWindowHandle};
+    use super::{hide_kind_for, wayland_token, HideKind};
+    use raw_window_handle::{
+        RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, XcbWindowHandle,
+        XlibDisplayHandle, XlibWindowHandle,
+    };
     use std::num::NonZeroU32;
     use std::ptr::NonNull;
 
     #[test]
-    fn wayland_windows_hide_by_minimizing_everything_else_unmaps() {
-        // winit's set_visible is a no-op on Wayland: a hide that only asked for
-        // it left the window on screen (frozen — JeTTY stops painting a window
-        // it believes hidden). There the hide minimizes.
+    fn wayland_windows_hide_by_closing_everything_else_unmaps() {
+        // winit's set_visible is a no-op on Wayland, and the minimize that
+        // replaced it is ignored by tiling compositors and can't be undone by a
+        // summon (the compositor refuses to raise an existing window without a
+        // token). There the hide closes the window.
         let wl = RawWindowHandle::Wayland(WaylandWindowHandle::new(NonNull::dangling()));
-        assert_eq!(hide_kind_for(Some(&wl)), HideKind::Minimize);
+        assert_eq!(hide_kind_for(Some(&wl)), HideKind::Close);
         let xlib = RawWindowHandle::Xlib(XlibWindowHandle::new(7));
         let xcb = RawWindowHandle::Xcb(XcbWindowHandle::new(NonZeroU32::new(7).unwrap()));
         assert_eq!(hide_kind_for(Some(&xlib)), HideKind::Unmap);
         assert_eq!(hide_kind_for(Some(&xcb)), HideKind::Unmap);
         // No handle (macOS before creation, an error): today's unmap.
         assert_eq!(hide_kind_for(None), HideKind::Unmap);
+    }
+
+    #[test]
+    fn an_activation_token_goes_to_wayland_windows_only() {
+        let wl = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(NonNull::dangling()));
+        let x11 = RawDisplayHandle::Xlib(XlibDisplayHandle::new(None, 0));
+        let tok = || Some("kwin-123".to_string());
+        assert_eq!(wayland_token(Some(&wl), tok()), tok());
+        // X11 has its own launch protocol (DESKTOP_STARTUP_ID): left alone.
+        assert_eq!(wayland_token(Some(&x11), tok()), None);
+        assert_eq!(wayland_token(None, tok()), None);
+        // An empty variable is no token.
+        assert_eq!(wayland_token(Some(&wl), Some(String::new())), None);
+        assert_eq!(wayland_token(Some(&wl), None), None);
     }
 }
 

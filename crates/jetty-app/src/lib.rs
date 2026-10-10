@@ -680,7 +680,14 @@ pub fn run() {
                 if !serve {
                     continue;
                 }
-                let mut events: Vec<AppEvent> = event.into_iter().collect();
+                // The launcher's activation token goes just ahead of a summon:
+                // a Wayland summon builds the window with it.
+                let token = caller
+                    .as_ref()
+                    .and_then(|c| c.activation_token.clone())
+                    .filter(|_| matches!(event, Some(AppEvent::SetVisible(true) | AppEvent::ToggleVisibility)));
+                let mut events: Vec<AppEvent> =
+                    token.map(AppEvent::ActivationToken).into_iter().chain(event).collect();
                 let newer = caller.filter(|c| c.newer_than(version) && announced.as_ref() != Some(&c.version));
                 if let Some(c) = newer {
                     let moved = c.appimage.as_deref().is_some_and(app::follow_newer_appimage);
