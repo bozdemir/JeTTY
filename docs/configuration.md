@@ -72,7 +72,7 @@ Names of fonts and themes are matched in any letter case, and a theme by its id
 | `ui_font_size` | `16.0` | The chrome font size in points, `10`–`28`. |
 | `line_height` | `1.3` | Line height as a multiple of the font size, `1.0`–`2.0`. Glyphs are centered in the taller row; backgrounds, selection and the cursor fill it. |
 | `builtin_glyphs` | `true` | Draw box drawing, block elements, Powerline separators, braille and sextants as cell-exact built-in glyphs, so borders and prompts join without seams at any size. `false` takes them from the font. |
-| `color_emoji` | `true` | Draw emoji in color from the installed emoji font, two cells wide. Text-style symbols (✔ ❤) stay text. |
+| `color_emoji` | `true` | Draw emoji in color from the installed emoji font, two cells wide — flags (🇹🇷) too. Text-style symbols (✔ ❤) stay text. |
 | `bold_is_bright` | `false` | Bold text in one of the 8 normal ANSI colors uses its bright twin (the classic xterm look). |
 
 ## Window
