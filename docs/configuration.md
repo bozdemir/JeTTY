@@ -128,7 +128,9 @@ Names of fonts and themes are matched in any letter case, and a theme by its id
 ## Notifications
 
 Run & Notify needs shell integration (`jetty --help` prints the line for your
-shell's rc file); without it nothing is ever notified.
+shell's rc file); without it no command is ever notified about. Programs can
+also ask for a notification themselves — `OSC 9`, `OSC 777 ; notify` and
+kitty's `OSC 99` — with no shell integration.
 
 | Key | Default | What it does |
 |---|---|---|
@@ -136,6 +138,7 @@ shell's rc file); without it nothing is ever notified.
 | `notify_min_seconds` | `10` | Only commands that ran at least this long notify on success, `1`–`86400` seconds (a failure may notify sooner). |
 | `notify_only_on_failure` | `false` | Only notify about failed commands. |
 | `auto_summon_on_finish` | `false` | Bring JeTTY back (with the tab that finished) when a command finishes — only while it is hidden, never mid-typing. Follows `notify_min_seconds` and `notify_only_on_failure`; works with `notify_on_command_finish` off too. |
+| `program_notifications` | `true` | Show the notifications programs ask for (`OSC 9`, `OSC 777 ; notify`, kitty's `OSC 99`) when their tab is out of sight, like a finished command's. Each names its tab and is one line (a title of up to 64 characters, a body of up to 256); a tab shows 3 in a row, then 1 every 5 seconds, and the rest are dropped. `false` keeps them off the desktop — the tab still gets its dot. |
 
 ## The config file itself
 

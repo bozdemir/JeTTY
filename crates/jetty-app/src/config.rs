@@ -270,6 +270,12 @@ pub struct Config {
     /// OFF. Inherits `notify_only_on_failure` (so it can be a failures-only summon).
     #[serde(default = "default_auto_summon_on_finish")]
     pub auto_summon_on_finish: bool,
+    /// Show the desktop notifications programs ask for (OSC 9, OSC 777, kitty's
+    /// OSC 99) — from a tab out of sight, named after it, a few at a time.
+    /// Default ON; needs no shell integration. Off, a request only lights the
+    /// tab's dot.
+    #[serde(default = "default_program_notifications")]
+    pub program_notifications: bool,
     // ── SSH-ready & yours (v0.16) ─────────────────────────────────────────────
     /// Allow OSC 52 clipboard PASTE — i.e. let a program in the terminal (including
     /// a remote host over SSH) READ the local system clipboard. Default `false`
@@ -437,6 +443,9 @@ fn default_notify_only_on_failure() -> bool {
 }
 fn default_auto_summon_on_finish() -> bool {
     false
+}
+fn default_program_notifications() -> bool {
+    true
 }
 
 fn default_theme() -> String {
@@ -1135,6 +1144,7 @@ impl Default for Config {
             notify_min_seconds: default_notify_min_seconds(),
             notify_only_on_failure: default_notify_only_on_failure(),
             auto_summon_on_finish: default_auto_summon_on_finish(),
+            program_notifications: default_program_notifications(),
             osc52_allow_paste: default_osc52_allow_paste(),
             run_selection: default_run_selection(),
             hot_reload: default_hot_reload(),
@@ -2611,6 +2621,7 @@ mod tests {
             notify_min_seconds: 30,
             notify_only_on_failure: true,
             auto_summon_on_finish: true,
+            program_notifications: false,
             osc52_allow_paste: true,
             run_selection: false,
             hot_reload: false,
@@ -2675,6 +2686,7 @@ mod tests {
             notify_min_seconds: 10,
             notify_only_on_failure: false,
             auto_summon_on_finish: false,
+            program_notifications: true,
             osc52_allow_paste: false,
             run_selection: true,
             hot_reload: true,
@@ -2745,6 +2757,7 @@ corner_radius = 8.0
         assert_eq!(cfg.notify_min_seconds, 10);
         assert!(!cfg.notify_only_on_failure);
         assert!(!cfg.auto_summon_on_finish, "auto-summon defaults OFF");
+        assert!(cfg.program_notifications, "program notifications default ON");
     }
 
     #[test]

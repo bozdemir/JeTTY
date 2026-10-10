@@ -1547,6 +1547,9 @@ pub struct App {
     /// Raise + focus JeTTY and activate the firing tab when a command finishes —
     /// ONLY when fully hidden. Opt-in, default OFF. Mirrors `auto_summon_on_finish`.
     auto_summon_on_finish: bool,
+    /// Show the desktop notifications programs ask for (OSC 9 / 777 / 99).
+    /// Mirrors `program_notifications`.
+    program_notifications: bool,
     /// Handle to the off-UI-thread notification worker. Cheap to clone; a `fire()`
     /// is a non-blocking `try_send` (dropped on a full queue). The worker exits
     /// when this last handle drops with the `App`.
@@ -2433,6 +2436,7 @@ impl App {
             notify_min_seconds: 10,
             notify_only_on_failure: false,
             auto_summon_on_finish: false,
+            program_notifications: true,
             // Long-lived notification worker (idles at recv; the zbus reactor it
             // later starts idles at epoll-wait — no busy loop, ~0% idle preserved).
             notifier: crate::notify::spawn_notifier(),
@@ -2646,6 +2650,7 @@ impl App {
         app.notify_min_seconds = cfg.notify_min_seconds.clamp(1, 86_400);
         app.notify_only_on_failure = cfg.notify_only_on_failure;
         app.auto_summon_on_finish = cfg.auto_summon_on_finish;
+        app.program_notifications = cfg.program_notifications;
         app.osc52_allow_paste = cfg.osc52_allow_paste;
         app.run_selection_enabled = cfg.run_selection;
         app.hot_reload = cfg.hot_reload;
@@ -2909,6 +2914,7 @@ impl App {
             notify_min_seconds: self.notify_min_seconds,
             notify_only_on_failure: self.notify_only_on_failure,
             auto_summon_on_finish: self.auto_summon_on_finish,
+            program_notifications: self.program_notifications,
             osc52_allow_paste: self.osc52_allow_paste,
             run_selection: self.run_selection_enabled,
             hot_reload: self.hot_reload,
@@ -3665,6 +3671,7 @@ impl App {
         self.notify_min_seconds = cfg.notify_min_seconds.clamp(1, 86_400);
         self.notify_only_on_failure = cfg.notify_only_on_failure;
         self.auto_summon_on_finish = cfg.auto_summon_on_finish;
+        self.program_notifications = cfg.program_notifications;
         // OSC 52 paste: apply LIVE to every existing tab (the setter preserves each
         // tab's scrollback), so it is not merely "new tabs only".
         if cfg.osc52_allow_paste != self.osc52_allow_paste {
@@ -9236,6 +9243,9 @@ impl App {
     /// to an empty `Vec` in the common (no-completion) case, so this is ~free on
     /// the idle/no-shell-integration path.
     fn dispatch_completions(&mut self, event_loop: &ActiveEventLoop) {
+        // The notifications programs asked for ride the same drains (gated
+        // before the auto-summon below can change what is on screen).
+        self.dispatch_program_notifications();
         let enabled = self.notify_on_finish;
         // Snapshot "is the user watching the main window" ONCE for this batch. An
         // auto-summon triggered by an earlier tab flips self.visible mid-loop; without
@@ -9336,6 +9346,73 @@ impl App {
                     dw.pulse_anim = Some((std::time::Instant::now(), k));
                     dw.request_paint();
                 }
+            }
+        }
+    }
+
+    /// Show the desktop notifications programs asked for (OSC 9 / 777 / 99,
+    /// [`jetty_core::ProgramNotification`]): only from a tab the user is not
+    /// looking at — Run & Notify's rule: JeTTY hidden or unfocused, or the tab
+    /// in the background — named after that tab, within its
+    /// [`crate::notify::ToastBudget`] (the rest are dropped), and only with
+    /// `program_notifications` on. A background main tab gets its attention
+    /// dot either way. When nothing came this is one `is_empty` test per tab.
+    fn dispatch_program_notifications(&mut self) {
+        let active = self.active;
+        let mut badge_changed = false;
+        let mut fired = false;
+        for i in 0..self.tabs.len() {
+            let notes = self.tabs[i].terminal.take_notifications();
+            if notes.is_empty() {
+                continue;
+            }
+            if i != active {
+                let meta = &mut self.tabs[i].meta;
+                let next = meta.activity.max(jetty_render::TabActivity::Bell);
+                badge_changed |= next != meta.activity;
+                meta.activity = next;
+            }
+            if !self.program_notifications || main_tab_watched(self.main_user_watching(), i, active) {
+                continue;
+            }
+            let (label, now) = (self.main_tab_label(i), std::time::Instant::now());
+            for n in notes {
+                if !self.tabs[i].meta.toasts.take(now) {
+                    break;
+                }
+                let (summary, body) = crate::notify::program_text(&label, &n.title, &n.body);
+                self.notifier.fire(summary, body);
+                fired = true;
+            }
+        }
+        if badge_changed && self.visible && !self.main_occluded {
+            self.request_main_paint();
+        }
+        // The taskbar / dock urgency (macOS' only signal), once until focused.
+        if fired && !(self.visible && self.main_focused) {
+            if let Some(w) = &self.window {
+                if bell_asks_attention(&mut self.main_attention) {
+                    w.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+                }
+            }
+        }
+        for dw in &mut self.detached {
+            let notes = dw.tab.terminal.take_notifications();
+            if notes.is_empty() || !self.program_notifications || (dw.focused && !dw.occluded) {
+                continue;
+            }
+            let (label, now) = (format!("{} (detached)", dw.tab.title), std::time::Instant::now());
+            let mut fired = false;
+            for n in notes {
+                if !dw.tab.meta.toasts.take(now) {
+                    break;
+                }
+                let (summary, body) = crate::notify::program_text(&label, &n.title, &n.body);
+                self.notifier.fire(summary, body);
+                fired = true;
+            }
+            if fired && bell_asks_attention(&mut dw.attention) {
+                dw.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
             }
         }
     }

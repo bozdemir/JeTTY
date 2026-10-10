@@ -178,6 +178,9 @@ pub(crate) struct TabMeta {
     pub(crate) smart_title: Option<String>,
     /// See [`FG_RETRIES`].
     pub(crate) fg_retries: u8,
+    /// The desktop notifications its programs may still show (OSC 9 / 777 /
+    /// 99): a burst, then one per interval.
+    pub(crate) toasts: crate::notify::ToastBudget,
 }
 
 impl TabMeta {
@@ -383,6 +386,7 @@ mod tests {
             osc_title: Some("build".into()),
             smart_title: Some("proj".into()),
             fg_retries: 0,
+            toasts: Default::default(),
         };
         let mut main = vec![TabMeta::default(), tab.clone(), TabMeta::default()];
         let mut detached = crate::detached::take_tab(&mut main, 1).expect("detach");

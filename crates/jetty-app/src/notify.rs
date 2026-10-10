@@ -1,4 +1,6 @@
-//! "Command finished" desktop notifications (v0.15 Run & Notify).
+//! "Command finished" desktop notifications (v0.15 Run & Notify), and the
+//! ones programs ask for themselves (OSC 9 / 777 / 99: [`ToastBudget`],
+//! [`program_text`]).
 //!
 //! The blocking D-Bus round trip runs on ONE long-lived worker thread, fed by a
 //! BOUNDED channel: the UI thread only ever `try_send`s (never blocks), and a
@@ -24,7 +26,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One notification for the worker to fire.
 pub enum NotifyMsg {
@@ -279,6 +281,54 @@ pub fn should_notify(
     }
 }
 
+/// Program notifications one tab may show back to back…
+const PROGRAM_BURST: u32 = 3;
+/// …and how soon it may show one more after that.
+const PROGRAM_EVERY: Duration = Duration::from_secs(5);
+
+/// A tab's allowance of program notifications (OSC 9 / 777 / 99): a burst of
+/// [`PROGRAM_BURST`], then one per [`PROGRAM_EVERY`], so a flood — a `cat`ed
+/// file, a script in a loop — can't bury the desktop in toasts; the rest are
+/// dropped. One instant per tab (a token bucket kept as the time the tab is
+/// paid up to, GCRA), travelling with the tab between windows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ToastBudget {
+    /// `None` = the tab never showed one.
+    paid_to: Option<Instant>,
+}
+
+impl ToastBudget {
+    /// Spend one toast at `now`: false — nothing spent — when the tab has
+    /// none left.
+    pub fn take(&mut self, now: Instant) -> bool {
+        let paid_to = self.paid_to.map_or(now, |t| t.max(now));
+        if paid_to > now + PROGRAM_EVERY * (PROGRAM_BURST - 1) {
+            return false;
+        }
+        self.paid_to = Some(paid_to + PROGRAM_EVERY);
+        true
+    }
+}
+
+/// Most chars of the tab's label a program notification's summary keeps, so
+/// the program's own title still shows after it.
+const PROGRAM_LABEL_MAX_CHARS: usize = 40;
+
+/// A program notification's `(summary, body)`. Its text is the program's —
+/// anything a `cat`ed file holds — so the summary starts with the label of the
+/// tab that asked (cut to [`PROGRAM_LABEL_MAX_CHARS`]), where no daemon's
+/// ellipsis can hide it, then the program's title; the body is the program's.
+/// Both arrive sanitized ([`jetty_core::ProgramNotification`]).
+pub fn program_text(label: &str, title: &str, body: &str) -> (String, String) {
+    let label: String = if label.chars().count() > PROGRAM_LABEL_MAX_CHARS {
+        label.chars().take(PROGRAM_LABEL_MAX_CHARS - 1).chain(std::iter::once('…')).collect()
+    } else {
+        label.to_string()
+    };
+    let summary = if title.is_empty() { label } else { format!("{label} — {title}") };
+    (summary, body.to_string())
+}
+
 /// Human-readable duration for the notification summary: `5s`, `1m 12s`, `1h 1m`.
 pub fn fmt_duration(d: Duration) -> String {
     let secs = d.as_secs();
@@ -366,6 +416,45 @@ mod tests {
             "&lt;a href=\"https://evil\"&gt;click&lt;/a&gt;"
         );
         assert_eq!(escape_markup("&amp;"), "&amp;amp;", "pre-escaped text stays literal");
+    }
+
+    #[test]
+    fn program_toasts_come_in_a_burst_then_one_per_interval() {
+        let t0 = Instant::now();
+        let mut b = ToastBudget::default();
+        for n in 0..PROGRAM_BURST {
+            assert!(b.take(t0), "toast {n} of the burst");
+        }
+        assert!(!b.take(t0), "past the burst: dropped");
+        assert!(!b.take(t0 + PROGRAM_EVERY / 2), "not earned yet");
+        let t1 = t0 + PROGRAM_EVERY;
+        assert!(b.take(t1), "one more per interval");
+        assert!(!b.take(t1));
+        // A refused toast spends nothing; a quiet spell restores the burst.
+        let t2 = t1 + PROGRAM_EVERY * 10;
+        for n in 0..PROGRAM_BURST {
+            assert!(b.take(t2), "toast {n} of the next burst");
+        }
+        assert!(!b.take(t2));
+        // A minute of flood right after that burst: one per interval once the
+        // burst is paid off (5 s, 10 s … 55 s).
+        let shown = (0..600).filter(|&k| b.take(t2 + Duration::from_millis(k * 100))).count();
+        assert_eq!(shown, 11);
+    }
+
+    #[test]
+    fn a_program_toast_names_its_tab_first() {
+        assert_eq!(
+            program_text("Tab 2 · claude", "Claude Code", "Waiting for your input"),
+            ("Tab 2 · claude — Claude Code".to_string(), "Waiting for your input".to_string())
+        );
+        // OSC 9 has no title: the tab's label is the summary.
+        assert_eq!(program_text("Tab 3", "", "Build finished"), ("Tab 3".to_string(), "Build finished".to_string()));
+        // A long tab title can't push the program's title out of sight.
+        let (summary, _) = program_text(&format!("Tab 4 · {}", "x".repeat(200)), "Update", "");
+        assert!(summary.starts_with("Tab 4 · xxx"));
+        assert!(summary.ends_with("x… — Update"), "{summary}");
+        assert_eq!(summary.chars().count(), PROGRAM_LABEL_MAX_CHARS + " — Update".chars().count());
     }
 
     #[test]
