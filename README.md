@@ -166,7 +166,7 @@ Installs to `~/.local/bin` by default. The script verifies the published `SHA256
 curl -fsSL https://raw.githubusercontent.com/bozdemir/JeTTY/main/install.sh | JETTY_PREFIX=/usr/local sudo -E sh
 ```
 
-Also available: a launcher entry. Or grab a `.deb` / **AppImage** from the [latest release](https://github.com/bozdemir/JeTTY/releases/latest):
+The installer also adds JeTTY to your application launcher (icon and `.desktop` entry). Or grab a `.deb` / **AppImage** from the [latest release](https://github.com/bozdemir/JeTTY/releases/latest):
 
 ```bash
 sudo apt install ./jetty_*_amd64.deb                              # Debian / Ubuntu

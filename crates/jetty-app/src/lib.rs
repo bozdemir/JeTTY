@@ -463,7 +463,8 @@ pub fn run() {
                      \x20   --version      Print version and exit.\n\
                      \x20   --help         Print this help and exit.\n\
                      \x20   --print-shell-integration <zsh|bash|fish>\n\
-                     \x20                  Print the OSC 133 shell-integration snippet to stdout.\n\n\
+                     \x20                  Print the OSC 133 shell-integration snippet to stdout.\n\
+                     Anything else is ignored: there is no `-e` — JeTTY always starts your shell.\n\n\
                      Bind `jetty --toggle` to a key in your compositor to summon from anywhere.\n\
                      Settings: Ctrl+, or Ctrl+Shift+O · Command palette: Ctrl+Shift+P\n\
                      Config: {config} (another dir: set JETTY_CONFIG_DIR)\n\
